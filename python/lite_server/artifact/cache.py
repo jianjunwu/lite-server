@@ -67,5 +67,10 @@ class ArtifactCache:
         else:
             artifact_path = Path(artifact_path)
             cache_key = self._cache_key(artifact_path)
-            self._index.pop(cache_key, None)
+            cached_path = self._index.pop(cache_key, None)
+            if cached_path is not None:
+                import shutil
+                p = Path(cached_path)
+                if p.exists():
+                    shutil.rmtree(p)
         self._save_index()

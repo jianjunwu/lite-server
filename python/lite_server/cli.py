@@ -143,26 +143,28 @@ def _cmd_benchmark(args):
     start_time = time.time()
     end_time = start_time + args.duration
 
-    def send_request():
-        try:
-            t0 = time.time()
-            resp = httpx.post(url, json=payload, timeout=30.0)
-            t1 = time.time()
-            return {"success": resp.status_code == 200, "latency_ms": (t1 - t0) * 1000}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+    with httpx.Client() as client:
 
-    with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
-        futures = []
-        while time.time() < end_time:
-            futures.append(executor.submit(send_request))
-            if len(futures) >= args.concurrency:
-                for f in as_completed(futures[:args.concurrency]):
-                    results.append(f.result())
-                futures = futures[args.concurrency:]
+        def send_request():
+            try:
+                t0 = time.time()
+                resp = client.post(url, json=payload, timeout=30.0)
+                t1 = time.time()
+                return {"success": resp.status_code == 200, "latency_ms": (t1 - t0) * 1000}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
 
-        for f in as_completed(futures):
-            results.append(f.result())
+        with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+            futures = []
+            while time.time() < end_time:
+                futures.append(executor.submit(send_request))
+                if len(futures) >= args.concurrency:
+                    for f in as_completed(futures[:args.concurrency]):
+                        results.append(f.result())
+                    futures = futures[args.concurrency:]
+
+            for f in as_completed(futures):
+                results.append(f.result())
 
     total = len(results)
     success = sum(1 for r in results if r.get("success"))

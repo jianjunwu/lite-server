@@ -39,7 +39,7 @@ impl std::fmt::Display for QueueError {
 
 /// Per-model-version inference queue with batch aggregation.
 pub struct InferenceQueue {
-    queues: DashMap<String, mpsc::Sender<QueueItem>>,
+    queues: DashMap<String, (mpsc::Sender<QueueItem>, std::sync::Arc<tokio::task::JoinHandle<()>>)>,
 }
 
 impl InferenceQueue {
@@ -60,8 +60,10 @@ impl InferenceQueue {
     ) {
         let key = format!("{}_{}", model_name, version);
 
-        // Remove stale queue if exists
-        self.queues.remove(&key);
+        // Abort and remove stale collector if exists
+        if let Some((_, (_, old_handle))) = self.queues.remove(&key) {
+            old_handle.abort();
+        }
 
         let max_queue_size = config.max_queue_size.max(1);
         let (tx, rx) = mpsc::channel(max_queue_size);
@@ -72,9 +74,7 @@ impl InferenceQueue {
         let min_timeout = Duration::from_secs_f64(config.min_batch_timeout as f64);
         let queue_threshold = config.adaptive_queue_threshold;
 
-        self.queues.insert(key, tx);
-
-        tokio::spawn(batch_collector(
+        let handle = tokio::spawn(batch_collector(
             rx,
             max_batch,
             batch_timeout,
@@ -86,12 +86,16 @@ impl InferenceQueue {
             model_name.to_string(),
             version.to_string(),
         ));
+
+        self.queues.insert(key, (tx, std::sync::Arc::new(handle)));
     }
 
     /// Unregister a model version and stop its collector.
     pub fn unregister_model(&self, model_name: &str, version: &str) {
         let key = format!("{}_{}", model_name, version);
-        self.queues.remove(&key);
+        if let Some((_, (_, handle))) = self.queues.remove(&key) {
+            handle.abort();
+        }
     }
 
     /// Submit a single request to the queue (non-blocking).
@@ -107,9 +111,8 @@ impl InferenceQueue {
             let entry = self
                 .queues
                 .get(&key)
-                .ok_or(QueueError::NotFound)?
-                .clone();
-            entry
+                .ok_or(QueueError::NotFound)?;
+            entry.0.clone()
         };
         sender
             .try_send(item)
@@ -502,5 +505,54 @@ mod tests {
         let t3 = compute_adaptive_timeout(2, 10, 8, base, min, 10);
         assert!(t1 >= t2, "increasing queue depth should reduce timeout");
         assert!(t2 >= t3, "increasing queue depth should reduce timeout");
+    }
+
+    #[tokio::test]
+    async fn test_register_model_aborts_old_collector() {
+        let queue = InferenceQueue::new();
+        let config = ModelConfig {
+            max_queue_size: 10,
+            max_batch_size: 1,
+            batch_timeout: 0.0,
+            adaptive_batching: false,
+            min_batch_timeout: 0.0,
+            adaptive_queue_threshold: 0,
+            ..Default::default()
+        };
+
+        queue.register_model("test_model", "1", &config, vec![], vec![]);
+        let first_handle = queue.queues.get("test_model_1").unwrap().1.clone();
+        assert!(!first_handle.is_finished());
+
+        // Re-register should abort the first collector
+        queue.register_model("test_model", "1", &config, vec![], vec![]);
+        let second_handle = queue.queues.get("test_model_1").unwrap().1.clone();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(first_handle.is_finished(), "old collector should be aborted");
+        assert!(!second_handle.is_finished(), "new collector should still be running");
+    }
+
+    #[tokio::test]
+    async fn test_unregister_model_aborts_collector() {
+        let queue = InferenceQueue::new();
+        let config = ModelConfig {
+            max_queue_size: 10,
+            max_batch_size: 1,
+            batch_timeout: 0.0,
+            adaptive_batching: false,
+            min_batch_timeout: 0.0,
+            adaptive_queue_threshold: 0,
+            ..Default::default()
+        };
+
+        queue.register_model("test_model", "1", &config, vec![], vec![]);
+        let handle = queue.queues.get("test_model_1").unwrap().1.clone();
+        assert!(!handle.is_finished());
+
+        queue.unregister_model("test_model", "1");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(handle.is_finished(), "collector should be aborted after unregister");
     }
 }

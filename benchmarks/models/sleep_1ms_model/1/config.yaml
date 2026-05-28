@@ -3,4 +3,4 @@ batch_timeout: 0.0
 stream: false
 accelerator: cpu
 devices: 1
-workers_per_device: 4
+workers_per_device: 1

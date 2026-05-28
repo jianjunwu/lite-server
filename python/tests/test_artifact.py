@@ -323,3 +323,37 @@ class TestArtifactCache:
         path2 = cache.get_or_unpack(artifact, "my_model")
         # Should re-extract because mtime changed
         assert path1 == path2  # Same path, but contents re-extracted
+
+    def test_invalidate_removes_cached_directory(self, artifact, tmp_path):
+        cache = ArtifactCache(tmp_path / "cache")
+        cached_path = cache.get_or_unpack(artifact, "my_model")
+        assert cached_path.exists()
+        assert cache._index  # index should have an entry
+
+        cache.invalidate(artifact)
+
+        # Index entry should be removed
+        cache_key = cache._cache_key(artifact)
+        assert cache_key not in cache._index
+        # Cached directory should be deleted from disk
+        assert not cached_path.exists()
+
+    def test_invalidate_unknown_artifact_is_noop(self, artifact, tmp_path):
+        cache = ArtifactCache(tmp_path / "cache")
+        cache.get_or_unpack(artifact, "my_model")
+
+        unknown = tmp_path / "unknown.lma"
+        unknown.write_text("nope")
+
+        # Should not raise
+        cache.invalidate(unknown)
+
+    def test_invalidate_all_clears_everything(self, artifact, tmp_path):
+        cache = ArtifactCache(tmp_path / "cache")
+        path1 = cache.get_or_unpack(artifact, "my_model")
+        assert path1.exists()
+
+        cache.invalidate()
+
+        assert not cache._index
+        assert not path1.exists()

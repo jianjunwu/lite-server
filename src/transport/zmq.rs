@@ -6,6 +6,9 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
+/// Max time to wait for a ZMQ response before failing the request.
+const ZMQ_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Internal command sent to the ZMQ blocking thread.
 struct ZmqCommand {
     request: pb::Request,
@@ -106,6 +109,8 @@ impl WorkerZmqClient {
                                     metrics: None,
                                 });
                             }
+                            // socket and ctx are dropped here, which invokes
+                            // zmq_close / zmq_ctx_destroy automatically.
                             return;
                         }
                     }
@@ -175,8 +180,56 @@ impl WorkerZmqClient {
             .await
             .map_err(|_| AppError::Transport("ZMQ command channel closed".to_string()))?;
 
-        response_rx
+        tokio::time::timeout(ZMQ_RESPONSE_TIMEOUT, response_rx)
             .await
+            .map_err(|_| AppError::InferenceTimeout("ZMQ response timeout".to_string()))?
             .map_err(|_| AppError::Transport("ZMQ response channel closed".to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_zmq_client_cleanup_does_not_panic() {
+        let endpoint = format!("ipc:///tmp/lite-server-zmq-test-{}", std::process::id());
+        let client = WorkerZmqClient::new(endpoint.clone());
+
+        // Drop client; the blocking task should shut down gracefully
+        drop(client);
+
+        // Small delay to let the blocking task finish
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // If we reach here without panic, cleanup succeeded
+    }
+
+    #[tokio::test]
+    async fn test_zmq_client_send_fails_when_no_peer() {
+        let endpoint = format!("ipc:///tmp/lite-server-zmq-test-timeout-{}", std::process::id());
+        let client = WorkerZmqClient::new(endpoint.clone());
+
+        let request = pb::Request {
+            uid: "test-uid".to_string(),
+            meta: None,
+            payload: Some(pb::request::Payload::Single(pb::SingleRequest {
+                data: vec![1, 2, 3],
+            })),
+        };
+
+        // Without a peer, ZMQ send fails after sndtimeo and the blocking task
+        // returns an error response payload rather than hanging forever.
+        let result = client.send(request).await;
+        assert!(
+            result.is_ok(),
+            "send() should return Ok with error payload, not hang or Err"
+        );
+        let resp = result.unwrap();
+        if let Some(pb::response::Payload::Single(single)) = resp.payload {
+            assert_eq!(single.status.unwrap().code, "Error");
+        } else {
+            panic!("Expected Single response with error status");
+        }
     }
 }

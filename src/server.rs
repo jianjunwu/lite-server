@@ -123,6 +123,7 @@ impl LiteServer {
                 }
                 watcher_handle.abort();
                 timeline_handle.abort();
+                reload_handle.abort();
                 let _ = endpoint_manager.shutdown().await;
                 result
             }
@@ -138,6 +139,7 @@ impl LiteServer {
                 }
                 watcher_handle.abort();
                 timeline_handle.abort();
+                reload_handle.abort();
                 let _ = endpoint_manager.shutdown().await;
                 result
             }
@@ -145,6 +147,7 @@ impl LiteServer {
                 info!("Shutdown signal received");
                 watcher_handle.abort();
                 timeline_handle.abort();
+                reload_handle.abort();
                 let _ = endpoint_manager.shutdown().await;
                 self.worker_manager.shutdown().await;
                 Ok(())
@@ -559,5 +562,41 @@ async fn start_file_watcher(
             }
             else => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inference_queue::InferenceQueue;
+    use crate::registry::ModelRegistry;
+    use crate::worker::WorkerManager;
+
+    #[tokio::test]
+    async fn test_file_watcher_aborts_cleanly() {
+        let tmp_dir = std::env::temp_dir().join(format!("lite-server-fw-test-{}", std::process::id()));
+        tokio::fs::create_dir_all(&tmp_dir).await.unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let inference_queue = Arc::new(InferenceQueue::new());
+        let worker_manager = Arc::new(WorkerManager::new(
+            registry,
+            tmp_dir.clone(),
+            inference_queue,
+        ));
+
+        let (tx, _rx) = mpsc::channel::<Vec<PathBuf>>(32);
+        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx));
+
+        // Give watcher time to start
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        handle.abort();
+
+        // Wait for abort to take effect
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        assert!(handle.is_finished());
+
+        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
     }
 }

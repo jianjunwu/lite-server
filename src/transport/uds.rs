@@ -70,6 +70,8 @@ enum InferRequest {
 pub struct WorkerConnection {
     request_tx: mpsc::UnboundedSender<InferRequest>,
     closed: std::sync::atomic::AtomicBool,
+    writer_handle: tokio::task::JoinHandle<()>,
+    reader_handle: tokio::task::JoinHandle<()>,
 }
 
 impl WorkerConnection {
@@ -89,7 +91,7 @@ impl WorkerConnection {
         // Start writer task
         let pending_writer = pending_single.clone();
         let pending_writer_batch = pending_batch.clone();
-        tokio::spawn(writer_task(
+        let writer_handle = tokio::spawn(writer_task(
             write_half,
             request_rx,
             pending_writer,
@@ -99,7 +101,7 @@ impl WorkerConnection {
         // Start reader task
         let pending_reader = pending_single.clone();
         let pending_reader_batch = pending_batch.clone();
-        tokio::spawn(reader_task(
+        let reader_handle = tokio::spawn(reader_task(
             read_half,
             pending_reader,
             pending_reader_batch,
@@ -108,6 +110,8 @@ impl WorkerConnection {
         Ok(Self {
             request_tx,
             closed: std::sync::atomic::AtomicBool::new(false),
+            writer_handle,
+            reader_handle,
         })
     }
 
@@ -136,7 +140,10 @@ impl WorkerConnection {
     }
 
     pub fn close(&self) {
-        self.closed.store(true, std::sync::atomic::Ordering::Relaxed);
+        if !self.closed.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            self.writer_handle.abort();
+            self.reader_handle.abort();
+        }
     }
 }
 
@@ -423,4 +430,90 @@ pub fn start_response_consumer(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::UnixListener;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn test_worker_connection_close_aborts_tasks() {
+        let tmp_dir = std::env::temp_dir().join(format!("lite-server-uds-test-{}", std::process::id()));
+        tokio::fs::create_dir_all(&tmp_dir).await.unwrap();
+        let socket_path = tmp_dir.join("test.sock");
+
+        // Start a dummy server that accepts the connection
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let conn = WorkerConnection::new(&socket_path).await.unwrap();
+        assert!(!conn.closed.load(std::sync::atomic::Ordering::Relaxed));
+
+        conn.close();
+
+        // Give tasks a moment to be cancelled
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        assert!(conn.closed.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(conn.writer_handle.is_finished());
+        assert!(conn.reader_handle.is_finished());
+
+        // Clean up
+        server_task.abort();
+        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_remove_connection_closes_and_clears_pool() {
+        let tmp_dir = std::env::temp_dir().join(format!("lite-server-pool-test-{}", std::process::id()));
+        tokio::fs::create_dir_all(&tmp_dir).await.unwrap();
+        let socket_path = tmp_dir.join("test.sock");
+
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Create connection and insert into pool manually
+        let conn = Arc::new(WorkerConnection::new(&socket_path).await.unwrap());
+        {
+            let mut guard = CONNECTION_POOL.write().await;
+            guard.insert(socket_path.clone(), conn.clone());
+        }
+
+        remove_connection(&socket_path).await;
+
+        // Pool should be empty
+        {
+            let guard = CONNECTION_POOL.read().await;
+            assert!(!guard.contains_key(&socket_path));
+        }
+
+        // Connection tasks should be aborted
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert!(conn.writer_handle.is_finished());
+        assert!(conn.reader_handle.is_finished());
+
+        server_task.abort();
+        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+    }
 }

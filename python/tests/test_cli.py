@@ -343,3 +343,55 @@ class TestInit:
         })()
         assert cli._cmd_init(args) == 0
         assert (tmp_path / "wiz_proj").exists()
+
+
+# ===== benchmark =====
+
+class TestBenchmark:
+    def test_benchmark_uses_client_context_manager(self, monkeypatch):
+        """Verify benchmark reuses a single httpx.Client instead of creating
+        a new connection per request."""
+        import time
+        import sys
+
+        mock_response = type("Response", (), {"status_code": 200})()
+        post_calls = []
+        client_instances = []
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                client_instances.append(self)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def post(self, url, **kwargs):
+                post_calls.append((url, kwargs))
+                return mock_response
+
+        fake_httpx = type("FakeHttpx", (), {"Client": FakeClient})()
+        monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+
+        # time.time is called extensively; make it monotonically increase
+        # so the benchmark loop runs a few rounds then exits.
+        t = [0.0]
+        def fake_time():
+            t[0] += 0.001
+            return t[0]
+
+        monkeypatch.setattr(time, "time", fake_time)
+
+        args = type("Args", (), {
+            "url": "http://127.0.0.1:8000",
+            "model": "test_model",
+            "version": None,
+            "concurrency": 1,
+            "duration": 0.005,
+        })()
+        cli._cmd_benchmark(args)
+
+        # Exactly one Client instance should be created
+        assert len(client_instances) == 1, f"Expected 1 Client, got {len(client_instances)}"
+        assert len(post_calls) >= 1
+        for url, kwargs in post_calls:
+            assert kwargs.get("json") == {"input": 1.0}
