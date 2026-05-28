@@ -45,7 +45,12 @@ jobs:
           target: x86_64-unknown-linux-gnu
           manylinux: manylinux2014
           args: --release
-          docker-options: -e PYO3_NO_PYTHON=1
+          before-script-linux: |
+            PYTHON_A=$(find /opt/python -name "libpython3.10.a" | head -1)
+            if [ -n "$PYTHON_A" ]; then
+              PYTHON_DIR=$(dirname "$PYTHON_A")
+              gcc -shared -Wl,--whole-archive "$PYTHON_A" -Wl,--no-whole-archive -o "$PYTHON_DIR/libpython3.10.so" -lpthread -ldl -lutil
+            fi
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
