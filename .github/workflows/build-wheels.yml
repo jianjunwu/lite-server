@@ -43,13 +43,13 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: x86_64-unknown-linux-gnu
-          manylinux: manylinux2014
+          manylinux: auto
           args: --release
           before-script-linux: |
-            PYTHON_A=$(find /opt/python -name "libpython3.10.a" | head -1)
-            if [ -n "$PYTHON_A" ]; then
-              PYTHON_DIR=$(dirname "$PYTHON_A")
-              gcc -shared -Wl,--whole-archive "$PYTHON_A" -Wl,--no-whole-archive -o "$PYTHON_DIR/libpython3.10.so" -lpthread -ldl -lutil
+            if command -v yum &> /dev/null; then
+              yum install -y python3-devel || true
+            elif command -v apt-get &> /dev/null; then
+              apt-get update && apt-get install -y libpython3-dev || true
             fi
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
