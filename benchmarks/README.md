@@ -4,14 +4,15 @@ Performance comparison of inference server architectures using `wrk`.
 
 ## Prerequisites
 
-Requires Rust toolchain, `wrk`, and Python dependencies:
+Requires the compiled `lite-server` Python package, `wrk`, and Python dependencies:
 
 ```bash
-# Install lite-server with benchmark dependencies
-uv pip install -e ".[benchmark]"
+# Build and install lite-server from the project root
+maturin build --release
+pip install dist/lite_server-*.whl
 
-# Or install dependencies separately
-uv pip install litserve
+# Install benchmark dependencies
+pip install litserve pyyaml
 
 # Install wrk (macOS)
 brew install wrk

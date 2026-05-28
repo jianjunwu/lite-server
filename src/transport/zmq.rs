@@ -148,8 +148,8 @@ impl WorkerZmqClient {
                         }
                     }
                     Err(zmq::Error::EAGAIN) => {
-                        // No message available, sleep briefly
-                        std::thread::sleep(Duration::from_millis(1));
+                        // No message available, yield to reduce latency
+                        std::thread::yield_now();
                     }
                     Err(e) => {
                         error!("ZMQ recv error: {}", e);

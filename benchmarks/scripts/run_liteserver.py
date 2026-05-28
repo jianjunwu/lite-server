@@ -1,13 +1,12 @@
 """Start lite-server for benchmarking.
 
-Requires Rust toolchain (cargo) and the lite-server source tree.
+Requires the lite-server Python package to be installed (e.g. via maturin build + pip install).
 """
 
 from __future__ import annotations
 
 import argparse
-import os
-import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -15,48 +14,6 @@ from pathlib import Path
 from urllib import request
 
 import yaml
-
-
-def _ensure_cargo_in_path() -> None:
-    """Detect cargo and prepend its directory to PATH for subprocess visibility.
-
-    Scans PATH and common rustup/cargo install directories. If found,
-    prepends the directory to os.environ['PATH'] so subprocess.Popen
-    inherits it automatically.
-    """
-    path_env = os.environ.get("PATH", "")
-    path_dirs = [p for p in path_env.split(os.pathsep) if p]
-
-    # Already in PATH?
-    for p in path_dirs:
-        if (Path(p) / "cargo").exists():
-            return
-
-    # Search common install locations
-    home = Path.home()
-    candidates = [
-        home / ".cargo" / "bin",
-        home / ".rustup" / "toolchains" / "stable-x86_64-apple-darwin" / "bin",
-        home / ".rustup" / "toolchains" / "stable-aarch64-apple-darwin" / "bin",
-        home / ".rustup" / "toolchains" / "stable-x86_64-unknown-linux-gnu" / "bin",
-        home / ".rustup" / "toolchains" / "stable-aarch64-unknown-linux-gnu" / "bin",
-    ]
-    for candidate in candidates:
-        if (candidate / "cargo").exists():
-            os.environ["PATH"] = str(candidate) + os.pathsep + path_env
-            return
-
-
-def _find_cargo_root() -> Path | None:
-    """Find the cargo project root (directory containing Cargo.toml)."""
-    script_dir = Path(__file__).resolve().parent
-    # Walk up until we find Cargo.toml
-    current = script_dir
-    while current != current.parent:
-        if (current / "Cargo.toml").exists():
-            return current
-        current = current.parent
-    return None
 
 
 def _set_workers_in_config(model_repo: Path, model_name: str, workers: int) -> None:
@@ -82,7 +39,7 @@ def _write_orchestration(model_repo: Path, model_name: str) -> Path:
         "models": [
             {
                 "name": model_name,
-                "load_policy": "explicit",
+                "load_policy": "all",
             }
         ],
     }
@@ -141,6 +98,9 @@ def main() -> int:
     parser.add_argument(
         "--duration", type=float, default=30.0, help="Expected benchmark duration (for timeout)"
     )
+    parser.add_argument(
+        "--core", action="store_true", help="Use lite-server-core binary instead of Python CLI"
+    )
     args = parser.parse_args()
 
     # Resolve model repository
@@ -164,21 +124,36 @@ def main() -> int:
     # Write orchestration.yaml for auto-load
     orch_path = _write_orchestration(model_repo, args.model)
 
-    # Ensure cargo is discoverable by subprocess
-    _ensure_cargo_in_path()
-
-    # Find cargo root
-    cargo_root = _find_cargo_root()
-    if cargo_root is None:
-        print("ERROR: Cannot find Cargo.toml project root", file=sys.stderr)
-        return 1
+    if args.core:
+        # Look for lite-server-core binary
+        cargo_root = Path(__file__).resolve().parent.parent.parent
+        core_binary = cargo_root / "target" / "release" / "lite-server-core"
+        if not core_binary.exists():
+            core_binary = shutil.which("lite-server-core")
+            if core_binary is None:
+                print(
+                    "ERROR: 'lite-server-core' binary not found. "
+                    "Run 'cargo build --release' first.",
+                    file=sys.stderr,
+                )
+                return 1
+            core_binary = Path(core_binary)
+        lite_server = str(core_binary)
+        subcmd = "serve"
+    else:
+        lite_server = shutil.which("lite-server")
+        if lite_server is None:
+            print(
+                "ERROR: 'lite-server' command not found. "
+                "Install the package first: maturin build --release && pip install dist/lite_server-*.whl",
+                file=sys.stderr,
+            )
+            return 1
+        subcmd = "serve"
 
     cmd = [
-        "cargo",
-        "run",
-        "--release",
-        "--",
-        "serve",
+        lite_server,
+        subcmd,
         "--port", str(args.port),
         "--host", "127.0.0.1",
         "--model-repo", str(model_repo),
@@ -187,14 +162,14 @@ def main() -> int:
         "--timeout", str(args.duration + 10.0),
     ]
 
-    print(f"[lite-server] Starting on port {args.port} with {args.workers} workers...")
+    label = "lite-server-core" if args.core else "lite-server"
+    print(f"[{label}] Starting on port {args.port} with {args.workers} workers...")
     print(f"  model-repo: {model_repo}")
     print(f"  model: {args.model}")
-    print(f"  cargo root: {cargo_root}")
+    print(f"  binary: {lite_server}")
 
     proc = subprocess.Popen(
         cmd,
-        cwd=str(cargo_root),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )

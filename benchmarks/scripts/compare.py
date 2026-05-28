@@ -136,9 +136,11 @@ def plot_results(rows: list[dict], output_dir: Path) -> None:
         subset = [r for r in rows if r["workers"] == w]
         concs = [r["concurrency"] for r in subset]
         ax_rps.plot(concs, [r["lite_rps"] for r in subset], "o-", label=f"lite-server w={w}")
+        ax_rps.plot(concs, [r["core_rps"] for r in subset], "^-", label=f"lite-server-core w={w}")
         ax_rps.plot(concs, [r["lit_rps"] for r in subset], "s--", label=f"LitServe w={w}")
 
         ax_lat.plot(concs, [r["lite_p99"] for r in subset], "o-", label=f"lite-server w={w}")
+        ax_lat.plot(concs, [r["core_p99"] for r in subset], "^-", label=f"lite-server-core w={w}")
         ax_lat.plot(concs, [r["lit_p99"] for r in subset], "s--", label=f"LitServe w={w}")
 
     ax_rps.set_xlabel("Concurrency")
@@ -167,6 +169,7 @@ def plot_results(rows: list[dict], output_dir: Path) -> None:
         fig2, ax2 = plt.subplots(figsize=(7, 5))
         ws = [r["workers"] for r in scale_rows]
         ax2.plot(ws, [r["lite_rps"] for r in scale_rows], "o-", label="lite-server")
+        ax2.plot(ws, [r["core_rps"] for r in scale_rows], "^-", label="lite-server-core")
         ax2.plot(ws, [r["lit_rps"] for r in scale_rows], "s-", label="LitServe")
         ax2.set_xlabel("Inference Workers")
         ax2.set_ylabel("Throughput (req/s)")
@@ -243,6 +246,7 @@ def main() -> int:
 
     lite_url = f"http://127.0.0.1:8000/v2/models/{args.model}/infer"
     lit_url = f"http://127.0.0.1:8001/v2/models/{args.model}/infer"
+    core_url = f"http://127.0.0.1:8002/v2/models/{args.model}/infer"
     lite_script = scripts_dir / "run_liteserver.py"
     lit_script = scripts_dir / "run_litserve.py"
 
@@ -327,6 +331,38 @@ def main() -> int:
             lit_proc.terminate()
             lit_proc.wait()
 
+            # ---- lite-server-core ----
+            print("[lite-server-core] Starting...")
+            core_proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(lite_script),
+                    "--port",
+                    "8002",
+                    "--workers",
+                    str(workers),
+                    "--duration",
+                    str(args.duration + 10),
+                    "--core",
+                    *model_repo_arg,
+                    *model_arg,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            if not wait_for_server(core_url, timeout=60):
+                print("ERROR: lite-server-core failed to start", file=sys.stderr)
+                core_proc.terminate()
+                core_proc.wait()
+                continue
+
+            time.sleep(args.warmup)
+            print(f"[lite-server-core] wrk -c{conc} -d{int(args.duration)}s ...")
+            core_res = run_wrk(args.wrk, core_url, conc, args.duration, lua_script)
+            core_proc.terminate()
+            core_proc.wait()
+
             row = {
                 "workers": workers,
                 "concurrency": conc,
@@ -338,6 +374,10 @@ def main() -> int:
                 "lit_p99": round(lit_res.get("p99", 0), 3),
                 "lit_p90": round(lit_res.get("p90", 0), 3),
                 "lit_p50": round(lit_res.get("p50", 0), 3),
+                "core_rps": round(core_res.get("rps", 0), 2),
+                "core_p99": round(core_res.get("p99", 0), 3),
+                "core_p90": round(core_res.get("p90", 0), 3),
+                "core_p50": round(core_res.get("p50", 0), 3),
             }
             rows.append(row)
 
@@ -346,9 +386,16 @@ def main() -> int:
                 if row["lit_rps"] > 0
                 else float("inf")
             )
-            print(f"  lite-server: {row['lite_rps']:.1f} req/s  p99={row['lite_p99']:.2f}ms")
-            print(f"  LitServe:    {row['lit_rps']:.1f} req/s  p99={row['lit_p99']:.2f}ms")
-            print(f"  lite-server / LitServe = {speedup:.2f}x")
+            speedup_core = (
+                row["core_rps"] / row["lit_rps"]
+                if row["lit_rps"] > 0
+                else float("inf")
+            )
+            print(f"  lite-server:      {row['lite_rps']:.1f} req/s  p99={row['lite_p99']:.2f}ms")
+            print(f"  lite-server-core: {row['core_rps']:.1f} req/s  p99={row['core_p99']:.2f}ms")
+            print(f"  LitServe:         {row['lit_rps']:.1f} req/s  p99={row['lit_p99']:.2f}ms")
+            print(f"  lite-server / LitServe      = {speedup:.2f}x")
+            print(f"  lite-server-core / LitServe = {speedup_core:.2f}x")
 
     # Write CSV
     fieldnames = [
@@ -362,6 +409,10 @@ def main() -> int:
         "lit_p50",
         "lit_p90",
         "lit_p99",
+        "core_rps",
+        "core_p50",
+        "core_p90",
+        "core_p99",
     ]
     with open(output_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

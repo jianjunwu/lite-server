@@ -159,19 +159,29 @@ async fn send_batch(
     inflight[worker_idx].fetch_add(1, Ordering::Relaxed);
     let zmq_client = &zmq_clients[worker_idx];
 
-    // Build protobuf batch request
-    let items: Vec<pb::BatchItem> = batch
-        .iter()
-        .map(|item| pb::BatchItem {
+    // Build protobuf request (Single if batch.len() == 1, else Batch)
+    let request = if batch.len() == 1 {
+        let item = &batch[0];
+        pb::Request {
             uid: item.uid.clone(),
-            data: item.data.clone(),
-        })
-        .collect();
-
-    let request = pb::Request {
-        uid: format!("batch-{}", uuid::Uuid::new_v4()),
-        meta: batch.first().and_then(|i| i.meta.clone()),
-        payload: Some(pb::request::Payload::Batch(pb::BatchRequest { items })),
+            meta: item.meta.clone(),
+            payload: Some(pb::request::Payload::Single(pb::SingleRequest {
+                data: item.data.clone(),
+            })),
+        }
+    } else {
+        let items: Vec<pb::BatchItem> = batch
+            .iter()
+            .map(|item| pb::BatchItem {
+                uid: item.uid.clone(),
+                data: item.data.clone(),
+            })
+            .collect();
+        pb::Request {
+            uid: format!("batch-{}", uuid::Uuid::new_v4()),
+            meta: batch.first().and_then(|i| i.meta.clone()),
+            payload: Some(pb::request::Payload::Batch(pb::BatchRequest { items })),
+        }
     };
 
     // Track queue depth decrease for all items in the batch
@@ -184,53 +194,65 @@ async fn send_batch(
     match result {
         Ok(resp) => {
             crate::metrics::prometheus::record_worker_metrics(model_name, resp.metrics.as_ref());
-            if let Some(pb::response::Payload::Batch(batch_resp)) = resp.payload {
-                let resp_map: std::collections::HashMap<String, pb::BatchItemResponse> =
-                    batch_resp
-                        .items
-                        .into_iter()
-                        .map(|item| (item.uid.clone(), item))
-                        .collect();
+            match resp.payload {
+                Some(pb::response::Payload::Batch(batch_resp)) => {
+                    let resp_map: std::collections::HashMap<String, pb::BatchItemResponse> =
+                        batch_resp
+                            .items
+                            .into_iter()
+                            .map(|item| (item.uid.clone(), item))
+                            .collect();
 
-                for queue_item in batch.drain(..) {
-                    let single_resp = if let Some(resp_item) = resp_map.get(&queue_item.uid) {
-                        pb::Response {
+                    for queue_item in batch.drain(..) {
+                        let single_resp = if let Some(resp_item) = resp_map.get(&queue_item.uid) {
+                            pb::Response {
+                                uid: queue_item.uid,
+                                payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+                                    data: resp_item.data.clone(),
+                                    status: resp_item.status.clone(),
+                                })),
+                                metrics: resp.metrics.clone(),
+                            }
+                        } else {
+                            pb::Response {
+                                uid: queue_item.uid,
+                                payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+                                    data: vec![],
+                                    status: Some(pb::Status {
+                                        code: "Error".to_string(),
+                                        message: "missing in batch response".to_string(),
+                                    }),
+                                })),
+                                metrics: None,
+                            }
+                        };
+                        let _ = queue_item.response_tx.send(single_resp);
+                    }
+                }
+                Some(pb::response::Payload::Single(single_resp)) => {
+                    if let Some(queue_item) = batch.pop() {
+                        let _ = queue_item.response_tx.send(pb::Response {
                             uid: queue_item.uid,
-                            payload: Some(pb::response::Payload::Single(pb::SingleResponse {
-                                data: resp_item.data.clone(),
-                                status: resp_item.status.clone(),
-                            })),
-                            metrics: resp.metrics.clone(),
-                        }
-                    } else {
-                        pb::Response {
+                            payload: Some(pb::response::Payload::Single(single_resp)),
+                            metrics: resp.metrics,
+                        });
+                    }
+                }
+                _ => {
+                    warn!("Unexpected response type from worker for {} {}", model_name, version);
+                    for queue_item in batch.drain(..) {
+                        let _ = queue_item.response_tx.send(pb::Response {
                             uid: queue_item.uid,
                             payload: Some(pb::response::Payload::Single(pb::SingleResponse {
                                 data: vec![],
                                 status: Some(pb::Status {
                                     code: "Error".to_string(),
-                                    message: "missing in batch response".to_string(),
+                                    message: "unexpected response type".to_string(),
                                 }),
                             })),
                             metrics: None,
-                        }
-                    };
-                    let _ = queue_item.response_tx.send(single_resp);
-                }
-            } else {
-                warn!("Unexpected response type from worker for {} {}", model_name, version);
-                for queue_item in batch.drain(..) {
-                    let _ = queue_item.response_tx.send(pb::Response {
-                        uid: queue_item.uid,
-                        payload: Some(pb::response::Payload::Single(pb::SingleResponse {
-                            data: vec![],
-                            status: Some(pb::Status {
-                                code: "Error".to_string(),
-                                message: "unexpected response type".to_string(),
-                            }),
-                        })),
-                        metrics: None,
-                    });
+                        });
+                    }
                 }
             }
         }
@@ -314,14 +336,20 @@ async fn batch_collector(
     version: String,
 ) {
     if max_batch_size <= 1 {
-        // Fast path: no batching, send immediately
+        // Fast path: no batching, send immediately and concurrently
         let worker_inflight: Vec<Arc<AtomicUsize>> = (0..zmq_clients.len())
             .map(|_| Arc::new(AtomicUsize::new(0)))
             .collect();
 
         while let Some(item) = rx.recv().await {
             let mut batch = vec![item];
-            send_batch(&mut batch, &zmq_clients, &worker_inflight, &model_name, &version).await;
+            let zmq_clients = zmq_clients.clone();
+            let worker_inflight = worker_inflight.clone();
+            let model_name = model_name.clone();
+            let version = version.clone();
+            tokio::spawn(async move {
+                send_batch(&mut batch, &zmq_clients, &worker_inflight, &model_name, &version).await;
+            });
         }
         return;
     }
@@ -340,7 +368,14 @@ async fn batch_collector(
                 prometheus::inc_queue_depth(&model_name, &version);
                 batch.push(item);
                 if batch.len() >= max_batch_size {
-                    send_batch(&mut batch, &zmq_clients, &worker_inflight, &model_name, &version).await;
+                    let mut current_batch = std::mem::take(&mut batch);
+                    let zmq_clients = zmq_clients.clone();
+                    let worker_inflight = worker_inflight.clone();
+                    let model_name = model_name.clone();
+                    let version = version.clone();
+                    tokio::spawn(async move {
+                        send_batch(&mut current_batch, &zmq_clients, &worker_inflight, &model_name, &version).await;
+                    });
                     deadline = None;
                 } else if deadline.is_none() {
                     let timeout = if adaptive {
@@ -367,7 +402,14 @@ async fn batch_collector(
                 }
             }, if deadline.is_some() => {
                 if !batch.is_empty() {
-                    send_batch(&mut batch, &zmq_clients, &worker_inflight, &model_name, &version).await;
+                    let mut current_batch = std::mem::take(&mut batch);
+                    let zmq_clients = zmq_clients.clone();
+                    let worker_inflight = worker_inflight.clone();
+                    let model_name = model_name.clone();
+                    let version = version.clone();
+                    tokio::spawn(async move {
+                        send_batch(&mut current_batch, &zmq_clients, &worker_inflight, &model_name, &version).await;
+                    });
                 }
                 deadline = None;
             }
@@ -377,7 +419,14 @@ async fn batch_collector(
 
     // Drain remaining items
     if !batch.is_empty() {
-        send_batch(&mut batch, &zmq_clients, &worker_inflight, &model_name, &version).await;
+        let mut current_batch = std::mem::take(&mut batch);
+        let zmq_clients = zmq_clients.clone();
+        let worker_inflight = worker_inflight.clone();
+        let model_name = model_name.clone();
+        let version = version.clone();
+        tokio::spawn(async move {
+            send_batch(&mut current_batch, &zmq_clients, &worker_inflight, &model_name, &version).await;
+        });
     }
 }
 
