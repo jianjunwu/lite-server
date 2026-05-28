@@ -28,31 +28,75 @@ jobs:
 
   build-wheels:
     needs: get-version
-    name: Build x86_64-unknown-linux-gnu
-    runs-on: ubuntu-latest
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: manylinux_2_28
+            before-script: |
+              curl -fsSL -o /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+              bash /tmp/miniconda.sh -b -p /opt/miniconda
+              /opt/miniconda/bin/conda install -y python=3.10
+            interpreter: /opt/miniconda/bin/python3.10
+          # Linux aarch64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            platform: manylinux_2_28
+            before-script: |
+              curl -fsSL -o /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-aarch64.sh
+              bash /tmp/miniconda.sh -b -p /opt/miniconda
+              /opt/miniconda/bin/conda install -y python=3.10
+            interpreter: /opt/miniconda/bin/python3.10
+          # macOS x86_64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            platform: auto
+            interpreter: python3.10
+          # macOS aarch64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            platform: auto
+            interpreter: python3.10
+          # Windows x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: auto
+            interpreter: python3.10
+          # Windows aarch64
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            platform: auto
+            interpreter: python3.10
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.10'
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu
+          targets: ${{ matrix.target }}
+
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
-          target: x86_64-unknown-linux-gnu
-          manylinux: manylinux_2_28
-          args: --release --interpreter /opt/miniconda/bin/python3.10
-          before-script-linux: |
-            curl -fsSL -o /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
-            bash /tmp/miniconda.sh -b -p /opt/miniconda
-            /opt/miniconda/bin/conda install -y python=3.10
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.platform }}
+          args: --release --interpreter ${{ matrix.interpreter }}
+          before-script-linux: ${{ matrix.before-script }}
+
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wheel-x86_64-unknown-linux-gnu
+          name: wheel-${{ matrix.target }}
           path: target/wheels/*.whl
 
   release:
@@ -63,11 +107,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download wheel artifact
+      - name: Download all wheel artifacts
         uses: actions/download-artifact@v4
         with:
-          name: wheel-x86_64-unknown-linux-gnu
           path: wheels
+          pattern: wheel-*
+          merge-multiple: true
+
       - name: Verify version matches tag
         run: |
           TAG=${GITHUB_REF#refs/tags/v}
@@ -76,6 +122,7 @@ jobs:
             echo "Error: Tag version ($TAG) does not match pyproject.toml version ($VERSION)"
             exit 1
           fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
