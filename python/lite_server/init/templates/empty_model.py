@@ -8,7 +8,7 @@ class MyAPI(LitAPI):
 
     def decode_request(self, request):
         """Convert HTTP request JSON to model input."""
-        return request["input"]
+        return request.get("input", 0)
 
     def predict(self, x, **kwargs):
         """Run inference. x is a list when batching is enabled."""

@@ -178,3 +178,50 @@ class TestGitignore:
         root = gen.generate()
         text = (root / ".gitignore").read_text()
         assert "*.pt" in text
+
+
+class TestServerYamlOrchestration:
+    """server.yaml must contain orchestration config."""
+
+    def test_contains_orchestration_section(self, tmp_path):
+        gen = ProjectGenerator("p", "empty", tmp_path, model_name="foo")
+        root = gen.generate()
+        text = (root / "server.yaml").read_text()
+        assert "orchestration:" in text
+        assert "load_models:" in text
+        assert "- foo" in text
+
+
+class TestModelPySafety:
+    """Generated model.py must not crash on edge-case inputs."""
+
+    def test_decode_request_without_input_key(self, tmp_path):
+        gen = ProjectGenerator("p", "empty", tmp_path)
+        root = gen.generate()
+        model_py = root / "model_repo" / "my_model" / "1" / "model.py"
+        code = compile(model_py.read_text(), str(model_py), "exec")
+        namespace = {}
+        exec(code, namespace)
+        # Find the LitAPI subclass
+        api_cls = None
+        for obj in namespace.values():
+            if isinstance(obj, type) and hasattr(obj, "predict") and obj.__name__ != "LitAPI":
+                api_cls = obj
+                break
+        assert api_cls is not None
+        instance = api_cls()
+        # Should not raise KeyError when "input" is missing
+        result = instance.decode_request({"other": "value"})
+        assert result is not None  # Safe default, not a crash
+
+
+class TestTestRequestPy:
+    """Generated test_request.py must handle HTTP errors."""
+
+    def test_has_status_code_check(self, tmp_path):
+        gen = ProjectGenerator("p", "empty", tmp_path)
+        root = gen.generate()
+        text = (root / "test_request.py").read_text()
+        assert "status_code" in text
+        # Should branch on error rather than blindly calling resp.json()
+        assert "if" in text or "try" in text or "raise_for_status" in text

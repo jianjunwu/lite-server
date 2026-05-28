@@ -171,6 +171,11 @@ SERVER_YAML = textwrap.dedent("""\
     model_repository:
       path: ./model_repo
 
+    orchestration:
+      control_mode: explicit
+      load_models:
+        - {model_name}
+
     webui:
       enabled: {webui}
 """)
@@ -458,7 +463,9 @@ class ProjectGenerator:
         metrics = str(self.options.get("metrics", True)).lower()
         webui = str(self.options.get("webui", True)).lower()
         (root / "server.yaml").write_text(
-            SERVER_YAML.format(grpc=grpc, metrics=metrics, webui=webui)
+            SERVER_YAML.format(
+                grpc=grpc, metrics=metrics, webui=webui, model_name=self.model_name
+            )
         )
 
         # Test script

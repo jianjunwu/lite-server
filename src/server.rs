@@ -217,10 +217,20 @@ impl LiteServer {
             // Activate default version
             if let Some(ref dv) = default_version {
                 if versions_loaded.contains(dv) {
-                    let _ = self.registry.activate_version(&name, dv).await;
+                    match self.registry.activate_version(&name, dv).await {
+                        Ok(true) => info!("Activated default version {} for {}", dv, name),
+                        Ok(false) => warn!("Failed to activate default version {} for {} (not ready)", dv, name),
+                        Err(e) => error!("Error activating default version {} for {}: {}", dv, name, e),
+                    }
                 }
             } else if !versions_loaded.is_empty() && self.registry.get_active_version(&name).await.is_none() {
-                let _ = self.registry.activate_version(&name, &versions_loaded[0]).await;
+                match self.registry.activate_version(&name, &versions_loaded[0]).await {
+                    Ok(true) => info!("Activated version {} for {}", versions_loaded[0], name),
+                    Ok(false) => warn!("Failed to activate version {} for {} (not ready)", versions_loaded[0], name),
+                    Err(e) => error!("Error activating version {} for {}: {}", versions_loaded[0], name, e),
+                }
+            } else {
+                info!("Skipping activation for {}: versions_loaded={:?}, active={:?}", name, versions_loaded, self.registry.get_active_version(&name).await);
             }
         }
 

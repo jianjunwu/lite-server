@@ -11,6 +11,7 @@ pub mod server;
 pub mod transport;
 pub mod worker;
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 use tracing::info;
 
@@ -73,6 +74,7 @@ pub fn run_server(
     })
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 #[pyo3(signature = (
     config=None,
@@ -107,6 +109,7 @@ fn serve(
     })
 }
 
+#[cfg(feature = "python")]
 #[pymodule]
 fn _lite_server(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(serve, m)?)?;

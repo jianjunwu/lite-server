@@ -44,6 +44,7 @@ manifest-path = "Cargo.toml"
 python-source = "python"
 module-name = "_lite_server"
 bindings = "pyo3"
+features = ["python"]
 include = ["python/**/*.py", "python/**/*.yaml", "python/**/*.j2"]
 
 [tool.pytest.ini_options]
