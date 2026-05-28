@@ -1,3 +1,3 @@
 pub mod liteserver {
-    include!("liteserver.rs");
+    include!("proto/liteserver.rs");
 }
