@@ -69,8 +69,6 @@ regex = "1"
 # base64
 base64 = "0.22"
 
-[build-dependencies]
-prost-build = "0.13"
 
 [dev-dependencies]
 tokio-test = "0.4"
