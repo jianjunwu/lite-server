@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -14,6 +15,11 @@ from pathlib import Path
 from urllib import request
 
 import yaml
+
+
+def _handle_sigterm(signum, frame):
+    """Convert SIGTERM to KeyboardInterrupt so finally block runs."""
+    raise KeyboardInterrupt
 
 
 def _set_workers_in_config(model_repo: Path, model_name: str, workers: int) -> None:
@@ -82,6 +88,8 @@ def wait_for_model_ready(url: str, timeout: float = 30.0) -> bool:
 
 
 def main() -> int:
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
     parser = argparse.ArgumentParser(description="Run lite-server benchmark target")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--workers", type=int, default=1, help="Inference workers per device")
