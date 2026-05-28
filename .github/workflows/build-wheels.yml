@@ -1,74 +1,80 @@
-name: Build Wheels
+name: Build and Release Wheels
 
 on:
   push:
     tags:
       - 'v*'
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Linux
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            platform: manylinux2014
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            platform: manylinux2014
-          # macOS
-          - os: macos-latest
-            target: x86_64-apple-darwin
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          # Windows
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-
+  get-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Get version from pyproject.toml
+        id: get_version
+        run: |
+          VERSION=$(python -c "import tomllib; f=open('pyproject.toml','rb'); print(tomllib.load(f)['project']['version']); f.close()")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
+  build-wheels:
+    needs: get-version
+    name: Build x86_64-unknown-linux-gnu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Install Rust toolchain
         uses: dtolnay/rust-action@stable
         with:
-          targets: ${{ matrix.target }}
-
+          targets: x86_64-unknown-linux-gnu
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
-          target: ${{ matrix.target }}
-          manylinux: ${{ matrix.platform || 'auto' }}
+          target: x86_64-unknown-linux-gnu
+          manylinux: manylinux2014
           args: --release
-
-      - name: Retag wheel as py3-none
-        shell: bash
-        run: |
-          python -m pip install wheel
-          for whl in target/wheels/*.whl; do
-            # Skip if already py3-none
-            if [[ "$whl" == *"py3-none"* ]]; then
-              continue
-            fi
-            python -m wheel tags --python-tag py3 --abi-tag none "$whl"
-            rm "$whl"
-          done
-
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wheel-${{ matrix.target }}
+          name: wheel-x86_64-unknown-linux-gnu
           path: target/wheels/*.whl
+
+  release:
+    name: Release
+    needs: [get-version, build-wheels]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-x86_64-unknown-linux-gnu
+          path: wheels
+      - name: Verify version matches tag
+        run: |
+          TAG=${GITHUB_REF#refs/tags/v}
+          VERSION="${{ needs.get-version.outputs.version }}"
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "Error: Tag version ($TAG) does not match pyproject.toml version ($VERSION)"
+            exit 1
+          fi
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.get-version.outputs.version }}
+          name: lite-server v${{ needs.get-version.outputs.version }}
+          files: wheels/*.whl
