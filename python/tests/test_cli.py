@@ -255,14 +255,15 @@ class TestPackUnpack:
 # ===== init =====
 
 class TestInit:
-    def test_init_basic_template(self, tmp_path, monkeypatch):
+    def test_init_empty_template(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         args = type("Args", (), {
-            "project_name": "basic_proj",
-            "template": "basic",
+            "project_name": "empty_proj",
+            "template": "empty",
+            "wizard": False,
         })()
         assert cli._cmd_init(args) == 0
-        proj = tmp_path / "basic_proj"
+        proj = tmp_path / "empty_proj"
         assert (proj / "model_repo" / "my_model" / "1" / "model.py").exists()
         assert (proj / "model_repo" / "my_model" / "1" / "config.yaml").exists()
         assert (proj / "server.yaml").exists()
@@ -280,39 +281,42 @@ class TestInit:
         assert "import requests" in tr
         assert "test_health" in tr
 
-    def test_init_streaming_template(self, tmp_path, monkeypatch):
+    def test_init_llm_template(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         args = type("Args", (), {
-            "project_name": "stream_proj",
-            "template": "streaming",
+            "project_name": "llm_proj",
+            "template": "llm",
+            "wizard": False,
         })()
         assert cli._cmd_init(args) == 0
-        model_py = tmp_path / "stream_proj" / "model_repo" / "my_model" / "1" / "model.py"
+        model_py = tmp_path / "llm_proj" / "model_repo" / "my_model" / "1" / "model.py"
         assert model_py.exists()
         content = model_py.read_text()
-        assert "yield" in content
-        config = tmp_path / "stream_proj" / "model_repo" / "my_model" / "1" / "config.yaml"
+        assert "messages" in content
+        config = tmp_path / "llm_proj" / "model_repo" / "my_model" / "1" / "config.yaml"
         assert "stream: true" in config.read_text()
 
-    def test_init_batching_template(self, tmp_path, monkeypatch):
+    def test_init_nlp_template(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         args = type("Args", (), {
-            "project_name": "batch_proj",
-            "template": "batching",
+            "project_name": "nlp_proj",
+            "template": "nlp",
+            "wizard": False,
         })()
         assert cli._cmd_init(args) == 0
-        config = tmp_path / "batch_proj" / "model_repo" / "my_model" / "1" / "config.yaml"
+        config = tmp_path / "nlp_proj" / "model_repo" / "my_model" / "1" / "config.yaml"
         assert "max_batch_size" in config.read_text()
-        model_py = tmp_path / "batch_proj" / "model_repo" / "my_model" / "1" / "model.py"
+        model_py = tmp_path / "nlp_proj" / "model_repo" / "my_model" / "1" / "model.py"
         content = model_py.read_text()
-        assert "batch" in content.lower()
+        assert "label" in content.lower()
 
     def test_init_existing_dir_fails(self, tmp_path, monkeypatch, capsys):
         monkeypatch.chdir(tmp_path)
         (tmp_path / "exists").mkdir()
         args = type("Args", (), {
             "project_name": "exists",
-            "template": "basic",
+            "template": "empty",
+            "wizard": False,
         })()
         assert cli._cmd_init(args) == 1
         captured = capsys.readouterr()
@@ -322,7 +326,20 @@ class TestInit:
         monkeypatch.chdir(tmp_path)
         args = type("Args", (), {
             "project_name": None,
-            "template": "basic",
+            "template": "empty",
+            "wizard": False,
         })()
         assert cli._cmd_init(args) == 0
         assert (tmp_path / "my_project").exists()
+
+    def test_init_wizard_mode(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        inputs = iter(["wiz_proj", "", "", "", "", "", "", ""])
+        monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
+        args = type("Args", (), {
+            "project_name": None,
+            "template": "empty",
+            "wizard": True,
+        })()
+        assert cli._cmd_init(args) == 0
+        assert (tmp_path / "wiz_proj").exists()

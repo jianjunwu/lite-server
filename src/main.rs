@@ -1,18 +1,6 @@
-mod config;
-mod ensemble;
-mod error;
-mod http;
-mod inference_queue;
-mod logging;
-mod metrics;
-mod registry;
-mod server;
-mod transport;
-mod worker;
-
-use crate::config::Config;
-use crate::server::LiteServer;
 use clap::{Parser, Subcommand};
+use lite_server::config::Config;
+use lite_server::server::LiteServer;
 use tracing::{error, info};
 
 #[derive(Parser)]
@@ -88,7 +76,7 @@ async fn main() {
             no_metrics,
         } => {
             let mut cfg = if let Some(config_path) = config {
-                match config::load_config(&config_path) {
+                match lite_server::config::load_config(&config_path) {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("Failed to load config: {}", e);
@@ -128,7 +116,7 @@ async fn main() {
 
             // Initialize logging
             let log_level = cfg.logging.level.clone();
-            logging::init(&log_level);
+            lite_server::logging::init(&log_level);
 
             info!("Starting lite-server v{}", env!("CARGO_PKG_VERSION"));
             info!("HTTP port: {}", cfg.server.http_port);
@@ -143,7 +131,7 @@ async fn main() {
         }
 
         Commands::ConfigCheck { config } => {
-            match config::load_config(&config) {
+            match lite_server::config::load_config(&config) {
                 Ok(cfg) => {
                     println!("Configuration OK: {}", config);
                     println!("  HTTP port: {}", cfg.server.http_port);

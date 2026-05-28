@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=1.0"]
+requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
@@ -8,23 +8,44 @@ version = "0.1.0"
 description = "High-performance inference server (Rust core + Python workers)"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.9"
+requires-python = ">=3.10"
+scripts = {lite-server = "lite_server.cli:main"}
 dependencies = [
     "pyyaml>=6.0",
     "litserve>=0.2.17",
+    "pyzmq>=25.0",
+    "protobuf>=5.0",
+]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.23",
+    "pytest-xdist>=3.0",
     "httpx>=0.28.1",
 ]
-benchmark = [
-    "litserve>=0.2.17",
-]
+benchmark = []
 
 [tool.maturin]
 manifest-path = "Cargo.toml"
 python-source = "python"
-module-name = "lite_server"
+module-name = "_lite_server"
+bindings = "pyo3"
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]
+addopts = "-n auto --dist=loadfile"
+

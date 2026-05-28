@@ -1,0 +1,89 @@
+"""Artifact unpacker: validate and extract .lma files."""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import zipfile
+from pathlib import Path
+from typing import Callable, Optional
+
+from lite_server.artifact.manifest import Manifest
+
+
+class ArtifactCorruptedError(ValueError):
+    """Raised when artifact checksum validation fails."""
+
+
+class SignatureInvalidError(ValueError):
+    """Raised when signature verification fails."""
+
+
+class ModelUnpacker:
+    """Unpack and validate a .lma artifact."""
+
+    def __init__(self, artifact_path: Path | str):
+        self.artifact_path = Path(artifact_path)
+        self.manifest: Optional[Manifest] = None
+
+    def validate(self, verify_key: Optional[bytes] = None) -> Manifest:
+        """Validate manifest, file checksums, and optional signature.
+
+        Returns the parsed Manifest on success.
+        Raises ArtifactCorruptedError or SignatureInvalidError on failure.
+        """
+        if not self.artifact_path.exists():
+            raise FileNotFoundError(f"Artifact not found: {self.artifact_path}")
+
+        with zipfile.ZipFile(self.artifact_path, "r") as zf:
+            manifest_raw = zf.read("manifest.json").decode("utf-8")
+            manifest = Manifest.from_dict(json.loads(manifest_raw))
+            self.manifest = manifest
+
+            # Verify file checksums
+            for rel_path, entry in manifest.files.items():
+                try:
+                    content = zf.read(rel_path)
+                except KeyError:
+                    raise ArtifactCorruptedError(f"File missing in artifact: {rel_path}")
+                actual = hashlib.sha256(content).hexdigest()
+                if actual != entry.sha256:
+                    raise ArtifactCorruptedError(
+                        f"Checksum mismatch for {rel_path}: "
+                        f"expected {entry.sha256[:16]}..., got {actual[:16]}..."
+                    )
+
+            # Verify signature (recompute HMAC over manifest without signature field)
+            if verify_key and manifest.signature:
+                manifest_dict = json.loads(manifest_raw)
+                manifest_dict.pop("signature", None)
+                canonical = json.dumps(manifest_dict, sort_keys=True, separators=(",", ":"))
+                expected = hmac.new(verify_key, canonical.encode(), hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(expected, manifest.signature):
+                    raise SignatureInvalidError("Artifact signature verification failed")
+
+        return manifest
+
+    def unpack(self, target_dir: Path | str, filter_func: Optional[Callable] = None) -> Path:
+        """Extract artifact contents to target_dir.
+
+        Args:
+            target_dir: Destination directory.
+            filter_func: Optional callable(zipinfo) -> bool to filter extracted files.
+
+        Returns:
+            Path to the extracted model directory.
+        """
+        target_dir = Path(target_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        with zipfile.ZipFile(self.artifact_path, "r") as zf:
+            if filter_func:
+                for info in zf.infolist():
+                    if filter_func(info):
+                        zf.extract(info, target_dir)
+            else:
+                zf.extractall(target_dir)
+
+        return target_dir

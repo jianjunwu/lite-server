@@ -55,7 +55,8 @@ def main(argv=None):
     # init
     init_parser = subparsers.add_parser("init", help="Initialize project")
     init_parser.add_argument("project_name", nargs="?")
-    init_parser.add_argument("--template", "-t", default="basic")
+    init_parser.add_argument("--template", "-t", default="empty")
+    init_parser.add_argument("--wizard", "-w", action="store_true", help="Interactive wizard mode")
 
     args = parser.parse_args(argv)
 
@@ -79,38 +80,28 @@ def main(argv=None):
 
 
 def _cmd_serve(args):
-    """Start the Rust server via subprocess."""
-    import subprocess
-    import shutil
+    """Start the Rust server."""
+    from lite_server import serve
 
-    cmd = ["lite-server-core"]
-    if args.config:
-        cmd.extend(["serve", "--config", args.config])
-    else:
-        cmd.append("serve")
-    if args.port:
-        cmd.extend(["--port", str(args.port)])
-    if args.host:
-        cmd.extend(["--host", args.host])
-    if args.model_repo:
-        cmd.extend(["--model-repo", args.model_repo])
-    if args.timeout:
-        cmd.extend(["--timeout", str(args.timeout)])
-    if args.log_level:
-        cmd.extend(["--log-level", args.log_level])
-    if args.no_metrics:
-        cmd.append("--no-metrics")
-
-    # Check if lite-server-core binary exists
-    binary = shutil.which("lite-server-core")
-    if not binary:
-        print("Error: lite-server-core binary not found. Please install lite-server first.", file=sys.stderr)
+    if serve is None:
+        print("Error: lite-server Rust extension not built. Run 'maturin develop'.", file=sys.stderr)
         return 1
 
     try:
-        subprocess.run(cmd, check=True)
+        serve(
+            config=args.config,
+            port=args.port,
+            host=args.host,
+            model_repo=args.model_repo,
+            timeout=args.timeout,
+            log_level=args.log_level,
+            no_metrics=args.no_metrics,
+        )
     except KeyboardInterrupt:
         print("\nShutting down...")
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -348,6 +339,14 @@ def _cmd_unpack(args):
 
 def _cmd_init(args):
     """Initialize a new lite-server project from a template."""
+    if getattr(args, "wizard", False):
+        from lite_server.init.wizard import run_wizard
+        try:
+            run_wizard(output_dir=str(Path(".")))
+            return 0
+        except SystemExit as e:
+            return e.code if isinstance(e.code, int) else 1
+
     from lite_server.init import ProjectGenerator
 
     project_name = args.project_name or "my_project"

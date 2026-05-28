@@ -1,4 +1,5 @@
 pub mod uds;
+pub mod zmq;
 
 use crate::error::AppError;
 use crate::worker::protocol::{InferenceRequest, InferenceResponse};
