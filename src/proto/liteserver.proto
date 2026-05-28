@@ -1,0 +1,94 @@
+syntax = "proto3";
+package liteserver;
+
+// ===== Request / Response Metadata =====
+message RequestMeta {
+  string route = 1;
+  map<string, string> headers = 2;
+  string client_ip = 3;
+  string request_id = 4;
+  int64 timestamp_ns = 5;
+  bytes payload = 6;  // original request body bytes (JSON)
+}
+
+// ===== Request Payloads =====
+message Request {
+  string uid = 1;
+  RequestMeta meta = 2;
+  oneof payload {
+    SingleRequest single = 10;
+    BatchRequest batch = 11;
+    CBAddRequest cb_add = 20;
+    CBRemoveRequest cb_remove = 21;
+  }
+}
+
+message SingleRequest {
+  bytes data = 1;  // JSON-encoded request body
+}
+
+message BatchRequest {
+  repeated BatchItem items = 1;
+}
+
+message BatchItem {
+  string uid = 1;
+  bytes data = 2;  // JSON-encoded item body
+}
+
+// Continuous Batching
+message CBAddRequest {
+  string uid = 1;
+  bytes data = 2;
+  RequestMeta meta = 3;
+}
+
+message CBRemoveRequest {
+  string uid = 1;
+}
+
+// ===== Response Payloads =====
+message Response {
+  string uid = 1;
+  oneof payload {
+    SingleResponse single = 10;
+    BatchResponse batch = 11;
+    CBCompletedResponse cb_completed = 20;
+  }
+  Metrics metrics = 30;
+}
+
+message SingleResponse {
+  bytes data = 1;  // JSON-encoded response body
+  Status status = 2;
+}
+
+message BatchResponse {
+  repeated BatchItemResponse items = 1;
+}
+
+message BatchItemResponse {
+  string uid = 1;
+  bytes data = 2;
+  Status status = 3;
+}
+
+message CBCompletedResponse {
+  repeated CompletedSequence sequences = 1;
+}
+
+message CompletedSequence {
+  string uid = 1;
+  bytes data = 2;  // JSON-encoded output
+}
+
+message Status {
+  string code = 1;    // "Ok" | "Error"
+  string message = 2;
+}
+
+message Metrics {
+  float prefill_ms = 1;
+  float decode_ms = 2;
+  int32 tokens_generated = 3;
+}

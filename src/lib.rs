@@ -5,6 +5,7 @@ pub mod http;
 pub mod inference_queue;
 pub mod logging;
 pub mod metrics;
+pub mod proto;
 pub mod registry;
 pub mod server;
 pub mod transport;

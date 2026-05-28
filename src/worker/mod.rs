@@ -5,6 +5,7 @@ use crate::config::{ModelConfig, OrchestrationConfig};
 use crate::error::AppError;
 use crate::inference_queue::InferenceQueue;
 use crate::registry::{ModelRegistry, types::*};
+use crate::transport::zmq::WorkerZmqClient;
 use crate::worker::protocol::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,8 @@ pub struct WorkerManager {
     // Track spawned child processes
     workers: Arc<RwLock<HashMap<String, Vec<WorkerProcess>>>>,
     inference_queue: Arc<InferenceQueue>,
+    // ZMQ clients for active workers
+    zmq_clients: Arc<RwLock<HashMap<String, Vec<Arc<WorkerZmqClient>>>>>,
 }
 
 struct WorkerProcess {
@@ -34,8 +37,7 @@ struct WorkerProcess {
     model_name: String,
     version: String,
     child: Child,
-    uds_path: PathBuf,
-    response_tx: mpsc::UnboundedSender<InferenceResponse>,
+    endpoint: String,
 }
 
 impl WorkerManager {
@@ -50,6 +52,7 @@ impl WorkerManager {
             pending: Arc::new(RwLock::new(HashMap::new())),
             workers: Arc::new(RwLock::new(HashMap::new())),
             inference_queue,
+            zmq_clients: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -143,19 +146,22 @@ impl WorkerManager {
 
         let mut worker_infos = Vec::new();
         let mut worker_processes = Vec::new();
+        let mut zmq_clients_for_model = Vec::new();
 
         for worker_id in 0..total_workers {
             let device = format!("{}:{}", accelerator, worker_id % devices);
-            let uds_path = std::env::temp_dir()
-                .join("lite-server")
-                .join(format!("{}_{}_{}.sock", model_name, version, worker_id));
+            let endpoint = format!(
+                "ipc:///tmp/lite-server/{}_{}_{}.sock",
+                model_name, version, worker_id
+            );
 
-            // Ensure parent dir exists
-            if let Some(parent) = uds_path.parent() {
+            // Remove stale socket
+            let socket_str = endpoint.strip_prefix("ipc://").unwrap_or(&endpoint);
+            let socket_path = std::path::Path::new(socket_str);
+            let _ = tokio::fs::remove_file(socket_path).await;
+            if let Some(parent) = socket_path.parent() {
                 let _ = tokio::fs::create_dir_all(parent).await;
             }
-            // Remove stale socket
-            let _ = tokio::fs::remove_file(&uds_path).await;
 
             // Find python module path
             let python_path = Self::find_python_module_path().unwrap_or_default();
@@ -191,8 +197,14 @@ impl WorkerManager {
                 .arg(&device)
                 .arg("--worker-id")
                 .arg(worker_id.to_string())
-                .arg("--uds-path")
-                .arg(&uds_path)
+                .arg("--endpoint")
+                .arg(&endpoint);
+
+            if model_config.continuous_batching {
+                child = child.arg("--continuous-batching");
+            }
+
+            let mut child = child
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -232,42 +244,25 @@ impl WorkerManager {
                 }
             });
 
+            // Create ZMQ client (binds the socket, worker connects)
+            let zmq_client = Arc::new(WorkerZmqClient::new(endpoint.clone()));
+            zmq_clients_for_model.push(zmq_client.clone());
+
             let info = WorkerInfo {
                 worker_id: worker_id as u32,
                 device,
-                uds_path: uds_path.clone(),
+                endpoint: endpoint.clone(),
                 pid: child.id(),
                 status: WorkerStatus::Ready,
             };
             worker_infos.push(info);
-
-            // Start response consumer for this worker
-            let (response_tx, mut response_rx) = mpsc::unbounded_channel::<InferenceResponse>();
-            let pending = self.pending.clone();
-            tokio::spawn(async move {
-                while let Some(response) = response_rx.recv().await {
-                    let uid = response.uid.clone();
-                    let sender = {
-                        let guard = pending.read().await;
-                        // oneshot::Sender is not Clone, so we need to remove it
-                        guard.get(&uid).is_some()
-                    };
-                    if sender {
-                        let mut guard = pending.write().await;
-                        if let Some(sender) = guard.remove(&uid) {
-                            let _ = sender.send(response);
-                        }
-                    }
-                }
-            });
 
             worker_processes.push(WorkerProcess {
                 worker_id: worker_id as u32,
                 model_name: model_name.to_string(),
                 version: version.to_string(),
                 child,
-                uds_path,
-                response_tx,
+                endpoint,
             });
         }
 
@@ -280,12 +275,14 @@ impl WorkerManager {
 
         // Register inference queue for batching
         self.inference_queue
-            .register_model(model_name, version, &model_config, worker_infos);
+            .register_model(model_name, version, &model_config, worker_infos, zmq_clients_for_model.clone());
 
         {
             let mut workers = self.workers.write().await;
+            let mut clients = self.zmq_clients.write().await;
             let key = format!("{}_{}", model_name, version);
-            workers.insert(key, worker_processes);
+            workers.insert(key.clone(), worker_processes);
+            clients.insert(key, zmq_clients_for_model);
         }
 
         crate::metrics::prometheus::record_model_load(model_name, version, true);
@@ -332,16 +329,18 @@ impl WorkerManager {
         let key = format!("{}_{}", model_name, version);
         {
             let mut workers = self.workers.write().await;
+            let mut clients = self.zmq_clients.write().await;
             if let Some(mut procs) = workers.remove(&key) {
                 for mut proc in procs.drain(..) {
-                    // Remove persistent connection from pool
-                    crate::transport::uds::remove_connection(&proc.uds_path).await;
+                    // Clean up ZMQ socket file
+                    let socket_str = proc.endpoint.strip_prefix("ipc://").unwrap_or(&proc.endpoint);
+                    let socket_path = std::path::Path::new(socket_str);
+                    let _ = tokio::fs::remove_file(socket_path).await;
                     let _ = proc.child.kill().await;
                     let _ = proc.child.wait().await;
-                    // Clean up UDS socket
-                    let _ = tokio::fs::remove_file(&proc.uds_path).await;
                 }
             }
+            clients.remove(&key);
         }
 
         self.registry.remove(model_name, version).await?;
@@ -400,13 +399,6 @@ impl WorkerManager {
     }
 }
 
-/// Pick a worker using random strategy
-pub fn pick_worker_random(num_workers: usize) -> usize {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    rng.gen_range(0..num_workers)
-}
-
 impl WorkerManager {
     fn find_python_module_path() -> Option<String> {
         // 1. Check compile-time manifest dir (development / cargo run)
@@ -442,4 +434,10 @@ impl WorkerManager {
 
         None
     }
+}
+
+/// Pick a random worker index.
+pub fn pick_worker_random(num_workers: usize) -> usize {
+    use rand::Rng;
+    rand::thread_rng().gen_range(0..num_workers.max(1))
 }

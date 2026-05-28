@@ -1,16 +1,32 @@
-"""Python inference worker entry point for lite-server."""
+"""Python inference worker entry point for lite-server (ZMQ + Protobuf)."""
 
 import argparse
-import asyncio
+import importlib.util
 import json
 import os
-import socket
-import struct
 import sys
+import threading
 import time
-from pathlib import Path
+import traceback
 
 import yaml
+import zmq
+
+from lite_server.api import LitAPI, RequestMeta
+from lite_server.proto import (
+    BatchItemResponse,
+    BatchRequest,
+    BatchResponse,
+    CBAddRequest,
+    CBCompletedResponse,
+    CBRemoveRequest,
+    CompletedSequence,
+    Request,
+    Response,
+    SingleRequest,
+    SingleResponse,
+    Status,
+)
 
 
 def parse_args():
@@ -21,12 +37,12 @@ def parse_args():
     parser.add_argument("--config", required=True)
     parser.add_argument("--device", required=True)
     parser.add_argument("--worker-id", type=int, required=True)
-    parser.add_argument("--uds-path", required=True)
+    parser.add_argument("--endpoint", required=True, help="ZMQ PAIR endpoint, e.g. ipc:///tmp/lite-server/...")
+    parser.add_argument("--continuous-batching", action="store_true", default=False)
     return parser.parse_args()
 
 
 def load_model_config(config_path: str):
-    """Load model config from YAML."""
     if not os.path.exists(config_path):
         return {}
     with open(config_path, "r") as f:
@@ -34,30 +50,20 @@ def load_model_config(config_path: str):
 
 
 def load_litapi(model_py_path: str, config: dict):
-    """Dynamically load LitAPI class from model.py."""
-    import importlib.util
-
     spec = importlib.util.spec_from_file_location("model_module", model_py_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    # Find LitAPI subclass
     LitAPIClass = None
     for attr_name in dir(module):
         attr = getattr(module, attr_name)
-        if (
-            isinstance(attr, type)
-            and attr_name != "LitAPI"
-            and hasattr(attr, "predict")
-        ):
-            # Simple heuristic: look for class with predict method
+        if isinstance(attr, type) and attr_name != "LitAPI" and hasattr(attr, "predict"):
             LitAPIClass = attr
             break
 
     if LitAPIClass is None:
         raise RuntimeError(f"No LitAPI subclass found in {model_py_path}")
 
-    # Instantiate with config
     max_batch_size = config.get("max_batch_size", 1)
     batch_timeout = config.get("batch_timeout", 0.0)
     stream = config.get("stream", False)
@@ -69,13 +75,10 @@ def load_litapi(model_py_path: str, config: dict):
         api_path=api_path,
         stream=stream,
     )
-
-    # Set config and call pre_setup if available
     instance.config = config
     if hasattr(instance, "pre_setup"):
         instance.pre_setup()
 
-    # Call setup if available (with device)
     if hasattr(instance, "setup"):
         device = config.get("accelerator", "cpu")
         if isinstance(device, list):
@@ -85,369 +88,244 @@ def load_litapi(model_py_path: str, config: dict):
     return instance
 
 
-class _RequestState:
-    """Internal state for a single request in continuous batching."""
+def _make_status(ok: bool, message: str = "") -> Status:
+    return Status(code="Ok" if ok else "Error", message=message)
 
-    def __init__(self, uid: str, input_data, stream: bool = False):
+
+def _make_error_response(uid: str, message: str) -> Response:
+    return Response(
+        uid=uid,
+        single=SingleResponse(
+            data=json.dumps({"error": message}).encode(),
+            status=_make_status(False, message),
+        ),
+    )
+
+
+def _meta_from_proto(meta_pb) -> RequestMeta:
+    payload = json.loads(meta_pb.payload) if meta_pb.payload else None
+    return RequestMeta(
+        route=meta_pb.route,
+        headers=dict(meta_pb.headers),
+        client_ip=meta_pb.client_ip,
+        request_id=meta_pb.request_id,
+        timestamp_ns=meta_pb.timestamp_ns,
+        payload=payload,
+    )
+
+
+def _run_predict(lit_api: LitAPI, data: bytes, meta: RequestMeta) -> tuple[bytes, Status]:
+    """Run the full predict pipeline with hooks."""
+    raw = json.loads(data) if data else {}
+    decoded = lit_api.decode_request(raw) if hasattr(lit_api, "decode_request") else raw
+
+    # Hook: on_request (skip if not implemented by model)
+    if hasattr(lit_api, "on_request"):
+        decoded = lit_api.on_request(decoded, meta)
+
+    # Predict
+    output = lit_api.predict(decoded)
+
+    # Encode
+    encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
+
+    # Hook: on_response (skip if not implemented by model)
+    if hasattr(lit_api, "on_response"):
+        encoded = lit_api.on_response(encoded, meta)
+
+    resp_bytes = json.dumps(encoded).encode()
+    return resp_bytes, _make_status(True)
+
+
+# ---------------------------------------------------------------------------
+# Standard Loop
+# ---------------------------------------------------------------------------
+
+def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str):
+    """Handle single + batch requests synchronously."""
+    while True:
+        try:
+            req_bytes = socket.recv()
+        except zmq.ZMQError as e:
+            if e.errno == zmq.ETERM:
+                break
+            continue
+
+        try:
+            request = Request()
+            request.ParseFromString(req_bytes)
+        except Exception as e:
+            socket.send(_make_error_response("", f"Protobuf parse: {e}").SerializeToString())
+            continue
+
+        uid = request.uid
+        meta = _meta_from_proto(request.meta) if request.HasField("meta") else None
+
+        try:
+            if request.HasField("single"):
+                resp_bytes, status = _run_predict(lit_api, request.single.data, meta)
+                response = Response(
+                    uid=uid,
+                    single=SingleResponse(data=resp_bytes, status=status),
+                )
+
+            elif request.HasField("batch"):
+                batch: BatchRequest = request.batch
+                items = []
+                for item in batch.items:
+                    try:
+                        resp_bytes, status = _run_predict(lit_api, item.data, meta)
+                    except Exception as e:
+                        resp_bytes = json.dumps({"error": str(e)}).encode()
+                        status = _make_status(False, str(e))
+                    items.append(
+                        BatchItemResponse(
+                            uid=item.uid,
+                            data=resp_bytes,
+                            status=status,
+                        )
+                    )
+                response = Response(
+                    uid=uid,
+                    batch=BatchResponse(items=items),
+                )
+            else:
+                response = _make_error_response(uid, "Unsupported payload type")
+
+        except Exception as e:
+            response = _make_error_response(uid, f"{type(e).__name__}: {e}")
+
+        socket.send(response.SerializeToString())
+
+
+# ---------------------------------------------------------------------------
+# Continuous Batching Loop
+# ---------------------------------------------------------------------------
+
+class CBState:
+    def __init__(self, uid: str, decoded_input, meta: RequestMeta):
         self.uid = uid
-        self.input = input_data
-        self.state = None
-        self.output = None
-        self.stream = stream
-        self.finished = False
+        self.input = decoded_input
+        self.output = []
+        self.meta = meta
+        self.prefilled = False
 
 
-class ContinuousBatchingLoop:
-    """Continuous batching loop for iterative model inference.
+def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str):
+    """Autonomous continuous batching loop."""
+    active: dict[str, CBState] = {}
+    lock = threading.Lock()
 
-    Manages a set of active requests, calling ``predict_step()`` repeatedly
-    until all requests report completion.  If ``predict_step`` is not
-    implemented by the loaded model, falls back to a single-shot ``predict``
-    call that completes immediately.
-    """
-
-    def __init__(self, lit_api, model_name: str = "unknown", worker_id: int = 0):
-        self.lit_api = lit_api
-        self.model_name = model_name
-        self.worker_id = worker_id
-        self.active: dict[str, _RequestState] = {}
-
-    def add_request(self, request: dict) -> str:
-        """Decode and add a new request to the active batch."""
-        uid = request.get("uid", "")
-        payload = request.get("payload", {})
-        data = payload.get("data", {})
-
-        if hasattr(self.lit_api, "decode_request") and callable(
-            getattr(self.lit_api, "decode_request")
-        ):
-            input_data = self.lit_api.decode_request(data)
-        else:
-            input_data = data
-
-        stream = payload.get("stream", False)
-        self.active[uid] = _RequestState(uid, input_data, stream=stream)
-        return uid
-
-    def step(self) -> list[dict]:
-        """Run one generation step for all active requests.
-
-        Returns a list of response dicts for requests that have produced
-        output this step (finished requests or streaming chunks).
-        """
-        if not self.active:
-            return []
-
-        uids = list(self.active.keys())
-        inputs = []
-        states = []
-        for uid in uids:
-            req = self.active[uid]
-            inputs.append(req.input)
-            states.append(req.state)
-
-        # Use predict_step if available; otherwise fallback to predict.
-        has_step = hasattr(self.lit_api, "predict_step") and callable(
-            getattr(self.lit_api, "predict_step")
-        )
-        if has_step:
-            outputs, new_states, dones = self.lit_api.predict_step(inputs, states)
-        else:
-            outputs = []
-            new_states = [None] * len(inputs)
-            dones = []
-            for inp in inputs:
-                outputs.append(self.lit_api.predict(inp))
-                dones.append(True)
-
-        # Pad to expected length defensively.
-        n = len(inputs)
-        if len(outputs) < n:
-            outputs.extend([None] * (n - len(outputs)))
-        if len(new_states) < n:
-            new_states.extend([None] * (n - len(new_states)))
-        if len(dones) < n:
-            dones.extend([True] * (n - len(dones)))
-
-        completed = []
-        has_encode = hasattr(self.lit_api, "encode_response") and callable(
-            getattr(self.lit_api, "encode_response")
+    def _handle_add(cb_add: CBAddRequest):
+        raw = json.loads(cb_add.data) if cb_add.data else {}
+        decoded = lit_api.decode_request(raw) if hasattr(lit_api, "decode_request") else raw
+        meta = _meta_from_proto(cb_add.meta) if cb_add.HasField("meta") else RequestMeta(
+            route="", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=raw,
         )
 
-        for i, uid in enumerate(uids):
-            req = self.active[uid]
-            req.output = outputs[i]
-            req.state = new_states[i]
+        try:
+            if hasattr(lit_api, "on_request"):
+                decoded = lit_api.on_request(decoded, meta)
+        except Exception as e:
+            # Reject immediately
+            err_resp = _make_error_response(cb_add.uid, str(e))
+            socket.send(err_resp.SerializeToString())
+            return
 
-            if dones[i]:
-                req.finished = True
-                encoded = self.lit_api.encode_response(req.output) if has_encode else req.output
-                completed.append({
-                    "uid": uid,
-                    "data": encoded if isinstance(encoded, dict) else {"output": encoded},
-                    "status": {"code": "Ok"},
-                    "worker_id": self.worker_id,
-                })
-                del self.active[uid]
-            elif req.stream:
-                encoded = self.lit_api.encode_response(req.output) if has_encode else req.output
-                completed.append({
-                    "uid": uid,
-                    "data": encoded if isinstance(encoded, dict) else {"output": encoded},
-                    "status": {"code": "Streaming"},
-                    "worker_id": self.worker_id,
-                })
+        state = CBState(cb_add.uid, decoded, meta)
+        active[cb_add.uid] = state
 
-        return completed
+        # Prefill
+        try:
+            lit_api.prefill(cb_add.uid, decoded)
+            state.prefilled = True
+        except Exception as e:
+            del active[cb_add.uid]
+            err_resp = _make_error_response(cb_add.uid, f"prefill failed: {e}")
+            socket.send(err_resp.SerializeToString())
 
+    def _handle_remove(cb_remove: CBRemoveRequest):
+        active.pop(cb_remove.uid, None)
 
-def pick_loop(config: dict):
-    """Select inference loop based on config."""
-    if config.get("bidirectional", False):
-        return "bidirectional"
-    if config.get("continuous_batching", False):
-        return "continuous"
-    if config.get("max_batch_size", 1) > 1:
-        return "batched"
-    return "single"
+    # Background step thread
+    def step_loop():
+        while True:
+            with lock:
+                if not active:
+                    time.sleep(0.001)
+                    continue
 
+                ready = [s for s in active.values() if s.prefilled]
+                if not ready:
+                    time.sleep(0.001)
+                    continue
 
-def _make_metrics(model_name: str, duration: float, batch_size: int) -> list:
-    """Build worker metric report compatible with light-server."""
-    return [
-        {
-            "name": "lightserver_inference_duration_seconds",
-            "value": duration,
-            "labels": {"model": model_name},
-            "type": "histogram",
-        },
-        {
-            "name": "lightserver_batch_size",
-            "value": batch_size,
-            "labels": {"model": model_name},
-            "type": "histogram",
-        },
-    ]
+                try:
+                    outputs = lit_api.step(ready)
+                except Exception as e:
+                    # Error: fail all active sequences
+                    for state in list(active.values()):
+                        err_resp = _make_error_response(state.uid, f"step failed: {e}")
+                        socket.send(err_resp.SerializeToString())
+                    active.clear()
+                    continue
 
+                completed = []
+                for state, token in zip(ready, outputs):
+                    state.output.append(token)
+                    if lit_api.has_finished(state.uid, token, state.output):
+                        completed.append(state.uid)
 
-async def handle_request(lit_api, request: dict, model_name: str = "unknown") -> dict:
-    """Handle a single inference request."""
-    payload = request["payload"]
-    msg_type = payload.get("type", payload.get("msg_type", "INFER"))
+                # Send completed sequences
+                for uid in completed:
+                    state = active.pop(uid)
+                    try:
+                        encoded = lit_api.encode_response(state.output) if hasattr(lit_api, "encode_response") else state.output
+                        if hasattr(lit_api, "on_response"):
+                            encoded = lit_api.on_response(encoded, state.meta)
+                        resp_bytes = json.dumps(encoded).encode()
+                        resp = Response(
+                            uid=uid,
+                            single=SingleResponse(data=resp_bytes, status=_make_status(True)),
+                        )
+                        socket.send(resp.SerializeToString())
+                    except Exception as e:
+                        err_resp = _make_error_response(uid, f"encode failed: {e}")
+                        socket.send(err_resp.SerializeToString())
 
-    if msg_type == "INFER":
-        data = payload.get("data", {})
-        # Call decode_request if available
-        if hasattr(lit_api, "decode_request"):
-            input_data = lit_api.decode_request(data)
-        else:
-            input_data = data
+            time.sleep(0.001)
 
-        # Call predict method
-        if hasattr(lit_api, "predict"):
-            start = time.time()
-            result = lit_api.predict(input_data)
-            duration = time.time() - start
+    threading.Thread(target=step_loop, daemon=True).start()
 
-            # Call encode_response if available
-            if hasattr(lit_api, "encode_response"):
-                result = lit_api.encode_response(result)
+    # Main thread: receive commands
+    while True:
+        try:
+            req_bytes = socket.recv()
+        except zmq.ZMQError as e:
+            if e.errno == zmq.ETERM:
+                break
+            continue
 
-            return {
-                "uid": request["uid"],
-                "data": result if isinstance(result, dict) else {"output": result},
-                "status": {"code": "Ok"},
-                "worker_id": request.get("worker_id", 0),
-                "metrics": _make_metrics(model_name, duration, 1),
-            }
-        else:
-            return {
-                "uid": request["uid"],
-                "data": None,
-                "status": {"code": "Error", "message": "predict method not found"},
-                "worker_id": request.get("worker_id", 0),
-            }
+        try:
+            request = Request()
+            request.ParseFromString(req_bytes)
+        except Exception:
+            continue
 
-    elif msg_type == "STREAM_OPEN":
-        stream_id = payload.get("stream_id", "")
-        if hasattr(lit_api, "stream_open"):
-            lit_api.stream_open(stream_id)
-        return {
-            "uid": request["uid"],
-            "data": {"stream_id": stream_id, "status": "opened"},
-            "status": {"code": "Ok"},
-            "worker_id": request.get("worker_id", 0),
-        }
-
-    elif msg_type == "STREAM_CHUNK":
-        stream_id = payload.get("stream_id", "")
-        chunk = payload.get("chunk", {})
-        if hasattr(lit_api, "stream_chunk"):
-            result = lit_api.stream_chunk(stream_id, chunk)
-            return {
-                "uid": request["uid"],
-                "data": result if isinstance(result, dict) else {"output": result},
-                "status": {"code": "Streaming"},
-                "worker_id": request.get("worker_id", 0),
-            }
-        return {
-            "uid": request["uid"],
-            "data": None,
-            "status": {"code": "FinishStreaming"},
-            "worker_id": request.get("worker_id", 0),
-        }
-
-    elif msg_type == "STREAM_CLOSE":
-        stream_id = payload.get("stream_id", "")
-        if hasattr(lit_api, "stream_close"):
-            lit_api.stream_close(stream_id)
-        return {
-            "uid": request["uid"],
-            "data": None,
-            "status": {"code": "FinishStreaming"},
-            "worker_id": request.get("worker_id", 0),
-        }
-
-    elif msg_type == "STREAM_CANCEL":
-        stream_id = payload.get("stream_id", "")
-        if hasattr(lit_api, "stream_cancel"):
-            lit_api.stream_cancel(stream_id)
-        return {
-            "uid": request["uid"],
-            "data": None,
-            "status": {"code": "FinishStreaming"},
-            "worker_id": request.get("worker_id", 0),
-        }
-
-    else:
-        return {
-            "uid": request["uid"],
-            "data": None,
-            "status": {"code": "Error", "message": f"Unknown msg_type: {msg_type}"},
-            "worker_id": request.get("worker_id", 0),
-        }
+        with lock:
+            if request.HasField("cb_add"):
+                _handle_add(request.cb_add)
+            elif request.HasField("cb_remove"):
+                _handle_remove(request.cb_remove)
 
 
-def handle_batch_request(lit_api, request: dict, model_name: str = "unknown") -> dict:
-    """Handle a batch inference request.
+# ---------------------------------------------------------------------------
+# Entry Point
+# ---------------------------------------------------------------------------
 
-    Args:
-        lit_api: The loaded model instance.
-        request: Dict with key "items" or "payload" containing list of {"uid": str, "data": any}.
-        model_name: Model name for metrics labels.
-
-    Returns:
-        Dict with key "type": "BATCH_RESPONSE" and "items" list of results.
-    """
-    # Support both direct call {"items": [...]} and full request {"payload": {"items": [...]}}
-    payload = request.get("payload", request)
-    items = payload.get("items", [])
-    if not items:
-        return {"type": "BATCH_RESPONSE", "items": []}
-
-    # Check predict exists upfront
-    if not hasattr(lit_api, "predict") or not callable(getattr(lit_api, "predict")):
-        return {
-            "type": "BATCH_RESPONSE",
-            "items": [
-                {
-                    "uid": item["uid"],
-                    "data": None,
-                    "status": {"code": "Error", "message": "predict method not found"},
-                }
-                for item in items
-            ],
-        }
-
-    try:
-        # 1. Decode each request
-        decoded = []
-        for item in items:
-            data = item.get("data", {})
-            if hasattr(lit_api, "decode_request") and callable(
-                getattr(lit_api, "decode_request")
-            ):
-                decoded.append(lit_api.decode_request(data))
-            else:
-                decoded.append(data)
-
-        # 2. Batch if available
-        has_batch = hasattr(lit_api, "batch") and callable(getattr(lit_api, "batch"))
-        if has_batch and len(decoded) > 0:
-            batched_input = lit_api.batch(decoded)
-        else:
-            batched_input = decoded
-
-        # 3. Predict
-        start = time.time()
-        if isinstance(batched_input, list):
-            # No batch method or it returned a list: predict each individually
-            results = [lit_api.predict(x) for x in batched_input]
-        else:
-            results = lit_api.predict(batched_input)
-        duration = time.time() - start
-
-        # 4. Unbatch if available
-        has_unbatch = hasattr(lit_api, "unbatch") and callable(
-            getattr(lit_api, "unbatch")
-        )
-        if has_unbatch and not isinstance(batched_input, list):
-            results = lit_api.unbatch(results)
-
-        # Ensure results is a list matching items length
-        if not isinstance(results, list):
-            results = [results]
-
-        # Pad or truncate to match items length (defensive)
-        if len(results) < len(items):
-            results.extend([None] * (len(items) - len(results)))
-        elif len(results) > len(items):
-            results = results[: len(items)]
-
-        # 5. Encode each response
-        response_items = []
-        has_encode = hasattr(lit_api, "encode_response") and callable(
-            getattr(lit_api, "encode_response")
-        )
-        for i, item in enumerate(items):
-            result = results[i]
-            if has_encode:
-                encoded = lit_api.encode_response(result)
-            else:
-                encoded = result
-
-            response_items.append(
-                {
-                    "uid": item["uid"],
-                    "data": encoded if isinstance(encoded, dict) else {"output": encoded},
-                    "status": {"code": "Ok"},
-                }
-            )
-
-        return {
-            "type": "BATCH_RESPONSE",
-            "items": response_items,
-            "metrics": _make_metrics(model_name, duration, len(items)),
-        }
-
-    except Exception as e:
-        return {
-            "type": "BATCH_RESPONSE",
-            "items": [
-                {
-                    "uid": item["uid"],
-                    "data": None,
-                    "status": {"code": "Error", "message": str(e)},
-                }
-                for item in items
-            ],
-        }
-
-
-async def worker_main():
+def worker_main():
     args = parse_args()
 
-    # Setup structured logging to stdout
     def log(level: str, message: str, **kwargs):
         record = {
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -461,7 +339,7 @@ async def worker_main():
         }
         print(json.dumps(record), flush=True, file=sys.stderr)
 
-    log("INFO", f"Worker {args.worker_id} starting", device=args.device)
+    log("INFO", f"Worker {args.worker_id} starting", device=args.device, endpoint=args.endpoint)
 
     # Load config and model
     try:
@@ -470,102 +348,36 @@ async def worker_main():
         log("INFO", "Model loaded successfully")
     except Exception as e:
         log("ERROR", f"Failed to load model: {e}")
-        startup = {
-            "status": "error",
-            "worker_id": args.worker_id,
-            "message": str(e),
-        }
-        print(json.dumps(startup), flush=True)
+        print(json.dumps({"status": "error", "worker_id": args.worker_id, "message": str(e)}), flush=True)
         sys.exit(1)
 
-    # Send ready signal
-    startup = {
-        "status": "ready",
-        "worker_id": args.worker_id,
-    }
-    print(json.dumps(startup), flush=True)
+    # Ready signal (keep JSON for startup handshake)
+    print(json.dumps({"status": "ready", "worker_id": args.worker_id}), flush=True)
 
-    # Create Unix socket server (Python worker listens, Rust connects)
-    if os.path.exists(args.uds_path):
-        os.remove(args.uds_path)
+    # Setup ZMQ PAIR
+    context = zmq.Context()
+    socket = context.socket(zmq.PAIR)
+    socket.connect(args.endpoint)
+    socket.setsockopt(zmq.LINGER, 0)
 
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(args.uds_path)
-    server.listen(1)
-    server.setblocking(False)
+    log("INFO", f"Connected ZMQ PAIR to {args.endpoint}")
 
-    log("INFO", f"Listening on UDS {args.uds_path}")
-
-    loop = asyncio.get_event_loop()
-
-    while True:
-        try:
-            conn, _ = await loop.sock_accept(server)
-        except Exception as e:
-            log("ERROR", f"Accept error: {e}")
-            continue
-
-        try:
-            while True:
-                # Read length prefix (4 bytes)
-                len_bytes = b""
-                while len(len_bytes) < 4:
-                    chunk = await loop.sock_recv(conn, 4 - len(len_bytes))
-                    if not chunk:
-                        break
-                    len_bytes += chunk
-                if len(len_bytes) < 4:
-                    break
-
-                msg_len = struct.unpack(">I", len_bytes)[0]
-
-                # Read message body
-                body = b""
-                while len(body) < msg_len:
-                    chunk = await loop.sock_recv(conn, msg_len - len(body))
-                    if not chunk:
-                        break
-                    body += chunk
-                if len(body) < msg_len:
-                    break
-
-                # Parse request
-                try:
-                    request = json.loads(body.decode("utf-8"))
-                except Exception as e:
-                    log("ERROR", f"Failed to parse request: {e}")
-                    continue
-
-                # Handle request
-                try:
-                    payload = request.get("payload", {})
-                    msg_type = payload.get("type", payload.get("msg_type", "INFER"))
-                    if msg_type == "BATCH_INFER":
-                        response = handle_batch_request(lit_api, request, args.model_name)
-                        response["worker_id"] = args.worker_id
-                        for item in response.get("items", []):
-                            item["worker_id"] = args.worker_id
-                    else:
-                        response = await handle_request(lit_api, request, args.model_name)
-                except Exception as e:
-                    log("ERROR", f"Request handling error: {e}")
-                    response = {
-                        "uid": request.get("uid", ""),
-                        "data": None,
-                        "status": {"code": "Error", "message": str(e)},
-                        "worker_id": args.worker_id,
-                    }
-
-                # Send response with length prefix
-                resp_bytes = json.dumps(response).encode("utf-8")
-                len_prefix = struct.pack(">I", len(resp_bytes))
-                await loop.sock_sendall(conn, len_prefix + resp_bytes)
-
-        except Exception as e:
-            log("ERROR", f"Connection error: {e}")
-        finally:
-            conn.close()
+    try:
+        if args.continuous_batching or config.get("continuous_batching", False):
+            run_cb_loop(lit_api, socket, args.model_name)
+        else:
+            run_standard_loop(lit_api, socket, args.model_name)
+    except KeyboardInterrupt:
+        log("INFO", "Interrupted, shutting down")
+    finally:
+        if hasattr(lit_api, "teardown"):
+            try:
+                lit_api.teardown()
+            except Exception as e:
+                log("ERROR", f"teardown error: {e}")
+        socket.close()
+        context.term()
 
 
 if __name__ == "__main__":
-    asyncio.run(worker_main())
+    worker_main()

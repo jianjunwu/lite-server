@@ -51,7 +51,7 @@ pub struct ModelVersion {
 pub struct WorkerInfo {
     pub worker_id: u32,
     pub device: String,
-    pub uds_path: PathBuf,
+    pub endpoint: String,
     pub pid: Option<u32>,
     pub status: WorkerStatus,
 }

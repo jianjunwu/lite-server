@@ -1,24 +1,22 @@
 use crate::config::ModelConfig;
 use crate::error::AppError;
 use crate::metrics::prometheus;
+use crate::proto::liteserver as pb;
 use crate::registry::types::WorkerInfo;
-use crate::transport::uds::send_batch_to_worker;
-use crate::worker::protocol::{
-    BatchInferenceResponse, BatchItem, BatchResponseItem, InferenceRequest, InferenceResponse,
-    RequestPayload, ResponseStatus,
-};
+use crate::transport::zmq::WorkerZmqClient;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{error, trace, warn};
+use tracing::{error, warn};
 
 /// A single item waiting in the inference queue.
 pub struct QueueItem {
     pub uid: String,
-    pub data: serde_json::Value,
-    pub response_tx: oneshot::Sender<InferenceResponse>,
+    pub data: Vec<u8>, // JSON-encoded request body
+    pub meta: Option<pb::RequestMeta>,
+    pub response_tx: oneshot::Sender<pb::Response>,
 }
 
 /// Error types for queue operations.
@@ -58,6 +56,7 @@ impl InferenceQueue {
         version: &str,
         config: &ModelConfig,
         workers: Vec<WorkerInfo>,
+        zmq_clients: Vec<Arc<WorkerZmqClient>>,
     ) {
         let key = format!("{}_{}", model_name, version);
 
@@ -83,6 +82,7 @@ impl InferenceQueue {
             min_timeout,
             queue_threshold,
             workers,
+            zmq_clients,
             model_name.to_string(),
             version.to_string(),
         ));
@@ -146,7 +146,7 @@ fn pick_worker_least_loaded(inflight: &[Arc<AtomicUsize>]) -> usize {
 /// Send a batch of requests to a worker and distribute responses.
 async fn send_batch(
     batch: &mut Vec<QueueItem>,
-    workers: &[WorkerInfo],
+    zmq_clients: &[Arc<WorkerZmqClient>],
     inflight: &[Arc<AtomicUsize>],
     model_name: &str,
     version: &str,
@@ -156,21 +156,22 @@ async fn send_batch(
     }
 
     let worker_idx = pick_worker_least_loaded(inflight);
-    let worker = &workers[worker_idx];
     inflight[worker_idx].fetch_add(1, Ordering::Relaxed);
+    let zmq_client = &zmq_clients[worker_idx];
 
-    // Build batch items
-    let items: Vec<BatchItem> = batch
+    // Build protobuf batch request
+    let items: Vec<pb::BatchItem> = batch
         .iter()
-        .map(|item| BatchItem {
+        .map(|item| pb::BatchItem {
             uid: item.uid.clone(),
             data: item.data.clone(),
         })
         .collect();
 
-    let request = InferenceRequest {
+    let request = pb::Request {
         uid: format!("batch-{}", uuid::Uuid::new_v4()),
-        payload: RequestPayload::BatchInfer { items },
+        meta: batch.first().and_then(|i| i.meta.clone()),
+        payload: Some(pb::request::Payload::Batch(pb::BatchRequest { items })),
     };
 
     // Track queue depth decrease for all items in the batch
@@ -178,42 +179,59 @@ async fn send_batch(
         prometheus::dec_queue_depth(model_name, version);
     }
 
-    let result = send_batch_to_worker(&worker.uds_path, request).await;
+    let result = zmq_client.send(request).await;
 
     match result {
-        Ok(batch_resp) => {
-            // Record worker-reported batch metrics
-            crate::metrics::prometheus::record_worker_metrics(model_name, &batch_resp.metrics);
+        Ok(resp) => {
+            crate::metrics::prometheus::record_worker_metrics(model_name, resp.metrics.as_ref());
+            if let Some(pb::response::Payload::Batch(batch_resp)) = resp.payload {
+                let resp_map: std::collections::HashMap<String, pb::BatchItemResponse> =
+                    batch_resp
+                        .items
+                        .into_iter()
+                        .map(|item| (item.uid.clone(), item))
+                        .collect();
 
-            // Build uid -> response item map for O(1) lookup
-            let resp_map: std::collections::HashMap<String, BatchResponseItem> = batch_resp
-                .items
-                .into_iter()
-                .map(|item| (item.uid.clone(), item))
-                .collect();
-
-            for queue_item in batch.drain(..) {
-                let resp = if let Some(resp_item) = resp_map.get(&queue_item.uid) {
-                    InferenceResponse {
+                for queue_item in batch.drain(..) {
+                    let single_resp = if let Some(resp_item) = resp_map.get(&queue_item.uid) {
+                        pb::Response {
+                            uid: queue_item.uid,
+                            payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+                                data: resp_item.data.clone(),
+                                status: resp_item.status.clone(),
+                            })),
+                            metrics: resp.metrics.clone(),
+                        }
+                    } else {
+                        pb::Response {
+                            uid: queue_item.uid,
+                            payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+                                data: vec![],
+                                status: Some(pb::Status {
+                                    code: "Error".to_string(),
+                                    message: "missing in batch response".to_string(),
+                                }),
+                            })),
+                            metrics: None,
+                        }
+                    };
+                    let _ = queue_item.response_tx.send(single_resp);
+                }
+            } else {
+                warn!("Unexpected response type from worker for {} {}", model_name, version);
+                for queue_item in batch.drain(..) {
+                    let _ = queue_item.response_tx.send(pb::Response {
                         uid: queue_item.uid,
-                        data: resp_item.data.clone(),
-                        status: ResponseStatus {
-                            code: resp_item.status.code.clone(),
-                            message: resp_item.status.message.clone(),
-                        },
-                        worker_id: resp_item.worker_id,
+                        payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+                            data: vec![],
+                            status: Some(pb::Status {
+                                code: "Error".to_string(),
+                                message: "unexpected response type".to_string(),
+                            }),
+                        })),
                         metrics: None,
-                    }
-                } else {
-                    InferenceResponse {
-                        uid: queue_item.uid,
-                        data: None,
-                        status: ResponseStatus::error("missing in batch response"),
-                        worker_id: worker_idx as u32,
-                        metrics: None,
-                    }
-                };
-                let _ = queue_item.response_tx.send(resp);
+                    });
+                }
             }
         }
         Err(e) => {
@@ -222,14 +240,17 @@ async fn send_batch(
                 model_name, version, e
             );
             for queue_item in batch.drain(..) {
-                let resp = InferenceResponse {
+                let _ = queue_item.response_tx.send(pb::Response {
                     uid: queue_item.uid,
-                    data: None,
-                    status: ResponseStatus::error(e.to_string()),
-                    worker_id: worker_idx as u32,
+                    payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+                        data: vec![],
+                        status: Some(pb::Status {
+                            code: "Error".to_string(),
+                            message: e.to_string(),
+                        }),
+                    })),
                     metrics: None,
-                };
-                let _ = queue_item.response_tx.send(resp);
+                });
             }
         }
     }
@@ -240,8 +261,8 @@ async fn send_batch(
 /// Compute adaptive batch timeout based on current batch size, queue depth, and config.
 ///
 /// Algorithm:
-/// - If batch is already full → return zero (dispatch immediately)
-/// - If batch is >50% full → aggressively reduce timeout
+/// - If batch is already full -> return zero (dispatch immediately)
+/// - If batch is >50% full -> aggressively reduce timeout
 /// - Scale timeout by queue pressure: more pending requests = shorter timeout
 /// - Never go below min_timeout
 pub fn compute_adaptive_timeout(
@@ -270,9 +291,9 @@ pub fn compute_adaptive_timeout(
     let pressure = fill_ratio.max(queue_pressure);
 
     // Scale timeout inversely with pressure:
-    // pressure 0.0 → full timeout
-    // pressure 0.5 → half timeout
-    // pressure 1.0 → min timeout
+    // pressure 0.0 -> full timeout
+    // pressure 0.5 -> half timeout
+    // pressure 1.0 -> min timeout
     let scale = 1.0 - pressure * 0.99; // never go fully to 0, keep at least 1% for fairness
     let scaled = base_timeout.mul_f32(scale.max(0.0));
 
@@ -287,25 +308,26 @@ async fn batch_collector(
     adaptive: bool,
     min_timeout: Duration,
     queue_threshold: usize,
-    workers: Vec<WorkerInfo>,
+    _workers: Vec<WorkerInfo>,
+    zmq_clients: Vec<Arc<WorkerZmqClient>>,
     model_name: String,
     version: String,
 ) {
     if max_batch_size <= 1 {
         // Fast path: no batching, send immediately
-        let worker_inflight: Vec<Arc<AtomicUsize>> = (0..workers.len())
+        let worker_inflight: Vec<Arc<AtomicUsize>> = (0..zmq_clients.len())
             .map(|_| Arc::new(AtomicUsize::new(0)))
             .collect();
 
         while let Some(item) = rx.recv().await {
             let mut batch = vec![item];
-            send_batch(&mut batch, &workers, &worker_inflight, &model_name, &version).await;
+            send_batch(&mut batch, &zmq_clients, &worker_inflight, &model_name, &version).await;
         }
         return;
     }
 
     let mut batch: Vec<QueueItem> = Vec::with_capacity(max_batch_size);
-    let worker_inflight: Vec<Arc<AtomicUsize>> = (0..workers.len())
+    let worker_inflight: Vec<Arc<AtomicUsize>> = (0..zmq_clients.len())
         .map(|_| Arc::new(AtomicUsize::new(0)))
         .collect();
 
@@ -318,7 +340,7 @@ async fn batch_collector(
                 prometheus::inc_queue_depth(&model_name, &version);
                 batch.push(item);
                 if batch.len() >= max_batch_size {
-                    send_batch(&mut batch, &workers, &worker_inflight, &model_name, &version).await;
+                    send_batch(&mut batch, &zmq_clients, &worker_inflight, &model_name, &version).await;
                     deadline = None;
                 } else if deadline.is_none() {
                     let timeout = if adaptive {
@@ -345,7 +367,7 @@ async fn batch_collector(
                 }
             }, if deadline.is_some() => {
                 if !batch.is_empty() {
-                    send_batch(&mut batch, &workers, &worker_inflight, &model_name, &version).await;
+                    send_batch(&mut batch, &zmq_clients, &worker_inflight, &model_name, &version).await;
                 }
                 deadline = None;
             }
@@ -355,7 +377,7 @@ async fn batch_collector(
 
     // Drain remaining items
     if !batch.is_empty() {
-        send_batch(&mut batch, &workers, &worker_inflight, &model_name, &version).await;
+        send_batch(&mut batch, &zmq_clients, &worker_inflight, &model_name, &version).await;
     }
 }
 
@@ -375,7 +397,7 @@ mod tests {
     fn test_adaptive_timeout_low_load() {
         let base = Duration::from_millis(50);
         let min = Duration::from_millis(1);
-        // Empty batch, no queue → should use ~full timeout
+        // Empty batch, no queue -> should use ~full timeout
         let result = compute_adaptive_timeout(0, 0, 8, base, min, 10);
         assert!(result >= Duration::from_millis(49), "low load should use near-full timeout");
         // Allow tiny floating-point drift from mul_f32
@@ -386,7 +408,7 @@ mod tests {
     fn test_adaptive_timeout_high_queue_pressure() {
         let base = Duration::from_millis(50);
         let min = Duration::from_millis(1);
-        // Empty batch but queue depth exceeds threshold → should use min timeout
+        // Empty batch but queue depth exceeds threshold -> should use min timeout
         let result = compute_adaptive_timeout(1, 20, 8, base, min, 10);
         assert_eq!(result, min, "high queue pressure should use min timeout");
     }
@@ -395,7 +417,7 @@ mod tests {
     fn test_adaptive_timeout_fill_pressure() {
         let base = Duration::from_millis(50);
         let min = Duration::from_millis(1);
-        // Batch 50% full → timeout should be significantly reduced
+        // Batch 50% full -> timeout should be significantly reduced
         let result = compute_adaptive_timeout(4, 0, 8, base, min, 10);
         assert!(result < base, "50% fill should reduce timeout");
         assert!(result >= min, "should respect min timeout");
@@ -405,7 +427,7 @@ mod tests {
     fn test_adaptive_timeout_respects_minimum() {
         let base = Duration::from_secs(1);
         let min = Duration::from_millis(5);
-        // Extreme pressure: scale = 0.01 → scaled = 10ms, which is > min (5ms)
+        // Extreme pressure: scale = 0.01 -> scaled = 10ms, which is > min (5ms)
         let result = compute_adaptive_timeout(7, 100, 8, base, min, 10);
         assert!(result >= min, "should never go below min_timeout");
         // At extreme pressure result should be close to min but not clamped unless scaled < min

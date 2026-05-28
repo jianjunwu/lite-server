@@ -1,9 +1,7 @@
 use crate::error::AppError;
 use crate::http::state::AppState;
-use crate::registry::types::{ModelType, VersionStatus};
-use crate::transport::uds::send_to_worker;
-use crate::worker::pick_worker_random;
-use crate::worker::protocol::{InferenceRequest, RequestPayload, ResponseStatus};
+use crate::proto::liteserver as pb;
+use crate::registry::types::ModelType;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -11,8 +9,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::oneshot;
 use tokio::time::{timeout, Duration};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
+use uuid::Uuid;
 
 // ===== Config parsing =====
 
@@ -301,40 +301,93 @@ async fn execute_step(
         )));
     }
 
-    // Get worker info
+    // Get model version info
     let mv = state.registry.get(&step.model, Some(&step.version)).await
         .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", step.model, step.version)))?;
+
+    if mv.model_type == ModelType::Ensemble {
+        return Err(AppError::Internal("nested ensemble not supported".to_string()));
+    }
 
     let num_workers = mv.workers.len();
     if num_workers == 0 {
         return Err(AppError::WorkerCrashed(format!("{} has no workers", step.model)));
     }
 
-    let worker_id = pick_worker_random(num_workers);
-    let worker = &mv.workers[worker_id];
-    let uds_path = worker.uds_path.clone();
+    // Send inference request through the unified queue
+    let uid = format!("ensemble_{}_{}_{}", step.model, step.version, Uuid::new_v4());
+    let payload_value = Value::Object(payload);
+    let payload_bytes = serde_json::to_vec(&payload_value).unwrap_or_default();
 
-    // Send inference request
-    let uid = format!("ensemble_{}_{}_{}", step.model, step.version, uuid::Uuid::new_v4());
-    let request = InferenceRequest {
-        uid,
-        payload: RequestPayload::Infer { data: Value::Object(payload) },
+    let meta = pb::RequestMeta {
+        route: "/predict".to_string(),
+        headers: HashMap::new(),
+        client_ip: "".to_string(),
+        request_id: uid.clone(),
+        timestamp_ns: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64,
+        payload: payload_bytes.clone(),
     };
+
+    let (response_tx, response_rx) = oneshot::channel();
+    let item = crate::inference_queue::QueueItem {
+        uid: uid.clone(),
+        data: payload_bytes,
+        meta: Some(meta),
+        response_tx,
+    };
+
+    match state.inference_queue.try_submit(&step.model, &step.version, item) {
+        Ok(()) => {}
+        Err(crate::inference_queue::QueueError::Full) => {
+            return Err(AppError::QueueFull(format!(
+                "Queue full for {} {}", step.model, step.version
+            )));
+        }
+        Err(_) => {
+            return Err(AppError::ModelNotReady(format!(
+                "Queue not available for {} {}", step.model, step.version
+            )));
+        }
+    }
 
     let timeout_duration = Duration::from_secs_f64(state.config.server.timeout as f64);
-    let response = match timeout(timeout_duration, send_to_worker(&uds_path, request)).await {
+    let response = match timeout(timeout_duration, response_rx).await {
         Ok(Ok(resp)) => resp,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Err(AppError::InferenceTimeout(format!(
-            "ensemble step {} timed out", step.name
-        ))),
+        Ok(Err(_)) => {
+            return Err(AppError::InferenceTimeout(format!(
+                "ensemble step {} response channel closed", step.name
+            )));
+        }
+        Err(_) => {
+            return Err(AppError::InferenceTimeout(format!(
+                "ensemble step {} timed out", step.name
+            )));
+        }
     };
 
-    match response.status.code.as_str() {
-        "Ok" => Ok(response.data.unwrap_or(json!({}))),
-        _ => Err(AppError::WorkerCrashed(
-            response.status.message.unwrap_or_else(|| "ensemble step inference error".to_string())
-        )),
+    match response.payload {
+        Some(pb::response::Payload::Single(single)) => {
+            let code = single.status.as_ref().map(|s| s.code.as_str()).unwrap_or("Ok");
+            match code {
+                "Ok" => {
+                    let data = if single.data.is_empty() {
+                        json!({})
+                    } else {
+                        serde_json::from_slice(&single.data).unwrap_or(json!({}))
+                    };
+                    Ok(data)
+                }
+                _ => Err(AppError::WorkerCrashed(
+                    single.status.as_ref().and_then(|s| {
+                        if s.message.is_empty() { None } else { Some(s.message.clone()) }
+                    }).unwrap_or_else(|| "ensemble step inference error".to_string())
+                )),
+            }
+        }
+        _ => Err(AppError::WorkerCrashed("unexpected response type".to_string())),
     }
 }
 

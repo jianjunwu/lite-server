@@ -1,24 +1,20 @@
-use crate::config::{Config, ModelConfig, OrchestrationConfig, ModelStrategyConfig};
 use crate::error::AppError;
 use crate::http::state::AppState;
 use crate::metrics::prometheus;
-use crate::registry::types::{VersionStatus, ModelType};
-use crate::transport::uds::send_to_worker;
-use crate::worker::protocol::{EndpointRequest, InferenceRequest, InferenceResponse, RequestPayload, ResponseStatus, ServerSnapshot};
-use crate::worker::endpoint_manager::EndpointManager;
-use crate::worker::pick_worker_random;
+use crate::proto::liteserver as pb;
+use crate::registry::types::ModelType;
 use axum::{
-    extract::{Path, Query, State, WebSocketUpgrade},
+    extract::{Path, Query, State},
     response::{IntoResponse, Json, Response},
 };
 use axum::extract::ws::{Message, WebSocket};
+use axum::http::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
-use tokio::time::timeout;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -291,23 +287,36 @@ pub async fn activate_version_handler(
 pub async fn infer_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
+    headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
-    do_infer(state, model_name, None, payload).await
+    do_infer(state, model_name, None, "/predict".to_string(), headers, payload).await
 }
 
 pub async fn infer_version_handler(
     State(state): State<Arc<AppState>>,
     Path((model_name, version)): Path<(String, String)>,
+    headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
-    do_infer(state, model_name, Some(version), payload).await
+    do_infer(state, model_name, Some(version), "/predict".to_string(), headers, payload).await
+}
+
+fn extract_client_ip(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
+        .unwrap_or("")
+        .to_string()
 }
 
 async fn do_infer(
     state: Arc<AppState>,
     model_name: String,
     version: Option<String>,
+    route: String,
+    headers: HeaderMap,
     payload: Value,
 ) -> Result<Json<Value>, AppError> {
     let resolved_version = match &version {
@@ -345,49 +354,34 @@ async fn do_infer(
 
     let start = Instant::now();
 
-    // Fast path: no batching, direct UDS (avoids queue overhead)
-    if mv.config.max_batch_size <= 1 {
-        let worker_id = pick_worker_random(num_workers);
-        let worker = &mv.workers[worker_id];
-        let uds_path = worker.uds_path.clone();
+    // Build request metadata
+    let header_map: HashMap<String, String> = headers
+        .iter()
+        .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), s.to_string())))
+        .collect();
+    let client_ip = extract_client_ip(&headers);
+    let request_id = Uuid::new_v4().to_string();
+    let timestamp_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64;
+    let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
 
-        let request = InferenceRequest {
-            uid: uid.clone(),
-            payload: RequestPayload::Infer { data: payload },
-        };
+    let meta = pb::RequestMeta {
+        route,
+        headers: header_map,
+        client_ip,
+        request_id,
+        timestamp_ns,
+        payload: payload_bytes,
+    };
 
-        let response = match send_to_worker(&uds_path, request).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                prometheus::record_request_end(&model_name, &resolved_version, "5xx", start.elapsed().as_secs_f64());
-                return Err(e);
-            }
-        };
-
-        let duration = start.elapsed().as_secs_f64();
-        prometheus::record_worker_metrics(&model_name, &response.metrics);
-        return match response.status.code.as_str() {
-            "Ok" => {
-                prometheus::record_request_end(&model_name, &resolved_version, "2xx", duration);
-                Ok(Json(response.data.unwrap_or(json!({}))))
-            }
-            "Error" => {
-                let msg = response.status.message.unwrap_or_else(|| "unknown worker error".to_string());
-                prometheus::record_request_end(&model_name, &resolved_version, "5xx", duration);
-                Err(AppError::WorkerCrashed(msg))
-            }
-            _ => {
-                prometheus::record_request_end(&model_name, &resolved_version, "2xx", duration);
-                Ok(Json(response.data.unwrap_or(json!({}))))
-            }
-        };
-    }
-
-    // Queue path: batching enabled
+    // All requests go through the unified inference queue
     let (response_tx, response_rx) = oneshot::channel();
     let item = crate::inference_queue::QueueItem {
         uid: uid.clone(),
-        data: payload,
+        data: meta.payload.clone(),
+        meta: Some(meta),
         response_tx,
     };
 
@@ -419,20 +413,38 @@ async fn do_infer(
     };
 
     let duration = start.elapsed().as_secs_f64();
-    prometheus::record_worker_metrics(&model_name, &response.metrics);
-    match response.status.code.as_str() {
-        "Ok" => {
-            prometheus::record_request_end(&model_name, &resolved_version, "2xx", duration);
-            Ok(Json(response.data.unwrap_or(json!({}))))
-        }
-        "Error" => {
-            let msg = response.status.message.unwrap_or_else(|| "unknown worker error".to_string());
-            prometheus::record_request_end(&model_name, &resolved_version, "5xx", duration);
-            Err(AppError::WorkerCrashed(msg))
+    prometheus::record_worker_metrics(&model_name, response.metrics.as_ref());
+
+    // Parse protobuf response
+    match response.payload {
+        Some(pb::response::Payload::Single(single)) => {
+            let data = if single.data.is_empty() {
+                json!({})
+            } else {
+                serde_json::from_slice(&single.data).unwrap_or(json!({}))
+            };
+            let code = single.status.as_ref().map(|s| s.code.as_str()).unwrap_or("Ok");
+            match code {
+                "Ok" => {
+                    prometheus::record_request_end(&model_name, &resolved_version, "2xx", duration);
+                    Ok(Json(data))
+                }
+                "Error" => {
+                    let msg = single.status.as_ref().and_then(|s| {
+                        if s.message.is_empty() { None } else { Some(s.message.clone()) }
+                    }).unwrap_or_else(|| "unknown worker error".to_string());
+                    prometheus::record_request_end(&model_name, &resolved_version, "5xx", duration);
+                    Err(AppError::WorkerCrashed(msg))
+                }
+                _ => {
+                    prometheus::record_request_end(&model_name, &resolved_version, "2xx", duration);
+                    Ok(Json(data))
+                }
+            }
         }
         _ => {
-            prometheus::record_request_end(&model_name, &resolved_version, "2xx", duration);
-            Ok(Json(response.data.unwrap_or(json!({}))))
+            prometheus::record_request_end(&model_name, &resolved_version, "5xx", duration);
+            Err(AppError::WorkerCrashed("unexpected response type".to_string()))
         }
     }
 }
@@ -442,7 +454,7 @@ async fn do_infer(
 pub async fn ws_stream_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
-    ws: WebSocketUpgrade,
+    ws: axum::extract::WebSocketUpgrade,
 ) -> Response {
     ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, socket))
 }
@@ -450,7 +462,7 @@ pub async fn ws_stream_handler(
 pub async fn ws_stream_version_handler(
     State(state): State<Arc<AppState>>,
     Path((model_name, version)): Path<(String, String)>,
-    ws: WebSocketUpgrade,
+    ws: axum::extract::WebSocketUpgrade,
 ) -> Response {
     ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), socket))
 }
@@ -491,65 +503,24 @@ async fn handle_ws_stream(
         return;
     }
 
-    let worker_id = pick_worker_random(num_workers);
+    let worker_id = crate::worker::pick_worker_random(num_workers);
     let worker = &mv.workers[worker_id];
-    let uds_path = worker.uds_path.clone();
+    let uds_path = worker.endpoint.clone();
 
     let stream_id = format!("ws-{}", Uuid::new_v4());
 
     // Send STREAM_OPEN
-    let open_req = InferenceRequest {
+    let open_req = pb::Request {
         uid: format!("{}_{}-stream-open", model_name, resolved_version),
-        payload: RequestPayload::StreamOpen { stream_id: stream_id.clone() },
+        meta: None,
+        payload: Some(pb::request::Payload::Single(pb::SingleRequest {
+            data: serde_json::to_vec(&json!({"stream_open": stream_id})).unwrap_or_default(),
+        })),
     };
 
-    if let Err(e) = send_to_worker(&uds_path, open_req).await {
-        error!("Stream open failed: {}", e);
-        let _ = socket.close().await;
-        return;
-    }
-
-    // Read from WebSocket and forward to worker
-    while let Some(msg) = socket.recv().await {
-        match msg {
-            Ok(Message::Text(text)) => {
-                let chunk: Value = match serde_json::from_str(&text) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let req = InferenceRequest {
-                    uid: format!("{}_{}-stream-{}", model_name, resolved_version, Uuid::new_v4()),
-                    payload: RequestPayload::StreamChunk { stream_id: stream_id.clone(), chunk },
-                };
-                if let Err(e) = send_to_worker(&uds_path, req).await {
-                    error!("Stream chunk failed: {}", e);
-                    break;
-                }
-            }
-            Ok(Message::Close(_)) => break,
-            Ok(Message::Binary(bin)) => {
-                // Forward binary data as JSON
-                let chunk = json!({"__binary__": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bin)});
-                let req = InferenceRequest {
-                    uid: format!("{}_{}-stream-{}", model_name, resolved_version, Uuid::new_v4()),
-                    payload: RequestPayload::StreamChunk { stream_id: stream_id.clone(), chunk },
-                };
-                if let Err(e) = send_to_worker(&uds_path, req).await {
-                    error!("Stream chunk failed: {}", e);
-                    break;
-                }
-            }
-            Err(_) => break,
-            _ => {}
-        }
-    }
-
-    // Send STREAM_CLOSE
-    let close_req = InferenceRequest {
-        uid: format!("{}_{}-stream-close", model_name, resolved_version),
-        payload: RequestPayload::StreamClose { stream_id: stream_id.clone() },
-    };
-    let _ = send_to_worker(&uds_path, close_req).await;
+    // TODO: WebSocket streaming needs to be migrated to ZMQ transport
+    // For now, this path is broken until streaming is redesigned
+    warn!("WebSocket streaming is not yet fully migrated to ZMQ");
     let _ = socket.close().await;
 }
 
@@ -605,7 +576,7 @@ pub async fn custom_endpoint_handler(
 
     let snapshot = ep_mgr.build_snapshot().await;
 
-    let req = EndpointRequest {
+    let req = crate::worker::protocol::EndpointRequest {
         request_id: Uuid::new_v4().to_string(),
         route,
         method,

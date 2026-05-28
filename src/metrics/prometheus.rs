@@ -219,82 +219,43 @@ lazy_static! {
 // ===== Custom metrics from Python workers =====
 
 /// Record metrics reported by a Python worker.
-pub fn record_worker_metrics(model: &str, metrics: &Option<Vec<crate::worker::protocol::WorkerMetric>>) {
-    if let Some(metrics) = metrics {
-        for m in metrics {
-            let labels = m.labels.as_ref();
-            match m.metric_type.as_str() {
-                "histogram" => {
-                    match m.name.as_str() {
-                        "lightserver_inference_duration_seconds" => {
-                            INFERENCE_DURATION.with_label_values(&[model]).observe(m.value);
-                        }
-                        "lightserver_batch_size" => {
-                            BATCH_SIZE.with_label_values(&[model]).observe(m.value);
-                        }
-                        _ => {
-                            // Dynamic histogram registration
-                            let key = format!("{}:{:?}", m.name, labels);
-                            let mut guard = CUSTOM_HISTOGRAMS.lock().unwrap();
-                            let hist = guard.entry(key.clone()).or_insert_with(|| {
-                                let label_names: Vec<&str> = labels
-                                    .map(|l| l.keys().map(|s| s.as_str()).collect())
-                                    .unwrap_or_default();
-                                let h = HistogramVec::new(
-                                    HistogramOpts::new(&m.name, "Worker-reported histogram")
-                                        .buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
-                                    &label_names,
-                                ).unwrap();
-                                let _ = REGISTRY.register(Box::new(h.clone()));
-                                h
-                            });
-                            let label_values: Vec<&str> = labels
-                                .map(|l| l.values().map(|s| s.as_str()).collect())
-                                .unwrap_or_default();
-                            let _ = hist.with_label_values(&label_values).observe(m.value);
-                        }
-                    }
-                }
-                "counter" => {
-                    let key = format!("{}:{:?}", m.name, labels);
-                    let mut guard = CUSTOM_COUNTERS.lock().unwrap();
-                    let counter = guard.entry(key.clone()).or_insert_with(|| {
-                        let label_names: Vec<&str> = labels
-                            .map(|l| l.keys().map(|s| s.as_str()).collect())
-                            .unwrap_or_default();
-                        let c = CounterVec::new(
-                            prometheus::Opts::new(&m.name, "Worker-reported counter"),
-                            &label_names,
-                        ).unwrap();
-                        let _ = REGISTRY.register(Box::new(c.clone()));
-                        c
-                    });
-                    let label_values: Vec<&str> = labels
-                        .map(|l| l.values().map(|s| s.as_str()).collect())
-                        .unwrap_or_default();
-                    let _ = counter.with_label_values(&label_values).inc_by(m.value);
-                }
-                "gauge" => {
-                    let key = format!("{}:{:?}", m.name, labels);
-                    let mut guard = CUSTOM_GAUGES.lock().unwrap();
-                    let gauge = guard.entry(key.clone()).or_insert_with(|| {
-                        let label_names: Vec<&str> = labels
-                            .map(|l| l.keys().map(|s| s.as_str()).collect())
-                            .unwrap_or_default();
-                        let g = GaugeVec::new(
-                            prometheus::Opts::new(&m.name, "Worker-reported gauge"),
-                            &label_names,
-                        ).unwrap();
-                        let _ = REGISTRY.register(Box::new(g.clone()));
-                        g
-                    });
-                    let label_values: Vec<&str> = labels
-                        .map(|l| l.values().map(|s| s.as_str()).collect())
-                        .unwrap_or_default();
-                    let _ = gauge.with_label_values(&label_values).set(m.value);
-                }
-                _ => {}
-            }
+pub fn record_worker_metrics(model: &str, metrics: Option<&crate::proto::liteserver::Metrics>) {
+    if let Some(m) = metrics {
+        if m.prefill_ms > 0.0 {
+            let mut guard = CUSTOM_GAUGES.lock().unwrap();
+            let gauge = guard.entry("prefill_ms".to_string()).or_insert_with(|| {
+                let g = GaugeVec::new(
+                    prometheus::Opts::new("lite_server_prefill_ms", "Prefill latency in ms"),
+                    &["model"],
+                ).unwrap();
+                let _ = REGISTRY.register(Box::new(g.clone()));
+                g
+            });
+            let _ = gauge.with_label_values(&[model]).set(m.prefill_ms as f64);
+        }
+        if m.decode_ms > 0.0 {
+            let mut guard = CUSTOM_GAUGES.lock().unwrap();
+            let gauge = guard.entry("decode_ms".to_string()).or_insert_with(|| {
+                let g = GaugeVec::new(
+                    prometheus::Opts::new("lite_server_decode_ms", "Decode latency in ms"),
+                    &["model"],
+                ).unwrap();
+                let _ = REGISTRY.register(Box::new(g.clone()));
+                g
+            });
+            let _ = gauge.with_label_values(&[model]).set(m.decode_ms as f64);
+        }
+        if m.tokens_generated > 0 {
+            let mut guard = CUSTOM_COUNTERS.lock().unwrap();
+            let counter = guard.entry("tokens_generated".to_string()).or_insert_with(|| {
+                let c = CounterVec::new(
+                    prometheus::Opts::new("lite_server_tokens_generated_total", "Total tokens generated"),
+                    &["model"],
+                ).unwrap();
+                let _ = REGISTRY.register(Box::new(c.clone()));
+                c
+            });
+            let _ = counter.with_label_values(&[model]).inc_by(m.tokens_generated as f64);
         }
     }
 }

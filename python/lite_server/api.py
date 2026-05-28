@@ -2,18 +2,31 @@
 
 Model authors subclass ``lite_server.api.LitAPI`` instead of
 ``litserve.LitAPI`` to gain access to framework-level hooks
-(teardown, on_file_changed, logger).
+(teardown, on_file_changed, logger, on_request, on_response).
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import litserve as ls
 
 if TYPE_CHECKING:
     from litserve.specs.base import LitSpec
+
+
+@dataclass
+class RequestMeta:
+    """Metadata about the original HTTP request, passed to hooks."""
+
+    route: str
+    headers: dict[str, str]
+    client_ip: str
+    request_id: str
+    timestamp_ns: int
+    payload: Any  # decoded original request body
 
 
 class LitAPI(ls.LitAPI):
@@ -63,6 +76,73 @@ class LitAPI(ls.LitAPI):
                 self.__class__.__module__ + "." + self.__class__.__name__
             )
         return self._logger
+
+    # ===== Request/Response Hooks =====
+
+    def on_request(self, request: Any, meta: RequestMeta) -> Any:
+        """Called after decode_request, before predict.
+
+        Override to modify the request, perform auth checks, inject context,
+        or log request metadata.  Raising an exception rejects the request
+        and returns an Error response to the client.
+
+        Args:
+            request: The decoded request (output of decode_request).
+            meta: Original HTTP request metadata (headers, route, ip, etc.).
+
+        Returns:
+            The (possibly modified) request to pass to predict.
+        """
+        return request
+
+    def on_response(self, response: Any, meta: RequestMeta) -> Any:
+        """Called after encode_response, before sending to the client.
+
+        Override to modify the response, inject headers, or log.
+
+        Args:
+            response: The encoded response (output of encode_response).
+            meta: Original HTTP request metadata.
+
+        Returns:
+            The (possibly modified) response to send to the client.
+        """
+        return response
+
+    # ===== Continuous Batching Hooks (optional) =====
+
+    def prefill(self, uid: str, decoded_input: Any) -> None:
+        """Add a new sequence to the continuous batching state.
+
+        Called when a new request arrives in CB mode.  Implement this to
+        perform the initial forward pass (e.g. KV-cache prefill).
+
+        Args:
+            uid: Unique request identifier.
+            decoded_input: Output of decode_request.
+        """
+        pass
+
+    def step(self, active_sequences: list[dict]) -> list[Any]:
+        """Run one generation step for all active sequences.
+
+        Each element in ``active_sequences`` is a dict with keys:
+        ``uid``, ``input``, ``output`` (list of tokens so far).
+
+        Returns:
+            A list of new tokens, one per active sequence.
+        """
+        pass
+
+    def has_finished(self, uid: str, token: Any, generated_sequence: list[Any]) -> bool:
+        """Check whether a sequence has finished generating.
+
+        Returns True when the sequence should be removed from the active
+        batch and its final response sent to the client.
+        """
+        return False
+
+    # ===== Lifecycle Hooks =====
 
     def on_file_changed(self, changed_files: list[str]) -> Any:
         """Called when files in the model directory change (hot reload).
