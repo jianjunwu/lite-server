@@ -254,6 +254,7 @@ async fn start_metrics_server(host: &str, port: u16) -> Result<(), AppError> {
     Ok(())
 }
 
+#[cfg(unix)]
 async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c()
@@ -273,6 +274,14 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
 
+    info!("signal received, starting graceful shutdown");
+}
+
+#[cfg(windows)]
+async fn shutdown_signal() {
+    signal::ctrl_c()
+        .await
+        .expect("failed to install Ctrl+C handler");
     info!("signal received, starting graceful shutdown");
 }
 

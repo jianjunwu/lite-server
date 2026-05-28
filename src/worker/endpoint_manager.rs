@@ -8,7 +8,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
@@ -62,9 +61,19 @@ impl EndpointManager {
     }
 
     async fn do_send_request(&self, request: &EndpointRequest) -> Result<EndpointResponse, AppError> {
-        let mut stream = UnixStream::connect(&self.uds_path)
+        #[cfg(unix)]
+        let mut stream = tokio::net::UnixStream::connect(&self.uds_path)
             .await
             .map_err(|e| AppError::Transport(format!("failed to connect to endpoint UDS: {}", e)))?;
+
+        #[cfg(windows)]
+        let mut stream = {
+            let path_str = self.uds_path.to_string_lossy();
+            let port = derive_port_from_path(&path_str);
+            tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+                .await
+                .map_err(|e| AppError::Transport(format!("failed to connect to endpoint: {}", e)))?
+        };
 
         let encoded = serde_json::to_vec(request).map_err(|e| {
             AppError::Transport(format!("json serialize endpoint request: {}", e))
@@ -114,6 +123,7 @@ impl EndpointManager {
             let _ = p.child.kill().await;
             let _ = p.child.wait().await;
         }
+        #[cfg(unix)]
         let _ = tokio::fs::remove_file(&self.uds_path).await;
     }
 
@@ -213,3 +223,12 @@ impl EndpointManager {
 
 // Reuse the module path finder from WorkerManager
 use super::WorkerManager;
+
+#[cfg(windows)]
+fn derive_port_from_path(path: &str) -> u16 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    30000 + (hasher.finish() % 35535) as u16
+}

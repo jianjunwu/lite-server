@@ -4,9 +4,38 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+#[cfg(unix)]
 use tokio::net::UnixStream;
+#[cfg(windows)]
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{error, info, warn};
+
+#[cfg(unix)]
+type Stream = UnixStream;
+#[cfg(windows)]
+type Stream = TcpStream;
+
+#[cfg(unix)]
+async fn connect_stream(path: &std::path::Path) -> Result<Stream, std::io::Error> {
+    UnixStream::connect(path).await
+}
+
+#[cfg(windows)]
+async fn connect_stream(path: &std::path::Path) -> Result<Stream, std::io::Error> {
+    let path_str = path.to_string_lossy();
+    let port = derive_port_from_path(&path_str);
+    TcpStream::connect(format!("127.0.0.1:{}", port)).await
+}
+
+#[cfg(windows)]
+fn derive_port_from_path(path: &str) -> u16 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    30000 + (hasher.finish() % 35535) as u16
+}
 
 // ===== Global connection pool =====
 
@@ -45,7 +74,7 @@ pub struct WorkerConnection {
 
 impl WorkerConnection {
     pub async fn new(uds_path: &Path) -> Result<Self, AppError> {
-        let stream = UnixStream::connect(uds_path)
+        let stream = connect_stream(uds_path)
             .await
             .map_err(|e| AppError::Transport(format!("failed to connect to UDS {}: {}", uds_path.display(), e)))?;
 
@@ -112,7 +141,7 @@ impl WorkerConnection {
 }
 
 async fn writer_task(
-    mut write_half: WriteHalf<UnixStream>,
+    mut write_half: WriteHalf<Stream>,
     mut request_rx: mpsc::UnboundedReceiver<InferRequest>,
     pending_single: Arc<RwLock<HashMap<String, oneshot::Sender<InferenceResponse>>>>,
     pending_batch: Arc<RwLock<HashMap<String, oneshot::Sender<BatchInferenceResponse>>>>,
@@ -192,7 +221,7 @@ async fn writer_task(
 }
 
 async fn reader_task(
-    mut read_half: ReadHalf<UnixStream>,
+    mut read_half: ReadHalf<Stream>,
     pending_single: Arc<RwLock<HashMap<String, oneshot::Sender<InferenceResponse>>>>,
     pending_batch: Arc<RwLock<HashMap<String, oneshot::Sender<BatchInferenceResponse>>>>,
 ) {
@@ -270,7 +299,7 @@ fn encode_request(request: &InferenceRequest) -> Result<Vec<u8>, AppError> {
     Ok(buf)
 }
 
-async fn write_frame(writer: &mut WriteHalf<UnixStream>, data: &[u8]) -> Result<(), AppError> {
+async fn write_frame(writer: &mut WriteHalf<Stream>, data: &[u8]) -> Result<(), AppError> {
     writer
         .write_all(data)
         .await
@@ -278,7 +307,7 @@ async fn write_frame(writer: &mut WriteHalf<UnixStream>, data: &[u8]) -> Result<
     Ok(())
 }
 
-async fn read_frame(reader: &mut ReadHalf<UnixStream>) -> Result<Vec<u8>, AppError> {
+async fn read_frame(reader: &mut ReadHalf<Stream>) -> Result<Vec<u8>, AppError> {
     let mut len_buf = [0u8; 4];
     reader
         .read_exact(&mut len_buf)
@@ -369,7 +398,7 @@ pub async fn send_batch_to_worker(
 /// Start a background task to consume responses from a worker stream.
 /// NOTE: This is legacy code for direct stream consumers. New code should use WorkerConnection.
 pub fn start_response_consumer(
-    stream: UnixStream,
+    stream: Stream,
     response_tx: mpsc::UnboundedSender<InferenceResponse>,
 ) {
     tokio::spawn(async move {
