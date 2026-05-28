@@ -47,11 +47,7 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             platform: manylinux_2_28
-            before-script: |
-              curl -fsSL -o /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-aarch64.sh
-              bash /tmp/miniconda.sh -b -p /opt/miniconda
-              /opt/miniconda/bin/conda install -y python=3.10
-            interpreter: /opt/miniconda/bin/python3.10
+            interpreter: python3.10
           # macOS x86_64
           - os: macos-13
             target: x86_64-apple-darwin
@@ -67,11 +63,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             platform: auto
             interpreter: python3.10
-          # Windows aarch64
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-            platform: auto
-            interpreter: python3.10
+            vcpkg: zeromq
 
     steps:
       - uses: actions/checkout@v4
@@ -84,6 +76,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install vcpkg dependencies (Windows)
+        if: runner.os == 'Windows' && matrix.vcpkg
+        shell: pwsh
+        run: |
+          vcpkg install ${{ matrix.vcpkg }}:x64-windows-static
+          "LIBZMQ_PREFIX=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static" >> $env:GITHUB_ENV
 
       - name: Build wheel
         uses: PyO3/maturin-action@v1
