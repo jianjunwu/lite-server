@@ -1,0 +1,90 @@
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VersionStatus {
+    Loading,
+    Ready,
+    Unloading,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelType {
+    LitAPI,
+    Ensemble,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelEntry {
+    pub name: String,
+    pub versions: HashMap<String, ModelVersion>,
+    pub load_policy: LoadPolicy,
+    pub max_loaded_versions: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LoadPolicy {
+    Explicit,
+    All,
+    Latest,
+}
+
+impl Default for LoadPolicy {
+    fn default() -> Self {
+        LoadPolicy::Explicit
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelVersion {
+    pub version: String,
+    pub status: VersionStatus,
+    pub config: crate::config::ModelConfig,
+    pub model_type: ModelType,
+    pub model_dir: PathBuf,
+    pub workers: Vec<WorkerInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerInfo {
+    pub worker_id: u32,
+    pub device: String,
+    pub uds_path: PathBuf,
+    pub pid: Option<u32>,
+    pub status: WorkerStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkerStatus {
+    Starting,
+    Ready,
+    Busy,
+    Error,
+    Stopped,
+}
+
+impl ModelEntry {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            versions: HashMap::new(),
+            load_policy: LoadPolicy::default(),
+            max_loaded_versions: None,
+        }
+    }
+
+    pub fn ready_versions(&self) -> Vec<&ModelVersion> {
+        self.versions
+            .values()
+            .filter(|v| v.status == VersionStatus::Ready)
+            .collect()
+    }
+
+    pub fn latest_version(&self) -> Option<&ModelVersion> {
+        self.ready_versions()
+            .into_iter()
+            .max_by_key(|v| &v.version)
+    }
+}

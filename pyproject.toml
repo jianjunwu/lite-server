@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.0"]
+build-backend = "maturin"
+
+[project]
+name = "lite-server"
+version = "0.1.0"
+description = "High-performance inference server (Rust core + Python workers)"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+dependencies = [
+    "pyyaml>=6.0",
+    "litserve>=0.2.17",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.28.1",
+]
+
+[tool.maturin]
+manifest-path = "Cargo.toml"
+python-source = "python"
+module-name = "lite_server"

@@ -1,0 +1,44 @@
+# Rust
+target/
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.dylib
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+ENV/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.python-version
+*.egg
+pip-wheel-metadata/
+.installed.cfg
+.coverage
+htmlcov/
+.tox/
+*.log
+.pytest_cache/
+wheels/
+share/python-wheels/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/
+CLAUDE.md
