@@ -11,6 +11,20 @@ import pytest
 from lite_server import cli
 
 
+# ===== version =====
+
+class TestVersion:
+    def test_version_flag_matches_package_version(self, capsys):
+        """--version must output the same version as lite_server.__version__."""
+        import lite_server
+        expected = f"lite-server {lite_server.__version__}"
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main(["--version"])
+        assert exc_info.value.code == 0
+        captured = capsys.readouterr()
+        assert expected in captured.out
+
+
 # ===== analyze =====
 
 class TestAnalyze:

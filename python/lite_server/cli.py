@@ -8,9 +8,12 @@ import sys
 from pathlib import Path
 
 
+from lite_server import __version__ as _pkg_version
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="lite-server")
-    parser.add_argument("-v", "--version", action="version", version="lite-server 0.1.0")
+    parser.add_argument("-v", "--version", action="version", version=f"lite-server {_pkg_version}")
     subparsers = parser.add_subparsers(dest="command")
 
     # serve
