@@ -1,5 +1,6 @@
 use reqwest;
 use serde_json::{json, Value};
+use serial_test::serial;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -154,6 +155,7 @@ async fn shared_base() -> String {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial]
 async fn test_health_endpoint() {
     let base = shared_base().await;
     let client = reqwest::Client::new();
@@ -164,6 +166,7 @@ async fn test_health_endpoint() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_info_endpoint() {
     let base = shared_base().await;
     let client = reqwest::Client::new();
@@ -181,6 +184,7 @@ async fn test_info_endpoint() {
 const MODEL: &str = "test_model";
 
 #[tokio::test]
+#[serial]
 async fn test_model_load_ready_infer_unload() {
     let base = shared_base().await;
     let client = reqwest::Client::new();
@@ -224,6 +228,7 @@ async fn test_model_load_ready_infer_unload() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_model_list_versions() {
     let base = shared_base().await;
     let client = reqwest::Client::new();
@@ -242,6 +247,7 @@ async fn test_model_list_versions() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_model_infer_versioned() {
     let base = shared_base().await;
     let client = reqwest::Client::new();
@@ -260,6 +266,7 @@ async fn test_model_infer_versioned() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_model_repository_index() {
     let base = shared_base().await;
     let client = reqwest::Client::new();
@@ -286,6 +293,7 @@ async fn test_model_repository_index() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial]
 async fn test_sse_streaming() {
     let base = shared_base().await;
     let client = reqwest::Client::new();
@@ -313,6 +321,7 @@ async fn test_sse_streaming() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial]
 async fn test_websocket_streaming() {
     use tokio_tungstenite::connect_async;
     use futures::SinkExt;
@@ -369,6 +378,7 @@ async fn test_websocket_streaming() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial]
 async fn test_metrics_endpoint() {
     let port = 18020;
     let metrics_port = 18021;
@@ -402,6 +412,7 @@ async fn test_metrics_endpoint() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial]
 async fn test_custom_endpoint_status() {
     let base = shared_base().await;
     let client = reqwest::Client::new();
@@ -424,6 +435,7 @@ async fn test_custom_endpoint_status() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial]
 async fn test_hot_reload() {
     let original = r#"from litserve import LitAPI
 

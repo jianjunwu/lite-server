@@ -5,11 +5,10 @@ use crate::streaming;
 use crate::worker::WorkerManager;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{error, warn};
 use uuid::Uuid;
 
 pub use pb::lite_server_server::{LiteServer, LiteServerServer};
@@ -55,11 +54,10 @@ impl LiteServer for GrpcService {
             None => self
                 .registry
                 .get_active_version(model_name)
-                .await
                 .ok_or_else(|| Status::not_found(format!("{} has no active version", model_name)))?,
         };
 
-        if !self.registry.is_ready(model_name, version).await {
+        if !self.registry.is_ready(model_name, version) {
             return Err(Status::unavailable(format!(
                 "{} version {} is not ready",
                 model_name, resolved_version
@@ -149,11 +147,10 @@ impl LiteServer for GrpcService {
             None => self
                 .registry
                 .get_active_version(model_name)
-                .await
                 .ok_or_else(|| Status::not_found(format!("{} has no active version", model_name)))?,
         };
 
-        if !self.registry.is_ready(model_name, version).await {
+        if !self.registry.is_ready(model_name, version) {
             return Err(Status::unavailable(format!(
                 "{} version {} is not ready",
                 model_name, resolved_version
@@ -247,11 +244,10 @@ impl LiteServer for GrpcService {
             None => self
                 .registry
                 .get_active_version(model_name)
-                .await
                 .ok_or_else(|| Status::not_found(format!("{} has no active version", model_name)))?,
         };
 
-        if !self.registry.is_ready(model_name, version).await {
+        if !self.registry.is_ready(model_name, version) {
             return Err(Status::unavailable(format!(
                 "{} version {} is not ready",
                 model_name, resolved_version
@@ -381,13 +377,12 @@ impl LiteServer for GrpcService {
                         None => self
                             .registry
                             .get_active_version(&model_name)
-                            .await
                             .ok_or_else(|| {
                                 Status::not_found(format!("{} has no active version", model_name))
                             })?,
                     };
 
-                    if !self.registry.is_ready(&model_name, version.as_deref()).await {
+                    if !self.registry.is_ready(&model_name, version.as_deref()) {
                         return Err(Status::unavailable(format!(
                             "{} version {} is not ready",
                             model_name, resolved_version

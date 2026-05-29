@@ -245,7 +245,7 @@ impl EndpointManager {
 
     /// Build server snapshot from current registry state.
     pub async fn build_snapshot(&self) -> crate::worker::protocol::ServerSnapshot {
-        let loaded = self.registry.list_loaded().await;
+        let loaded = self.registry.list_loaded();
         let models: Vec<serde_json::Value> = loaded
             .into_iter()
             .map(|(name, version, _mv)| {

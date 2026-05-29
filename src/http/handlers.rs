@@ -36,7 +36,7 @@ pub async fn health_handler() -> impl IntoResponse {
 // ===== Info =====
 
 pub async fn info_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let models = state.registry.list_loaded().await;
+    let models = state.registry.list_loaded();
     let loaded: Vec<String> = models.iter().map(|(n, v, _)| format!("{}/{}", n, v)).collect();
     Json(json!({
         "server": "lite-server",
@@ -58,7 +58,7 @@ pub async fn metrics_handler() -> impl IntoResponse {
 // ===== List Models =====
 
 pub async fn list_models_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let models = state.registry.list_loaded().await;
+    let models = state.registry.list_loaded();
     let models_json: Vec<Value> = models
         .into_iter()
         .map(|(name, version, mv)| {
@@ -81,8 +81,8 @@ pub async fn list_versions_handler(
     Path(model_name): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
-    let versions = state.registry.list_versions(&model_name).await;
-    let active = state.registry.get_active_version(&model_name).await;
+    let versions = state.registry.list_versions(&model_name);
+    let active = state.registry.get_active_version(&model_name);
     Ok(Json(json!({
         "name": model_name,
         "active_version": active,
@@ -101,8 +101,8 @@ pub async fn model_ready_handler(
     if let Some(ref v) = query.version {
         crate::validation::validate_identifier(v)?;
     }
-    let ready = state.registry.is_ready(&model_name, query.version.as_deref()).await;
-    let active_version = state.registry.get_active_version(&model_name).await;
+    let ready = state.registry.is_ready(&model_name, query.version.as_deref());
+    let active_version = state.registry.get_active_version(&model_name);
     Ok(Json(json!({
         "name": model_name,
         "version": query.version.or(active_version.clone()),
@@ -204,9 +204,9 @@ pub async fn load_model_handler(
     state.worker_manager.load_model(&model_name, &version, &config).await?;
 
     // Auto-activate if no active version
-    let active = state.registry.get_active_version(&model_name).await;
+    let active = state.registry.get_active_version(&model_name);
     if active.is_none() {
-        state.registry.activate_version(&model_name, &version).await?;
+        state.registry.activate_version(&model_name, &version)?;
     }
 
     Ok(Json(json!({
@@ -292,7 +292,7 @@ pub async fn activate_version_handler(
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_identifier(&version)?;
 
-    let success = state.registry.activate_version(&model_name, &version).await?;
+    let success = state.registry.activate_version(&model_name, &version)?;
     if !success {
         return Err(AppError::ModelNotReady(format!(
             "Model {} version {} is not ready",
@@ -349,12 +349,12 @@ async fn do_infer(
 ) -> Result<Json<Value>, AppError> {
     let resolved_version = match &version {
         Some(v) => v.clone(),
-        None => state.registry.get_active_version(&model_name).await
+        None => state.registry.get_active_version(&model_name)
             .ok_or_else(|| AppError::ModelNotFound(format!("{} has no active version", model_name)))?,
     };
 
     // Check ready
-    if !state.registry.is_ready(&model_name, version.as_deref()).await {
+    if !state.registry.is_ready(&model_name, version.as_deref()) {
         return Err(AppError::ModelNotReady(format!(
             "{} version {} is not ready",
             model_name, resolved_version
@@ -362,7 +362,7 @@ async fn do_infer(
     }
 
     // Get model version info
-    let mv = state.registry.get(&model_name, Some(&resolved_version)).await
+    let mv = state.registry.get(&model_name, Some(&resolved_version))
         .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", model_name, resolved_version)))?;
 
     // Handle ensemble
@@ -441,7 +441,7 @@ async fn do_infer(
     };
 
     let duration = start.elapsed().as_secs_f64();
-    prometheus::record_worker_metrics(&model_name, response.metrics.as_ref()).await;
+    prometheus::record_worker_metrics(&model_name, response.metrics.as_ref());
 
     // Parse protobuf response
     match response.payload {
@@ -486,7 +486,7 @@ async fn resolve_version(
 ) -> Result<String, AppError> {
     match version {
         Some(v) => Ok(v),
-        None => state.registry.get_active_version(model_name).await.ok_or_else(|| {
+        None => state.registry.get_active_version(model_name).ok_or_else(|| {
             AppError::ModelNotFound(format!("{} has no active version", model_name))
         }),
     }
@@ -525,7 +525,6 @@ async fn open_worker_stream(
     let mv = state
         .registry
         .get(model_name, Some(resolved_version))
-        .await
         .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", model_name, resolved_version)))?;
 
     let num_workers = mv.workers.len();
@@ -563,7 +562,7 @@ pub async fn sse_infer_handler(
     crate::validation::validate_identifier(&model_name)?;
     let resolved_version = resolve_version(&state, &model_name, None).await?;
 
-    if !state.registry.is_ready(&model_name, None).await {
+    if !state.registry.is_ready(&model_name, None) {
         return Err(AppError::ModelNotReady(format!(
             "{} version {} is not ready",
             model_name, resolved_version
@@ -638,7 +637,7 @@ pub async fn sse_infer_version_handler(
     crate::validation::validate_identifier(&version)?;
     let resolved_version = resolve_version(&state, &model_name, Some(version)).await?;
 
-    if !state.registry.is_ready(&model_name, Some(&resolved_version)).await {
+    if !state.registry.is_ready(&model_name, Some(&resolved_version)) {
         return Err(AppError::ModelNotReady(format!(
             "{} version {} is not ready",
             model_name, resolved_version
@@ -751,7 +750,7 @@ async fn handle_ws_stream(
         }
     };
 
-    if !state.registry.is_ready(&model_name, None).await {
+    if !state.registry.is_ready(&model_name, None) {
         let _ = socket.close().await;
         return;
     }

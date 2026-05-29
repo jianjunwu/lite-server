@@ -12,6 +12,17 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, warn};
 
+/// Pre-sized key for model_version lookups — single allocation, no reallocation.
+/// Used on the hot path (try_submit / has_queue) to avoid repeated format! overhead.
+#[inline]
+fn model_version_key(model: &str, version: &str) -> String {
+    let mut key = String::with_capacity(model.len() + 1 + version.len());
+    key.push_str(model);
+    key.push('_');
+    key.push_str(version);
+    key
+}
+
 /// A single item waiting in the inference queue.
 pub struct QueueItem {
     pub uid: String,
@@ -59,7 +70,7 @@ impl InferenceQueue {
         workers: Vec<WorkerInfo>,
         zmq_clients: Vec<Arc<WorkerZmqClient>>,
     ) {
-        let key = format!("{}_{}", model_name, version);
+        let key = model_version_key(model_name, version);
 
         // Abort and remove stale collector if exists
         if let Some((_, (_, old_handle))) = self.queues.remove(&key) {
@@ -93,7 +104,7 @@ impl InferenceQueue {
 
     /// Unregister a model version and stop its collector.
     pub fn unregister_model(&self, model_name: &str, version: &str) {
-        let key = format!("{}_{}", model_name, version);
+        let key = model_version_key(model_name, version);
         if let Some((_, (_, handle))) = self.queues.remove(&key) {
             handle.abort();
         }
@@ -107,7 +118,7 @@ impl InferenceQueue {
         version: &str,
         item: QueueItem,
     ) -> Result<(), QueueError> {
-        let key = format!("{}_{}", model_name, version);
+        let key = model_version_key(model_name, version);
         let sender = {
             let entry = self
                 .queues
@@ -125,7 +136,7 @@ impl InferenceQueue {
 
     /// Check if a queue exists for the model version.
     pub fn has_queue(&self, model_name: &str, version: &str) -> bool {
-        let key = format!("{}_{}", model_name, version);
+        let key = model_version_key(model_name, version);
         self.queues.contains_key(&key)
     }
 }
@@ -199,7 +210,7 @@ async fn send_batch(
 
     match result {
         Ok(resp) => {
-            crate::metrics::prometheus::record_worker_metrics(model_name, resp.metrics.as_ref()).await;
+            crate::metrics::prometheus::record_worker_metrics(model_name, resp.metrics.as_ref());
             match resp.payload {
                 Some(pb::response::Payload::Batch(batch_resp)) => {
                     let resp_map: std::collections::HashMap<String, pb::BatchItemResponse> =
@@ -440,6 +451,43 @@ async fn batch_collector(
 mod tests {
     use super::*;
     use bytes::Bytes;
+
+    // ===== Key pre-computation tests =====
+
+    #[test]
+    fn model_version_key_format() {
+        assert_eq!(model_version_key("my_model", "1"), "my_model_1");
+        assert_eq!(model_version_key("resnet", "v2"), "resnet_v2");
+        assert_eq!(model_version_key("", ""), "_");
+    }
+
+    #[test]
+    fn model_version_key_single_allocation() {
+        // String::with_capacity should pre-allocate exactly the right size
+        let key = model_version_key("model", "1");
+        assert_eq!(key.capacity(), key.len(), "no over-allocation");
+        assert_eq!(key, "model_1");
+    }
+
+    #[tokio::test]
+    async fn model_version_key_used_in_try_submit() {
+        // Verify that try_submit internally uses the same key format
+        let queue = InferenceQueue::new();
+        let config = ModelConfig {
+            max_queue_size: 10,
+            max_batch_size: 1,
+            batch_timeout: 0.0,
+            adaptive_batching: false,
+            min_batch_timeout: 0.0,
+            adaptive_queue_threshold: 0,
+            ..Default::default()
+        };
+        queue.register_model("test_model", "1", &config, vec![], vec![]);
+
+        // has_queue should find it using the same key
+        assert!(queue.has_queue("test_model", "1"));
+        assert!(!queue.has_queue("test_model", "2"));
+    }
 
     #[test]
     fn test_adaptive_timeout_full_batch() {

@@ -4,7 +4,6 @@ use prometheus::{
 };
 use std::sync::Arc;
 use std::collections::HashMap;
-use tokio::sync::Mutex;
 
 lazy_static! {
     pub static ref REGISTRY: Registry = Registry::new();
@@ -103,11 +102,12 @@ lazy_static! {
     ).unwrap();
 }
 
-// Custom metrics reported by Python workers
+// Custom metrics reported by Python workers — std::sync::Mutex is sufficient
+// since the critical section is a brief HashMap lookup/insert (no async needed).
 lazy_static! {
-    static ref CUSTOM_COUNTERS: Mutex<HashMap<String, CounterVec>> = Mutex::new(HashMap::new());
-    static ref CUSTOM_GAUGES: Mutex<HashMap<String, GaugeVec>> = Mutex::new(HashMap::new());
-    static ref CUSTOM_HISTOGRAMS: Mutex<HashMap<String, HistogramVec>> = Mutex::new(HashMap::new());
+    static ref CUSTOM_COUNTERS: std::sync::Mutex<HashMap<String, CounterVec>> = std::sync::Mutex::new(HashMap::new());
+    static ref CUSTOM_GAUGES: std::sync::Mutex<HashMap<String, GaugeVec>> = std::sync::Mutex::new(HashMap::new());
+    static ref CUSTOM_HISTOGRAMS: std::sync::Mutex<HashMap<String, HistogramVec>> = std::sync::Mutex::new(HashMap::new());
 }
 
 pub fn register_metrics() -> Result<(), prometheus::Error> {
@@ -219,10 +219,10 @@ lazy_static! {
 // ===== Custom metrics from Python workers =====
 
 /// Record metrics reported by a Python worker.
-pub async fn record_worker_metrics(model: &str, metrics: Option<&crate::proto::liteserver::Metrics>) {
+pub fn record_worker_metrics(model: &str, metrics: Option<&crate::proto::liteserver::Metrics>) {
     if let Some(m) = metrics {
         if m.prefill_ms > 0.0 {
-            let mut guard = CUSTOM_GAUGES.lock().await;
+            let mut guard = CUSTOM_GAUGES.lock().unwrap();
             let gauge = guard.entry("prefill_ms".to_string()).or_insert_with(|| {
                 let g = GaugeVec::new(
                     prometheus::Opts::new("lite_server_prefill_ms", "Prefill latency in ms"),
@@ -234,7 +234,7 @@ pub async fn record_worker_metrics(model: &str, metrics: Option<&crate::proto::l
             let _ = gauge.with_label_values(&[model]).set(m.prefill_ms as f64);
         }
         if m.decode_ms > 0.0 {
-            let mut guard = CUSTOM_GAUGES.lock().await;
+            let mut guard = CUSTOM_GAUGES.lock().unwrap();
             let gauge = guard.entry("decode_ms".to_string()).or_insert_with(|| {
                 let g = GaugeVec::new(
                     prometheus::Opts::new("lite_server_decode_ms", "Decode latency in ms"),
@@ -246,7 +246,7 @@ pub async fn record_worker_metrics(model: &str, metrics: Option<&crate::proto::l
             let _ = gauge.with_label_values(&[model]).set(m.decode_ms as f64);
         }
         if m.tokens_generated > 0 {
-            let mut guard = CUSTOM_COUNTERS.lock().await;
+            let mut guard = CUSTOM_COUNTERS.lock().unwrap();
             let counter = guard.entry("tokens_generated".to_string()).or_insert_with(|| {
                 let c = CounterVec::new(
                     prometheus::Opts::new("lite_server_tokens_generated_total", "Total tokens generated"),
@@ -351,8 +351,8 @@ mod tests {
         record_stream_close("proto_m", "1", "grpc");
     }
 
-    #[tokio::test]
-    async fn test_record_worker_metrics_concurrent_access() {
+    #[test]
+    fn test_record_worker_metrics_sync_no_await() {
         use crate::proto::liteserver::Metrics;
         let metrics = Metrics {
             prefill_ms: 10.0,
@@ -361,11 +361,9 @@ mod tests {
         };
         let m = Some(&metrics);
 
-        // Concurrent calls should not panic or deadlock
-        let (r1, r2, r3) = tokio::join!(
-            async { record_worker_metrics("concurrent_m1", m).await },
-            async { record_worker_metrics("concurrent_m2", m).await },
-            async { record_worker_metrics("concurrent_m3", m).await },
-        );
+        // Must compile and run without .await — proves std::sync::Mutex not tokio::sync::Mutex
+        record_worker_metrics("sync_m1", m);
+        record_worker_metrics("sync_m2", m);
+        record_worker_metrics("sync_m3", m);
     }
 }

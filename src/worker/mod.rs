@@ -124,14 +124,12 @@ impl WorkerManager {
         };
 
         self.registry
-            .register(model_name, version, model_config.clone(), model_type, model_dir.clone())
-            .await?;
+            .register(model_name, version, model_config.clone(), model_type, model_dir.clone())?;
 
         if is_ensemble {
             // Ensemble: no workers, just mark ready
             self.registry
-                .set_status(model_name, version, VersionStatus::Ready)
-                .await?;
+                .set_status(model_name, version, VersionStatus::Ready)?;
             crate::metrics::prometheus::record_model_load(model_name, version, true);
             info!("Ensemble {} version {} loaded", model_name, version);
             return Ok(());
@@ -323,11 +321,9 @@ impl WorkerManager {
         }
 
         self.registry
-            .set_workers(model_name, version, worker_infos.clone())
-            .await?;
+            .set_workers(model_name, version, worker_infos.clone())?;
         self.registry
-            .set_status(model_name, version, VersionStatus::Ready)
-            .await?;
+            .set_status(model_name, version, VersionStatus::Ready)?;
 
         // Register inference queue for batching
         self.inference_queue
@@ -357,7 +353,7 @@ impl WorkerManager {
             self.unload_version(model_name, v).await?;
             Ok(true)
         } else {
-            let versions = self.registry.list_versions(model_name).await;
+            let versions = self.registry.list_versions(model_name);
             let version_strings: Vec<String> = versions.into_iter().map(|v| v.version).collect();
             let mut unloaded = false;
             for v in version_strings {
@@ -379,8 +375,7 @@ impl WorkerManager {
         self.inference_queue.unregister_model(model_name, version);
 
         self.registry
-            .set_status(model_name, version, VersionStatus::Unloading)
-            .await?;
+            .set_status(model_name, version, VersionStatus::Unloading)?;
 
         let key = format!("{}_{}", model_name, version);
         {
@@ -399,7 +394,7 @@ impl WorkerManager {
             clients.remove(&key);
         }
 
-        self.registry.remove(model_name, version).await?;
+        self.registry.remove(model_name, version)?;
 
         crate::metrics::prometheus::record_model_unload(model_name, version);
         crate::metrics::prometheus::set_active_workers(model_name, version, 0.0);
@@ -415,13 +410,13 @@ impl WorkerManager {
     ) -> Result<bool, AppError> {
         let v = match version {
             Some(v) => v.to_string(),
-            None => match self.registry.get_active_version(model_name).await {
+            None => match self.registry.get_active_version(model_name) {
                 Some(v) => v,
                 None => return Ok(false),
             },
         };
 
-        let config = match self.registry.get(model_name, Some(&v)).await {
+        let config = match self.registry.get(model_name, Some(&v)) {
             Some(mv) => mv.config,
             None => return Ok(false),
         };
@@ -433,7 +428,7 @@ impl WorkerManager {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         self.load_model(model_name, &v, &config).await?;
-        self.registry.activate_version(model_name, &v).await?;
+        self.registry.activate_version(model_name, &v)?;
 
         info!("Model {} version {} reloaded", model_name, v);
         Ok(true)

@@ -101,7 +101,7 @@ impl LiteServer {
             let mut tick = interval(Duration::from_secs(10));
             loop {
                 tick.tick().await;
-                let models = registry_for_timeline.list_loaded().await;
+                let models = registry_for_timeline.list_loaded();
                 for (name, version, _) in models {
                     crate::metrics::aggregator::TIMELINE.sample(&name, &version).await;
                 }
@@ -194,7 +194,7 @@ impl LiteServer {
 
         // Apply strategies to registry
         for strategy in &orch.models {
-            self.registry.set_strategy(&strategy.name, strategy).await?;
+            self.registry.set_strategy(&strategy.name, strategy)?;
         }
 
         let available = scan_repo_models(&repo_path).await;
@@ -257,20 +257,20 @@ impl LiteServer {
             // Activate default version
             if let Some(ref dv) = default_version {
                 if versions_loaded.contains(dv) {
-                    match self.registry.activate_version(&name, dv).await {
+                    match self.registry.activate_version(&name, dv) {
                         Ok(true) => info!("Activated default version {} for {}", dv, name),
                         Ok(false) => warn!("Failed to activate default version {} for {} (not ready)", dv, name),
                         Err(e) => error!("Error activating default version {} for {}: {}", dv, name, e),
                     }
                 }
-            } else if !versions_loaded.is_empty() && self.registry.get_active_version(&name).await.is_none() {
-                match self.registry.activate_version(&name, &versions_loaded[0]).await {
+            } else if !versions_loaded.is_empty() && self.registry.get_active_version(&name).is_none() {
+                match self.registry.activate_version(&name, &versions_loaded[0]) {
                     Ok(true) => info!("Activated version {} for {}", versions_loaded[0], name),
                     Ok(false) => warn!("Failed to activate version {} for {} (not ready)", versions_loaded[0], name),
                     Err(e) => error!("Error activating version {} for {}: {}", versions_loaded[0], name, e),
                 }
             } else {
-                info!("Skipping activation for {}: versions_loaded={:?}, active={:?}", name, versions_loaded, self.registry.get_active_version(&name).await);
+                info!("Skipping activation for {}: versions_loaded={:?}, active={:?}", name, versions_loaded, self.registry.get_active_version(&name));
             }
         }
 
@@ -495,7 +495,7 @@ async fn process_watch_events(
         }
         last_reload.insert(key, Instant::now());
 
-        if registry.get(&name, Some(&version)).await.is_some() {
+        if registry.get(&name, Some(&version)).is_some() {
             info!("Hot reload: reloading {} version {}", name, version);
             if let Err(e) = worker_manager.reload_model(&name, Some(&version)).await {
                 warn!("Hot reload failed for {} version {}: {}", name, version, e);

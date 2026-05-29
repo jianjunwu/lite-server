@@ -282,7 +282,7 @@ async fn execute_step(
     }
 
     // Ensure sub-model is ready
-    if !state.registry.is_ready(&step.model, Some(&step.version)).await {
+    if !state.registry.is_ready(&step.model, Some(&step.version)) {
         info!("Auto-loading sub-model {} v{} for ensemble", step.model, step.version);
         let sub_model_dir = crate::validation::resolve_model_dir(
             &state.repo_path, &step.model, &step.version,
@@ -300,14 +300,14 @@ async fn execute_step(
         tokio::time::sleep(Duration::from_millis(1500)).await;
     }
 
-    if !state.registry.is_ready(&step.model, Some(&step.version)).await {
+    if !state.registry.is_ready(&step.model, Some(&step.version)) {
         return Err(AppError::ModelNotReady(format!(
             "sub-model {} v{} is not ready", step.model, step.version
         )));
     }
 
     // Get model version info
-    let mv = state.registry.get(&step.model, Some(&step.version)).await
+    let mv = state.registry.get(&step.model, Some(&step.version))
         .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", step.model, step.version)))?;
 
     if mv.model_type == ModelType::Ensemble {

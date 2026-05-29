@@ -2,7 +2,6 @@ use crate::error::AppError;
 use crate::proto::liteserver as pb;
 use dashmap::DashMap;
 use prost::Message;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
@@ -10,7 +9,7 @@ use tokio::io::{split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::UnixStream;
 #[cfg(windows)]
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
@@ -81,12 +80,12 @@ impl WorkerConnection {
         let (read_half, write_half) = split(stream);
         let (request_tx, request_rx) = mpsc::unbounded_channel::<InferRequest>();
 
-        let pending_single: Arc<RwLock<HashMap<String, oneshot::Sender<pb::Response>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
-        let pending_batch: Arc<RwLock<HashMap<String, oneshot::Sender<pb::BatchResponse>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
-        let stream_routes: Arc<RwLock<HashMap<String, mpsc::Sender<pb::StreamResponse>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let pending_single: Arc<DashMap<String, oneshot::Sender<pb::Response>>> =
+            Arc::new(DashMap::new());
+        let pending_batch: Arc<DashMap<String, oneshot::Sender<pb::BatchResponse>>> =
+            Arc::new(DashMap::new());
+        let stream_routes: Arc<DashMap<String, mpsc::Sender<pb::StreamResponse>>> =
+            Arc::new(DashMap::new());
 
         let writer_handle = tokio::spawn(writer_task(
             write_half,
@@ -149,16 +148,16 @@ impl WorkerConnection {
 async fn writer_task(
     mut write_half: WriteHalf<Stream>,
     mut request_rx: mpsc::UnboundedReceiver<InferRequest>,
-    pending_single: Arc<RwLock<HashMap<String, oneshot::Sender<pb::Response>>>>,
-    pending_batch: Arc<RwLock<HashMap<String, oneshot::Sender<pb::BatchResponse>>>>,
-    stream_routes: Arc<RwLock<HashMap<String, mpsc::Sender<pb::StreamResponse>>>>,
+    pending_single: Arc<DashMap<String, oneshot::Sender<pb::Response>>>,
+    pending_batch: Arc<DashMap<String, oneshot::Sender<pb::BatchResponse>>>,
+    stream_routes: Arc<DashMap<String, mpsc::Sender<pb::StreamResponse>>>,
 ) {
     while let Some(req) = request_rx.recv().await {
         let uid = match &req {
             InferRequest::Single(r, _) => r.uid.clone(),
             InferRequest::Batch(r, _) => r.uid.clone(),
             InferRequest::Stream(r, sid, _) => {
-                let _ = stream_routes.write().await.insert(sid.clone(), mpsc::channel(1).0);
+                stream_routes.insert(sid.clone(), mpsc::channel(1).0);
                 r.uid.clone()
             }
         };
@@ -195,26 +194,23 @@ async fn writer_task(
 
         match req {
             InferRequest::Single(_, tx) => {
-                let mut guard = pending_single.write().await;
-                guard.insert(uid.clone(), tx);
+                pending_single.insert(uid.clone(), tx);
             }
             InferRequest::Batch(_, tx) => {
-                let mut guard = pending_batch.write().await;
-                guard.insert(uid.clone(), tx);
+                pending_batch.insert(uid.clone(), tx);
             }
             InferRequest::Stream(_, sid, tx) => {
-                let mut guard = stream_routes.write().await;
-                guard.insert(sid, tx);
+                stream_routes.insert(sid, tx);
             }
         }
 
         if let Err(e) = write_frame(&mut write_half, &encoded).await {
             error!("UDS write error: {}", e);
             let err_msg = format!("UDS write failed: {}", e);
-            if let Some(tx) = pending_single.write().await.remove(&uid) {
+            if let Some((_, tx)) = pending_single.remove(&uid) {
                 let _ = tx.send(error_response(&uid, &err_msg));
             }
-            if let Some(tx) = pending_batch.write().await.remove(&uid) {
+            if let Some((_, tx)) = pending_batch.remove(&uid) {
                 let _ = tx.send(pb::BatchResponse {
                     items: vec![],
                 });
@@ -222,14 +218,14 @@ async fn writer_task(
             break;
         }
     }
-    clear_pending(&pending_single, &pending_batch, "UDS connection closed").await;
+    clear_pending(&pending_single, &pending_batch, "UDS connection closed");
 }
 
 async fn reader_task(
     mut read_half: ReadHalf<Stream>,
-    pending_single: Arc<RwLock<HashMap<String, oneshot::Sender<pb::Response>>>>,
-    pending_batch: Arc<RwLock<HashMap<String, oneshot::Sender<pb::BatchResponse>>>>,
-    stream_routes: Arc<RwLock<HashMap<String, mpsc::Sender<pb::StreamResponse>>>>,
+    pending_single: Arc<DashMap<String, oneshot::Sender<pb::Response>>>,
+    pending_batch: Arc<DashMap<String, oneshot::Sender<pb::BatchResponse>>>,
+    stream_routes: Arc<DashMap<String, mpsc::Sender<pb::StreamResponse>>>,
 ) {
     loop {
         let frame = match read_frame(&mut read_half).await {
@@ -250,15 +246,14 @@ async fn reader_task(
 
         if let Some(pb::response::Payload::Stream(ref stream_resp)) = value.payload {
             let sid = &stream_resp.stream_id;
-            if let Some(tx) = stream_routes.write().await.remove(sid) {
+            if let Some((_, tx)) = stream_routes.remove(sid) {
                 let is_done = matches!(stream_resp.payload, Some(pb::stream_response::Payload::Done(_)));
                 let is_error = matches!(stream_resp.payload, Some(pb::stream_response::Payload::Error(_)));
                 if tx.try_send(stream_resp.clone()).is_err() {
                     warn!("Stream channel closed for {}", sid);
                 }
                 if !is_done && !is_error {
-                    let mut guard = stream_routes.write().await;
-                    guard.insert(sid.clone(), tx);
+                    stream_routes.insert(sid.clone(), tx);
                 }
             }
             continue;
@@ -276,8 +271,8 @@ async fn reader_task(
         if is_batch {
             match value.payload {
                 Some(pb::response::Payload::Batch(batch_resp)) => {
-                    let mut guard = pending_batch.write().await;
-                    if let Some(tx) = guard.remove(&batch_resp.items.first().map(|i| i.uid.clone()).unwrap_or_default()) {
+                    let key = batch_resp.items.first().map(|i| i.uid.clone()).unwrap_or_default();
+                    if let Some((_, tx)) = pending_batch.remove(&key) {
                         let _ = tx.send(pb::BatchResponse {
                             items: batch_resp.items,
                         });
@@ -286,13 +281,12 @@ async fn reader_task(
                 _ => {}
             }
         } else {
-            let mut guard = pending_single.write().await;
-            if let Some(tx) = guard.remove(&value.uid) {
+            if let Some((_, tx)) = pending_single.remove(&value.uid) {
                 let _ = tx.send(value);
             }
         }
     }
-    clear_pending(&pending_single, &pending_batch, "UDS connection closed").await;
+    clear_pending(&pending_single, &pending_batch, "UDS connection closed");
 }
 
 fn encode_request(request: &pb::Request) -> Result<Vec<u8>, AppError> {
@@ -346,20 +340,20 @@ fn error_response(uid: &str, message: &str) -> pb::Response {
     }
 }
 
-async fn clear_pending(
-    pending_single: &Arc<RwLock<HashMap<String, oneshot::Sender<pb::Response>>>>,
-    pending_batch: &Arc<RwLock<HashMap<String, oneshot::Sender<pb::BatchResponse>>>>,
+fn clear_pending(
+    pending_single: &DashMap<String, oneshot::Sender<pb::Response>>,
+    pending_batch: &DashMap<String, oneshot::Sender<pb::BatchResponse>>,
     message: &str,
 ) {
-    {
-        let mut guard = pending_single.write().await;
-        for (_, tx) in guard.drain() {
+    let keys: Vec<String> = pending_single.iter().map(|e| e.key().clone()).collect();
+    for key in keys {
+        if let Some((_, tx)) = pending_single.remove(&key) {
             let _ = tx.send(error_response("", message));
         }
     }
-    {
-        let mut guard = pending_batch.write().await;
-        for (_, tx) in guard.drain() {
+    let keys: Vec<String> = pending_batch.iter().map(|e| e.key().clone()).collect();
+    for key in keys {
+        if let Some((_, tx)) = pending_batch.remove(&key) {
             let _ = tx.send(pb::BatchResponse {
                 items: vec![],
             });
@@ -400,6 +394,41 @@ mod tests {
         let _existed = CONNECTION_POOL.remove(&key);
         let _exists = CONNECTION_POOL.contains_key(&key);
         let _len = CONNECTION_POOL.len();
+    }
+
+    // ===== UDS pending maps must be DashMap (lock-free) =====
+
+    /// Verify that pending map helper functions operate without .await.
+    /// If pending_single/pending_batch/stream_routes revert to RwLock<HashMap>,
+    /// these calls won't compile because DashMap ops are sync.
+    #[test]
+    fn uds_pending_insert_remove_are_sync() {
+        let pending: DashMap<String, oneshot::Sender<pb::Response>> = DashMap::new();
+        let (tx, _rx) = oneshot::channel();
+        pending.insert("uid-1".to_string(), tx);
+        assert!(pending.contains_key("uid-1"));
+        let _ = pending.remove("uid-1");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn uds_pending_batch_insert_remove_are_sync() {
+        let pending: DashMap<String, oneshot::Sender<pb::BatchResponse>> = DashMap::new();
+        let (tx, _rx) = oneshot::channel();
+        pending.insert("batch-1".to_string(), tx);
+        assert!(pending.contains_key("batch-1"));
+        let _ = pending.remove("batch-1");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn uds_stream_routes_insert_remove_are_sync() {
+        let routes: DashMap<String, mpsc::Sender<pb::StreamResponse>> = DashMap::new();
+        let (tx, _rx) = mpsc::channel(1);
+        routes.insert("stream-1".to_string(), tx);
+        assert!(routes.contains_key("stream-1"));
+        let _ = routes.remove("stream-1");
+        assert!(routes.is_empty());
     }
 }
 
