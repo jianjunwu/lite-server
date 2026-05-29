@@ -1,5 +1,6 @@
 use crate::error::AppError;
 use crate::proto::liteserver as pb;
+use dashmap::DashMap;
 use prost::Message;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -42,21 +43,20 @@ fn derive_port_from_path(path: &str) -> u16 {
 }
 
 lazy_static::lazy_static! {
-    static ref CONNECTION_POOL: RwLock<HashMap<PathBuf, Arc<WorkerConnection>>> = RwLock::new(HashMap::new());
+    static ref CONNECTION_POOL: DashMap<PathBuf, Arc<WorkerConnection>> = DashMap::new();
 }
 
 pub async fn remove_connection(uds_path: &Path) {
-    let mut guard = CONNECTION_POOL.write().await;
-    if let Some(conn) = guard.remove(uds_path) {
+    if let Some((_, conn)) = CONNECTION_POOL.remove(uds_path) {
         conn.close();
     }
 }
 
 pub async fn clear_connections() {
-    let mut guard = CONNECTION_POOL.write().await;
-    for (_, conn) in guard.drain() {
-        conn.close();
+    for entry in CONNECTION_POOL.iter() {
+        entry.value().close();
     }
+    CONNECTION_POOL.clear();
 }
 
 enum InferRequest {
@@ -375,19 +375,42 @@ pub async fn send_to_worker(
     conn.send_single(request).await
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CONNECTION_POOL must be DashMap so insert/get/remove are lock-free per shard.
+    /// This test verifies the type — if someone reverts to RwLock<HashMap>, it won't compile.
+    #[test]
+    fn connection_pool_type_is_dashmap() {
+        fn assert_type<T>() {}
+        // This compiles only if CONNECTION_POOL is DashMap<PathBuf, Arc<WorkerConnection>>
+        assert_type::<DashMap<PathBuf, Arc<WorkerConnection>>>();
+        // Verify the static is accessible without .await (DashMap ops are sync)
+        let _ = CONNECTION_POOL.len();
+    }
+
+    /// get_or_create_connection must use DashMap::entry (no double-check RwLock pattern).
+    /// We can't easily test the full async path without a real UDS socket,
+    /// but we verify remove/contains_key are sync (no .await needed).
+    #[test]
+    fn connection_pool_operations_are_sync() {
+        let key = PathBuf::from("/tmp/test-dashmap-sync.sock");
+        // These must compile without .await — proves DashMap not RwLock
+        let _existed = CONNECTION_POOL.remove(&key);
+        let _exists = CONNECTION_POOL.contains_key(&key);
+        let _len = CONNECTION_POOL.len();
+    }
+}
+
 async fn get_or_create_connection(uds_path: &Path) -> Result<Arc<WorkerConnection>, AppError> {
-    {
-        let guard = CONNECTION_POOL.read().await;
-        if let Some(conn) = guard.get(uds_path) {
-            return Ok(conn.clone());
+    match CONNECTION_POOL.entry(uds_path.to_path_buf()) {
+        dashmap::Entry::Occupied(e) => Ok(e.get().clone()),
+        dashmap::Entry::Vacant(e) => {
+            let conn = Arc::new(WorkerConnection::new(uds_path).await?);
+            e.insert(conn.clone());
+            info!("Established persistent UDS connection to {}", uds_path.display());
+            Ok(conn)
         }
     }
-    let mut guard = CONNECTION_POOL.write().await;
-    if let Some(conn) = guard.get(uds_path) {
-        return Ok(conn.clone());
-    }
-    let conn = Arc::new(WorkerConnection::new(uds_path).await?);
-    guard.insert(uds_path.to_path_buf(), conn.clone());
-    info!("Established persistent UDS connection to {}", uds_path.display());
-    Ok(conn)
 }

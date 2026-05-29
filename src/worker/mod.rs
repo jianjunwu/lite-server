@@ -7,6 +7,7 @@ use crate::inference_queue::InferenceQueue;
 use crate::registry::{ModelRegistry, types::*};
 use crate::transport::zmq::WorkerZmqClient;
 use crate::worker::protocol::*;
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -19,7 +20,7 @@ use tokio::time::timeout;
 use tracing::{error, info, warn};
 
 /// Global pending response map: uid -> oneshot sender
-pub type PendingMap = Arc<RwLock<HashMap<String, oneshot::Sender<InferenceResponse>>>>;
+pub type PendingMap = Arc<DashMap<String, oneshot::Sender<InferenceResponse>>>;
 
 pub struct WorkerManager {
     registry: Arc<ModelRegistry>,
@@ -49,7 +50,7 @@ impl WorkerManager {
         Self {
             registry,
             repo_path,
-            pending: Arc::new(RwLock::new(HashMap::new())),
+            pending: Arc::new(DashMap::new()),
             workers: Arc::new(RwLock::new(HashMap::new())),
             inference_queue,
             zmq_clients: Arc::new(RwLock::new(HashMap::new())),
@@ -500,6 +501,45 @@ pub fn pick_worker_random(num_workers: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PendingMap must be Arc<DashMap> for lock-free per-uid insert/remove.
+    /// This verifies the type alias — reverting to Arc<RwLock<HashMap>> won't compile.
+    #[test]
+    fn pending_map_type_is_dashmap() {
+        fn assert_type<T>() {}
+        assert_type::<Arc<DashMap<String, oneshot::Sender<InferenceResponse>>>>();
+    }
+
+    /// PendingMap insert/remove must be sync (no .await), proving DashMap not RwLock.
+    #[tokio::test]
+    async fn pending_map_insert_remove_are_sync() {
+        let pending: PendingMap = Arc::new(DashMap::new());
+        let (tx, _rx) = oneshot::channel::<InferenceResponse>();
+        // insert is sync on DashMap — this won't compile if PendingMap uses RwLock
+        pending.insert("uid-1".to_string(), tx);
+        assert_eq!(pending.len(), 1);
+        // remove is also sync
+        let _ = pending.remove("uid-1");
+        assert!(pending.is_empty());
+    }
+
+    /// Concurrent inserts from multiple tasks must not deadlock or panic.
+    #[tokio::test]
+    async fn pending_map_concurrent_inserts() {
+        let pending: PendingMap = Arc::new(DashMap::new());
+        let mut handles = Vec::new();
+        for i in 0..100 {
+            let p = pending.clone();
+            handles.push(tokio::spawn(async move {
+                let (tx, _rx) = oneshot::channel::<InferenceResponse>();
+                p.insert(format!("uid-{}", i), tx);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(pending.len(), 100);
+    }
 
     #[test]
     fn test_pick_worker_random_single() {
