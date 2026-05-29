@@ -58,7 +58,13 @@ pub fn run_server(
         cfg.metrics.enabled = false;
     }
 
-    logging::init(&cfg.logging.level);
+    let _log_guard = logging::init(
+        &cfg.logging.level,
+        cfg.logging.info_output.as_deref(),
+        cfg.logging.error_output.as_deref(),
+        &cfg.logging.rotation,
+        cfg.logging.max_size,
+    );
     info!("Starting lite-server v{}", env!("CARGO_PKG_VERSION"));
     info!("HTTP port: {}", cfg.server.http_port);
     info!("Metrics port: {}", cfg.server.metrics_port);

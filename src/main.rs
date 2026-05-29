@@ -115,8 +115,13 @@ async fn main() {
             }
 
             // Initialize logging
-            let log_level = cfg.logging.level.clone();
-            lite_server::logging::init(&log_level);
+            let _log_guard = lite_server::logging::init(
+                &cfg.logging.level,
+                cfg.logging.info_output.as_deref(),
+                cfg.logging.error_output.as_deref(),
+                &cfg.logging.rotation,
+                cfg.logging.max_size,
+            );
 
             info!("Starting lite-server v{}", env!("CARGO_PKG_VERSION"));
             info!("HTTP port: {}", cfg.server.http_port);

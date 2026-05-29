@@ -98,7 +98,7 @@ impl Default for LoggingConfig {
             output: None,
             info_output: None,
             error_output: None,
-            rotation: "daily".to_string(),
+            rotation: "none".to_string(),
             rotate_by: "none".to_string(),
             max_size: 100,
             when: "midnight".to_string(),

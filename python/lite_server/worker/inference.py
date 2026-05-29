@@ -3,6 +3,7 @@
 import argparse
 import importlib.util
 import json
+import logging
 import os
 import sys
 import threading
@@ -40,6 +41,16 @@ def parse_args():
     parser.add_argument("--endpoint", required=True, help="ZMQ PAIR endpoint, e.g. ipc:///tmp/lite-server/...")
     parser.add_argument("--continuous-batching", action="store_true", default=False)
     return parser.parse_args()
+
+
+def setup_logging(worker_id: int):
+    """Configure worker logging: plain text to stderr (captured by Rust)."""
+    logger = logging.getLogger("inference_worker")
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(handler)
+    return logger
 
 
 def load_model_config(config_path: str):
@@ -326,28 +337,17 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str):
 def worker_main():
     args = parse_args()
 
-    def log(level: str, message: str, **kwargs):
-        record = {
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "level": level,
-            "logger": "inference_worker",
-            "message": message,
-            "worker_id": args.worker_id,
-            "model": args.model_name,
-            "version": args.version,
-            **kwargs,
-        }
-        print(json.dumps(record), flush=True, file=sys.stderr)
+    log = setup_logging(args.worker_id)
 
-    log("INFO", f"Worker {args.worker_id} starting", device=args.device, endpoint=args.endpoint)
+    log.info(f"Worker {args.worker_id} starting, device={args.device}, endpoint={args.endpoint}")
 
     # Load config and model
     try:
         config = load_model_config(args.config)
         lit_api = load_litapi(args.model_py, config)
-        log("INFO", "Model loaded successfully")
+        log.info("Model loaded successfully")
     except Exception as e:
-        log("ERROR", f"Failed to load model: {e}")
+        log.error(f"Failed to load model: {e}")
         print(json.dumps({"status": "error", "worker_id": args.worker_id, "message": str(e)}), flush=True)
         sys.exit(1)
 
@@ -360,7 +360,7 @@ def worker_main():
     socket.connect(args.endpoint)
     socket.setsockopt(zmq.LINGER, 0)
 
-    log("INFO", f"Connected ZMQ PAIR to {args.endpoint}")
+    log.info(f"Connected ZMQ PAIR to {args.endpoint}")
 
     try:
         if args.continuous_batching or config.get("continuous_batching", False):
@@ -368,13 +368,13 @@ def worker_main():
         else:
             run_standard_loop(lit_api, socket, args.model_name)
     except KeyboardInterrupt:
-        log("INFO", "Interrupted, shutting down")
+        log.info("Interrupted, shutting down")
     finally:
         if hasattr(lit_api, "teardown"):
             try:
                 lit_api.teardown()
             except Exception as e:
-                log("ERROR", f"teardown error: {e}")
+                log.error(f"teardown error: {e}")
         socket.close()
         context.term()
 

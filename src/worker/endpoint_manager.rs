@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
@@ -163,14 +163,18 @@ impl EndpointManager {
         let stderr = child.stderr.take().unwrap();
 
         // Wait for startup signal
-        let mut reader = BufReader::new(stdout).lines();
-        let startup_line = timeout(Duration::from_secs(30), reader.next_line())
+        let mut reader = BufReader::new(stdout);
+        let mut startup_line = String::new();
+        let n = timeout(Duration::from_secs(30), reader.read_line(&mut startup_line))
             .await
             .map_err(|_| AppError::InferenceTimeout("endpoint startup timeout".to_string()))?
-            .map_err(|e| AppError::Io(e))?
-            .ok_or_else(|| AppError::WorkerCrashed("endpoint worker exited before ready".to_string()))?;
+            .map_err(|e| AppError::Io(e))?;
+        if n == 0 {
+            return Err(AppError::WorkerCrashed("endpoint worker exited before ready".to_string()));
+        }
+        let stdout = reader.into_inner();
 
-        let startup: EndpointStartup = serde_json::from_str(&startup_line)
+        let startup: EndpointStartup = serde_json::from_str(startup_line.trim())
             .map_err(|e| AppError::Internal(format!("endpoint startup JSON parse error: {}", e)))?;
 
         if startup.status != "ready" {
@@ -188,11 +192,42 @@ impl EndpointManager {
             *routes = startup.routes;
         }
 
+        // Drain stdout so the endpoint worker does not get SIGPIPE/BrokenPipeError
+        tokio::spawn(async move {
+            let mut discard = [0u8; 1024];
+            let mut stdout = stdout;
+            loop {
+                match stdout.read(&mut discard).await {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+
         // Start stderr logger
         tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                eprintln!("[endpoints] {}", line);
+            let mut reader = BufReader::new(stderr);
+            let mut buf = Vec::with_capacity(1024);
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf).await {
+                    Ok(0) => {
+                        tracing::debug!("Endpoint stderr EOF");
+                        break;
+                    }
+                    Ok(_) => {
+                        while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
+                            buf.pop();
+                        }
+                        let line = String::from_utf8_lossy(&buf);
+                        eprintln!("[endpoints] {}", line);
+                    }
+                    Err(e) => {
+                        tracing::error!("Endpoint stderr read error: {}", e);
+                        break;
+                    }
+                }
             }
         });
 

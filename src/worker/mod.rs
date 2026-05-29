@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::timeout;
@@ -214,14 +214,18 @@ impl WorkerManager {
             let stderr = child.stderr.take().unwrap();
 
             // Wait for "ready" signal
-            let mut reader = BufReader::new(stdout).lines();
-            let ready_line = timeout(Duration::from_secs(60), reader.next_line())
+            let mut reader = BufReader::new(stdout);
+            let mut ready_line = String::new();
+            let n = timeout(Duration::from_secs(60), reader.read_line(&mut ready_line))
                 .await
                 .map_err(|_| AppError::InferenceTimeout("worker startup timeout".to_string()))?
-                .map_err(|e| AppError::Io(e))?
-                .ok_or_else(|| AppError::WorkerCrashed("worker exited before ready".to_string()))?;
+                .map_err(|e| AppError::Io(e))?;
+            if n == 0 {
+                return Err(AppError::WorkerCrashed("worker exited before ready".to_string()));
+            }
+            let stdout = reader.into_inner();
 
-            let startup: WorkerStartup = serde_json::from_str(&ready_line)
+            let startup: WorkerStartup = serde_json::from_str(ready_line.trim())
                 .map_err(|e| AppError::Internal(format!("worker startup JSON parse error: {}", e)))?;
 
             if startup.status != "ready" {
@@ -233,14 +237,54 @@ impl WorkerManager {
 
             info!("Worker {} for {} v{} ready (pid={:?})", worker_id, model_name, version, child.id());
 
+            // Drain stdout so the worker does not get SIGPIPE/BrokenPipeError
+            // if anything writes to stdout after the ready signal.
+            tokio::spawn(async move {
+                let mut discard = [0u8; 1024];
+                let mut stdout = stdout;
+                loop {
+                    match stdout.read(&mut discard).await {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+            });
+
             // Start stderr logger
             let model_name_clone = model_name.to_string();
             let version_clone = version.to_string();
             let worker_id_clone = worker_id;
             tokio::spawn(async move {
-                let mut reader = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = reader.next_line().await {
-                    eprintln!("[worker {} {} v{}] {}", worker_id_clone, model_name_clone, version_clone, line);
+                let mut reader = BufReader::new(stderr);
+                let mut buf = Vec::with_capacity(1024);
+                loop {
+                    buf.clear();
+                    match reader.read_until(b'\n', &mut buf).await {
+                        Ok(0) => {
+                            tracing::debug!(worker_id = worker_id_clone, "Worker stderr EOF");
+                            break;
+                        }
+                        Ok(_) => {
+                            // Strip trailing newline / carriage-return
+                            while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
+                                buf.pop();
+                            }
+                            let line = String::from_utf8_lossy(&buf);
+                            let trimmed = line.trim();
+                            if trimmed.starts_with("[ERROR]") {
+                                tracing::error!(worker_id = worker_id_clone, model = %model_name_clone, version = %version_clone, "{}", trimmed.strip_prefix("[ERROR]").unwrap_or(trimmed).trim());
+                            } else if trimmed.starts_with("[WARN]") {
+                                tracing::warn!(worker_id = worker_id_clone, model = %model_name_clone, version = %version_clone, "{}", trimmed.strip_prefix("[WARN]").unwrap_or(trimmed).trim());
+                            } else {
+                                tracing::info!(worker_id = worker_id_clone, model = %model_name_clone, version = %version_clone, "{}", trimmed);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(worker_id = worker_id_clone, "Worker stderr read error: {}", e);
+                            break;
+                        }
+                    }
                 }
             });
 
