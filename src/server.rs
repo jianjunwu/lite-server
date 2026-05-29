@@ -95,9 +95,8 @@ impl LiteServer {
 
         // Start hot reload watcher
         let (watch_tx, mut watch_rx) = mpsc::channel::<Vec<PathBuf>>(32);
-        let watch_repo_path = repo_path.canonicalize().unwrap_or_else(|_| repo_path.clone());
         let watcher_handle = tokio::spawn(start_file_watcher(
-            watch_repo_path,
+            repo_path.clone(),
             self.worker_manager.clone(),
             watch_tx,
         ));
