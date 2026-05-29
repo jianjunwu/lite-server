@@ -87,6 +87,21 @@ def wait_for_model_ready(url: str, timeout: float = 30.0) -> bool:
     return False
 
 
+def _safe_terminate(proc: subprocess.Popen) -> None:
+    """Gracefully terminate a subprocess, falling back to kill."""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            pass
+
+
 def main() -> int:
     signal.signal(signal.SIGTERM, _handle_sigterm)
 
@@ -190,8 +205,7 @@ def main() -> int:
             stderr = proc.stderr.read().decode() if proc.stderr else ""
             if stderr:
                 print(f"stderr:\n{stderr}", file=sys.stderr)
-            proc.terminate()
-            proc.wait()
+            _safe_terminate(proc)
             return 1
 
         # Wait for model ready
@@ -201,8 +215,7 @@ def main() -> int:
             stderr = proc.stderr.read().decode() if proc.stderr else ""
             if stderr:
                 print(f"stderr:\n{stderr}", file=sys.stderr)
-            proc.terminate()
-            proc.wait()
+            _safe_terminate(proc)
             return 1
 
         print(f"[lite-server] Ready. Model '{args.model}' loaded.")
@@ -211,9 +224,9 @@ def main() -> int:
         proc.wait()
     except KeyboardInterrupt:
         print("\n[lite-server] Shutting down...")
-        proc.terminate()
-        proc.wait()
+        _safe_terminate(proc)
     finally:
+        _safe_terminate(proc)
         # Clean up orchestration.yaml
         try:
             orch_path.unlink(missing_ok=True)

@@ -8,9 +8,11 @@ and outputs CSV + optional matplotlib charts.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -39,6 +41,48 @@ def wait_for_server(url: str, timeout: float = 30.0) -> bool:
             pass
         time.sleep(0.2)
     return False
+
+
+@contextlib.contextmanager
+def _managed_popen(cmd, **kwargs):
+    """启动子进程并在退出时级联清理整个进程组（SIGTERM → SIGKILL）"""
+    proc = subprocess.Popen(cmd, start_new_session=True, **kwargs)
+    try:
+        yield proc
+    finally:
+        if proc.poll() is not None:
+            return
+
+        pgid = None
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+
+        try:
+            proc.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+        try:
+            proc.wait(timeout=2)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+
+        try:
+            proc.kill()
+            proc.wait(timeout=1)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            pass
 
 
 def run_wrk(
@@ -271,7 +315,7 @@ def main() -> int:
 
             # ---- lite-server ----
             print("[lite-server] Starting...")
-            lite_proc = subprocess.Popen(
+            with _managed_popen(
                 [
                     sys.executable,
                     str(lite_script),
@@ -286,23 +330,18 @@ def main() -> int:
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-            )
+            ) as lite_proc:
+                if not wait_for_server(lite_url, timeout=60):
+                    print("ERROR: lite-server failed to start", file=sys.stderr)
+                    continue
 
-            if not wait_for_server(lite_url, timeout=60):
-                print("ERROR: lite-server failed to start", file=sys.stderr)
-                lite_proc.terminate()
-                lite_proc.wait()
-                continue
-
-            time.sleep(args.warmup)
-            print(f"[lite-server] wrk -c{conc} -d{int(args.duration)}s ...")
-            lite_res = run_wrk(args.wrk, lite_url, conc, args.duration, lua_script)
-            lite_proc.terminate()
-            lite_proc.wait()
+                time.sleep(args.warmup)
+                print(f"[lite-server] wrk -c{conc} -d{int(args.duration)}s ...")
+                lite_res = run_wrk(args.wrk, lite_url, conc, args.duration, lua_script)
 
             # ---- LitServe ----
             print("[LitServe] Starting...")
-            lit_proc = subprocess.Popen(
+            with _managed_popen(
                 [
                     sys.executable,
                     str(lit_script),
@@ -317,23 +356,18 @@ def main() -> int:
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-            )
+            ) as lit_proc:
+                if not wait_for_server(lit_url, timeout=60):
+                    print("ERROR: LitServe failed to start", file=sys.stderr)
+                    continue
 
-            if not wait_for_server(lit_url, timeout=60):
-                print("ERROR: LitServe failed to start", file=sys.stderr)
-                lit_proc.terminate()
-                lit_proc.wait()
-                continue
-
-            time.sleep(args.warmup)
-            print(f"[LitServe] wrk -c{conc} -d{int(args.duration)}s ...")
-            lit_res = run_wrk(args.wrk, lit_url, conc, args.duration, lua_script)
-            lit_proc.terminate()
-            lit_proc.wait()
+                time.sleep(args.warmup)
+                print(f"[LitServe] wrk -c{conc} -d{int(args.duration)}s ...")
+                lit_res = run_wrk(args.wrk, lit_url, conc, args.duration, lua_script)
 
             # ---- lite-server-core ----
             print("[lite-server-core] Starting...")
-            core_proc = subprocess.Popen(
+            with _managed_popen(
                 [
                     sys.executable,
                     str(lite_script),
@@ -349,19 +383,14 @@ def main() -> int:
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-            )
+            ) as core_proc:
+                if not wait_for_server(core_url, timeout=60):
+                    print("ERROR: lite-server-core failed to start", file=sys.stderr)
+                    continue
 
-            if not wait_for_server(core_url, timeout=60):
-                print("ERROR: lite-server-core failed to start", file=sys.stderr)
-                core_proc.terminate()
-                core_proc.wait()
-                continue
-
-            time.sleep(args.warmup)
-            print(f"[lite-server-core] wrk -c{conc} -d{int(args.duration)}s ...")
-            core_res = run_wrk(args.wrk, core_url, conc, args.duration, lua_script)
-            core_proc.terminate()
-            core_proc.wait()
+                time.sleep(args.warmup)
+                print(f"[lite-server-core] wrk -c{conc} -d{int(args.duration)}s ...")
+                core_res = run_wrk(args.wrk, core_url, conc, args.duration, lua_script)
 
             row = {
                 "workers": workers,
