@@ -82,6 +82,18 @@ impl LiteServer {
             None
         };
 
+        // Start gRPC server if enabled
+        let grpc_fut = if self.config.grpc.enabled {
+            Some(crate::grpc::start_grpc_server(
+                self.config.server.host.clone(),
+                self.config.server.grpc_port,
+                self.registry.clone(),
+                self.worker_manager.clone(),
+            ))
+        } else {
+            None
+        };
+
         // Start timeline sampler
         let registry_for_timeline = self.registry.clone();
         let timeline_handle = tokio::spawn(async move {
@@ -136,6 +148,22 @@ impl LiteServer {
             } => {
                 if let Err(e) = &result {
                     error!("Metrics server error: {}", e);
+                }
+                watcher_handle.abort();
+                timeline_handle.abort();
+                reload_handle.abort();
+                let _ = endpoint_manager.shutdown().await;
+                result
+            }
+            result = async {
+                if let Some(fut) = grpc_fut {
+                    fut.await
+                } else {
+                    futures::future::pending().await
+                }
+            } => {
+                if let Err(e) = &result {
+                    error!("gRPC server error: {}", e);
                 }
                 watcher_handle.abort();
                 timeline_handle.abort();

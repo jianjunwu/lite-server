@@ -1,3 +1,3 @@
 pub mod liteserver {
-    include!("proto/liteserver.rs");
+    include!(concat!(env!("OUT_DIR"), "/liteserver.rs"));
 }

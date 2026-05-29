@@ -77,6 +77,28 @@ class LitAPI(ls.LitAPI):
             )
         return self._logger
 
+    # ===== Streaming Hooks (optional) =====
+
+    def stream_predict(self, request: Any) -> Iterator[Any]:
+        """Generator for server-side streaming.
+
+        Override to enable streaming output. Each yielded value is sent
+        as a chunk to the client via SSE/WebSocket/gRPC.
+
+        If not overridden, the worker automatically falls back to
+        predict() and sends the result as a single chunk.
+        """
+        raise NotImplementedError
+
+    def bidi_stream(self) -> "BidiStreamHandler":
+        """Return a handler for bidirectional streaming (e.g. ASR).
+
+        The handler must implement:
+          - on_chunk(chunk) -> Optional[output_chunk]
+          - on_close()
+        """
+        raise NotImplementedError
+
     # ===== Request/Response Hooks =====
 
     def on_request(self, request: Any, meta: RequestMeta) -> Any:

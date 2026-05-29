@@ -76,7 +76,7 @@ async fn wait_for_server(port: u16, timeout_secs: u64) {
 #[tokio::test]
 async fn test_server_health() {
     let server = start_server(
-        &["--port", "18000", "--model-repo", "./examples/model_repo", "--no-metrics", "--log-level", "warn"],
+        &["--port", "18000", "--model-repo", "./examples/model_repo", "--no-metrics", "--no-grpc", "--log-level", "warn"],
     );
 
     wait_for_server(18000, 15).await;
@@ -107,7 +107,7 @@ async fn test_server_health() {
 #[tokio::test]
 async fn test_model_lifecycle() {
     let server = start_server(
-        &["--port", "18001", "--model-repo", "./examples/model_repo", "--no-metrics", "--log-level", "warn"],
+        &["--port", "18001", "--model-repo", "./examples/model_repo", "--no-metrics", "--no-grpc", "--log-level", "warn"],
     );
 
     wait_for_server(18001, 15).await;
@@ -157,6 +157,7 @@ async fn test_metrics_endpoint() {
         "--port", "18002",
         "--metrics-port", "18003",
         "--model-repo", "./examples/model_repo",
+        "--no-grpc",
         "--log-level", "warn",
     ]);
 
@@ -185,7 +186,7 @@ async fn test_metrics_endpoint() {
 #[tokio::test]
 async fn test_custom_endpoint() {
     let server = start_server(
-        &["--port", "18004", "--model-repo", "./examples/model_repo", "--no-metrics", "--log-level", "warn"],
+        &["--port", "18004", "--model-repo", "./examples/model_repo", "--no-metrics", "--no-grpc", "--log-level", "warn"],
     );
 
     wait_for_server(18004, 15).await;
@@ -246,6 +247,7 @@ class TestAPI(LitAPI):
         "--model-repo",
         &repo_dst.to_string_lossy(),
         "--no-metrics",
+        "--no-grpc",
         "--log-level", "warn",
         "--log-verbose",
     ]);

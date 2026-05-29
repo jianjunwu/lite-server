@@ -60,6 +60,17 @@ impl WorkerManager {
         self.pending.clone()
     }
 
+    /// Get ZMQ clients for a model version (used for streaming).
+    pub async fn get_zmq_clients(
+        &self,
+        model_name: &str,
+        version: &str,
+    ) -> Option<Vec<Arc<WorkerZmqClient>>> {
+        let key = format!("{}_{}", model_name, version);
+        let guard = self.zmq_clients.read().await;
+        guard.get(&key).cloned()
+    }
+
     pub async fn load_model(
         &self,
         model_name: &str,

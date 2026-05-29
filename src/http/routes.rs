@@ -51,6 +51,9 @@ pub fn create_routes(state: AppState, endpoint_routes: Vec<EndpointRoute>) -> Ro
         // Inference
         .route("/v2/models/:model_name/infer", post(infer_handler))
         .route("/v2/models/:model_name/versions/:version/infer", post(infer_version_handler))
+        // SSE streaming
+        .route("/v2/models/:model_name/events", post(sse_infer_handler))
+        .route("/v2/models/:model_name/versions/:version/events", post(sse_infer_version_handler))
         // WebSocket streaming
         .route("/v2/models/:model_name/stream", get(ws_stream_handler))
         .route("/v2/models/:model_name/versions/:version/stream", get(ws_stream_version_handler));

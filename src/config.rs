@@ -39,7 +39,7 @@ impl Default for ServerConfig {
             timeout: 30.0,
             log_level: "info".to_string(),
             http_workers: None,
-            transport: "mp".to_string(),
+            transport: "zmq".to_string(),
             cache_registry: false,
         }
     }
@@ -147,6 +147,10 @@ pub struct FeaturesConfig {
     pub playground: bool,
     pub alerts: bool,
     pub version_compare: bool,
+    pub streaming: bool,
+    pub grpc_streaming: bool,
+    pub sse: bool,
+    pub websocket_streaming: bool,
 }
 
 impl Default for FeaturesConfig {
@@ -159,6 +163,10 @@ impl Default for FeaturesConfig {
             playground: false,
             alerts: true,
             version_compare: false,
+            streaming: true,
+            grpc_streaming: true,
+            sse: true,
+            websocket_streaming: true,
         }
     }
 }

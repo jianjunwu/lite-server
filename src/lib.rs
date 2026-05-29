@@ -1,6 +1,7 @@
 pub mod config;
 pub mod ensemble;
 pub mod error;
+pub mod grpc;
 pub mod http;
 pub mod inference_queue;
 pub mod logging;
@@ -8,6 +9,7 @@ pub mod metrics;
 pub mod proto;
 pub mod registry;
 pub mod server;
+pub mod streaming;
 pub mod transport;
 pub mod validation;
 pub mod worker;

@@ -27,6 +27,15 @@ from lite_server.proto import (
     SingleRequest,
     SingleResponse,
     Status,
+    StreamCancel,
+    StreamChunk,
+    StreamChunkResponse,
+    StreamClose,
+    StreamDone,
+    StreamError,
+    StreamOpen,
+    StreamRequest,
+    StreamResponse,
 )
 
 
@@ -113,6 +122,36 @@ def _make_error_response(uid: str, message: str) -> Response:
     )
 
 
+def _make_stream_error(stream_id: str, message: str) -> Response:
+    return Response(
+        uid=f"stream-error-{stream_id}",
+        stream=StreamResponse(
+            stream_id=stream_id,
+            error=StreamError(message=message),
+        ),
+    )
+
+
+def _make_stream_chunk(stream_id: str, data: bytes, is_final: bool = False) -> Response:
+    return Response(
+        uid=f"stream-chunk-{stream_id}",
+        stream=StreamResponse(
+            stream_id=stream_id,
+            chunk=StreamChunkResponse(data=data, is_final=is_final),
+        ),
+    )
+
+
+def _make_stream_done(stream_id: str) -> Response:
+    return Response(
+        uid=f"stream-done-{stream_id}",
+        stream=StreamResponse(
+            stream_id=stream_id,
+            done=StreamDone(),
+        ),
+    )
+
+
 def _meta_from_proto(meta_pb) -> RequestMeta:
     payload = json.loads(meta_pb.payload) if meta_pb.payload else None
     return RequestMeta(
@@ -130,17 +169,13 @@ def _run_predict(lit_api: LitAPI, data: bytes, meta: RequestMeta) -> tuple[bytes
     raw = json.loads(data) if data else {}
     decoded = lit_api.decode_request(raw) if hasattr(lit_api, "decode_request") else raw
 
-    # Hook: on_request (skip if not implemented by model)
     if hasattr(lit_api, "on_request"):
         decoded = lit_api.on_request(decoded, meta)
 
-    # Predict
     output = lit_api.predict(decoded)
 
-    # Encode
     encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
 
-    # Hook: on_response (skip if not implemented by model)
     if hasattr(lit_api, "on_response"):
         encoded = lit_api.on_response(encoded, meta)
 
@@ -149,11 +184,89 @@ def _run_predict(lit_api: LitAPI, data: bytes, meta: RequestMeta) -> tuple[bytes
 
 
 # ---------------------------------------------------------------------------
+# Streaming Support
+# ---------------------------------------------------------------------------
+
+def _has_stream_predict(lit_api: LitAPI) -> bool:
+    return hasattr(lit_api, "stream_predict") and callable(getattr(lit_api, "stream_predict"))
+
+
+def _consume_stream_generator(lit_api: LitAPI, generator, stream_id: str, socket: zmq.Socket, log: logging.Logger):
+    """Background thread: consume a stream_predict generator and send chunks."""
+    try:
+        for output in generator:
+            encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
+            meta = None  # TODO: pass meta through
+            if hasattr(lit_api, "on_response") and meta is not None:
+                encoded = lit_api.on_response(encoded, meta)
+            resp_bytes = json.dumps(encoded).encode()
+            socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
+    except Exception as e:
+        log.error(f"stream_predict error for {stream_id}: {e}")
+        socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
+        return
+
+    socket.send(_make_stream_done(stream_id).SerializeToString())
+
+
+def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.Socket, active_streams: dict, log: logging.Logger):
+    stream_id = stream_req.stream_id
+    open_req = stream_req.open
+    data = open_req.data if open_req else b""
+    meta = _meta_from_proto(open_req.meta) if open_req and open_req.HasField("meta") else None
+
+    if not _has_stream_predict(lit_api):
+        # Fallback: predict() once, send as single chunk
+        try:
+            resp_bytes, status = _run_predict(lit_api, data, meta)
+            socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=True).SerializeToString())
+            socket.send(_make_stream_done(stream_id).SerializeToString())
+        except Exception as e:
+            socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
+        return
+
+    # Normal streaming: start generator
+    raw = json.loads(data) if data else {}
+    decoded = lit_api.decode_request(raw) if hasattr(lit_api, "decode_request") else raw
+
+    if hasattr(lit_api, "on_request") and meta is not None:
+        try:
+            decoded = lit_api.on_request(decoded, meta)
+        except Exception as e:
+            socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
+            return
+
+    try:
+        generator = lit_api.stream_predict(decoded)
+    except Exception as e:
+        socket.send(_make_stream_error(stream_id, f"stream_predict failed: {e}").SerializeToString())
+        return
+
+    active_streams[stream_id] = generator
+    threading.Thread(
+        target=_consume_stream_generator,
+        args=(lit_api, generator, stream_id, socket, log),
+        daemon=True,
+    ).start()
+
+
+def _handle_stream_cancel(stream_id: str, active_streams: dict):
+    generator = active_streams.pop(stream_id, None)
+    if generator is not None:
+        try:
+            generator.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Standard Loop
 # ---------------------------------------------------------------------------
 
-def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str):
-    """Handle single + batch requests synchronously."""
+def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: logging.Logger):
+    """Handle single + batch + stream requests synchronously."""
+    active_streams: dict[str, any] = {}
+
     while True:
         try:
             req_bytes = socket.recv()
@@ -200,6 +313,23 @@ def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str):
                     uid=uid,
                     batch=BatchResponse(items=items),
                 )
+
+            elif request.HasField("stream"):
+                stream_req: StreamRequest = request.stream
+                action = stream_req.WhichOneof("action")
+
+                if action == "open":
+                    _handle_stream_open(lit_api, stream_req, socket, active_streams, log)
+                    continue  # chunks sent asynchronously
+                elif action == "cancel":
+                    _handle_stream_cancel(stream_req.stream_id, active_streams)
+                    continue
+                elif action == "close":
+                    _handle_stream_cancel(stream_req.stream_id, active_streams)
+                    continue
+                else:
+                    response = _make_error_response(uid, f"Unsupported stream action: {action}")
+
             else:
                 response = _make_error_response(uid, "Unsupported payload type")
 
@@ -238,7 +368,6 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str):
             if hasattr(lit_api, "on_request"):
                 decoded = lit_api.on_request(decoded, meta)
         except Exception as e:
-            # Reject immediately
             err_resp = _make_error_response(cb_add.uid, str(e))
             socket.send(err_resp.SerializeToString())
             return
@@ -246,7 +375,6 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str):
         state = CBState(cb_add.uid, decoded, meta)
         active[cb_add.uid] = state
 
-        # Prefill
         try:
             lit_api.prefill(cb_add.uid, decoded)
             state.prefilled = True
@@ -258,7 +386,6 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str):
     def _handle_remove(cb_remove: CBRemoveRequest):
         active.pop(cb_remove.uid, None)
 
-    # Background step thread
     def step_loop():
         while True:
             with lock:
@@ -274,7 +401,6 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str):
                 try:
                     outputs = lit_api.step(ready)
                 except Exception as e:
-                    # Error: fail all active sequences
                     for state in list(active.values()):
                         err_resp = _make_error_response(state.uid, f"step failed: {e}")
                         socket.send(err_resp.SerializeToString())
@@ -287,7 +413,6 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str):
                     if lit_api.has_finished(state.uid, token, state.output):
                         completed.append(state.uid)
 
-                # Send completed sequences
                 for uid in completed:
                     state = active.pop(uid)
                     try:
@@ -308,7 +433,6 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str):
 
     threading.Thread(target=step_loop, daemon=True).start()
 
-    # Main thread: receive commands
     while True:
         try:
             req_bytes = socket.recv()
@@ -341,7 +465,6 @@ def worker_main():
 
     log.info(f"Worker {args.worker_id} starting, device={args.device}, endpoint={args.endpoint}")
 
-    # Load config and model
     try:
         config = load_model_config(args.config)
         lit_api = load_litapi(args.model_py, config)
@@ -351,10 +474,8 @@ def worker_main():
         print(json.dumps({"status": "error", "worker_id": args.worker_id, "message": str(e)}), flush=True)
         sys.exit(1)
 
-    # Ready signal (keep JSON for startup handshake)
     print(json.dumps({"status": "ready", "worker_id": args.worker_id}), flush=True)
 
-    # Setup ZMQ PAIR
     context = zmq.Context()
     socket = context.socket(zmq.PAIR)
     socket.connect(args.endpoint)
@@ -366,7 +487,7 @@ def worker_main():
         if args.continuous_batching or config.get("continuous_batching", False):
             run_cb_loop(lit_api, socket, args.model_name)
         else:
-            run_standard_loop(lit_api, socket, args.model_name)
+            run_standard_loop(lit_api, socket, args.model_name, log)
     except KeyboardInterrupt:
         log.info("Interrupted, shutting down")
     finally:

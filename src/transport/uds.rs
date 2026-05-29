@@ -1,5 +1,6 @@
 use crate::error::AppError;
-use crate::worker::protocol::{BatchInferenceResponse, InferenceRequest, InferenceResponse, ResponseStatus};
+use crate::proto::liteserver as pb;
+use prost::Message;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,8 +12,8 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{error, info, warn};
 
-/// Maximum allowed frame size for UDS transport (16 MiB).
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+const STREAM_CHANNEL_SIZE: usize = 64;
 
 #[cfg(unix)]
 type Stream = UnixStream;
@@ -40,13 +41,10 @@ fn derive_port_from_path(path: &str) -> u16 {
     30000 + (hasher.finish() % 35535) as u16
 }
 
-// ===== Global connection pool =====
-
 lazy_static::lazy_static! {
     static ref CONNECTION_POOL: RwLock<HashMap<PathBuf, Arc<WorkerConnection>>> = RwLock::new(HashMap::new());
 }
 
-/// Remove a connection from the pool (called on worker unload).
 pub async fn remove_connection(uds_path: &Path) {
     let mut guard = CONNECTION_POOL.write().await;
     if let Some(conn) = guard.remove(uds_path) {
@@ -54,7 +52,6 @@ pub async fn remove_connection(uds_path: &Path) {
     }
 }
 
-/// Clear all connections from the pool.
 pub async fn clear_connections() {
     let mut guard = CONNECTION_POOL.write().await;
     for (_, conn) in guard.drain() {
@@ -62,14 +59,12 @@ pub async fn clear_connections() {
     }
 }
 
-// ===== WorkerConnection =====
-
 enum InferRequest {
-    Single(InferenceRequest, oneshot::Sender<InferenceResponse>),
-    Batch(InferenceRequest, oneshot::Sender<BatchInferenceResponse>),
+    Single(pb::Request, oneshot::Sender<pb::Response>),
+    Batch(pb::Request, oneshot::Sender<pb::BatchResponse>),
+    Stream(pb::Request, String, mpsc::Sender<pb::StreamResponse>),
 }
 
-/// A persistent UDS connection to a Python worker with request multiplexing.
 pub struct WorkerConnection {
     request_tx: mpsc::UnboundedSender<InferRequest>,
     closed: std::sync::atomic::AtomicBool,
@@ -86,28 +81,26 @@ impl WorkerConnection {
         let (read_half, write_half) = split(stream);
         let (request_tx, request_rx) = mpsc::unbounded_channel::<InferRequest>();
 
-        let pending_single: Arc<RwLock<HashMap<String, oneshot::Sender<InferenceResponse>>>> =
+        let pending_single: Arc<RwLock<HashMap<String, oneshot::Sender<pb::Response>>>> =
             Arc::new(RwLock::new(HashMap::new()));
-        let pending_batch: Arc<RwLock<HashMap<String, oneshot::Sender<BatchInferenceResponse>>>> =
+        let pending_batch: Arc<RwLock<HashMap<String, oneshot::Sender<pb::BatchResponse>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let stream_routes: Arc<RwLock<HashMap<String, mpsc::Sender<pb::StreamResponse>>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
-        // Start writer task
-        let pending_writer = pending_single.clone();
-        let pending_writer_batch = pending_batch.clone();
         let writer_handle = tokio::spawn(writer_task(
             write_half,
             request_rx,
-            pending_writer,
-            pending_writer_batch,
+            pending_single.clone(),
+            pending_batch.clone(),
+            stream_routes.clone(),
         ));
 
-        // Start reader task
-        let pending_reader = pending_single.clone();
-        let pending_reader_batch = pending_batch.clone();
         let reader_handle = tokio::spawn(reader_task(
             read_half,
-            pending_reader,
-            pending_reader_batch,
+            pending_single.clone(),
+            pending_batch.clone(),
+            stream_routes.clone(),
         ));
 
         Ok(Self {
@@ -118,7 +111,7 @@ impl WorkerConnection {
         })
     }
 
-    pub async fn send_single(&self, request: InferenceRequest) -> Result<InferenceResponse, AppError> {
+    pub async fn send_single(&self, request: pb::Request) -> Result<pb::Response, AppError> {
         if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(AppError::Transport("worker connection closed".to_string()));
         }
@@ -130,16 +123,19 @@ impl WorkerConnection {
             .map_err(|_| AppError::Transport("response channel closed".to_string()))
     }
 
-    pub async fn send_batch(&self, request: InferenceRequest) -> Result<BatchInferenceResponse, AppError> {
+    pub async fn send_stream(
+        &self,
+        request: pb::Request,
+        stream_id: String,
+    ) -> Result<mpsc::Receiver<pb::StreamResponse>, AppError> {
         if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(AppError::Transport("worker connection closed".to_string()));
         }
-        let (tx, rx) = oneshot::channel();
+        let (tx, rx) = mpsc::channel(STREAM_CHANNEL_SIZE);
         self.request_tx
-            .send(InferRequest::Batch(request, tx))
+            .send(InferRequest::Stream(request, stream_id, tx))
             .map_err(|_| AppError::Transport("worker connection closed".to_string()))?;
-        rx.await
-            .map_err(|_| AppError::Transport("response channel closed".to_string()))
+        Ok(rx)
     }
 
     pub fn close(&self) {
@@ -153,37 +149,43 @@ impl WorkerConnection {
 async fn writer_task(
     mut write_half: WriteHalf<Stream>,
     mut request_rx: mpsc::UnboundedReceiver<InferRequest>,
-    pending_single: Arc<RwLock<HashMap<String, oneshot::Sender<InferenceResponse>>>>,
-    pending_batch: Arc<RwLock<HashMap<String, oneshot::Sender<BatchInferenceResponse>>>>,
+    pending_single: Arc<RwLock<HashMap<String, oneshot::Sender<pb::Response>>>>,
+    pending_batch: Arc<RwLock<HashMap<String, oneshot::Sender<pb::BatchResponse>>>>,
+    stream_routes: Arc<RwLock<HashMap<String, mpsc::Sender<pb::StreamResponse>>>>,
 ) {
     while let Some(req) = request_rx.recv().await {
         let uid = match &req {
             InferRequest::Single(r, _) => r.uid.clone(),
             InferRequest::Batch(r, _) => r.uid.clone(),
+            InferRequest::Stream(r, sid, _) => {
+                let _ = stream_routes.write().await.insert(sid.clone(), mpsc::channel(1).0);
+                r.uid.clone()
+            }
         };
 
         let encoded = match encode_request(match &req {
             InferRequest::Single(r, _) => r,
             InferRequest::Batch(r, _) => r,
+            InferRequest::Stream(r, _, _) => r,
         }) {
             Ok(v) => v,
             Err(e) => {
                 error!("Failed to encode request: {}", e);
                 match req {
                     InferRequest::Single(_, tx) => {
-                        let _ = tx.send(InferenceResponse {
-                            uid: uid.clone(),
-                            data: None,
-                            status: ResponseStatus::error(format!("encode failed: {}", e)),
-                            worker_id: 0,
-                            metrics: None,
-                        });
+                        let _ = tx.send(error_response(&uid, &format!("encode failed: {}", e)));
                     }
                     InferRequest::Batch(_, tx) => {
-                        let _ = tx.send(BatchInferenceResponse {
-                            response_type: "BATCH_RESPONSE".to_string(),
+                        let _ = tx.send(pb::BatchResponse {
                             items: vec![],
-                            metrics: None,
+                        });
+                    }
+                    InferRequest::Stream(_, sid, tx) => {
+                        let _ = tx.try_send(pb::StreamResponse {
+                            stream_id: sid,
+                            payload: Some(pb::stream_response::Payload::Error(pb::StreamError {
+                                message: format!("encode failed: {}", e),
+                            })),
                         });
                     }
                 }
@@ -191,7 +193,6 @@ async fn writer_task(
             }
         };
 
-        // Register pending before writing (take ownership of sender)
         match req {
             InferRequest::Single(_, tx) => {
                 let mut guard = pending_single.write().await;
@@ -201,39 +202,34 @@ async fn writer_task(
                 let mut guard = pending_batch.write().await;
                 guard.insert(uid.clone(), tx);
             }
+            InferRequest::Stream(_, sid, tx) => {
+                let mut guard = stream_routes.write().await;
+                guard.insert(sid, tx);
+            }
         }
 
         if let Err(e) = write_frame(&mut write_half, &encoded).await {
             error!("UDS write error: {}", e);
-            // Remove from pending and notify
             let err_msg = format!("UDS write failed: {}", e);
             if let Some(tx) = pending_single.write().await.remove(&uid) {
-                let _ = tx.send(InferenceResponse {
-                    uid: uid.clone(),
-                    data: None,
-                    status: ResponseStatus::error(&err_msg),
-                    worker_id: 0,
-                    metrics: None,
-                });
+                let _ = tx.send(error_response(&uid, &err_msg));
             }
             if let Some(tx) = pending_batch.write().await.remove(&uid) {
-                let _ = tx.send(BatchInferenceResponse {
-                    response_type: "BATCH_RESPONSE".to_string(),
+                let _ = tx.send(pb::BatchResponse {
                     items: vec![],
-                    metrics: None,
                 });
             }
             break;
         }
     }
-    // Connection broken: clear remaining pending requests
     clear_pending(&pending_single, &pending_batch, "UDS connection closed").await;
 }
 
 async fn reader_task(
     mut read_half: ReadHalf<Stream>,
-    pending_single: Arc<RwLock<HashMap<String, oneshot::Sender<InferenceResponse>>>>,
-    pending_batch: Arc<RwLock<HashMap<String, oneshot::Sender<BatchInferenceResponse>>>>,
+    pending_single: Arc<RwLock<HashMap<String, oneshot::Sender<pb::Response>>>>,
+    pending_batch: Arc<RwLock<HashMap<String, oneshot::Sender<pb::BatchResponse>>>>,
+    stream_routes: Arc<RwLock<HashMap<String, mpsc::Sender<pb::StreamResponse>>>>,
 ) {
     loop {
         let frame = match read_frame(&mut read_half).await {
@@ -244,64 +240,63 @@ async fn reader_task(
             }
         };
 
-        // Try to parse as JSON Value first to detect response type
-        let value: serde_json::Value = match serde_json::from_slice(&frame) {
+        let value: pb::Response = match pb::Response::decode(frame.as_slice()) {
             Ok(v) => v,
             Err(e) => {
-                error!("UDS response JSON parse error: {}", e);
+                error!("UDS response protobuf decode error: {}", e);
                 continue;
             }
         };
 
-        // Check if it's a batch response
-        let is_batch = value
-            .get("type")
-            .and_then(|v| v.as_str())
-            == Some("BATCH_RESPONSE");
-
-        if is_batch {
-            match serde_json::from_value::<BatchInferenceResponse>(value) {
-                Ok(batch_resp) => {
-                    let mut guard = pending_batch.write().await;
-                    if let Some(tx) = guard.remove(&batch_resp.items.first().map(|i| i.uid.clone()).unwrap_or_default()) {
-                        let _ = tx.send(batch_resp);
-                    } else {
-                        // Fallback: try to find by any uid in the batch
-                        for item in &batch_resp.items {
-                            if let Some(tx) = guard.remove(&item.uid) {
-                                let _ = tx.send(batch_resp);
-                                break;
-                            }
-                        }
-                    }
+        if let Some(pb::response::Payload::Stream(ref stream_resp)) = value.payload {
+            let sid = &stream_resp.stream_id;
+            if let Some(tx) = stream_routes.write().await.remove(sid) {
+                let is_done = matches!(stream_resp.payload, Some(pb::stream_response::Payload::Done(_)));
+                let is_error = matches!(stream_resp.payload, Some(pb::stream_response::Payload::Error(_)));
+                if tx.try_send(stream_resp.clone()).is_err() {
+                    warn!("Stream channel closed for {}", sid);
                 }
-                Err(e) => {
-                    error!("UDS batch response deserialize error: {}", e);
+                if !is_done && !is_error {
+                    let mut guard = stream_routes.write().await;
+                    guard.insert(sid.clone(), tx);
                 }
             }
-        } else {
-            match serde_json::from_value::<InferenceResponse>(value) {
-                Ok(response) => {
-                    let mut guard = pending_single.write().await;
-                    if let Some(tx) = guard.remove(&response.uid) {
-                        let _ = tx.send(response);
+            continue;
+        }
+
+        let is_batch = value
+            .payload
+            .as_ref()
+            .and_then(|p| match p {
+                pb::response::Payload::Batch(_) => Some(true),
+                _ => None,
+            })
+            .is_some();
+
+        if is_batch {
+            match value.payload {
+                Some(pb::response::Payload::Batch(batch_resp)) => {
+                    let mut guard = pending_batch.write().await;
+                    if let Some(tx) = guard.remove(&batch_resp.items.first().map(|i| i.uid.clone()).unwrap_or_default()) {
+                        let _ = tx.send(pb::BatchResponse {
+                            items: batch_resp.items,
+                        });
                     }
                 }
-                Err(e) => {
-                    error!("UDS response deserialize error: {}", e);
-                }
+                _ => {}
+            }
+        } else {
+            let mut guard = pending_single.write().await;
+            if let Some(tx) = guard.remove(&value.uid) {
+                let _ = tx.send(value);
             }
         }
     }
-    // Connection broken: clear remaining pending requests
     clear_pending(&pending_single, &pending_batch, "UDS connection closed").await;
 }
 
-// ===== Helpers =====
-
-fn encode_request(request: &InferenceRequest) -> Result<Vec<u8>, AppError> {
-    let encoded = serde_json::to_vec(request)
-        .map_err(|e| AppError::Transport(format!("json serialize: {}", e)))?;
+fn encode_request(request: &pb::Request) -> Result<Vec<u8>, AppError> {
+    let encoded = request.encode_to_vec();
     let len = encoded.len() as u32;
     let mut buf = Vec::with_capacity(4 + encoded.len());
     buf.extend_from_slice(&len.to_be_bytes());
@@ -337,240 +332,62 @@ async fn read_frame(reader: &mut ReadHalf<Stream>) -> Result<Vec<u8>, AppError> 
     Ok(resp_buf)
 }
 
+fn error_response(uid: &str, message: &str) -> pb::Response {
+    pb::Response {
+        uid: uid.to_string(),
+        payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+            data: vec![],
+            status: Some(pb::Status {
+                code: "Error".to_string(),
+                message: message.to_string(),
+            }),
+        })),
+        metrics: None,
+    }
+}
+
 async fn clear_pending(
-    pending_single: &Arc<RwLock<HashMap<String, oneshot::Sender<InferenceResponse>>>>,
-    pending_batch: &Arc<RwLock<HashMap<String, oneshot::Sender<BatchInferenceResponse>>>>,
+    pending_single: &Arc<RwLock<HashMap<String, oneshot::Sender<pb::Response>>>>,
+    pending_batch: &Arc<RwLock<HashMap<String, oneshot::Sender<pb::BatchResponse>>>>,
     message: &str,
 ) {
     {
         let mut guard = pending_single.write().await;
         for (_, tx) in guard.drain() {
-            let _ = tx.send(InferenceResponse {
-                uid: "".to_string(),
-                data: None,
-                status: ResponseStatus::error(message),
-                worker_id: 0,
-                metrics: None,
-            });
+            let _ = tx.send(error_response("", message));
         }
     }
     {
         let mut guard = pending_batch.write().await;
         for (_, tx) in guard.drain() {
-            let _ = tx.send(BatchInferenceResponse {
-                response_type: "BATCH_RESPONSE".to_string(),
+            let _ = tx.send(pb::BatchResponse {
                 items: vec![],
-                metrics: None,
             });
         }
     }
 }
 
-// ===== Public API =====
+pub async fn send_to_worker(
+    uds_path: &Path,
+    request: pb::Request,
+) -> Result<pb::Response, AppError> {
+    let conn = get_or_create_connection(uds_path).await?;
+    conn.send_single(request).await
+}
 
 async fn get_or_create_connection(uds_path: &Path) -> Result<Arc<WorkerConnection>, AppError> {
-    // Fast path: check pool
     {
         let guard = CONNECTION_POOL.read().await;
         if let Some(conn) = guard.get(uds_path) {
             return Ok(conn.clone());
         }
     }
-
-    // Slow path: create new connection
     let mut guard = CONNECTION_POOL.write().await;
     if let Some(conn) = guard.get(uds_path) {
         return Ok(conn.clone());
     }
-
     let conn = Arc::new(WorkerConnection::new(uds_path).await?);
     guard.insert(uds_path.to_path_buf(), conn.clone());
     info!("Established persistent UDS connection to {}", uds_path.display());
     Ok(conn)
-}
-
-/// Send a single inference request using a persistent UDS connection.
-pub async fn send_to_worker(
-    uds_path: &Path,
-    request: InferenceRequest,
-) -> Result<InferenceResponse, AppError> {
-    let conn = get_or_create_connection(uds_path).await?;
-    conn.send_single(request).await
-}
-
-/// Send a batch inference request using a persistent UDS connection.
-pub async fn send_batch_to_worker(
-    uds_path: &Path,
-    request: InferenceRequest,
-) -> Result<BatchInferenceResponse, AppError> {
-    let conn = get_or_create_connection(uds_path).await?;
-    conn.send_batch(request).await
-}
-
-// ===== Legacy response consumer (kept for compatibility with existing worker startup code) =====
-
-/// Start a background task to consume responses from a worker stream.
-/// NOTE: This is legacy code for direct stream consumers. New code should use WorkerConnection.
-pub fn start_response_consumer(
-    stream: Stream,
-    response_tx: mpsc::UnboundedSender<InferenceResponse>,
-) {
-    tokio::spawn(async move {
-        let (mut read_half, _) = split(stream);
-        loop {
-            let frame = match read_frame(&mut read_half).await {
-                Ok(v) => v,
-                Err(e) => {
-                    error!("UDS response consumer read error: {}", e);
-                    break;
-                }
-            };
-            match serde_json::from_slice::<InferenceResponse>(&frame) {
-                Ok(response) => {
-                    if response_tx.send(response).is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    error!("UDS response deserialize error: {}", e);
-                }
-            }
-        }
-    });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::UnixListener;
-
-    #[tokio::test]
-    async fn test_read_frame_rejects_oversized() {
-        let tmp_dir = std::env::temp_dir()
-            .join(format!("lite-server-frame-oversized-{}", std::process::id()));
-        tokio::fs::create_dir_all(&tmp_dir).await.unwrap();
-        let socket_path = tmp_dir.join("test.sock");
-
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        let server_task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let len = (MAX_FRAME_SIZE + 1) as u32;
-            stream.write_all(&len.to_be_bytes()).await.unwrap();
-        });
-
-        let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
-        let (mut read_half, _) = split(stream);
-
-        let result = read_frame(&mut read_half).await;
-        assert!(matches!(result, Err(AppError::FrameTooLarge)));
-
-        server_task.await.unwrap();
-        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-    }
-
-    #[tokio::test]
-    async fn test_read_frame_accepts_normal_size() {
-        let tmp_dir = std::env::temp_dir()
-            .join(format!("lite-server-frame-normal-{}", std::process::id()));
-        tokio::fs::create_dir_all(&tmp_dir).await.unwrap();
-        let socket_path = tmp_dir.join("test.sock");
-
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        let payload = b"hello world";
-        let server_task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let len = payload.len() as u32;
-            stream.write_all(&len.to_be_bytes()).await.unwrap();
-            stream.write_all(payload).await.unwrap();
-        });
-
-        let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
-        let (mut read_half, _) = split(stream);
-
-        let result = read_frame(&mut read_half).await.unwrap();
-        assert_eq!(result, payload);
-
-        server_task.await.unwrap();
-        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-    }
-
-    #[tokio::test]
-    async fn test_worker_connection_close_aborts_tasks() {
-        let tmp_dir = std::env::temp_dir().join(format!("lite-server-uds-test-{}", std::process::id()));
-        tokio::fs::create_dir_all(&tmp_dir).await.unwrap();
-        let socket_path = tmp_dir.join("test.sock");
-
-        // Start a dummy server that accepts the connection
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        let server_task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 1024];
-            loop {
-                match stream.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(_) => continue,
-                    Err(_) => break,
-                }
-            }
-        });
-
-        let conn = WorkerConnection::new(&socket_path).await.unwrap();
-        assert!(!conn.closed.load(std::sync::atomic::Ordering::Relaxed));
-
-        conn.close();
-
-        // Give tasks a moment to be cancelled
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        assert!(conn.closed.load(std::sync::atomic::Ordering::Relaxed));
-        assert!(conn.writer_handle.is_finished());
-        assert!(conn.reader_handle.is_finished());
-
-        // Clean up
-        server_task.abort();
-        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-    }
-
-    #[tokio::test]
-    async fn test_remove_connection_closes_and_clears_pool() {
-        let tmp_dir = std::env::temp_dir().join(format!("lite-server-pool-test-{}", std::process::id()));
-        tokio::fs::create_dir_all(&tmp_dir).await.unwrap();
-        let socket_path = tmp_dir.join("test.sock");
-
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        let server_task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 1024];
-            loop {
-                match stream.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(_) => continue,
-                    Err(_) => break,
-                }
-            }
-        });
-
-        // Create connection and insert into pool manually
-        let conn = Arc::new(WorkerConnection::new(&socket_path).await.unwrap());
-        {
-            let mut guard = CONNECTION_POOL.write().await;
-            guard.insert(socket_path.clone(), conn.clone());
-        }
-
-        remove_connection(&socket_path).await;
-
-        // Pool should be empty
-        {
-            let guard = CONNECTION_POOL.read().await;
-            assert!(!guard.contains_key(&socket_path));
-        }
-
-        // Connection tasks should be aborted
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        assert!(conn.writer_handle.is_finished());
-        assert!(conn.reader_handle.is_finished());
-
-        server_task.abort();
-        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-    }
 }

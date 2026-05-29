@@ -54,6 +54,18 @@ enum Commands {
         /// Also log to stderr (useful when stdout is piped)
         #[arg(long)]
         log_verbose: bool,
+
+        /// Worker transport: zmq or uds
+        #[arg(long, default_value = "zmq")]
+        transport: String,
+
+        /// gRPC server port
+        #[arg(long)]
+        grpc_port: Option<u16>,
+
+        /// Disable gRPC server
+        #[arg(long)]
+        no_grpc: bool,
     },
 
     /// Validate configuration file
@@ -79,6 +91,9 @@ async fn main() {
             metrics_port,
             no_metrics,
             log_verbose,
+            transport,
+            grpc_port,
+            no_grpc,
         } => {
             let mut cfg = if let Some(config_path) = config {
                 match lite_server::config::load_config(&config_path) {
@@ -117,6 +132,15 @@ async fn main() {
             }
             if no_metrics {
                 cfg.metrics.enabled = false;
+            }
+            if !transport.is_empty() {
+                cfg.server.transport = transport;
+            }
+            if let Some(gp) = grpc_port {
+                cfg.server.grpc_port = gp;
+            }
+            if no_grpc {
+                cfg.grpc.enabled = false;
             }
 
             // Initialize logging

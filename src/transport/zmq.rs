@@ -6,26 +6,26 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
-/// Max time to wait for a ZMQ response before failing the request.
 const ZMQ_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+const STREAM_CHANNEL_SIZE: usize = 64;
 
-/// Internal command sent to the ZMQ blocking thread.
-struct ZmqCommand {
-    request: pb::Request,
-    response_tx: oneshot::Sender<pb::Response>,
+enum ZmqCommand {
+    Unary {
+        request: pb::Request,
+        response_tx: oneshot::Sender<pb::Response>,
+    },
+    Stream {
+        request: pb::Request,
+        chunk_tx: mpsc::Sender<pb::StreamResponse>,
+        stream_id: String,
+    },
 }
 
-/// A ZMQ PAIR client for a single Python worker.
-///
-/// Each worker gets one `WorkerZmqClient` with a dedicated PAIR socket.
-/// The socket runs in a `spawn_blocking` task; the async side communicates
-/// via channels.
 pub struct WorkerZmqClient {
     cmd_tx: mpsc::Sender<ZmqCommand>,
 }
 
 impl WorkerZmqClient {
-    /// Create a new ZMQ client and spawn the background blocking task.
     pub fn new(endpoint: String) -> Self {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ZmqCommand>(128);
 
@@ -59,35 +59,33 @@ impl WorkerZmqClient {
 
             info!("ZMQ PAIR worker socket bound to {}", endpoint);
 
-            // Local pending map inside the blocking thread
             let mut pending: HashMap<String, oneshot::Sender<pb::Response>> = HashMap::new();
+            let mut stream_routes: HashMap<String, mpsc::Sender<pb::StreamResponse>> = HashMap::new();
 
             loop {
-                // ---- 1. Drain async command channel (non-blocking) ----
                 loop {
                     match cmd_rx.try_recv() {
-                        Ok(cmd) => {
-                            let uid = cmd.request.uid.clone();
-                            let bytes = cmd.request.encode_to_vec();
+                        Ok(ZmqCommand::Unary { request, response_tx }) => {
+                            let uid = request.uid.clone();
+                            let bytes = request.encode_to_vec();
                             match socket.send(&bytes, 0) {
                                 Ok(_) => {
-                                    pending.insert(uid, cmd.response_tx);
+                                    pending.insert(uid, response_tx);
                                 }
                                 Err(e) => {
                                     error!("ZMQ send error: {}", e);
-                                    let _ = cmd.response_tx.send(pb::Response {
-                                        uid: uid.clone(),
-                                        payload: Some(pb::response::Payload::Single(
-                                            pb::SingleResponse {
-                                                data: vec![],
-                                                status: Some(pb::Status {
-                                                    code: "Error".to_string(),
-                                                    message: format!("ZMQ send: {}", e),
-                                                }),
-                                            },
-                                        )),
-                                        metrics: None,
-                                    });
+                                    let _ = response_tx.send(error_response(&uid, &format!("ZMQ send: {}", e)));
+                                }
+                            }
+                        }
+                        Ok(ZmqCommand::Stream { request, chunk_tx, stream_id }) => {
+                            let bytes = request.encode_to_vec();
+                            match socket.send(&bytes, 0) {
+                                Ok(_) => {
+                                    stream_routes.insert(stream_id, chunk_tx);
+                                }
+                                Err(e) => {
+                                    error!("ZMQ stream send error: {}", e);
                                 }
                             }
                         }
@@ -95,33 +93,18 @@ impl WorkerZmqClient {
                         Err(mpsc::error::TryRecvError::Disconnected) => {
                             info!("ZMQ command channel closed, draining pending and shutting down");
                             for (uid, tx) in pending.drain() {
-                                let _ = tx.send(pb::Response {
-                                    uid,
-                                    payload: Some(pb::response::Payload::Single(
-                                        pb::SingleResponse {
-                                            data: vec![],
-                                            status: Some(pb::Status {
-                                                code: "Error".to_string(),
-                                                message: "Worker shutting down".to_string(),
-                                            }),
-                                        },
-                                    )),
-                                    metrics: None,
-                                });
+                                let _ = tx.send(error_response(&uid, "Worker shutting down"));
                             }
-                            // socket and ctx are dropped here, which invokes
-                            // zmq_close / zmq_ctx_destroy automatically.
+                            stream_routes.clear();
                             return;
                         }
                     }
                 }
 
-                // ---- 2. Receive responses (non-blocking) ----
                 match socket.recv_bytes(zmq::DONTWAIT) {
                     Ok(bytes) => {
                         match pb::Response::decode(bytes.as_slice()) {
                             Ok(resp) => {
-                                // Handle CB completed: multiple uids in one response
                                 if let Some(pb::response::Payload::CbCompleted(ref cb)) = resp.payload {
                                     for seq in &cb.sequences {
                                         if let Some(tx) = pending.remove(&seq.uid) {
@@ -141,6 +124,18 @@ impl WorkerZmqClient {
                                             let _ = tx.send(single_resp);
                                         }
                                     }
+                                } else if let Some(pb::response::Payload::Stream(ref stream_resp)) = resp.payload {
+                                    let sid = &stream_resp.stream_id;
+                                    if let Some(tx) = stream_routes.get(sid) {
+                                        let is_done = matches!(stream_resp.payload, Some(pb::stream_response::Payload::Done(_)));
+                                        let is_error = matches!(stream_resp.payload, Some(pb::stream_response::Payload::Error(_)));
+                                        if tx.try_send(stream_resp.clone()).is_err() {
+                                            warn!("Stream channel full or closed for {}", sid);
+                                            stream_routes.remove(sid);
+                                        } else if is_done || is_error {
+                                            stream_routes.remove(sid);
+                                        }
+                                    }
                                 } else if let Some(tx) = pending.remove(&resp.uid) {
                                     let _ = tx.send(resp);
                                 } else {
@@ -153,7 +148,6 @@ impl WorkerZmqClient {
                         }
                     }
                     Err(zmq::Error::EAGAIN) => {
-                        // No message available, yield to reduce latency
                         std::thread::yield_now();
                     }
                     Err(e) => {
@@ -167,10 +161,9 @@ impl WorkerZmqClient {
         Self { cmd_tx }
     }
 
-    /// Send a request and wait for the response.
     pub async fn send(&self, request: pb::Request) -> Result<pb::Response, AppError> {
         let (response_tx, response_rx) = oneshot::channel();
-        let cmd = ZmqCommand {
+        let cmd = ZmqCommand::Unary {
             request,
             response_tx,
         };
@@ -185,6 +178,40 @@ impl WorkerZmqClient {
             .map_err(|_| AppError::InferenceTimeout("ZMQ response timeout".to_string()))?
             .map_err(|_| AppError::Transport("ZMQ response channel closed".to_string()))
     }
+
+    pub async fn send_stream(
+        &self,
+        request: pb::Request,
+        stream_id: String,
+    ) -> Result<mpsc::Receiver<pb::StreamResponse>, AppError> {
+        let (chunk_tx, chunk_rx) = mpsc::channel(STREAM_CHANNEL_SIZE);
+        let cmd = ZmqCommand::Stream {
+            request,
+            chunk_tx,
+            stream_id,
+        };
+
+        self.cmd_tx
+            .send(cmd)
+            .await
+            .map_err(|_| AppError::Transport("ZMQ command channel closed".to_string()))?;
+
+        Ok(chunk_rx)
+    }
+}
+
+fn error_response(uid: &str, message: &str) -> pb::Response {
+    pb::Response {
+        uid: uid.to_string(),
+        payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+            data: vec![],
+            status: Some(pb::Status {
+                code: "Error".to_string(),
+                message: message.to_string(),
+            }),
+        })),
+        metrics: None,
+    }
 }
 
 #[cfg(test)]
@@ -195,14 +222,8 @@ mod tests {
     async fn test_zmq_client_cleanup_does_not_panic() {
         let endpoint = format!("ipc:///tmp/lite-server-zmq-test-{}", std::process::id());
         let client = WorkerZmqClient::new(endpoint.clone());
-
-        // Drop client; the blocking task should shut down gracefully
         drop(client);
-
-        // Small delay to let the blocking task finish
         tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // If we reach here without panic, cleanup succeeded
     }
 
     #[tokio::test]
@@ -218,13 +239,8 @@ mod tests {
             })),
         };
 
-        // Without a peer, ZMQ send fails after sndtimeo and the blocking task
-        // returns an error response payload rather than hanging forever.
         let result = client.send(request).await;
-        assert!(
-            result.is_ok(),
-            "send() should return Ok with error payload, not hang or Err"
-        );
+        assert!(result.is_ok(), "send() should return Ok with error payload");
         let resp = result.unwrap();
         if let Some(pb::response::Payload::Single(single)) = resp.payload {
             assert_eq!(single.status.unwrap().code, "Error");

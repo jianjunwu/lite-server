@@ -29,8 +29,7 @@ struct EndpointProcess {
 impl EndpointManager {
     pub fn new(repo_path: PathBuf, registry: Arc<ModelRegistry>) -> Self {
         let uds_path = std::env::temp_dir()
-            .join("lite-server")
-            .join("endpoints.sock");
+            .join(format!("lite-server-{}-endpoints.sock", std::process::id()));
         Self {
             repo_path,
             registry,

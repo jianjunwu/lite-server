@@ -3,18 +3,22 @@ use crate::http::state::AppState;
 use crate::metrics::prometheus;
 use crate::proto::liteserver as pb;
 use crate::registry::types::ModelType;
+use crate::streaming;
 use axum::{
     extract::{Path, Query, State},
     response::{IntoResponse, Json, Response},
 };
 use axum::extract::ws::{Message, WebSocket};
 use axum::http::header::HeaderMap;
+use axum::response::sse::{Event, Sse};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -473,6 +477,195 @@ async fn do_infer(
     }
 }
 
+// ===== Streaming Helpers =====
+
+async fn resolve_version(
+    state: &AppState,
+    model_name: &str,
+    version: Option<String>,
+) -> Result<String, AppError> {
+    match version {
+        Some(v) => Ok(v),
+        None => state.registry.get_active_version(model_name).await.ok_or_else(|| {
+            AppError::ModelNotFound(format!("{} has no active version", model_name))
+        }),
+    }
+}
+
+fn build_request_meta(headers: &HeaderMap, payload: &Value, route: &str) -> pb::RequestMeta {
+    let header_map: HashMap<String, String> = headers
+        .iter()
+        .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), s.to_string())))
+        .collect();
+    let client_ip = extract_client_ip(headers);
+    let request_id = Uuid::new_v4().to_string();
+    let timestamp_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64;
+    let payload_bytes = serde_json::to_vec(payload).unwrap_or_default();
+
+    pb::RequestMeta {
+        route: route.to_string(),
+        headers: header_map,
+        client_ip,
+        request_id,
+        timestamp_ns,
+        payload: payload_bytes,
+    }
+}
+
+async fn open_worker_stream(
+    state: &Arc<AppState>,
+    model_name: &str,
+    resolved_version: &str,
+    meta: pb::RequestMeta,
+    payload_bytes: Vec<u8>,
+) -> Result<(String, mpsc::Receiver<pb::StreamResponse>), AppError> {
+    let mv = state
+        .registry
+        .get(model_name, Some(resolved_version))
+        .await
+        .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", model_name, resolved_version)))?;
+
+    let num_workers = mv.workers.len();
+    if num_workers == 0 {
+        return Err(AppError::WorkerCrashed(format!("{} has no workers", model_name)));
+    }
+
+    let worker_id = crate::worker::pick_worker_random(num_workers);
+    let clients = state
+        .worker_manager
+        .get_zmq_clients(model_name, resolved_version)
+        .await
+        .ok_or_else(|| AppError::WorkerCrashed(format!("{} {} has no ZMQ clients", model_name, resolved_version)))?;
+
+    if worker_id >= clients.len() {
+        return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
+    }
+
+    let client = &clients[worker_id];
+    let stream_id = format!("stream-{}", Uuid::new_v4());
+    let open_req = streaming::build_stream_open(stream_id.clone(), payload_bytes, Some(meta));
+
+    let chunk_rx = client.send_stream(open_req, stream_id.clone()).await?;
+    Ok((stream_id, chunk_rx))
+}
+
+// ===== SSE Streaming =====
+
+pub async fn sse_infer_handler(
+    State(state): State<Arc<AppState>>,
+    Path(model_name): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
+    let resolved_version = resolve_version(&state, &model_name, None).await?;
+
+    if !state.registry.is_ready(&model_name, None).await {
+        return Err(AppError::ModelNotReady(format!(
+            "{} version {} is not ready",
+            model_name, resolved_version
+        )));
+    }
+
+    let meta = build_request_meta(&headers, &payload, "/predict");
+    let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    let (stream_id, mut chunk_rx) = open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await?;
+
+    let (event_tx, event_rx) = mpsc::channel(64);
+
+    tokio::spawn(async move {
+        while let Some(chunk) = chunk_rx.recv().await {
+            let event = match &chunk.payload {
+                Some(pb::stream_response::Payload::Chunk(c)) => {
+                    let data = String::from_utf8_lossy(&c.data);
+                    Event::default().data(data.to_string())
+                }
+                Some(pb::stream_response::Payload::Error(e)) => {
+                    Event::default().data(json!({"error": e.message}).to_string())
+                }
+                Some(pb::stream_response::Payload::Done(_)) => {
+                    Event::default().data("[DONE]")
+                }
+                _ => continue,
+            };
+            if event_tx.send(Ok(event)).await.is_err() {
+                break;
+            }
+            if matches!(chunk.payload, Some(pb::stream_response::Payload::Done(_))) {
+                break;
+            }
+        }
+        // Ensure stream is cleaned up on worker side
+        let cancel_req = streaming::build_stream_cancel(stream_id);
+        let _ = open_worker_stream_cancel(state, cancel_req).await;
+    });
+
+    Ok(Sse::new(ReceiverStream::new(event_rx)))
+}
+
+pub async fn sse_infer_version_handler(
+    State(state): State<Arc<AppState>>,
+    Path((model_name, version)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
+    crate::validation::validate_identifier(&version)?;
+    let resolved_version = resolve_version(&state, &model_name, Some(version)).await?;
+
+    if !state.registry.is_ready(&model_name, Some(&resolved_version)).await {
+        return Err(AppError::ModelNotReady(format!(
+            "{} version {} is not ready",
+            model_name, resolved_version
+        )));
+    }
+
+    let meta = build_request_meta(&headers, &payload, "/predict");
+    let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    let (stream_id, mut chunk_rx) = open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await?;
+
+    let (event_tx, event_rx) = mpsc::channel(64);
+
+    tokio::spawn(async move {
+        while let Some(chunk) = chunk_rx.recv().await {
+            let event = match &chunk.payload {
+                Some(pb::stream_response::Payload::Chunk(c)) => {
+                    let data = String::from_utf8_lossy(&c.data);
+                    Event::default().data(data.to_string())
+                }
+                Some(pb::stream_response::Payload::Error(e)) => {
+                    Event::default().data(json!({"error": e.message}).to_string())
+                }
+                Some(pb::stream_response::Payload::Done(_)) => {
+                    Event::default().data("[DONE]")
+                }
+                _ => continue,
+            };
+            if event_tx.send(Ok(event)).await.is_err() {
+                break;
+            }
+            if matches!(chunk.payload, Some(pb::stream_response::Payload::Done(_))) {
+                break;
+            }
+        }
+        let cancel_req = streaming::build_stream_cancel(stream_id);
+        let _ = open_worker_stream_cancel(state, cancel_req).await;
+    });
+
+    Ok(Sse::new(ReceiverStream::new(event_rx)))
+}
+
+async fn open_worker_stream_cancel(state: Arc<AppState>, cancel_req: pb::Request) -> Result<(), AppError> {
+    // Fire-and-forget cancel to worker; best-effort
+    // We need a worker to send cancel to, but we don't know which one.
+    // For now, skip explicit cancel - the worker handles client disconnect via stream timeout.
+    let _ = (state, cancel_req);
+    Ok(())
+}
+
 // ===== WebSocket Streaming =====
 
 pub async fn ws_stream_handler(
@@ -506,55 +699,87 @@ async fn handle_ws_stream(
     version: Option<String>,
     mut socket: WebSocket,
 ) {
-    let resolved_version = match &version {
-        Some(v) => v.clone(),
-        None => match state.registry.get_active_version(&model_name).await {
-            Some(v) => v,
-            None => {
-                let _ = socket.close().await;
-                return;
-            }
-        },
-    };
-
-    if !state.registry.is_ready(&model_name, version.as_deref()).await {
-        let _ = socket.close().await;
-        return;
-    }
-
-    let mv = match state.registry.get(&model_name, Some(&resolved_version)).await {
-        Some(mv) => mv,
-        None => {
+    let resolved_version = match resolve_version(&state, &model_name, version).await {
+        Ok(v) => v,
+        Err(_) => {
             let _ = socket.close().await;
             return;
         }
     };
 
-    let num_workers = mv.workers.len();
-    if num_workers == 0 {
+    if !state.registry.is_ready(&model_name, None).await {
         let _ = socket.close().await;
         return;
     }
 
-    let worker_id = crate::worker::pick_worker_random(num_workers);
-    let worker = &mv.workers[worker_id];
-    let uds_path = worker.endpoint.clone();
-
-    let stream_id = format!("ws-{}", Uuid::new_v4());
-
-    // Send STREAM_OPEN
-    let open_req = pb::Request {
-        uid: format!("{}_{}-stream-open", model_name, resolved_version),
-        meta: None,
-        payload: Some(pb::request::Payload::Single(pb::SingleRequest {
-            data: serde_json::to_vec(&json!({"stream_open": stream_id})).unwrap_or_default(),
-        })),
+    // Wait for first message from client (the request payload)
+    let first_msg = match socket.recv().await {
+        Some(Ok(Message::Text(text))) => text,
+        Some(Ok(Message::Binary(bin))) => String::from_utf8_lossy(&bin).to_string(),
+        _ => {
+            let _ = socket.close().await;
+            return;
+        }
     };
 
-    // TODO: WebSocket streaming needs to be migrated to ZMQ transport
-    // For now, this path is broken until streaming is redesigned
-    warn!("WebSocket streaming is not yet fully migrated to ZMQ");
-    let _ = socket.close().await;
+    let payload: Value = match serde_json::from_str(&first_msg) {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = socket.send(Message::Text(json!({"error": "invalid JSON"}).to_string())).await;
+            let _ = socket.close().await;
+            return;
+        }
+    };
+
+    let headers = HeaderMap::new();
+    let meta = build_request_meta(&headers, &payload, "/predict");
+    let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+
+    let (stream_id, mut chunk_rx) = match open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = socket.send(Message::Text(json!({"error": e.to_string()}).to_string())).await;
+            let _ = socket.close().await;
+            return;
+        }
+    };
+
+    // Spawn task to forward worker chunks -> WebSocket
+    let mut send_task = tokio::spawn(async move {
+        while let Some(chunk) = chunk_rx.recv().await {
+            let msg = match &chunk.payload {
+                Some(pb::stream_response::Payload::Chunk(c)) => {
+                    Message::Binary(c.data.clone())
+                }
+                Some(pb::stream_response::Payload::Error(e)) => {
+                    Message::Text(json!({"error": e.message}).to_string())
+                }
+                Some(pb::stream_response::Payload::Done(_)) => {
+                    Message::Text(json!({"done": true}).to_string())
+                }
+                _ => continue,
+            };
+            if socket.send(msg).await.is_err() {
+                break;
+            }
+            if matches!(chunk.payload, Some(pb::stream_response::Payload::Done(_))) {
+                let _ = socket.close().await;
+                break;
+            }
+        }
+        stream_id
+    });
+
+    // For now, we don't handle bidirectional streaming over WebSocket
+    // Just wait for the send task to complete
+    let completed_stream_id = match send_task.await {
+        Ok(sid) => sid,
+        Err(_) => return,
+    };
+
+    // Send cancel to clean up
+    let cancel_req = streaming::build_stream_cancel(completed_stream_id);
+    let _ = open_worker_stream_cancel(state, cancel_req).await;
 }
 
 // ===== Custom Endpoint Handler =====
