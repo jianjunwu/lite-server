@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -289,6 +288,67 @@ pub fn load_model_config(path: &Path) -> anyhow::Result<ModelConfig> {
     Ok(config)
 }
 
+/// CLI 参数覆盖集。None/bool 默认值 = 不覆盖（保持 YAML 或内置默认值）。
+#[derive(Debug, Clone, Default)]
+pub struct CliOverrides {
+    pub port: Option<u16>,
+    pub host: Option<String>,
+    pub model_repo: Option<String>,
+    pub http_workers: Option<usize>,
+    pub timeout: Option<f32>,
+    pub transport: Option<String>,
+    pub log_level: Option<String>,
+    pub grpc_port: Option<u16>,
+    pub metrics_port: Option<u16>,
+    pub no_grpc: bool,
+    pub no_metrics: bool,
+    pub no_streaming_metrics: bool,
+    pub log_verbose: bool,
+}
+
+impl Config {
+    /// 用 CLI 参数覆盖当前配置，未指定的字段保持不变。
+    pub fn apply_overrides(&mut self, cli: &CliOverrides) {
+        if let Some(p) = cli.port {
+            self.server.http_port = p;
+        }
+        if let Some(ref h) = cli.host {
+            self.server.host = h.clone();
+        }
+        if let Some(ref r) = cli.model_repo {
+            self.model_repository.path = r.clone();
+        }
+        if let Some(w) = cli.http_workers {
+            self.server.http_workers = Some(w);
+        }
+        if let Some(t) = cli.timeout {
+            self.server.timeout = t;
+        }
+        if let Some(ref t) = cli.transport {
+            self.server.transport = t.clone();
+        }
+        if let Some(ref l) = cli.log_level {
+            self.server.log_level = l.clone();
+            self.logging.level = l.clone();
+        }
+        if let Some(gp) = cli.grpc_port {
+            self.server.grpc_port = gp;
+        }
+        if let Some(mp) = cli.metrics_port {
+            self.server.metrics_port = mp;
+        }
+        if cli.no_grpc {
+            self.grpc.enabled = false;
+        }
+        if cli.no_metrics {
+            self.metrics.enabled = false;
+        }
+        if cli.no_streaming_metrics {
+            self.features.streaming_metrics = false;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,5 +526,79 @@ mod tests {
         assert_eq!(parsed.max_batch_size, 8);
         assert!(parsed.stream);
         assert_eq!(parsed.api_path, "/v2/generate");
+    }
+
+    // --- apply_overrides ---
+
+    #[test]
+    fn test_apply_overrides_partial() {
+        let mut cfg = Config::default();
+        let overrides = CliOverrides {
+            port: Some(9090),
+            host: Some("127.0.0.1".to_string()),
+            ..Default::default()
+        };
+        cfg.apply_overrides(&overrides);
+
+        assert_eq!(cfg.server.http_port, 9090);
+        assert_eq!(cfg.server.host, "127.0.0.1");
+        // Unchanged fields keep defaults
+        assert_eq!(cfg.server.grpc_port, 8001);
+        assert_eq!(cfg.server.transport, "zmq");
+        assert!(cfg.grpc.enabled);
+    }
+
+    #[test]
+    fn test_apply_overrides_none_keeps_defaults() {
+        let mut cfg = Config::default();
+        let overrides = CliOverrides::default();
+        cfg.apply_overrides(&overrides);
+
+        assert_eq!(cfg.server.http_port, 8000);
+        assert_eq!(cfg.server.host, "0.0.0.0");
+        assert!(cfg.grpc.enabled);
+        assert!(cfg.metrics.enabled);
+        assert!(cfg.features.streaming_metrics);
+    }
+
+    #[test]
+    fn test_apply_overrides_bool_flags() {
+        let mut cfg = Config::default();
+        let overrides = CliOverrides {
+            no_grpc: true,
+            no_metrics: true,
+            no_streaming_metrics: true,
+            ..Default::default()
+        };
+        cfg.apply_overrides(&overrides);
+
+        assert!(!cfg.grpc.enabled);
+        assert!(!cfg.metrics.enabled);
+        assert!(!cfg.features.streaming_metrics);
+    }
+
+    #[test]
+    fn test_apply_overrides_log_level_propagates() {
+        let mut cfg = Config::default();
+        let overrides = CliOverrides {
+            log_level: Some("debug".to_string()),
+            ..Default::default()
+        };
+        cfg.apply_overrides(&overrides);
+
+        assert_eq!(cfg.server.log_level, "debug");
+        assert_eq!(cfg.logging.level, "debug");
+    }
+
+    #[test]
+    fn test_apply_overrides_transport() {
+        let mut cfg = Config::default();
+        let overrides = CliOverrides {
+            transport: Some("uds".to_string()),
+            ..Default::default()
+        };
+        cfg.apply_overrides(&overrides);
+
+        assert_eq!(cfg.server.transport, "uds");
     }
 }

@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use lite_server::config::Config;
+use lite_server::config::{CliOverrides, Config};
 use lite_server::server::LiteServer;
 use tracing::{error, info};
 
@@ -56,8 +56,8 @@ enum Commands {
         log_verbose: bool,
 
         /// Worker transport: zmq or uds
-        #[arg(long, default_value = "zmq")]
-        transport: String,
+        #[arg(long)]
+        transport: Option<String>,
 
         /// gRPC server port
         #[arg(long)]
@@ -113,43 +113,21 @@ async fn main() {
             };
 
             // CLI overrides
-            if let Some(p) = port {
-                cfg.server.http_port = p;
-            }
-            if let Some(h) = host {
-                cfg.server.host = h;
-            }
-            if let Some(r) = model_repo {
-                cfg.model_repository.path = r;
-            }
-            if let Some(w) = http_workers {
-                cfg.server.http_workers = Some(w);
-            }
-            if let Some(t) = timeout {
-                cfg.server.timeout = t;
-            }
-            if let Some(l) = log_level {
-                cfg.server.log_level = l.clone();
-                cfg.logging.level = l;
-            }
-            if let Some(mp) = metrics_port {
-                cfg.server.metrics_port = mp;
-            }
-            if no_metrics {
-                cfg.metrics.enabled = false;
-            }
-            if !transport.is_empty() {
-                cfg.server.transport = transport;
-            }
-            if let Some(gp) = grpc_port {
-                cfg.server.grpc_port = gp;
-            }
-            if no_grpc {
-                cfg.grpc.enabled = false;
-            }
-            if no_streaming_metrics {
-                cfg.features.streaming_metrics = false;
-            }
+            cfg.apply_overrides(&CliOverrides {
+                port,
+                host,
+                model_repo,
+                http_workers,
+                timeout,
+                transport,
+                log_level,
+                grpc_port,
+                metrics_port,
+                no_grpc,
+                no_metrics,
+                no_streaming_metrics,
+                log_verbose: false, // handled below by logging::init
+            });
 
             // Initialize logging
             let _log_guard = lite_server::logging::init(

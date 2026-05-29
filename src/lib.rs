@@ -30,6 +30,11 @@ pub fn run_server(
     log_level: Option<String>,
     metrics_port: Option<u16>,
     no_metrics: Option<bool>,
+    transport: Option<String>,
+    grpc_port: Option<u16>,
+    no_grpc: Option<bool>,
+    no_streaming_metrics: Option<bool>,
+    log_verbose: Option<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut cfg = if let Some(config_path) = config {
         config::load_config(&config_path)?
@@ -37,39 +42,30 @@ pub fn run_server(
         config::Config::default()
     };
 
-    if let Some(p) = port {
-        cfg.server.http_port = p;
-    }
-    if let Some(h) = host {
-        cfg.server.host = h;
-    }
-    if let Some(r) = model_repo {
-        cfg.model_repository.path = r;
-    }
-    if let Some(w) = http_workers {
-        cfg.server.http_workers = Some(w);
-    }
-    if let Some(t) = timeout {
-        cfg.server.timeout = t;
-    }
-    if let Some(l) = log_level {
-        cfg.server.log_level = l.clone();
-        cfg.logging.level = l;
-    }
-    if let Some(mp) = metrics_port {
-        cfg.server.metrics_port = mp;
-    }
-    if no_metrics == Some(true) {
-        cfg.metrics.enabled = false;
-    }
+    cfg.apply_overrides(&config::CliOverrides {
+        port,
+        host,
+        model_repo,
+        http_workers,
+        timeout,
+        transport,
+        log_level,
+        grpc_port,
+        metrics_port,
+        no_grpc: no_grpc == Some(true),
+        no_metrics: no_metrics == Some(true),
+        no_streaming_metrics: no_streaming_metrics == Some(true),
+        log_verbose: false, // handled below by logging::init
+    });
 
+    let log_verbose = log_verbose.unwrap_or(false);
     let _log_guard = logging::init(
         &cfg.logging.level,
         cfg.logging.info_output.as_deref(),
         cfg.logging.error_output.as_deref(),
         &cfg.logging.rotation,
         cfg.logging.max_size,
-        false,
+        log_verbose,
     );
     info!("Starting lite-server v{}", env!("CARGO_PKG_VERSION"));
     info!("HTTP port: {}", cfg.server.http_port);
@@ -98,6 +94,11 @@ pub fn run_server(
     log_level=None,
     metrics_port=None,
     no_metrics=None,
+    transport=None,
+    grpc_port=None,
+    no_grpc=None,
+    no_streaming_metrics=None,
+    log_verbose=None,
 ))]
 fn serve(
     config: Option<String>,
@@ -109,12 +110,17 @@ fn serve(
     log_level: Option<String>,
     metrics_port: Option<u16>,
     no_metrics: Option<bool>,
+    transport: Option<String>,
+    grpc_port: Option<u16>,
+    no_grpc: Option<bool>,
+    no_streaming_metrics: Option<bool>,
+    log_verbose: Option<bool>,
 ) -> PyResult<()> {
     pyo3::Python::with_gil(|py| {
         py.allow_threads(|| {
             run_server(
                 config, port, host, model_repo, http_workers, timeout, log_level, metrics_port,
-                no_metrics,
+                no_metrics, transport, grpc_port, no_grpc, no_streaming_metrics, log_verbose,
             )
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })

@@ -25,6 +25,11 @@ def main(argv=None):
     serve_parser.add_argument("--timeout", type=float, help="Request timeout")
     serve_parser.add_argument("--log-level", help="Log level")
     serve_parser.add_argument("--no-metrics", action="store_true", help="Disable metrics")
+    serve_parser.add_argument("--transport", help="Worker transport: zmq or uds")
+    serve_parser.add_argument("--grpc-port", type=int, help="gRPC server port")
+    serve_parser.add_argument("--no-grpc", action="store_true", help="Disable gRPC server")
+    serve_parser.add_argument("--no-streaming-metrics", action="store_true", help="Disable streaming metrics")
+    serve_parser.add_argument("--log-verbose", action="store_true", help="Also log to stderr")
 
     # config-check
     check_parser = subparsers.add_parser("config-check", help="Validate configuration")
@@ -99,6 +104,11 @@ def _cmd_serve(args):
             timeout=args.timeout,
             log_level=args.log_level,
             no_metrics=args.no_metrics,
+            transport=args.transport,
+            grpc_port=args.grpc_port,
+            no_grpc=args.no_grpc,
+            no_streaming_metrics=args.no_streaming_metrics,
+            log_verbose=args.log_verbose,
         )
     except KeyboardInterrupt:
         print("\nShutting down...")
