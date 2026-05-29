@@ -9,6 +9,7 @@ pub mod proto;
 pub mod registry;
 pub mod server;
 pub mod transport;
+pub mod validation;
 pub mod worker;
 
 #[cfg(feature = "python")]

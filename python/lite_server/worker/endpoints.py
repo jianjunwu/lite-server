@@ -11,6 +11,8 @@ import sys
 import time
 from pathlib import Path
 
+MAX_FRAME_SIZE = 16 * 1024 * 1024  # 16 MiB
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -180,6 +182,9 @@ async def handle_connection(conn, endpoints):
                 break
 
             msg_len = struct.unpack(">I", len_bytes)[0]
+
+            if msg_len > MAX_FRAME_SIZE:
+                break
 
             # Read message body
             body = b""

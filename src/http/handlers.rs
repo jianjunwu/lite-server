@@ -76,6 +76,7 @@ pub async fn list_versions_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
 ) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
     let versions = state.registry.list_versions(&model_name).await;
     let active = state.registry.get_active_version(&model_name).await;
     Ok(Json(json!({
@@ -92,6 +93,10 @@ pub async fn model_ready_handler(
     Path(model_name): Path<String>,
     Query(query): Query<VersionQuery>,
 ) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
+    if let Some(ref v) = query.version {
+        crate::validation::validate_identifier(v)?;
+    }
     let ready = state.registry.is_ready(&model_name, query.version.as_deref()).await;
     let active_version = state.registry.get_active_version(&model_name).await;
     Ok(Json(json!({
@@ -185,6 +190,8 @@ pub async fn load_model_handler(
     Query(query): Query<VersionQuery>,
 ) -> Result<Json<Value>, AppError> {
     let version = query.version.unwrap_or_else(|| "1".to_string());
+    crate::validation::validate_identifier(&model_name)?;
+    crate::validation::validate_identifier(&version)?;
 
     // Load model config
     let config_path = state.repo_path.join(&model_name).join(&version).join("config.yaml");
@@ -211,6 +218,10 @@ pub async fn unload_model_handler(
     Path(model_name): Path<String>,
     Query(query): Query<VersionQuery>,
 ) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
+    if let Some(ref v) = query.version {
+        crate::validation::validate_identifier(v)?;
+    }
     let success = state.worker_manager.unload_model(&model_name, query.version.as_deref()).await?;
     if !success {
         return Err(AppError::ModelNotFound(format!("{} not loaded", model_name)));
@@ -228,6 +239,10 @@ pub async fn reload_model_handler(
     Path(model_name): Path<String>,
     Query(query): Query<VersionQuery>,
 ) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
+    if let Some(ref v) = query.version {
+        crate::validation::validate_identifier(v)?;
+    }
     let success = state.worker_manager.reload_model(&model_name, query.version.as_deref()).await?;
     if !success {
         return Err(AppError::ModelNotFound(format!("{} not loaded", model_name)));
@@ -244,6 +259,9 @@ pub async fn delete_version_handler(
     State(state): State<Arc<AppState>>,
     Path((model_name, version)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
+    crate::validation::validate_identifier(&version)?;
+
     // Unload first if loaded
     let _ = state.worker_manager.unload_model(&model_name, Some(&version)).await;
 
@@ -267,6 +285,9 @@ pub async fn activate_version_handler(
     State(state): State<Arc<AppState>>,
     Path((model_name, version)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
+    crate::validation::validate_identifier(&version)?;
+
     let success = state.registry.activate_version(&model_name, &version).await?;
     if !success {
         return Err(AppError::ModelNotReady(format!(
@@ -290,6 +311,7 @@ pub async fn infer_handler(
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
     do_infer(state, model_name, None, "/predict".to_string(), headers, payload).await
 }
 
@@ -299,6 +321,8 @@ pub async fn infer_version_handler(
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
+    crate::validation::validate_identifier(&version)?;
     do_infer(state, model_name, Some(version), "/predict".to_string(), headers, payload).await
 }
 
@@ -456,6 +480,9 @@ pub async fn ws_stream_handler(
     Path(model_name): Path<String>,
     ws: axum::extract::WebSocketUpgrade,
 ) -> Response {
+    if let Err(e) = crate::validation::validate_identifier(&model_name) {
+        return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+    }
     ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, socket))
 }
 
@@ -464,6 +491,12 @@ pub async fn ws_stream_version_handler(
     Path((model_name, version)): Path<(String, String)>,
     ws: axum::extract::WebSocketUpgrade,
 ) -> Response {
+    if let Err(e) = crate::validation::validate_identifier(&model_name) {
+        return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+    }
+    if let Err(e) = crate::validation::validate_identifier(&version) {
+        return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+    }
     ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), socket))
 }
 
@@ -616,14 +649,16 @@ pub struct TimelineQuery {
 pub async fn timeline_model_handler(
     Path(model_name): Path<String>,
     Query(query): Query<TimelineQuery>,
-) -> impl IntoResponse {
+) -> Result<Json<Value>, AppError> {
     let version = query.version.unwrap_or_else(|| "1".to_string());
+    crate::validation::validate_identifier(&model_name)?;
+    crate::validation::validate_identifier(&version)?;
     let entries = crate::metrics::aggregator::TIMELINE.get_timeline(&model_name, &version);
-    Json(json!({
+    Ok(Json(json!({
         "model": model_name,
         "version": version,
         "entries": entries,
-    }))
+    })))
 }
 
 // ===== Alerts =====
@@ -638,6 +673,7 @@ pub async fn alerts_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
 pub async fn compare_versions_handler(
     Path(model_name): Path<String>,
 ) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
     match crate::metrics::aggregator::VersionComparator::compare(
         &crate::metrics::aggregator::TIMELINE,
         &model_name,

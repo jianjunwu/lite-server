@@ -95,6 +95,11 @@ impl EndpointManager {
             .map_err(|e| AppError::Transport(format!("read len from endpoint UDS: {}", e)))?;
         let resp_len = u32::from_be_bytes(len_buf) as usize;
 
+        const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+        if resp_len > MAX_FRAME_SIZE {
+            return Err(AppError::FrameTooLarge);
+        }
+
         let mut resp_buf = vec![0u8; resp_len];
         tokio::io::AsyncReadExt::read_exact(&mut stream, &mut resp_buf)
             .await

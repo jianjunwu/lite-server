@@ -216,7 +216,9 @@ pub async fn execute_ensemble(
     version: &str,
     payload: Value,
 ) -> Result<Value, AppError> {
-    let model_dir = state.repo_path.join(model_name).join(version);
+    let model_dir = crate::validation::resolve_model_dir(
+        &state.repo_path, model_name, version,
+    )?;
     let config_path = model_dir.join("config.yaml");
 
     let steps = parse_ensemble_config(&config_path)?;
@@ -282,8 +284,11 @@ async fn execute_step(
     // Ensure sub-model is ready
     if !state.registry.is_ready(&step.model, Some(&step.version)).await {
         info!("Auto-loading sub-model {} v{} for ensemble", step.model, step.version);
+        let sub_model_dir = crate::validation::resolve_model_dir(
+            &state.repo_path, &step.model, &step.version,
+        )?;
         let config = crate::config::load_model_config(
-            &state.repo_path.join(&step.model).join(&step.version).join("config.yaml")
+            &sub_model_dir.join("config.yaml")
         ).unwrap_or_default();
         if let Err(e) = state.worker_manager.load_model(&step.model, &step.version, &config).await {
             warn!("Failed to auto-load sub-model {} v{}: {}", step.model, step.version, e);

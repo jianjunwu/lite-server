@@ -68,13 +68,13 @@ impl WorkerManager {
     ) -> Result<(), AppError> {
         info!("Loading model {} version {}", model_name, version);
 
-        let model_dir = self.repo_path.join(model_name).join(version);
+        let model_dir = crate::validation::resolve_model_dir(
+            &self.repo_path, model_name, version,
+        )?;
         if !model_dir.exists() {
             return Err(AppError::ModelNotFound(format!(
-                "{} version {} not found at {}",
-                model_name,
-                version,
-                model_dir.display()
+                "{} version {} not found",
+                model_name, version
             )));
         }
 
@@ -93,8 +93,8 @@ impl WorkerManager {
 
         if !model_py.exists() && !is_ensemble {
             return Err(AppError::ModelNotFound(format!(
-                "Neither model.py nor ensemble config found in {}",
-                model_dir.display()
+                "Neither model.py nor ensemble config found for {} version {}",
+                model_name, version
             )));
         }
 

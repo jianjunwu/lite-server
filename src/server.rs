@@ -205,6 +205,14 @@ impl LiteServer {
                 };
 
                 if should_load {
+                    if let Err(e) = crate::validation::validate_identifier(&name) {
+                        error!("Skipping model with invalid name '{}': {}", name, e);
+                        continue;
+                    }
+                    if let Err(e) = crate::validation::validate_identifier(&version) {
+                        error!("Skipping {} version with invalid version '{}': {}", name, version, e);
+                        continue;
+                    }
                     let config_path = repo_path.join(&name).join(&version).join("config.yaml");
                     let config = crate::config::load_model_config(&config_path).unwrap_or_default();
 
@@ -425,11 +433,19 @@ async fn process_watch_events(
                         }
                     } else if path.exists() {
                         // File change: trigger reload of the containing model
-                        models_to_reload.insert((model_name.to_string(), version.to_string()));
+                        if crate::validation::validate_identifier(model_name).is_ok()
+                            && crate::validation::validate_identifier(version).is_ok()
+                        {
+                            models_to_reload.insert((model_name.to_string(), version.to_string()));
+                        }
                     } else {
                         // File was deleted
-                        models_to_reload.insert((model_name.to_string(), version.to_string()));
-                        models_to_check_removed.push((model_name.to_string(), version.to_string()));
+                        if crate::validation::validate_identifier(model_name).is_ok()
+                            && crate::validation::validate_identifier(version).is_ok()
+                        {
+                            models_to_reload.insert((model_name.to_string(), version.to_string()));
+                            models_to_check_removed.push((model_name.to_string(), version.to_string()));
+                        }
                     }
                 }
             }

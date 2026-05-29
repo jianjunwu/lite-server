@@ -44,8 +44,34 @@ pub enum AppError {
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
+    #[error("frame too large")]
+    FrameTooLarge,
+
     #[error("internal error: {0}")]
     Internal(String),
+}
+
+impl AppError {
+    /// Return a sanitized, public-facing error message.
+    /// Never includes file paths, stack traces, or other internal details.
+    pub fn pub_error_message(&self) -> &'static str {
+        match self {
+            AppError::ModelNotFound(_) => "model not found",
+            AppError::ModelNotReady(_) => "model not ready",
+            AppError::VersionNotFound(_, _) => "model version not found",
+            AppError::InferenceTimeout(_) => "inference timeout",
+            AppError::QueueFull(_) => "queue full",
+            AppError::WorkerCrashed(_) => "service temporarily unavailable",
+            AppError::Validation(_) => "validation error",
+            AppError::Config(_) => "invalid configuration",
+            AppError::Transport(_) => "transport error",
+            AppError::Python(_) => "internal server error",
+            AppError::Io(_) => "internal server error",
+            AppError::Serialization(_) => "serialization error",
+            AppError::FrameTooLarge => "message too large",
+            AppError::Internal(_) => "internal server error",
+        }
+    }
 }
 
 impl IntoResponse for AppError {
@@ -63,13 +89,18 @@ impl IntoResponse for AppError {
             AppError::Python(_) => (StatusCode::INTERNAL_SERVER_ERROR, "PYTHON_ERROR"),
             AppError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "IO_ERROR"),
             AppError::Serialization(_) => (StatusCode::BAD_REQUEST, "SERIALIZATION_ERROR"),
+            AppError::FrameTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "FRAME_TOO_LARGE"),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
         };
+
+        // Log full internal details for operational debugging.
+        // The sanitized message is what goes to the client.
+        tracing::error!(error_code = %code, detail = %self.to_string(), "request error");
 
         let body = Json(json!({
             "error": {
                 "code": code,
-                "message": self.to_string(),
+                "message": self.pub_error_message(),
             }
         }));
 
@@ -86,5 +117,72 @@ impl From<anyhow::Error> for AppError {
 impl From<Box<dyn std::error::Error + Send + Sync>> for AppError {
     fn from(err: Box<dyn std::error::Error + Send + Sync>) -> Self {
         AppError::Internal(err.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pub_error_message_does_not_leak_paths() {
+        let err = AppError::ModelNotFound(
+            "bert at /home/user/models/bert".to_string());
+        assert_eq!(err.pub_error_message(), "model not found");
+        assert!(!err.pub_error_message().contains("/home/user"));
+
+        let err = AppError::Io(
+            std::io::Error::new(std::io::ErrorKind::NotFound, "file not found"));
+        assert_eq!(err.pub_error_message(), "internal server error");
+        assert!(!err.pub_error_message().contains("file not found"));
+
+        let err = AppError::Internal("something broke at line 42".to_string());
+        assert_eq!(err.pub_error_message(), "internal server error");
+    }
+
+    #[test]
+    fn test_pub_error_message_variants() {
+        assert_eq!(
+            AppError::ModelNotReady("x".to_string()).pub_error_message(),
+            "model not ready"
+        );
+        assert_eq!(
+            AppError::VersionNotFound("a".to_string(), "b".to_string()).pub_error_message(),
+            "model version not found"
+        );
+        assert_eq!(
+            AppError::InferenceTimeout("x".to_string()).pub_error_message(),
+            "inference timeout"
+        );
+        assert_eq!(
+            AppError::QueueFull("x".to_string()).pub_error_message(),
+            "queue full"
+        );
+        assert_eq!(
+            AppError::WorkerCrashed("x".to_string()).pub_error_message(),
+            "service temporarily unavailable"
+        );
+        assert_eq!(
+            AppError::Validation("x".to_string()).pub_error_message(),
+            "validation error"
+        );
+        assert_eq!(
+            AppError::Config("x".to_string()).pub_error_message(),
+            "invalid configuration"
+        );
+        assert_eq!(
+            AppError::Transport("x".to_string()).pub_error_message(),
+            "transport error"
+        );
+        assert_eq!(
+            AppError::Python("x".to_string()).pub_error_message(),
+            "internal server error"
+        );
+        assert_eq!(
+            AppError::Serialization(
+                serde_json::from_str::<serde_json::Value>("invalid").unwrap_err()
+            ).pub_error_message(),
+            "serialization error"
+        );
     }
 }

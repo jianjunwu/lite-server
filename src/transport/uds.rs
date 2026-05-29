@@ -11,6 +11,9 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{error, info, warn};
 
+/// Maximum allowed frame size for UDS transport (16 MiB).
+const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
 #[cfg(unix)]
 type Stream = UnixStream;
 #[cfg(windows)]
@@ -322,6 +325,10 @@ async fn read_frame(reader: &mut ReadHalf<Stream>) -> Result<Vec<u8>, AppError> 
         .map_err(|e| AppError::Transport(format!("read len from UDS: {}", e)))?;
     let resp_len = u32::from_be_bytes(len_buf) as usize;
 
+    if resp_len > MAX_FRAME_SIZE {
+        return Err(AppError::FrameTooLarge);
+    }
+
     let mut resp_buf = vec![0u8; resp_len];
     reader
         .read_exact(&mut resp_buf)
@@ -435,8 +442,58 @@ pub fn start_response_consumer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
-    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn test_read_frame_rejects_oversized() {
+        let tmp_dir = std::env::temp_dir()
+            .join(format!("lite-server-frame-test-{}", std::process::id()));
+        tokio::fs::create_dir_all(&tmp_dir).await.unwrap();
+        let socket_path = tmp_dir.join("test.sock");
+
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let len = (MAX_FRAME_SIZE + 1) as u32;
+            stream.write_all(&len.to_be_bytes()).await.unwrap();
+        });
+
+        let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let (mut read_half, _) = split(stream);
+
+        let result = read_frame(&mut read_half).await;
+        assert!(matches!(result, Err(AppError::FrameTooLarge)));
+
+        server_task.await.unwrap();
+        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_read_frame_accepts_normal_size() {
+        let tmp_dir = std::env::temp_dir()
+            .join(format!("lite-server-frame-test-{}", std::process::id()));
+        tokio::fs::create_dir_all(&tmp_dir).await.unwrap();
+        let socket_path = tmp_dir.join("test.sock");
+
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let payload = b"hello world";
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let len = payload.len() as u32;
+            stream.write_all(&len.to_be_bytes()).await.unwrap();
+            stream.write_all(payload).await.unwrap();
+        });
+
+        let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let (mut read_half, _) = split(stream);
+
+        let result = read_frame(&mut read_half).await.unwrap();
+        assert_eq!(result, payload);
+
+        server_task.await.unwrap();
+        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+    }
 
     #[tokio::test]
     async fn test_worker_connection_close_aborts_tasks() {
