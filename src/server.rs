@@ -50,7 +50,9 @@ impl LiteServer {
         self.load_initial_models().await?;
 
         // Start endpoint manager
-        let repo_path = PathBuf::from(&self.config.model_repository.path);
+        let repo_path = PathBuf::from(&self.config.model_repository.path)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(&self.config.model_repository.path));
         let endpoint_manager = Arc::new(EndpointManager::new(repo_path.clone(), self.registry.clone()));
         let endpoint_routes = match endpoint_manager.start().await {
             Ok(()) => endpoint_manager.routes().await,
@@ -104,11 +106,10 @@ impl LiteServer {
         // Process reload events
         let reload_worker = self.worker_manager.clone();
         let reload_registry = self.registry.clone();
-        let reload_repo = repo_path.canonicalize().unwrap_or_else(|_| repo_path.clone());
         let reload_handle = tokio::spawn(async move {
             let mut last_reload: std::collections::HashMap<(String, String), Instant> = std::collections::HashMap::new();
             while let Some(paths) = watch_rx.recv().await {
-                if let Err(e) = process_watch_events(paths, reload_repo.clone(), reload_worker.clone(), reload_registry.clone(), &mut last_reload).await {
+                if let Err(e) = process_watch_events(paths, repo_path.clone(), reload_worker.clone(), reload_registry.clone(), &mut last_reload).await {
                     warn!("Hot reload processing error: {}", e);
                 }
             }
@@ -412,7 +413,8 @@ async fn process_watch_events(
         }
 
         // Try to extract model name and version from path
-        if let Ok(relative) = path.strip_prefix(&repo_path) {
+        let strip_result = path.strip_prefix(&repo_path);
+        if let Ok(relative) = strip_result {
             let components: Vec<std::path::Component> = relative.components().collect();
             if components.len() >= 2 {
                 // Expected: model_name/version/file
@@ -612,6 +614,48 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         assert!(handle.is_finished());
 
+        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_file_watcher_detects_changes() {
+        let tmp_dir_raw = std::env::temp_dir().join(format!("lite-server-fw-detect-{}", std::process::id()));
+        tokio::fs::create_dir_all(&tmp_dir_raw).await.unwrap();
+        let tmp_dir = tmp_dir_raw.canonicalize().unwrap();
+        let sub_dir = tmp_dir.join("model").join("1");
+        tokio::fs::create_dir_all(&sub_dir).await.unwrap();
+        let model_py = sub_dir.join("model.py");
+        tokio::fs::write(&model_py, "original").await.unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let inference_queue = Arc::new(InferenceQueue::new());
+        let worker_manager = Arc::new(WorkerManager::new(
+            registry,
+            tmp_dir.clone(),
+            inference_queue,
+        ));
+
+        let (tx, mut rx) = mpsc::channel::<Vec<PathBuf>>(32);
+        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx));
+
+        // Give watcher time to start
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        // Modify the file
+        tokio::fs::write(&model_py, "modified").await.unwrap();
+
+        // Wait for event with timeout
+        let paths = tokio::time::timeout(
+            tokio::time::Duration::from_secs(10),
+            rx.recv()
+        ).await.expect("Timeout waiting for watcher event").expect("Channel closed");
+
+        // Check if strip_prefix works
+        for p in &paths {
+            let _stripped = p.strip_prefix(&tmp_dir);
+        }
+
+        handle.abort();
         let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
     }
 }

@@ -23,7 +23,7 @@ fn start_server(args: &[&str]) -> std::process::Child {
     cmd.arg("serve")
         .current_dir(project_root())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::inherit());
 
     for arg in args {
         cmd.arg(arg);
@@ -247,6 +247,7 @@ class TestAPI(LitAPI):
         &repo_dst.to_string_lossy(),
         "--no-metrics",
         "--log-level", "warn",
+        "--log-verbose",
     ]);
 
     wait_for_server(18005, 15).await;

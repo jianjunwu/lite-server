@@ -65,6 +65,7 @@ pub fn run_server(
         cfg.logging.error_output.as_deref(),
         &cfg.logging.rotation,
         cfg.logging.max_size,
+        false,
     );
     info!("Starting lite-server v{}", env!("CARGO_PKG_VERSION"));
     info!("HTTP port: {}", cfg.server.http_port);

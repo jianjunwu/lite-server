@@ -448,7 +448,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_frame_rejects_oversized() {
         let tmp_dir = std::env::temp_dir()
-            .join(format!("lite-server-frame-test-{}", std::process::id()));
+            .join(format!("lite-server-frame-oversized-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp_dir).await.unwrap();
         let socket_path = tmp_dir.join("test.sock");
 
@@ -472,7 +472,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_frame_accepts_normal_size() {
         let tmp_dir = std::env::temp_dir()
-            .join(format!("lite-server-frame-test-{}", std::process::id()));
+            .join(format!("lite-server-frame-normal-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp_dir).await.unwrap();
         let socket_path = tmp_dir.join("test.sock");
 

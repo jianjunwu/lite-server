@@ -50,6 +50,10 @@ enum Commands {
         /// Disable metrics
         #[arg(long)]
         no_metrics: bool,
+
+        /// Also log to stderr (useful when stdout is piped)
+        #[arg(long)]
+        log_verbose: bool,
     },
 
     /// Validate configuration file
@@ -74,6 +78,7 @@ async fn main() {
             log_level,
             metrics_port,
             no_metrics,
+            log_verbose,
         } => {
             let mut cfg = if let Some(config_path) = config {
                 match lite_server::config::load_config(&config_path) {
@@ -121,6 +126,7 @@ async fn main() {
                 cfg.logging.error_output.as_deref(),
                 &cfg.logging.rotation,
                 cfg.logging.max_size,
+                log_verbose,
             );
 
             info!("Starting lite-server v{}", env!("CARGO_PKG_VERSION"));
