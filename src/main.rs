@@ -66,6 +66,10 @@ enum Commands {
         /// Disable gRPC server
         #[arg(long)]
         no_grpc: bool,
+
+        /// Disable streaming metrics collection
+        #[arg(long)]
+        no_streaming_metrics: bool,
     },
 
     /// Validate configuration file
@@ -94,6 +98,7 @@ async fn main() {
             transport,
             grpc_port,
             no_grpc,
+            no_streaming_metrics,
         } => {
             let mut cfg = if let Some(config_path) = config {
                 match lite_server::config::load_config(&config_path) {
@@ -141,6 +146,9 @@ async fn main() {
             }
             if no_grpc {
                 cfg.grpc.enabled = false;
+            }
+            if no_streaming_metrics {
+                cfg.features.streaming_metrics = false;
             }
 
             // Initialize logging

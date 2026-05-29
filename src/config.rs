@@ -151,6 +151,7 @@ pub struct FeaturesConfig {
     pub grpc_streaming: bool,
     pub sse: bool,
     pub websocket_streaming: bool,
+    pub streaming_metrics: bool,
 }
 
 impl Default for FeaturesConfig {
@@ -167,6 +168,7 @@ impl Default for FeaturesConfig {
             grpc_streaming: true,
             sse: true,
             websocket_streaming: true,
+            streaming_metrics: true,
         }
     }
 }
@@ -313,6 +315,7 @@ mod tests {
         assert_eq!(cfg.model_repository.path, "./model_repo");
         assert!(cfg.features.streaming);
         assert!(cfg.features.websocket_streaming);
+        assert!(cfg.features.streaming_metrics);
         assert_eq!(cfg.orchestration.control_mode, "explicit");
     }
 

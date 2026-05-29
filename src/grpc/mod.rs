@@ -19,13 +19,15 @@ pub use pb::lite_server_server::{LiteServer, LiteServerServer};
 pub struct GrpcService {
     registry: Arc<ModelRegistry>,
     worker_manager: Arc<WorkerManager>,
+    streaming_metrics: bool,
 }
 
 impl GrpcService {
-    pub fn new(registry: Arc<ModelRegistry>, worker_manager: Arc<WorkerManager>) -> Self {
+    pub fn new(registry: Arc<ModelRegistry>, worker_manager: Arc<WorkerManager>, streaming_metrics: bool) -> Self {
         Self {
             registry,
             worker_manager,
+            streaming_metrics,
         }
     }
 }
@@ -293,10 +295,31 @@ impl LiteServer for GrpcService {
         let (tx, rx) = mpsc::channel(64);
         let cancel_client = client.clone();
 
+        let stream_metrics = self.streaming_metrics;
+        let metrics_model = model_name.to_string();
+        let metrics_version = resolved_version.clone();
+        if stream_metrics {
+            crate::metrics::prometheus::record_stream_open(&metrics_model, &metrics_version, "grpc");
+        }
+
         tokio::spawn(async move {
+            let open_time = std::time::Instant::now();
+            let mut first_chunk = true;
+            let mut last_chunk_time = open_time;
+
             while let Some(chunk) = chunk_rx.recv().await {
                 match chunk.payload {
                     Some(pb::stream_response::Payload::Chunk(ref c)) => {
+                        if stream_metrics {
+                            if first_chunk {
+                                crate::metrics::prometheus::record_stream_ttft(&metrics_model, &metrics_version, "grpc", open_time.elapsed().as_secs_f64());
+                                first_chunk = false;
+                            } else {
+                                crate::metrics::prometheus::record_stream_tbt(&metrics_model, &metrics_version, "grpc", last_chunk_time.elapsed().as_secs_f64());
+                            }
+                            last_chunk_time = std::time::Instant::now();
+                            crate::metrics::prometheus::record_stream_chunk(&metrics_model, &metrics_version, "grpc");
+                        }
                         let grpc_chunk = pb::StreamChunk {
                             data: c.data.clone(),
                         };
@@ -313,6 +336,9 @@ impl LiteServer for GrpcService {
                     }
                     _ => {}
                 }
+            }
+            if stream_metrics {
+                crate::metrics::prometheus::record_stream_close(&metrics_model, &metrics_version, "grpc");
             }
             // Cleanup: send cancel to worker
             let cancel_req = streaming::build_stream_cancel(stream_id);
@@ -411,6 +437,13 @@ impl LiteServer for GrpcService {
         let (tx, rx) = mpsc::channel(64);
         let worker_client = client.clone();
 
+        let stream_metrics = self.streaming_metrics;
+        let metrics_model = model_name.clone();
+        let metrics_version = resolved_version.clone();
+        if stream_metrics {
+            crate::metrics::prometheus::record_stream_open(&metrics_model, &metrics_version, "grpc");
+        }
+
         // Spawn forwarder: worker chunks -> gRPC stream
         let stream_id_for_incoming = stream_id.clone();
         tokio::spawn(async move {
@@ -436,9 +469,23 @@ impl LiteServer for GrpcService {
             });
 
             // Forward worker chunks -> gRPC
+            let open_time = std::time::Instant::now();
+            let mut first_chunk = true;
+            let mut last_chunk_time = open_time;
+
             while let Some(chunk) = chunk_rx.recv().await {
                 match chunk.payload {
                     Some(pb::stream_response::Payload::Chunk(ref c)) => {
+                        if stream_metrics {
+                            if first_chunk {
+                                crate::metrics::prometheus::record_stream_ttft(&metrics_model, &metrics_version, "grpc", open_time.elapsed().as_secs_f64());
+                                first_chunk = false;
+                            } else {
+                                crate::metrics::prometheus::record_stream_tbt(&metrics_model, &metrics_version, "grpc", last_chunk_time.elapsed().as_secs_f64());
+                            }
+                            last_chunk_time = std::time::Instant::now();
+                            crate::metrics::prometheus::record_stream_chunk(&metrics_model, &metrics_version, "grpc");
+                        }
                         let bidi_chunk = pb::BidiChunk {
                             stream_id: stream_id.clone(),
                             payload: Some(pb::bidi_chunk::Payload::Data(pb::BidiData {
@@ -470,6 +517,10 @@ impl LiteServer for GrpcService {
                 }
             }
 
+            if stream_metrics {
+                crate::metrics::prometheus::record_stream_close(&metrics_model, &metrics_version, "grpc");
+            }
+
             incoming_task.abort();
         });
 
@@ -483,12 +534,13 @@ pub async fn start_grpc_server(
     port: u16,
     registry: Arc<ModelRegistry>,
     worker_manager: Arc<WorkerManager>,
+    streaming_metrics: bool,
 ) -> Result<(), AppError> {
     let addr: std::net::SocketAddr = format!("{}:{}", host, port)
         .parse()
         .map_err(|e| AppError::Config(format!("invalid gRPC address: {}", e)))?;
 
-    let service = GrpcService::new(registry, worker_manager);
+    let service = GrpcService::new(registry, worker_manager, streaming_metrics);
     let server = LiteServerServer::new(service);
 
     tracing::info!("Starting gRPC server on {}", addr);

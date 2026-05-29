@@ -89,6 +89,7 @@ impl LiteServer {
                 self.config.server.grpc_port,
                 self.registry.clone(),
                 self.worker_manager.clone(),
+                self.config.features.streaming_metrics,
             ))
         } else {
             None
@@ -102,7 +103,7 @@ impl LiteServer {
                 tick.tick().await;
                 let models = registry_for_timeline.list_loaded().await;
                 for (name, version, _) in models {
-                    crate::metrics::aggregator::TIMELINE.sample(&name, &version);
+                    crate::metrics::aggregator::TIMELINE.sample(&name, &version).await;
                 }
             }
         });

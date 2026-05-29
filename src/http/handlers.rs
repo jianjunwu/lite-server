@@ -431,17 +431,17 @@ async fn do_infer(
     let response = match tokio::time::timeout(timeout_duration, response_rx).await {
         Ok(Ok(resp)) => resp,
         Ok(Err(_)) => {
-            prometheus::record_request_end(&model_name, &resolved_version, "5xx", start.elapsed().as_secs_f64());
+            prometheus::record_request_end(&model_name, &resolved_version, "5xx", start.elapsed().as_secs_f64()).await;
             return Err(AppError::InferenceTimeout("response channel closed".to_string()));
         }
         Err(_) => {
-            prometheus::record_request_end(&model_name, &resolved_version, "5xx", start.elapsed().as_secs_f64());
+            prometheus::record_request_end(&model_name, &resolved_version, "5xx", start.elapsed().as_secs_f64()).await;
             return Err(AppError::InferenceTimeout("request timeout".to_string()));
         }
     };
 
     let duration = start.elapsed().as_secs_f64();
-    prometheus::record_worker_metrics(&model_name, response.metrics.as_ref());
+    prometheus::record_worker_metrics(&model_name, response.metrics.as_ref()).await;
 
     // Parse protobuf response
     match response.payload {
@@ -454,24 +454,24 @@ async fn do_infer(
             let code = single.status.as_ref().map(|s| s.code.as_str()).unwrap_or("Ok");
             match code {
                 "Ok" => {
-                    prometheus::record_request_end(&model_name, &resolved_version, "2xx", duration);
+                    prometheus::record_request_end(&model_name, &resolved_version, "2xx", duration).await;
                     Ok(Json(data))
                 }
                 "Error" => {
                     let msg = single.status.as_ref().and_then(|s| {
                         if s.message.is_empty() { None } else { Some(s.message.clone()) }
                     }).unwrap_or_else(|| "unknown worker error".to_string());
-                    prometheus::record_request_end(&model_name, &resolved_version, "5xx", duration);
+                    prometheus::record_request_end(&model_name, &resolved_version, "5xx", duration).await;
                     Err(AppError::WorkerCrashed(msg))
                 }
                 _ => {
-                    prometheus::record_request_end(&model_name, &resolved_version, "2xx", duration);
+                    prometheus::record_request_end(&model_name, &resolved_version, "2xx", duration).await;
                     Ok(Json(data))
                 }
             }
         }
         _ => {
-            prometheus::record_request_end(&model_name, &resolved_version, "5xx", duration);
+            prometheus::record_request_end(&model_name, &resolved_version, "5xx", duration).await;
             Err(AppError::WorkerCrashed("unexpected response type".to_string()))
         }
     }
@@ -574,12 +574,31 @@ pub async fn sse_infer_handler(
     let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
     let (stream_id, mut chunk_rx) = open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await?;
 
+    let stream_metrics = state.config.features.streaming_metrics;
+    if stream_metrics {
+        prometheus::record_stream_open(&model_name, &resolved_version, "sse");
+    }
+
     let (event_tx, event_rx) = mpsc::channel(64);
 
     tokio::spawn(async move {
+        let open_time = std::time::Instant::now();
+        let mut first_chunk = true;
+        let mut last_chunk_time = open_time;
+
         while let Some(chunk) = chunk_rx.recv().await {
             let event = match &chunk.payload {
                 Some(pb::stream_response::Payload::Chunk(c)) => {
+                    if stream_metrics {
+                        if first_chunk {
+                            prometheus::record_stream_ttft(&model_name, &resolved_version, "sse", open_time.elapsed().as_secs_f64());
+                            first_chunk = false;
+                        } else {
+                            prometheus::record_stream_tbt(&model_name, &resolved_version, "sse", last_chunk_time.elapsed().as_secs_f64());
+                        }
+                        last_chunk_time = std::time::Instant::now();
+                        prometheus::record_stream_chunk(&model_name, &resolved_version, "sse");
+                    }
                     let data = String::from_utf8_lossy(&c.data);
                     Event::default().data(data.to_string())
                 }
@@ -597,6 +616,9 @@ pub async fn sse_infer_handler(
             if matches!(chunk.payload, Some(pb::stream_response::Payload::Done(_))) {
                 break;
             }
+        }
+        if stream_metrics {
+            prometheus::record_stream_close(&model_name, &resolved_version, "sse");
         }
         // Ensure stream is cleaned up on worker side
         let cancel_req = streaming::build_stream_cancel(stream_id);
@@ -627,12 +649,31 @@ pub async fn sse_infer_version_handler(
     let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
     let (stream_id, mut chunk_rx) = open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await?;
 
+    let stream_metrics = state.config.features.streaming_metrics;
+    if stream_metrics {
+        prometheus::record_stream_open(&model_name, &resolved_version, "sse");
+    }
+
     let (event_tx, event_rx) = mpsc::channel(64);
 
     tokio::spawn(async move {
+        let open_time = std::time::Instant::now();
+        let mut first_chunk = true;
+        let mut last_chunk_time = open_time;
+
         while let Some(chunk) = chunk_rx.recv().await {
             let event = match &chunk.payload {
                 Some(pb::stream_response::Payload::Chunk(c)) => {
+                    if stream_metrics {
+                        if first_chunk {
+                            prometheus::record_stream_ttft(&model_name, &resolved_version, "sse", open_time.elapsed().as_secs_f64());
+                            first_chunk = false;
+                        } else {
+                            prometheus::record_stream_tbt(&model_name, &resolved_version, "sse", last_chunk_time.elapsed().as_secs_f64());
+                        }
+                        last_chunk_time = std::time::Instant::now();
+                        prometheus::record_stream_chunk(&model_name, &resolved_version, "sse");
+                    }
                     let data = String::from_utf8_lossy(&c.data);
                     Event::default().data(data.to_string())
                 }
@@ -650,6 +691,9 @@ pub async fn sse_infer_version_handler(
             if matches!(chunk.payload, Some(pb::stream_response::Payload::Done(_))) {
                 break;
             }
+        }
+        if stream_metrics {
+            prometheus::record_stream_close(&model_name, &resolved_version, "sse");
         }
         let cancel_req = streaming::build_stream_cancel(stream_id);
         let _ = open_worker_stream_cancel(state, cancel_req).await;
@@ -744,11 +788,30 @@ async fn handle_ws_stream(
         }
     };
 
+    let stream_metrics = state.config.features.streaming_metrics;
+    if stream_metrics {
+        prometheus::record_stream_open(&model_name, &resolved_version, "websocket");
+    }
+
     // Spawn task to forward worker chunks -> WebSocket
     let mut send_task = tokio::spawn(async move {
+        let open_time = std::time::Instant::now();
+        let mut first_chunk = true;
+        let mut last_chunk_time = open_time;
+
         while let Some(chunk) = chunk_rx.recv().await {
             let msg = match &chunk.payload {
                 Some(pb::stream_response::Payload::Chunk(c)) => {
+                    if stream_metrics {
+                        if first_chunk {
+                            prometheus::record_stream_ttft(&model_name, &resolved_version, "websocket", open_time.elapsed().as_secs_f64());
+                            first_chunk = false;
+                        } else {
+                            prometheus::record_stream_tbt(&model_name, &resolved_version, "websocket", last_chunk_time.elapsed().as_secs_f64());
+                        }
+                        last_chunk_time = std::time::Instant::now();
+                        prometheus::record_stream_chunk(&model_name, &resolved_version, "websocket");
+                    }
                     Message::Binary(c.data.clone())
                 }
                 Some(pb::stream_response::Payload::Error(e)) => {
@@ -766,6 +829,9 @@ async fn handle_ws_stream(
                 let _ = socket.close().await;
                 break;
             }
+        }
+        if stream_metrics {
+            prometheus::record_stream_close(&model_name, &resolved_version, "websocket");
         }
         stream_id
     });
@@ -862,7 +928,7 @@ pub async fn custom_endpoint_handler(
 // ===== Timeline =====
 
 pub async fn timeline_handler() -> impl IntoResponse {
-    let snapshots = crate::metrics::aggregator::TIMELINE.all_snapshots();
+    let snapshots = crate::metrics::aggregator::TIMELINE.all_snapshots().await;
     Json(json!({ "snapshots": snapshots }))
 }
 
@@ -878,7 +944,7 @@ pub async fn timeline_model_handler(
     let version = query.version.unwrap_or_else(|| "1".to_string());
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_identifier(&version)?;
-    let entries = crate::metrics::aggregator::TIMELINE.get_timeline(&model_name, &version);
+    let entries = crate::metrics::aggregator::TIMELINE.get_timeline(&model_name, &version).await;
     Ok(Json(json!({
         "model": model_name,
         "version": version,
@@ -889,7 +955,7 @@ pub async fn timeline_model_handler(
 // ===== Alerts =====
 
 pub async fn alerts_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let alerts = state.alert_engine.evaluate(&crate::metrics::aggregator::TIMELINE);
+    let alerts = state.alert_engine.evaluate(&crate::metrics::aggregator::TIMELINE).await;
     Json(json!({ "alerts": alerts }))
 }
 
@@ -902,7 +968,7 @@ pub async fn compare_versions_handler(
     match crate::metrics::aggregator::VersionComparator::compare(
         &crate::metrics::aggregator::TIMELINE,
         &model_name,
-    ) {
+    ).await {
         Some(comp) => Ok(Json(json!(comp))),
         None => Err(AppError::ModelNotFound(format!(
             "No timeline data for model {}",

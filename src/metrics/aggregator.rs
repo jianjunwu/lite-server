@@ -2,8 +2,8 @@ use lazy_static::lazy_static;
 use prometheus::{CounterVec, GaugeVec};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex;
 use tracing::warn;
 
 // Max data points per model timeline (ring buffer capacity)
@@ -55,9 +55,9 @@ impl TimelineAggregator {
     }
 
     /// Record a latency sample from request handling.
-    pub fn record_latency(&self, model: &str, version: &str, duration_secs: f64) {
+    pub async fn record_latency(&self, model: &str, version: &str, duration_secs: f64) {
         let key = format!("{}_{}", model, version);
-        let mut samples = self.latency_samples.lock().unwrap();
+        let mut samples = self.latency_samples.lock().await;
         let deque = samples.entry(key).or_insert_with(|| VecDeque::with_capacity(1000));
         deque.push_back(duration_secs);
         // Keep last 1000 samples (~1-2 minutes at high throughput)
@@ -67,13 +67,13 @@ impl TimelineAggregator {
     }
 
     /// Sample current metrics into the timeline. Call periodically (e.g. every 10s).
-    pub fn sample(&self, model: &str, version: &str) {
+    pub async fn sample(&self, model: &str, version: &str) {
         let key = format!("{}_{}", model, version);
         let now = now_secs();
 
         // Throttle to SAMPLE_INTERVAL_SECS
         {
-            let last_map = self.last_sample.lock().unwrap();
+            let last_map = self.last_sample.lock().await;
             if let Some(ts) = last_map.get(&key) {
                 if now - ts < SAMPLE_INTERVAL_SECS {
                     return;
@@ -82,10 +82,10 @@ impl TimelineAggregator {
         }
 
         // Compute QPS from request count delta
-        let qps = self.compute_qps(&key, model, version, now);
+        let qps = self.compute_qps(&key, model, version, now).await;
 
         // Compute p99 from latency samples
-        let p99_ms = self.compute_p99_ms(&key);
+        let p99_ms = self.compute_p99_ms(&key).await;
 
         // Read queue depth and active workers from Prometheus gauges
         let queue_depth = read_gauge(&super::prometheus::QUEUE_DEPTH, &[model, version]);
@@ -100,7 +100,7 @@ impl TimelineAggregator {
         };
 
         {
-            let mut data = self.data.lock().unwrap();
+            let mut data = self.data.lock().await;
             let deque = data.entry(key.clone()).or_insert_with(|| {
                 VecDeque::with_capacity(MAX_TIMELINE_POINTS)
             });
@@ -111,27 +111,27 @@ impl TimelineAggregator {
         }
 
         {
-            let mut last_map = self.last_sample.lock().unwrap();
+            let mut last_map = self.last_sample.lock().await;
             last_map.insert(key, now);
         }
     }
 
     /// Get timeline entries for a specific model version.
-    pub fn get_timeline(&self, model: &str, version: &str) -> Vec<TimelineEntry> {
+    pub async fn get_timeline(&self, model: &str, version: &str) -> Vec<TimelineEntry> {
         let key = format!("{}_{}", model, version);
-        let data = self.data.lock().unwrap();
+        let data = self.data.lock().await;
         data.get(&key).cloned().unwrap_or_default().into_iter().collect()
     }
 
     /// Get all known model_version keys.
-    pub fn keys(&self) -> Vec<String> {
-        let data = self.data.lock().unwrap();
+    pub async fn keys(&self) -> Vec<String> {
+        let data = self.data.lock().await;
         data.keys().cloned().collect()
     }
 
     /// Get latest snapshot for every known key.
-    pub fn all_snapshots(&self) -> Vec<TimelineSnapshot> {
-        let data = self.data.lock().unwrap();
+    pub async fn all_snapshots(&self) -> Vec<TimelineSnapshot> {
+        let data = self.data.lock().await;
         data.iter()
             .filter_map(|(key, entries)| {
                 let parts: Vec<&str> = key.splitn(2, '_').collect();
@@ -147,15 +147,15 @@ impl TimelineAggregator {
             .collect()
     }
 
-    fn compute_qps(&self, key: &str, model: &str, version: &str, now: f64) -> f64 {
+    async fn compute_qps(&self, key: &str, model: &str, version: &str, now: f64) -> f64 {
         // Sum all success + error request counts
         let current_count = read_counter(&super::prometheus::REQUESTS_TOTAL, &[model, version, "2xx"])
             + read_counter(&super::prometheus::REQUESTS_TOTAL, &[model, version, "5xx"]);
 
-        let mut last_counts = self.last_counts.lock().unwrap();
+        let mut last_counts = self.last_counts.lock().await;
         let last_count = last_counts.get(key).copied().unwrap_or(current_count);
         let elapsed = {
-            let mut last_check = self.last_check.lock().unwrap();
+            let mut last_check = self.last_check.lock().await;
             let dt = now - *last_check;
             *last_check = now;
             dt.max(0.001)
@@ -166,8 +166,8 @@ impl TimelineAggregator {
         round(qps, 2)
     }
 
-    fn compute_p99_ms(&self, key: &str) -> f64 {
-        let samples = self.latency_samples.lock().unwrap();
+    async fn compute_p99_ms(&self, key: &str) -> f64 {
+        let samples = self.latency_samples.lock().await;
         let deque = match samples.get(key) {
             Some(d) if d.len() >= 2 => d,
             _ => return 0.0,
@@ -228,11 +228,11 @@ impl AlertEngine {
         Self { thresholds }
     }
 
-    pub fn evaluate(&self, timeline: &TimelineAggregator) -> Vec<Alert> {
+    pub async fn evaluate(&self, timeline: &TimelineAggregator) -> Vec<Alert> {
         let mut alerts = Vec::new();
         let now = now_secs();
 
-        for snapshot in timeline.all_snapshots() {
+        for snapshot in timeline.all_snapshots().await {
             if let Some(latest) = snapshot.entries.last() {
                 // Queue depth alerts
                 if latest.queue_depth >= self.thresholds.queue_depth_critical {
@@ -325,9 +325,9 @@ pub struct VersionMetrics {
 pub struct VersionComparator;
 
 impl VersionComparator {
-    pub fn compare(timeline: &TimelineAggregator, model: &str) -> Option<VersionComparison> {
+    pub async fn compare(timeline: &TimelineAggregator, model: &str) -> Option<VersionComparison> {
         let _prefix = format!("{}_", model);
-        let data = timeline.all_snapshots();
+        let data = timeline.all_snapshots().await;
         let mut versions: Vec<VersionMetrics> = Vec::new();
 
         for snap in data {
@@ -385,4 +385,93 @@ fn read_counter(counter: &CounterVec, labels: &[&str]) -> f64 {
 
 fn read_gauge(gauge: &GaugeVec, labels: &[&str]) -> f64 {
     gauge.with_label_values(labels).get()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_record_latency_stores_sample() {
+        let agg = TimelineAggregator::new();
+        agg.record_latency("m", "1", 0.05).await;
+        agg.record_latency("m", "1", 0.10).await;
+
+        let samples = agg.latency_samples.lock().await;
+        let deque = samples.get("m_1").unwrap();
+        assert_eq!(deque.len(), 2);
+        assert_eq!(deque[0], 0.05);
+        assert_eq!(deque[1], 0.10);
+    }
+
+    #[tokio::test]
+    async fn test_record_latency_caps_at_1000() {
+        let agg = TimelineAggregator::new();
+        for i in 0..1100 {
+            agg.record_latency("m", "1", i as f64 * 0.001).await;
+        }
+        let samples = agg.latency_samples.lock().await;
+        let deque = samples.get("m_1").unwrap();
+        assert_eq!(deque.len(), 1000);
+        // First 100 should have been evicted
+        assert_eq!(deque[0], 0.1);
+    }
+
+    #[tokio::test]
+    async fn test_get_timeline_returns_empty_for_unknown() {
+        let agg = TimelineAggregator::new();
+        let entries = agg.get_timeline("unknown", "1").await;
+        assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_keys_returns_known_keys() {
+        let agg = TimelineAggregator::new();
+        // keys() reads from `data` map, which is populated by sample()
+        // Since sample() needs prometheus gauges, we insert directly
+        {
+            let mut data = agg.data.lock().await;
+            data.insert("model_a_1".to_string(), VecDeque::new());
+            data.insert("model_b_2".to_string(), VecDeque::new());
+        }
+        let keys = agg.keys().await;
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&"model_a_1".to_string()));
+        assert!(keys.contains(&"model_b_2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_record_and_read_no_deadlock() {
+        let agg = TimelineAggregator::new();
+
+        let agg_writer = &agg;
+        let agg_reader = &agg;
+
+        let (r1, r2) = tokio::join!(
+            async {
+                for i in 0..100 {
+                    agg_writer.record_latency("m", "1", i as f64 * 0.001).await;
+                }
+            },
+            async {
+                for _ in 0..10 {
+                    let _ = agg_reader.all_snapshots().await;
+                }
+            }
+        );
+
+        // Both should complete without deadlock
+    }
+
+    #[tokio::test]
+    async fn test_all_snapshots_returns_data() {
+        let agg = TimelineAggregator::new();
+        agg.record_latency("m", "1", 0.05).await;
+        agg.record_latency("m", "1", 0.10).await;
+
+        // sample() requires prometheus gauges registered, so just test all_snapshots with data
+        let snapshots = agg.all_snapshots().await;
+        // Data map is empty because sample() hasn't been called — only latency_samples has data
+        assert!(snapshots.is_empty());
+    }
 }

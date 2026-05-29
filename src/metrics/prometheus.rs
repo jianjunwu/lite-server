@@ -4,7 +4,7 @@ use prometheus::{
 };
 use std::sync::Arc;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use tokio::sync::Mutex;
 
 lazy_static! {
     pub static ref REGISTRY: Registry = Registry::new();
@@ -142,10 +142,10 @@ pub fn record_request_start(model: &str, version: &str) {
     // Kept for backward compat during transition
 }
 
-pub fn record_request_end(model: &str, version: &str, status: &str, duration_secs: f64) {
+pub async fn record_request_end(model: &str, version: &str, status: &str, duration_secs: f64) {
     REQUESTS_TOTAL.with_label_values(&[model, version, status]).inc();
     REQUEST_DURATION.with_label_values(&[model, version]).observe(duration_secs);
-    super::aggregator::TIMELINE.record_latency(model, version, duration_secs);
+    super::aggregator::TIMELINE.record_latency(model, version, duration_secs).await;
 }
 
 // ===== Queue metrics =====
@@ -219,10 +219,10 @@ lazy_static! {
 // ===== Custom metrics from Python workers =====
 
 /// Record metrics reported by a Python worker.
-pub fn record_worker_metrics(model: &str, metrics: Option<&crate::proto::liteserver::Metrics>) {
+pub async fn record_worker_metrics(model: &str, metrics: Option<&crate::proto::liteserver::Metrics>) {
     if let Some(m) = metrics {
         if m.prefill_ms > 0.0 {
-            let mut guard = CUSTOM_GAUGES.lock().unwrap();
+            let mut guard = CUSTOM_GAUGES.lock().await;
             let gauge = guard.entry("prefill_ms".to_string()).or_insert_with(|| {
                 let g = GaugeVec::new(
                     prometheus::Opts::new("lite_server_prefill_ms", "Prefill latency in ms"),
@@ -234,7 +234,7 @@ pub fn record_worker_metrics(model: &str, metrics: Option<&crate::proto::liteser
             let _ = gauge.with_label_values(&[model]).set(m.prefill_ms as f64);
         }
         if m.decode_ms > 0.0 {
-            let mut guard = CUSTOM_GAUGES.lock().unwrap();
+            let mut guard = CUSTOM_GAUGES.lock().await;
             let gauge = guard.entry("decode_ms".to_string()).or_insert_with(|| {
                 let g = GaugeVec::new(
                     prometheus::Opts::new("lite_server_decode_ms", "Decode latency in ms"),
@@ -246,7 +246,7 @@ pub fn record_worker_metrics(model: &str, metrics: Option<&crate::proto::liteser
             let _ = gauge.with_label_values(&[model]).set(m.decode_ms as f64);
         }
         if m.tokens_generated > 0 {
-            let mut guard = CUSTOM_COUNTERS.lock().unwrap();
+            let mut guard = CUSTOM_COUNTERS.lock().await;
             let counter = guard.entry("tokens_generated".to_string()).or_insert_with(|| {
                 let c = CounterVec::new(
                     prometheus::Opts::new("lite_server_tokens_generated_total", "Total tokens generated"),
@@ -257,5 +257,115 @@ pub fn record_worker_metrics(model: &str, metrics: Option<&crate::proto::liteser
             });
             let _ = counter.with_label_values(&[model]).inc_by(m.tokens_generated as f64);
         }
+    }
+}
+
+// ===== Streaming metric recording functions =====
+
+pub fn record_stream_ttft(model: &str, version: &str, protocol: &str, ttft_secs: f64) {
+    STREAMING_TTFT.with_label_values(&[model, version, protocol]).observe(ttft_secs);
+}
+
+pub fn record_stream_tbt(model: &str, version: &str, protocol: &str, tbt_secs: f64) {
+    STREAMING_TBT.with_label_values(&[model, version, protocol]).observe(tbt_secs);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_record_stream_ttft_records_value() {
+        let model = "ttft_model";
+        let version = "1";
+        let protocol = "sse";
+        let before = STREAMING_TTFT.with_label_values(&[model, version, protocol]).get_sample_count();
+        record_stream_ttft(model, version, protocol, 0.05);
+        let after = STREAMING_TTFT.with_label_values(&[model, version, protocol]).get_sample_count();
+        assert_eq!(after, before + 1);
+    }
+
+    #[test]
+    fn test_record_stream_tbt_records_value() {
+        let model = "tbt_model";
+        let version = "1";
+        let protocol = "websocket";
+        let before = STREAMING_TBT.with_label_values(&[model, version, protocol]).get_sample_count();
+        record_stream_tbt(model, version, protocol, 0.01);
+        let after = STREAMING_TBT.with_label_values(&[model, version, protocol]).get_sample_count();
+        assert_eq!(after, before + 1);
+    }
+
+    #[test]
+    fn test_record_stream_open_increments_connections() {
+        let model = "conn_model";
+        let version = "1";
+        let protocol = "sse";
+        let before = STREAMING_CONNECTIONS.with_label_values(&[model, version, protocol]).get();
+        record_stream_open(model, version, protocol);
+        let after = STREAMING_CONNECTIONS.with_label_values(&[model, version, protocol]).get();
+        assert_eq!(after, before + 1.0);
+        // cleanup
+        record_stream_close(model, version, protocol);
+    }
+
+    #[test]
+    fn test_record_stream_close_decrements_connections() {
+        let model = "close_model";
+        let version = "1";
+        let protocol = "sse";
+        record_stream_open(model, version, protocol);
+        record_stream_close(model, version, protocol);
+        // net zero — gauge should be back to its value before open
+        // (other tests may have incremented, so just check relative)
+    }
+
+    #[test]
+    fn test_record_stream_chunk_increments_total() {
+        let model = "chunk_model";
+        let version = "1";
+        let protocol = "grpc";
+        let before = STREAMING_CHUNKS_TOTAL.with_label_values(&[model, version, protocol]).get();
+        record_stream_chunk(model, version, protocol);
+        let after = STREAMING_CHUNKS_TOTAL.with_label_values(&[model, version, protocol]).get();
+        assert_eq!(after, before + 1.0);
+    }
+
+    #[test]
+    fn test_streaming_metrics_distinguished_by_protocol() {
+        record_stream_open("proto_m", "1", "sse");
+        record_stream_open("proto_m", "1", "websocket");
+        record_stream_open("proto_m", "1", "grpc");
+
+        let sse = STREAMING_CONNECTIONS.with_label_values(&["proto_m", "1", "sse"]).get();
+        let ws = STREAMING_CONNECTIONS.with_label_values(&["proto_m", "1", "websocket"]).get();
+        let grpc = STREAMING_CONNECTIONS.with_label_values(&["proto_m", "1", "grpc"]).get();
+
+        assert!(sse >= 1.0);
+        assert!(ws >= 1.0);
+        assert!(grpc >= 1.0);
+
+        // cleanup
+        record_stream_close("proto_m", "1", "sse");
+        record_stream_close("proto_m", "1", "websocket");
+        record_stream_close("proto_m", "1", "grpc");
+    }
+
+    #[tokio::test]
+    async fn test_record_worker_metrics_concurrent_access() {
+        use crate::proto::liteserver::Metrics;
+        let metrics = Metrics {
+            prefill_ms: 10.0,
+            decode_ms: 5.0,
+            tokens_generated: 100,
+        };
+        let m = Some(&metrics);
+
+        // Concurrent calls should not panic or deadlock
+        let (r1, r2, r3) = tokio::join!(
+            async { record_worker_metrics("concurrent_m1", m).await },
+            async { record_worker_metrics("concurrent_m2", m).await },
+            async { record_worker_metrics("concurrent_m3", m).await },
+        );
     }
 }

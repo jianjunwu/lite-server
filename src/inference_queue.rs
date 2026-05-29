@@ -199,7 +199,7 @@ async fn send_batch(
 
     match result {
         Ok(resp) => {
-            crate::metrics::prometheus::record_worker_metrics(model_name, resp.metrics.as_ref());
+            crate::metrics::prometheus::record_worker_metrics(model_name, resp.metrics.as_ref()).await;
             match resp.payload {
                 Some(pb::response::Payload::Batch(batch_resp)) => {
                     let resp_map: std::collections::HashMap<String, pb::BatchItemResponse> =
