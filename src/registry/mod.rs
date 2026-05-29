@@ -228,3 +228,329 @@ impl Default for ModelRegistry {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ModelConfig;
+    use crate::registry::types::*;
+
+    fn test_config() -> ModelConfig {
+        ModelConfig {
+            max_batch_size: 1,
+            ..Default::default()
+        }
+    }
+
+    fn tmp_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("lite-server-reg-test-{}", std::process::id()))
+    }
+
+    // --- Basic lifecycle ---
+
+    #[tokio::test]
+    async fn test_register_and_get() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .await
+            .unwrap();
+
+        let mv = reg.get("m1", Some("1")).await.unwrap();
+        assert_eq!(mv.version, "1");
+        assert_eq!(mv.status, VersionStatus::Loading);
+    }
+
+    #[tokio::test]
+    async fn test_set_status() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .await
+            .unwrap();
+
+        reg.set_status("m1", "1", VersionStatus::Ready)
+            .await
+            .unwrap();
+
+        let mv = reg.get("m1", Some("1")).await.unwrap();
+        assert_eq!(mv.status, VersionStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn test_is_ready() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .await
+            .unwrap();
+
+        assert!(!reg.is_ready("m1", Some("1")).await);
+
+        reg.set_status("m1", "1", VersionStatus::Ready)
+            .await
+            .unwrap();
+
+        assert!(reg.is_ready("m1", Some("1")).await);
+    }
+
+    #[tokio::test]
+    async fn test_is_ready_nonexistent() {
+        let reg = ModelRegistry::new();
+        assert!(!reg.is_ready("nope", Some("1")).await);
+    }
+
+    // --- Activate version ---
+
+    #[tokio::test]
+    async fn test_activate_version() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .await
+            .unwrap();
+        reg.set_status("m1", "1", VersionStatus::Ready)
+            .await
+            .unwrap();
+
+        let ok = reg.activate_version("m1", "1").await.unwrap();
+        assert!(ok);
+        assert_eq!(reg.get_active_version("m1").await, Some("1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_activate_not_ready_fails() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .await
+            .unwrap();
+        // status is Loading, not Ready
+
+        let ok = reg.activate_version("m1", "1").await.unwrap();
+        assert!(!ok);
+        assert_eq!(reg.get_active_version("m1").await, None);
+    }
+
+    #[tokio::test]
+    async fn test_activate_nonexistent_model_errors() {
+        let reg = ModelRegistry::new();
+        let result = reg.activate_version("nope", "1").await;
+        assert!(result.is_err());
+    }
+
+    // --- Deactivate ---
+
+    #[tokio::test]
+    async fn test_deactivate() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .await
+            .unwrap();
+        reg.set_status("m1", "1", VersionStatus::Ready)
+            .await
+            .unwrap();
+        reg.activate_version("m1", "1").await.unwrap();
+
+        reg.deactivate("m1").await;
+        assert_eq!(reg.get_active_version("m1").await, None);
+    }
+
+    // --- Multiple versions ---
+
+    #[tokio::test]
+    async fn test_multiple_versions() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .await
+            .unwrap();
+        reg.register("m1", "2", test_config(), ModelType::LitAPI, tmp_dir())
+            .await
+            .unwrap();
+
+        let versions = reg.list_versions("m1").await;
+        assert_eq!(versions.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_activate_switches_version() {
+        let reg = ModelRegistry::new();
+        for v in &["1", "2"] {
+            reg.register("m1", v, test_config(), ModelType::LitAPI, tmp_dir())
+                .await
+                .unwrap();
+            reg.set_status("m1", v, VersionStatus::Ready)
+                .await
+                .unwrap();
+        }
+
+        reg.activate_version("m1", "1").await.unwrap();
+        assert_eq!(reg.get_active_version("m1").await, Some("1".to_string()));
+
+        reg.activate_version("m1", "2").await.unwrap();
+        assert_eq!(reg.get_active_version("m1").await, Some("2".to_string()));
+    }
+
+    // --- Remove ---
+
+    #[tokio::test]
+    async fn test_remove_version() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .await
+            .unwrap();
+
+        reg.remove("m1", "1").await.unwrap();
+        assert!(reg.get("m1", Some("1")).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_remove_auto_activates_another_ready() {
+        let reg = ModelRegistry::new();
+        for v in &["1", "2"] {
+            reg.register("m1", v, test_config(), ModelType::LitAPI, tmp_dir())
+                .await
+                .unwrap();
+            reg.set_status("m1", v, VersionStatus::Ready)
+                .await
+                .unwrap();
+        }
+        reg.activate_version("m1", "1").await.unwrap();
+
+        reg.remove("m1", "1").await.unwrap();
+        // Should auto-activate v2
+        assert_eq!(reg.get_active_version("m1").await, Some("2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_remove_active_no_other_ready_clears_active() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .await
+            .unwrap();
+        reg.set_status("m1", "1", VersionStatus::Ready)
+            .await
+            .unwrap();
+        reg.activate_version("m1", "1").await.unwrap();
+
+        reg.remove("m1", "1").await.unwrap();
+        assert_eq!(reg.get_active_version("m1").await, None);
+    }
+
+    #[tokio::test]
+    async fn test_remove_last_version_removes_model() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .await
+            .unwrap();
+
+        reg.remove("m1", "1").await.unwrap();
+        assert!(reg.list_loaded().await.is_empty());
+    }
+
+    // --- list_loaded ---
+
+    #[tokio::test]
+    async fn test_list_loaded_empty() {
+        let reg = ModelRegistry::new();
+        assert!(reg.list_loaded().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_loaded_multiple_models() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .await
+            .unwrap();
+        reg.register("m2", "1", test_config(), ModelType::Ensemble, tmp_dir())
+            .await
+            .unwrap();
+
+        let loaded = reg.list_loaded().await;
+        assert_eq!(loaded.len(), 2);
+    }
+
+    // --- Set workers ---
+
+    #[tokio::test]
+    async fn test_set_workers() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .await
+            .unwrap();
+
+        let workers = vec![WorkerInfo {
+            worker_id: 0,
+            device: "cpu:0".to_string(),
+            endpoint: "ipc:///tmp/w0.sock".to_string(),
+            pid: Some(1234),
+            status: WorkerStatus::Ready,
+        }];
+        reg.set_workers("m1", "1", workers).await.unwrap();
+
+        let mv = reg.get("m1", Some("1")).await.unwrap();
+        assert_eq!(mv.workers.len(), 1);
+        assert_eq!(mv.workers[0].pid, Some(1234));
+    }
+
+    // --- get with active version ---
+
+    #[tokio::test]
+    async fn test_get_uses_active_version_when_none_specified() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .await
+            .unwrap();
+        reg.set_status("m1", "1", VersionStatus::Ready)
+            .await
+            .unwrap();
+        reg.activate_version("m1", "1").await.unwrap();
+
+        let mv = reg.get("m1", None).await.unwrap();
+        assert_eq!(mv.version, "1");
+    }
+
+    #[tokio::test]
+    async fn test_get_returns_none_when_no_active() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .await
+            .unwrap();
+
+        let mv = reg.get("m1", None).await;
+        assert!(mv.is_none());
+    }
+
+    // --- Strategy ---
+
+    #[tokio::test]
+    async fn test_set_and_get_strategy() {
+        let reg = ModelRegistry::new();
+        let strategy = ModelStrategyConfig {
+            name: "m1".to_string(),
+            load_policy: "latest".to_string(),
+            max_loaded_versions: Some(2),
+            ..Default::default()
+        };
+
+        reg.set_strategy("m1", &strategy).await.unwrap();
+        let got = reg.get_strategy("m1").await.unwrap();
+        assert_eq!(got.load_policy, "latest");
+        assert_eq!(got.max_loaded_versions, Some(2));
+    }
+
+    // --- set_status on nonexistent ---
+
+    #[tokio::test]
+    async fn test_set_status_nonexistent_model_errors() {
+        let reg = ModelRegistry::new();
+        let result = reg.set_status("nope", "1", VersionStatus::Ready).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_set_status_nonexistent_version_errors() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .await
+            .unwrap();
+
+        let result = reg.set_status("m1", "99", VersionStatus::Ready).await;
+        assert!(result.is_err());
+    }
+}

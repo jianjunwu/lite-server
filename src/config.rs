@@ -286,3 +286,182 @@ pub fn load_model_config(path: &Path) -> anyhow::Result<ModelConfig> {
     let config: ModelConfig = serde_yaml::from_str(&content)?;
     Ok(config)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    // --- Default values ---
+
+    #[test]
+    fn test_server_config_defaults() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.http_port, 8000);
+        assert_eq!(cfg.grpc_port, 8001);
+        assert_eq!(cfg.host, "0.0.0.0");
+        assert_eq!(cfg.timeout, 30.0);
+        assert_eq!(cfg.transport, "zmq");
+    }
+
+    #[test]
+    fn test_config_defaults() {
+        let cfg = Config::default();
+        assert_eq!(cfg.server.http_port, 8000);
+        assert!(cfg.grpc.enabled);
+        assert!(cfg.metrics.enabled);
+        assert_eq!(cfg.model_repository.path, "./model_repo");
+        assert!(cfg.features.streaming);
+        assert!(cfg.features.websocket_streaming);
+        assert_eq!(cfg.orchestration.control_mode, "explicit");
+    }
+
+    #[test]
+    fn test_model_config_defaults() {
+        let cfg = ModelConfig::default();
+        assert_eq!(cfg.api_path, "/predict");
+        assert_eq!(cfg.max_batch_size, 1);
+        assert!(!cfg.stream);
+        assert!(!cfg.continuous_batching);
+        assert_eq!(cfg.max_queue_size, 1000);
+    }
+
+    // --- load_config ---
+
+    #[test]
+    fn test_load_config_valid_yaml() {
+        let dir = std::env::temp_dir().join("lite-server-config-test-valid");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("server.yaml");
+        fs::write(&path, "server:\n  http_port: 9090\n  host: 127.0.0.1\n").unwrap();
+
+        let cfg = load_config(path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.server.http_port, 9090);
+        assert_eq!(cfg.server.host, "127.0.0.1");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_config_missing_file() {
+        let result = load_config("/tmp/nonexistent-lite-server-config.yaml");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_config_invalid_yaml() {
+        let dir = std::env::temp_dir().join("lite-server-config-test-invalid");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("bad.yaml");
+        fs::write(&path, "server: [invalid").unwrap();
+
+        let result = load_config(path.to_str().unwrap());
+        assert!(result.is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_config_partial_fields() {
+        let dir = std::env::temp_dir().join("lite-server-config-test-partial");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("partial.yaml");
+        fs::write(&path, "server:\n  http_port: 7777\n").unwrap();
+
+        let cfg = load_config(path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.server.http_port, 7777);
+        // Other fields should be defaults
+        assert_eq!(cfg.server.host, "0.0.0.0");
+        assert_eq!(cfg.server.grpc_port, 8001);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- load_model_config ---
+
+    #[test]
+    fn test_load_model_config_valid() {
+        let dir = std::env::temp_dir().join("lite-server-model-config-valid");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("config.yaml");
+        fs::write(&path, "max_batch_size: 4\nstream: true\napi_path: /generate\n").unwrap();
+
+        let cfg = load_model_config(&path).unwrap();
+        assert_eq!(cfg.max_batch_size, 4);
+        assert!(cfg.stream);
+        assert_eq!(cfg.api_path, "/generate");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_model_config_missing_file_returns_default() {
+        let path = Path::new("/tmp/nonexistent-lite-server-model-config.yaml");
+        let cfg = load_model_config(path).unwrap();
+        assert_eq!(cfg.max_batch_size, 1);
+        assert!(!cfg.stream);
+    }
+
+    #[test]
+    fn test_load_model_config_empty_file_returns_default() {
+        let dir = std::env::temp_dir().join("lite-server-model-config-empty");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("config.yaml");
+        fs::write(&path, "").unwrap();
+
+        let cfg = load_model_config(&path).unwrap();
+        assert_eq!(cfg.max_batch_size, 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- load_orchestration ---
+
+    #[test]
+    fn test_load_orchestration_valid() {
+        let dir = std::env::temp_dir().join("lite-server-orch-valid");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("orchestration.yaml");
+        fs::write(&path, "control_mode: auto\npoll_interval: 10\n").unwrap();
+
+        let orch = load_orchestration(&path).unwrap();
+        assert_eq!(orch.control_mode, "auto");
+        assert_eq!(orch.poll_interval, 10);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_orchestration_missing_file_returns_default() {
+        let path = Path::new("/tmp/nonexistent-lite-server-orch.yaml");
+        let orch = load_orchestration(path).unwrap();
+        assert_eq!(orch.control_mode, "explicit");
+    }
+
+    // --- Serialization roundtrip ---
+
+    #[test]
+    fn test_config_yaml_roundtrip() {
+        let cfg = Config::default();
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        let parsed: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.server.http_port, cfg.server.http_port);
+        assert_eq!(parsed.server.host, cfg.server.host);
+        assert_eq!(parsed.grpc.enabled, cfg.grpc.enabled);
+    }
+
+    #[test]
+    fn test_model_config_yaml_roundtrip() {
+        let cfg = ModelConfig {
+            max_batch_size: 8,
+            stream: true,
+            api_path: "/v2/generate".to_string(),
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        let parsed: ModelConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.max_batch_size, 8);
+        assert!(parsed.stream);
+        assert_eq!(parsed.api_path, "/v2/generate");
+    }
+}

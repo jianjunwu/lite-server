@@ -496,3 +496,35 @@ pub fn pick_worker_random(num_workers: usize) -> usize {
     use rand::Rng;
     rand::thread_rng().gen_range(0..num_workers.max(1))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pick_worker_random_single() {
+        // With 1 worker, always returns 0
+        for _ in 0..100 {
+            assert_eq!(pick_worker_random(1), 0);
+        }
+    }
+
+    #[test]
+    fn test_pick_worker_random_zero_treated_as_one() {
+        // 0 workers should still return 0 (max(1) fallback)
+        assert_eq!(pick_worker_random(0), 0);
+    }
+
+    #[test]
+    fn test_pick_worker_random_distribution() {
+        // With multiple workers, all should be picked at least once
+        let n = 4;
+        let mut seen = vec![false; n];
+        for _ in 0..1000 {
+            let idx = pick_worker_random(n);
+            assert!(idx < n, "idx {} >= num_workers {}", idx, n);
+            seen[idx] = true;
+        }
+        assert!(seen.iter().all(|&s| s), "not all workers were picked");
+    }
+}
