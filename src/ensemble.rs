@@ -339,8 +339,8 @@ async fn execute_step(
     let (response_tx, response_rx) = oneshot::channel();
     let item = crate::inference_queue::QueueItem {
         uid: uid.clone(),
-        data: payload_bytes,
-        meta: Some(meta),
+        data: bytes::Bytes::from(payload_bytes),
+        meta: Some(std::sync::Arc::new(meta)),
         response_tx,
     };
 

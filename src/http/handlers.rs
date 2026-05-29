@@ -408,8 +408,8 @@ async fn do_infer(
     let (response_tx, response_rx) = oneshot::channel();
     let item = crate::inference_queue::QueueItem {
         uid: uid.clone(),
-        data: meta.payload.clone(),
-        meta: Some(meta),
+        data: bytes::Bytes::from(meta.payload.clone()),
+        meta: Some(std::sync::Arc::new(meta)),
         response_tx,
     };
 

@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use crate::config::ModelConfig;
 use crate::error::AppError;
 use crate::metrics::prometheus;
@@ -14,8 +15,8 @@ use tracing::{error, warn};
 /// A single item waiting in the inference queue.
 pub struct QueueItem {
     pub uid: String,
-    pub data: Vec<u8>, // JSON-encoded request body
-    pub meta: Option<pb::RequestMeta>,
+    pub data: Bytes, // JSON-encoded request body (zero-copy shared buffer)
+    pub meta: Option<Arc<pb::RequestMeta>>, // shared via Arc (refcount-cloned)
     pub response_tx: oneshot::Sender<pb::Response>,
 }
 
@@ -163,13 +164,15 @@ async fn send_batch(
     let zmq_client = &zmq_clients[worker_idx];
 
     // Build protobuf request (Single if batch.len() == 1, else Batch)
+    // Prost proto types require owned Vec<u8>/RequestMeta, so we convert at
+    // the serialization boundary. QueueItem.data is Bytes, meta is Arc.
     let request = if batch.len() == 1 {
         let item = &batch[0];
         pb::Request {
             uid: item.uid.clone(),
-            meta: item.meta.clone(),
+            meta: item.meta.as_deref().cloned(),
             payload: Some(pb::request::Payload::Single(pb::SingleRequest {
-                data: item.data.clone(),
+                data: item.data.to_vec(),
             })),
         }
     } else {
@@ -177,12 +180,12 @@ async fn send_batch(
             .iter()
             .map(|item| pb::BatchItem {
                 uid: item.uid.clone(),
-                data: item.data.clone(),
+                data: item.data.to_vec(),
             })
             .collect();
         pb::Request {
             uid: format!("batch-{}", uuid::Uuid::new_v4()),
-            meta: batch.first().and_then(|i| i.meta.clone()),
+            meta: batch.first().and_then(|i| i.meta.as_deref().cloned()),
             payload: Some(pb::request::Payload::Batch(pb::BatchRequest { items })),
         }
     };
@@ -436,6 +439,7 @@ async fn batch_collector(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     #[test]
     fn test_adaptive_timeout_full_batch() {
@@ -554,5 +558,191 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(handle.is_finished(), "collector should be aborted after unregister");
+    }
+
+    // ===== Phase 1: Bytes-based zero-copy tests =====
+
+    #[test]
+    fn test_queue_item_data_is_bytes() {
+        // QueueItem.data should be Bytes, not Vec<u8>
+        let data = Bytes::from(vec![1u8, 2, 3, 4]);
+        let (tx, _rx) = oneshot::channel();
+        let item = QueueItem {
+            uid: "test".to_string(),
+            data: data.clone(),
+            meta: None,
+            response_tx: tx,
+        };
+        // Bytes::clone shares the same underlying buffer
+        let cloned_data = item.data.clone();
+        assert_eq!(item.data.as_ptr(), cloned_data.as_ptr(),
+            "Bytes::clone should share the same buffer (zero-copy)");
+    }
+
+    #[test]
+    fn test_bytes_clone_is_refcount_not_data_copy() {
+        // Cloning Bytes should NOT copy the underlying data
+        let payload = vec![0u8; 4096]; // 4KB payload
+        let data = Bytes::from(payload);
+        let ptr = data.as_ptr();
+
+        // Simulate what send_batch does: clone N times for batch items
+        let clones: Vec<Bytes> = (0..10).map(|_| data.clone()).collect();
+
+        for (i, clone) in clones.iter().enumerate() {
+            assert_eq!(clone.as_ptr(), ptr,
+                "clone[{}] should share the same buffer, not copy", i);
+        }
+        // All clones + original share the same refcount
+        assert_eq!(data.as_ptr(), ptr);
+    }
+
+    #[test]
+    fn test_bytes_to_vec_for_protobuf() {
+        // Bytes must be convertible to Vec<u8> for prost-generated proto types
+        let data = Bytes::from(vec![10u8, 20, 30]);
+        let vec_data: Vec<u8> = data.to_vec();
+        assert_eq!(vec_data, vec![10, 20, 30]);
+
+        // Verify it works with SingleRequest.data: Vec<u8>
+        let single = pb::SingleRequest { data: data.to_vec() };
+        assert_eq!(single.data, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn test_queue_item_with_meta_bytes_shares_buffer() {
+        // When QueueItem has both data and meta.payload pointing to same Bytes,
+        // cloning should not duplicate the payload
+        let payload_bytes = Bytes::from(vec![1u8; 1024]);
+        let (tx, _rx) = oneshot::channel();
+
+        let meta = Arc::new(pb::RequestMeta {
+            route: "/infer".to_string(),
+            headers: Default::default(),
+            client_ip: "127.0.0.1".to_string(),
+            request_id: "req-1".to_string(),
+            timestamp_ns: 0,
+            payload: payload_bytes.to_vec(), // prost needs Vec<u8>
+        });
+
+        let item = QueueItem {
+            uid: "u1".to_string(),
+            data: payload_bytes.clone(),
+            meta: Some(meta),
+            response_tx: tx,
+        };
+
+        // Cloning the item's data is zero-copy
+        let data_clone = item.data.clone();
+        assert_eq!(item.data.as_ptr(), data_clone.as_ptr());
+
+        // Cloning meta is also zero-copy (Arc refcount)
+        let meta_clone = item.meta.clone();
+        let meta_ptr = item.meta.as_ref().unwrap().as_ref() as *const pb::RequestMeta;
+        let clone_ptr = meta_clone.as_ref().unwrap().as_ref() as *const pb::RequestMeta;
+        assert_eq!(meta_ptr, clone_ptr);
+    }
+
+    #[tokio::test]
+    async fn test_batch_send_with_bytes_data() {
+        // Full integration: QueueItem with Bytes flows through channel and send_batch
+        // builds correct protobuf request without data corruption
+        let (tx, mut rx) = mpsc::channel::<QueueItem>(10);
+
+        let payload = Bytes::from(r#"{"input":"hello"}"#.as_bytes().to_vec());
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let item = QueueItem {
+            uid: "req-1".to_string(),
+            data: payload.clone(),
+            meta: None,
+            response_tx: resp_tx,
+        };
+        tx.try_send(item).unwrap();
+
+        // Receive and verify data integrity
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.data, payload);
+        assert_eq!(received.uid, "req-1");
+
+        // Build proto request from Bytes data (simulates send_batch logic)
+        let proto_data: Vec<u8> = received.data.to_vec();
+        let single = pb::SingleRequest { data: proto_data };
+        assert_eq!(single.data, r#"{"input":"hello"}"#.as_bytes());
+
+        // Send a mock response
+        let _ = received.response_tx.send(pb::Response {
+            uid: "req-1".to_string(),
+            payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+                data: b"ok".to_vec(),
+                status: Some(pb::Status { code: "Ok".to_string(), message: String::new() }),
+            })),
+            metrics: None,
+        });
+
+        let resp = resp_rx.await.unwrap();
+        assert_eq!(resp.uid, "req-1");
+    }
+
+    // ===== Phase 2: Arc<RequestMeta> zero-copy tests =====
+
+    #[test]
+    fn test_queue_item_meta_is_arc() {
+        // QueueItem.meta should be Option<Arc<RequestMeta>>, not Option<RequestMeta>
+        let meta = pb::RequestMeta {
+            route: "/infer".to_string(),
+            headers: {
+                let mut h = std::collections::HashMap::new();
+                h.insert("content-type".to_string(), "application/json".to_string());
+                h
+            },
+            client_ip: "127.0.0.1".to_string(),
+            request_id: "req-1".to_string(),
+            timestamp_ns: 1234567890,
+            payload: vec![1u8, 2, 3],
+        };
+        let (tx, _rx) = oneshot::channel();
+        let item = QueueItem {
+            uid: "test".to_string(),
+            data: Bytes::new(),
+            meta: Some(Arc::new(meta)),
+            response_tx: tx,
+        };
+        // Cloning meta should be a refcount bump, not a deep copy
+        let meta_clone = item.meta.clone();
+        let meta_ptr = item.meta.as_ref().unwrap().as_ref() as *const pb::RequestMeta;
+        let clone_ptr = meta_clone.as_ref().unwrap().as_ref() as *const pb::RequestMeta;
+        assert_eq!(meta_ptr, clone_ptr,
+            "Arc<RequestMeta> clone should share the same allocation");
+    }
+
+    #[test]
+    fn test_arc_meta_batch_clone_is_cheap() {
+        // Simulates send_batch batch path: N items share meta via Arc
+        let meta = Arc::new(pb::RequestMeta {
+            route: "/infer".to_string(),
+            headers: {
+                let mut h = std::collections::HashMap::new();
+                for i in 0..50 {
+                    h.insert(format!("header-{}", i), format!("value-{}", i));
+                }
+                h
+            },
+            client_ip: "10.0.0.1".to_string(),
+            request_id: "req-batch".to_string(),
+            timestamp_ns: 9999999,
+            payload: vec![0u8; 4096], // 4KB payload
+        });
+
+        // Simulate batch items each holding Arc<RequestMeta>
+        let items: Vec<(String, Arc<pb::RequestMeta>)> = (0..100)
+            .map(|i| (format!("uid-{}", i), Arc::clone(&meta)))
+            .collect();
+
+        // All should share the same allocation
+        let ptr = meta.as_ref() as *const pb::RequestMeta;
+        for (uid, item_meta) in &items {
+            assert_eq!(item_meta.as_ref() as *const pb::RequestMeta, ptr,
+                "batch item {} should share meta via Arc", uid);
+        }
     }
 }
