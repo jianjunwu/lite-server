@@ -68,7 +68,7 @@ impl EndpointManager {
         #[cfg(windows)]
         let mut stream = {
             let path_str = self.uds_path.to_string_lossy();
-            let port = derive_port_from_path(&path_str);
+            let port = crate::transport::derive_port_from_path(&path_str);
             tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
                 .await
                 .map_err(|e| AppError::Transport(format!("failed to connect to endpoint: {}", e)))?
@@ -146,7 +146,10 @@ impl EndpointManager {
             let new_pythonpath = if current_pythonpath.is_empty() {
                 python_path
             } else {
-                format!("{}:{}", current_pythonpath, python_path)
+                #[cfg(windows)]
+                { format!("{};{}", current_pythonpath, python_path) }
+                #[cfg(not(windows))]
+                { format!("{}:{}", current_pythonpath, python_path) }
             };
             cmd.env("PYTHONPATH", new_pythonpath);
         }
@@ -262,12 +265,3 @@ impl EndpointManager {
 
 // Reuse the module path finder from WorkerManager
 use super::WorkerManager;
-
-#[cfg(windows)]
-fn derive_port_from_path(path: &str) -> u16 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
-    30000 + (hasher.finish() % 35535) as u16
-}

@@ -220,7 +220,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_zmq_client_cleanup_does_not_panic() {
-        let endpoint = format!("ipc:///tmp/lite-server-zmq-test-{}", std::process::id());
+        #[cfg(unix)]
+        let endpoint = {
+            let sock = std::env::temp_dir().join(format!("lite-server-zmq-test-{}.sock", std::process::id()));
+            format!("ipc://{}", sock.display())
+        };
+        #[cfg(windows)]
+        let endpoint = format!("tcp://127.0.0.1:{}", 31000 + std::process::id() % 1000);
         let client = WorkerZmqClient::new(endpoint.clone());
         drop(client);
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -228,7 +234,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_zmq_client_send_fails_when_no_peer() {
-        let endpoint = format!("ipc:///tmp/lite-server-zmq-test-timeout-{}", std::process::id());
+        #[cfg(unix)]
+        let endpoint = {
+            let sock = std::env::temp_dir().join(format!("lite-server-zmq-test-timeout-{}.sock", std::process::id()));
+            format!("ipc://{}", sock.display())
+        };
+        #[cfg(windows)]
+        let endpoint = format!("tcp://127.0.0.1:{}", 32000 + std::process::id() % 1000);
         let client = WorkerZmqClient::new(endpoint.clone());
 
         let request = pb::Request {

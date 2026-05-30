@@ -28,17 +28,8 @@ async fn connect_stream(path: &std::path::Path) -> Result<Stream, std::io::Error
 #[cfg(windows)]
 async fn connect_stream(path: &std::path::Path) -> Result<Stream, std::io::Error> {
     let path_str = path.to_string_lossy();
-    let port = derive_port_from_path(&path_str);
+    let port = crate::transport::derive_port_from_path(&path_str);
     TcpStream::connect(format!("127.0.0.1:{}", port)).await
-}
-
-#[cfg(windows)]
-fn derive_port_from_path(path: &str) -> u16 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
-    30000 + (hasher.finish() % 35535) as u16
 }
 
 lazy_static::lazy_static! {

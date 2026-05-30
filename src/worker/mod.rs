@@ -160,17 +160,17 @@ impl WorkerManager {
 
         for worker_id in 0..total_workers {
             let device = format!("{}:{}", accelerator, worker_id % devices);
-            let endpoint = format!(
-                "ipc:///tmp/lite-server/{}_{}_{}.sock",
-                model_name, version, worker_id
-            );
+            let endpoint = worker_endpoint(model_name, version, worker_id);
 
-            // Remove stale socket
-            let socket_str = endpoint.strip_prefix("ipc://").unwrap_or(&endpoint);
-            let socket_path = std::path::Path::new(socket_str);
-            let _ = tokio::fs::remove_file(socket_path).await;
-            if let Some(parent) = socket_path.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
+            // Remove stale socket (Unix only — TCP ports are released on process exit)
+            #[cfg(unix)]
+            {
+                let socket_str = endpoint.strip_prefix("ipc://").unwrap_or(&endpoint);
+                let socket_path = std::path::Path::new(socket_str);
+                let _ = tokio::fs::remove_file(socket_path).await;
+                if let Some(parent) = socket_path.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
             }
 
             // Find python module path
@@ -187,7 +187,10 @@ impl WorkerManager {
                 let new_pythonpath = if current_pythonpath.is_empty() {
                     python_module_dir
                 } else {
-                    format!("{}:{}", current_pythonpath, python_module_dir)
+                    #[cfg(windows)]
+                    { format!("{};{}", current_pythonpath, python_module_dir) }
+                    #[cfg(not(windows))]
+                    { format!("{}:{}", current_pythonpath, python_module_dir) }
                 };
                 cmd.env("PYTHONPATH", new_pythonpath);
             }
@@ -383,10 +386,13 @@ impl WorkerManager {
             let mut clients = self.zmq_clients.write().await;
             if let Some(mut procs) = workers.remove(&key) {
                 for mut proc in procs.drain(..) {
-                    // Clean up ZMQ socket file
-                    let socket_str = proc.endpoint.strip_prefix("ipc://").unwrap_or(&proc.endpoint);
-                    let socket_path = std::path::Path::new(socket_str);
-                    let _ = tokio::fs::remove_file(socket_path).await;
+                    // Clean up ZMQ socket file (Unix only)
+                    #[cfg(unix)]
+                    {
+                        let socket_str = proc.endpoint.strip_prefix("ipc://").unwrap_or(&proc.endpoint);
+                        let socket_path = std::path::Path::new(socket_str);
+                        let _ = tokio::fs::remove_file(socket_path).await;
+                    }
                     let _ = proc.child.kill().await;
                     let _ = proc.child.wait().await;
                 }
@@ -484,6 +490,25 @@ impl WorkerManager {
         }
 
         None
+    }
+}
+
+/// Build a platform-appropriate ZMQ endpoint for a worker.
+/// - Unix: IPC socket in the system temp directory
+/// - Windows: TCP on localhost (IPC not supported)
+fn worker_endpoint(model_name: &str, version: &str, worker_id: usize) -> String {
+    #[cfg(unix)]
+    {
+        let sock_path = std::env::temp_dir()
+            .join("lite-server")
+            .join(format!("{}_{}_{}.sock", model_name, version, worker_id));
+        format!("ipc://{}", sock_path.display())
+    }
+    #[cfg(windows)]
+    {
+        let key = format!("{}_{}_{}", model_name, version, worker_id);
+        let port = crate::transport::derive_port_from_path(&key);
+        format!("tcp://127.0.0.1:{}", port)
     }
 }
 
