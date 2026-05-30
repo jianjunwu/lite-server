@@ -1,6 +1,7 @@
 """pytest tests for lite_server.worker.inference (ZMQ + Protobuf)."""
 
 import json
+import sys
 import textwrap
 
 import pytest
@@ -79,6 +80,52 @@ class TestLoadLitAPI:
         '''))
         with pytest.raises(RuntimeError, match="No LitAPI subclass"):
             inference.load_litapi(str(model_py), {})
+
+    def test_loads_with_local_sibling_import(self, tmp_path):
+        """model.py that imports a sibling module (e.g. utils) should load successfully."""
+        utils_py = tmp_path / "utils.py"
+        utils_py.write_text(textwrap.dedent('''
+            def add(x):
+                return x + 1
+        '''))
+        model_py = tmp_path / "model.py"
+        model_py.write_text(textwrap.dedent('''
+            from utils import add
+
+            class MyModel:
+                def __init__(self, **kwargs):
+                    pass
+                def predict(self, x):
+                    return {"result": add(x)}
+        '''))
+        api = inference.load_litapi(str(model_py), {})
+        assert api.predict(5) == {"result": 6}
+
+    def test_sys_path_cleaned_after_load(self, tmp_path):
+        """model_dir should not remain in sys.path after load_litapi returns."""
+        # Clean sys.modules of any stale 'utils' from prior tests
+        saved_utils = sys.modules.pop("utils", None)
+        try:
+            utils_py = tmp_path / "utils.py"
+            utils_py.write_text("def noop(): pass\n")
+            model_py = tmp_path / "model.py"
+            model_py.write_text(textwrap.dedent('''
+                from utils import noop
+
+                class MyModel:
+                    def __init__(self, **kwargs):
+                        pass
+                    def predict(self, x):
+                        return x
+            '''))
+            model_dir = str(tmp_path)
+            assert model_dir not in sys.path
+            inference.load_litapi(str(model_py), {})
+            assert model_dir not in sys.path
+        finally:
+            sys.modules.pop("utils", None)
+            if saved_utils is not None:
+                sys.modules["utils"] = saved_utils
 
 
 class TestRunPredict:

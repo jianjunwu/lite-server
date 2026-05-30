@@ -93,9 +93,15 @@ def load_model_config(config_path: str):
 
 
 def load_litapi(model_py_path: str, config: dict, device: str = "cpu"):
+    model_dir = os.path.dirname(os.path.abspath(model_py_path))
     spec = importlib.util.spec_from_file_location("model_module", model_py_path)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+
+    sys.path.insert(0, model_dir)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(model_dir)
 
     LitAPIClass = None
     for attr_name in dir(module):
