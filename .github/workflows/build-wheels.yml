@@ -71,7 +71,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             platform: manylinux_2_28
             before-script: |
-              apt-get update && apt-get install -y protobuf-compiler
+              yum install -y protobuf-compiler
               curl -fsSL -o /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
               bash /tmp/miniconda.sh -b -p /opt/miniconda
               /opt/miniconda/bin/conda install -y python=3.10
@@ -81,7 +81,7 @@ jobs:
           #   target: aarch64-unknown-linux-gnu
           #   platform: manylinux_2_28
           #   before-script: |
-          #     apt-get update && apt-get install -y protobuf-compiler
+          #     yum install -y protobuf-compiler
           #   interpreter: python3.10
           # # macOS x86_64 (disabled: macos-13 runner scarce)
           # - os: macos-13
@@ -136,10 +136,6 @@ jobs:
           & "$env:USERPROFILE\miniconda\Scripts\conda.exe" install -y -c conda-forge libprotobuf
           "PROTOC=$env:USERPROFILE\miniconda\Library\bin\protoc.exe" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
 
-      - name: Set PROTOC for Linux
-        if: runner.os == 'Linux'
-        run: echo "PROTOC=/usr/bin/protoc" >> $GITHUB_ENV
-
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
@@ -147,8 +143,7 @@ jobs:
           manylinux: ${{ matrix.platform }}
           args: --release --interpreter ${{ matrix.interpreter }}
           before-script-linux: ${{ matrix.before-script }}
-        env:
-          PROTOC: ${{ env.PROTOC }}
+          docker-options: -e PROTOC=/usr/bin/protoc
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
