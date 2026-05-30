@@ -121,13 +121,6 @@ curl http://localhost:8000/status
 # => {"server": "lite-server", "loaded_models_count": 1, "loaded_models": [...]}
 ```
 
-## Legacy
-
-| Example | Description |
-|---------|-------------|
-| [model_repo/test_model](model_repo/test_model/) | Original test model (minimal echo) |
-| [model_repo/status_endpoint.py](model_repo/status_endpoint.py) | Custom endpoint example |
-
 ## More Documentation
 
 - [Model Authoring Guide](../docs/model-authoring.md) — Full `LitAPI` interface reference

@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 use serial_test::serial;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -57,6 +58,54 @@ fn stop_server(mut child: std::process::Child) {
         let _ = child.kill();
     }
     let _ = child.wait();
+}
+
+/// Create a self-contained model_repo in a temp directory with test_model and status_endpoint.
+fn create_test_model_repo() -> std::path::PathBuf {
+    let tmp = std::env::temp_dir().join(format!("lite-server-test-{}", std::process::id()));
+    let model_dir = tmp.join("test_model/1");
+    std::fs::create_dir_all(&model_dir).unwrap();
+
+    std::fs::write(
+        model_dir.join("model.py"),
+        r#"from litserve import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x * 2}
+
+    def encode_response(self, output):
+        return output
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        model_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        tmp.join("status_endpoint.py"),
+        "'''Custom endpoint example - GET /status returns server overview.'''\n\nmethods = [\"GET\"]\n\n\ndef handler(request, server):\n    '''Return a quick status overview of the server.'''\n    models = server.registry.list_loaded()\n    return {\n        \"server\": \"lite-server\",\n        \"loaded_models_count\": len(models),\n        \"loaded_models\": models,\n    }\n",
+    )
+    .unwrap();
+
+    tmp
+}
+
+/// Return a cached model_repo path (created once, reused across tests).
+fn test_model_repo() -> &'static std::path::PathBuf {
+    static REPO: OnceLock<std::path::PathBuf> = OnceLock::new();
+    REPO.get_or_init(create_test_model_repo)
 }
 
 async fn wait_for_server(port: u16, timeout_secs: u64) {
@@ -134,9 +183,10 @@ async fn ensure_shared_server() {
         wait_for_server(SHARED_PORT, 10).await;
         return;
     }
+    let repo = test_model_repo();
     let _child = start_server(&[
         "--port", &SHARED_PORT.to_string(),
-        "--model-repo", "./examples/model_repo",
+        "--model-repo", &repo.to_string_lossy(),
         "--no-metrics",
         "--no-grpc",
         "--log-level", "warn",
@@ -382,10 +432,11 @@ async fn test_websocket_streaming() {
 async fn test_metrics_endpoint() {
     let port = 18020;
     let metrics_port = 18021;
+    let repo = test_model_repo();
     let server = start_server(&[
         "--port", &port.to_string(),
         "--metrics-port", &metrics_port.to_string(),
-        "--model-repo", "./examples/model_repo",
+        "--model-repo", &repo.to_string_lossy(),
         "--no-grpc",
         "--log-level", "warn",
     ]);
@@ -457,7 +508,7 @@ class TestAPI(LitAPI):
 "#;
 
     let tmp_dir = std::env::temp_dir().join(format!("lite-server-hotreload-{}", std::process::id()));
-    let repo_src = project_root().join("examples/model_repo");
+    let repo_src = test_model_repo().clone();
     let repo_dst = tmp_dir.join("model_repo");
 
     tokio::fs::create_dir_all(&repo_dst).await.unwrap();
