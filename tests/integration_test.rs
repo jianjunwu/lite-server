@@ -1,9 +1,8 @@
 use reqwest;
 use serde_json::{json, Value};
 use serial_test::serial;
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -172,27 +171,55 @@ async fn unload_model(base: &str, model: &str, version: &str) {
 // Shared server fixture — one server for most tests
 // ---------------------------------------------------------------------------
 
-static SHARED_SERVER_STARTED: AtomicBool = AtomicBool::new(false);
+static SHARED_SERVER: Mutex<Option<Child>> = Mutex::new(None);
 
 const SHARED_PORT: u16 = 18010;
 
+/// Kill any stale lite-server-core process listening on the given port.
+fn kill_stale_on_port(port: u16) {
+    let output = Command::new("lsof")
+        .args(["-ti", &format!(":{}", port)])
+        .output();
+    if let Ok(out) = output {
+        let pids = String::from_utf8_lossy(&out.stdout);
+        for pid_str in pids.lines() {
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                // Verify it's our binary before killing
+                let ps = Command::new("ps")
+                    .args(["-p", &pid.to_string(), "-o", "comm="])
+                    .output();
+                if let Ok(ps_out) = ps {
+                    let comm = String::from_utf8_lossy(&ps_out.stdout);
+                    if comm.contains("lite-server") {
+                        unsafe { libc::kill(pid, libc::SIGKILL); }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Start the shared server once. Safe to call from async context.
 async fn ensure_shared_server() {
-    if SHARED_SERVER_STARTED.swap(true, Ordering::SeqCst) {
+    let mut guard = SHARED_SERVER.lock().unwrap();
+    if guard.is_some() {
         // Already started — wait for it to be ready
+        drop(guard);
         wait_for_server(SHARED_PORT, 10).await;
         return;
     }
+    kill_stale_on_port(SHARED_PORT);
     let repo = test_model_repo();
-    let _child = start_server(&[
+    let child = start_server(&[
         "--port", &SHARED_PORT.to_string(),
         "--model-repo", &repo.to_string_lossy(),
         "--no-metrics",
         "--no-grpc",
         "--log-level", "warn",
     ]);
+    *guard = Some(child);
+    drop(guard);
     wait_for_server(SHARED_PORT, 15).await;
-    // _child leaks intentionally — killed when test process exits
 }
 
 async fn shared_base() -> String {
@@ -432,6 +459,8 @@ async fn test_websocket_streaming() {
 async fn test_metrics_endpoint() {
     let port = 18020;
     let metrics_port = 18021;
+    kill_stale_on_port(port);
+    kill_stale_on_port(metrics_port);
     let repo = test_model_repo();
     let server = start_server(&[
         "--port", &port.to_string(),
@@ -522,6 +551,7 @@ class TestAPI(LitAPI):
     tokio::fs::write(&model_py, original).await.unwrap();
 
     let port = 18030;
+    kill_stale_on_port(port);
     let server = start_server(&[
         "--port", &port.to_string(),
         "--model-repo", &repo_dst.to_string_lossy(),

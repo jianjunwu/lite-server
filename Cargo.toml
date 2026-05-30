@@ -12,7 +12,7 @@ path = "src/main.rs"
 tokio = { version = "1.40", features = ["full", "process"] }
 
 # HTTP framework
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.7", features = ["ws", "multipart"] }
 hyper-util = { version = "0.1", features = ["server", "tokio"] }
 
 # serialization

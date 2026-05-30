@@ -46,6 +46,10 @@ pub fn create_routes(state: AppState, endpoint_routes: Vec<EndpointRoute>) -> Ro
         .route("/v2/repository/models/:model_name/unload", post(unload_model_handler))
         // Admin: reload
         .route("/v2/models/:model_name/reload", post(reload_model_handler))
+        // Admin: upload/download/list files
+        .route("/v2/repository/models/:model_name/versions/:version/upload", post(upload_model_handler))
+        .route("/v2/repository/models/:model_name/versions/:version/download", get(download_model_handler))
+        .route("/v2/repository/models/:model_name/versions/:version/files", get(list_files_handler))
         // Admin: delete version
         .route("/v2/models/:model_name/versions/:version", delete(delete_version_handler))
         // Admin: activate version
