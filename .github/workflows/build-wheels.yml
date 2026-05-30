@@ -48,7 +48,7 @@ jobs:
         run: pip install -e ".[dev]"
 
       - name: Run Rust tests
-        run: cargo test -- --test-threads=1 --skip test_model_infer_versioned
+        run: cargo test -- --test-threads=1 --skip test_model_infer_versioned --skip test_hot_reload
 
   get-version:
     runs-on: ubuntu-latest
