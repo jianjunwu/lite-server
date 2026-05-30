@@ -38,35 +38,23 @@
 # 1. 安装
 pip install litserve  # lite-server 依赖 litserve 的 LitAPI
 
-# 2. 创建模型
-mkdir -p model_repo/my_model/1
-cat > model_repo/my_model/1/model.py << 'EOF'
-from lite_server import LitAPI
-
-class MyAPI(LitAPI):
-    def setup(self, device):
-        self.model = lambda x: x * 2
-
-    def decode_request(self, request):
-        return request.get("input", 0)
-
-    def predict(self, x):
-        return self.model(x)
-
-    def encode_response(self, output):
-        return {"result": output}
-EOF
+# 2. 脚手架创建项目
+python -m lite_server init my_project --template empty
+cd my_project
 
 # 3. 启动服务
-python -m lite_server serve
-# 或者: lite-server-core serve
+python -m lite_server serve --config server.yaml
 
 # 4. 测试
+python test_request.py
+# 或手动测试：
 curl -X POST http://localhost:8000/v2/models/my_model/infer \
   -H 'Content-Type: application/json' \
   -d '{"input": 21}'
-# => {"result": 42}
+# => {"output": 42}
 ```
+
+可用模板：`empty`、`llm`、`cv-classify`、`cv-detect`、`nlp`。使用 `--wizard` 进入交互式选择。
 
 ## 架构
 
@@ -198,6 +186,7 @@ python -m lite_server init my_project           # 脚手架创建项目
 | 04 | [multi_version](examples/04_multi_version/) | 双版本切换演示 |
 | 05 | [ensemble](examples/05_ensemble/) | DAG 多模型流水线 |
 | 06 | [custom_endpoint](examples/06_custom_endpoint/) | 自定义 HTTP 端点 |
+| 07 | [custom_params](examples/07_custom_params/) | 配置驱动的模型行为 |
 
 详见 [examples/README.md](examples/README.md) 获取学习路径和使用说明。
 
@@ -306,7 +295,8 @@ cd python && python -m pytest tests/
 │   ├── comparison.md
 │   ├── comparison_zh.md
 │   ├── configuration.md
-│   └── model-authoring.md
+│   ├── model-authoring.md
+│   └── model-authoring_zh.md
 ├── Cargo.toml        # Rust 清单
 └── pyproject.toml    # Python 打包（maturin）
 ```

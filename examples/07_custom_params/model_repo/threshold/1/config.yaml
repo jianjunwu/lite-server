@@ -1,0 +1,12 @@
+max_batch_size: 1
+stream: false
+accelerator: cpu
+devices: 1
+workers_per_device: 1
+
+# ===== Custom Parameters =====
+# Any field added here is accessible in model.py via self.config.get('key', default)
+
+threshold: 0.5
+label: "positive"
+negative_label: "negative"

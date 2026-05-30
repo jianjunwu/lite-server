@@ -1,55 +1,55 @@
-# Model Authoring Guide
+# 模型开发指南
 
-This guide covers how to write model code for lite-server. Models are Python classes that implement the `LitAPI` interface.
+本指南介绍如何为 lite-server 编写模型代码。模型是实现 `LitAPI` 接口的 Python 类。
 
-[中文版](model-authoring_zh.md)
+[English](model-authoring.md)
 
-## Quick Start
+## 快速开始
 
 ```python
 from lite_server import LitAPI
 
 class MyModel(LitAPI):
     def setup(self, device):
-        """Load model weights and initialize resources."""
+        """加载模型权重和初始化资源。"""
         self.model = load_my_model()
 
     def decode_request(self, request):
-        """Parse the raw HTTP request body."""
+        """解析原始 HTTP 请求体。"""
         return request.get("input", "")
 
     def predict(self, x):
-        """Run inference. Receives decoded input, returns output."""
+        """运行推理。接收解码后的输入，返回输出。"""
         return self.model(x)
 
     def encode_response(self, output):
-        """Format the prediction into an HTTP response body."""
+        """将预测结果格式化为 HTTP 响应体。"""
         return {"result": output}
 ```
 
-Save as `model_repo/{model_name}/{version}/model.py`.
+保存为 `model_repo/{model_name}/{version}/model.py`。
 
-## Directory Structure
+## 目录结构
 
 ```
 model_repo/
   {model_name}/
     {version}/
-      model.py          # Required: LitAPI subclass
-      config.yaml        # Optional: model configuration
-  orchestration.yaml     # Optional: model loading strategy
+      model.py          # 必需：LitAPI 子类
+      config.yaml        # 可选：模型配置
+  orchestration.yaml     # 可选：模型加载策略
 ```
 
-- `model_name`: alphanumeric, underscores, hyphens (e.g., `my_model`, `resnet-v2`)
-- `version`: numeric or string (e.g., `1`, `v2`, `latest`)
+- `model_name`：字母、数字、下划线、连字符（如 `my_model`、`resnet-v2`）
+- `version`：数字或字符串（如 `1`、`v2`、`latest`）
 
-## LitAPI Interface
+## LitAPI 接口
 
-### Required Methods
+### 必需方法
 
 #### `setup(self, device)`
 
-Called once when the worker starts. Load your model and any resources here.
+Worker 启动时调用一次。在此加载模型和资源。
 
 ```python
 def setup(self, device):
@@ -58,12 +58,12 @@ def setup(self, device):
     self.model.eval()
 ```
 
-- `device` is a string like `"cpu"` or `"cuda:0"`
-- Resources stored on `self` persist for the worker's lifetime
+- `device` 是字符串，如 `"cpu"` 或 `"cuda:0"`
+- 存储在 `self` 上的资源在 worker 生命周期内持续存在
 
 #### `decode_request(self, request)`
 
-Parse the raw HTTP request body (dict from JSON) into the format your model expects.
+将原始 HTTP 请求体（JSON 字典）解析为模型期望的格式。
 
 ```python
 def decode_request(self, request):
@@ -75,7 +75,7 @@ def decode_request(self, request):
 
 #### `predict(self, x)`
 
-Run inference. Receives the output of `decode_request()`.
+运行推理。接收 `decode_request()` 的输出。
 
 ```python
 def predict(self, x):
@@ -83,11 +83,11 @@ def predict(self, x):
     return self.model(**tokens)
 ```
 
-When batching is enabled (`max_batch_size > 1`), `x` is a **list** of decoded inputs:
+启用批处理时（`max_batch_size > 1`），`x` 是解码输入的**列表**：
 
 ```python
 def predict(self, x):
-    # x is a list when batching is active
+    # 批处理激活时 x 是列表
     if isinstance(x, list):
         return [self._infer(item) for item in x]
     return self._infer(x)
@@ -95,38 +95,38 @@ def predict(self, x):
 
 #### `encode_response(self, output)`
 
-Format the prediction output into an HTTP response body (must be JSON-serializable).
+将预测输出格式化为 HTTP 响应体（必须可 JSON 序列化）。
 
 ```python
 def encode_response(self, output):
     return {"prediction": output.tolist(), "confidence": float(output.max())}
 ```
 
-### Optional Methods
+### 可选方法
 
 #### `stream_predict(self, request)`
 
-Generator for streaming output. Each yielded value is sent as a chunk via SSE/WebSocket/gRPC.
+流式输出生成器。每个 yield 的值通过 SSE/WebSocket/gRPC 作为 chunk 发送。
 
 ```python
 def stream_predict(self, request):
     prompt = request.get("prompt", "")
     for token in self.model.generate(prompt):
         yield {"token": token}
-        time.sleep(0.02)  # simulate generation latency
+        time.sleep(0.02)  # 模拟生成延迟
 ```
 
-Enable streaming in `config.yaml`:
+在 `config.yaml` 中启用流式：
 
 ```yaml
 stream: true
 ```
 
-If `stream_predict()` is not implemented, the server falls back to `predict()` and sends the result as a single chunk.
+如果未实现 `stream_predict()`，服务器回退到 `predict()` 并将结果作为单个 chunk 发送。
 
 #### `on_request(self, request, meta)`
 
-Called after `decode_request()`, before `predict()`. Use for auth, logging, or request modification.
+在 `decode_request()` 之后、`predict()` 之前调用。用于鉴权、日志或请求修改。
 
 ```python
 def on_request(self, request, meta):
@@ -136,11 +136,11 @@ def on_request(self, request, meta):
     return request
 ```
 
-`meta` is a `RequestMeta` object with: `route`, `headers`, `client_ip`, `request_id`, `timestamp_ns`, `payload`.
+`meta` 是 `RequestMeta` 对象，包含：`route`、`headers`、`client_ip`、`request_id`、`timestamp_ns`、`payload`。
 
 #### `on_response(self, response, meta)`
 
-Called after `encode_response()`, before sending to client. Use for response modification or logging. Also called in the streaming path (after each chunk is encoded).
+在 `encode_response()` 之后、发送给客户端之前调用。用于响应修改或日志。流式路径中也会调用（每个 chunk 编码后）。
 
 ```python
 def on_response(self, response, meta):
@@ -150,7 +150,7 @@ def on_response(self, response, meta):
 
 #### `on_file_changed(self, changed_files)`
 
-Called when files in the model directory change (hot reload). Override to implement custom reload logic.
+当模型目录中的文件变化时调用（热更新）。覆盖以实现自定义重载逻辑。
 
 ```python
 def on_file_changed(self, changed_files):
@@ -159,11 +159,11 @@ def on_file_changed(self, changed_files):
         self.model = torch.load("weights.pt")
 ```
 
-If not overridden, the default behavior restarts the worker (re-runs `setup()`).
+如果未覆盖，默认行为是重启 worker（重新运行 `setup()`）。
 
 #### `teardown(self)`
 
-Called when the model is unloaded. Release resources here.
+模型卸载时调用。在此释放资源。
 
 ```python
 def teardown(self):
@@ -171,9 +171,9 @@ def teardown(self):
     torch.cuda.empty_cache()
 ```
 
-## Continuous Batching (LLM)
+## 连续批处理（LLM）
 
-For LLM workloads, enable continuous batching to process multiple sequences simultaneously with iterative generation.
+对于 LLM 工作负载，启用连续批处理以同时处理多个序列并进行迭代生成。
 
 ```yaml
 # config.yaml
@@ -181,17 +181,17 @@ continuous_batching: true
 max_sequence_length: 4096
 ```
 
-Implement three hooks:
+实现三个钩子：
 
 ```python
 class LLMModel(LitAPI):
     def prefill(self, uid, decoded_input):
-        """Initialize a new sequence in the KV cache."""
+        """在 KV 缓存中初始化新序列。"""
         tokens = self.tokenizer.encode(decoded_input["prompt"])
         self.kv_cache.add(uid, tokens)
 
     def step(self, active_sequences):
-        """Run one generation step for all active sequences."""
+        """为所有活跃序列运行一步生成。"""
         new_tokens = []
         for seq in active_sequences:
             token = self.model.generate_step(seq["uid"])
@@ -199,15 +199,15 @@ class LLMModel(LitAPI):
         return new_tokens
 
     def has_finished(self, uid, token, generated_sequence):
-        """Check if a sequence is done generating."""
+        """检查序列是否完成生成。"""
         return token == self.eos_token or len(generated_sequence) >= self.max_length
 ```
 
-Each element in `active_sequences` has keys: `uid`, `input`, `output` (list of tokens so far).
+`active_sequences` 中每个元素包含键：`uid`、`input`、`output`（到目前为止的 token 列表）。
 
-## Batching
+## 批处理
 
-Enable batching to process multiple requests in a single `predict()` call:
+启用批处理以在单次 `predict()` 调用中处理多个请求：
 
 ```yaml
 # config.yaml
@@ -216,30 +216,30 @@ batch_timeout: 0.01
 adaptive_batching: true
 ```
 
-When batching is active, `predict()` receives a **list** of decoded inputs:
+批处理激活时，`predict()` 接收解码输入的**列表**：
 
 ```python
 def predict(self, x):
-    # x is a list of decoded inputs
+    # x 是解码输入的列表
     batch_input = [item["text"] for item in x]
     results = self.model(batch(batch_input))
-    return [{"output": r} for r in results]  # must return list, one per input
+    return [{"output": r} for r in results]  # 必须返回列表，每个输入一个结果
 ```
 
-Key rules:
-- Return a **list** with one result per input
-- The order must match the input order
-- `batch_timeout` controls how long to wait for more requests (adaptive batching adjusts this automatically)
+关键规则：
+- 返回**列表**，每个输入一个结果
+- 顺序必须与输入顺序一致
+- `batch_timeout` 控制等待更多请求的时间（自适应批处理会自动调整）
 
-#### Custom `batch()` / `unbatch()`
+#### 自定义 `batch()` / `unbatch()`
 
-Override `batch()` to reshape decoded inputs before prediction, and `unbatch()` to split batch output back into per-request responses. The full pipeline becomes:
+覆盖 `batch()` 以在预测前重塑解码输入，覆盖 `unbatch()` 以将批处理输出拆分为每个请求的响应。完整流程：
 
 ```
 decode_request → batch → predict → unbatch → encode_response
 ```
 
-When only one request is queued, `batch()` and `unbatch()` are both skipped — `predict()` receives the decoded request directly.
+当只有一个请求排队时，`batch()` 和 `unbatch()` 都会被跳过 — `predict()` 直接接收解码后的请求。
 
 ```python
 class CustomBatchModel(LitAPI):
@@ -247,7 +247,7 @@ class CustomBatchModel(LitAPI):
         return {"value": request["input"], "weight": request.get("weight", 1.0)}
 
     def batch(self, inputs):
-        """Merge decoded requests into a single batch dict."""
+        """将解码后的请求合并为单个批处理字典。"""
         return {
             "values": [x["value"] for x in inputs],
             "weights": [x["weight"] for x in inputs],
@@ -256,14 +256,14 @@ class CustomBatchModel(LitAPI):
 
     def predict(self, batch):
         if isinstance(batch, dict) and "values" in batch:
-            # Multiple requests — came through batch()
+            # 多个请求 — 通过 batch() 处理
             results = [v * w for v, w in zip(batch["values"], batch["weights"])]
             return {"results": results, "batch_size": batch["batch_size"]}
-        # Single request — batch() skipped
+        # 单个请求 — batch() 被跳过
         return {"output": batch["value"] * batch["weight"], "batch_size": 1}
 
     def unbatch(self, output):
-        """Split batch output back into per-request responses."""
+        """将批处理输出拆分为每个请求的响应。"""
         return [
             {"output": r, "batch_size": output["batch_size"]}
             for r in output["results"]
@@ -273,54 +273,54 @@ class CustomBatchModel(LitAPI):
         return output
 ```
 
-See [examples/02_batching](../examples/02_batching/) for a runnable demo.
+参见 [examples/02_batching](../examples/02_batching/) 获取可运行的示例。
 
-## Bidirectional Streaming
+## 双向流式
 
-For real-time bidirectional communication (e.g., ASR):
+用于实时双向通信（如 ASR）：
 
 ```python
 class ASRModel(LitAPI):
     def bidi_stream(self):
         class Handler:
             def on_chunk(self, chunk):
-                # Process incoming audio chunk, return partial result
+                # 处理传入的音频 chunk，返回部分结果
                 return self.model.process_audio(chunk)
 
             def on_close(self):
-                # Finalize and return final result
+                # 完成并返回最终结果
                 return self.model.finalize()
         return Handler()
 ```
 
-Enable in config:
+在配置中启用：
 
 ```yaml
 bidirectional: true
 ```
 
-## Custom Parameters
+## 自定义参数
 
-All fields in `config.yaml` are accessible in your model code via `self.config`. This lets you tune behavior without changing code.
+`config.yaml` 中的所有字段可通过 `self.config` 在模型代码中访问。这使你无需修改代码即可调整行为。
 
-### Defining Parameters
+### 定义参数
 
-Add any custom fields to `config.yaml` alongside the standard fields:
+在 `config.yaml` 中添加任意自定义字段：
 
 ```yaml
 # model_repo/my_model/1/config.yaml
 max_batch_size: 1
 stream: false
 
-# Custom parameters
+# 自定义参数
 threshold: 0.5
 label: "positive"
 model_path: "/opt/models/weights.pt"
 ```
 
-### Accessing in model.py
+### 在 model.py 中访问
 
-Use `self.config.get(key, default)` in `setup()` or anywhere in your model:
+在 `setup()` 或模型的任何位置使用 `self.config.get(key, default)`：
 
 ```python
 class MyModel(LitAPI):
@@ -336,38 +336,38 @@ class MyModel(LitAPI):
         return {"label": "other"}
 ```
 
-### When to Use
+### 使用场景
 
-- **Thresholds and hyperparameters**: confidence cutoffs, temperature, max_length
-- **File paths**: model weights, label files, lookup tables
-- **Feature flags**: enable/disable behaviors per model version
-- **A/B testing**: different configs for different versions
+- **阈值和超参数**：置信度截断、temperature、max_length
+- **文件路径**：模型权重、标签文件、查找表
+- **特性开关**：按模型版本启用/禁用行为
+- **A/B 测试**：不同版本使用不同配置
 
-See [examples/07_custom_params](../examples/07_custom_params/) for a runnable demo.
+参见 [examples/07_custom_params](../examples/07_custom_params/) 获取可运行的示例。
 
-## Best Practices
+## 最佳实践
 
-### Resource Management
+### 资源管理
 
-- Load heavy resources (model weights, tokenizers) in `setup()`, not in `predict()`
-- Use `teardown()` to release GPU memory and file handles
-- Store all state on `self` — workers are long-lived processes
+- 在 `setup()` 中加载重型资源（模型权重、分词器），而不是在 `predict()` 中
+- 使用 `teardown()` 释放 GPU 内存和文件句柄
+- 将所有状态存储在 `self` 上 — worker 是长生命周期进程
 
-### Error Handling
+### 错误处理
 
-- Raise exceptions in `predict()` to signal errors — the server retries on a different worker
-- Use `on_request()` for input validation — raise to reject early
-- Avoid bare `except:` — let unexpected errors propagate for debugging
+- 在 `predict()` 中抛出异常以发出错误信号 — 服务器会在不同 worker 上重试
+- 使用 `on_request()` 进行输入验证 — 抛出异常以提前拒绝
+- 避免裸 `except:` — 让意外错误传播以便调试
 
-### Performance
+### 性能
 
-- Keep `decode_request()` and `encode_response()` lightweight — they run on every request
-- For batch inference, ensure `predict()` returns results in the same order as inputs
-- Use `adaptive_batching: true` for variable-load workloads
+- 保持 `decode_request()` 和 `encode_response()` 轻量 — 它们在每个请求上运行
+- 对于批处理推理，确保 `predict()` 按输入顺序返回结果
+- 对可变负载工作负载使用 `adaptive_batching: true`
 
-### Testing
+### 测试
 
-Models can be tested independently without starting the server:
+模型可以独立测试，无需启动服务器：
 
 ```python
 api = MyModel(max_batch_size=1)
@@ -376,10 +376,10 @@ result = api.encode_response(api.predict(api.decode_request({"input": 42})))
 assert result == {"result": 84}
 ```
 
-## Example: Complete Model
+## 示例：完整模型
 
 ```python
-"""Image classification model with preprocessing and batch support."""
+"""图像分类模型，支持预处理和批处理。"""
 
 import numpy as np
 from lite_server import LitAPI
@@ -391,21 +391,21 @@ class ImageClassifier(LitAPI):
         self.labels = load_labels("imagenet_labels.txt")
 
     def decode_request(self, request):
-        # request: {"image": base64_encoded_string}
+        # request: {"image": base64编码字符串}
         import base64
         img_bytes = base64.b64decode(request["image"])
         return preprocess_image(img_bytes)
 
     def predict(self, x):
         if isinstance(x, list):
-            # Batching: x is a list of preprocessed images
+            # 批处理：x 是预处理图像的列表
             batch = np.stack(x)
             outputs = self.model(batch)
             return [self._decode_output(o) for o in outputs]
         return self._decode_output(self.model(x))
 
     def encode_response(self, output):
-        return output  # already a dict with label + confidence
+        return output  # 已经是包含 label + confidence 的字典
 
     def _decode_output(self, logits):
         idx = int(np.argmax(logits))
@@ -415,6 +415,6 @@ class ImageClassifier(LitAPI):
         del self.model
 ```
 
-## Config Reference
+## 配置参考
 
-See [configuration.md](configuration.md) for the full model config field reference.
+参见 [configuration.md](configuration.md) 获取完整的模型配置字段参考。
