@@ -150,8 +150,9 @@ jobs:
           manylinux: ${{ matrix.platform }}
           args: --release --interpreter ${{ matrix.interpreter }}
           before-script-linux: ${{ matrix.before-script }}
+          docker-options: ${{ runner.os == 'Linux' && '-e PROTOC=/usr/bin/protoc' || ' ' }}
         env:
-          PROTOC: ${{ runner.os == 'Linux' && '/usr/bin/protoc' || env.PROTOC }}
+          PROTOC: ${{ env.PROTOC }}
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
