@@ -7,7 +7,6 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::runtime::Runtime;
 
 // ---------------------------------------------------------------------------
 // validate_identifier
@@ -26,7 +25,6 @@ pub fn validate_identifier(s: &str) -> PyResult<()> {
 #[pyclass(name = "ModelRegistry")]
 pub struct PyModelRegistry {
     inner: Arc<ModelRegistry>,
-    rt: Runtime,
 }
 
 #[pymethods]
@@ -35,8 +33,6 @@ impl PyModelRegistry {
     fn new() -> PyResult<Self> {
         Ok(Self {
             inner: Arc::new(ModelRegistry::new()),
-            rt: Runtime::new()
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?,
         })
     }
 
@@ -60,19 +56,15 @@ impl PyModelRegistry {
                 format!("unknown model_type: {}", model_type),
             )),
         };
-        let reg = self.inner.clone();
-        self.rt.block_on(async {
-            reg.register(name, version, mc, mt, PathBuf::from(model_dir)).await
-        }).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        self.inner
+            .register(name, version, mc, mt, PathBuf::from(model_dir))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// get(name, version=None) -> dict | None
     #[pyo3(signature = (name, version=None))]
     fn get(&self, name: &str, version: Option<&str>) -> PyResult<Option<PyObject>> {
-        let reg = self.inner.clone();
-        let mv = self.rt.block_on(async {
-            reg.get(name, version).await
-        });
+        let mv = self.inner.get(name, version);
         match mv {
             Some(mv) => Python::with_gil(|py| {
                 let dict = PyDict::new(py);
@@ -91,47 +83,37 @@ impl PyModelRegistry {
     /// status: "Loading" | "Ready" | "Unloading" | "Error"
     fn set_status(&self, name: &str, version: &str, status: &str) -> PyResult<()> {
         let vs = parse_status(status)?;
-        let reg = self.inner.clone();
-        self.rt.block_on(async {
-            reg.set_status(name, version, vs).await
-        }).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        self.inner
+            .set_status(name, version, vs)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// is_ready(name, version) -> bool
     fn is_ready(&self, name: &str, version: &str) -> PyResult<bool> {
-        let reg = self.inner.clone();
-        Ok(self.rt.block_on(async {
-            reg.is_ready(name, Some(version)).await
-        }))
+        Ok(self.inner.is_ready(name, Some(version)))
     }
 
     /// activate_version(name, version) -> bool
     fn activate_version(&self, name: &str, version: &str) -> PyResult<bool> {
-        let reg = self.inner.clone();
-        self.rt.block_on(async {
-            reg.activate_version(name, version).await
-        }).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        self.inner
+            .activate_version(name, version)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// deactivate(name)
     fn deactivate(&self, name: &str) -> PyResult<()> {
-        let reg = self.inner.clone();
-        self.rt.block_on(async { reg.deactivate(name).await });
+        self.inner.deactivate(name);
         Ok(())
     }
 
     /// get_active_version(name) -> str | None
     fn get_active_version(&self, name: &str) -> PyResult<Option<String>> {
-        let reg = self.inner.clone();
-        Ok(self.rt.block_on(async {
-            reg.get_active_version(name).await
-        }))
+        Ok(self.inner.get_active_version(name))
     }
 
     /// list_loaded() -> list[dict]
     fn list_loaded(&self) -> PyResult<Vec<PyObject>> {
-        let reg = self.inner.clone();
-        let loaded = self.rt.block_on(async { reg.list_loaded().await });
+        let loaded = self.inner.list_loaded();
         Python::with_gil(|py| {
             let mut result = Vec::with_capacity(loaded.len());
             for (name, version, mv) in loaded {
@@ -147,8 +129,7 @@ impl PyModelRegistry {
 
     /// list_versions(name) -> list[dict]
     fn list_versions(&self, name: &str) -> PyResult<Vec<PyObject>> {
-        let reg = self.inner.clone();
-        let versions = self.rt.block_on(async { reg.list_versions(name).await });
+        let versions = self.inner.list_versions(name);
         Python::with_gil(|py| {
             let mut result = Vec::with_capacity(versions.len());
             for mv in versions {
@@ -163,10 +144,9 @@ impl PyModelRegistry {
 
     /// remove(name, version)
     fn remove(&self, name: &str, version: &str) -> PyResult<()> {
-        let reg = self.inner.clone();
-        self.rt.block_on(async {
-            reg.remove(name, version).await
-        }).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        self.inner
+            .remove(name, version)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 }
 
