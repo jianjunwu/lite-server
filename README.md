@@ -27,7 +27,7 @@ High-performance model inference server — Rust core for I/O, Python for infere
 | | Feature | What it means for you |
 |---|---------|----------------------|
 | **Fast** | Rust HTTP core (axum/tokio), zero-copy data path, adaptive batching | Higher throughput, lower latency than pure-Python servers |
-| **Stable** | Outlier detection, request retry, worker auto-recycle | Self-healing workers, no manual babysitting |
+| **Stable** | Outlier detection, heartbeat, auto-respawn, lifecycle hooks | Self-healing workers that detect hangs and restart automatically |
 | **Simple** | `pip install`, write one `model.py`, done | No Docker, no Java, no C++ build tools |
 | **Flexible** | Hot reload, multi-version, ensemble DAG | A/B testing, canary deploys, multi-model pipelines in one server |
 | **Observable** | Prometheus metrics, timeline, alerts | Know what's happening in production without guessing |
@@ -92,6 +92,8 @@ See [docs/architecture.md](docs/architecture.md) for details.
 | Multi-Version | Yes (activate/deactivate) | Yes | Yes | Manual | Manual |
 | Ensemble | DAG with parallel layers | Yes | No | Pipeline | Deployment graph |
 | Outlier Detection | Envoy-style auto-eject | No | No | No | No |
+| Heartbeat + Respawn | ZMQ probe, auto-restart hung workers | No | No | No | No |
+| Lifecycle Hooks | Shell + HTTP callbacks | No | No | No | No |
 | Streaming | SSE + WebSocket + gRPC | Yes | No | Yes | Yes |
 | Min. Overhead | ~10MB | ~500MB | ~200MB | ~50MB | ~100MB |
 
@@ -132,7 +134,9 @@ See [docs/benchmark.md](docs/benchmark.md) for full results and reproduction ste
 - **Outlier detection** — consecutive errors trigger automatic worker ejection (Envoy-style)
 - **Request retry** — failed requests retry on a different worker (up to 3 attempts)
 - **Least-loaded routing** — requests go to the worker with fewest inflight tasks
-- **Max-requests recycle** — auto-restart workers after N requests to prevent memory leaks
+- **Max-requests recycle** — auto-restart workers after N requests, with jitter to prevent thundering herd
+- **Heartbeat detection** — periodic ZMQ probes detect hung workers, auto-kill and respawn
+- **Lifecycle hooks** — shell commands and HTTP callbacks on worker ready/exit/error for alerting and observability
 - **Per-request timeout** — hard timeout prevents stuck requests from blocking the queue
 
 ### Observability
@@ -165,16 +169,18 @@ maturin build --release  # release wheel
 ## CLI Commands
 
 ```bash
-python -m lite_server serve                     # Start inference server
-python -m lite_server serve --config server.yaml
-python -m lite_server serve --port 9000 --workers 4
-python -m lite_server config-check server.yaml  # Validate config
-python -m lite_server benchmark --model my_model
-python -m lite_server analyze --model my_model
-python -m lite_server pack ./my_model --version 1
-python -m lite_server unpack my_model_v1.lma
-python -m lite_server init my_project           # Scaffold new project
+lite-server serve                     # Start inference server
+lite-server serve --config server.yaml
+lite-server serve --port 9000 --max-requests 1000 --max-requests-jitter 100
+lite-server config-check server.yaml  # Validate config
+lite-server benchmark --model my_model
+lite-server analyze --model my_model
+lite-server pack ./my_model --version 1
+lite-server unpack my_model_v1.lma
+lite-server init my_project           # Scaffold new project
 ```
+
+See [docs/cli.md](docs/cli.md) for the full CLI reference.
 
 ## Examples
 
@@ -237,9 +243,24 @@ stream: false
 accelerator: cpu
 workers_per_device: 1
 request_timeout: 30.0
+
+# Worker lifecycle — auto-restart + jitter + heartbeat + hooks
+max_requests: 500
+max_requests_jitter: 50
+
+heartbeat_interval: 10.0
+heartbeat_timeout: 5.0
+heartbeat_max_failures: 3
+
+hooks:
+  on_ready: 'echo "Worker $WORKER_ID ready"'
+  on_error: 'curl -s -X POST http://alerts.internal/worker-error \
+    -d "{\"model\":\"$MODEL\",\"reason\":\"$REASON\"}"'
 ```
 
 See [docs/configuration.md](docs/configuration.md) for the full configuration reference (server, model, orchestration, CLI flags).
+
+See [docs/cli.md](docs/cli.md) for the complete CLI reference.
 
 See [docs/model-authoring.md](docs/model-authoring.md) for the complete model authoring guide (LitAPI interface, streaming, continuous batching, best practices).
 
@@ -261,7 +282,7 @@ Put each model in its own directory under `model_repo/` and list them in `orches
 Use the activate/deactivate API: `POST /v2/models/{name}/versions/{v}/activate`. See [examples/04_multi_version](examples/04_multi_version/).
 
 **Q: What happens if a worker crashes?**
-The worker is automatically restarted. In-flight requests are retried on other workers (up to 3 attempts). Outlier detection ejects unhealthy workers.
+The worker is automatically restarted. In-flight requests are retried on other workers (up to 3 attempts). Outlier detection ejects unhealthy workers. Heartbeat probes detect hung processes and trigger automatic respawn. Lifecycle hooks fire on exit/error for alerting.
 
 ## Multi-Platform
 
@@ -294,9 +315,12 @@ cd python && python -m pytest tests/
 ├── docs/             # Documentation
 │   ├── architecture.md
 │   ├── benchmark.md
+│   ├── cli.md              # CLI reference (en)
+│   ├── cli_zh.md           # CLI reference (zh)
 │   ├── comparison.md
 │   ├── comparison_zh.md
 │   ├── configuration.md
+│   ├── configuration_zh.md
 │   ├── model-authoring.md
 │   └── model-authoring_zh.md
 ├── Cargo.toml        # Rust manifest

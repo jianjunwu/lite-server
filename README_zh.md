@@ -26,7 +26,7 @@
 | | 特性 | 对你意味着什么 |
 |---|------|--------------|
 | **快** | Rust HTTP 内核 (axum/tokio)、零拷贝数据路径、自适应 batching | 比纯 Python 方案吞吐更高、延迟更低 |
-| **稳** | 异常检测、请求重试、worker 自动回收 | Worker 自愈，不用人工盯 |
+| **稳** | 异常检测、心跳检测、自动重启、生命周期钩子 | Worker 自动发现卡死并重启，不用人工盯 |
 | **简** | `pip install`，写一个 `model.py` 就能上线 | 不用 Docker、不用 Java、不用编译 C++ |
 | **灵** | 热重载、多版本、ensemble DAG 编排 | A/B 测试、灰度发布、多模型流水线一站搞定 |
 | **明** | Prometheus 指标、时间线、告警 | 生产环境一目了然，不用猜 |
@@ -90,6 +90,8 @@ Rust 内核处理所有 I/O（HTTP、gRPC、IPC、指标、文件监听），Pyt
 | 多版本 | 支持（激活/停用切换） | 支持 | 支持 | 手动管理 | 手动管理 |
 | Ensemble | DAG 并行分层执行 | 支持 | 不支持 | Pipeline | Deployment graph |
 | 异常检测 | Envoy 风格自动剔除 | 不支持 | 不支持 | 不支持 | 不支持 |
+| 心跳 + 自动重启 | ZMQ 探测，自动重启卡死 worker | 不支持 | 不支持 | 不支持 | 不支持 |
+| 生命周期钩子 | Shell + HTTP 回调 | 不支持 | 不支持 | 不支持 | 不支持 |
 | 流式输出 | SSE + WebSocket + gRPC | 支持 | 不支持 | 支持 | 支持 |
 | 最小开销 | ~10MB | ~500MB | ~200MB | ~50MB | ~100MB |
 
@@ -130,7 +132,9 @@ Rust 内核处理所有 I/O（HTTP、gRPC、IPC、指标、文件监听），Pyt
 - **异常检测** — 连续错误自动剔除 worker（Envoy 风格）
 - **请求重试** — 失败请求自动重试到其他 worker（最多 3 次）
 - **最小负载路由** — 请求发给当前最空闲的 worker
-- **最大请求数回收** — 处理 N 个请求后自动重启 worker，防止内存泄漏
+- **最大请求数回收** — 处理 N 个请求后自动重启 worker，支持抖动防止惊群效应
+- **心跳检测** — 定期 ZMQ 探测检测卡死 worker，自动杀死并重启
+- **生命周期钩子** — worker 就绪/退出/异常时触发 shell 命令或 HTTP 回调，便于告警和可观测
 - **单请求超时** — 硬超时防止卡死请求阻塞队列
 
 ### 可观测性
@@ -163,16 +167,18 @@ maturin build --release  # 发布 wheel
 ## CLI 命令
 
 ```bash
-python -m lite_server serve                     # 启动推理服务器
-python -m lite_server serve --config server.yaml
-python -m lite_server serve --port 9000 --workers 4
-python -m lite_server config-check server.yaml  # 校验配置
-python -m lite_server benchmark --model my_model
-python -m lite_server analyze --model my_model
-python -m lite_server pack ./my_model --version 1
-python -m lite_server unpack my_model_v1.lma
-python -m lite_server init my_project           # 脚手架创建项目
+lite-server serve                     # 启动推理服务器
+lite-server serve --config server.yaml
+lite-server serve --port 9000 --max-requests 1000 --max-requests-jitter 100
+lite-server config-check server.yaml  # 校验配置
+lite-server benchmark --model my_model
+lite-server analyze --model my_model
+lite-server pack ./my_model --version 1
+lite-server unpack my_model_v1.lma
+lite-server init my_project           # 脚手架创建项目
 ```
+
+详见 [docs/cli_zh.md](docs/cli_zh.md) 获取完整 CLI 参考手册。
 
 ## 示例
 
@@ -235,11 +241,26 @@ stream: false
 accelerator: cpu
 workers_per_device: 1
 request_timeout: 30.0
+
+# Worker 生命周期 — 自动重启 + 抖动 + 心跳 + 钩子
+max_requests: 500
+max_requests_jitter: 50
+
+heartbeat_interval: 10.0
+heartbeat_timeout: 5.0
+heartbeat_max_failures: 3
+
+hooks:
+  on_ready: 'echo "Worker $WORKER_ID ready"'
+  on_error: 'curl -s -X POST http://alerts.internal/worker-error \
+    -d "{\"model\":\"$MODEL\",\"reason\":\"$REASON\"}"'
 ```
 
-详见 [docs/configuration.md](docs/configuration.md) 获取完整配置参考（服务器、模型、编排、CLI 参数）。
+详见 [docs/configuration_zh.md](docs/configuration_zh.md) 获取完整配置参考（服务器、模型、编排、CLI 参数）。
 
-详见 [docs/model-authoring.md](docs/model-authoring.md) 获取模型开发指南（LitAPI 接口、流式输出、continuous batching、最佳实践）。
+详见 [docs/cli_zh.md](docs/cli_zh.md) 获取完整 CLI 参考手册。
+
+详见 [docs/model-authoring_zh.md](docs/model-authoring_zh.md) 获取模型开发指南（LitAPI 接口、流式输出、continuous batching、最佳实践）。
 
 ## 常见问题
 
@@ -259,7 +280,7 @@ lite-server 用 Rust HTTP 内核（axum/tokio）替代了 Python 的 uvicorn，�
 使用激活/停用 API：`POST /v2/models/{name}/versions/{v}/activate`。详见 [examples/04_multi_version](examples/04_multi_version/)。
 
 **Q: Worker 崩溃了怎么办？**
-Worker 会自动重启。正在处理的请求会自动重试到其他 worker（最多 3 次）。异常检测会剔除不健康的 worker。
+Worker 会自动重启。正在处理的请求会自动重试到其他 worker（最多 3 次）。异常检测会剔除不健康的 worker。心跳探测能发现卡死进程并触发自动重启。生命周期钩子在退出/异常时触发，便于告警。
 
 ## 多平台支持
 
@@ -292,9 +313,12 @@ cd python && python -m pytest tests/
 ├── docs/             # 文档
 │   ├── architecture.md
 │   ├── benchmark.md
+│   ├── cli.md              # CLI 参考（英文）
+│   ├── cli_zh.md           # CLI 参考（中文）
 │   ├── comparison.md
 │   ├── comparison_zh.md
 │   ├── configuration.md
+│   ├── configuration_zh.md
 │   ├── model-authoring.md
 │   └── model-authoring_zh.md
 ├── Cargo.toml        # Rust 清单
