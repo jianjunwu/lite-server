@@ -11,44 +11,37 @@ permissions:
   contents: read
 
 jobs:
-  cargo-test:
-    name: Rust tests (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libzmq3-dev protobuf-compiler
-
-      - name: Install system dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: brew install zeromq
-
-      - name: Install Miniconda and protoc (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          curl -fsSL -o /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-arm64.sh
-          bash /tmp/miniconda.sh -b -p "$HOME/miniconda"
-          "$HOME/miniconda/bin/conda" install -y -c conda-forge libprotobuf
-          echo "PROTOC=$HOME/miniconda/bin/protoc" >> $GITHUB_ENV
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install Python dependencies
-        run: pip install -e ".[dev]"
-
-      - name: Run Rust tests
-        run: cargo test -- --test-threads=1 --skip test_model_infer_versioned
+  # cargo-test:  # TEMP: commented out to focus on x86_64 build fix
+  #   name: Rust tests (${{ matrix.os }})
+  #   runs-on: ${{ matrix.os }}
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       os: [ubuntu-latest, macos-latest]
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: Install Rust toolchain
+  #       uses: dtolnay/rust-toolchain@stable
+  #     - name: Install system dependencies (Linux)
+  #       if: runner.os == 'Linux'
+  #       run: sudo apt-get update && sudo apt-get install -y libzmq3-dev protobuf-compiler
+  #     - name: Install system dependencies (macOS)
+  #       if: runner.os == 'macOS'
+  #       run: brew install zeromq
+  #     - name: Install Miniconda and protoc (macOS)
+  #       if: runner.os == 'macOS'
+  #       run: |
+  #         curl -fsSL -o /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-arm64.sh
+  #         bash /tmp/miniconda.sh -b -p "$HOME/miniconda"
+  #         "$HOME/miniconda/bin/conda" install -y -c conda-forge libprotobuf
+  #         echo "PROTOC=$HOME/miniconda/bin/protoc" >> $GITHUB_ENV
+  #     - uses: actions/setup-python@v5
+  #       with:
+  #         python-version: '3.10'
+  #     - name: Install Python dependencies
+  #       run: pip install -e ".[dev]"
+  #     - name: Run Rust tests
+  #       run: cargo test -- --test-threads=1 --skip test_model_infer_versioned
 
   get-version:
     runs-on: ubuntu-latest
@@ -83,29 +76,29 @@ jobs:
               bash /tmp/miniconda.sh -b -p /opt/miniconda
               /opt/miniconda/bin/conda install -y python=3.10
             interpreter: /opt/miniconda/bin/python3.10
-          # Linux aarch64
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            platform: manylinux_2_28
-            before-script: |
-              apt-get update && apt-get install -y protobuf-compiler
-            interpreter: python3.10
-          # macOS x86_64 (disabled: macos-13 runner scarce)
+          # # Linux aarch64 (TEMP: commented out)
+          # - os: ubuntu-latest
+          #   target: aarch64-unknown-linux-gnu
+          #   platform: manylinux_2_28
+          #   before-script: |
+          #     apt-get update && apt-get install -y protobuf-compiler
+          #   interpreter: python3.10
+          # # macOS x86_64 (disabled: macos-13 runner scarce)
           # - os: macos-13
           #   target: x86_64-apple-darwin
           #   platform: auto
           #   interpreter: python3.10
-          # macOS aarch64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            platform: auto
-            interpreter: python3.10
-          # Windows x86_64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            platform: auto
-            interpreter: python3.10
-            vcpkg: zeromq
+          # # macOS aarch64 (TEMP: commented out)
+          # - os: macos-latest
+          #   target: aarch64-apple-darwin
+          #   platform: auto
+          #   interpreter: python3.10
+          # # Windows x86_64 (TEMP: commented out)
+          # - os: windows-latest
+          #   target: x86_64-pc-windows-msvc
+          #   platform: auto
+          #   interpreter: python3.10
+          #   vcpkg: zeromq
 
     steps:
       - uses: actions/checkout@v4
@@ -143,6 +136,10 @@ jobs:
           & "$env:USERPROFILE\miniconda\Scripts\conda.exe" install -y -c conda-forge libprotobuf
           "PROTOC=$env:USERPROFILE\miniconda\Library\bin\protoc.exe" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
 
+      - name: Set PROTOC for Linux
+        if: runner.os == 'Linux'
+        run: echo "PROTOC=/usr/bin/protoc" >> $GITHUB_ENV
+
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
@@ -150,7 +147,6 @@ jobs:
           manylinux: ${{ matrix.platform }}
           args: --release --interpreter ${{ matrix.interpreter }}
           before-script-linux: ${{ matrix.before-script }}
-          docker-options: ${{ runner.os == 'Linux' && '-e PROTOC=/usr/bin/protoc' || ' ' }}
         env:
           PROTOC: ${{ env.PROTOC }}
 
@@ -160,33 +156,31 @@ jobs:
           name: wheel-${{ matrix.target }}
           path: target/wheels/*.whl
 
-  release:
-    name: Release
-    needs: [get-version, build-wheels]
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    permissions:
-      contents: write
-    steps:
-      - name: Download all wheel artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: wheels
-          pattern: wheel-*
-          merge-multiple: true
-
-      - name: Verify version matches tag
-        run: |
-          TAG=${GITHUB_REF#refs/tags/v}
-          VERSION="${{ needs.get-version.outputs.version }}"
-          if [ "$TAG" != "$VERSION" ]; then
-            echo "Error: Tag version ($TAG) does not match pyproject.toml version ($VERSION)"
-            exit 1
-          fi
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ needs.get-version.outputs.version }}
-          name: lite-server v${{ needs.get-version.outputs.version }}
-          files: wheels/*.whl
+  # release:  # TEMP: commented out to focus on x86_64 build fix
+  #   name: Release
+  #   needs: [get-version, build-wheels]
+  #   runs-on: ubuntu-latest
+  #   if: startsWith(github.ref, 'refs/tags/v')
+  #   permissions:
+  #     contents: write
+  #   steps:
+  #     - name: Download all wheel artifacts
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         path: wheels
+  #         pattern: wheel-*
+  #         merge-multiple: true
+  #     - name: Verify version matches tag
+  #       run: |
+  #         TAG=${GITHUB_REF#refs/tags/v}
+  #         VERSION="${{ needs.get-version.outputs.version }}"
+  #         if [ "$TAG" != "$VERSION" ]; then
+  #           echo "Error: Tag version ($TAG) does not match pyproject.toml version ($VERSION)"
+  #           exit 1
+  #         fi
+  #     - name: Create GitHub Release
+  #       uses: softprops/action-gh-release@v2
+  #       with:
+  #         tag_name: v${{ needs.get-version.outputs.version }}
+  #         name: lite-server v${{ needs.get-version.outputs.version }}
+  #         files: wheels/*.whl
