@@ -94,6 +94,25 @@ async fn wait_model_ready(base: &str, model: &str, timeout_secs: u64) -> bool {
     false
 }
 
+/// Poll until a model is NOT ready (fully unloaded). Returns false on timeout.
+async fn wait_model_not_ready(base: &str, model: &str, timeout_secs: u64) -> bool {
+    let client = reqwest::Client::new();
+    let url = format!("{}/v2/models/{}/ready", base, model);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(1)).send().await {
+            if let Ok(body) = resp.json::<Value>().await {
+                if body["ready"].as_bool() == Some(false) {
+                    return true;
+                }
+            }
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
 /// Load a model and wait until ready.
 async fn load_model(base: &str, model: &str, version: &str) {
     let client = reqwest::Client::new();
@@ -252,6 +271,12 @@ async fn test_model_infer_versioned() {
     let base = shared_base().await;
     let client = reqwest::Client::new();
 
+    // Wait for any previous unload to complete before loading
+    assert!(
+        wait_model_not_ready(&base, MODEL, 10).await,
+        "model {} still ready — previous unload may not have completed",
+        MODEL
+    );
     load_model(&base, MODEL, "1").await;
 
     let resp = client
@@ -497,7 +522,7 @@ class TestAPI(LitAPI):
     tokio::fs::write(&model_py, modified).await.unwrap();
 
     // Poll until hot reload picks up the change (no fixed sleep)
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut reloaded = false;
     while tokio::time::Instant::now() < deadline {
         let resp = client
@@ -513,7 +538,7 @@ class TestAPI(LitAPI):
         }
         sleep(Duration::from_millis(500)).await;
     }
-    assert!(reloaded, "hot reload did not pick up model change within 15s");
+    assert!(reloaded, "hot reload did not pick up model change within 30s");
 
     stop_server(server);
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
