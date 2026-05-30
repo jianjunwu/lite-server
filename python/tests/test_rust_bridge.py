@@ -214,7 +214,7 @@ class TestModelRegistryModelType:
 class TestModelRegistryConfig:
     def test_config_fields_propagate(self):
         reg = ModelRegistry()
-        reg.register("m1", "1", {"max_batch_size": 8, "api_path": "/generate", "stream": True}, "lit_api", "/tmp/m1")
+        reg.register("m1", "1", {"max_batch_size": 8, "stream": True}, "lit_api", "/tmp/m1")
         mv = reg.get("m1", "1")
         assert mv is not None
 

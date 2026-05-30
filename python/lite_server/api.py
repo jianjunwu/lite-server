@@ -48,7 +48,6 @@ class LitAPI(ls.LitAPI):
         self,
         max_batch_size: int = 1,
         batch_timeout: float = 0.0,
-        api_path: str = "/predict",
         stream: bool = False,
         loop: Any = "auto",
         spec: LitSpec | None = None,
@@ -58,7 +57,6 @@ class LitAPI(ls.LitAPI):
         super().__init__(
             max_batch_size=max_batch_size,
             batch_timeout=batch_timeout,
-            api_path=api_path,
             stream=stream,
             loop=loop,
             spec=spec,

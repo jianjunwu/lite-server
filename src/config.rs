@@ -237,7 +237,6 @@ impl Default for ModelStrategyConfig {
 #[serde(default)]
 pub struct ModelConfig {
     pub name: String,
-    pub api_path: String,
     pub max_batch_size: usize,
     pub batch_timeout: f32,
     pub stream: bool,
@@ -267,7 +266,6 @@ impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             name: "".to_string(),
-            api_path: "/predict".to_string(),
             max_batch_size: 1,
             batch_timeout: 0.0,
             stream: false,
@@ -457,7 +455,6 @@ mod tests {
     #[test]
     fn test_model_config_defaults() {
         let cfg = ModelConfig::default();
-        assert_eq!(cfg.api_path, "/predict");
         assert_eq!(cfg.max_batch_size, 1);
         assert!(!cfg.stream);
         assert!(!cfg.continuous_batching);
@@ -522,12 +519,11 @@ mod tests {
         let dir = std::env::temp_dir().join("lite-server-model-config-valid");
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("config.yaml");
-        fs::write(&path, "max_batch_size: 4\nstream: true\napi_path: /generate\n").unwrap();
+        fs::write(&path, "max_batch_size: 4\nstream: true\n").unwrap();
 
         let cfg = load_model_config(&path).unwrap();
         assert_eq!(cfg.max_batch_size, 4);
         assert!(cfg.stream);
-        assert_eq!(cfg.api_path, "/generate");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -593,14 +589,12 @@ mod tests {
         let cfg = ModelConfig {
             max_batch_size: 8,
             stream: true,
-            api_path: "/v2/generate".to_string(),
             ..Default::default()
         };
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         let parsed: ModelConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.max_batch_size, 8);
         assert!(parsed.stream);
-        assert_eq!(parsed.api_path, "/v2/generate");
     }
 
     // --- apply_overrides ---

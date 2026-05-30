@@ -110,12 +110,10 @@ def load_litapi(model_py_path: str, config: dict, device: str = "cpu"):
     max_batch_size = config.get("max_batch_size", 1)
     batch_timeout = config.get("batch_timeout", 0.0)
     stream = config.get("stream", False)
-    api_path = config.get("api_path", "/predict")
 
     instance = LitAPIClass(
         max_batch_size=max_batch_size,
         batch_timeout=batch_timeout,
-        api_path=api_path,
         stream=stream,
     )
     instance.config = config

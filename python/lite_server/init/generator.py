@@ -32,24 +32,53 @@ def _render_config_yaml(batch: bool, stream: bool, continuous_batching: bool = F
         "# This file controls inference behavior for this specific version.",
         "# Place it alongside model.py in model_repo/<name>/<version>/config.yaml",
         "#",
-        "# Key fields:",
-        "#   api_path              - Custom HTTP endpoint (default: /predict)",
-        "#   max_batch_size        - Max requests to batch together (1 = disabled)",
-        "#   batch_timeout         - Max seconds to wait before processing a batch",
-        "#   stream                - Enable streaming response (yield tokens/chunks)",
-        "#   bidirectional         - Enable WebSocket bidirectional streaming",
-        "#   continuous_batching   - LLM continuous batching (requires stream=true)",
-        "#   max_sequence_length   - Max tokens per sequence (for LLM)",
-        "#   accelerator           - Device type: auto | cpu | cuda | mps | tpu",
-        "#   workers_per_device    - Inference workers per GPU/device",
-        "#   max_queue_size        - Max pending requests before rejecting",
-        "#   queue_mode            - Queue strategy: per_worker | shared",
+        "# All fields are optional. Omitted fields use defaults.",
+        "#",
+        "# TIP: All fields in this file are accessible in model.py via self.config:",
+        "#   value = self.config.get('my_custom_param', 'default_value')",
         "",
-        "# API endpoint path",
-        "api_path: /predict",
+        "# ===== Dynamic Batching =====",
+        "# max_batch_size: 1            # Max requests to batch together (1 = disabled)",
+        "# batch_timeout: 0.0           # Max seconds to wait before processing a batch",
+        "# adaptive_batching: false     # Dynamically adjust batch timeout based on queue pressure",
+        "# min_batch_timeout: 0.001     # Minimum batch timeout when adaptive_batching is enabled",
+        "# adaptive_queue_threshold: 10 # Queue depth threshold for adaptive batching",
         "",
-        "# Dynamic batching",
+        "# ===== Streaming =====",
+        "# stream: false                # Enable streaming output (requires stream_predict in model.py)",
+        "# bidirectional: false         # Enable bidirectional streaming (WebSocket)",
+        "",
+        "# ===== Continuous Batching (LLM) =====",
+        "# continuous_batching: false   # Enable continuous batching mode",
+        "# max_sequence_length: 2048    # Max sequence length for continuous batching",
+        "",
+        "# ===== Resource Allocation =====",
+        "# accelerator: null            # Accelerator type: cpu, cuda, mps, tpu, auto (null = cpu)",
+        "# devices: null                # Device assignment (null = auto, or integer like 1)",
+        "# workers_per_device: null     # Workers per device (null = 1)",
+        "",
+        "# ===== Queue & Timeout =====",
+        "# max_queue_size: 1000         # Max pending requests per worker",
+        "# queue_mode: per_worker       # Queue mode: per_worker or shared",
+        "# request_timeout: 0.0         # Per-request hard timeout in seconds (0 = disabled)",
+        "# max_requests: 0              # Auto-restart worker after N requests (0 = disabled)",
+        "# health_check_interval: 15.0  # Active health check interval in seconds (0 = disabled)",
+        "",
+        "# ===== Hot Reload =====",
+        "# hot_reload: false            # Enable file watching for hot reload",
+        "# hot_reload_patterns:         # Glob patterns to watch (e.g., *.py, model_*.yaml)",
+        "#   - \"*.py\"",
+        "# hot_reload_interval: 1.0     # Polling interval in seconds",
+        "",
+        "# ===== Custom Parameters =====",
+        "# Add your own parameters below. Access them in model.py via self.config.get('key')",
+        "# my_model_path: /opt/models/weights.pt",
+        "# my_threshold: 0.5",
     ]
+
+    # Add active configuration based on template options
+    lines.extend(["", "# ===== Active Configuration =====", ""])
+
     if batch:
         lines.extend([
             "max_batch_size: 8",
@@ -60,19 +89,12 @@ def _render_config_yaml(batch: bool, stream: bool, continuous_batching: bool = F
             "# max_batch_size: 8",
             "# batch_timeout: 0.01",
         ])
-    lines.extend([
-        "",
-        "# Streaming",
-    ])
+
     if stream:
         lines.append("stream: true")
     else:
         lines.append("# stream: true")
-    lines.append("# bidirectional: false        # Bidirectional streaming")
-    lines.extend([
-        "",
-        "# Continuous batching (for LLM)",
-    ])
+
     if continuous_batching:
         lines.extend([
             "continuous_batching: true",
@@ -83,16 +105,7 @@ def _render_config_yaml(batch: bool, stream: bool, continuous_batching: bool = F
             "# continuous_batching: false",
             "# max_sequence_length: 2048",
         ])
-    lines.extend([
-        "",
-        "# Resource allocation",
-        "# accelerator: auto           # auto | cpu | cuda | mps | tpu",
-        "# devices: 1                  # Number of GPUs / devices",
-        "# workers_per_device: 1       # Inference workers per device",
-        "",
-        "# Queue limits",
-        "# max_queue_size: 1000        # Max pending requests per model",
-    ])
+
     return "\n".join(lines) + "\n"
 
 

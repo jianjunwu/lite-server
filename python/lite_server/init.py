@@ -38,7 +38,6 @@ TEMPLATES = {
         '''),
         "config_yaml": textwrap.dedent('''\
             name: {model_name}
-            api_path: /predict
             max_batch_size: 1
             batch_timeout: 0.0
             stream: false
@@ -76,7 +75,6 @@ TEMPLATES = {
         '''),
         "config_yaml": textwrap.dedent('''\
             name: {model_name}
-            api_path: /predict
             max_batch_size: 1
             batch_timeout: 0.0
             stream: true
@@ -119,7 +117,6 @@ TEMPLATES = {
         '''),
         "config_yaml": textwrap.dedent('''\
             name: {model_name}
-            api_path: /predict
             max_batch_size: 8
             batch_timeout: 0.01
             stream: false

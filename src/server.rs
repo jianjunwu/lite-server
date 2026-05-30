@@ -9,10 +9,11 @@ use crate::worker::endpoint_manager::EndpointManager;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::signal;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration, Instant};
-use tracing::{info, error, warn};
+use tracing::{debug, info, error, warn};
 
 pub struct LiteServer {
     config: Config,
@@ -51,6 +52,14 @@ impl LiteServer {
 
         // Load initial models
         self.load_initial_models().await?;
+
+        // P2: Check if any loaded model has hot_reload enabled
+        let has_hot_reload = Arc::new(AtomicBool::new(self.registry_has_hot_reload_models()));
+        if has_hot_reload.load(Ordering::Relaxed) {
+            info!("Hot reload: enabled models detected, starting file watcher");
+        } else {
+            info!("Hot reload: no enabled models, file watcher will start on demand");
+        }
 
         // Start endpoint manager
         let repo_path = PathBuf::from(&self.config.model_repository.path)
@@ -120,22 +129,33 @@ impl LiteServer {
             }
         });
 
-        // Start hot reload watcher
+        // P2: Start hot reload watcher with on-demand flag
         let (watch_tx, mut watch_rx) = mpsc::channel::<Vec<PathBuf>>(32);
+        let has_hot_reload_for_watcher = has_hot_reload.clone();
         let watcher_handle = tokio::spawn(start_file_watcher(
             repo_path.clone(),
             self.worker_manager.clone(),
             watch_tx,
+            has_hot_reload_for_watcher,
         ));
 
         // Process reload events
         let reload_worker = self.worker_manager.clone();
         let reload_registry = self.registry.clone();
         let model_defaults = self.config.model_defaults.clone();
+        let has_hot_reload_for_reload = has_hot_reload.clone();
         let reload_handle = tokio::spawn(async move {
             let mut last_reload: std::collections::HashMap<(String, String), Instant> = std::collections::HashMap::new();
             while let Some(paths) = watch_rx.recv().await {
-                if let Err(e) = process_watch_events(paths, repo_path.clone(), reload_worker.clone(), reload_registry.clone(), &mut last_reload, &model_defaults).await {
+                if let Err(e) = process_watch_events(
+                    paths,
+                    repo_path.clone(),
+                    reload_worker.clone(),
+                    reload_registry.clone(),
+                    &mut last_reload,
+                    &model_defaults,
+                    &has_hot_reload_for_reload,
+                ).await {
                     warn!("Hot reload processing error: {}", e);
                 }
             }
@@ -211,6 +231,11 @@ impl LiteServer {
         self.worker_manager.shutdown().await;
 
         Ok(())
+    }
+
+    /// Check if any loaded model has hot_reload enabled.
+    fn registry_has_hot_reload_models(&self) -> bool {
+        self.registry.list_loaded().iter().any(|(_, _, mv)| mv.config.hot_reload)
     }
 
     async fn load_initial_models(&self) -> Result<(), AppError> {
@@ -441,6 +466,26 @@ fn group_by_model(models: Vec<RepoModel>) -> HashMap<String, Vec<RepoModel>> {
     map
 }
 
+/// Check if a filename matches any of the glob-like patterns.
+/// Supports simple `*` wildcard (e.g., `*.py`, `model_*.yaml`).
+fn matches_patterns(filename: &str, patterns: &[String]) -> bool {
+    if patterns.is_empty() {
+        return true; // no patterns = match all
+    }
+    patterns.iter().any(|p| {
+        if let Some(suffix) = p.strip_prefix("*.") {
+            // Simple suffix match: "*.py" matches "foo.py"
+            filename.ends_with(&format!(".{}", suffix))
+        } else if let Some(prefix) = p.strip_suffix(".*") {
+            // Prefix match: "model_.*" matches "model_abc"
+            filename.starts_with(prefix)
+        } else {
+            // Exact match
+            filename == p
+        }
+    })
+}
+
 async fn process_watch_events(
     paths: Vec<PathBuf>,
     repo_path: PathBuf,
@@ -448,11 +493,14 @@ async fn process_watch_events(
     registry: Arc<ModelRegistry>,
     last_reload: &mut std::collections::HashMap<(String, String), Instant>,
     model_defaults: &crate::config::ModelDefaults,
+    has_hot_reload: &AtomicBool,
 ) -> Result<(), AppError> {
     use std::collections::HashSet;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
+    // Map from (model, version) to the set of changed files for that model
     let mut models_to_reload: HashSet<(String, String)> = HashSet::new();
+    let mut trigger_files: std::collections::HashMap<(String, String), Vec<PathBuf>> =
+        std::collections::HashMap::new();
     let mut models_to_check_new: Vec<PathBuf> = Vec::new();
     let mut models_to_check_removed: Vec<(String, String)> = Vec::new();
 
@@ -498,14 +546,18 @@ async fn process_watch_events(
                         if crate::validation::validate_identifier(model_name).is_ok()
                             && crate::validation::validate_identifier(version).is_ok()
                         {
-                            models_to_reload.insert((model_name.to_string(), version.to_string()));
+                            let key = (model_name.to_string(), version.to_string());
+                            models_to_reload.insert(key.clone());
+                            trigger_files.entry(key).or_default().push(path.clone());
                         }
                     } else {
                         // File was deleted
                         if crate::validation::validate_identifier(model_name).is_ok()
                             && crate::validation::validate_identifier(version).is_ok()
                         {
-                            models_to_reload.insert((model_name.to_string(), version.to_string()));
+                            let key = (model_name.to_string(), version.to_string());
+                            models_to_reload.insert(key.clone());
+                            trigger_files.entry(key).or_default().push(path.clone());
                             models_to_check_removed.push((model_name.to_string(), version.to_string()));
                         }
                     }
@@ -524,15 +576,36 @@ async fn process_watch_events(
                 continue;
             }
         }
-        last_reload.insert(key, Instant::now());
 
-        if registry.get(&name, Some(&version)).is_some() {
+        // P0: Check if hot_reload is enabled for this model version
+        if let Some(mv) = registry.get(&name, Some(&version)) {
+            if !mv.config.hot_reload {
+                debug!("Hot reload: skipping {} version {} (hot_reload=false)", name, version);
+                continue;
+            }
+
+            // P1: Check hot_reload_patterns - if configured, only reload when matching files change
+            if !mv.config.hot_reload_patterns.is_empty() {
+                let empty: Vec<PathBuf> = Vec::new();
+                let files = trigger_files.get(&key).unwrap_or(&empty);
+                let any_match = files.iter().any(|f| {
+                    let fname = f.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    matches_patterns(fname, &mv.config.hot_reload_patterns)
+                });
+                if !any_match {
+                    debug!("Hot reload: skipping {} version {} (no pattern match)", name, version);
+                    continue;
+                }
+            }
+
+            last_reload.insert(key, Instant::now());
             info!("Hot reload: reloading {} version {}", name, version);
             if let Err(e) = worker_manager.reload_model(&name, Some(&version)).await {
                 warn!("Hot reload failed for {} version {}: {}", name, version, e);
             }
         } else {
             // Model not loaded yet, try to load it
+            // For new models, check config.yaml for hot_reload setting
             let config_path = repo_path.join(&name).join(&version).join("config.yaml");
             if config_path.exists() {
                 let mut config = crate::config::load_model_config(&config_path).unwrap_or_default();
@@ -540,15 +613,28 @@ async fn process_watch_events(
                 if let Some(v) = model_defaults.max_requests { config.max_requests = v; }
                 if let Some(v) = model_defaults.request_timeout { config.request_timeout = v; }
                 if let Some(v) = model_defaults.health_check_interval { config.health_check_interval = v; }
+
+                // P0: Only auto-load if hot_reload is enabled
+                if !config.hot_reload {
+                    debug!("Hot reload: skipping new model {} version {} (hot_reload=false)", name, version);
+                    continue;
+                }
+
+                last_reload.insert(key, Instant::now());
                 info!("Hot reload: auto-loading new model {} version {}", name, version);
                 if let Err(e) = worker_manager.load_model(&name, &version, &config).await {
                     warn!("Hot load failed for {} version {}: {}", name, version, e);
+                } else {
+                    // P2: Update flag when new hot_reload model is loaded
+                    has_hot_reload.store(true, Ordering::Relaxed);
                 }
             }
         }
     }
 
     // Check for removed models
+    // After unloading, re-check if any hot_reload models remain
+    let had_unloads = !models_to_check_removed.is_empty();
     for (name, version) in models_to_check_removed {
         let version_dir = repo_path.join(&name).join(&version);
         if !version_dir.exists() {
@@ -557,15 +643,28 @@ async fn process_watch_events(
         }
     }
 
+    // P2: Re-check hot_reload flag after potential unloads
+    if had_unloads {
+        let any_hot_reload = registry.list_loaded().iter().any(|(_, _, mv)| mv.config.hot_reload);
+        has_hot_reload.store(any_hot_reload, Ordering::Relaxed);
+        if !any_hot_reload {
+            info!("Hot reload: no more enabled models, watcher will skip events");
+        }
+    }
+
     Ok(())
 }
 
 // ===== Hot Reload File Watcher =====
 
+/// Start a file watcher on the model repository directory.
+/// The `has_hot_reload` flag controls whether events are actually sent for processing.
+/// When no models have hot_reload enabled, events are collected but not forwarded.
 async fn start_file_watcher(
     repo_path: PathBuf,
     worker_manager: Arc<WorkerManager>,
     tx: mpsc::Sender<Vec<PathBuf>>,
+    has_hot_reload: Arc<AtomicBool>,
 ) {
     use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -601,6 +700,11 @@ async fn start_file_watcher(
             Some(res) = notify_rx.recv() => {
                 match res {
                     Ok(event) => {
+                        // P2: Skip collecting events if no hot_reload models
+                        if !has_hot_reload.load(Ordering::Relaxed) {
+                            continue;
+                        }
+
                         for path in event.paths {
                             // Skip UDS sockets, temp files, hidden files, Python cache
                             if path.extension().map(|e| e == "sock").unwrap_or(false) {
@@ -667,7 +771,8 @@ mod tests {
         ));
 
         let (tx, _rx) = mpsc::channel::<Vec<PathBuf>>(32);
-        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx));
+        let has_hot_reload = Arc::new(AtomicBool::new(true));
+        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload));
 
         // Give watcher time to start
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -700,7 +805,8 @@ mod tests {
         ));
 
         let (tx, mut rx) = mpsc::channel::<Vec<PathBuf>>(32);
-        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx));
+        let has_hot_reload = Arc::new(AtomicBool::new(true));
+        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload));
 
         // Give watcher time to start
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -721,5 +827,25 @@ mod tests {
 
         handle.abort();
         let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+    }
+
+    #[test]
+    fn test_matches_patterns() {
+        // Wildcard suffix
+        assert!(matches_patterns("model.py", &["*.py".to_string()]));
+        assert!(!matches_patterns("model.yaml", &["*.py".to_string()]));
+
+        // Exact match
+        assert!(matches_patterns("config.yaml", &["config.yaml".to_string()]));
+        assert!(!matches_patterns("other.yaml", &["config.yaml".to_string()]));
+
+        // Empty patterns = match all
+        assert!(matches_patterns("anything.txt", &[]));
+
+        // Multiple patterns
+        let patterns = vec!["*.py".to_string(), "*.yaml".to_string()];
+        assert!(matches_patterns("model.py", &patterns));
+        assert!(matches_patterns("config.yaml", &patterns));
+        assert!(!matches_patterns("data.json", &patterns));
     }
 }

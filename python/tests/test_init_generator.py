@@ -89,12 +89,6 @@ class TestServerYaml:
 class TestConfigYaml:
     """model version config.yaml content."""
 
-    def test_contains_api_path(self, tmp_path):
-        gen = ProjectGenerator("p", "empty", tmp_path, model_name="m")
-        root = gen.generate()
-        text = (root / "model_repo" / "m" / "1" / "config.yaml").read_text()
-        assert "api_path: /predict" in text
-
     def test_llm_template_has_stream_true(self, tmp_path):
         gen = ProjectGenerator("p", "llm", tmp_path)
         root = gen.generate()
