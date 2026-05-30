@@ -38,18 +38,32 @@ jobs:
 
       - name: Install Miniconda and protoc
         run: |
-          curl -fsSL -o /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-$([ "$RUNNER_OS" = "macOS" ] && echo "MacOSX" || echo "Linux")-x86_64.sh
-          bash /tmp/miniconda.sh -b -p /opt/miniconda
-          /opt/miniconda/bin/conda install -y -c conda-forge protobuf
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            curl -fsSL -o /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-arm64.sh
+            bash /tmp/miniconda.sh -b -p "$HOME/miniconda"
+            "$HOME/miniconda/bin/conda" install -y -c conda-forge protobuf
+          else
+            curl -fsSL -o /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+            bash /tmp/miniconda.sh -b -p /opt/miniconda
+            /opt/miniconda/bin/conda install -y -c conda-forge protobuf
+          fi
 
       - name: Install Python dependencies
         run: |
-          export PATH="/opt/miniconda/bin:$PATH"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            export PATH="$HOME/miniconda/bin:$PATH"
+          else
+            export PATH="/opt/miniconda/bin:$PATH"
+          fi
           pip install -e ".[dev]"
 
       - name: Run Rust tests
         run: |
-          export PATH="/opt/miniconda/bin:$PATH"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            export PATH="$HOME/miniconda/bin:$PATH"
+          else
+            export PATH="/opt/miniconda/bin:$PATH"
+          fi
           cargo test -- --test-threads=1
 
   get-version:
@@ -133,10 +147,10 @@ jobs:
       - name: Install Miniconda and protoc (macOS)
         if: runner.os == 'macOS'
         run: |
-          curl -fsSL -o /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-x86_64.sh
-          bash /tmp/miniconda.sh -b -p /opt/miniconda
-          /opt/miniconda/bin/conda install -y -c conda-forge protobuf
-          echo "/opt/miniconda/bin" >> $GITHUB_PATH
+          curl -fsSL -o /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-arm64.sh
+          bash /tmp/miniconda.sh -b -p "$HOME/miniconda"
+          "$HOME/miniconda/bin/conda" install -y -c conda-forge protobuf
+          echo "$HOME/miniconda/bin" >> $GITHUB_PATH
 
       - name: Install Miniconda and protoc (Windows)
         if: runner.os == 'Windows'
