@@ -37,8 +37,9 @@ struct WorkerProcess {
     worker_id: u32,
     model_name: String,
     version: String,
-    child: Child,
+    pid: Option<u32>,
     endpoint: String,
+    shutdown_tx: Option<oneshot::Sender<()>>,
 }
 
 impl WorkerManager {
@@ -223,8 +224,10 @@ impl WorkerManager {
                 .spawn()
                 .map_err(|e| AppError::Python(format!("failed to spawn worker: {}", e)))?;
 
-            let stdout = child.stdout.take().unwrap();
-            let stderr = child.stderr.take().unwrap();
+            let stdout = child.stdout.take()
+                .ok_or_else(|| AppError::Internal("worker stdout not piped".to_string()))?;
+            let stderr = child.stderr.take()
+                .ok_or_else(|| AppError::Internal("worker stderr not piped".to_string()))?;
 
             // Wait for "ready" signal
             let mut reader = BufReader::new(stdout);
@@ -305,11 +308,25 @@ impl WorkerManager {
             let zmq_client = Arc::new(WorkerZmqClient::new(endpoint.clone()));
             zmq_clients_for_model.push(zmq_client.clone());
 
+            let pid = child.id();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+            // Spawn monitor task — owns the Child, detects exits and handles cleanup
+            let endpoint_clone = endpoint.clone();
+            spawn_worker_monitor(child, model_name, version, worker_id as u32, shutdown_rx, move || {
+                // Best-effort socket cleanup on unexpected exit
+                #[cfg(unix)]
+                {
+                    let socket_str = endpoint_clone.strip_prefix("ipc://").unwrap_or(&endpoint_clone);
+                    let _ = std::fs::remove_file(socket_str);
+                }
+            });
+
             let info = WorkerInfo {
                 worker_id: worker_id as u32,
                 device,
                 endpoint: endpoint.clone(),
-                pid: child.id(),
+                pid,
                 status: WorkerStatus::Ready,
             };
             worker_infos.push(info);
@@ -318,8 +335,9 @@ impl WorkerManager {
                 worker_id: worker_id as u32,
                 model_name: model_name.to_string(),
                 version: version.to_string(),
-                child,
+                pid,
                 endpoint,
+                shutdown_tx: Some(shutdown_tx),
             });
         }
 
@@ -386,6 +404,10 @@ impl WorkerManager {
             let mut clients = self.zmq_clients.write().await;
             if let Some(mut procs) = workers.remove(&key) {
                 for mut proc in procs.drain(..) {
+                    // Signal the monitor task to kill the process
+                    if let Some(tx) = proc.shutdown_tx.take() {
+                        let _ = tx.send(());
+                    }
                     // Clean up ZMQ socket file (Unix only)
                     #[cfg(unix)]
                     {
@@ -393,8 +415,6 @@ impl WorkerManager {
                         let socket_path = std::path::Path::new(socket_str);
                         let _ = tokio::fs::remove_file(socket_path).await;
                     }
-                    let _ = proc.child.kill().await;
-                    let _ = proc.child.wait().await;
                 }
             }
             clients.remove(&key);
@@ -493,6 +513,58 @@ impl WorkerManager {
     }
 }
 
+/// Spawn a background task that monitors a worker child process.
+/// - If the process exits on its own (crash, OOM kill), logs the event and runs cleanup.
+/// - If a shutdown signal is sent via `shutdown_rx`, kills the process and runs cleanup.
+fn spawn_worker_monitor(
+    mut child: Child,
+    model_name: &str,
+    version: &str,
+    worker_id: u32,
+    mut shutdown_rx: oneshot::Receiver<()>,
+    on_exit: impl FnOnce() + Send + 'static,
+) {
+    let model = model_name.to_string();
+    let ver = version.to_string();
+    tokio::spawn(async move {
+        tokio::select! {
+            result = child.wait() => {
+                match result {
+                    Ok(status) => {
+                        if status.success() {
+                            info!(
+                                model = %model, version = %ver, worker_id,
+                                "Worker process exited cleanly"
+                            );
+                        } else {
+                            error!(
+                                model = %model, version = %ver, worker_id,
+                                exit_code = status.code().unwrap_or(-1),
+                                "Worker process exited unexpectedly"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            model = %model, version = %ver, worker_id,
+                            error = %e,
+                            "Failed to wait on worker process"
+                        );
+                    }
+                }
+            }
+            _ = &mut shutdown_rx => {
+                info!(
+                    model = %model, version = %ver, worker_id,
+                    "Shutting down worker process"
+                );
+                let _ = child.kill().await;
+            }
+        }
+        on_exit();
+    });
+}
+
 /// Build a platform-appropriate ZMQ endpoint for a worker.
 /// - Unix: IPC socket in the system temp directory
 /// - Windows: TCP on localhost (IPC not supported)
@@ -586,5 +658,42 @@ mod tests {
             seen[idx] = true;
         }
         assert!(seen.iter().all(|&s| s), "not all workers were picked");
+    }
+
+    /// When a child process exits unexpectedly, the monitor task must detect it
+    /// and invoke the cleanup callback.
+    #[tokio::test]
+    async fn test_worker_monitor_detects_exit() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Spawn a process that exits immediately
+        #[cfg(unix)]
+        let child = tokio::process::Command::new("false")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        #[cfg(windows)]
+        let child = tokio::process::Command::new("cmd")
+            .args(["/c", "exit", "1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let cleaned_up = Arc::new(AtomicBool::new(false));
+        let cleaned_up_clone = cleaned_up.clone();
+
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        spawn_worker_monitor(child, "test_model", "1", 0, shutdown_rx, move || {
+            cleaned_up_clone.store(true, Ordering::SeqCst);
+        });
+
+        // Wait for the monitor to detect the exit and run cleanup
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !cleaned_up.load(Ordering::SeqCst) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(cleaned_up.load(Ordering::SeqCst), "monitor should have triggered cleanup");
     }
 }

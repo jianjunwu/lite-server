@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, Instrument};
 use uuid::Uuid;
 
 #[derive(Deserialize)]
@@ -52,7 +52,7 @@ pub async fn metrics_handler() -> impl IntoResponse {
     Response::builder()
         .header("content-type", "text/plain; charset=utf-8")
         .body(body)
-        .unwrap()
+        .expect("metrics response: builder should not fail with string body")
 }
 
 // ===== List Models =====
@@ -130,7 +130,7 @@ async fn scan_repository(repo_path: &std::path::Path) -> Vec<Value> {
         if !model_dir.is_dir() {
             continue;
         }
-        let model_name = model_dir.file_name().unwrap().to_string_lossy().to_string();
+        let model_name = model_dir.file_name().unwrap_or_default().to_string_lossy().to_string();
 
         let mut versions = Vec::new();
         if let Ok(mut version_entries) = tokio::fs::read_dir(&model_dir).await {
@@ -139,7 +139,7 @@ async fn scan_repository(repo_path: &std::path::Path) -> Vec<Value> {
                 if !version_dir.is_dir() {
                     continue;
                 }
-                let version = version_dir.file_name().unwrap().to_string_lossy().to_string();
+                let version = version_dir.file_name().unwrap_or_default().to_string_lossy().to_string();
                 let model_py = version_dir.join("model.py");
                 let config_yaml = version_dir.join("config.yaml");
 
@@ -172,7 +172,7 @@ async fn scan_repository(repo_path: &std::path::Path) -> Vec<Value> {
             if path.extension().map(|e| e == "lma").unwrap_or(false) {
                 // Simplified: just list the artifact file
                 models.push(json!({
-                    "name": path.file_stem().unwrap().to_string_lossy().to_string(),
+                    "name": path.file_stem().unwrap_or_default().to_string_lossy().to_string(),
                     "version": "1",
                     "path": path.to_string_lossy().to_string(),
                     "has_config": false,
@@ -347,6 +347,14 @@ async fn do_infer(
     headers: HeaderMap,
     payload: Value,
 ) -> Result<Json<Value>, AppError> {
+    let request_id = Uuid::new_v4().to_string();
+    let span = tracing::info_span!(
+        "inference",
+        model = %model_name,
+        version = version.as_deref().unwrap_or("auto"),
+        request_id = %request_id,
+    );
+    async move {
     let resolved_version = match &version {
         Some(v) => v.clone(),
         None => state.registry.get_active_version(&model_name)
@@ -378,7 +386,7 @@ async fn do_infer(
     }
 
     let uid = format!("{}_{}-{}-{}", model_name, resolved_version, Uuid::new_v4(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
 
     let start = Instant::now();
 
@@ -388,7 +396,6 @@ async fn do_infer(
         .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), s.to_string())))
         .collect();
     let client_ip = extract_client_ip(&headers);
-    let request_id = Uuid::new_v4().to_string();
     let timestamp_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -431,10 +438,12 @@ async fn do_infer(
     let response = match tokio::time::timeout(timeout_duration, response_rx).await {
         Ok(Ok(resp)) => resp,
         Ok(Err(_)) => {
+            error!(timeout_secs = %timeout_duration.as_secs(), "Response channel closed");
             prometheus::record_request_end(&model_name, &resolved_version, "5xx", start.elapsed().as_secs_f64()).await;
             return Err(AppError::InferenceTimeout("response channel closed".to_string()));
         }
         Err(_) => {
+            error!(timeout_secs = %timeout_duration.as_secs(), elapsed_ms = %start.elapsed().as_millis(), "Inference request timed out");
             prometheus::record_request_end(&model_name, &resolved_version, "5xx", start.elapsed().as_secs_f64()).await;
             return Err(AppError::InferenceTimeout("request timeout".to_string()));
         }
@@ -461,6 +470,7 @@ async fn do_infer(
                     let msg = single.status.as_ref().and_then(|s| {
                         if s.message.is_empty() { None } else { Some(s.message.clone()) }
                     }).unwrap_or_else(|| "unknown worker error".to_string());
+                    error!(worker_error = %msg, duration_ms = %(duration * 1000.0) as u64, "Worker returned error");
                     prometheus::record_request_end(&model_name, &resolved_version, "5xx", duration).await;
                     Err(AppError::WorkerCrashed(msg))
                 }
@@ -475,6 +485,7 @@ async fn do_infer(
             Err(AppError::WorkerCrashed("unexpected response type".to_string()))
         }
     }
+    }.instrument(span).await
 }
 
 // ===== Streaming Helpers =====

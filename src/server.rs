@@ -288,7 +288,7 @@ async fn start_metrics_server(host: &str, port: u16) -> Result<(), AppError> {
         axum::response::Response::builder()
             .header("content-type", "text/plain; charset=utf-8")
             .body(body)
-            .unwrap()
+            .expect("metrics response: builder should not fail with string body")
     }));
 
     let listener = tokio::net::TcpListener::bind(addr)

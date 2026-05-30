@@ -158,7 +158,7 @@ impl SizeRotatingAppender {
     }
 
     fn rotate(&self) -> std::io::Result<()> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let backup = inner.path.with_extension("log.1");
         let _ = rename(&inner.path, &backup);
         inner.file = OpenOptions::new()
@@ -171,18 +171,54 @@ impl SizeRotatingAppender {
 
 impl Write for SizeRotatingAppender {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let current_size = inner.file.metadata()?.len() as usize;
         if current_size + buf.len() > inner.max_size {
             drop(inner);
             self.rotate()?;
-            inner = self.inner.lock().unwrap();
+            inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         }
         inner.file.write_all(buf)?;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.lock().unwrap().file.flush()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).file.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// After a panic inside the mutex, SizeRotatingAppender must still work.
+    /// Without poisoning recovery, this test panics on the second .lock().unwrap().
+    #[test]
+    fn size_rotating_appender_survives_mutex_poisoning() {
+        let dir = std::env::temp_dir().join(format!("lite-server-log-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.log");
+
+        let appender = SizeRotatingAppender::new(path.clone(), 1024 * 1024).unwrap();
+
+        // Poison the mutex: panic while holding the lock
+        let inner_clone = appender.inner.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = inner_clone.lock().unwrap();
+            panic!("intentional poison");
+        }));
+        // Mutex is now poisoned
+
+        // Write must still succeed after poisoning
+        let mut a = appender.clone();
+        let result = a.write(b"after poison\n");
+        assert!(result.is_ok(), "write should succeed after mutex poisoning");
+
+        // Flush must still succeed after poisoning
+        let result = a.flush();
+        assert!(result.is_ok(), "flush should succeed after mutex poisoning");
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -166,8 +166,10 @@ impl EndpointManager {
             .spawn()
             .map_err(|e| AppError::Python(format!("failed to spawn endpoint worker: {}", e)))?;
 
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
+        let stdout = child.stdout.take()
+            .ok_or_else(|| AppError::Internal("endpoint stdout not piped".to_string()))?;
+        let stderr = child.stderr.take()
+            .ok_or_else(|| AppError::Internal("endpoint stderr not piped".to_string()))?;
 
         // Wait for startup signal
         let mut reader = BufReader::new(stdout);
