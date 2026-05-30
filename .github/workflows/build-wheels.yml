@@ -77,20 +77,20 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             platform: manylinux_2_28
+            protoc-path: /usr/bin/protoc
             before-script: |
               apt-get update && apt-get install -y protobuf-compiler
               curl -fsSL -o /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
               bash /tmp/miniconda.sh -b -p /opt/miniconda
               /opt/miniconda/bin/conda install -y python=3.10
-              export PROTOC=/usr/bin/protoc
             interpreter: /opt/miniconda/bin/python3.10
           # Linux aarch64
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             platform: manylinux_2_28
+            protoc-path: /usr/bin/protoc
             before-script: |
               apt-get update && apt-get install -y protobuf-compiler
-              export PROTOC=/usr/bin/protoc
             interpreter: python3.10
           # macOS x86_64 (disabled: macos-13 runner scarce)
           # - os: macos-13
@@ -152,6 +152,8 @@ jobs:
           manylinux: ${{ matrix.platform }}
           args: --release --interpreter ${{ matrix.interpreter }}
           before-script-linux: ${{ matrix.before-script }}
+        env:
+          PROTOC: ${{ matrix.protoc-path || env.PROTOC }}
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
