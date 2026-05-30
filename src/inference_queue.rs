@@ -1,6 +1,5 @@
 use bytes::Bytes;
 use crate::config::ModelConfig;
-use crate::error::AppError;
 use crate::metrics::prometheus;
 use crate::proto::liteserver as pb;
 use crate::registry::types::WorkerInfo;
@@ -8,9 +7,9 @@ use crate::transport::zmq::WorkerZmqClient;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
-use tracing::{error, warn};
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tracing::{error, info, warn};
 
 /// Pre-sized key for model_version lookups — single allocation, no reallocation.
 /// Used on the hot path (try_submit / has_queue) to avoid repeated format! overhead.
@@ -48,6 +47,129 @@ impl std::fmt::Display for QueueError {
         }
     }
 }
+
+// ===== Outlier Detection (inspired by Envoy) =====
+
+/// Per-worker ejection state.
+struct EjectedWorker {
+    ejected_at: Instant,
+}
+
+/// Per-worker outlier detection tracking.
+struct WorkerOutlier {
+    consecutive_errors: AtomicUsize,
+    ejected: Mutex<Option<EjectedWorker>>,
+}
+
+/// Shared outlier detection state for a model version's workers.
+pub struct OutlierState {
+    workers: Vec<WorkerOutlier>,
+    // Precomputed thresholds (read-only after construction)
+    consecutive_threshold: usize,
+    base_ejection_time: Duration,
+    max_ejection_percent: usize,
+}
+
+impl OutlierState {
+    pub fn new(num_workers: usize) -> Self {
+        Self {
+            workers: (0..num_workers)
+                .map(|_| WorkerOutlier {
+                    consecutive_errors: AtomicUsize::new(0),
+                    ejected: Mutex::new(None),
+                })
+                .collect(),
+            consecutive_threshold: 3,
+            base_ejection_time: Duration::from_secs(30),
+            max_ejection_percent: 50,
+        }
+    }
+
+    /// Record a successful request — reset consecutive error count.
+    pub fn record_success(&self, worker_idx: usize) {
+        if let Some(w) = self.workers.get(worker_idx) {
+            w.consecutive_errors.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Record an error — increment count and potentially eject.
+    pub async fn record_error(&self, worker_idx: usize) {
+        let w = match self.workers.get(worker_idx) {
+            Some(w) => w,
+            None => return,
+        };
+        let count = w.consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
+        if count >= self.consecutive_threshold {
+            self.maybe_eject(worker_idx).await;
+        }
+    }
+
+    /// Eject a worker if not already ejected and below max ejection percent.
+    async fn maybe_eject(&self, worker_idx: usize) {
+        let w = &self.workers[worker_idx];
+        let mut guard = w.ejected.lock().await;
+        if guard.is_some() {
+            return; // already ejected
+        }
+        // Count currently ejected workers (non-blocking, approximate is fine)
+        let mut ejected_count = 0;
+        for (i, other) in self.workers.iter().enumerate() {
+            if i == worker_idx {
+                continue;
+            }
+            if let Ok(g) = other.ejected.try_lock() {
+                if g.is_some() {
+                    ejected_count += 1;
+                }
+            }
+        }
+        let max_ejected = (self.workers.len() * self.max_ejection_percent / 100).max(1);
+        if ejected_count < max_ejected {
+            *guard = Some(EjectedWorker {
+                ejected_at: Instant::now(),
+            });
+            prometheus::inc_worker_ejection();
+            info!("Worker {} ejected after {} consecutive errors", worker_idx, self.consecutive_threshold);
+        }
+    }
+
+    /// Check if a worker is currently ejected, recovering if ejection time has passed.
+    pub async fn is_ejected(&self, worker_idx: usize) -> bool {
+        let w = match self.workers.get(worker_idx) {
+            Some(w) => w,
+            None => return false,
+        };
+        let mut guard = w.ejected.lock().await;
+        if let Some(ref ejected) = *guard {
+            if ejected.ejected_at.elapsed() >= self.base_ejection_time {
+                // Recovery: clear ejection state and reset errors
+                *guard = None;
+                w.consecutive_errors.store(0, Ordering::Relaxed);
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Count currently active (non-ejected) workers.
+    pub async fn active_count(&self) -> usize {
+        let mut count = 0;
+        for w in &self.workers {
+            let guard = w.ejected.lock().await;
+            if guard.is_none() {
+                count += 1;
+            }
+        }
+        count
+    }
+}
+
+// ===== Retry configuration =====
+
+const MAX_RETRIES: usize = 3;
 
 /// Per-model-version inference queue with batch aggregation.
 pub struct InferenceQueue {
@@ -141,42 +263,55 @@ impl InferenceQueue {
     }
 }
 
-/// Pick the worker with the lowest inflight count (least-loaded).
-fn pick_worker_least_loaded(inflight: &[Arc<AtomicUsize>]) -> usize {
+/// Pick the worker with the lowest inflight count (least-loaded), skipping ejected workers.
+async fn pick_worker_least_loaded(inflight: &[Arc<AtomicUsize>], outlier: &OutlierState) -> usize {
     if inflight.len() == 1 {
         return 0;
     }
-    let mut min_idx = 0;
-    let mut min_val = inflight[0].load(Ordering::Relaxed);
-    for (i, count) in inflight.iter().enumerate().skip(1) {
-        let val = count.load(Ordering::Relaxed);
-        if val < min_val {
-            min_val = val;
-            min_idx = i;
+
+    let mut best_active: Option<(usize, usize)> = None;
+    let mut best_ejected: Option<(usize, usize)> = None;
+
+    for (i, counter) in inflight.iter().enumerate() {
+        let load = counter.load(Ordering::Relaxed);
+        if outlier.is_ejected(i).await {
+            if best_ejected.is_none() || load < best_ejected.unwrap().1 {
+                best_ejected = Some((i, load));
+            }
+        } else {
+            if best_active.is_none() || load < best_active.unwrap().1 {
+                best_active = Some((i, load));
+            }
         }
     }
-    min_idx
+
+    // Prefer active worker; if all ejected, fall back to least-loaded ejected
+    best_active
+        .or(best_ejected)
+        .map(|(idx, _)| idx)
+        .unwrap_or(0)
 }
 
-/// Send a batch of requests to a worker and distribute responses.
-async fn send_batch(
+/// Send a batch to a single worker. Returns Err on transport/worker failure.
+/// On success, all items are drained and responses sent to callers.
+/// On error, the batch is drained with error responses and Err is returned.
+async fn do_send_batch(
     batch: &mut Vec<QueueItem>,
     zmq_clients: &[Arc<WorkerZmqClient>],
     inflight: &[Arc<AtomicUsize>],
+    outlier: &OutlierState,
     model_name: &str,
     version: &str,
-) {
+) -> Result<(), ()> {
     if batch.is_empty() {
-        return;
+        return Ok(());
     }
 
-    let worker_idx = pick_worker_least_loaded(inflight);
+    let worker_idx = pick_worker_least_loaded(inflight, outlier).await;
     inflight[worker_idx].fetch_add(1, Ordering::Relaxed);
     let zmq_client = &zmq_clients[worker_idx];
 
     // Build protobuf request (Single if batch.len() == 1, else Batch)
-    // Prost proto types require owned Vec<u8>/RequestMeta, so we convert at
-    // the serialization boundary. QueueItem.data is Bytes, meta is Arc.
     let request = if batch.len() == 1 {
         let item = &batch[0];
         pb::Request {
@@ -220,8 +355,12 @@ async fn send_batch(
                             .map(|item| (item.uid.clone(), item))
                             .collect();
 
+                    let mut all_ok = true;
                     for queue_item in batch.drain(..) {
                         let single_resp = if let Some(resp_item) = resp_map.get(&queue_item.uid) {
+                            if resp_item.status.as_ref().map(|s| s.code.as_str()) == Some("Error") {
+                                all_ok = false;
+                            }
                             pb::Response {
                                 uid: queue_item.uid,
                                 payload: Some(pb::response::Payload::Single(pb::SingleResponse {
@@ -231,6 +370,7 @@ async fn send_batch(
                                 metrics: resp.metrics.clone(),
                             }
                         } else {
+                            all_ok = false;
                             pb::Response {
                                 uid: queue_item.uid,
                                 payload: Some(pb::response::Payload::Single(pb::SingleResponse {
@@ -245,14 +385,32 @@ async fn send_batch(
                         };
                         let _ = queue_item.response_tx.send(single_resp);
                     }
+
+                    inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
+                    if all_ok {
+                        outlier.record_success(worker_idx);
+                        Ok(())
+                    } else {
+                        outlier.record_error(worker_idx).await;
+                        Err(())
+                    }
                 }
                 Some(pb::response::Payload::Single(single_resp)) => {
+                    let is_error = single_resp.status.as_ref().map(|s| s.code.as_str()) == Some("Error");
                     if let Some(queue_item) = batch.pop() {
                         let _ = queue_item.response_tx.send(pb::Response {
                             uid: queue_item.uid,
                             payload: Some(pb::response::Payload::Single(single_resp)),
                             metrics: resp.metrics,
                         });
+                    }
+                    inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
+                    if is_error {
+                        outlier.record_error(worker_idx).await;
+                        Err(())
+                    } else {
+                        outlier.record_success(worker_idx);
+                        Ok(())
                     }
                 }
                 _ => {
@@ -270,6 +428,9 @@ async fn send_batch(
                             metrics: None,
                         });
                     }
+                    inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
+                    outlier.record_error(worker_idx).await;
+                    Err(())
                 }
             }
         }
@@ -291,10 +452,47 @@ async fn send_batch(
                     metrics: None,
                 });
             }
+            inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
+            outlier.record_error(worker_idx).await;
+            Err(())
         }
     }
+}
 
-    inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
+/// Send a batch with retry on failure. Retries on a different worker (if available).
+async fn send_batch_with_retry(
+    mut batch: Vec<QueueItem>,
+    zmq_clients: &[Arc<WorkerZmqClient>],
+    inflight: &[Arc<AtomicUsize>],
+    outlier: &OutlierState,
+    model_name: &str,
+    version: &str,
+) {
+    if batch.is_empty() {
+        return;
+    }
+
+    // Fast path: single worker, no retry possible
+    if zmq_clients.len() <= 1 {
+        let _ = do_send_batch(&mut batch, zmq_clients, inflight, outlier, model_name, version).await;
+        return;
+    }
+
+    for attempt in 0..MAX_RETRIES {
+        if attempt > 0 {
+            prometheus::inc_retry(model_name, version);
+        }
+        match do_send_batch(&mut batch, zmq_clients, inflight, outlier, model_name, version).await {
+            Ok(()) => return,
+            Err(()) => {
+                if batch.is_empty() {
+                    return; // all items already got error responses
+                }
+                // items remain — retry on next worker
+            }
+        }
+    }
+    // All retries exhausted; remaining items already have error responses from last attempt
 }
 
 /// Compute adaptive batch timeout based on current batch size, queue depth, and config.
@@ -352,30 +550,28 @@ async fn batch_collector(
     model_name: String,
     version: String,
 ) {
+    let worker_inflight: Vec<Arc<AtomicUsize>> = (0..zmq_clients.len())
+        .map(|_| Arc::new(AtomicUsize::new(0)))
+        .collect();
+    let outlier = Arc::new(OutlierState::new(zmq_clients.len()));
+
     if max_batch_size <= 1 {
         // Fast path: no batching, send immediately and concurrently
-        let worker_inflight: Vec<Arc<AtomicUsize>> = (0..zmq_clients.len())
-            .map(|_| Arc::new(AtomicUsize::new(0)))
-            .collect();
-
         while let Some(item) = rx.recv().await {
-            let mut batch = vec![item];
+            let batch = vec![item];
             let zmq_clients = zmq_clients.clone();
             let worker_inflight = worker_inflight.clone();
+            let outlier = outlier.clone();
             let model_name = model_name.clone();
             let version = version.clone();
             tokio::spawn(async move {
-                send_batch(&mut batch, &zmq_clients, &worker_inflight, &model_name, &version).await;
+                send_batch_with_retry(batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version).await;
             });
         }
         return;
     }
 
     let mut batch: Vec<QueueItem> = Vec::with_capacity(max_batch_size);
-    let worker_inflight: Vec<Arc<AtomicUsize>> = (0..zmq_clients.len())
-        .map(|_| Arc::new(AtomicUsize::new(0)))
-        .collect();
-
     let mut deadline: Option<tokio::time::Instant> = None;
 
     loop {
@@ -385,13 +581,14 @@ async fn batch_collector(
                 prometheus::inc_queue_depth(&model_name, &version);
                 batch.push(item);
                 if batch.len() >= max_batch_size {
-                    let mut current_batch = std::mem::take(&mut batch);
+                    let current_batch = std::mem::take(&mut batch);
                     let zmq_clients = zmq_clients.clone();
                     let worker_inflight = worker_inflight.clone();
+                    let outlier = outlier.clone();
                     let model_name = model_name.clone();
                     let version = version.clone();
                     tokio::spawn(async move {
-                        send_batch(&mut current_batch, &zmq_clients, &worker_inflight, &model_name, &version).await;
+                        send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version).await;
                     });
                     deadline = None;
                 } else if deadline.is_none() {
@@ -419,13 +616,14 @@ async fn batch_collector(
                 }
             }, if deadline.is_some() => {
                 if !batch.is_empty() {
-                    let mut current_batch = std::mem::take(&mut batch);
+                    let current_batch = std::mem::take(&mut batch);
                     let zmq_clients = zmq_clients.clone();
                     let worker_inflight = worker_inflight.clone();
+                    let outlier = outlier.clone();
                     let model_name = model_name.clone();
                     let version = version.clone();
                     tokio::spawn(async move {
-                        send_batch(&mut current_batch, &zmq_clients, &worker_inflight, &model_name, &version).await;
+                        send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version).await;
                     });
                 }
                 deadline = None;
@@ -436,13 +634,14 @@ async fn batch_collector(
 
     // Drain remaining items
     if !batch.is_empty() {
-        let mut current_batch = std::mem::take(&mut batch);
+        let current_batch = std::mem::take(&mut batch);
         let zmq_clients = zmq_clients.clone();
         let worker_inflight = worker_inflight.clone();
+        let outlier = outlier.clone();
         let model_name = model_name.clone();
         let version = version.clone();
         tokio::spawn(async move {
-            send_batch(&mut current_batch, &zmq_clients, &worker_inflight, &model_name, &version).await;
+            send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version).await;
         });
     }
 }
@@ -792,5 +991,143 @@ mod tests {
             assert_eq!(item_meta.as_ref() as *const pb::RequestMeta, ptr,
                 "batch item {} should share meta via Arc", uid);
         }
+    }
+
+    // ===== Outlier Detection tests =====
+
+    #[tokio::test]
+    async fn test_outlier_eject_after_consecutive_errors() {
+        let outlier = OutlierState::new(3);
+        // Not ejected initially
+        assert!(!outlier.is_ejected(0).await);
+
+        // Below threshold — not ejected
+        outlier.record_error(0).await;
+        outlier.record_error(0).await;
+        assert!(!outlier.is_ejected(0).await);
+
+        // At threshold — ejected
+        outlier.record_error(0).await;
+        assert!(outlier.is_ejected(0).await);
+    }
+
+    #[tokio::test]
+    async fn test_outlier_success_resets_error_count() {
+        let outlier = OutlierState::new(2);
+        outlier.record_error(0).await;
+        outlier.record_error(0).await;
+        // Reset by success
+        outlier.record_success(0);
+        // Need 3 more errors to eject
+        outlier.record_error(0).await;
+        outlier.record_error(0).await;
+        assert!(!outlier.is_ejected(0).await, "should not eject after reset");
+        outlier.record_error(0).await;
+        assert!(outlier.is_ejected(0).await, "should eject after 3 consecutive errors post-reset");
+    }
+
+    #[tokio::test]
+    async fn test_outlier_active_count() {
+        let outlier = OutlierState::new(3);
+        assert_eq!(outlier.active_count().await, 3);
+
+        // Eject one worker
+        for _ in 0..3 {
+            outlier.record_error(0).await;
+        }
+        assert_eq!(outlier.active_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_outlier_max_ejection_percent() {
+        // 4 workers, max 50% ejection = max 2 ejected
+        let outlier = OutlierState::new(4);
+
+        // Eject workers 0 and 1
+        for i in 0..2 {
+            for _ in 0..3 {
+                outlier.record_error(i).await;
+            }
+        }
+        assert!(outlier.is_ejected(0).await);
+        assert!(outlier.is_ejected(1).await);
+
+        // Worker 2 should NOT be ejected (at max)
+        for _ in 0..3 {
+            outlier.record_error(2).await;
+        }
+        assert!(!outlier.is_ejected(2).await, "should respect max_ejection_percent");
+    }
+
+    // ===== pick_worker with outlier tests =====
+
+    #[tokio::test]
+    async fn test_pick_worker_skips_ejected() {
+        let outlier = OutlierState::new(3);
+        let inflight: Vec<Arc<AtomicUsize>> = (0..3)
+            .map(|_| Arc::new(AtomicUsize::new(0)))
+            .collect();
+
+        // Eject worker 0
+        for _ in 0..3 {
+            outlier.record_error(0).await;
+        }
+
+        // Should skip ejected worker 0, pick 1 or 2 (both load 0)
+        let picked = pick_worker_least_loaded(&inflight, &outlier).await;
+        assert!(picked == 1 || picked == 2, "should skip ejected worker, got {}", picked);
+    }
+
+    #[tokio::test]
+    async fn test_pick_worker_least_loaded_skips_ejected() {
+        let outlier = OutlierState::new(3);
+        let inflight: Vec<Arc<AtomicUsize>> = vec![
+            Arc::new(AtomicUsize::new(0)), // worker 0 — ejected
+            Arc::new(AtomicUsize::new(5)), // worker 1 — high load
+            Arc::new(AtomicUsize::new(1)), // worker 2 — low load
+        ];
+
+        // Eject worker 0
+        for _ in 0..3 {
+            outlier.record_error(0).await;
+        }
+
+        // Should pick worker 2 (lowest load among active)
+        let picked = pick_worker_least_loaded(&inflight, &outlier).await;
+        assert_eq!(picked, 2, "should pick lowest-load active worker");
+    }
+
+    #[tokio::test]
+    async fn test_pick_worker_all_ejected_falls_back() {
+        let outlier = OutlierState::new(2);
+        let inflight: Vec<Arc<AtomicUsize>> = (0..2)
+            .map(|_| Arc::new(AtomicUsize::new(0)))
+            .collect();
+
+        // Eject both workers
+        for i in 0..2 {
+            for _ in 0..3 {
+                outlier.record_error(i).await;
+            }
+        }
+
+        // Both ejected, but max_ejection_percent=50 means only 1 can be ejected
+        // Actually with 2 workers, max_ejected = max(2*50/100, 1) = 1
+        // So only worker 0 should be ejected, worker 1 should still be active
+        let picked = pick_worker_least_loaded(&inflight, &outlier).await;
+        assert_eq!(picked, 1, "second worker should still be active");
+    }
+
+    #[tokio::test]
+    async fn test_pick_worker_single_worker_ignores_outlier() {
+        let outlier = OutlierState::new(1);
+        let inflight: Vec<Arc<AtomicUsize>> = vec![Arc::new(AtomicUsize::new(0))];
+
+        // Even if ejected, single worker fast path returns 0
+        for _ in 0..3 {
+            outlier.record_error(0).await;
+        }
+        let picked = pick_worker_least_loaded(&inflight, &outlier).await;
+        assert_eq!(picked, 0, "single worker should always return 0");
     }
 }

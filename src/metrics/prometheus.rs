@@ -68,6 +68,20 @@ lazy_static! {
         &["ensemble", "step", "model"]
     ).unwrap();
 
+    // Outlier detection metrics
+    pub static ref WORKER_EJECTIONS_TOTAL: Counter = Counter::new(
+        "lightserver_worker_ejections_total",
+        "Total worker ejections due to consecutive failures"
+    ).unwrap();
+
+    pub static ref RETRIES_TOTAL: CounterVec = CounterVec::new(
+        prometheus::Opts::new(
+            "lightserver_retries_total",
+            "Total request retries"
+        ),
+        &["model", "version"]
+    ).unwrap();
+
     // Streaming metrics
     pub static ref STREAMING_CONNECTIONS: GaugeVec = GaugeVec::new(
         prometheus::Opts::new(
@@ -118,6 +132,8 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(VERSION_SWITCHES_TOTAL.clone()))?;
     REGISTRY.register(Box::new(ACTIVE_WORKERS.clone()))?;
     REGISTRY.register(Box::new(ENSEMBLE_STEP_LATENCY.clone()))?;
+    REGISTRY.register(Box::new(WORKER_EJECTIONS_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(RETRIES_TOTAL.clone()))?;
     REGISTRY.register(Box::new(STREAMING_CONNECTIONS.clone()))?;
     REGISTRY.register(Box::new(STREAMING_TTFT.clone()))?;
     REGISTRY.register(Box::new(STREAMING_TBT.clone()))?;
@@ -146,6 +162,16 @@ pub async fn record_request_end(model: &str, version: &str, status: &str, durati
     REQUESTS_TOTAL.with_label_values(&[model, version, status]).inc();
     REQUEST_DURATION.with_label_values(&[model, version]).observe(duration_secs);
     super::aggregator::TIMELINE.record_latency(model, version, duration_secs).await;
+}
+
+// ===== Outlier detection metrics =====
+
+pub fn inc_worker_ejection() {
+    WORKER_EJECTIONS_TOTAL.inc();
+}
+
+pub fn inc_retry(model: &str, version: &str) {
+    RETRIES_TOTAL.with_label_values(&[model, version]).inc();
 }
 
 // ===== Queue metrics =====
