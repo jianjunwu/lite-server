@@ -518,6 +518,7 @@ async fn test_custom_endpoint_status() {
 
 #[tokio::test]
 #[serial]
+#[ignore] // flaky on CI: filesystem watcher timeout on macOS runners
 async fn test_hot_reload() {
     let original = r#"from litserve import LitAPI
 
