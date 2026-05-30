@@ -104,7 +104,17 @@ impl IntoResponse for AppError {
             }
         }));
 
-        (status, body).into_response()
+        let mut response = (status, body).into_response();
+
+        // Add Retry-After header for 503 responses (queue full)
+        if matches!(self, AppError::QueueFull(_)) {
+            response.headers_mut().insert(
+                "retry-after",
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
+
+        response
     }
 }
 
@@ -184,5 +194,25 @@ mod tests {
             ).pub_error_message(),
             "serialization error"
         );
+    }
+
+    #[tokio::test]
+    async fn test_queue_full_has_retry_after_header() {
+        use axum::response::IntoResponse;
+        let err = AppError::QueueFull("queue full".to_string());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry_after = response.headers().get("retry-after");
+        assert!(retry_after.is_some(), "QueueFull should have Retry-After header");
+        assert_eq!(retry_after.unwrap().to_str().unwrap(), "1");
+    }
+
+    #[tokio::test]
+    async fn test_non_queue_full_no_retry_after_header() {
+        use axum::response::IntoResponse;
+        let err = AppError::ModelNotFound("test".to_string());
+        let response = err.into_response();
+        assert!(response.headers().get("retry-after").is_none(),
+            "non-QueueFull errors should not have Retry-After header");
     }
 }

@@ -543,12 +543,18 @@ async fn open_worker_stream(
         return Err(AppError::WorkerCrashed(format!("{} has no workers", model_name)));
     }
 
-    let worker_id = crate::worker::pick_worker_random(num_workers);
     let clients = state
         .worker_manager
         .get_zmq_clients(model_name, resolved_version)
         .await
         .ok_or_else(|| AppError::WorkerCrashed(format!("{} {} has no ZMQ clients", model_name, resolved_version)))?;
+
+    // Skip ejected workers for streaming requests
+    let worker_id = if let Some(outlier) = state.worker_manager.get_outlier_state(model_name, resolved_version).await {
+        crate::worker::pick_worker_skip_ejected(num_workers, &outlier)
+    } else {
+        crate::worker::pick_worker_random(num_workers)
+    };
 
     if worker_id >= clients.len() {
         return Err(AppError::WorkerCrashed("invalid worker index".to_string()));

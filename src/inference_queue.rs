@@ -8,7 +8,8 @@ use dashmap::DashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use std::sync::Mutex;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
 /// Pre-sized key for model_version lookups — single allocation, no reallocation.
@@ -93,21 +94,21 @@ impl OutlierState {
     }
 
     /// Record an error — increment count and potentially eject.
-    pub async fn record_error(&self, worker_idx: usize) {
+    pub fn record_error(&self, worker_idx: usize) {
         let w = match self.workers.get(worker_idx) {
             Some(w) => w,
             None => return,
         };
         let count = w.consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
         if count >= self.consecutive_threshold {
-            self.maybe_eject(worker_idx).await;
+            self.maybe_eject(worker_idx);
         }
     }
 
     /// Eject a worker if not already ejected and below max ejection percent.
-    async fn maybe_eject(&self, worker_idx: usize) {
+    fn maybe_eject(&self, worker_idx: usize) {
         let w = &self.workers[worker_idx];
-        let mut guard = w.ejected.lock().await;
+        let mut guard = w.ejected.lock().unwrap();
         if guard.is_some() {
             return; // already ejected
         }
@@ -134,12 +135,12 @@ impl OutlierState {
     }
 
     /// Check if a worker is currently ejected, recovering if ejection time has passed.
-    pub async fn is_ejected(&self, worker_idx: usize) -> bool {
+    pub fn is_ejected(&self, worker_idx: usize) -> bool {
         let w = match self.workers.get(worker_idx) {
             Some(w) => w,
             None => return false,
         };
-        let mut guard = w.ejected.lock().await;
+        let mut guard = w.ejected.lock().unwrap();
         if let Some(ref ejected) = *guard {
             if ejected.ejected_at.elapsed() >= self.base_ejection_time {
                 // Recovery: clear ejection state and reset errors
@@ -155,10 +156,10 @@ impl OutlierState {
     }
 
     /// Count currently active (non-ejected) workers.
-    pub async fn active_count(&self) -> usize {
+    pub fn active_count(&self) -> usize {
         let mut count = 0;
         for w in &self.workers {
-            let guard = w.ejected.lock().await;
+            let guard = w.ejected.lock().unwrap();
             if guard.is_none() {
                 count += 1;
             }
@@ -264,7 +265,7 @@ impl InferenceQueue {
 }
 
 /// Pick the worker with the lowest inflight count (least-loaded), skipping ejected workers.
-async fn pick_worker_least_loaded(inflight: &[Arc<AtomicUsize>], outlier: &OutlierState) -> usize {
+fn pick_worker_least_loaded(inflight: &[Arc<AtomicUsize>], outlier: &OutlierState) -> usize {
     if inflight.len() == 1 {
         return 0;
     }
@@ -274,7 +275,7 @@ async fn pick_worker_least_loaded(inflight: &[Arc<AtomicUsize>], outlier: &Outli
 
     for (i, counter) in inflight.iter().enumerate() {
         let load = counter.load(Ordering::Relaxed);
-        if outlier.is_ejected(i).await {
+        if outlier.is_ejected(i) {
             if best_ejected.is_none() || load < best_ejected.unwrap().1 {
                 best_ejected = Some((i, load));
             }
@@ -307,7 +308,7 @@ async fn do_send_batch(
         return Ok(());
     }
 
-    let worker_idx = pick_worker_least_loaded(inflight, outlier).await;
+    let worker_idx = pick_worker_least_loaded(inflight, outlier);
     inflight[worker_idx].fetch_add(1, Ordering::Relaxed);
     let zmq_client = &zmq_clients[worker_idx];
 
@@ -391,7 +392,7 @@ async fn do_send_batch(
                         outlier.record_success(worker_idx);
                         Ok(())
                     } else {
-                        outlier.record_error(worker_idx).await;
+                        outlier.record_error(worker_idx);
                         Err(())
                     }
                 }
@@ -406,7 +407,7 @@ async fn do_send_batch(
                     }
                     inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
                     if is_error {
-                        outlier.record_error(worker_idx).await;
+                        outlier.record_error(worker_idx);
                         Err(())
                     } else {
                         outlier.record_success(worker_idx);
@@ -429,7 +430,7 @@ async fn do_send_batch(
                         });
                     }
                     inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
-                    outlier.record_error(worker_idx).await;
+                    outlier.record_error(worker_idx);
                     Err(())
                 }
             }
@@ -453,7 +454,7 @@ async fn do_send_batch(
                 });
             }
             inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
-            outlier.record_error(worker_idx).await;
+            outlier.record_error(worker_idx);
             Err(())
         }
     }
@@ -999,43 +1000,43 @@ mod tests {
     async fn test_outlier_eject_after_consecutive_errors() {
         let outlier = OutlierState::new(3);
         // Not ejected initially
-        assert!(!outlier.is_ejected(0).await);
+        assert!(!outlier.is_ejected(0));
 
         // Below threshold — not ejected
-        outlier.record_error(0).await;
-        outlier.record_error(0).await;
-        assert!(!outlier.is_ejected(0).await);
+        outlier.record_error(0);
+        outlier.record_error(0);
+        assert!(!outlier.is_ejected(0));
 
         // At threshold — ejected
-        outlier.record_error(0).await;
-        assert!(outlier.is_ejected(0).await);
+        outlier.record_error(0);
+        assert!(outlier.is_ejected(0));
     }
 
     #[tokio::test]
     async fn test_outlier_success_resets_error_count() {
         let outlier = OutlierState::new(2);
-        outlier.record_error(0).await;
-        outlier.record_error(0).await;
+        outlier.record_error(0);
+        outlier.record_error(0);
         // Reset by success
         outlier.record_success(0);
         // Need 3 more errors to eject
-        outlier.record_error(0).await;
-        outlier.record_error(0).await;
-        assert!(!outlier.is_ejected(0).await, "should not eject after reset");
-        outlier.record_error(0).await;
-        assert!(outlier.is_ejected(0).await, "should eject after 3 consecutive errors post-reset");
+        outlier.record_error(0);
+        outlier.record_error(0);
+        assert!(!outlier.is_ejected(0), "should not eject after reset");
+        outlier.record_error(0);
+        assert!(outlier.is_ejected(0), "should eject after 3 consecutive errors post-reset");
     }
 
     #[tokio::test]
     async fn test_outlier_active_count() {
         let outlier = OutlierState::new(3);
-        assert_eq!(outlier.active_count().await, 3);
+        assert_eq!(outlier.active_count(), 3);
 
         // Eject one worker
         for _ in 0..3 {
-            outlier.record_error(0).await;
+            outlier.record_error(0);
         }
-        assert_eq!(outlier.active_count().await, 2);
+        assert_eq!(outlier.active_count(), 2);
     }
 
     #[tokio::test]
@@ -1046,17 +1047,17 @@ mod tests {
         // Eject workers 0 and 1
         for i in 0..2 {
             for _ in 0..3 {
-                outlier.record_error(i).await;
+                outlier.record_error(i);
             }
         }
-        assert!(outlier.is_ejected(0).await);
-        assert!(outlier.is_ejected(1).await);
+        assert!(outlier.is_ejected(0));
+        assert!(outlier.is_ejected(1));
 
         // Worker 2 should NOT be ejected (at max)
         for _ in 0..3 {
-            outlier.record_error(2).await;
+            outlier.record_error(2);
         }
-        assert!(!outlier.is_ejected(2).await, "should respect max_ejection_percent");
+        assert!(!outlier.is_ejected(2), "should respect max_ejection_percent");
     }
 
     // ===== pick_worker with outlier tests =====
@@ -1070,11 +1071,11 @@ mod tests {
 
         // Eject worker 0
         for _ in 0..3 {
-            outlier.record_error(0).await;
+            outlier.record_error(0);
         }
 
         // Should skip ejected worker 0, pick 1 or 2 (both load 0)
-        let picked = pick_worker_least_loaded(&inflight, &outlier).await;
+        let picked = pick_worker_least_loaded(&inflight, &outlier);
         assert!(picked == 1 || picked == 2, "should skip ejected worker, got {}", picked);
     }
 
@@ -1089,11 +1090,11 @@ mod tests {
 
         // Eject worker 0
         for _ in 0..3 {
-            outlier.record_error(0).await;
+            outlier.record_error(0);
         }
 
         // Should pick worker 2 (lowest load among active)
-        let picked = pick_worker_least_loaded(&inflight, &outlier).await;
+        let picked = pick_worker_least_loaded(&inflight, &outlier);
         assert_eq!(picked, 2, "should pick lowest-load active worker");
     }
 
@@ -1107,14 +1108,14 @@ mod tests {
         // Eject both workers
         for i in 0..2 {
             for _ in 0..3 {
-                outlier.record_error(i).await;
+                outlier.record_error(i);
             }
         }
 
         // Both ejected, but max_ejection_percent=50 means only 1 can be ejected
         // Actually with 2 workers, max_ejected = max(2*50/100, 1) = 1
         // So only worker 0 should be ejected, worker 1 should still be active
-        let picked = pick_worker_least_loaded(&inflight, &outlier).await;
+        let picked = pick_worker_least_loaded(&inflight, &outlier);
         assert_eq!(picked, 1, "second worker should still be active");
     }
 
@@ -1125,9 +1126,9 @@ mod tests {
 
         // Even if ejected, single worker fast path returns 0
         for _ in 0..3 {
-            outlier.record_error(0).await;
+            outlier.record_error(0);
         }
-        let picked = pick_worker_least_loaded(&inflight, &outlier).await;
+        let picked = pick_worker_least_loaded(&inflight, &outlier);
         assert_eq!(picked, 0, "single worker should always return 0");
     }
 }

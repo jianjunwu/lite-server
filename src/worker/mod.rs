@@ -3,7 +3,7 @@ pub mod endpoint_manager;
 
 use crate::config::{ModelConfig, OrchestrationConfig};
 use crate::error::AppError;
-use crate::inference_queue::InferenceQueue;
+use crate::inference_queue::{InferenceQueue, OutlierState};
 use crate::registry::{ModelRegistry, types::*};
 use crate::transport::zmq::WorkerZmqClient;
 use crate::worker::protocol::*;
@@ -31,6 +31,8 @@ pub struct WorkerManager {
     inference_queue: Arc<InferenceQueue>,
     // ZMQ clients for active workers
     zmq_clients: Arc<RwLock<HashMap<String, Vec<Arc<WorkerZmqClient>>>>>,
+    // Outlier detection state per model version (shared with batch_collector)
+    outlier_states: Arc<RwLock<HashMap<String, Arc<OutlierState>>>>,
 }
 
 struct WorkerProcess {
@@ -55,6 +57,7 @@ impl WorkerManager {
             workers: Arc::new(RwLock::new(HashMap::new())),
             inference_queue,
             zmq_clients: Arc::new(RwLock::new(HashMap::new())),
+            outlier_states: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -70,6 +73,17 @@ impl WorkerManager {
     ) -> Option<Vec<Arc<WorkerZmqClient>>> {
         let key = format!("{}_{}", model_name, version);
         let guard = self.zmq_clients.read().await;
+        guard.get(&key).cloned()
+    }
+
+    /// Get outlier detection state for a model version (used for streaming worker selection).
+    pub async fn get_outlier_state(
+        &self,
+        model_name: &str,
+        version: &str,
+    ) -> Option<Arc<OutlierState>> {
+        let key = format!("{}_{}", model_name, version);
+        let guard = self.outlier_states.read().await;
         guard.get(&key).cloned()
     }
 
@@ -353,9 +367,11 @@ impl WorkerManager {
         {
             let mut workers = self.workers.write().await;
             let mut clients = self.zmq_clients.write().await;
+            let mut outliers = self.outlier_states.write().await;
             let key = format!("{}_{}", model_name, version);
             workers.insert(key.clone(), worker_processes);
-            clients.insert(key, zmq_clients_for_model);
+            clients.insert(key.clone(), zmq_clients_for_model);
+            outliers.insert(key, Arc::new(OutlierState::new(total_workers)));
         }
 
         crate::metrics::prometheus::record_model_load(model_name, version, true);
@@ -402,6 +418,8 @@ impl WorkerManager {
         {
             let mut workers = self.workers.write().await;
             let mut clients = self.zmq_clients.write().await;
+            let mut outliers = self.outlier_states.write().await;
+            outliers.remove(&key);
             if let Some(mut procs) = workers.remove(&key) {
                 for mut proc in procs.drain(..) {
                     // Signal the monitor task to kill the process
@@ -590,6 +608,28 @@ pub fn pick_worker_random(num_workers: usize) -> usize {
     rand::thread_rng().gen_range(0..num_workers.max(1))
 }
 
+/// Pick a random non-ejected worker index. Falls back to any worker if all are ejected.
+pub fn pick_worker_skip_ejected(num_workers: usize, outlier: &OutlierState) -> usize {
+    use rand::Rng;
+    if num_workers <= 1 {
+        return 0;
+    }
+
+    let mut rng = rand::thread_rng();
+    let start = rng.gen_range(0..num_workers);
+
+    // Try to find a non-ejected worker starting from random offset
+    for i in 0..num_workers {
+        let idx = (start + i) % num_workers;
+        if !outlier.is_ejected(idx) {
+            return idx;
+        }
+    }
+
+    // All ejected — fall back to random
+    start
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -695,5 +735,57 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(cleaned_up.load(Ordering::SeqCst), "monitor should have triggered cleanup");
+    }
+
+    // ===== pick_worker_skip_ejected tests =====
+
+    #[test]
+    fn test_pick_worker_skip_ejected_all_active() {
+        let outlier = OutlierState::new(4);
+        // All active — should return valid index
+        for _ in 0..10 {
+            let idx = pick_worker_skip_ejected(4, &outlier);
+            assert!(idx < 4, "index {} out of range", idx);
+        }
+    }
+
+    #[test]
+    fn test_pick_worker_skip_ejected_avoids_ejected() {
+        let outlier = OutlierState::new(3);
+        // Eject worker 0
+        for _ in 0..3 {
+            outlier.record_error(0);
+        }
+        assert!(outlier.is_ejected(0));
+
+        // Should never pick ejected worker 0
+        for _ in 0..100 {
+            let idx = pick_worker_skip_ejected(3, &outlier);
+            assert!(idx == 1 || idx == 2, "should skip ejected worker 0, got {}", idx);
+        }
+    }
+
+    #[test]
+    fn test_pick_worker_skip_ejected_single_worker() {
+        let outlier = OutlierState::new(1);
+        // Single worker always returns 0
+        assert_eq!(pick_worker_skip_ejected(1, &outlier), 0);
+
+        // Even if ejected
+        outlier.record_error(0);
+        assert_eq!(pick_worker_skip_ejected(1, &outlier), 0);
+    }
+
+    #[test]
+    fn test_pick_worker_skip_ejected_all_ejected_fallback() {
+        let outlier = OutlierState::new(2);
+        // Eject worker 0 (max 50% of 2 = 1 ejection allowed)
+        for _ in 0..3 {
+            outlier.record_error(0);
+        }
+        // Worker 1 still active, should pick it
+        for _ in 0..20 {
+            assert_eq!(pick_worker_skip_ejected(2, &outlier), 1);
+        }
     }
 }
