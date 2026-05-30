@@ -39,6 +39,8 @@ pub fn run_server(
     max_requests: Option<usize>,
     request_timeout: Option<f32>,
     health_check_interval: Option<f32>,
+    graceful_timeout: Option<f32>,
+    keepalive_timeout: Option<f32>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut cfg = if let Some(config_path) = config {
         config::load_config(&config_path)?
@@ -64,6 +66,8 @@ pub fn run_server(
         max_requests,
         request_timeout,
         health_check_interval,
+        graceful_timeout,
+        keepalive_timeout,
     });
 
     let log_verbose = log_verbose.unwrap_or(false);
@@ -110,6 +114,8 @@ pub fn run_server(
     max_queue_size=None,
     max_requests=None,
     request_timeout=None,
+    graceful_timeout=None,
+    keepalive_timeout=None,
 ))]
 fn serve(
     config: Option<String>,
@@ -129,13 +135,16 @@ fn serve(
     max_queue_size: Option<usize>,
     max_requests: Option<usize>,
     request_timeout: Option<f32>,
+    graceful_timeout: Option<f32>,
+    keepalive_timeout: Option<f32>,
 ) -> PyResult<()> {
     pyo3::Python::with_gil(|py| {
         py.allow_threads(|| {
             run_server(
                 config, port, host, model_repo, http_workers, timeout, log_level, metrics_port,
                 no_metrics, transport, grpc_port, no_grpc, no_streaming_metrics, log_verbose,
-                max_queue_size, max_requests, request_timeout,
+                max_queue_size, max_requests, request_timeout, None, graceful_timeout,
+                keepalive_timeout,
             )
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })

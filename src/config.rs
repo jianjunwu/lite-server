@@ -28,6 +28,10 @@ pub struct ServerConfig {
     pub http_workers: Option<usize>,
     pub transport: String,
     pub cache_registry: bool,
+    /// Max seconds to wait for in-flight requests during graceful shutdown.
+    pub graceful_timeout: f32,
+    /// HTTP keep-alive timeout in seconds. 0 = disable keep-alive.
+    pub keepalive_timeout: f32,
 }
 
 impl Default for ServerConfig {
@@ -42,6 +46,8 @@ impl Default for ServerConfig {
             http_workers: None,
             transport: "zmq".to_string(),
             cache_registry: false,
+            graceful_timeout: 30.0,
+            keepalive_timeout: 5.0,
         }
     }
 }
@@ -286,6 +292,11 @@ impl Default for ModelConfig {
     }
 }
 
+/// Returns the Unix socket path if `host` starts with `unix:`, otherwise `None`.
+pub fn unix_socket_path(host: &str) -> Option<&str> {
+    host.strip_prefix("unix:")
+}
+
 pub fn load_config(path: &str) -> anyhow::Result<Config> {
     let content = std::fs::read_to_string(path)?;
     let config: Config = serde_yaml::from_str(&content)?;
@@ -330,6 +341,8 @@ pub struct CliOverrides {
     pub max_requests: Option<usize>,
     pub request_timeout: Option<f32>,
     pub health_check_interval: Option<f32>,
+    pub graceful_timeout: Option<f32>,
+    pub keepalive_timeout: Option<f32>,
 }
 
 impl Config {
@@ -384,6 +397,12 @@ impl Config {
         if let Some(v) = cli.health_check_interval {
             self.model_defaults.health_check_interval = Some(v);
         }
+        if let Some(t) = cli.graceful_timeout {
+            self.server.graceful_timeout = t;
+        }
+        if let Some(t) = cli.keepalive_timeout {
+            self.server.keepalive_timeout = t;
+        }
     }
 
     /// Apply CLI model defaults to a ModelConfig (called per-model at load time).
@@ -418,6 +437,8 @@ mod tests {
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.timeout, 30.0);
         assert_eq!(cfg.transport, "zmq");
+        assert_eq!(cfg.graceful_timeout, 30.0);
+        assert_eq!(cfg.keepalive_timeout, 5.0);
     }
 
     #[test]
@@ -793,5 +814,83 @@ mod tests {
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         let parsed: ModelConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.health_check_interval, 20.0);
+    }
+
+    // --- Unix socket path detection ---
+
+    #[test]
+    fn test_unix_socket_path_detects_unix_prefix() {
+        assert_eq!(unix_socket_path("unix:/tmp/lite-server.sock"), Some("/tmp/lite-server.sock"));
+        assert_eq!(unix_socket_path("unix:./lite-server.sock"), Some("./lite-server.sock"));
+    }
+
+    #[test]
+    fn test_unix_socket_path_returns_none_for_tcp_host() {
+        assert_eq!(unix_socket_path("0.0.0.0"), None);
+        assert_eq!(unix_socket_path("127.0.0.1"), None);
+        assert_eq!(unix_socket_path("[::1]"), None);
+    }
+
+    // --- Config YAML with new fields ---
+
+    #[test]
+    fn test_load_config_with_unix_host_and_timeouts() {
+        let dir = std::env::temp_dir().join("lite-server-config-test-unix");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("server.yaml");
+        fs::write(
+            &path,
+            "server:\n  host: unix:/tmp/test.sock\n  graceful_timeout: 60.0\n  keepalive_timeout: 10.0\n",
+        )
+        .unwrap();
+
+        let cfg = load_config(path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.server.host, "unix:/tmp/test.sock");
+        assert_eq!(cfg.server.graceful_timeout, 60.0);
+        assert_eq!(cfg.server.keepalive_timeout, 10.0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- CLI overrides for new fields ---
+
+    #[test]
+    fn test_apply_overrides_graceful_timeout() {
+        let mut cfg = Config::default();
+        let overrides = CliOverrides {
+            graceful_timeout: Some(60.0),
+            ..Default::default()
+        };
+        cfg.apply_overrides(&overrides);
+        assert_eq!(cfg.server.graceful_timeout, 60.0);
+    }
+
+    #[test]
+    fn test_apply_overrides_keepalive_timeout() {
+        let mut cfg = Config::default();
+        let overrides = CliOverrides {
+            keepalive_timeout: Some(0.0),
+            ..Default::default()
+        };
+        cfg.apply_overrides(&overrides);
+        assert_eq!(cfg.server.keepalive_timeout, 0.0);
+    }
+
+    #[test]
+    fn test_new_fields_yaml_roundtrip() {
+        let cfg = Config {
+            server: ServerConfig {
+                host: "unix:/tmp/test.sock".to_string(),
+                graceful_timeout: 60.0,
+                keepalive_timeout: 10.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        let parsed: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.server.host, "unix:/tmp/test.sock");
+        assert_eq!(parsed.server.graceful_timeout, 60.0);
+        assert_eq!(parsed.server.keepalive_timeout, 10.0);
     }
 }

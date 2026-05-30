@@ -65,35 +65,44 @@ impl LiteServer {
             }
         };
 
-        // Start HTTP server
-        let http_fut = http::start_http_server(
+        // Start HTTP server as spawned task with graceful shutdown channel
+        let (http_shutdown_tx, http_shutdown_rx) = tokio::sync::oneshot::channel();
+        let mut http_handle = tokio::spawn(http::start_http_server(
             self.config.clone(),
             self.registry.clone(),
             self.worker_manager.clone(),
             self.inference_queue.clone(),
             Some(endpoint_manager.clone()),
             endpoint_routes,
-        );
+            http_shutdown_rx,
+        ));
+
+        // When HTTP uses a Unix socket, gRPC/metrics still need a TCP host.
+        let tcp_host = if crate::config::unix_socket_path(&self.config.server.host).is_some() {
+            "127.0.0.1".to_string()
+        } else {
+            self.config.server.host.clone()
+        };
 
         // Start metrics server if enabled
-        let metrics_fut = if self.config.metrics.enabled {
-            Some(start_metrics_server(
-                &self.config.server.host,
+        let mut metrics_handle = if self.config.metrics.enabled {
+            Some(tokio::spawn(start_metrics_server(
+                tcp_host.clone(),
                 self.config.server.metrics_port,
-            ))
+            )))
         } else {
             None
         };
 
         // Start gRPC server if enabled
-        let grpc_fut = if self.config.grpc.enabled {
-            Some(crate::grpc::start_grpc_server(
-                self.config.server.host.clone(),
+        let mut grpc_handle = if self.config.grpc.enabled {
+            Some(tokio::spawn(crate::grpc::start_grpc_server(
+                tcp_host,
                 self.config.server.grpc_port,
                 self.registry.clone(),
                 self.worker_manager.clone(),
                 self.config.features.streaming_metrics,
-            ))
+            )))
         } else {
             None
         };
@@ -132,60 +141,76 @@ impl LiteServer {
             }
         });
 
-        // Wait for shutdown signal
-        tokio::select! {
-            result = http_fut => {
-                if let Err(e) = &result {
-                    error!("HTTP server error: {}", e);
+        // Wait for any server to exit or shutdown signal
+        let shutdown_reason = tokio::select! {
+            result = &mut http_handle => {
+                match result {
+                    Ok(Ok(())) => "http_server_finished".to_string(),
+                    Ok(Err(e)) => return Err(e),
+                    Err(e) => return Err(AppError::Internal(format!("HTTP task panicked: {}", e))),
                 }
-                watcher_handle.abort();
-                timeline_handle.abort();
-                reload_handle.abort();
-                let _ = endpoint_manager.shutdown().await;
-                result
             }
             result = async {
-                if let Some(fut) = metrics_fut {
-                    fut.await
-                } else {
-                    futures::future::pending().await
+                match metrics_handle.as_mut() {
+                    Some(h) => h.await,
+                    None => futures::future::pending().await,
                 }
             } => {
-                if let Err(e) = &result {
-                    error!("Metrics server error: {}", e);
+                match result {
+                    Ok(Ok(())) => "metrics_server_finished".to_string(),
+                    Ok(Err(e)) => return Err(e),
+                    Err(e) => return Err(AppError::Internal(format!("Metrics task panicked: {}", e))),
                 }
-                watcher_handle.abort();
-                timeline_handle.abort();
-                reload_handle.abort();
-                let _ = endpoint_manager.shutdown().await;
-                result
             }
             result = async {
-                if let Some(fut) = grpc_fut {
-                    fut.await
-                } else {
-                    futures::future::pending().await
+                match grpc_handle.as_mut() {
+                    Some(h) => h.await,
+                    None => futures::future::pending().await,
                 }
             } => {
-                if let Err(e) = &result {
-                    error!("gRPC server error: {}", e);
+                match result {
+                    Ok(Ok(())) => "grpc_server_finished".to_string(),
+                    Ok(Err(e)) => return Err(e),
+                    Err(e) => return Err(AppError::Internal(format!("gRPC task panicked: {}", e))),
                 }
-                watcher_handle.abort();
-                timeline_handle.abort();
-                reload_handle.abort();
-                let _ = endpoint_manager.shutdown().await;
-                result
             }
-            _ = shutdown_signal() => {
-                info!("Shutdown signal received");
-                watcher_handle.abort();
-                timeline_handle.abort();
-                reload_handle.abort();
-                let _ = endpoint_manager.shutdown().await;
-                self.worker_manager.shutdown().await;
-                Ok(())
-            }
+            _ = shutdown_signal() => "shutdown_signal".to_string(),
+        };
+
+        info!("{} received, starting graceful shutdown", shutdown_reason);
+
+        // Abort background tasks
+        watcher_handle.abort();
+        timeline_handle.abort();
+        reload_handle.abort();
+
+        // Notify HTTP server to start graceful shutdown
+        let _ = http_shutdown_tx.send(());
+
+        // Wait for HTTP server with graceful timeout
+        let graceful_timeout = Duration::from_secs_f32(self.config.server.graceful_timeout);
+        match tokio::time::timeout(graceful_timeout, http_handle).await {
+            Ok(Ok(Ok(()))) => info!("HTTP server shut down gracefully"),
+            Ok(Ok(Err(e))) => error!("HTTP server error during shutdown: {}", e),
+            Ok(Err(e)) => error!("HTTP task panicked during shutdown: {}", e),
+            Err(_) => warn!(
+                "HTTP server graceful shutdown timed out after {}s",
+                self.config.server.graceful_timeout
+            ),
         }
+
+        // Abort metrics and gRPC if still running
+        if let Some(h) = metrics_handle {
+            h.abort();
+        }
+        if let Some(h) = grpc_handle {
+            h.abort();
+        }
+
+        let _ = endpoint_manager.shutdown().await;
+        self.worker_manager.shutdown().await;
+
+        Ok(())
     }
 
     async fn load_initial_models(&self) -> Result<(), AppError> {
@@ -283,7 +308,7 @@ impl LiteServer {
     }
 }
 
-async fn start_metrics_server(host: &str, port: u16) -> Result<(), AppError> {
+async fn start_metrics_server(host: String, port: u16) -> Result<(), AppError> {
     let addr: std::net::SocketAddr = format!("{}:{}", host, port)
         .parse()
         .map_err(|e| AppError::Config(format!("invalid metrics address: {}", e)))?;

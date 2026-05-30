@@ -86,6 +86,14 @@ enum Commands {
         /// Active health check interval in seconds (0 = disabled, overrides model config)
         #[arg(long)]
         health_check_interval: Option<f32>,
+
+        /// Graceful shutdown timeout in seconds (max time to wait for in-flight requests)
+        #[arg(long)]
+        graceful_timeout: Option<f32>,
+
+        /// HTTP keep-alive timeout in seconds. 0 = disable keep-alive
+        #[arg(long)]
+        keepalive_timeout: Option<f32>,
     },
 
     /// Validate configuration file
@@ -119,6 +127,8 @@ async fn main() {
             max_requests,
             request_timeout,
             health_check_interval,
+            graceful_timeout,
+            keepalive_timeout,
         } => {
             let mut cfg = if let Some(config_path) = config {
                 match lite_server::config::load_config(&config_path) {
@@ -151,6 +161,8 @@ async fn main() {
                 max_requests,
                 request_timeout,
                 health_check_interval,
+                graceful_timeout,
+                keepalive_timeout,
             });
 
             // Initialize logging

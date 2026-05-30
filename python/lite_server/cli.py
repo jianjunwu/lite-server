@@ -33,6 +33,8 @@ def main(argv=None):
     serve_parser.add_argument("--max-queue-size", type=int, help="Max queue size per model (overrides model config)")
     serve_parser.add_argument("--max-requests", type=int, help="Auto-restart worker after N requests (0=disabled)")
     serve_parser.add_argument("--request-timeout", type=float, help="Per-request hard timeout in seconds (0=disabled)")
+    serve_parser.add_argument("--graceful-timeout", type=float, help="Graceful shutdown timeout in seconds")
+    serve_parser.add_argument("--keepalive-timeout", type=float, help="HTTP keep-alive timeout in seconds (0=disabled)")
 
     # config-check
     check_parser = subparsers.add_parser("config-check", help="Validate configuration")
@@ -115,6 +117,8 @@ def _cmd_serve(args):
             max_queue_size=args.max_queue_size,
             max_requests=args.max_requests,
             request_timeout=args.request_timeout,
+            graceful_timeout=args.graceful_timeout,
+            keepalive_timeout=args.keepalive_timeout,
         )
     except KeyboardInterrupt:
         print("\nShutting down...")
