@@ -4,6 +4,23 @@
 
 [English](README.md)
 
+## 目录
+
+- [为什么选 lite-server？](#为什么选-lite-server)
+- [快速开始](#快速开始)
+- [架构](#架构)
+- [与其他框架对比](#与其他框架对比)
+- [性能基准](#性能基准)
+- [功能特性](#功能特性)
+- [安装](#安装)
+- [CLI 命令](#cli-命令)
+- [示例](#示例)
+- [API 端点](#api-端点)
+- [配置](#配置)
+- [常见问题](#常见问题)
+- [开发](#开发)
+- [License](#license)
+
 ## 为什么选 lite-server？
 
 | | 特性 | 对你意味着什么 |
@@ -50,6 +67,30 @@ curl -X POST http://localhost:8000/v2/models/my_model/infer \
   -d '{"input": 21}'
 # => {"result": 42}
 ```
+
+## 架构
+
+```
+  HTTP/gRPC 请求
+        │
+        ▼
+  ┌─────────────────┐     ┌──────────────────┐
+  │   Rust 内核      │     │  Python Workers   │
+  │  (axum/tokio)    │────►│  (子进程)          │
+  │                  │ZMQ  │                   │
+  │  ┌────────────┐  │/UDS │  ┌─────────────┐  │
+  │  │ 推理队列    │  │     │  │  model.py   │  │
+  │  │ (per model)│  │     │  │  (LitAPI)   │  │
+  │  └────────────┘  │     │  └─────────────┘  │
+  │  ┌────────────┐  │     └──────────────────┘
+  │  │ 指标 & 告警 │  │
+  │  └────────────┘  │
+  └─────────────────┘
+```
+
+Rust 内核处理所有 I/O（HTTP、gRPC、IPC、指标、文件监听），Python worker 负责模型推理。这种分离让你拥有 Rust 级别的吞吐和 Python 级别的简洁。
+
+详见 [docs/architecture.md](docs/architecture.md)。
 
 ## 与其他框架对比
 
@@ -157,7 +198,7 @@ python -m lite_server init my_project           # 脚手架创建项目
 | 05 | [ensemble](examples/05_ensemble/) | DAG 多模型流水线 |
 | 06 | [custom_endpoint](examples/06_custom_endpoint/) | 自定义 HTTP 端点 |
 
-详见 [examples/README.md](examples/README.md)。
+详见 [examples/README.md](examples/README.md) 获取学习路径和使用说明。
 
 ## API 端点
 
@@ -180,8 +221,9 @@ python -m lite_server init my_project           # 脚手架创建项目
 
 ## 配置
 
+最小 `server.yaml`：
+
 ```yaml
-# server.yaml
 server:
   http_port: 8000
   host: 0.0.0.0
@@ -189,12 +231,6 @@ server:
 
 model_repository:
   path: ./model_repo
-
-metrics:
-  enabled: true
-
-grpc:
-  enabled: true
 ```
 
 单模型配置（`model_repo/my_model/1/config.yaml`）：
@@ -204,13 +240,33 @@ max_batch_size: 8
 batch_timeout: 0.01
 stream: false
 accelerator: cpu
-devices: 1
 workers_per_device: 1
-max_queue_size: 1000
 request_timeout: 30.0
-max_requests: 0  # 0 = 不启用
-adaptive_batching: true
 ```
+
+详见 [docs/configuration.md](docs/configuration.md) 获取完整配置参考（服务器、模型、编排、CLI 参数）。
+
+详见 [docs/model-authoring.md](docs/model-authoring.md) 获取模型开发指南（LitAPI 接口、流式输出、continuous batching、最佳实践）。
+
+## 常见问题
+
+**Q: lite-server 和 LitServe 有什么区别？**
+lite-server 用 Rust HTTP 内核（axum/tokio）替代了 Python 的 uvicorn，多 worker 并发场景下吞吐提升 3 倍。模型代码写法一样（兼容 LitAPI）。
+
+**Q: 需要 Docker 吗？**
+不需要。`pip install` 后直接运行。支持 Linux、macOS、Windows。
+
+**Q: 能直接用现有的 LitAPI 代码吗？**
+可以。`from lite_server import LitAPI` 是 `litserve.LitAPI` 的即插即用替代品，额外提供了流式输出、continuous batching、生命周期钩子。
+
+**Q: 怎么部署多个模型？**
+每个模型放在 `model_repo/` 下独立目录，在 `orchestration.yaml` 中声明。详见 [examples/05_ensemble](examples/05_ensemble/)。
+
+**Q: 怎么切换模型版本？**
+使用激活/停用 API：`POST /v2/models/{name}/versions/{v}/activate`。详见 [examples/04_multi_version](examples/04_multi_version/)。
+
+**Q: Worker 崩溃了怎么办？**
+Worker 会自动重启。正在处理的请求会自动重试到其他 worker（最多 3 次）。异常检测会剔除不健康的 worker。
 
 ## 多平台支持
 
@@ -241,6 +297,12 @@ cd python && python -m pytest tests/
 ├── examples/         # 示例模型仓库
 ├── benchmarks/       # 性能基准测试
 ├── docs/             # 文档
+│   ├── architecture.md
+│   ├── benchmark.md
+│   ├── comparison.md
+│   ├── comparison_zh.md
+│   ├── configuration.md
+│   └── model-authoring.md
 ├── Cargo.toml        # Rust 清单
 └── pyproject.toml    # Python 打包（maturin）
 ```

@@ -4,6 +4,24 @@ High-performance model inference server — Rust core for I/O, Python for infere
 
 [中文文档](README_zh.md)
 
+## Table of Contents
+
+- [Why lite-server?](#why-lite-server)
+- [Quick Start](#quick-start)
+- [Architecture](#architecture)
+- [Comparison](#comparison)
+- [Benchmarks](#benchmarks)
+- [Features](#features)
+- [Installation](#installation)
+- [CLI Commands](#cli-commands)
+- [Examples](#examples)
+- [API Endpoints](#api-endpoints)
+- [Configuration](#configuration)
+- [FAQ](#faq)
+- [Development](#development)
+- [License](#license)
+
+
 ## Why lite-server?
 
 | | Feature | What it means for you |
@@ -50,6 +68,31 @@ curl -X POST http://localhost:8000/v2/models/my_model/infer \
   -d '{"input": 21}'
 # => {"result": 42}
 ```
+
+## Architecture
+
+```
+  HTTP/gRPC Request
+        │
+        ▼
+  ┌─────────────────┐     ┌──────────────────┐
+  │   Rust Core      │     │  Python Workers   │
+  │  (axum/tokio)    │────►│  (subprocesses)   │
+  │                  │ZMQ  │                   │
+  │  ┌────────────┐  │/UDS │  ┌─────────────┐  │
+  │  │ Inference  │  │     │  │  model.py   │  │
+  │  │ Queue      │  │     │  │  (LitAPI)   │  │
+  │  └────────────┘  │     │  └─────────────┘  │
+  │  ┌────────────┐  │     └──────────────────┘
+  │  │ Metrics &  │  │
+  │  │ Alerts     │  │
+  │  └────────────┘  │
+  └─────────────────┘
+```
+
+The Rust core handles all I/O (HTTP, gRPC, IPC, metrics, file watching), while Python workers handle model inference. This separation gives you Rust-level throughput with Python-level simplicity.
+
+See [docs/architecture.md](docs/architecture.md) for details.
 
 ## Comparison with Other Frameworks
 
@@ -157,7 +200,7 @@ See [examples/](examples/) for runnable model repositories:
 | 05 | [ensemble](examples/05_ensemble/) | DAG-based multi-model pipeline |
 | 06 | [custom_endpoint](examples/06_custom_endpoint/) | Custom HTTP endpoint |
 
-See [examples/README.md](examples/README.md) for usage details.
+See [examples/README.md](examples/README.md) for learning path and usage details.
 
 ## API Endpoints
 
@@ -180,8 +223,9 @@ See [examples/README.md](examples/README.md) for usage details.
 
 ## Configuration
 
+Minimal `server.yaml`:
+
 ```yaml
-# server.yaml
 server:
   http_port: 8000
   host: 0.0.0.0
@@ -189,12 +233,6 @@ server:
 
 model_repository:
   path: ./model_repo
-
-metrics:
-  enabled: true
-
-grpc:
-  enabled: true
 ```
 
 Per-model config (`model_repo/my_model/1/config.yaml`):
@@ -204,13 +242,33 @@ max_batch_size: 8
 batch_timeout: 0.01
 stream: false
 accelerator: cpu
-devices: 1
 workers_per_device: 1
-max_queue_size: 1000
 request_timeout: 30.0
-max_requests: 0  # 0 = disabled
-adaptive_batching: true
 ```
+
+See [docs/configuration.md](docs/configuration.md) for the full configuration reference (server, model, orchestration, CLI flags).
+
+See [docs/model-authoring.md](docs/model-authoring.md) for the complete model authoring guide (LitAPI interface, streaming, continuous batching, best practices).
+
+## FAQ
+
+**Q: How is lite-server different from LitServe?**
+lite-server uses a Rust HTTP core (axum/tokio) instead of Python's uvicorn, giving 3x higher throughput at multi-worker concurrency. Models are written the same way (LitAPI-compatible).
+
+**Q: Do I need Docker?**
+No. `pip install` and run directly. Works on Linux, macOS, and Windows.
+
+**Q: Can I use my existing LitAPI code?**
+Yes. `from lite_server import LitAPI` is a drop-in replacement for `litserve.LitAPI` with additional hooks (streaming, continuous batching, lifecycle).
+
+**Q: How do I deploy multiple models?**
+Put each model in its own directory under `model_repo/` and list them in `orchestration.yaml`. See [examples/05_ensemble](examples/05_ensemble/) for multi-model pipelines.
+
+**Q: How do I switch model versions?**
+Use the activate/deactivate API: `POST /v2/models/{name}/versions/{v}/activate`. See [examples/04_multi_version](examples/04_multi_version/).
+
+**Q: What happens if a worker crashes?**
+The worker is automatically restarted. In-flight requests are retried on other workers (up to 3 attempts). Outlier detection ejects unhealthy workers.
 
 ## Multi-Platform
 
@@ -241,6 +299,12 @@ cd python && python -m pytest tests/
 ├── examples/         # Example model repositories
 ├── benchmarks/       # Performance benchmarks
 ├── docs/             # Documentation
+│   ├── architecture.md
+│   ├── benchmark.md
+│   ├── comparison.md
+│   ├── comparison_zh.md
+│   ├── configuration.md
+│   └── model-authoring.md
 ├── Cargo.toml        # Rust manifest
 └── pyproject.toml    # Python packaging (maturin)
 ```
