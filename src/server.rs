@@ -46,6 +46,9 @@ impl LiteServer {
             error!("Failed to register metrics: {}", e);
         }
 
+        // Start reload listener for max_requests auto-recycle
+        self.worker_manager.start_reload_listener().await;
+
         // Load initial models
         self.load_initial_models().await?;
 

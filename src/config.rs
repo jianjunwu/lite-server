@@ -236,6 +236,10 @@ pub struct ModelConfig {
     pub adaptive_batching: bool,
     pub min_batch_timeout: f32,
     pub adaptive_queue_threshold: usize,
+    /// Per-request hard timeout in seconds. 0 = disabled.
+    pub request_timeout: f32,
+    /// Auto-restart worker after this many requests. 0 = disabled.
+    pub max_requests: usize,
 }
 
 impl Default for ModelConfig {
@@ -260,6 +264,8 @@ impl Default for ModelConfig {
             adaptive_batching: false,
             min_batch_timeout: 0.001,
             adaptive_queue_threshold: 10,
+            request_timeout: 0.0,
+            max_requests: 0,
         }
     }
 }

@@ -3,7 +3,7 @@ pub mod endpoint_manager;
 
 use crate::config::{ModelConfig, OrchestrationConfig};
 use crate::error::AppError;
-use crate::inference_queue::{InferenceQueue, OutlierState};
+use crate::inference_queue::{InferenceQueue, OutlierState, ReloadSignal};
 use crate::registry::{ModelRegistry, types::*};
 use crate::transport::zmq::WorkerZmqClient;
 use crate::worker::protocol::*;
@@ -33,6 +33,9 @@ pub struct WorkerManager {
     zmq_clients: Arc<RwLock<HashMap<String, Vec<Arc<WorkerZmqClient>>>>>,
     // Outlier detection state per model version (shared with batch_collector)
     outlier_states: Arc<RwLock<HashMap<String, Arc<OutlierState>>>>,
+    // Reload channel for max_requests auto-recycle
+    reload_tx: mpsc::Sender<ReloadSignal>,
+    reload_rx: tokio::sync::Mutex<Option<mpsc::Receiver<ReloadSignal>>>,
 }
 
 struct WorkerProcess {
@@ -50,6 +53,7 @@ impl WorkerManager {
         repo_path: PathBuf,
         inference_queue: Arc<InferenceQueue>,
     ) -> Self {
+        let (reload_tx, reload_rx) = mpsc::channel::<ReloadSignal>(8);
         Self {
             registry,
             repo_path,
@@ -58,6 +62,37 @@ impl WorkerManager {
             inference_queue,
             zmq_clients: Arc::new(RwLock::new(HashMap::new())),
             outlier_states: Arc::new(RwLock::new(HashMap::new())),
+            reload_tx,
+            reload_rx: tokio::sync::Mutex::new(Some(reload_rx)),
+        }
+    }
+
+    /// Start the reload listener. Must be called once after construction.
+    pub async fn start_reload_listener(self: &Arc<Self>) {
+        let mut rx_guard = self.reload_rx.lock().await;
+        if let Some(mut rx) = rx_guard.take() {
+            let wm = Arc::downgrade(self);
+            tokio::spawn(async move {
+                let mut reloading = std::collections::HashSet::new();
+                while let Some(signal) = rx.recv().await {
+                    let key = signal.model_name.clone();
+                    if !reloading.insert(key.clone()) {
+                        continue; // already reloading
+                    }
+                    if let Some(wm) = wm.upgrade() {
+                        info!("Auto-recycling model {} (max_requests reached)", signal.model_name);
+                        let result = wm.reload_model(&signal.model_name, None).await;
+                        match result {
+                            Ok(true) => info!("Model {} auto-recycled successfully", signal.model_name),
+                            Ok(false) => warn!("Model {} not found for auto-recycle", signal.model_name),
+                            Err(e) => error!("Model {} auto-recycle failed: {}", signal.model_name, e),
+                        }
+                        reloading.remove(&key);
+                    } else {
+                        break; // WorkerManager dropped
+                    }
+                }
+            });
         }
     }
 
@@ -362,7 +397,7 @@ impl WorkerManager {
 
         // Register inference queue for batching
         self.inference_queue
-            .register_model(model_name, version, &model_config, worker_infos, zmq_clients_for_model.clone());
+            .register_model(model_name, version, &model_config, worker_infos, zmq_clients_for_model.clone(), self.reload_tx.clone());
 
         {
             let mut workers = self.workers.write().await;
@@ -787,5 +822,70 @@ mod tests {
         for _ in 0..20 {
             assert_eq!(pick_worker_skip_ejected(2, &outlier), 1);
         }
+    }
+
+    // ===== Reload Channel tests =====
+
+    #[test]
+    fn test_reload_channel_creation() {
+        // WorkerManager creates a reload channel in its constructor
+        let (tx, mut rx) = mpsc::channel::<crate::inference_queue::ReloadSignal>(8);
+
+        // Sender should be cloneable (for multiple batch collectors)
+        let tx2 = tx.clone();
+
+        // Send a signal
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            tx.send(crate::inference_queue::ReloadSignal {
+                model_name: "test".to_string(),
+            }).await.unwrap();
+
+            let signal = rx.recv().await.unwrap();
+            assert_eq!(signal.model_name, "test");
+
+            // Clone also works
+            tx2.send(crate::inference_queue::ReloadSignal {
+                model_name: "test2".to_string(),
+            }).await.unwrap();
+            let signal2 = rx.recv().await.unwrap();
+            assert_eq!(signal2.model_name, "test2");
+        });
+    }
+
+    #[test]
+    fn test_reload_signal_dedup() {
+        // Simulate the dedup logic from start_reload_listener
+        let mut reloading = std::collections::HashSet::new();
+
+        // First signal for model_a → should process
+        assert!(reloading.insert("model_a".to_string()));
+
+        // Second signal for model_a while reloading → should skip
+        assert!(!reloading.insert("model_a".to_string()));
+
+        // Different model → should process
+        assert!(reloading.insert("model_b".to_string()));
+
+        // After model_a finishes reloading
+        reloading.remove("model_a");
+
+        // model_a can be reloaded again
+        assert!(reloading.insert("model_a".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_reload_channel_try_send_non_blocking() {
+        // try_send should not block even when channel is full
+        let (tx, _rx) = mpsc::channel::<crate::inference_queue::ReloadSignal>(1);
+
+        // First send succeeds
+        assert!(tx.try_send(crate::inference_queue::ReloadSignal {
+            model_name: "m1".to_string(),
+        }).is_ok());
+
+        // Second send should fail (channel full) — not block
+        assert!(tx.try_send(crate::inference_queue::ReloadSignal {
+            model_name: "m2".to_string(),
+        }).is_err());
     }
 }

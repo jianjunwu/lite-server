@@ -172,6 +172,12 @@ impl OutlierState {
 
 const MAX_RETRIES: usize = 3;
 
+/// Signal to trigger a model version reload (worker auto-recycle).
+#[derive(Debug)]
+pub struct ReloadSignal {
+    pub model_name: String,
+}
+
 /// Per-model-version inference queue with batch aggregation.
 pub struct InferenceQueue {
     queues: DashMap<String, (mpsc::Sender<QueueItem>, std::sync::Arc<tokio::task::JoinHandle<()>>)>,
@@ -192,6 +198,7 @@ impl InferenceQueue {
         config: &ModelConfig,
         workers: Vec<WorkerInfo>,
         zmq_clients: Vec<Arc<WorkerZmqClient>>,
+        reload_tx: mpsc::Sender<ReloadSignal>,
     ) {
         let key = model_version_key(model_name, version);
 
@@ -208,6 +215,8 @@ impl InferenceQueue {
         let adaptive = config.adaptive_batching;
         let min_timeout = Duration::from_secs_f64(config.min_batch_timeout as f64);
         let queue_threshold = config.adaptive_queue_threshold;
+        let request_timeout = Duration::from_secs_f64(config.request_timeout as f64);
+        let max_requests = config.max_requests;
 
         let handle = tokio::spawn(batch_collector(
             rx,
@@ -220,6 +229,9 @@ impl InferenceQueue {
             zmq_clients,
             model_name.to_string(),
             version.to_string(),
+            request_timeout,
+            max_requests,
+            reload_tx,
         ));
 
         self.queues.insert(key, (tx, std::sync::Arc::new(handle)));
@@ -303,6 +315,7 @@ async fn do_send_batch(
     outlier: &OutlierState,
     model_name: &str,
     version: &str,
+    request_timeout: Duration,
 ) -> Result<(), ()> {
     if batch.is_empty() {
         return Ok(());
@@ -342,7 +355,32 @@ async fn do_send_batch(
         prometheus::dec_queue_depth(model_name, version);
     }
 
-    let result = zmq_client.send(request).await;
+    let result = if request_timeout > Duration::ZERO {
+        match tokio::time::timeout(request_timeout, zmq_client.send(request)).await {
+            Ok(r) => r,
+            Err(_) => {
+                error!("Request timeout ({:?}) for {} {}", request_timeout, model_name, version);
+                for queue_item in batch.drain(..) {
+                    let _ = queue_item.response_tx.send(pb::Response {
+                        uid: queue_item.uid,
+                        payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+                            data: vec![],
+                            status: Some(pb::Status {
+                                code: "Timeout".to_string(),
+                                message: "request timeout".to_string(),
+                            }),
+                        })),
+                        metrics: None,
+                    });
+                }
+                inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
+                outlier.record_error(worker_idx);
+                return Err(());
+            }
+        }
+    } else {
+        zmq_client.send(request).await
+    };
 
     match result {
         Ok(resp) => {
@@ -468,14 +506,23 @@ async fn send_batch_with_retry(
     outlier: &OutlierState,
     model_name: &str,
     version: &str,
+    request_timeout: Duration,
+    request_count: &AtomicUsize,
+    max_requests: usize,
+    reload_tx: &mpsc::Sender<ReloadSignal>,
 ) {
     if batch.is_empty() {
         return;
     }
 
+    let batch_size = batch.len();
+
     // Fast path: single worker, no retry possible
     if zmq_clients.len() <= 1 {
-        let _ = do_send_batch(&mut batch, zmq_clients, inflight, outlier, model_name, version).await;
+        let result = do_send_batch(&mut batch, zmq_clients, inflight, outlier, model_name, version, request_timeout).await;
+        if result.is_ok() {
+            check_max_requests(request_count, batch_size, max_requests, model_name, version, reload_tx).await;
+        }
         return;
     }
 
@@ -483,8 +530,11 @@ async fn send_batch_with_retry(
         if attempt > 0 {
             prometheus::inc_retry(model_name, version);
         }
-        match do_send_batch(&mut batch, zmq_clients, inflight, outlier, model_name, version).await {
-            Ok(()) => return,
+        match do_send_batch(&mut batch, zmq_clients, inflight, outlier, model_name, version, request_timeout).await {
+            Ok(()) => {
+                check_max_requests(request_count, batch_size, max_requests, model_name, version, reload_tx).await;
+                return;
+            }
             Err(()) => {
                 if batch.is_empty() {
                     return; // all items already got error responses
@@ -494,6 +544,28 @@ async fn send_batch_with_retry(
         }
     }
     // All retries exhausted; remaining items already have error responses from last attempt
+}
+
+/// Check if worker hit max_requests and signal reload.
+#[inline]
+async fn check_max_requests(
+    request_count: &AtomicUsize,
+    batch_size: usize,
+    max_requests: usize,
+    model_name: &str,
+    version: &str,
+    reload_tx: &mpsc::Sender<ReloadSignal>,
+) {
+    if max_requests == 0 {
+        return;
+    }
+    let prev = request_count.fetch_add(batch_size, Ordering::Relaxed);
+    if prev < max_requests && prev + batch_size >= max_requests {
+        info!("Worker hit max_requests ({}), signaling reload for {} {}", max_requests, model_name, version);
+        let _ = reload_tx.try_send(ReloadSignal {
+            model_name: model_name.to_string(),
+        });
+    }
 }
 
 /// Compute adaptive batch timeout based on current batch size, queue depth, and config.
@@ -550,11 +622,15 @@ async fn batch_collector(
     zmq_clients: Vec<Arc<WorkerZmqClient>>,
     model_name: String,
     version: String,
+    request_timeout: Duration,
+    max_requests: usize,
+    reload_tx: mpsc::Sender<ReloadSignal>,
 ) {
     let worker_inflight: Vec<Arc<AtomicUsize>> = (0..zmq_clients.len())
         .map(|_| Arc::new(AtomicUsize::new(0)))
         .collect();
     let outlier = Arc::new(OutlierState::new(zmq_clients.len()));
+    let request_count = Arc::new(AtomicUsize::new(0));
 
     if max_batch_size <= 1 {
         // Fast path: no batching, send immediately and concurrently
@@ -565,8 +641,10 @@ async fn batch_collector(
             let outlier = outlier.clone();
             let model_name = model_name.clone();
             let version = version.clone();
+            let request_count = request_count.clone();
+            let reload_tx = reload_tx.clone();
             tokio::spawn(async move {
-                send_batch_with_retry(batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version).await;
+                send_batch_with_retry(batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx).await;
             });
         }
         return;
@@ -588,8 +666,10 @@ async fn batch_collector(
                     let outlier = outlier.clone();
                     let model_name = model_name.clone();
                     let version = version.clone();
+                    let request_count = request_count.clone();
+                    let reload_tx = reload_tx.clone();
                     tokio::spawn(async move {
-                        send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version).await;
+                        send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx).await;
                     });
                     deadline = None;
                 } else if deadline.is_none() {
@@ -623,8 +703,10 @@ async fn batch_collector(
                     let outlier = outlier.clone();
                     let model_name = model_name.clone();
                     let version = version.clone();
+                    let request_count = request_count.clone();
+                    let reload_tx = reload_tx.clone();
                     tokio::spawn(async move {
-                        send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version).await;
+                        send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx).await;
                     });
                 }
                 deadline = None;
@@ -641,8 +723,10 @@ async fn batch_collector(
         let outlier = outlier.clone();
         let model_name = model_name.clone();
         let version = version.clone();
+        let request_count = request_count.clone();
+        let reload_tx = reload_tx.clone();
         tokio::spawn(async move {
-            send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version).await;
+            send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx).await;
         });
     }
 }
@@ -682,7 +766,8 @@ mod tests {
             adaptive_queue_threshold: 0,
             ..Default::default()
         };
-        queue.register_model("test_model", "1", &config, vec![], vec![]);
+        let (reload_tx, _reload_rx) = mpsc::channel(8);
+        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx);
 
         // has_queue should find it using the same key
         assert!(queue.has_queue("test_model", "1"));
@@ -771,13 +856,14 @@ mod tests {
             adaptive_queue_threshold: 0,
             ..Default::default()
         };
+        let (reload_tx, _reload_rx) = mpsc::channel(8);
 
-        queue.register_model("test_model", "1", &config, vec![], vec![]);
+        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx.clone());
         let first_handle = queue.queues.get("test_model_1").unwrap().1.clone();
         assert!(!first_handle.is_finished());
 
         // Re-register should abort the first collector
-        queue.register_model("test_model", "1", &config, vec![], vec![]);
+        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx);
         let second_handle = queue.queues.get("test_model_1").unwrap().1.clone();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -797,8 +883,9 @@ mod tests {
             adaptive_queue_threshold: 0,
             ..Default::default()
         };
+        let (reload_tx, _reload_rx) = mpsc::channel(8);
 
-        queue.register_model("test_model", "1", &config, vec![], vec![]);
+        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx);
         let handle = queue.queues.get("test_model_1").unwrap().1.clone();
         assert!(!handle.is_finished());
 
@@ -1130,5 +1217,95 @@ mod tests {
         }
         let picked = pick_worker_least_loaded(&inflight, &outlier);
         assert_eq!(picked, 0, "single worker should always return 0");
+    }
+
+    // ===== Request Timeout tests =====
+
+    #[test]
+    fn test_request_timeout_zero_is_disabled() {
+        // Duration::ZERO means no timeout — verify the condition
+        let timeout = Duration::ZERO;
+        assert!(timeout.is_zero());
+        assert!(!timeout.gt(&Duration::ZERO));
+    }
+
+    #[test]
+    fn test_request_timeout_positive_is_enabled() {
+        let timeout = Duration::from_secs(30);
+        assert!(!timeout.is_zero());
+        assert!(timeout.gt(&Duration::ZERO));
+    }
+
+    #[tokio::test]
+    async fn test_request_timeout_triggers_on_slow_response() {
+        // Simulate a slow ZMQ client by using tokio::time::pause
+        tokio::time::pause();
+
+        let timeout = Duration::from_millis(100);
+
+        // Simulate: timeout expires before response arrives
+        let result = tokio::time::timeout(timeout, async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok::<_, ()>(())
+        }).await;
+
+        assert!(result.is_err(), "should timeout when response takes too long");
+    }
+
+    // ===== Max Requests tests =====
+
+    #[tokio::test]
+    async fn test_check_max_requests_sends_signal() {
+        let (tx, mut rx) = mpsc::channel::<ReloadSignal>(8);
+        let counter = AtomicUsize::new(0);
+
+        // First batch: counter goes from 0 to 3, max_requests=5 → no signal
+        check_max_requests(&counter, 3, 5, "model_a", "1", &tx).await;
+        assert!(rx.try_recv().is_err(), "should not signal yet");
+
+        // Second batch: counter goes from 3 to 6, crosses 5 → signal
+        check_max_requests(&counter, 3, 5, "model_a", "1", &tx).await;
+        let signal = rx.try_recv().unwrap();
+        assert_eq!(signal.model_name, "model_a");
+    }
+
+    #[tokio::test]
+    async fn test_check_max_requests_disabled_when_zero() {
+        let (tx, mut rx) = mpsc::channel::<ReloadSignal>(8);
+        let counter = AtomicUsize::new(0);
+
+        // max_requests=0 means disabled
+        for _ in 0..10 {
+            check_max_requests(&counter, 1, 0, "model_b", "1", &tx).await;
+        }
+        assert!(rx.try_recv().is_err(), "should never signal when max_requests=0");
+        assert_eq!(counter.load(Ordering::Relaxed), 0, "counter should not increment when disabled");
+    }
+
+    #[tokio::test]
+    async fn test_check_max_requests_only_signals_once() {
+        let (tx, mut rx) = mpsc::channel::<ReloadSignal>(8);
+        let counter = AtomicUsize::new(0);
+
+        // Cross threshold at batch 3
+        check_max_requests(&counter, 3, 5, "m", "1", &tx).await;
+        // Already crossed, next call should not signal again
+        check_max_requests(&counter, 3, 5, "m", "1", &tx).await;
+        check_max_requests(&counter, 3, 5, "m", "1", &tx).await;
+
+        // Only one signal should have been sent
+        assert!(rx.try_recv().is_ok(), "first signal should arrive");
+        assert!(rx.try_recv().is_err(), "should not send duplicate signals");
+    }
+
+    #[tokio::test]
+    async fn test_check_max_requests_batch_size_exact() {
+        let (tx, mut rx) = mpsc::channel::<ReloadSignal>(8);
+        let counter = AtomicUsize::new(0);
+
+        // Single batch that exactly hits max_requests
+        check_max_requests(&counter, 10, 10, "exact", "1", &tx).await;
+        let signal = rx.try_recv().unwrap();
+        assert_eq!(signal.model_name, "exact");
     }
 }
