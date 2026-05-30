@@ -37,6 +37,7 @@ pub fn run_server(
     log_verbose: Option<bool>,
     max_queue_size: Option<usize>,
     max_requests: Option<usize>,
+    max_requests_jitter: Option<usize>,
     request_timeout: Option<f32>,
     health_check_interval: Option<f32>,
     graceful_timeout: Option<f32>,
@@ -64,6 +65,7 @@ pub fn run_server(
         log_verbose: false, // handled below by logging::init
         max_queue_size,
         max_requests,
+        max_requests_jitter,
         request_timeout,
         health_check_interval,
         graceful_timeout,
@@ -113,6 +115,7 @@ pub fn run_server(
     log_verbose=None,
     max_queue_size=None,
     max_requests=None,
+    max_requests_jitter=None,
     request_timeout=None,
     graceful_timeout=None,
     keepalive_timeout=None,
@@ -134,6 +137,7 @@ fn serve(
     log_verbose: Option<bool>,
     max_queue_size: Option<usize>,
     max_requests: Option<usize>,
+    max_requests_jitter: Option<usize>,
     request_timeout: Option<f32>,
     graceful_timeout: Option<f32>,
     keepalive_timeout: Option<f32>,
@@ -143,8 +147,8 @@ fn serve(
             run_server(
                 config, port, host, model_repo, http_workers, timeout, log_level, metrics_port,
                 no_metrics, transport, grpc_port, no_grpc, no_streaming_metrics, log_verbose,
-                max_queue_size, max_requests, request_timeout, None, graceful_timeout,
-                keepalive_timeout,
+                max_queue_size, max_requests, max_requests_jitter, request_timeout, None,
+                graceful_timeout, keepalive_timeout,
             )
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })

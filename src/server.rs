@@ -50,6 +50,9 @@ impl LiteServer {
         // Start reload listener for max_requests auto-recycle
         self.worker_manager.start_reload_listener().await;
 
+        // Start respawn listener for heartbeat-triggered worker restarts
+        self.worker_manager.start_respawn_listener().await;
+
         // Load initial models
         self.load_initial_models().await?;
 

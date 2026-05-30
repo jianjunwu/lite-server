@@ -1,9 +1,10 @@
 pub mod protocol;
 pub mod endpoint_manager;
 
-use crate::config::{ModelConfig, OrchestrationConfig};
+use crate::config::{HttpHookConfig, ModelConfig, OrchestrationConfig};
 use crate::error::AppError;
 use crate::inference_queue::{InferenceQueue, OutlierState, ReloadSignal};
+use crate::proto::liteserver as pb;
 use crate::registry::{ModelRegistry, types::*};
 use crate::transport::zmq::WorkerZmqClient;
 use crate::worker::protocol::*;
@@ -18,6 +19,107 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::timeout;
 use tracing::{error, info, warn};
+
+/// Respawn signal sent from monitor to respawn listener.
+struct RespawnSignal {
+    model_name: String,
+    version: String,
+    worker_id: u32,
+}
+
+// ===== Worker Lifecycle Hooks =====
+
+/// Replace $MODEL, $VERSION, $WORKER_ID, $EXIT_CODE, $REASON placeholders in a string.
+fn replace_hook_vars(template: &str, vars: &[(String, String)]) -> String {
+    let mut result = template.to_string();
+    for (key, value) in vars {
+        result = result.replace(key.as_str(), value.as_str());
+    }
+    result
+}
+
+/// Execute a worker lifecycle hook (shell command + optional HTTP callback).
+/// Both are fire-and-forget: spawned as background tasks, never block the caller.
+pub fn execute_hook(
+    hook_type: &str,
+    hooks: &crate::config::WorkerHooksConfig,
+    vars: Vec<(String, String)>,
+) {
+    // Determine which shell command and HTTP hook to use based on hook_type
+    let shell_cmd = match hook_type {
+        "ready" => hooks.on_ready.as_deref(),
+        "exit" => hooks.on_exit.as_deref(),
+        "error" => hooks.on_error.as_deref(),
+        _ => None,
+    };
+    let http_hook = match hook_type {
+        "ready" => hooks.on_ready_http.as_ref(),
+        "exit" => hooks.on_exit_http.as_ref(),
+        "error" => hooks.on_error_http.as_ref(),
+        _ => None,
+    };
+
+    // Skip if no hooks configured
+    if shell_cmd.is_none() && http_hook.is_none() {
+        return;
+    }
+
+    // Shell hook: fire-and-forget
+    if let Some(cmd) = shell_cmd {
+        let resolved = replace_hook_vars(cmd, &vars);
+        let hook_name = hook_type.to_string();
+        tokio::spawn(async move {
+            match tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(&resolved)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await
+            {
+                Ok(status) => {
+                    if !status.success() {
+                        warn!("Hook '{}' command exited with {}", hook_name, status);
+                    }
+                }
+                Err(e) => {
+                    warn!("Hook '{}' command failed to execute: {}", hook_name, e);
+                }
+            }
+        });
+    }
+
+    // HTTP hook: fire-and-forget
+    if let Some(http) = http_hook {
+        let url = replace_hook_vars(&http.url, &vars);
+        let method = http.method.clone();
+        let body = http.body_template.as_deref().map(|t| replace_hook_vars(t, &vars));
+        let hook_name = hook_type.to_string();
+        tokio::spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap_or_default();
+            let result = match method.to_uppercase().as_str() {
+                "GET" => client.get(&url).send().await,
+                _ => {
+                    let b = body.unwrap_or_default();
+                    client.post(&url).body(b).send().await
+                }
+            };
+            match result {
+                Ok(resp) => {
+                    if !resp.status().is_success() {
+                        warn!("Hook '{}' HTTP {} returned {}", hook_name, url, resp.status());
+                    }
+                }
+                Err(e) => {
+                    warn!("Hook '{}' HTTP {} failed: {}", hook_name, url, e);
+                }
+            }
+        });
+    }
+}
 
 /// Global pending response map: uid -> oneshot sender
 pub type PendingMap = Arc<DashMap<String, oneshot::Sender<InferenceResponse>>>;
@@ -36,6 +138,10 @@ pub struct WorkerManager {
     // Reload channel for max_requests auto-recycle
     reload_tx: mpsc::Sender<ReloadSignal>,
     reload_rx: tokio::sync::Mutex<Option<mpsc::Receiver<ReloadSignal>>>,
+
+    // Respawn channel for heartbeat-triggered worker restarts
+    respawn_tx: mpsc::Sender<RespawnSignal>,
+    respawn_rx: tokio::sync::Mutex<Option<mpsc::Receiver<RespawnSignal>>>,
 }
 
 struct WorkerProcess {
@@ -54,6 +160,7 @@ impl WorkerManager {
         inference_queue: Arc<InferenceQueue>,
     ) -> Self {
         let (reload_tx, reload_rx) = mpsc::channel::<ReloadSignal>(8);
+        let (respawn_tx, respawn_rx) = mpsc::channel::<RespawnSignal>(8);
         Self {
             registry,
             repo_path,
@@ -64,6 +171,8 @@ impl WorkerManager {
             outlier_states: Arc::new(RwLock::new(HashMap::new())),
             reload_tx,
             reload_rx: tokio::sync::Mutex::new(Some(reload_rx)),
+            respawn_tx,
+            respawn_rx: tokio::sync::Mutex::new(Some(respawn_rx)),
         }
     }
 
@@ -94,6 +203,303 @@ impl WorkerManager {
                 }
             });
         }
+    }
+
+    /// Start the respawn listener. Must be called once after construction.
+    pub async fn start_respawn_listener(self: &Arc<Self>) {
+        let mut rx_guard = self.respawn_rx.lock().await;
+        if let Some(mut rx) = rx_guard.take() {
+            let wm = Arc::downgrade(self);
+            tokio::spawn(async move {
+                while let Some(signal) = rx.recv().await {
+                    if let Some(wm) = wm.upgrade() {
+                        info!(
+                            model = %signal.model_name, version = %signal.version,
+                            worker_id = signal.worker_id,
+                            "Respawning worker (heartbeat timeout)"
+                        );
+                        if let Err(e) = wm.respawn_worker(
+                            &signal.model_name, &signal.version, signal.worker_id,
+                        ).await {
+                            error!(
+                                model = %signal.model_name, version = %signal.version,
+                                worker_id = signal.worker_id,
+                                "Worker respawn failed: {}", e
+                            );
+                        }
+                    } else {
+                        break; // WorkerManager dropped
+                    }
+                }
+            });
+        }
+    }
+
+    /// Respawn a single worker that was killed by heartbeat timeout.
+    /// Kills the old worker, spawns a new one, and updates all registries.
+    async fn respawn_worker(
+        &self,
+        model_name: &str,
+        version: &str,
+        worker_id: u32,
+    ) -> Result<(), AppError> {
+        let key = format!("{}_{}", model_name, version);
+
+        // Get config from registry
+        let model_version = self.registry
+            .get(model_name, Some(version))
+            .ok_or_else(|| AppError::ModelNotFound(format!("{} v{}", model_name, version)))?;
+        let model_config = model_version.config;
+
+        let model_dir = crate::validation::resolve_model_dir(
+            &self.repo_path, model_name, version,
+        )?;
+        let model_py = model_dir.join("model.py");
+        let config_yaml = model_dir.join("config.yaml");
+
+        // Remove old worker entry
+        {
+            let mut workers = self.workers.write().await;
+            if let Some(procs) = workers.get_mut(&key) {
+                procs.retain(|w| w.worker_id != worker_id);
+            }
+        }
+
+        // Remove old ZMQ client and create new one
+        let endpoint = worker_endpoint(model_name, version, worker_id as usize);
+        {
+            let mut clients = self.zmq_clients.write().await;
+            if let Some(list) = clients.get_mut(&key) {
+                // Remove the old client at this worker_id index
+                if (worker_id as usize) < list.len() {
+                    list.remove(worker_id as usize);
+                }
+            }
+        }
+
+        // Remove stale socket (Unix only)
+        #[cfg(unix)]
+        {
+            let socket_str = endpoint.strip_prefix("ipc://").unwrap_or(&endpoint);
+            let socket_path = std::path::Path::new(socket_str);
+            let _ = tokio::fs::remove_file(socket_path).await;
+            if let Some(parent) = socket_path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+        }
+
+        // Spawn new worker
+        let accelerator = model_config.accelerator.as_deref().unwrap_or("cpu");
+        let devices = match &model_config.devices {
+            Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(1) as usize,
+            Some(serde_json::Value::String(s)) if s == "auto" => 1,
+            _ => 1,
+        };
+        let device = format!("{}:{}", accelerator, worker_id as usize % devices);
+
+        let python_path = Self::find_python_module_path().unwrap_or_default();
+        let python_module_dir = if python_path.is_empty() {
+            String::new()
+        } else {
+            format!("{}", python_path)
+        };
+
+        let mut cmd = Command::new("python");
+        if !python_module_dir.is_empty() {
+            let current_pythonpath = std::env::var("PYTHONPATH").unwrap_or_default();
+            let new_pythonpath = if current_pythonpath.is_empty() {
+                python_module_dir
+            } else {
+                #[cfg(windows)]
+                { format!("{};{}", current_pythonpath, python_module_dir) }
+                #[cfg(not(windows))]
+                { format!("{}:{}", current_pythonpath, python_module_dir) }
+            };
+            cmd.env("PYTHONPATH", new_pythonpath);
+        }
+
+        let mut child = cmd
+            .arg("-m")
+            .arg("lite_server.worker.inference")
+            .arg("--model-name")
+            .arg(model_name)
+            .arg("--version")
+            .arg(version)
+            .arg("--model-py")
+            .arg(&model_py)
+            .arg("--config")
+            .arg(&config_yaml)
+            .arg("--device")
+            .arg(&device)
+            .arg("--worker-id")
+            .arg(worker_id.to_string())
+            .arg("--endpoint")
+            .arg(&endpoint);
+
+        if model_config.continuous_batching {
+            child = child.arg("--continuous-batching");
+        }
+
+        let mut child = child
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| AppError::Python(format!("failed to spawn worker: {}", e)))?;
+
+        let stdout = child.stdout.take()
+            .ok_or_else(|| AppError::Internal("worker stdout not piped".to_string()))?;
+        let stderr = child.stderr.take()
+            .ok_or_else(|| AppError::Internal("worker stderr not piped".to_string()))?;
+
+        // Wait for "ready" signal
+        let mut reader = BufReader::new(stdout);
+        let mut ready_line = String::new();
+        let n = timeout(Duration::from_secs(60), reader.read_line(&mut ready_line))
+            .await
+            .map_err(|_| AppError::InferenceTimeout("worker startup timeout".to_string()))?
+            .map_err(|e| AppError::Io(e))?;
+        if n == 0 {
+            return Err(AppError::WorkerCrashed("worker exited before ready".to_string()));
+        }
+        let stdout = reader.into_inner();
+
+        let startup: WorkerStartup = serde_json::from_str(ready_line.trim())
+            .map_err(|e| AppError::Internal(format!("worker startup JSON parse error: {}", e)))?;
+
+        if startup.status != "ready" {
+            return Err(AppError::WorkerCrashed(format!(
+                "worker {} startup failed: {:?}",
+                worker_id, startup.message
+            )));
+        }
+
+        info!("Worker {} for {} v{} respawned (pid={:?})", worker_id, model_name, version, child.id());
+
+        // Fire on_ready lifecycle hook
+        execute_hook("ready", &model_config.hooks, vec![
+            ("$MODEL".to_string(), model_name.to_string()),
+            ("$VERSION".to_string(), version.to_string()),
+            ("$WORKER_ID".to_string(), worker_id.to_string()),
+        ]);
+
+        // Drain stdout
+        tokio::spawn(async move {
+            let mut discard = [0u8; 1024];
+            let mut stdout = stdout;
+            loop {
+                match stdout.read(&mut discard).await {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Start stderr logger
+        let model_name_clone = model_name.to_string();
+        let version_clone = version.to_string();
+        let worker_id_clone = worker_id;
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut buf = Vec::with_capacity(1024);
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
+                            buf.pop();
+                        }
+                        let line = String::from_utf8_lossy(&buf);
+                        let trimmed = line.trim();
+                        if trimmed.starts_with("[ERROR]") {
+                            tracing::error!(worker_id = worker_id_clone, model = %model_name_clone, version = %version_clone, "{}", trimmed.strip_prefix("[ERROR]").unwrap_or(trimmed).trim());
+                        } else if trimmed.starts_with("[WARN]") {
+                            tracing::warn!(worker_id = worker_id_clone, model = %model_name_clone, version = %version_clone, "{}", trimmed.strip_prefix("[WARN]").unwrap_or(trimmed).trim());
+                        } else {
+                            tracing::info!(worker_id = worker_id_clone, model = %model_name_clone, version = %version_clone, "{}", trimmed);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(worker_id = worker_id_clone, "Worker stderr read error: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Create ZMQ client
+        let zmq_client = Arc::new(WorkerZmqClient::new(endpoint.clone()));
+
+        // Insert new ZMQ client
+        {
+            let mut clients = self.zmq_clients.write().await;
+            if let Some(list) = clients.get_mut(&key) {
+                let idx = worker_id as usize;
+                if idx < list.len() {
+                    list[idx] = zmq_client.clone();
+                } else {
+                    list.push(zmq_client.clone());
+                }
+            }
+        }
+
+        let pid = child.id();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        // Spawn monitor for the new worker
+        let endpoint_clone = endpoint.clone();
+        let hooks_arc = Arc::new(model_config.hooks.clone());
+        let heartbeat_dur = Duration::from_secs_f32(model_config.heartbeat_interval);
+        let heartbeat_timeout_dur = Duration::from_secs_f32(model_config.heartbeat_timeout);
+        spawn_worker_monitor(
+            child, model_name, version, worker_id, shutdown_rx,
+            move || {
+                #[cfg(unix)]
+                {
+                    let socket_str = endpoint_clone.strip_prefix("ipc://").unwrap_or(&endpoint_clone);
+                    let _ = std::fs::remove_file(socket_str);
+                }
+            },
+            Some(hooks_arc),
+            Some(zmq_client.clone()),
+            heartbeat_dur,
+            heartbeat_timeout_dur,
+            model_config.heartbeat_max_failures,
+            Some(self.respawn_tx.clone()),
+        );
+
+        // Update registry worker info
+        let new_info = WorkerInfo {
+            worker_id,
+            device,
+            endpoint: endpoint.clone(),
+            pid,
+            status: WorkerStatus::Ready,
+        };
+        self.registry.replace_worker(model_name, version, worker_id, new_info)?;
+
+        // Update WorkerProcess entry
+        {
+            let mut workers = self.workers.write().await;
+            if let Some(procs) = workers.get_mut(&key) {
+                procs.push(WorkerProcess {
+                    worker_id,
+                    model_name: model_name.to_string(),
+                    version: version.to_string(),
+                    pid,
+                    endpoint,
+                    shutdown_tx: Some(shutdown_tx),
+                });
+            }
+        }
+
+        // Record metric
+        crate::metrics::prometheus::WORKER_RESPAWNS_TOTAL
+            .with_label_values(&[model_name, version, "heartbeat_timeout"])
+            .inc();
+
+        Ok(())
     }
 
     pub fn pending(&self) -> PendingMap {
@@ -302,6 +708,13 @@ impl WorkerManager {
 
             info!("Worker {} for {} v{} ready (pid={:?})", worker_id, model_name, version, child.id());
 
+            // Fire on_ready lifecycle hook
+            execute_hook("ready", &model_config.hooks, vec![
+                ("$MODEL".to_string(), model_name.to_string()),
+                ("$VERSION".to_string(), version.to_string()),
+                ("$WORKER_ID".to_string(), worker_id.to_string()),
+            ]);
+
             // Drain stdout so the worker does not get SIGPIPE/BrokenPipeError
             // if anything writes to stdout after the ready signal.
             tokio::spawn(async move {
@@ -362,14 +775,26 @@ impl WorkerManager {
 
             // Spawn monitor task — owns the Child, detects exits and handles cleanup
             let endpoint_clone = endpoint.clone();
-            spawn_worker_monitor(child, model_name, version, worker_id as u32, shutdown_rx, move || {
-                // Best-effort socket cleanup on unexpected exit
-                #[cfg(unix)]
-                {
-                    let socket_str = endpoint_clone.strip_prefix("ipc://").unwrap_or(&endpoint_clone);
-                    let _ = std::fs::remove_file(socket_str);
-                }
-            });
+            let hooks_arc = Arc::new(model_config.hooks.clone());
+            let heartbeat_dur = Duration::from_secs_f32(model_config.heartbeat_interval);
+            let heartbeat_timeout_dur = Duration::from_secs_f32(model_config.heartbeat_timeout);
+            spawn_worker_monitor(
+                child, model_name, version, worker_id as u32, shutdown_rx,
+                move || {
+                    // Best-effort socket cleanup on unexpected exit
+                    #[cfg(unix)]
+                    {
+                        let socket_str = endpoint_clone.strip_prefix("ipc://").unwrap_or(&endpoint_clone);
+                        let _ = std::fs::remove_file(socket_str);
+                    }
+                },
+                Some(hooks_arc),
+                Some(zmq_client.clone()),
+                heartbeat_dur,
+                heartbeat_timeout_dur,
+                model_config.heartbeat_max_failures,
+                Some(self.respawn_tx.clone()),
+            );
 
             let info = WorkerInfo {
                 worker_id: worker_id as u32,
@@ -572,6 +997,8 @@ impl WorkerManager {
 /// Spawn a background task that monitors a worker child process.
 /// - If the process exits on its own (crash, OOM kill), logs the event and runs cleanup.
 /// - If a shutdown signal is sent via `shutdown_rx`, kills the process and runs cleanup.
+/// - If heartbeat is enabled, periodically probes the worker via ZMQ and triggers respawn on timeout.
+/// - Fires lifecycle hooks (on_exit / on_error) if configured.
 fn spawn_worker_monitor(
     mut child: Child,
     model_name: &str,
@@ -579,45 +1006,216 @@ fn spawn_worker_monitor(
     worker_id: u32,
     mut shutdown_rx: oneshot::Receiver<()>,
     on_exit: impl FnOnce() + Send + 'static,
+    hooks: Option<Arc<crate::config::WorkerHooksConfig>>,
+    zmq_client: Option<Arc<WorkerZmqClient>>,
+    heartbeat_interval: Duration,
+    heartbeat_timeout: Duration,
+    heartbeat_max_failures: usize,
+    respawn_tx: Option<mpsc::Sender<RespawnSignal>>,
 ) {
     let model = model_name.to_string();
     let ver = version.to_string();
+    let hook_vars: Vec<(String, String)> = vec![
+        ("$MODEL".to_string(), model_name.to_string()),
+        ("$VERSION".to_string(), version.to_string()),
+        ("$WORKER_ID".to_string(), worker_id.to_string()),
+    ];
     tokio::spawn(async move {
-        tokio::select! {
-            result = child.wait() => {
-                match result {
-                    Ok(status) => {
-                        if status.success() {
-                            info!(
-                                model = %model, version = %ver, worker_id,
-                                "Worker process exited cleanly"
-                            );
-                        } else {
+        // If heartbeat is enabled, wrap the select with a heartbeat loop
+        let heartbeat_enabled = heartbeat_interval.as_secs() > 0
+            && zmq_client.is_some()
+            && respawn_tx.is_some();
+
+        if heartbeat_enabled {
+            let client = zmq_client.unwrap();
+            let mut tx_opt = respawn_tx;
+            let mut consecutive_failures: usize = 0;
+
+            loop {
+                tokio::select! {
+                    result = child.wait() => {
+                        match result {
+                            Ok(status) => {
+                                if status.success() {
+                                    info!(
+                                        model = %model, version = %ver, worker_id,
+                                        "Worker process exited cleanly"
+                                    );
+                                    if let Some(ref h) = hooks {
+                                        execute_hook("exit", h, hook_vars.clone());
+                                    }
+                                } else {
+                                    let exit_code = status.code().unwrap_or(-1);
+                                    error!(
+                                        model = %model, version = %ver, worker_id,
+                                        exit_code,
+                                        "Worker process exited unexpectedly"
+                                    );
+                                    if let Some(ref h) = hooks {
+                                        let mut vars = hook_vars.clone();
+                                        vars.push(("$EXIT_CODE".to_string(), exit_code.to_string()));
+                                        vars.push(("$REASON".to_string(), "crash".to_string()));
+                                        execute_hook("error", h, vars);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    model = %model, version = %ver, worker_id,
+                                    error = %e,
+                                    "Failed to wait on worker process"
+                                );
+                            }
+                        }
+                        on_exit();
+                        return;
+                    }
+                    _ = &mut shutdown_rx => {
+                        info!(
+                            model = %model, version = %ver, worker_id,
+                            "Shutting down worker process"
+                        );
+                        let _ = child.kill().await;
+                        on_exit();
+                        return;
+                    }
+                    _ = tokio::time::sleep(heartbeat_interval) => {
+                        // Heartbeat probe: send empty request via ZMQ
+                        let probe_uid = format!("heartbeat-{}-{}-{}", model, ver, worker_id);
+                        let request = pb::Request {
+                            uid: probe_uid,
+                            meta: None,
+                            payload: Some(pb::request::Payload::Single(pb::SingleRequest {
+                                data: vec![],
+                            })),
+                        };
+                        let result = timeout(heartbeat_timeout, client.send(request)).await;
+                        match result {
+                            Ok(Ok(resp)) => {
+                                let is_error = resp.payload.as_ref().and_then(|p| match p {
+                                    pb::response::Payload::Single(s) => s.status.as_ref(),
+                                    _ => None,
+                                }).map(|s| s.code == "Error").unwrap_or(false);
+
+                                if is_error {
+                                    consecutive_failures += 1;
+                                    warn!(
+                                        model = %model, version = %ver, worker_id,
+                                        consecutive_failures,
+                                        "Heartbeat probe returned error"
+                                    );
+                                } else {
+                                    if consecutive_failures > 0 {
+                                        info!(
+                                            model = %model, version = %ver, worker_id,
+                                            "Heartbeat recovered after {} failures", consecutive_failures
+                                        );
+                                    }
+                                    consecutive_failures = 0;
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                consecutive_failures += 1;
+                                warn!(
+                                    model = %model, version = %ver, worker_id,
+                                    consecutive_failures, error = %e,
+                                    "Heartbeat probe failed"
+                                );
+                            }
+                            Err(_) => {
+                                consecutive_failures += 1;
+                                warn!(
+                                    model = %model, version = %ver, worker_id,
+                                    consecutive_failures,
+                                    "Heartbeat probe timed out"
+                                );
+                            }
+                        }
+
+                        if consecutive_failures >= heartbeat_max_failures {
                             error!(
                                 model = %model, version = %ver, worker_id,
-                                exit_code = status.code().unwrap_or(-1),
-                                "Worker process exited unexpectedly"
+                                consecutive_failures,
+                                "Heartbeat failed {} times, killing worker", consecutive_failures
                             );
+                            let _ = child.kill().await;
+
+                            // Fire error hook
+                            if let Some(ref h) = hooks {
+                                let mut vars = hook_vars.clone();
+                                vars.push(("$EXIT_CODE".to_string(), "-1".to_string()));
+                                vars.push(("$REASON".to_string(), "heartbeat_timeout".to_string()));
+                                execute_hook("error", h, vars);
+                            }
+
+                            // Record metric
+                            crate::metrics::prometheus::WORKER_RESPAWNS_TOTAL
+                                .with_label_values(&[&model, &ver, "heartbeat_timeout"])
+                                .inc();
+
+                            // Send respawn signal
+                            if let Some(tx) = tx_opt.take() {
+                                let _ = tx.send(RespawnSignal {
+                                    model_name: model.clone(),
+                                    version: ver.clone(),
+                                    worker_id,
+                                }).await;
+                            }
+
+                            on_exit();
+                            return;
                         }
-                    }
-                    Err(e) => {
-                        error!(
-                            model = %model, version = %ver, worker_id,
-                            error = %e,
-                            "Failed to wait on worker process"
-                        );
                     }
                 }
             }
-            _ = &mut shutdown_rx => {
-                info!(
-                    model = %model, version = %ver, worker_id,
-                    "Shutting down worker process"
-                );
-                let _ = child.kill().await;
+        } else {
+            // No heartbeat — original behavior
+            tokio::select! {
+                result = child.wait() => {
+                    match result {
+                        Ok(status) => {
+                            if status.success() {
+                                info!(
+                                    model = %model, version = %ver, worker_id,
+                                    "Worker process exited cleanly"
+                                );
+                                if let Some(ref h) = hooks {
+                                    execute_hook("exit", h, hook_vars.clone());
+                                }
+                            } else {
+                                let exit_code = status.code().unwrap_or(-1);
+                                error!(
+                                    model = %model, version = %ver, worker_id,
+                                    exit_code,
+                                    "Worker process exited unexpectedly"
+                                );
+                                if let Some(ref h) = hooks {
+                                    let mut vars = hook_vars.clone();
+                                    vars.push(("$EXIT_CODE".to_string(), exit_code.to_string()));
+                                    vars.push(("$REASON".to_string(), "crash".to_string()));
+                                    execute_hook("error", h, vars);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                model = %model, version = %ver, worker_id,
+                                error = %e,
+                                "Failed to wait on worker process"
+                            );
+                        }
+                    }
+                }
+                _ = &mut shutdown_rx => {
+                    info!(
+                        model = %model, version = %ver, worker_id,
+                        "Shutting down worker process"
+                    );
+                    let _ = child.kill().await;
+                }
             }
+            on_exit();
         }
-        on_exit();
     });
 }
 
@@ -671,6 +1269,7 @@ pub fn pick_worker_skip_ejected(num_workers: usize, outlier: &OutlierState) -> u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// PendingMap must be Arc<DashMap> for lock-free per-uid insert/remove.
     /// This verifies the type alias — reverting to Arc<RwLock<HashMap>> won't compile.
@@ -763,9 +1362,11 @@ mod tests {
         let cleaned_up_clone = cleaned_up.clone();
 
         let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        spawn_worker_monitor(child, "test_model", "1", 0, shutdown_rx, move || {
-            cleaned_up_clone.store(true, Ordering::SeqCst);
-        });
+        spawn_worker_monitor(
+            child, "test_model", "1", 0, shutdown_rx,
+            move || { cleaned_up_clone.store(true, Ordering::SeqCst); },
+            None, None, Duration::ZERO, Duration::from_secs(5), 3, None,
+        );
 
         // Wait for the monitor to detect the exit and run cleanup
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -890,5 +1491,150 @@ mod tests {
         assert!(tx.try_send(crate::inference_queue::ReloadSignal {
             model_name: "m2".to_string(),
         }).is_err());
+    }
+
+    // ===== Lifecycle Hooks tests =====
+
+    #[test]
+    fn test_replace_hook_vars() {
+        let vars = vec![
+            ("$MODEL".to_string(), "bert".to_string()),
+            ("$VERSION".to_string(), "v1".to_string()),
+            ("$WORKER_ID".to_string(), "2".to_string()),
+            ("$EXIT_CODE".to_string(), "137".to_string()),
+            ("$REASON".to_string(), "crash".to_string()),
+        ];
+        let template = "model=$MODEL version=$VERSION worker=$WORKER_ID exit=$EXIT_CODE reason=$REASON";
+        let result = replace_hook_vars(template, &vars);
+        assert_eq!(result, "model=bert version=v1 worker=2 exit=137 reason=crash");
+    }
+
+    #[test]
+    fn test_replace_hook_vars_no_match() {
+        let vars = vec![("$MODEL".to_string(), "x".to_string())];
+        let result = replace_hook_vars("no placeholders here", &vars);
+        assert_eq!(result, "no placeholders here");
+    }
+
+    #[test]
+    fn test_replace_hook_vars_empty_template() {
+        let vars = vec![("$MODEL".to_string(), "x".to_string())];
+        let result = replace_hook_vars("", &vars);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_execute_hook_no_hooks_configured() {
+        // Should not panic when no hooks are configured
+        let hooks = crate::config::WorkerHooksConfig::default();
+        execute_hook("ready", &hooks, vec![("$MODEL".to_string(), "test".to_string())]);
+    }
+
+    #[test]
+    fn test_worker_hooks_config_default_is_empty() {
+        let hooks = crate::config::WorkerHooksConfig::default();
+        assert!(hooks.on_ready.is_none());
+        assert!(hooks.on_exit.is_none());
+        assert!(hooks.on_error.is_none());
+        assert!(hooks.on_ready_http.is_none());
+        assert!(hooks.on_exit_http.is_none());
+        assert!(hooks.on_error_http.is_none());
+    }
+
+    #[test]
+    fn test_worker_hooks_config_yaml_roundtrip() {
+        let hooks = crate::config::WorkerHooksConfig {
+            on_ready: Some("echo ready".to_string()),
+            on_exit: Some("echo exit".to_string()),
+            on_error: None,
+            on_ready_http: Some(crate::config::HttpHookConfig {
+                url: "http://localhost/hook".to_string(),
+                method: "POST".to_string(),
+                body_template: Some(r#"{"model":"$MODEL"}"#.to_string()),
+            }),
+            on_exit_http: None,
+            on_error_http: None,
+        };
+        let yaml = serde_yaml::to_string(&hooks).unwrap();
+        let parsed: crate::config::WorkerHooksConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.on_ready, Some("echo ready".to_string()));
+        assert!(parsed.on_ready_http.is_some());
+        assert_eq!(parsed.on_ready_http.as_ref().unwrap().url, "http://localhost/hook");
+    }
+
+    #[tokio::test]
+    async fn test_execute_shell_hook_runs_command() {
+        // Use a hook that creates a temp file to verify execution
+        let tmp = std::env::temp_dir().join(format!("lite-server-hook-test-{}", std::process::id()));
+        let tmp_str = tmp.to_string_lossy().to_string();
+        let hooks = crate::config::WorkerHooksConfig {
+            on_ready: Some(format!("touch {}", tmp_str)),
+            ..Default::default()
+        };
+        execute_hook("ready", &hooks, vec![("$MODEL".to_string(), "test".to_string())]);
+
+        // Wait for the background task to complete
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(tmp.exists(), "shell hook should have created the file");
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+
+    // ===== Heartbeat / Respawn tests =====
+
+    #[test]
+    fn test_heartbeat_config_defaults() {
+        let cfg = crate::config::ModelConfig::default();
+        assert_eq!(cfg.heartbeat_interval, 0.0, "heartbeat should be disabled by default");
+        assert_eq!(cfg.heartbeat_timeout, 5.0);
+        assert_eq!(cfg.heartbeat_max_failures, 3);
+    }
+
+    #[test]
+    fn test_heartbeat_config_yaml_roundtrip() {
+        let yaml = r#"
+heartbeat_interval: 10.0
+heartbeat_timeout: 3.0
+heartbeat_max_failures: 5
+"#;
+        let cfg: crate::config::ModelConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.heartbeat_interval, 10.0);
+        assert_eq!(cfg.heartbeat_timeout, 3.0);
+        assert_eq!(cfg.heartbeat_max_failures, 5);
+    }
+
+    #[tokio::test]
+    async fn test_respawn_channel_creation() {
+        let (tx, mut rx) = mpsc::channel::<RespawnSignal>(8);
+        tx.send(RespawnSignal {
+            model_name: "m".to_string(),
+            version: "1".to_string(),
+            worker_id: 0,
+        }).await.unwrap();
+        let sig = rx.recv().await.unwrap();
+        assert_eq!(sig.model_name, "m");
+        assert_eq!(sig.worker_id, 0);
+    }
+
+    #[tokio::test]
+    async fn test_monitor_no_heartbeat_when_disabled() {
+        // With heartbeat disabled (interval=0), monitor should use the simple path
+        // and respond to shutdown signal without trying to probe.
+        let mut cmd = Command::new("python");
+        cmd.arg("-c").arg("import time; time.sleep(60)");
+        let child = cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let done = Arc::new(AtomicBool::new(false));
+        let done_c = done.clone();
+
+        spawn_worker_monitor(
+            child, "test", "1", 0, shutdown_rx,
+            move || { done_c.store(true, Ordering::SeqCst); },
+            None, None, Duration::ZERO, Duration::from_secs(5), 3, None,
+        );
+
+        // Send shutdown
+        shutdown_tx.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(done.load(Ordering::SeqCst), "monitor should exit on shutdown signal");
     }
 }

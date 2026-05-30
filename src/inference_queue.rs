@@ -23,6 +23,18 @@ fn model_version_key(model: &str, version: &str) -> String {
     key
 }
 
+/// Compute jittered max_requests to prevent thundering herd on worker recycle.
+/// When jitter > 0, the actual threshold is `max_requests ± random(0, jitter)`.
+/// When max_requests is 0 (disabled) or jitter is 0, returns the original value.
+pub fn compute_jittered_max_requests(max_requests: usize, jitter: usize) -> usize {
+    if max_requests == 0 || jitter == 0 {
+        return max_requests;
+    }
+    use rand::Rng;
+    let offset = rand::thread_rng().gen_range(-(jitter as i64)..=(jitter as i64));
+    (max_requests as i64 + offset).max(1) as usize
+}
+
 /// A single item waiting in the inference queue.
 pub struct QueueItem {
     pub uid: String,
@@ -218,6 +230,7 @@ impl InferenceQueue {
         let queue_threshold = config.adaptive_queue_threshold;
         let request_timeout = Duration::from_secs_f64(config.request_timeout as f64);
         let max_requests = config.max_requests;
+        let max_requests_jitter = config.max_requests_jitter;
         let health_interval = Duration::from_secs_f64(config.health_check_interval as f64);
 
         let handle = tokio::spawn(batch_collector(
@@ -233,6 +246,7 @@ impl InferenceQueue {
             version.to_string(),
             request_timeout,
             max_requests,
+            max_requests_jitter,
             reload_tx,
             outlier.clone(),
         ));
@@ -644,6 +658,7 @@ async fn batch_collector(
     version: String,
     request_timeout: Duration,
     max_requests: usize,
+    max_requests_jitter: usize,
     reload_tx: mpsc::Sender<ReloadSignal>,
     outlier: Arc<OutlierState>,
 ) {
@@ -651,6 +666,9 @@ async fn batch_collector(
         .map(|_| Arc::new(AtomicUsize::new(0)))
         .collect();
     let request_count = Arc::new(AtomicUsize::new(0));
+
+    // Compute jittered max_requests to prevent thundering herd on recycle
+    let max_requests = compute_jittered_max_requests(max_requests, max_requests_jitter);
 
     if max_batch_size <= 1 {
         // Fast path: no batching, send immediately and concurrently
@@ -1454,5 +1472,50 @@ mod tests {
         let outlier = Arc::new(OutlierState::new(1));
         queue.register_model("m", "1", &config, vec![], vec![], reload_tx, outlier);
         assert!(queue.has_queue("m", "1"));
+    }
+
+    // ===== max_requests_jitter tests =====
+
+    #[test]
+    fn test_jitter_zero_means_exact() {
+        // When jitter is 0, should return exact max_requests
+        assert_eq!(compute_jittered_max_requests(100, 0), 100);
+        assert_eq!(compute_jittered_max_requests(1, 0), 1);
+    }
+
+    #[test]
+    fn test_jitter_disabled_when_max_requests_zero() {
+        // When max_requests is 0 (disabled), jitter has no effect
+        assert_eq!(compute_jittered_max_requests(0, 10), 0);
+        assert_eq!(compute_jittered_max_requests(0, 0), 0);
+    }
+
+    #[test]
+    fn test_jittered_max_requests_within_range() {
+        // With max_requests=100, jitter=10, result should be in [90, 110]
+        for _ in 0..200 {
+            let result = compute_jittered_max_requests(100, 10);
+            assert!(result >= 90 && result <= 110,
+                "jittered value {} out of expected range [90, 110]", result);
+        }
+    }
+
+    #[test]
+    fn test_jittered_max_requests_never_zero() {
+        // Even with large jitter and small max_requests, result should be >= 1
+        for _ in 0..100 {
+            let result = compute_jittered_max_requests(1, 5);
+            assert!(result >= 1, "jittered value must be >= 1, got {}", result);
+        }
+    }
+
+    #[test]
+    fn test_jittered_max_requests_varies() {
+        // Multiple calls should produce different values (probabilistic)
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            seen.insert(compute_jittered_max_requests(100, 20));
+        }
+        assert!(seen.len() > 1, "jitter should produce varied values, got {:?}", seen);
     }
 }

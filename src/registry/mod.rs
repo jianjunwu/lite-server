@@ -122,6 +122,31 @@ impl ModelRegistry {
         Ok(())
     }
 
+    /// Replace a specific worker in the registry by worker_id.
+    /// If the worker_id doesn't exist, appends the new info.
+    pub fn replace_worker(
+        &self,
+        model_name: &str,
+        version: &str,
+        worker_id: u32,
+        info: WorkerInfo,
+    ) -> Result<(), AppError> {
+        let mut entry = self
+            .models
+            .get_mut(model_name)
+            .ok_or_else(|| AppError::ModelNotFound(model_name.to_string()))?;
+        let mv = entry
+            .versions
+            .get_mut(version)
+            .ok_or_else(|| AppError::VersionNotFound(model_name.to_string(), version.to_string()))?;
+        if let Some(existing) = mv.workers.iter_mut().find(|w| w.worker_id == worker_id) {
+            *existing = info;
+        } else {
+            mv.workers.push(info);
+        }
+        Ok(())
+    }
+
     pub fn activate_version(&self, model_name: &str, version: &str) -> Result<bool, AppError> {
         let entry = self
             .models

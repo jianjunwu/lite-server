@@ -207,6 +207,8 @@ impl Default for OrchestrationConfig {
 pub struct ModelDefaults {
     pub max_queue_size: Option<usize>,
     pub max_requests: Option<usize>,
+    /// Jitter range for max_requests to prevent thundering herd on worker recycle.
+    pub max_requests_jitter: Option<usize>,
     pub request_timeout: Option<f32>,
     pub health_check_interval: Option<f32>,
 }
@@ -231,6 +233,32 @@ impl Default for ModelStrategyConfig {
             max_loaded_versions: None,
         }
     }
+}
+
+/// HTTP hook configuration for worker lifecycle events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpHookConfig {
+    pub url: String,
+    #[serde(default = "default_http_method")]
+    pub method: String,
+    pub body_template: Option<String>,
+}
+
+fn default_http_method() -> String {
+    "POST".to_string()
+}
+
+/// Worker lifecycle hook configuration.
+/// Shell commands and HTTP hooks are both fire-and-forget, non-blocking.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct WorkerHooksConfig {
+    pub on_ready: Option<String>,
+    pub on_exit: Option<String>,
+    pub on_error: Option<String>,
+    pub on_ready_http: Option<HttpHookConfig>,
+    pub on_exit_http: Option<HttpHookConfig>,
+    pub on_error_http: Option<HttpHookConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,8 +286,18 @@ pub struct ModelConfig {
     pub request_timeout: f32,
     /// Auto-restart worker after this many requests. 0 = disabled.
     pub max_requests: usize,
+    /// Random jitter added to max_requests to prevent thundering herd. 0 = disabled.
+    pub max_requests_jitter: usize,
     /// Active health check interval in seconds. 0 = disabled.
     pub health_check_interval: f32,
+    /// Worker lifecycle hooks (shell commands and HTTP callbacks).
+    pub hooks: WorkerHooksConfig,
+    /// Heartbeat probe interval in seconds. 0 = disabled.
+    pub heartbeat_interval: f32,
+    /// Heartbeat timeout in seconds — max time to wait for a probe response.
+    pub heartbeat_timeout: f32,
+    /// Consecutive heartbeat failures before killing the worker.
+    pub heartbeat_max_failures: usize,
 }
 
 impl Default for ModelConfig {
@@ -285,7 +323,12 @@ impl Default for ModelConfig {
             adaptive_queue_threshold: 10,
             request_timeout: 0.0,
             max_requests: 0,
+            max_requests_jitter: 0,
             health_check_interval: 15.0,
+            hooks: WorkerHooksConfig::default(),
+            heartbeat_interval: 0.0,
+            heartbeat_timeout: 5.0,
+            heartbeat_max_failures: 3,
         }
     }
 }
@@ -337,6 +380,7 @@ pub struct CliOverrides {
     pub log_verbose: bool,
     pub max_queue_size: Option<usize>,
     pub max_requests: Option<usize>,
+    pub max_requests_jitter: Option<usize>,
     pub request_timeout: Option<f32>,
     pub health_check_interval: Option<f32>,
     pub graceful_timeout: Option<f32>,
@@ -389,6 +433,9 @@ impl Config {
         if let Some(v) = cli.max_requests {
             self.model_defaults.max_requests = Some(v);
         }
+        if let Some(v) = cli.max_requests_jitter {
+            self.model_defaults.max_requests_jitter = Some(v);
+        }
         if let Some(v) = cli.request_timeout {
             self.model_defaults.request_timeout = Some(v);
         }
@@ -410,6 +457,9 @@ impl Config {
         }
         if let Some(v) = self.model_defaults.max_requests {
             model.max_requests = v;
+        }
+        if let Some(v) = self.model_defaults.max_requests_jitter {
+            model.max_requests_jitter = v;
         }
         if let Some(v) = self.model_defaults.request_timeout {
             model.request_timeout = v;
@@ -886,5 +936,91 @@ mod tests {
         assert_eq!(parsed.server.host, "unix:/tmp/test.sock");
         assert_eq!(parsed.server.graceful_timeout, 60.0);
         assert_eq!(parsed.server.keepalive_timeout, 10.0);
+    }
+
+    // --- max_requests_jitter ---
+
+    #[test]
+    fn test_max_requests_jitter_default() {
+        let cfg = ModelConfig::default();
+        assert_eq!(cfg.max_requests_jitter, 0);
+    }
+
+    #[test]
+    fn test_max_requests_jitter_yaml_roundtrip() {
+        let cfg = ModelConfig {
+            max_requests: 100,
+            max_requests_jitter: 10,
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        let parsed: ModelConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.max_requests, 100);
+        assert_eq!(parsed.max_requests_jitter, 10);
+    }
+
+    // --- Worker Hooks ---
+
+    #[test]
+    fn test_worker_hooks_default_empty() {
+        let cfg = ModelConfig::default();
+        assert!(cfg.hooks.on_ready.is_none());
+        assert!(cfg.hooks.on_exit.is_none());
+        assert!(cfg.hooks.on_error.is_none());
+    }
+
+    #[test]
+    fn test_worker_hooks_yaml_roundtrip() {
+        let cfg = ModelConfig {
+            hooks: WorkerHooksConfig {
+                on_ready: Some("echo ready".to_string()),
+                on_exit: Some("echo exit".to_string()),
+                on_error: Some("echo error".to_string()),
+                on_ready_http: Some(HttpHookConfig {
+                    url: "http://localhost/ready".to_string(),
+                    method: "POST".to_string(),
+                    body_template: Some(r#"{"model":"$MODEL"}"#.to_string()),
+                }),
+                on_exit_http: None,
+                on_error_http: None,
+            },
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        let parsed: ModelConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.hooks.on_ready, Some("echo ready".to_string()));
+        assert_eq!(parsed.hooks.on_exit, Some("echo exit".to_string()));
+        assert!(parsed.hooks.on_ready_http.is_some());
+        assert_eq!(parsed.hooks.on_ready_http.as_ref().unwrap().method, "POST");
+    }
+
+    #[test]
+    fn test_http_hook_config_default_method() {
+        // When method is not specified, should default to POST
+        let yaml = r#"url: "http://localhost/hook""#;
+        let parsed: HttpHookConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(parsed.method, "POST");
+    }
+
+    #[test]
+    fn test_heartbeat_config_defaults() {
+        let cfg = ModelConfig::default();
+        assert_eq!(cfg.heartbeat_interval, 0.0);
+        assert_eq!(cfg.heartbeat_timeout, 5.0);
+        assert_eq!(cfg.heartbeat_max_failures, 3);
+    }
+
+    #[test]
+    fn test_heartbeat_config_yaml_roundtrip() {
+        let yaml = r#"
+name: test
+heartbeat_interval: 10.0
+heartbeat_timeout: 3.0
+heartbeat_max_failures: 5
+"#;
+        let cfg: ModelConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.heartbeat_interval, 10.0);
+        assert_eq!(cfg.heartbeat_timeout, 3.0);
+        assert_eq!(cfg.heartbeat_max_failures, 5);
     }
 }

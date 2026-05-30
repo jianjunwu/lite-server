@@ -79,6 +79,10 @@ enum Commands {
         #[arg(long)]
         max_requests: Option<usize>,
 
+        /// Jitter range for max_requests to prevent thundering herd (overrides model config)
+        #[arg(long)]
+        max_requests_jitter: Option<usize>,
+
         /// Per-request hard timeout in seconds (0 = disabled, overrides model config)
         #[arg(long)]
         request_timeout: Option<f32>,
@@ -125,6 +129,7 @@ async fn main() {
             no_streaming_metrics,
             max_queue_size,
             max_requests,
+            max_requests_jitter,
             request_timeout,
             health_check_interval,
             graceful_timeout,
@@ -159,6 +164,7 @@ async fn main() {
                 log_verbose: false, // handled below by logging::init
                 max_queue_size,
                 max_requests,
+                max_requests_jitter,
                 request_timeout,
                 health_check_interval,
                 graceful_timeout,

@@ -131,6 +131,14 @@ lazy_static! {
         ),
         &["model", "version", "worker_id"]
     ).unwrap();
+
+    pub static ref WORKER_RESPAWNS_TOTAL: CounterVec = CounterVec::new(
+        prometheus::Opts::new(
+            "lightserver_worker_respawns_total",
+            "Total worker respawns"
+        ),
+        &["model", "version", "reason"]
+    ).unwrap();
 }
 
 // Custom metrics reported by Python workers — std::sync::Mutex is sufficient
@@ -159,6 +167,7 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(BATCH_SIZE.clone()))?;
     REGISTRY.register(Box::new(HEALTH_CHECK_TOTAL.clone()))?;
     REGISTRY.register(Box::new(WORKER_HEALTH_STATUS.clone()))?;
+    REGISTRY.register(Box::new(WORKER_RESPAWNS_TOTAL.clone()))?;
     Ok(())
 }
 
