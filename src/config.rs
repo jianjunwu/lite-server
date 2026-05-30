@@ -12,6 +12,8 @@ pub struct Config {
     pub webui: WebUIConfig,
     pub features: FeaturesConfig,
     pub orchestration: OrchestrationConfig,
+    /// CLI-provided defaults that override per-model config when set.
+    pub model_defaults: ModelDefaults,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +194,16 @@ impl Default for OrchestrationConfig {
     }
 }
 
+/// CLI-level defaults for model parameters.  When set (Some), these override
+/// the per-model config.yaml values for every loaded model.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ModelDefaults {
+    pub max_queue_size: Option<usize>,
+    pub max_requests: Option<usize>,
+    pub request_timeout: Option<f32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelStrategyConfig {
@@ -310,6 +322,9 @@ pub struct CliOverrides {
     pub no_metrics: bool,
     pub no_streaming_metrics: bool,
     pub log_verbose: bool,
+    pub max_queue_size: Option<usize>,
+    pub max_requests: Option<usize>,
+    pub request_timeout: Option<f32>,
 }
 
 impl Config {
@@ -351,6 +366,28 @@ impl Config {
         }
         if cli.no_streaming_metrics {
             self.features.streaming_metrics = false;
+        }
+        if let Some(v) = cli.max_queue_size {
+            self.model_defaults.max_queue_size = Some(v);
+        }
+        if let Some(v) = cli.max_requests {
+            self.model_defaults.max_requests = Some(v);
+        }
+        if let Some(v) = cli.request_timeout {
+            self.model_defaults.request_timeout = Some(v);
+        }
+    }
+
+    /// Apply CLI model defaults to a ModelConfig (called per-model at load time).
+    pub fn apply_model_defaults(&self, model: &mut ModelConfig) {
+        if let Some(v) = self.model_defaults.max_queue_size {
+            model.max_queue_size = v;
+        }
+        if let Some(v) = self.model_defaults.max_requests {
+            model.max_requests = v;
+        }
+        if let Some(v) = self.model_defaults.request_timeout {
+            model.request_timeout = v;
         }
     }
 }
@@ -606,5 +643,87 @@ mod tests {
         cfg.apply_overrides(&overrides);
 
         assert_eq!(cfg.server.transport, "uds");
+    }
+
+    // --- Model defaults ---
+
+    #[test]
+    fn test_model_defaults_none_by_default() {
+        let cfg = Config::default();
+        assert!(cfg.model_defaults.max_queue_size.is_none());
+        assert!(cfg.model_defaults.max_requests.is_none());
+        assert!(cfg.model_defaults.request_timeout.is_none());
+    }
+
+    #[test]
+    fn test_apply_overrides_model_defaults() {
+        let mut cfg = Config::default();
+        let overrides = CliOverrides {
+            max_queue_size: Some(500),
+            max_requests: Some(10000),
+            request_timeout: Some(60.0),
+            ..Default::default()
+        };
+        cfg.apply_overrides(&overrides);
+
+        assert_eq!(cfg.model_defaults.max_queue_size, Some(500));
+        assert_eq!(cfg.model_defaults.max_requests, Some(10000));
+        assert_eq!(cfg.model_defaults.request_timeout, Some(60.0));
+    }
+
+    #[test]
+    fn test_apply_model_defaults_overrides_model_config() {
+        let cfg = Config {
+            model_defaults: ModelDefaults {
+                max_queue_size: Some(200),
+                max_requests: Some(5000),
+                request_timeout: Some(45.0),
+            },
+            ..Default::default()
+        };
+
+        let mut model = ModelConfig::default();
+        assert_eq!(model.max_queue_size, 1000); // default
+        assert_eq!(model.max_requests, 0); // default
+        assert_eq!(model.request_timeout, 0.0); // default
+
+        cfg.apply_model_defaults(&mut model);
+        assert_eq!(model.max_queue_size, 200);
+        assert_eq!(model.max_requests, 5000);
+        assert_eq!(model.request_timeout, 45.0);
+    }
+
+    #[test]
+    fn test_apply_model_defaults_none_keeps_model_config() {
+        let cfg = Config::default(); // all model_defaults are None
+
+        let mut model = ModelConfig {
+            max_queue_size: 500,
+            max_requests: 100,
+            request_timeout: 10.0,
+            ..Default::default()
+        };
+
+        cfg.apply_model_defaults(&mut model);
+        assert_eq!(model.max_queue_size, 500); // unchanged
+        assert_eq!(model.max_requests, 100); // unchanged
+        assert_eq!(model.request_timeout, 10.0); // unchanged
+    }
+
+    #[test]
+    fn test_model_defaults_yaml_roundtrip() {
+        let cfg = Config {
+            model_defaults: ModelDefaults {
+                max_queue_size: Some(300),
+                max_requests: Some(8000),
+                request_timeout: Some(120.0),
+            },
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        let parsed: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.model_defaults.max_queue_size, Some(300));
+        assert_eq!(parsed.model_defaults.max_requests, Some(8000));
+        assert_eq!(parsed.model_defaults.request_timeout, Some(120.0));
     }
 }

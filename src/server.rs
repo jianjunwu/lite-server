@@ -122,10 +122,11 @@ impl LiteServer {
         // Process reload events
         let reload_worker = self.worker_manager.clone();
         let reload_registry = self.registry.clone();
+        let model_defaults = self.config.model_defaults.clone();
         let reload_handle = tokio::spawn(async move {
             let mut last_reload: std::collections::HashMap<(String, String), Instant> = std::collections::HashMap::new();
             while let Some(paths) = watch_rx.recv().await {
-                if let Err(e) = process_watch_events(paths, repo_path.clone(), reload_worker.clone(), reload_registry.clone(), &mut last_reload).await {
+                if let Err(e) = process_watch_events(paths, repo_path.clone(), reload_worker.clone(), reload_registry.clone(), &mut last_reload, &model_defaults).await {
                     warn!("Hot reload processing error: {}", e);
                 }
             }
@@ -247,7 +248,8 @@ impl LiteServer {
                         continue;
                     }
                     let config_path = repo_path.join(&name).join(&version).join("config.yaml");
-                    let config = crate::config::load_model_config(&config_path).unwrap_or_default();
+                    let mut config = crate::config::load_model_config(&config_path).unwrap_or_default();
+                    self.config.apply_model_defaults(&mut config);
 
                     if let Err(e) = self.worker_manager.load_model(&name, &version, &config).await {
                         error!("Failed to load {} version {}: {}", name, version, e);
@@ -420,6 +422,7 @@ async fn process_watch_events(
     worker_manager: Arc<WorkerManager>,
     registry: Arc<ModelRegistry>,
     last_reload: &mut std::collections::HashMap<(String, String), Instant>,
+    model_defaults: &crate::config::ModelDefaults,
 ) -> Result<(), AppError> {
     use std::collections::HashSet;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -507,7 +510,10 @@ async fn process_watch_events(
             // Model not loaded yet, try to load it
             let config_path = repo_path.join(&name).join(&version).join("config.yaml");
             if config_path.exists() {
-                let config = crate::config::load_model_config(&config_path).unwrap_or_default();
+                let mut config = crate::config::load_model_config(&config_path).unwrap_or_default();
+                if let Some(v) = model_defaults.max_queue_size { config.max_queue_size = v; }
+                if let Some(v) = model_defaults.max_requests { config.max_requests = v; }
+                if let Some(v) = model_defaults.request_timeout { config.request_timeout = v; }
                 info!("Hot reload: auto-loading new model {} version {}", name, version);
                 if let Err(e) = worker_manager.load_model(&name, &version, &config).await {
                     warn!("Hot load failed for {} version {}: {}", name, version, e);

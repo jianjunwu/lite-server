@@ -30,6 +30,9 @@ def main(argv=None):
     serve_parser.add_argument("--no-grpc", action="store_true", help="Disable gRPC server")
     serve_parser.add_argument("--no-streaming-metrics", action="store_true", help="Disable streaming metrics")
     serve_parser.add_argument("--log-verbose", action="store_true", help="Also log to stderr")
+    serve_parser.add_argument("--max-queue-size", type=int, help="Max queue size per model (overrides model config)")
+    serve_parser.add_argument("--max-requests", type=int, help="Auto-restart worker after N requests (0=disabled)")
+    serve_parser.add_argument("--request-timeout", type=float, help="Per-request hard timeout in seconds (0=disabled)")
 
     # config-check
     check_parser = subparsers.add_parser("config-check", help="Validate configuration")
@@ -109,6 +112,9 @@ def _cmd_serve(args):
             no_grpc=args.no_grpc,
             no_streaming_metrics=args.no_streaming_metrics,
             log_verbose=args.log_verbose,
+            max_queue_size=args.max_queue_size,
+            max_requests=args.max_requests,
+            request_timeout=args.request_timeout,
         )
     except KeyboardInterrupt:
         print("\nShutting down...")

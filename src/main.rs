@@ -70,6 +70,18 @@ enum Commands {
         /// Disable streaming metrics collection
         #[arg(long)]
         no_streaming_metrics: bool,
+
+        /// Max queue size per model (overrides model config)
+        #[arg(long)]
+        max_queue_size: Option<usize>,
+
+        /// Auto-restart worker after N requests (0 = disabled, overrides model config)
+        #[arg(long)]
+        max_requests: Option<usize>,
+
+        /// Per-request hard timeout in seconds (0 = disabled, overrides model config)
+        #[arg(long)]
+        request_timeout: Option<f32>,
     },
 
     /// Validate configuration file
@@ -99,6 +111,9 @@ async fn main() {
             grpc_port,
             no_grpc,
             no_streaming_metrics,
+            max_queue_size,
+            max_requests,
+            request_timeout,
         } => {
             let mut cfg = if let Some(config_path) = config {
                 match lite_server::config::load_config(&config_path) {
@@ -127,6 +142,9 @@ async fn main() {
                 no_metrics,
                 no_streaming_metrics,
                 log_verbose: false, // handled below by logging::init
+                max_queue_size,
+                max_requests,
+                request_timeout,
             });
 
             // Initialize logging
