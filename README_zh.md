@@ -135,6 +135,7 @@ Rust 内核处理所有 I/O（HTTP、gRPC、IPC、指标、文件监听），Pyt
 - **多版本** — 独立加载、卸载、激活、停用
 - **加载策略** — `explicit`（手动指定）、`latest`（最新版本）、`all`（全部加载）
 - **模型打包** — `.lma` 格式，SHA256 + HMAC 签名验证
+- **模型上传/下载** — 通过 HTTP API 上传 `.lma` 包或原始文件，支持自动加载
 
 ### Worker 韧性
 
@@ -213,6 +214,9 @@ python -m lite_server init my_project           # 脚手架创建项目
 | GET | `/v2/models/{name}/ready` | 就绪检查 |
 | POST | `/v2/repository/models/{name}/load` | 加载模型 |
 | POST | `/v2/repository/models/{name}/unload` | 卸载模型 |
+| POST | `/v2/repository/models/{name}/versions/{v}/upload` | 上传模型文件（.lma 或原始文件） |
+| GET | `/v2/repository/models/{name}/versions/{v}/download` | 下载模型文件 |
+| GET | `/v2/repository/models/{name}/versions/{v}/files` | 列出版本目录文件 |
 | POST | `/v2/models/{name}/reload` | 热重载 |
 | POST | `/v2/models/{name}/versions/{v}/activate` | 激活版本 |
 | GET | `/health` | 健康检查 |

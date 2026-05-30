@@ -137,6 +137,7 @@ See [docs/benchmark.md](docs/benchmark.md) for full results and reproduction ste
 - **Multi-version** — load, unload, activate, deactivate versions independently
 - **Load policies** — `explicit`, `latest`, `all` for version management
 - **Model packing** — `.lma` format with SHA256 + HMAC signature
+- **Model upload/download** — upload `.lma` artifacts or raw files via HTTP API, with auto-load support
 
 ### Worker Resilience
 
@@ -215,6 +216,9 @@ See [examples/README.md](examples/README.md) for learning path and usage details
 | GET | `/v2/models/{name}/ready` | Readiness check |
 | POST | `/v2/repository/models/{name}/load` | Load model |
 | POST | `/v2/repository/models/{name}/unload` | Unload model |
+| POST | `/v2/repository/models/{name}/versions/{v}/upload` | Upload model files (.lma or raw) |
+| GET | `/v2/repository/models/{name}/versions/{v}/download` | Download model files |
+| GET | `/v2/repository/models/{name}/versions/{v}/files` | List version directory contents |
 | POST | `/v2/models/{name}/reload` | Hot reload |
 | POST | `/v2/models/{name}/versions/{v}/activate` | Activate version |
 | GET | `/health` | Health check |

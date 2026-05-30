@@ -23,7 +23,7 @@ Start from example 01 and work your way up. Each example builds on concepts from
 | # | Example | Description | Key Concept |
 |---|---------|-------------|-------------|
 | 01 | [basic](01_basic/) | Minimal echo model | `LitAPI` lifecycle: setup → decode → predict → encode |
-| 02 | [batching](02_batching/) | Request batching | `max_batch_size`, adaptive batching, batch vs single predict |
+| 02 | [batching](02_batching/) | Request batching | `max_batch_size`, adaptive batching, custom `batch()` / `unbatch()` |
 | 03 | [streaming](03_streaming/) | Token-by-token output | `stream_predict()`, SSE, WebSocket |
 
 ### Advanced
@@ -68,6 +68,15 @@ for i in $(seq 1 8); do
 done
 wait
 # => {"output": 1, "batch_size": 8}  (batch_size varies by timing)
+
+# Custom batch/unbatch demo — send requests with weights
+for i in $(seq 1 4); do
+  curl -s -X POST http://localhost:8000/v2/models/custom_batch/infer \
+    -H 'Content-Type: application/json' \
+    -d "{\"input\": $i, \"weight\": 0.5}" &
+done
+wait
+# => {"output": 0.5, "batch_size": 4}
 ```
 
 ### 03 Streaming (SSE)

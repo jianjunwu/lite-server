@@ -138,7 +138,7 @@ def on_request(self, request, meta):
 
 #### `on_response(self, response, meta)`
 
-Called after `encode_response()`, before sending to client. Use for response modification or logging.
+Called after `encode_response()`, before sending to client. Use for response modification or logging. Also called in the streaming path (after each chunk is encoded).
 
 ```python
 def on_response(self, response, meta):
@@ -228,6 +228,50 @@ Key rules:
 - Return a **list** with one result per input
 - The order must match the input order
 - `batch_timeout` controls how long to wait for more requests (adaptive batching adjusts this automatically)
+
+#### Custom `batch()` / `unbatch()`
+
+Override `batch()` to reshape decoded inputs before prediction, and `unbatch()` to split batch output back into per-request responses. The full pipeline becomes:
+
+```
+decode_request → batch → predict → unbatch → encode_response
+```
+
+When only one request is queued, `batch()` and `unbatch()` are both skipped — `predict()` receives the decoded request directly.
+
+```python
+class CustomBatchModel(LitAPI):
+    def decode_request(self, request):
+        return {"value": request["input"], "weight": request.get("weight", 1.0)}
+
+    def batch(self, inputs):
+        """Merge decoded requests into a single batch dict."""
+        return {
+            "values": [x["value"] for x in inputs],
+            "weights": [x["weight"] for x in inputs],
+            "batch_size": len(inputs),
+        }
+
+    def predict(self, batch):
+        if isinstance(batch, dict) and "values" in batch:
+            # Multiple requests — came through batch()
+            results = [v * w for v, w in zip(batch["values"], batch["weights"])]
+            return {"results": results, "batch_size": batch["batch_size"]}
+        # Single request — batch() skipped
+        return {"output": batch["value"] * batch["weight"], "batch_size": 1}
+
+    def unbatch(self, output):
+        """Split batch output back into per-request responses."""
+        return [
+            {"output": r, "batch_size": output["batch_size"]}
+            for r in output["results"]
+        ]
+
+    def encode_response(self, output):
+        return output
+```
+
+See [examples/02_batching](../examples/02_batching/) for a runnable demo.
 
 ## Bidirectional Streaming
 
