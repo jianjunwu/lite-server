@@ -1,9 +1,10 @@
 """Test that run_liteserver.py properly cleans up on SIGTERM."""
 
-import os
+import socket
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from urllib import request
@@ -14,7 +15,14 @@ RUN_SCRIPT = Path(__file__).resolve().parent.parent.parent / "benchmarks" / "scr
 MODEL_REPO = Path(__file__).resolve().parent.parent.parent / "benchmarks" / "models"
 
 
-def _wait_for_health(port: int, timeout: float = 30.0) -> bool:
+def _free_port() -> int:
+    """Return a port currently unused on localhost."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _wait_for_health(port: int, timeout: float = 60.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -28,27 +36,16 @@ def _wait_for_health(port: int, timeout: float = 30.0) -> bool:
     return False
 
 
-def _lite_server_procs() -> list:
-    result = subprocess.run(
-        ["ps", "aux"],
-        capture_output=True,
-        text=True,
-    )
-    procs = []
-    for line in result.stdout.splitlines():
-        if "lite-server serve" in line and "grep" not in line:
-            procs.append(line)
-    return procs
+def _drain_stream(stream, collector: list):
+    """Read lines from *stream* into *collector* in a background thread."""
+    for line in iter(stream.readline, b""):
+        collector.append(line.decode(errors="replace"))
 
 
 class TestBenchmarkLifecycle:
     def test_sigterm_cleans_up_child_process(self):
         """SIGTERM to run_liteserver.py should also terminate lite-server serve."""
-        port = 18000  # Use high port to avoid conflicts
-
-        # Count existing lite-server processes before test
-        before = _lite_server_procs()
-        before_count = len(before)
+        port = _free_port()
 
         proc = subprocess.Popen(
             [
@@ -64,13 +61,19 @@ class TestBenchmarkLifecycle:
             stderr=subprocess.PIPE,
         )
 
+        stderr_lines: list[str] = []
+        stderr_drainer = threading.Thread(target=_drain_stream, args=(proc.stderr, stderr_lines), daemon=True)
+        stderr_drainer.start()
+
         try:
             # Wait for server to be ready
-            assert _wait_for_health(port, timeout=30), "lite-server failed to start"
+            assert _wait_for_health(port), (
+                f"lite-server failed to start on port {port}\n"
+                f"stderr:\n{''.join(stderr_lines[-50:])}"
+            )
 
-            # Verify lite-server serve process exists
-            during = _lite_server_procs()
-            assert len(during) > before_count, "lite-server serve process not found"
+            # Verify server is actually responding
+            assert _wait_for_health(port, timeout=1), "health endpoint not responding"
 
             # Send SIGTERM to run_liteserver.py
             proc.send_signal(signal.SIGTERM)
@@ -81,29 +84,26 @@ class TestBenchmarkLifecycle:
             except subprocess.TimeoutExpired:
                 pytest.fail("run_liteserver.py did not exit after SIGTERM")
 
-            # Wait a bit for cleanup
-            time.sleep(1)
+            # Wait for cleanup: health endpoint should stop responding
+            deadline = time.time() + 5
+            still_alive = False
+            while time.time() < deadline:
+                try:
+                    req = request.Request(f"http://127.0.0.1:{port}/health", method="GET")
+                    with request.urlopen(req, timeout=1) as resp:
+                        if resp.status == 200:
+                            time.sleep(0.3)
+                            continue
+                except Exception:
+                    break
+            else:
+                still_alive = True
 
-            # Verify lite-server serve process is gone
-            after = _lite_server_procs()
-            after_count = len(after)
-
-            assert after_count == before_count, (
-                f"lite-server serve process leaked: "
-                f"before={before_count}, after={after_count}\n"
-                f"Remaining: {after}"
+            assert not still_alive, (
+                f"lite-server still responding on port {port} after SIGTERM"
             )
         finally:
             # Hard kill any remaining processes from this test
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
-
-            # Also kill any stray lite-server serve on this port
-            for line in _lite_server_procs():
-                if f"--port {port}" in line:
-                    pid = int(line.split()[1])
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass

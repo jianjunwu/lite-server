@@ -377,12 +377,12 @@ class TestHandleStreamCancel:
     def test_cancel_removes_from_active(self):
         gen = iter([1, 2, 3])
         active = {"s1": gen}
-        inference._handle_stream_cancel("s1", active)
+        inference._handle_stream_cancel("s1", active, log)
         assert "s1" not in active
 
     def test_cancel_nonexistent_is_noop(self):
         active = {}
-        inference._handle_stream_cancel("nope", active)
+        inference._handle_stream_cancel("nope", active, log)
         assert "nope" not in active
 
     def test_cancel_closes_generator(self):
@@ -399,7 +399,7 @@ class TestHandleStreamCancel:
         g = gen()
         next(g)
         active = {"s-close": g}
-        inference._handle_stream_cancel("s-close", active)
+        inference._handle_stream_cancel("s-close", active, log)
         assert closed.wait(timeout=2.0)
 
 
