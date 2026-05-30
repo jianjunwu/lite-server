@@ -209,12 +209,11 @@ def _has_stream_predict(lit_api: LitAPI) -> bool:
     return hasattr(lit_api, "stream_predict") and callable(getattr(lit_api, "stream_predict"))
 
 
-def _consume_stream_generator(lit_api: LitAPI, generator, stream_id: str, socket: zmq.Socket, log: logging.Logger):
+def _consume_stream_generator(lit_api: LitAPI, generator, stream_id: str, socket: zmq.Socket, log: logging.Logger, meta=None):
     """Background thread: consume a stream_predict generator and send chunks."""
     try:
         for output in generator:
             encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
-            meta = None  # TODO: pass meta through
             if hasattr(lit_api, "on_response") and meta is not None:
                 encoded = lit_api.on_response(encoded, meta)
             resp_bytes = json.dumps(encoded).encode()
@@ -263,7 +262,7 @@ def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.
     active_streams[stream_id] = generator
     threading.Thread(
         target=_consume_stream_generator,
-        args=(lit_api, generator, stream_id, socket, log),
+        args=(lit_api, generator, stream_id, socket, log, meta),
         daemon=True,
     ).start()
 

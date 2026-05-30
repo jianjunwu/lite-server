@@ -368,6 +368,41 @@ class TestHandleStreamOpenWithHooks:
         assert len(err_resps) == 1
         assert "auth failed" in err_resps[0].stream.error.message
 
+    def test_on_response_hook_applied(self):
+        class OnResponseStreamAPI:
+            def on_response(self, response, meta):
+                response["tagged"] = meta.route
+                return response
+
+            def stream_predict(self, x):
+                yield {"a": 1}
+                yield {"b": 2}
+
+        sock = SyncSocket()
+        meta = ProtoMeta(route="/stream", headers={}, client_ip="", request_id="r2", timestamp_ns=0)
+        stream_req = StreamRequest(
+            stream_id="s-onresp",
+            open=StreamOpen(data=b'{}', meta=meta),
+        )
+        inference._handle_stream_open(OnResponseStreamAPI(), stream_req, sock, {}, log)
+
+        done_resps = sock.wait_for(
+            lambda r: r.HasField("stream") and r.stream.HasField("done") and r.stream.stream_id == "s-onresp"
+        )
+        assert len(done_resps) >= 1
+
+        responses = sock.get_stream_responses("s-onresp")
+        chunk_resps = [r for r in responses if r.stream.HasField("chunk")]
+        assert len(chunk_resps) == 2
+
+        body0 = json.loads(chunk_resps[0].stream.chunk.data)
+        assert body0["a"] == 1
+        assert body0["tagged"] == "/stream"
+
+        body1 = json.loads(chunk_resps[1].stream.chunk.data)
+        assert body1["b"] == 2
+        assert body1["tagged"] == "/stream"
+
 
 # ---------------------------------------------------------------------------
 # Cancel
