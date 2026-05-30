@@ -71,13 +71,18 @@ class _LevelPrefixFormatter(logging.Formatter):
 
 
 def setup_logging(worker_id: int):
-    """Configure worker logging: plain text to stderr (captured by Rust)."""
-    logger = logging.getLogger("inference_worker")
-    logger.setLevel(logging.INFO)
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(_LevelPrefixFormatter())
-    logger.addHandler(handler)
-    return logger
+    """Configure worker logging: plain text to stderr (captured by Rust).
+
+    Configures the root logger so that all child loggers (including the
+    user's model logger via ``LitAPI.logger``) inherit the handler and level.
+    """
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    if not root.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(_LevelPrefixFormatter())
+        root.addHandler(handler)
+    return logging.getLogger("inference_worker")
 
 
 def load_model_config(config_path: str):
