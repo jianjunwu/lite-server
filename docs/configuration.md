@@ -1,5 +1,7 @@
 # Configuration Reference
 
+[中文版](configuration_zh.md)
+
 lite-server uses three layers of configuration: **server config** (YAML file or CLI), **model config** (per-model `config.yaml`), and **orchestration config** (`orchestration.yaml`). CLI flags override YAML values.
 
 ## Server Configuration
@@ -64,6 +66,7 @@ features:
 model_defaults:                # CLI-level defaults applied to all models
   max_queue_size: null         # Override max_queue_size for all models
   max_requests: null           # Override max_requests for all models
+  max_requests_jitter: null    # Override max_requests_jitter for all models
   request_timeout: null        # Override request_timeout for all models
   health_check_interval: null  # Override health_check_interval for all models
 ```
@@ -98,7 +101,28 @@ max_queue_size: 1000           # Max pending requests per worker
 queue_mode: per_worker         # Queue mode: "per_worker" or "shared"
 request_timeout: 0.0           # Per-request hard timeout in seconds (0 = disabled)
 max_requests: 0                # Auto-restart worker after N requests (0 = disabled)
+max_requests_jitter: 0         # Random jitter for max_requests (prevents thundering herd)
 health_check_interval: 15.0    # Active health check interval in seconds (0 = disabled)
+
+# Heartbeat (Worker Liveness Detection)
+heartbeat_interval: 0.0        # Heartbeat probe interval in seconds (0 = disabled)
+heartbeat_timeout: 5.0         # Max seconds to wait for a probe response
+heartbeat_max_failures: 3      # Consecutive failures before killing the worker
+
+# Worker Lifecycle Hooks
+hooks:
+  on_ready: null               # Shell command on worker ready
+  on_exit: null                # Shell command on worker exit
+  on_error: null               # Shell command on worker error
+  on_ready_http: null          # HTTP callback on worker ready
+  on_exit_http: null           # HTTP callback on worker exit
+  on_error_http: null          # HTTP callback on worker error
+  # HTTP hook format:
+  # on_ready_http:
+  #   url: "http://notify.internal/worker-ready"
+  #   method: POST             # GET or POST (default: POST)
+  #   body_template: '{"model":"$MODEL","worker":$WORKER_ID}'
+  # Available variables: $MODEL, $VERSION, $WORKER_ID, $EXIT_CODE, $REASON
 
 # Hot Reload
 hot_reload: false              # Enable file watching for hot reload
@@ -161,7 +185,9 @@ python -m lite_server serve [flags]
 | `--log-verbose` | Also log to stderr | — |
 | `--max-queue-size` | Max queue size for all models | `model_defaults.max_queue_size` |
 | `--max-requests` | Auto-restart after N requests | `model_defaults.max_requests` |
+| `--max-requests-jitter` | Jitter for max_requests | `model_defaults.max_requests_jitter` |
 | `--request-timeout` | Per-request timeout | `model_defaults.request_timeout` |
+| `--health-check-interval` | Health check interval | `model_defaults.health_check_interval` |
 | `--graceful-timeout` | Graceful shutdown timeout | `server.graceful_timeout` |
 | `--keepalive-timeout` | HTTP keep-alive timeout | `server.keepalive_timeout` |
 
@@ -175,7 +201,7 @@ Configuration values are resolved in this order (highest priority first):
 
 For model config, the precedence is:
 
-1. CLI `--max-queue-size`, `--max-requests`, `--request-timeout` (via `model_defaults`)
+1. CLI `--max-queue-size`, `--max-requests`, `--max-requests-jitter`, `--request-timeout`, `--health-check-interval` (via `model_defaults`)
 2. Per-model `config.yaml`
 3. Built-in defaults
 
@@ -240,4 +266,24 @@ max_batch_size: 4
 batch_timeout: 0.05
 workers_per_device: 1
 request_timeout: 120.0
+```
+
+### Production with Heartbeat and Hooks
+
+```yaml
+# model_repo/my_model/1/config.yaml
+max_requests: 500
+max_requests_jitter: 50
+
+heartbeat_interval: 10.0
+heartbeat_timeout: 5.0
+heartbeat_max_failures: 3
+
+hooks:
+  on_ready: 'echo "Worker $WORKER_ID ready for $MODEL"'
+  on_error: 'curl -s -X POST http://alerts.internal/worker-error -d "{\"model\":\"$MODEL\",\"worker\":$WORKER_ID,\"reason\":\"$REASON\"}"'
+  on_exit_http:
+    url: "http://notify.internal/worker-exit"
+    method: POST
+    body_template: '{"model":"$MODEL","version":"$VERSION","worker":$WORKER_ID}'
 ```
