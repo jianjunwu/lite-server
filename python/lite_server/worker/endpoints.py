@@ -2,16 +2,80 @@
 
 import argparse
 import asyncio
+import hashlib
 import importlib.util
 import json
+import logging
 import os
 import socket
 import struct
 import sys
-import time
 from pathlib import Path
 
 MAX_FRAME_SIZE = 16 * 1024 * 1024  # 16 MiB
+
+logger = logging.getLogger("endpoint_worker")
+
+
+class _LevelPrefixFormatter(logging.Formatter):
+    """Formatter that outputs [WARN] instead of [WARNING] to align with Rust stderr parser."""
+
+    _LEVEL_MAP = {
+        logging.DEBUG: "DEBUG",
+        logging.INFO: "INFO",
+        logging.WARNING: "WARN",
+        logging.ERROR: "ERROR",
+        logging.CRITICAL: "CRITICAL",
+    }
+
+    def format(self, record):
+        prefix = self._LEVEL_MAP.get(record.levelno, record.levelname)
+        msg = record.getMessage()
+        return f"[{prefix}] {msg}"
+
+
+def setup_logging() -> logging.Logger:
+    """Configure endpoint worker logging: plain text to stderr (captured by Rust).
+
+    Returns the configured logger instance.
+    """
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(_LevelPrefixFormatter())
+        logger.addHandler(handler)
+    return logger
+
+
+def derive_port_from_path(path: str) -> int:
+    """Derive a deterministic localhost port from a path string.
+
+    Port range: 30000-59999. Mirrors the Rust side's derive_port_from_path.
+    """
+    h = hashlib.md5(path.encode("utf-8")).digest()
+    port = 30000 + (int.from_bytes(h[:4], "little") % 30000)
+    return port
+
+
+def create_server_socket(uds_path: str) -> socket.socket:
+    """Create a server socket appropriate for the current platform.
+
+    On Unix: AF_UNIX (Unix Domain Socket).
+    On Windows: AF_INET TCP on 127.0.0.1 with port derived from uds_path.
+    """
+    if sys.platform == "win32":
+        port = derive_port_from_path(uds_path)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", port))
+    else:
+        if os.path.exists(uds_path):
+            os.remove(uds_path)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(uds_path)
+    sock.listen(4)
+    sock.setblocking(False)
+    return sock
 
 
 def parse_args():
@@ -74,11 +138,7 @@ def load_endpoints(repo_path: str):
                 "methods": [m.upper() for m in methods],
             }
         except Exception as e:
-            print(json.dumps({
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                "level": "ERROR",
-                "message": f"Failed to load endpoint {py_file}: {e}",
-            }), file=sys.stderr, flush=True)
+            logger.error("Failed to load endpoint %s: %s", py_file, e, exc_info=True)
 
     return endpoints
 
@@ -123,6 +183,7 @@ async def handle_request(endpoints, req_data: dict) -> dict:
             "body": result,
         }
     except Exception as e:
+        logger.error("handler error for %s: %s", route, e, exc_info=True)
         return {
             "request_id": req_data.get("request_id", ""),
             "status_code": 500,
@@ -132,6 +193,7 @@ async def handle_request(endpoints, req_data: dict) -> dict:
 
 
 async def worker_main():
+    setup_logging()
     args = parse_args()
 
     # Load endpoints
@@ -145,30 +207,28 @@ async def worker_main():
     }
     print(json.dumps(startup), flush=True)
 
-    # Create Unix socket server
+    # Create server socket (AF_UNIX on Unix, AF_INET TCP on Windows)
     uds_path = args.uds_path
-    if os.path.exists(uds_path):
-        os.remove(uds_path)
+    server = create_server_socket(uds_path)
 
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(uds_path)
-    server.listen(4)
-    server.setblocking(False)
+    loop = asyncio.get_running_loop()
 
-    loop = asyncio.get_event_loop()
+    try:
+        while True:
+            try:
+                conn, _ = await loop.sock_accept(server)
+            except Exception as e:
+                logger.debug("accept failed: %s", e)
+                continue
 
-    while True:
-        try:
-            conn, _ = await loop.sock_accept(server)
-        except Exception:
-            continue
-
-        asyncio.create_task(handle_connection(conn, endpoints))
+            asyncio.create_task(handle_connection(conn, endpoints))
+    finally:
+        server.close()
 
 
 async def handle_connection(conn, endpoints):
-    """Handle a single UDS connection."""
-    loop = asyncio.get_event_loop()
+    """Handle a single connection."""
+    loop = asyncio.get_running_loop()
     try:
         while True:
             # Read length prefix (4 bytes big-endian)
@@ -184,6 +244,7 @@ async def handle_connection(conn, endpoints):
             msg_len = struct.unpack(">I", len_bytes)[0]
 
             if msg_len > MAX_FRAME_SIZE:
+                logger.warning("frame too large: %d bytes", msg_len)
                 break
 
             # Read message body
@@ -199,7 +260,8 @@ async def handle_connection(conn, endpoints):
             # Parse request
             try:
                 req_data = json.loads(body.decode("utf-8"))
-            except Exception:
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                logger.warning("invalid request payload: %s", e)
                 continue
 
             # Handle request
@@ -209,8 +271,8 @@ async def handle_connection(conn, endpoints):
             resp_bytes = json.dumps(response).encode("utf-8")
             len_prefix = struct.pack(">I", len(resp_bytes))
             await loop.sock_sendall(conn, len_prefix + resp_bytes)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error("connection handler error: %s", e, exc_info=True)
     finally:
         conn.close()
 

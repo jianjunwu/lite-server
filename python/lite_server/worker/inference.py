@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import traceback
+from typing import Any
 
 import yaml
 import zmq
@@ -52,12 +53,29 @@ def parse_args():
     return parser.parse_args()
 
 
+class _LevelPrefixFormatter(logging.Formatter):
+    """Formatter that outputs [WARN] instead of [WARNING] to align with Rust stderr parser."""
+
+    _LEVEL_MAP = {
+        logging.DEBUG: "DEBUG",
+        logging.INFO: "INFO",
+        logging.WARNING: "WARN",
+        logging.ERROR: "ERROR",
+        logging.CRITICAL: "CRITICAL",
+    }
+
+    def format(self, record):
+        prefix = self._LEVEL_MAP.get(record.levelno, record.levelname)
+        msg = record.getMessage()
+        return f"[{prefix}] {msg}"
+
+
 def setup_logging(worker_id: int):
     """Configure worker logging: plain text to stderr (captured by Rust)."""
     logger = logging.getLogger("inference_worker")
     logger.setLevel(logging.INFO)
     handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    handler.setFormatter(_LevelPrefixFormatter())
     logger.addHandler(handler)
     return logger
 
@@ -250,13 +268,13 @@ def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.
     ).start()
 
 
-def _handle_stream_cancel(stream_id: str, active_streams: dict):
+def _handle_stream_cancel(stream_id: str, active_streams: dict, log: logging.Logger):
     generator = active_streams.pop(stream_id, None)
     if generator is not None:
         try:
             generator.close()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("stream %s close error: %s", stream_id, e)
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +283,7 @@ def _handle_stream_cancel(stream_id: str, active_streams: dict):
 
 def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: logging.Logger):
     """Handle single + batch + stream requests synchronously."""
-    active_streams: dict[str, any] = {}
+    active_streams: dict[str, Any] = {}
 
     while True:
         try:
@@ -322,10 +340,10 @@ def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log:
                     _handle_stream_open(lit_api, stream_req, socket, active_streams, log)
                     continue  # chunks sent asynchronously
                 elif action == "cancel":
-                    _handle_stream_cancel(stream_req.stream_id, active_streams)
+                    _handle_stream_cancel(stream_req.stream_id, active_streams, log)
                     continue
                 elif action == "close":
-                    _handle_stream_cancel(stream_req.stream_id, active_streams)
+                    _handle_stream_cancel(stream_req.stream_id, active_streams, log)
                     continue
                 else:
                     response = _make_error_response(uid, f"Unsupported stream action: {action}")
@@ -334,6 +352,7 @@ def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log:
                 response = _make_error_response(uid, "Unsupported payload type")
 
         except Exception as e:
+            log.error("request %s failed: %s", uid, e, exc_info=True)
             response = _make_error_response(uid, f"{type(e).__name__}: {e}")
 
         socket.send(response.SerializeToString())
@@ -352,7 +371,7 @@ class CBState:
         self.prefilled = False
 
 
-def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str):
+def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: logging.Logger):
     """Autonomous continuous batching loop."""
     active: dict[str, CBState] = {}
     lock = threading.Lock()
@@ -401,6 +420,7 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str):
                 try:
                     outputs = lit_api.step(ready)
                 except Exception as e:
+                    log.error("cb step error: %s", e, exc_info=True)
                     for state in list(active.values()):
                         err_resp = _make_error_response(state.uid, f"step failed: {e}")
                         socket.send(err_resp.SerializeToString())
@@ -426,6 +446,7 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str):
                         )
                         socket.send(resp.SerializeToString())
                     except Exception as e:
+                        log.error("cb encode error for %s: %s", uid, e, exc_info=True)
                         err_resp = _make_error_response(uid, f"encode failed: {e}")
                         socket.send(err_resp.SerializeToString())
 
@@ -444,7 +465,8 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str):
         try:
             request = Request()
             request.ParseFromString(req_bytes)
-        except Exception:
+        except Exception as e:
+            log.warning("cb protobuf parse error: %s", e)
             continue
 
         with lock:
@@ -478,14 +500,14 @@ def worker_main():
 
     context = zmq.Context()
     socket = context.socket(zmq.PAIR)
-    socket.connect(args.endpoint)
-    socket.setsockopt(zmq.LINGER, 0)
-
-    log.info(f"Connected ZMQ PAIR to {args.endpoint}")
-
     try:
+        socket.connect(args.endpoint)
+        socket.setsockopt(zmq.LINGER, 0)
+
+        log.info(f"Connected ZMQ PAIR to {args.endpoint}")
+
         if args.continuous_batching or config.get("continuous_batching", False):
-            run_cb_loop(lit_api, socket, args.model_name)
+            run_cb_loop(lit_api, socket, args.model_name, log)
         else:
             run_standard_loop(lit_api, socket, args.model_name, log)
     except KeyboardInterrupt:

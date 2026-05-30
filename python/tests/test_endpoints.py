@@ -1,5 +1,9 @@
 """pytest unit tests for lite_server.worker.endpoints."""
 
+import logging
+import os
+import socket
+import sys
 import textwrap
 
 import pytest
@@ -7,8 +11,13 @@ import pytest
 from lite_server.worker.endpoints import (
     RegistryProxy,
     ServerProxy,
+    _LevelPrefixFormatter,
+    create_server_socket,
+    derive_port_from_path,
     handle_request,
     load_endpoints,
+    logger,
+    setup_logging,
 )
 
 
@@ -73,13 +82,14 @@ class TestLoadEndpoints:
         endpoints = load_endpoints(str(tmp_path))
         assert endpoints == {}
 
-    def test_broken_endpoint_logged_but_not_crashed(self, tmp_path, capsys):
+    def test_broken_endpoint_logged_but_not_crashed(self, tmp_path, caplog):
         ep_file = tmp_path / "broken_endpoint.py"
         ep_file.write_text("raise ValueError('bad')")
-        endpoints = load_endpoints(str(tmp_path))
+        setup_logging()
+        with caplog.at_level(logging.ERROR, logger="endpoint_worker"):
+            endpoints = load_endpoints(str(tmp_path))
         assert "/broken" not in endpoints
-        captured = capsys.readouterr()
-        assert "Failed to load endpoint" in captured.err
+        assert any("Failed to load endpoint" in r.message for r in caplog.records)
 
 
 class TestHandleRequest:
@@ -198,3 +208,97 @@ class TestHandleRequest:
         resp = await handle_request(ep, req)
         assert resp["status_code"] == 200
         assert resp["body"]["count"] == 1
+
+
+class TestDerivePortFromPath:
+    def test_returns_port_in_valid_range(self):
+        port = derive_port_from_path("/tmp/lite-server-12345-endpoints.sock")
+        assert 30000 <= port <= 59999
+
+    def test_deterministic(self):
+        path = "/tmp/lite-server-12345-endpoints.sock"
+        assert derive_port_from_path(path) == derive_port_from_path(path)
+
+    def test_different_paths_give_different_ports(self):
+        p1 = derive_port_from_path("/tmp/lite-server-1-endpoints.sock")
+        p2 = derive_port_from_path("/tmp/lite-server-2-endpoints.sock")
+        # Not guaranteed but extremely likely with good hash
+        assert p1 != p2
+
+    def test_returns_int(self):
+        port = derive_port_from_path("any-path")
+        assert isinstance(port, int)
+
+
+class TestCreateServerSocket:
+    @pytest.mark.skipif(sys.platform == "win32", reason="Unix-only test")
+    def test_unix_creates_af_unix_socket(self):
+        import tempfile
+        sock_path = os.path.join(tempfile.gettempdir(), f"ls-test-{os.getpid()}.sock")
+        sock = create_server_socket(sock_path)
+        try:
+            assert sock.family == socket.AF_UNIX
+            assert sock.type == socket.SOCK_STREAM
+        finally:
+            sock.close()
+            if os.path.exists(sock_path):
+                os.remove(sock_path)
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+    def test_windows_creates_tcp_socket(self, tmp_path):
+        sock_path = str(tmp_path / "test.sock")
+        sock = create_server_socket(sock_path)
+        try:
+            assert sock.family == socket.AF_INET
+            assert sock.type == socket.SOCK_STREAM
+        finally:
+            sock.close()
+
+
+class TestLevelPrefixFormatter:
+    """Test that log format aligns with Rust stderr parser ([WARN] not [WARNING])."""
+
+    def _make_record(self, level, msg):
+        return logging.LogRecord("test", level, "", 0, msg, (), None)
+
+    def test_warning_maps_to_warn(self):
+        fmt = _LevelPrefixFormatter()
+        output = fmt.format(self._make_record(logging.WARNING, "test msg"))
+        assert output == "[WARN] test msg"
+
+    def test_error_maps_to_error(self):
+        fmt = _LevelPrefixFormatter()
+        output = fmt.format(self._make_record(logging.ERROR, "test msg"))
+        assert output == "[ERROR] test msg"
+
+    def test_info_maps_to_info(self):
+        fmt = _LevelPrefixFormatter()
+        output = fmt.format(self._make_record(logging.INFO, "test msg"))
+        assert output == "[INFO] test msg"
+
+    def test_critical_maps_to_critical(self):
+        fmt = _LevelPrefixFormatter()
+        output = fmt.format(self._make_record(logging.CRITICAL, "test msg"))
+        assert output == "[CRITICAL] test msg"
+
+    def test_no_warning_in_output(self):
+        """Ensure [WARNING] never appears — Rust side won't parse it."""
+        fmt = _LevelPrefixFormatter()
+        output = fmt.format(self._make_record(logging.WARNING, "test"))
+        assert "[WARNING]" not in output
+
+
+class TestSetupLogging:
+    def test_returns_logger(self):
+        log = setup_logging()
+        assert isinstance(log, logging.Logger)
+        assert log.name == "endpoint_worker"
+
+    def test_has_handler(self):
+        setup_logging()
+        assert len(logger.handlers) > 0
+
+    def test_handler_uses_level_prefix_formatter(self):
+        setup_logging()
+        formatter = logger.handlers[0].formatter
+        assert isinstance(formatter, _LevelPrefixFormatter)
