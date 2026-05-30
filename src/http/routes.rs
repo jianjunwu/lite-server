@@ -36,6 +36,8 @@ pub fn create_routes(state: AppState, endpoint_routes: Vec<EndpointRoute>) -> Ro
         .route("/v2/models/:model_name/versions", get(list_versions_handler))
         // Admin: model ready check
         .route("/v2/models/:model_name/ready", get(model_ready_handler))
+        // Admin: model health (per-worker status)
+        .route("/v2/models/:model_name/health", get(model_health_handler))
         // Admin: repository index
         .route("/v2/repository/index", post(repository_index_handler))
         // Admin: load

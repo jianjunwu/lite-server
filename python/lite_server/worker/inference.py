@@ -305,11 +305,21 @@ def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log:
 
         try:
             if request.HasField("single"):
-                resp_bytes, status = _run_predict(lit_api, request.single.data, meta)
-                response = Response(
-                    uid=uid,
-                    single=SingleResponse(data=resp_bytes, status=status),
-                )
+                # Health check: empty data → skip predict pipeline
+                if not request.single.data:
+                    response = Response(
+                        uid=uid,
+                        single=SingleResponse(
+                            data=b"{}",
+                            status=_make_status(True),
+                        ),
+                    )
+                else:
+                    resp_bytes, status = _run_predict(lit_api, request.single.data, meta)
+                    response = Response(
+                        uid=uid,
+                        single=SingleResponse(data=resp_bytes, status=status),
+                    )
 
             elif request.HasField("batch"):
                 batch: BatchRequest = request.batch

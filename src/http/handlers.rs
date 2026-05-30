@@ -111,6 +111,64 @@ pub async fn model_ready_handler(
     })))
 }
 
+// ===== Model Health =====
+
+pub async fn model_health_handler(
+    State(state): State<Arc<AppState>>,
+    Path(model_name): Path<String>,
+    Query(query): Query<VersionQuery>,
+) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
+    if let Some(ref v) = query.version {
+        crate::validation::validate_identifier(v)?;
+    }
+
+    let resolved_version = match &query.version {
+        Some(v) => v.clone(),
+        None => state.registry.get_active_version(&model_name)
+            .ok_or_else(|| AppError::ModelNotFound(format!("{} has no active version", model_name)))?,
+    };
+
+    let mv = state.registry.get(&model_name, Some(&resolved_version))
+        .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", model_name, resolved_version)))?;
+
+    let total_workers = mv.workers.len();
+
+    if let Some(outlier) = state.inference_queue.get_outlier_state(&model_name, &resolved_version) {
+        let mut workers_json = Vec::with_capacity(total_workers);
+        let mut healthy_count = 0usize;
+        for i in 0..total_workers {
+            let healthy = !outlier.is_ejected(i);
+            if healthy {
+                healthy_count += 1;
+            }
+            workers_json.push(json!({
+                "worker_id": i,
+                "healthy": healthy,
+            }));
+        }
+        Ok(Json(json!({
+            "model": model_name,
+            "version": resolved_version,
+            "healthy_workers": healthy_count,
+            "total_workers": total_workers,
+            "workers": workers_json,
+        })))
+    } else {
+        // No outlier state means no active queue — report all unknown
+        let workers_json: Vec<Value> = (0..total_workers)
+            .map(|i| json!({"worker_id": i, "healthy": true}))
+            .collect();
+        Ok(Json(json!({
+            "model": model_name,
+            "version": resolved_version,
+            "healthy_workers": total_workers,
+            "total_workers": total_workers,
+            "workers": workers_json,
+        })))
+    }
+}
+
 // ===== Repository Index =====
 
 pub async fn repository_index_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {

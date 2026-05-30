@@ -38,6 +38,7 @@ pub fn run_server(
     max_queue_size: Option<usize>,
     max_requests: Option<usize>,
     request_timeout: Option<f32>,
+    health_check_interval: Option<f32>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut cfg = if let Some(config_path) = config {
         config::load_config(&config_path)?
@@ -62,6 +63,7 @@ pub fn run_server(
         max_queue_size,
         max_requests,
         request_timeout,
+        health_check_interval,
     });
 
     let log_verbose = log_verbose.unwrap_or(false);

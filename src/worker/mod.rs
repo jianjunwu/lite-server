@@ -395,9 +395,12 @@ impl WorkerManager {
         self.registry
             .set_status(model_name, version, VersionStatus::Ready)?;
 
+        // Create shared OutlierState — single instance for batch_collector, health_checker, and streaming
+        let outlier = Arc::new(OutlierState::new(total_workers));
+
         // Register inference queue for batching
         self.inference_queue
-            .register_model(model_name, version, &model_config, worker_infos, zmq_clients_for_model.clone(), self.reload_tx.clone());
+            .register_model(model_name, version, &model_config, worker_infos, zmq_clients_for_model.clone(), self.reload_tx.clone(), outlier.clone());
 
         {
             let mut workers = self.workers.write().await;
@@ -406,7 +409,7 @@ impl WorkerManager {
             let key = format!("{}_{}", model_name, version);
             workers.insert(key.clone(), worker_processes);
             clients.insert(key.clone(), zmq_clients_for_model);
-            outliers.insert(key, Arc::new(OutlierState::new(total_workers)));
+            outliers.insert(key, outlier);
         }
 
         crate::metrics::prometheus::record_model_load(model_name, version, true);

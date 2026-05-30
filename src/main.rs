@@ -82,6 +82,10 @@ enum Commands {
         /// Per-request hard timeout in seconds (0 = disabled, overrides model config)
         #[arg(long)]
         request_timeout: Option<f32>,
+
+        /// Active health check interval in seconds (0 = disabled, overrides model config)
+        #[arg(long)]
+        health_check_interval: Option<f32>,
     },
 
     /// Validate configuration file
@@ -114,6 +118,7 @@ async fn main() {
             max_queue_size,
             max_requests,
             request_timeout,
+            health_check_interval,
         } => {
             let mut cfg = if let Some(config_path) = config {
                 match lite_server::config::load_config(&config_path) {
@@ -145,6 +150,7 @@ async fn main() {
                 max_queue_size,
                 max_requests,
                 request_timeout,
+                health_check_interval,
             });
 
             // Initialize logging

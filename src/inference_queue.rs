@@ -180,7 +180,7 @@ pub struct ReloadSignal {
 
 /// Per-model-version inference queue with batch aggregation.
 pub struct InferenceQueue {
-    queues: DashMap<String, (mpsc::Sender<QueueItem>, std::sync::Arc<tokio::task::JoinHandle<()>>)>,
+    queues: DashMap<String, (mpsc::Sender<QueueItem>, std::sync::Arc<tokio::task::JoinHandle<()>>, Arc<OutlierState>)>,
 }
 
 impl InferenceQueue {
@@ -199,11 +199,12 @@ impl InferenceQueue {
         workers: Vec<WorkerInfo>,
         zmq_clients: Vec<Arc<WorkerZmqClient>>,
         reload_tx: mpsc::Sender<ReloadSignal>,
+        outlier: Arc<OutlierState>,
     ) {
         let key = model_version_key(model_name, version);
 
         // Abort and remove stale collector if exists
-        if let Some((_, (_, old_handle))) = self.queues.remove(&key) {
+        if let Some((_, (_, old_handle, _))) = self.queues.remove(&key) {
             old_handle.abort();
         }
 
@@ -217,6 +218,7 @@ impl InferenceQueue {
         let queue_threshold = config.adaptive_queue_threshold;
         let request_timeout = Duration::from_secs_f64(config.request_timeout as f64);
         let max_requests = config.max_requests;
+        let health_interval = Duration::from_secs_f64(config.health_check_interval as f64);
 
         let handle = tokio::spawn(batch_collector(
             rx,
@@ -226,21 +228,33 @@ impl InferenceQueue {
             min_timeout,
             queue_threshold,
             workers,
-            zmq_clients,
+            zmq_clients.clone(),
             model_name.to_string(),
             version.to_string(),
             request_timeout,
             max_requests,
             reload_tx,
+            outlier.clone(),
         ));
 
-        self.queues.insert(key, (tx, std::sync::Arc::new(handle)));
+        // Spawn health checker if interval > 0
+        if health_interval > Duration::ZERO {
+            tokio::spawn(health_checker(
+                health_interval,
+                zmq_clients,
+                outlier.clone(),
+                model_name.to_string(),
+                version.to_string(),
+            ));
+        }
+
+        self.queues.insert(key, (tx, std::sync::Arc::new(handle), outlier));
     }
 
     /// Unregister a model version and stop its collector.
     pub fn unregister_model(&self, model_name: &str, version: &str) {
         let key = model_version_key(model_name, version);
-        if let Some((_, (_, handle))) = self.queues.remove(&key) {
+        if let Some((_, (_, handle, _))) = self.queues.remove(&key) {
             handle.abort();
         }
     }
@@ -273,6 +287,12 @@ impl InferenceQueue {
     pub fn has_queue(&self, model_name: &str, version: &str) -> bool {
         let key = model_version_key(model_name, version);
         self.queues.contains_key(&key)
+    }
+
+    /// Get outlier detection state for a model version.
+    pub fn get_outlier_state(&self, model_name: &str, version: &str) -> Option<Arc<OutlierState>> {
+        let key = model_version_key(model_name, version);
+        self.queues.get(&key).map(|entry| entry.2.clone())
     }
 }
 
@@ -625,11 +645,11 @@ async fn batch_collector(
     request_timeout: Duration,
     max_requests: usize,
     reload_tx: mpsc::Sender<ReloadSignal>,
+    outlier: Arc<OutlierState>,
 ) {
     let worker_inflight: Vec<Arc<AtomicUsize>> = (0..zmq_clients.len())
         .map(|_| Arc::new(AtomicUsize::new(0)))
         .collect();
-    let outlier = Arc::new(OutlierState::new(zmq_clients.len()));
     let request_count = Arc::new(AtomicUsize::new(0));
 
     if max_batch_size <= 1 {
@@ -731,6 +751,73 @@ async fn batch_collector(
     }
 }
 
+/// Background task that periodically probes workers for health.
+/// Probes ALL workers concurrently (including ejected ones) for early recovery.
+async fn health_checker(
+    interval: Duration,
+    zmq_clients: Vec<Arc<WorkerZmqClient>>,
+    outlier: Arc<OutlierState>,
+    model_name: String,
+    version: String,
+) {
+    let probe_timeout = Duration::from_secs(5);
+    let uid_prefix = format!("health-{}-{}", model_name, version);
+    loop {
+        tokio::time::sleep(interval).await;
+        // Probe all workers concurrently to avoid O(N * timeout) sequential delay
+        let futs: Vec<_> = zmq_clients.iter().enumerate().map(|(idx, client)| {
+            let client = client.clone();
+            let outlier = outlier.clone();
+            let model_name = model_name.clone();
+            let version = version.clone();
+            let uid = format!("{}-{}", uid_prefix, idx);
+            async move {
+                let was_ejected = outlier.is_ejected(idx);
+                let request = pb::Request {
+                    uid,
+                    meta: None,
+                    payload: Some(pb::request::Payload::Single(pb::SingleRequest {
+                        data: vec![],
+                    })),
+                };
+                let result = tokio::time::timeout(probe_timeout, client.send(request)).await;
+                match result {
+                    Ok(Ok(resp)) => {
+                        let is_error = resp.payload.as_ref().and_then(|p| match p {
+                            pb::response::Payload::Single(s) => s.status.as_ref(),
+                            _ => None,
+                        }).map(|s| s.code.as_str()) == Some("Error");
+                        if is_error {
+                            outlier.record_error(idx);
+                            prometheus::inc_health_check(&model_name, &version, "error");
+                        } else {
+                            outlier.record_success(idx);
+                            prometheus::inc_health_check(&model_name, &version, "ok");
+                            if was_ejected {
+                                info!(
+                                    "Worker {} for {} {} recovered via active health check",
+                                    idx, model_name, version
+                                );
+                            }
+                        }
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        outlier.record_error(idx);
+                        prometheus::inc_health_check(&model_name, &version, "error");
+                    }
+                }
+                prometheus::set_worker_health(
+                    &model_name,
+                    &version,
+                    idx,
+                    !outlier.is_ejected(idx),
+                );
+            }
+        }).collect();
+        futures::future::join_all(futs).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -767,7 +854,8 @@ mod tests {
             ..Default::default()
         };
         let (reload_tx, _reload_rx) = mpsc::channel(8);
-        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx);
+        let outlier = Arc::new(OutlierState::new(0));
+        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx, outlier);
 
         // has_queue should find it using the same key
         assert!(queue.has_queue("test_model", "1"));
@@ -858,12 +946,14 @@ mod tests {
         };
         let (reload_tx, _reload_rx) = mpsc::channel(8);
 
-        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx.clone());
+        let outlier = Arc::new(OutlierState::new(0));
+        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx.clone(), outlier);
         let first_handle = queue.queues.get("test_model_1").unwrap().1.clone();
         assert!(!first_handle.is_finished());
 
         // Re-register should abort the first collector
-        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx);
+        let outlier = Arc::new(OutlierState::new(0));
+        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx, outlier);
         let second_handle = queue.queues.get("test_model_1").unwrap().1.clone();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -885,7 +975,8 @@ mod tests {
         };
         let (reload_tx, _reload_rx) = mpsc::channel(8);
 
-        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx);
+        let outlier = Arc::new(OutlierState::new(0));
+        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx, outlier);
         let handle = queue.queues.get("test_model_1").unwrap().1.clone();
         assert!(!handle.is_finished());
 
@@ -1307,5 +1398,61 @@ mod tests {
         check_max_requests(&counter, 10, 10, "exact", "1", &tx).await;
         let signal = rx.try_recv().unwrap();
         assert_eq!(signal.model_name, "exact");
+    }
+
+    // ===== Shared OutlierState tests =====
+
+    #[tokio::test]
+    async fn test_outlier_state_shared_between_register_and_accessor() {
+        let queue = InferenceQueue::new();
+        let config = ModelConfig {
+            max_batch_size: 1,
+            batch_timeout: 0.0,
+            max_queue_size: 10,
+            health_check_interval: 0.0, // disable health checker for this test
+            ..Default::default()
+        };
+        let (reload_tx, _reload_rx) = mpsc::channel(8);
+        let outlier = Arc::new(OutlierState::new(2));
+
+        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx, outlier.clone());
+
+        let retrieved = queue.get_outlier_state("test_model", "1").unwrap();
+        // Must be the same Arc
+        assert!(Arc::ptr_eq(&outlier, &retrieved));
+
+        // Mutations via one handle are visible via the other
+        // Record enough errors to trigger ejection (threshold is 3)
+        outlier.record_error(0);
+        outlier.record_error(0);
+        outlier.record_error(0);
+        assert!(retrieved.is_ejected(0), "worker should be ejected via shared state");
+        assert_eq!(outlier.active_count(), 1);
+    }
+
+    #[test]
+    fn test_get_outlier_state_nonexistent() {
+        let queue = InferenceQueue::new();
+        assert!(queue.get_outlier_state("no_such_model", "1").is_none());
+    }
+
+    // ===== Health checker tests =====
+
+    #[tokio::test]
+    async fn test_health_check_interval_zero_skips_checker() {
+        // When health_check_interval is 0, register_model should not spawn a health checker.
+        // We verify by checking that the queue still works (no panic, no extra tasks).
+        let queue = InferenceQueue::new();
+        let config = ModelConfig {
+            max_batch_size: 1,
+            batch_timeout: 0.0,
+            max_queue_size: 10,
+            health_check_interval: 0.0,
+            ..Default::default()
+        };
+        let (reload_tx, _reload_rx) = mpsc::channel(8);
+        let outlier = Arc::new(OutlierState::new(1));
+        queue.register_model("m", "1", &config, vec![], vec![], reload_tx, outlier);
+        assert!(queue.has_queue("m", "1"));
     }
 }

@@ -114,6 +114,23 @@ lazy_static! {
         ),
         &["model", "version", "protocol"]
     ).unwrap();
+
+    // Health check metrics
+    pub static ref HEALTH_CHECK_TOTAL: CounterVec = CounterVec::new(
+        prometheus::Opts::new(
+            "lightserver_health_check_total",
+            "Total active health check probes"
+        ),
+        &["model", "version", "result"]
+    ).unwrap();
+
+    pub static ref WORKER_HEALTH_STATUS: GaugeVec = GaugeVec::new(
+        prometheus::Opts::new(
+            "lightserver_worker_health_status",
+            "Worker health status (1=healthy, 0=ejected)"
+        ),
+        &["model", "version", "worker_id"]
+    ).unwrap();
 }
 
 // Custom metrics reported by Python workers — std::sync::Mutex is sufficient
@@ -140,6 +157,8 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(STREAMING_CHUNKS_TOTAL.clone()))?;
     REGISTRY.register(Box::new(INFERENCE_DURATION.clone()))?;
     REGISTRY.register(Box::new(BATCH_SIZE.clone()))?;
+    REGISTRY.register(Box::new(HEALTH_CHECK_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(WORKER_HEALTH_STATUS.clone()))?;
     Ok(())
 }
 
@@ -294,6 +313,17 @@ pub fn record_stream_ttft(model: &str, version: &str, protocol: &str, ttft_secs:
 
 pub fn record_stream_tbt(model: &str, version: &str, protocol: &str, tbt_secs: f64) {
     STREAMING_TBT.with_label_values(&[model, version, protocol]).observe(tbt_secs);
+}
+
+// ===== Health check metric recording functions =====
+
+pub fn inc_health_check(model: &str, version: &str, result: &str) {
+    HEALTH_CHECK_TOTAL.with_label_values(&[model, version, result]).inc();
+}
+
+pub fn set_worker_health(model: &str, version: &str, worker_id: usize, healthy: bool) {
+    let id_str = worker_id.to_string();
+    WORKER_HEALTH_STATUS.with_label_values(&[model, version, &id_str]).set(if healthy { 1.0 } else { 0.0 });
 }
 
 #[cfg(test)]

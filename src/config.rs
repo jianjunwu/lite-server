@@ -202,6 +202,7 @@ pub struct ModelDefaults {
     pub max_queue_size: Option<usize>,
     pub max_requests: Option<usize>,
     pub request_timeout: Option<f32>,
+    pub health_check_interval: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,6 +253,8 @@ pub struct ModelConfig {
     pub request_timeout: f32,
     /// Auto-restart worker after this many requests. 0 = disabled.
     pub max_requests: usize,
+    /// Active health check interval in seconds. 0 = disabled.
+    pub health_check_interval: f32,
 }
 
 impl Default for ModelConfig {
@@ -278,6 +281,7 @@ impl Default for ModelConfig {
             adaptive_queue_threshold: 10,
             request_timeout: 0.0,
             max_requests: 0,
+            health_check_interval: 15.0,
         }
     }
 }
@@ -325,6 +329,7 @@ pub struct CliOverrides {
     pub max_queue_size: Option<usize>,
     pub max_requests: Option<usize>,
     pub request_timeout: Option<f32>,
+    pub health_check_interval: Option<f32>,
 }
 
 impl Config {
@@ -376,6 +381,9 @@ impl Config {
         if let Some(v) = cli.request_timeout {
             self.model_defaults.request_timeout = Some(v);
         }
+        if let Some(v) = cli.health_check_interval {
+            self.model_defaults.health_check_interval = Some(v);
+        }
     }
 
     /// Apply CLI model defaults to a ModelConfig (called per-model at load time).
@@ -388,6 +396,9 @@ impl Config {
         }
         if let Some(v) = self.model_defaults.request_timeout {
             model.request_timeout = v;
+        }
+        if let Some(v) = self.model_defaults.health_check_interval {
+            model.health_check_interval = v;
         }
     }
 }
@@ -653,6 +664,7 @@ mod tests {
         assert!(cfg.model_defaults.max_queue_size.is_none());
         assert!(cfg.model_defaults.max_requests.is_none());
         assert!(cfg.model_defaults.request_timeout.is_none());
+        assert!(cfg.model_defaults.health_check_interval.is_none());
     }
 
     #[test]
@@ -678,6 +690,7 @@ mod tests {
                 max_queue_size: Some(200),
                 max_requests: Some(5000),
                 request_timeout: Some(45.0),
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -717,6 +730,7 @@ mod tests {
                 max_queue_size: Some(300),
                 max_requests: Some(8000),
                 request_timeout: Some(120.0),
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -725,5 +739,59 @@ mod tests {
         assert_eq!(parsed.model_defaults.max_queue_size, Some(300));
         assert_eq!(parsed.model_defaults.max_requests, Some(8000));
         assert_eq!(parsed.model_defaults.request_timeout, Some(120.0));
+    }
+
+    // --- health_check_interval ---
+
+    #[test]
+    fn test_health_check_interval_default() {
+        let cfg = ModelConfig::default();
+        assert_eq!(cfg.health_check_interval, 15.0);
+    }
+
+    #[test]
+    fn test_health_check_interval_zero_disables() {
+        let cfg = ModelConfig {
+            health_check_interval: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(cfg.health_check_interval, 0.0);
+    }
+
+    #[test]
+    fn test_apply_overrides_health_check_interval() {
+        let mut cfg = Config::default();
+        let overrides = CliOverrides {
+            health_check_interval: Some(30.0),
+            ..Default::default()
+        };
+        cfg.apply_overrides(&overrides);
+        assert_eq!(cfg.model_defaults.health_check_interval, Some(30.0));
+    }
+
+    #[test]
+    fn test_apply_model_defaults_health_check_interval() {
+        let cfg = Config {
+            model_defaults: ModelDefaults {
+                health_check_interval: Some(10.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut model = ModelConfig::default();
+        assert_eq!(model.health_check_interval, 15.0); // default
+        cfg.apply_model_defaults(&mut model);
+        assert_eq!(model.health_check_interval, 10.0);
+    }
+
+    #[test]
+    fn test_health_check_interval_yaml_roundtrip() {
+        let cfg = ModelConfig {
+            health_check_interval: 20.0,
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        let parsed: ModelConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.health_check_interval, 20.0);
     }
 }

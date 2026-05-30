@@ -514,6 +514,7 @@ async fn process_watch_events(
                 if let Some(v) = model_defaults.max_queue_size { config.max_queue_size = v; }
                 if let Some(v) = model_defaults.max_requests { config.max_requests = v; }
                 if let Some(v) = model_defaults.request_timeout { config.request_timeout = v; }
+                if let Some(v) = model_defaults.health_check_interval { config.health_check_interval = v; }
                 info!("Hot reload: auto-loading new model {} version {}", name, version);
                 if let Err(e) = worker_manager.load_model(&name, &version, &config).await {
                     warn!("Hot load failed for {} version {}: {}", name, version, e);

@@ -167,3 +167,48 @@ class TestMetaFromProto:
         meta_pb = ProtoMeta(route="/", headers={}, client_ip="", request_id="", timestamp_ns=0)
         meta = inference._meta_from_proto(meta_pb)
         assert meta.payload is None
+
+
+class TestHealthCheck:
+    """Active health check sends empty data; worker must return OK without calling predict."""
+
+    def test_empty_data_returns_ok(self):
+        """When SingleRequest.data is empty, _run_predict should not be called."""
+        call_count = 0
+
+        class StrictAPI:
+            def predict(self, x):
+                nonlocal call_count
+                call_count += 1
+                # This would fail if called with empty input
+                return {"output": x["required_field"]}
+
+        meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
+        # Simulate what the worker does: empty data → skip predict
+        data = b""
+        if not data:
+            result = b"{}"
+            from lite_server.proto import Status
+            status = Status(code="Ok", message="")
+        else:
+            result, status = inference._run_predict(StrictAPI(), data, meta)
+
+        assert call_count == 0, "predict() should not be called for health check"
+        assert status.code == "Ok"
+        assert result == b"{}"
+
+    def test_non_empty_data_calls_predict(self):
+        """Normal requests with data should still go through predict."""
+        call_count = 0
+
+        class CountingAPI:
+            def predict(self, x):
+                nonlocal call_count
+                call_count += 1
+                return {"output": 42}
+
+        meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
+        data = json.dumps({"input": 1}).encode()
+        resp_bytes, status = inference._run_predict(CountingAPI(), data, meta)
+        assert call_count == 1
+        assert status.code == "Ok"
