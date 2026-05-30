@@ -1,5 +1,7 @@
 # Architecture
 
+[中文版](zh/architecture.md)
+
 lite-server is a hybrid Rust + Python inference server. The Rust core handles all I/O (HTTP, gRPC, IPC, metrics, file watching), while Python workers handle model inference.
 
 ## High-Level Architecture

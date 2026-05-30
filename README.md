@@ -315,14 +315,17 @@ cd python && python -m pytest tests/
 ├── docs/             # Documentation
 │   ├── architecture.md
 │   ├── benchmark.md
-│   ├── cli.md              # CLI reference (en)
-│   ├── cli_zh.md           # CLI reference (zh)
+│   ├── cli.md              # CLI reference
 │   ├── comparison.md
-│   ├── comparison_zh.md
 │   ├── configuration.md
-│   ├── configuration_zh.md
 │   ├── model-authoring.md
-│   └── model-authoring_zh.md
+│   └── zh/                 # Chinese docs
+│       ├── architecture.md
+│       ├── benchmark.md
+│       ├── cli.md
+│       ├── comparison.md
+│       ├── configuration.md
+│       └── model-authoring.md
 ├── Cargo.toml        # Rust manifest
 └── pyproject.toml    # Python packaging (maturin)
 ```

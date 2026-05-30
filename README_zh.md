@@ -78,7 +78,7 @@ curl -X POST http://localhost:8000/v2/models/my_model/infer \
 
 Rust 内核处理所有 I/O（HTTP、gRPC、IPC、指标、文件监听），Python worker 负责模型推理。这种分离让你拥有 Rust 级别的吞吐和 Python 级别的简洁。
 
-详见 [docs/architecture.md](docs/architecture.md)。
+详见 [docs/zh/architecture.md](docs/zh/architecture.md)。
 
 ## 与其他框架对比
 
@@ -95,7 +95,7 @@ Rust 内核处理所有 I/O（HTTP、gRPC、IPC、指标、文件监听），Pyt
 | 流式输出 | SSE + WebSocket + gRPC | 支持 | 不支持 | 支持 | 支持 |
 | 最小开销 | ~10MB | ~500MB | ~200MB | ~50MB | ~100MB |
 
-详见 [docs/comparison_zh.md](docs/comparison_zh.md)。
+详见 [docs/zh/comparison.md](docs/zh/comparison.md)。
 
 ## 性能基准
 
@@ -107,7 +107,7 @@ Rust 内核处理所有 I/O（HTTP、gRPC、IPC、指标、文件监听），Pyt
 | LitServe | 531 req/s | 162.6 ms |
 | lite-server-core | 1,364 req/s | 11.6 ms |
 
-详见 [docs/benchmark.md](docs/benchmark.md)。
+详见 [docs/zh/benchmark.md](docs/zh/benchmark.md)。
 
 ## 功能特性
 
@@ -178,7 +178,7 @@ lite-server unpack my_model_v1.lma
 lite-server init my_project           # 脚手架创建项目
 ```
 
-详见 [docs/cli_zh.md](docs/cli_zh.md) 获取完整 CLI 参考手册。
+详见 [docs/zh/cli.md](docs/zh/cli.md) 获取完整 CLI 参考手册。
 
 ## 示例
 
@@ -256,11 +256,11 @@ hooks:
     -d "{\"model\":\"$MODEL\",\"reason\":\"$REASON\"}"'
 ```
 
-详见 [docs/configuration_zh.md](docs/configuration_zh.md) 获取完整配置参考（服务器、模型、编排、CLI 参数）。
+详见 [docs/zh/configuration.md](docs/zh/configuration.md) 获取完整配置参考（服务器、模型、编排、CLI 参数）。
 
-详见 [docs/cli_zh.md](docs/cli_zh.md) 获取完整 CLI 参考手册。
+详见 [docs/zh/cli.md](docs/zh/cli.md) 获取完整 CLI 参考手册。
 
-详见 [docs/model-authoring_zh.md](docs/model-authoring_zh.md) 获取模型开发指南（LitAPI 接口、流式输出、continuous batching、最佳实践）。
+详见 [docs/zh/model-authoring.md](docs/zh/model-authoring.md) 获取模型开发指南（LitAPI 接口、流式输出、continuous batching、最佳实践）。
 
 ## 常见问题
 
@@ -313,14 +313,17 @@ cd python && python -m pytest tests/
 ├── docs/             # 文档
 │   ├── architecture.md
 │   ├── benchmark.md
-│   ├── cli.md              # CLI 参考（英文）
-│   ├── cli_zh.md           # CLI 参考（中文）
+│   ├── cli.md              # CLI 参考
 │   ├── comparison.md
-│   ├── comparison_zh.md
 │   ├── configuration.md
-│   ├── configuration_zh.md
 │   ├── model-authoring.md
-│   └── model-authoring_zh.md
+│   └── zh/                 # 中文文档
+│       ├── architecture.md
+│       ├── benchmark.md
+│       ├── cli.md
+│       ├── comparison.md
+│       ├── configuration.md
+│       └── model-authoring.md
 ├── Cargo.toml        # Rust 清单
 └── pyproject.toml    # Python 打包（maturin）
 ```

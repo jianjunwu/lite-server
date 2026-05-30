@@ -1,6 +1,6 @@
 # CLI 参考手册
 
-[English](cli.md)
+[English](../cli.md)
 
 ## 安装
 

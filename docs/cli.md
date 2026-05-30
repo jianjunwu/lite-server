@@ -1,6 +1,6 @@
 # CLI Reference
 
-[中文版](cli_zh.md)
+[中文版](zh/cli.md)
 
 ## Installation
 

@@ -1,6 +1,6 @@
 # 框架对比：lite-server vs 主流推理服务器
 
-[English](comparison.md)
+[English](../comparison.md)
 
 ## 一句话总结
 

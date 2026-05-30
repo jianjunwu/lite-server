@@ -1,5 +1,7 @@
 # Benchmarks
 
+[中文版](zh/benchmark.md)
+
 Performance comparison of lite-server vs LitServe using `wrk`.
 
 ## Test Environment

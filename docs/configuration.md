@@ -1,6 +1,6 @@
 # Configuration Reference
 
-[中文版](configuration_zh.md)
+[中文版](zh/configuration.md)
 
 lite-server uses three layers of configuration: **server config** (YAML file or CLI), **model config** (per-model `config.yaml`), and **orchestration config** (`orchestration.yaml`). CLI flags override YAML values.
 

@@ -2,7 +2,7 @@
 
 This guide covers how to write model code for lite-server. Models are Python classes that implement the `LitAPI` interface.
 
-[中文版](model-authoring_zh.md)
+[中文版](zh/model-authoring.md)
 
 ## Quick Start
 

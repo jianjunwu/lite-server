@@ -1,6 +1,6 @@
 # Framework Comparison: lite-server vs Other Inference Servers
 
-[中文版](comparison_zh.md)
+[中文版](zh/comparison.md)
 
 ## TL;DR
 

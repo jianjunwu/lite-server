@@ -1,6 +1,6 @@
 # 配置参考
 
-[English](configuration.md)
+[English](../configuration.md)
 
 lite-server 采用三层配置：**服务器配置**（YAML 文件或 CLI）、**模型配置**（每模型 `config.yaml`）和**编排配置**（`orchestration.yaml`）。CLI 参数覆盖 YAML 值。
 
@@ -163,7 +163,7 @@ models:                        # 每个模型的版本策略
 
 ## CLI 参数
 
-所有服务器配置字段均可通过 CLI 参数覆盖，详见 [CLI 参考手册](cli_zh.md)。
+所有服务器配置字段均可通过 CLI 参数覆盖，详见 [CLI 参考手册](cli.md)。
 
 ```bash
 lite-server serve [参数]

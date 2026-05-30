@@ -2,7 +2,7 @@
 
 本指南介绍如何为 lite-server 编写模型代码。模型是实现 `LitAPI` 接口的 Python 类。
 
-[English](model-authoring.md)
+[English](../model-authoring.md)
 
 ## 快速开始
 
@@ -417,4 +417,4 @@ class ImageClassifier(LitAPI):
 
 ## 配置参考
 
-参见 [configuration.md](configuration.md) 获取完整的模型配置字段参考。
+参见 [configuration.md](../configuration.md) 获取完整的模型配置字段参考。
