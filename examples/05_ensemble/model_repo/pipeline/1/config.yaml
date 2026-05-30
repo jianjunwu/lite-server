@@ -1,0 +1,13 @@
+ensemble:
+  steps:
+    - name: preprocess
+      model: step_a
+      version: "1"
+      inputs:
+        input: "$request.input"
+
+    - name: postprocess
+      model: step_b
+      version: "1"
+      inputs:
+        input: "$preprocess.output"

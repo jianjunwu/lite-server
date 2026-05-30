@@ -1,0 +1,7 @@
+control_mode: explicit
+load_models:
+  - multi_version
+models:
+  - name: multi_version
+    load_policy: all
+    default_version: v2
