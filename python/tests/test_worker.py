@@ -67,9 +67,9 @@ class TestLoadLitAPI:
                 def predict(self, x):
                     return x
         '''))
-        api = inference.load_litapi(str(model_py), {"accelerator": "cpu"})
+        api = inference.load_litapi(str(model_py), {}, device="cpu:0")
         assert api.pre is True
-        assert api.dev == "cpu"
+        assert api.dev == "cpu:0"
 
     def test_raises_when_no_predict(self, tmp_path):
         model_py = tmp_path / "model.py"

@@ -87,7 +87,7 @@ def load_model_config(config_path: str):
         return yaml.safe_load(f) or {}
 
 
-def load_litapi(model_py_path: str, config: dict):
+def load_litapi(model_py_path: str, config: dict, device: str = "cpu"):
     spec = importlib.util.spec_from_file_location("model_module", model_py_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -118,9 +118,6 @@ def load_litapi(model_py_path: str, config: dict):
         instance.pre_setup()
 
     if hasattr(instance, "setup"):
-        device = config.get("accelerator", "cpu")
-        if isinstance(device, list):
-            device = device[0] if device else "cpu"
         instance.setup(device)
 
     return instance
@@ -498,7 +495,7 @@ def worker_main():
 
     try:
         config = load_model_config(args.config)
-        lit_api = load_litapi(args.model_py, config)
+        lit_api = load_litapi(args.model_py, config, device=args.device)
         log.info("Model loaded successfully")
     except Exception as e:
         log.error(f"Failed to load model: {e}")
