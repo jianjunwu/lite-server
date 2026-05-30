@@ -114,7 +114,7 @@ See [docs/benchmark.md](docs/benchmark.md) for full results and reproduction ste
 
 ### From Wheel (Recommended)
 
-Pre-built wheels for Linux, macOS, Windows (x86_64 + aarch64), Python 3.9-3.14:
+Pre-built wheels for Linux, macOS, Windows (x86_64 + aarch64), Python 3.10-3.14:
 
 ```bash
 pip install lite-server-<version>-py3-none-<platform>.whl
@@ -122,7 +122,7 @@ pip install lite-server-<version>-py3-none-<platform>.whl
 
 ### From Source
 
-Requires Rust >= 1.70 and Python >= 3.9.
+Requires Rust >= 1.70 and Python >= 3.10.
 
 ```bash
 pip install maturin

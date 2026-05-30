@@ -114,7 +114,7 @@ curl -X POST http://localhost:8000/v2/models/my_model/infer \
 
 ### 预编译 Wheel（推荐）
 
-支持 Linux、macOS、Windows（x86_64 + aarch64），Python 3.9-3.14：
+支持 Linux、macOS、Windows（x86_64 + aarch64），Python 3.10-3.14：
 
 ```bash
 pip install lite-server-<version>-py3-none-<platform>.whl
@@ -122,7 +122,7 @@ pip install lite-server-<version>-py3-none-<platform>.whl
 
 ### 从源码编译
 
-需要 Rust >= 1.70 和 Python >= 3.9。
+需要 Rust >= 1.70 和 Python >= 3.10。
 
 ```bash
 pip install maturin

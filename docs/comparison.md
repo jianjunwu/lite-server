@@ -26,7 +26,7 @@
 | Aspect | lite-server | Triton | TorchServe | BentoML | Ray Serve |
 |--------|------------|--------|------------|---------|-----------|
 | Install command | `pip install` | Docker only | Java + pip | `pip install` | `pip install` |
-| Min. dependencies | Python 3.9+ | CUDA, Docker | Java 11+, Python | Python 3.8+ | Python 3.8+ |
+| Min. dependencies | Python 3.10+ | CUDA, Docker | Java 11+, Python | Python 3.8+ | Python 3.8+ |
 | Container required | No | Yes (strongly recommended) | No | No | No |
 | Binary size | ~15MB | ~1GB | ~500MB | ~50MB | ~200MB |
 
@@ -78,7 +78,7 @@
 | Linux aarch64 | Yes | Yes | Yes | Yes | Yes |
 | macOS | Yes | No | Yes | Yes | Yes |
 | Windows | Yes | No | No | Yes | No |
-| Python versions | 3.9 - 3.14 | 3.8 - 3.10 | 3.8 - 3.11 | 3.8+ | 3.8+ |
+| Python versions | 3.10 - 3.14 | 3.8 - 3.10 | 3.8 - 3.11 | 3.8+ | 3.8+ |
 
 ## When to Choose lite-server
 

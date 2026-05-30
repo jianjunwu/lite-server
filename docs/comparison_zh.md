@@ -26,7 +26,7 @@
 | 维度 | lite-server | Triton | TorchServe | BentoML | Ray Serve |
 |------|------------|--------|------------|---------|-----------|
 | 安装命令 | `pip install` | 仅 Docker | Java + pip | `pip install` | `pip install` |
-| 最低依赖 | Python 3.9+ | CUDA, Docker | Java 11+, Python | Python 3.8+ | Python 3.8+ |
+| 最低依赖 | Python 3.10+ | CUDA, Docker | Java 11+, Python | Python 3.8+ | Python 3.8+ |
 | 需要容器 | 否 | 强烈推荐 | 否 | 否 | 否 |
 | 二进制大小 | ~15MB | ~1GB | ~500MB | ~50MB | ~200MB |
 
@@ -78,7 +78,7 @@
 | Linux aarch64 | 支持 | 支持 | 支持 | 支持 | 支持 |
 | macOS | 支持 | 不支持 | 支持 | 支持 | 支持 |
 | Windows | 支持 | 不支持 | 不支持 | 支持 | 不支持 |
-| Python 版本 | 3.9 - 3.14 | 3.8 - 3.10 | 3.8 - 3.11 | 3.8+ | 3.8+ |
+| Python 版本 | 3.10 - 3.14 | 3.8 - 3.10 | 3.8 - 3.11 | 3.8+ | 3.8+ |
 
 ## 什么时候选 lite-server
 
