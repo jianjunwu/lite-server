@@ -145,13 +145,13 @@ jobs:
 
       - name: Build wheel
         uses: PyO3/maturin-action@v1
-        env:
-          PROTOC: ${{ runner.os == 'Linux' && '/usr/bin/protoc' || env.PROTOC }}
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.platform }}
           args: --release --interpreter ${{ matrix.interpreter }}
           before-script-linux: ${{ matrix.before-script }}
+        env:
+          PROTOC: ${{ runner.os == 'Linux' && '/usr/bin/protoc' || env.PROTOC }}
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
