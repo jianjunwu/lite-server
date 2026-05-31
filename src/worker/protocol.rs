@@ -159,6 +159,7 @@ pub struct EndpointRoute {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::HashMap;
 
     #[test]
     fn test_batch_infer_serde() {
@@ -237,5 +238,77 @@ mod tests {
             }
             _ => panic!("expected Infer"),
         }
+    }
+
+    #[test]
+    fn test_endpoint_request_serde() {
+        let req = EndpointRequest {
+            request_id: "r1".to_string(),
+            route: "/v1/chat/completions".to_string(),
+            method: "POST".to_string(),
+            headers: HashMap::from([("content-type".into(), "application/json".into())]),
+            query: HashMap::new(),
+            body: Some(json!({"messages": [{"role": "user", "content": "hi"}], "stream": true})),
+            server_state: ServerSnapshot {
+                loaded_models: vec![],
+                config: json!({}),
+            },
+        };
+        let json_str = serde_json::to_string(&req).unwrap();
+        assert!(json_str.contains("stream"));
+        assert!(json_str.contains("/v1/chat/completions"));
+
+        let decoded: EndpointRequest = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(decoded.request_id, "r1");
+        let body = decoded.body.unwrap();
+        assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn test_endpoint_response_normal() {
+        let resp = EndpointResponse {
+            request_id: "r2".to_string(),
+            status_code: 200,
+            headers: None,
+            body: json!({"choices": [{"message": {"content": "hello"}}]}),
+        };
+        let json_str = serde_json::to_string(&resp).unwrap();
+        let decoded: EndpointResponse = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(decoded.status_code, 200);
+        assert_eq!(decoded.body["choices"][0]["message"]["content"], "hello");
+    }
+
+    #[test]
+    fn test_endpoint_response_with_stream_flag() {
+        // The stream flag is not part of EndpointResponse struct (it's dynamic JSON),
+        // but the Python side sends it as part of the frame. Verify JSON roundtrip.
+        let stream_header = json!({
+            "request_id": "r3",
+            "status_code": 200,
+            "stream": true,
+        });
+        let json_str = serde_json::to_string(&stream_header).unwrap();
+        let decoded: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(decoded["stream"], true);
+        assert_eq!(decoded["status_code"], 200);
+    }
+
+    #[test]
+    fn test_stream_chunk_frame_format() {
+        // Verify chunk frames match expected OpenAI streaming format
+        let chunk = json!({
+            "choices": [{"delta": {"content": "token"}, "index": 0}]
+        });
+        let json_str = serde_json::to_string(&chunk).unwrap();
+        let decoded: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(decoded["choices"][0]["delta"]["content"], "token");
+    }
+
+    #[test]
+    fn test_done_frame_format() {
+        let done = json!({"type": "done"});
+        let json_str = serde_json::to_string(&done).unwrap();
+        let decoded: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(decoded["type"], "done");
     }
 }

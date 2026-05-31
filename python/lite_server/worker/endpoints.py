@@ -110,6 +110,21 @@ class ServerProxy:
         return self._snapshot.get("config", {})
 
 
+def _find_openai_endpoint_class(mod):
+    """Find the first OpenAIEndpoint subclass in a module, if any."""
+    from lite_server.specs.openai import OpenAIEndpoint
+
+    for attr_name in dir(mod):
+        attr = getattr(mod, attr_name)
+        if (
+            isinstance(attr, type)
+            and issubclass(attr, OpenAIEndpoint)
+            and attr is not OpenAIEndpoint
+        ):
+            return attr
+    return None
+
+
 def load_endpoints(repo_path: str):
     """Scan repo root for *_endpoint.py and load them."""
     endpoints = {}
@@ -128,6 +143,22 @@ def load_endpoints(repo_path: str):
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
 
+            # Check for OpenAIEndpoint subclass first
+            ep_class = _find_openai_endpoint_class(mod)
+            if ep_class is not None:
+                instance = ep_class()
+                instance.setup()
+                for route_def in instance.get_routes():
+                    r = route_def["route"]
+                    methods = [m.upper() for m in route_def.get("methods", ["POST"])]
+                    # Capture instance in closure via default arg
+                    endpoints[r] = {
+                        "handler": lambda request, _srv, _ep=instance: _ep.handle(request),
+                        "methods": methods,
+                    }
+                continue
+
+            # Fall back to traditional handler function
             handler = getattr(mod, "handler", None)
             methods = getattr(mod, "methods", ["GET"])
             if handler is None:
@@ -172,6 +203,9 @@ async def handle_request(endpoints, req_data: dict) -> dict:
             result = await handler(request, server)
         else:
             result = handler(request, server)
+            # Handler may return a coroutine (e.g. from async lambda wrapper)
+            if asyncio.iscoroutine(result):
+                result = await result
 
         if not isinstance(result, dict):
             result = {"data": result}
@@ -226,6 +260,13 @@ async def worker_main():
         server.close()
 
 
+async def _send_frame(loop, conn, data: dict):
+    """Send a length-prefixed JSON frame over the connection."""
+    payload = json.dumps(data).encode("utf-8")
+    len_prefix = struct.pack(">I", len(payload))
+    await loop.sock_sendall(conn, len_prefix + payload)
+
+
 async def handle_connection(conn, endpoints):
     """Handle a single connection."""
     loop = asyncio.get_running_loop()
@@ -267,10 +308,22 @@ async def handle_connection(conn, endpoints):
             # Handle request
             response = await handle_request(endpoints, req_data)
 
-            # Send response
-            resp_bytes = json.dumps(response).encode("utf-8")
-            len_prefix = struct.pack(">I", len(resp_bytes))
-            await loop.sock_sendall(conn, len_prefix + resp_bytes)
+            if response.get("stream"):
+                # Streaming: send header, then each chunk, then done
+                header = {
+                    "request_id": response.get("request_id", ""),
+                    "status_code": response.get("status_code", 200),
+                    "stream": True,
+                }
+                await _send_frame(loop, conn, header)
+
+                for chunk in response.get("chunks", []):
+                    await _send_frame(loop, conn, chunk)
+
+                await _send_frame(loop, conn, {"type": "done"})
+            else:
+                # Single response
+                await _send_frame(loop, conn, response)
     except Exception as e:
         logger.error("connection handler error: %s", e, exc_info=True)
     finally:

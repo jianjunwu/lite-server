@@ -13,5 +13,6 @@ except ImportError:
     serve = None  # fallback when extension is not built
 
 from lite_server.api import LitAPI
+from lite_server.specs.openai import OpenAIEndpoint
 
-__all__ = ["serve", "LitAPI", "__version__"]
+__all__ = ["serve", "LitAPI", "OpenAIEndpoint", "__version__"]

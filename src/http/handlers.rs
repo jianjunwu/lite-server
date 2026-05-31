@@ -972,6 +972,13 @@ pub async fn custom_endpoint_handler(
         }))
     };
 
+    // Check if client requested streaming
+    let is_stream = body
+        .as_ref()
+        .and_then(|b| b.get("stream"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let snapshot = ep_mgr.build_snapshot().await;
 
     let req = crate::worker::protocol::EndpointRequest {
@@ -984,19 +991,54 @@ pub async fn custom_endpoint_handler(
         server_state: snapshot,
     };
 
-    let response = ep_mgr.send_request(req).await?;
+    if is_stream {
+        // Streaming: return SSE response
+        let mut chunk_rx = ep_mgr.send_stream_request(req).await?;
 
-    let mut builder = Response::builder().status(response.status_code);
-    if let Some(hdrs) = response.headers {
-        for (k, v) in hdrs {
-            builder = builder.header(k, v);
+        let (event_tx, event_rx) = mpsc::channel(64);
+
+        tokio::spawn(async move {
+            while let Some(chunk) = chunk_rx.recv().await {
+                // Check for error chunks
+                if let Some(err) = chunk.get("error") {
+                    let event = Event::default()
+                        .event("error")
+                        .data(json!({"error": err}).to_string());
+                    if event_tx.send(Ok::<_, Infallible>(event)).await.is_err() {
+                        break;
+                    }
+                    break;
+                }
+
+                let data = chunk.to_string();
+                let event = Event::default().data(data);
+                if event_tx.send(Ok::<_, Infallible>(event)).await.is_err() {
+                    break;
+                }
+            }
+            // Send done event
+            let _ = event_tx
+                .send(Ok::<_, Infallible>(Event::default().data("[DONE]")))
+                .await;
+        });
+
+        Ok(Sse::new(ReceiverStream::new(event_rx)).into_response())
+    } else {
+        // Non-streaming: single response
+        let response = ep_mgr.send_request(req).await?;
+
+        let mut builder = Response::builder().status(response.status_code);
+        if let Some(hdrs) = response.headers {
+            for (k, v) in hdrs {
+                builder = builder.header(k, v);
+            }
         }
-    }
-    let resp = builder
-        .body(axum::body::Body::from(response.body.to_string()))
-        .map_err(|e| AppError::Internal(format!("build response: {}", e)))?;
+        let resp = builder
+            .body(axum::body::Body::from(response.body.to_string()))
+            .map_err(|e| AppError::Internal(format!("build response: {}", e)))?;
 
-    Ok(resp)
+        Ok(resp)
+    }
 }
 
 // ===== Upload Model =====

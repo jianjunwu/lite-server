@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tokio::time::timeout;
 use tracing::{error, info, warn};
 
@@ -109,6 +109,109 @@ impl EndpointManager {
         })?;
 
         Ok(response)
+    }
+
+    /// Send a request and return a channel that yields streaming chunks.
+    ///
+    /// The Python side sends: header frame (stream:true) -> chunk frames -> done frame.
+    /// This method reads the header, then spawns a task to forward chunks via channel.
+    pub async fn send_stream_request(
+        &self,
+        request: EndpointRequest,
+    ) -> Result<mpsc::Receiver<serde_json::Value>, AppError> {
+        #[cfg(unix)]
+        let mut stream = tokio::net::UnixStream::connect(&self.uds_path)
+            .await
+            .map_err(|e| AppError::Transport(format!("failed to connect to endpoint UDS: {}", e)))?;
+
+        #[cfg(windows)]
+        let mut stream = {
+            let path_str = self.uds_path.to_string_lossy();
+            let port = crate::transport::derive_port_from_path(&path_str);
+            tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+                .await
+                .map_err(|e| AppError::Transport(format!("failed to connect to endpoint: {}", e)))?
+        };
+
+        // Send request
+        let encoded = serde_json::to_vec(&request).map_err(|e| {
+            AppError::Transport(format!("json serialize endpoint request: {}", e))
+        })?;
+        let len = encoded.len() as u32;
+        let mut buf = Vec::with_capacity(4 + encoded.len());
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(&encoded);
+        tokio::io::AsyncWriteExt::write_all(&mut stream, &buf)
+            .await
+            .map_err(|e| AppError::Transport(format!("write to endpoint UDS: {}", e)))?;
+
+        // Read stream header (first frame)
+        let header = Self::read_frame(&mut stream).await?;
+        let header_val: serde_json::Value = serde_json::from_slice(&header)
+            .map_err(|e| AppError::Transport(format!("parse stream header: {}", e)))?;
+
+        if !header_val.get("stream").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return Err(AppError::Transport("expected stream header".to_string()));
+        }
+
+        let (tx, rx) = mpsc::channel(64);
+
+        // Spawn task to read chunks and forward via channel
+        tokio::spawn(async move {
+            const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+            loop {
+                match Self::read_frame(&mut stream).await {
+                    Ok(frame_data) => {
+                        if frame_data.len() > MAX_FRAME_SIZE {
+                            let _ = tx.send(json!({"error": "chunk too large"})).await;
+                            break;
+                        }
+                        let chunk: serde_json::Value = match serde_json::from_slice(&frame_data) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let _ = tx.send(json!({"error": format!("parse chunk: {}", e)})).await;
+                                break;
+                            }
+                        };
+                        // Check for done marker
+                        if chunk.get("type").and_then(|v| v.as_str()) == Some("done") {
+                            break;
+                        }
+                        if tx.send(chunk).await.is_err() {
+                            break; // receiver dropped
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(json!({"error": e.to_string()})).await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(rx)
+    }
+
+    /// Read a single length-prefixed frame from the stream.
+    async fn read_frame<S>(stream: &mut S) -> Result<Vec<u8>, AppError>
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
+        const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
+        let mut len_buf = [0u8; 4];
+        tokio::io::AsyncReadExt::read_exact(stream, &mut len_buf)
+            .await
+            .map_err(|e| AppError::Transport(format!("read frame len: {}", e)))?;
+        let frame_len = u32::from_be_bytes(len_buf) as usize;
+        if frame_len > MAX_FRAME_SIZE {
+            return Err(AppError::FrameTooLarge);
+        }
+        let mut buf = vec![0u8; frame_len];
+        tokio::io::AsyncReadExt::read_exact(stream, &mut buf)
+            .await
+            .map_err(|e| AppError::Transport(format!("read frame body: {}", e)))?;
+        Ok(buf)
     }
 
     pub async fn restart(&self) -> Result<(), AppError> {
