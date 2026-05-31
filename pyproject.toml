@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "lite-server"
-version = "0.4.0"
+version = "0.5.0"
 description = "High-performance inference server (Rust core + Python workers)"
 readme = "README.md"
 license = {text = "MIT"}
