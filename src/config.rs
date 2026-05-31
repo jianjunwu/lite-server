@@ -9,7 +9,6 @@ pub struct Config {
     pub metrics: MetricsConfig,
     pub logging: LoggingConfig,
     pub model_repository: ModelRepositoryConfig,
-    pub webui: WebUIConfig,
     pub features: FeaturesConfig,
     pub orchestration: OrchestrationConfig,
     /// CLI-provided defaults that override per-model config when set.
@@ -24,7 +23,6 @@ pub struct ServerConfig {
     pub metrics_port: u16,
     pub host: String,
     pub timeout: f32,
-    pub log_level: String,
     pub threads: Option<usize>,
     pub transport: String,
     pub cache_registry: bool,
@@ -42,7 +40,6 @@ impl Default for ServerConfig {
             metrics_port: 8002,
             host: "0.0.0.0".to_string(),
             timeout: 30.0,
-            log_level: "info".to_string(),
             threads: None,
             transport: "zmq".to_string(),
             cache_registry: false,
@@ -83,32 +80,25 @@ impl Default for MetricsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LoggingConfig {
-    pub mode: String,
     pub level: String,
-    pub format: String,
-    pub output: Option<String>,
     pub info_output: Option<String>,
     pub error_output: Option<String>,
+    /// Rotation strategy: "none", "size", "daily", "hourly"
     pub rotation: String,
-    pub rotate_by: String,
+    /// Max log file size in MB (when rotation=size)
     pub max_size: usize,
-    pub when: String,
+    /// Number of rotated log files to keep
     pub backup_count: usize,
 }
 
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
-            mode: "queue".to_string(),
             level: "info".to_string(),
-            format: "text".to_string(),
-            output: None,
             info_output: None,
             error_output: None,
             rotation: "none".to_string(),
-            rotate_by: "none".to_string(),
             max_size: 100,
-            when: "midnight".to_string(),
             backup_count: 7,
         }
     }
@@ -128,21 +118,6 @@ impl Default for ModelRepositoryConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct WebUIConfig {
-    pub enabled: bool,
-    pub report_retention_days: usize,
-}
-
-impl Default for WebUIConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            report_retention_days: 30,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -372,6 +347,9 @@ pub struct CliOverrides {
     pub timeout: Option<f32>,
     pub transport: Option<String>,
     pub log_level: Option<String>,
+    pub log_info_output: Option<String>,
+    pub log_error_output: Option<String>,
+    pub log_rotation: Option<String>,
     pub grpc_port: Option<u16>,
     pub metrics_port: Option<u16>,
     pub no_grpc: bool,
@@ -409,8 +387,16 @@ impl Config {
             self.server.transport = t.clone();
         }
         if let Some(ref l) = cli.log_level {
-            self.server.log_level = l.clone();
             self.logging.level = l.clone();
+        }
+        if let Some(ref p) = cli.log_info_output {
+            self.logging.info_output = Some(p.clone());
+        }
+        if let Some(ref p) = cli.log_error_output {
+            self.logging.error_output = Some(p.clone());
+        }
+        if let Some(ref r) = cli.log_rotation {
+            self.logging.rotation = r.clone();
         }
         if let Some(gp) = cli.grpc_port {
             self.server.grpc_port = gp;
@@ -705,7 +691,6 @@ mod tests {
         };
         cfg.apply_overrides(&overrides);
 
-        assert_eq!(cfg.server.log_level, "debug");
         assert_eq!(cfg.logging.level, "debug");
     }
 

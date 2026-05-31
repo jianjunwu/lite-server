@@ -27,6 +27,7 @@ pub fn init(
     error_output: Option<&str>,
     rotation: &str,
     max_size: usize,
+    backup_count: usize,
     verbose: bool,
 ) -> LogGuard {
     let filter = EnvFilter::try_from_default_env()
@@ -44,7 +45,7 @@ pub fn init(
 
     let mut info_guard = None;
     let info_layer = if let Some(path) = info_output {
-        match create_writer(path, rotation, max_size) {
+        match create_writer(path, rotation, max_size, backup_count) {
             Ok((writer, guard)) => {
                 info_guard = Some(guard);
                 Some(
@@ -66,7 +67,7 @@ pub fn init(
     let mut error_guard = None;
     let error_filter = EnvFilter::new("error");
     let error_layer = if let Some(path) = error_output {
-        match create_writer(path, rotation, max_size) {
+        match create_writer(path, rotation, max_size, backup_count) {
             Ok((writer, guard)) => {
                 error_guard = Some(guard);
                 Some(
@@ -103,6 +104,7 @@ fn create_writer(
     path: &str,
     rotation: &str,
     max_size: usize,
+    backup_count: usize,
 ) -> Result<(NonBlocking, WorkerGuard), std::io::Error> {
     let path = std::path::Path::new(path);
     let parent = path.parent().unwrap_or(std::path::Path::new("."));
@@ -115,12 +117,19 @@ fn create_writer(
 
     match rotation {
         "daily" => {
+            cleanup_old_logs(parent, file_name, backup_count);
             let appender = tracing_appender::rolling::daily(parent, file_name);
             let (writer, guard) = tracing_appender::non_blocking(appender);
             Ok((writer, guard))
         }
+        "hourly" => {
+            cleanup_old_logs(parent, file_name, backup_count);
+            let appender = tracing_appender::rolling::hourly(parent, file_name);
+            let (writer, guard) = tracing_appender::non_blocking(appender);
+            Ok((writer, guard))
+        }
         "size" => {
-            let appender = SizeRotatingAppender::new(path.to_path_buf(), max_size * 1024 * 1024)?;
+            let appender = SizeRotatingAppender::new(path.to_path_buf(), max_size * 1024 * 1024, backup_count)?;
             let (writer, guard) = tracing_appender::non_blocking(appender);
             Ok((writer, guard))
         }
@@ -129,6 +138,33 @@ fn create_writer(
             let (writer, guard) = tracing_appender::non_blocking(file);
             Ok((writer, guard))
         }
+    }
+}
+
+/// Remove old rotated log files exceeding backup_count.
+/// Matches files like `<name>.2024-01-01` or `<name>.2024-01-01-12`.
+fn cleanup_old_logs(parent: &std::path::Path, file_name: &str, backup_count: usize) {
+    let Ok(entries) = std::fs::read_dir(parent) else { return };
+    let prefix = format!("{}.", file_name);
+    let mut matches: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with(&prefix))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if matches.len() <= backup_count {
+        return;
+    }
+
+    matches.sort();
+    let to_remove = matches.len() - backup_count;
+    for path in &matches[..to_remove] {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -142,16 +178,18 @@ struct SizeRotatingAppender {
 struct SizeRotatingAppenderInner {
     path: PathBuf,
     max_size: usize,
+    backup_count: usize,
     file: File,
 }
 
 impl SizeRotatingAppender {
-    fn new(path: PathBuf, max_size: usize) -> std::io::Result<Self> {
+    fn new(path: PathBuf, max_size: usize, backup_count: usize) -> std::io::Result<Self> {
         let file = OpenOptions::new().append(true).create(true).open(&path)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(SizeRotatingAppenderInner {
                 path,
                 max_size,
+                backup_count,
                 file,
             })),
         })
@@ -159,8 +197,32 @@ impl SizeRotatingAppender {
 
     fn rotate(&self) -> std::io::Result<()> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let backup = inner.path.with_extension("log.1");
+        let ext = inner.path.extension().unwrap_or_default().to_string_lossy().to_string();
+        let stem = inner.path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let parent = inner.path.parent().unwrap_or(std::path::Path::new("."));
+
+        // Shift existing backups: .N -> .N+1, delete those beyond backup_count
+        for i in (1..inner.backup_count).rev() {
+            let from = parent.join(format!("{}.{}.{}", stem, i, ext));
+            let to = parent.join(format!("{}.{}.{}", stem, i + 1, ext));
+            if from.exists() {
+                let _ = rename(&from, &to);
+            }
+        }
+        // Current -> .1
+        let backup = parent.join(format!("{}.1.{}", stem, ext));
         let _ = rename(&inner.path, &backup);
+
+        // Remove files beyond backup_count
+        for i in (inner.backup_count + 1).. {
+            let old = parent.join(format!("{}.{}.{}", stem, i, ext));
+            if old.exists() {
+                let _ = std::fs::remove_file(&old);
+            } else {
+                break;
+            }
+        }
+
         inner.file = OpenOptions::new()
             .append(true)
             .create(true)
@@ -199,7 +261,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.log");
 
-        let appender = SizeRotatingAppender::new(path.clone(), 1024 * 1024).unwrap();
+        let appender = SizeRotatingAppender::new(path.clone(), 1024 * 1024, 7).unwrap();
 
         // Poison the mutex: panic while holding the lock
         let inner_clone = appender.inner.clone();

@@ -28,6 +28,9 @@ pub fn run_server(
     threads: Option<usize>,
     timeout: Option<f32>,
     log_level: Option<String>,
+    log_info_output: Option<String>,
+    log_error_output: Option<String>,
+    log_rotation: Option<String>,
     metrics_port: Option<u16>,
     no_metrics: Option<bool>,
     transport: Option<String>,
@@ -57,6 +60,9 @@ pub fn run_server(
         timeout,
         transport,
         log_level,
+        log_info_output,
+        log_error_output,
+        log_rotation,
         grpc_port,
         metrics_port,
         no_grpc: no_grpc == Some(true),
@@ -79,6 +85,7 @@ pub fn run_server(
         cfg.logging.error_output.as_deref(),
         &cfg.logging.rotation,
         cfg.logging.max_size,
+        cfg.logging.backup_count,
         log_verbose,
     );
     info!("Starting lite-server v{}", env!("CARGO_PKG_VERSION"));
@@ -126,6 +133,9 @@ fn build_runtime(threads: Option<usize>) -> tokio::runtime::Runtime {
     threads=None,
     timeout=None,
     log_level=None,
+    log_info_output=None,
+    log_error_output=None,
+    log_rotation=None,
     metrics_port=None,
     no_metrics=None,
     transport=None,
@@ -148,6 +158,9 @@ fn serve(
     threads: Option<usize>,
     timeout: Option<f32>,
     log_level: Option<String>,
+    log_info_output: Option<String>,
+    log_error_output: Option<String>,
+    log_rotation: Option<String>,
     metrics_port: Option<u16>,
     no_metrics: Option<bool>,
     transport: Option<String>,
@@ -165,10 +178,11 @@ fn serve(
     pyo3::Python::with_gil(|py| {
         py.allow_threads(|| {
             run_server(
-                config, port, host, model_repo, threads, timeout, log_level, metrics_port,
-                no_metrics, transport, grpc_port, no_grpc, no_streaming_metrics, log_verbose,
-                max_queue_size, max_requests, max_requests_jitter, request_timeout, None,
-                graceful_timeout, keepalive_timeout,
+                config, port, host, model_repo, threads, timeout, log_level,
+                log_info_output, log_error_output, log_rotation,
+                metrics_port, no_metrics, transport, grpc_port, no_grpc, no_streaming_metrics,
+                log_verbose, max_queue_size, max_requests, max_requests_jitter, request_timeout,
+                None, graceful_timeout, keepalive_timeout,
             )
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })

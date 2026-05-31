@@ -15,12 +15,19 @@ server:
   metrics_port: 8002           # Prometheus 指标端口
   host: 0.0.0.0                # 绑定地址（支持 unix:/path/to/sock 使用 UDS）
   timeout: 30.0                # 全局请求超时（秒）
-  log_level: info              # 日志级别：trace, debug, info, warn, error
   threads: null                # Tokio 工作线程数（null = 自动 = CPU 核数）
   transport: zmq               # Worker IPC 传输：zmq 或 uds
   cache_registry: false        # 缓存模型注册表到磁盘
   graceful_timeout: 30.0       # 优雅关闭时等待进行中请求的最大秒数
   keepalive_timeout: 5.0       # HTTP keep-alive 超时（秒），0 = 禁用
+
+logging:
+  level: info                  # 日志级别：trace, debug, info, warn, error
+  info_output: null            # info 级别日志的独立文件
+  error_output: null           # error 级别日志的独立文件
+  rotation: none               # none, size, daily, hourly
+  max_size: 100                # 最大日志文件大小（MB），rotation=size 时生效
+  backup_count: 7              # 保留的轮转日志文件数
 
 grpc:
   enabled: true                # 启用 gRPC 服务
@@ -29,25 +36,8 @@ grpc:
 metrics:
   enabled: true                # 启用 Prometheus 指标端点
 
-logging:
-  mode: queue                  # direct 或 queue（异步日志）
-  level: info                  # 日志级别（同 server.log_level）
-  format: text                 # text 或 json
-  output: null                 # 日志文件路径（null = 仅 stdout）
-  info_output: null            # info 级别日志的独立文件
-  error_output: null           # error 级别日志的独立文件
-  rotation: none               # none, size, time
-  rotate_by: none              # 轮转触发条件（size: "100MB", time: "daily"）
-  max_size: 100                # 最大日志文件大小（MB）
-  when: midnight               # 轮转时间（rotation=time 时）：midnight, hourly 等
-  backup_count: 7              # 保留的轮转日志文件数
-
 model_repository:
   path: ./model_repo           # 模型仓库目录
-
-webui:
-  enabled: true                # 启用 Web UI 仪表盘
-  report_retention_days: 30    # 报告保留天数
 
 features:
   timeline: false              # 启用历史指标时间线

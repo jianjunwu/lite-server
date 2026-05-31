@@ -15,12 +15,19 @@ server:
   metrics_port: 8002           # Prometheus metrics port
   host: 0.0.0.0                # Bind address (supports unix:/path/to/sock for UDS)
   timeout: 30.0                # Global request timeout (seconds)
-  log_level: info              # Log level: trace, debug, info, warn, error
   threads: null                # Tokio worker threads (null = auto = CPU cores)
   transport: zmq               # Worker IPC transport: "zmq" or "uds"
   cache_registry: false        # Cache model registry to disk
   graceful_timeout: 30.0       # Max seconds to wait for in-flight requests during shutdown
   keepalive_timeout: 5.0       # HTTP keep-alive timeout (seconds), 0 = disable
+
+logging:
+  level: info                  # Log level: trace, debug, info, warn, error
+  info_output: null            # Separate file for info-level logs
+  error_output: null           # Separate file for error-level logs
+  rotation: none               # none, size, daily, hourly
+  max_size: 100                # Max log file size in MB (rotation=size)
+  backup_count: 7              # Number of rotated log files to keep
 
 grpc:
   enabled: true                # Enable gRPC server
@@ -29,25 +36,8 @@ grpc:
 metrics:
   enabled: true                # Enable Prometheus metrics endpoint
 
-logging:
-  mode: queue                  # "direct" or "queue" (async logging)
-  level: info                  # Log level (same as server.log_level)
-  format: text                 # "text" or "json"
-  output: null                 # Log file path (null = stdout only)
-  info_output: null            # Separate file for info-level logs
-  error_output: null           # Separate file for error-level logs
-  rotation: none               # "none", "size", "time"
-  rotate_by: none              # Rotation trigger (for size: "100MB", for time: "daily")
-  max_size: 100                # Max log file size in MB (when rotation=none)
-  when: midnight               # Rotation time (when rotation=time): "midnight", "hourly", etc.
-  backup_count: 7              # Number of rotated log files to keep
-
 model_repository:
   path: ./model_repo           # Path to the model repository directory
-
-webui:
-  enabled: true                # Enable Web UI dashboard
-  report_retention_days: 30    # Days to retain reports
 
 features:
   timeline: false              # Enable historical metric timeline

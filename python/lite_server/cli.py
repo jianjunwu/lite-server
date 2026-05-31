@@ -24,6 +24,9 @@ def main(argv=None):
     serve_parser.add_argument("--model-repo", help="Model repository path")
     serve_parser.add_argument("--timeout", type=float, help="Request timeout")
     serve_parser.add_argument("--log-level", help="Log level")
+    serve_parser.add_argument("--log-info-output", help="Info log file path")
+    serve_parser.add_argument("--log-error-output", help="Error log file path")
+    serve_parser.add_argument("--log-rotation", help="Log rotation: none, size, daily, hourly")
     serve_parser.add_argument("--no-metrics", action="store_true", help="Disable metrics")
     serve_parser.add_argument("--transport", help="Worker transport: zmq or uds")
     serve_parser.add_argument("--grpc-port", type=int, help="gRPC server port")
@@ -111,6 +114,9 @@ def _cmd_serve(args):
             threads=args.threads,
             timeout=args.timeout,
             log_level=args.log_level,
+            log_info_output=args.log_info_output,
+            log_error_output=args.log_error_output,
+            log_rotation=args.log_rotation,
             no_metrics=args.no_metrics,
             transport=args.transport,
             grpc_port=args.grpc_port,

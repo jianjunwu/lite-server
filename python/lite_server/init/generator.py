@@ -189,10 +189,17 @@ SERVER_YAML = textwrap.dedent("""\
       http_port: 8000
       grpc_port: 8001
       metrics_port: 8002
-      log_level: info
       # timeout: 30.0               # Request timeout in seconds
       # threads: 4                  # Tokio worker threads (None = auto = CPU cores)
       # transport: mp               # mp | zmq
+
+    logging:
+      level: info
+      # info_output: null           # Info log file path
+      # error_output: null          # Error log file path
+      # rotation: none              # none, size, daily, hourly
+      # max_size: 100               # Max log file size in MB (rotation=size)
+      # backup_count: 7             # Number of rotated log files to keep
 
     grpc:
       enabled: {grpc}
@@ -207,9 +214,6 @@ SERVER_YAML = textwrap.dedent("""\
       control_mode: explicit
       load_models:
         - {model_name}
-
-    webui:
-      enabled: {webui}
 """)
 
 TEST_REQUEST_PY = textwrap.dedent('''\
@@ -493,10 +497,9 @@ class ProjectGenerator:
         # Server config
         grpc = str(self.options.get("grpc", True)).lower()
         metrics = str(self.options.get("metrics", True)).lower()
-        webui = str(self.options.get("webui", True)).lower()
         (root / "server.yaml").write_text(
             SERVER_YAML.format(
-                grpc=grpc, metrics=metrics, webui=webui, model_name=self.model_name
+                grpc=grpc, metrics=metrics, model_name=self.model_name
             )
         )
 

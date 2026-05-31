@@ -14,8 +14,8 @@ class TestRunWizard:
 
     def test_generates_project_with_defaults(self, tmp_path, monkeypatch):
         # project_name, template(default=empty), model_name(default=my_model),
-        # grpc(y), metrics(y), webui(y), batch(n), stream(n)
-        inputs = iter(["myproj", "", "", "", "", "", "", ""])
+        # grpc(y), metrics(y), batch(n), stream(n)
+        inputs = iter(["myproj", "", "", "", "", "", ""])
         monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
 
         run_wizard(output_dir=str(tmp_path))
@@ -25,7 +25,7 @@ class TestRunWizard:
         assert (root / "server.yaml").exists()
 
     def test_uses_empty_template_by_default(self, tmp_path, monkeypatch):
-        inputs = iter(["myproj", "", "", "", "", "", "", ""])
+        inputs = iter(["myproj", "", "", "", "", "", ""])
         monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
 
         run_wizard(output_dir=str(tmp_path))
@@ -37,7 +37,7 @@ class TestRunWizard:
         assert "class MyAPI" in text or "class MyModel" in text
 
     def test_custom_model_name(self, tmp_path, monkeypatch):
-        inputs = iter(["myproj", "", "classifier", "", "", "", "", ""])
+        inputs = iter(["myproj", "", "classifier", "", "", "", ""])
         monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
 
         run_wizard(output_dir=str(tmp_path))
@@ -46,7 +46,7 @@ class TestRunWizard:
         assert (root / "model_repo" / "classifier").exists()
 
     def test_enables_features_when_yes(self, tmp_path, monkeypatch):
-        inputs = iter(["myproj", "", "", "y", "y", "y", "y", "y"])
+        inputs = iter(["myproj", "", "", "y", "y", "y", "y"])
         monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
 
         run_wizard(output_dir=str(tmp_path))
@@ -56,7 +56,7 @@ class TestRunWizard:
         assert "enabled: true" in cfg
 
     def test_skips_features_when_no(self, tmp_path, monkeypatch):
-        inputs = iter(["myproj", "", "", "n", "n", "n", "n", "n"])
+        inputs = iter(["myproj", "", "", "n", "n", "n", "n"])
         monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
 
         run_wizard(output_dir=str(tmp_path))

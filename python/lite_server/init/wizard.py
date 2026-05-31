@@ -77,7 +77,6 @@ def run_wizard(output_dir: str = ".") -> None:
     print("\n--- Service Configuration ---")
     grpc = _ask_yn("Enable gRPC?", default=True)
     metrics = _ask_yn("Enable Prometheus metrics?", default=True)
-    webui = _ask_yn("Enable Web UI?", default=True)
 
     print("\n--- Inference Features ---")
     batch = _ask_yn("Enable dynamic batching?", default=False)
@@ -86,7 +85,6 @@ def run_wizard(output_dir: str = ".") -> None:
     options: dict[str, Any] = {
         "grpc": grpc,
         "metrics": metrics,
-        "webui": webui,
         "batch": batch,
         "stream": stream,
     }

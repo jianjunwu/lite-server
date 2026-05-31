@@ -43,6 +43,18 @@ enum Commands {
         #[arg(long)]
         log_level: Option<String>,
 
+        /// Info log file path
+        #[arg(long)]
+        log_info_output: Option<String>,
+
+        /// Error log file path
+        #[arg(long)]
+        log_error_output: Option<String>,
+
+        /// Log rotation strategy: none, size, daily, hourly
+        #[arg(long)]
+        log_rotation: Option<String>,
+
         /// Metrics server port
         #[arg(long)]
         metrics_port: Option<u16>,
@@ -119,6 +131,9 @@ fn main() {
             threads,
             timeout,
             log_level,
+            log_info_output,
+            log_error_output,
+            log_rotation,
             metrics_port,
             no_metrics,
             log_verbose,
@@ -155,6 +170,9 @@ fn main() {
                 timeout,
                 transport,
                 log_level,
+                log_info_output,
+                log_error_output,
+                log_rotation,
                 grpc_port,
                 metrics_port,
                 no_grpc,
@@ -177,6 +195,7 @@ fn main() {
                 cfg.logging.error_output.as_deref(),
                 &cfg.logging.rotation,
                 cfg.logging.max_size,
+                cfg.logging.backup_count,
                 log_verbose,
             );
 
