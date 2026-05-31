@@ -34,6 +34,7 @@ Start from example 01 and work your way up. Each example builds on concepts from
 | 05 | [ensemble](05_ensemble/) | Multi-model DAG pipeline | Ensemble config, parallel step execution, `$request`/`$step` refs |
 | 06 | [custom_endpoint](06_custom_endpoint/) | Custom HTTP routes | `*_endpoint.py` auto-discovery, server context access |
 | 07 | [custom_params](07_custom_params/) | Config-driven behavior | `self.config`, custom YAML fields |
+| 08 | [openai_compatible](08_openai_compatible/) | OpenAI-compatible endpoint | `OpenAIEndpoint` base class, `/v1/chat/completions` |
 
 ## Running Any Example
 
@@ -145,6 +146,31 @@ curl -X POST http://localhost:8000/v2/models/threshold/infer \
   -H 'Content-Type: application/json' \
   -d '{"score": 0.3}'
 # => {"label": "negative", "score": 0.3, "threshold": 0.5}
+```
+
+### 08 OpenAI-Compatible Endpoint
+
+```bash
+# Non-streaming chat completion
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "demo-chat",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+# => {"id":"chatcmpl-xxx","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"Echo: Hello!"},"finish_reason":"stop"}],...}
+
+# Streaming chat completion
+curl -N -X POST http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "demo-chat",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
+# => data: {"choices":[{"delta":{"content":"E"},...}]}
+# => data: {"choices":[{"delta":{"content":"c"},...}]}
+# => ...
 ```
 
 ## More Documentation

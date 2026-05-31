@@ -193,6 +193,7 @@ lite-server init my_project           # 脚手架创建项目
 | 05 | [ensemble](examples/05_ensemble/) | DAG 多模型流水线 |
 | 06 | [custom_endpoint](examples/06_custom_endpoint/) | 自定义 HTTP 端点 |
 | 07 | [custom_params](examples/07_custom_params/) | 配置驱动的模型行为 |
+| 08 | [openai_compatible](examples/08_openai_compatible/) | OpenAI 兼容聊天端点 |
 
 详见 [examples/README.md](examples/README.md) 获取学习路径和使用说明。
 
@@ -200,6 +201,7 @@ lite-server init my_project           # 脚手架创建项目
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
+| POST | `/v1/chat/completions` | OpenAI 兼容聊天完成 |
 | POST | `/v2/models/{name}/infer` | 推理（活跃版本） |
 | POST | `/v2/models/{name}/versions/{v}/infer` | 推理（指定版本） |
 | POST | `/v2/models/{name}/events` | SSE 流式 |

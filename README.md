@@ -195,6 +195,7 @@ See [examples/](examples/) for runnable model repositories:
 | 05 | [ensemble](examples/05_ensemble/) | DAG-based multi-model pipeline |
 | 06 | [custom_endpoint](examples/06_custom_endpoint/) | Custom HTTP endpoint |
 | 07 | [custom_params](examples/07_custom_params/) | Config-driven model behavior |
+| 08 | [openai_compatible](examples/08_openai_compatible/) | OpenAI-compatible chat endpoint |
 
 See [examples/README.md](examples/README.md) for learning path and usage details.
 
@@ -202,6 +203,7 @@ See [examples/README.md](examples/README.md) for learning path and usage details
 
 | Method | Path | Description |
 |--------|------|-------------|
+| POST | `/v1/chat/completions` | OpenAI-compatible chat completion |
 | POST | `/v2/models/{name}/infer` | Inference (active version) |
 | POST | `/v2/models/{name}/versions/{v}/infer` | Inference (specific version) |
 | POST | `/v2/models/{name}/events` | SSE streaming |

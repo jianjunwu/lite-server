@@ -275,6 +275,103 @@ class CustomBatchModel(LitAPI):
 
 See [examples/02_batching](../examples/02_batching/) for a runnable demo.
 
+## OpenAI-Compatible Endpoint
+
+For OpenAI-compatible chat completion endpoints, use the `OpenAIEndpoint` base class instead of `LitAPI`. This auto-registers `/v1/chat/completions` and handles the OpenAI request/response format.
+
+### Basic Usage
+
+```python
+from lite_server.specs.openai import OpenAIEndpoint
+
+class ChatModel(OpenAIEndpoint):
+    model = "my-chat-model"
+
+    def setup(self):
+        """Initialize model resources."""
+        self.llm = load_llm()
+
+    def decode_request(self, request):
+        """Extract prompt from OpenAI messages format."""
+        messages = request.get("messages", [])
+        # Convert messages to prompt string
+        return "\n".join(m["content"] for m in messages if m.get("role") == "user")
+
+    def predict(self, x):
+        """Generate response. Return str or dict with 'text' key."""
+        return self.llm.generate(x)
+```
+
+Save as `model_repo/{model_name}/{version}/model.py`. The endpoint is automatically available at `/v1/chat/completions`.
+
+### Streaming Support
+
+Override `stream_predict()` to enable SSE streaming:
+
+```python
+import asyncio
+
+class StreamingChatModel(OpenAIEndpoint):
+    model = "streaming-chat"
+
+    def setup(self):
+        self.llm = load_llm()
+
+    def decode_request(self, request):
+        messages = request.get("messages", [])
+        return "\n".join(m["content"] for m in messages if m.get("role") == "user")
+
+    def predict(self, x):
+        return self.llm.generate(x)
+
+    async def stream_predict(self, x):
+        """Yield OpenAI streaming chunks."""
+        for token in self.llm.generate_stream(x):
+            yield {
+                "choices": [{"delta": {"content": token}, "index": 0}]
+            }
+            await asyncio.sleep(0.02)
+        # Final chunk signals completion
+        yield {
+            "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}]
+        }
+```
+
+When `stream: true` is in the request, the server uses `stream_predict()`. If not overridden, it falls back to `predict()` wrapped as a single chunk.
+
+### Custom Response Format
+
+Override `encode_response()` for custom OpenAI response format:
+
+```python
+class CustomResponseModel(OpenAIEndpoint):
+    def encode_response(self, output):
+        return {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": self.model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": output["text"]},
+                "finish_reason": "stop"
+            }],
+            "usage": output.get("usage", {"prompt_tokens": 0, "completion_tokens": 0})
+        }
+```
+
+### OpenAIEndpoint vs LitAPI
+
+| Aspect | `OpenAIEndpoint` | `LitAPI` |
+|--------|------------------|----------|
+| Route | `/v1/chat/completions` (auto-registered) | `/v2/models/{name}/infer` |
+| Request format | OpenAI chat format (`messages` array) | Custom JSON |
+| Response format | OpenAI completion format | Custom JSON |
+| Streaming | `stream_predict()` async generator | `stream_predict()` generator |
+| Use case | OpenAI-compatible APIs | Custom inference endpoints |
+
+See [examples/08_openai_compatible](../examples/08_openai_compatible/) for a runnable demo.
+
 ## Bidirectional Streaming
 
 For real-time bidirectional communication (e.g., ASR):
