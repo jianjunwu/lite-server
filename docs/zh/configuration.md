@@ -16,7 +16,7 @@ server:
   host: 0.0.0.0                # 绑定地址（支持 unix:/path/to/sock 使用 UDS）
   timeout: 30.0                # 全局请求超时（秒）
   log_level: info              # 日志级别：trace, debug, info, warn, error
-  http_workers: null           # HTTP 工作线程数（null = 自动，通常等于 CPU 核数）
+  threads: null                # Tokio 工作线程数（null = 自动 = CPU 核数）
   transport: zmq               # Worker IPC 传输：zmq 或 uds
   cache_registry: false        # 缓存模型注册表到磁盘
   graceful_timeout: 30.0       # 优雅关闭时等待进行中请求的最大秒数

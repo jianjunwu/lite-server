@@ -31,9 +31,9 @@ enum Commands {
         #[arg(long)]
         model_repo: Option<String>,
 
-        /// Number of HTTP worker threads (tokio)
+        /// Number of Tokio worker threads (null = auto = CPU cores)
         #[arg(long)]
-        http_workers: Option<usize>,
+        threads: Option<usize>,
 
         /// Request timeout in seconds
         #[arg(long)]
@@ -107,8 +107,7 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let cli = Cli::parse();
 
     match cli.command {
@@ -117,7 +116,7 @@ async fn main() {
             port,
             host,
             model_repo,
-            http_workers,
+            threads,
             timeout,
             log_level,
             metrics_port,
@@ -152,7 +151,7 @@ async fn main() {
                 port,
                 host,
                 model_repo,
-                http_workers,
+                threads,
                 timeout,
                 transport,
                 log_level,
@@ -186,8 +185,10 @@ async fn main() {
             info!("Metrics port: {}", cfg.server.metrics_port);
             info!("Model repo: {}", cfg.model_repository.path);
 
+            // Build tokio runtime with configured thread count
+            let rt = build_runtime(cfg.server.threads);
             let server = LiteServer::new(cfg);
-            if let Err(e) = server.run().await {
+            if let Err(e) = rt.block_on(server.run()) {
                 error!("Server error: {}", e);
                 std::process::exit(1);
             }
@@ -207,6 +208,25 @@ async fn main() {
                     std::process::exit(1);
                 }
             }
+        }
+    }
+}
+
+fn build_runtime(threads: Option<usize>) -> tokio::runtime::Runtime {
+    match threads {
+        Some(1) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build single-threaded tokio runtime"),
+        n => {
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            builder.enable_all();
+            if let Some(t) = n {
+                builder.worker_threads(t);
+            }
+            builder
+                .build()
+                .expect("failed to build multi-threaded tokio runtime")
         }
     }
 }

@@ -37,7 +37,7 @@ lite-server serve [OPTIONS]
 | `--host` | string | 0.0.0.0 | Bind address. Use `unix:/path/to/sock` for Unix domain sockets |
 | `--timeout` | float | 30.0 | Global request timeout in seconds |
 | `--log-level` | string | info | Log level: `trace`, `debug`, `info`, `warn`, `error` |
-| `--http-workers` | int | auto | Number of HTTP worker threads (Tokio) |
+| `--threads` | int | auto | Number of Tokio worker threads |
 | `--transport` | string | zmq | Worker IPC transport: `zmq` or `uds` |
 | `--graceful-timeout` | float | 30.0 | Max seconds to wait for in-flight requests during shutdown |
 | `--keepalive-timeout` | float | 5.0 | HTTP keep-alive timeout in seconds. 0 = disable |

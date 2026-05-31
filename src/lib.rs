@@ -25,7 +25,7 @@ pub fn run_server(
     port: Option<u16>,
     host: Option<String>,
     model_repo: Option<String>,
-    http_workers: Option<usize>,
+    threads: Option<usize>,
     timeout: Option<f32>,
     log_level: Option<String>,
     metrics_port: Option<u16>,
@@ -53,7 +53,7 @@ pub fn run_server(
         port,
         host,
         model_repo,
-        http_workers,
+        threads,
         timeout,
         transport,
         log_level,
@@ -86,14 +86,34 @@ pub fn run_server(
     info!("Metrics port: {}", cfg.server.metrics_port);
     info!("Model repo: {}", cfg.model_repository.path);
 
+    let threads = cfg.server.threads;
     let server = server::LiteServer::new(cfg);
 
-    let rt = tokio::runtime::Runtime::new()?;
+    let rt = build_runtime(threads);
     rt.block_on(async {
         server.run().await.map_err(|e| {
             Box::<dyn std::error::Error + Send + Sync>::from(format!("Server error: {}", e))
         })
     })
+}
+
+fn build_runtime(threads: Option<usize>) -> tokio::runtime::Runtime {
+    match threads {
+        Some(1) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build single-threaded tokio runtime"),
+        n => {
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            builder.enable_all();
+            if let Some(t) = n {
+                builder.worker_threads(t);
+            }
+            builder
+                .build()
+                .expect("failed to build multi-threaded tokio runtime")
+        }
+    }
 }
 
 #[cfg(feature = "python")]
@@ -103,7 +123,7 @@ pub fn run_server(
     port=None,
     host=None,
     model_repo=None,
-    http_workers=None,
+    threads=None,
     timeout=None,
     log_level=None,
     metrics_port=None,
@@ -125,7 +145,7 @@ fn serve(
     port: Option<u16>,
     host: Option<String>,
     model_repo: Option<String>,
-    http_workers: Option<usize>,
+    threads: Option<usize>,
     timeout: Option<f32>,
     log_level: Option<String>,
     metrics_port: Option<u16>,
@@ -145,7 +165,7 @@ fn serve(
     pyo3::Python::with_gil(|py| {
         py.allow_threads(|| {
             run_server(
-                config, port, host, model_repo, http_workers, timeout, log_level, metrics_port,
+                config, port, host, model_repo, threads, timeout, log_level, metrics_port,
                 no_metrics, transport, grpc_port, no_grpc, no_streaming_metrics, log_verbose,
                 max_queue_size, max_requests, max_requests_jitter, request_timeout, None,
                 graceful_timeout, keepalive_timeout,

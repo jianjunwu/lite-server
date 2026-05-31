@@ -25,7 +25,7 @@ pub struct ServerConfig {
     pub host: String,
     pub timeout: f32,
     pub log_level: String,
-    pub http_workers: Option<usize>,
+    pub threads: Option<usize>,
     pub transport: String,
     pub cache_registry: bool,
     /// Max seconds to wait for in-flight requests during graceful shutdown.
@@ -43,7 +43,7 @@ impl Default for ServerConfig {
             host: "0.0.0.0".to_string(),
             timeout: 30.0,
             log_level: "info".to_string(),
-            http_workers: None,
+            threads: None,
             transport: "zmq".to_string(),
             cache_registry: false,
             graceful_timeout: 30.0,
@@ -368,7 +368,7 @@ pub struct CliOverrides {
     pub port: Option<u16>,
     pub host: Option<String>,
     pub model_repo: Option<String>,
-    pub http_workers: Option<usize>,
+    pub threads: Option<usize>,
     pub timeout: Option<f32>,
     pub transport: Option<String>,
     pub log_level: Option<String>,
@@ -399,8 +399,8 @@ impl Config {
         if let Some(ref r) = cli.model_repo {
             self.model_repository.path = r.clone();
         }
-        if let Some(w) = cli.http_workers {
-            self.server.http_workers = Some(w);
+        if let Some(t) = cli.threads {
+            self.server.threads = Some(t);
         }
         if let Some(t) = cli.timeout {
             self.server.timeout = t;

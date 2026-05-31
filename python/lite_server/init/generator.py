@@ -170,7 +170,7 @@ SERVER_YAML = textwrap.dedent("""\
     #   server.grpc_port     - gRPC service port (requires grpc.enabled=true)
     #   server.metrics_port  - Prometheus /metrics endpoint port
     #   server.timeout       - Per-request timeout in seconds
-    #   server.http_workers  - Tokio worker threads (None = auto = num CPUs)
+    #   server.threads       - Tokio worker threads (None = auto = num CPUs)
     #   server.transport     - Worker transport: "mp" (multiprocessing) or "zmq"
     #
     #   model_repository.path - Root directory for model versions
@@ -191,7 +191,7 @@ SERVER_YAML = textwrap.dedent("""\
       metrics_port: 8002
       log_level: info
       # timeout: 30.0               # Request timeout in seconds
-      # http_workers: 1             # HTTP worker processes (None = auto)
+      # threads: 4                  # Tokio worker threads (None = auto = CPU cores)
       # transport: mp               # mp | zmq
 
     grpc:

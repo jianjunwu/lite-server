@@ -16,7 +16,7 @@ server:
   host: 0.0.0.0                # Bind address (supports unix:/path/to/sock for UDS)
   timeout: 30.0                # Global request timeout (seconds)
   log_level: info              # Log level: trace, debug, info, warn, error
-  http_workers: null           # HTTP worker threads (null = auto, typically CPU cores)
+  threads: null                # Tokio worker threads (null = auto = CPU cores)
   transport: zmq               # Worker IPC transport: "zmq" or "uds"
   cache_registry: false        # Cache model registry to disk
   graceful_timeout: 30.0       # Max seconds to wait for in-flight requests during shutdown

@@ -35,6 +35,7 @@ def main(argv=None):
     serve_parser.add_argument("--max-requests-jitter", type=int, help="Jitter range for max_requests to prevent thundering herd")
     serve_parser.add_argument("--request-timeout", type=float, help="Per-request hard timeout in seconds (0=disabled)")
     serve_parser.add_argument("--graceful-timeout", type=float, help="Graceful shutdown timeout in seconds")
+    serve_parser.add_argument("--threads", type=int, help="Number of Tokio worker threads (default: auto = CPU cores)")
     serve_parser.add_argument("--keepalive-timeout", type=float, help="HTTP keep-alive timeout in seconds (0=disabled)")
 
     # config-check
@@ -107,6 +108,7 @@ def _cmd_serve(args):
             port=args.port,
             host=args.host,
             model_repo=args.model_repo,
+            threads=args.threads,
             timeout=args.timeout,
             log_level=args.log_level,
             no_metrics=args.no_metrics,
