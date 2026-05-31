@@ -263,6 +263,32 @@ class TestModelUnpacker:
         assert (target / "1" / "model.py").exists()
         assert (target / "1" / "config.yaml").exists()
 
+    def test_unpack_and_validate_extracts_and_verifies(self, artifact, tmp_path):
+        """Single-pass: extract files and validate checksums together."""
+        unpacker = ModelUnpacker(artifact)
+        target = tmp_path / "extracted"
+        manifest = unpacker.unpack_and_validate(target)
+
+        assert manifest.name == "my_model"
+        assert (target / "1" / "model.py").read_text() == "print('hello')"
+        assert (target / "1" / "config.yaml").read_text() == "stream: true\n"
+
+    def test_unpack_and_validate_detects_corruption(self, artifact, tmp_path):
+        """Single-pass: corrupted file must be detected during extraction."""
+        tampered = tmp_path / "tampered.lma"
+        with zipfile.ZipFile(artifact, "r") as src:
+            with zipfile.ZipFile(tampered, "w") as dst:
+                for info in src.infolist():
+                    if info.filename == "1/model.py":
+                        dst.writestr(info, "tampered content")
+                    else:
+                        dst.writestr(info, src.read(info.filename))
+
+        unpacker = ModelUnpacker(tampered)
+        target = tmp_path / "extracted"
+        with pytest.raises(ArtifactCorruptedError, match="Checksum mismatch"):
+            unpacker.unpack_and_validate(target)
+
     def test_file_not_found(self, tmp_path):
         unpacker = ModelUnpacker(tmp_path / "missing.lma")
         with pytest.raises(FileNotFoundError):

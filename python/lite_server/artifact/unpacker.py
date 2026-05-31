@@ -87,3 +87,61 @@ class ModelUnpacker:
                 zf.extractall(target_dir)
 
         return target_dir
+
+    def unpack_and_validate(self, target_dir: Path | str, verify_key: Optional[bytes] = None) -> Manifest:
+        """Extract and validate checksums in a single pass.
+
+        Streams each file from the zip, computes SHA256 on the fly,
+        validates against the manifest, and writes to disk — all in one
+        read of the zip archive.
+
+        Returns:
+            The validated Manifest.
+
+        Raises:
+            ArtifactCorruptedError: If a file is missing or checksum mismatches.
+            SignatureInvalidError: If signature verification fails.
+        """
+        target_dir = Path(target_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        if not self.artifact_path.exists():
+            raise FileNotFoundError(f"Artifact not found: {self.artifact_path}")
+
+        with zipfile.ZipFile(self.artifact_path, "r") as zf:
+            manifest_raw = zf.read("manifest.json").decode("utf-8")
+            manifest = Manifest.from_dict(json.loads(manifest_raw))
+            self.manifest = manifest
+
+            for rel_path, entry in manifest.files.items():
+                try:
+                    info = zf.getinfo(rel_path)
+                except KeyError:
+                    raise ArtifactCorruptedError(f"File missing in artifact: {rel_path}")
+
+                # Single pass: stream-read, hash, and write
+                h = hashlib.sha256()
+                out_path = target_dir / rel_path
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(info) as src, open(out_path, "wb") as dst:
+                    while chunk := src.read(65536):
+                        h.update(chunk)
+                        dst.write(chunk)
+
+                actual = h.hexdigest()
+                if actual != entry.sha256:
+                    raise ArtifactCorruptedError(
+                        f"Checksum mismatch for {rel_path}: "
+                        f"expected {entry.sha256[:16]}..., got {actual[:16]}..."
+                    )
+
+            # Verify signature
+            if verify_key and manifest.signature:
+                manifest_dict = json.loads(manifest_raw)
+                manifest_dict.pop("signature", None)
+                canonical = json.dumps(manifest_dict, sort_keys=True, separators=(",", ":"))
+                expected = hmac.new(verify_key, canonical.encode(), hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(expected, manifest.signature):
+                    raise SignatureInvalidError("Artifact signature verification failed")
+
+        return manifest

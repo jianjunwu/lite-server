@@ -41,15 +41,15 @@ class ModelPacker:
         name = self.model_dir.name
         artifact_path = output_dir / f"{name}_v{self.version}.lma"
 
-        # Collect files and checksums
+        # Collect file metadata only (no content in memory)
         files: dict[str, FileEntry] = {}
-        file_data: dict[str, bytes] = {}
+        rel_paths: list[str] = []
 
         for path in sorted(self.model_dir.rglob("*")):
             if path.is_file() and not _should_ignore(path, self.model_dir):
                 rel = path.relative_to(self.model_dir).as_posix()
                 files[rel] = FileEntry(size=path.stat().st_size, sha256=_sha256_file(path))
-                file_data[rel] = path.read_bytes()
+                rel_paths.append(rel)
 
         self.manifest = Manifest(
             name=name,
@@ -66,12 +66,12 @@ class ModelPacker:
             sig = hmac.new(sign_key, canonical.encode(), hashlib.sha256)
             self.manifest.signature = sig.hexdigest()
 
-        # Write zip archive
+        # Write zip archive — read files from disk via zf.write()
         with zipfile.ZipFile(artifact_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("manifest.json", self.manifest.to_canonical_json())
-            for rel, data in sorted(file_data.items()):
-                zf.writestr(rel, data)
+            for rel in sorted(rel_paths):
+                zf.write(self.model_dir / rel, arcname=rel)
 
         self._artifact_path = artifact_path
-        self._file_paths = [(rel, self.model_dir / rel) for rel in file_data]
+        self._file_paths = [(rel, self.model_dir / rel) for rel in rel_paths]
         return artifact_path
