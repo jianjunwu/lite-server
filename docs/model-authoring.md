@@ -396,6 +396,109 @@ Enable in config:
 bidirectional: true
 ```
 
+## Custom Metrics
+
+Collect application-level metrics (gauges, counters, histograms) from your model code. Metrics flow through the same Prometheus endpoint as built-in server metrics (`/metrics`).
+
+### How It Works
+
+1. **Pre-register** metrics in `setup()` — returns a numeric ID
+2. **Report** values in `predict()` / `stream_predict()` using the ID
+3. Metrics are automatically attached to the response and recorded in Prometheus
+
+Pre-registration lets the server pre-allocate Prometheus objects, keeping the hot path zero-allocation (~50ns per `report_metric` call).
+
+### API
+
+```python
+def register_metric(self, name: str, metric_type: str) -> int
+```
+
+Pre-register a metric. Call in `setup()`. Returns a numeric ID.
+
+- `name`: Prometheus metric name (e.g. `"batch_size"`, `"cache_hit_rate"`)
+- `metric_type`: `"gauge"`, `"counter"`, or `"histogram"`
+
+```python
+def report_metric(self, metric_id: int, value: float) -> None
+```
+
+Report a metric value by ID. Call in `predict()` or `stream_predict()`.
+
+### Example
+
+```python
+import time
+from lite_server import LitAPI
+
+class MyModel(LitAPI):
+    def setup(self, device):
+        self.model = load_model()
+        # Pre-register metrics — one-time cost
+        self.g_batch_size = self.register_metric("my_batch_size", "gauge")
+        self.c_predictions = self.register_metric("my_predictions_total", "counter")
+        self.h_latency = self.register_metric("my_inference_ms", "histogram")
+
+    def predict(self, x):
+        start = time.time()
+        output = self.model(x)
+        elapsed_ms = (time.time() - start) * 1000
+
+        # Report metrics — hot path, ~50ns each
+        self.report_metric(self.g_batch_size, len(x) if isinstance(x, list) else 1)
+        self.report_metric(self.c_predictions, 1.0)
+        self.report_metric(self.h_latency, elapsed_ms)
+
+        return output
+```
+
+### Prometheus Output
+
+After sending requests, check `/metrics`:
+
+```
+# Gauge
+lite_server_my_batch_size{model="mymodel"} 32
+
+# Counter
+lite_server_my_predictions_total_total{model="mymodel"} 1542
+
+# Histogram
+lite_server_my_inference_ms_count{model="mymodel"} 1542
+lite_server_my_inference_ms_sum{model="mymodel"} 462.6
+lite_server_my_inference_ms_bucket{model="mymodel",le="0.1"} 1200
+lite_server_my_inference_ms_bucket{model="mymodel",le="0.5"} 1400
+...
+```
+
+### Metric Types
+
+| Type | Prometheus Type | Use Case |
+|------|----------------|----------|
+| `gauge` | Gauge | Current value: queue length, cache hit rate, GPU utilization |
+| `counter` | Counter (cumulative) | Monotonic count: total predictions, total errors, total tokens |
+| `histogram` | Histogram | Distribution: latency, batch size, token count per request |
+
+### Streaming Support
+
+Metrics work in all modes — standard, batch, streaming, and continuous batching. In streaming mode, metrics are collected after the generator completes and attached to the `StreamDone` message.
+
+```python
+def stream_predict(self, request):
+    for token in self.model.generate(request["prompt"]):
+        yield {"token": token}
+    # Metrics reported during generation are automatically collected
+    self.report_metric(self.c_predictions, 1.0)
+```
+
+### Notes
+
+- Metric names must not conflict with built-in Prometheus metrics (e.g. `lightserver_requests_total`)
+- IDs are per-LitAPI-instance — different models can register the same metric name (values are separated by the `model` label)
+- Default histogram buckets: `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]`
+
+See [examples/09_custom_metrics](../examples/09_custom_metrics/) for a runnable demo.
+
 ## Custom Parameters
 
 All fields in `config.yaml` are accessible in your model code via `self.config`. This lets you tune behavior without changing code.

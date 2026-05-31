@@ -140,6 +140,7 @@ Rust 内核处理所有 I/O（HTTP、gRPC、IPC、指标、文件监听），Pyt
 ### 可观测性
 
 - **Prometheus 指标** — QPS、P50/P90/P99 延迟、队列深度、TTFT、batch 大小、worker 剔除数
+- **自定义指标** — 通过 `register_metric()` / `report_metric()` 从模型代码采集 Gauge、Counter、Histogram
 - **时间线** — 每个模型的历史指标采样
 - **告警** — 内置异常检测告警规则
 - **结构化日志** — 基于 tracing 的日志，包含 model/worker 上下文
@@ -194,6 +195,7 @@ lite-server init my_project           # 脚手架创建项目
 | 06 | [custom_endpoint](examples/06_custom_endpoint/) | 自定义 HTTP 端点 |
 | 07 | [custom_params](examples/07_custom_params/) | 配置驱动的模型行为 |
 | 08 | [openai_compatible](examples/08_openai_compatible/) | OpenAI 兼容聊天端点 |
+| 09 | [custom_metrics](examples/09_custom_metrics/) | 自定义 Prometheus 指标（Gauge/Counter/Histogram） |
 
 详见 [examples/README.md](examples/README.md) 获取学习路径和使用说明。
 

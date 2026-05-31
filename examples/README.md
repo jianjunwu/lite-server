@@ -35,6 +35,7 @@ Start from example 01 and work your way up. Each example builds on concepts from
 | 06 | [custom_endpoint](06_custom_endpoint/) | Custom HTTP routes | `*_endpoint.py` auto-discovery, server context access |
 | 07 | [custom_params](07_custom_params/) | Config-driven behavior | `self.config`, custom YAML fields |
 | 08 | [openai_compatible](08_openai_compatible/) | OpenAI-compatible endpoint | `OpenAIEndpoint` base class, `/v1/chat/completions` |
+| 09 | [custom_metrics](09_custom_metrics/) | Custom Prometheus metrics | `register_metric()`, `report_metric()`, gauge/counter/histogram |
 
 ## Running Any Example
 
@@ -146,6 +147,24 @@ curl -X POST http://localhost:8000/v2/models/threshold/infer \
   -H 'Content-Type: application/json' \
   -d '{"score": 0.3}'
 # => {"label": "negative", "score": 0.3, "threshold": 0.5}
+```
+
+### 09 Custom Metrics
+
+```bash
+# Send requests to generate metric data
+for i in $(seq 1 10); do
+  curl -s -X POST http://localhost:8000/v2/models/metrics_demo/infer \
+    -H 'Content-Type: application/json' \
+    -d "{\"input\": $i}" &
+done
+wait
+
+# Check custom metrics in Prometheus output
+curl -s http://localhost:8000/metrics | grep demo_
+# => lite_server_demo_batch_size{model="metrics_demo"} 1
+# => lite_server_demo_predictions_total_total{model="metrics_demo"} 10
+# => lite_server_demo_inference_ms_count{model="metrics_demo"} 10
 ```
 
 ### 08 OpenAI-Compatible Endpoint

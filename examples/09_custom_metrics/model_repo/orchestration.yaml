@@ -1,0 +1,3 @@
+control_mode: explicit
+load_models:
+  - metrics_demo

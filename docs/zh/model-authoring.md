@@ -396,6 +396,109 @@ class ASRModel(LitAPI):
 bidirectional: true
 ```
 
+## 自定义指标
+
+从模型代码中采集应用级指标（Gauge、Counter、Histogram）。指标通过 Prometheus 端点 `/metrics` 自动暴露。
+
+### 工作原理
+
+1. **预注册**：在 `setup()` 中声明指标 → 返回数字 ID
+2. **上报**：在 `predict()` / `stream_predict()` 中使用 ID 上报值
+3. 指标自动附加到响应并记录到 Prometheus
+
+预注册让服务器预先分配 Prometheus 对象，热路径零分配（`report_metric` 约 50ns）。
+
+### API
+
+```python
+def register_metric(self, name: str, metric_type: str) -> int
+```
+
+预注册指标。在 `setup()` 中调用。返回数字 ID。
+
+- `name`：Prometheus 指标名（如 `"batch_size"`、`"cache_hit_rate"`）
+- `metric_type`：`"gauge"`、`"counter"` 或 `"histogram"`
+
+```python
+def report_metric(self, metric_id: int, value: float) -> None
+```
+
+通过预注册 ID 上报指标值。在 `predict()` 或 `stream_predict()` 中调用。
+
+### 示例
+
+```python
+import time
+from lite_server import LitAPI
+
+class MyModel(LitAPI):
+    def setup(self, device):
+        self.model = load_model()
+        # 预注册指标 — 一次性开销
+        self.g_batch_size = self.register_metric("my_batch_size", "gauge")
+        self.c_predictions = self.register_metric("my_predictions_total", "counter")
+        self.h_latency = self.register_metric("my_inference_ms", "histogram")
+
+    def predict(self, x):
+        start = time.time()
+        output = self.model(x)
+        elapsed_ms = (time.time() - start) * 1000
+
+        # 上报指标 — 热路径，约 50ns 每次
+        self.report_metric(self.g_batch_size, len(x) if isinstance(x, list) else 1)
+        self.report_metric(self.c_predictions, 1.0)
+        self.report_metric(self.h_latency, elapsed_ms)
+
+        return output
+```
+
+### Prometheus 输出
+
+发送请求后查看 `/metrics`：
+
+```
+# Gauge
+lite_server_my_batch_size{model="mymodel"} 32
+
+# Counter
+lite_server_my_predictions_total_total{model="mymodel"} 1542
+
+# Histogram
+lite_server_my_inference_ms_count{model="mymodel"} 1542
+lite_server_my_inference_ms_sum{model="mymodel"} 462.6
+lite_server_my_inference_ms_bucket{model="mymodel",le="0.1"} 1200
+lite_server_my_inference_ms_bucket{model="mymodel",le="0.5"} 1400
+...
+```
+
+### 指标类型
+
+| 类型 | Prometheus 类型 | 使用场景 |
+|------|----------------|----------|
+| `gauge` | Gauge | 当前值：队列长度、缓存命中率、GPU 利用率 |
+| `counter` | Counter（累计） | 单调计数：总预测次数、总错误数、总 token 数 |
+| `histogram` | Histogram | 分布：延迟、batch 大小、每请求 token 数 |
+
+### 流式支持
+
+指标在所有模式下均可使用 — 标准、批处理、流式和连续批处理。流式模式下，指标在生成器完成后收集并附加到 `StreamDone` 消息。
+
+```python
+def stream_predict(self, request):
+    for token in self.model.generate(request["prompt"]):
+        yield {"token": token}
+    # 生成期间上报的指标会自动收集
+    self.report_metric(self.c_predictions, 1.0)
+```
+
+### 注意事项
+
+- 指标名不得与内置 Prometheus 指标冲突（如 `lightserver_requests_total`）
+- ID 按 LitAPI 实例隔离 — 不同模型可注册相同指标名（值通过 `model` 标签区分）
+- 默认 Histogram 桶：`[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]`
+
+参见 [examples/09_custom_metrics](../examples/09_custom_metrics/) 获取可运行的示例。
+
 ## 自定义参数
 
 `config.yaml` 中的所有字段可通过 `self.config` 在模型代码中访问。这使你无需修改代码即可调整行为。

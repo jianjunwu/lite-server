@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, List, Tuple
 
 import litserve as ls
 
@@ -27,6 +27,14 @@ class RequestMeta:
     request_id: str
     timestamp_ns: int
     payload: Any  # decoded original request body
+
+
+@dataclass
+class _MetricSpec:
+    """Internal: pre-registered metric specification."""
+
+    name: str
+    metric_type: str  # "gauge" | "counter" | "histogram"
 
 
 class LitAPI(ls.LitAPI):
@@ -65,6 +73,8 @@ class LitAPI(ls.LitAPI):
         )
         self.config: dict[str, Any] = {}
         self._logger: logging.Logger | None = None
+        self._metric_specs: List[_MetricSpec] = []
+        self._metric_values: List[Tuple[int, float]] = []
 
     @property
     def logger(self) -> logging.Logger:
@@ -74,6 +84,37 @@ class LitAPI(ls.LitAPI):
                 self.__class__.__module__ + "." + self.__class__.__name__
             )
         return self._logger
+
+    # ===== Custom Metrics =====
+
+    def register_metric(self, name: str, metric_type: str) -> int:
+        """Pre-register a custom metric during ``setup()``.
+
+        Returns a numeric ID for use with :meth:`report_metric`.
+        Pre-registration lets the server pre-allocate Prometheus objects,
+        keeping the hot path zero-allocation.
+
+        Args:
+            name: Prometheus metric name (e.g. ``"cache_hit_rate"``).
+            metric_type: One of ``"gauge"``, ``"counter"``, or ``"histogram"``.
+
+        Returns:
+            Numeric metric ID.
+        """
+        idx = len(self._metric_specs)
+        self._metric_specs.append(_MetricSpec(name, metric_type))
+        return idx
+
+    def report_metric(self, metric_id: int, value: float) -> None:
+        """Report a metric value by pre-registered ID.
+
+        Hot path — only ``list.append((int, float))``, ~50 ns.
+
+        Args:
+            metric_id: ID returned by :meth:`register_metric`.
+            value: Metric value.
+        """
+        self._metric_values.append((metric_id, value))
 
     # ===== Streaming Hooks (optional) =====
 

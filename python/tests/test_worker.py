@@ -136,7 +136,7 @@ class TestRunPredict:
 
         meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
         data = json.dumps({"input": 5}).encode()
-        resp_bytes, status = inference._run_predict(MockAPI(), data, meta)
+        resp_bytes, status, metrics = inference._run_predict(MockAPI(), data, meta)
         assert json.loads(resp_bytes) == {"output": 10}
         assert status.code == "Ok"
 
@@ -151,7 +151,7 @@ class TestRunPredict:
 
         meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
         data = json.dumps({"input": 5}).encode()
-        resp_bytes, status = inference._run_predict(HookAPI(), data, meta)
+        resp_bytes, status, metrics = inference._run_predict(HookAPI(), data, meta)
         assert json.loads(resp_bytes) == {"output": 12}
 
     def test_on_request_hook_can_reject(self):
@@ -174,7 +174,7 @@ class TestRunPredict:
 
         meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
         data = json.dumps({"input": 5}).encode()
-        resp_bytes, status = inference._run_predict(PlainAPI(), data, meta)
+        resp_bytes, status, metrics = inference._run_predict(PlainAPI(), data, meta)
         assert json.loads(resp_bytes) == {"output": 10}
 
 
@@ -238,7 +238,7 @@ class TestHealthCheck:
             from lite_server.proto import Status
             status = Status(code="Ok", message="")
         else:
-            result, status = inference._run_predict(StrictAPI(), data, meta)
+            result, status, _ = inference._run_predict(StrictAPI(), data, meta)
 
         assert call_count == 0, "predict() should not be called for health check"
         assert status.code == "Ok"
@@ -256,6 +256,6 @@ class TestHealthCheck:
 
         meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
         data = json.dumps({"input": 1}).encode()
-        resp_bytes, status = inference._run_predict(CountingAPI(), data, meta)
+        resp_bytes, status, metrics = inference._run_predict(CountingAPI(), data, meta)
         assert call_count == 1
         assert status.code == "Ok"

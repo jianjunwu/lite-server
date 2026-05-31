@@ -23,6 +23,8 @@ from lite_server.proto import (
     CBCompletedResponse,
     CBRemoveRequest,
     CompletedSequence,
+    Metrics,
+    MetricValue,
     Request,
     Response,
     SingleRequest,
@@ -166,12 +168,12 @@ def _make_stream_chunk(stream_id: str, data: bytes, is_final: bool = False) -> R
     )
 
 
-def _make_stream_done(stream_id: str) -> Response:
+def _make_stream_done(stream_id: str, metrics=None) -> Response:
     return Response(
         uid=f"stream-done-{stream_id}",
         stream=StreamResponse(
             stream_id=stream_id,
-            done=StreamDone(),
+            done=StreamDone(metrics=metrics),
         ),
     )
 
@@ -188,7 +190,32 @@ def _meta_from_proto(meta_pb) -> RequestMeta:
     )
 
 
-def _run_predict(lit_api: LitAPI, data: bytes, meta: RequestMeta) -> tuple[bytes, Status]:
+def _collect_metrics(lit_api: LitAPI):
+    """Collect pre-registered custom metrics from the LitAPI instance."""
+    values = getattr(lit_api, "_metric_values", None)
+    if not values:
+        return None
+    specs = lit_api._metric_specs
+    gauges = []
+    counters = []
+    histograms = []
+    for mid, val in values:
+        if mid < len(specs):
+            spec = specs[mid]
+            mv = MetricValue(id=mid, value=val)
+            if spec.metric_type == "gauge":
+                gauges.append(mv)
+            elif spec.metric_type == "counter":
+                counters.append(mv)
+            elif spec.metric_type == "histogram":
+                histograms.append(mv)
+    lit_api._metric_values = []
+    if not gauges and not counters and not histograms:
+        return None
+    return Metrics(gauges=gauges, counters=counters, histograms=histograms)
+
+
+def _run_predict(lit_api: LitAPI, data: bytes, meta: RequestMeta):
     """Run the full predict pipeline with hooks."""
     raw = json.loads(data) if data else {}
     decoded = lit_api.decode_request(raw) if hasattr(lit_api, "decode_request") else raw
@@ -204,7 +231,8 @@ def _run_predict(lit_api: LitAPI, data: bytes, meta: RequestMeta) -> tuple[bytes
         encoded = lit_api.on_response(encoded, meta)
 
     resp_bytes = json.dumps(encoded).encode()
-    return resp_bytes, _make_status(True)
+    metrics = _collect_metrics(lit_api)
+    return resp_bytes, _make_status(True), metrics
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +257,8 @@ def _consume_stream_generator(lit_api: LitAPI, generator, stream_id: str, socket
         socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
         return
 
-    socket.send(_make_stream_done(stream_id).SerializeToString())
+    metrics = _collect_metrics(lit_api)
+    socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
 
 
 def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.Socket, active_streams: dict, log: logging.Logger):
@@ -241,9 +270,9 @@ def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.
     if not _has_stream_predict(lit_api):
         # Fallback: predict() once, send as single chunk
         try:
-            resp_bytes, status = _run_predict(lit_api, data, meta)
+            resp_bytes, status, metrics = _run_predict(lit_api, data, meta)
             socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=True).SerializeToString())
-            socket.send(_make_stream_done(stream_id).SerializeToString())
+            socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
         except Exception as e:
             socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
         return
@@ -320,10 +349,11 @@ def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log:
                         ),
                     )
                 else:
-                    resp_bytes, status = _run_predict(lit_api, request.single.data, meta)
+                    resp_bytes, status, metrics = _run_predict(lit_api, request.single.data, meta)
                     response = Response(
                         uid=uid,
                         single=SingleResponse(data=resp_bytes, status=status),
+                        metrics=metrics,
                     )
 
             elif request.HasField("batch"):
@@ -331,7 +361,7 @@ def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log:
                 items = []
                 for item in batch.items:
                     try:
-                        resp_bytes, status = _run_predict(lit_api, item.data, meta)
+                        resp_bytes, status, _item_metrics = _run_predict(lit_api, item.data, meta)
                     except Exception as e:
                         resp_bytes = json.dumps({"error": str(e)}).encode()
                         status = _make_status(False, str(e))
@@ -342,9 +372,12 @@ def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log:
                             status=status,
                         )
                     )
+                # Collect metrics once after all batch items
+                metrics = _collect_metrics(lit_api)
                 response = Response(
                     uid=uid,
                     batch=BatchResponse(items=items),
+                    metrics=metrics,
                 )
 
             elif request.HasField("stream"):
@@ -455,9 +488,11 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
                         if hasattr(lit_api, "on_response"):
                             encoded = lit_api.on_response(encoded, state.meta)
                         resp_bytes = json.dumps(encoded).encode()
+                        metrics = _collect_metrics(lit_api)
                         resp = Response(
                             uid=uid,
                             single=SingleResponse(data=resp_bytes, status=_make_status(True)),
+                            metrics=metrics,
                         )
                         socket.send(resp.SerializeToString())
                     except Exception as e:

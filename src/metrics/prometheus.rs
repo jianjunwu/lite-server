@@ -149,6 +149,15 @@ lazy_static! {
     static ref CUSTOM_HISTOGRAMS: std::sync::Mutex<HashMap<String, HistogramVec>> = std::sync::Mutex::new(HashMap::new());
 }
 
+// Pre-allocated custom metric objects, indexed by numeric ID (from register_metric).
+// Vec is append-only; registration is idempotent (duplicate specs reuse existing index).
+lazy_static! {
+    static ref CUSTOM_GAUGE_OBJECTS: std::sync::Mutex<Vec<GaugeVec>> = std::sync::Mutex::new(Vec::new());
+    static ref CUSTOM_COUNTER_OBJECTS: std::sync::Mutex<Vec<CounterVec>> = std::sync::Mutex::new(Vec::new());
+    static ref CUSTOM_HISTOGRAM_OBJECTS: std::sync::Mutex<Vec<HistogramVec>> = std::sync::Mutex::new(Vec::new());
+    static ref CUSTOM_METRIC_INDEX: std::sync::Mutex<HashMap<String, (String, usize)>> = std::sync::Mutex::new(HashMap::new());
+}
+
 pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(REQUESTS_TOTAL.clone()))?;
     REGISTRY.register(Box::new(REQUEST_DURATION.clone()))?;
@@ -311,6 +320,105 @@ pub fn record_worker_metrics(model: &str, metrics: Option<&crate::proto::liteser
             });
             let _ = counter.with_label_values(&[model]).inc_by(m.tokens_generated as f64);
         }
+        // Pre-registered custom metrics (numeric ID path)
+        record_custom_metrics(model, &m.gauges, &m.counters, &m.histograms);
+    }
+}
+
+// ===== Pre-registered custom metrics (numeric ID path) =====
+
+/// Pre-register custom metric objects during model setup.
+/// Each spec is (name, type) where type is "gauge", "counter", or "histogram".
+/// Objects are stored in order — the index IS the numeric ID used at record time.
+pub fn register_custom_metrics(specs: &[(&str, &str)]) {
+    let mut gauges = CUSTOM_GAUGE_OBJECTS.lock().unwrap();
+    let mut counters = CUSTOM_COUNTER_OBJECTS.lock().unwrap();
+    let mut histograms = CUSTOM_HISTOGRAM_OBJECTS.lock().unwrap();
+    let mut index = CUSTOM_METRIC_INDEX.lock().unwrap();
+
+    for (name, metric_type) in specs {
+        let key = format!("{}:{}", name, metric_type);
+        if index.contains_key(&key) {
+            continue; // already registered — idempotent
+        }
+        match *metric_type {
+            "gauge" => {
+                let idx = gauges.len();
+                let g = GaugeVec::new(
+                    prometheus::Opts::new(
+                        format!("lite_server_{}", name),
+                        format!("Custom gauge: {}", name),
+                    ),
+                    &["model"],
+                ).unwrap();
+                let _ = REGISTRY.register(Box::new(g.clone()));
+                gauges.push(g);
+                index.insert(key, ("gauge".to_string(), idx));
+            }
+            "counter" => {
+                let idx = counters.len();
+                let c = CounterVec::new(
+                    prometheus::Opts::new(
+                        format!("lite_server_{}_total", name),
+                        format!("Custom counter: {}", name),
+                    ),
+                    &["model"],
+                ).unwrap();
+                let _ = REGISTRY.register(Box::new(c.clone()));
+                counters.push(c);
+                index.insert(key, ("counter".to_string(), idx));
+            }
+            "histogram" => {
+                let idx = histograms.len();
+                let h = HistogramVec::new(
+                    HistogramOpts::new(
+                        format!("lite_server_{}", name),
+                        format!("Custom histogram: {}", name),
+                    )
+                    .buckets(vec![
+                        0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+                    ]),
+                    &["model"],
+                ).unwrap();
+                let _ = REGISTRY.register(Box::new(h.clone()));
+                histograms.push(h);
+                index.insert(key, ("histogram".to_string(), idx));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Record pre-registered custom metrics — hot path, O(1) per metric, no HashMap.
+pub fn record_custom_metrics(
+    model: &str,
+    gauges: &[crate::proto::liteserver::MetricValue],
+    counters: &[crate::proto::liteserver::MetricValue],
+    histograms: &[crate::proto::liteserver::MetricValue],
+) {
+    if !gauges.is_empty() {
+        let guard = CUSTOM_GAUGE_OBJECTS.lock().unwrap();
+        for mv in gauges {
+            if let Some(g) = guard.get(mv.id as usize) {
+                let _ = g.with_label_values(&[model]).set(mv.value as f64);
+            }
+        }
+    }
+    if !counters.is_empty() {
+        let guard = CUSTOM_COUNTER_OBJECTS.lock().unwrap();
+        for mv in counters {
+            if let Some(c) = guard.get(mv.id as usize) {
+                let _ = c.with_label_values(&[model]).inc_by(mv.value as f64);
+            }
+        }
+    }
+    if !histograms.is_empty() {
+        let guard = CUSTOM_HISTOGRAM_OBJECTS.lock().unwrap();
+        for mv in histograms {
+            if let Some(h) = guard.get(mv.id as usize) {
+                let _ = h.with_label_values(&[model]).observe(mv.value as f64);
+            }
+        }
     }
 }
 
@@ -423,6 +531,9 @@ mod tests {
             prefill_ms: 10.0,
             decode_ms: 5.0,
             tokens_generated: 100,
+            gauges: vec![],
+            counters: vec![],
+            histograms: vec![],
         };
         let m = Some(&metrics);
 
@@ -430,5 +541,57 @@ mod tests {
         record_worker_metrics("sync_m1", m);
         record_worker_metrics("sync_m2", m);
         record_worker_metrics("sync_m3", m);
+    }
+
+    #[test]
+    fn test_register_custom_metrics_and_record() {
+        use crate::proto::liteserver::MetricValue;
+
+        register_custom_metrics(&[
+            ("rcmr_gauge", "gauge"),
+            ("rcmr_counter", "counter"),
+            ("rcmr_histogram", "histogram"),
+        ]);
+
+        // Look up the IDs assigned by register_custom_metrics
+        let index = CUSTOM_METRIC_INDEX.lock().unwrap();
+        let gauge_id = index.get("rcmr_gauge:gauge").unwrap().1;
+        let counter_id = index.get("rcmr_counter:counter").unwrap().1;
+        let histogram_id = index.get("rcmr_histogram:histogram").unwrap().1;
+        drop(index);
+
+        let gauges = vec![MetricValue { id: gauge_id as i32, value: 42.0 }];
+        let counters = vec![MetricValue { id: counter_id as i32, value: 5.0 }];
+        let histograms = vec![MetricValue { id: histogram_id as i32, value: 0.15 }];
+        record_custom_metrics("rcmr_model", &gauges, &counters, &histograms);
+
+        let output = gather_metrics();
+        assert!(output.contains("lite_server_rcmr_gauge"), "gauge missing: {}", output);
+        assert!(output.contains("lite_server_rcmr_counter_total"), "counter missing: {}", output);
+        assert!(output.contains("lite_server_rcmr_histogram"), "histogram missing: {}", output);
+    }
+
+    #[test]
+    fn test_record_worker_metrics_with_custom_fields() {
+        use crate::proto::liteserver::{MetricValue, Metrics};
+
+        register_custom_metrics(&[("rwmc_gauge", "gauge")]);
+
+        let index = CUSTOM_METRIC_INDEX.lock().unwrap();
+        let gauge_id = index.get("rwmc_gauge:gauge").unwrap().1;
+        drop(index);
+
+        let metrics = Metrics {
+            prefill_ms: 0.0,
+            decode_ms: 0.0,
+            tokens_generated: 0,
+            gauges: vec![MetricValue { id: gauge_id as i32, value: 99.5 }],
+            counters: vec![],
+            histograms: vec![],
+        };
+        record_worker_metrics("rwmc_model", Some(&metrics));
+
+        let output = gather_metrics();
+        assert!(output.contains("lite_server_rwmc_gauge"), "custom gauge missing: {}", output);
     }
 }

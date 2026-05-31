@@ -218,3 +218,122 @@ class TestLogger:
         assert a.logger.name != b.logger.name
         assert "ModelA" in a.logger.name
         assert "ModelB" in b.logger.name
+
+
+class TestCustomMetrics:
+    """register_metric() and report_metric() custom metrics API."""
+
+    def _make_api(self):
+        from lite_server.api import LitAPI
+
+        class Dummy(LitAPI):
+            def setup(self, device): pass
+            def decode_request(self, request): return request
+            def predict(self, x): return x
+            def encode_response(self, output): return output
+
+        return Dummy()
+
+    def test_register_metric_returns_sequential_ids(self):
+        api = self._make_api()
+        id0 = api.register_metric("batch_size", "gauge")
+        id1 = api.register_metric("latency_ms", "histogram")
+        id2 = api.register_metric("errors", "counter")
+        assert id0 == 0
+        assert id1 == 1
+        assert id2 == 2
+
+    def test_register_metric_stores_specs(self):
+        api = self._make_api()
+        api.register_metric("a", "gauge")
+        api.register_metric("b", "counter")
+        assert len(api._metric_specs) == 2
+        assert api._metric_specs[0].name == "a"
+        assert api._metric_specs[0].metric_type == "gauge"
+        assert api._metric_specs[1].name == "b"
+        assert api._metric_specs[1].metric_type == "counter"
+
+    def test_report_metric_appends_to_buffer(self):
+        api = self._make_api()
+        g = api.register_metric("x", "gauge")
+        api.report_metric(g, 42.0)
+        api.report_metric(g, 99.5)
+        assert len(api._metric_values) == 2
+        assert api._metric_values[0] == (0, 42.0)
+        assert api._metric_values[1] == (0, 99.5)
+
+    def test_report_metric_initial_buffer_is_empty(self):
+        api = self._make_api()
+        assert api._metric_values == []
+
+    def test_multiple_metric_types(self):
+        api = self._make_api()
+        g = api.register_metric("g1", "gauge")
+        c = api.register_metric("c1", "counter")
+        h = api.register_metric("h1", "histogram")
+        api.report_metric(g, 1.0)
+        api.report_metric(c, 2.0)
+        api.report_metric(h, 3.0)
+        assert api._metric_values == [(0, 1.0), (1, 2.0), (2, 3.0)]
+
+
+class TestCollectMetrics:
+    """_collect_metrics() gathers metric values into a Metrics proto."""
+
+    def test_collect_returns_none_when_empty(self):
+        from lite_server.worker.inference import _collect_metrics
+
+        api = self._make_api()
+        assert _collect_metrics(api) is None
+
+    def test_collect_returns_metrics_proto(self):
+        from lite_server.worker.inference import _collect_metrics
+        from lite_server.proto import Metrics
+
+        api = self._make_api()
+        g = api.register_metric("test_g", "gauge")
+        c = api.register_metric("test_c", "counter")
+        h = api.register_metric("test_h", "histogram")
+        api.report_metric(g, 10.0)
+        api.report_metric(c, 20.0)
+        api.report_metric(h, 30.0)
+
+        m = _collect_metrics(api)
+        assert isinstance(m, Metrics)
+        assert len(m.gauges) == 1
+        assert m.gauges[0].id == g
+        assert m.gauges[0].value == 10.0
+        assert len(m.counters) == 1
+        assert m.counters[0].id == c
+        assert m.counters[0].value == 20.0
+        assert len(m.histograms) == 1
+        assert m.histograms[0].id == h
+        assert m.histograms[0].value == 30.0
+
+    def test_collect_clears_buffer(self):
+        from lite_server.worker.inference import _collect_metrics
+
+        api = self._make_api()
+        g = api.register_metric("x", "gauge")
+        api.report_metric(g, 1.0)
+        _collect_metrics(api)
+        assert api._metric_values == []
+
+    def test_collect_returns_none_when_no_specs(self):
+        from lite_server.worker.inference import _collect_metrics
+
+        api = self._make_api()
+        # Manually add a value without registering — should be ignored
+        api._metric_values.append((99, 1.0))
+        assert _collect_metrics(api) is None
+
+    def _make_api(self):
+        from lite_server.api import LitAPI
+
+        class Dummy(LitAPI):
+            def setup(self, device): pass
+            def decode_request(self, request): return request
+            def predict(self, x): return x
+            def encode_response(self, output): return output
+
+        return Dummy()

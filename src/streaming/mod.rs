@@ -203,7 +203,7 @@ mod tests {
         let engine = StreamingEngine::new();
         let chunk = pb::StreamResponse {
             stream_id: "nope".to_string(),
-            payload: Some(pb::stream_response::Payload::Done(pb::StreamDone {})),
+            payload: Some(pb::stream_response::Payload::Done(pb::StreamDone { metrics: None })),
         };
         assert!(!engine.route_chunk("nope", chunk));
     }
@@ -222,7 +222,7 @@ mod tests {
         for _ in 0..2 {
             let chunk = pb::StreamResponse {
                 stream_id: "s-tiny".to_string(),
-                payload: Some(pb::stream_response::Payload::Done(pb::StreamDone {})),
+                payload: Some(pb::stream_response::Payload::Done(pb::StreamDone { metrics: None })),
             };
             assert!(engine.route_chunk("s-tiny", chunk));
         }
@@ -230,7 +230,7 @@ mod tests {
         // Next one should fail (channel full) and remove the stream
         let chunk = pb::StreamResponse {
             stream_id: "s-tiny".to_string(),
-            payload: Some(pb::stream_response::Payload::Done(pb::StreamDone {})),
+            payload: Some(pb::stream_response::Payload::Done(pb::StreamDone { metrics: None })),
         };
         assert!(!engine.route_chunk("s-tiny", chunk));
         assert!(!engine.has_stream("s-tiny"));

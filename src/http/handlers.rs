@@ -679,7 +679,8 @@ pub async fn sse_infer_handler(
                 Some(pb::stream_response::Payload::Error(e)) => {
                     Event::default().data(json!({"error": e.message}).to_string())
                 }
-                Some(pb::stream_response::Payload::Done(_)) => {
+                Some(pb::stream_response::Payload::Done(done)) => {
+                    prometheus::record_worker_metrics(&model_name, done.metrics.as_ref());
                     Event::default().data("[DONE]")
                 }
                 _ => continue,
@@ -754,7 +755,8 @@ pub async fn sse_infer_version_handler(
                 Some(pb::stream_response::Payload::Error(e)) => {
                     Event::default().data(json!({"error": e.message}).to_string())
                 }
-                Some(pb::stream_response::Payload::Done(_)) => {
+                Some(pb::stream_response::Payload::Done(done)) => {
+                    prometheus::record_worker_metrics(&model_name, done.metrics.as_ref());
                     Event::default().data("[DONE]")
                 }
                 _ => continue,
@@ -891,7 +893,8 @@ async fn handle_ws_stream(
                 Some(pb::stream_response::Payload::Error(e)) => {
                     Message::Text(json!({"error": e.message}).to_string())
                 }
-                Some(pb::stream_response::Payload::Done(_)) => {
+                Some(pb::stream_response::Payload::Done(done)) => {
+                    prometheus::record_worker_metrics(&model_name, done.metrics.as_ref());
                     Message::Text(json!({"done": true}).to_string())
                 }
                 _ => continue,

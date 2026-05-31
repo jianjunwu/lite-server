@@ -142,6 +142,7 @@ See [docs/benchmark.md](docs/benchmark.md) for full results and reproduction ste
 ### Observability
 
 - **Prometheus metrics** — QPS, P50/P90/P99 latency, queue depth, TTFT, batch size, worker ejections
+- **Custom metrics** — gauge, counter, histogram from model code via `register_metric()` / `report_metric()`
 - **Timeline** — historical metric sampling per model
 - **Alerts** — built-in alert rules for anomaly detection
 - **Structured logging** — tracing-based logs with model/worker context
@@ -196,6 +197,7 @@ See [examples/](examples/) for runnable model repositories:
 | 06 | [custom_endpoint](examples/06_custom_endpoint/) | Custom HTTP endpoint |
 | 07 | [custom_params](examples/07_custom_params/) | Config-driven model behavior |
 | 08 | [openai_compatible](examples/08_openai_compatible/) | OpenAI-compatible chat endpoint |
+| 09 | [custom_metrics](examples/09_custom_metrics/) | Custom Prometheus metrics (gauge/counter/histogram) |
 
 See [examples/README.md](examples/README.md) for learning path and usage details.
 
