@@ -37,7 +37,6 @@ model_repo/
     {version}/
       model.py          # Required: LitAPI subclass
       config.yaml        # Optional: model configuration
-  orchestration.yaml     # Optional: model loading strategy
 ```
 
 - `model_name`: alphanumeric, underscores, hyphens (e.g., `my_model`, `resnet-v2`)

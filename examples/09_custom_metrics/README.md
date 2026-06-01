@@ -5,8 +5,8 @@ Demonstrates how to collect custom Prometheus metrics (gauge, counter, histogram
 ## Run
 
 ```bash
-# From the project root
-python -m lite_server serve --model-repo examples/09_custom_metrics/model_repo
+cd examples/09_custom_metrics
+python -m lite_server serve --config server.yaml
 ```
 
 ## Test

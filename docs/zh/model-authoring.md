@@ -37,7 +37,6 @@ model_repo/
     {version}/
       model.py          # 必需：LitAPI 子类
       config.yaml        # 可选：模型配置
-  orchestration.yaml     # 可选：模型加载策略
 ```
 
 - `model_name`：字母、数字、下划线、连字符（如 `my_model`、`resnet-v2`）

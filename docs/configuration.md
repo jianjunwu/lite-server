@@ -2,7 +2,7 @@
 
 [中文版](zh/configuration.md)
 
-lite-server uses three layers of configuration: **server config** (YAML file or CLI), **model config** (per-model `config.yaml`), and **orchestration config** (`orchestration.yaml`). CLI flags override YAML values.
+lite-server uses three layers of configuration: **server config** (YAML file or CLI), **model config** (per-model `config.yaml`), and **orchestration config** (`orchestration` section in `server.yaml`). CLI flags override YAML values.
 
 ## Server Configuration
 
@@ -123,7 +123,7 @@ hot_reload_interval: 1.0       # Polling interval in seconds
 
 ## Orchestration Configuration
 
-Path: `model_repo/orchestration.yaml`
+Path: `server.yaml` (`orchestration` section)
 
 Controls which models and versions to load at startup.
 

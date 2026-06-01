@@ -5,8 +5,8 @@ The simplest lite-server example. A model that returns `input * 2`.
 ## Run
 
 ```bash
-# From the project root
-python -m lite_server serve --model-repo examples/01_basic/model_repo
+cd examples/01_basic
+python -m lite_server serve --config server.yaml
 ```
 
 ## Test

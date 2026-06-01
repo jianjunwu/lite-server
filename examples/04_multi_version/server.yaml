@@ -1,0 +1,14 @@
+server:
+  http_port: 8000
+
+model_repository:
+  path: ./model_repo
+
+orchestration:
+  control_mode: explicit
+  load_models:
+    - multi_version
+  models:
+    - name: multi_version
+      load_policy: all
+      default_version: v2

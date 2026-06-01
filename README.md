@@ -280,7 +280,7 @@ No. `pip install` and run directly. Works on Linux, macOS, and Windows.
 Yes. `from lite_server import LitAPI` is a drop-in replacement for `litserve.LitAPI` with additional hooks (streaming, continuous batching, lifecycle).
 
 **Q: How do I deploy multiple models?**
-Put each model in its own directory under `model_repo/` and list them in `orchestration.yaml`. See [examples/05_ensemble](examples/05_ensemble/) for multi-model pipelines.
+Put each model in its own directory under `model_repo/` and list them in `server.yaml`. See [examples/05_ensemble](examples/05_ensemble/) for multi-model pipelines.
 
 **Q: How do I switch model versions?**
 Use the activate/deactivate API: `POST /v2/models/{name}/versions/{v}/activate`. See [examples/04_multi_version](examples/04_multi_version/).

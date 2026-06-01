@@ -5,7 +5,8 @@ Demonstrates request batching — both with default behavior and custom batch/un
 ## Run
 
 ```bash
-python -m lite_server serve --model-repo examples/02_batching/model_repo
+cd examples/02_batching
+python -m lite_server serve --config server.yaml
 ```
 
 ## Models

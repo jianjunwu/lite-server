@@ -5,7 +5,8 @@ Demonstrates how to add custom HTTP endpoints to the server. A `*_endpoint.py` f
 ## Run
 
 ```bash
-python -m lite_server serve --model-repo examples/06_custom_endpoint/model_repo
+cd examples/06_custom_endpoint
+python -m lite_server serve --config server.yaml
 ```
 
 ## Test

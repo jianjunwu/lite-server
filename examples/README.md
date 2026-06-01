@@ -30,7 +30,7 @@ Start from example 01 and work your way up. Each example builds on concepts from
 
 | # | Example | Description | Key Concept |
 |---|---------|-------------|-------------|
-| 04 | [multi_version](04_multi_version/) | Version switching | `orchestration.yaml`, activate/deactivate versions at runtime |
+| 04 | [multi_version](04_multi_version/) | Version switching | `server.yaml`, activate/deactivate versions at runtime |
 | 05 | [ensemble](05_ensemble/) | Multi-model DAG pipeline | Ensemble config, parallel step execution, `$request`/`$step` refs |
 | 06 | [custom_endpoint](06_custom_endpoint/) | Custom HTTP routes | `*_endpoint.py` auto-discovery, server context access |
 | 07 | [custom_params](07_custom_params/) | Config-driven behavior | `self.config`, custom YAML fields |
@@ -41,10 +41,12 @@ Start from example 01 and work your way up. Each example builds on concepts from
 
 ```bash
 # From the project root
-python -m lite_server serve --model-repo examples/<example>/model_repo
+cd examples/<example>
+python -m lite_server serve --config server.yaml
 
 # Or with the Rust binary directly
-lite-server-core serve --model-repo examples/<example>/model_repo
+cd examples/<example>
+lite-server-core serve --config server.yaml
 ```
 
 Each example's README has specific test commands.

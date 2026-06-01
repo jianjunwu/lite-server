@@ -2,7 +2,7 @@
 
 [English](../configuration.md)
 
-lite-server 采用三层配置：**服务器配置**（YAML 文件或 CLI）、**模型配置**（每模型 `config.yaml`）和**编排配置**（`orchestration.yaml`）。CLI 参数覆盖 YAML 值。
+lite-server 采用三层配置：**服务器配置**（YAML 文件或 CLI）、**模型配置**（每模型 `config.yaml`）和**编排配置**（`server.yaml` 中的 `orchestration` 段落）。CLI 参数覆盖 YAML 值。
 
 ## 服务器配置
 
@@ -123,7 +123,7 @@ hot_reload_interval: 1.0       # 轮询间隔（秒）
 
 ## 编排配置
 
-路径：`model_repo/orchestration.yaml`
+路径：`server.yaml`（`orchestration` 段落）
 
 控制启动时加载哪些模型和版本。
 

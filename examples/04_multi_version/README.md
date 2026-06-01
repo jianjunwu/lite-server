@@ -5,13 +5,14 @@ Demonstrates multi-version model management. Two versions of the same model run 
 ## Run
 
 ```bash
-python -m lite_server serve --model-repo examples/04_multi_version/model_repo
+cd examples/04_multi_version
+python -m lite_server serve --config server.yaml
 ```
 
 ## Test
 
 ```bash
-# Inference uses the active version (v2 by default, set in orchestration.yaml)
+# Inference uses the active version (v2 by default, set in server.yaml)
 curl -X POST http://localhost:8000/v2/models/multi_version/infer \
   -H 'Content-Type: application/json' \
   -d '{"input": 10}'
@@ -38,7 +39,7 @@ curl -X POST http://localhost:8000/v2/models/multi_version/versions/v2/infer \
 ## What You Learn
 
 - How to organize multiple versions under one model name
-- How `orchestration.yaml` controls which versions to load
+- How `server.yaml` controls which versions to load
 - How to activate/deactivate versions at runtime
 - How to target a specific version in inference requests
 
@@ -53,7 +54,7 @@ model_repo/
     v2/
       model.py        # Version 2: x * 2
       config.yaml
-  orchestration.yaml  # Loads all versions, sets v2 as default
+server.yaml           # Loads all versions, sets v2 as default
 ```
 
 ## Orchestration Config

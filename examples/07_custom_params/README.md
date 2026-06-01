@@ -9,8 +9,8 @@ All fields in `config.yaml` are available in `model.py` through `self.config.get
 ## Run
 
 ```bash
-# From the project root
-python -m lite_server serve --model-repo examples/07_custom_params/model_repo
+cd examples/07_custom_params
+python -m lite_server serve --config server.yaml
 ```
 
 ## Test

@@ -5,7 +5,8 @@ Demonstrates ensemble inference with a DAG pipeline. Multiple models are chained
 ## Run
 
 ```bash
-python -m lite_server serve --model-repo examples/05_ensemble/model_repo
+cd examples/05_ensemble
+python -m lite_server serve --config server.yaml
 ```
 
 ## Test

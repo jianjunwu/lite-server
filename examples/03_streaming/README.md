@@ -5,7 +5,8 @@ Demonstrates server-side streaming. Each request produces multiple chunks sent v
 ## Run
 
 ```bash
-python -m lite_server serve --model-repo examples/03_streaming/model_repo
+cd examples/03_streaming
+python -m lite_server serve --config server.yaml
 ```
 
 ## Test

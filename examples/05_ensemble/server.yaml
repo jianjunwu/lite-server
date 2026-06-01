@@ -1,0 +1,19 @@
+server:
+  http_port: 8000
+
+model_repository:
+  path: ./model_repo
+
+orchestration:
+  control_mode: explicit
+  load_models:
+    - step_a
+    - step_b
+    - pipeline
+    - bm25_recall
+    - cf_recall
+    - visual_recall
+    - seq_recall
+    - merge
+    - rank
+    - multi_pipeline

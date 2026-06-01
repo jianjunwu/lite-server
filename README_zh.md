@@ -278,7 +278,7 @@ lite-server 用 Rust HTTP 内核（axum/tokio）替代了 Python 的 uvicorn，�
 可以。`from lite_server import LitAPI` 是 `litserve.LitAPI` 的即插即用替代品，额外提供了流式输出、continuous batching、生命周期钩子。
 
 **Q: 怎么部署多个模型？**
-每个模型放在 `model_repo/` 下独立目录，在 `orchestration.yaml` 中声明。详见 [examples/05_ensemble](examples/05_ensemble/)。
+每个模型放在 `model_repo/` 下独立目录，在 `server.yaml` 的 `orchestration` 段落中声明。详见 [examples/05_ensemble](examples/05_ensemble/)。
 
 **Q: 怎么切换模型版本？**
 使用激活/停用 API：`POST /v2/models/{name}/versions/{v}/activate`。详见 [examples/04_multi_version](examples/04_multi_version/)。

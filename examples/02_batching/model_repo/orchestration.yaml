@@ -1,4 +1,0 @@
-control_mode: explicit
-load_models:
-  - batched
-  - custom_batch

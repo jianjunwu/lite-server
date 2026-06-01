@@ -11,8 +11,8 @@
 ## 运行
 
 ```bash
-# 从项目根目录
-python -m lite_server serve --model-repo examples/07_custom_params/model_repo
+cd examples/07_custom_params
+python -m lite_server serve --config server.yaml
 ```
 
 ## 测试
