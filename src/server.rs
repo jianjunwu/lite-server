@@ -254,6 +254,9 @@ impl LiteServer {
             self.registry.set_strategy(&strategy.name, strategy)?;
         }
 
+        // Auto-unpack any .lma artifacts placed in the model repo
+        auto_unpack_lma_files(&repo_path).await;
+
         let available = scan_repo_models(&repo_path).await;
         let by_model = group_by_model(available);
 
@@ -409,6 +412,60 @@ struct RepoModel {
     path: String,
     has_config: bool,
     model_type: String,
+}
+
+/// Auto-unpack .lma artifact files found in the model repository root.
+/// Shells out to `python -m lite_server unpack` to extract each .lma into
+/// the standard repo/model_name/version/ directory layout.
+async fn auto_unpack_lma_files(repo_path: &Path) {
+    let mut entries = match tokio::fs::read_dir(repo_path).await {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().map(|e| e == "lma").unwrap_or(false) {
+            let output = tokio::process::Command::new("python")
+                .args([
+                    "-m",
+                    "lite_server",
+                    "unpack",
+                    path.to_str().unwrap_or(""),
+                    "--to",
+                    repo_path.to_str().unwrap_or(""),
+                ])
+                .output()
+                .await;
+
+            match output {
+                Ok(out) if out.status.success() => {
+                    info!(
+                        "Auto-unpacked .lma artifact: {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    );
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    warn!(
+                        "Failed to unpack .lma artifact {}: {}",
+                        path.display(),
+                        stderr.trim()
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to run unpack for .lma artifact {}: {}",
+                        path.display(),
+                        e
+                    );
+                }
+            }
+        }
+    }
 }
 
 async fn scan_repo_models(repo_path: &Path) -> Vec<RepoModel> {
