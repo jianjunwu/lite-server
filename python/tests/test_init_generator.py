@@ -130,6 +130,14 @@ class TestConfigYamlStructure:
         assert "accelerator" in text
         assert "hooks" in text
 
+    def test_example_contains_on_error_http(self, tmp_path):
+        """WorkerHooksConfig supports on_error_http; example should show it."""
+        gen = ProjectGenerator("p", "empty", tmp_path)
+        root = gen.generate()
+        example = root / "model_repo" / "my_model" / "1" / "config.yaml.example"
+        text = example.read_text()
+        assert "on_error_http" in text
+
 
 class TestServerYamlEnhanced:
     """server.yaml should expose model_defaults, features and key defaults."""
@@ -164,15 +172,12 @@ class TestServerYamlEnhanced:
         text = (root / "server.yaml").read_text()
         assert "features:" in text
 
-    def test_transport_is_uncommented(self, tmp_path):
+    def test_no_transport_field(self, tmp_path):
+        """transport was removed from ServerConfig (commit 95518e0)."""
         gen = ProjectGenerator("p", "empty", tmp_path)
         root = gen.generate()
         text = (root / "server.yaml").read_text()
-        # transport should be an active config line, not commented
-        for line in text.splitlines():
-            if "transport:" in line and not line.strip().startswith("#"):
-                return
-        pytest.fail("transport should be uncommented in server.yaml")
+        assert "transport" not in text
 
 
 class TestNoStandaloneOrchestration:
@@ -321,3 +326,13 @@ class TestTestRequestPy:
         assert "status_code" in text
         # Should branch on error rather than blindly calling resp.json()
         assert "if" in text or "try" in text or "raise_for_status" in text
+
+    def test_fstring_interpolation_not_escaped(self, tmp_path):
+        """f-string must interpolate BASE_URL variable, not print literal {BASE_URL}."""
+        gen = ProjectGenerator("p", "empty", tmp_path)
+        root = gen.generate()
+        text = (root / "test_request.py").read_text()
+        # The template should NOT have {{BASE_URL}} (escaped braces) in f-strings
+        # because the template itself is a regular string, not an f-string.
+        assert "{{BASE_URL}}" not in text, "f-string braces are double-escaped"
+        assert "{{e}}" not in text, "f-string braces are double-escaped"

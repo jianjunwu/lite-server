@@ -131,6 +131,9 @@ CONFIG_YAML_EXAMPLE = textwrap.dedent("""\
     #   on_exit_http:                                   # HTTP callback on worker exit
     #     url: 'http://notify.internal/worker-exit'
     #     method: POST
+    #   on_error_http:                                  # HTTP callback on worker error
+    #     url: 'http://notify.internal/worker-error'
+    #     method: POST
 
     # ===== Hot Reload =====
     # hot_reload: false            # Enable file watching for hot reload
@@ -172,7 +175,6 @@ SERVER_YAML = textwrap.dedent("""\
     #   server.metrics_port  - Prometheus /metrics endpoint port
     #   server.timeout       - Per-request timeout in seconds
     #   server.threads       - Tokio worker threads (None = auto = num CPUs)
-    #   server.transport     - Worker transport: zmq | mp | uds
     #
     #   model_repository.path - Root directory for model versions
     #
@@ -192,7 +194,6 @@ SERVER_YAML = textwrap.dedent("""\
       metrics_port: 8002
       timeout: 30.0               # Request timeout in seconds
       # threads: null             # Tokio threads (None = auto = CPU cores)
-      transport: zmq              # zmq | mp | uds
       graceful_timeout: 30.0      # Max seconds for graceful shutdown
       keepalive_timeout: 5.0      # HTTP keep-alive timeout (0 = disable)
 
@@ -262,12 +263,12 @@ TEST_REQUEST_PY = textwrap.dedent('''\
             print("Response:", resp.json())
         except requests.exceptions.ConnectionError:
             print(
-                f"Error: Cannot connect to {{BASE_URL}}."
+                f"Error: Cannot connect to {BASE_URL}."
                 " Is the server running?"
             )
             sys.exit(1)
         except requests.exceptions.HTTPError as e:
-            print(f"HTTP Error: {{e}}")
+            print(f"HTTP Error: {e}")
             sys.exit(1)
 
 
@@ -278,7 +279,7 @@ TEST_REQUEST_PY = textwrap.dedent('''\
             print("Ready:", resp.status_code)
         except requests.exceptions.ConnectionError:
             print(
-                f"Error: Cannot connect to {{BASE_URL}}."
+                f"Error: Cannot connect to {BASE_URL}."
                 " Is the server running?"
             )
             sys.exit(1)

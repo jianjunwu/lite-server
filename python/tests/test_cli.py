@@ -308,6 +308,40 @@ class TestPackUnpack:
 
 # ===== init =====
 
+# ===== config-check =====
+
+class TestConfigCheck:
+    def test_config_check_valid_server_yaml(self, tmp_path):
+        config = tmp_path / "server.yaml"
+        config.write_text(textwrap.dedent("""\
+            server:
+              http_port: 8000
+              host: 0.0.0.0
+        """))
+        args = type("Args", (), {"config": str(config)})()
+        assert cli._cmd_config_check(args) == 0
+
+    def test_config_check_invalid_yaml(self, tmp_path, capsys):
+        config = tmp_path / "bad.yaml"
+        config.write_text("server: [invalid")
+        args = type("Args", (), {"config": str(config)})()
+        assert cli._cmd_config_check(args) == 1
+        captured = capsys.readouterr()
+        assert "error" in captured.err.lower()
+
+    def test_config_check_validates_model_config(self, tmp_path):
+        """config-check should validate model config YAML syntax, not just server config."""
+        config = tmp_path / "model_config.yaml"
+        config.write_text(textwrap.dedent("""\
+            max_batch_size: 4
+            stream: true
+            accelerator: cpu
+            max_queue_size: 100
+        """))
+        args = type("Args", (), {"config": str(config)})()
+        assert cli._cmd_config_check(args) == 0
+
+
 class TestInit:
     def test_init_empty_template(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)

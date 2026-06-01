@@ -147,6 +147,8 @@ def _cmd_config_check(args):
         import yaml
         with open(args.config, "r") as f:
             cfg = yaml.safe_load(f)
+        if cfg is None:
+            cfg = {}
         print(f"Configuration OK: {args.config}")
         if "server" in cfg:
             s = cfg["server"]
@@ -155,6 +157,16 @@ def _cmd_config_check(args):
             print(f"  Metrics port: {s.get('metrics_port', 8002)}")
         if "model_repository" in cfg:
             print(f"  Model repo: {cfg['model_repository'].get('path', './model_repo')}")
+        # Model-level config (no server section)
+        if "server" not in cfg:
+            if "max_batch_size" in cfg:
+                print(f"  max_batch_size: {cfg['max_batch_size']}")
+            if "stream" in cfg:
+                print(f"  stream: {cfg['stream']}")
+            if "accelerator" in cfg:
+                print(f"  accelerator: {cfg['accelerator']}")
+            if "max_queue_size" in cfg:
+                print(f"  max_queue_size: {cfg['max_queue_size']}")
         return 0
     except Exception as e:
         print(f"Configuration error: {e}", file=sys.stderr)
