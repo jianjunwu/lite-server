@@ -96,6 +96,8 @@ impl WorkerZmqClient {
                                 let _ = tx.send(error_response(&uid, "Worker shutting down"));
                             }
                             stream_routes.clear();
+                            drop(socket);
+                            drop(ctx);
                             return;
                         }
                     }

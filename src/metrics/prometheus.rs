@@ -197,7 +197,7 @@ pub fn record_request_start(_model: &str, _version: &str) {
 pub async fn record_request_end(model: &str, version: &str, status: &str, duration_secs: f64) {
     REQUESTS_TOTAL.with_label_values(&[model, version, status]).inc();
     REQUEST_DURATION.with_label_values(&[model, version]).observe(duration_secs);
-    super::aggregator::TIMELINE.record_latency(model, version, duration_secs).await;
+    super::aggregator::TIMELINE.record_latency(model, version, duration_secs);
 }
 
 // ===== Outlier detection metrics =====

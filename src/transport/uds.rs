@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 const STREAM_CHANNEL_SIZE: usize = 64;
+const MAX_PENDING_REQUESTS: usize = 1024;
 
 #[cfg(unix)]
 type Stream = UnixStream;
@@ -57,7 +58,7 @@ enum InferRequest {
 }
 
 pub struct WorkerConnection {
-    request_tx: mpsc::UnboundedSender<InferRequest>,
+    request_tx: mpsc::Sender<InferRequest>,
     closed: std::sync::atomic::AtomicBool,
     writer_handle: tokio::task::JoinHandle<()>,
     reader_handle: tokio::task::JoinHandle<()>,
@@ -70,7 +71,7 @@ impl WorkerConnection {
             .map_err(|e| AppError::Transport(format!("failed to connect to UDS {}: {}", uds_path.display(), e)))?;
 
         let (read_half, write_half) = split(stream);
-        let (request_tx, request_rx) = mpsc::unbounded_channel::<InferRequest>();
+        let (request_tx, request_rx) = mpsc::channel::<InferRequest>(MAX_PENDING_REQUESTS);
 
         let pending_single: Arc<DashMap<String, oneshot::Sender<pb::Response>>> =
             Arc::new(DashMap::new());
@@ -109,6 +110,7 @@ impl WorkerConnection {
         let (tx, rx) = oneshot::channel();
         self.request_tx
             .send(InferRequest::Single(request, tx))
+            .await
             .map_err(|_| AppError::Transport("worker connection closed".to_string()))?;
         rx.await
             .map_err(|_| AppError::Transport("response channel closed".to_string()))
@@ -125,6 +127,7 @@ impl WorkerConnection {
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_SIZE);
         self.request_tx
             .send(InferRequest::Stream(request, stream_id, tx))
+            .await
             .map_err(|_| AppError::Transport("worker connection closed".to_string()))?;
         Ok(rx)
     }
@@ -139,7 +142,7 @@ impl WorkerConnection {
 
 async fn writer_task(
     mut write_half: WriteHalf<Stream>,
-    mut request_rx: mpsc::UnboundedReceiver<InferRequest>,
+    mut request_rx: mpsc::Receiver<InferRequest>,
     pending_single: Arc<DashMap<String, oneshot::Sender<pb::Response>>>,
     pending_batch: Arc<DashMap<String, oneshot::Sender<pb::BatchResponse>>>,
     stream_routes: Arc<DashMap<String, mpsc::Sender<pb::StreamResponse>>>,

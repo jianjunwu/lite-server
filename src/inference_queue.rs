@@ -120,7 +120,7 @@ impl OutlierState {
     /// Eject a worker if not already ejected and below max ejection percent.
     fn maybe_eject(&self, worker_idx: usize) {
         let w = &self.workers[worker_idx];
-        let mut guard = w.ejected.lock().unwrap();
+        let mut guard = w.ejected.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_some() {
             return; // already ejected
         }
@@ -130,10 +130,13 @@ impl OutlierState {
             if i == worker_idx {
                 continue;
             }
-            if let Ok(g) = other.ejected.try_lock() {
-                if g.is_some() {
-                    ejected_count += 1;
-                }
+            let is_ej = match other.ejected.try_lock() {
+                Ok(g) => g.is_some(),
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().is_some(),
+                Err(std::sync::TryLockError::WouldBlock) => false,
+            };
+            if is_ej {
+                ejected_count += 1;
             }
         }
         let max_ejected = (self.workers.len() * self.max_ejection_percent / 100).max(1);
@@ -152,7 +155,7 @@ impl OutlierState {
             Some(w) => w,
             None => return false,
         };
-        let mut guard = w.ejected.lock().unwrap();
+        let mut guard = w.ejected.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref ejected) = *guard {
             if ejected.ejected_at.elapsed() >= self.base_ejection_time {
                 // Recovery: clear ejection state and reset errors
@@ -171,7 +174,7 @@ impl OutlierState {
     pub fn active_count(&self) -> usize {
         let mut count = 0;
         for w in &self.workers {
-            let guard = w.ejected.lock().unwrap();
+            let guard = w.ejected.lock().unwrap_or_else(|e| e.into_inner());
             if guard.is_none() {
                 count += 1;
             }
@@ -1254,6 +1257,27 @@ mod tests {
             outlier.record_error(2);
         }
         assert!(!outlier.is_ejected(2), "should respect max_ejection_percent");
+    }
+
+    #[test]
+    fn test_outlier_survives_mutex_poison() {
+        let outlier = OutlierState::new(1);
+        // Poison the mutex by panicking while holding the lock
+        let result = std::panic::catch_unwind(|| {
+            let _guard = outlier.workers[0].ejected.lock().unwrap();
+            panic!("intentional panic to poison mutex");
+        });
+        assert!(result.is_err(), "should have panicked");
+
+        // After poisoning, is_ejected should NOT panic
+        assert!(!outlier.is_ejected(0), "is_ejected should survive mutex poison");
+        // active_count should also not panic
+        assert_eq!(outlier.active_count(), 1);
+        // record_error -> maybe_eject should also not panic
+        outlier.record_error(0);
+        outlier.record_error(0);
+        outlier.record_error(0);
+        assert!(outlier.is_ejected(0), "should eject after threshold");
     }
 
     // ===== pick_worker with outlier tests =====

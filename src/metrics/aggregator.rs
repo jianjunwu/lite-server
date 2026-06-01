@@ -1,3 +1,4 @@
+use dashmap::DashMap;
 use lazy_static::lazy_static;
 use prometheus::{CounterVec, GaugeVec};
 use serde::Serialize;
@@ -34,8 +35,8 @@ pub struct TimelineAggregator {
     data: Mutex<HashMap<String, VecDeque<TimelineEntry>>>,
     /// Last sample timestamp per key
     last_sample: Mutex<HashMap<String, f64>>,
-    /// Latency samples per key (sliding window, seconds)
-    latency_samples: Mutex<HashMap<String, VecDeque<f64>>>,
+    /// Latency samples per key (sliding window, seconds) — DashMap shards eliminate cross-key contention.
+    latency_samples: DashMap<String, std::sync::Mutex<VecDeque<f64>>>,
     /// Last request count per key (for QPS delta)
     last_counts: Mutex<HashMap<String, f64>>,
     /// Last check timestamp
@@ -47,17 +48,19 @@ impl TimelineAggregator {
         Self {
             data: Mutex::new(HashMap::new()),
             last_sample: Mutex::new(HashMap::new()),
-            latency_samples: Mutex::new(HashMap::new()),
+            latency_samples: DashMap::new(),
             last_counts: Mutex::new(HashMap::new()),
             last_check: Mutex::new(now_secs()),
         }
     }
 
-    /// Record a latency sample from request handling.
-    pub async fn record_latency(&self, model: &str, version: &str, duration_secs: f64) {
+    /// Record a latency sample from request handling. Lock-free across keys; per-key mutex is held briefly.
+    pub fn record_latency(&self, model: &str, version: &str, duration_secs: f64) {
         let key = format!("{}_{}", model, version);
-        let mut samples = self.latency_samples.lock().await;
-        let deque = samples.entry(key).or_insert_with(|| VecDeque::with_capacity(1000));
+        let entry = self.latency_samples.entry(key).or_insert_with(|| {
+            std::sync::Mutex::new(VecDeque::with_capacity(1000))
+        });
+        let mut deque = entry.value().lock().unwrap();
         deque.push_back(duration_secs);
         // Keep last 1000 samples (~1-2 minutes at high throughput)
         while deque.len() > 1000 {
@@ -84,7 +87,7 @@ impl TimelineAggregator {
         let qps = self.compute_qps(&key, model, version, now).await;
 
         // Compute p99 from latency samples
-        let p99_ms = self.compute_p99_ms(&key).await;
+        let p99_ms = self.compute_p99_ms(&key);
 
         // Read queue depth and active workers from Prometheus gauges
         let queue_depth = read_gauge(&super::prometheus::QUEUE_DEPTH, &[model, version]);
@@ -165,14 +168,23 @@ impl TimelineAggregator {
         round(qps, 2)
     }
 
-    async fn compute_p99_ms(&self, key: &str) -> f64 {
-        let samples = self.latency_samples.lock().await;
-        let deque = match samples.get(key) {
-            Some(d) if d.len() >= 2 => d,
-            _ => return 0.0,
+    fn compute_p99_ms(&self, key: &str) -> f64 {
+        let entry = match self.latency_samples.get(key) {
+            Some(e) => e,
+            None => return 0.0,
         };
-        let mut sorted: Vec<f64> = deque.iter().copied().collect();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let deque = match entry.value().lock() {
+            Ok(g) => g,
+            Err(_) => return 0.0,
+        };
+        if deque.len() < 2 {
+            return 0.0;
+        }
+        let mut sorted: Vec<f64> = deque.iter().copied().filter(|v| !v.is_nan()).collect();
+        if sorted.len() < 2 {
+            return 0.0;
+        }
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let n = sorted.len();
         let p99 = sorted[((n as f64 * 0.99) as usize).min(n - 1)];
         round(p99 * 1000.0, 1)
@@ -390,30 +402,41 @@ fn read_gauge(gauge: &GaugeVec, labels: &[&str]) -> f64 {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_record_latency_stores_sample() {
+    #[test]
+    fn test_record_latency_stores_sample() {
         let agg = TimelineAggregator::new();
-        agg.record_latency("m", "1", 0.05).await;
-        agg.record_latency("m", "1", 0.10).await;
+        agg.record_latency("m", "1", 0.05);
+        agg.record_latency("m", "1", 0.10);
 
-        let samples = agg.latency_samples.lock().await;
-        let deque = samples.get("m_1").unwrap();
+        let entry = agg.latency_samples.get("m_1").unwrap();
+        let deque = entry.value().lock().unwrap();
         assert_eq!(deque.len(), 2);
         assert_eq!(deque[0], 0.05);
         assert_eq!(deque[1], 0.10);
     }
 
-    #[tokio::test]
-    async fn test_record_latency_caps_at_1000() {
+    #[test]
+    fn test_record_latency_caps_at_1000() {
         let agg = TimelineAggregator::new();
         for i in 0..1100 {
-            agg.record_latency("m", "1", i as f64 * 0.001).await;
+            agg.record_latency("m", "1", i as f64 * 0.001);
         }
-        let samples = agg.latency_samples.lock().await;
-        let deque = samples.get("m_1").unwrap();
+        let entry = agg.latency_samples.get("m_1").unwrap();
+        let deque = entry.value().lock().unwrap();
         assert_eq!(deque.len(), 1000);
         // First 100 should have been evicted
         assert_eq!(deque[0], 0.1);
+    }
+
+    #[test]
+    fn test_compute_p99_ignores_nan() {
+        let agg = TimelineAggregator::new();
+        agg.record_latency("m", "1", 0.05);
+        agg.record_latency("m", "1", f64::NAN);
+        agg.record_latency("m", "1", 0.10);
+
+        let p99 = agg.compute_p99_ms("m_1");
+        assert!(p99 >= 50.0 && p99 <= 110.0, "p99 should be around 100ms, got {}", p99);
     }
 
     #[tokio::test]
@@ -443,18 +466,15 @@ mod tests {
     async fn test_concurrent_record_and_read_no_deadlock() {
         let agg = TimelineAggregator::new();
 
-        let agg_writer = &agg;
-        let agg_reader = &agg;
-
         let (_r1, _r2) = tokio::join!(
             async {
                 for i in 0..100 {
-                    agg_writer.record_latency("m", "1", i as f64 * 0.001).await;
+                    agg.record_latency("m", "1", i as f64 * 0.001);
                 }
             },
             async {
                 for _ in 0..10 {
-                    let _ = agg_reader.all_snapshots().await;
+                    let _ = agg.all_snapshots().await;
                 }
             }
         );
@@ -465,8 +485,8 @@ mod tests {
     #[tokio::test]
     async fn test_all_snapshots_returns_data() {
         let agg = TimelineAggregator::new();
-        agg.record_latency("m", "1", 0.05).await;
-        agg.record_latency("m", "1", 0.10).await;
+        agg.record_latency("m", "1", 0.05);
+        agg.record_latency("m", "1", 0.10);
 
         // sample() requires prometheus gauges registered, so just test all_snapshots with data
         let snapshots = agg.all_snapshots().await;
