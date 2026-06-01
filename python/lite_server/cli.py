@@ -27,8 +27,8 @@ def main(argv=None):
     serve_parser.add_argument("--log-info-output", help="Info log file path")
     serve_parser.add_argument("--log-error-output", help="Error log file path")
     serve_parser.add_argument("--log-rotation", help="Log rotation: none, size, daily, hourly")
+    serve_parser.add_argument("--metrics-port", type=int, help="Metrics server port")
     serve_parser.add_argument("--no-metrics", action="store_true", help="Disable metrics")
-    serve_parser.add_argument("--transport", help="Worker transport: zmq or uds")
     serve_parser.add_argument("--grpc-port", type=int, help="gRPC server port")
     serve_parser.add_argument("--no-grpc", action="store_true", help="Disable gRPC server")
     serve_parser.add_argument("--no-streaming-metrics", action="store_true", help="Disable streaming metrics")
@@ -37,6 +37,7 @@ def main(argv=None):
     serve_parser.add_argument("--max-requests", type=int, help="Auto-restart worker after N requests (0=disabled)")
     serve_parser.add_argument("--max-requests-jitter", type=int, help="Jitter range for max_requests to prevent thundering herd")
     serve_parser.add_argument("--request-timeout", type=float, help="Per-request hard timeout in seconds (0=disabled)")
+    serve_parser.add_argument("--health-check-interval", type=float, help="Active health check interval in seconds (0=disabled)")
     serve_parser.add_argument("--graceful-timeout", type=float, help="Graceful shutdown timeout in seconds")
     serve_parser.add_argument("--threads", type=int, help="Number of Tokio worker threads (default: auto = CPU cores)")
     serve_parser.add_argument("--keepalive-timeout", type=float, help="HTTP keep-alive timeout in seconds (0=disabled)")
@@ -120,7 +121,7 @@ def _cmd_serve(args):
             log_error_output=args.log_error_output,
             log_rotation=args.log_rotation,
             no_metrics=args.no_metrics,
-            transport=args.transport,
+            metrics_port=args.metrics_port,
             grpc_port=args.grpc_port,
             no_grpc=args.no_grpc,
             no_streaming_metrics=args.no_streaming_metrics,
@@ -129,6 +130,7 @@ def _cmd_serve(args):
             max_requests=args.max_requests,
             max_requests_jitter=args.max_requests_jitter,
             request_timeout=args.request_timeout,
+            health_check_interval=args.health_check_interval,
             graceful_timeout=args.graceful_timeout,
             keepalive_timeout=args.keepalive_timeout,
         )

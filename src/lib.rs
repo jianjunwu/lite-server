@@ -144,6 +144,7 @@ fn build_runtime(threads: Option<usize>) -> tokio::runtime::Runtime {
     max_requests=None,
     max_requests_jitter=None,
     request_timeout=None,
+    health_check_interval=None,
     graceful_timeout=None,
     keepalive_timeout=None,
 ))]
@@ -168,6 +169,7 @@ fn serve(
     max_requests: Option<usize>,
     max_requests_jitter: Option<usize>,
     request_timeout: Option<f32>,
+    health_check_interval: Option<f32>,
     graceful_timeout: Option<f32>,
     keepalive_timeout: Option<f32>,
 ) -> PyResult<()> {
@@ -178,7 +180,7 @@ fn serve(
                 log_info_output, log_error_output, log_rotation,
                 metrics_port, no_metrics, grpc_port, no_grpc, no_streaming_metrics,
                 log_verbose, max_queue_size, max_requests, max_requests_jitter, request_timeout,
-                None, graceful_timeout, keepalive_timeout,
+                health_check_interval, graceful_timeout, keepalive_timeout,
             )
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })

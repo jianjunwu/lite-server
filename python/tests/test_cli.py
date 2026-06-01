@@ -421,3 +421,73 @@ class TestBenchmark:
         assert len(post_calls) >= 1
         for url, kwargs in post_calls:
             assert kwargs.get("json") == {"input": 1.0}
+
+
+# ===== serve CLI args parity with Rust =====
+
+class TestServeArgs:
+    def test_serve_help_excludes_transport(self, capsys):
+        """--transport was removed from Rust; Python CLI must not advertise it."""
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main(["serve", "--help"])
+        assert exc_info.value.code == 0
+        captured = capsys.readouterr()
+        assert "--transport" not in captured.out
+
+    def test_serve_help_includes_metrics_port(self, capsys):
+        """--metrics-port must be available in Python CLI (parity with Rust)."""
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main(["serve", "--help"])
+        assert exc_info.value.code == 0
+        captured = capsys.readouterr()
+        assert "--metrics-port" in captured.out
+
+    def test_serve_help_includes_health_check_interval(self, capsys):
+        """--health-check-interval must be available in Python CLI (parity with Rust)."""
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main(["serve", "--help"])
+        assert exc_info.value.code == 0
+        captured = capsys.readouterr()
+        assert "--health-check-interval" in captured.out
+
+    def test_cmd_serve_forwards_correct_kwargs(self, monkeypatch):
+        """_cmd_serve must forward exactly the params Rust serve() accepts."""
+        called_with = {}
+
+        def fake_serve(**kwargs):
+            called_with.update(kwargs)
+
+        monkeypatch.setattr("lite_server.serve", fake_serve)
+
+        args = type("Args", (), {
+            "config": None,
+            "port": 9000,
+            "host": "127.0.0.1",
+            "model_repo": "./models",
+            "threads": 4,
+            "timeout": 60.0,
+            "log_level": "debug",
+            "log_info_output": "/tmp/info.log",
+            "log_error_output": "/tmp/error.log",
+            "log_rotation": "daily",
+            "no_metrics": True,
+            "grpc_port": 50051,
+            "no_grpc": True,
+            "no_streaming_metrics": True,
+            "log_verbose": True,
+            "max_queue_size": 200,
+            "max_requests": 1000,
+            "max_requests_jitter": 50,
+            "request_timeout": 30.0,
+            "graceful_timeout": 60.0,
+            "keepalive_timeout": 10.0,
+            "metrics_port": 9090,
+            "health_check_interval": 20.0,
+        })()
+        assert cli._cmd_serve(args) == 0
+
+        assert called_with["port"] == 9000
+        assert called_with["host"] == "127.0.0.1"
+        assert called_with["metrics_port"] == 9090
+        assert called_with["health_check_interval"] == 20.0
+        assert "transport" not in called_with
