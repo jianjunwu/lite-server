@@ -4,11 +4,9 @@ pub mod state;
 
 use crate::config::{unix_socket_path, Config};
 use crate::error::AppError;
-use crate::http::handlers::*;
 use crate::http::routes::create_routes;
 use crate::http::state::AppState;
 use crate::inference_queue::InferenceQueue;
-use crate::metrics::prometheus;
 use crate::registry::ModelRegistry;
 use crate::worker::WorkerManager;
 use crate::worker::endpoint_manager::EndpointManager;
@@ -20,7 +18,7 @@ use axum::Router;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{info, error};
+use tracing::info;
 
 async fn disable_keepalive_middleware(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;

@@ -99,7 +99,7 @@ impl LiteServer for GrpcService {
         let worker_id = crate::worker::pick_worker_random(clients.len());
         let client = &clients[worker_id];
 
-        let start = Instant::now();
+        let _start = Instant::now();
         let resp = client
             .send(internal_req)
             .await

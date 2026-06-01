@@ -1,8 +1,7 @@
 use lazy_static::lazy_static;
 use prometheus::{
-    Counter, CounterVec, GaugeVec, HistogramOpts, HistogramVec, Registry, TextEncoder, Encoder,
+    Counter, CounterVec, GaugeVec, HistogramOpts, HistogramVec, Registry, TextEncoder,
 };
-use std::sync::Arc;
 use std::collections::HashMap;
 
 lazy_static! {
@@ -190,7 +189,7 @@ pub fn gather_metrics() -> String {
 
 // ===== Request metrics =====
 
-pub fn record_request_start(model: &str, version: &str) {
+pub fn record_request_start(_model: &str, _version: &str) {
     // Light-server uses explicit inc_queue_depth in queue manager
     // Kept for backward compat during transition
 }

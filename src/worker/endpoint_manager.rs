@@ -2,8 +2,7 @@ use crate::error::AppError;
 use crate::registry::ModelRegistry;
 use crate::worker::protocol::{EndpointRequest, EndpointResponse, EndpointRoute, EndpointStartup};
 use serde_json::json;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::timeout;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// Manages the custom endpoint Python subprocess.
 pub struct EndpointManager {

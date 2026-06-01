@@ -93,7 +93,7 @@ pub fn resolve_model_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    
 
     #[test]
     fn test_validate_identifier_accepts_valid() {

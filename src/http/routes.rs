@@ -1,4 +1,3 @@
-use crate::config::Config;
 use crate::http::handlers::*;
 use crate::http::state::AppState;
 use crate::worker::protocol::EndpointRoute;

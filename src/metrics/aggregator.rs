@@ -2,9 +2,8 @@ use lazy_static::lazy_static;
 use prometheus::{CounterVec, GaugeVec};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
-use tracing::warn;
 
 // Max data points per model timeline (ring buffer capacity)
 const MAX_TIMELINE_POINTS: usize = 30;
@@ -447,7 +446,7 @@ mod tests {
         let agg_writer = &agg;
         let agg_reader = &agg;
 
-        let (r1, r2) = tokio::join!(
+        let (_r1, _r2) = tokio::join!(
             async {
                 for i in 0..100 {
                     agg_writer.record_latency("m", "1", i as f64 * 0.001).await;

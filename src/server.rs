@@ -243,11 +243,7 @@ impl LiteServer {
 
     async fn load_initial_models(&self) -> Result<(), AppError> {
         let repo_path = PathBuf::from(&self.config.model_repository.path);
-        let orch = if let Some(orch_path) = find_orchestration(&repo_path) {
-            crate::config::load_orchestration(&orch_path).unwrap_or_default()
-        } else {
-            OrchestrationConfig::default()
-        };
+        let orch = resolve_orchestration(&repo_path, &self.config.orchestration);
 
         // Apply strategies to registry
         for strategy in &orch.models {
@@ -405,13 +401,23 @@ fn find_orchestration(repo_path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Resolve orchestration config: prefer standalone file for backward compat,
+/// fall back to server.yaml orchestration section.
+fn resolve_orchestration(
+    repo_path: &Path,
+    config_orch: &OrchestrationConfig,
+) -> OrchestrationConfig {
+    if let Some(orch_path) = find_orchestration(repo_path) {
+        crate::config::load_orchestration(&orch_path).unwrap_or_default()
+    } else {
+        config_orch.clone()
+    }
+}
+
 #[derive(Clone)]
 struct RepoModel {
     name: String,
     version: String,
-    path: String,
-    has_config: bool,
-    model_type: String,
 }
 
 /// Auto-unpack .lma artifact files found in the model repository root.
@@ -504,9 +510,6 @@ async fn scan_repo_models(repo_path: &Path) -> Vec<RepoModel> {
                     versions.push(RepoModel {
                         name: model_name.clone(),
                         version,
-                        path: version_dir.to_string_lossy().to_string(),
-                        has_config: config_yaml.exists(),
-                        model_type: if is_ensemble { "ensemble".to_string() } else { "litapi".to_string() },
                     });
                 }
             }
@@ -722,7 +725,7 @@ async fn process_watch_events(
 /// When no models have hot_reload enabled, events are collected but not forwarded.
 async fn start_file_watcher(
     repo_path: PathBuf,
-    worker_manager: Arc<WorkerManager>,
+    _worker_manager: Arc<WorkerManager>,
     tx: mpsc::Sender<Vec<PathBuf>>,
     has_hot_reload: Arc<AtomicBool>,
 ) {
@@ -907,5 +910,77 @@ mod tests {
         assert!(matches_patterns("model.py", &patterns));
         assert!(matches_patterns("config.yaml", &patterns));
         assert!(!matches_patterns("data.json", &patterns));
+    }
+
+    // --- resolve_orchestration ---
+
+    #[test]
+    fn test_resolve_orchestration_from_file() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-orch-file-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let orch_path = tmp.join("orchestration.yaml");
+        std::fs::write(
+            &orch_path,
+            "control_mode: poll\nload_models:\n  - from_file\n",
+        )
+        .unwrap();
+
+        let config_orch = OrchestrationConfig::default();
+        let resolved = resolve_orchestration(&tmp, &config_orch);
+        assert_eq!(resolved.control_mode, "poll");
+        assert_eq!(resolved.load_models, vec!["from_file"]);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_resolve_orchestration_fallback_to_config() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-orch-config-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // No orchestration.yaml written
+
+        let config_orch = OrchestrationConfig {
+            control_mode: "explicit".to_string(),
+            load_models: vec!["from_config".to_string()],
+            ..Default::default()
+        };
+        let resolved = resolve_orchestration(&tmp, &config_orch);
+        assert_eq!(resolved.control_mode, "explicit");
+        assert_eq!(resolved.load_models, vec!["from_config"]);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_resolve_orchestration_file_takes_precedence() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-orch-prec-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let orch_path = tmp.join("orchestration.yaml");
+        std::fs::write(
+            &orch_path,
+            "control_mode: all\nload_models:\n  - from_file\n",
+        )
+        .unwrap();
+
+        let config_orch = OrchestrationConfig {
+            control_mode: "explicit".to_string(),
+            load_models: vec!["from_config".to_string()],
+            ..Default::default()
+        };
+        let resolved = resolve_orchestration(&tmp, &config_orch);
+        // File takes precedence for backward compat
+        assert_eq!(resolved.control_mode, "all");
+        assert_eq!(resolved.load_models, vec!["from_file"]);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

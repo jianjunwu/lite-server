@@ -49,6 +49,7 @@ pub async fn clear_connections() {
     CONNECTION_POOL.clear();
 }
 
+#[allow(dead_code)]
 enum InferRequest {
     Single(pb::Request, oneshot::Sender<pb::Response>),
     Batch(pb::Request, oneshot::Sender<pb::BatchResponse>),

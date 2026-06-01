@@ -11,7 +11,7 @@ use axum::{
 use axum::extract::ws::{Message, WebSocket};
 use axum::http::header::{HeaderMap, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::response::sse::{Event, Sse};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -870,7 +870,7 @@ async fn handle_ws_stream(
     }
 
     // Spawn task to forward worker chunks -> WebSocket
-    let mut send_task = tokio::spawn(async move {
+    let send_task = tokio::spawn(async move {
         let open_time = std::time::Instant::now();
         let mut first_chunk = true;
         let mut last_chunk_time = open_time;

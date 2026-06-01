@@ -1,7 +1,7 @@
 pub mod protocol;
 pub mod endpoint_manager;
 
-use crate::config::{HttpHookConfig, ModelConfig, OrchestrationConfig};
+use crate::config::ModelConfig;
 use crate::error::AppError;
 use crate::inference_queue::{InferenceQueue, OutlierState, ReloadSignal};
 use crate::proto::liteserver as pb;
@@ -10,10 +10,10 @@ use crate::transport::zmq::WorkerZmqClient;
 use crate::worker::protocol::*;
 use dashmap::DashMap;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -146,9 +146,6 @@ pub struct WorkerManager {
 
 struct WorkerProcess {
     worker_id: u32,
-    model_name: String,
-    version: String,
-    pid: Option<u32>,
     endpoint: String,
     shutdown_tx: Option<oneshot::Sender<()>>,
 }
@@ -485,9 +482,6 @@ impl WorkerManager {
             if let Some(procs) = workers.get_mut(&key) {
                 procs.push(WorkerProcess {
                     worker_id,
-                    model_name: model_name.to_string(),
-                    version: version.to_string(),
-                    pid,
                     endpoint,
                     shutdown_tx: Some(shutdown_tx),
                 });
@@ -807,9 +801,6 @@ impl WorkerManager {
 
             worker_processes.push(WorkerProcess {
                 worker_id: worker_id as u32,
-                model_name: model_name.to_string(),
-                version: version.to_string(),
-                pid,
                 endpoint,
                 shutdown_tx: Some(shutdown_tx),
             });

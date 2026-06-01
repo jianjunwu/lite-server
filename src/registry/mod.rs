@@ -252,7 +252,7 @@ impl Default for ModelRegistry {
 mod tests {
     use super::*;
     use crate::config::ModelConfig;
-    use crate::registry::types::*;
+    
 
     fn test_config() -> ModelConfig {
         ModelConfig {
