@@ -81,3 +81,39 @@ class TestRunWizard:
 
         with pytest.raises(SystemExit):
             run_wizard(output_dir=str(tmp_path))
+
+
+class TestWizardOptionsPropagation:
+    """Wizard batch/stream options must affect model config.yaml."""
+
+    def test_batch_yes_sets_max_batch_size(self, tmp_path, monkeypatch):
+        # proj, template(empty), model_name, grpc(y), metrics(y), batch(y), stream(n)
+        inputs = iter(["myproj", "", "", "", "", "y", ""])
+        monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
+
+        run_wizard(output_dir=str(tmp_path))
+
+        root = tmp_path / "myproj"
+        cfg = (root / "model_repo" / "my_model" / "1" / "config.yaml").read_text()
+        assert "max_batch_size:" in cfg
+        # Should be an active (uncommented) config line
+        for line in cfg.splitlines():
+            if "max_batch_size:" in line and not line.strip().startswith("#"):
+                return
+        pytest.fail("max_batch_size should be uncommented when batch=yes")
+
+    def test_stream_yes_sets_stream_true(self, tmp_path, monkeypatch):
+        # proj, template(empty), model_name, grpc(y), metrics(y), batch(n), stream(y)
+        inputs = iter(["myproj", "", "", "", "", "", "y"])
+        monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
+
+        run_wizard(output_dir=str(tmp_path))
+
+        root = tmp_path / "myproj"
+        cfg = (root / "model_repo" / "my_model" / "1" / "config.yaml").read_text()
+        assert "stream:" in cfg
+        for line in cfg.splitlines():
+            if "stream:" in line and not line.strip().startswith("#"):
+                assert "true" in line
+                return
+        pytest.fail("stream should be uncommented and true when stream=yes")

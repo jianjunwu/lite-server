@@ -329,40 +329,12 @@ class TestInit:
         assert (proj / "requirements.txt").exists()
         assert (proj / ".gitignore").exists()
         assert (proj / ".github" / "workflows" / "ci.yml").exists()
-        assert (proj / "model_repo" / "orchestration.yaml").exists()
+        assert not (proj / "model_repo" / "orchestration.yaml").exists()
+        assert (proj / "model_repo" / "my_model" / "1" / "config.yaml.example").exists()
         # Verify test_request.py uses requests (not httpx) and has health check
         tr = (proj / "test_request.py").read_text()
         assert "import requests" in tr
         assert "test_health" in tr
-
-    def test_init_llm_template(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        args = type("Args", (), {
-            "project_name": "llm_proj",
-            "template": "llm",
-            "wizard": False,
-        })()
-        assert cli._cmd_init(args) == 0
-        model_py = tmp_path / "llm_proj" / "model_repo" / "my_model" / "1" / "model.py"
-        assert model_py.exists()
-        content = model_py.read_text()
-        assert "messages" in content
-        config = tmp_path / "llm_proj" / "model_repo" / "my_model" / "1" / "config.yaml"
-        assert "stream: true" in config.read_text()
-
-    def test_init_nlp_template(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        args = type("Args", (), {
-            "project_name": "nlp_proj",
-            "template": "nlp",
-            "wizard": False,
-        })()
-        assert cli._cmd_init(args) == 0
-        config = tmp_path / "nlp_proj" / "model_repo" / "my_model" / "1" / "config.yaml"
-        assert "max_batch_size" in config.read_text()
-        model_py = tmp_path / "nlp_proj" / "model_repo" / "my_model" / "1" / "model.py"
-        content = model_py.read_text()
-        assert "label" in content.lower()
 
     def test_init_existing_dir_fails(self, tmp_path, monkeypatch, capsys):
         monkeypatch.chdir(tmp_path)

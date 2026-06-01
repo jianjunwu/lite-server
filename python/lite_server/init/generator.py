@@ -25,107 +25,124 @@ def _load_template(name: str) -> str:
         return (base / name).read_text(encoding="utf-8")
 
 
-def _render_config_yaml(batch: bool, stream: bool, continuous_batching: bool = False) -> str:
+def _render_config_yaml(
+    batch: bool = False,
+    stream: bool = False,
+    continuous_batching: bool = False,
+    accelerator: str | None = None,
+) -> str:
+    """Render concise active config for config.yaml."""
     lines = [
         "# Model version configuration",
         "#",
         "# This file controls inference behavior for this specific version.",
-        "# Place it alongside model.py in model_repo/<name>/<version>/config.yaml",
+        "# All fields are optional. Omitted fields use system defaults.",
         "#",
-        "# All fields are optional. Omitted fields use defaults.",
-        "#",
-        "# TIP: All fields in this file are accessible in model.py via self.config:",
+        "# TIP: All fields are accessible in model.py via self.config:",
         "#   value = self.config.get('my_custom_param', 'default_value')",
         "",
-        "# ===== Dynamic Batching =====",
-        "# max_batch_size: 1            # Max requests to batch together (1 = disabled)",
-        "# batch_timeout: 0.0           # Max seconds to wait before processing a batch",
-        "# adaptive_batching: false     # Dynamically adjust batch timeout based on queue pressure",
-        "# min_batch_timeout: 0.001     # Minimum batch timeout when adaptive_batching is enabled",
-        "# adaptive_queue_threshold: 10 # Queue depth threshold for adaptive batching",
-        "",
-        "# ===== Streaming =====",
-        "# stream: false                # Enable streaming output (requires stream_predict in model.py)",
-        "# bidirectional: false         # Enable bidirectional streaming (WebSocket)",
-        "",
-        "# ===== Continuous Batching (LLM) =====",
-        "# continuous_batching: false   # Enable continuous batching mode",
-        "# max_sequence_length: 2048    # Max sequence length for continuous batching",
-        "",
-        "# ===== Resource Allocation =====",
-        "# accelerator: null            # Accelerator type: cpu, cuda, mps, tpu, auto (null = cpu)",
-        "# devices: null                # Device assignment (null = auto, or integer like 1)",
-        "# workers_per_device: null     # Workers per device (null = 1)",
-        "",
-        "# ===== Queue & Timeout =====",
-        "# max_queue_size: 1000         # Max pending requests per worker",
-        "# queue_mode: per_worker       # Queue mode: per_worker or shared",
-        "# request_timeout: 0.0         # Per-request hard timeout in seconds (0 = disabled)",
-        "# max_requests: 0              # Auto-restart worker after N requests (0 = disabled)",
-        "# max_requests_jitter: 0       # Random jitter for max_requests (prevents thundering herd)",
-        "# health_check_interval: 15.0  # Active health check interval in seconds (0 = disabled)",
-        "",
-        "# ===== Heartbeat (Worker Liveness) =====",
-        "# heartbeat_interval: 0.0     # Heartbeat probe interval in seconds (0 = disabled)",
-        "# heartbeat_timeout: 5.0      # Max seconds to wait for a probe response",
-        "# heartbeat_max_failures: 3   # Consecutive failures before killing the worker",
-        "",
-        "# ===== Worker Lifecycle Hooks =====",
-        "# hooks:",
-        "#   on_ready: 'echo \"Worker $WORKER_ID ready\"'   # Shell command on worker ready",
-        "#   on_exit: 'echo \"Worker $WORKER_ID exited\"'   # Shell command on worker exit",
-        "#   on_error: 'echo \"Worker $WORKER_ID error\"'   # Shell command on worker error",
-        "#   on_ready_http:                                  # HTTP callback on worker ready",
-        "#     url: 'http://notify.internal/worker-ready'",
-        "#     method: POST",
-        "#     body_template: '{\"model\":\"$MODEL\",\"worker\":$WORKER_ID}'",
-        "#   on_exit_http:                                   # HTTP callback on worker exit",
-        "#     url: 'http://notify.internal/worker-exit'",
-        "#     method: POST",
-        "",
-        "# ===== Hot Reload =====",
-        "# hot_reload: false            # Enable file watching for hot reload",
-        "# hot_reload_patterns:         # Glob patterns to watch (e.g., *.py, model_*.yaml)",
-        "#   - \"*.py\"",
-        "# hot_reload_interval: 1.0     # Polling interval in seconds",
-        "",
-        "# ===== Custom Parameters =====",
-        "# Add your own parameters below. Access them in model.py via self.config.get('key')",
-        "# my_model_path: /opt/models/weights.pt",
-        "# my_threshold: 0.5",
+        "# ===== Inference Behavior =====",
     ]
-
-    # Add active configuration based on template options
-    lines.extend(["", "# ===== Active Configuration =====", ""])
 
     if batch:
         lines.extend([
             "max_batch_size: 8",
             "batch_timeout: 0.01",
         ])
-    else:
-        lines.extend([
-            "# max_batch_size: 8",
-            "# batch_timeout: 0.01",
-        ])
-
     if stream:
         lines.append("stream: true")
-    else:
-        lines.append("# stream: true")
-
     if continuous_batching:
         lines.extend([
             "continuous_batching: true",
             "max_sequence_length: 2048",
         ])
-    else:
+
+    if accelerator:
         lines.extend([
-            "# continuous_batching: false",
-            "# max_sequence_length: 2048",
+            "",
+            "# ===== Resource Allocation =====",
+            f"accelerator: {accelerator}",
         ])
 
+    lines.extend([
+        "",
+        "# ===== Queue & Timeout =====",
+        "max_queue_size: 1000",
+        "queue_mode: per_worker     # per_worker | shared",
+        "request_timeout: 30.0      # 0 = no limit (not recommended for production)",
+        "",
+        "# ===== Lifecycle =====",
+        "health_check_interval: 15.0",
+        "",
+        "# ===== Custom Parameters =====",
+        "# Add your own parameters below. Access them in model.py via self.config.get('key')",
+        "# my_threshold: 0.5",
+    ])
+
     return "\n".join(lines) + "\n"
+
+
+CONFIG_YAML_EXAMPLE = textwrap.dedent("""\
+    # Complete reference for all model config fields.
+    # Copy fields you need into config.yaml and uncomment them.
+
+    # ===== Dynamic Batching =====
+    # max_batch_size: 1            # Max requests to batch together (1 = disabled)
+    # batch_timeout: 0.0           # Max seconds to wait before processing a batch
+    # adaptive_batching: false     # Dynamically adjust batch timeout based on queue pressure
+    # min_batch_timeout: 0.001     # Minimum batch timeout when adaptive_batching is enabled
+    # adaptive_queue_threshold: 10 # Queue depth threshold for adaptive batching
+
+    # ===== Streaming =====
+    # stream: false                # Enable streaming output (requires stream_predict in model.py)
+    # bidirectional: false         # Enable bidirectional streaming (WebSocket)
+
+    # ===== Continuous Batching (LLM) =====
+    # continuous_batching: false   # Enable continuous batching mode
+    # max_sequence_length: 2048    # Max sequence length for continuous batching
+
+    # ===== Resource Allocation =====
+    # accelerator: null            # Accelerator type: cpu, cuda, mps, tpu, auto (null = cpu)
+    # devices: null                # Device assignment (null = auto, or integer like 1)
+    # workers_per_device: null     # Workers per device (null = 1)
+
+    # ===== Queue & Timeout =====
+    # max_queue_size: 1000         # Max pending requests per worker
+    # queue_mode: per_worker       # Queue mode: per_worker or shared
+    # request_timeout: 0.0         # Per-request hard timeout in seconds (0 = disabled)
+    # max_requests: 0              # Auto-restart worker after N requests (0 = disabled)
+    # max_requests_jitter: 0       # Random jitter for max_requests (prevents thundering herd)
+    # health_check_interval: 15.0  # Active health check interval in seconds (0 = disabled)
+
+    # ===== Heartbeat (Worker Liveness) =====
+    # heartbeat_interval: 0.0     # Heartbeat probe interval in seconds (0 = disabled)
+    # heartbeat_timeout: 5.0      # Max seconds to wait for a probe response
+    # heartbeat_max_failures: 3   # Consecutive failures before killing the worker
+
+    # ===== Worker Lifecycle Hooks =====
+    # hooks:
+    #   on_ready: 'echo "Worker $WORKER_ID ready"'   # Shell command on worker ready
+    #   on_exit: 'echo "Worker $WORKER_ID exited"'   # Shell command on worker exit
+    #   on_error: 'echo "Worker $WORKER_ID error"'   # Shell command on worker error
+    #   on_ready_http:                                  # HTTP callback on worker ready
+    #     url: 'http://notify.internal/worker-ready'
+    #     method: POST
+    #     body_template: '{"model":"$MODEL","worker":$WORKER_ID}'
+    #   on_exit_http:                                   # HTTP callback on worker exit
+    #     url: 'http://notify.internal/worker-exit'
+    #     method: POST
+
+    # ===== Hot Reload =====
+    # hot_reload: false            # Enable file watching for hot reload
+    # hot_reload_patterns:         # Glob patterns to watch (e.g., *.py, model_*.yaml)
+    #   - "*.py"
+    # hot_reload_interval: 1.0     # Polling interval in seconds
+
+    # ===== Custom Parameters =====
+    # Add your own parameters below. Access them in model.py via self.config.get('key')
+    # my_model_path: /opt/models/weights.pt
+    # my_threshold: 0.5
+""")
 
 
 # ---------------------------------------------------------------------------
@@ -136,22 +153,6 @@ TEMPLATES = {
     "empty": {
         "model_py": _load_template("empty_model.py"),
         "config_yaml": _render_config_yaml(batch=False, stream=False),
-    },
-    "llm": {
-        "model_py": _load_template("llm_model.py"),
-        "config_yaml": _render_config_yaml(batch=False, stream=True, continuous_batching=True),
-    },
-    "cv-classify": {
-        "model_py": _load_template("cv_classify_model.py"),
-        "config_yaml": _render_config_yaml(batch=True, stream=False),
-    },
-    "cv-detect": {
-        "model_py": _load_template("cv_detect_model.py"),
-        "config_yaml": _render_config_yaml(batch=True, stream=False),
-    },
-    "nlp": {
-        "model_py": _load_template("nlp_model.py"),
-        "config_yaml": _render_config_yaml(batch=True, stream=False),
     },
 }
 
@@ -171,7 +172,7 @@ SERVER_YAML = textwrap.dedent("""\
     #   server.metrics_port  - Prometheus /metrics endpoint port
     #   server.timeout       - Per-request timeout in seconds
     #   server.threads       - Tokio worker threads (None = auto = num CPUs)
-    #   server.transport     - Worker transport: "mp" (multiprocessing) or "zmq"
+    #   server.transport     - Worker transport: zmq | mp | uds
     #
     #   model_repository.path - Root directory for model versions
     #
@@ -189,9 +190,17 @@ SERVER_YAML = textwrap.dedent("""\
       http_port: 8000
       grpc_port: 8001
       metrics_port: 8002
-      # timeout: 30.0               # Request timeout in seconds
-      # threads: 4                  # Tokio worker threads (None = auto = CPU cores)
-      # transport: mp               # mp | zmq
+      timeout: 30.0               # Request timeout in seconds
+      # threads: null             # Tokio threads (None = auto = CPU cores)
+      transport: zmq              # zmq | mp | uds
+      graceful_timeout: 30.0      # Max seconds for graceful shutdown
+      keepalive_timeout: 5.0      # HTTP keep-alive timeout (0 = disable)
+
+    grpc:
+      enabled: {grpc}
+
+    metrics:
+      enabled: {metrics}
 
     logging:
       level: info
@@ -201,12 +210,6 @@ SERVER_YAML = textwrap.dedent("""\
       # max_size: 100               # Max log file size in MB (rotation=size)
       # backup_count: 7             # Number of rotated log files to keep
 
-    grpc:
-      enabled: {grpc}
-
-    metrics:
-      enabled: {metrics}
-
     model_repository:
       path: ./model_repo
 
@@ -214,10 +217,36 @@ SERVER_YAML = textwrap.dedent("""\
       control_mode: explicit
       load_models:
         - {model_name}
+
+    # Model-level defaults applied to every loaded model.
+    # These override the per-model config.yaml values when set (non-null).
+    model_defaults:
+      # max_queue_size: null
+      # request_timeout: null
+      # max_requests: null          # Auto-restart worker after N requests
+      # max_requests_jitter: null   # Random jitter for max_requests
+      # health_check_interval: null
+
+    # Feature flags for the admin UI and API.
+    features:
+      # timeline: false
+      system_overview: true
+      # custom_metrics: false
+      benchmarks: true
+      # playground: false
+      alerts: true
+      # version_compare: false
+      streaming: true
+      grpc_streaming: true
+      sse: true
+      websocket_streaming: true
+      streaming_metrics: true
 """)
 
 TEST_REQUEST_PY = textwrap.dedent('''\
     """Test script for the {model_name} model."""
+    import sys
+
     import requests
 
     BASE_URL = "http://127.0.0.1:8000"
@@ -226,14 +255,33 @@ TEST_REQUEST_PY = textwrap.dedent('''\
 
     def test_infer():
         payload = {"{input_key}": "hello world"}
-        resp = requests.post(URL, json=payload)
-        print("Status:", resp.status_code)
-        print("Response:", resp.json())
+        try:
+            resp = requests.post(URL, json=payload, timeout=10)
+            resp.raise_for_status()
+            print("Status:", resp.status_code)
+            print("Response:", resp.json())
+        except requests.exceptions.ConnectionError:
+            print(
+                f"Error: Cannot connect to {{BASE_URL}}."
+                " Is the server running?"
+            )
+            sys.exit(1)
+        except requests.exceptions.HTTPError as e:
+            print(f"HTTP Error: {{e}}")
+            sys.exit(1)
 
 
     def test_health():
-        resp = requests.get(BASE_URL + "/v2/models/{model_name}/ready")
-        print("Ready:", resp.status_code)
+        try:
+            url = BASE_URL + "/v2/models/{model_name}/ready"
+            resp = requests.get(url, timeout=10)
+            print("Ready:", resp.status_code)
+        except requests.exceptions.ConnectionError:
+            print(
+                f"Error: Cannot connect to {{BASE_URL}}."
+                " Is the server running?"
+            )
+            sys.exit(1)
 
 
     if __name__ == "__main__":
@@ -274,9 +322,9 @@ README_MD = textwrap.dedent("""\
     ├── model_repo/
     │   └── {model_name}/
     │       └── 1/
-    │           ├── model.py     # LitAPI implementation
-    │           └── config.yaml  # Model config
-    │   └── orchestration.yaml   # Model orchestration
+    │           ├── model.py           # LitAPI implementation
+    │           ├── config.yaml        # Active model config
+    │           └── config.yaml.example # Full reference
     └── .github/
         └── workflows/
             └── ci.yml           # GitHub Actions CI
@@ -338,6 +386,14 @@ DOCKER_COMPOSE = textwrap.dedent("""\
           - ./model_repo:/app/model_repo
         environment:
           - PYTHONUNBUFFERED=1
+          # - RUST_LOG=info         # Server log level
+        restart: unless-stopped
+        healthcheck:
+          test: ["CMD", "curl", "-f", "http://localhost:8000/v2/health/ready"]
+          interval: 30s
+          timeout: 5s
+          retries: 3
+          start_period: 10s
 """)
 
 REQUIREMENTS_TXT = textwrap.dedent("""\
@@ -422,35 +478,19 @@ CI_YML = textwrap.dedent("""\
           - name: Install dependencies
             run: |
               pip install -r requirements.txt
-          - name: Validate config
+          - name: Validate server config
             run: lite-server config-check server.yaml
+          - name: Validate model configs
+            run: |
+              for cfg in model_repo/**/config.yaml; do
+                lite-server config-check "$cfg" || true
+              done
           - name: Lint model code
             run: |
               python -m py_compile model_repo/{model_name}/1/model.py
+              pip install ruff
+              ruff check model_repo/{model_name}/1/model.py || true
 """)
-
-ORCHESTRATION_YAML = textwrap.dedent("""\
-    # Orchestration config: controls which models are loaded and how.
-    #
-    # control_mode: explicit | poll | all
-    #   explicit: only load models listed in load_models
-    #   poll:     auto-detect repo changes and load/unload models
-    #   all:      load all available models on startup
-    control_mode: explicit
-    poll_interval: 5
-
-    # List of model names to load on startup
-    load_models:
-      - {model_name}
-
-    # Per-model loading strategy
-    models:
-      - name: {model_name}
-        load_policy: explicit
-        versions_to_load:
-          - "1"
-""")
-
 
 # ---------------------------------------------------------------------------
 # Generator
@@ -469,8 +509,9 @@ class ProjectGenerator:
         options: dict[str, Any] | None = None,
     ):
         if template not in TEMPLATES:
+            avail = ", ".join(TEMPLATES)
             raise ValueError(
-                f"Unknown template '{template}'. Available: {', '.join(TEMPLATES)}"
+                f"Unknown template '{template}'. Available: {avail}"
             )
         self.project_name = project_name
         self.template = template
@@ -490,9 +531,19 @@ class ProjectGenerator:
         model_dir = root / "model_repo" / self.model_name / "1"
         model_dir.mkdir(parents=True)
 
+        # Resolve config from wizard overrides (empty template defaults)
+        batch = self.options.get("batch", False)
+        stream = self.options.get("stream", False)
+
+        config_yaml = _render_config_yaml(
+            batch=batch,
+            stream=stream,
+        )
+
         # Model files
         (model_dir / "model.py").write_text(tmpl["model_py"])
-        (model_dir / "config.yaml").write_text(tmpl["config_yaml"])
+        (model_dir / "config.yaml").write_text(config_yaml)
+        (model_dir / "config.yaml.example").write_text(CONFIG_YAML_EXAMPLE)
 
         # Server config
         grpc = str(self.options.get("grpc", True)).lower()
@@ -504,16 +555,9 @@ class ProjectGenerator:
         )
 
         # Test script
-        input_key = "input"
-        if self.template in ("llm",):
-            input_key = "prompt"
-        elif self.template in ("nlp",):
-            input_key = "text"
-        elif self.template in ("cv-classify", "cv-detect"):
-            input_key = "image"
-        (root / "test_request.py").write_text(
-            TEST_REQUEST_PY.replace("{model_name}", self.model_name).replace("{input_key}", input_key)
-        )
+        tr = TEST_REQUEST_PY.replace("{model_name}", self.model_name)
+        tr = tr.replace("{input_key}", "input")
+        (root / "test_request.py").write_text(tr)
 
         # README
         (root / "README.md").write_text(
@@ -546,11 +590,6 @@ class ProjectGenerator:
         ci_dir.mkdir(parents=True)
         (ci_dir / "ci.yml").write_text(
             CI_YML.format(model_name=self.model_name)
-        )
-
-        # Orchestration config
-        (root / "model_repo" / "orchestration.yaml").write_text(
-            ORCHESTRATION_YAML.format(model_name=self.model_name)
         )
 
         return root

@@ -14,8 +14,8 @@ class TestProjectGeneratorBasics:
         with pytest.raises(ValueError, match="Unknown template"):
             ProjectGenerator("proj", "not_a_template", tmp_path)
 
-    def test_all_templates_are_known(self):
-        assert set(TEMPLATES) == {"empty", "llm", "cv-classify", "cv-detect", "nlp"}
+    def test_only_empty_template_exists(self):
+        assert set(TEMPLATES) == {"empty"}
 
     def test_model_name_defaults_to_my_model(self, tmp_path):
         gen = ProjectGenerator("proj", "empty", tmp_path)
@@ -49,7 +49,7 @@ class TestProjectGeneration:
         assert (root / ".github" / "workflows" / "ci.yml").exists()
         assert (root / "model_repo" / "test_model" / "1" / "model.py").exists()
         assert (root / "model_repo" / "test_model" / "1" / "config.yaml").exists()
-        assert (root / "model_repo" / "orchestration.yaml").exists()
+        assert (root / "model_repo" / "test_model" / "1" / "config.yaml.example").exists()
 
     def test_model_py_is_valid_python(self, tmp_path, template):
         gen = ProjectGenerator("myproj", template, tmp_path)
@@ -89,17 +89,135 @@ class TestServerYaml:
 class TestConfigYaml:
     """model version config.yaml content."""
 
-    def test_llm_template_has_stream_true(self, tmp_path):
-        gen = ProjectGenerator("p", "llm", tmp_path)
+    def test_empty_template_has_minimal_config(self, tmp_path):
+        gen = ProjectGenerator("p", "empty", tmp_path)
         root = gen.generate()
         text = (root / "model_repo" / "my_model" / "1" / "config.yaml").read_text()
-        assert "stream: true" in text
+        assert "max_queue_size: 1000" in text
+        assert "request_timeout: 30.0" in text
 
-    def test_cv_detect_template_has_batch_size(self, tmp_path):
-        gen = ProjectGenerator("p", "cv-detect", tmp_path)
+
+class TestConfigYamlStructure:
+    """config.yaml should be concise: active config on top, reference below."""
+
+    def test_generates_config_yaml_example(self, tmp_path):
+        gen = ProjectGenerator("p", "empty", tmp_path)
+        root = gen.generate()
+        example = root / "model_repo" / "my_model" / "1" / "config.yaml.example"
+        assert example.exists(), "Should generate config.yaml.example as reference"
+
+    def test_active_config_not_all_commented(self, tmp_path):
+        gen = ProjectGenerator("p", "empty", tmp_path)
         root = gen.generate()
         text = (root / "model_repo" / "my_model" / "1" / "config.yaml").read_text()
+        lines = text.splitlines()
+        active_lines = [l for l in lines if l.strip() and not l.strip().startswith("#")]
+        assert len(active_lines) >= 3, "Active config should have at least a few uncommented lines"
+
+    def test_contains_request_timeout(self, tmp_path):
+        gen = ProjectGenerator("p", "empty", tmp_path)
+        root = gen.generate()
+        text = (root / "model_repo" / "my_model" / "1" / "config.yaml").read_text()
+        assert "request_timeout:" in text
+
+    def test_example_contains_all_fields(self, tmp_path):
+        gen = ProjectGenerator("p", "empty", tmp_path)
+        root = gen.generate()
+        example = root / "model_repo" / "my_model" / "1" / "config.yaml.example"
+        text = example.read_text()
         assert "max_batch_size" in text
+        assert "stream" in text
+        assert "accelerator" in text
+        assert "hooks" in text
+
+
+class TestServerYamlEnhanced:
+    """server.yaml should expose model_defaults, features and key defaults."""
+
+    def test_contains_timeout_with_value(self, tmp_path):
+        gen = ProjectGenerator("p", "empty", tmp_path)
+        root = gen.generate()
+        text = (root / "server.yaml").read_text()
+        assert "timeout: 30.0" in text
+
+    def test_contains_graceful_timeout(self, tmp_path):
+        gen = ProjectGenerator("p", "empty", tmp_path)
+        root = gen.generate()
+        text = (root / "server.yaml").read_text()
+        assert "graceful_timeout:" in text
+
+    def test_contains_keepalive_timeout(self, tmp_path):
+        gen = ProjectGenerator("p", "empty", tmp_path)
+        root = gen.generate()
+        text = (root / "server.yaml").read_text()
+        assert "keepalive_timeout:" in text
+
+    def test_contains_model_defaults(self, tmp_path):
+        gen = ProjectGenerator("p", "empty", tmp_path)
+        root = gen.generate()
+        text = (root / "server.yaml").read_text()
+        assert "model_defaults:" in text
+
+    def test_contains_features(self, tmp_path):
+        gen = ProjectGenerator("p", "empty", tmp_path)
+        root = gen.generate()
+        text = (root / "server.yaml").read_text()
+        assert "features:" in text
+
+    def test_transport_is_uncommented(self, tmp_path):
+        gen = ProjectGenerator("p", "empty", tmp_path)
+        root = gen.generate()
+        text = (root / "server.yaml").read_text()
+        # transport should be an active config line, not commented
+        for line in text.splitlines():
+            if "transport:" in line and not line.strip().startswith("#"):
+                return
+        pytest.fail("transport should be uncommented in server.yaml")
+
+
+class TestNoStandaloneOrchestration:
+    """orchestration.yaml should NOT be generated standalone; server.yaml owns it."""
+
+    def test_no_standalone_orchestration_yaml(self, tmp_path):
+        gen = ProjectGenerator("p", "empty", tmp_path, model_name="foo")
+        root = gen.generate()
+        assert not (root / "model_repo" / "orchestration.yaml").exists()
+
+
+class TestDockerCompose:
+    """docker-compose.yml should include healthcheck and restart."""
+
+    def test_contains_restart_policy(self, tmp_path):
+        gen = ProjectGenerator("p", "empty", tmp_path)
+        root = gen.generate()
+        text = (root / "docker-compose.yml").read_text()
+        assert "restart:" in text
+
+    def test_contains_healthcheck(self, tmp_path):
+        gen = ProjectGenerator("p", "empty", tmp_path)
+        root = gen.generate()
+        text = (root / "docker-compose.yml").read_text()
+        assert "healthcheck:" in text
+
+
+class TestCIEnhanced:
+    """CI workflow should validate model configs."""
+
+    def test_validates_model_config(self, tmp_path):
+        gen = ProjectGenerator("p", "empty", tmp_path, model_name="foo")
+        root = gen.generate()
+        text = (root / ".github" / "workflows" / "ci.yml").read_text()
+        assert "config.yaml" in text or "config-check" in text
+
+
+class TestTestRequestPyEnhanced:
+    """test_request.py should handle connection errors gracefully."""
+
+    def test_has_error_handling(self, tmp_path):
+        gen = ProjectGenerator("p", "empty", tmp_path)
+        root = gen.generate()
+        text = (root / "test_request.py").read_text()
+        assert "try:" in text or "except" in text or "ConnectionError" in text
 
 
 class TestMakefile:
@@ -124,22 +242,6 @@ class TestMakefile:
         text = (root / "Makefile").read_text()
         assert "benchmark:" in text
         assert "--model foo" in text
-
-
-class TestOrchestrationYaml:
-    """orchestration.yaml content."""
-
-    def test_lists_model_in_load_models(self, tmp_path):
-        gen = ProjectGenerator("p", "empty", tmp_path, model_name="foo")
-        root = gen.generate()
-        text = (root / "model_repo" / "orchestration.yaml").read_text()
-        assert "- foo" in text
-
-    def test_control_mode_explicit(self, tmp_path):
-        gen = ProjectGenerator("p", "empty", tmp_path)
-        root = gen.generate()
-        text = (root / "model_repo" / "orchestration.yaml").read_text()
-        assert "control_mode: explicit" in text
 
 
 class TestDockerfile:
