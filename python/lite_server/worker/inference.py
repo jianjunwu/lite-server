@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import traceback
+from contextlib import contextmanager
 from typing import Any
 
 import yaml
@@ -99,37 +100,42 @@ def load_litapi(model_py_path: str, config: dict, device: str = "cpu"):
     spec = importlib.util.spec_from_file_location("model_module", model_py_path)
     module = importlib.util.module_from_spec(spec)
 
-    sys.path.insert(0, model_dir)
-    try:
-        spec.loader.exec_module(module)
-    finally:
-        sys.path.remove(model_dir)
+    # Protect stdout during model module import and setup.
+    # C-level inference libraries (CANN, ONNX Runtime, MagicMind, etc.) may
+    # write init logs directly to fd 1, which breaks the worker-ready handshake
+    # protocol that expects the first stdout line to be valid JSON.
+    with _protect_stdout():
+        sys.path.insert(0, model_dir)
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.path.remove(model_dir)
 
-    LitAPIClass = None
-    for attr_name in dir(module):
-        attr = getattr(module, attr_name)
-        if isinstance(attr, type) and attr_name != "LitAPI" and hasattr(attr, "predict"):
-            LitAPIClass = attr
-            break
+        LitAPIClass = None
+        for attr_name in dir(module):
+            attr = getattr(module, attr_name)
+            if isinstance(attr, type) and attr_name != "LitAPI" and hasattr(attr, "predict"):
+                LitAPIClass = attr
+                break
 
-    if LitAPIClass is None:
-        raise RuntimeError(f"No LitAPI subclass found in {model_py_path}")
+        if LitAPIClass is None:
+            raise RuntimeError(f"No LitAPI subclass found in {model_py_path}")
 
-    max_batch_size = config.get("max_batch_size", 1)
-    batch_timeout = config.get("batch_timeout", 0.0)
-    stream = config.get("stream", False)
+        max_batch_size = config.get("max_batch_size", 1)
+        batch_timeout = config.get("batch_timeout", 0.0)
+        stream = config.get("stream", False)
 
-    instance = LitAPIClass(
-        max_batch_size=max_batch_size,
-        batch_timeout=batch_timeout,
-        stream=stream,
-    )
-    instance.config = config
-    if hasattr(instance, "pre_setup"):
-        instance.pre_setup()
+        instance = LitAPIClass(
+            max_batch_size=max_batch_size,
+            batch_timeout=batch_timeout,
+            stream=stream,
+        )
+        instance.config = config
+        if hasattr(instance, "pre_setup"):
+            instance.pre_setup()
 
-    if hasattr(instance, "setup"):
-        instance.setup(device)
+        if hasattr(instance, "setup"):
+            instance.setup(device)
 
     return instance
 
@@ -529,6 +535,28 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
 # ---------------------------------------------------------------------------
 # Entry Point
 # ---------------------------------------------------------------------------
+
+@contextmanager
+def _protect_stdout():
+    """Redirect fd 1 (stdout) to stderr during model loading.
+
+    C-level inference libraries (CANN, ONNX Runtime, MagicMind, etc.) often
+    write init logs directly to fd 1. Since lite-server uses the first line of
+    stdout for the worker-ready handshake, any pollution causes a JSON parse
+    error and the worker is treated as crashed.
+
+    This context manager redirects fd 1 → stderr at the OS level so that
+    library init output is still captured (via Rust's stderr → tracing
+    forwarder) while keeping the stdout channel clean for the protocol.
+    """
+    saved = os.dup(1)
+    try:
+        os.dup2(2, 1)
+        yield
+    finally:
+        os.dup2(saved, 1)
+        os.close(saved)
+
 
 def worker_main():
     args = parse_args()

@@ -1,6 +1,8 @@
 """pytest tests for lite_server.worker.inference (ZMQ + Protobuf)."""
 
 import json
+import os
+import subprocess
 import sys
 import textwrap
 
@@ -259,3 +261,52 @@ class TestHealthCheck:
         resp_bytes, status, metrics = inference._run_predict(CountingAPI(), data, meta)
         assert call_count == 1
         assert status.code == "Ok"
+
+
+class TestStdoutProtection:
+    """C-level writes to fd 1 during model loading must not pollute the handshake."""
+
+    def test_ready_signal_clean_after_os_write_to_fd1(self, tmp_path):
+        """Simulate CANN/ONNX Runtime init writing to fd 1 during setup()."""
+        model_py = tmp_path / "model.py"
+        model_py.write_text(textwrap.dedent("""\
+            import os as _os
+            class MyModel:
+                def __init__(self, **kwargs):
+                    pass
+                def setup(self, device):
+                    _os.write(1, b"[CANN] Initializing NPU...\\n")
+                    _os.write(1, b"[CANN] Driver: 8.0.rc1\\n")
+                def predict(self, x):
+                    return {"output": x * 2}
+        """))
+        (tmp_path / "config.yaml").write_text("")
+
+        this_dir = os.path.dirname(os.path.abspath(__file__))
+        python_dir = os.path.dirname(this_dir)  # python/tests -> python/
+
+        script = textwrap.dedent(f"""\
+            import sys, json
+            sys.path.insert(0, {repr(python_dir)})
+            from lite_server.worker import inference
+            api = inference.load_litapi({repr(str(model_py))}, {{}}, device="npu:0")
+            print(json.dumps({{"status": "ready", "worker_id": 0}}), flush=True)
+        """)
+
+        env = os.environ.copy()
+        env["PYTHONPATH"] = python_dir
+
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=30,
+            cwd=str(tmp_path), env=env,
+        )
+
+        stdout_lines = [l for l in result.stdout.strip().split("\n") if l]
+        assert len(stdout_lines) == 1, (
+            f"Expected exactly 1 line on stdout (the ready signal), "
+            f"got {len(stdout_lines)}: {stdout_lines}"
+        )
+        parsed = json.loads(stdout_lines[0])
+        assert parsed["status"] == "ready"
+        assert parsed["worker_id"] == 0

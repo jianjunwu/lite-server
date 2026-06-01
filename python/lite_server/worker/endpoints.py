@@ -10,6 +10,7 @@ import os
 import socket
 import struct
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 MAX_FRAME_SIZE = 16 * 1024 * 1024  # 16 MiB
@@ -226,12 +227,30 @@ async def handle_request(endpoints, req_data: dict) -> dict:
         }
 
 
+@contextmanager
+def _protect_stdout():
+    """Redirect fd 1 (stdout) to stderr during endpoint loading.
+
+    Endpoint modules may import inference frameworks (CANN, ONNX Runtime,
+    MagicMind, etc.) whose C-level init writes to fd 1, polluting the
+    stdout channel used for the worker-ready handshake.
+    """
+    saved = os.dup(1)
+    try:
+        os.dup2(2, 1)
+        yield
+    finally:
+        os.dup2(saved, 1)
+        os.close(saved)
+
+
 async def worker_main():
     setup_logging()
     args = parse_args()
 
     # Load endpoints
-    endpoints = load_endpoints(args.repo_path)
+    with _protect_stdout():
+        endpoints = load_endpoints(args.repo_path)
     routes = [{"route": r, "methods": ep["methods"]} for r, ep in endpoints.items()]
 
     # Send startup signal
