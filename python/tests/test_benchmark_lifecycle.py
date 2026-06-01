@@ -1,7 +1,9 @@
 """Test that run_liteserver.py properly cleans up on SIGTERM."""
 
-import socket
+import os
+import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -13,6 +15,17 @@ import pytest
 
 RUN_SCRIPT = Path(__file__).resolve().parent.parent.parent / "benchmarks" / "scripts" / "run_liteserver.py"
 MODEL_REPO = Path(__file__).resolve().parent.parent.parent / "benchmarks" / "models"
+
+
+def _clean_env() -> dict:
+    """Return a copy of os.environ without PYTHONPATH.
+
+    PYTHONPATH=python (set for dev tests) would interfere with the
+    child lite-server process, which must use the installed package.
+    """
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    return env
 
 
 def _free_port() -> int:
@@ -43,9 +56,15 @@ def _drain_stream(stream, collector: list):
 
 
 class TestBenchmarkLifecycle:
-    def test_sigterm_cleans_up_child_process(self):
+    def test_sigterm_cleans_up_child_process(self, tmp_path):
         """SIGTERM to run_liteserver.py should also terminate lite-server serve."""
         port = _free_port()
+
+        # Copy model repo to a temp dir to isolate from concurrent test runs.
+        # Use copytree with ignore to exclude __pycache__ which can carry
+        # stale bytecode from a different Python version.
+        tmp_repo = tmp_path / "models"
+        shutil.copytree(MODEL_REPO, tmp_repo, ignore=shutil.ignore_patterns("__pycache__"))
 
         proc = subprocess.Popen(
             [
@@ -54,11 +73,12 @@ class TestBenchmarkLifecycle:
                 "--port", str(port),
                 "--workers", "1",
                 "--duration", "60",
-                "--model-repo", str(MODEL_REPO),
+                "--model-repo", str(tmp_repo),
                 "--model", "sleep_1ms_model",
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
+            env=_clean_env(),
         )
 
         stderr_lines: list[str] = []

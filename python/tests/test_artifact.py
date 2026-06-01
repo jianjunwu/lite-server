@@ -20,6 +20,7 @@ from lite_server.artifact import (
     _sha256_file,
     _should_ignore,
 )
+from lite_server.artifact.packer import _validate_version, _validate_name, _resolve_version_dir
 
 
 class TestShouldIgnore:
@@ -112,29 +113,192 @@ class TestManifest:
         assert m1.to_canonical_json() == m2.to_canonical_json()
 
 
+class TestValidateVersion:
+    """Version format validation."""
+
+    def test_accepts_bare_number(self):
+        assert _validate_version("1") == "1"
+        assert _validate_version("123") == "123"
+
+    def test_accepts_semver(self):
+        assert _validate_version("1.0") == "1.0"
+        assert _validate_version("1.0.0") == "1.0.0"
+        assert _validate_version("12.3.4") == "12.3.4"
+
+    def test_accepts_v_prefix_and_strips(self):
+        assert _validate_version("v1") == "1"
+        assert _validate_version("v1.0") == "1.0"
+        assert _validate_version("v1.0.0") == "1.0.0"
+
+    def test_rejects_invalid_formats(self):
+        for bad in ["abc", "1.0.0.0", "1_0", "", "v", "1-0", "1.0-beta"]:
+            with pytest.raises(ValueError, match="invalid version"):
+                _validate_version(bad)
+
+
+class TestValidateName:
+    """Model name validation."""
+
+    def test_accepts_valid_names(self):
+        assert _validate_name("my_model") == "my_model"
+        assert _validate_name("model-v2") == "model-v2"
+        assert _validate_name("Model123") == "Model123"
+
+    def test_rejects_empty(self):
+        with pytest.raises(ValueError, match="name cannot be empty"):
+            _validate_name("")
+
+    def test_rejects_special_chars(self):
+        for bad in ["my model", "model/v2", "model@1", "a.b"]:
+            with pytest.raises(ValueError, match="invalid model name"):
+                _validate_name(bad)
+
+
+class TestResolveVersionDir:
+    """Auto-detect version subdirectory from model dir."""
+
+    def test_finds_numeric_dir(self, tmp_path):
+        model_dir = tmp_path / "my_model"
+        vdir = model_dir / "1"
+        vdir.mkdir(parents=True)
+        (vdir / "model.py").write_text("x")
+
+        result = _resolve_version_dir(model_dir, "1")
+        assert result == vdir
+
+    def test_finds_v_prefixed_dir(self, tmp_path):
+        model_dir = tmp_path / "my_model"
+        vdir = model_dir / "v1"
+        vdir.mkdir(parents=True)
+        (vdir / "model.py").write_text("x")
+
+        result = _resolve_version_dir(model_dir, "1")
+        assert result == vdir
+
+    def test_raises_when_version_dir_missing(self, tmp_path):
+        model_dir = tmp_path / "my_model"
+        model_dir.mkdir()
+
+        with pytest.raises(ValueError, match="version.*not found"):
+            _resolve_version_dir(model_dir, "99")
+
+
 class TestModelPacker:
     """Packing model directories into .lma artifacts."""
 
-    def test_packs_files(self, tmp_path):
+    def test_packs_version_dir_only(self, tmp_path):
+        """Pack model_dir with version — should only include that version's files."""
         model_dir = tmp_path / "my_model"
         model_dir.mkdir()
-        vdir = model_dir / "1"
-        vdir.mkdir()
-        (vdir / "model.py").write_text("print('hello')")
-        (vdir / "config.yaml").write_text("stream: true\n")
+        v1 = model_dir / "1"
+        v1.mkdir()
+        (v1 / "model.py").write_text("v1 code")
+        v2 = model_dir / "2"
+        v2.mkdir()
+        (v2 / "model.py").write_text("v2 code")
 
-        packer = ModelPacker(model_dir, version="1.0.0")
+        packer = ModelPacker(model_dir, version="1")
         artifact = packer.pack(tmp_path / "out")
 
-        assert artifact.exists()
-        assert artifact.suffix == ".lma"
-
-        # Verify it's a valid zip
         with zipfile.ZipFile(artifact, "r") as zf:
             names = zf.namelist()
-            assert "manifest.json" in names
             assert "1/model.py" in names
-            assert "1/config.yaml" in names
+            assert "2/model.py" not in names
+
+    def test_packs_version_dir_with_v_prefix(self, tmp_path):
+        """Pack when version dirs use v-prefix naming."""
+        model_dir = tmp_path / "my_model"
+        model_dir.mkdir()
+        v1 = model_dir / "v1"
+        v1.mkdir()
+        (v1 / "model.py").write_text("v1 code")
+
+        packer = ModelPacker(model_dir, version="1")
+        artifact = packer.pack(tmp_path / "out")
+
+        with zipfile.ZipFile(artifact, "r") as zf:
+            names = zf.namelist()
+            assert "v1/model.py" in names
+
+    def test_includes_public_files_from_model_root(self, tmp_path):
+        """Public files like requirements.txt at model root should be included."""
+        model_dir = tmp_path / "my_model"
+        model_dir.mkdir()
+        (model_dir / "requirements.txt").write_text("torch>=2.0\n")
+        v1 = model_dir / "1"
+        v1.mkdir()
+        (v1 / "model.py").write_text("v1 code")
+
+        packer = ModelPacker(model_dir, version="1")
+        artifact = packer.pack(tmp_path / "out")
+
+        with zipfile.ZipFile(artifact, "r") as zf:
+            names = zf.namelist()
+            assert "requirements.txt" in names
+            assert "1/model.py" in names
+
+    def test_infers_name_from_model_dir(self, tmp_path):
+        """When model_dir is the model root, name = model_dir.name."""
+        model_dir = tmp_path / "my_model"
+        vdir = model_dir / "1"
+        vdir.mkdir(parents=True)
+        (vdir / "model.py").write_text("x")
+
+        packer = ModelPacker(model_dir, version="1")
+        assert packer.name == "my_model"
+
+    def test_infers_name_from_parent_when_version_dir(self, tmp_path):
+        """When model_dir is a version dir (leaf matches version), use parent name."""
+        model_dir = tmp_path / "my_model" / "1"
+        model_dir.mkdir(parents=True)
+        (model_dir / "model.py").write_text("x")
+
+        packer = ModelPacker(model_dir, version="1")
+        assert packer.name == "my_model"
+
+    def test_explicit_name_overrides_inference(self, tmp_path):
+        model_dir = tmp_path / "my_model"
+        vdir = model_dir / "1"
+        vdir.mkdir(parents=True)
+        (vdir / "model.py").write_text("x")
+
+        packer = ModelPacker(model_dir, version="1", name="custom")
+        assert packer.name == "custom"
+        artifact = packer.pack(tmp_path / "out")
+        assert artifact.name == "custom_v1.lma"
+
+    def test_artifact_name_includes_model_name(self, tmp_path):
+        model_dir = tmp_path / "my_model"
+        vdir = model_dir / "1"
+        vdir.mkdir(parents=True)
+        (vdir / "model.py").write_text("x")
+
+        packer = ModelPacker(model_dir, version="1")
+        artifact = packer.pack(tmp_path / "out")
+        assert artifact.name == "my_model_v1.lma"
+
+    def test_manifest_name_is_model_name(self, tmp_path):
+        model_dir = tmp_path / "my_model"
+        vdir = model_dir / "1"
+        vdir.mkdir(parents=True)
+        (vdir / "model.py").write_text("x")
+
+        packer = ModelPacker(model_dir, version="1")
+        packer.pack(tmp_path / "out")
+        assert packer.manifest.name == "my_model"
+        assert packer.manifest.version == "1"
+
+    def test_rejects_invalid_version(self, tmp_path):
+        model_dir = tmp_path / "my_model"
+        model_dir.mkdir()
+        with pytest.raises(ValueError, match="invalid version"):
+            ModelPacker(model_dir, version="abc")
+
+    def test_rejects_invalid_name(self, tmp_path):
+        model_dir = tmp_path / "my_model"
+        model_dir.mkdir()
+        with pytest.raises(ValueError, match="invalid model name"):
+            ModelPacker(model_dir, version="1", name="bad name")
 
     def test_manifest_contains_checksums(self, tmp_path):
         model_dir = tmp_path / "my_model"
@@ -143,7 +307,7 @@ class TestModelPacker:
         vdir.mkdir()
         (vdir / "model.py").write_text("print('hello')")
 
-        packer = ModelPacker(model_dir, version="1.0.0")
+        packer = ModelPacker(model_dir, version="1")
         packer.pack(tmp_path / "out")
 
         expected_hash = hashlib.sha256(b"print('hello')").hexdigest()
@@ -160,7 +324,7 @@ class TestModelPacker:
         pycache.mkdir()
         (pycache / "foo.cpython-312.pyc").write_text("x")
 
-        packer = ModelPacker(model_dir, version="1.0.0")
+        packer = ModelPacker(model_dir, version="1")
         packer.pack(tmp_path / "out")
 
         with zipfile.ZipFile(packer._artifact_path, "r") as zf:
@@ -175,7 +339,7 @@ class TestModelPacker:
         (vdir / "model.py").write_text("x")
 
         key = b"secret_key_32_bytes_long_12345678"
-        packer = ModelPacker(model_dir, version="1.0.0")
+        packer = ModelPacker(model_dir, version="1")
         packer.pack(tmp_path / "out", sign_key=key)
 
         assert packer.manifest is not None
@@ -195,14 +359,14 @@ class TestModelUnpacker:
         (vdir / "model.py").write_text("print('hello')")
         (vdir / "config.yaml").write_text("stream: true\n")
 
-        packer = ModelPacker(model_dir, version="1.0.0")
+        packer = ModelPacker(model_dir, version="1")
         return packer.pack(tmp_path / "out")
 
     def test_validate_returns_manifest(self, artifact):
         unpacker = ModelUnpacker(artifact)
         manifest = unpacker.validate()
         assert manifest.name == "my_model"
-        assert manifest.version == "1.0.0"
+        assert manifest.version == "1"
         assert "1/model.py" in manifest.files
 
     def test_validate_detects_missing_file(self, artifact, tmp_path):
@@ -237,7 +401,7 @@ class TestModelUnpacker:
         key = b"secret_key_32_bytes_long_12345678"
         # Re-pack with signature
         model_dir = artifact.parent.parent / "my_model"
-        packer = ModelPacker(model_dir, version="1.0.0")
+        packer = ModelPacker(model_dir, version="1")
         signed = packer.pack(artifact.parent, sign_key=key)
 
         unpacker = ModelUnpacker(signed)
@@ -247,7 +411,7 @@ class TestModelUnpacker:
     def test_validate_signature_fails_with_wrong_key(self, artifact):
         key = b"secret_key_32_bytes_long_12345678"
         model_dir = artifact.parent.parent / "my_model"
-        packer = ModelPacker(model_dir, version="1.0.0")
+        packer = ModelPacker(model_dir, version="1")
         signed = packer.pack(artifact.parent, sign_key=key)
 
         wrong_key = b"wrong_key_32_bytes_long_123456789"
@@ -255,23 +419,27 @@ class TestModelUnpacker:
         with pytest.raises(SignatureInvalidError):
             unpacker.validate(verify_key=wrong_key)
 
-    def test_unpack_extracts_files(self, artifact, tmp_path):
+    def test_unpack_prepends_model_name_dir(self, artifact, tmp_path):
+        """Unpack should create target/model_name/ structure."""
         unpacker = ModelUnpacker(artifact)
         target = tmp_path / "extracted"
-        unpacker.unpack(target)
+        model_dir = unpacker.unpack(target)
 
-        assert (target / "1" / "model.py").exists()
-        assert (target / "1" / "config.yaml").exists()
+        # Returns the model directory path
+        assert model_dir == target / "my_model"
+        assert (target / "my_model" / "1" / "model.py").exists()
+        assert (target / "my_model" / "1" / "config.yaml").exists()
 
-    def test_unpack_and_validate_extracts_and_verifies(self, artifact, tmp_path):
-        """Single-pass: extract files and validate checksums together."""
+    def test_unpack_and_validate_prepends_model_name_dir(self, artifact, tmp_path):
+        """Single-pass unpack should also prepend model name dir."""
         unpacker = ModelUnpacker(artifact)
         target = tmp_path / "extracted"
-        manifest = unpacker.unpack_and_validate(target)
+        manifest, model_dir = unpacker.unpack_and_validate(target)
 
         assert manifest.name == "my_model"
-        assert (target / "1" / "model.py").read_text() == "print('hello')"
-        assert (target / "1" / "config.yaml").read_text() == "stream: true\n"
+        assert model_dir == target / "my_model"
+        assert (target / "my_model" / "1" / "model.py").read_text() == "print('hello')"
+        assert (target / "my_model" / "1" / "config.yaml").read_text() == "stream: true\n"
 
     def test_unpack_and_validate_detects_corruption(self, artifact, tmp_path):
         """Single-pass: corrupted file must be detected during extraction."""
@@ -289,6 +457,15 @@ class TestModelUnpacker:
         with pytest.raises(ArtifactCorruptedError, match="Checksum mismatch"):
             unpacker.unpack_and_validate(target)
 
+    def test_unpack_skip_name_dir(self, artifact, tmp_path):
+        """Unpack with prepend_name=False extracts without model name dir."""
+        unpacker = ModelUnpacker(artifact)
+        target = tmp_path / "extracted"
+        model_dir = unpacker.unpack(target, prepend_name=False)
+
+        assert model_dir == target
+        assert (target / "1" / "model.py").exists()
+
     def test_file_not_found(self, tmp_path):
         unpacker = ModelUnpacker(tmp_path / "missing.lma")
         with pytest.raises(FileNotFoundError):
@@ -305,7 +482,7 @@ class TestArtifactCache:
         vdir = model_dir / "1"
         vdir.mkdir()
         (vdir / "model.py").write_text("x")
-        packer = ModelPacker(model_dir, version="1.0")
+        packer = ModelPacker(model_dir, version="1")
         return packer.pack(tmp_path / "out")
 
     def test_cache_hit(self, artifact, tmp_path):
@@ -329,7 +506,7 @@ class TestArtifactCache:
         vdir = model_dir2 / "1"
         vdir.mkdir()
         (vdir / "model.py").write_text("y")
-        packer2 = ModelPacker(model_dir2, version="1.0")
+        packer2 = ModelPacker(model_dir2, version="1")
         artifact2 = packer2.pack(tmp_path / "out")
 
         path2 = cache.get_or_unpack(artifact2, "other_model")
@@ -343,7 +520,7 @@ class TestArtifactCache:
         import time
         time.sleep(0.01)
         model_dir = artifact.parent.parent / "my_model"
-        packer = ModelPacker(model_dir, version="1.0")
+        packer = ModelPacker(model_dir, version="1")
         packer.pack(artifact.parent)
 
         path2 = cache.get_or_unpack(artifact, "my_model")

@@ -7,7 +7,7 @@ import hmac
 import json
 import zipfile
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 from lite_server.artifact.manifest import Manifest
 
@@ -65,18 +65,29 @@ class ModelUnpacker:
 
         return manifest
 
-    def unpack(self, target_dir: Path | str, filter_func: Optional[Callable] = None) -> Path:
+    def unpack(
+        self,
+        target_dir: Path | str,
+        filter_func: Optional[Callable] = None,
+        prepend_name: bool = True,
+    ) -> Path:
         """Extract artifact contents to target_dir.
 
         Args:
             target_dir: Destination directory.
             filter_func: Optional callable(zipinfo) -> bool to filter extracted files.
+            prepend_name: If True, prepend manifest.name as top-level directory.
 
         Returns:
             Path to the extracted model directory.
         """
         target_dir = Path(target_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
+
+        if prepend_name:
+            manifest = self._ensure_manifest()
+            target_dir = target_dir / manifest.name
+            target_dir.mkdir(parents=True, exist_ok=True)
 
         with zipfile.ZipFile(self.artifact_path, "r") as zf:
             if filter_func:
@@ -88,15 +99,25 @@ class ModelUnpacker:
 
         return target_dir
 
-    def unpack_and_validate(self, target_dir: Path | str, verify_key: Optional[bytes] = None) -> Manifest:
+    def unpack_and_validate(
+        self,
+        target_dir: Path | str,
+        verify_key: Optional[bytes] = None,
+        prepend_name: bool = True,
+    ) -> Tuple[Manifest, Path]:
         """Extract and validate checksums in a single pass.
 
         Streams each file from the zip, computes SHA256 on the fly,
         validates against the manifest, and writes to disk — all in one
         read of the zip archive.
 
+        Args:
+            target_dir: Destination directory.
+            verify_key: Optional HMAC key for signature verification.
+            prepend_name: If True, prepend manifest.name as top-level directory.
+
         Returns:
-            The validated Manifest.
+            Tuple of (validated Manifest, path to extracted model directory).
 
         Raises:
             ArtifactCorruptedError: If a file is missing or checksum mismatches.
@@ -113,6 +134,12 @@ class ModelUnpacker:
             manifest = Manifest.from_dict(json.loads(manifest_raw))
             self.manifest = manifest
 
+            if prepend_name:
+                extract_dir = target_dir / manifest.name
+            else:
+                extract_dir = target_dir
+            extract_dir.mkdir(parents=True, exist_ok=True)
+
             for rel_path, entry in manifest.files.items():
                 try:
                     info = zf.getinfo(rel_path)
@@ -121,7 +148,7 @@ class ModelUnpacker:
 
                 # Single pass: stream-read, hash, and write
                 h = hashlib.sha256()
-                out_path = target_dir / rel_path
+                out_path = extract_dir / rel_path
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 with zf.open(info) as src, open(out_path, "wb") as dst:
                     while chunk := src.read(65536):
@@ -144,4 +171,10 @@ class ModelUnpacker:
                 if not hmac.compare_digest(expected, manifest.signature):
                     raise SignatureInvalidError("Artifact signature verification failed")
 
-        return manifest
+        return manifest, extract_dir
+
+    def _ensure_manifest(self) -> Manifest:
+        """Return cached manifest, loading it from the artifact if needed."""
+        if self.manifest is None:
+            self.validate()
+        return self.manifest  # type: ignore[return-value]

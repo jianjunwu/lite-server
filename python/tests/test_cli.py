@@ -132,20 +132,21 @@ class TestAnalyze:
 class TestPackUnpack:
     def test_pack_valid_model(self, tmp_path):
         model_dir = tmp_path / "my_model"
-        model_dir.mkdir()
-        (model_dir / "model.py").write_text("# model")
-        (model_dir / "config.yaml").write_text("max_batch_size: 1\n")
+        vdir = model_dir / "1"
+        vdir.mkdir(parents=True)
+        (vdir / "model.py").write_text("# model")
+        (vdir / "config.yaml").write_text("max_batch_size: 1\n")
 
         out_dir = tmp_path / "artifacts"
         args = type("Args", (), {
             "model_dir": str(model_dir),
             "version": "1",
             "output": str(out_dir),
+            "name": None,
         })()
         assert cli._cmd_pack(args) == 0
         artifact = out_dir / "my_model_v1.lma"
         assert artifact.exists()
-        # Verify it's a valid zip with manifest.json
         with zipfile.ZipFile(artifact, "r") as zf:
             assert "manifest.json" in zf.namelist()
 
@@ -154,16 +155,47 @@ class TestPackUnpack:
             "model_dir": str(tmp_path / "nope"),
             "version": "1",
             "output": str(tmp_path),
+            "name": None,
         })()
         assert cli._cmd_pack(args) == 1
+
+    def test_pack_rejects_invalid_version(self, tmp_path, capsys):
+        model_dir = tmp_path / "my_model"
+        model_dir.mkdir()
+        args = type("Args", (), {
+            "model_dir": str(model_dir),
+            "version": "abc",
+            "output": str(tmp_path),
+            "name": None,
+        })()
+        assert cli._cmd_pack(args) == 1
+        captured = capsys.readouterr()
+        assert "invalid version" in captured.err.lower()
+
+    def test_pack_with_name_override(self, tmp_path):
+        model_dir = tmp_path / "my_model"
+        vdir = model_dir / "1"
+        vdir.mkdir(parents=True)
+        (vdir / "model.py").write_text("# model")
+
+        out_dir = tmp_path / "artifacts"
+        args = type("Args", (), {
+            "model_dir": str(model_dir),
+            "version": "1",
+            "output": str(out_dir),
+            "name": "custom",
+        })()
+        assert cli._cmd_pack(args) == 0
+        assert (out_dir / "custom_v1.lma").exists()
 
     def test_unpack_valid_artifact(self, tmp_path):
         from lite_server.artifact import ModelPacker, ModelUnpacker
 
         model_dir = tmp_path / "src_model"
-        model_dir.mkdir()
-        (model_dir / "model.py").write_text("# model")
-        (model_dir / "config.yaml").write_text("max_batch_size: 1\n")
+        vdir = model_dir / "1"
+        vdir.mkdir(parents=True)
+        (vdir / "model.py").write_text("# model")
+        (vdir / "config.yaml").write_text("max_batch_size: 1\n")
 
         packer = ModelPacker(model_dir, version="1")
         artifact = packer.pack(tmp_path / "artifacts")
@@ -174,7 +206,7 @@ class TestPackUnpack:
             "target_dir": str(target),
         })()
         assert cli._cmd_unpack(args) == 0
-        assert (target / "model.py").exists()
+        assert (target / "src_model" / "1" / "model.py").exists()
 
     def test_unpack_missing_artifact(self, tmp_path, capsys):
         args = type("Args", (), {
@@ -190,19 +222,20 @@ class TestPackUnpack:
         monkeypatch.setenv("LITE_SERVER_SIGN_KEY", str(key_file))
 
         model_dir = tmp_path / "signed_model"
-        model_dir.mkdir()
-        (model_dir / "model.py").write_text("# model")
+        vdir = model_dir / "1"
+        vdir.mkdir(parents=True)
+        (vdir / "model.py").write_text("# model")
 
         out_dir = tmp_path / "artifacts"
         args = type("Args", (), {
             "model_dir": str(model_dir),
-            "version": "2",
+            "version": "1",
             "output": str(out_dir),
+            "name": None,
         })()
         assert cli._cmd_pack(args) == 0
-        artifact = out_dir / "signed_model_v2.lma"
+        artifact = out_dir / "signed_model_v1.lma"
         assert artifact.exists()
-        # Verify manifest has signature
         with zipfile.ZipFile(artifact, "r") as zf:
             manifest = json.loads(zf.read("manifest.json"))
         assert manifest["signature"] != ""
@@ -215,15 +248,17 @@ class TestPackUnpack:
         monkeypatch.setenv("LITE_SERVER_SIGN_KEY", str(key_file))
 
         model_dir = tmp_path / "src_model"
-        model_dir.mkdir()
-        (model_dir / "model.py").write_text("# model")
-        (model_dir / "config.yaml").write_text("max_batch_size: 1\n")
+        vdir = model_dir / "1"
+        vdir.mkdir(parents=True)
+        (vdir / "model.py").write_text("# model")
+        (vdir / "config.yaml").write_text("max_batch_size: 1\n")
 
         artifact_dir = tmp_path / "artifacts"
         pack_args = type("Args", (), {
             "model_dir": str(model_dir),
             "version": "1",
             "output": str(artifact_dir),
+            "name": None,
         })()
         assert cli._cmd_pack(pack_args) == 0
 
@@ -233,7 +268,7 @@ class TestPackUnpack:
             "target_dir": str(target),
         })()
         assert cli._cmd_unpack(unpack_args) == 0
-        assert (target / "model.py").exists()
+        assert (target / "src_model" / "1" / "model.py").exists()
 
     def test_unpack_tampered_artifact_fails(self, tmp_path, monkeypatch):
         key_dir = tmp_path / "keys"
@@ -242,21 +277,22 @@ class TestPackUnpack:
         monkeypatch.setenv("LITE_SERVER_SIGN_KEY", str(key_file))
 
         model_dir = tmp_path / "src_model"
-        model_dir.mkdir()
-        (model_dir / "model.py").write_text("# original")
+        vdir = model_dir / "1"
+        vdir.mkdir(parents=True)
+        (vdir / "model.py").write_text("# original")
 
         artifact_dir = tmp_path / "artifacts"
         pack_args = type("Args", (), {
             "model_dir": str(model_dir),
             "version": "1",
             "output": str(artifact_dir),
+            "name": None,
         })()
         assert cli._cmd_pack(pack_args) == 0
 
-        # Tamper with the artifact by appending a modified file
         artifact = artifact_dir / "src_model_v1.lma"
         with zipfile.ZipFile(artifact, "a") as zf:
-            zf.writestr("model.py", "# tampered")
+            zf.writestr("1/model.py", "# tampered")
 
         target = tmp_path / "unpacked"
         unpack_args = type("Args", (), {

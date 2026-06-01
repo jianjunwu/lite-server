@@ -63,6 +63,7 @@ def main(argv=None):
     pack_parser = subparsers.add_parser("pack", help="Pack model into artifact")
     pack_parser.add_argument("model_dir", help="Model directory")
     pack_parser.add_argument("--version", "-v", required=True)
+    pack_parser.add_argument("--name", "-n", default=None, help="Model name (auto-inferred from directory if omitted)")
     pack_parser.add_argument("--output", "-o", default="./artifacts")
 
     # unpack
@@ -332,8 +333,18 @@ def _cmd_pack(args):
     if key_env:
         sign_key = _load_or_create_key(Path(key_env))
 
-    packer = ModelPacker(model_dir, version=args.version)
-    artifact_path = packer.pack(args.output, sign_key=sign_key)
+    try:
+        name = args.name
+        packer = ModelPacker(model_dir, version=args.version, name=name)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        artifact_path = packer.pack(args.output, sign_key=sign_key)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
 
     print(f"Packed artifact: {artifact_path}")
     if sign_key:
@@ -367,8 +378,8 @@ def _cmd_unpack(args):
 
     target_dir = Path(args.target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
-    unpacker.unpack(target_dir)
-    print(f"Extracted to: {target_dir}")
+    target = unpacker.unpack(target_dir)
+    print(f"Extracted to: {target}")
     return 0
 
 

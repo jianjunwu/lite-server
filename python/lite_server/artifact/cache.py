@@ -50,7 +50,7 @@ class ArtifactCache:
         # Cache miss or stale: extract
         cached_path.mkdir(parents=True, exist_ok=True)
         unpacker = ModelUnpacker(artifact_path)
-        unpacker.unpack(cached_path)
+        unpacker.unpack(cached_path, prepend_name=False)
 
         self._index[cache_key] = str(cached_path)
         self._save_index()
