@@ -1,0 +1,41 @@
+ensemble:
+  steps:
+    - name: bm25_recall
+      model: bm25_recall
+      version: "1"
+      inputs:
+        query: "$request.query"
+
+    - name: cf_recall
+      model: cf_recall
+      version: "1"
+      inputs:
+        user_id: "$request.user_id"
+
+    - name: visual_recall
+      model: visual_recall
+      version: "1"
+      inputs:
+        image: "$request.image"
+
+    - name: seq_recall
+      model: seq_recall
+      version: "1"
+      inputs:
+        history: "$request.history"
+
+    - name: merge
+      model: merge
+      version: "1"
+      inputs:
+        bm25: "$bm25_recall.items"
+        cf: "$cf_recall.items"
+        visual: "$visual_recall.items"
+        seq: "$seq_recall.items"
+
+    - name: rank
+      model: rank
+      version: "1"
+      inputs:
+        candidates: "$merge.merged"
+        top_k: "$request.top_k"
