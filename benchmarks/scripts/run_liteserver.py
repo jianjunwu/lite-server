@@ -10,6 +10,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from urllib import request
@@ -141,11 +142,15 @@ def main() -> int:
         print(f"ERROR: Model not found: {model_dir}", file=sys.stderr)
         return 1
 
-    # Update workers_per_device in model config
-    _set_workers_in_config(model_repo, args.model, args.workers)
+    # Create a temporary copy of model repo to avoid modifying tracked files
+    temp_repo = Path(tempfile.mkdtemp(prefix="lite_server_benchmark_"))
+    shutil.copytree(model_repo, temp_repo, dirs_exist_ok=True)
 
-    # Write orchestration.yaml for auto-load
-    orch_path = _write_orchestration(model_repo, args.model)
+    # Update workers_per_device in the temporary config
+    _set_workers_in_config(temp_repo, args.model, args.workers)
+
+    # Write orchestration.yaml for auto-load in the temporary repo
+    orch_path = _write_orchestration(temp_repo, args.model)
 
     if args.core:
         # Look for lite-server-core binary
@@ -179,7 +184,7 @@ def main() -> int:
         subcmd,
         "--port", str(args.port),
         "--host", "127.0.0.1",
-        "--model-repo", str(model_repo),
+        "--model-repo", str(temp_repo),
         "--no-metrics",
         "--log-level", "warning",
         "--timeout", str(args.duration + 10.0),
@@ -227,9 +232,9 @@ def main() -> int:
         _safe_terminate(proc)
     finally:
         _safe_terminate(proc)
-        # Clean up orchestration.yaml
+        # Clean up temporary model repo
         try:
-            orch_path.unlink(missing_ok=True)
+            shutil.rmtree(temp_repo, ignore_errors=True)
         except Exception:
             pass
 
