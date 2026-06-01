@@ -99,7 +99,7 @@ pub async fn model_ready_handler(
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     if let Some(ref v) = query.version {
-        crate::validation::validate_identifier(v)?;
+        crate::validation::validate_version(v)?;
     }
     let ready = state.registry.is_ready(&model_name, query.version.as_deref());
     let active_version = state.registry.get_active_version(&model_name);
@@ -120,7 +120,7 @@ pub async fn model_health_handler(
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     if let Some(ref v) = query.version {
-        crate::validation::validate_identifier(v)?;
+        crate::validation::validate_version(v)?;
     }
 
     let resolved_version = match &query.version {
@@ -253,7 +253,7 @@ pub async fn load_model_handler(
 ) -> Result<Json<Value>, AppError> {
     let version = query.version.unwrap_or_else(|| "1".to_string());
     crate::validation::validate_identifier(&model_name)?;
-    crate::validation::validate_identifier(&version)?;
+    crate::validation::validate_version(&version)?;
 
     // Load model config
     let config_path = state.repo_path.join(&model_name).join(&version).join("config.yaml");
@@ -282,7 +282,7 @@ pub async fn unload_model_handler(
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     if let Some(ref v) = query.version {
-        crate::validation::validate_identifier(v)?;
+        crate::validation::validate_version(v)?;
     }
     let success = state.worker_manager.unload_model(&model_name, query.version.as_deref()).await?;
     if !success {
@@ -303,7 +303,7 @@ pub async fn reload_model_handler(
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     if let Some(ref v) = query.version {
-        crate::validation::validate_identifier(v)?;
+        crate::validation::validate_version(v)?;
     }
     let success = state.worker_manager.reload_model(&model_name, query.version.as_deref()).await?;
     if !success {
@@ -322,7 +322,7 @@ pub async fn delete_version_handler(
     Path((model_name, version)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
-    crate::validation::validate_identifier(&version)?;
+    crate::validation::validate_version(&version)?;
 
     // Unload first if loaded
     let _ = state.worker_manager.unload_model(&model_name, Some(&version)).await;
@@ -348,7 +348,7 @@ pub async fn activate_version_handler(
     Path((model_name, version)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
-    crate::validation::validate_identifier(&version)?;
+    crate::validation::validate_version(&version)?;
 
     let success = state.registry.activate_version(&model_name, &version)?;
     if !success {
@@ -384,7 +384,7 @@ pub async fn infer_version_handler(
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
-    crate::validation::validate_identifier(&version)?;
+    crate::validation::validate_version(&version)?;
     do_infer(state, model_name, Some(version), "/predict".to_string(), headers, payload).await
 }
 
@@ -710,7 +710,7 @@ pub async fn sse_infer_version_handler(
     Json(payload): Json<Value>,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
-    crate::validation::validate_identifier(&version)?;
+    crate::validation::validate_version(&version)?;
     let resolved_version = resolve_version(&state, &model_name, Some(version)).await?;
 
     if !state.registry.is_ready(&model_name, Some(&resolved_version)) {
@@ -807,7 +807,7 @@ pub async fn ws_stream_version_handler(
     if let Err(e) = crate::validation::validate_identifier(&model_name) {
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
     }
-    if let Err(e) = crate::validation::validate_identifier(&version) {
+    if let Err(e) = crate::validation::validate_version(&version) {
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
     }
     ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), socket))
@@ -1058,7 +1058,7 @@ pub async fn upload_model_handler(
     mut multipart: Multipart,
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
-    crate::validation::validate_identifier(&version)?;
+    crate::validation::validate_version(&version)?;
 
     let target_dir = crate::validation::resolve_model_dir(&state.repo_path, &model_name, &version)?;
     tokio::fs::create_dir_all(&target_dir)
@@ -1101,6 +1101,7 @@ pub async fn upload_model_handler(
                     tmp_file.to_str().unwrap_or(""),
                     "--to",
                     target_dir.to_str().unwrap_or(""),
+                    "--flat",
                 ])
                 .output()
                 .await
@@ -1183,7 +1184,7 @@ pub async fn download_model_handler(
     Query(query): Query<DownloadQuery>,
 ) -> Result<Response, AppError> {
     crate::validation::validate_identifier(&model_name)?;
-    crate::validation::validate_identifier(&version)?;
+    crate::validation::validate_version(&version)?;
 
     let model_dir = crate::validation::resolve_model_dir(&state.repo_path, &model_name, &version)?;
 
@@ -1301,7 +1302,7 @@ pub async fn list_files_handler(
     Path((model_name, version)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
-    crate::validation::validate_identifier(&version)?;
+    crate::validation::validate_version(&version)?;
 
     let model_dir = crate::validation::resolve_model_dir(&state.repo_path, &model_name, &version)?;
 
@@ -1361,7 +1362,7 @@ pub async fn timeline_model_handler(
 ) -> Result<Json<Value>, AppError> {
     let version = query.version.unwrap_or_else(|| "1".to_string());
     crate::validation::validate_identifier(&model_name)?;
-    crate::validation::validate_identifier(&version)?;
+    crate::validation::validate_version(&version)?;
     let entries = crate::metrics::aggregator::TIMELINE.get_timeline(&model_name, &version).await;
     Ok(Json(json!({
         "model": model_name,

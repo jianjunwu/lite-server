@@ -70,6 +70,7 @@ def main(argv=None):
     unpack_parser = subparsers.add_parser("unpack", help="Unpack artifact")
     unpack_parser.add_argument("artifact", help="Path to .lma file")
     unpack_parser.add_argument("--to", dest="target_dir", default=".")
+    unpack_parser.add_argument("--flat", action="store_true", help="Extract files directly without prepending model name directory")
 
     # init
     init_parser = subparsers.add_parser("init", help="Initialize project")
@@ -378,7 +379,7 @@ def _cmd_unpack(args):
 
     target_dir = Path(args.target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
-    target = unpacker.unpack(target_dir)
+    target = unpacker.unpack(target_dir, prepend_name=not args.flat)
     print(f"Extracted to: {target}")
     return 0
 

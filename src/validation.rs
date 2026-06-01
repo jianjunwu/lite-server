@@ -3,11 +3,12 @@ use regex::Regex;
 
 lazy_static::lazy_static! {
     static ref IDENTIFIER_RE: Regex = Regex::new(r"^[a-zA-Z0-9_-]+$").unwrap();
+    static ref VERSION_RE: Regex = Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$").unwrap();
 }
 
 const MAX_IDENTIFIER_LEN: usize = 64;
 
-/// Validate that a model name or version string contains only safe characters.
+/// Validate that a model name contains only safe characters.
 /// Allowed: alphanumeric, underscore, hyphen. Length: 1-64.
 pub fn validate_identifier(s: &str) -> Result<(), AppError> {
     if s.is_empty() {
@@ -22,6 +23,31 @@ pub fn validate_identifier(s: &str) -> Result<(), AppError> {
     if !IDENTIFIER_RE.is_match(s) {
         return Err(AppError::Validation(
             "identifier contains invalid characters; allowed: a-z, A-Z, 0-9, _, -".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a version string. Like validate_identifier but also allows dots
+/// (for semantic versioning like 1.0.0). Rejects ".." to prevent path traversal.
+pub fn validate_version(s: &str) -> Result<(), AppError> {
+    if s.is_empty() {
+        return Err(AppError::Validation("version cannot be empty".to_string()));
+    }
+    if s.len() > MAX_IDENTIFIER_LEN {
+        return Err(AppError::Validation(format!(
+            "version exceeds maximum length of {} characters",
+            MAX_IDENTIFIER_LEN
+        )));
+    }
+    if s.contains("..") || s.starts_with('.') || s.ends_with('.') {
+        return Err(AppError::Validation(
+            "version contains invalid characters".to_string(),
+        ));
+    }
+    if !VERSION_RE.is_match(s) {
+        return Err(AppError::Validation(
+            "version contains invalid characters; allowed: a-z, A-Z, 0-9, _, -, .".to_string(),
         ));
     }
     Ok(())
@@ -101,6 +127,33 @@ mod tests {
         assert!(validate_identifier("model.name").is_err());
         assert!(validate_identifier("model%20name").is_err());
         assert!(validate_identifier("model\x00name").is_err());
+    }
+
+    #[test]
+    fn test_validate_version_accepts_semver() {
+        assert!(validate_version("1").is_ok());
+        assert!(validate_version("1.0").is_ok());
+        assert!(validate_version("1.0.0").is_ok());
+        assert!(validate_version("v1").is_ok());
+        assert!(validate_version("v1.0.0").is_ok());
+        assert!(validate_version("my_version_test").is_ok());
+    }
+
+    #[test]
+    fn test_validate_version_rejects_traversal() {
+        assert!(validate_version("..").is_err());
+        assert!(validate_version("../etc").is_err());
+        assert!(validate_version("a..b").is_err());
+    }
+
+    #[test]
+    fn test_validate_version_rejects_bad_chars() {
+        assert!(validate_version("").is_err());
+        assert!(validate_version("1.0.0.0").is_ok()); // 4 segments is fine as version
+        assert!(validate_version("version/name").is_err());
+        assert!(validate_version("v1.0.0-rc1").is_ok()); // hyphens ok
+        assert!(validate_version(".1").is_err()); // leading dot rejected
+        assert!(validate_version("1.").is_err()); // trailing dot rejected
     }
 
     #[test]

@@ -204,6 +204,7 @@ class TestPackUnpack:
         args = type("Args", (), {
             "artifact": str(artifact),
             "target_dir": str(target),
+            "flat": False,
         })()
         assert cli._cmd_unpack(args) == 0
         assert (target / "src_model" / "1" / "model.py").exists()
@@ -212,6 +213,7 @@ class TestPackUnpack:
         args = type("Args", (), {
             "artifact": str(tmp_path / "nope.lma"),
             "target_dir": str(tmp_path),
+            "flat": False,
         })()
         assert cli._cmd_unpack(args) == 1
 
@@ -266,6 +268,7 @@ class TestPackUnpack:
         unpack_args = type("Args", (), {
             "artifact": str(artifact_dir / "src_model_v1.lma"),
             "target_dir": str(target),
+            "flat": False,
         })()
         assert cli._cmd_unpack(unpack_args) == 0
         assert (target / "src_model" / "1" / "model.py").exists()
@@ -298,6 +301,7 @@ class TestPackUnpack:
         unpack_args = type("Args", (), {
             "artifact": str(artifact),
             "target_dir": str(target),
+            "flat": False,
         })()
         assert cli._cmd_unpack(unpack_args) == 1
 
