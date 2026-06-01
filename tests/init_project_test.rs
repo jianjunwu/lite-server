@@ -137,6 +137,7 @@ async fn test_init_project_runs_end_to_end() {
             "--metrics-port",
             "18091",
             "--no-metrics",
+            "--no-grpc",
             "--log-level",
             "warn",
         ],
