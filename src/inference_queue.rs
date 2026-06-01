@@ -369,7 +369,7 @@ async fn do_send_batch(
             uid: item.uid.clone(),
             meta: item.meta.as_deref().cloned(),
             payload: Some(pb::request::Payload::Single(pb::SingleRequest {
-                data: item.data.to_vec(),
+                data: item.data.clone(),
             })),
         }
     } else {
@@ -377,7 +377,7 @@ async fn do_send_batch(
             .iter()
             .map(|item| pb::BatchItem {
                 uid: item.uid.clone(),
-                data: item.data.to_vec(),
+                data: item.data.clone(),
             })
             .collect();
         pb::Request {
@@ -401,7 +401,7 @@ async fn do_send_batch(
                     let _ = queue_item.response_tx.send(pb::Response {
                         uid: queue_item.uid,
                         payload: Some(pb::response::Payload::Single(pb::SingleResponse {
-                            data: vec![],
+                            data: Default::default(),
                             status: Some(pb::Status {
                                 code: "Timeout".to_string(),
                                 message: "request timeout".to_string(),
@@ -450,7 +450,7 @@ async fn do_send_batch(
                             pb::Response {
                                 uid: queue_item.uid,
                                 payload: Some(pb::response::Payload::Single(pb::SingleResponse {
-                                    data: vec![],
+                                    data: Default::default(),
                                     status: Some(pb::Status {
                                         code: "Error".to_string(),
                                         message: "missing in batch response".to_string(),
@@ -495,7 +495,7 @@ async fn do_send_batch(
                         let _ = queue_item.response_tx.send(pb::Response {
                             uid: queue_item.uid,
                             payload: Some(pb::response::Payload::Single(pb::SingleResponse {
-                                data: vec![],
+                                data: Default::default(),
                                 status: Some(pb::Status {
                                     code: "Error".to_string(),
                                     message: "unexpected response type".to_string(),
@@ -519,7 +519,7 @@ async fn do_send_batch(
                 let _ = queue_item.response_tx.send(pb::Response {
                     uid: queue_item.uid,
                     payload: Some(pb::response::Payload::Single(pb::SingleResponse {
-                        data: vec![],
+                        data: Default::default(),
                         status: Some(pb::Status {
                             code: "Error".to_string(),
                             message: e.to_string(),
@@ -798,7 +798,7 @@ async fn health_checker(
                     uid,
                     meta: None,
                     payload: Some(pb::request::Payload::Single(pb::SingleRequest {
-                        data: vec![],
+                        data: Default::default(),
                     })),
                 };
                 let result = tokio::time::timeout(probe_timeout, client.send(request)).await;
@@ -1051,9 +1051,9 @@ mod tests {
         let vec_data: Vec<u8> = data.to_vec();
         assert_eq!(vec_data, vec![10, 20, 30]);
 
-        // Verify it works with SingleRequest.data: Vec<u8>
-        let single = pb::SingleRequest { data: data.to_vec() };
-        assert_eq!(single.data, vec![10, 20, 30]);
+        // Verify it works with SingleRequest.data: Bytes
+        let single = pb::SingleRequest { data: data.clone() };
+        assert_eq!(single.data, Bytes::from_static(&[10, 20, 30]));
     }
 
     #[test]
@@ -1069,7 +1069,7 @@ mod tests {
             client_ip: "127.0.0.1".to_string(),
             request_id: "req-1".to_string(),
             timestamp_ns: 0,
-            payload: payload_bytes.to_vec(), // prost needs Vec<u8>
+            payload: payload_bytes.clone(),
         });
 
         let item = QueueItem {
@@ -1112,15 +1112,15 @@ mod tests {
         assert_eq!(received.uid, "req-1");
 
         // Build proto request from Bytes data (simulates send_batch logic)
-        let proto_data: Vec<u8> = received.data.to_vec();
+        let proto_data = received.data.clone();
         let single = pb::SingleRequest { data: proto_data };
-        assert_eq!(single.data, r#"{"input":"hello"}"#.as_bytes());
+        assert_eq!(single.data, Bytes::from_static(r#"{"input":"hello"}"#.as_bytes()));
 
         // Send a mock response
         let _ = received.response_tx.send(pb::Response {
             uid: "req-1".to_string(),
             payload: Some(pb::response::Payload::Single(pb::SingleResponse {
-                data: b"ok".to_vec(),
+                data: Bytes::from_static(b"ok"),
                 status: Some(pb::Status { code: "Ok".to_string(), message: String::new() }),
             })),
             metrics: None,
@@ -1145,7 +1145,7 @@ mod tests {
             client_ip: "127.0.0.1".to_string(),
             request_id: "req-1".to_string(),
             timestamp_ns: 1234567890,
-            payload: vec![1u8, 2, 3],
+            payload: Bytes::from_static(&[1u8, 2, 3]),
         };
         let (tx, _rx) = oneshot::channel();
         let item = QueueItem {
@@ -1177,7 +1177,7 @@ mod tests {
             client_ip: "10.0.0.1".to_string(),
             request_id: "req-batch".to_string(),
             timestamp_ns: 9999999,
-            payload: vec![0u8; 4096], // 4KB payload
+            payload: Bytes::from(vec![0u8; 4096]), // 4KB payload
         });
 
         // Simulate batch items each holding Arc<RequestMeta>

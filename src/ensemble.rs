@@ -47,8 +47,9 @@ lazy_static::lazy_static! {
         .expect("invalid ensemble ref regex");
 }
 
-pub fn parse_ensemble_config(config_path: &PathBuf) -> Result<Vec<EnsembleStep>, AppError> {
-    let content = std::fs::read_to_string(config_path)
+pub async fn parse_ensemble_config(config_path: &PathBuf) -> Result<Vec<EnsembleStep>, AppError> {
+    let content = tokio::fs::read_to_string(config_path)
+        .await
         .map_err(|e| AppError::Config(format!("failed to read ensemble config: {}", e)))?;
     let config: EnsembleConfig = serde_yaml::from_str(&content)
         .map_err(|e| AppError::Config(format!("failed to parse ensemble config: {}", e)))?;
@@ -221,7 +222,7 @@ pub async fn execute_ensemble(
     )?;
     let config_path = model_dir.join("config.yaml");
 
-    let steps = parse_ensemble_config(&config_path)?;
+    let steps = parse_ensemble_config(&config_path).await?;
     let layers = topological_layers(&steps);
 
     let mut context: HashMap<String, Value> = HashMap::new();
@@ -296,8 +297,15 @@ async fn execute_step(
                 "sub-model {} v{} not ready: {}", step.model, step.version, e
             )));
         }
-        // Wait briefly for worker startup
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // Poll with exponential backoff for worker readiness
+        let mut retries = 0;
+        let max_retries = 30;
+        let mut delay = Duration::from_millis(50);
+        while !state.registry.is_ready(&step.model, Some(&step.version)) && retries < max_retries {
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_millis(500));
+            retries += 1;
+        }
     }
 
     if !state.registry.is_ready(&step.model, Some(&step.version)) {
@@ -333,7 +341,7 @@ async fn execute_step(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as i64,
-        payload: payload_bytes.clone(),
+        payload: bytes::Bytes::from(payload_bytes.clone()),
     };
 
     let (response_tx, response_rx) = oneshot::channel();

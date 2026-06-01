@@ -39,8 +39,8 @@ pub struct TimelineAggregator {
     latency_samples: DashMap<String, std::sync::Mutex<VecDeque<f64>>>,
     /// Last request count per key (for QPS delta)
     last_counts: Mutex<HashMap<String, f64>>,
-    /// Last check timestamp
-    last_check: Mutex<f64>,
+    /// Last check timestamp per key (for QPS delta)
+    last_check: Mutex<HashMap<String, f64>>,
 }
 
 impl TimelineAggregator {
@@ -50,7 +50,7 @@ impl TimelineAggregator {
             last_sample: Mutex::new(HashMap::new()),
             latency_samples: DashMap::new(),
             last_counts: Mutex::new(HashMap::new()),
-            last_check: Mutex::new(now_secs()),
+            last_check: Mutex::new(HashMap::new()),
         }
     }
 
@@ -158,8 +158,8 @@ impl TimelineAggregator {
         let last_count = last_counts.get(key).copied().unwrap_or(current_count);
         let elapsed = {
             let mut last_check = self.last_check.lock().await;
-            let dt = now - *last_check;
-            *last_check = now;
+            let dt = now - last_check.get(key).copied().unwrap_or(now);
+            last_check.insert(key.to_string(), now);
             dt.max(0.001)
         };
 
@@ -180,14 +180,16 @@ impl TimelineAggregator {
         if deque.len() < 2 {
             return 0.0;
         }
-        let mut sorted: Vec<f64> = deque.iter().copied().filter(|v| !v.is_nan()).collect();
-        if sorted.len() < 2 {
+        let mut samples: Vec<f64> = deque.iter().copied().filter(|v| !v.is_nan()).collect();
+        if samples.len() < 2 {
             return 0.0;
         }
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let n = sorted.len();
-        let p99 = sorted[((n as f64 * 0.99) as usize).min(n - 1)];
-        round(p99 * 1000.0, 1)
+        let n = samples.len();
+        let p99_idx = ((n as f64 * 0.99) as usize).min(n - 1);
+        let (_, p99, _) = samples.select_nth_unstable_by(p99_idx, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        round(*p99 * 1000.0, 1)
     }
 }
 
@@ -437,6 +439,18 @@ mod tests {
 
         let p99 = agg.compute_p99_ms("m_1");
         assert!(p99 >= 50.0 && p99 <= 110.0, "p99 should be around 100ms, got {}", p99);
+    }
+
+    #[test]
+    fn test_compute_p99_matches_full_sort() {
+        let agg = TimelineAggregator::new();
+        // Insert 1000 sorted values 0.001..1.0
+        for i in 1..=1000 {
+            agg.record_latency("m", "1", i as f64 * 0.001);
+        }
+        let p99 = agg.compute_p99_ms("m_1");
+        // 99th percentile of 1000 sorted values = index 990 (0-based) = 0.991s = 991ms
+        assert_eq!(p99, 991.0, "p99 of 1000 sorted samples should be 991ms");
     }
 
     #[tokio::test]

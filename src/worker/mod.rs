@@ -1077,7 +1077,7 @@ fn spawn_worker_monitor(
                             uid: probe_uid,
                             meta: None,
                             payload: Some(pb::request::Payload::Single(pb::SingleRequest {
-                                data: vec![],
+                                data: Default::default(),
                             })),
                         };
                         let result = timeout(heartbeat_timeout, client.send(request)).await;

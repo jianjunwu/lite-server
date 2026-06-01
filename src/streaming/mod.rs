@@ -75,7 +75,7 @@ impl StreamingEngine {
 }
 
 /// Build a protobuf StreamRequest::Open.
-pub fn build_stream_open(stream_id: String, data: Vec<u8>, meta: Option<pb::RequestMeta>) -> pb::Request {
+pub fn build_stream_open(stream_id: String, data: bytes::Bytes, meta: Option<pb::RequestMeta>) -> pb::Request {
     pb::Request {
         uid: format!("stream-open-{}", stream_id),
         meta: meta.clone(),
@@ -87,7 +87,7 @@ pub fn build_stream_open(stream_id: String, data: Vec<u8>, meta: Option<pb::Requ
 }
 
 /// Build a protobuf StreamRequest::Chunk.
-pub fn build_stream_chunk(stream_id: String, data: Vec<u8>) -> pb::Request {
+pub fn build_stream_chunk(stream_id: String, data: bytes::Bytes) -> pb::Request {
     pb::Request {
         uid: format!("stream-chunk-{}", stream_id),
         meta: None,
@@ -177,7 +177,7 @@ mod tests {
             stream_id: "s1".to_string(),
             payload: Some(pb::stream_response::Payload::Chunk(
                 pb::StreamChunkResponse {
-                    data: b"hello".to_vec(),
+                    data: bytes::Bytes::from_static(b"hello"),
                     is_final: false,
                 },
             )),
@@ -189,7 +189,7 @@ mod tests {
         let received = handle.chunk_rx.recv().await.unwrap();
         match received.payload {
             Some(pb::stream_response::Payload::Chunk(c)) => {
-                assert_eq!(c.data, b"hello");
+                assert_eq!(c.data, &b"hello"[..]);
             }
             _ => panic!("expected chunk"),
         }
@@ -253,14 +253,14 @@ mod tests {
 
     #[test]
     fn test_build_stream_open() {
-        let req = build_stream_open("s1".to_string(), b"data".to_vec(), None);
+        let req = build_stream_open("s1".to_string(), bytes::Bytes::from_static(b"data"), None);
         assert_eq!(req.uid, "stream-open-s1");
         match req.payload {
             Some(pb::request::Payload::Stream(s)) => {
                 assert_eq!(s.stream_id, "s1");
                 match s.action {
                     Some(pb::stream_request::Action::Open(o)) => {
-                        assert_eq!(o.data, b"data");
+                        assert_eq!(o.data, &b"data"[..]);
                     }
                     _ => panic!("expected open action"),
                 }
@@ -271,12 +271,12 @@ mod tests {
 
     #[test]
     fn test_build_stream_chunk() {
-        let req = build_stream_chunk("s1".to_string(), b"chunk".to_vec());
+        let req = build_stream_chunk("s1".to_string(), bytes::Bytes::from_static(b"chunk"));
         assert_eq!(req.uid, "stream-chunk-s1");
         match req.payload {
             Some(pb::request::Payload::Stream(s)) => match s.action {
                 Some(pb::stream_request::Action::Chunk(c)) => {
-                    assert_eq!(c.data, b"chunk");
+                    assert_eq!(c.data, &b"chunk"[..]);
                 }
                 _ => panic!("expected chunk action"),
             },
@@ -316,9 +316,9 @@ mod tests {
             client_ip: "1.2.3.4".to_string(),
             request_id: "r1".to_string(),
             timestamp_ns: 100,
-            payload: vec![],
+            payload: Default::default(),
         };
-        let req = build_stream_open("s1".to_string(), b"d".to_vec(), Some(meta));
+        let req = build_stream_open("s1".to_string(), bytes::Bytes::from_static(b"d"), Some(meta));
         match req.payload {
             Some(pb::request::Payload::Stream(s)) => match s.action {
                 Some(pb::stream_request::Action::Open(o)) => {

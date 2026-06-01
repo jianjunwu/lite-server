@@ -466,7 +466,7 @@ async fn do_infer(
         client_ip,
         request_id,
         timestamp_ns,
-        payload: payload_bytes,
+        payload: bytes::Bytes::from(payload_bytes),
     };
 
     // All requests go through the unified inference queue
@@ -572,7 +572,7 @@ fn build_request_meta(headers: &HeaderMap, payload: &Value, route: &str) -> pb::
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as i64;
-    let payload_bytes = serde_json::to_vec(payload).unwrap_or_default();
+    let payload_bytes = bytes::Bytes::from(serde_json::to_vec(payload).unwrap_or_default());
 
     pb::RequestMeta {
         route: route.to_string(),
@@ -589,7 +589,7 @@ async fn open_worker_stream(
     model_name: &str,
     resolved_version: &str,
     meta: pb::RequestMeta,
-    payload_bytes: Vec<u8>,
+    payload_bytes: bytes::Bytes,
 ) -> Result<(String, mpsc::Receiver<pb::StreamResponse>), AppError> {
     let mv = state
         .registry
@@ -645,7 +645,7 @@ pub async fn sse_infer_handler(
     }
 
     let meta = build_request_meta(&headers, &payload, "/predict");
-    let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    let payload_bytes = bytes::Bytes::from(serde_json::to_vec(&payload).unwrap_or_default());
     let (stream_id, mut chunk_rx) = open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await?;
 
     let stream_metrics = state.config.features.streaming_metrics;
@@ -721,7 +721,7 @@ pub async fn sse_infer_version_handler(
     }
 
     let meta = build_request_meta(&headers, &payload, "/predict");
-    let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    let payload_bytes = bytes::Bytes::from(serde_json::to_vec(&payload).unwrap_or_default());
     let (stream_id, mut chunk_rx) = open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await?;
 
     let stream_metrics = state.config.features.streaming_metrics;
@@ -853,7 +853,7 @@ async fn handle_ws_stream(
 
     let headers = HeaderMap::new();
     let meta = build_request_meta(&headers, &payload, "/predict");
-    let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    let payload_bytes = bytes::Bytes::from(serde_json::to_vec(&payload).unwrap_or_default());
 
     let (stream_id, mut chunk_rx) = match open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await {
         Ok(r) => r,
@@ -888,7 +888,7 @@ async fn handle_ws_stream(
                         last_chunk_time = std::time::Instant::now();
                         prometheus::record_stream_chunk(&model_name, &resolved_version, "websocket");
                     }
-                    Message::Binary(c.data.clone())
+                    Message::Binary(c.data.to_vec())
                 }
                 Some(pb::stream_response::Payload::Error(e)) => {
                     Message::Text(json!({"error": e.message}).to_string())

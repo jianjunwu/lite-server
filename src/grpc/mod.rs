@@ -167,7 +167,7 @@ impl LiteServer for GrpcService {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as i64,
-            payload: vec![],
+            payload: Default::default(),
         };
 
         let items: Vec<pb::BatchItem> = req

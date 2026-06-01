@@ -325,7 +325,7 @@ fn error_response(uid: &str, message: &str) -> pb::Response {
     pb::Response {
         uid: uid.to_string(),
         payload: Some(pb::response::Payload::Single(pb::SingleResponse {
-            data: vec![],
+            data: Default::default(),
             status: Some(pb::Status {
                 code: "Error".to_string(),
                 message: message.to_string(),
