@@ -24,7 +24,6 @@ pub struct ServerConfig {
     pub host: String,
     pub timeout: f32,
     pub threads: Option<usize>,
-    pub transport: String,
     pub cache_registry: bool,
     /// Max seconds to wait for in-flight requests during graceful shutdown.
     pub graceful_timeout: f32,
@@ -41,7 +40,6 @@ impl Default for ServerConfig {
             host: "0.0.0.0".to_string(),
             timeout: 30.0,
             threads: None,
-            transport: "zmq".to_string(),
             cache_registry: false,
             graceful_timeout: 30.0,
             keepalive_timeout: 5.0,
@@ -345,7 +343,6 @@ pub struct CliOverrides {
     pub model_repo: Option<String>,
     pub threads: Option<usize>,
     pub timeout: Option<f32>,
-    pub transport: Option<String>,
     pub log_level: Option<String>,
     pub log_info_output: Option<String>,
     pub log_error_output: Option<String>,
@@ -382,9 +379,6 @@ impl Config {
         }
         if let Some(t) = cli.timeout {
             self.server.timeout = t;
-        }
-        if let Some(ref t) = cli.transport {
-            self.server.transport = t.clone();
         }
         if let Some(ref l) = cli.log_level {
             self.logging.level = l.clone();
@@ -470,7 +464,6 @@ mod tests {
         assert_eq!(cfg.grpc_port, 8001);
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.timeout, 30.0);
-        assert_eq!(cfg.transport, "zmq");
         assert_eq!(cfg.graceful_timeout, 30.0);
         assert_eq!(cfg.keepalive_timeout, 5.0);
     }
@@ -649,7 +642,6 @@ mod tests {
         assert_eq!(cfg.server.host, "127.0.0.1");
         // Unchanged fields keep defaults
         assert_eq!(cfg.server.grpc_port, 8001);
-        assert_eq!(cfg.server.transport, "zmq");
         assert!(cfg.grpc.enabled);
     }
 
@@ -692,18 +684,6 @@ mod tests {
         cfg.apply_overrides(&overrides);
 
         assert_eq!(cfg.logging.level, "debug");
-    }
-
-    #[test]
-    fn test_apply_overrides_transport() {
-        let mut cfg = Config::default();
-        let overrides = CliOverrides {
-            transport: Some("uds".to_string()),
-            ..Default::default()
-        };
-        cfg.apply_overrides(&overrides);
-
-        assert_eq!(cfg.server.transport, "uds");
     }
 
     // --- Model defaults ---

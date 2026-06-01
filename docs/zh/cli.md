@@ -38,7 +38,6 @@ lite-server serve [选项]
 | `--timeout` | float | 30.0 | 全局请求超时（秒） |
 | `--log-level` | string | info | 日志级别：`trace`、`debug`、`info`、`warn`、`error` |
 | `--threads` | int | 自动 | Tokio 工作线程数 |
-| `--transport` | string | zmq | Worker IPC 传输方式：`zmq` 或 `uds` |
 | `--graceful-timeout` | float | 30.0 | 优雅关闭时等待进行中请求的最大秒数 |
 | `--keepalive-timeout` | float | 5.0 | HTTP keep-alive 超时（秒），0 = 禁用 |
 
@@ -88,9 +87,6 @@ lite-server serve --config server.yaml \
   --keepalive-timeout 10 \
   --max-requests 1000 \
   --max-requests-jitter 100
-
-# Unix 域套接字传输
-lite-server serve --transport uds --host unix:/tmp/lite-server.sock
 
 # 禁用 gRPC 和指标
 lite-server serve --no-grpc --no-metrics

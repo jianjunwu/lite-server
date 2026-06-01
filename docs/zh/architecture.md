@@ -160,12 +160,7 @@ lite-server-core（主进程）
 
 ## IPC 协议
 
-Worker 使用二进制协议与 Rust 内核通信：
-
-- **ZMQ**（默认）：ZeroMQ REQ/REP 套接字，bincode 序列化
-- **UDS**：Unix 域套接字，长度前缀 bincode 帧
-
-传输方式通过 `server.transport` 配置选择（`"zmq"` 或 `"uds"`）。
+Worker 使用 ZeroMQ PAIR 套接字与 Rust 内核通信，协议为 protobuf 序列化。
 
 ## 数据路径
 

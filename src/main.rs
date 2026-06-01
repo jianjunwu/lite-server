@@ -67,10 +67,6 @@ enum Commands {
         #[arg(long)]
         log_verbose: bool,
 
-        /// Worker transport: zmq or uds
-        #[arg(long)]
-        transport: Option<String>,
-
         /// gRPC server port
         #[arg(long)]
         grpc_port: Option<u16>,
@@ -137,7 +133,6 @@ fn main() {
             metrics_port,
             no_metrics,
             log_verbose,
-            transport,
             grpc_port,
             no_grpc,
             no_streaming_metrics,
@@ -168,7 +163,6 @@ fn main() {
                 model_repo,
                 threads,
                 timeout,
-                transport,
                 log_level,
                 log_info_output,
                 log_error_output,

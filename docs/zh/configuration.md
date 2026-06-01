@@ -16,7 +16,6 @@ server:
   host: 0.0.0.0                # 绑定地址（支持 unix:/path/to/sock 使用 UDS）
   timeout: 30.0                # 全局请求超时（秒）
   threads: null                # Tokio 工作线程数（null = 自动 = CPU 核数）
-  transport: zmq               # Worker IPC 传输：zmq 或 uds
   cache_registry: false        # 缓存模型注册表到磁盘
   graceful_timeout: 30.0       # 优雅关闭时等待进行中请求的最大秒数
   keepalive_timeout: 5.0       # HTTP keep-alive 超时（秒），0 = 禁用
@@ -168,7 +167,6 @@ lite-server serve [参数]
 | `--timeout` | 全局请求超时 | `server.timeout` |
 | `--log-level` | 日志级别 | `server.log_level` + `logging.level` |
 | `--no-metrics` | 禁用指标 | `metrics.enabled` |
-| `--transport` | Worker 传输（zmq/uds） | `server.transport` |
 | `--grpc-port` | gRPC 端口 | `server.grpc_port` |
 | `--no-grpc` | 禁用 gRPC | `grpc.enabled` |
 | `--no-streaming-metrics` | 禁用流式指标 | `features.streaming_metrics` |
@@ -195,22 +193,6 @@ lite-server serve [参数]
 2. 模型 `config.yaml`
 3. 内置默认值
 
-## Unix 域套接字传输
-
-使用 Unix 域套接字替代 TCP 进行 worker IPC：
-
-```yaml
-server:
-  transport: uds
-  host: unix:/tmp/lite-server.sock
-```
-
-或通过 CLI：
-
-```bash
-lite-server serve --transport uds --host unix:/tmp/lite-server.sock
-```
-
 ## 配置示例
 
 ### 开发环境（单模型，无配置文件）
@@ -226,7 +208,6 @@ lite-server serve --model-repo ./my_models
 server:
   http_port: 8080
   host: 0.0.0.0
-  transport: zmq
   graceful_timeout: 60.0
   keepalive_timeout: 10.0
 

@@ -158,12 +158,7 @@ lite-server-core (main process)
 
 ## IPC Protocol
 
-Workers communicate with the Rust core using a binary protocol:
-
-- **ZMQ** (default): ZeroMQ REQ/REP sockets, bincode serialization
-- **UDS**: Unix domain sockets, length-prefixed bincode frames
-
-The transport is selected via `server.transport` config (`"zmq"` or `"uds"`).
+Workers communicate with the Rust core using ZeroMQ PAIR sockets with protobuf serialization.
 
 ## Data Path
 

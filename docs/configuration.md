@@ -16,7 +16,6 @@ server:
   host: 0.0.0.0                # Bind address (supports unix:/path/to/sock for UDS)
   timeout: 30.0                # Global request timeout (seconds)
   threads: null                # Tokio worker threads (null = auto = CPU cores)
-  transport: zmq               # Worker IPC transport: "zmq" or "uds"
   cache_registry: false        # Cache model registry to disk
   graceful_timeout: 30.0       # Max seconds to wait for in-flight requests during shutdown
   keepalive_timeout: 5.0       # HTTP keep-alive timeout (seconds), 0 = disable
@@ -168,7 +167,6 @@ python -m lite_server serve [flags]
 | `--timeout` | Global request timeout | `server.timeout` |
 | `--log-level` | Log level | `server.log_level` + `logging.level` |
 | `--no-metrics` | Disable metrics | `metrics.enabled` |
-| `--transport` | Worker transport (zmq/uds) | `server.transport` |
 | `--grpc-port` | gRPC port | `server.grpc_port` |
 | `--no-grpc` | Disable gRPC | `grpc.enabled` |
 | `--no-streaming-metrics` | Disable streaming metrics | `features.streaming_metrics` |
@@ -195,22 +193,6 @@ For model config, the precedence is:
 2. Per-model `config.yaml`
 3. Built-in defaults
 
-## Unix Socket Transport
-
-To use Unix domain sockets instead of TCP for worker IPC:
-
-```yaml
-server:
-  transport: uds
-  host: unix:/tmp/lite-server.sock
-```
-
-Or via CLI:
-
-```bash
-python -m lite_server serve --transport uds --host unix:/tmp/lite-server.sock
-```
-
 ## Minimal Config Examples
 
 ### Development (single model, no config file)
@@ -226,7 +208,6 @@ python -m lite_server serve --model-repo ./my_models
 server:
   http_port: 8080
   host: 0.0.0.0
-  transport: zmq
   graceful_timeout: 60.0
   keepalive_timeout: 10.0
 

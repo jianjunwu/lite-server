@@ -38,7 +38,6 @@ lite-server serve [OPTIONS]
 | `--timeout` | float | 30.0 | Global request timeout in seconds |
 | `--log-level` | string | info | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `--threads` | int | auto | Number of Tokio worker threads |
-| `--transport` | string | zmq | Worker IPC transport: `zmq` or `uds` |
 | `--graceful-timeout` | float | 30.0 | Max seconds to wait for in-flight requests during shutdown |
 | `--keepalive-timeout` | float | 5.0 | HTTP keep-alive timeout in seconds. 0 = disable |
 
@@ -88,9 +87,6 @@ lite-server serve --config server.yaml \
   --keepalive-timeout 10 \
   --max-requests 1000 \
   --max-requests-jitter 100
-
-# Unix domain socket transport
-lite-server serve --transport uds --host unix:/tmp/lite-server.sock
 
 # Disable gRPC and metrics
 lite-server serve --no-grpc --no-metrics

@@ -1,4 +1,3 @@
-pub mod uds;
 pub mod zmq;
 
 use crate::error::AppError;
