@@ -170,6 +170,57 @@ def teardown(self):
     torch.cuda.empty_cache()
 ```
 
+## AsyncLitAPI
+
+For inference pipelines that involve async I/O — such as calling external APIs, using async model libraries, or awaiting coroutines — use `AsyncLitAPI` instead of `LitAPI`.
+
+### Usage
+
+```python
+import asyncio
+from lite_server import AsyncLitAPI
+
+class AsyncModel(AsyncLitAPI):
+    async def setup(self, device):
+        self.client = await create_async_client()
+
+    async def decode_request(self, request):
+        return request.get("input", "")
+
+    async def predict(self, x):
+        # Async I/O: e.g. remote API call or async model inference
+        result = await self.client.predict(x)
+        return {"output": result}
+
+    def encode_response(self, output):
+        return output
+```
+
+### Constraints
+
+- `predict()` must be `async def`.
+- `max_batch_size` is forced to `1` — async does not support batching.
+- `enable_async` is automatically set to `True`.
+
+### Mixed Sync/Async Hooks
+
+`decode_request`, `encode_response`, `on_request`, and `on_response` may be **sync or async**. The worker adapts automatically:
+
+```python
+class MixedHooksModel(AsyncLitAPI):
+    def decode_request(self, request):          # sync is fine
+        return request["input"]
+
+    async def predict(self, x):                  # must be async
+        await asyncio.sleep(0.05)
+        return {"output": x}
+
+    def encode_response(self, output):           # sync is fine
+        return output
+```
+
+See [examples/10_async](../examples/10_async/) for a runnable demo.
+
 ## Continuous Batching (LLM)
 
 For LLM workloads, enable continuous batching to process multiple sequences simultaneously with iterative generation.
@@ -543,6 +594,74 @@ class MyModel(LitAPI):
 - **A/B testing**: different configs for different versions
 
 See [examples/07_custom_params](../examples/07_custom_params/) for a runnable demo.
+
+## Logging
+
+Every `LitAPI` instance has a `self.logger` property (a standard Python `logging.Logger`) that is bound to the model class name. Use it to emit structured logs at any stage of the inference lifecycle.
+
+### Basic Usage
+
+```python
+class MyModel(LitAPI):
+    def setup(self, device):
+        self.logger.info("Loading model on device=%s", device)
+        self.model = load_model()
+
+    def predict(self, x):
+        self.logger.debug("predict input=%s", x)
+        output = self.model(x)
+        self.logger.info("predict output=%s", output)
+        return output
+```
+
+### Log Levels
+
+| Method | Use Case |
+|--------|----------|
+| `logger.debug(...)` | Verbose diagnostics: raw inputs/outputs, intermediate tensors |
+| `logger.info(...)` | Lifecycle events: model loaded, request received, response sent |
+| `logger.warning(...)` | Recoverable issues: deprecated feature used, fallback triggered |
+| `logger.error(...)` | Errors that will fail the request |
+
+### Controlling Verbosity
+
+The worker configures the root logger so that all model loggers inherit the same handler and level. Control it via the `--log-level` CLI flag:
+
+```bash
+python -m lite_server serve --config server.yaml --log-level info
+```
+
+Or in `server.yaml`:
+
+```yaml
+server:
+  log_level: info
+```
+
+### Per-Request Tracing
+
+Use `on_request` and `on_response` to log request metadata:
+
+```python
+def on_request(self, request, meta):
+    self.logger.info(
+        "Request from %s | route=%s | request_id=%s",
+        meta.client_ip, meta.route, meta.request_id,
+    )
+    return request
+
+def on_response(self, response, meta):
+    self.logger.info(
+        "Response ready | request_id=%s | latency_ms=%.2f",
+        meta.request_id,
+        (time.time_ns() - meta.timestamp_ns) / 1_000_000,
+    )
+    return response
+```
+
+`meta` is a `RequestMeta` object with: `route`, `headers`, `client_ip`, `request_id`, `timestamp_ns`, `payload`.
+
+See [examples/11_logging](../examples/11_logging/) for a runnable demo.
 
 ## Best Practices
 

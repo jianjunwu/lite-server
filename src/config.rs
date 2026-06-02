@@ -95,7 +95,7 @@ pub struct LoggingConfig {
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
-            level: "info".to_string(),
+            level: "warn".to_string(),
             info_output: None,
             error_output: None,
             rotation: "none".to_string(),

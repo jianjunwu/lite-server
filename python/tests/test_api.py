@@ -337,3 +337,53 @@ class TestCollectMetrics:
             def encode_response(self, output): return output
 
         return Dummy()
+
+
+class TestAsyncLitAPI:
+    """AsyncLitAPI subclassing and constraints."""
+
+    def test_async_litapi_forces_max_batch_size_to_one(self):
+        from lite_server.api_async import AsyncLitAPI
+
+        class Dummy(AsyncLitAPI):
+            def setup(self, device): pass
+            async def predict(self, x): return x
+
+        api = Dummy(max_batch_size=8)
+        assert api.max_batch_size == 1
+
+    def test_async_litapi_sets_enable_async(self):
+        from lite_server.api_async import AsyncLitAPI
+
+        class Dummy(AsyncLitAPI):
+            def setup(self, device): pass
+            async def predict(self, x): return x
+
+        api = Dummy()
+        assert api.enable_async is True
+
+    def test_async_predict_must_be_implemented(self):
+        from lite_server.api_async import AsyncLitAPI
+
+        class Dummy(AsyncLitAPI):
+            def setup(self, device): pass
+
+        api = Dummy()
+        import asyncio
+        with pytest.raises(NotImplementedError):
+            asyncio.run(api.predict({}))
+
+    def test_async_litapi_is_instance_of_litapi(self):
+        from lite_server.api import LitAPI
+        from lite_server.api_async import AsyncLitAPI
+
+        class Dummy(AsyncLitAPI):
+            def setup(self, device): pass
+            async def predict(self, x): return x
+
+        api = Dummy()
+        assert isinstance(api, LitAPI)
+
+    def test_async_litapi_exported_from_package(self):
+        from lite_server import AsyncLitAPI
+        assert AsyncLitAPI is not None

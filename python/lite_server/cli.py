@@ -3,12 +3,15 @@
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sys
 from pathlib import Path
 
 
 from lite_server import __version__ as _pkg_version
+
+_logger = logging.getLogger("lite_server.cli")
 
 
 def main(argv=None):
@@ -106,7 +109,7 @@ def _cmd_serve(args):
     from lite_server import serve
 
     if serve is None:
-        print("Error: lite-server Rust extension not built. Run 'maturin develop'.", file=sys.stderr)
+        _logger.error("lite-server Rust extension not built. Run 'maturin develop'.")
         return 1
 
     try:
@@ -139,7 +142,7 @@ def _cmd_serve(args):
     except KeyboardInterrupt:
         print("\nShutting down...")
     except RuntimeError as e:
-        print(f"Error: {e}", file=sys.stderr)
+        _logger.error("%s", e)
         return 1
     return 0
 
@@ -171,7 +174,7 @@ def _cmd_config_check(args):
                 print(f"  max_queue_size: {cfg['max_queue_size']}")
         return 0
     except Exception as e:
-        print(f"Configuration error: {e}", file=sys.stderr)
+        _logger.error("Configuration error: %s", e)
         return 1
 
 
@@ -254,7 +257,7 @@ def _cmd_analyze(args):
     model_dir = repo / args.model
 
     if not model_dir.exists():
-        print(f"Model not found: {model_dir}", file=sys.stderr)
+        _logger.error("Model not found: %s", model_dir)
         return 1
 
     # Find version directory (use first numeric dir, or '1')
@@ -341,7 +344,7 @@ def _cmd_pack(args):
 
     model_dir = Path(args.model_dir)
     if not model_dir.exists():
-        print(f"Model directory not found: {model_dir}", file=sys.stderr)
+        _logger.error("Model directory not found: %s", model_dir)
         return 1
 
     # Load signing key if configured
@@ -354,13 +357,13 @@ def _cmd_pack(args):
         name = args.name
         packer = ModelPacker(model_dir, version=args.version, name=name)
     except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
+        _logger.error("%s", e)
         return 1
 
     try:
         artifact_path = packer.pack(args.output, sign_key=sign_key)
     except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
+        _logger.error("%s", e)
         return 1
 
     print(f"Packed artifact: {artifact_path}")
@@ -375,7 +378,7 @@ def _cmd_unpack(args):
 
     artifact_path = Path(args.artifact)
     if not artifact_path.exists():
-        print(f"Artifact not found: {artifact_path}", file=sys.stderr)
+        _logger.error("Artifact not found: %s", artifact_path)
         return 1
 
     # Load verification key if configured
@@ -390,7 +393,7 @@ def _cmd_unpack(args):
         print(f"Artifact valid: {manifest.name} v{manifest.version}")
         print(f"  Files: {len(manifest.files)}")
     except Exception as e:
-        print(f"Validation failed: {e}", file=sys.stderr)
+        _logger.error("Validation failed: %s", e)
         return 1
 
     target_dir = Path(args.target_dir)
@@ -428,10 +431,10 @@ def _cmd_init(args):
         print(f"  lite-server serve --config server.yaml")
         return 0
     except FileExistsError as e:
-        print(f"Error: {e}", file=sys.stderr)
+        _logger.error("%s", e)
         return 1
     except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
+        _logger.error("%s", e)
         return 1
 
 

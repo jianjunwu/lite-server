@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::sync::Mutex;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Pre-sized key for model_version lookups — single allocation, no reallocation.
 /// Used on the hot path (try_submit / has_queue) to avoid repeated format! overhead.
@@ -236,6 +236,7 @@ impl InferenceQueue {
         let max_requests_jitter = config.max_requests_jitter;
         let health_interval = Duration::from_secs_f64(config.health_check_interval as f64);
 
+        let worker_count = workers.len();
         let handle = tokio::spawn(batch_collector(
             rx,
             max_batch,
@@ -266,6 +267,13 @@ impl InferenceQueue {
         }
 
         self.queues.insert(key, (tx, std::sync::Arc::new(handle), outlier));
+        info!(
+            model = %model_name,
+            version = %version,
+            workers = worker_count,
+            max_batch = max_batch,
+            "model registered"
+        );
     }
 
     /// Unregister a model version and stop its collector.
@@ -273,6 +281,7 @@ impl InferenceQueue {
         let key = model_version_key(model_name, version);
         if let Some((_, (_, handle, _))) = self.queues.remove(&key) {
             handle.abort();
+            info!(model = %model_name, version = %version, "model unregistered");
         }
     }
 
@@ -295,8 +304,14 @@ impl InferenceQueue {
         sender
             .try_send(item)
             .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => QueueError::Full,
-                mpsc::error::TrySendError::Closed(_) => QueueError::Closed,
+                mpsc::error::TrySendError::Full(_) => {
+                    debug!(model = %model_name, version = %version, "queue full");
+                    QueueError::Full
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    debug!(model = %model_name, version = %version, "queue closed");
+                    QueueError::Closed
+                }
             })
     }
 
@@ -358,7 +373,15 @@ async fn do_send_batch(
         return Ok(());
     }
 
+    let batch_size = batch.len();
     let worker_idx = pick_worker_least_loaded(inflight, outlier);
+    debug!(
+        model = %model_name,
+        version = %version,
+        batch_size = batch_size,
+        worker_idx = worker_idx,
+        "sending batch"
+    );
     inflight[worker_idx].fetch_add(1, Ordering::Relaxed);
     let zmq_client = &zmq_clients[worker_idx];
 
@@ -465,6 +488,7 @@ async fn do_send_batch(
                     inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
                     if all_ok {
                         outlier.record_success(worker_idx);
+                        debug!(model = %model_name, version = %version, worker_idx = worker_idx, "batch ok");
                         Ok(())
                     } else {
                         outlier.record_error(worker_idx);
@@ -486,6 +510,7 @@ async fn do_send_batch(
                         Err(())
                     } else {
                         outlier.record_success(worker_idx);
+                        debug!(model = %model_name, version = %version, worker_idx = worker_idx, "batch ok");
                         Ok(())
                     }
                 }
@@ -576,6 +601,12 @@ async fn send_batch_with_retry(
                 if batch.is_empty() {
                     return; // all items already got error responses
                 }
+                warn!(
+                    model = %model_name,
+                    version = %version,
+                    attempt = attempt + 1,
+                    "batch failed, retrying"
+                );
                 // items remain — retry on next worker
             }
         }
@@ -738,6 +769,7 @@ async fn batch_collector(
                 }
             }, if deadline.is_some() => {
                 if !batch.is_empty() {
+                    debug!(model = %model_name, version = %version, batch_size = batch.len(), "batch timeout");
                     let current_batch = std::mem::take(&mut batch);
                     let zmq_clients = zmq_clients.clone();
                     let worker_inflight = worker_inflight.clone();
@@ -825,6 +857,9 @@ async fn health_checker(
                     Ok(Err(_)) | Err(_) => {
                         outlier.record_error(idx);
                         prometheus::inc_health_check(&model_name, &version, "error");
+                        if !was_ejected && outlier.is_ejected(idx) {
+                            warn!(model = %model_name, version = %version, worker_idx = idx, "worker ejected");
+                        }
                     }
                 }
                 prometheus::set_worker_health(

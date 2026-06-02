@@ -169,7 +169,7 @@ fn main() {
                 endpoints_dir,
                 threads,
                 timeout,
-                log_level,
+                log_level: log_level.clone(),
                 log_info_output,
                 log_error_output,
                 log_rotation,
@@ -188,9 +188,18 @@ fn main() {
                 keepalive_timeout,
             });
 
+            // Default warn; --log-verbose bumps to info unless --log-level is explicitly set
+            let effective_level = if log_level.is_some() {
+                cfg.logging.level.clone()
+            } else if log_verbose {
+                "info".to_string()
+            } else {
+                "warn".to_string()
+            };
+
             // Initialize logging
             let _log_guard = lite_server::logging::init(
-                &cfg.logging.level,
+                &effective_level,
                 cfg.logging.info_output.as_deref(),
                 cfg.logging.error_output.as_deref(),
                 &cfg.logging.rotation,

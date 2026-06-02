@@ -259,6 +259,7 @@ pub async fn load_model_handler(
     let config_path = state.repo_path.join(&model_name).join(&version).join("config.yaml");
     let config = crate::config::load_model_config(&config_path).unwrap_or_default();
 
+    info!(model = %model_name, version = %version, "load model requested");
     state.worker_manager.load_model(&model_name, &version, &config).await?;
 
     // Auto-activate if no active version
@@ -284,6 +285,7 @@ pub async fn unload_model_handler(
     if let Some(ref v) = query.version {
         crate::validation::validate_version(v)?;
     }
+    info!(model = %model_name, version = ?query.version, "unload model requested");
     let success = state.worker_manager.unload_model(&model_name, query.version.as_deref()).await?;
     if !success {
         return Err(AppError::ModelNotFound(format!("{} not loaded", model_name)));
@@ -305,6 +307,7 @@ pub async fn reload_model_handler(
     if let Some(ref v) = query.version {
         crate::validation::validate_version(v)?;
     }
+    info!(model = %model_name, version = ?query.version, "reload model requested");
     let success = state.worker_manager.reload_model(&model_name, query.version.as_deref()).await?;
     if !success {
         return Err(AppError::ModelNotFound(format!("{} not loaded", model_name)));
@@ -324,6 +327,7 @@ pub async fn delete_version_handler(
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
 
+    info!(model = %model_name, version = %version, "delete version requested");
     // Unload first if loaded
     let _ = state.worker_manager.unload_model(&model_name, Some(&version)).await;
 
@@ -350,6 +354,7 @@ pub async fn activate_version_handler(
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
 
+    info!(model = %model_name, version = %version, "activate version requested");
     let success = state.registry.activate_version(&model_name, &version)?;
     if !success {
         return Err(AppError::ModelNotReady(format!(
@@ -1419,6 +1424,7 @@ mod upload_download_tests {
             registry.clone(),
             repo_path.clone(),
             inference_queue.clone(),
+            "warn".to_string(),
         ));
         Arc::new(AppState::new(
             registry,

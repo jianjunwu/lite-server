@@ -31,6 +31,7 @@ impl LiteServer {
             registry.clone(),
             repo_path,
             inference_queue.clone(),
+            config.logging.level.clone(),
         ));
 
         Self {
@@ -835,6 +836,7 @@ mod tests {
             registry,
             tmp_dir.clone(),
             inference_queue,
+            "warn".to_string(),
         ));
 
         let (tx, _rx) = mpsc::channel::<Vec<PathBuf>>(32);
@@ -869,6 +871,7 @@ mod tests {
             registry,
             tmp_dir.clone(),
             inference_queue,
+            "warn".to_string(),
         ));
 
         let (tx, mut rx) = mpsc::channel::<Vec<PathBuf>>(32);

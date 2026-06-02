@@ -147,6 +147,8 @@ pub struct WorkerManager {
     // Respawn channel for heartbeat-triggered worker restarts
     respawn_tx: mpsc::Sender<RespawnSignal>,
     respawn_rx: tokio::sync::Mutex<Option<mpsc::Receiver<RespawnSignal>>>,
+    // Log level passed to Python workers
+    log_level: String,
 }
 
 struct WorkerProcess {
@@ -160,6 +162,7 @@ impl WorkerManager {
         registry: Arc<ModelRegistry>,
         repo_path: PathBuf,
         inference_queue: Arc<InferenceQueue>,
+        log_level: String,
     ) -> Self {
         let (reload_tx, reload_rx) = mpsc::channel::<ReloadSignal>(8);
         let (respawn_tx, respawn_rx) = mpsc::channel::<RespawnSignal>(8);
@@ -175,6 +178,7 @@ impl WorkerManager {
             reload_rx: tokio::sync::Mutex::new(Some(reload_rx)),
             respawn_tx,
             respawn_rx: tokio::sync::Mutex::new(Some(respawn_rx)),
+            log_level,
         }
     }
 
@@ -336,7 +340,9 @@ impl WorkerManager {
             .arg("--worker-id")
             .arg(worker_id.to_string())
             .arg("--endpoint")
-            .arg(&endpoint);
+            .arg(&endpoint)
+            .arg("--log-level")
+            .arg(&self.log_level);
 
         if model_config.continuous_batching {
             child = child.arg("--continuous-batching");
@@ -666,7 +672,9 @@ impl WorkerManager {
                 .arg("--worker-id")
                 .arg(worker_id.to_string())
                 .arg("--endpoint")
-                .arg(&endpoint);
+                .arg(&endpoint)
+                .arg("--log-level")
+                .arg(&self.log_level);
 
             if model_config.continuous_batching {
                 child = child.arg("--continuous-batching");
@@ -676,7 +684,10 @@ impl WorkerManager {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
-                .map_err(|e| AppError::Python(format!("failed to spawn worker: {}", e)))?;
+                .map_err(|e| {
+                    warn!(model = %model_name, version = %version, worker_id, "failed to spawn worker: {}", e);
+                    AppError::Python(format!("failed to spawn worker: {}", e))
+                })?;
 
             let stdout = child.stdout.take()
                 .ok_or_else(|| AppError::Internal("worker stdout not piped".to_string()))?;
@@ -938,6 +949,7 @@ impl WorkerManager {
     }
 
     pub async fn shutdown(&self) {
+        info!("Shutting down all workers");
         let workers = self.workers.read().await;
         let keys: Vec<String> = workers.keys().cloned().collect();
         drop(workers);
