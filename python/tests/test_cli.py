@@ -69,15 +69,14 @@ class TestAnalyze:
         assert "encode_response" in report["methods"]
         assert report["config"]["max_batch_size"] == 4
 
-    def test_analyze_missing_model(self, tmp_path, capsys):
+    def test_analyze_missing_model(self, tmp_path, caplog):
         args = type("Args", (), {
             "model_repo": str(tmp_path / "model_repo"),
             "model": "missing",
             "output_dir": str(tmp_path / "reports"),
         })()
         assert cli._cmd_analyze(args) == 1
-        captured = capsys.readouterr()
-        assert "not found" in captured.err.lower()
+        assert "not found" in caplog.text.lower()
 
     def test_analyze_missing_predict(self, tmp_path, monkeypatch):
         repo = tmp_path / "model_repo"
@@ -159,7 +158,7 @@ class TestPackUnpack:
         })()
         assert cli._cmd_pack(args) == 1
 
-    def test_pack_rejects_invalid_version(self, tmp_path, capsys):
+    def test_pack_rejects_invalid_version(self, tmp_path, caplog):
         model_dir = tmp_path / "my_model"
         model_dir.mkdir()
         args = type("Args", (), {
@@ -169,8 +168,7 @@ class TestPackUnpack:
             "name": None,
         })()
         assert cli._cmd_pack(args) == 1
-        captured = capsys.readouterr()
-        assert "invalid version" in captured.err.lower()
+        assert "invalid version" in caplog.text.lower()
 
     def test_pack_with_name_override(self, tmp_path):
         model_dir = tmp_path / "my_model"
@@ -321,13 +319,12 @@ class TestConfigCheck:
         args = type("Args", (), {"config": str(config)})()
         assert cli._cmd_config_check(args) == 0
 
-    def test_config_check_invalid_yaml(self, tmp_path, capsys):
+    def test_config_check_invalid_yaml(self, tmp_path, caplog):
         config = tmp_path / "bad.yaml"
         config.write_text("server: [invalid")
         args = type("Args", (), {"config": str(config)})()
         assert cli._cmd_config_check(args) == 1
-        captured = capsys.readouterr()
-        assert "error" in captured.err.lower()
+        assert "error" in caplog.text.lower()
 
     def test_config_check_validates_model_config(self, tmp_path):
         """config-check should validate model config YAML syntax, not just server config."""
@@ -370,7 +367,7 @@ class TestInit:
         assert "import requests" in tr
         assert "test_health" in tr
 
-    def test_init_existing_dir_fails(self, tmp_path, monkeypatch, capsys):
+    def test_init_existing_dir_fails(self, tmp_path, monkeypatch, caplog):
         monkeypatch.chdir(tmp_path)
         (tmp_path / "exists").mkdir()
         args = type("Args", (), {
@@ -379,8 +376,7 @@ class TestInit:
             "wizard": False,
         })()
         assert cli._cmd_init(args) == 1
-        captured = capsys.readouterr()
-        assert "already exists" in captured.err.lower()
+        assert "already exists" in caplog.text.lower()
 
     def test_init_default_project_name(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)

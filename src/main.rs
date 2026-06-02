@@ -169,7 +169,7 @@ fn main() {
                 endpoints_dir,
                 threads,
                 timeout,
-                log_level,
+                log_level: log_level.clone(),
                 log_info_output,
                 log_error_output,
                 log_rotation,

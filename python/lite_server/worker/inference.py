@@ -820,6 +820,8 @@ def _run_teardown(lit_api, log):
 
 
 def worker_main():
+    import zmq
+
     args = parse_args()
 
     log = setup_logging(args.worker_id, args.log_level)

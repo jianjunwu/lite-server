@@ -139,7 +139,8 @@ class TestRunPredict:
 
         meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
         data = json.dumps({"input": 5}).encode()
-        resp_bytes, status, metrics = inference._run_predict(MockAPI(), data, meta)
+        log = logging.getLogger("test")
+        resp_bytes, status, metrics = inference._run_predict(MockAPI(), data, meta, log)
         assert json.loads(resp_bytes) == {"output": 10}
         assert status.code == "Ok"
 
@@ -154,7 +155,8 @@ class TestRunPredict:
 
         meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
         data = json.dumps({"input": 5}).encode()
-        resp_bytes, status, metrics = inference._run_predict(HookAPI(), data, meta)
+        log = logging.getLogger("test")
+        resp_bytes, status, metrics = inference._run_predict(HookAPI(), data, meta, log)
         assert json.loads(resp_bytes) == {"output": 12}
 
     def test_on_request_hook_can_reject(self):
@@ -167,8 +169,9 @@ class TestRunPredict:
 
         meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
         data = json.dumps({"input": 5}).encode()
+        log = logging.getLogger("test")
         with pytest.raises(ValueError, match="rejected"):
-            inference._run_predict(RejectAPI(), data, meta)
+            inference._run_predict(RejectAPI(), data, meta, log)
 
     def test_skips_hooks_when_not_implemented(self):
         class PlainAPI:
@@ -177,7 +180,8 @@ class TestRunPredict:
 
         meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
         data = json.dumps({"input": 5}).encode()
-        resp_bytes, status, metrics = inference._run_predict(PlainAPI(), data, meta)
+        log = logging.getLogger("test")
+        resp_bytes, status, metrics = inference._run_predict(PlainAPI(), data, meta, log)
         assert json.loads(resp_bytes) == {"output": 10}
 
 
@@ -259,7 +263,8 @@ class TestHealthCheck:
 
         meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
         data = json.dumps({"input": 1}).encode()
-        resp_bytes, status, metrics = inference._run_predict(CountingAPI(), data, meta)
+        log = logging.getLogger("test")
+        resp_bytes, status, metrics = inference._run_predict(CountingAPI(), data, meta, log)
         assert call_count == 1
         assert status.code == "Ok"
 
@@ -462,7 +467,8 @@ class TestRunPredictAsync:
 
         meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
         data = json.dumps({"input": 5}).encode()
-        resp_bytes, status, metrics = asyncio.run(_run_predict_async(AsyncAPI(), data, meta))
+        log = logging.getLogger("test")
+        resp_bytes, status, metrics = asyncio.run(_run_predict_async(AsyncAPI(), data, meta, log))
         assert json.loads(resp_bytes) == {"encoded": 10, "on_response": True}
         assert status.code == "Ok"
 
@@ -480,7 +486,8 @@ class TestRunPredictAsync:
 
         meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
         data = json.dumps({"input": 4}).encode()
-        resp_bytes, status, metrics = asyncio.run(_run_predict_async(SimpleAsyncAPI(), data, meta))
+        log = logging.getLogger("test")
+        resp_bytes, status, metrics = asyncio.run(_run_predict_async(SimpleAsyncAPI(), data, meta, log))
         assert json.loads(resp_bytes) == {"output": 12}
         assert status.code == "Ok"
 
@@ -512,7 +519,8 @@ class TestRunPredictAsync:
 
         meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
         data = json.dumps({"input": 1}).encode()
-        resp_bytes, status, metrics = asyncio.run(_run_predict_async(MixedAPI(), data, meta))
+        log = logging.getLogger("test")
+        resp_bytes, status, metrics = asyncio.run(_run_predict_async(MixedAPI(), data, meta, log))
         assert json.loads(resp_bytes) == {"input": 1, "hooked": True, "sync_hook": True}
 
 
