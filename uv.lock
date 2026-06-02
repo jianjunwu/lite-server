@@ -299,7 +299,7 @@ wheels = [
 
 [[package]]
 name = "lite-server"
-version = "0.6.0"
+version = "0.6.5"
 source = { editable = "." }
 dependencies = [
     { name = "litserve" },
