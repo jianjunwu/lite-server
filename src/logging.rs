@@ -31,7 +31,7 @@ pub fn init(
     verbose: bool,
 ) -> LogGuard {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("lite_server={},worker=info,tokio=warn,hyper=warn", level)));
+        .unwrap_or_else(|_| EnvFilter::new(format!("lite_server={},tokio=warn,hyper=warn", level)));
 
     // stdout layer (always)
     let stdout_layer = fmt::layer().with_target(true).with_thread_ids(true);

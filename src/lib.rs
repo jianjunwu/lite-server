@@ -52,6 +52,7 @@ pub fn run_server(
         config::Config::default()
     };
 
+    let log_level_specified = log_level.is_some();
     cfg.apply_overrides(&config::CliOverrides {
         port,
         host,
@@ -79,8 +80,16 @@ pub fn run_server(
     });
 
     let log_verbose = log_verbose.unwrap_or(false);
+    // Default warn; --log-verbose bumps to info unless --log-level is explicitly set
+    let effective_level = if log_level_specified {
+        cfg.logging.level.clone()
+    } else if log_verbose {
+        "info".to_string()
+    } else {
+        "warn".to_string()
+    };
     let _log_guard = logging::init(
-        &cfg.logging.level,
+        &effective_level,
         cfg.logging.info_output.as_deref(),
         cfg.logging.error_output.as_deref(),
         &cfg.logging.rotation,

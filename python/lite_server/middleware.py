@@ -94,7 +94,7 @@ def log_requests(handler: Callable) -> Callable:
         result = await _maybe_async(handler, request, server)
         elapsed = (time.monotonic() - start) * 1000
         status = result.get("status_code", 200) if isinstance(result, dict) else 200
-        logger.info("%s %s -> %d in %.2fms", method, route, status, elapsed)
+        logger.debug("%s %s -> %d in %.2fms", method, route, status, elapsed)
         return result
 
     return wrapper

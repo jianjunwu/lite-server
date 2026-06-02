@@ -56,6 +56,7 @@ def parse_args():
     parser.add_argument("--worker-id", type=int, required=True)
     parser.add_argument("--endpoint", required=True, help="ZMQ PAIR endpoint, e.g. ipc:///tmp/lite-server/...")
     parser.add_argument("--continuous-batching", action="store_true", default=False)
+    parser.add_argument("--log-level", default="warn", help="Logging level: debug, info, warn, error")
     return parser.parse_args()
 
 
@@ -76,14 +77,15 @@ class _LevelPrefixFormatter(logging.Formatter):
         return f"[{prefix}] {msg}"
 
 
-def setup_logging(worker_id: int):
+def setup_logging(worker_id: int, level_str: str = "warn"):
     """Configure worker logging: plain text to stderr (captured by Rust).
 
     Configures the root logger so that all child loggers (including the
     user's model logger via ``LitAPI.logger``) inherit the handler and level.
     """
+    level = getattr(logging, level_str.upper(), logging.INFO)
     root = logging.getLogger()
-    root.setLevel(logging.INFO)
+    root.setLevel(level)
     if not root.handlers:
         handler = logging.StreamHandler(sys.stderr)
         handler.setFormatter(_LevelPrefixFormatter())
@@ -224,20 +226,41 @@ def _collect_metrics(lit_api: LitAPI):
     return Metrics(gauges=gauges, counters=counters, histograms=histograms)
 
 
-def _run_predict(lit_api: LitAPI, data: bytes, meta: RequestMeta):
+def _run_predict(lit_api: LitAPI, data: bytes, meta: RequestMeta, log: logging.Logger):
     """Run the full predict pipeline with hooks."""
     raw = json.loads(data) if data else {}
-    decoded = lit_api.decode_request(raw) if hasattr(lit_api, "decode_request") else raw
+
+    try:
+        decoded = lit_api.decode_request(raw) if hasattr(lit_api, "decode_request") else raw
+    except Exception as e:
+        log.warning("decode_request failed: %s", e, exc_info=True)
+        raise
 
     if hasattr(lit_api, "on_request"):
-        decoded = lit_api.on_request(decoded, meta)
+        try:
+            decoded = lit_api.on_request(decoded, meta)
+        except Exception as e:
+            log.warning("on_request hook failed: %s", e, exc_info=True)
+            raise
 
-    output = lit_api.predict(decoded)
+    try:
+        output = lit_api.predict(decoded)
+    except Exception as e:
+        log.error("predict failed: %s", e, exc_info=True)
+        raise
 
-    encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
+    try:
+        encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
+    except Exception as e:
+        log.warning("encode_response failed: %s", e, exc_info=True)
+        raise
 
     if hasattr(lit_api, "on_response"):
-        encoded = lit_api.on_response(encoded, meta)
+        try:
+            encoded = lit_api.on_response(encoded, meta)
+        except Exception as e:
+            log.warning("on_response hook failed: %s", e, exc_info=True)
+            raise
 
     resp_bytes = json.dumps(encoded).encode()
     metrics = _collect_metrics(lit_api)
@@ -270,27 +293,47 @@ async def _maybe_await(func, *args, **kwargs):
     return result
 
 
-async def _run_predict_async(lit_api: LitAPI, data: bytes, meta: RequestMeta):
+async def _run_predict_async(lit_api: LitAPI, data: bytes, meta: RequestMeta, log: logging.Logger):
     """Async version of the full predict pipeline with hooks."""
     raw = json.loads(data) if data else {}
 
-    if hasattr(lit_api, "decode_request"):
-        decoded = await _maybe_await(lit_api.decode_request, raw)
-    else:
-        decoded = raw
+    try:
+        if hasattr(lit_api, "decode_request"):
+            decoded = await _maybe_await(lit_api.decode_request, raw)
+        else:
+            decoded = raw
+    except Exception as e:
+        log.warning("decode_request failed: %s", e, exc_info=True)
+        raise
 
     if hasattr(lit_api, "on_request"):
-        decoded = await _maybe_await(lit_api.on_request, decoded, meta)
+        try:
+            decoded = await _maybe_await(lit_api.on_request, decoded, meta)
+        except Exception as e:
+            log.warning("on_request hook failed: %s", e, exc_info=True)
+            raise
 
-    output = await _maybe_await(lit_api.predict, decoded)
+    try:
+        output = await _maybe_await(lit_api.predict, decoded)
+    except Exception as e:
+        log.error("predict failed: %s", e, exc_info=True)
+        raise
 
-    if hasattr(lit_api, "encode_response"):
-        encoded = await _maybe_await(lit_api.encode_response, output)
-    else:
-        encoded = output
+    try:
+        if hasattr(lit_api, "encode_response"):
+            encoded = await _maybe_await(lit_api.encode_response, output)
+        else:
+            encoded = output
+    except Exception as e:
+        log.warning("encode_response failed: %s", e, exc_info=True)
+        raise
 
     if hasattr(lit_api, "on_response"):
-        encoded = await _maybe_await(lit_api.on_response, encoded, meta)
+        try:
+            encoded = await _maybe_await(lit_api.on_response, encoded, meta)
+        except Exception as e:
+            log.warning("on_response hook failed: %s", e, exc_info=True)
+            raise
 
     resp_bytes = json.dumps(encoded).encode()
     metrics = _collect_metrics(lit_api)
@@ -332,7 +375,7 @@ def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.
     if not _has_stream_predict(lit_api):
         # Fallback: predict() once, send as single chunk
         try:
-            resp_bytes, status, metrics = _run_predict(lit_api, data, meta)
+            resp_bytes, status, metrics = _run_predict(lit_api, data, meta, log)
             socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=True).SerializeToString())
             socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
         except Exception as e:
@@ -433,7 +476,7 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
                     single=SingleResponse(data=b"{}", status=_make_status(True)),
                 )
             else:
-                resp_bytes, status, metrics = await _run_predict_async(lit_api, request.single.data, meta)
+                resp_bytes, status, metrics = await _run_predict_async(lit_api, request.single.data, meta, log)
                 response = Response(
                     uid=uid,
                     single=SingleResponse(data=resp_bytes, status=status),
@@ -445,7 +488,7 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
             items = []
             for item in batch.items:
                 try:
-                    resp_bytes, status, _item_metrics = await _run_predict_async(lit_api, item.data, meta)
+                    resp_bytes, status, _item_metrics = await _run_predict_async(lit_api, item.data, meta, log)
                 except Exception as e:
                     resp_bytes = json.dumps({"error": str(e)}).encode()
                     status = _make_status(False, str(e))
@@ -515,7 +558,7 @@ def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log:
                         ),
                     )
                 else:
-                    resp_bytes, status, metrics = _run_predict(lit_api, request.single.data, meta)
+                    resp_bytes, status, metrics = _run_predict(lit_api, request.single.data, meta, log)
                     response = Response(
                         uid=uid,
                         single=SingleResponse(data=resp_bytes, status=status),
@@ -527,7 +570,7 @@ def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log:
                 items = []
                 for item in batch.items:
                     try:
-                        resp_bytes, status, _item_metrics = _run_predict(lit_api, item.data, meta)
+                        resp_bytes, status, _item_metrics = _run_predict(lit_api, item.data, meta, log)
                     except Exception as e:
                         resp_bytes = json.dumps({"error": str(e)}).encode()
                         status = _make_status(False, str(e))
@@ -779,7 +822,7 @@ def _run_teardown(lit_api, log):
 def worker_main():
     args = parse_args()
 
-    log = setup_logging(args.worker_id)
+    log = setup_logging(args.worker_id, args.log_level)
 
     log.info(f"Worker {args.worker_id} starting, device={args.device}, endpoint={args.endpoint}")
 
