@@ -36,6 +36,8 @@ Start from example 01 and work your way up. Each example builds on concepts from
 | 07 | [custom_params](07_custom_params/) | Config-driven behavior | `self.config`, custom YAML fields |
 | 08 | [openai_compatible](08_openai_compatible/) | OpenAI-compatible endpoint | `OpenAIEndpoint` base class, `/v1/chat/completions` |
 | 09 | [custom_metrics](09_custom_metrics/) | Custom Prometheus metrics | `register_metric()`, `report_metric()`, gauge/counter/histogram |
+| 10 | [async](10_async/) | Asynchronous inference | `AsyncLitAPI`, `async def predict()`, sync/async mixed hooks |
+| 11 | [logging](11_logging/) | Structured logging at every stage | `self.logger`, per-request tracing, `--log-level` |
 
 ## Running Any Example
 
@@ -167,6 +169,34 @@ curl -s http://localhost:8000/metrics | grep demo_
 # => lite_server_demo_batch_size{model="metrics_demo"} 1
 # => lite_server_demo_predictions_total_total{model="metrics_demo"} 10
 # => lite_server_demo_inference_ms_count{model="metrics_demo"} 10
+```
+
+### 10 Async
+
+```bash
+# Single request
+curl -X POST http://localhost:8000/v2/models/async_echo/infer \
+  -H 'Content-Type: application/json' \
+  -d '{"input": "hello"}'
+# => {"output": "async_echo: hello"}
+
+# Concurrent requests — async workers handle them without blocking
+for i in $(seq 1 5); do
+  curl -s -X POST http://localhost:8000/v2/models/async_echo/infer \
+    -H 'Content-Type: application/json' \
+    -d "{\"input\": \"msg-$i\"}" &
+done
+wait
+```
+
+### 11 Logging
+
+```bash
+# Run with --log-level info to see per-request logs
+curl -X POST http://localhost:8000/v2/models/logged_model/infer \
+  -H 'Content-Type: application/json' \
+  -d '{"input": 21}'
+# => {"output": 42, "call_count": 1}
 ```
 
 ### 08 OpenAI-Compatible Endpoint

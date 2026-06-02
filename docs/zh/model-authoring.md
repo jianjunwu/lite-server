@@ -170,6 +170,57 @@ def teardown(self):
     torch.cuda.empty_cache()
 ```
 
+## AsyncLitAPI
+
+对于涉及异步 I/O 的推理流程 —— 例如调用外部 API、使用异步模型库或等待协程 —— 使用 `AsyncLitAPI` 替代 `LitAPI`。
+
+### 用法
+
+```python
+import asyncio
+from lite_server import AsyncLitAPI
+
+class AsyncModel(AsyncLitAPI):
+    async def setup(self, device):
+        self.client = await create_async_client()
+
+    async def decode_request(self, request):
+        return request.get("input", "")
+
+    async def predict(self, x):
+        # 异步 I/O：例如远程 API 调用或异步模型推理
+        result = await self.client.predict(x)
+        return {"output": result}
+
+    def encode_response(self, output):
+        return output
+```
+
+### 约束
+
+- `predict()` 必须是 `async def`。
+- `max_batch_size` 强制为 `1` —— 异步不支持批处理。
+- `enable_async` 自动设置为 `True`。
+
+### 混合 Sync/Async Hook
+
+`decode_request`、`encode_response`、`on_request` 和 `on_response` 可以是**同步或异步**。worker 自动适配：
+
+```python
+class MixedHooksModel(AsyncLitAPI):
+    def decode_request(self, request):          # 同步也可以
+        return request["input"]
+
+    async def predict(self, x):                  # 必须是异步
+        await asyncio.sleep(0.05)
+        return {"output": x}
+
+    def encode_response(self, output):           # 同步也可以
+        return output
+```
+
+参见 [examples/10_async](../examples/10_async/) 获取可运行的示例。
+
 ## 连续批处理（LLM）
 
 对于 LLM 工作负载，启用连续批处理以同时处理多个序列并进行迭代生成。
@@ -543,6 +594,74 @@ class MyModel(LitAPI):
 - **A/B 测试**：不同版本使用不同配置
 
 参见 [examples/07_custom_params](../examples/07_custom_params/) 获取可运行的示例。
+
+## 日志
+
+每个 `LitAPI` 实例都有一个 `self.logger` 属性（标准的 Python `logging.Logger`），绑定到模型类名。在推理生命周期的任何阶段都可以使用它来输出结构化日志。
+
+### 基本用法
+
+```python
+class MyModel(LitAPI):
+    def setup(self, device):
+        self.logger.info("Loading model on device=%s", device)
+        self.model = load_model()
+
+    def predict(self, x):
+        self.logger.debug("predict input=%s", x)
+        output = self.model(x)
+        self.logger.info("predict output=%s", output)
+        return output
+```
+
+### 日志级别
+
+| 方法 | 使用场景 |
+|------|----------|
+| `logger.debug(...)` | 详细诊断：原始输入/输出、中间张量 |
+| `logger.info(...)` | 生命周期事件：模型加载完成、请求接收、响应发送 |
+| `logger.warning(...)` | 可恢复问题：使用了已废弃的功能、触发了回退逻辑 |
+| `logger.error(...)` | 会导致请求失败的错误 |
+
+### 控制详细程度
+
+worker 会配置根 logger，所有模型 logger 继承相同的 handler 和级别。通过 `--log-level` CLI 标志控制：
+
+```bash
+python -m lite_server serve --config server.yaml --log-level info
+```
+
+或在 `server.yaml` 中：
+
+```yaml
+server:
+  log_level: info
+```
+
+### 按请求追踪
+
+使用 `on_request` 和 `on_response` 记录请求元数据：
+
+```python
+def on_request(self, request, meta):
+    self.logger.info(
+        "Request from %s | route=%s | request_id=%s",
+        meta.client_ip, meta.route, meta.request_id,
+    )
+    return request
+
+def on_response(self, response, meta):
+    self.logger.info(
+        "Response ready | request_id=%s | latency_ms=%.2f",
+        meta.request_id,
+        (time.time_ns() - meta.timestamp_ns) / 1_000_000,
+    )
+    return response
+```
+
+`meta` 是一个 `RequestMeta` 对象，包含：`route`、`headers`、`client_ip`、`request_id`、`timestamp_ns`、`payload`。
+
+参见 [examples/11_logging](../examples/11_logging/) 获取可运行的示例。
 
 ## 最佳实践
 
