@@ -122,6 +122,9 @@ When `stream: true` and model implements `stream_predict()`:
 | Ensemble | `ensemble.rs` | DAG-based multi-model pipeline orchestration |
 | Config | `config.rs` | YAML config loading, CLI override application |
 | Server | `server.rs` | Main server lifecycle, graceful shutdown |
+| Endpoint Worker | `worker/endpoint_manager.rs` | Custom HTTP endpoint worker process management |
+
+**Custom Endpoints.** The Rust core spawns a dedicated Python endpoint worker that loads user-defined HTTP routes from the `endpoints/` directory or decorator-registered routes. The endpoint worker communicates with the Rust core via UDS (Unix domain socket) or TCP (Windows), using a length-prefixed JSON/Protobuf protocol. This isolates custom endpoint logic from inference workers.
 
 ### Python Package (`python/`)
 

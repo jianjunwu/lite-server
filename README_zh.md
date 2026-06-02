@@ -127,6 +127,14 @@ Rust 内核处理所有 I/O（HTTP、gRPC、IPC、指标、文件监听），Pyt
 - **模型打包** — `.lma` 格式，SHA256 + HMAC 签名验证
 - **模型上传/下载** — 通过 HTTP API 上传 `.lma` 包或原始文件，支持自动加载
 
+### 自定义端点
+
+- **目录自动发现** — 将 Python 文件放入 `endpoints/` 目录即可自动注册
+- **装饰器路由** — `@endpoint.get("/status")` 精确控制路由
+- **服务器上下文访问** — handler 中可使用 `server.registry`、`server.infer()`、`server.metrics`
+- **中间件链** — 支持按路由或全局中间件（认证、限流、CORS）
+- **流式响应** — 自定义端点支持 chunked 和 SSE 流式输出
+
 ### Worker 韧性
 
 - **异常检测** — 连续错误自动剔除 worker（Envoy 风格）
@@ -218,9 +226,11 @@ lite-server init my_project           # 脚手架创建项目
 | GET | `/v2/repository/models/{name}/versions/{v}/files` | 列出版本目录文件 |
 | POST | `/v2/models/{name}/reload` | 热重载 |
 | POST | `/v2/models/{name}/versions/{v}/activate` | 激活版本 |
-| GET | `/health` | 健康检查 |
+| GET | `/health` | 健康检查（可被自定义端点覆盖） |
 | GET | `/info` | 服务器信息 |
 | GET | `/metrics` | Prometheus 指标 |
+
+**自定义端点**（从 `endpoints/` 目录加载或装饰器注册）与内置路由一起动态注册。系统路由（`/info`、`/metrics`、`/health`、`/v2/models`、`/v2/repository`）不可覆盖。
 
 ## 配置
 
@@ -230,10 +240,12 @@ lite-server init my_project           # 脚手架创建项目
 server:
   http_port: 8000
   host: 0.0.0.0
-  transport: zmq  # zmq 或 uds
 
 model_repository:
   path: ./model_repo
+
+# 可选：自定义 HTTP 端点目录
+endpoints_dir: ./endpoints
 ```
 
 单模型配置（`model_repo/my_model/1/config.yaml`）：

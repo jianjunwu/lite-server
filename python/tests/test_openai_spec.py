@@ -269,7 +269,9 @@ class TestResponseFormat:
 class TestLoadEndpointsIntegration:
     def test_openai_endpoint_detected(self, tmp_path):
         """load_endpoints should detect OpenAIEndpoint subclasses."""
-        ep_file = tmp_path / "chat_endpoint.py"
+        ep_dir = tmp_path / "endpoints"
+        ep_dir.mkdir()
+        ep_file = ep_dir / "chat.py"
         ep_file.write_text(
             "from lite_server.specs.openai import OpenAIEndpoint\n"
             "\n"
@@ -289,7 +291,9 @@ class TestLoadEndpointsIntegration:
 
     def test_openai_endpoint_handler_is_callable(self, tmp_path):
         """The registered handler should be the endpoint's handle method."""
-        ep_file = tmp_path / "chat_endpoint.py"
+        ep_dir = tmp_path / "endpoints"
+        ep_dir.mkdir()
+        ep_file = ep_dir / "chat.py"
         ep_file.write_text(
             "from lite_server.specs.openai import OpenAIEndpoint\n"
             "\n"
@@ -304,16 +308,3 @@ class TestLoadEndpointsIntegration:
         endpoints = load_endpoints(str(tmp_path))
         handler = endpoints["/v1/chat/completions"]["handler"]
         assert callable(handler)
-
-    def test_old_style_endpoint_still_works(self, tmp_path):
-        """Existing *_endpoint.py with handler function must not break."""
-        ep_file = tmp_path / "status_endpoint.py"
-        ep_file.write_text(
-            "methods = ['GET']\n"
-            "def handler(request, server):\n"
-            "    return {'status': 'ok'}\n"
-        )
-        from lite_server.worker.endpoints import load_endpoints
-        endpoints = load_endpoints(str(tmp_path))
-        assert "/status" in endpoints
-        assert endpoints["/status"]["methods"] == ["GET"]

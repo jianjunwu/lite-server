@@ -38,6 +38,9 @@ metrics:
 model_repository:
   path: ./model_repo           # 模型仓库目录
 
+endpoints_dir: ./endpoints     # 自定义 HTTP 端点目录（可选）
+                               # 递归扫描 *.py 文件
+
 features:
   timeline: false              # 启用历史指标时间线
   system_overview: true        # 启用系统概览
@@ -164,6 +167,7 @@ lite-server serve [参数]
 | `--port` | HTTP 端口 | `server.http_port` |
 | `--host` | 绑定地址 | `server.host` |
 | `--model-repo` | 模型仓库路径 | `model_repository.path` |
+| `--endpoints-dir` | 自定义端点目录 | `endpoints_dir` |
 | `--timeout` | 全局请求超时 | `server.timeout` |
 | `--log-level` | 日志级别 | `server.log_level` + `logging.level` |
 | `--no-metrics` | 禁用指标 | `metrics.enabled` |

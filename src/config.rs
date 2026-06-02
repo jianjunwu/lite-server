@@ -13,6 +13,9 @@ pub struct Config {
     pub orchestration: OrchestrationConfig,
     /// CLI-provided defaults that override per-model config when set.
     pub model_defaults: ModelDefaults,
+    /// Custom endpoint directory. Defaults to model_repository.path when None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoints_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -341,6 +344,7 @@ pub struct CliOverrides {
     pub port: Option<u16>,
     pub host: Option<String>,
     pub model_repo: Option<String>,
+    pub endpoints_dir: Option<String>,
     pub threads: Option<usize>,
     pub timeout: Option<f32>,
     pub log_level: Option<String>,
@@ -373,6 +377,9 @@ impl Config {
         }
         if let Some(ref r) = cli.model_repo {
             self.model_repository.path = r.clone();
+        }
+        if let Some(ref e) = cli.endpoints_dir {
+            self.endpoints_dir = Some(e.clone());
         }
         if let Some(t) = cli.threads {
             self.server.threads = Some(t);

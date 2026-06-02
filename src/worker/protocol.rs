@@ -147,7 +147,14 @@ pub struct EndpointStartup {
     pub status: String,
     pub routes: Vec<EndpointRoute>,
     pub message: Option<String>,
+    #[serde(default)]
+    pub protocol_version: String,
 }
+
+/// Protocol version constants.
+pub const PROTOCOL_VERSION_V0: &str = "v0"; // JSON only
+pub const PROTOCOL_VERSION_V1: &str = "v1"; // Protobuf
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[PROTOCOL_VERSION_V0, PROTOCOL_VERSION_V1];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointRoute {

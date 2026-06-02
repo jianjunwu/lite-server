@@ -7,13 +7,15 @@ use tokio::sync::mpsc;
 
 /// Derive a deterministic localhost port from a path string (Windows only).
 /// Used as a fallback when Unix Domain Sockets are not available.
+/// Uses FNV-1a for cross-language consistency.
 #[cfg(windows)]
 pub fn derive_port_from_path(path: &str) -> u16 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
-    30000 + (hasher.finish() % 30000) as u16
+    let mut hash: u32 = 0x811c9dc5;
+    for b in path.bytes() {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    30000 + (hash % 30000) as u16
 }
 
 /// Unified transport interface for worker communication.

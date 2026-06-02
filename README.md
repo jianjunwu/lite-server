@@ -129,6 +129,14 @@ See [docs/benchmark.md](docs/benchmark.md) for full results and reproduction ste
 - **Model packing** — `.lma` format with SHA256 + HMAC signature
 - **Model upload/download** — upload `.lma` artifacts or raw files via HTTP API, with auto-load support
 
+### Custom Endpoints
+
+- **Directory-based discovery** — place Python files in `endpoints/` for auto-registration
+- **Decorator routing** — `@endpoint.get("/status")` for explicit control
+- **Server context access** — `server.registry`, `server.infer()`, `server.metrics` from handlers
+- **Middleware chain** — per-route or global middleware (auth, rate limiting, CORS)
+- **Streaming support** — chunked and SSE responses from custom endpoints
+
 ### Worker Resilience
 
 - **Outlier detection** — consecutive errors trigger automatic worker ejection (Envoy-style)
@@ -220,9 +228,11 @@ See [examples/README.md](examples/README.md) for learning path and usage details
 | GET | `/v2/repository/models/{name}/versions/{v}/files` | List version directory contents |
 | POST | `/v2/models/{name}/reload` | Hot reload |
 | POST | `/v2/models/{name}/versions/{v}/activate` | Activate version |
-| GET | `/health` | Health check |
+| GET | `/health` | Health check (overridable by custom endpoints) |
 | GET | `/info` | Server info |
 | GET | `/metrics` | Prometheus metrics |
+
+**Custom endpoints** (loaded from `endpoints/` directory or decorator-registered) are registered dynamically alongside built-in routes. System routes (`/info`, `/metrics`, `/health`, `/v2/models`, `/v2/repository`) cannot be overridden.
 
 ## Configuration
 
@@ -232,10 +242,12 @@ Minimal `server.yaml`:
 server:
   http_port: 8000
   host: 0.0.0.0
-  transport: zmq  # zmq or uds
 
 model_repository:
   path: ./model_repo
+
+# Optional: custom HTTP endpoints directory
+endpoints_dir: ./endpoints
 ```
 
 Per-model config (`model_repo/my_model/1/config.yaml`):

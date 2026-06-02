@@ -1,12 +1,13 @@
 # 06 Custom Endpoints
 
-Demonstrates how to add custom HTTP endpoints to the server. A `*_endpoint.py` file in the model repo registers new routes.
+Demonstrates how to add custom HTTP endpoints to the server. Endpoints are defined in the `endpoints/` directory (or any directory specified via `--endpoints-dir`).
 
 ## Run
 
 ```bash
 cd examples/06_custom_endpoint
-python -m lite_server serve --config server.yaml
+lite-server serve --config server.yaml
+# or: python -m lite_server serve --config server.yaml
 ```
 
 ## Test
@@ -20,21 +21,21 @@ curl -X POST http://localhost:8000/v2/models/echo/infer \
 
 # Custom status endpoint
 curl http://localhost:8000/status
-# => {"server": "lite-server", "loaded_models_count": 1, "loaded_models": [...]}
+# => {"server": "lite-server", "loaded_models_count": 1}
 ```
 
 ## What You Learn
 
 - How to create custom HTTP endpoints alongside inference routes
-- How `*_endpoint.py` files are auto-discovered from the model repo
+- How endpoint files are auto-discovered from the `endpoints/` directory
 - How to access the server's model registry from a custom endpoint
 
 ## How It Works
 
-Any `*_endpoint.py` file in the model repo root is auto-discovered:
+Place Python files in the `endpoints/` directory. They are auto-discovered recursively:
 
 ```python
-# status_endpoint.py
+# endpoints/status.py
 
 methods = ["GET"]  # HTTP methods to register
 
@@ -46,3 +47,23 @@ def handler(request, server):
 ```
 
 The `methods` list defines which HTTP methods to register. The `handler` function receives the request and server context.
+
+## Advanced: Decorator-based Routes
+
+You can also use the decorator API for more control:
+
+```python
+from lite_server import endpoint
+
+@endpoint.get("/status")
+def status(request, server):
+    return {"loaded": len(server.registry.list_loaded())}
+```
+
+## CLI: Specify Custom Endpoint Directory
+
+```bash
+lite-server serve --endpoints-dir ./my-endpoints --config server.yaml
+```
+
+Priority: `--endpoints-dir` > `server.yaml endpoints_dir` > `model_repository.path`

@@ -939,18 +939,22 @@ pub async fn custom_endpoint_handler(
     let route = request.uri().path().to_string();
     let method = request.method().to_string();
 
-    // Extract query params
+    let request_id = Uuid::new_v4().to_string();
+    let span = tracing::info_span!(
+        "endpoint_request",
+        route = %route,
+        method = %method,
+        request_id = %request_id,
+    );
+    let _enter = span.enter();
+
+    // Extract query params with proper URL decoding
     let query: HashMap<String, String> = request
         .uri()
         .query()
         .map(|q| {
-            q.split('&')
-                .filter_map(|pair| {
-                    let mut parts = pair.splitn(2, '=');
-                    let key = parts.next()?.to_string();
-                    let val = parts.next().map(|v| v.to_string()).unwrap_or_default();
-                    Some((key, val))
-                })
+            form_urlencoded::parse(q.as_bytes())
+                .into_owned()
                 .collect()
         })
         .unwrap_or_default();

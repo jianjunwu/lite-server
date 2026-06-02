@@ -38,6 +38,9 @@ metrics:
 model_repository:
   path: ./model_repo           # Path to the model repository directory
 
+endpoints_dir: ./endpoints     # Custom HTTP endpoints directory (optional)
+                               # Scanned recursively for *.py files
+
 features:
   timeline: false              # Enable historical metric timeline
   system_overview: true        # Enable system overview in dashboard
@@ -164,6 +167,7 @@ python -m lite_server serve [flags]
 | `--port` | HTTP port | `server.http_port` |
 | `--host` | Bind address | `server.host` |
 | `--model-repo` | Model repository path | `model_repository.path` |
+| `--endpoints-dir` | Custom endpoints directory | `endpoints_dir` |
 | `--timeout` | Global request timeout | `server.timeout` |
 | `--log-level` | Log level | `server.log_level` + `logging.level` |
 | `--no-metrics` | Disable metrics | `metrics.enabled` |

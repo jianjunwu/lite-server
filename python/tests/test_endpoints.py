@@ -8,9 +8,8 @@ import textwrap
 
 import pytest
 
+from lite_server.server_proxy import RegistryProxy, ServerProxy
 from lite_server.worker.endpoints import (
-    RegistryProxy,
-    ServerProxy,
     _LevelPrefixFormatter,
     create_server_socket,
     derive_port_from_path,
@@ -50,7 +49,9 @@ class TestServerProxy:
 
 class TestLoadEndpoints:
     def test_loads_endpoint_file(self, tmp_path):
-        ep_file = tmp_path / "status_endpoint.py"
+        ep_dir = tmp_path / "endpoints"
+        ep_dir.mkdir()
+        ep_file = ep_dir / "status.py"
         ep_file.write_text(textwrap.dedent('''
             methods = ["GET", "POST"]
             def handler(request, server):
@@ -61,7 +62,9 @@ class TestLoadEndpoints:
         assert endpoints["/status"]["methods"] == ["GET", "POST"]
 
     def test_missing_handler_skipped(self, tmp_path):
-        ep_file = tmp_path / "bad_endpoint.py"
+        ep_dir = tmp_path / "endpoints"
+        ep_dir.mkdir()
+        ep_file = ep_dir / "bad.py"
         ep_file.write_text(textwrap.dedent('''
             methods = ["GET"]
         '''))
@@ -69,7 +72,9 @@ class TestLoadEndpoints:
         assert "/bad" not in endpoints
 
     def test_methods_default_to_get(self, tmp_path):
-        ep_file = tmp_path / "hello_endpoint.py"
+        ep_dir = tmp_path / "endpoints"
+        ep_dir.mkdir()
+        ep_file = ep_dir / "hello.py"
         ep_file.write_text(textwrap.dedent('''
             def handler(request, server):
                 return "hello"
@@ -78,18 +83,22 @@ class TestLoadEndpoints:
         assert endpoints["/hello"]["methods"] == ["GET"]
 
     def test_ignores_non_endpoint_files(self, tmp_path):
-        (tmp_path / "helper.py").write_text("x = 1")
+        ep_dir = tmp_path / "endpoints"
+        ep_dir.mkdir()
+        (ep_dir / "helper.py").write_text("x = 1")
         endpoints = load_endpoints(str(tmp_path))
         assert endpoints == {}
 
     def test_broken_endpoint_logged_but_not_crashed(self, tmp_path, caplog):
-        ep_file = tmp_path / "broken_endpoint.py"
+        ep_dir = tmp_path / "endpoints"
+        ep_dir.mkdir()
+        ep_file = ep_dir / "broken.py"
         ep_file.write_text("raise ValueError('bad')")
         setup_logging()
         with caplog.at_level(logging.ERROR, logger="endpoint_worker"):
             endpoints = load_endpoints(str(tmp_path))
         assert "/broken" not in endpoints
-        assert any("Failed to load endpoint" in r.message for r in caplog.records)
+        assert any("Failed to load subdirectory endpoint" in r.message for r in caplog.records)
 
 
 class TestHandleRequest:
@@ -167,7 +176,7 @@ class TestHandleRequest:
         }
         resp = await handle_request(endpoints, req)
         assert resp["status_code"] == 500
-        assert "oops" in resp["body"]["error"]
+        assert "internal server error" in resp["body"]["error"].lower()
 
     @pytest.mark.asyncio
     async def test_non_dict_result_wrapped(self, endpoints):

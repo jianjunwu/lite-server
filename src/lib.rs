@@ -25,6 +25,7 @@ pub fn run_server(
     port: Option<u16>,
     host: Option<String>,
     model_repo: Option<String>,
+    endpoints_dir: Option<String>,
     threads: Option<usize>,
     timeout: Option<f32>,
     log_level: Option<String>,
@@ -55,6 +56,7 @@ pub fn run_server(
         port,
         host,
         model_repo,
+        endpoints_dir,
         threads,
         timeout,
         log_level,
@@ -128,6 +130,7 @@ fn build_runtime(threads: Option<usize>) -> tokio::runtime::Runtime {
     port=None,
     host=None,
     model_repo=None,
+    endpoints_dir=None,
     threads=None,
     timeout=None,
     log_level=None,
@@ -153,6 +156,7 @@ fn serve(
     port: Option<u16>,
     host: Option<String>,
     model_repo: Option<String>,
+    endpoints_dir: Option<String>,
     threads: Option<usize>,
     timeout: Option<f32>,
     log_level: Option<String>,
@@ -176,7 +180,7 @@ fn serve(
     pyo3::Python::with_gil(|py| {
         py.allow_threads(|| {
             run_server(
-                config, port, host, model_repo, threads, timeout, log_level,
+                config, port, host, model_repo, endpoints_dir, threads, timeout, log_level,
                 log_info_output, log_error_output, log_rotation,
                 metrics_port, no_metrics, grpc_port, no_grpc, no_streaming_metrics,
                 log_verbose, max_queue_size, max_requests, max_requests_jitter, request_timeout,

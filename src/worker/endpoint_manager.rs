@@ -8,9 +8,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::timeout;
 use tracing::{info, warn};
+
+const ENDPOINT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Manages the custom endpoint Python subprocess.
 pub struct EndpointManager {
@@ -19,6 +21,8 @@ pub struct EndpointManager {
     uds_path: PathBuf,
     process: RwLock<Option<EndpointProcess>>,
     routes: RwLock<Vec<EndpointRoute>>,
+    /// Prevents concurrent restarts from multiple requests.
+    restart_lock: Mutex<()>,
 }
 
 struct EndpointProcess {
@@ -35,6 +39,7 @@ impl EndpointManager {
             uds_path,
             process: RwLock::new(None),
             routes: RwLock::new(Vec::new()),
+            restart_lock: Mutex::new(()),
         }
     }
 
@@ -47,14 +52,20 @@ impl EndpointManager {
     }
 
     pub async fn send_request(&self, request: EndpointRequest) -> Result<EndpointResponse, AppError> {
-        // Retry once if connection fails (process might be restarting)
-        match self.do_send_request(&request).await {
-            Ok(resp) => Ok(resp),
-            Err(e) => {
-                warn!("Endpoint request failed, attempting restart: {}", e);
-                self.restart().await?;
-                self.do_send_request(&request).await
+        let fut = async {
+            // Retry once if connection fails (process might be restarting)
+            match self.do_send_request(&request).await {
+                Ok(resp) => Ok(resp),
+                Err(e) => {
+                    warn!("Endpoint request failed, attempting restart: {}", e);
+                    self.restart().await?;
+                    self.do_send_request(&request).await
+                }
             }
+        };
+        match timeout(ENDPOINT_REQUEST_TIMEOUT, fut).await {
+            Ok(result) => result,
+            Err(_) => Err(AppError::InferenceTimeout("endpoint request timeout".to_string())),
         }
     }
 
@@ -214,6 +225,7 @@ impl EndpointManager {
     }
 
     pub async fn restart(&self) -> Result<(), AppError> {
+        let _guard = self.restart_lock.lock().await;
         info!("Restarting endpoint process");
         self.kill().await;
         self.spawn_endpoint_process().await
@@ -295,7 +307,23 @@ impl EndpointManager {
             )));
         }
 
-        info!("Endpoint process ready with {} routes", startup.routes.len());
+        // Protocol version negotiation
+        let proto_ver = if startup.protocol_version.is_empty() {
+            crate::worker::protocol::PROTOCOL_VERSION_V0.to_string()
+        } else {
+            startup.protocol_version.clone()
+        };
+        if !crate::worker::protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&proto_ver.as_str()) {
+            return Err(AppError::Config(format!(
+                "endpoint protocol version '{}' not supported",
+                proto_ver
+            )));
+        }
+        info!(
+            "Endpoint process ready with {} routes (protocol: {})",
+            startup.routes.len(),
+            proto_ver
+        );
 
         // Store routes
         {

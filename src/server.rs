@@ -68,7 +68,11 @@ impl LiteServer {
         let repo_path = PathBuf::from(&self.config.model_repository.path)
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(&self.config.model_repository.path));
-        let endpoint_manager = Arc::new(EndpointManager::new(repo_path.clone(), self.registry.clone()));
+        let ep_dir = self.config.endpoints_dir.as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| repo_path.clone());
+        let ep_dir = ep_dir.canonicalize().unwrap_or(ep_dir);
+        let endpoint_manager = Arc::new(EndpointManager::new(ep_dir, self.registry.clone()));
         let endpoint_routes = match endpoint_manager.start().await {
             Ok(()) => endpoint_manager.routes().await,
             Err(e) => {

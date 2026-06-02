@@ -48,6 +48,13 @@ lite-server serve [选项]
 | `--grpc-port` | int | 8001 | gRPC 服务端口 |
 | `--metrics-port` | int | 8002 | Prometheus `/metrics` 端点端口 |
 
+#### 模型仓库与自定义端点
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--model-repo` | string | ./model_repo | 模型仓库目录 |
+| `--endpoints-dir` | string | — | 自定义端点目录（覆盖 server.yaml 中的 `endpoints_dir`） |
+
 #### 功能开关
 
 | 参数 | 说明 |

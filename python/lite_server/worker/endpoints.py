@@ -2,7 +2,6 @@
 
 import argparse
 import asyncio
-import hashlib
 import importlib.util
 import json
 import logging
@@ -16,6 +15,16 @@ from pathlib import Path
 MAX_FRAME_SIZE = 16 * 1024 * 1024  # 16 MiB
 
 logger = logging.getLogger("endpoint_worker")
+
+# Production vs development error handling
+_IS_DEV = os.environ.get("LITE_SERVER_ENV") == "development"
+
+
+def _sanitize_error(e: Exception) -> str:
+    """Return safe error message for client. Detailed errors go to logs only."""
+    if _IS_DEV:
+        return str(e)
+    return "internal server error"
 
 
 class _LevelPrefixFormatter(logging.Formatter):
@@ -51,11 +60,14 @@ def setup_logging() -> logging.Logger:
 def derive_port_from_path(path: str) -> int:
     """Derive a deterministic localhost port from a path string.
 
-    Port range: 30000-59999. Mirrors the Rust side's derive_port_from_path.
+    Uses FNV-1a for cross-language consistency.
+    Port range: 30000-59999.
     """
-    h = hashlib.md5(path.encode("utf-8")).digest()
-    port = 30000 + (int.from_bytes(h[:4], "little") % 30000)
-    return port
+    hash_val = 0x811C9DC5
+    for b in path.encode("utf-8"):
+        hash_val ^= b
+        hash_val = (hash_val * 0x01000193) & 0xFFFFFFFF
+    return 30000 + (hash_val % 30000)
 
 
 def create_server_socket(uds_path: str) -> socket.socket:
@@ -74,6 +86,7 @@ def create_server_socket(uds_path: str) -> socket.socket:
             os.remove(uds_path)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.bind(uds_path)
+        os.chmod(uds_path, 0o600)
     sock.listen(4)
     sock.setblocking(False)
     return sock
@@ -86,29 +99,8 @@ def parse_args():
     return parser.parse_args()
 
 
-class RegistryProxy:
-    """Proxy for server.registry compatible with light-server."""
-
-    def __init__(self, snapshot):
-        self._snapshot = snapshot
-
-    def list_loaded(self):
-        return self._snapshot.get("loaded_models", [])
-
-
-class ServerProxy:
-    """Proxy for server object compatible with light-server."""
-
-    def __init__(self, snapshot):
-        self._snapshot = snapshot
-
-    @property
-    def registry(self):
-        return RegistryProxy(self._snapshot)
-
-    @property
-    def config(self):
-        return self._snapshot.get("config", {})
+# Re-export the full-featured proxy from the new module
+from lite_server.server_proxy import ServerProxy
 
 
 def _find_openai_endpoint_class(mod):
@@ -127,50 +119,69 @@ def _find_openai_endpoint_class(mod):
 
 
 def load_endpoints(repo_path: str):
-    """Scan repo root for *_endpoint.py and load them."""
+    """Scan repo for endpoint modules.
+
+    Three loading modes (in order):
+      1. Subdirectory: endpoints/**/*.py (recursive)
+      2. Decorator: collect routes from the global EndpointRouter
+    """
     endpoints = {}
     repo = Path(repo_path)
     if not repo.exists():
         return endpoints
 
-    for py_file in repo.glob("*_endpoint.py"):
-        stem = py_file.stem
-        if not stem.endswith("_endpoint"):
-            continue
-        route = stem[:-9]  # strip "_endpoint"
+    # ---- Mode 1: Subdirectory scan (endpoints/**/*.py) ----
+    endpoints_dir = repo / "endpoints"
+    if endpoints_dir.exists() and endpoints_dir.is_dir():
+        for py_file in endpoints_dir.rglob("*.py"):
+            if py_file.name.startswith("_"):
+                continue
+            try:
+                module_name = f"ep_sub_{py_file.stem}"
+                spec = importlib.util.spec_from_file_location(module_name, py_file)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
 
-        try:
-            spec = importlib.util.spec_from_file_location(f"ep_{route}", py_file)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
+                # Check for OpenAIEndpoint subclass
+                ep_class = _find_openai_endpoint_class(mod)
+                if ep_class is not None:
+                    instance = ep_class()
+                    instance.setup()
+                    for route_def in instance.get_routes():
+                        r = route_def["route"]
+                        methods = [m.upper() for m in route_def.get("methods", ["POST"])]
+                        endpoints[r] = {
+                            "handler": lambda request, _srv, _ep=instance: _ep.handle(request),
+                            "methods": methods,
+                        }
+                    continue
 
-            # Check for OpenAIEndpoint subclass first
-            ep_class = _find_openai_endpoint_class(mod)
-            if ep_class is not None:
-                instance = ep_class()
-                instance.setup()
-                for route_def in instance.get_routes():
-                    r = route_def["route"]
-                    methods = [m.upper() for m in route_def.get("methods", ["POST"])]
-                    # Capture instance in closure via default arg
-                    endpoints[r] = {
-                        "handler": lambda request, _srv, _ep=instance: _ep.handle(request),
-                        "methods": methods,
+                # Check for plain handler file (methods + handler)
+                handler = getattr(mod, "handler", None)
+                if handler is not None and callable(handler):
+                    route = f"/{py_file.stem}"
+                    methods = getattr(mod, "methods", ["GET"])
+                    if isinstance(methods, str):
+                        methods = [methods]
+                    endpoints[route] = {
+                        "handler": handler,
+                        "methods": [m.upper() for m in methods],
                     }
-                continue
+                    continue
+            except Exception as e:
+                logger.error("Failed to load subdirectory endpoint %s: %s", py_file, e, exc_info=True)
 
-            # Fall back to traditional handler function
-            handler = getattr(mod, "handler", None)
-            methods = getattr(mod, "methods", ["GET"])
-            if handler is None:
-                continue
-
-            endpoints[f"/{route}"] = {
-                "handler": handler,
-                "methods": [m.upper() for m in methods],
+    # ---- Mode 2: Decorator-registered routes ----
+    try:
+        from lite_server.endpoint import router as _global_router
+        for route_def in _global_router.routes:
+            endpoints[route_def.path] = {
+                "handler": route_def.handler,
+                "methods": route_def.methods,
+                "middleware": route_def.middleware,
             }
-        except Exception as e:
-            logger.error("Failed to load endpoint %s: %s", py_file, e, exc_info=True)
+    except Exception as e:
+        logger.debug("No decorator routes collected: %s", e)
 
     return endpoints
 
@@ -223,7 +234,7 @@ async def handle_request(endpoints, req_data: dict) -> dict:
             "request_id": req_data.get("request_id", ""),
             "status_code": 500,
             "headers": None,
-            "body": {"error": str(e)},
+            "body": {"error": _sanitize_error(e)},
         }
 
 
@@ -253,10 +264,11 @@ async def worker_main():
         endpoints = load_endpoints(args.repo_path)
     routes = [{"route": r, "methods": ep["methods"]} for r, ep in endpoints.items()]
 
-    # Send startup signal
+    # Send startup signal with protocol version
     startup = {
         "status": "ready",
         "routes": routes,
+        "protocol_version": "v0",  # JSON only for now; v1 = Protobuf
     }
     print(json.dumps(startup), flush=True)
 

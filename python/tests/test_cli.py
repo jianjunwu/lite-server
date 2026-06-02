@@ -517,6 +517,7 @@ class TestServeArgs:
             "keepalive_timeout": 10.0,
             "metrics_port": 9090,
             "health_check_interval": 20.0,
+            "endpoints_dir": None,
         })()
         assert cli._cmd_serve(args) == 0
 

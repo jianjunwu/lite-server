@@ -92,8 +92,10 @@ class TestAPI(LitAPI):
     )
     .unwrap();
 
+    let endpoints_dir = tmp.join("endpoints");
+    std::fs::create_dir_all(&endpoints_dir).unwrap();
     std::fs::write(
-        tmp.join("status_endpoint.py"),
+        endpoints_dir.join("status.py"),
         "'''Custom endpoint example - GET /status returns server overview.'''\n\nmethods = [\"GET\"]\n\n\ndef handler(request, server):\n    '''Return a quick status overview of the server.'''\n    models = server.registry.list_loaded()\n    return {\n        \"server\": \"lite-server\",\n        \"loaded_models_count\": len(models),\n        \"loaded_models\": models,\n    }\n",
     )
     .unwrap();
