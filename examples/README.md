@@ -34,10 +34,19 @@ Start from example 01 and work your way up. Each example builds on concepts from
 | 05 | [ensemble](05_ensemble/) | Multi-model DAG pipeline | Ensemble config, parallel step execution, `$request`/`$step` refs |
 | 06 | [custom_endpoint](06_custom_endpoint/) | Custom HTTP routes | `endpoints/` directory scan, decorator routes, server context access |
 | 07 | [custom_params](07_custom_params/) | Config-driven behavior | `self.config`, custom YAML fields |
-| 08 | [openai_compatible](08_openai_compatible/) | OpenAI-compatible endpoint | `OpenAIEndpoint` base class, `/v1/chat/completions` |
 | 09 | [custom_metrics](09_custom_metrics/) | Custom Prometheus metrics | `register_metric()`, `report_metric()`, gauge/counter/histogram |
 | 10 | [async](10_async/) | Asynchronous inference | `AsyncLitAPI`, `async def predict()`, sync/async mixed hooks |
 | 11 | [logging](11_logging/) | Structured logging at every stage | `self.logger`, per-request tracing, `--log-level` |
+
+### Production
+
+| # | Example | Description | Key Concept |
+|---|---------|-------------|-------------|
+| 12 | [continuous_batching](12_continuous_batching/) | LLM continuous batching | `prefill()` / `step()` / `has_finished()` hooks |
+| 13 | [bidi_streaming](13_bidi_streaming/) | Bidirectional streaming (ASR) | `BidiStreamHandler`, `on_open` / `on_chunk` / `on_close` |
+| 14 | [lifecycle_hooks](14_lifecycle_hooks/) | Worker lifecycle hooks | `on_ready` / `on_error` / `on_exit` shell + HTTP callbacks |
+| 15 | [middleware](15_middleware/) | Endpoint middleware chain | `require_api_key`, `rate_limit`, `cors`, `log_requests` |
+| 16 | [grpc](16_grpc/) | gRPC inference endpoints | `grpc_port`, auto-generated gRPC from LitAPI |
 
 ## Running Any Example
 
@@ -199,29 +208,67 @@ curl -X POST http://localhost:8000/v2/models/logged_model/infer \
 # => {"output": 42, "call_count": 1}
 ```
 
-### 08 OpenAI-Compatible Endpoint
+### 12 Continuous Batching
 
 ```bash
-# Non-streaming chat completion
-curl -X POST http://localhost:8000/v1/chat/completions \
+curl -X POST http://localhost:8000/v2/models/cb_llm/infer \
   -H 'Content-Type: application/json' \
-  -d '{
-    "model": "demo-chat",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
-# => {"id":"chatcmpl-xxx","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"Echo: Hello!"},"finish_reason":"stop"}],...}
+  -d '{"prompt": "hello world this is a test"}'
+# => {"tokens": ["hello","world","this","is","a"], "text": "hello world this is a"}
+```
 
-# Streaming chat completion
-curl -N -X POST http://localhost:8000/v1/chat/completions \
+### 13 Bidirectional Streaming
+
+```bash
+websocat ws://localhost:8000/v2/models/asr/stream
+> {"text": "hello"}
+< {"partial": "hello", "is_final": false}
+> {"text": "world"}
+< {"partial": "hello world", "is_final": false}
+# Close connection to trigger on_close()
+< {"final": "hello world", "is_final": true, "buffer": ["hello", "world"]}
+```
+
+### 14 Lifecycle Hooks
+
+```bash
+curl -X POST http://localhost:8000/v2/models/hooked_model/infer \
   -H 'Content-Type: application/json' \
-  -d '{
-    "model": "demo-chat",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "stream": true
-  }'
-# => data: {"choices":[{"delta":{"content":"E"},...}]}
-# => data: {"choices":[{"delta":{"content":"c"},...}]}
-# => ...
+  -d '{"input": "hello"}'
+# => {"output": "hello", "count": 1}
+# Console shows hook commands executing (echo statements)
+```
+
+### 15 Middleware
+
+```bash
+# Public endpoint — no auth needed
+curl http://localhost:8000/public
+# => {"message": "this endpoint is public"}
+
+# Protected endpoint — requires API key
+curl http://localhost:8000/status
+# => {"error": "unauthorized"}  (401)
+
+curl -H "X-API-Key: secret-api-key-123" http://localhost:8000/status
+# => {"server": "lite-server", "loaded_models": ["protected"], ...}
+```
+
+### 16 gRPC
+
+```bash
+# HTTP still works
+curl -X POST http://localhost:8000/v2/models/grpc_echo/infer \
+  -H 'Content-Type: application/json' \
+  -d '{"input": "hello"}'
+# => {"output": "grpc_echo: hello"}
+
+# gRPC inference via grpcurl
+grpcurl -plaintext \
+  -d '{"model_name": "grpc_echo", "input": {"input": "hello"}}' \
+  localhost:8001 \
+  liteserver.LiteServer/Infer
+# => {"output": "grpc_echo: hello"}
 ```
 
 ## More Documentation

@@ -1,0 +1,17 @@
+max_batch_size: 1
+stream: false
+accelerator: cpu
+devices: 1
+workers_per_device: 1
+
+# Worker lifecycle hooks
+hooks:
+  on_ready: 'echo "Worker $WORKER_ID ready for model $MODEL on device $DEVICE"'
+  on_exit: 'echo "Worker $WORKER_ID exiting (code=$EXIT_CODE, signal=$EXIT_SIGNAL)"'
+  on_error: 'echo "Worker $WORKER_ID error: $REASON"'
+  on_ready_http:
+    url: "http://localhost:8000/health"
+    method: "GET"
+  on_error_http:
+    url: "http://localhost:8000/health"
+    method: "GET"

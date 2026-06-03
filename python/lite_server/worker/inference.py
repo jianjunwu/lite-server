@@ -372,8 +372,19 @@ def _has_stream_predict(lit_api: LitAPI) -> bool:
 
 
 def _has_bidi_stream(lit_api: LitAPI) -> bool:
-    """Detect whether the API implements bidirectional streaming."""
-    return hasattr(lit_api, "bidi_stream") and callable(getattr(lit_api, "bidi_stream"))
+    """Detect whether the API implements bidirectional streaming.
+
+    Only returns True when the subclass actually overrides bidi_stream(),
+    not when it merely inherits the base NotImplementedError version.
+    """
+    if not hasattr(lit_api, "bidi_stream"):
+        return False
+    for cls in type(lit_api).__mro__:
+        if "bidi_stream" in cls.__dict__:
+            if cls is LitAPI:
+                return False
+            return callable(cls.__dict__["bidi_stream"])
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1402,6 +1413,14 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
                     _handle_add(request.cb_add)
                 elif request.HasField("cb_remove"):
                     _handle_remove(request.cb_remove)
+                elif request.HasField("single"):
+                    # Route standard SingleRequest through CB pipeline
+                    cb_add = CBAddRequest()
+                    cb_add.uid = request.uid
+                    cb_add.data = request.single.data
+                    if request.HasField("meta"):
+                        cb_add.meta.CopyFrom(request.meta)
+                    _handle_add(cb_add)
     finally:
         if cb_loop is not None:
             cb_loop.close()

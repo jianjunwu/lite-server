@@ -6,20 +6,32 @@ High-performance model inference server — Rust core for I/O, Python for infere
 
 ## Table of Contents
 
-- [Why lite-server?](#why-lite-server)
-- [Quick Start](#quick-start)
-- [Architecture](#architecture)
-- [Comparison](#comparison)
-- [Benchmarks](#benchmarks)
-- [Features](#features)
-- [Installation](#installation)
-- [CLI Commands](#cli-commands)
-- [Examples](#examples)
-- [API Endpoints](#api-endpoints)
-- [Configuration](#configuration)
-- [FAQ](#faq)
-- [Development](#development)
-- [License](#license)
+- [lite-server](#lite-server)
+  - [Table of Contents](#table-of-contents)
+  - [Why lite-server?](#why-lite-server)
+  - [Quick Start](#quick-start)
+  - [Architecture](#architecture)
+  - [Comparison with Other Frameworks](#comparison-with-other-frameworks)
+  - [Benchmarks](#benchmarks)
+  - [Features](#features)
+    - [Inference Modes](#inference-modes)
+    - [Model Management](#model-management)
+    - [Custom Endpoints](#custom-endpoints)
+    - [Worker Resilience](#worker-resilience)
+    - [Observability](#observability)
+  - [Installation](#installation)
+    - [From Wheel (Recommended)](#from-wheel-recommended)
+    - [From Source](#from-source)
+  - [CLI Commands](#cli-commands)
+  - [Examples](#examples)
+  - [API Endpoints](#api-endpoints)
+  - [Configuration](#configuration)
+  - [FAQ](#faq)
+  - [Multi-Platform](#multi-platform)
+  - [Development](#development)
+    - [Project Structure](#project-structure)
+  - [TODO](#todo)
+  - [License](#license)
 
 
 ## Why lite-server?
@@ -204,8 +216,14 @@ See [examples/](examples/) for runnable model repositories:
 | 05 | [ensemble](examples/05_ensemble/) | DAG-based multi-model pipeline |
 | 06 | [custom_endpoint](examples/06_custom_endpoint/) | Custom HTTP endpoint |
 | 07 | [custom_params](examples/07_custom_params/) | Config-driven model behavior |
-| 08 | [openai_compatible](examples/08_openai_compatible/) | OpenAI-compatible chat endpoint |
 | 09 | [custom_metrics](examples/09_custom_metrics/) | Custom Prometheus metrics (gauge/counter/histogram) |
+| 10 | [async](examples/10_async/) | Asynchronous inference (AsyncLitAPI) |
+| 11 | [logging](examples/11_logging/) | Structured logging at every stage |
+| 12 | [continuous_batching](examples/12_continuous_batching/) | LLM continuous batching (prefill/step/has_finished) |
+| 13 | [bidi_streaming](examples/13_bidi_streaming/) | Bidirectional streaming for ASR |
+| 14 | [lifecycle_hooks](examples/14_lifecycle_hooks/) | Worker lifecycle hooks (shell + HTTP) |
+| 15 | [middleware](examples/15_middleware/) | Endpoint middleware (auth, rate limit, CORS) |
+| 16 | [grpc](examples/16_grpc/) | gRPC inference endpoints |
 
 See [examples/README.md](examples/README.md) for learning path and usage details.
 
@@ -345,6 +363,11 @@ cd python && python -m pytest tests/
 ├── Cargo.toml        # Rust manifest
 └── pyproject.toml    # Python packaging (maturin)
 ```
+
+## TODO
+
+- [ ] OpenAI-compatible endpoint example — reimplement with decorator pattern (`@endpoint.post("/v1/chat/completions")`) replacing the removed `08_openai_compatible`
+- [ ] `server.infer()` — wire up so custom endpoint handlers can call loaded LitAPI models
 
 ## License
 

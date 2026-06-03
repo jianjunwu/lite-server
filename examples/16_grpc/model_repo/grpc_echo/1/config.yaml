@@ -1,0 +1,5 @@
+max_batch_size: 1
+stream: false
+accelerator: cpu
+devices: 1
+workers_per_device: 1

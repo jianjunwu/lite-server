@@ -1148,6 +1148,159 @@ class TestCBLoopAsyncMethods:
         assert _has_async_methods(MixedCBModel()) is True
 
 
+class TestCBLoopSingleRequestRouting:
+    """CB loop should handle standard SingleRequest by converting to CBAddRequest."""
+
+    def _make_socket(self):
+        import zmq
+
+        class MockSocket:
+            def __init__(self):
+                self._msgs = []
+                self._incoming = []
+
+            def send(self, data):
+                self._msgs.append(data)
+
+            def recv(self):
+                while not self._incoming:
+                    import time
+                    time.sleep(0.001)
+                return self._incoming.pop(0)
+
+            def inject(self, data):
+                self._incoming.append(data)
+
+        return MockSocket()
+
+    def test_cb_loop_handles_single_request(self):
+        """A standard SingleRequest should be processed through the CB pipeline."""
+        import threading
+        import json
+        from lite_server.worker.inference import run_cb_loop
+        from lite_server.proto import Request, Response
+
+        class EchoCBModel:
+            def __init__(self):
+                self._metric_specs = []
+                self._metric_values = []
+
+            def decode_request(self, req):
+                return req.get("input", "")
+
+            def prefill(self, uid, decoded_input):
+                pass  # side-effect only
+
+            def step(self, active_sequences):
+                # Echo the input for each active sequence
+                return [f"cb_echo: {s.input}" for s in active_sequences]
+
+            def has_finished(self, uid, token, generated_sequence):
+                return True  # one and done
+
+            def encode_response(self, output):
+                return {"output": output}
+
+        model = EchoCBModel()
+        socket = self._make_socket()
+        log = __import__("logging").getLogger("test")
+
+        # Build a standard SingleRequest (what Rust inference_queue sends)
+        req = Request()
+        req.uid = "req-001"
+        req.single.data = json.dumps({"input": "hello"}).encode()
+        socket.inject(req.SerializeToString())
+
+        def runner():
+            try:
+                run_cb_loop(model, socket, "test_model", log)
+            except Exception:
+                pass
+
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+
+        # Wait for response (max 5 seconds)
+        import time
+        deadline = time.time() + 5
+        response = None
+        while time.time() < deadline:
+            if socket._msgs:
+                resp = Response()
+                resp.ParseFromString(socket._msgs[0])
+                if resp.uid == "req-001":
+                    response = resp
+                    break
+            time.sleep(0.01)
+
+        assert response is not None, "No response received for SingleRequest"
+        data = json.loads(response.single.data)
+        # CB encode_response receives accumulated token list
+        assert data == {"output": ["cb_echo: hello"]}, f"Unexpected output: {data}"
+
+    def test_cb_loop_single_request_with_multiple_sequences(self):
+        """Multiple concurrent SingleRequests should batch in CB pipeline."""
+        import threading
+        import json
+        from lite_server.worker.inference import run_cb_loop
+        from lite_server.proto import Request, Response
+
+        class MultiCBModel:
+            def __init__(self):
+                self._metric_specs = []
+                self._metric_values = []
+
+            def decode_request(self, req):
+                return req.get("text", "")
+
+            def prefill(self, uid, decoded_input):
+                pass
+
+            def step(self, active_sequences):
+                return [f"token({s.input})" for s in active_sequences]
+
+            def has_finished(self, uid, token, generated_sequence):
+                return True  # one step then done
+
+            def encode_response(self, output):
+                return {"result": output}
+
+        model = MultiCBModel()
+        socket = self._make_socket()
+        log = __import__("logging").getLogger("test")
+
+        # Send two standard SingleRequests
+        for i, uid in enumerate(["req-a", "req-b"]):
+            req = Request()
+            req.uid = uid
+            req.single.data = json.dumps({"text": f"msg-{i}"}).encode()
+            socket.inject(req.SerializeToString())
+
+        def runner():
+            try:
+                run_cb_loop(model, socket, "test_model", log)
+            except Exception:
+                pass
+
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+
+        import time
+        deadline = time.time() + 5
+        responses = {}
+        while time.time() < deadline and len(responses) < 2:
+            for msg in list(socket._msgs):
+                resp = Response()
+                resp.ParseFromString(msg)
+                if resp.uid in ("req-a", "req-b") and resp.uid not in responses:
+                    responses[resp.uid] = json.loads(resp.single.data)
+            time.sleep(0.01)
+
+        assert len(responses) == 2, f"Expected 2 responses, got {len(responses)}"
+        assert responses["req-a"] == {"result": ["token(msg-0)"]}
+        assert responses["req-b"] == {"result": ["token(msg-1)"]}
+
+
 class TestTeardownHelper:
     """_run_teardown lifecycle hook."""
 
@@ -1818,6 +1971,138 @@ class TestAsyncStreamingMetrics:
         asyncio.run(runner())
         # Buffer should be cleared after stream_done
         assert model._metric_values == []
+
+
+class TestHasBidiStream:
+    """Unit tests for _has_bidi_stream detection."""
+
+    def test_no_bidi_when_not_overridden(self):
+        """LitAPI subclass without bidi_stream override should return False."""
+        from lite_server import LitAPI
+        from lite_server.worker.inference import _has_bidi_stream
+
+        class PlainModel(LitAPI):
+            def setup(self, device):
+                pass
+
+            def decode_request(self, request):
+                return request
+
+            def predict(self, x):
+                return x
+
+            def encode_response(self, output):
+                return output
+
+        api = PlainModel()
+        assert _has_bidi_stream(api) is False, (
+            "Plain LitAPI without bidi_stream override should return False"
+        )
+
+    def test_no_bidi_when_only_stream_predict(self):
+        """LitAPI with stream_predict but no bidi_stream should return False."""
+        from lite_server import LitAPI
+        from lite_server.worker.inference import _has_bidi_stream
+
+        class StreamingModel(LitAPI):
+            def setup(self, device):
+                pass
+
+            def decode_request(self, request):
+                return request
+
+            def predict(self, x):
+                return x
+
+            def stream_predict(self, request):
+                yield {"token": "hello"}
+
+            def encode_response(self, output):
+                return output
+
+        api = StreamingModel()
+        assert _has_bidi_stream(api) is False, (
+            "Model with stream_predict but no bidi_stream should return False"
+        )
+
+    def test_has_bidi_when_overridden(self):
+        """LitAPI subclass that overrides bidi_stream should return True."""
+        from lite_server import BidiStreamHandler, LitAPI
+        from lite_server.worker.inference import _has_bidi_stream
+
+        class BidiModel(LitAPI):
+            def setup(self, device):
+                pass
+
+            def decode_request(self, request):
+                return request
+
+            def predict(self, x):
+                return x
+
+            def encode_response(self, output):
+                return output
+
+            def bidi_stream(self):
+                class Handler(BidiStreamHandler):
+                    pass
+                return Handler()
+
+        api = BidiModel()
+        assert _has_bidi_stream(api) is True, (
+            "Model with bidi_stream override should return True"
+        )
+
+    def test_has_bidi_with_async_litapi(self):
+        """AsyncLitAPI subclass with bidi_stream should return True."""
+        from lite_server import AsyncLitAPI, BidiStreamHandler
+        from lite_server.worker.inference import _has_bidi_stream
+
+        class AsyncBidiModel(AsyncLitAPI):
+            async def setup(self, device):
+                pass
+
+            def decode_request(self, request):
+                return request
+
+            async def predict(self, x):
+                return x
+
+            def encode_response(self, output):
+                return output
+
+            def bidi_stream(self):
+                class Handler(BidiStreamHandler):
+                    pass
+                return Handler()
+
+        api = AsyncBidiModel()
+        assert _has_bidi_stream(api) is True, (
+            "AsyncLitAPI with bidi_stream override should return True"
+        )
+
+    def test_no_bidi_with_async_litapi_without_override(self):
+        """AsyncLitAPI without bidi_stream should return False."""
+        from lite_server import AsyncLitAPI
+        from lite_server.worker.inference import _has_bidi_stream
+
+        class PlainAsyncModel(AsyncLitAPI):
+            async def setup(self, device):
+                pass
+
+            def decode_request(self, request):
+                return request
+
+            async def predict(self, x):
+                return x
+
+            def encode_response(self, output):
+                return output
+
+        api = PlainAsyncModel()
+        assert _has_bidi_stream(api) is False, (
+            "AsyncLitAPI without bidi_stream override should return False"
+        )
 
 
 class TestBidiStreamingStandardLoop:

@@ -1,0 +1,8 @@
+continuous_batching: true
+max_sequence_length: 4096
+accelerator: cpu
+devices: 1
+workers_per_device: 1
+
+# Custom params
+max_tokens_per_seq: 5

@@ -6,20 +6,32 @@
 
 ## 目录
 
-- [为什么选 lite-server？](#为什么选-lite-server)
-- [快速开始](#快速开始)
-- [架构](#架构)
-- [与其他框架对比](#与其他框架对比)
-- [性能基准](#性能基准)
-- [功能特性](#功能特性)
-- [安装](#安装)
-- [CLI 命令](#cli-命令)
-- [示例](#示例)
-- [API 端点](#api-端点)
-- [配置](#配置)
-- [常见问题](#常见问题)
-- [开发](#开发)
-- [License](#license)
+- [lite-server](#lite-server)
+  - [目录](#目录)
+  - [为什么选 lite-server？](#为什么选-lite-server)
+  - [快速开始](#快速开始)
+  - [架构](#架构)
+  - [与其他框架对比](#与其他框架对比)
+  - [性能基准](#性能基准)
+  - [功能特性](#功能特性)
+    - [推理模式](#推理模式)
+    - [模型管理](#模型管理)
+    - [自定义端点](#自定义端点)
+    - [Worker 韧性](#worker-韧性)
+    - [可观测性](#可观测性)
+  - [安装](#安装)
+    - [预编译 Wheel（推荐）](#预编译-wheel推荐)
+    - [从源码编译](#从源码编译)
+  - [CLI 命令](#cli-命令)
+  - [示例](#示例)
+  - [API 端点](#api-端点)
+  - [配置](#配置)
+  - [常见问题](#常见问题)
+  - [多平台支持](#多平台支持)
+  - [开发](#开发)
+    - [项目结构](#项目结构)
+  - [TODO](#todo)
+  - [License](#license)
 
 ## 为什么选 lite-server？
 
@@ -202,8 +214,14 @@ lite-server init my_project           # 脚手架创建项目
 | 05 | [ensemble](examples/05_ensemble/) | DAG 多模型流水线 |
 | 06 | [custom_endpoint](examples/06_custom_endpoint/) | 自定义 HTTP 端点 |
 | 07 | [custom_params](examples/07_custom_params/) | 配置驱动的模型行为 |
-| 08 | [openai_compatible](examples/08_openai_compatible/) | OpenAI 兼容聊天端点 |
 | 09 | [custom_metrics](examples/09_custom_metrics/) | 自定义 Prometheus 指标（Gauge/Counter/Histogram） |
+| 10 | [async](examples/10_async/) | 异步推理（AsyncLitAPI） |
+| 11 | [logging](examples/11_logging/) | 各阶段结构化日志 |
+| 12 | [continuous_batching](examples/12_continuous_batching/) | LLM 连续批处理（prefill/step/has_finished） |
+| 13 | [bidi_streaming](examples/13_bidi_streaming/) | 双向流式通信（ASR） |
+| 14 | [lifecycle_hooks](examples/14_lifecycle_hooks/) | Worker 生命周期钩子（shell + HTTP） |
+| 15 | [middleware](examples/15_middleware/) | 端点中间件（认证、限流、CORS） |
+| 16 | [grpc](examples/16_grpc/) | gRPC 推理端点 |
 
 详见 [examples/README.md](examples/README.md) 获取学习路径和使用说明。
 
@@ -343,6 +361,11 @@ cd python && python -m pytest tests/
 ├── Cargo.toml        # Rust 清单
 └── pyproject.toml    # Python 打包（maturin）
 ```
+
+## TODO
+
+- [ ] OpenAI 兼容端点示例 — 用装饰器模式 (`@endpoint.post("/v1/chat/completions")`) 重新实现，替代已删除的 `08_openai_compatible`
+- [ ] `server.infer()` — 实现后使自定义端点可以调用已加载的 LitAPI 模型
 
 ## License
 

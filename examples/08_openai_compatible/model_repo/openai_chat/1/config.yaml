@@ -1,3 +1,0 @@
-max_batch_size: 1
-stream: true
-request_timeout: 30.0
