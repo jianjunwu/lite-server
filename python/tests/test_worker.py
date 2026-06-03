@@ -1106,3 +1106,355 @@ class TestAsyncLoopEdgeCases:
         asyncio.run(runner())
         # The slow task was cancelled on shutdown, no response sent
         assert len(socket._msgs) == 0
+
+
+class TestBatchPredict:
+    """Batch predict path: batch() -> predict(batched) -> unbatch()."""
+
+    def _make_socket(self):
+        class MockSocket:
+            def __init__(self):
+                self._msgs = []
+                self._incoming = []
+
+            def send(self, data):
+                self._msgs.append(data)
+
+            def recv(self):
+                while not self._incoming:
+                    import time
+                    time.sleep(0.001)
+                return self._incoming.pop(0)
+
+            def inject(self, data):
+                self._incoming.append(data)
+
+        return MockSocket()
+
+    def test_standard_batch_predict_full_path(self):
+        from lite_server.worker.inference import run_standard_loop
+        from lite_server.proto import Request, BatchRequest, BatchItem, Response
+
+        class BatchModel:
+            def batch(self, inputs):
+                return {"values": [x["input"] for x in inputs], "batch_size": len(inputs)}
+
+            def predict(self, batched):
+                return [{"result": v * 2, "batch_size": batched["batch_size"]} for v in batched["values"]]
+
+            def unbatch(self, output):
+                return output
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        req = Request(
+            uid="batch-1",
+            batch=BatchRequest(items=[
+                BatchItem(uid="i1", data=json.dumps({"input": 1}).encode()),
+                BatchItem(uid="i2", data=json.dumps({"input": 2}).encode()),
+            ]),
+        )
+        socket.inject(req.SerializeToString())
+
+        import threading
+        t = threading.Thread(target=run_standard_loop, args=(BatchModel(), socket, "test", log))
+        t.start()
+        import time
+        time.sleep(0.05)
+        socket.inject(b"")  # empty to break recv
+        t.join(timeout=0.1)
+
+        assert len(socket._msgs) >= 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.uid == "batch-1"
+        assert len(resp.batch.items) == 2
+        assert json.loads(resp.batch.items[0].data)["result"] == 2
+        assert json.loads(resp.batch.items[1].data)["result"] == 4
+
+    def test_standard_batch_predict_fallback_no_batch_methods(self):
+        from lite_server.worker.inference import run_standard_loop
+        from lite_server.proto import Request, BatchRequest, BatchItem, Response
+
+        class SimpleModel:
+            def predict(self, x):
+                return {"result": x["input"] + 1}
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        req = Request(
+            uid="batch-2",
+            batch=BatchRequest(items=[
+                BatchItem(uid="i1", data=json.dumps({"input": 1}).encode()),
+                BatchItem(uid="i2", data=json.dumps({"input": 2}).encode()),
+            ]),
+        )
+        socket.inject(req.SerializeToString())
+
+        import threading
+        t = threading.Thread(target=run_standard_loop, args=(SimpleModel(), socket, "test", log))
+        t.start()
+        import time
+        time.sleep(0.05)
+        socket.inject(b"")
+        t.join(timeout=0.1)
+
+        assert len(socket._msgs) >= 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.uid == "batch-2"
+        assert len(resp.batch.items) == 2
+        assert json.loads(resp.batch.items[0].data)["result"] == 2
+        assert json.loads(resp.batch.items[1].data)["result"] == 3
+
+    def test_standard_batch_predict_whole_batch_fails(self):
+        from lite_server.worker.inference import run_standard_loop
+        from lite_server.proto import Request, BatchRequest, BatchItem, Response
+
+        class BrokenBatchModel:
+            def batch(self, inputs):
+                return inputs
+
+            def predict(self, batched):
+                raise ValueError("batch predict boom")
+
+            def unbatch(self, output):
+                return output
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        req = Request(
+            uid="batch-3",
+            batch=BatchRequest(items=[
+                BatchItem(uid="i1", data=json.dumps({"input": 1}).encode()),
+                BatchItem(uid="i2", data=json.dumps({"input": 2}).encode()),
+            ]),
+        )
+        socket.inject(req.SerializeToString())
+
+        import threading
+        t = threading.Thread(target=run_standard_loop, args=(BrokenBatchModel(), socket, "test", log))
+        t.start()
+        import time
+        time.sleep(0.05)
+        socket.inject(b"")
+        t.join(timeout=0.1)
+
+        assert len(socket._msgs) >= 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.uid == "batch-3"
+        assert len(resp.batch.items) == 2
+        for item in resp.batch.items:
+            assert item.status.code == "Error"
+            assert "batch predict boom" in item.status.message
+
+    def test_standard_single_request_on_request_before_decode(self):
+        from lite_server.worker.inference import run_standard_loop
+        from lite_server.proto import Request, SingleRequest, Response
+        from lite_server.api import RequestMeta
+
+        class ModelWithHook:
+            def on_request(self, request, meta):
+                request["injected"] = True
+                return request
+
+            def decode_request(self, request):
+                assert request.get("injected") is True
+                return {"decoded": request}
+
+            def predict(self, x):
+                return {"has_injected": x["decoded"].get("injected", False)}
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        req = Request(uid="hook-1", single=SingleRequest(data=json.dumps({"input": 1}).encode()))
+        socket.inject(req.SerializeToString())
+
+        import threading
+        t = threading.Thread(target=run_standard_loop, args=(ModelWithHook(), socket, "test", log))
+        t.start()
+        import time
+        time.sleep(0.05)
+        socket.inject(b"")
+        t.join(timeout=0.1)
+
+        assert len(socket._msgs) >= 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.uid == "hook-1"
+        assert json.loads(resp.single.data)["has_injected"] is True
+
+
+class TestAsyncBatchPredict:
+    """Async batch predict path."""
+
+    def _make_socket(self):
+        class MockSocket:
+            def __init__(self):
+                self._msgs = []
+                self._incoming = []
+
+            async def send(self, data):
+                self._msgs.append(data)
+
+            async def recv(self):
+                while not self._incoming:
+                    import asyncio
+                    await asyncio.sleep(0.001)
+                return self._incoming.pop(0)
+
+            def inject(self, data):
+                self._incoming.append(data)
+
+        return MockSocket()
+
+    def test_async_batch_predict_full_path(self):
+        import asyncio
+        from lite_server.worker.inference import run_async_loop
+        from lite_server.proto import Request, BatchRequest, BatchItem, Response
+
+        class AsyncBatchModel:
+            async def batch(self, inputs):
+                return {"values": [x["input"] for x in inputs], "batch_size": len(inputs)}
+
+            async def predict(self, batched):
+                return [{"result": v * 2, "batch_size": batched["batch_size"]} for v in batched["values"]]
+
+            async def unbatch(self, output):
+                return output
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        req = Request(
+            uid="async-batch-1",
+            batch=BatchRequest(items=[
+                BatchItem(uid="i1", data=json.dumps({"input": 1}).encode()),
+                BatchItem(uid="i2", data=json.dumps({"input": 3}).encode()),
+            ]),
+        )
+        socket.inject(req.SerializeToString())
+
+        async def runner():
+            task = asyncio.create_task(run_async_loop(AsyncBatchModel(), socket, "test", log))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(runner())
+        assert len(socket._msgs) == 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.uid == "async-batch-1"
+        assert len(resp.batch.items) == 2
+        assert json.loads(resp.batch.items[0].data)["result"] == 2
+        assert json.loads(resp.batch.items[1].data)["result"] == 6
+
+    def test_async_batch_predict_fallback_concurrent(self):
+        import asyncio
+        from lite_server.worker.inference import run_async_loop
+        from lite_server.proto import Request, BatchRequest, BatchItem, Response
+
+        class AsyncSimpleModel:
+            async def predict(self, x):
+                await asyncio.sleep(0.01)
+                return {"result": x["input"] + 1}
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        req = Request(
+            uid="async-batch-2",
+            batch=BatchRequest(items=[
+                BatchItem(uid="i1", data=json.dumps({"input": 1}).encode()),
+                BatchItem(uid="i2", data=json.dumps({"input": 2}).encode()),
+                BatchItem(uid="i3", data=json.dumps({"input": 3}).encode()),
+            ]),
+        )
+        socket.inject(req.SerializeToString())
+
+        async def runner():
+            task = asyncio.create_task(run_async_loop(AsyncSimpleModel(), socket, "test", log))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(runner())
+        assert len(socket._msgs) == 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.uid == "async-batch-2"
+        assert len(resp.batch.items) == 3
+        for i, item in enumerate(resp.batch.items):
+            assert json.loads(item.data)["result"] == i + 2
+
+    def test_async_single_on_request_before_decode(self):
+        import asyncio
+        from lite_server.worker.inference import run_async_loop
+        from lite_server.proto import Request, SingleRequest, Response
+
+        class AsyncModelWithHook:
+            async def on_request(self, request, meta):
+                request["async_injected"] = True
+                return request
+
+            async def decode_request(self, request):
+                assert request.get("async_injected") is True
+                return {"decoded": request}
+
+            async def predict(self, x):
+                return {"has_injected": x["decoded"].get("async_injected", False)}
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        req = Request(uid="async-hook-1", single=SingleRequest(data=json.dumps({"input": 1}).encode()))
+        socket.inject(req.SerializeToString())
+
+        async def runner():
+            task = asyncio.create_task(run_async_loop(AsyncModelWithHook(), socket, "test", log))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(runner())
+        assert len(socket._msgs) == 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.uid == "async-hook-1"
+        assert json.loads(resp.single.data)["has_injected"] is True

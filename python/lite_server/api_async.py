@@ -8,10 +8,9 @@ from lite_server.api import LitAPI
 class AsyncLitAPI(LitAPI):
     """Asynchronous inference API base class. ``predict()`` must be ``async def``.
 
-    Constraints:
-    - ``max_batch_size`` is forced to 1 (async does not support batching).
     - ``decode_request`` / ``encode_response`` / ``on_request`` / ``on_response``
       may be sync or async; the worker adapts automatically.
+    - ``batch`` / ``unbatch`` may be sync or async; the worker adapts automatically.
     - ``stream_predict`` may be an async generator (future phase).
 
     Usage::
@@ -25,7 +24,6 @@ class AsyncLitAPI(LitAPI):
     """
 
     def __init__(self, **kwargs):
-        kwargs["max_batch_size"] = 1
         kwargs["enable_async"] = True
         super().__init__(**kwargs)
 

@@ -141,18 +141,18 @@ class LitAPI(ls.LitAPI):
     # ===== Request/Response Hooks =====
 
     def on_request(self, request: Any, meta: RequestMeta) -> Any:
-        """Called after decode_request, before predict.
+        """Called before decode_request.
 
-        Override to modify the request, perform auth checks, inject context,
+        Override to modify the raw request, perform auth checks, inject context,
         or log request metadata.  Raising an exception rejects the request
         and returns an Error response to the client.
 
         Args:
-            request: The decoded request (output of decode_request).
+            request: The raw request payload (JSON dict from HTTP body).
             meta: Original HTTP request metadata (headers, route, ip, etc.).
 
         Returns:
-            The (possibly modified) request to pass to predict.
+            The (possibly modified) raw request to pass to decode_request.
         """
         return request
 

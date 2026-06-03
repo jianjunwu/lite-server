@@ -342,7 +342,7 @@ class TestCollectMetrics:
 class TestAsyncLitAPI:
     """AsyncLitAPI subclassing and constraints."""
 
-    def test_async_litapi_forces_max_batch_size_to_one(self):
+    def test_async_litapi_does_not_force_max_batch_size(self):
         from lite_server.api_async import AsyncLitAPI
 
         class Dummy(AsyncLitAPI):
@@ -350,7 +350,7 @@ class TestAsyncLitAPI:
             async def predict(self, x): return x
 
         api = Dummy(max_batch_size=8)
-        assert api.max_batch_size == 1
+        assert api.max_batch_size == 8
 
     def test_async_litapi_sets_enable_async(self):
         from lite_server.api_async import AsyncLitAPI

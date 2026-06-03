@@ -226,35 +226,53 @@ def _collect_metrics(lit_api: LitAPI):
     return Metrics(gauges=gauges, counters=counters, histograms=histograms)
 
 
+def _has_batch_methods(lit_api) -> bool:
+    """Detect whether user has overridden batch/unbatch."""
+    import litserve as ls
+
+    batch_func = getattr(lit_api, "batch", None)
+    unbatch_func = getattr(lit_api, "unbatch", None)
+    if batch_func is None or unbatch_func is None:
+        return False
+    batch_overridden = batch_func.__code__ is not ls.LitAPI.batch.__code__
+    unbatch_overridden = unbatch_func.__code__ is not ls.LitAPI.unbatch.__code__
+    return batch_overridden and unbatch_overridden
+
+
 def _run_predict(lit_api: LitAPI, data: bytes, meta: RequestMeta, log: logging.Logger):
     """Run the full predict pipeline with hooks."""
     raw = json.loads(data) if data else {}
 
+    # 1. on_request (pre-decode)
+    if hasattr(lit_api, "on_request"):
+        try:
+            raw = lit_api.on_request(raw, meta)
+        except Exception as e:
+            log.warning("on_request hook failed: %s", e, exc_info=True)
+            raise
+
+    # 2. decode_request
     try:
         decoded = lit_api.decode_request(raw) if hasattr(lit_api, "decode_request") else raw
     except Exception as e:
         log.warning("decode_request failed: %s", e, exc_info=True)
         raise
 
-    if hasattr(lit_api, "on_request"):
-        try:
-            decoded = lit_api.on_request(decoded, meta)
-        except Exception as e:
-            log.warning("on_request hook failed: %s", e, exc_info=True)
-            raise
-
+    # 3. predict
     try:
         output = lit_api.predict(decoded)
     except Exception as e:
         log.error("predict failed: %s", e, exc_info=True)
         raise
 
+    # 4. encode_response
     try:
         encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
     except Exception as e:
         log.warning("encode_response failed: %s", e, exc_info=True)
         raise
 
+    # 5. on_response
     if hasattr(lit_api, "on_response"):
         try:
             encoded = lit_api.on_response(encoded, meta)
@@ -297,6 +315,15 @@ async def _run_predict_async(lit_api: LitAPI, data: bytes, meta: RequestMeta, lo
     """Async version of the full predict pipeline with hooks."""
     raw = json.loads(data) if data else {}
 
+    # 1. on_request (pre-decode)
+    if hasattr(lit_api, "on_request"):
+        try:
+            raw = await _maybe_await(lit_api.on_request, raw, meta)
+        except Exception as e:
+            log.warning("on_request hook failed: %s", e, exc_info=True)
+            raise
+
+    # 2. decode_request
     try:
         if hasattr(lit_api, "decode_request"):
             decoded = await _maybe_await(lit_api.decode_request, raw)
@@ -306,19 +333,14 @@ async def _run_predict_async(lit_api: LitAPI, data: bytes, meta: RequestMeta, lo
         log.warning("decode_request failed: %s", e, exc_info=True)
         raise
 
-    if hasattr(lit_api, "on_request"):
-        try:
-            decoded = await _maybe_await(lit_api.on_request, decoded, meta)
-        except Exception as e:
-            log.warning("on_request hook failed: %s", e, exc_info=True)
-            raise
-
+    # 3. predict
     try:
         output = await _maybe_await(lit_api.predict, decoded)
     except Exception as e:
         log.error("predict failed: %s", e, exc_info=True)
         raise
 
+    # 4. encode_response
     try:
         if hasattr(lit_api, "encode_response"):
             encoded = await _maybe_await(lit_api.encode_response, output)
@@ -328,6 +350,7 @@ async def _run_predict_async(lit_api: LitAPI, data: bytes, meta: RequestMeta, lo
         log.warning("encode_response failed: %s", e, exc_info=True)
         raise
 
+    # 5. on_response
     if hasattr(lit_api, "on_response"):
         try:
             encoded = await _maybe_await(lit_api.on_response, encoded, meta)
@@ -384,14 +407,15 @@ def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.
 
     # Normal streaming: start generator
     raw = json.loads(data) if data else {}
-    decoded = lit_api.decode_request(raw) if hasattr(lit_api, "decode_request") else raw
 
     if hasattr(lit_api, "on_request") and meta is not None:
         try:
-            decoded = lit_api.on_request(decoded, meta)
+            raw = lit_api.on_request(raw, meta)
         except Exception as e:
             socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
             return
+
+    decoded = lit_api.decode_request(raw) if hasattr(lit_api, "decode_request") else raw
 
     try:
         generator = lit_api.stream_predict(decoded)
@@ -485,20 +509,94 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
 
         elif request.HasField("batch"):
             batch: BatchRequest = request.batch
-            items = []
-            for item in batch.items:
+            batch_items = batch.items
+
+            # Phase 1: per-item async on_request → decode
+            decoded_map: dict[str, Any] = {}
+            error_map: dict[str, Exception] = {}
+
+            for item in batch_items:
                 try:
-                    resp_bytes, status, _item_metrics = await _run_predict_async(lit_api, item.data, meta, log)
+                    raw = json.loads(item.data) if item.data else {}
+                    if hasattr(lit_api, "on_request"):
+                        raw = await _maybe_await(lit_api.on_request, raw, meta)
+                    if hasattr(lit_api, "decode_request"):
+                        decoded = await _maybe_await(lit_api.decode_request, raw)
+                    else:
+                        decoded = raw
+                    decoded_map[item.uid] = decoded
                 except Exception as e:
-                    resp_bytes = json.dumps({"error": str(e)}).encode()
-                    status = _make_status(False, str(e))
-                items.append(
-                    BatchItemResponse(
-                        uid=item.uid,
-                        data=resp_bytes,
-                        status=status,
+                    error_map[item.uid] = e
+
+            # Phase 2: batch → predict → unbatch
+            success_outputs: dict[str, Any] = {}
+
+            if decoded_map and _has_batch_methods(lit_api):
+                decoded_uids = list(decoded_map.keys())
+                decodeds = [decoded_map[_uid] for _uid in decoded_uids]
+                try:
+                    batched = await _maybe_await(lit_api.batch, decodeds)
+                    output = await _maybe_await(lit_api.predict, batched)
+                    outputs = await _maybe_await(lit_api.unbatch, output)
+                    if len(outputs) != len(decoded_uids):
+                        raise ValueError(f"unbatch: {len(outputs)} vs {len(decoded_uids)}")
+                    for _uid, out in zip(decoded_uids, outputs):
+                        success_outputs[_uid] = out
+                except Exception as e:
+                    for _uid in decoded_uids:
+                        error_map[_uid] = e
+            else:
+                # Fallback: concurrent per-item predict
+                tasks = []
+                uid_list = []
+                for _uid, decoded in decoded_map.items():
+                    tasks.append(_maybe_await(lit_api.predict, decoded))
+                    uid_list.append(_uid)
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for _uid, result in zip(uid_list, results):
+                    if isinstance(result, Exception):
+                        error_map[_uid] = result
+                    else:
+                        success_outputs[_uid] = result
+
+            # Phase 3: per-item async encode → on_response
+            final_map: dict[str, bytes] = {}
+
+            for item_uid, output in success_outputs.items():
+                try:
+                    if hasattr(lit_api, "encode_response"):
+                        encoded = await _maybe_await(lit_api.encode_response, output)
+                    else:
+                        encoded = output
+                    if hasattr(lit_api, "on_response"):
+                        encoded = await _maybe_await(lit_api.on_response, encoded, meta)
+                    final_map[item_uid] = json.dumps(encoded).encode()
+                except Exception as e:
+                    error_map[item_uid] = e
+
+            # Phase 4: assemble BatchResponse
+            items = []
+            for item in batch_items:
+                item_uid = item.uid
+                if item_uid in final_map:
+                    items.append(
+                        BatchItemResponse(
+                            uid=item_uid,
+                            data=final_map[item_uid],
+                            status=_make_status(True),
+                        )
                     )
-                )
+                else:
+                    err = error_map.get(item_uid, Exception("unknown error"))
+                    err_bytes = json.dumps({"error": str(err)}).encode()
+                    items.append(
+                        BatchItemResponse(
+                            uid=item_uid,
+                            data=err_bytes,
+                            status=_make_status(False, str(err)),
+                        )
+                    )
+
             metrics = _collect_metrics(lit_api)
             response = Response(
                 uid=uid,
@@ -567,21 +665,88 @@ def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log:
 
             elif request.HasField("batch"):
                 batch: BatchRequest = request.batch
-                items = []
-                for item in batch.items:
+                batch_items = batch.items
+
+                # Phase 1: on_request → decode (per item)
+                decoded_map: dict[str, Any] = {}
+                error_map: dict[str, Exception] = {}
+
+                for item in batch_items:
                     try:
-                        resp_bytes, status, _item_metrics = _run_predict(lit_api, item.data, meta, log)
+                        raw = json.loads(item.data) if item.data else {}
+                        if hasattr(lit_api, "on_request"):
+                            raw = lit_api.on_request(raw, meta)
+                        decoded = lit_api.decode_request(raw) if hasattr(lit_api, "decode_request") else raw
+                        decoded_map[item.uid] = decoded
                     except Exception as e:
-                        resp_bytes = json.dumps({"error": str(e)}).encode()
-                        status = _make_status(False, str(e))
-                    items.append(
-                        BatchItemResponse(
-                            uid=item.uid,
-                            data=resp_bytes,
-                            status=status,
+                        log.warning("batch item %s on_request/decode failed: %s", item.uid, e, exc_info=True)
+                        error_map[item.uid] = e
+
+                # Phase 2: batch → predict → unbatch
+                success_outputs: dict[str, Any] = {}
+
+                if decoded_map and _has_batch_methods(lit_api):
+                    decoded_uids = list(decoded_map.keys())
+                    decodeds = [decoded_map[_uid] for _uid in decoded_uids]
+                    try:
+                        batched = lit_api.batch(decodeds)
+                        output = lit_api.predict(batched)
+                        outputs = lit_api.unbatch(output)
+                        if len(outputs) != len(decoded_uids):
+                            raise ValueError(
+                                f"unbatch returned {len(outputs)} outputs, expected {len(decoded_uids)}"
+                            )
+                        for _uid, out in zip(decoded_uids, outputs):
+                            success_outputs[_uid] = out
+                    except Exception as e:
+                        log.error("batch predict failed: %s", e, exc_info=True)
+                        for _uid in decoded_uids:
+                            error_map[_uid] = e
+                else:
+                    # Fallback: per-item predict
+                    for _uid, decoded in decoded_map.items():
+                        try:
+                            success_outputs[_uid] = lit_api.predict(decoded)
+                        except Exception as e:
+                            log.error("predict failed for %s: %s", _uid, e, exc_info=True)
+                            error_map[_uid] = e
+
+                # Phase 3: encode → on_response (per item)
+                final_map: dict[str, bytes] = {}
+
+                for _uid, output in success_outputs.items():
+                    try:
+                        encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
+                        if hasattr(lit_api, "on_response"):
+                            encoded = lit_api.on_response(encoded, meta)
+                        final_map[_uid] = json.dumps(encoded).encode()
+                    except Exception as e:
+                        log.warning("encode/on_response failed for %s: %s", _uid, e, exc_info=True)
+                        error_map[_uid] = e
+
+                # Phase 4: assemble BatchResponse
+                items = []
+                for item in batch_items:
+                    item_uid = item.uid
+                    if item_uid in final_map:
+                        items.append(
+                            BatchItemResponse(
+                                uid=item_uid,
+                                data=final_map[item_uid],
+                                status=_make_status(True),
+                            )
                         )
-                    )
-                # Collect metrics once after all batch items
+                    else:
+                        err = error_map.get(item_uid, Exception("unknown error"))
+                        err_bytes = json.dumps({"error": str(err)}).encode()
+                        items.append(
+                            BatchItemResponse(
+                                uid=item_uid,
+                                data=err_bytes,
+                                status=_make_status(False, str(err)),
+                            )
+                        )
+
                 metrics = _collect_metrics(lit_api)
                 response = Response(
                     uid=uid,
@@ -672,21 +837,23 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
 
     def _handle_add(cb_add: CBAddRequest):
         raw = json.loads(cb_add.data) if cb_add.data else {}
-        if hasattr(lit_api, "decode_request"):
-            decoded = _invoke_method(lit_api.decode_request, raw)
-        else:
-            decoded = raw
         meta = _meta_from_proto(cb_add.meta) if cb_add.HasField("meta") else RequestMeta(
             route="", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=raw,
         )
 
+        # on_request moved before decode
         try:
             if hasattr(lit_api, "on_request"):
-                decoded = _invoke_method(lit_api.on_request, decoded, meta)
+                raw = _invoke_method(lit_api.on_request, raw, meta)
         except Exception as e:
             err_resp = _make_error_response(cb_add.uid, str(e))
             socket.send(err_resp.SerializeToString())
             return
+
+        if hasattr(lit_api, "decode_request"):
+            decoded = _invoke_method(lit_api.decode_request, raw)
+        else:
+            decoded = raw
 
         state = CBState(cb_add.uid, decoded, meta)
         active[cb_add.uid] = state
