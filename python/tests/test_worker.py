@@ -696,14 +696,22 @@ class TestAsyncLoop:
         assert resp.single.status.code == "Error"
         assert "boom" in resp.single.status.message
 
-    def test_async_stream_not_supported(self):
+    def test_async_stream_with_async_generator(self):
         import asyncio
         from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import Request, StreamRequest, StreamOpen, Response
+        from lite_server.proto import Request, StreamRequest, StreamOpen, StreamCancel, Response
 
-        class AsyncModel:
+        class AsyncStreamModel:
             async def predict(self, x):
                 return x
+
+            async def stream_predict(self, x):
+                for i in range(3):
+                    await asyncio.sleep(0.001)
+                    yield {"token": i, "input": x.get("input")}
+
+            def encode_response(self, output):
+                return output
 
             _metric_specs = []
             _metric_values = []
@@ -713,12 +721,12 @@ class TestAsyncLoop:
 
         req = Request(
             uid="stream-1",
-            stream=StreamRequest(stream_id="s1", open=StreamOpen(data=b"{}")),
+            stream=StreamRequest(stream_id="s1", open=StreamOpen(data=json.dumps({"input": 42}).encode())),
         )
         socket.inject(req.SerializeToString())
 
         async def runner():
-            task = asyncio.create_task(run_async_loop(AsyncModel(), socket, "test", log))
+            task = asyncio.create_task(run_async_loop(AsyncStreamModel(), socket, "test", log))
             await asyncio.sleep(0.05)
             task.cancel()
             try:
@@ -727,12 +735,207 @@ class TestAsyncLoop:
                 pass
 
         asyncio.run(runner())
-        assert len(socket._msgs) == 1
+        # Expect: 3 chunks + 1 done = 4 messages
+        assert len(socket._msgs) == 4, f"Expected 4 messages, got {len(socket._msgs)}"
+
+        # Parse chunks
+        for i in range(3):
+            resp = Response()
+            resp.ParseFromString(socket._msgs[i])
+            assert resp.stream.stream_id == "s1"
+            assert resp.stream.chunk.is_final is False
+            data = json.loads(resp.stream.chunk.data)
+            assert data["token"] == i
+            assert data["input"] == 42
+
+        # Parse done
+        done_resp = Response()
+        done_resp.ParseFromString(socket._msgs[3])
+        assert done_resp.stream.stream_id == "s1"
+        assert done_resp.stream.done is not None
+
+    def test_async_stream_with_sync_generator(self):
+        import asyncio
+        from lite_server.worker.inference import run_async_loop
+        from lite_server.proto import Request, StreamRequest, StreamOpen, Response
+
+        class SyncStreamModel:
+            def predict(self, x):
+                return x
+
+            def stream_predict(self, x):
+                for i in range(3):
+                    yield {"token": i, "input": x.get("input")}
+
+            def encode_response(self, output):
+                return output
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        req = Request(
+            uid="stream-2",
+            stream=StreamRequest(stream_id="s2", open=StreamOpen(data=json.dumps({"input": 99}).encode())),
+        )
+        socket.inject(req.SerializeToString())
+
+        async def runner():
+            task = asyncio.create_task(run_async_loop(SyncStreamModel(), socket, "test", log))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(runner())
+        assert len(socket._msgs) == 4, f"Expected 4 messages, got {len(socket._msgs)}"
+
+        for i in range(3):
+            resp = Response()
+            resp.ParseFromString(socket._msgs[i])
+            data = json.loads(resp.stream.chunk.data)
+            assert data["token"] == i
+            assert data["input"] == 99
+
+    def test_async_stream_fallback_no_stream_predict(self):
+        import asyncio
+        from lite_server.worker.inference import run_async_loop
+        from lite_server.proto import Request, StreamRequest, StreamOpen, Response
+
+        class NoStreamModel:
+            async def predict(self, x):
+                return {"fallback": True, "input": x.get("input")}
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        req = Request(
+            uid="stream-3",
+            stream=StreamRequest(stream_id="s3", open=StreamOpen(data=json.dumps({"input": 7}).encode())),
+        )
+        socket.inject(req.SerializeToString())
+
+        async def runner():
+            task = asyncio.create_task(run_async_loop(NoStreamModel(), socket, "test", log))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(runner())
+        # Expect: 1 final chunk + 1 done = 2 messages
+        assert len(socket._msgs) == 2, f"Expected 2 messages, got {len(socket._msgs)}"
+
         resp = Response()
         resp.ParseFromString(socket._msgs[0])
-        assert resp.uid == "stream-1"
-        assert resp.single.status.code == "Error"
-        assert "not yet supported" in resp.single.status.message
+        assert resp.stream.stream_id == "s3"
+        assert resp.stream.chunk.is_final is True
+        data = json.loads(resp.stream.chunk.data)
+        assert data["fallback"] is True
+        assert data["input"] == 7
+
+    def test_async_stream_error_in_stream_predict(self):
+        import asyncio
+        from lite_server.worker.inference import run_async_loop
+        from lite_server.proto import Request, StreamRequest, StreamOpen, Response
+
+        class BrokenStreamModel:
+            async def stream_predict(self, x):
+                yield {"token": 0}
+                raise ValueError("stream broke")
+
+            def encode_response(self, output):
+                return output
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        req = Request(
+            uid="stream-4",
+            stream=StreamRequest(stream_id="s4", open=StreamOpen(data=b"{}")),
+        )
+        socket.inject(req.SerializeToString())
+
+        async def runner():
+            task = asyncio.create_task(run_async_loop(BrokenStreamModel(), socket, "test", log))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(runner())
+        # Expect: 1 chunk + 1 error = 2 messages
+        assert len(socket._msgs) == 2, f"Expected 2 messages, got {len(socket._msgs)}"
+
+        resp = Response()
+        resp.ParseFromString(socket._msgs[1])
+        assert resp.stream.stream_id == "s4"
+        assert resp.stream.error is not None
+        assert "stream broke" in resp.stream.error.message
+
+    def test_async_stream_cancel(self):
+        import asyncio
+        from lite_server.worker.inference import run_async_loop
+        from lite_server.proto import Request, StreamRequest, StreamOpen, StreamCancel, Response
+
+        class SlowStreamModel:
+            async def stream_predict(self, x):
+                for i in range(100):
+                    await asyncio.sleep(0.01)
+                    yield {"token": i}
+
+            def encode_response(self, output):
+                return output
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        # Inject open request
+        open_req = Request(
+            uid="stream-open-5",
+            stream=StreamRequest(stream_id="s5", open=StreamOpen(data=b"{}")),
+        )
+        socket.inject(open_req.SerializeToString())
+
+        # Inject cancel request after a short delay
+        async def delayed_cancel():
+            await asyncio.sleep(0.03)
+            cancel_req = Request(
+                uid="stream-cancel-5",
+                stream=StreamRequest(stream_id="s5", cancel=StreamCancel()),
+            )
+            socket.inject(cancel_req.SerializeToString())
+
+        async def runner():
+            task = asyncio.create_task(run_async_loop(SlowStreamModel(), socket, "test", log))
+            asyncio.create_task(delayed_cancel())
+            await asyncio.sleep(0.1)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(runner())
+        # Should have received some chunks before cancel, then the stream task was cancelled
+        assert len(socket._msgs) >= 1
 
     def test_async_concurrent_requests(self):
         import asyncio
@@ -1458,3 +1661,160 @@ class TestAsyncBatchPredict:
         resp.ParseFromString(socket._msgs[0])
         assert resp.uid == "async-hook-1"
         assert json.loads(resp.single.data)["has_injected"] is True
+
+
+class TestAsyncStreamingMetrics:
+    """Metrics accumulation and flush_metrics in async streaming."""
+
+    def _make_socket(self):
+        class MockSocket:
+            def __init__(self):
+                self._msgs = []
+                self._incoming = []
+
+            async def send(self, data):
+                self._msgs.append(data)
+
+            async def recv(self):
+                while not self._incoming:
+                    import asyncio
+                    await asyncio.sleep(0.001)
+                return self._incoming.pop(0)
+
+            def inject(self, data):
+                self._incoming.append(data)
+
+        return MockSocket()
+
+    def test_streaming_metrics_accumulate_until_done(self):
+        import asyncio
+        from lite_server.worker.inference import run_async_loop
+        from lite_server.proto import Request, StreamRequest, StreamOpen, Response
+
+        class MetricStreamModel:
+            def __init__(self):
+                self._metric_specs = []
+                self._metric_values = []
+
+            async def stream_predict(self, x):
+                for i in range(3):
+                    self.report_metric(self.token_counter, 1.0)
+                    yield {"token": i}
+
+            def encode_response(self, output):
+                return output
+
+            def register_metric(self, name, metric_type):
+                idx = len(self._metric_specs)
+                self._metric_specs.append(type("Spec", (), {"name": name, "metric_type": metric_type})())
+                return idx
+
+            def report_metric(self, metric_id, value):
+                self._metric_values.append((metric_id, value))
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        model = MetricStreamModel()
+        model.token_counter = model.register_metric("tokens", "counter")
+
+        req = Request(
+            uid="stream-m1",
+            stream=StreamRequest(stream_id="sm1", open=StreamOpen(data=b"{}")),
+        )
+        socket.inject(req.SerializeToString())
+
+        async def runner():
+            task = asyncio.create_task(run_async_loop(model, socket, "test", log))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(runner())
+        # 3 chunks + 1 done
+        assert len(socket._msgs) == 4
+
+        # Verify done carries metrics (3 individual observations)
+        done_resp = Response()
+        done_resp.ParseFromString(socket._msgs[3])
+        assert done_resp.stream.done is not None
+        assert done_resp.stream.done.metrics is not None
+        assert len(done_resp.stream.done.metrics.counters) == 3
+        assert sum(c.value for c in done_resp.stream.done.metrics.counters) == 3.0
+
+    def test_flush_metrics_clears_buffer(self):
+        from lite_server.api import LitAPI
+
+        class Dummy(LitAPI):
+            def setup(self, device): pass
+            def decode_request(self, request): return request
+            def predict(self, x): return x
+            def encode_response(self, output): return output
+
+        api = Dummy()
+        g = api.register_metric("x", "gauge")
+        api.report_metric(g, 10.0)
+        api.report_metric(g, 20.0)
+
+        assert len(api._metric_values) == 2
+
+        m = api.flush_metrics()
+        assert m is not None
+        assert len(m.gauges) == 2
+        assert api._metric_values == []
+
+        # Second flush returns None
+        assert api.flush_metrics() is None
+
+    def test_streaming_metrics_cleared_after_done(self):
+        import asyncio
+        from lite_server.worker.inference import run_async_loop
+        from lite_server.proto import Request, StreamRequest, StreamOpen, Response
+
+        class MetricStreamModel:
+            def __init__(self):
+                self._metric_specs = []
+                self._metric_values = []
+
+            async def stream_predict(self, x):
+                self.report_metric(self.counter_id, 1.0)
+                yield {"token": 0}
+
+            def encode_response(self, output):
+                return output
+
+            def register_metric(self, name, metric_type):
+                idx = len(self._metric_specs)
+                self._metric_specs.append(type("Spec", (), {"name": name, "metric_type": metric_type})())
+                return idx
+
+            def report_metric(self, metric_id, value):
+                self._metric_values.append((metric_id, value))
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        model = MetricStreamModel()
+        model.counter_id = model.register_metric("cnt", "counter")
+
+        req = Request(
+            uid="stream-m2",
+            stream=StreamRequest(stream_id="sm2", open=StreamOpen(data=b"{}")),
+        )
+        socket.inject(req.SerializeToString())
+
+        async def runner():
+            task = asyncio.create_task(run_async_loop(model, socket, "test", log))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(runner())
+        # Buffer should be cleared after stream_done
+        assert model._metric_values == []

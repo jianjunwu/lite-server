@@ -445,8 +445,9 @@ def _handle_stream_cancel(stream_id: str, active_streams: dict, log: logging.Log
 # ---------------------------------------------------------------------------
 
 async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.Logger):
-    """Handle single + batch requests asynchronously (streaming not yet supported in async mode)."""
+    """Handle single + batch + stream requests asynchronously."""
     pending_tasks: dict[str, asyncio.Task] = {}
+    active_streams: dict[str, asyncio.Task] = {}
 
     while True:
         try:
@@ -463,17 +464,30 @@ async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.
             await socket.send(_make_error_response("", f"Protobuf parse: {e}").SerializeToString())
             continue
 
-        task = asyncio.create_task(
-            _handle_request_async(lit_api, request, socket, log)
-        )
-        pending_tasks[request.uid] = task
+        if request.HasField("stream"):
+            stream_id = request.stream.stream_id
+            task = asyncio.create_task(
+                _handle_stream_async(lit_api, request, socket, active_streams, log)
+            )
+            active_streams[stream_id] = task
+            pending_tasks[request.uid] = task
+        else:
+            task = asyncio.create_task(
+                _handle_request_async(lit_api, request, socket, log)
+            )
+            pending_tasks[request.uid] = task
 
         # Clean up completed tasks and retrieve exceptions to avoid warnings
         done = [uid for uid, t in pending_tasks.items() if t.done()]
         for uid in done:
             t = pending_tasks.pop(uid)
+            # Also clean up active_streams if this was a stream task
+            for sid, stream_task in list(active_streams.items()):
+                if stream_task is t:
+                    active_streams.pop(sid, None)
+                    break
             exc = t.exception()
-            if exc is not None:
+            if exc is not None and not isinstance(exc, asyncio.CancelledError):
                 log.error("async task %s failed: %s", uid, exc)
 
     # Cancel any pending tasks on shutdown
@@ -604,10 +618,6 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
                 metrics=metrics,
             )
 
-        elif request.HasField("stream"):
-            # Async streaming is not yet supported in Phase 1
-            response = _make_error_response(uid, "Async streaming not yet supported")
-
         else:
             response = _make_error_response(uid, "Unsupported payload type")
 
@@ -616,6 +626,179 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
         response = _make_error_response(uid, f"{type(e).__name__}: {e}")
 
     await socket.send(response.SerializeToString())
+
+
+# ---------------------------------------------------------------------------
+# Async Streaming Support
+# ---------------------------------------------------------------------------
+
+async def _handle_stream_async(
+    lit_api: LitAPI,
+    request: Request,
+    socket,
+    active_streams: dict[str, asyncio.Task],
+    log: logging.Logger,
+):
+    """Handle stream open/cancel/close in async loop."""
+    stream_req = request.stream
+    stream_id = stream_req.stream_id
+    action = stream_req.WhichOneof("action")
+
+    if action == "open":
+        await _handle_stream_open_async(lit_api, stream_req, socket, active_streams, log)
+    elif action in ("cancel", "close"):
+        task = active_streams.pop(stream_id, None)
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+
+async def _handle_stream_open_async(
+    lit_api: LitAPI,
+    stream_req: StreamRequest,
+    socket,
+    active_streams: dict[str, asyncio.Task],
+    log: logging.Logger,
+):
+    """Open a stream in async loop."""
+    stream_id = stream_req.stream_id
+    open_req = stream_req.open
+    data = open_req.data if open_req else b""
+    meta = _meta_from_proto(open_req.meta) if open_req and open_req.HasField("meta") else None
+
+    if not _has_stream_predict(lit_api):
+        # Fallback: predict() once, send as single chunk
+        try:
+            resp_bytes, status, metrics = await _run_predict_async(lit_api, data, meta, log)
+            await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=True).SerializeToString())
+            await socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
+        except Exception as e:
+            log.error("stream fallback predict failed for %s: %s", stream_id, e, exc_info=True)
+            await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
+        return
+
+    # Normal streaming
+    raw = json.loads(data) if data else {}
+
+    if hasattr(lit_api, "on_request") and meta is not None:
+        try:
+            raw = await _maybe_await(lit_api.on_request, raw, meta)
+        except Exception as e:
+            log.warning("on_request hook failed for stream %s: %s", stream_id, e, exc_info=True)
+            await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
+            return
+
+    try:
+        decoded = await _maybe_await(lit_api.decode_request, raw) if hasattr(lit_api, "decode_request") else raw
+    except Exception as e:
+        log.warning("decode_request failed for stream %s: %s", stream_id, e, exc_info=True)
+        await socket.send(_make_stream_error(stream_id, f"decode failed: {e}").SerializeToString())
+        return
+
+    try:
+        generator = await _maybe_await(lit_api.stream_predict, decoded)
+    except Exception as e:
+        log.error("stream_predict failed for %s: %s", stream_id, e, exc_info=True)
+        await socket.send(_make_stream_error(stream_id, f"stream_predict failed: {e}").SerializeToString())
+        return
+
+    if inspect.isasyncgen(generator):
+        task = asyncio.create_task(
+            _consume_async_stream(lit_api, generator, stream_id, socket, log, meta)
+        )
+    else:
+        task = asyncio.create_task(
+            _consume_sync_stream_async(lit_api, generator, stream_id, socket, log, meta)
+        )
+
+    active_streams[stream_id] = task
+
+
+async def _consume_async_stream(
+    lit_api: LitAPI,
+    generator,
+    stream_id: str,
+    socket,
+    log: logging.Logger,
+    meta=None,
+):
+    """Consume an async generator and send chunks."""
+    try:
+        async for output in generator:
+            try:
+                encoded = await _maybe_await(lit_api.encode_response, output) if hasattr(lit_api, "encode_response") else output
+                if hasattr(lit_api, "on_response") and meta is not None:
+                    encoded = await _maybe_await(lit_api.on_response, encoded, meta)
+                resp_bytes = json.dumps(encoded).encode()
+                await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
+            except Exception as e:
+                log.error("encode/on_response failed for stream %s: %s", stream_id, e, exc_info=True)
+                await socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
+                return
+    except asyncio.CancelledError:
+        # Propagate cancellation so the task is properly cancelled
+        raise
+    except Exception as e:
+        log.error("async stream_predict error for %s: %s", stream_id, e, exc_info=True)
+        await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
+        return
+
+    metrics = _collect_metrics(lit_api)
+    await socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
+
+
+_SENTINEL = object()
+
+
+async def _consume_sync_stream_async(
+    lit_api: LitAPI,
+    generator,
+    stream_id: str,
+    socket,
+    log: logging.Logger,
+    meta=None,
+):
+    """Consume a sync generator in a background thread and send chunks asynchronously."""
+
+    def _next_item():
+        try:
+            return next(generator)
+        except StopIteration:
+            return _SENTINEL
+
+    try:
+        while True:
+            output = await asyncio.to_thread(_next_item)
+            if output is _SENTINEL:
+                break
+
+            try:
+                encoded = await _maybe_await(lit_api.encode_response, output) if hasattr(lit_api, "encode_response") else output
+                if hasattr(lit_api, "on_response") and meta is not None:
+                    encoded = await _maybe_await(lit_api.on_response, encoded, meta)
+                resp_bytes = json.dumps(encoded).encode()
+                await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
+            except Exception as e:
+                log.error("encode/on_response failed for stream %s: %s", stream_id, e, exc_info=True)
+                await socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
+                return
+    except asyncio.CancelledError:
+        # Try to close the generator; don't wait indefinitely
+        try:
+            await asyncio.to_thread(generator.close)
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        log.error("sync stream_predict error for %s: %s", stream_id, e, exc_info=True)
+        await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
+        return
+
+    metrics = _collect_metrics(lit_api)
+    await socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
 
 
 # ---------------------------------------------------------------------------

@@ -108,6 +108,11 @@ class LitAPI(ls.LitAPI):
     def report_metric(self, metric_id: int, value: float) -> None:
         """Report a metric value by pre-registered ID.
 
+        Metrics are request-scoped: reported values accumulate in a buffer
+        and are collected once at the end of a request (or stream). In
+        streaming mode this means values from all chunks are aggregated into
+        a single Metrics proto sent with ``StreamDone``.
+
         Hot path — only ``list.append((int, float))``, ~50 ns.
 
         Args:
@@ -115,6 +120,17 @@ class LitAPI(ls.LitAPI):
             value: Metric value.
         """
         self._metric_values.append((metric_id, value))
+
+    def flush_metrics(self):
+        """Immediately collect and clear the metric buffer.
+
+        Returns the Metrics proto (or None if empty).  Useful in
+        streaming hooks when you want per-chunk metrics instead of
+        waiting for the stream to finish.
+        """
+        from lite_server.worker.inference import _collect_metrics
+
+        return _collect_metrics(self)
 
     # ===== Streaming Hooks (optional) =====
 
