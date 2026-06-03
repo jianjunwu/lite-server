@@ -17,7 +17,7 @@ from typing import Any
 import yaml
 import zmq
 
-from lite_server.api import LitAPI, RequestMeta
+from lite_server.api import LitAPI, RequestMeta, BidiStreamHandler
 from lite_server.api_async import AsyncLitAPI
 from lite_server.proto import (
     BatchItemResponse,
@@ -371,6 +371,11 @@ def _has_stream_predict(lit_api: LitAPI) -> bool:
     return hasattr(lit_api, "stream_predict") and callable(getattr(lit_api, "stream_predict"))
 
 
+def _has_bidi_stream(lit_api: LitAPI) -> bool:
+    """Detect whether the API implements bidirectional streaming."""
+    return hasattr(lit_api, "bidi_stream") and callable(getattr(lit_api, "bidi_stream"))
+
+
 def _consume_stream_generator(lit_api: LitAPI, generator, stream_id: str, socket: zmq.Socket, log: logging.Logger, meta=None):
     """Background thread: consume a stream_predict generator and send chunks."""
     try:
@@ -395,6 +400,47 @@ def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.
     data = open_req.data if open_req else b""
     meta = _meta_from_proto(open_req.meta) if open_req and open_req.HasField("meta") else None
 
+    # Try bidirectional streaming first
+    if _has_bidi_stream(lit_api):
+        raw = json.loads(data) if data else {}
+
+        if hasattr(lit_api, "on_request") and meta is not None:
+            try:
+                raw = lit_api.on_request(raw, meta)
+            except Exception as e:
+                socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
+                return
+
+        decoded = lit_api.decode_request(raw) if hasattr(lit_api, "decode_request") else raw
+
+        try:
+            handler = lit_api.bidi_stream()
+        except Exception as e:
+            socket.send(_make_stream_error(stream_id, f"bidi_stream failed: {e}").SerializeToString())
+            return
+
+        active_streams[stream_id] = handler
+
+        try:
+            output = handler.on_open(decoded)
+        except Exception as e:
+            log.error("bidi on_open failed for %s: %s", stream_id, e, exc_info=True)
+            socket.send(_make_stream_error(stream_id, f"on_open failed: {e}").SerializeToString())
+            return
+
+        if output is not None:
+            try:
+                encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
+                if hasattr(lit_api, "on_response") and meta is not None:
+                    encoded = lit_api.on_response(encoded, meta)
+                resp_bytes = json.dumps(encoded).encode()
+                socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
+            except Exception as e:
+                log.error("bidi on_open encode failed for %s: %s", stream_id, e, exc_info=True)
+                socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
+                return
+        return
+
     if not _has_stream_predict(lit_api):
         # Fallback: predict() once, send as single chunk
         try:
@@ -405,7 +451,7 @@ def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.
             socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
         return
 
-    # Normal streaming: start generator
+    # Normal uni-directional streaming: start generator
     raw = json.loads(data) if data else {}
 
     if hasattr(lit_api, "on_request") and meta is not None:
@@ -431,11 +477,51 @@ def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.
     ).start()
 
 
-def _handle_stream_cancel(stream_id: str, active_streams: dict, log: logging.Logger):
-    generator = active_streams.pop(stream_id, None)
-    if generator is not None:
+def _handle_stream_chunk(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.Socket, active_streams: dict, log: logging.Logger, meta=None):
+    """Handle a mid-stream chunk for bidirectional streaming (sync worker)."""
+    stream_id = stream_req.stream_id
+    handler = active_streams.get(stream_id)
+    if handler is None:
+        socket.send(_make_stream_error(stream_id, "stream not found").SerializeToString())
+        return
+
+    data = stream_req.chunk.data if stream_req.chunk else b""
+    raw = json.loads(data) if data else {}
+
+    try:
+        output = handler.on_chunk(raw)
+    except Exception as e:
+        log.error("bidi on_chunk failed for %s: %s", stream_id, e, exc_info=True)
+        socket.send(_make_stream_error(stream_id, f"on_chunk failed: {e}").SerializeToString())
+        return
+
+    if output is not None:
         try:
-            generator.close()
+            encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
+            if hasattr(lit_api, "on_response") and meta is not None:
+                encoded = lit_api.on_response(encoded, meta)
+            resp_bytes = json.dumps(encoded).encode()
+            socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
+        except Exception as e:
+            log.error("bidi encode failed for %s: %s", stream_id, e, exc_info=True)
+            socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
+
+
+def _handle_stream_close(stream_id: str, active_streams: dict, socket: zmq.Socket, log: logging.Logger):
+    """Close a stream: cleanup generator or bidi handler, send StreamDone."""
+    entry = active_streams.pop(stream_id, None)
+    if entry is None:
+        return
+
+    if isinstance(entry, BidiStreamHandler):
+        try:
+            entry.on_close()
+        except Exception as e:
+            log.debug("bidi on_close error for %s: %s", stream_id, e)
+    else:
+        # It's a generator
+        try:
+            entry.close()
         except Exception as e:
             log.debug("stream %s close error: %s", stream_id, e)
 
@@ -466,10 +552,14 @@ async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.
 
         if request.HasField("stream"):
             stream_id = request.stream.stream_id
+            action = request.stream.WhichOneof("action")
             task = asyncio.create_task(
                 _handle_stream_async(lit_api, request, socket, active_streams, log)
             )
-            active_streams[stream_id] = task
+            # Only register in active_streams for open; chunk/close/cancel
+            # must not overwrite the existing handler or consumption task.
+            if action == "open":
+                active_streams[stream_id] = task
             pending_tasks[request.uid] = task
         else:
             task = asyncio.create_task(
@@ -636,22 +726,44 @@ async def _handle_stream_async(
     lit_api: LitAPI,
     request: Request,
     socket,
-    active_streams: dict[str, asyncio.Task],
+    active_streams: dict[str, Any],
     log: logging.Logger,
 ):
-    """Handle stream open/cancel/close in async loop."""
+    """Handle stream open/chunk/close/cancel in async loop."""
     stream_req = request.stream
     stream_id = stream_req.stream_id
     action = stream_req.WhichOneof("action")
 
     if action == "open":
         await _handle_stream_open_async(lit_api, stream_req, socket, active_streams, log)
-    elif action in ("cancel", "close"):
-        task = active_streams.pop(stream_id, None)
-        if task is not None:
-            task.cancel()
+    elif action == "chunk":
+        await _handle_stream_chunk_async(lit_api, stream_req, socket, active_streams, log)
+    elif action == "close":
+        entry = active_streams.pop(stream_id, None)
+        if isinstance(entry, BidiStreamHandler):
             try:
-                await task
+                await _maybe_await(entry.on_close)
+            except Exception as e:
+                log.debug("bidi on_close error for %s: %s", stream_id, e)
+            metrics = _collect_metrics(lit_api)
+            await socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
+        elif isinstance(entry, asyncio.Task):
+            entry.cancel()
+            try:
+                await entry
+            except asyncio.CancelledError:
+                pass
+    elif action == "cancel":
+        entry = active_streams.pop(stream_id, None)
+        if isinstance(entry, BidiStreamHandler):
+            try:
+                await _maybe_await(entry.on_close)
+            except Exception as e:
+                log.debug("bidi on_close error for %s: %s", stream_id, e)
+        elif isinstance(entry, asyncio.Task):
+            entry.cancel()
+            try:
+                await entry
             except asyncio.CancelledError:
                 pass
 
@@ -660,7 +772,7 @@ async def _handle_stream_open_async(
     lit_api: LitAPI,
     stream_req: StreamRequest,
     socket,
-    active_streams: dict[str, asyncio.Task],
+    active_streams: dict[str, Any],
     log: logging.Logger,
 ):
     """Open a stream in async loop."""
@@ -668,6 +780,54 @@ async def _handle_stream_open_async(
     open_req = stream_req.open
     data = open_req.data if open_req else b""
     meta = _meta_from_proto(open_req.meta) if open_req and open_req.HasField("meta") else None
+
+    # Try bidirectional streaming first
+    if _has_bidi_stream(lit_api):
+        raw = json.loads(data) if data else {}
+
+        if hasattr(lit_api, "on_request") and meta is not None:
+            try:
+                raw = await _maybe_await(lit_api.on_request, raw, meta)
+            except Exception as e:
+                log.warning("on_request hook failed for bidi %s: %s", stream_id, e, exc_info=True)
+                await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
+                return
+
+        try:
+            decoded = await _maybe_await(lit_api.decode_request, raw) if hasattr(lit_api, "decode_request") else raw
+        except Exception as e:
+            log.warning("decode_request failed for bidi %s: %s", stream_id, e, exc_info=True)
+            await socket.send(_make_stream_error(stream_id, f"decode failed: {e}").SerializeToString())
+            return
+
+        try:
+            handler = await _maybe_await(lit_api.bidi_stream)
+        except Exception as e:
+            log.error("bidi_stream failed for %s: %s", stream_id, e, exc_info=True)
+            await socket.send(_make_stream_error(stream_id, f"bidi_stream failed: {e}").SerializeToString())
+            return
+
+        active_streams[stream_id] = handler
+
+        try:
+            output = await _maybe_await(handler.on_open, decoded)
+        except Exception as e:
+            log.error("bidi on_open failed for %s: %s", stream_id, e, exc_info=True)
+            await socket.send(_make_stream_error(stream_id, f"on_open failed: {e}").SerializeToString())
+            return
+
+        if output is not None:
+            try:
+                encoded = await _maybe_await(lit_api.encode_response, output) if hasattr(lit_api, "encode_response") else output
+                if hasattr(lit_api, "on_response") and meta is not None:
+                    encoded = await _maybe_await(lit_api.on_response, encoded, meta)
+                resp_bytes = json.dumps(encoded).encode()
+                await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
+            except Exception as e:
+                log.error("bidi on_open encode failed for %s: %s", stream_id, e, exc_info=True)
+                await socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
+                return
+        return
 
     if not _has_stream_predict(lit_api):
         # Fallback: predict() once, send as single chunk
@@ -680,7 +840,7 @@ async def _handle_stream_open_async(
             await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
         return
 
-    # Normal streaming
+    # Normal uni-directional streaming
     raw = json.loads(data) if data else {}
 
     if hasattr(lit_api, "on_request") and meta is not None:
@@ -715,6 +875,40 @@ async def _handle_stream_open_async(
         )
 
     active_streams[stream_id] = task
+
+
+async def _handle_stream_chunk_async(
+    lit_api: LitAPI,
+    stream_req: StreamRequest,
+    socket,
+    active_streams: dict[str, Any],
+    log: logging.Logger,
+):
+    """Handle a mid-stream chunk for bidirectional streaming (async loop)."""
+    stream_id = stream_req.stream_id
+    handler = active_streams.get(stream_id)
+    if handler is None or not isinstance(handler, BidiStreamHandler):
+        await socket.send(_make_stream_error(stream_id, "bidi stream not found").SerializeToString())
+        return
+
+    data = stream_req.chunk.data if stream_req.chunk else b""
+    raw = json.loads(data) if data else {}
+
+    try:
+        output = await _maybe_await(handler.on_chunk, raw)
+    except Exception as e:
+        log.error("bidi on_chunk failed for %s: %s", stream_id, e, exc_info=True)
+        await socket.send(_make_stream_error(stream_id, f"on_chunk failed: {e}").SerializeToString())
+        return
+
+    if output is not None:
+        try:
+            encoded = await _maybe_await(lit_api.encode_response, output) if hasattr(lit_api, "encode_response") else output
+            resp_bytes = json.dumps(encoded).encode()
+            await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
+        except Exception as e:
+            log.error("bidi encode failed for %s: %s", stream_id, e, exc_info=True)
+            await socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
 
 
 async def _consume_async_stream(
@@ -944,11 +1138,16 @@ def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log:
                 if action == "open":
                     _handle_stream_open(lit_api, stream_req, socket, active_streams, log)
                     continue  # chunks sent asynchronously
-                elif action == "cancel":
-                    _handle_stream_cancel(stream_req.stream_id, active_streams, log)
+                elif action == "chunk":
+                    _handle_stream_chunk(lit_api, stream_req, socket, active_streams, log, meta=None)
                     continue
                 elif action == "close":
-                    _handle_stream_cancel(stream_req.stream_id, active_streams, log)
+                    _handle_stream_close(stream_req.stream_id, active_streams, socket, log)
+                    metrics = _collect_metrics(lit_api)
+                    socket.send(_make_stream_done(stream_req.stream_id, metrics).SerializeToString())
+                    continue
+                elif action == "cancel":
+                    _handle_stream_close(stream_req.stream_id, active_streams, socket, log)
                     continue
                 else:
                     response = _make_error_response(uid, f"Unsupported stream action: {action}")

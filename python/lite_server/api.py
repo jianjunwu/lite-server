@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Tuple
+from typing import TYPE_CHECKING, Any, Iterator, List, Tuple
 
 import litserve as ls
 
@@ -35,6 +35,41 @@ class _MetricSpec:
 
     name: str
     metric_type: str  # "gauge" | "counter" | "histogram"
+
+
+class BidiStreamHandler:
+    """Handler for bidirectional streaming (e.g. ASR, real-time dialogue).
+
+    Override :meth:`on_open`, :meth:`on_chunk`, and :meth:`on_close`
+    to process client input and optionally produce output chunks.
+    """
+
+    def on_open(self, initial_data: Any) -> Any | None:
+        """Called with the initial payload when the stream opens.
+
+        Args:
+            initial_data: Decoded output of ``decode_request`` for the open
+                payload.
+
+        Returns:
+            A response chunk (sent immediately to the client), or None.
+        """
+        return None
+
+    def on_chunk(self, chunk: Any) -> Any | None:
+        """Called with each incoming chunk from the client.
+
+        Args:
+            chunk: Decoded chunk data (JSON dict from the client).
+
+        Returns:
+            A response chunk (sent to the client), or None if no output.
+        """
+        return None
+
+    def on_close(self) -> None:
+        """Called when the stream is closed by the client or server."""
+        pass
 
 
 class LitAPI(ls.LitAPI):
@@ -159,9 +194,9 @@ class LitAPI(ls.LitAPI):
     def on_request(self, request: Any, meta: RequestMeta) -> Any:
         """Called before decode_request.
 
-        Override to modify the raw request, perform auth checks, inject context,
-        or log request metadata.  Raising an exception rejects the request
-        and returns an Error response to the client.
+        Override to modify the raw request, perform auth checks, inject
+        context, or log request metadata.  Raising an exception rejects the
+        request and returns an Error response to the client.
 
         Args:
             request: The raw request payload (JSON dict from HTTP body).
@@ -211,7 +246,9 @@ class LitAPI(ls.LitAPI):
         """
         pass
 
-    def has_finished(self, uid: str, token: Any, generated_sequence: list[Any]) -> bool:
+    def has_finished(
+        self, uid: str, token: Any, generated_sequence: list[Any]
+    ) -> bool:
         """Check whether a sequence has finished generating.
 
         Returns True when the sequence should be removed from the active

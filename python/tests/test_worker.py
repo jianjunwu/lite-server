@@ -1818,3 +1818,1553 @@ class TestAsyncStreamingMetrics:
         asyncio.run(runner())
         # Buffer should be cleared after stream_done
         assert model._metric_values == []
+
+
+class TestBidiStreamingStandardLoop:
+    """Bidirectional streaming via standard (sync) worker loop."""
+
+    def _make_socket(self):
+        class MockSocket:
+            def __init__(self):
+                self._msgs = []
+                self._incoming = []
+
+            def send(self, data):
+                self._msgs.append(data)
+
+            def recv(self):
+                while not self._incoming:
+                    import time
+                    time.sleep(0.001)
+                return self._incoming.pop(0)
+
+            def inject(self, data):
+                self._incoming.append(data)
+
+        return MockSocket()
+
+    def test_bidi_open_chunk_close_with_responses(self):
+        import threading
+        from lite_server.worker.inference import run_standard_loop
+        from lite_server.proto import (
+            Request, StreamRequest, StreamOpen, StreamChunk,
+            StreamClose, Response,
+        )
+        from lite_server.api import BidiStreamHandler
+
+        class EchoHandler(BidiStreamHandler):
+            def __init__(self):
+                self.chunks = []
+
+            def on_open(self, initial_data):
+                return {"type": "open_ack", "data": initial_data}
+
+            def on_chunk(self, chunk):
+                self.chunks.append(chunk)
+                return {"type": "chunk_ack", "received": chunk}
+
+            def on_close(self):
+                self.chunks.append("closed")
+
+        class BidiModel:
+            def bidi_stream(self):
+                return EchoHandler()
+
+            def encode_response(self, output):
+                return output
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        # Open
+        socket.inject(Request(
+            uid="b1",
+            stream=StreamRequest(stream_id="bs1", open=StreamOpen(data=json.dumps({"hello": 1}).encode())),
+        ).SerializeToString())
+
+        # Chunk
+        socket.inject(Request(
+            uid="b2",
+            stream=StreamRequest(stream_id="bs1", chunk=StreamChunk(data=json.dumps({"msg": "a"}).encode())),
+        ).SerializeToString())
+
+        # Close
+        socket.inject(Request(
+            uid="b3",
+            stream=StreamRequest(stream_id="bs1", close=StreamClose()),
+        ).SerializeToString())
+
+        t = threading.Thread(target=run_standard_loop, args=(BidiModel(), socket, "test", log))
+        t.start()
+        import time
+        time.sleep(0.05)
+        socket.inject(b"")
+        t.join(timeout=0.1)
+
+        # Expect: open response + chunk response + stream_done (+ possible error from empty injection)
+        assert len(socket._msgs) >= 3, f"Expected at least 3 messages, got {len(socket._msgs)}"
+
+        resp1 = Response()
+        resp1.ParseFromString(socket._msgs[0])
+        assert resp1.stream.stream_id == "bs1"
+        data1 = json.loads(resp1.stream.chunk.data)
+        assert data1["type"] == "open_ack"
+        assert data1["data"] == {"hello": 1}
+
+        resp2 = Response()
+        resp2.ParseFromString(socket._msgs[1])
+        assert resp2.stream.stream_id == "bs1"
+        data2 = json.loads(resp2.stream.chunk.data)
+        assert data2["type"] == "chunk_ack"
+        assert data2["received"] == {"msg": "a"}
+
+        resp3 = Response()
+        resp3.ParseFromString(socket._msgs[2])
+        assert resp3.stream.stream_id == "bs1"
+        assert resp3.stream.done is not None
+
+    def test_bidi_chunk_when_stream_not_found(self):
+        import threading
+        from lite_server.worker.inference import run_standard_loop
+        from lite_server.proto import (
+            Request, StreamRequest, StreamChunk, Response,
+        )
+
+        class NoBidiModel:
+            def predict(self, x):
+                return x
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        socket.inject(Request(
+            uid="b1",
+            stream=StreamRequest(stream_id="nx", chunk=StreamChunk(data=b"{}")),
+        ).SerializeToString())
+
+        t = threading.Thread(target=run_standard_loop, args=(NoBidiModel(), socket, "test", log))
+        t.start()
+        import time
+        time.sleep(0.03)
+        socket.inject(b"")
+        t.join(timeout=0.1)
+
+        assert len(socket._msgs) >= 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.stream.error.message == "stream not found"
+
+    def test_bidi_metrics_collected_on_close(self):
+        import threading
+        from lite_server.worker.inference import run_standard_loop
+        from lite_server.proto import (
+            Request, StreamRequest, StreamOpen, StreamChunk,
+            StreamClose, Response,
+        )
+        from lite_server.api import BidiStreamHandler, _MetricSpec
+
+        class MetricHandler(BidiStreamHandler):
+            def on_open(self, initial_data):
+                return None
+
+            def on_chunk(self, chunk):
+                return None
+
+            def on_close(self):
+                pass
+
+        class MetricBidiModel:
+            def __init__(self):
+                self._metric_specs = []
+                self._metric_values = []
+
+            def bidi_stream(self):
+                return MetricHandler()
+
+            def encode_response(self, output):
+                return output
+
+            def register_metric(self, name, metric_type):
+                idx = len(self._metric_specs)
+                self._metric_specs.append(_MetricSpec(name, metric_type))
+                return idx
+
+            def report_metric(self, metric_id, value):
+                self._metric_values.append((metric_id, value))
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        model = MetricBidiModel()
+        gid = model.register_metric("g1", "gauge")
+        model.report_metric(gid, 42.0)
+
+        socket.inject(Request(
+            uid="bm1",
+            stream=StreamRequest(stream_id="bms1", open=StreamOpen(data=b"{}")),
+        ).SerializeToString())
+
+        socket.inject(Request(
+            uid="bm2",
+            stream=StreamRequest(stream_id="bms1", chunk=StreamChunk(data=b"{}")),
+        ).SerializeToString())
+
+        socket.inject(Request(
+            uid="bm3",
+            stream=StreamRequest(stream_id="bms1", close=StreamClose()),
+        ).SerializeToString())
+
+        t = threading.Thread(target=run_standard_loop, args=(model, socket, "test", log))
+        t.start()
+        import time
+        time.sleep(0.05)
+        socket.inject(b"")
+        t.join(timeout=0.1)
+
+        # Find the StreamDone message (may not be last due to empty-injection error)
+        done_resp = None
+        for msg in socket._msgs:
+            r = Response()
+            r.ParseFromString(msg)
+            if r.stream.done is not None:
+                done_resp = r
+                break
+        assert done_resp is not None, "StreamDone not found"
+        assert len(done_resp.stream.done.metrics.gauges) == 1
+        assert done_resp.stream.done.metrics.gauges[0].value == 42.0
+        assert model._metric_values == []
+
+
+class TestBidiStreamingAsyncLoop:
+    """Bidirectional streaming via async worker loop."""
+
+    def _make_socket(self):
+        class MockSocket:
+            def __init__(self):
+                self._msgs = []
+                self._incoming = []
+
+            async def send(self, data):
+                self._msgs.append(data)
+
+            async def recv(self):
+                while not self._incoming:
+                    import asyncio
+                    await asyncio.sleep(0.001)
+                return self._incoming.pop(0)
+
+            def inject(self, data):
+                self._incoming.append(data)
+
+        return MockSocket()
+
+    def test_async_bidi_open_chunk_close(self):
+        import asyncio
+        from lite_server.worker.inference import run_async_loop
+        from lite_server.proto import (
+            Request, StreamRequest, StreamOpen, StreamChunk,
+            StreamClose, Response,
+        )
+        from lite_server.api import BidiStreamHandler
+
+        class AsyncBidiHandler(BidiStreamHandler):
+            def __init__(self):
+                self.chunks = []
+
+            def on_open(self, initial_data):
+                return {"type": "open_ack", "data": initial_data}
+
+            def on_chunk(self, chunk):
+                self.chunks.append(chunk)
+                return {"type": "chunk_ack", "received": chunk}
+
+            def on_close(self):
+                self.chunks.append("closed")
+
+        class AsyncBidiModel:
+            async def predict(self, x):
+                return x
+
+            def bidi_stream(self):
+                return AsyncBidiHandler()
+
+            def encode_response(self, output):
+                return output
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        socket.inject(Request(
+            uid="ab1",
+            stream=StreamRequest(stream_id="abs1", open=StreamOpen(data=json.dumps({"hello": 1}).encode())),
+        ).SerializeToString())
+
+        socket.inject(Request(
+            uid="ab2",
+            stream=StreamRequest(stream_id="abs1", chunk=StreamChunk(data=json.dumps({"msg": "a"}).encode())),
+        ).SerializeToString())
+
+        socket.inject(Request(
+            uid="ab3",
+            stream=StreamRequest(stream_id="abs1", close=StreamClose()),
+        ).SerializeToString())
+
+        async def runner():
+            task = asyncio.create_task(run_async_loop(AsyncBidiModel(), socket, "test", log))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(runner())
+
+        # open_ack + chunk_ack + stream_done = at least 3 messages
+        assert len(socket._msgs) >= 3, f"Expected at least 3 messages, got {len(socket._msgs)}"
+
+        resp1 = Response()
+        resp1.ParseFromString(socket._msgs[0])
+        data1 = json.loads(resp1.stream.chunk.data)
+        assert data1["type"] == "open_ack"
+
+        resp2 = Response()
+        resp2.ParseFromString(socket._msgs[1])
+        data2 = json.loads(resp2.stream.chunk.data)
+        assert data2["type"] == "chunk_ack"
+
+        resp3 = Response()
+        resp3.ParseFromString(socket._msgs[2])
+        assert resp3.stream.done is not None
+
+    def test_async_bidi_chunk_when_stream_not_found(self):
+        import asyncio
+        from lite_server.worker.inference import run_async_loop
+        from lite_server.proto import (
+            Request, StreamRequest, StreamChunk, Response,
+        )
+
+        class NoBidiModel:
+            async def predict(self, x):
+                return x
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        socket.inject(Request(
+            uid="ab1",
+            stream=StreamRequest(stream_id="nx", chunk=StreamChunk(data=b"{}")),
+        ).SerializeToString())
+
+        async def runner():
+            task = asyncio.create_task(run_async_loop(NoBidiModel(), socket, "test", log))
+            await asyncio.sleep(0.03)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(runner())
+
+        assert len(socket._msgs) >= 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.stream.error.message == "bidi stream not found"
+
+    def test_async_bidi_cancel_calls_on_close(self):
+        import asyncio
+        from lite_server.worker.inference import run_async_loop
+        from lite_server.proto import (
+            Request, StreamRequest, StreamOpen, StreamCancel, Response,
+        )
+        from lite_server.api import BidiStreamHandler
+
+        class TrackHandler(BidiStreamHandler):
+            def __init__(self):
+                self.closed = False
+
+            def on_open(self, initial_data):
+                return None
+
+            def on_chunk(self, chunk):
+                return None
+
+            def on_close(self):
+                self.closed = True
+
+        class TrackModel:
+            async def predict(self, x):
+                return x
+
+            def bidi_stream(self):
+                return TrackHandler()
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        model = TrackModel()
+        handler = None
+
+        original_bidi_stream = model.bidi_stream
+
+        def capture_bidi_stream():
+            nonlocal handler
+            handler = original_bidi_stream()
+            return handler
+
+        model.bidi_stream = capture_bidi_stream
+
+        socket.inject(Request(
+            uid="ac1",
+            stream=StreamRequest(stream_id="acs1", open=StreamOpen(data=b"{}")),
+        ).SerializeToString())
+
+        socket.inject(Request(
+            uid="ac2",
+            stream=StreamRequest(stream_id="acs1", cancel=StreamCancel()),
+        ).SerializeToString())
+
+        async def runner():
+            task = asyncio.create_task(run_async_loop(model, socket, "test", log))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(runner())
+
+        assert handler is not None
+        assert handler.closed is True
+
+
+class TestStandardLoopStreaming:
+    """Uni-directional streaming via standard (sync) worker loop."""
+
+    def _make_socket(self):
+        class MockSocket:
+            def __init__(self):
+                self._msgs = []
+                self._incoming = []
+
+            def send(self, data):
+                self._msgs.append(data)
+
+            def recv(self):
+                while not self._incoming:
+                    import time
+                    time.sleep(0.001)
+                return self._incoming.pop(0)
+
+            def inject(self, data):
+                self._incoming.append(data)
+
+        return MockSocket()
+
+    def test_standard_stream_predict(self):
+        import threading
+        from lite_server.worker.inference import run_standard_loop
+        from lite_server.proto import (
+            Request, StreamRequest, StreamOpen, Response,
+        )
+
+        class StreamModel:
+            def stream_predict(self, x):
+                for i in range(3):
+                    yield {"token": i, "input": x.get("input")}
+
+            def encode_response(self, output):
+                return output
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        socket.inject(Request(
+            uid="s1",
+            stream=StreamRequest(
+                stream_id="ss1",
+                open=StreamOpen(data=json.dumps({"input": 42}).encode()),
+            ),
+        ).SerializeToString())
+
+        t = threading.Thread(target=run_standard_loop, args=(StreamModel(), socket, "test", log))
+        t.start()
+        import time
+        time.sleep(0.05)
+        socket.inject(b"")
+        t.join(timeout=0.1)
+
+        # 3 chunks + done (+ possible error from empty injection)
+        assert len(socket._msgs) >= 4
+        for i in range(3):
+            resp = Response()
+            resp.ParseFromString(socket._msgs[i])
+            assert resp.stream.stream_id == "ss1"
+            data = json.loads(resp.stream.chunk.data)
+            assert data["token"] == i
+            assert data["input"] == 42
+
+        done_resp = Response()
+        done_resp.ParseFromString(socket._msgs[3])
+        assert done_resp.stream.done is not None
+
+    def test_standard_stream_fallback_no_stream_predict(self):
+        import threading
+        from lite_server.worker.inference import run_standard_loop
+        from lite_server.proto import (
+            Request, StreamRequest, StreamOpen, Response,
+        )
+
+        class NoStreamModel:
+            def predict(self, x):
+                return {"result": x["input"] * 2}
+
+            def encode_response(self, output):
+                return output
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        socket.inject(Request(
+            uid="s2",
+            stream=StreamRequest(
+                stream_id="ss2",
+                open=StreamOpen(data=json.dumps({"input": 5}).encode()),
+            ),
+        ).SerializeToString())
+
+        t = threading.Thread(target=run_standard_loop, args=(NoStreamModel(), socket, "test", log))
+        t.start()
+        import time
+        time.sleep(0.03)
+        socket.inject(b"")
+        t.join(timeout=0.1)
+
+        # Expect: 1 final chunk + done (+ possible error)
+        assert len(socket._msgs) >= 2
+        resp1 = Response()
+        resp1.ParseFromString(socket._msgs[0])
+        assert resp1.stream.chunk.is_final is True
+        assert json.loads(resp1.stream.chunk.data)["result"] == 10
+
+        resp2 = Response()
+        resp2.ParseFromString(socket._msgs[1])
+        assert resp2.stream.done is not None
+
+    def test_standard_stream_error_in_stream_predict(self):
+        import threading
+        from lite_server.worker.inference import run_standard_loop
+        from lite_server.proto import (
+            Request, StreamRequest, StreamOpen, Response,
+        )
+
+        class BadStreamModel:
+            def stream_predict(self, x):
+                yield {"token": 0}
+                raise RuntimeError("mid-stream boom")
+
+            def encode_response(self, output):
+                return output
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        socket.inject(Request(
+            uid="s3",
+            stream=StreamRequest(
+                stream_id="ss3",
+                open=StreamOpen(data=json.dumps({"input": 1}).encode()),
+            ),
+        ).SerializeToString())
+
+        t = threading.Thread(target=run_standard_loop, args=(BadStreamModel(), socket, "test", log))
+        t.start()
+        import time
+        time.sleep(0.05)
+        socket.inject(b"")
+        t.join(timeout=0.1)
+
+        assert len(socket._msgs) >= 2
+        resp1 = Response()
+        resp1.ParseFromString(socket._msgs[0])
+        assert json.loads(resp1.stream.chunk.data)["token"] == 0
+
+        resp2 = Response()
+        resp2.ParseFromString(socket._msgs[1])
+        assert resp2.stream.error.message == "mid-stream boom"
+
+    def test_standard_stream_cancel(self):
+        import threading
+        from lite_server.worker.inference import run_standard_loop
+        from lite_server.proto import (
+            Request, StreamRequest, StreamOpen, StreamCancel, Response,
+        )
+
+        class SlowStreamModel:
+            def stream_predict(self, x):
+                import time
+                for i in range(100):
+                    time.sleep(0.01)
+                    yield {"token": i}
+
+            def encode_response(self, output):
+                return output
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        socket.inject(Request(
+            uid="s4",
+            stream=StreamRequest(
+                stream_id="ss4",
+                open=StreamOpen(data=json.dumps({"input": 1}).encode()),
+            ),
+        ).SerializeToString())
+
+        # Cancel after a short delay
+        import time
+        time.sleep(0.02)
+        socket.inject(Request(
+            uid="s5",
+            stream=StreamRequest(stream_id="ss4", cancel=StreamCancel()),
+        ).SerializeToString())
+
+        t = threading.Thread(target=run_standard_loop, args=(SlowStreamModel(), socket, "test", log))
+        t.start()
+        time.sleep(0.05)
+        socket.inject(b"")
+        t.join(timeout=0.1)
+
+        # Should have received at most a few chunks before cancel
+        stream_msgs = []
+        for msg in socket._msgs:
+            r = Response()
+            r.ParseFromString(msg)
+            if r.stream.stream_id == "ss4":
+                stream_msgs.append(r)
+
+        # Cancel should have closed the generator; no done message
+        assert all(m.stream.error.message == "" or m.stream.chunk.data for m in stream_msgs)
+
+    def test_standard_stream_with_hooks(self):
+        import threading
+        from lite_server.worker.inference import run_standard_loop
+        from lite_server.proto import (
+            Request, StreamRequest, StreamOpen, Response,
+        )
+
+        class HookedStreamModel:
+            def on_request(self, req, meta):
+                req["hooked"] = True
+                return req
+
+            def decode_request(self, req):
+                return req
+
+            def stream_predict(self, x):
+                yield {"token": 0, "hooked": x.get("hooked")}
+
+            def encode_response(self, output):
+                return output
+
+            def on_response(self, resp, meta):
+                resp["sync_hook"] = True
+                return resp
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        from lite_server.proto import RequestMeta as ProtoMeta
+        socket.inject(Request(
+            uid="s5",
+            stream=StreamRequest(
+                stream_id="ss5",
+                open=StreamOpen(
+                    data=json.dumps({"input": 1}).encode(),
+                    meta=ProtoMeta(route="/stream", headers={}, client_ip="", request_id="", timestamp_ns=0),
+                ),
+            ),
+        ).SerializeToString())
+
+        t = threading.Thread(target=run_standard_loop, args=(HookedStreamModel(), socket, "test", log))
+        t.start()
+        import time
+        time.sleep(0.03)
+        socket.inject(b"")
+        t.join(timeout=0.1)
+
+        assert len(socket._msgs) >= 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        data = json.loads(resp.stream.chunk.data)
+        assert data["hooked"] is True
+        assert data["sync_hook"] is True
+
+
+class TestStandardLoopBidiErrors:
+    """Bidirectional streaming error handling (standard loop)."""
+
+    def _make_socket(self):
+        class MockSocket:
+            def __init__(self):
+                self._msgs = []
+                self._incoming = []
+
+            def send(self, data):
+                self._msgs.append(data)
+
+            def recv(self):
+                while not self._incoming:
+                    import time
+                    time.sleep(0.001)
+                return self._incoming.pop(0)
+
+            def inject(self, data):
+                self._incoming.append(data)
+
+        return MockSocket()
+
+    def test_standard_bidi_error_in_on_open(self):
+        import threading
+        from lite_server.worker.inference import run_standard_loop
+        from lite_server.proto import (
+            Request, StreamRequest, StreamOpen, Response,
+        )
+        from lite_server.api import BidiStreamHandler
+
+        class BadOpenHandler(BidiStreamHandler):
+            def on_open(self, initial_data):
+                raise RuntimeError("open failed")
+
+        class BadOpenModel:
+            def bidi_stream(self):
+                return BadOpenHandler()
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        socket.inject(Request(
+            uid="be1",
+            stream=StreamRequest(
+                stream_id="be1",
+                open=StreamOpen(data=b"{}"),
+            ),
+        ).SerializeToString())
+
+        t = threading.Thread(target=run_standard_loop, args=(BadOpenModel(), socket, "test", log))
+        t.start()
+        import time
+        time.sleep(0.03)
+        socket.inject(b"")
+        t.join(timeout=0.1)
+
+        assert len(socket._msgs) >= 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.stream.error.message == "on_open failed: open failed"
+
+    def test_standard_bidi_error_in_on_chunk(self):
+        import threading
+        from lite_server.worker.inference import run_standard_loop
+        from lite_server.proto import (
+            Request, StreamRequest, StreamOpen, StreamChunk, Response,
+        )
+        from lite_server.api import BidiStreamHandler
+
+        class BadChunkHandler(BidiStreamHandler):
+            def on_open(self, initial_data):
+                return None
+
+            def on_chunk(self, chunk):
+                raise RuntimeError("chunk failed")
+
+        class BadChunkModel:
+            def bidi_stream(self):
+                return BadChunkHandler()
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        socket.inject(Request(
+            uid="be2",
+            stream=StreamRequest(
+                stream_id="be2",
+                open=StreamOpen(data=b"{}"),
+            ),
+        ).SerializeToString())
+
+        socket.inject(Request(
+            uid="be3",
+            stream=StreamRequest(
+                stream_id="be2",
+                chunk=StreamChunk(data=b"{}"),
+            ),
+        ).SerializeToString())
+
+        t = threading.Thread(target=run_standard_loop, args=(BadChunkModel(), socket, "test", log))
+        t.start()
+        import time
+        time.sleep(0.03)
+        socket.inject(b"")
+        t.join(timeout=0.1)
+
+        assert len(socket._msgs) >= 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.stream.error.message == "on_chunk failed: chunk failed"
+
+    def test_standard_bidi_open_no_response(self):
+        import threading
+        from lite_server.worker.inference import run_standard_loop
+        from lite_server.proto import (
+            Request, StreamRequest, StreamOpen, StreamChunk,
+            StreamClose, Response,
+        )
+        from lite_server.api import BidiStreamHandler
+
+        class SilentHandler(BidiStreamHandler):
+            def on_open(self, initial_data):
+                return None
+
+            def on_chunk(self, chunk):
+                return None
+
+            def on_close(self):
+                pass
+
+        class SilentModel:
+            def bidi_stream(self):
+                return SilentHandler()
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        socket.inject(Request(
+            uid="be4",
+            stream=StreamRequest(
+                stream_id="be4",
+                open=StreamOpen(data=b"{}"),
+            ),
+        ).SerializeToString())
+
+        socket.inject(Request(
+            uid="be5",
+            stream=StreamRequest(
+                stream_id="be4",
+                chunk=StreamChunk(data=b"{}"),
+            ),
+        ).SerializeToString())
+
+        socket.inject(Request(
+            uid="be6",
+            stream=StreamRequest(stream_id="be4", close=StreamClose()),
+        ).SerializeToString())
+
+        t = threading.Thread(target=run_standard_loop, args=(SilentModel(), socket, "test", log))
+        t.start()
+        import time
+        time.sleep(0.03)
+        socket.inject(b"")
+        t.join(timeout=0.1)
+
+        # No chunk responses (on_open/on_chunk returned None), just StreamDone
+        done_resp = None
+        for msg in socket._msgs:
+            r = Response()
+            r.ParseFromString(msg)
+            if r.stream.done is not None:
+                done_resp = r
+                break
+        assert done_resp is not None
+
+
+class TestAsyncLoopStreamingHooks:
+    """Async loop streaming with on_request/on_response hooks."""
+
+    def _make_socket(self):
+        class MockSocket:
+            def __init__(self):
+                self._msgs = []
+                self._incoming = []
+
+            async def send(self, data):
+                self._msgs.append(data)
+
+            async def recv(self):
+                while not self._incoming:
+                    import asyncio
+                    await asyncio.sleep(0.001)
+                return self._incoming.pop(0)
+
+            def inject(self, data):
+                self._incoming.append(data)
+
+        return MockSocket()
+
+    def test_async_stream_with_hooks(self):
+        import asyncio
+        from lite_server.worker.inference import run_async_loop
+        from lite_server.proto import (
+            Request, StreamRequest, StreamOpen, Response,
+        )
+
+        class HookedStreamModel:
+            async def on_request(self, req, meta):
+                req["hooked"] = True
+                return req
+
+            async def decode_request(self, req):
+                return req
+
+            async def stream_predict(self, x):
+                yield {"token": 0, "hooked": x.get("hooked")}
+
+            async def encode_response(self, output):
+                return output
+
+            async def on_response(self, resp, meta):
+                resp["async_hook"] = True
+                return resp
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        from lite_server.proto import RequestMeta as ProtoMeta
+        socket.inject(Request(
+            uid="ah1",
+            stream=StreamRequest(
+                stream_id="ahs1",
+                open=StreamOpen(
+                    data=json.dumps({"input": 1}).encode(),
+                    meta=ProtoMeta(route="/stream", headers={}, client_ip="", request_id="", timestamp_ns=0),
+                ),
+            ),
+        ).SerializeToString())
+
+        async def runner():
+            task = asyncio.create_task(run_async_loop(HookedStreamModel(), socket, "test", log))
+            await asyncio.sleep(0.03)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(runner())
+
+        assert len(socket._msgs) >= 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        data = json.loads(resp.stream.chunk.data)
+        assert data["hooked"] is True
+        assert data["async_hook"] is True
+
+
+class TestAsyncLoopBidiErrors:
+    """Bidirectional streaming error handling (async loop)."""
+
+    def _make_socket(self):
+        class MockSocket:
+            def __init__(self):
+                self._msgs = []
+                self._incoming = []
+
+            async def send(self, data):
+                self._msgs.append(data)
+
+            async def recv(self):
+                while not self._incoming:
+                    import asyncio
+                    await asyncio.sleep(0.001)
+                return self._incoming.pop(0)
+
+            def inject(self, data):
+                self._incoming.append(data)
+
+        return MockSocket()
+
+    def test_async_bidi_error_in_on_open(self):
+        import asyncio
+        from lite_server.worker.inference import run_async_loop
+        from lite_server.proto import (
+            Request, StreamRequest, StreamOpen, Response,
+        )
+        from lite_server.api import BidiStreamHandler
+
+        class BadOpenHandler(BidiStreamHandler):
+            def on_open(self, initial_data):
+                raise RuntimeError("open failed")
+
+        class BadOpenModel:
+            async def predict(self, x):
+                return x
+
+            def bidi_stream(self):
+                return BadOpenHandler()
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        socket.inject(Request(
+            uid="ae1",
+            stream=StreamRequest(
+                stream_id="ae1",
+                open=StreamOpen(data=b"{}"),
+            ),
+        ).SerializeToString())
+
+        async def runner():
+            task = asyncio.create_task(run_async_loop(BadOpenModel(), socket, "test", log))
+            await asyncio.sleep(0.03)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(runner())
+
+        assert len(socket._msgs) >= 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.stream.error.message == "on_open failed: open failed"
+
+    def test_async_bidi_error_in_on_chunk(self):
+        import asyncio
+        from lite_server.worker.inference import run_async_loop
+        from lite_server.proto import (
+            Request, StreamRequest, StreamOpen, StreamChunk, Response,
+        )
+        from lite_server.api import BidiStreamHandler
+
+        class BadChunkHandler(BidiStreamHandler):
+            def on_open(self, initial_data):
+                return None
+
+            def on_chunk(self, chunk):
+                raise RuntimeError("chunk failed")
+
+        class BadChunkModel:
+            async def predict(self, x):
+                return x
+
+            def bidi_stream(self):
+                return BadChunkHandler()
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        socket.inject(Request(
+            uid="ae2",
+            stream=StreamRequest(
+                stream_id="ae2",
+                open=StreamOpen(data=b"{}"),
+            ),
+        ).SerializeToString())
+
+        socket.inject(Request(
+            uid="ae3",
+            stream=StreamRequest(
+                stream_id="ae2",
+                chunk=StreamChunk(data=b"{}"),
+            ),
+        ).SerializeToString())
+
+        async def runner():
+            task = asyncio.create_task(run_async_loop(BadChunkModel(), socket, "test", log))
+            await asyncio.sleep(0.03)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(runner())
+
+        assert len(socket._msgs) >= 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.stream.error.message == "on_chunk failed: chunk failed"
+
+    def test_async_bidi_metrics_collected_on_close(self):
+        import asyncio
+        from lite_server.worker.inference import run_async_loop
+        from lite_server.proto import (
+            Request, StreamRequest, StreamOpen, StreamChunk,
+            StreamClose, Response,
+        )
+        from lite_server.api import BidiStreamHandler, _MetricSpec
+
+        class MetricHandler(BidiStreamHandler):
+            def on_open(self, initial_data):
+                return None
+
+            def on_chunk(self, chunk):
+                return None
+
+            def on_close(self):
+                pass
+
+        class MetricBidiModel:
+            def __init__(self):
+                self._metric_specs = []
+                self._metric_values = []
+
+            async def predict(self, x):
+                return x
+
+            def bidi_stream(self):
+                return MetricHandler()
+
+            def encode_response(self, output):
+                return output
+
+            def register_metric(self, name, metric_type):
+                idx = len(self._metric_specs)
+                self._metric_specs.append(_MetricSpec(name, metric_type))
+                return idx
+
+            def report_metric(self, metric_id, value):
+                self._metric_values.append((metric_id, value))
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        model = MetricBidiModel()
+        cid = model.register_metric("c1", "counter")
+        model.report_metric(cid, 1.0)
+
+        socket.inject(Request(
+            uid="am1",
+            stream=StreamRequest(
+                stream_id="ams1",
+                open=StreamOpen(data=b"{}"),
+            ),
+        ).SerializeToString())
+
+        socket.inject(Request(
+            uid="am2",
+            stream=StreamRequest(
+                stream_id="ams1",
+                chunk=StreamChunk(data=b"{}"),
+            ),
+        ).SerializeToString())
+
+        socket.inject(Request(
+            uid="am3",
+            stream=StreamRequest(stream_id="ams1", close=StreamClose()),
+        ).SerializeToString())
+
+        async def runner():
+            task = asyncio.create_task(run_async_loop(model, socket, "test", log))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(runner())
+
+        done_resp = None
+        for msg in socket._msgs:
+            r = Response()
+            r.ParseFromString(msg)
+            if r.stream.done is not None:
+                done_resp = r
+                break
+        assert done_resp is not None
+        assert len(done_resp.stream.done.metrics.counters) == 1
+        assert done_resp.stream.done.metrics.counters[0].value == 1.0
+        assert model._metric_values == []
+
+    def test_async_bidi_open_no_response(self):
+        import asyncio
+        from lite_server.worker.inference import run_async_loop
+        from lite_server.proto import (
+            Request, StreamRequest, StreamOpen, StreamClose, Response,
+        )
+        from lite_server.api import BidiStreamHandler
+
+        class SilentHandler(BidiStreamHandler):
+            def on_open(self, initial_data):
+                return None
+
+            def on_close(self):
+                pass
+
+        class SilentModel:
+            async def predict(self, x):
+                return x
+
+            def bidi_stream(self):
+                return SilentHandler()
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        socket.inject(Request(
+            uid="an1",
+            stream=StreamRequest(
+                stream_id="ans1",
+                open=StreamOpen(data=b"{}"),
+            ),
+        ).SerializeToString())
+
+        socket.inject(Request(
+            uid="an2",
+            stream=StreamRequest(stream_id="ans1", close=StreamClose()),
+        ).SerializeToString())
+
+        async def runner():
+            task = asyncio.create_task(run_async_loop(SilentModel(), socket, "test", log))
+            await asyncio.sleep(0.03)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(runner())
+
+        # Only StreamDone, no chunks
+        assert len(socket._msgs) >= 1
+        done_resp = Response()
+        done_resp.ParseFromString(socket._msgs[0])
+        assert done_resp.stream.done is not None
+
+
+class TestStandardLoopNonStreaming:
+    """Non-streaming scenarios via standard (sync) worker loop."""
+
+    def _make_socket(self):
+        class MockSocket:
+            def __init__(self):
+                self._msgs = []
+                self._incoming = []
+
+            def send(self, data):
+                self._msgs.append(data)
+
+            def recv(self):
+                while not self._incoming:
+                    import time
+                    time.sleep(0.001)
+                return self._incoming.pop(0)
+
+            def inject(self, data):
+                self._incoming.append(data)
+
+        return MockSocket()
+
+    def test_standard_health_check_empty_data(self):
+        import threading
+        from lite_server.worker.inference import run_standard_loop
+        from lite_server.proto import Request, SingleRequest, Response
+
+        class StrictAPI:
+            def predict(self, x):
+                # Would fail if called
+                return {"output": x["required_field"]}
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        socket.inject(Request(
+            uid="hc1",
+            single=SingleRequest(data=b""),
+        ).SerializeToString())
+
+        t = threading.Thread(target=run_standard_loop, args=(StrictAPI(), socket, "test", log))
+        t.start()
+        import time
+        time.sleep(0.02)
+        socket.inject(b"")
+        t.join(timeout=0.1)
+
+        assert len(socket._msgs) >= 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.single.status.code == "Ok"
+        assert resp.single.data == b"{}"
+
+    def test_standard_single_error_in_predict(self):
+        import threading
+        from lite_server.worker.inference import run_standard_loop
+        from lite_server.proto import Request, SingleRequest, Response
+
+        class BadAPI:
+            def predict(self, x):
+                raise RuntimeError("predict boom")
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        socket.inject(Request(
+            uid="err1",
+            single=SingleRequest(data=json.dumps({"input": 1}).encode()),
+        ).SerializeToString())
+
+        t = threading.Thread(target=run_standard_loop, args=(BadAPI(), socket, "test", log))
+        t.start()
+        import time
+        time.sleep(0.02)
+        socket.inject(b"")
+        t.join(timeout=0.1)
+
+        assert len(socket._msgs) >= 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.single.status.code == "Error"
+        assert "predict boom" in resp.single.status.message
+
+    def test_standard_batch_partial_failure(self):
+        import threading
+        from lite_server.worker.inference import run_standard_loop
+        from lite_server.proto import (
+            Request, BatchRequest, BatchItem, Response,
+        )
+
+        class PartialAPI:
+            def decode_request(self, req):
+                if req.get("bad"):
+                    raise ValueError("bad input")
+                return req
+
+            def predict(self, x):
+                return {"result": x["input"] + 1}
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        socket.inject(Request(
+            uid="batch-p1",
+            batch=BatchRequest(items=[
+                BatchItem(uid="ok", data=json.dumps({"input": 1}).encode()),
+                BatchItem(uid="fail", data=json.dumps({"bad": True}).encode()),
+            ]),
+        ).SerializeToString())
+
+        t = threading.Thread(target=run_standard_loop, args=(PartialAPI(), socket, "test", log))
+        t.start()
+        import time
+        time.sleep(0.03)
+        socket.inject(b"")
+        t.join(timeout=0.1)
+
+        assert len(socket._msgs) >= 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert len(resp.batch.items) == 2
+        assert resp.batch.items[0].status.code == "Ok"
+        assert json.loads(resp.batch.items[0].data)["result"] == 2
+        assert resp.batch.items[1].status.code == "Error"
+
+
+class TestAsyncLoopNonStreaming:
+    """Non-streaming edge cases via async worker loop."""
+
+    def _make_socket(self):
+        class MockSocket:
+            def __init__(self):
+                self._msgs = []
+                self._incoming = []
+
+            async def send(self, data):
+                self._msgs.append(data)
+
+            async def recv(self):
+                while not self._incoming:
+                    import asyncio
+                    await asyncio.sleep(0.001)
+                return self._incoming.pop(0)
+
+            def inject(self, data):
+                self._incoming.append(data)
+
+        return MockSocket()
+
+    def test_async_single_request_error_in_predict(self):
+        import asyncio
+        from lite_server.worker.inference import run_async_loop
+        from lite_server.proto import Request, SingleRequest, Response
+
+        class BadAPI:
+            async def predict(self, x):
+                raise RuntimeError("async predict boom")
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        socket.inject(Request(
+            uid="aerr1",
+            single=SingleRequest(data=json.dumps({"input": 1}).encode()),
+        ).SerializeToString())
+
+        async def runner():
+            task = asyncio.create_task(run_async_loop(BadAPI(), socket, "test", log))
+            await asyncio.sleep(0.03)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(runner())
+
+        assert len(socket._msgs) >= 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.single.status.code == "Error"
+        assert "async predict boom" in resp.single.status.message
+
+    def test_async_batch_partial_failure(self):
+        import asyncio
+        from lite_server.worker.inference import run_async_loop
+        from lite_server.proto import (
+            Request, BatchRequest, BatchItem, Response,
+        )
+
+        class PartialAPI:
+            async def decode_request(self, req):
+                if req.get("bad"):
+                    raise ValueError("bad input")
+                return req
+
+            async def predict(self, x):
+                return {"result": x["input"] + 1}
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        socket.inject(Request(
+            uid="abp1",
+            batch=BatchRequest(items=[
+                BatchItem(uid="ok", data=json.dumps({"input": 1}).encode()),
+                BatchItem(uid="fail", data=json.dumps({"bad": True}).encode()),
+            ]),
+        ).SerializeToString())
+
+        async def runner():
+            task = asyncio.create_task(run_async_loop(PartialAPI(), socket, "test", log))
+            await asyncio.sleep(0.03)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(runner())
+
+        assert len(socket._msgs) >= 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert len(resp.batch.items) == 2
+        assert resp.batch.items[0].status.code == "Ok"
+        assert json.loads(resp.batch.items[0].data)["result"] == 2
+        assert resp.batch.items[1].status.code == "Error"
+
+    def test_async_health_check_empty_data(self):
+        import asyncio
+        from lite_server.worker.inference import run_async_loop
+        from lite_server.proto import Request, SingleRequest, Response
+
+        class StrictAPI:
+            async def predict(self, x):
+                return {"output": x["required_field"]}
+
+            _metric_specs = []
+            _metric_values = []
+
+        socket = self._make_socket()
+        log = logging.getLogger("test")
+
+        socket.inject(Request(
+            uid="ahc1",
+            single=SingleRequest(data=b""),
+        ).SerializeToString())
+
+        async def runner():
+            task = asyncio.create_task(run_async_loop(StrictAPI(), socket, "test", log))
+            await asyncio.sleep(0.03)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(runner())
+
+        assert len(socket._msgs) >= 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.single.status.code == "Ok"
+        assert resp.single.data == b"{}"
