@@ -7,6 +7,7 @@ import json
 import logging
 import threading
 from unittest.mock import MagicMock
+from lite_server.worker.inference import _StreamTracker
 
 import pytest
 
@@ -134,7 +135,7 @@ class TestHandleStreamOpenFallback:
             stream_id="s-fallback",
             open=StreamOpen(data=json.dumps({"val": 4}).encode()),
         )
-        inference._handle_stream_open(PlainAPI(), stream_req, sock, {}, log)
+        inference._handle_stream_open(PlainAPI(), stream_req, sock, _StreamTracker(), log)
 
         # Wait for done signal — deterministic, no sleep race
         done_resps = sock.wait_for(
@@ -162,7 +163,7 @@ class TestHandleStreamOpenFallback:
             stream_id="s-empty",
             open=StreamOpen(data=b""),
         )
-        inference._handle_stream_open(EchoAPI(), stream_req, sock, {}, log)
+        inference._handle_stream_open(EchoAPI(), stream_req, sock, _StreamTracker(), log)
 
         done_resps = sock.wait_for(
             lambda r: r.HasField("stream") and r.stream.HasField("done") and r.stream.stream_id == "s-empty"
@@ -183,7 +184,7 @@ class TestHandleStreamOpenFallback:
             stream_id="s-err",
             open=StreamOpen(data=b'{"x": 1}'),
         )
-        inference._handle_stream_open(BadAPI(), stream_req, sock, {}, log)
+        inference._handle_stream_open(BadAPI(), stream_req, sock, _StreamTracker(), log)
 
         err_resps = sock.wait_for(
             lambda r: r.HasField("stream") and r.stream.HasField("error") and r.stream.stream_id == "s-err"
@@ -210,7 +211,7 @@ class TestHandleStreamOpen:
             stream_id="s-ok",
             open=StreamOpen(data=json.dumps({"prompt": "go"}).encode()),
         )
-        inference._handle_stream_open(StreamAPI(), stream_req, sock, {}, log)
+        inference._handle_stream_open(StreamAPI(), stream_req, sock, _StreamTracker(), log)
 
         done_resps = sock.wait_for(
             lambda r: r.HasField("stream") and r.stream.HasField("done") and r.stream.stream_id == "s-ok"
@@ -232,18 +233,19 @@ class TestHandleStreamOpen:
                 yield "b"
 
         sock = SyncSocket()
-        active = {}
+        active = _StreamTracker()
         stream_req = StreamRequest(
             stream_id="s-reg",
             open=StreamOpen(data=b'{}'),
         )
         inference._handle_stream_open(StreamAPI(), stream_req, sock, active, log)
-        assert "s-reg" in active
-
-        # Wait for completion so thread doesn't leak
+        # Stream is registered immediately, then consumed by background thread.
+        # Wait for done signal to verify the stream was processed.
         sock.wait_for(
             lambda r: r.HasField("stream") and r.stream.HasField("done") and r.stream.stream_id == "s-reg"
         )
+        # Verify stream was cleaned up after completion
+        assert "s-reg" not in active._streams
 
     def test_stream_predict_error_sends_stream_error(self):
         class ErrorStreamAPI:
@@ -256,7 +258,7 @@ class TestHandleStreamOpen:
             stream_id="s-mid-err",
             open=StreamOpen(data=b'{}'),
         )
-        inference._handle_stream_open(ErrorStreamAPI(), stream_req, sock, {}, log)
+        inference._handle_stream_open(ErrorStreamAPI(), stream_req, sock, _StreamTracker(), log)
 
         err_resps = sock.wait_for(
             lambda r: r.HasField("stream") and r.stream.HasField("error") and r.stream.stream_id == "s-mid-err"
@@ -282,7 +284,7 @@ class TestHandleStreamOpen:
             stream_id="s-init-err",
             open=StreamOpen(data=b'{}'),
         )
-        inference._handle_stream_open(InitFailAPI(), stream_req, sock, {}, log)
+        inference._handle_stream_open(InitFailAPI(), stream_req, sock, _StreamTracker(), log)
 
         err_resps = sock.wait_for(
             lambda r: r.HasField("stream") and r.stream.HasField("error") and r.stream.stream_id == "s-init-err"
@@ -309,7 +311,7 @@ class TestHandleStreamOpenWithHooks:
             stream_id="s-dec",
             open=StreamOpen(data=json.dumps({"val": 5}).encode()),
         )
-        inference._handle_stream_open(DecodeStreamAPI(), stream_req, sock, {}, log)
+        inference._handle_stream_open(DecodeStreamAPI(), stream_req, sock, _StreamTracker(), log)
 
         done_resps = sock.wait_for(
             lambda r: r.HasField("stream") and r.stream.HasField("done") and r.stream.stream_id == "s-dec"
@@ -335,7 +337,7 @@ class TestHandleStreamOpenWithHooks:
             stream_id="s-hook",
             open=StreamOpen(data=json.dumps({"q": 1}).encode(), meta=meta),
         )
-        inference._handle_stream_open(HookStreamAPI(), stream_req, sock, {}, log)
+        inference._handle_stream_open(HookStreamAPI(), stream_req, sock, _StreamTracker(), log)
 
         done_resps = sock.wait_for(
             lambda r: r.HasField("stream") and r.stream.HasField("done") and r.stream.stream_id == "s-hook"
@@ -360,7 +362,7 @@ class TestHandleStreamOpenWithHooks:
             stream_id="s-reject",
             open=StreamOpen(data=b'{}', meta=meta),
         )
-        inference._handle_stream_open(RejectStreamAPI(), stream_req, sock, {}, log)
+        inference._handle_stream_open(RejectStreamAPI(), stream_req, sock, _StreamTracker(), log)
 
         err_resps = sock.wait_for(
             lambda r: r.HasField("stream") and r.stream.HasField("error") and r.stream.stream_id == "s-reject"
@@ -384,7 +386,7 @@ class TestHandleStreamOpenWithHooks:
             stream_id="s-onresp",
             open=StreamOpen(data=b'{}', meta=meta),
         )
-        inference._handle_stream_open(OnResponseStreamAPI(), stream_req, sock, {}, log)
+        inference._handle_stream_open(OnResponseStreamAPI(), stream_req, sock, _StreamTracker(), log)
 
         done_resps = sock.wait_for(
             lambda r: r.HasField("stream") and r.stream.HasField("done") and r.stream.stream_id == "s-onresp"
@@ -411,14 +413,17 @@ class TestHandleStreamOpenWithHooks:
 class TestHandleStreamCancel:
     def test_cancel_removes_from_active(self):
         gen = iter([1, 2, 3])
-        active = {"s1": gen}
-        inference._handle_stream_cancel("s1", active, log)
-        assert "s1" not in active
+        sock = SyncSocket()
+        active = _StreamTracker()
+        active.add("s1", gen)
+        inference._handle_stream_close("s1", active, sock, log)
+        assert "s1" not in active._streams
 
     def test_cancel_nonexistent_is_noop(self):
-        active = {}
-        inference._handle_stream_cancel("nope", active, log)
-        assert "nope" not in active
+        sock = SyncSocket()
+        active = _StreamTracker()
+        inference._handle_stream_close("nope", active, sock, log)
+        assert "nope" not in active._streams
 
     def test_cancel_closes_generator(self):
         closed = threading.Event()
@@ -433,8 +438,10 @@ class TestHandleStreamCancel:
 
         g = gen()
         next(g)
-        active = {"s-close": g}
-        inference._handle_stream_cancel("s-close", active, log)
+        sock = SyncSocket()
+        active = _StreamTracker()
+        active.add("s-close", g)
+        inference._handle_stream_close("s-close", active, sock, log)
         assert closed.wait(timeout=2.0)
 
 

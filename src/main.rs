@@ -188,11 +188,13 @@ fn main() {
                 keepalive_timeout,
             });
 
-            // Default warn; --log-verbose bumps to info unless --log-level is explicitly set
+            // Default warn; --log-verbose bumps to debug (captures info + debug) unless
+            // --log-level is explicitly set. Debug shows request-level tracing but not
+            // per-chunk streaming noise.
             let effective_level = if log_level.is_some() {
                 cfg.logging.level.clone()
             } else if log_verbose {
-                "info".to_string()
+                "debug".to_string()
             } else {
                 "warn".to_string()
             };

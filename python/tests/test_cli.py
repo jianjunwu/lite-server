@@ -405,37 +405,46 @@ class TestInit:
 
 class TestBenchmark:
     def test_benchmark_uses_client_context_manager(self, monkeypatch):
-        """Verify benchmark reuses a single httpx.Client instead of creating
+        """Verify benchmark reuses a single httpx.AsyncClient instead of creating
         a new connection per request."""
         import time
         import sys
+        import asyncio
 
         mock_response = type("Response", (), {"status_code": 200})()
         post_calls = []
         client_instances = []
 
-        class FakeClient:
+        class FakeLimits:
+            def __init__(self, *args, **kwargs):
+                pass
+
+        class FakeAsyncClient:
             def __init__(self, *args, **kwargs):
                 client_instances.append(self)
-            def __enter__(self):
+            async def __aenter__(self):
                 return self
-            def __exit__(self, *args):
+            async def __aexit__(self, *args):
                 return False
-            def post(self, url, **kwargs):
+            async def post(self, url, **kwargs):
                 post_calls.append((url, kwargs))
                 return mock_response
 
-        fake_httpx = type("FakeHttpx", (), {"Client": FakeClient})()
+        fake_httpx = type("FakeHttpx", (), {
+            "AsyncClient": FakeAsyncClient,
+            "Limits": FakeLimits,
+            "Timeout": lambda *args, **kwargs: type("FakeTimeout", (), {})(),
+        })()
         monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
 
-        # time.time is called extensively; make it monotonically increase
+        # time.monotonic is called extensively; make it monotonically increase
         # so the benchmark loop runs a few rounds then exits.
         t = [0.0]
-        def fake_time():
+        def fake_monotonic():
             t[0] += 0.001
             return t[0]
 
-        monkeypatch.setattr(time, "time", fake_time)
+        monkeypatch.setattr(time, "monotonic", fake_monotonic)
 
         args = type("Args", (), {
             "url": "http://127.0.0.1:8000",
@@ -446,8 +455,8 @@ class TestBenchmark:
         })()
         cli._cmd_benchmark(args)
 
-        # Exactly one Client instance should be created
-        assert len(client_instances) == 1, f"Expected 1 Client, got {len(client_instances)}"
+        # Exactly one AsyncClient instance should be created
+        assert len(client_instances) == 1, f"Expected 1 AsyncClient, got {len(client_instances)}"
         assert len(post_calls) >= 1
         for url, kwargs in post_calls:
             assert kwargs.get("json") == {"input": 1.0}

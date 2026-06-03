@@ -80,11 +80,11 @@ pub fn run_server(
     });
 
     let log_verbose = log_verbose.unwrap_or(false);
-    // Default warn; --log-verbose bumps to info unless --log-level is explicitly set
+    // Default warn; --log-verbose bumps to debug unless --log-level is explicitly set
     let effective_level = if log_level_specified {
         cfg.logging.level.clone()
     } else if log_verbose {
-        "info".to_string()
+        "debug".to_string()
     } else {
         "warn".to_string()
     };

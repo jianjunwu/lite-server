@@ -9,11 +9,58 @@ use crate::worker::endpoint_manager::EndpointManager;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::signal;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration, Instant};
 use tracing::{debug, info, error, warn};
+
+/// Tracks in-flight requests during graceful shutdown.
+#[derive(Clone)]
+pub struct ShutdownState {
+    pub pending_count: Arc<AtomicUsize>,
+    pub start_time: Arc<std::sync::Mutex<Option<Instant>>>,
+}
+
+impl ShutdownState {
+    pub fn new() -> Self {
+        Self {
+            pending_count: Arc::new(AtomicUsize::new(0)),
+            start_time: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    pub fn mark_start(&self) {
+        *self.start_time.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    }
+
+    pub fn elapsed(&self) -> Option<Duration> {
+        self.start_time
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|t| t.elapsed())
+    }
+
+    pub fn inc_pending(&self) {
+        self.pending_count.fetch_add(1, Ordering::Relaxed);
+        prometheus::SHUTDOWN_PENDING_REQUESTS.inc();
+    }
+
+    pub fn dec_pending(&self) {
+        self.pending_count.fetch_sub(1, Ordering::Relaxed);
+        prometheus::SHUTDOWN_PENDING_REQUESTS.dec();
+    }
+
+    pub fn pending(&self) -> usize {
+        self.pending_count.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for ShutdownState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 pub struct LiteServer {
     config: Config,
@@ -82,6 +129,9 @@ impl LiteServer {
             }
         };
 
+        // Create shared shutdown state for pending request tracking
+        let shutdown_state = Arc::new(ShutdownState::new());
+
         // Start HTTP server as spawned task with graceful shutdown channel
         let (http_shutdown_tx, http_shutdown_rx) = tokio::sync::oneshot::channel();
         let mut http_handle = tokio::spawn(http::start_http_server(
@@ -92,6 +142,7 @@ impl LiteServer {
             Some(endpoint_manager.clone()),
             endpoint_routes,
             http_shutdown_rx,
+            shutdown_state.clone(),
         ));
 
         // When HTTP uses a Unix socket, gRPC/metrics still need a TCP host.
@@ -207,6 +258,9 @@ impl LiteServer {
 
         info!("{} received, starting graceful shutdown", shutdown_reason);
 
+        // Mark shutdown start for pending request tracking
+        shutdown_state.mark_start();
+
         // Abort background tasks
         watcher_handle.abort();
         timeline_handle.abort();
@@ -215,17 +269,53 @@ impl LiteServer {
         // Notify HTTP server to start graceful shutdown
         let _ = http_shutdown_tx.send(());
 
+        // Spawn periodic shutdown status logger
+        let state_for_monitor = shutdown_state.clone();
+        let monitor_graceful = self.config.server.graceful_timeout;
+        let monitor_handle = tokio::spawn(async move {
+            let mut tick = interval(Duration::from_secs(2));
+            loop {
+                tick.tick().await;
+                let pending = state_for_monitor.pending();
+                if pending == 0 {
+                    let elapsed = state_for_monitor
+                        .elapsed()
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    info!(
+                        "Graceful shutdown: all requests drained after {}s",
+                        elapsed
+                    );
+                    break;
+                }
+                let elapsed = state_for_monitor
+                    .elapsed()
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                info!(
+                    "Graceful shutdown: {} in-flight after {}s (timeout {}s)",
+                    pending, elapsed, monitor_graceful
+                );
+            }
+        });
+
         // Wait for HTTP server with graceful timeout
         let graceful_timeout = Duration::from_secs_f32(self.config.server.graceful_timeout);
         match tokio::time::timeout(graceful_timeout, http_handle).await {
             Ok(Ok(Ok(()))) => info!("HTTP server shut down gracefully"),
             Ok(Ok(Err(e))) => error!("HTTP server error during shutdown: {}", e),
             Ok(Err(e)) => error!("HTTP task panicked during shutdown: {}", e),
-            Err(_) => warn!(
-                "HTTP server graceful shutdown timed out after {}s",
-                self.config.server.graceful_timeout
-            ),
+            Err(_) => {
+                let remaining = shutdown_state.pending();
+                warn!(
+                    "HTTP server graceful shutdown timed out after {}s ({} requests still pending)",
+                    self.config.server.graceful_timeout,
+                    remaining
+                );
+            }
         }
+
+        monitor_handle.abort();
 
         // Abort metrics and gRPC if still running
         if let Some(h) = metrics_handle {

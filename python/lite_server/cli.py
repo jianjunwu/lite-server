@@ -179,57 +179,88 @@ def _cmd_config_check(args):
 
 
 def _cmd_benchmark(args):
-    """Run benchmark against running server."""
-    import httpx
+    """Run benchmark against running server using async HTTP with precise concurrency control."""
+    import asyncio
     import time
     import statistics
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import json
+    import sys
 
-    payload = {"input": 1.0}  # default payload
+    payload = {"input": 1.0}
 
     url = f"{args.url}/v2/models/{args.model}/infer"
     if args.version:
         url = f"{args.url}/v2/models/{args.model}/versions/{args.version}/infer"
 
-    print(f"Benchmarking {args.model} (concurrency={args.concurrency}, duration={args.duration}s)")
+    async def run_benchmark():
+        import httpx
 
-    results = []
-    start_time = time.time()
-    end_time = start_time + args.duration
+        print(f"Benchmarking {args.model} (concurrency={args.concurrency}, duration={args.duration}s)")
 
-    with httpx.Client() as client:
+        results: list[dict] = []
+        sem = asyncio.Semaphore(args.concurrency)
+        running = True
 
-        def send_request():
-            try:
-                t0 = time.time()
-                resp = client.post(url, json=payload, timeout=30.0)
-                t1 = time.time()
-                return {"success": resp.status_code == 200, "latency_ms": (t1 - t0) * 1000}
-            except Exception as e:
-                return {"success": False, "error": str(e)}
+        async def send_request(client: httpx.AsyncClient):
+            async with sem:
+                t0 = time.monotonic()
+                try:
+                    resp = await client.post(
+                        url, json=payload,
+                        timeout=httpx.Timeout(30.0, connect=5.0),
+                    )
+                    results.append({
+                        "success": resp.status_code == 200,
+                        "latency_ms": (time.monotonic() - t0) * 1000,
+                    })
+                except Exception as e:
+                    results.append({
+                        "success": False,
+                        "latency_ms": (time.monotonic() - t0) * 1000,
+                        "error": str(e),
+                    })
 
-        with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
-            futures = []
-            while time.time() < end_time:
-                futures.append(executor.submit(send_request))
-                if len(futures) >= args.concurrency:
-                    for f in as_completed(futures[:args.concurrency]):
-                        results.append(f.result())
-                    futures = futures[args.concurrency:]
+        async with httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=args.concurrency * 2, max_keepalive_connections=args.concurrency),
+        ) as client:
+            tasks: list[asyncio.Task] = []
+            deadline = time.monotonic() + args.duration
 
-            for f in as_completed(futures):
-                results.append(f.result())
+            while time.monotonic() < deadline:
+                tasks.append(asyncio.create_task(send_request(client)))
+                # Trim completed tasks periodically to bound memory
+                if len(tasks) > args.concurrency * 4:
+                    tasks = [t for t in tasks if not t.done()]
+
+            # Wait for remaining tasks to finish
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        return results
+
+    # Windows: use SelectorEventLoop for subprocess compat
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    try:
+        results = asyncio.run(run_benchmark())
+    except KeyboardInterrupt:
+        print("\nBenchmark interrupted.")
+        return 130
 
     total = len(results)
+    if total == 0:
+        print("No requests completed — is the server running?")
+        return 1
+
     success = sum(1 for r in results if r.get("success"))
     failed = total - success
     latencies = [r["latency_ms"] for r in results if r.get("success")]
 
-    duration = args.duration
-    throughput = total / duration if duration > 0 else 0
+    throughput = total / args.duration if args.duration > 0 else 0
 
     print(f"\nBenchmark Results ({args.model}):")
-    print(f"  Duration:        {duration}s")
+    print(f"  Duration:        {args.duration}s")
     print(f"  Total requests:  {total}")
     print(f"  Success:         {success}")
     print(f"  Failed:          {failed}")

@@ -138,6 +138,21 @@ lazy_static! {
         ),
         &["model", "version", "reason"]
     ).unwrap();
+
+    // Shutdown tracking
+    pub static ref SHUTDOWN_PENDING_REQUESTS: prometheus::IntGauge = prometheus::IntGauge::new(
+        "lightserver_shutdown_pending_requests",
+        "Number of in-flight requests during shutdown"
+    ).unwrap();
+
+    // Connection tracking
+    pub static ref OPEN_CONNECTIONS: GaugeVec = GaugeVec::new(
+        prometheus::Opts::new(
+            "lightserver_open_connections",
+            "Current open connections by type"
+        ),
+        &["type"]
+    ).unwrap();
 }
 
 // Custom metrics reported by Python workers — std::sync::Mutex is sufficient
@@ -176,6 +191,8 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(HEALTH_CHECK_TOTAL.clone()))?;
     REGISTRY.register(Box::new(WORKER_HEALTH_STATUS.clone()))?;
     REGISTRY.register(Box::new(WORKER_RESPAWNS_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(SHUTDOWN_PENDING_REQUESTS.clone()))?;
+    REGISTRY.register(Box::new(OPEN_CONNECTIONS.clone()))?;
     Ok(())
 }
 

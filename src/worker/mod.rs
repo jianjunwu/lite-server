@@ -425,7 +425,7 @@ impl WorkerManager {
                         } else if trimmed.starts_with("[WARN]") {
                             tracing::warn!(worker_id = worker_id_clone, model = %model_name_clone, version = %version_clone, "{}", trimmed.strip_prefix("[WARN]").unwrap_or(trimmed).trim());
                         } else {
-                            tracing::info!(worker_id = worker_id_clone, model = %model_name_clone, version = %version_clone, "{}", trimmed);
+                            tracing::debug!(worker_id = worker_id_clone, model = %model_name_clone, version = %version_clone, "{}", trimmed);
                         }
                     }
                     Err(e) => {
@@ -765,7 +765,7 @@ impl WorkerManager {
                             } else if trimmed.starts_with("[WARN]") {
                                 tracing::warn!(worker_id = worker_id_clone, model = %model_name_clone, version = %version_clone, "{}", trimmed.strip_prefix("[WARN]").unwrap_or(trimmed).trim());
                             } else {
-                                tracing::info!(worker_id = worker_id_clone, model = %model_name_clone, version = %version_clone, "{}", trimmed);
+                                tracing::debug!(worker_id = worker_id_clone, model = %model_name_clone, version = %version_clone, "{}", trimmed);
                             }
                         }
                         Err(e) => {
