@@ -702,7 +702,7 @@ pub async fn sse_infer_handler(
         }
         // Ensure stream is cleaned up on worker side
         let cancel_req = streaming::build_stream_cancel(stream_id);
-        let _ = open_worker_stream_cancel(state, cancel_req).await;
+        open_worker_stream_cancel(&state, &model_name, &resolved_version, cancel_req).await;
     });
 
     Ok(Sse::new(ReceiverStream::new(event_rx)))
@@ -777,18 +777,34 @@ pub async fn sse_infer_version_handler(
             prometheus::record_stream_close(&model_name, &resolved_version, "sse");
         }
         let cancel_req = streaming::build_stream_cancel(stream_id);
-        let _ = open_worker_stream_cancel(state, cancel_req).await;
+        open_worker_stream_cancel(&state, &model_name, &resolved_version, cancel_req).await;
     });
 
     Ok(Sse::new(ReceiverStream::new(event_rx)))
 }
 
-async fn open_worker_stream_cancel(state: Arc<AppState>, cancel_req: pb::Request) -> Result<(), AppError> {
-    // Fire-and-forget cancel to worker; best-effort
-    // We need a worker to send cancel to, but we don't know which one.
-    // For now, skip explicit cancel - the worker handles client disconnect via stream timeout.
-    let _ = (state, cancel_req);
-    Ok(())
+/// Send a stream cancel request to all workers for a model version.
+/// Best-effort: workers that don't own the stream will ignore it.
+async fn open_worker_stream_cancel(
+    state: &Arc<AppState>,
+    model_name: &str,
+    version: &str,
+    cancel_req: pb::Request,
+) {
+    let clients = state
+        .worker_manager
+        .get_zmq_clients(model_name, version)
+        .await;
+    match clients {
+        Some(list) => {
+            for client in &list {
+                let _ = client.send(cancel_req.clone()).await;
+            }
+        }
+        None => {
+            // Worker may already be unloaded; nothing to cancel
+        }
+    }
 }
 
 // ===== WebSocket Streaming =====
@@ -874,6 +890,10 @@ async fn handle_ws_stream(
         prometheus::record_stream_open(&model_name, &resolved_version, "websocket");
     }
 
+    // Clone before move so cancel can reference them after the task completes
+    let model_name_owned = model_name.clone();
+    let version_owned = resolved_version.clone();
+
     // Spawn task to forward worker chunks -> WebSocket
     let send_task = tokio::spawn(async move {
         let open_time = std::time::Instant::now();
@@ -927,7 +947,7 @@ async fn handle_ws_stream(
 
     // Send cancel to clean up
     let cancel_req = streaming::build_stream_cancel(completed_stream_id);
-    let _ = open_worker_stream_cancel(state, cancel_req).await;
+    open_worker_stream_cancel(&state, &model_name_owned, &version_owned, cancel_req).await;
 }
 
 // ===== Custom Endpoint Handler =====

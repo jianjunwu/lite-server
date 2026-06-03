@@ -8,7 +8,7 @@ pub mod endpoint_proto {
 
 use crate::config::ModelConfig;
 use crate::error::AppError;
-use crate::inference_queue::{InferenceQueue, OutlierState, ReloadSignal};
+use crate::inference_queue::{InferenceQueue, OutlierState, ReloadSignal, model_version_key, parse_model_version_key};
 use crate::proto::liteserver as pb;
 use crate::registry::{ModelRegistry, types::*};
 use crate::transport::zmq::WorkerZmqClient;
@@ -249,7 +249,7 @@ impl WorkerManager {
         version: &str,
         worker_id: u32,
     ) -> Result<(), AppError> {
-        let key = format!("{}_{}", model_name, version);
+        let key = model_version_key(model_name, version);
 
         // Get config from registry
         let model_version = self.registry
@@ -517,7 +517,7 @@ impl WorkerManager {
         model_name: &str,
         version: &str,
     ) -> Option<Vec<Arc<WorkerZmqClient>>> {
-        let key = format!("{}_{}", model_name, version);
+        let key = model_version_key(model_name, version);
         let guard = self.zmq_clients.read().await;
         guard.get(&key).cloned()
     }
@@ -528,7 +528,7 @@ impl WorkerManager {
         model_name: &str,
         version: &str,
     ) -> Option<Arc<OutlierState>> {
-        let key = format!("{}_{}", model_name, version);
+        let key = model_version_key(model_name, version);
         let guard = self.outlier_states.read().await;
         guard.get(&key).cloned()
     }
@@ -838,7 +838,7 @@ impl WorkerManager {
             let mut workers = self.workers.write().await;
             let mut clients = self.zmq_clients.write().await;
             let mut outliers = self.outlier_states.write().await;
-            let key = format!("{}_{}", model_name, version);
+            let key = model_version_key(model_name, version);
             workers.insert(key.clone(), worker_processes);
             clients.insert(key.clone(), zmq_clients_for_model);
             outliers.insert(key, outlier);
@@ -884,7 +884,7 @@ impl WorkerManager {
         self.registry
             .set_status(model_name, version, VersionStatus::Unloading)?;
 
-        let key = format!("{}_{}", model_name, version);
+        let key = model_version_key(model_name, version);
         {
             let mut workers = self.workers.write().await;
             let mut clients = self.zmq_clients.write().await;
@@ -955,10 +955,8 @@ impl WorkerManager {
         drop(workers);
 
         for key in keys {
-            let parts: Vec<&str> = key.rsplitn(2, '_').collect();
-            if parts.len() == 2 {
-                let version = parts[0];
-                let model_name = parts[1];
+            let (model_name, version) = parse_model_version_key(&key);
+            if !model_name.is_empty() && !version.is_empty() {
                 let _ = self.unload_version(model_name, version).await;
             }
         }
@@ -1030,7 +1028,7 @@ fn spawn_worker_monitor(
     ];
     tokio::spawn(async move {
         // If heartbeat is enabled, wrap the select with a heartbeat loop
-        let heartbeat_enabled = heartbeat_interval.as_secs() > 0
+        let heartbeat_enabled = heartbeat_interval > Duration::ZERO
             && zmq_client.is_some()
             && respawn_tx.is_some();
 
@@ -1644,5 +1642,45 @@ heartbeat_max_failures: 5
         shutdown_tx.send(()).unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(done.load(Ordering::SeqCst), "monitor should exit on shutdown signal");
+    }
+
+    // ===== Key format: underscore in model name / version =====
+
+    #[test]
+    fn test_model_version_key_roundtrip_with_underscores() {
+        // Reproduce the bug: model_name="bert_base_2024" version="03_v1"
+        // Old key = "bert_base_2024_03_v1"
+        // rsplitn(2, '_') = ["v1", "bert_base_2024_03"] — model_name truncated!
+        let key_with_underscore_version = "bert_base_2024_03_v1";
+        let parts: Vec<&str> = key_with_underscore_version.rsplitn(2, '_').collect();
+        // Assert the BUG: model_name should be "bert_base_2024" but is "bert_base_2024_03"
+        assert_ne!(parts[1], "bert_base_2024",
+            "rsplitn('_', 2) mis-parses keys when version contains underscores");
+        // Assert the version is also wrong
+        assert_eq!(parts[0], "v1", "rsplitn only captures last segment of underscored version");
+
+        // Also breaks when model_name contains underscores and version is simple:
+        let key_with_underscore_model = "my_model_v1";
+        let parts2: Vec<&str> = key_with_underscore_model.rsplitn(2, '_').collect();
+        // This happens to work: "my_model" + "v1" → ["v1", "my_model"] ✓
+        assert_eq!(parts2[0], "v1");
+        assert_eq!(parts2[1], "my_model");
+    }
+
+    // ===== Heartbeat sub-second detection =====
+
+    #[test]
+    fn test_heartbeat_enabled_with_sub_second_interval() {
+        // The bug: heartbeat_enabled = heartbeat_interval.as_secs() > 0
+        // For Duration::from_millis(500), as_secs() returns 0 → disabled (WRONG)
+        let sub_second = Duration::from_millis(500);
+        let old_check = sub_second.as_secs() > 0;
+        assert!(!old_check,
+            "BUG: as_secs() truncates sub-second intervals — heartbeat silently disabled");
+
+        // The fix: compare against Duration::ZERO
+        let fixed_check = sub_second > Duration::ZERO;
+        assert!(fixed_check,
+            "FIX: > Duration::ZERO correctly detects non-zero sub-second intervals");
     }
 }

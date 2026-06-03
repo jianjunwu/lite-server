@@ -21,12 +21,27 @@ impl ModelRegistry {
         }
     }
 
+    /// Return (name, version, ModelVersion) tuples for all loaded models.
+    /// Clones ModelVersion — prefer list_loaded_keys() when only (name, version) needed.
     pub fn list_loaded(&self) -> Vec<(String, String, ModelVersion)> {
         let mut result = Vec::new();
         for entry in self.models.iter() {
             let name = entry.key();
             for (version, mv) in entry.versions.iter() {
                 result.push((name.clone(), version.clone(), mv.clone()));
+            }
+        }
+        result
+    }
+
+    /// Return (name, version) tuples without cloning ModelVersion.
+    /// Intended for hot-path iteration (e.g. timeline sampling).
+    pub fn list_loaded_keys(&self) -> Vec<(String, String)> {
+        let mut result = Vec::new();
+        for entry in self.models.iter() {
+            let name = entry.key();
+            for version in entry.versions.keys() {
+                result.push((name.clone(), version.clone()));
             }
         }
         result
@@ -563,6 +578,26 @@ mod tests {
     }
 
     // --- Concurrent access ---
+
+    #[test]
+    fn test_list_loaded_keys() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir()).unwrap();
+        reg.register("m1", "2", test_config(), ModelType::LitAPI, tmp_dir()).unwrap();
+        reg.register("m2", "1", test_config(), ModelType::Ensemble, tmp_dir()).unwrap();
+
+        let keys = reg.list_loaded_keys();
+        assert_eq!(keys.len(), 3);
+        assert!(keys.contains(&("m1".to_string(), "1".to_string())));
+        assert!(keys.contains(&("m1".to_string(), "2".to_string())));
+        assert!(keys.contains(&("m2".to_string(), "1".to_string())));
+    }
+
+    #[test]
+    fn test_list_loaded_keys_empty() {
+        let reg = ModelRegistry::new();
+        assert!(reg.list_loaded_keys().is_empty());
+    }
 
     #[tokio::test]
     async fn test_concurrent_reads_and_writes() {

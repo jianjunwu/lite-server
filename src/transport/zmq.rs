@@ -103,58 +103,69 @@ impl WorkerZmqClient {
                     }
                 }
 
-                match socket.recv_bytes(zmq::DONTWAIT) {
-                    Ok(bytes) => {
-                        match pb::Response::decode(bytes.as_slice()) {
-                            Ok(resp) => {
-                                if let Some(pb::response::Payload::CbCompleted(ref cb)) = resp.payload {
-                                    for seq in &cb.sequences {
-                                        if let Some(tx) = pending.remove(&seq.uid) {
-                                            let single_resp = pb::Response {
-                                                uid: seq.uid.clone(),
-                                                payload: Some(pb::response::Payload::Single(
-                                                    pb::SingleResponse {
-                                                        data: seq.data.clone(),
-                                                        status: Some(pb::Status {
-                                                            code: "Ok".to_string(),
-                                                            message: "".to_string(),
-                                                        }),
-                                                    },
-                                                )),
-                                                metrics: resp.metrics.clone(),
-                                            };
-                                            let _ = tx.send(single_resp);
+                // Use zmq::poll with 100ms timeout instead of DONTWAIT busy-loop.
+                // Cross-platform: zmq::poll works on all supported ZMQ backends.
+                match socket.poll(zmq::POLLIN, 100) {
+                    Ok(_) => {
+                        match socket.recv_bytes(0) {
+                            Ok(bytes) => {
+                                match pb::Response::decode(bytes.as_slice()) {
+                                    Ok(resp) => {
+                                        if let Some(pb::response::Payload::CbCompleted(ref cb)) = resp.payload {
+                                            for seq in &cb.sequences {
+                                                if let Some(tx) = pending.remove(&seq.uid) {
+                                                    let single_resp = pb::Response {
+                                                        uid: seq.uid.clone(),
+                                                        payload: Some(pb::response::Payload::Single(
+                                                            pb::SingleResponse {
+                                                                data: seq.data.clone(),
+                                                                status: Some(pb::Status {
+                                                                    code: "Ok".to_string(),
+                                                                    message: "".to_string(),
+                                                                }),
+                                                            },
+                                                        )),
+                                                        metrics: resp.metrics.clone(),
+                                                    };
+                                                    let _ = tx.send(single_resp);
+                                                }
+                                            }
+                                        } else if let Some(pb::response::Payload::Stream(ref stream_resp)) = resp.payload {
+                                            let sid = &stream_resp.stream_id;
+                                            if let Some(tx) = stream_routes.get(sid) {
+                                                let is_done = matches!(stream_resp.payload, Some(pb::stream_response::Payload::Done(_)));
+                                                let is_error = matches!(stream_resp.payload, Some(pb::stream_response::Payload::Error(_)));
+                                                if tx.try_send(stream_resp.clone()).is_err() {
+                                                    warn!("Stream channel full or closed for {}", sid);
+                                                    stream_routes.remove(sid);
+                                                } else if is_done || is_error {
+                                                    stream_routes.remove(sid);
+                                                }
+                                            }
+                                        } else if let Some(tx) = pending.remove(&resp.uid) {
+                                            let _ = tx.send(resp);
+                                        } else {
+                                            warn!("Received response for unknown uid: {}", resp.uid);
                                         }
                                     }
-                                } else if let Some(pb::response::Payload::Stream(ref stream_resp)) = resp.payload {
-                                    let sid = &stream_resp.stream_id;
-                                    if let Some(tx) = stream_routes.get(sid) {
-                                        let is_done = matches!(stream_resp.payload, Some(pb::stream_response::Payload::Done(_)));
-                                        let is_error = matches!(stream_resp.payload, Some(pb::stream_response::Payload::Error(_)));
-                                        if tx.try_send(stream_resp.clone()).is_err() {
-                                            warn!("Stream channel full or closed for {}", sid);
-                                            stream_routes.remove(sid);
-                                        } else if is_done || is_error {
-                                            stream_routes.remove(sid);
-                                        }
+                                    Err(e) => {
+                                        error!("Protobuf decode error: {}", e);
                                     }
-                                } else if let Some(tx) = pending.remove(&resp.uid) {
-                                    let _ = tx.send(resp);
-                                } else {
-                                    warn!("Received response for unknown uid: {}", resp.uid);
                                 }
                             }
+                            Err(zmq::Error::EAGAIN) => {
+                                // poll signaled readable but recv got EAGAIN — rare, retry
+                                continue;
+                            }
                             Err(e) => {
-                                error!("Protobuf decode error: {}", e);
+                                error!("ZMQ recv error: {}", e);
+                                std::thread::sleep(Duration::from_millis(10));
                             }
                         }
                     }
-                    Err(zmq::Error::EAGAIN) => {
-                        std::thread::yield_now();
-                    }
                     Err(e) => {
-                        error!("ZMQ recv error: {}", e);
-                        std::thread::sleep(Duration::from_millis(10));
+                        error!("ZMQ poll error: {}", e);
+                        std::thread::sleep(Duration::from_millis(100));
                     }
                 }
             }

@@ -13,14 +13,23 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 /// Pre-sized key for model_version lookups — single allocation, no reallocation.
+/// Uses null-byte separator (\x00) which cannot appear in validated model names or versions.
 /// Used on the hot path (try_submit / has_queue) to avoid repeated format! overhead.
 #[inline]
-fn model_version_key(model: &str, version: &str) -> String {
+pub fn model_version_key(model: &str, version: &str) -> String {
     let mut key = String::with_capacity(model.len() + 1 + version.len());
     key.push_str(model);
-    key.push('_');
+    key.push('\x00');
     key.push_str(version);
     key
+}
+
+/// Parse a model_version key back into (model_name, version).
+/// The separator is \x00 which cannot appear in validated identifiers.
+#[inline]
+pub fn parse_model_version_key(key: &str) -> (&str, &str) {
+    let mut parts = key.splitn(2, '\x00');
+    (parts.next().unwrap_or(""), parts.next().unwrap_or(""))
 }
 
 /// Compute jittered max_requests to prevent thundering herd on worker recycle.
@@ -195,7 +204,12 @@ pub struct ReloadSignal {
 
 /// Per-model-version inference queue with batch aggregation.
 pub struct InferenceQueue {
-    queues: DashMap<String, (mpsc::Sender<QueueItem>, std::sync::Arc<tokio::task::JoinHandle<()>>, Arc<OutlierState>)>,
+    queues: DashMap<String, (
+        mpsc::Sender<QueueItem>,
+        std::sync::Arc<tokio::task::JoinHandle<()>>,
+        Arc<OutlierState>,
+        Option<std::sync::Arc<tokio::task::JoinHandle<()>>>, // health_checker (abortable)
+    )>,
 }
 
 impl InferenceQueue {
@@ -218,9 +232,12 @@ impl InferenceQueue {
     ) {
         let key = model_version_key(model_name, version);
 
-        // Abort and remove stale collector if exists
-        if let Some((_, (_, old_handle, _))) = self.queues.remove(&key) {
+        // Abort and remove stale collector + health checker if exists
+        if let Some((_, (_, old_handle, _, old_health))) = self.queues.remove(&key) {
             old_handle.abort();
+            if let Some(h) = old_health {
+                h.abort();
+            }
         }
 
         let max_queue_size = config.max_queue_size.max(1);
@@ -256,17 +273,19 @@ impl InferenceQueue {
         ));
 
         // Spawn health checker if interval > 0
-        if health_interval > Duration::ZERO {
-            tokio::spawn(health_checker(
+        let health_handle = if health_interval > Duration::ZERO {
+            Some(std::sync::Arc::new(tokio::spawn(health_checker(
                 health_interval,
                 zmq_clients,
                 outlier.clone(),
                 model_name.to_string(),
                 version.to_string(),
-            ));
-        }
+            ))))
+        } else {
+            None
+        };
 
-        self.queues.insert(key, (tx, std::sync::Arc::new(handle), outlier));
+        self.queues.insert(key, (tx, std::sync::Arc::new(handle), outlier, health_handle));
         info!(
             model = %model_name,
             version = %version,
@@ -276,11 +295,14 @@ impl InferenceQueue {
         );
     }
 
-    /// Unregister a model version and stop its collector.
+    /// Unregister a model version and stop its collector + health checker.
     pub fn unregister_model(&self, model_name: &str, version: &str) {
         let key = model_version_key(model_name, version);
-        if let Some((_, (_, handle, _))) = self.queues.remove(&key) {
-            handle.abort();
+        if let Some((_, (_, batch_handle, _, health_handle))) = self.queues.remove(&key) {
+            batch_handle.abort();
+            if let Some(h) = health_handle {
+                h.abort();
+            }
             info!(model = %model_name, version = %version, "model unregistered");
         }
     }
@@ -883,17 +905,34 @@ mod tests {
 
     #[test]
     fn model_version_key_format() {
-        assert_eq!(model_version_key("my_model", "1"), "my_model_1");
-        assert_eq!(model_version_key("resnet", "v2"), "resnet_v2");
-        assert_eq!(model_version_key("", ""), "_");
+        assert_eq!(model_version_key("my_model", "1"), "my_model\x001");
+        assert_eq!(model_version_key("resnet", "v2"), "resnet\x00v2");
+        assert_eq!(model_version_key("", ""), "\x00");
+    }
+
+    #[test]
+    fn model_version_key_roundtrip() {
+        // Test roundtrip with underscores in both name and version
+        let test_cases = vec![
+            ("simple", "1"),
+            ("bert_base_2024", "03_v1"),   // underscored model & version
+            ("my-model", "1.0.0-beta"),    // semver-style version
+        ];
+        for (model, version) in test_cases {
+            let key = model_version_key(model, version);
+            let (parsed_model, parsed_version) = parse_model_version_key(&key);
+            assert_eq!(parsed_model, model,
+                "model_name roundtrip failed for '{}_{}'", model, version);
+            assert_eq!(parsed_version, version,
+                "version roundtrip failed for '{}_{}'", model, version);
+        }
     }
 
     #[test]
     fn model_version_key_single_allocation() {
         // String::with_capacity should pre-allocate exactly the right size
         let key = model_version_key("model", "1");
-        assert_eq!(key.capacity(), key.len(), "no over-allocation");
-        assert_eq!(key, "model_1");
+        assert_eq!(key.len(), key.capacity(), "no over-allocation");
     }
 
     #[tokio::test]
@@ -1004,13 +1043,13 @@ mod tests {
 
         let outlier = Arc::new(OutlierState::new(0));
         queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx.clone(), outlier);
-        let first_handle = queue.queues.get("test_model_1").unwrap().1.clone();
+        let first_handle = queue.queues.get(&model_version_key("test_model", "1")).unwrap().1.clone();
         assert!(!first_handle.is_finished());
 
         // Re-register should abort the first collector
         let outlier = Arc::new(OutlierState::new(0));
         queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx, outlier);
-        let second_handle = queue.queues.get("test_model_1").unwrap().1.clone();
+        let second_handle = queue.queues.get(&model_version_key("test_model", "1")).unwrap().1.clone();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(first_handle.is_finished(), "old collector should be aborted");
@@ -1033,7 +1072,7 @@ mod tests {
 
         let outlier = Arc::new(OutlierState::new(0));
         queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx, outlier);
-        let handle = queue.queues.get("test_model_1").unwrap().1.clone();
+        let handle = queue.queues.get(&model_version_key("test_model", "1")).unwrap().1.clone();
         assert!(!handle.is_finished());
 
         queue.unregister_model("test_model", "1");

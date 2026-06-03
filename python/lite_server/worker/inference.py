@@ -376,25 +376,89 @@ def _has_bidi_stream(lit_api: LitAPI) -> bool:
     return hasattr(lit_api, "bidi_stream") and callable(getattr(lit_api, "bidi_stream"))
 
 
-def _consume_stream_generator(lit_api: LitAPI, generator, stream_id: str, socket: zmq.Socket, log: logging.Logger, meta=None):
+# ---------------------------------------------------------------------------
+# Stream Tracker — prevents unbounded active_streams growth
+# ---------------------------------------------------------------------------
+
+_STREAM_IDLE_TIMEOUT = 300.0  # 5 minutes
+
+
+class _StreamTracker:
+    """Thread-safe tracker for active streams with automatic timeout cleanup."""
+
+    def __init__(self, timeout: float = _STREAM_IDLE_TIMEOUT):
+        self._streams: dict[str, Any] = {}
+        self._timestamps: dict[str, float] = {}
+        self._lock = threading.Lock()
+        self._timeout = timeout
+
+    def add(self, stream_id: str, entry: Any):
+        with self._lock:
+            self._streams[stream_id] = entry
+            self._timestamps[stream_id] = time.monotonic()
+
+    def remove(self, stream_id: str) -> Any:
+        with self._lock:
+            self._timestamps.pop(stream_id, None)
+            return self._streams.pop(stream_id, None)
+
+    def get(self, stream_id: str) -> Any | None:
+        return self._streams.get(stream_id)
+
+    def touch(self, stream_id: str):
+        """Update last activity timestamp."""
+        with self._lock:
+            if stream_id in self._timestamps:
+                self._timestamps[stream_id] = time.monotonic()
+
+    def cleanup_expired(self) -> list[str]:
+        """Remove streams that have exceeded the idle timeout.
+        Returns list of expired stream IDs that were removed.
+        """
+        now = time.monotonic()
+        expired = []
+        with self._lock:
+            for sid, ts in list(self._timestamps.items()):
+                if now - ts > self._timeout:
+                    expired.append(sid)
+            for sid in expired:
+                entry = self._streams.pop(sid, None)
+                self._timestamps.pop(sid, None)
+                if isinstance(entry, BidiStreamHandler):
+                    try:
+                        entry.on_close()
+                    except Exception:
+                        pass
+                elif hasattr(entry, "close"):
+                    try:
+                        entry.close()
+                    except Exception:
+                        pass
+        return expired
+
+
+def _consume_stream_generator(lit_api: LitAPI, generator, stream_id: str, socket: zmq.Socket, active_streams: _StreamTracker, log: logging.Logger, meta=None):
     """Background thread: consume a stream_predict generator and send chunks."""
     try:
         for output in generator:
+            active_streams.touch(stream_id)
             encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
             if hasattr(lit_api, "on_response") and meta is not None:
                 encoded = lit_api.on_response(encoded, meta)
             resp_bytes = json.dumps(encoded).encode()
             socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
     except Exception as e:
-        log.error(f"stream_predict error for {stream_id}: {e}")
+        log.error("stream_predict error for %s: %s", stream_id, e)
         socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
+        active_streams.remove(stream_id)
         return
 
     metrics = _collect_metrics(lit_api)
     socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
+    active_streams.remove(stream_id)
 
 
-def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.Socket, active_streams: dict, log: logging.Logger):
+def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.Socket, active_streams: _StreamTracker, log: logging.Logger):
     stream_id = stream_req.stream_id
     open_req = stream_req.open
     data = open_req.data if open_req else b""
@@ -419,7 +483,7 @@ def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.
             socket.send(_make_stream_error(stream_id, f"bidi_stream failed: {e}").SerializeToString())
             return
 
-        active_streams[stream_id] = handler
+        active_streams.add(stream_id, handler)
 
         try:
             output = handler.on_open(decoded)
@@ -469,15 +533,15 @@ def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.
         socket.send(_make_stream_error(stream_id, f"stream_predict failed: {e}").SerializeToString())
         return
 
-    active_streams[stream_id] = generator
+    active_streams.add(stream_id, generator)
     threading.Thread(
         target=_consume_stream_generator,
-        args=(lit_api, generator, stream_id, socket, log, meta),
+        args=(lit_api, generator, stream_id, socket, active_streams, log, meta),
         daemon=True,
     ).start()
 
 
-def _handle_stream_chunk(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.Socket, active_streams: dict, log: logging.Logger, meta=None):
+def _handle_stream_chunk(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.Socket, active_streams: _StreamTracker, log: logging.Logger, meta=None):
     """Handle a mid-stream chunk for bidirectional streaming (sync worker)."""
     stream_id = stream_req.stream_id
     handler = active_streams.get(stream_id)
@@ -507,9 +571,9 @@ def _handle_stream_chunk(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq
             socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
 
 
-def _handle_stream_close(stream_id: str, active_streams: dict, socket: zmq.Socket, log: logging.Logger):
+def _handle_stream_close(stream_id: str, active_streams: _StreamTracker, socket: zmq.Socket, log: logging.Logger):
     """Close a stream: cleanup generator or bidi handler, send StreamDone."""
-    entry = active_streams.pop(stream_id, None)
+    entry = active_streams.remove(stream_id)
     if entry is None:
         return
 
@@ -1001,7 +1065,8 @@ async def _consume_sync_stream_async(
 
 def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: logging.Logger):
     """Handle single + batch + stream requests synchronously."""
-    active_streams: dict[str, Any] = {}
+    active_streams = _StreamTracker()
+    last_cleanup = time.monotonic()
 
     while True:
         try:
@@ -1160,6 +1225,14 @@ def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log:
             response = _make_error_response(uid, f"{type(e).__name__}: {e}")
 
         socket.send(response.SerializeToString())
+
+        # Periodic stream expiration cleanup (~every 30s)
+        now = time.monotonic()
+        if now - last_cleanup > 30.0:
+            expired = active_streams.cleanup_expired()
+            if expired:
+                log.info("Cleaned up %d expired streams: %s", len(expired), expired)
+            last_cleanup = now
 
 
 # ---------------------------------------------------------------------------

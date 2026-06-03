@@ -124,14 +124,14 @@ impl LiteServer {
             None
         };
 
-        // Start timeline sampler
+        // Start timeline sampler (uses list_loaded_keys to avoid cloning ModelVersion)
         let registry_for_timeline = self.registry.clone();
         let timeline_handle = tokio::spawn(async move {
             let mut tick = interval(Duration::from_secs(10));
             loop {
                 tick.tick().await;
-                let models = registry_for_timeline.list_loaded();
-                for (name, version, _) in models {
+                let models = registry_for_timeline.list_loaded_keys();
+                for (name, version) in models {
                     crate::metrics::aggregator::TIMELINE.sample(&name, &version).await;
                 }
             }
