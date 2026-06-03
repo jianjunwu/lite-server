@@ -174,7 +174,6 @@ python -m lite_server serve [flags]
 | `--grpc-port` | gRPC port | `server.grpc_port` |
 | `--no-grpc` | Disable gRPC | `grpc.enabled` |
 | `--no-streaming-metrics` | Disable streaming metrics | `features.streaming_metrics` |
-| `--log-verbose` | Also log to stderr | — |
 | `--max-queue-size` | Max queue size for all models | `model_defaults.max_queue_size` |
 | `--max-requests` | Auto-restart after N requests | `model_defaults.max_requests` |
 | `--max-requests-jitter` | Jitter for max_requests | `model_defaults.max_requests_jitter` |

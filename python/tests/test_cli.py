@@ -513,7 +513,6 @@ class TestServeArgs:
             "grpc_port": 50051,
             "no_grpc": True,
             "no_streaming_metrics": True,
-            "log_verbose": True,
             "max_queue_size": 200,
             "max_requests": 1000,
             "max_requests_jitter": 50,

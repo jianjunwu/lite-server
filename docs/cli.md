@@ -62,7 +62,6 @@ lite-server serve [OPTIONS]
 | `--no-metrics` | Disable Prometheus metrics endpoint |
 | `--no-grpc` | Disable gRPC server |
 | `--no-streaming-metrics` | Disable streaming-specific metrics |
-| `--log-verbose` | Also log to stderr (useful when stdout is piped) |
 
 #### Model Defaults (Override All Models)
 

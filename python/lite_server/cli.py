@@ -36,7 +36,7 @@ def main(argv=None):
     serve_parser.add_argument("--grpc-port", type=int, help="gRPC server port")
     serve_parser.add_argument("--no-grpc", action="store_true", help="Disable gRPC server")
     serve_parser.add_argument("--no-streaming-metrics", action="store_true", help="Disable streaming metrics")
-    serve_parser.add_argument("--log-verbose", action="store_true", help="Also log to stderr")
+
     serve_parser.add_argument("--max-queue-size", type=int, help="Max queue size per model (overrides model config)")
     serve_parser.add_argument("--max-requests", type=int, help="Auto-restart worker after N requests (0=disabled)")
     serve_parser.add_argument("--max-requests-jitter", type=int, help="Jitter range for max_requests to prevent thundering herd")
@@ -130,7 +130,6 @@ def _cmd_serve(args):
             grpc_port=args.grpc_port,
             no_grpc=args.no_grpc,
             no_streaming_metrics=args.no_streaming_metrics,
-            log_verbose=args.log_verbose,
             max_queue_size=args.max_queue_size,
             max_requests=args.max_requests,
             max_requests_jitter=args.max_requests_jitter,

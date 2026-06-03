@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use lite_server::config::{CliOverrides, Config};
 use lite_server::server::LiteServer;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 #[derive(Parser)]
 #[command(name = "lite-server")]
@@ -66,10 +66,6 @@ enum Commands {
         /// Disable metrics
         #[arg(long)]
         no_metrics: bool,
-
-        /// Also log to stderr (useful when stdout is piped)
-        #[arg(long)]
-        log_verbose: bool,
 
         /// gRPC server port
         #[arg(long)]
@@ -137,7 +133,6 @@ fn main() {
             log_rotation,
             metrics_port,
             no_metrics,
-            log_verbose,
             grpc_port,
             no_grpc,
             no_streaming_metrics,
@@ -178,7 +173,6 @@ fn main() {
                 no_grpc,
                 no_metrics,
                 no_streaming_metrics,
-                log_verbose: false, // handled below by logging::init
                 max_queue_size,
                 max_requests,
                 max_requests_jitter,
@@ -188,29 +182,19 @@ fn main() {
                 keepalive_timeout,
             });
 
-            // Default warn; --log-verbose bumps to debug (captures info + debug) unless
-            // --log-level is explicitly set. Debug shows request-level tracing but not
-            // per-chunk streaming noise.
-            let effective_level = if log_level.is_some() {
-                cfg.logging.level.clone()
-            } else if log_verbose {
-                "debug".to_string()
-            } else {
-                "warn".to_string()
-            };
-
-            // Initialize logging
+            // Initialize logging (level from config, overridable via --log-level CLI)
             let _log_guard = lite_server::logging::init(
-                &effective_level,
+                &cfg.logging.level,
                 cfg.logging.info_output.as_deref(),
                 cfg.logging.error_output.as_deref(),
                 &cfg.logging.rotation,
                 cfg.logging.max_size,
                 cfg.logging.backup_count,
-                log_verbose,
             );
 
             info!("Starting lite-server v{}", env!("CARGO_PKG_VERSION"));
+            debug!("Configuration loaded, log level: {}", cfg.logging.level);
+            debug!("Server config: {:?}", cfg.server);
             info!("HTTP port: {}", cfg.server.http_port);
             info!("Metrics port: {}", cfg.server.metrics_port);
             info!("Model repo: {}", cfg.model_repository.path);

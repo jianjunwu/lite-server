@@ -37,7 +37,6 @@ pub fn run_server(
     grpc_port: Option<u16>,
     no_grpc: Option<bool>,
     no_streaming_metrics: Option<bool>,
-    log_verbose: Option<bool>,
     max_queue_size: Option<usize>,
     max_requests: Option<usize>,
     max_requests_jitter: Option<usize>,
@@ -52,7 +51,6 @@ pub fn run_server(
         config::Config::default()
     };
 
-    let log_level_specified = log_level.is_some();
     cfg.apply_overrides(&config::CliOverrides {
         port,
         host,
@@ -69,7 +67,6 @@ pub fn run_server(
         no_grpc: no_grpc == Some(true),
         no_metrics: no_metrics == Some(true),
         no_streaming_metrics: no_streaming_metrics == Some(true),
-        log_verbose: false, // handled below by logging::init
         max_queue_size,
         max_requests,
         max_requests_jitter,
@@ -79,23 +76,13 @@ pub fn run_server(
         keepalive_timeout,
     });
 
-    let log_verbose = log_verbose.unwrap_or(false);
-    // Default warn; --log-verbose bumps to debug unless --log-level is explicitly set
-    let effective_level = if log_level_specified {
-        cfg.logging.level.clone()
-    } else if log_verbose {
-        "debug".to_string()
-    } else {
-        "warn".to_string()
-    };
     let _log_guard = logging::init(
-        &effective_level,
+        &cfg.logging.level,
         cfg.logging.info_output.as_deref(),
         cfg.logging.error_output.as_deref(),
         &cfg.logging.rotation,
         cfg.logging.max_size,
         cfg.logging.backup_count,
-        log_verbose,
     );
     info!("Starting lite-server v{}", env!("CARGO_PKG_VERSION"));
     info!("HTTP port: {}", cfg.server.http_port);
@@ -151,7 +138,6 @@ fn build_runtime(threads: Option<usize>) -> tokio::runtime::Runtime {
     grpc_port=None,
     no_grpc=None,
     no_streaming_metrics=None,
-    log_verbose=None,
     max_queue_size=None,
     max_requests=None,
     max_requests_jitter=None,
@@ -177,7 +163,6 @@ fn serve(
     grpc_port: Option<u16>,
     no_grpc: Option<bool>,
     no_streaming_metrics: Option<bool>,
-    log_verbose: Option<bool>,
     max_queue_size: Option<usize>,
     max_requests: Option<usize>,
     max_requests_jitter: Option<usize>,
@@ -192,7 +177,7 @@ fn serve(
                 config, port, host, model_repo, endpoints_dir, threads, timeout, log_level,
                 log_info_output, log_error_output, log_rotation,
                 metrics_port, no_metrics, grpc_port, no_grpc, no_streaming_metrics,
-                log_verbose, max_queue_size, max_requests, max_requests_jitter, request_timeout,
+                max_queue_size, max_requests, max_requests_jitter, request_timeout,
                 health_check_interval, graceful_timeout, keepalive_timeout,
             )
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))

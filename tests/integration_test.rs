@@ -561,7 +561,6 @@ class TestAPI(LitAPI):
         "--no-metrics",
         "--no-grpc",
         "--log-level", "warn",
-        "--log-verbose",
     ]);
 
     wait_for_server(port, 15).await;

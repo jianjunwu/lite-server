@@ -174,7 +174,6 @@ lite-server serve [参数]
 | `--grpc-port` | gRPC 端口 | `server.grpc_port` |
 | `--no-grpc` | 禁用 gRPC | `grpc.enabled` |
 | `--no-streaming-metrics` | 禁用流式指标 | `features.streaming_metrics` |
-| `--log-verbose` | 同时输出到 stderr | — |
 | `--max-queue-size` | 所有模型的最大队列 | `model_defaults.max_queue_size` |
 | `--max-requests` | N 个请求后自动重启 | `model_defaults.max_requests` |
 | `--max-requests-jitter` | max_requests 抖动 | `model_defaults.max_requests_jitter` |

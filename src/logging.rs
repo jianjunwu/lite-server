@@ -28,20 +28,12 @@ pub fn init(
     rotation: &str,
     max_size: usize,
     backup_count: usize,
-    verbose: bool,
 ) -> LogGuard {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("lite_server={},tokio=warn,hyper=warn", level)));
 
     // stdout layer (always)
     let stdout_layer = fmt::layer().with_target(true).with_thread_ids(true);
-
-    // stderr layer (when --log-verbose)
-    let stderr_layer = if verbose {
-        Some(fmt::layer().with_writer(std::io::stderr).with_ansi(false).with_target(true))
-    } else {
-        None
-    };
 
     let mut info_guard = None;
     let info_layer = if let Some(path) = info_output {
@@ -89,7 +81,6 @@ pub fn init(
     tracing_subscriber::registry()
         .with(filter)
         .with(stdout_layer)
-        .with(stderr_layer)
         .with(info_layer)
         .with(error_layer)
         .init();

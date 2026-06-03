@@ -95,7 +95,7 @@ pub struct LoggingConfig {
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
-            level: "warn".to_string(),
+            level: "info".to_string(),
             info_output: None,
             error_output: None,
             rotation: "none".to_string(),
@@ -356,7 +356,6 @@ pub struct CliOverrides {
     pub no_grpc: bool,
     pub no_metrics: bool,
     pub no_streaming_metrics: bool,
-    pub log_verbose: bool,
     pub max_queue_size: Option<usize>,
     pub max_requests: Option<usize>,
     pub max_requests_jitter: Option<usize>,

@@ -62,7 +62,6 @@ lite-server serve [选项]
 | `--no-metrics` | 禁用 Prometheus 指标端点 |
 | `--no-grpc` | 禁用 gRPC 服务 |
 | `--no-streaming-metrics` | 禁用流式指标采集 |
-| `--log-verbose` | 同时输出到 stderr（stdout 被重定向时有用） |
 
 #### 模型默认值（覆盖所有模型）
 
