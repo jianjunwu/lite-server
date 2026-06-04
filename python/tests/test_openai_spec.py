@@ -308,3 +308,125 @@ class TestLoadEndpointsIntegration:
         endpoints = load_endpoints(str(tmp_path))
         handler = endpoints["/v1/chat/completions"]["handler"]
         assert callable(handler)
+
+
+# ===== EndpointSpec detect() and registry =====
+
+class TestDetectClassMethod:
+    """Test EndpointSpec.detect() discovers subclasses in loaded modules."""
+
+    @pytest.fixture
+    def minimal_module_dict(self):
+        """Create a dict of classes simulating a loaded module's namespace."""
+        from lite_server.specs.openai import OpenAIEndpoint
+
+        class MyEndpoint(OpenAIEndpoint):
+            def setup(self):
+                pass
+
+            def decode_request(self, request):
+                return request.get("messages", [{}])[0].get("content", "")
+
+            def predict(self, x):
+                return f"echo: {x}"
+
+        class NotAnEndpoint:
+            pass
+
+        return {
+            "MyEndpoint": MyEndpoint,
+            "NotAnEndpoint": NotAnEndpoint,
+            "SomeConstant": 42,
+            "OpenAIEndpoint": OpenAIEndpoint,
+        }
+
+    def test_detect_finds_concrete_subclass(self, minimal_module_dict):
+        """detect() should return instances of concrete OpenAIEndpoint subclasses."""
+        import types
+        mod = types.SimpleNamespace(**minimal_module_dict)
+        from lite_server.specs.openai import OpenAIEndpoint
+        instances = OpenAIEndpoint.detect(mod)
+        assert len(instances) == 1
+        assert isinstance(instances[0], OpenAIEndpoint)
+
+    def test_detect_excludes_base_class(self, minimal_module_dict):
+        """detect() should NOT return an instance of the abstract OpenAIEndpoint base."""
+        import types
+        mod = types.SimpleNamespace(**minimal_module_dict)
+        from lite_server.specs.openai import OpenAIEndpoint
+        instances = OpenAIEndpoint.detect(mod)
+        assert not any(i.__class__ is OpenAIEndpoint for i in instances)
+
+    def test_detect_skips_non_type_entries(self, minimal_module_dict):
+        """detect() should skip module entries that are not classes."""
+        import types
+        mod = types.SimpleNamespace(**minimal_module_dict)
+        from lite_server.specs.openai import OpenAIEndpoint
+        instances = OpenAIEndpoint.detect(mod)
+        assert len(instances) > 0
+
+    def test_detect_returns_empty_when_no_subclass(self):
+        """detect() should return empty list when no subclass exists in module."""
+        import types
+        mod = types.SimpleNamespace()
+        from lite_server.specs.openai import OpenAIEndpoint
+        instances = OpenAIEndpoint.detect(mod)
+        assert instances == []
+
+    def test_detect_skips_abstract_endpoints(self):
+        """detect() should skip subclasses that have abstract methods."""
+        import types
+        from abc import ABC, abstractmethod
+        from lite_server.specs.openai import OpenAIEndpoint
+
+        class AbstractEndpoint(OpenAIEndpoint, ABC):
+            @abstractmethod
+            def missing_method(self): pass
+
+        mod = types.SimpleNamespace(AbstractEndpoint=AbstractEndpoint)
+        instances = OpenAIEndpoint.detect(mod)
+        assert len(instances) == 0
+
+    def test_detect_multiple_concrete_subclasses(self):
+        """detect() should find all concrete subclasses in a module."""
+        import types
+        from lite_server.specs.openai import OpenAIEndpoint
+
+        class EndpointOne(OpenAIEndpoint):
+            def setup(self): pass
+            def decode_request(self, req): return req
+            def predict(self, x): return x
+
+        class EndpointTwo(OpenAIEndpoint):
+            def setup(self): pass
+            def decode_request(self, req): return req
+            def predict(self, x): return x
+
+        mod = types.SimpleNamespace(EndpointOne=EndpointOne, EndpointTwo=EndpointTwo)
+        instances = OpenAIEndpoint.detect(mod)
+        assert len(instances) == 2
+
+
+class TestRegistryAutoRegistration:
+    """Test that EndpointSpec subclasses are auto-registered."""
+
+    def test_openai_endpoint_in_registry(self):
+        """OpenAIEndpoint should be auto-registered in _SPEC_REGISTRY."""
+        from lite_server.specs.base import _SPEC_REGISTRY
+        from lite_server.specs.openai import OpenAIEndpoint
+        assert OpenAIEndpoint in _SPEC_REGISTRY
+
+    def test_registry_contains_only_concrete_specs(self):
+        """_SPEC_REGISTRY should not contain abstract classes."""
+        from lite_server.specs.base import _SPEC_REGISTRY
+        from lite_server.specs.openai import OpenAIEndpoint
+        # OpenAIEndpoint must be concrete (no abstract methods)
+        assert OpenAIEndpoint in _SPEC_REGISTRY
+        assert not OpenAIEndpoint.__abstractmethods__, (
+            f"OpenAIEndpoint has abstract methods: {OpenAIEndpoint.__abstractmethods__}"
+        )
+
+    def test_registry_is_list(self):
+        """_SPEC_REGISTRY should be a list supporting iteration."""
+        from lite_server.specs.base import _SPEC_REGISTRY
+        assert isinstance(_SPEC_REGISTRY, list)

@@ -18,6 +18,7 @@ from lite_server.endpoint import endpoint, router
 from lite_server.middleware import cors, log_requests, rate_limit, require_api_key
 from lite_server.server_proxy import ServerProxy
 from lite_server.specs.openai import OpenAIEndpoint
+from lite_server.specs.base import EndpointSpec
 
 __all__ = [
     "serve",
@@ -25,6 +26,7 @@ __all__ = [
     "AsyncLitAPI",
     "BidiStreamHandler",
     "OpenAIEndpoint",
+    "EndpointSpec",
     "ServerProxy",
     "cors",
     "endpoint",

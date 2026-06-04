@@ -103,32 +103,20 @@ def parse_args():
 from lite_server.server_proxy import ServerProxy
 
 
-def _find_openai_endpoint_class(mod):
-    """Find the first OpenAIEndpoint subclass in a module, if any."""
-    from lite_server.specs.openai import OpenAIEndpoint
-
-    for attr_name in dir(mod):
-        attr = getattr(mod, attr_name)
-        if (
-            isinstance(attr, type)
-            and issubclass(attr, OpenAIEndpoint)
-            and attr is not OpenAIEndpoint
-        ):
-            return attr
-    return None
-
-
 def load_endpoints(repo_path: str):
     """Scan repo for endpoint modules.
 
     Three loading modes (in order):
-      1. Subdirectory: endpoints/**/*.py (recursive)
+      1. Subdirectory: endpoints/**/*.py (recursive) — includes EndpointSpec
+         subclasses via auto-registration
       2. Decorator: collect routes from the global EndpointRouter
     """
     endpoints = {}
     repo = Path(repo_path)
     if not repo.exists():
         return endpoints
+
+    from lite_server.specs.base import _SPEC_REGISTRY
 
     # ---- Mode 1: Subdirectory scan (endpoints/**/*.py) ----
     endpoints_dir = repo / "endpoints"
@@ -142,18 +130,21 @@ def load_endpoints(repo_path: str):
                 mod = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(mod)
 
-                # Check for OpenAIEndpoint subclass
-                ep_class = _find_openai_endpoint_class(mod)
-                if ep_class is not None:
-                    instance = ep_class()
-                    instance.setup()
-                    for route_def in instance.get_routes():
-                        r = route_def["route"]
-                        methods = [m.upper() for m in route_def.get("methods", ["POST"])]
-                        endpoints[r] = {
-                            "handler": lambda request, _srv, _ep=instance: _ep.handle(request),
-                            "methods": methods,
-                        }
+                # Check for registered EndpointSpec subclasses
+                spec_matched = False
+                for spec_cls in _SPEC_REGISTRY:
+                    instances = spec_cls.detect(mod)
+                    for instance in instances:
+                        instance.setup()
+                        for route_def in instance.get_routes():
+                            r = route_def["route"]
+                            methods = [m.upper() for m in route_def.get("methods", ["POST"])]
+                            endpoints[r] = {
+                                "handler": lambda request, _srv, _ep=instance: _ep.handle(request),
+                                "methods": methods,
+                            }
+                            spec_matched = True
+                if spec_matched:
                     continue
 
                 # Check for plain handler file (methods + handler)

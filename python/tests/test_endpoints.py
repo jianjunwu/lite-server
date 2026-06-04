@@ -311,3 +311,61 @@ class TestSetupLogging:
         setup_logging()
         formatter = logger.handlers[0].formatter
         assert isinstance(formatter, _LevelPrefixFormatter)
+
+
+# ===== EndpointSpec registry integration =====
+
+class TestLoadEndpointsWithCustomSpec:
+    """load_endpoints() should discover custom EndpointSpec subclasses via registry."""
+
+    def test_custom_spec_detected_via_registry(self, tmp_path):
+        """A custom EndpointSpec subclass in an endpoint file should be detected."""
+        ep_dir = tmp_path / "endpoints"
+        ep_dir.mkdir()
+        ep_file = ep_dir / "custom.py"
+        ep_file.write_text(textwrap.dedent("""\
+            from lite_server.specs.base import EndpointSpec
+
+            class CustomSpec(EndpointSpec):
+                routes = ["/v1/custom"]
+
+                def setup(self):
+                    pass
+
+                def decode_request(self, request):
+                    return request
+
+                def predict(self, x):
+                    return x
+
+                @classmethod
+                def detect(cls, mod):
+                    for attr_name in dir(mod):
+                        attr = getattr(mod, attr_name)
+                        if (
+                            isinstance(attr, type)
+                            and issubclass(attr, cls)
+                            and not getattr(attr, "__abstractmethods__", None)
+                        ):
+                            return [attr()]
+                    return []
+
+                def get_routes(self):
+                    return [{"route": r, "methods": ["GET"]} for r in self.routes]
+
+                async def handle(self, request):
+                    decoded = self.decode_request(request)
+                    result = self.predict(decoded)
+                    return {
+                        "request_id": request.get("request_id", ""),
+                        "status_code": 200,
+                        "headers": None,
+                        "body": result,
+                    }
+        """))
+        from lite_server.worker.endpoints import load_endpoints
+        endpoints = load_endpoints(str(tmp_path))
+
+        assert "/v1/custom" in endpoints
+        assert "GET" in endpoints["/v1/custom"]["methods"]
+        assert callable(endpoints["/v1/custom"]["handler"])

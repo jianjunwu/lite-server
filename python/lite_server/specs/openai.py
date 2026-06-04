@@ -12,8 +12,10 @@ import time
 import uuid
 from typing import Any, AsyncIterator
 
+from lite_server.specs.base import EndpointSpec
 
-class OpenAIEndpoint:
+
+class OpenAIEndpoint(EndpointSpec):
     """Base class for OpenAI-compatible endpoints.
 
     Subclasses must implement:
@@ -35,6 +37,21 @@ class OpenAIEndpoint:
 
     # Default routes registered when `routes` is None
     _DEFAULT_ROUTES = ["/v1/chat/completions"]
+
+    @classmethod
+    def detect(cls, mod) -> list[OpenAIEndpoint]:
+        """Discover concrete OpenAIEndpoint subclasses in a loaded module."""
+        instances: list[OpenAIEndpoint] = []
+        for attr_name in dir(mod):
+            attr = getattr(mod, attr_name)
+            if (
+                isinstance(attr, type)
+                and issubclass(attr, cls)
+                and attr is not cls
+                and not getattr(attr, "__abstractmethods__", None)
+            ):
+                instances.append(attr())
+        return instances
 
     def setup(self) -> None:
         """Initialize model. Called once at startup."""
