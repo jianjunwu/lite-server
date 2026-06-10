@@ -56,7 +56,7 @@ def parse_args():
     parser.add_argument("--worker-id", type=int, required=True)
     parser.add_argument("--endpoint", required=True, help="ZMQ PAIR endpoint, e.g. ipc:///tmp/lite-server/...")
     parser.add_argument("--continuous-batching", action="store_true", default=False)
-    parser.add_argument("--log-level", default="warn", help="Logging level: debug, info, warn, error")
+    parser.add_argument("--log-level", default="info", help="Logging level: debug, info, warn, error")
     return parser.parse_args()
 
 
@@ -73,11 +73,24 @@ class _LevelPrefixFormatter(logging.Formatter):
 
     def format(self, record):
         prefix = self._LEVEL_MAP.get(record.levelno, record.levelname)
-        msg = record.getMessage()
-        return f"[{prefix}] {msg}"
+        s = record.getMessage()
+        if record.exc_info:
+            if not record.exc_text:
+                record.exc_text = self.formatException(record.exc_info)
+        if record.exc_text:
+            if s[-1:] != "\n":
+                s = s + "\n"
+            s = s + record.exc_text
+        if record.stack_info:
+            if s[-1:] != "\n":
+                s = s + "\n"
+            s = s + self.formatStack(record.stack_info)
+        # Prefix every line so the Rust stderr parser forwards traceback
+        # lines at the correct tracing level.
+        return '\n'.join(f"[{prefix}] {ln}" for ln in s.split('\n'))
 
 
-def setup_logging(worker_id: int, level_str: str = "warn"):
+def setup_logging(worker_id: int, level_str: str = "info"):
     """Configure worker logging: plain text to stderr (captured by Rust).
 
     Configures the root logger so that all child loggers (including the

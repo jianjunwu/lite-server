@@ -3653,3 +3653,74 @@ class TestAsyncLoopNonStreaming:
         resp.ParseFromString(socket._msgs[0])
         assert resp.single.status.code == "Ok"
         assert resp.single.data == b"{}"
+
+
+# ---------------------------------------------------------------------------
+# _LevelPrefixFormatter tests
+# ---------------------------------------------------------------------------
+
+class TestLevelPrefixFormatter:
+    def test_format_includes_exception_traceback(self):
+        """Formatter must include exception traceback (exc_info), not just the message."""
+        import io
+        fmt = inference._LevelPrefixFormatter()
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        handler.setFormatter(fmt)
+        logger = logging.getLogger("test_fmt_exc")
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            logger.exception("something failed")
+
+        output = buf.getvalue()
+        assert "[ERROR]" in output
+        assert "something failed" in output
+        assert "ValueError" in output, f"traceback missing from: {output!r}"
+        assert "boom" in output, f"exception message missing from: {output!r}"
+
+    def test_format_each_line_prefixed_with_level(self):
+        """Every line of multi-line output must start with [LEVEL] so the
+        Rust stderr parser forwards all traceback lines at the correct level."""
+        import io
+        fmt = inference._LevelPrefixFormatter()
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        handler.setFormatter(fmt)
+        logger = logging.getLogger("test_fmt_lines")
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+
+        try:
+            raise RuntimeError("multi-line-test")
+        except RuntimeError:
+            logger.exception("line1\nline2")
+
+        output = buf.getvalue()
+        for line in output.rstrip('\n').split('\n'):
+            assert line.startswith("[ERROR]"), f"line not prefixed: {line!r}"
+
+    def test_format_simple_info_message(self):
+        """Simple INFO message without exception should still work."""
+        fmt = inference._LevelPrefixFormatter()
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname="t.py", lineno=1,
+            msg="hello %s", args=("world",), exc_info=None,
+        )
+        output = fmt.format(record)
+        assert output == "[INFO] hello world"
+
+    def test_format_warn_message(self):
+        """WARN message with level prefix."""
+        fmt = inference._LevelPrefixFormatter()
+        record = logging.LogRecord(
+            name="test", level=logging.WARNING, pathname="t.py", lineno=1,
+            msg="careful", args=(), exc_info=None,
+        )
+        output = fmt.format(record)
+        assert output == "[WARN] careful"

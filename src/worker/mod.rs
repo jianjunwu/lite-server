@@ -760,12 +760,27 @@ impl WorkerManager {
                             }
                             let line = String::from_utf8_lossy(&buf);
                             let trimmed = line.trim();
-                            if trimmed.starts_with("[ERROR]") {
-                                tracing::error!(worker_id = worker_id_clone, model = %model_name_clone, version = %version_clone, "{}", trimmed.strip_prefix("[ERROR]").unwrap_or(trimmed).trim());
-                            } else if trimmed.starts_with("[WARN]") {
-                                tracing::warn!(worker_id = worker_id_clone, model = %model_name_clone, version = %version_clone, "{}", trimmed.strip_prefix("[WARN]").unwrap_or(trimmed).trim());
-                            } else {
-                                tracing::debug!(worker_id = worker_id_clone, model = %model_name_clone, version = %version_clone, "{}", trimmed);
+                            let level = classify_stderr_line(trimmed);
+                            let msg = trimmed
+                                .strip_prefix("[ERROR]")
+                                .or_else(|| trimmed.strip_prefix("[WARN]"))
+                                .or_else(|| trimmed.strip_prefix("[INFO]"))
+                                .or_else(|| trimmed.strip_prefix("[DEBUG]"))
+                                .unwrap_or(trimmed)
+                                .trim();
+                            match level {
+                                tracing::Level::ERROR => {
+                                    tracing::error!(worker_id = worker_id_clone, model = %model_name_clone, version = %version_clone, "{}", msg);
+                                }
+                                tracing::Level::WARN => {
+                                    tracing::warn!(worker_id = worker_id_clone, model = %model_name_clone, version = %version_clone, "{}", msg);
+                                }
+                                tracing::Level::INFO => {
+                                    tracing::info!(worker_id = worker_id_clone, model = %model_name_clone, version = %version_clone, "{}", msg);
+                                }
+                                _ => {
+                                    tracing::debug!(worker_id = worker_id_clone, model = %model_name_clone, version = %version_clone, "{}", trimmed);
+                                }
                             }
                         }
                         Err(e) => {
@@ -1272,6 +1287,20 @@ pub fn pick_worker_skip_ejected(num_workers: usize, outlier: &OutlierState) -> u
     start
 }
 
+/// Classify a stderr line from the Python worker into a tracing level.
+fn classify_stderr_line(line: &str) -> tracing::Level {
+    let trimmed = line.trim();
+    if trimmed.starts_with("[ERROR]") {
+        tracing::Level::ERROR
+    } else if trimmed.starts_with("[WARN]") {
+        tracing::Level::WARN
+    } else if trimmed.starts_with("[INFO]") {
+        tracing::Level::INFO
+    } else {
+        tracing::Level::DEBUG
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1667,7 +1696,26 @@ heartbeat_max_failures: 5
         assert_eq!(parts2[1], "my_model");
     }
 
-    // ===== Heartbeat sub-second detection =====
+    // ===== Stderr line classification =====
+
+    #[test]
+    fn test_classify_stderr_line_info_not_dropped() {
+        // BUG: [INFO] fell through to DEBUG, making Python info logs invisible
+        // at the default Rust tracing level ("info").
+        assert_eq!(
+            classify_stderr_line("[INFO] hello world"),
+            tracing::Level::INFO,
+            "BUG: [INFO] was classified as DEBUG, making info logs invisible"
+        );
+        assert_eq!(classify_stderr_line("[ERROR] boom"), tracing::Level::ERROR);
+        assert_eq!(classify_stderr_line("[WARN] hmm"), tracing::Level::WARN);
+        assert_eq!(classify_stderr_line("plain text"), tracing::Level::DEBUG);
+        assert_eq!(classify_stderr_line("[DEBUG] debug stuff"), tracing::Level::DEBUG);
+        // Traceback lines (indented) should be DEBUG so they don't spam unless
+        // the user wants full verbosity.
+        assert_eq!(classify_stderr_line("  File \"x.py\", line 1"), tracing::Level::DEBUG);
+        assert_eq!(classify_stderr_line("Traceback (most recent call last):"), tracing::Level::DEBUG);
+    }
 
     #[test]
     fn test_heartbeat_enabled_with_sub_second_interval() {
