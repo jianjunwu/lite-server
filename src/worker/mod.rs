@@ -656,6 +656,8 @@ impl WorkerManager {
                 cmd.env("PYTHONPATH", new_pythonpath);
             }
 
+            cmd.current_dir(&model_dir);
+
             let mut child = cmd
                 .arg("-m")
                 .arg("lite_server.worker.inference")
