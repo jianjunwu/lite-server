@@ -410,17 +410,10 @@ impl WorkerManager {
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr);
             let mut buf = Vec::with_capacity(1024);
-            let mut batcher: Option<StderrBatcher> = None;
             loop {
                 buf.clear();
                 match reader.read_until(b'\n', &mut buf).await {
-                    Ok(0) => {
-                        if let Some(b) = batcher.take() {
-                            let (level, msg) = b.finish();
-                            emit_stderr_batch(level, &msg, worker_id_clone as usize, &model_name_clone, &version_clone);
-                        }
-                        break;
-                    }
+                    Ok(0) => break,
                     Ok(_) => {
                         while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
                             buf.pop();
@@ -428,25 +421,9 @@ impl WorkerManager {
                         let line = String::from_utf8_lossy(&buf);
                         let level = classify_stderr_line(line.trim());
                         let msg = strip_level_prefix(line.trim());
-
-                        match &mut batcher {
-                            Some(b) if b.level == level => {
-                                b.push(msg.to_string());
-                            }
-                            _ => {
-                                if let Some(b) = batcher.take() {
-                                    let (lvl, joined) = b.finish();
-                                    emit_stderr_batch(lvl, &joined, worker_id_clone as usize, &model_name_clone, &version_clone);
-                                }
-                                batcher = Some(StderrBatcher::new(level, msg.to_string()));
-                            }
-                        }
+                        emit_stderr_line(level, msg, worker_id_clone as usize, &model_name_clone, &version_clone);
                     }
                     Err(e) => {
-                        if let Some(b) = batcher.take() {
-                            let (level, msg) = b.finish();
-                            emit_stderr_batch(level, &msg, worker_id_clone as usize, &model_name_clone, &version_clone);
-                        }
                         tracing::error!(worker_id = worker_id_clone, "Worker stderr read error: {}", e);
                         break;
                     }
@@ -766,16 +743,10 @@ impl WorkerManager {
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
                 let mut buf = Vec::with_capacity(1024);
-                let mut batcher: Option<StderrBatcher> = None;
                 loop {
                     buf.clear();
                     match reader.read_until(b'\n', &mut buf).await {
                         Ok(0) => {
-                            // Flush remaining batch at EOF
-                            if let Some(b) = batcher.take() {
-                                let (level, msg) = b.finish();
-                                emit_stderr_batch(level, &msg, worker_id_clone, &model_name_clone, &version_clone);
-                            }
                             tracing::debug!(worker_id = worker_id_clone, "Worker stderr EOF");
                             break;
                         }
@@ -787,27 +758,9 @@ impl WorkerManager {
                             let line = String::from_utf8_lossy(&buf);
                             let level = classify_stderr_line(line.trim());
                             let msg = strip_level_prefix(line.trim());
-
-                            match &mut batcher {
-                                Some(b) if b.level == level => {
-                                    b.push(msg.to_string());
-                                }
-                                _ => {
-                                    // Flush previous batch when level changes
-                                    if let Some(b) = batcher.take() {
-                                        let (lvl, joined) = b.finish();
-                                        emit_stderr_batch(lvl, &joined, worker_id_clone, &model_name_clone, &version_clone);
-                                    }
-                                    batcher = Some(StderrBatcher::new(level, msg.to_string()));
-                                }
-                            }
+                            emit_stderr_line(level, msg, worker_id_clone, &model_name_clone, &version_clone);
                         }
                         Err(e) => {
-                            // Flush batch before reporting read error
-                            if let Some(b) = batcher.take() {
-                                let (level, msg) = b.finish();
-                                emit_stderr_batch(level, &msg, worker_id_clone, &model_name_clone, &version_clone);
-                            }
                             tracing::error!(worker_id = worker_id_clone, "Worker stderr read error: {}", e);
                             break;
                         }
@@ -1337,32 +1290,8 @@ fn strip_level_prefix(line: &str) -> &str {
         .trim()
 }
 
-/// Batches consecutive same-level stderr lines so tracebacks are emitted as
-/// a single tracing event instead of one event per line.
-struct StderrBatcher {
-    level: tracing::Level,
-    lines: Vec<String>,
-}
-
-impl StderrBatcher {
-    fn new(level: tracing::Level, first_line: String) -> Self {
-        Self {
-            level,
-            lines: vec![first_line],
-        }
-    }
-
-    fn push(&mut self, line: String) {
-        self.lines.push(line);
-    }
-
-    fn finish(self) -> (tracing::Level, String) {
-        (self.level, self.lines.join("\n"))
-    }
-}
-
-/// Emit a batched stderr message at the given tracing level.
-fn emit_stderr_batch(level: tracing::Level, msg: &str, worker_id: usize, model: &str, version: &str) {
+/// Emit a single stderr line at the given tracing level.
+fn emit_stderr_line(level: tracing::Level, msg: &str, worker_id: usize, model: &str, version: &str) {
     match level {
         tracing::Level::ERROR => {
             tracing::error!(worker_id = worker_id, model = %model, version = %version, "{}", msg);
@@ -1378,6 +1307,7 @@ fn emit_stderr_batch(level: tracing::Level, msg: &str, worker_id: usize, model: 
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -1793,26 +1723,6 @@ heartbeat_max_failures: 5
         // the user wants full verbosity.
         assert_eq!(classify_stderr_line("  File \"x.py\", line 1"), tracing::Level::DEBUG);
         assert_eq!(classify_stderr_line("Traceback (most recent call last):"), tracing::Level::DEBUG);
-    }
-
-    #[test]
-    fn test_stderr_batcher_single_line() {
-        let b = StderrBatcher::new(tracing::Level::ERROR, "predict failed".into());
-        let (level, msg) = b.finish();
-        assert_eq!(level, tracing::Level::ERROR);
-        assert_eq!(msg, "predict failed");
-    }
-
-    #[test]
-    fn test_stderr_batcher_multiple_lines() {
-        let mut b = StderrBatcher::new(tracing::Level::ERROR, "predict failed".into());
-        b.push("Traceback (most recent call last):".into());
-        b.push("  File \"model.py\", line 10, in predict".into());
-        b.push("RuntimeError: boom".into());
-        let (level, msg) = b.finish();
-        assert_eq!(level, tracing::Level::ERROR);
-        assert!(msg.contains('\n'), "multi-line batch must use \\n separator");
-        assert!(msg.contains("model.py"), "traceback info must be preserved");
     }
 
     #[test]
