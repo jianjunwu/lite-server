@@ -19,6 +19,7 @@ import zmq
 
 from lite_server.api import LitAPI, RequestMeta, BidiStreamHandler
 from lite_server.api_async import AsyncLitAPI
+from lite_server.exceptions import HTTPException
 from lite_server.proto import (
     BatchItemResponse,
     BatchRequest,
@@ -162,22 +163,41 @@ def _make_status(ok: bool, message: str = "") -> Status:
     return Status(code="Ok" if ok else "Error", message=message)
 
 
-def _make_error_response(uid: str, message: str) -> Response:
+def _make_error_response(uid: str, message: str,
+                         status_code: int | None = None,
+                         error_code: str | None = None) -> Response:
+    if status_code is not None:
+        # Structured model error: client sees {"error": {"code": ..., "message": ...}}
+        # Status.message carries the HTTP status code so the Rust/tonic side
+        # can distinguish model-level errors from internal worker errors.
+        data = json.dumps({
+            "error": {"code": error_code or "MODEL_ERROR", "message": message}
+        }).encode()
+        status = Status(code="Error", message=str(status_code))
+    else:
+        # Internal/unexpected error: keep existing format, Rust will sanitize
+        data = json.dumps({"error": message}).encode()
+        status = Status(code="Error", message=message)
     return Response(
         uid=uid,
-        single=SingleResponse(
-            data=json.dumps({"error": message}).encode(),
-            status=_make_status(False, message),
-        ),
+        single=SingleResponse(data=data, status=status),
     )
 
 
-def _make_stream_error(stream_id: str, message: str) -> Response:
+def _make_stream_error(stream_id: str, message: str,
+                       error_code: str | None = None) -> Response:
+    if error_code is not None:
+        # Structured error for model-level HTTPException in streaming.
+        # The StreamError.message contains a JSON object that the Rust/tonic
+        # side parses to produce a structured error event.
+        msg = json.dumps({"error": {"code": error_code, "message": message}})
+    else:
+        msg = message
     return Response(
         uid=f"stream-error-{stream_id}",
         stream=StreamResponse(
             stream_id=stream_id,
-            error=StreamError(message=message),
+            error=StreamError(message=msg),
         ),
     )
 
@@ -471,6 +491,11 @@ def _consume_stream_generator(lit_api: LitAPI, generator, stream_id: str, socket
                 encoded = lit_api.on_response(encoded, meta)
             resp_bytes = json.dumps(encoded).encode()
             socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
+    except HTTPException as e:
+        log.warning("stream_predict rejected for %s: %s", stream_id, e.detail)
+        socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
+        active_streams.remove(stream_id)
+        return
     except Exception as e:
         log.error("stream_predict error for %s: %s", stream_id, e)
         socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
@@ -495,6 +520,10 @@ def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.
         if hasattr(lit_api, "on_request") and meta is not None:
             try:
                 raw = lit_api.on_request(raw, meta)
+            except HTTPException as e:
+                log.warning("bidi on_request rejected for %s: %s", stream_id, e.detail)
+                socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
+                return
             except Exception as e:
                 socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
                 return
@@ -503,6 +532,10 @@ def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.
 
         try:
             handler = lit_api.bidi_stream()
+        except HTTPException as e:
+            log.warning("bidi_stream rejected for %s: %s", stream_id, e.detail)
+            socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
+            return
         except Exception as e:
             socket.send(_make_stream_error(stream_id, f"bidi_stream failed: {e}").SerializeToString())
             return
@@ -511,6 +544,10 @@ def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.
 
         try:
             output = handler.on_open(decoded)
+        except HTTPException as e:
+            log.warning("bidi on_open rejected for %s: %s", stream_id, e.detail)
+            socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
+            return
         except Exception as e:
             log.error("bidi on_open failed for %s: %s", stream_id, e, exc_info=True)
             socket.send(_make_stream_error(stream_id, f"on_open failed: {e}").SerializeToString())
@@ -523,6 +560,10 @@ def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.
                     encoded = lit_api.on_response(encoded, meta)
                 resp_bytes = json.dumps(encoded).encode()
                 socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
+            except HTTPException as e:
+                log.warning("bidi on_open encode rejected for %s: %s", stream_id, e.detail)
+                socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
+                return
             except Exception as e:
                 log.error("bidi on_open encode failed for %s: %s", stream_id, e, exc_info=True)
                 socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
@@ -535,6 +576,9 @@ def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.
             resp_bytes, status, metrics = _run_predict(lit_api, data, meta, log)
             socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=True).SerializeToString())
             socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
+        except HTTPException as e:
+            log.warning("stream fallback predict rejected for %s: %s", stream_id, e.detail)
+            socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
         except Exception as e:
             socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
         return
@@ -545,6 +589,10 @@ def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.
     if hasattr(lit_api, "on_request") and meta is not None:
         try:
             raw = lit_api.on_request(raw, meta)
+        except HTTPException as e:
+            log.warning("stream on_request rejected for %s: %s", stream_id, e.detail)
+            socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
+            return
         except Exception as e:
             socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
             return
@@ -553,6 +601,10 @@ def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.
 
     try:
         generator = lit_api.stream_predict(decoded)
+    except HTTPException as e:
+        log.warning("stream_predict rejected for %s: %s", stream_id, e.detail)
+        socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
+        return
     except Exception as e:
         socket.send(_make_stream_error(stream_id, f"stream_predict failed: {e}").SerializeToString())
         return
@@ -578,6 +630,10 @@ def _handle_stream_chunk(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq
 
     try:
         output = handler.on_chunk(raw)
+    except HTTPException as e:
+        log.warning("bidi on_chunk rejected for %s: %s", stream_id, e.detail)
+        socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
+        return
     except Exception as e:
         log.error("bidi on_chunk failed for %s: %s", stream_id, e, exc_info=True)
         socket.send(_make_stream_error(stream_id, f"on_chunk failed: {e}").SerializeToString())
@@ -590,6 +646,9 @@ def _handle_stream_chunk(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq
                 encoded = lit_api.on_response(encoded, meta)
             resp_bytes = json.dumps(encoded).encode()
             socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
+        except HTTPException as e:
+            log.warning("bidi encode rejected for %s: %s", stream_id, e.detail)
+            socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
         except Exception as e:
             log.error("bidi encode failed for %s: %s", stream_id, e, exc_info=True)
             socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
@@ -799,6 +858,9 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
         else:
             response = _make_error_response(uid, "Unsupported payload type")
 
+    except HTTPException as e:
+        log.warning("async request %s rejected: %s", uid, e.detail)
+        response = _make_error_response(uid, e.detail, status_code=e.status_code, error_code=e.error_code)
     except Exception as e:
         log.error("async request %s failed: %s", uid, e, exc_info=True)
         response = _make_error_response(uid, f"{type(e).__name__}: {e}")
@@ -876,6 +938,10 @@ async def _handle_stream_open_async(
         if hasattr(lit_api, "on_request") and meta is not None:
             try:
                 raw = await _maybe_await(lit_api.on_request, raw, meta)
+            except HTTPException as e:
+                log.warning("bidi on_request rejected for %s: %s", stream_id, e.detail)
+                await socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
+                return
             except Exception as e:
                 log.warning("on_request hook failed for bidi %s: %s", stream_id, e, exc_info=True)
                 await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
@@ -883,6 +949,10 @@ async def _handle_stream_open_async(
 
         try:
             decoded = await _maybe_await(lit_api.decode_request, raw) if hasattr(lit_api, "decode_request") else raw
+        except HTTPException as e:
+            log.warning("bidi decode_request rejected for %s: %s", stream_id, e.detail)
+            await socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
+            return
         except Exception as e:
             log.warning("decode_request failed for bidi %s: %s", stream_id, e, exc_info=True)
             await socket.send(_make_stream_error(stream_id, f"decode failed: {e}").SerializeToString())
@@ -890,6 +960,10 @@ async def _handle_stream_open_async(
 
         try:
             handler = await _maybe_await(lit_api.bidi_stream)
+        except HTTPException as e:
+            log.warning("bidi_stream rejected for %s: %s", stream_id, e.detail)
+            await socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
+            return
         except Exception as e:
             log.error("bidi_stream failed for %s: %s", stream_id, e, exc_info=True)
             await socket.send(_make_stream_error(stream_id, f"bidi_stream failed: {e}").SerializeToString())
@@ -899,6 +973,10 @@ async def _handle_stream_open_async(
 
         try:
             output = await _maybe_await(handler.on_open, decoded)
+        except HTTPException as e:
+            log.warning("bidi on_open rejected for %s: %s", stream_id, e.detail)
+            await socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
+            return
         except Exception as e:
             log.error("bidi on_open failed for %s: %s", stream_id, e, exc_info=True)
             await socket.send(_make_stream_error(stream_id, f"on_open failed: {e}").SerializeToString())
@@ -911,6 +989,10 @@ async def _handle_stream_open_async(
                     encoded = await _maybe_await(lit_api.on_response, encoded, meta)
                 resp_bytes = json.dumps(encoded).encode()
                 await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
+            except HTTPException as e:
+                log.warning("bidi on_open encode rejected for %s: %s", stream_id, e.detail)
+                await socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
+                return
             except Exception as e:
                 log.error("bidi on_open encode failed for %s: %s", stream_id, e, exc_info=True)
                 await socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
@@ -923,6 +1005,9 @@ async def _handle_stream_open_async(
             resp_bytes, status, metrics = await _run_predict_async(lit_api, data, meta, log)
             await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=True).SerializeToString())
             await socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
+        except HTTPException as e:
+            log.warning("stream fallback predict rejected for %s: %s", stream_id, e.detail)
+            await socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
         except Exception as e:
             log.error("stream fallback predict failed for %s: %s", stream_id, e, exc_info=True)
             await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
@@ -934,6 +1019,10 @@ async def _handle_stream_open_async(
     if hasattr(lit_api, "on_request") and meta is not None:
         try:
             raw = await _maybe_await(lit_api.on_request, raw, meta)
+        except HTTPException as e:
+            log.warning("stream on_request rejected for %s: %s", stream_id, e.detail)
+            await socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
+            return
         except Exception as e:
             log.warning("on_request hook failed for stream %s: %s", stream_id, e, exc_info=True)
             await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
@@ -941,6 +1030,10 @@ async def _handle_stream_open_async(
 
     try:
         decoded = await _maybe_await(lit_api.decode_request, raw) if hasattr(lit_api, "decode_request") else raw
+    except HTTPException as e:
+        log.warning("stream decode_request rejected for %s: %s", stream_id, e.detail)
+        await socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
+        return
     except Exception as e:
         log.warning("decode_request failed for stream %s: %s", stream_id, e, exc_info=True)
         await socket.send(_make_stream_error(stream_id, f"decode failed: {e}").SerializeToString())
@@ -948,6 +1041,10 @@ async def _handle_stream_open_async(
 
     try:
         generator = await _maybe_await(lit_api.stream_predict, decoded)
+    except HTTPException as e:
+        log.warning("stream_predict rejected for %s: %s", stream_id, e.detail)
+        await socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
+        return
     except Exception as e:
         log.error("stream_predict failed for %s: %s", stream_id, e, exc_info=True)
         await socket.send(_make_stream_error(stream_id, f"stream_predict failed: {e}").SerializeToString())
@@ -984,6 +1081,10 @@ async def _handle_stream_chunk_async(
 
     try:
         output = await _maybe_await(handler.on_chunk, raw)
+    except HTTPException as e:
+        log.warning("bidi on_chunk rejected for %s: %s", stream_id, e.detail)
+        await socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
+        return
     except Exception as e:
         log.error("bidi on_chunk failed for %s: %s", stream_id, e, exc_info=True)
         await socket.send(_make_stream_error(stream_id, f"on_chunk failed: {e}").SerializeToString())
@@ -994,6 +1095,9 @@ async def _handle_stream_chunk_async(
             encoded = await _maybe_await(lit_api.encode_response, output) if hasattr(lit_api, "encode_response") else output
             resp_bytes = json.dumps(encoded).encode()
             await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
+        except HTTPException as e:
+            log.warning("bidi encode rejected for %s: %s", stream_id, e.detail)
+            await socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
         except Exception as e:
             log.error("bidi encode failed for %s: %s", stream_id, e, exc_info=True)
             await socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
@@ -1016,6 +1120,10 @@ async def _consume_async_stream(
                     encoded = await _maybe_await(lit_api.on_response, encoded, meta)
                 resp_bytes = json.dumps(encoded).encode()
                 await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
+            except HTTPException as e:
+                log.warning("stream encode rejected for %s: %s", stream_id, e.detail)
+                await socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
+                return
             except Exception as e:
                 log.error("encode/on_response failed for stream %s: %s", stream_id, e, exc_info=True)
                 await socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
@@ -1023,6 +1131,10 @@ async def _consume_async_stream(
     except asyncio.CancelledError:
         # Propagate cancellation so the task is properly cancelled
         raise
+    except HTTPException as e:
+        log.warning("async stream_predict rejected for %s: %s", stream_id, e.detail)
+        await socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
+        return
     except Exception as e:
         log.error("async stream_predict error for %s: %s", stream_id, e, exc_info=True)
         await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
@@ -1063,6 +1175,10 @@ async def _consume_sync_stream_async(
                     encoded = await _maybe_await(lit_api.on_response, encoded, meta)
                 resp_bytes = json.dumps(encoded).encode()
                 await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
+            except HTTPException as e:
+                log.warning("stream encode rejected for %s: %s", stream_id, e.detail)
+                await socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
+                return
             except Exception as e:
                 log.error("encode/on_response failed for stream %s: %s", stream_id, e, exc_info=True)
                 await socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
@@ -1074,6 +1190,10 @@ async def _consume_sync_stream_async(
         except Exception:
             pass
         raise
+    except HTTPException as e:
+        log.warning("sync stream_predict rejected for %s: %s", stream_id, e.detail)
+        await socket.send(_make_stream_error(stream_id, e.detail, error_code=e.error_code).SerializeToString())
+        return
     except Exception as e:
         log.error("sync stream_predict error for %s: %s", stream_id, e, exc_info=True)
         await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
@@ -1244,6 +1364,9 @@ def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log:
             else:
                 response = _make_error_response(uid, "Unsupported payload type")
 
+        except HTTPException as e:
+            log.warning("request %s rejected: %s", uid, e.detail)
+            response = _make_error_response(uid, e.detail, status_code=e.status_code, error_code=e.error_code)
         except Exception as e:
             log.error("request %s failed: %s", uid, e, exc_info=True)
             response = _make_error_response(uid, f"{type(e).__name__}: {e}")
@@ -1324,6 +1447,10 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
         try:
             if hasattr(lit_api, "on_request"):
                 raw = _invoke_method(lit_api.on_request, raw, meta)
+        except HTTPException as e:
+            err_resp = _make_error_response(cb_add.uid, e.detail, status_code=e.status_code, error_code=e.error_code)
+            socket.send(err_resp.SerializeToString())
+            return
         except Exception as e:
             err_resp = _make_error_response(cb_add.uid, str(e))
             socket.send(err_resp.SerializeToString())
@@ -1340,6 +1467,10 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
         try:
             _invoke_method(lit_api.prefill, cb_add.uid, decoded)
             state.prefilled = True
+        except HTTPException as e:
+            del active[cb_add.uid]
+            err_resp = _make_error_response(cb_add.uid, e.detail, status_code=e.status_code, error_code=e.error_code)
+            socket.send(err_resp.SerializeToString())
         except Exception as e:
             del active[cb_add.uid]
             err_resp = _make_error_response(cb_add.uid, f"prefill failed: {e}")
@@ -1364,6 +1495,13 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
 
                 try:
                     outputs = _invoke_method(lit_api.step, ready)
+                except HTTPException as e:
+                    log.warning("cb step rejected: %s", e.detail)
+                    for state in list(active.values()):
+                        err_resp = _make_error_response(state.uid, e.detail, status_code=e.status_code, error_code=e.error_code)
+                        socket.send(err_resp.SerializeToString())
+                    active.clear()
+                    continue
                 except Exception as e:
                     log.error("cb step error: %s", e, exc_info=True)
                     for state in list(active.values()):
@@ -1395,6 +1533,10 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
                             metrics=metrics,
                         )
                         socket.send(resp.SerializeToString())
+                    except HTTPException as e:
+                        log.warning("cb encode rejected for %s: %s", uid, e.detail)
+                        err_resp = _make_error_response(uid, e.detail, status_code=e.status_code, error_code=e.error_code)
+                        socket.send(err_resp.SerializeToString())
                     except Exception as e:
                         log.error("cb encode error for %s: %s", uid, e, exc_info=True)
                         err_resp = _make_error_response(uid, f"encode failed: {e}")

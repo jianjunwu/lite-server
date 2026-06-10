@@ -49,6 +49,12 @@ pub enum AppError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// Model-initiated error with explicit HTTP status and client-facing message.
+    /// Unlike WorkerCrashed, the message is NOT sanitized — the model author
+    /// intentionally exposes it.
+    #[error("model error ({0}): {2}")]
+    ModelError(u16, String, String),  // status_code, error_code, detail
 }
 
 impl AppError {
@@ -70,12 +76,37 @@ impl AppError {
             AppError::Serialization(_) => "serialization error",
             AppError::FrameTooLarge => "message too large",
             AppError::Internal(_) => "internal server error",
+            // ModelError is handled specially in IntoResponse
+            // and never reaches this point, but provide a fallback.
+            AppError::ModelError(_, _, _) => "model error",
         }
     }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        // Model errors carry a model-author-facing message — return it
+        // directly without sanitization.
+        if let AppError::ModelError(status_code, error_code, message) = &self {
+            let status = StatusCode::from_u16(*status_code)
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            // Log at info level — not a server fault, the model intentionally
+            // rejected the request.
+            tracing::info!(
+                status = %status_code,
+                error_code = %error_code,
+                detail = %message,
+                "model error"
+            );
+            let body = Json(json!({
+                "error": {
+                    "code": error_code,
+                    "message": message,
+                }
+            }));
+            return (status, body).into_response();
+        }
+
         let (status, code) = match &self {
             AppError::ModelNotFound(_) => (StatusCode::NOT_FOUND, "MODEL_NOT_FOUND"),
             AppError::ModelNotReady(_) => (StatusCode::SERVICE_UNAVAILABLE, "MODEL_NOT_READY"),
@@ -91,6 +122,8 @@ impl IntoResponse for AppError {
             AppError::Serialization(_) => (StatusCode::BAD_REQUEST, "SERIALIZATION_ERROR"),
             AppError::FrameTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "FRAME_TOO_LARGE"),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
+            // Handled above via early return; should never reach here.
+            AppError::ModelError(..) => unreachable!(),
         };
 
         // Log full internal details for operational debugging.
@@ -214,5 +247,66 @@ mod tests {
         let response = err.into_response();
         assert!(response.headers().get("retry-after").is_none(),
             "non-QueueFull errors should not have Retry-After header");
+    }
+
+    // ===== ModelError tests =====
+
+    #[tokio::test]
+    async fn test_model_error_passthrough_message() {
+        use axum::response::IntoResponse;
+        let err = AppError::ModelError(
+            400,
+            "INVALID_INPUT".to_string(),
+            "input must be non-negative".to_string(),
+        );
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Read body — the message should NOT be sanitized
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error"]["code"], "INVALID_INPUT");
+        assert_eq!(body["error"]["message"], "input must be non-negative");
+    }
+
+    #[tokio::test]
+    async fn test_model_error_various_status_codes() {
+        use axum::response::IntoResponse;
+        // 503
+        let err = AppError::ModelError(
+            503,
+            "MODEL_NOT_READY".to_string(),
+            "model loading".to_string(),
+        );
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // 404
+        let err = AppError::ModelError(
+            404,
+            "NOT_FOUND".to_string(),
+            "item not in vocab".to_string(),
+        );
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_worker_crashed_still_sanitized() {
+        use axum::response::IntoResponse;
+        let err = AppError::WorkerCrashed("internal traceback details".to_string());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error"]["code"], "WORKER_CRASHED");
+        // Must NOT leak internal details
+        assert!(body["error"]["message"].as_str().unwrap().contains("unavailable"));
+        assert!(!body["error"]["message"].as_str().unwrap().contains("traceback"));
     }
 }

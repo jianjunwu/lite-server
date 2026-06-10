@@ -533,6 +533,33 @@ async fn do_infer(
                     let msg = single.status.as_ref().and_then(|s| {
                         if s.message.is_empty() { None } else { Some(s.message.clone()) }
                     }).unwrap_or_else(|| "unknown worker error".to_string());
+
+                    // If Status.message parses as a u16 HTTP status code, the
+                    // worker is signalling a model-level HTTPException with a
+                    // structured error body in `data`. Return it to the client
+                    // without sanitization.
+                    if let Ok(http_status) = msg.parse::<u16>() {
+                        let error_code = data
+                            .get("error")
+                            .and_then(|e| e.get("code"))
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("MODEL_ERROR")
+                            .to_string();
+                        let error_message = data
+                            .get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("model error")
+                            .to_string();
+                        let status_family = match http_status / 100 {
+                            4 => "4xx",
+                            _ => "5xx",
+                        };
+                        prometheus::record_request_end(&model_name, &resolved_version, status_family, duration).await;
+                        return Err(AppError::ModelError(http_status, error_code, error_message));
+                    }
+
+                    // Not a numeric status code — internal worker error, sanitize.
                     error!(worker_error = %msg, duration_ms = %(duration * 1000.0) as u64, "Worker returned error");
                     prometheus::record_request_end(&model_name, &resolved_version, "5xx", duration).await;
                     Err(AppError::WorkerCrashed(msg))
@@ -682,7 +709,14 @@ pub async fn sse_infer_handler(
                     Event::default().data(data.to_string())
                 }
                 Some(pb::stream_response::Payload::Error(e)) => {
-                    Event::default().data(json!({"error": e.message}).to_string())
+                    // Try to parse as structured error from HTTPException
+                    let event_data = match serde_json::from_str::<serde_json::Value>(&e.message) {
+                        Ok(val) if val.get("error").and_then(|err| err.get("code")).is_some() => {
+                            json!({"error": val["error"]}).to_string()
+                        }
+                        _ => json!({"error": e.message}).to_string(),
+                    };
+                    Event::default().data(event_data)
                 }
                 Some(pb::stream_response::Payload::Done(done)) => {
                     prometheus::record_worker_metrics(&model_name, done.metrics.as_ref());
@@ -758,7 +792,14 @@ pub async fn sse_infer_version_handler(
                     Event::default().data(data.to_string())
                 }
                 Some(pb::stream_response::Payload::Error(e)) => {
-                    Event::default().data(json!({"error": e.message}).to_string())
+                    // Try to parse as structured error from HTTPException
+                    let event_data = match serde_json::from_str::<serde_json::Value>(&e.message) {
+                        Ok(val) if val.get("error").and_then(|err| err.get("code")).is_some() => {
+                            json!({"error": val["error"]}).to_string()
+                        }
+                        _ => json!({"error": e.message}).to_string(),
+                    };
+                    Event::default().data(event_data)
                 }
                 Some(pb::stream_response::Payload::Done(done)) => {
                     prometheus::record_worker_metrics(&model_name, done.metrics.as_ref());
@@ -916,7 +957,14 @@ async fn handle_ws_stream(
                     Message::Binary(c.data.to_vec())
                 }
                 Some(pb::stream_response::Payload::Error(e)) => {
-                    Message::Text(json!({"error": e.message}).to_string())
+                    // Try to parse as structured error from HTTPException
+                    let event_data = match serde_json::from_str::<serde_json::Value>(&e.message) {
+                        Ok(val) if val.get("error").and_then(|err| err.get("code")).is_some() => {
+                            json!({"error": val["error"]}).to_string()
+                        }
+                        _ => json!({"error": e.message}).to_string(),
+                    };
+                    Message::Text(event_data)
                 }
                 Some(pb::stream_response::Payload::Done(done)) => {
                     prometheus::record_worker_metrics(&model_name, done.metrics.as_ref());

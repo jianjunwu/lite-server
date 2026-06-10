@@ -278,3 +278,19 @@ class LitAPI(ls.LitAPI):
         Override to release resources (GPU memory, file handles, etc.).
         """
         pass
+
+
+# Re-export exception classes for convenient access::
+#
+#     from lite_server import BadRequestError
+#     from lite_server.api import HTTPException
+#
+from lite_server.exceptions import (  # noqa: F401, E402
+    BadRequestError,
+    ForbiddenError,
+    HTTPException,
+    InternalServerError,
+    NotFoundError,
+    ServiceUnavailableError,
+    UnauthorizedError,
+)

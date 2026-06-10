@@ -31,6 +31,46 @@ impl GrpcService {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Helpers: map worker error signals to gRPC status codes
+// ---------------------------------------------------------------------------
+
+/// Map an HTTP status code (from the worker's Status.message) to a gRPC code.
+fn http_status_to_grpc_code(http_status: u16) -> tonic::Code {
+    match http_status {
+        400 | 422 => tonic::Code::InvalidArgument,
+        401 => tonic::Code::Unauthenticated,
+        403 => tonic::Code::PermissionDenied,
+        404 => tonic::Code::NotFound,
+        429 => tonic::Code::ResourceExhausted,
+        503 => tonic::Code::Unavailable,
+        504 => tonic::Code::DeadlineExceeded,
+        _ => tonic::Code::Internal,
+    }
+}
+
+/// Map an error_code string (from a structured stream error) to a gRPC code.
+fn error_code_to_grpc_code(code: &str) -> tonic::Code {
+    match code {
+        "BAD_REQUEST" | "INVALID_INPUT" | "VALIDATION_ERROR" => tonic::Code::InvalidArgument,
+        "UNAUTHORIZED" => tonic::Code::Unauthenticated,
+        "FORBIDDEN" => tonic::Code::PermissionDenied,
+        "NOT_FOUND" => tonic::Code::NotFound,
+        "SERVICE_UNAVAILABLE" | "MODEL_NOT_READY" => tonic::Code::Unavailable,
+        _ => tonic::Code::Internal,
+    }
+}
+
+/// Extract (error_code, message) from a structured model error JSON payload.
+fn try_parse_model_error(
+    data: &serde_json::Value,
+) -> Option<(String, String)> {
+    let err = data.get("error")?;
+    let code = err.get("code")?.as_str()?.to_string();
+    let message = err.get("message")?.as_str()?.to_string();
+    Some((code, message))
+}
+
 #[tonic::async_trait]
 impl LiteServer for GrpcService {
     async fn infer(
@@ -107,20 +147,39 @@ impl LiteServer for GrpcService {
 
         match resp.payload {
             Some(pb::response::Payload::Single(single)) => {
-                let status = single.status.as_ref().map(|s| pb::Status {
+                let grpc_status = single.status.as_ref().map(|s| pb::Status {
                     code: s.code.clone(),
                     message: s.message.clone(),
                 });
-                if status.as_ref().map(|s| s.code.as_str()) == Some("Error") {
-                    return Err(Status::internal(
-                        status.map(|s| s.message).unwrap_or_default(),
-                    ));
+                let code = single.status.as_ref().map(|s| s.code.as_str()).unwrap_or("Ok");
+                match code {
+                    "Error" => {
+                        let msg = grpc_status
+                            .as_ref()
+                            .map(|s| s.message.clone())
+                            .unwrap_or_default();
+                        // If Status.message parses as u16, the worker signalled
+                        // a model-level HTTPException with structured error in data.
+                        if let Ok(http_status) = msg.parse::<u16>() {
+                            let data: serde_json::Value =
+                                serde_json::from_slice(&single.data).unwrap_or(serde_json::json!({}));
+                            let (error_code, error_message) =
+                                try_parse_model_error(&data)
+                                    .unwrap_or_else(|| ("MODEL_ERROR".into(), msg));
+                            return Err(Status::new(
+                                http_status_to_grpc_code(http_status),
+                                format!("[{}] {}", error_code, error_message),
+                            ));
+                        }
+                        // Not a numeric status code — internal worker error.
+                        return Err(Status::internal(msg));
+                    }
+                    _ => Ok(Response::new(pb::InferResponse {
+                        data: single.data,
+                        status: grpc_status,
+                        metrics: resp.metrics,
+                    })),
                 }
-                Ok(Response::new(pb::InferResponse {
-                    data: single.data,
-                    status,
-                    metrics: resp.metrics,
-                }))
             }
             _ => Err(Status::internal("unexpected response type")),
         }
@@ -324,7 +383,20 @@ impl LiteServer for GrpcService {
                         }
                     }
                     Some(pb::stream_response::Payload::Error(ref e)) => {
-                        let _ = tx.send(Err(Status::internal(e.message.clone()))).await;
+                        let grpc_err = match serde_json::from_str::<serde_json::Value>(&e.message) {
+                            Ok(val) => {
+                                if let Some((error_code, error_message)) = try_parse_model_error(&val) {
+                                    Status::new(
+                                        error_code_to_grpc_code(&error_code),
+                                        format!("[{}] {}", error_code, error_message),
+                                    )
+                                } else {
+                                    Status::internal(e.message.clone())
+                                }
+                            }
+                            Err(_) => Status::internal(e.message.clone()),
+                        };
+                        let _ = tx.send(Err(grpc_err)).await;
                         break;
                     }
                     Some(pb::stream_response::Payload::Done(_)) => {
@@ -496,7 +568,20 @@ impl LiteServer for GrpcService {
                             stream_id: stream_id.clone(),
                             payload: Some(pb::bidi_chunk::Payload::Close(pb::BidiClose {})),
                         };
-                        let _ = tx.send(Err(Status::internal(e.message.clone()))).await;
+                        let grpc_err = match serde_json::from_str::<serde_json::Value>(&e.message) {
+                            Ok(val) => {
+                                if let Some((error_code, error_message)) = try_parse_model_error(&val) {
+                                    Status::new(
+                                        error_code_to_grpc_code(&error_code),
+                                        format!("[{}] {}", error_code, error_message),
+                                    )
+                                } else {
+                                    Status::internal(e.message.clone())
+                                }
+                            }
+                            Err(_) => Status::internal(e.message.clone()),
+                        };
+                        let _ = tx.send(Err(grpc_err)).await;
                         let _ = tx.send(Ok(bidi_chunk)).await;
                         break;
                     }
@@ -547,4 +632,73 @@ pub async fn start_grpc_server(
         .map_err(|e| AppError::Internal(format!("gRPC server error: {}", e)))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_http_status_to_grpc_code() {
+        assert_eq!(http_status_to_grpc_code(400), tonic::Code::InvalidArgument);
+        assert_eq!(http_status_to_grpc_code(422), tonic::Code::InvalidArgument);
+        assert_eq!(http_status_to_grpc_code(401), tonic::Code::Unauthenticated);
+        assert_eq!(http_status_to_grpc_code(403), tonic::Code::PermissionDenied);
+        assert_eq!(http_status_to_grpc_code(404), tonic::Code::NotFound);
+        assert_eq!(http_status_to_grpc_code(429), tonic::Code::ResourceExhausted);
+        assert_eq!(http_status_to_grpc_code(503), tonic::Code::Unavailable);
+        assert_eq!(http_status_to_grpc_code(504), tonic::Code::DeadlineExceeded);
+        // Unknown HTTP status falls back to Internal
+        assert_eq!(http_status_to_grpc_code(418), tonic::Code::Internal);
+        assert_eq!(http_status_to_grpc_code(500), tonic::Code::Internal);
+    }
+
+    #[test]
+    fn test_error_code_to_grpc_code() {
+        assert_eq!(error_code_to_grpc_code("BAD_REQUEST"), tonic::Code::InvalidArgument);
+        assert_eq!(error_code_to_grpc_code("INVALID_INPUT"), tonic::Code::InvalidArgument);
+        assert_eq!(error_code_to_grpc_code("VALIDATION_ERROR"), tonic::Code::InvalidArgument);
+        assert_eq!(error_code_to_grpc_code("UNAUTHORIZED"), tonic::Code::Unauthenticated);
+        assert_eq!(error_code_to_grpc_code("FORBIDDEN"), tonic::Code::PermissionDenied);
+        assert_eq!(error_code_to_grpc_code("NOT_FOUND"), tonic::Code::NotFound);
+        assert_eq!(error_code_to_grpc_code("SERVICE_UNAVAILABLE"), tonic::Code::Unavailable);
+        assert_eq!(error_code_to_grpc_code("MODEL_NOT_READY"), tonic::Code::Unavailable);
+        // Unknown falls back to Internal
+        assert_eq!(error_code_to_grpc_code("UNKNOWN_CODE"), tonic::Code::Internal);
+    }
+
+    #[test]
+    fn test_try_parse_model_error_valid() {
+        let data = serde_json::json!({
+            "error": {
+                "code": "INVALID_INPUT",
+                "message": "input must be non-negative"
+            }
+        });
+        let result = try_parse_model_error(&data);
+        assert!(result.is_some());
+        let (code, message) = result.unwrap();
+        assert_eq!(code, "INVALID_INPUT");
+        assert_eq!(message, "input must be non-negative");
+    }
+
+    #[test]
+    fn test_try_parse_model_error_legacy_format() {
+        // Legacy format: {"error": "plain string"} — not parsable as model error
+        let data = serde_json::json!({"error": "TypeError: something"});
+        let result = try_parse_model_error(&data);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_try_parse_model_error_missing_fields() {
+        let data = serde_json::json!({"error": {"code": "X"}});
+        assert!(try_parse_model_error(&data).is_none());
+
+        let data = serde_json::json!({"error": {"message": "X"}});
+        assert!(try_parse_model_error(&data).is_none());
+
+        let data = serde_json::json!({"other": "stuff"});
+        assert!(try_parse_model_error(&data).is_none());
+    }
 }

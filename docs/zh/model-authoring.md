@@ -677,6 +677,59 @@ def on_response(self, response, meta):
 - 使用 `on_request()` 进行输入验证 — 抛出异常以提前拒绝
 - 避免裸 `except:` — 让意外错误传播以便调试
 
+#### 类型化 HTTP 错误
+
+使用 `HTTPException` 子类返回带有结构化错误信息的类型化 HTTP 错误。子类可用于**所有钩子**（`predict`、`stream_predict`、`bidi_stream`、`decode_request`、`encode_response`、`on_request`、`on_response`、`prefill`、`step`）以及所有协议（HTTP、SSE、WebSocket、gRPC）。
+
+```python
+from lite_server.exceptions import (
+    BadRequestError,
+    UnauthorizedError,
+    ForbiddenError,
+    NotFoundError,
+    InternalServerError,
+    ServiceUnavailableError,
+)
+
+class MyModel(LitAPI):
+    def predict(self, x):
+        if x.get("value") < 0:
+            raise BadRequestError("input must be non-negative", "INVALID_INPUT")
+        if self.model is None:
+            raise ServiceUnavailableError("model not loaded yet")
+        return self.model(x)
+
+    def on_request(self, request, meta):
+        if not self._check_auth(meta.headers):
+            raise UnauthorizedError("invalid or missing token")
+        return request
+```
+
+| 异常类 | HTTP 状态码 | 默认 error_code |
+|--------|------------|-----------------|
+| `BadRequestError` | 400 | `BAD_REQUEST` |
+| `UnauthorizedError` | 401 | `UNAUTHORIZED` |
+| `ForbiddenError` | 403 | `FORBIDDEN` |
+| `NotFoundError` | 404 | `NOT_FOUND` |
+| `InternalServerError` | 500 | `INTERNAL_ERROR` |
+| `ServiceUnavailableError` | 503 | `SERVICE_UNAVAILABLE` |
+
+所有异常类都接受自定义 `error_code` 作为第二个参数。客户端收到结构化响应：
+
+```json
+{"error": {"code": "INVALID_INPUT", "message": "input must be non-negative"}}
+```
+
+可通过直接继承 `HTTPException` 支持自定义状态码：
+
+```python
+from lite_server.exceptions import HTTPException
+
+class PaymentRequiredError(HTTPException):
+    def __init__(self, detail, error_code="PAYMENT_REQUIRED"):
+        super().__init__(402, detail, error_code)
+```
+
 ### 性能
 
 - 保持 `decode_request()` 和 `encode_response()` 轻量 — 它们在每个请求上运行

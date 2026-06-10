@@ -677,6 +677,59 @@ See [examples/11_logging](../examples/11_logging/) for a runnable demo.
 - Use `on_request()` for input validation — raise to reject early
 - Avoid bare `except:` — let unexpected errors propagate for debugging
 
+#### Typed HTTP Errors
+
+Use `HTTPException` subclasses to return typed HTTP errors with structured responses. Subclasses work in **all hooks** (`predict`, `stream_predict`, `bidi_stream`, `decode_request`, `encode_response`, `on_request`, `on_response`, `prefill`, `step`) and across all protocols (HTTP, SSE, WebSocket, gRPC).
+
+```python
+from lite_server.exceptions import (
+    BadRequestError,
+    UnauthorizedError,
+    ForbiddenError,
+    NotFoundError,
+    InternalServerError,
+    ServiceUnavailableError,
+)
+
+class MyModel(LitAPI):
+    def predict(self, x):
+        if x.get("value") < 0:
+            raise BadRequestError("input must be non-negative", "INVALID_INPUT")
+        if self.model is None:
+            raise ServiceUnavailableError("model not loaded yet")
+        return self.model(x)
+
+    def on_request(self, request, meta):
+        if not self._check_auth(meta.headers):
+            raise UnauthorizedError("invalid or missing token")
+        return request
+```
+
+| Exception | HTTP Status | Default error_code |
+|-----------|-------------|--------------------|
+| `BadRequestError` | 400 | `BAD_REQUEST` |
+| `UnauthorizedError` | 401 | `UNAUTHORIZED` |
+| `ForbiddenError` | 403 | `FORBIDDEN` |
+| `NotFoundError` | 404 | `NOT_FOUND` |
+| `InternalServerError` | 500 | `INTERNAL_ERROR` |
+| `ServiceUnavailableError` | 503 | `SERVICE_UNAVAILABLE` |
+
+All accept a custom `error_code` as the second argument. The client receives a structured response:
+
+```json
+{"error": {"code": "INVALID_INPUT", "message": "input must be non-negative"}}
+```
+
+Custom status codes are supported via subclassing `HTTPException` directly:
+
+```python
+from lite_server.exceptions import HTTPException
+
+class PaymentRequiredError(HTTPException):
+    def __init__(self, detail, error_code="PAYMENT_REQUIRED"):
+        super().__init__(402, detail, error_code)
+```
+
 ### Performance
 
 - Keep `decode_request()` and `encode_response()` lightweight — they run on every request
