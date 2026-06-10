@@ -73,7 +73,7 @@ class _LevelPrefixFormatter(logging.Formatter):
 
     def format(self, record):
         prefix = self._LEVEL_MAP.get(record.levelno, record.levelname)
-        s = record.getMessage()
+        s = f"{record.pathname}:{record.lineno} {record.getMessage()}"
         if record.exc_info:
             if not record.exc_text:
                 record.exc_text = self.formatException(record.exc_info)
@@ -261,28 +261,28 @@ def _run_predict(lit_api: LitAPI, data: bytes, meta: RequestMeta, log: logging.L
         try:
             raw = lit_api.on_request(raw, meta)
         except Exception as e:
-            log.warning("on_request hook failed: %s", e, exc_info=True)
+            log.warning("on_request hook failed: %s", e)
             raise
 
     # 2. decode_request
     try:
         decoded = lit_api.decode_request(raw) if hasattr(lit_api, "decode_request") else raw
     except Exception as e:
-        log.warning("decode_request failed: %s", e, exc_info=True)
+        log.warning("decode_request failed: %s", e)
         raise
 
     # 3. predict
     try:
         output = lit_api.predict(decoded)
     except Exception as e:
-        log.error("predict failed: %s", e, exc_info=True)
+        log.error("predict failed: %s", e)
         raise
 
     # 4. encode_response
     try:
         encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
     except Exception as e:
-        log.warning("encode_response failed: %s", e, exc_info=True)
+        log.warning("encode_response failed: %s", e)
         raise
 
     # 5. on_response
@@ -290,7 +290,7 @@ def _run_predict(lit_api: LitAPI, data: bytes, meta: RequestMeta, log: logging.L
         try:
             encoded = lit_api.on_response(encoded, meta)
         except Exception as e:
-            log.warning("on_response hook failed: %s", e, exc_info=True)
+            log.warning("on_response hook failed: %s", e)
             raise
 
     resp_bytes = json.dumps(encoded).encode()
@@ -333,7 +333,7 @@ async def _run_predict_async(lit_api: LitAPI, data: bytes, meta: RequestMeta, lo
         try:
             raw = await _maybe_await(lit_api.on_request, raw, meta)
         except Exception as e:
-            log.warning("on_request hook failed: %s", e, exc_info=True)
+            log.warning("on_request hook failed: %s", e)
             raise
 
     # 2. decode_request
@@ -343,14 +343,14 @@ async def _run_predict_async(lit_api: LitAPI, data: bytes, meta: RequestMeta, lo
         else:
             decoded = raw
     except Exception as e:
-        log.warning("decode_request failed: %s", e, exc_info=True)
+        log.warning("decode_request failed: %s", e)
         raise
 
     # 3. predict
     try:
         output = await _maybe_await(lit_api.predict, decoded)
     except Exception as e:
-        log.error("predict failed: %s", e, exc_info=True)
+        log.error("predict failed: %s", e)
         raise
 
     # 4. encode_response
@@ -360,7 +360,7 @@ async def _run_predict_async(lit_api: LitAPI, data: bytes, meta: RequestMeta, lo
         else:
             encoded = output
     except Exception as e:
-        log.warning("encode_response failed: %s", e, exc_info=True)
+        log.warning("encode_response failed: %s", e)
         raise
 
     # 5. on_response
@@ -368,7 +368,7 @@ async def _run_predict_async(lit_api: LitAPI, data: bytes, meta: RequestMeta, lo
         try:
             encoded = await _maybe_await(lit_api.on_response, encoded, meta)
         except Exception as e:
-            log.warning("on_response hook failed: %s", e, exc_info=True)
+            log.warning("on_response hook failed: %s", e)
             raise
 
     resp_bytes = json.dumps(encoded).encode()

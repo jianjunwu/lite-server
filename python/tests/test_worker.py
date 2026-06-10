@@ -185,6 +185,57 @@ class TestRunPredict:
         assert json.loads(resp_bytes) == {"output": 10}
 
 
+class TestRunPredictErrorLogging:
+    """Verify _run_predict logs include location info on exceptions."""
+
+    def test_predict_exception_log_has_exc_info(self, caplog):
+        """Inner _run_predict catch should NOT use exc_info (avoids duplicate).
+        The full traceback is logged once by the outer run_standard_loop catch."""
+        class BoomAPI:
+            def predict(self, x):
+                raise RuntimeError("boom")
+
+        meta = RequestMeta(
+            route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None
+        )
+        data = json.dumps({"input": 5}).encode()
+        log = logging.getLogger("test_predict_error")
+
+        with caplog.at_level(logging.ERROR):
+            try:
+                inference._run_predict(BoomAPI(), data, meta, log)
+            except RuntimeError:
+                pass
+
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(error_records) >= 1, "expected at least one ERROR log record"
+        assert error_records[0].exc_info is None, \
+            "inner catch must NOT use exc_info=True — traceback is logged by outer catch"
+
+    def test_predict_exception_log_includes_inference_file(self, caplog):
+        """The log record's pathname should point to inference.py."""
+        class BoomAPI:
+            def predict(self, x):
+                raise RuntimeError("boom")
+
+        meta = RequestMeta(
+            route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None
+        )
+        data = json.dumps({"input": 5}).encode()
+        log = logging.getLogger("test_predict_path")
+
+        with caplog.at_level(logging.ERROR):
+            try:
+                inference._run_predict(BoomAPI(), data, meta, log)
+            except RuntimeError:
+                pass
+
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(error_records) >= 1
+        assert error_records[0].pathname.endswith("inference.py"), \
+            f"expected pathname ending with inference.py, got: {error_records[0].pathname}"
+
+
 class TestMakeErrorResponse:
     def test_error_response_structure(self):
         resp = inference._make_error_response("uid-1", "something broke")
@@ -3713,7 +3764,7 @@ class TestLevelPrefixFormatter:
             msg="hello %s", args=("world",), exc_info=None,
         )
         output = fmt.format(record)
-        assert output == "[INFO] hello world"
+        assert output == "[INFO] t.py:1 hello world"
 
     def test_format_warn_message(self):
         """WARN message with level prefix."""
@@ -3723,4 +3774,30 @@ class TestLevelPrefixFormatter:
             msg="careful", args=(), exc_info=None,
         )
         output = fmt.format(record)
-        assert output == "[WARN] careful"
+        assert output == "[WARN] t.py:1 careful"
+
+    def test_format_includes_pathname_lineno(self):
+        """Log messages must include file path and line number."""
+        fmt = inference._LevelPrefixFormatter()
+        record = logging.LogRecord(
+            name="test", level=logging.ERROR,
+            pathname="/p/inference.py", lineno=278,
+            msg="predict failed: boom", args=(), exc_info=None,
+        )
+        output = fmt.format(record)
+        assert "/p/inference.py:278" in output, \
+            f"expected pathname:lineno in: {output!r}"
+
+    def test_format_exc_text_already_set_includes_location(self):
+        """When record.exc_text is pre-set, output still includes pathname:lineno."""
+        fmt = inference._LevelPrefixFormatter()
+        record = logging.LogRecord(
+            name="test", level=logging.ERROR,
+            pathname="/p/inference.py", lineno=278,
+            msg="predict failed", args=(), exc_info=None,
+        )
+        record.exc_text = "ValueError: boom"
+        output = fmt.format(record)
+        assert "/p/inference.py:278" in output, \
+            f"expected pathname:lineno in: {output!r}"
+        assert "ValueError: boom" in output
