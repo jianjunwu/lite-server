@@ -119,6 +119,7 @@ impl WorkerZmqClient {
                                                         payload: Some(pb::response::Payload::Single(
                                                             pb::SingleResponse {
                                                                 data: seq.data.clone(),
+                                                                headers: HashMap::new(),
                                                                 status: Some(pb::Status {
                                                                     code: "Ok".to_string(),
                                                                     message: "".to_string(),
@@ -218,6 +219,7 @@ fn error_response(uid: &str, message: &str) -> pb::Response {
         uid: uid.to_string(),
         payload: Some(pb::response::Payload::Single(pb::SingleResponse {
             data: Default::default(),
+            headers: HashMap::new(),
             status: Some(pb::Status {
                 code: "Error".to_string(),
                 message: message.to_string(),

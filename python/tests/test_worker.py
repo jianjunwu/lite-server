@@ -140,7 +140,7 @@ class TestRunPredict:
         meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
         data = json.dumps({"input": 5}).encode()
         log = logging.getLogger("test")
-        resp_bytes, status, metrics = inference._run_predict(MockAPI(), data, meta, log)
+        resp_bytes, status, metrics, _ = inference._run_predict(MockAPI(), data, meta, log)
         assert json.loads(resp_bytes) == {"output": 10}
         assert status.code == "Ok"
 
@@ -156,7 +156,7 @@ class TestRunPredict:
         meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
         data = json.dumps({"input": 5}).encode()
         log = logging.getLogger("test")
-        resp_bytes, status, metrics = inference._run_predict(HookAPI(), data, meta, log)
+        resp_bytes, status, metrics, _ = inference._run_predict(HookAPI(), data, meta, log)
         assert json.loads(resp_bytes) == {"output": 12}
 
     def test_on_request_hook_can_reject(self):
@@ -181,8 +181,88 @@ class TestRunPredict:
         meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
         data = json.dumps({"input": 5}).encode()
         log = logging.getLogger("test")
-        resp_bytes, status, metrics = inference._run_predict(PlainAPI(), data, meta, log)
+        resp_bytes, status, metrics, _ = inference._run_predict(PlainAPI(), data, meta, log)
         assert json.loads(resp_bytes) == {"output": 10}
+
+
+class TestRunPredictResponseHeaders:
+    """_run_predict: on_response returning ResponseWithHeaders passes headers."""
+
+    def test_on_response_with_headers_returns_headers_in_tuple(self):
+        from lite_server.api import ResponseWithHeaders
+
+        class HeaderAPI:
+            def predict(self, x):
+                return {"output": x.get("input", 0) * 2}
+
+            def on_response(self, response, meta):
+                return ResponseWithHeaders(
+                    body=response, headers={"X-Custom": "hello", "X-Other": "world"}
+                )
+
+        meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
+        data = json.dumps({"input": 5}).encode()
+        log = logging.getLogger("test")
+        resp_bytes, status, metrics, headers = inference._run_predict(HeaderAPI(), data, meta, log)
+        assert json.loads(resp_bytes) == {"output": 10}
+        assert status.code == "Ok"
+        assert headers == {"X-Custom": "hello", "X-Other": "world"}
+
+    def test_on_response_plain_body_returns_none_headers(self):
+        class PlainAPI:
+            def predict(self, x):
+                return {"output": x.get("input", 0) * 2}
+
+            def on_response(self, response, meta):
+                return {"wrapped": response}
+
+        meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
+        data = json.dumps({"input": 5}).encode()
+        log = logging.getLogger("test")
+        resp_bytes, status, metrics, headers = inference._run_predict(PlainAPI(), data, meta, log)
+        assert json.loads(resp_bytes) == {"wrapped": {"output": 10}}
+        assert status.code == "Ok"
+        assert headers is None
+
+    def test_no_on_response_still_returns_none_headers(self):
+        class NoHookAPI:
+            def predict(self, x):
+                return {"output": x.get("input", 0) + 1}
+
+        meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
+        data = json.dumps({"input": 3}).encode()
+        log = logging.getLogger("test")
+        resp_bytes, status, metrics, headers = inference._run_predict(NoHookAPI(), data, meta, log)
+        assert json.loads(resp_bytes) == {"output": 4}
+        assert status.code == "Ok"
+        assert headers is None
+
+
+class TestRunPredictAsyncResponseHeaders:
+    """_run_predict_async: on_response returning ResponseWithHeaders passes headers."""
+
+    def test_async_on_response_with_headers(self):
+        import asyncio
+        from lite_server.api import ResponseWithHeaders
+        from lite_server.worker.inference import _run_predict_async
+
+        class AsyncHeaderAPI:
+            async def predict(self, x):
+                return {"output": x.get("input", 0) * 2}
+
+            async def on_response(self, response, meta):
+                return ResponseWithHeaders(
+                    body=response, headers={"X-Async": "true"}
+                )
+
+        meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
+        data = json.dumps({"input": 5}).encode()
+        log = logging.getLogger("test")
+        resp_bytes, status, metrics, headers = asyncio.run(
+            _run_predict_async(AsyncHeaderAPI(), data, meta, log)
+        )
+        assert json.loads(resp_bytes) == {"output": 10}
+        assert headers == {"X-Async": "true"}
 
 
 class TestRunPredictErrorLogging:
@@ -296,7 +376,7 @@ class TestHealthCheck:
             from lite_server.proto import Status
             status = Status(code="Ok", message="")
         else:
-            result, status, _ = inference._run_predict(StrictAPI(), data, meta)
+            result, status, _, _ = inference._run_predict(StrictAPI(), data, meta)
 
         assert call_count == 0, "predict() should not be called for health check"
         assert status.code == "Ok"
@@ -315,7 +395,7 @@ class TestHealthCheck:
         meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
         data = json.dumps({"input": 1}).encode()
         log = logging.getLogger("test")
-        resp_bytes, status, metrics = inference._run_predict(CountingAPI(), data, meta, log)
+        resp_bytes, status, metrics, _ = inference._run_predict(CountingAPI(), data, meta, log)
         assert call_count == 1
         assert status.code == "Ok"
 
@@ -519,7 +599,7 @@ class TestRunPredictAsync:
         meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
         data = json.dumps({"input": 5}).encode()
         log = logging.getLogger("test")
-        resp_bytes, status, metrics = asyncio.run(_run_predict_async(AsyncAPI(), data, meta, log))
+        resp_bytes, status, metrics, _ = asyncio.run(_run_predict_async(AsyncAPI(), data, meta, log))
         assert json.loads(resp_bytes) == {"encoded": 10, "on_response": True}
         assert status.code == "Ok"
 
@@ -538,7 +618,7 @@ class TestRunPredictAsync:
         meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
         data = json.dumps({"input": 4}).encode()
         log = logging.getLogger("test")
-        resp_bytes, status, metrics = asyncio.run(_run_predict_async(SimpleAsyncAPI(), data, meta, log))
+        resp_bytes, status, metrics, _ = asyncio.run(_run_predict_async(SimpleAsyncAPI(), data, meta, log))
         assert json.loads(resp_bytes) == {"output": 12}
         assert status.code == "Ok"
 
@@ -571,7 +651,7 @@ class TestRunPredictAsync:
         meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
         data = json.dumps({"input": 1}).encode()
         log = logging.getLogger("test")
-        resp_bytes, status, metrics = asyncio.run(_run_predict_async(MixedAPI(), data, meta, log))
+        resp_bytes, status, metrics, _ = asyncio.run(_run_predict_async(MixedAPI(), data, meta, log))
         assert json.loads(resp_bytes) == {"input": 1, "hooked": True, "sync_hook": True}
 
 

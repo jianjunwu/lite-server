@@ -387,3 +387,59 @@ class TestAsyncLitAPI:
     def test_async_litapi_exported_from_package(self):
         from lite_server import AsyncLitAPI
         assert AsyncLitAPI is not None
+
+
+class TestResponseWithHeaders:
+    """ResponseWithHeaders: on_response can attach custom HTTP headers."""
+
+    def test_can_import(self):
+        from lite_server.api import ResponseWithHeaders
+        assert ResponseWithHeaders is not None
+
+    def test_stores_body_and_headers(self):
+        from lite_server.api import ResponseWithHeaders
+        r = ResponseWithHeaders(body={"result": 42}, headers={"X-Custom": "val"})
+        assert r.body == {"result": 42}
+        assert r.headers == {"X-Custom": "val"}
+
+    def test_empty_headers(self):
+        from lite_server.api import ResponseWithHeaders
+        r = ResponseWithHeaders(body="data", headers={})
+        assert r.body == "data"
+        assert r.headers == {}
+
+    def test_is_dataclass(self):
+        from dataclasses import is_dataclass
+        from lite_server.api import ResponseWithHeaders
+        assert is_dataclass(ResponseWithHeaders)
+
+
+class TestUnwrapResponse:
+    """_unwrap_response: extract body and headers from on_response result."""
+
+    def test_unwrap_plain_body_returns_none_headers(self):
+        from lite_server.worker.inference import _unwrap_response
+        body, headers = _unwrap_response({"output": 1})
+        assert body == {"output": 1}
+        assert headers is None
+
+    def test_unwrap_response_with_headers_extracts_both(self):
+        from lite_server.api import ResponseWithHeaders
+        from lite_server.worker.inference import _unwrap_response
+        body, headers = _unwrap_response(
+            ResponseWithHeaders(body={"out": 99}, headers={"X-Trace": "abc"})
+        )
+        assert body == {"out": 99}
+        assert headers == {"X-Trace": "abc"}
+
+    def test_unwrap_none_body(self):
+        from lite_server.worker.inference import _unwrap_response
+        body, headers = _unwrap_response(None)
+        assert body is None
+        assert headers is None
+
+    def test_unwrap_string_body(self):
+        from lite_server.worker.inference import _unwrap_response
+        body, headers = _unwrap_response("plain string")
+        assert body == "plain string"
+        assert headers is None

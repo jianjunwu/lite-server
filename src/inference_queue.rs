@@ -442,6 +442,7 @@ async fn do_send_batch(
                         uid: queue_item.uid,
                         payload: Some(pb::response::Payload::Single(pb::SingleResponse {
                             data: Default::default(),
+                            headers: Default::default(),
                             status: Some(pb::Status {
                                 code: "Timeout".to_string(),
                                 message: "request timeout".to_string(),
@@ -481,6 +482,7 @@ async fn do_send_batch(
                                 uid: queue_item.uid,
                                 payload: Some(pb::response::Payload::Single(pb::SingleResponse {
                                     data: resp_item.data.clone(),
+                                    headers: Default::default(),
                                     status: resp_item.status.clone(),
                                 })),
                                 metrics: resp.metrics.clone(),
@@ -491,6 +493,7 @@ async fn do_send_batch(
                                 uid: queue_item.uid,
                                 payload: Some(pb::response::Payload::Single(pb::SingleResponse {
                                     data: Default::default(),
+                                    headers: Default::default(),
                                     status: Some(pb::Status {
                                         code: "Error".to_string(),
                                         message: "missing in batch response".to_string(),
@@ -538,6 +541,7 @@ async fn do_send_batch(
                             uid: queue_item.uid,
                             payload: Some(pb::response::Payload::Single(pb::SingleResponse {
                                 data: Default::default(),
+                                headers: Default::default(),
                                 status: Some(pb::Status {
                                     code: "Error".to_string(),
                                     message: "unexpected response type".to_string(),
@@ -562,6 +566,7 @@ async fn do_send_batch(
                     uid: queue_item.uid,
                     payload: Some(pb::response::Payload::Single(pb::SingleResponse {
                         data: Default::default(),
+                        headers: Default::default(),
                         status: Some(pb::Status {
                             code: "Error".to_string(),
                             message: e.to_string(),
@@ -1196,6 +1201,7 @@ mod tests {
             uid: "req-1".to_string(),
             payload: Some(pb::response::Payload::Single(pb::SingleResponse {
                 data: Bytes::from_static(b"ok"),
+                headers: Default::default(),
                 status: Some(pb::Status { code: "Ok".to_string(), message: String::new() }),
             })),
             metrics: None,

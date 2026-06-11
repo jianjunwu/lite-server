@@ -9,6 +9,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
+use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 use uuid::Uuid;
 
 pub use pb::lite_server_server::{LiteServer, LiteServerServer};
@@ -69,6 +70,41 @@ fn try_parse_model_error(
     let code = err.get("code")?.as_str()?.to_string();
     let message = err.get("message")?.as_str()?.to_string();
     Some((code, message))
+}
+
+/// Headers that must not be set by user code (RFC 7230 §6.1 hop-by-hop headers
+/// and other transport headers managed by the server).
+const BLOCKED_RESPONSE_HEADERS: &[&str] = &[
+    "content-type",
+    "content-length",
+    "transfer-encoding",
+    "content-encoding",
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "upgrade",
+];
+
+/// Inject custom response headers into tonic gRPC metadata,
+/// blocking hop-by-hop and transport headers.
+fn inject_grpc_metadata(
+    metadata: &mut MetadataMap,
+    headers: &HashMap<String, String>,
+) {
+    for (k, v) in headers {
+        let lower = k.to_ascii_lowercase();
+        if BLOCKED_RESPONSE_HEADERS.contains(&lower.as_str()) {
+            continue;
+        }
+        if let Ok(mk) = MetadataKey::from_bytes(k.as_bytes()) {
+            if let Ok(mv) = MetadataValue::try_from(v.as_str()) {
+                metadata.insert(mk, mv);
+            }
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -174,11 +210,16 @@ impl LiteServer for GrpcService {
                         // Not a numeric status code — internal worker error.
                         return Err(Status::internal(msg));
                     }
-                    _ => Ok(Response::new(pb::InferResponse {
-                        data: single.data,
-                        status: grpc_status,
-                        metrics: resp.metrics,
-                    })),
+                    _ => {
+                        let headers = single.headers.clone();
+                        let mut response = Response::new(pb::InferResponse {
+                            data: single.data,
+                            status: grpc_status,
+                            metrics: resp.metrics,
+                        });
+                        inject_grpc_metadata(response.metadata_mut(), &headers);
+                        Ok(response)
+                    }
                 }
             }
             _ => Err(Status::internal("unexpected response type")),
@@ -274,7 +315,9 @@ impl LiteServer for GrpcService {
                         metrics: None,
                     })
                     .collect();
-                Ok(Response::new(pb::BatchInferResponse { items }))
+                let mut response = Response::new(pb::BatchInferResponse { items });
+                inject_grpc_metadata(response.metadata_mut(), &batch_resp.headers);
+                Ok(response)
             }
             _ => Err(Status::internal("unexpected response type")),
         }

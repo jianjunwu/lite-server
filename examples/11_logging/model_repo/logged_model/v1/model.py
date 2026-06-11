@@ -1,8 +1,9 @@
-"""Model demonstrating structured logging at different stages."""
+"""Model demonstrating structured logging at different stages, plus
+response headers via :class:`~lite_server.api.ResponseWithHeaders`."""
 
 import time
 
-from lite_server import LitAPI
+from lite_server import LitAPI, ResponseWithHeaders
 
 
 class LoggedModelAPI(LitAPI):
@@ -49,4 +50,10 @@ class LoggedModelAPI(LitAPI):
             "Info: response ready | request_id=%s | output=%s",
             meta.request_id, response,
         )
-        return response
+        return ResponseWithHeaders(
+            body=response,
+            headers={
+                "X-Request-ID": meta.request_id,
+                "X-Call-Count": str(self.call_count),
+            },
+        )

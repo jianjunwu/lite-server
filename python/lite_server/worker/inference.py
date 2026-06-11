@@ -17,7 +17,7 @@ from typing import Any
 import yaml
 import zmq
 
-from lite_server.api import LitAPI, RequestMeta, BidiStreamHandler
+from lite_server.api import LitAPI, RequestMeta, BidiStreamHandler, ResponseWithHeaders
 from lite_server.api_async import AsyncLitAPI
 from lite_server.exceptions import HTTPException
 from lite_server.proto import (
@@ -161,6 +161,17 @@ def load_litapi(model_py_path: str, config: dict, device: str = "cpu"):
 
 def _make_status(ok: bool, message: str = "") -> Status:
     return Status(code="Ok" if ok else "Error", message=message)
+
+
+def _unwrap_response(encoded: Any) -> tuple[Any, dict[str, str] | None]:
+    """Extract body and optional headers from on_response return value.
+
+    Returns ``(body, headers)`` where headers is None if the value is a
+    plain body, or the headers dict if it's a ResponseWithHeaders.
+    """
+    if isinstance(encoded, ResponseWithHeaders):
+        return encoded.body, encoded.headers or None
+    return encoded, None
 
 
 def _make_error_response(uid: str, message: str,
@@ -313,9 +324,10 @@ def _run_predict(lit_api: LitAPI, data: bytes, meta: RequestMeta, log: logging.L
             log.warning("on_response hook failed: %s", e)
             raise
 
+    encoded, resp_headers = _unwrap_response(encoded)
     resp_bytes = json.dumps(encoded).encode()
     metrics = _collect_metrics(lit_api)
-    return resp_bytes, _make_status(True), metrics
+    return resp_bytes, _make_status(True), metrics, resp_headers
 
 
 # ---------------------------------------------------------------------------
@@ -391,9 +403,10 @@ async def _run_predict_async(lit_api: LitAPI, data: bytes, meta: RequestMeta, lo
             log.warning("on_response hook failed: %s", e)
             raise
 
+    encoded, resp_headers = _unwrap_response(encoded)
     resp_bytes = json.dumps(encoded).encode()
     metrics = _collect_metrics(lit_api)
-    return resp_bytes, _make_status(True), metrics
+    return resp_bytes, _make_status(True), metrics, resp_headers
 
 
 # ---------------------------------------------------------------------------
@@ -489,6 +502,7 @@ def _consume_stream_generator(lit_api: LitAPI, generator, stream_id: str, socket
             encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
             if hasattr(lit_api, "on_response") and meta is not None:
                 encoded = lit_api.on_response(encoded, meta)
+            encoded, _ = _unwrap_response(encoded)
             resp_bytes = json.dumps(encoded).encode()
             socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
     except HTTPException as e:
@@ -558,6 +572,7 @@ def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.
                 encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
                 if hasattr(lit_api, "on_response") and meta is not None:
                     encoded = lit_api.on_response(encoded, meta)
+                encoded, _ = _unwrap_response(encoded)
                 resp_bytes = json.dumps(encoded).encode()
                 socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
             except HTTPException as e:
@@ -573,7 +588,7 @@ def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.
     if not _has_stream_predict(lit_api):
         # Fallback: predict() once, send as single chunk
         try:
-            resp_bytes, status, metrics = _run_predict(lit_api, data, meta, log)
+            resp_bytes, status, metrics, _ = _run_predict(lit_api, data, meta, log)
             socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=True).SerializeToString())
             socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
         except HTTPException as e:
@@ -644,6 +659,7 @@ def _handle_stream_chunk(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq
             encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
             if hasattr(lit_api, "on_response") and meta is not None:
                 encoded = lit_api.on_response(encoded, meta)
+            encoded, _ = _unwrap_response(encoded)
             resp_bytes = json.dumps(encoded).encode()
             socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
         except HTTPException as e:
@@ -751,10 +767,13 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
                     single=SingleResponse(data=b"{}", status=_make_status(True)),
                 )
             else:
-                resp_bytes, status, metrics = await _run_predict_async(lit_api, request.single.data, meta, log)
+                resp_bytes, status, metrics, resp_headers = await _run_predict_async(lit_api, request.single.data, meta, log)
+                single_resp = SingleResponse(data=resp_bytes, status=status)
+                if resp_headers:
+                    single_resp.headers.update(resp_headers)
                 response = Response(
                     uid=uid,
-                    single=SingleResponse(data=resp_bytes, status=status),
+                    single=single_resp,
                     metrics=metrics,
                 )
 
@@ -812,6 +831,7 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
 
             # Phase 3: per-item async encode → on_response
             final_map: dict[str, bytes] = {}
+            batch_headers: dict[str, str] = {}
 
             for item_uid, output in success_outputs.items():
                 try:
@@ -821,6 +841,9 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
                         encoded = output
                     if hasattr(lit_api, "on_response"):
                         encoded = await _maybe_await(lit_api.on_response, encoded, meta)
+                    encoded, item_headers = _unwrap_response(encoded)
+                    if item_headers:
+                        batch_headers.update(item_headers)
                     final_map[item_uid] = json.dumps(encoded).encode()
                 except Exception as e:
                     error_map[item_uid] = e
@@ -849,9 +872,12 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
                     )
 
             metrics = _collect_metrics(lit_api)
+            batch_resp = BatchResponse(items=items)
+            if batch_headers:
+                batch_resp.headers.update(batch_headers)
             response = Response(
                 uid=uid,
-                batch=BatchResponse(items=items),
+                batch=batch_resp,
                 metrics=metrics,
             )
 
@@ -987,6 +1013,7 @@ async def _handle_stream_open_async(
                 encoded = await _maybe_await(lit_api.encode_response, output) if hasattr(lit_api, "encode_response") else output
                 if hasattr(lit_api, "on_response") and meta is not None:
                     encoded = await _maybe_await(lit_api.on_response, encoded, meta)
+                encoded, _ = _unwrap_response(encoded)
                 resp_bytes = json.dumps(encoded).encode()
                 await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
             except HTTPException as e:
@@ -1002,7 +1029,7 @@ async def _handle_stream_open_async(
     if not _has_stream_predict(lit_api):
         # Fallback: predict() once, send as single chunk
         try:
-            resp_bytes, status, metrics = await _run_predict_async(lit_api, data, meta, log)
+            resp_bytes, status, metrics, _ = await _run_predict_async(lit_api, data, meta, log)
             await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=True).SerializeToString())
             await socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
         except HTTPException as e:
@@ -1118,6 +1145,7 @@ async def _consume_async_stream(
                 encoded = await _maybe_await(lit_api.encode_response, output) if hasattr(lit_api, "encode_response") else output
                 if hasattr(lit_api, "on_response") and meta is not None:
                     encoded = await _maybe_await(lit_api.on_response, encoded, meta)
+                encoded, _ = _unwrap_response(encoded)
                 resp_bytes = json.dumps(encoded).encode()
                 await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
             except HTTPException as e:
@@ -1173,6 +1201,7 @@ async def _consume_sync_stream_async(
                 encoded = await _maybe_await(lit_api.encode_response, output) if hasattr(lit_api, "encode_response") else output
                 if hasattr(lit_api, "on_response") and meta is not None:
                     encoded = await _maybe_await(lit_api.on_response, encoded, meta)
+                encoded, _ = _unwrap_response(encoded)
                 resp_bytes = json.dumps(encoded).encode()
                 await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
             except HTTPException as e:
@@ -1242,10 +1271,13 @@ def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log:
                         ),
                     )
                 else:
-                    resp_bytes, status, metrics = _run_predict(lit_api, request.single.data, meta, log)
+                    resp_bytes, status, metrics, resp_headers = _run_predict(lit_api, request.single.data, meta, log)
+                    single_resp = SingleResponse(data=resp_bytes, status=status)
+                    if resp_headers:
+                        single_resp.headers.update(resp_headers)
                     response = Response(
                         uid=uid,
-                        single=SingleResponse(data=resp_bytes, status=status),
+                        single=single_resp,
                         metrics=metrics,
                     )
 
@@ -1299,12 +1331,16 @@ def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log:
 
                 # Phase 3: encode → on_response (per item)
                 final_map: dict[str, bytes] = {}
+                batch_headers: dict[str, str] = {}
 
                 for _uid, output in success_outputs.items():
                     try:
                         encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
                         if hasattr(lit_api, "on_response"):
                             encoded = lit_api.on_response(encoded, meta)
+                        encoded, item_headers = _unwrap_response(encoded)
+                        if item_headers:
+                            batch_headers.update(item_headers)
                         final_map[_uid] = json.dumps(encoded).encode()
                     except Exception as e:
                         log.warning("encode/on_response failed for %s: %s", _uid, e, exc_info=True)
@@ -1334,9 +1370,12 @@ def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log:
                         )
 
                 metrics = _collect_metrics(lit_api)
+                batch_resp = BatchResponse(items=items)
+                if batch_headers:
+                    batch_resp.headers.update(batch_headers)
                 response = Response(
                     uid=uid,
-                    batch=BatchResponse(items=items),
+                    batch=batch_resp,
                     metrics=metrics,
                 )
 
@@ -1525,11 +1564,15 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
                             encoded = state.output
                         if hasattr(lit_api, "on_response"):
                             encoded = _invoke_method(lit_api.on_response, encoded, state.meta)
+                        encoded, resp_headers = _unwrap_response(encoded)
                         resp_bytes = json.dumps(encoded).encode()
                         metrics = _collect_metrics(lit_api)
+                        single_resp = SingleResponse(data=resp_bytes, status=_make_status(True))
+                        if resp_headers:
+                            single_resp.headers.update(resp_headers)
                         resp = Response(
                             uid=uid,
-                            single=SingleResponse(data=resp_bytes, status=_make_status(True)),
+                            single=single_resp,
                             metrics=metrics,
                         )
                         socket.send(resp.SerializeToString())

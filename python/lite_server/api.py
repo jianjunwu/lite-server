@@ -8,7 +8,7 @@ Model authors subclass ``lite_server.api.LitAPI`` instead of
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Iterator, List, Tuple
 
 import litserve as ls
@@ -27,6 +27,23 @@ class RequestMeta:
     request_id: str
     timestamp_ns: int
     payload: Any  # decoded original request body
+
+
+@dataclass
+class ResponseWithHeaders:
+    """Return this from ``on_response`` to attach custom HTTP response headers.
+
+    Example::
+
+        def on_response(self, response, meta):
+            return ResponseWithHeaders(
+                body=response,
+                headers={"X-Cache-Hit": "1", "X-Request-ID": meta.request_id},
+            )
+    """
+
+    body: Any
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -212,12 +229,26 @@ class LitAPI(ls.LitAPI):
 
         Override to modify the response, inject headers, or log.
 
+        To attach custom HTTP response headers, return a
+        :class:`ResponseWithHeaders` instead of the raw value::
+
+            def on_response(self, response, meta):
+                return ResponseWithHeaders(
+                    body=response,
+                    headers={"X-Request-ID": meta.request_id},
+                )
+
+        Hop-by-hop and transport headers (content-type, content-length,
+        connection, etc.) are filtered by the server.
+
         Args:
             response: The encoded response (output of encode_response).
             meta: Original HTTP request metadata.
 
         Returns:
             The (possibly modified) response to send to the client.
+            Return a :class:`ResponseWithHeaders` to include custom
+            HTTP headers.
         """
         return response
 

@@ -377,7 +377,7 @@ pub async fn infer_handler(
     Path(model_name): Path<String>,
     headers: HeaderMap,
     Json(payload): Json<Value>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     do_infer(state, model_name, None, "/predict".to_string(), headers, payload).await
 }
@@ -387,7 +387,7 @@ pub async fn infer_version_handler(
     Path((model_name, version)): Path<(String, String)>,
     headers: HeaderMap,
     Json(payload): Json<Value>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
     do_infer(state, model_name, Some(version), "/predict".to_string(), headers, payload).await
@@ -402,6 +402,36 @@ fn extract_client_ip(headers: &HeaderMap) -> String {
         .to_string()
 }
 
+/// Headers that must NOT be overridden by user code — managed by the HTTP
+/// library or carry hop-by-hop semantics (RFC 7230 §6.1).
+const BLOCKED_RESPONSE_HEADERS: &[&str] = &[
+    "content-type",
+    "content-length",
+    "transfer-encoding",
+    "content-encoding",
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "upgrade",
+];
+
+fn inject_response_headers(
+    builder: axum::http::response::Builder,
+    headers: &std::collections::HashMap<String, String>,
+) -> axum::http::response::Builder {
+    let mut builder = builder;
+    for (k, v) in headers {
+        let lower = k.to_ascii_lowercase();
+        if !BLOCKED_RESPONSE_HEADERS.contains(&lower.as_str()) {
+            builder = builder.header(k.as_str(), v.as_str());
+        }
+    }
+    builder
+}
+
 async fn do_infer(
     state: Arc<AppState>,
     model_name: String,
@@ -409,7 +439,7 @@ async fn do_infer(
     route: String,
     headers: HeaderMap,
     payload: Value,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response, AppError> {
     let request_id = Uuid::new_v4().to_string();
     let span = tracing::info_span!(
         "inference",
@@ -439,7 +469,7 @@ async fn do_infer(
     // Handle ensemble
     if mv.model_type == ModelType::Ensemble {
         let result = crate::ensemble::execute_ensemble(state, &model_name, &resolved_version, payload).await?;
-        return Ok(Json(result));
+        return Ok(Json(result).into_response());
     }
 
     // Pick worker info (needed for both paths)
@@ -527,7 +557,13 @@ async fn do_infer(
             match code {
                 "Ok" => {
                     prometheus::record_request_end(&model_name, &resolved_version, "2xx", duration).await;
-                    Ok(Json(data))
+                    let json_body = serde_json::to_string(&data).unwrap_or_default();
+                    let builder = Response::builder()
+                        .header("content-type", "application/json; charset=utf-8");
+                    let builder = inject_response_headers(builder, &single.headers);
+                    builder
+                        .body(axum::body::Body::from(json_body))
+                        .map_err(|e| AppError::Internal(format!("build response: {}", e)))
                 }
                 "Error" => {
                     let msg = single.status.as_ref().and_then(|s| {
@@ -566,7 +602,13 @@ async fn do_infer(
                 }
                 _ => {
                     prometheus::record_request_end(&model_name, &resolved_version, "2xx", duration).await;
-                    Ok(Json(data))
+                    let json_body = serde_json::to_string(&data).unwrap_or_default();
+                    let builder = Response::builder()
+                        .header("content-type", "application/json; charset=utf-8");
+                    let builder = inject_response_headers(builder, &single.headers);
+                    builder
+                        .body(axum::body::Body::from(json_body))
+                        .map_err(|e| AppError::Internal(format!("build response: {}", e)))
                 }
             }
         }
