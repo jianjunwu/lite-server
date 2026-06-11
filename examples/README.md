@@ -8,7 +8,7 @@ Each example is a self-contained directory with its own model repository, README
 # Install lite-server (from wheel or source)
 pip install lite-server-*.whl
 # or
-pip install litserve && pip install -e .
+pip install -e .
 
 # Install example dependencies (if any)
 pip install pyyaml

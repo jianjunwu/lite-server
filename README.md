@@ -49,7 +49,7 @@ High-performance model inference server — Rust core for I/O, Python for infere
 
 ```bash
 # 1. Install
-pip install litserve  # lite-server depends on litserve's LitAPI
+pip install lite-server
 
 # 2. Scaffold a project
 python -m lite_server init my_project --template empty
@@ -235,12 +235,18 @@ See [examples/README.md](examples/README.md) for learning path and usage details
 | POST | `/v2/models/{name}/infer` | Inference (active version) |
 | POST | `/v2/models/{name}/versions/{v}/infer` | Inference (specific version) |
 | POST | `/v2/models/{name}/events` | SSE streaming |
+| POST | `/v2/models/{name}/versions/{v}/events` | SSE streaming (specific version) |
 | GET | `/v2/models/{name}/stream` | WebSocket streaming |
+| GET | `/v2/models/{name}/versions/{v}/stream` | WebSocket streaming (specific version) |
 | GET | `/v2/models` | List loaded models |
 | GET | `/v2/models/{name}/versions` | List versions |
 | GET | `/v2/models/{name}/ready` | Readiness check |
+| GET | `/v2/models/{name}/health` | Per-worker health status |
+| GET | `/v2/models/{name}/compare` | Compare model versions |
+| DELETE | `/v2/models/{name}/versions/{v}` | Delete model version |
 | POST | `/v2/repository/models/{name}/load` | Load model |
 | POST | `/v2/repository/models/{name}/unload` | Unload model |
+| POST | `/v2/repository/index` | Index model repository |
 | POST | `/v2/repository/models/{name}/versions/{v}/upload` | Upload model files (.lma or raw) |
 | GET | `/v2/repository/models/{name}/versions/{v}/download` | Download model files |
 | GET | `/v2/repository/models/{name}/versions/{v}/files` | List version directory contents |
@@ -249,8 +255,11 @@ See [examples/README.md](examples/README.md) for learning path and usage details
 | GET | `/health` | Health check (overridable by custom endpoints) |
 | GET | `/info` | Server info |
 | GET | `/metrics` | Prometheus metrics |
+| GET | `/metrics/timeline` | Historical metric timeline |
+| GET | `/metrics/timeline/{name}` | Per-model metric timeline |
+| GET | `/metrics/alerts` | Alert rules and status |
 
-**Custom endpoints** (loaded from `endpoints/` directory or decorator-registered) are registered dynamically alongside built-in routes. System routes (`/info`, `/metrics`, `/health`, `/v2/models`, `/v2/repository`) cannot be overridden.
+**Custom endpoints** (loaded from `endpoints/` directory or decorator-registered) are registered dynamically alongside built-in routes. System routes (`/info`, `/metrics`, `/v2/models`, `/v2/repository`) cannot be overridden.
 
 ## Configuration
 

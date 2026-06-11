@@ -37,6 +37,9 @@ lite-server serve [OPTIONS]
 | `--host` | string | 0.0.0.0 | Bind address. Use `unix:/path/to/sock` for Unix domain sockets |
 | `--timeout` | float | 30.0 | Global request timeout in seconds |
 | `--log-level` | string | info | Log level: `trace`, `debug`, `info`, `warn`, `error` |
+| `--log-info-output` | string | — | Separate file for info-level logs |
+| `--log-error-output` | string | — | Separate file for error-level logs |
+| `--log-rotation` | string | none | Log rotation strategy: `none`, `size`, `daily`, `hourly` |
 | `--threads` | int | auto | Number of Tokio worker threads |
 | `--graceful-timeout` | float | 30.0 | Max seconds to wait for in-flight requests during shutdown |
 | `--keepalive-timeout` | float | 5.0 | HTTP keep-alive timeout in seconds. 0 = disable |
@@ -159,6 +162,7 @@ lite-server pack <MODEL_DIR> --version <VERSION> [OPTIONS]
 |------|------|---------|-------------|
 | `model_dir` | string | (positional) | Model directory to pack |
 | `--version`, `-v` | string | (required) | Version number |
+| `--name`, `-n` | string | (auto-inferred) | Model name (default: inferred from directory name) |
 | `--output`, `-o` | string | ./artifacts | Output directory |
 
 ```bash
@@ -177,6 +181,7 @@ lite-server unpack <ARTIFACT> [OPTIONS]
 |------|------|---------|-------------|
 | `artifact` | string | (positional) | Path to .lma artifact file |
 | `--to` | string | . | Target directory |
+| `--flat` | flag | false | Extract files directly without model name subdirectory |
 
 ---
 

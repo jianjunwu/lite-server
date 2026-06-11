@@ -169,7 +169,7 @@ lite-server serve [参数]
 | `--model-repo` | 模型仓库路径 | `model_repository.path` |
 | `--endpoints-dir` | 自定义端点目录 | `endpoints_dir` |
 | `--timeout` | 全局请求超时 | `server.timeout` |
-| `--log-level` | 日志级别 | `server.log_level` + `logging.level` |
+| `--log-level` | 日志级别 | `logging.level` |
 | `--no-metrics` | 禁用指标 | `metrics.enabled` |
 | `--grpc-port` | gRPC 端口 | `server.grpc_port` |
 | `--no-grpc` | 禁用 gRPC | `grpc.enabled` |
@@ -222,10 +222,10 @@ features:
   streaming: true
 
 logging:
-  format: json
-  output: /var/log/lite-server/server.log
+  level: info
+  info_output: /var/log/lite-server/server.log
   rotation: size
-  rotate_by: 100MB
+  max_size: 100
   backup_count: 10
 ```
 

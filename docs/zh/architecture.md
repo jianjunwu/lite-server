@@ -118,7 +118,7 @@ lite-server 是 Rust + Python 混合架构的推理服务器。Rust 内核处理
 | Worker 管理器 | `worker/` | Worker 进程管理、健康监控、异常检测 |
 | 传输层 | `transport/` | ZMQ 和 UDS 进程间通信 |
 | 指标 | `metrics/` | Prometheus 指标、时间线聚合、告警引擎 |
-| 文件监听 | `watcher/` | 热重载文件系统监听器 |
+| 文件监听 | `server.rs` | 热重载文件系统监听器 |
 | Ensemble | `ensemble.rs` | DAG 多模型流水线编排 |
 | 配置 | `config.rs` | YAML 配置加载、CLI 参数覆盖 |
 | 服务器 | `server.rs` | 主服务器生命周期、优雅关闭 |

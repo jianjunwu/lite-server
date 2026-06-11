@@ -48,7 +48,7 @@
 
 ```bash
 # 1. 安装
-pip install litserve  # lite-server 依赖 litserve 的 LitAPI
+pip install lite-server  # lite-server 依赖 litserve 的 LitAPI
 
 # 2. 脚手架创建项目
 python -m lite_server init my_project --template empty
@@ -233,12 +233,18 @@ lite-server init my_project           # 脚手架创建项目
 | POST | `/v2/models/{name}/infer` | 推理（活跃版本） |
 | POST | `/v2/models/{name}/versions/{v}/infer` | 推理（指定版本） |
 | POST | `/v2/models/{name}/events` | SSE 流式 |
+| POST | `/v2/models/{name}/versions/{v}/events` | SSE 流式（指定版本） |
 | GET | `/v2/models/{name}/stream` | WebSocket 流式 |
+| GET | `/v2/models/{name}/versions/{v}/stream` | WebSocket 流式（指定版本） |
 | GET | `/v2/models` | 列出已加载模型 |
 | GET | `/v2/models/{name}/versions` | 列出版本 |
 | GET | `/v2/models/{name}/ready` | 就绪检查 |
+| GET | `/v2/models/{name}/health` | 各 worker 健康状态 |
+| GET | `/v2/models/{name}/compare` | 比较模型版本 |
+| DELETE | `/v2/models/{name}/versions/{v}` | 删除模型版本 |
 | POST | `/v2/repository/models/{name}/load` | 加载模型 |
 | POST | `/v2/repository/models/{name}/unload` | 卸载模型 |
+| POST | `/v2/repository/index` | 索引模型仓库 |
 | POST | `/v2/repository/models/{name}/versions/{v}/upload` | 上传模型文件（.lma 或原始文件） |
 | GET | `/v2/repository/models/{name}/versions/{v}/download` | 下载模型文件 |
 | GET | `/v2/repository/models/{name}/versions/{v}/files` | 列出版本目录文件 |
@@ -247,8 +253,11 @@ lite-server init my_project           # 脚手架创建项目
 | GET | `/health` | 健康检查（可被自定义端点覆盖） |
 | GET | `/info` | 服务器信息 |
 | GET | `/metrics` | Prometheus 指标 |
+| GET | `/metrics/timeline` | 历史指标时间线 |
+| GET | `/metrics/timeline/{name}` | 单模型指标时间线 |
+| GET | `/metrics/alerts` | 告警规则与状态 |
 
-**自定义端点**（从 `endpoints/` 目录加载或装饰器注册）与内置路由一起动态注册。系统路由（`/info`、`/metrics`、`/health`、`/v2/models`、`/v2/repository`）不可覆盖。
+**自定义端点**（从 `endpoints/` 目录加载或装饰器注册）与内置路由一起动态注册。系统路由（`/info`、`/metrics`、`/v2/models`、`/v2/repository`）不可覆盖。
 
 ## 配置
 

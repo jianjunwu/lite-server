@@ -169,7 +169,7 @@ python -m lite_server serve [flags]
 | `--model-repo` | Model repository path | `model_repository.path` |
 | `--endpoints-dir` | Custom endpoints directory | `endpoints_dir` |
 | `--timeout` | Global request timeout | `server.timeout` |
-| `--log-level` | Log level | `server.log_level` + `logging.level` |
+| `--log-level` | Log level | `logging.level` |
 | `--no-metrics` | Disable metrics | `metrics.enabled` |
 | `--grpc-port` | gRPC port | `server.grpc_port` |
 | `--no-grpc` | Disable gRPC | `grpc.enabled` |
@@ -222,10 +222,10 @@ features:
   streaming: true
 
 logging:
-  format: json
-  output: /var/log/lite-server/server.log
+  level: info
+  info_output: /var/log/lite-server/server.log
   rotation: size
-  rotate_by: 100MB
+  max_size: 100
   backup_count: 10
 ```
 

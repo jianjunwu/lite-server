@@ -118,7 +118,7 @@ When `stream: true` and model implements `stream_predict()`:
 | Worker Manager | `worker/` | Worker process spawning, health monitoring, outlier detection |
 | Transport | `transport/` | ZMQ and UDS IPC between core and workers |
 | Metrics | `metrics/` | Prometheus metrics, timeline aggregation, alert engine |
-| Watcher | `watcher/` | File system watcher for hot reload |
+| Watcher | `server.rs` | File system watcher for hot reload |
 | Ensemble | `ensemble.rs` | DAG-based multi-model pipeline orchestration |
 | Config | `config.rs` | YAML config loading, CLI override application |
 | Server | `server.rs` | Main server lifecycle, graceful shutdown |

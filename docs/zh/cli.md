@@ -37,6 +37,9 @@ lite-server serve [选项]
 | `--host` | string | 0.0.0.0 | 绑定地址。使用 `unix:/path/to/sock` 启用 Unix 域套接字 |
 | `--timeout` | float | 30.0 | 全局请求超时（秒） |
 | `--log-level` | string | info | 日志级别：`trace`、`debug`、`info`、`warn`、`error` |
+| `--log-info-output` | string | — | info 级别日志的独立文件 |
+| `--log-error-output` | string | — | error 级别日志的独立文件 |
+| `--log-rotation` | string | none | 日志轮转策略：`none`、`size`、`daily`、`hourly` |
 | `--threads` | int | 自动 | Tokio 工作线程数 |
 | `--graceful-timeout` | float | 30.0 | 优雅关闭时等待进行中请求的最大秒数 |
 | `--keepalive-timeout` | float | 5.0 | HTTP keep-alive 超时（秒），0 = 禁用 |
@@ -159,6 +162,7 @@ lite-server pack <模型目录> --version <版本> [选项]
 |------|------|--------|------|
 | `model_dir` | string | （位置参数） | 要打包的模型目录 |
 | `--version`, `-v` | string | （必填） | 版本号 |
+| `--name`, `-n` | string | （自动推断） | 模型名称（默认从目录名推断） |
 | `--output`, `-o` | string | ./artifacts | 输出目录 |
 
 ```bash
@@ -177,6 +181,7 @@ lite-server unpack <制品文件> [选项]
 |------|------|--------|------|
 | `artifact` | string | （位置参数） | .lma 制品文件路径 |
 | `--to` | string | . | 目标目录 |
+| `--flat` | flag | false | 直接解压文件，不创建模型名子目录 |
 
 ---
 
