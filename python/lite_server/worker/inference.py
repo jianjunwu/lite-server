@@ -274,7 +274,7 @@ def _collect_metrics(lit_api: LitAPI):
     for mid, val in values:
         if mid < len(specs):
             spec = specs[mid]
-            mv = MetricValue(id=mid, value=val)
+            mv = MetricValue(id=spec.metric_id, value=val)
             if spec.metric_type == "gauge":
                 gauges.append(mv)
             elif spec.metric_type == "counter":
@@ -1843,7 +1843,13 @@ def worker_main():
         print(json.dumps({"status": "error", "worker_id": args.worker_id, "message": str(e)}), flush=True)
         sys.exit(1)
 
-    print(json.dumps({"status": "ready", "worker_id": args.worker_id}), flush=True)
+    specs = [{"name": s.name, "metric_type": s.metric_type}
+             for s in lit_api._metric_specs]
+    print(json.dumps({
+        "status": "ready",
+        "worker_id": args.worker_id,
+        "metric_specs": specs,
+    }), flush=True)
 
     if args.continuous_batching or config.get("continuous_batching", False):
         context = zmq.Context()

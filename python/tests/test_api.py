@@ -301,13 +301,13 @@ class TestCollectMetrics:
         m = _collect_metrics(api)
         assert isinstance(m, Metrics)
         assert len(m.gauges) == 1
-        assert m.gauges[0].id == g
+        assert m.gauges[0].id == 0  # per-type index: first gauge
         assert m.gauges[0].value == 10.0
         assert len(m.counters) == 1
-        assert m.counters[0].id == c
+        assert m.counters[0].id == 0  # per-type index: first counter
         assert m.counters[0].value == 20.0
         assert len(m.histograms) == 1
-        assert m.histograms[0].id == h
+        assert m.histograms[0].id == 0  # per-type index: first histogram
         assert m.histograms[0].value == 30.0
 
     def test_collect_clears_buffer(self):

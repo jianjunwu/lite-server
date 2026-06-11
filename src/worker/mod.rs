@@ -386,6 +386,14 @@ impl WorkerManager {
             )));
         }
 
+        // Register custom metrics from Python worker
+        if let Some(ref specs) = startup.metric_specs {
+            let spec_refs: Vec<(&str, &str)> = specs.iter()
+                .map(|s| (s.name.as_str(), s.metric_type.as_str()))
+                .collect();
+            crate::metrics::prometheus::register_custom_metrics(&spec_refs);
+        }
+
         info!("Worker {} for {} v{} respawned (pid={:?})", worker_id, model_name, version, child.id());
 
         // Fire on_ready lifecycle hook
@@ -716,6 +724,14 @@ impl WorkerManager {
                     "worker {} startup failed: {:?}",
                     worker_id, startup.message
                 )));
+            }
+
+            // Register custom metrics from Python worker
+            if let Some(ref specs) = startup.metric_specs {
+                let spec_refs: Vec<(&str, &str)> = specs.iter()
+                    .map(|s| (s.name.as_str(), s.metric_type.as_str()))
+                    .collect();
+                crate::metrics::prometheus::register_custom_metrics(&spec_refs);
             }
 
             info!("Worker {} for {} v{} ready (pid={:?})", worker_id, model_name, version, child.id());

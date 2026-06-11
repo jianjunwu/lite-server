@@ -2029,7 +2029,14 @@ class TestAsyncStreamingMetrics:
 
             def register_metric(self, name, metric_type):
                 idx = len(self._metric_specs)
-                self._metric_specs.append(type("Spec", (), {"name": name, "metric_type": metric_type})())
+                per_type_id = sum(
+                    1 for s in self._metric_specs
+                    if s.metric_type == metric_type
+                )
+                self._metric_specs.append(type("Spec", (), {
+                    "name": name, "metric_type": metric_type,
+                    "metric_id": per_type_id,
+                })())
                 return idx
 
             def report_metric(self, metric_id, value):
@@ -2111,7 +2118,14 @@ class TestAsyncStreamingMetrics:
 
             def register_metric(self, name, metric_type):
                 idx = len(self._metric_specs)
-                self._metric_specs.append(type("Spec", (), {"name": name, "metric_type": metric_type})())
+                per_type_id = sum(
+                    1 for s in self._metric_specs
+                    if s.metric_type == metric_type
+                )
+                self._metric_specs.append(type("Spec", (), {
+                    "name": name, "metric_type": metric_type,
+                    "metric_id": per_type_id,
+                })())
                 return idx
 
             def report_metric(self, metric_id, value):

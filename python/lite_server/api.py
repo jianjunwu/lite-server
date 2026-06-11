@@ -52,6 +52,7 @@ class _MetricSpec:
 
     name: str
     metric_type: str  # "gauge" | "counter" | "histogram"
+    metric_id: int = 0  # per-type index for Rust-side Vec lookup
 
 
 class BidiStreamHandler:
@@ -154,7 +155,10 @@ class LitAPI(ls.LitAPI):
             Numeric metric ID.
         """
         idx = len(self._metric_specs)
-        self._metric_specs.append(_MetricSpec(name, metric_type))
+        per_type_id = sum(
+            1 for s in self._metric_specs if s.metric_type == metric_type
+        )
+        self._metric_specs.append(_MetricSpec(name, metric_type, per_type_id))
         return idx
 
     def report_metric(self, metric_id: int, value: float) -> None:

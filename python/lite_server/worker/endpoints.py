@@ -119,7 +119,12 @@ def load_endpoints(repo_path: str):
     from lite_server.specs.base import _SPEC_REGISTRY
 
     # ---- Mode 1: Subdirectory scan (endpoints/**/*.py) ----
-    endpoints_dir = repo / "endpoints"
+    # When repo_path IS the endpoints directory (explicit endpoints_dir
+    # config), scan it directly. Otherwise scan the repo/endpoints/ subdirectory.
+    if any(repo.glob("*.py")):
+        endpoints_dir = repo
+    else:
+        endpoints_dir = repo / "endpoints"
     if endpoints_dir.exists() and endpoints_dir.is_dir():
         for py_file in endpoints_dir.rglob("*.py"):
             if py_file.name.startswith("_"):

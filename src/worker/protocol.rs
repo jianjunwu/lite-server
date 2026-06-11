@@ -108,10 +108,18 @@ pub struct BatchResponseItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricSpec {
+    pub name: String,
+    pub metric_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerStartup {
     pub status: String,
     pub worker_id: u32,
     pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metric_specs: Option<Vec<MetricSpec>>,
 }
 
 // ===== Endpoint Protocol =====
@@ -317,5 +325,35 @@ mod tests {
         let json_str = serde_json::to_string(&done).unwrap();
         let decoded: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(decoded["type"], "done");
+    }
+
+    #[test]
+    fn test_worker_startup_with_metric_specs() {
+        let json = r#"{
+            "status": "ready",
+            "worker_id": 0,
+            "metric_specs": [
+                {"name": "cache_hit_rate", "metric_type": "gauge"},
+                {"name": "errors", "metric_type": "counter"}
+            ]
+        }"#;
+        let startup: WorkerStartup = serde_json::from_str(json).unwrap();
+        assert_eq!(startup.status, "ready");
+        assert_eq!(startup.worker_id, 0);
+        let specs = startup.metric_specs.unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "cache_hit_rate");
+        assert_eq!(specs[0].metric_type, "gauge");
+        assert_eq!(specs[1].name, "errors");
+        assert_eq!(specs[1].metric_type, "counter");
+    }
+
+    #[test]
+    fn test_worker_startup_without_metric_specs() {
+        let json = r#"{"status": "ready", "worker_id": 1}"#;
+        let startup: WorkerStartup = serde_json::from_str(json).unwrap();
+        assert_eq!(startup.status, "ready");
+        assert_eq!(startup.worker_id, 1);
+        assert!(startup.metric_specs.is_none());
     }
 }

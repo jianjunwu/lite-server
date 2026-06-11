@@ -100,6 +100,19 @@ class TestLoadEndpoints:
         assert "/broken" not in endpoints
         assert any("Failed to load subdirectory endpoint" in r.message for r in caplog.records)
 
+    def test_loads_endpoints_from_configured_dir(self, tmp_path):
+        """When repo_path IS the endpoints directory (explicit endpoints_dir
+        config), load_endpoints should detect .py files directly."""
+        ep_file = tmp_path / "status.py"
+        ep_file.write_text(textwrap.dedent('''
+            methods = ["GET", "POST"]
+            def handler(request, server):
+                return {"status": "ok"}
+        '''))
+        endpoints = load_endpoints(str(tmp_path))
+        assert "/status" in endpoints
+        assert endpoints["/status"]["methods"] == ["GET", "POST"]
+
 
 class TestHandleRequest:
     @pytest.fixture
