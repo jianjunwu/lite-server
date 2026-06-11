@@ -543,7 +543,7 @@ def stream_predict(self, request):
 
 ### 注意事项
 
-- 指标名不得与内置 Prometheus 指标冲突（如 `lightserver_requests_total`）
+- 指标名不得与内置 Prometheus 指标冲突（如 `liteserver_requests_total`）
 - ID 按 LitAPI 实例隔离 — 不同模型可注册相同指标名（值通过 `model` 标签区分）
 - 默认 Histogram 桶：`[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]`
 

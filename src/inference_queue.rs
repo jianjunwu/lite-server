@@ -432,11 +432,6 @@ async fn do_send_batch(
         }
     };
 
-    // Track queue depth decrease for all items in the batch
-    for _ in 0..batch.len() {
-        prometheus::dec_queue_depth(model_name, version);
-    }
-
     let result = if request_timeout > Duration::ZERO {
         match tokio::time::timeout(request_timeout, zmq_client.send(request)).await {
             Ok(r) => r,
@@ -599,6 +594,11 @@ async fn send_batch_with_retry(
         return;
     }
 
+    // Decrement queue depth once per item — retries must not decrement again
+    for _ in 0..batch.len() {
+        prometheus::dec_queue_depth(model_name, version);
+    }
+
     let batch_size = batch.len();
 
     // Fast path: single worker, no retry possible
@@ -729,6 +729,7 @@ async fn batch_collector(
     if max_batch_size <= 1 {
         // Fast path: no batching, send immediately and concurrently
         while let Some(item) = rx.recv().await {
+            prometheus::inc_queue_depth(&model_name, &version);
             let batch = vec![item];
             let zmq_clients = zmq_clients.clone();
             let worker_inflight = worker_inflight.clone();

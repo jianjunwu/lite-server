@@ -484,7 +484,7 @@ async fn test_metrics_endpoint() {
         .send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("lightserver"), "metrics body: {}", body);
+    assert!(body.contains("liteserver"), "metrics body: {}", body);
 
     stop_server(server);
 }

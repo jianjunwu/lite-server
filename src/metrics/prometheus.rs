@@ -10,7 +10,7 @@ lazy_static! {
     // Request metrics
     pub static ref REQUESTS_TOTAL: CounterVec = CounterVec::new(
         prometheus::Opts::new(
-            "lightserver_requests_total",
+            "liteserver_requests_total",
             "Total HTTP requests"
         ),
         &["model", "version", "status"]
@@ -18,7 +18,7 @@ lazy_static! {
 
     pub static ref REQUEST_DURATION: HistogramVec = HistogramVec::new(
         HistogramOpts::new(
-            "lightserver_request_duration_seconds",
+            "liteserver_request_duration_seconds",
             "End-to-end request latency"
         ).buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
         &["model", "version"]
@@ -27,7 +27,7 @@ lazy_static! {
     // Queue metrics
     pub static ref QUEUE_DEPTH: GaugeVec = GaugeVec::new(
         prometheus::Opts::new(
-            "lightserver_queue_depth",
+            "liteserver_queue_depth",
             "Current request queue size"
         ),
         &["model", "version"]
@@ -36,7 +36,7 @@ lazy_static! {
     // Model metrics
     pub static ref MODEL_LOAD_TOTAL: CounterVec = CounterVec::new(
         prometheus::Opts::new(
-            "lightserver_model_load_total",
+            "liteserver_model_load_total",
             "Model load/unload events"
         ),
         &["model", "version", "action", "status"]
@@ -44,7 +44,7 @@ lazy_static! {
 
     pub static ref VERSION_SWITCHES_TOTAL: CounterVec = CounterVec::new(
         prometheus::Opts::new(
-            "lightserver_version_switches_total",
+            "liteserver_version_switches_total",
             "Active version changes"
         ),
         &["model"]
@@ -52,7 +52,7 @@ lazy_static! {
 
     pub static ref ACTIVE_WORKERS: GaugeVec = GaugeVec::new(
         prometheus::Opts::new(
-            "lightserver_active_workers",
+            "liteserver_active_workers",
             "Number of alive inference workers"
         ),
         &["model", "version"]
@@ -61,7 +61,7 @@ lazy_static! {
     // Ensemble metrics
     pub static ref ENSEMBLE_STEP_LATENCY: HistogramVec = HistogramVec::new(
         HistogramOpts::new(
-            "lightserver_ensemble_step_latency_seconds",
+            "liteserver_ensemble_step_latency_seconds",
             "Per-step latency in ensemble DAG"
         ).buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]),
         &["ensemble", "step", "model"]
@@ -69,13 +69,13 @@ lazy_static! {
 
     // Outlier detection metrics
     pub static ref WORKER_EJECTIONS_TOTAL: Counter = Counter::new(
-        "lightserver_worker_ejections_total",
+        "liteserver_worker_ejections_total",
         "Total worker ejections due to consecutive failures"
     ).unwrap();
 
     pub static ref RETRIES_TOTAL: CounterVec = CounterVec::new(
         prometheus::Opts::new(
-            "lightserver_retries_total",
+            "liteserver_retries_total",
             "Total request retries"
         ),
         &["model", "version"]
@@ -84,7 +84,7 @@ lazy_static! {
     // Streaming metrics
     pub static ref STREAMING_CONNECTIONS: GaugeVec = GaugeVec::new(
         prometheus::Opts::new(
-            "lightserver_streaming_connections",
+            "liteserver_streaming_connections",
             "Active bidirectional streaming connections"
         ),
         &["model", "version", "protocol"]
@@ -92,7 +92,7 @@ lazy_static! {
 
     pub static ref STREAMING_TTFT: HistogramVec = HistogramVec::new(
         HistogramOpts::new(
-            "lightserver_streaming_ttft_seconds",
+            "liteserver_streaming_ttft_seconds",
             "Time to first token in streaming"
         ).buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]),
         &["model", "version", "protocol"]
@@ -100,7 +100,7 @@ lazy_static! {
 
     pub static ref STREAMING_TBT: HistogramVec = HistogramVec::new(
         HistogramOpts::new(
-            "lightserver_streaming_tbt_seconds",
+            "liteserver_streaming_tbt_seconds",
             "Time between tokens in streaming"
         ).buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5]),
         &["model", "version", "protocol"]
@@ -108,7 +108,7 @@ lazy_static! {
 
     pub static ref STREAMING_CHUNKS_TOTAL: CounterVec = CounterVec::new(
         prometheus::Opts::new(
-            "lightserver_streaming_chunks_total",
+            "liteserver_streaming_chunks_total",
             "Total streaming output chunks"
         ),
         &["model", "version", "protocol"]
@@ -117,7 +117,7 @@ lazy_static! {
     // Health check metrics
     pub static ref HEALTH_CHECK_TOTAL: CounterVec = CounterVec::new(
         prometheus::Opts::new(
-            "lightserver_health_check_total",
+            "liteserver_health_check_total",
             "Total active health check probes"
         ),
         &["model", "version", "result"]
@@ -125,7 +125,7 @@ lazy_static! {
 
     pub static ref WORKER_HEALTH_STATUS: GaugeVec = GaugeVec::new(
         prometheus::Opts::new(
-            "lightserver_worker_health_status",
+            "liteserver_worker_health_status",
             "Worker health status (1=healthy, 0=ejected)"
         ),
         &["model", "version", "worker_id"]
@@ -133,7 +133,7 @@ lazy_static! {
 
     pub static ref WORKER_RESPAWNS_TOTAL: CounterVec = CounterVec::new(
         prometheus::Opts::new(
-            "lightserver_worker_respawns_total",
+            "liteserver_worker_respawns_total",
             "Total worker respawns"
         ),
         &["model", "version", "reason"]
@@ -141,14 +141,14 @@ lazy_static! {
 
     // Shutdown tracking
     pub static ref SHUTDOWN_PENDING_REQUESTS: prometheus::IntGauge = prometheus::IntGauge::new(
-        "lightserver_shutdown_pending_requests",
+        "liteserver_shutdown_pending_requests",
         "Number of in-flight requests during shutdown"
     ).unwrap();
 
     // Connection tracking
     pub static ref OPEN_CONNECTIONS: GaugeVec = GaugeVec::new(
         prometheus::Opts::new(
-            "lightserver_open_connections",
+            "liteserver_open_connections",
             "Current open connections by type"
         ),
         &["type"]
@@ -207,7 +207,7 @@ pub fn gather_metrics() -> String {
 // ===== Request metrics =====
 
 pub fn record_request_start(_model: &str, _version: &str) {
-    // Light-server uses explicit inc_queue_depth in queue manager
+    // liteserver uses explicit inc_queue_depth in queue manager
     // Kept for backward compat during transition
 }
 
@@ -276,11 +276,11 @@ pub fn record_stream_close(model: &str, version: &str, protocol: &str) {
     STREAMING_CONNECTIONS.with_label_values(&[model, version, protocol]).dec();
 }
 
-// Pre-defined worker metrics (light-server compatible)
+// Pre-defined worker metrics (liteserver compatible)
 lazy_static! {
     pub static ref INFERENCE_DURATION: HistogramVec = HistogramVec::new(
         HistogramOpts::new(
-            "lightserver_inference_duration_seconds",
+            "liteserver_inference_duration_seconds",
             "Time inside predict()"
         ).buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
         &["model"]
@@ -288,7 +288,7 @@ lazy_static! {
 
     pub static ref BATCH_SIZE: HistogramVec = HistogramVec::new(
         HistogramOpts::new(
-            "lightserver_batch_size",
+            "liteserver_batch_size",
             "Actual batch size processed"
         ).buckets(vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]),
         &["model"]
@@ -609,5 +609,57 @@ mod tests {
 
         let output = gather_metrics();
         assert!(output.contains("lite_server_rwmc_gauge"), "custom gauge missing: {}", output);
+    }
+
+    #[test]
+    fn test_inc_queue_depth_increments_gauge() {
+        let model = "qd_inc_model";
+        let version = "1";
+        let before = QUEUE_DEPTH.with_label_values(&[model, version]).get();
+        inc_queue_depth(model, version);
+        let after = QUEUE_DEPTH.with_label_values(&[model, version]).get();
+        assert_eq!(after, before + 1.0, "inc_queue_depth should increment gauge by 1");
+    }
+
+    #[test]
+    fn test_dec_queue_depth_decrements_gauge() {
+        let model = "qd_dec_model";
+        let version = "1";
+        // First inc so we start from a known positive value
+        inc_queue_depth(model, version);
+        let before = QUEUE_DEPTH.with_label_values(&[model, version]).get();
+        dec_queue_depth(model, version);
+        let after = QUEUE_DEPTH.with_label_values(&[model, version]).get();
+        assert_eq!(after, before - 1.0, "dec_queue_depth should decrement gauge by 1");
+    }
+
+    #[test]
+    fn test_inc_dec_queue_depth_net_zero() {
+        let model = "qd_balance";
+        let version = "1";
+        inc_queue_depth(model, version);
+        inc_queue_depth(model, version);
+        inc_queue_depth(model, version);
+        dec_queue_depth(model, version);
+        dec_queue_depth(model, version);
+        dec_queue_depth(model, version);
+        let value = QUEUE_DEPTH.with_label_values(&[model, version]).get();
+        // With equal inc and dec, the gauge should have returned to its original
+        // value (0 for a fresh label set in this test binary).
+        assert_eq!(value, 0.0, "balanced inc/dec should net to zero, got {}", value);
+    }
+
+    #[test]
+    fn test_queue_depth_goes_negative_on_extra_dec() {
+        // This test documents the bug: calling dec more times than inc
+        // causes the gauge to go negative. The fix ensures inc/dec are
+        // always called symmetrically in inference_queue.rs.
+        let model = "qd_negative";
+        let version = "1";
+        inc_queue_depth(model, version); // +1
+        dec_queue_depth(model, version); // 0
+        dec_queue_depth(model, version); // -1 (extra dec, e.g. from retry)
+        let value = QUEUE_DEPTH.with_label_values(&[model, version]).get();
+        assert!(value < 0.0, "extra dec should produce negative value, got {}", value);
     }
 }
