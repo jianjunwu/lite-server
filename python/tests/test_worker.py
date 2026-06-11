@@ -130,6 +130,45 @@ class TestLoadLitAPI:
             if saved_utils is not None:
                 sys.modules["utils"] = saved_utils
 
+    def test_loads_callbacks_from_model_dir(self, tmp_path):
+        """Callbacks defined in the model directory should be loaded."""
+        # Clean sys.modules to isolate from prior test modules
+        saved = sys.modules.pop("callbacks", None)
+        try:
+            # Write a callback module in the model directory
+            callbacks_py = tmp_path / "callbacks.py"
+            callbacks_py.write_text(textwrap.dedent('''
+                from lite_server.callback import Callback
+
+                class Tracker(Callback):
+                    called = False
+
+                    def on_before_decode(self, request, meta):
+                        request["_hooked"] = True
+                        return request
+            '''))
+
+            model_py = tmp_path / "model.py"
+            model_py.write_text(textwrap.dedent('''
+                class MyModel:
+                    def __init__(self, **kwargs):
+                        pass
+                    def predict(self, x):
+                        return x
+            '''))
+
+            config = {"callbacks": ["callbacks.Tracker"]}
+            api = inference.load_litapi(str(model_py), config)
+            assert hasattr(api, "predict")
+            # Verify the callback was loaded
+            callback_runner = getattr(api, "_callback_runner", None)
+            assert callback_runner is not None
+            assert callback_runner.has_callbacks()
+        finally:
+            sys.modules.pop("callbacks", None)
+            if saved is not None:
+                sys.modules["callbacks"] = saved
+
 
 class TestRunPredict:
     def test_basic_predict(self):

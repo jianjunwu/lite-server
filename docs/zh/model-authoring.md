@@ -170,6 +170,99 @@ def teardown(self):
     torch.cuda.empty_cache()
 ```
 
+## Callbacks 回调系统
+
+Callbacks 是一种**可组合的、声明式的**拦截推理请求生命周期的方式。与内联的 `on_request`/`on_response` 钩子不同，Callbacks 是独立的类，可以被复用、共享并跨模型组合。
+
+### Callback 基类
+
+继承 `Callback` 并覆盖你关心的钩子。所有钩子都有默认的 no-op 实现 — 只定义你需要的方法。
+
+```python
+from lite_server import Callback
+
+class MyCallback(Callback):
+    def on_before_decode(self, request, meta):
+        """在 decode_request 之前调用。返回修改后的请求。"""
+        request["_timestamp"] = meta.timestamp_ns
+        return request
+
+    def on_after_predict(self, output, meta):
+        """在 predict 之后调用。返回修改后的输出。"""
+        output["_latency_ns"] = time.time_ns() - meta.timestamp_ns
+        return output
+```
+
+**9 个钩子**（按请求生命周期顺序）：
+
+| 钩子 | 触发时机 | 参数 |
+|------|---------|------|
+| `on_before_setup` | `LitAPI.setup()` 之前 | `(config, device)` |
+| `on_after_setup` | `LitAPI.setup()` 完成后 | `(lit_api)` |
+| `on_teardown` | 模型卸载 / worker 关闭时 | `(lit_api)` |
+| `on_before_decode` | `decode_request` 之前 | `(request, meta)` |
+| `on_after_decode` | `decode_request` 之后 | `(decoded, meta)` |
+| `on_before_predict` | `predict` 之前 | `(decoded, meta)` |
+| `on_after_predict` | `predict` 之后 | `(output, meta)` |
+| `on_before_encode` | `encode_response` 之前 | `(output, meta)` |
+| `on_after_encode` | `encode_response` 之后，发送前 | `(encoded, meta)` |
+
+数据转换钩子（decode/predict/encode 系列）可返回修改后的值来转换流经管线的数据，返回 `None` 保持不变。
+
+### CallbackRunner 特性
+
+- **异常隔离**：一个 callback 失败不影响其他 callback 执行
+- **数据转换链**：多个 callback 按注册顺序链式转换数据
+- **异步支持**：callback 可以是 `async def`，`trigger_async` 自动检测并等待
+- **预计算索引**：`_hooked` 字典预先计算哪些 callback 覆盖了哪些钩子，避免热路径上的 `getattr` 查找
+
+### 声明式加载
+
+在 `config.yaml` 中通过 `callbacks` 字段声明 callback 类路径，服务启动时自动加载并注册：
+
+```yaml
+# config.yaml
+callbacks:
+  - my_package.callbacks.AuditLogger
+  - my_package.callbacks.MetricsCollector
+```
+
+每个类必须是无参构造的 `Callback` 子类。
+
+### 完整示例：审计日志
+
+```python
+"""审计日志 callback：记录每个请求的输入/输出和延迟。"""
+import time
+from lite_server import Callback
+
+class AuditLogger(Callback):
+    def on_before_decode(self, request, meta):
+        self._start_ns = time.time_ns()
+        request["_audit_id"] = meta.request_id
+        return request
+
+    def on_after_predict(self, output, meta):
+        elapsed_ms = (time.time_ns() - self._start_ns) / 1_000_000
+        print(f"[AUDIT] request_id={meta.request_id} latency={elapsed_ms:.2f}ms")
+        return output
+
+    def on_teardown(self, lit_api):
+        print(f"[AUDIT] model torn down, total handled: {lit_api.call_count}")
+```
+
+### Callback vs LitAPI 内联 Hook
+
+| 方面 | `Callback` | `LitAPI.on_request` / `on_response` |
+|------|-----------|--------------------------------------|
+| 定义方式 | 独立类，声明式注册 | 在模型类中内联定义 |
+| 复用性 | 可跨模型共享 | 每个模型单独实现 |
+| 组合性 | 多个 callback 可链式组合 | 只能在模型内实现一次 |
+| 注册方式 | config.yaml 中 `callbacks:` 字段 | 模型代码中覆盖方法 |
+| 异常隔离 | 自动隔离，不影响其他 callback | 异常直接传播 |
+
+参见 [examples/14_lifecycle_hooks](../examples/14_lifecycle_hooks/) 获取可运行示例。
+
 ## AsyncLitAPI
 
 对于涉及异步 I/O 的推理流程 —— 例如调用外部 API、使用异步模型库或等待协程 —— 使用 `AsyncLitAPI` 替代 `LitAPI`。

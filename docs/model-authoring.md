@@ -170,6 +170,99 @@ def teardown(self):
     torch.cuda.empty_cache()
 ```
 
+## Callbacks
+
+Callbacks are a **composable, declarative** way to intercept the inference request lifecycle. Unlike inline `on_request`/`on_response` hooks, Callbacks are standalone classes that can be reused, shared, and combined across models.
+
+### Callback Base Class
+
+Subclass `Callback` and override the hooks you care about. All hooks have default no-op implementations — only define the methods you need.
+
+```python
+from lite_server import Callback
+
+class MyCallback(Callback):
+    def on_before_decode(self, request, meta):
+        """Called before decode_request. Return modified request."""
+        request["_timestamp"] = meta.timestamp_ns
+        return request
+
+    def on_after_predict(self, output, meta):
+        """Called after predict. Return modified output."""
+        output["_latency_ns"] = time.time_ns() - meta.timestamp_ns
+        return output
+```
+
+**9 hooks** (in request lifecycle order):
+
+| Hook | When | Signature |
+|------|------|-----------|
+| `on_before_setup` | Before `LitAPI.setup()` | `(config, device)` |
+| `on_after_setup` | After `LitAPI.setup()` succeeds | `(lit_api)` |
+| `on_teardown` | Model unload / worker shutdown | `(lit_api)` |
+| `on_before_decode` | Before `decode_request` | `(request, meta)` |
+| `on_after_decode` | After `decode_request`, before `predict` | `(decoded, meta)` |
+| `on_before_predict` | Before `predict` | `(decoded, meta)` |
+| `on_after_predict` | After `predict`, before `encode_response` | `(output, meta)` |
+| `on_before_encode` | Before `encode_response` | `(output, meta)` |
+| `on_after_encode` | After `encode_response`, before sending | `(encoded, meta)` |
+
+Data-transforming hooks (decode/predict/encode series) may return a modified value to transform data flowing through the pipeline. Return `None` to pass through unchanged.
+
+### CallbackRunner Features
+
+- **Exception isolation**: a failing callback does not prevent other callbacks from executing
+- **Data transformation chain**: multiple callbacks chain their transformations in registration order
+- **Async support**: callbacks can be `async def` — `trigger_async` auto-detects and awaits them
+- **Pre-computed index**: the `_hooked` dict pre-computes which callbacks override which hooks, avoiding `getattr` lookups on the hot path
+
+### Declarative Loading
+
+Declare callback class paths in `config.yaml` under the `callbacks` key. The server loads and registers them automatically on startup:
+
+```yaml
+# config.yaml
+callbacks:
+  - my_package.callbacks.AuditLogger
+  - my_package.callbacks.MetricsCollector
+```
+
+Each class must be a no-arg constructible `Callback` subclass.
+
+### Complete Example: Audit Logger
+
+```python
+"""Audit-logging callback: records input/output and latency per request."""
+import time
+from lite_server import Callback
+
+class AuditLogger(Callback):
+    def on_before_decode(self, request, meta):
+        self._start_ns = time.time_ns()
+        request["_audit_id"] = meta.request_id
+        return request
+
+    def on_after_predict(self, output, meta):
+        elapsed_ms = (time.time_ns() - self._start_ns) / 1_000_000
+        print(f"[AUDIT] request_id={meta.request_id} latency={elapsed_ms:.2f}ms")
+        return output
+
+    def on_teardown(self, lit_api):
+        print(f"[AUDIT] model torn down, total handled: {lit_api.call_count}")
+```
+
+### Callback vs LitAPI Inline Hooks
+
+| Aspect | `Callback` | `LitAPI.on_request` / `on_response` |
+|--------|-----------|--------------------------------------|
+| Definition | Standalone class, declarative registration | Inline method on model class |
+| Reusability | Shared across models | Per-model implementation |
+| Composability | Multiple callbacks chain together | Single implementation per model |
+| Registration | `callbacks:` field in config.yaml | Override method in model code |
+| Exception isolation | Automatic, others still run | Exception propagates directly |
+
+See [examples/14_lifecycle_hooks](../examples/14_lifecycle_hooks/) for a runnable demo.
+
 ## AsyncLitAPI
 
 For inference pipelines that involve async I/O — such as calling external APIs, using async model libraries, or awaiting coroutines — use `AsyncLitAPI` instead of `LitAPI`.

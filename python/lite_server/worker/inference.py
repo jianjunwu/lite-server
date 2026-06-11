@@ -120,8 +120,12 @@ def load_litapi(model_py_path: str, config: dict, device: str = "cpu"):
     spec = importlib.util.spec_from_file_location("model_module", model_py_path)
     module = importlib.util.module_from_spec(spec)
 
-    # Load callbacks from config
-    callback_runner = load_callbacks(config)
+    # Add model directory to path so callbacks can be imported
+    sys.path.insert(0, model_dir)
+    try:
+        callback_runner = load_callbacks(config)
+    finally:
+        sys.path.remove(model_dir)
 
     # Protect stdout during model module import and setup.
     # C-level inference libraries (CANN, ONNX Runtime, MagicMind, etc.) may

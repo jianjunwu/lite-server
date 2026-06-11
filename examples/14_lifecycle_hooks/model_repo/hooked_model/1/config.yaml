@@ -4,7 +4,7 @@ accelerator: cpu
 devices: 1
 workers_per_device: 1
 
-# Worker lifecycle hooks
+# Worker lifecycle hooks (shell commands / HTTP callbacks)
 hooks:
   on_ready: 'echo "Worker $WORKER_ID ready for model $MODEL on device $DEVICE"'
   on_exit: 'echo "Worker $WORKER_ID exiting (code=$EXIT_CODE, signal=$EXIT_SIGNAL)"'
@@ -15,3 +15,10 @@ hooks:
   on_error_http:
     url: "http://localhost:8000/health"
     method: "GET"
+
+# Inference lifecycle callbacks (Python Callback classes)
+# Each class must be a no-arg constructible Callback subclass.
+# Callbacks chain in order with automatic exception isolation.
+callbacks:
+  - callbacks.AuditLogger
+  - callbacks.ResponseEnricher
