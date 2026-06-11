@@ -146,6 +146,7 @@ impl LiteServer {
 
         // Start HTTP server as spawned task with graceful shutdown channel
         let (http_shutdown_tx, http_shutdown_rx) = tokio::sync::oneshot::channel();
+        let has_hot_reload_for_http = has_hot_reload.clone();
         let mut http_handle = tokio::spawn(http::start_http_server(
             self.config.clone(),
             self.registry.clone(),
@@ -156,6 +157,7 @@ impl LiteServer {
             http_shutdown_rx,
             shutdown_state.clone(),
             self.callback_runner.clone(),
+            has_hot_reload_for_http,
         ));
 
         // When HTTP uses a Unix socket, gRPC/metrics still need a TCP host.

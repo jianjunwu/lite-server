@@ -7,6 +7,7 @@ use crate::server::ShutdownState;
 use crate::worker::WorkerManager;
 use crate::worker::endpoint_manager::EndpointManager;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -20,6 +21,7 @@ pub struct AppState {
     pub alert_engine: Arc<AlertEngine>,
     pub shutdown_state: Arc<ShutdownState>,
     pub callback_runner: Arc<CallbackRunner>,
+    pub has_hot_reload: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -31,6 +33,7 @@ impl AppState {
         config: Config,
         repo_path: PathBuf,
         callback_runner: Arc<CallbackRunner>,
+        has_hot_reload: Arc<AtomicBool>,
     ) -> Self {
         Self {
             registry,
@@ -42,6 +45,7 @@ impl AppState {
             alert_engine: Arc::new(AlertEngine::new(AlertThresholds::default())),
             shutdown_state: Arc::new(ShutdownState::new()),
             callback_runner,
+            has_hot_reload,
         }
     }
 }

@@ -13,6 +13,7 @@ use axum::http::header::{HeaderMap, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::response::sse::{Event, Sse};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -262,6 +263,11 @@ pub async fn load_model_handler(
     info!(model = %model_name, version = %version, "load model requested");
     state.worker_manager.load_model(&model_name, &version, &config).await?;
 
+    // Update hot reload flag so watcher picks up events for this model
+    if config.hot_reload {
+        state.has_hot_reload.store(true, Ordering::Relaxed);
+    }
+
     // Auto-activate if no active version
     let active = state.registry.get_active_version(&model_name);
     if active.is_none() {
@@ -290,6 +296,11 @@ pub async fn unload_model_handler(
     if !success {
         return Err(AppError::ModelNotFound(format!("{} not loaded", model_name)));
     }
+
+    // Re-check if any loaded models still have hot_reload enabled
+    let any_hot_reload = state.registry.list_loaded().iter().any(|(_, _, mv)| mv.config.hot_reload);
+    state.has_hot_reload.store(any_hot_reload, Ordering::Relaxed);
+
     Ok(Json(json!({
         "success": true,
         "message": format!("Model {} unloaded", model_name),
@@ -1515,6 +1526,7 @@ mod upload_download_tests {
             Config::default(),
             repo_path,
             callback_runner,
+            Arc::new(AtomicBool::new(false)),
         ))
     }
 

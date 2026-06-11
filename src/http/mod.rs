@@ -17,6 +17,7 @@ use axum::response::Response;
 use axum::Router;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tracing::info;
 
@@ -42,9 +43,10 @@ pub async fn start_http_server(
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     shutdown_state: Arc<crate::server::ShutdownState>,
     callback_runner: Arc<crate::callback::CallbackRunner>,
+    has_hot_reload: Arc<AtomicBool>,
 ) -> Result<(), AppError> {
     let repo_path = PathBuf::from(&config.model_repository.path);
-    let mut state = AppState::new(registry, worker_manager, inference_queue, endpoint_manager, config.clone(), repo_path, callback_runner);
+    let mut state = AppState::new(registry, worker_manager, inference_queue, endpoint_manager, config.clone(), repo_path, callback_runner, has_hot_reload);
     state.shutdown_state = shutdown_state;
 
     let app = create_routes(state, endpoint_routes);
