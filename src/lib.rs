@@ -1,3 +1,4 @@
+pub mod callback;
 pub mod config;
 pub mod ensemble;
 pub mod error;

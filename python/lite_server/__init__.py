@@ -14,6 +14,7 @@ except ImportError:
 
 from lite_server.api import BidiStreamHandler, LitAPI, ResponseWithHeaders
 from lite_server.api_async import AsyncLitAPI
+from lite_server.callback import Callback, CallbackRunner
 from lite_server.endpoint import endpoint, router
 from lite_server.middleware import cors, log_requests, rate_limit, require_api_key
 from lite_server.server_proxy import ServerProxy
@@ -25,6 +26,8 @@ __all__ = [
     "LitAPI",
     "AsyncLitAPI",
     "BidiStreamHandler",
+    "Callback",
+    "CallbackRunner",
     "OpenAIEndpoint",
     "EndpointSpec",
     "ServerProxy",

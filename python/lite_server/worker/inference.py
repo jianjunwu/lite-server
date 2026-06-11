@@ -19,6 +19,7 @@ import zmq
 
 from lite_server.api import LitAPI, RequestMeta, BidiStreamHandler, ResponseWithHeaders
 from lite_server.api_async import AsyncLitAPI
+from lite_server.callback import CallbackRunner, load_callbacks
 from lite_server.exceptions import HTTPException
 from lite_server.proto import (
     BatchItemResponse,
@@ -119,6 +120,9 @@ def load_litapi(model_py_path: str, config: dict, device: str = "cpu"):
     spec = importlib.util.spec_from_file_location("model_module", model_py_path)
     module = importlib.util.module_from_spec(spec)
 
+    # Load callbacks from config
+    callback_runner = load_callbacks(config)
+
     # Protect stdout during model module import and setup.
     # C-level inference libraries (CANN, ONNX Runtime, MagicMind, etc.) may
     # write init logs directly to fd 1, which breaks the worker-ready handshake
@@ -144,6 +148,9 @@ def load_litapi(model_py_path: str, config: dict, device: str = "cpu"):
         batch_timeout = config.get("batch_timeout", 0.0)
         stream = config.get("stream", False)
 
+        # on_before_setup
+        callback_runner.trigger_void("on_before_setup", config, device)
+
         instance = LitAPIClass(
             max_batch_size=max_batch_size,
             batch_timeout=batch_timeout,
@@ -155,6 +162,12 @@ def load_litapi(model_py_path: str, config: dict, device: str = "cpu"):
 
         if hasattr(instance, "setup"):
             instance.setup(device)
+
+        # on_after_setup
+        callback_runner.trigger_void("on_after_setup", instance)
+
+    # Store callback runner on the instance for later use
+    instance._callback_runner = callback_runner
 
     return instance
 
@@ -286,8 +299,9 @@ def _has_batch_methods(lit_api) -> bool:
 def _run_predict(lit_api: LitAPI, data: bytes, meta: RequestMeta, log: logging.Logger):
     """Run the full predict pipeline with hooks."""
     raw = json.loads(data) if data else {}
+    runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
 
-    # 1. on_request (pre-decode)
+    # 1. on_request (pre-decode) — LitAPI hook (backward compat)
     if hasattr(lit_api, "on_request"):
         try:
             raw = lit_api.on_request(raw, meta)
@@ -295,28 +309,52 @@ def _run_predict(lit_api: LitAPI, data: bytes, meta: RequestMeta, log: logging.L
             log.warning("on_request hook failed: %s", e)
             raise
 
-    # 2. decode_request
+    # 2. on_before_decode — Callback hook
+    if runner is not None:
+        raw = runner.trigger("on_before_decode", raw, meta)
+
+    # 3. decode_request
     try:
         decoded = lit_api.decode_request(raw) if hasattr(lit_api, "decode_request") else raw
     except Exception as e:
         log.warning("decode_request failed: %s", e)
         raise
 
-    # 3. predict
+    # 4. on_after_decode — Callback hook
+    if runner is not None:
+        decoded = runner.trigger("on_after_decode", decoded, meta)
+
+    # 5. on_before_predict — Callback hook
+    if runner is not None:
+        decoded = runner.trigger("on_before_predict", decoded, meta)
+
+    # 6. predict
     try:
         output = lit_api.predict(decoded)
     except Exception as e:
         log.error("predict failed: %s", e)
         raise
 
-    # 4. encode_response
+    # 7. on_after_predict — Callback hook
+    if runner is not None:
+        output = runner.trigger("on_after_predict", output, meta)
+
+    # 8. on_before_encode — Callback hook
+    if runner is not None:
+        output = runner.trigger("on_before_encode", output, meta)
+
+    # 9. encode_response
     try:
         encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
     except Exception as e:
         log.warning("encode_response failed: %s", e)
         raise
 
-    # 5. on_response
+    # 10. on_after_encode — Callback hook
+    if runner is not None:
+        encoded = runner.trigger("on_after_encode", encoded, meta)
+
+    # 11. on_response — LitAPI hook (backward compat)
     if hasattr(lit_api, "on_response"):
         try:
             encoded = lit_api.on_response(encoded, meta)
@@ -359,8 +397,9 @@ async def _maybe_await(func, *args, **kwargs):
 async def _run_predict_async(lit_api: LitAPI, data: bytes, meta: RequestMeta, log: logging.Logger):
     """Async version of the full predict pipeline with hooks."""
     raw = json.loads(data) if data else {}
+    runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
 
-    # 1. on_request (pre-decode)
+    # 1. on_request (pre-decode) — LitAPI hook (backward compat)
     if hasattr(lit_api, "on_request"):
         try:
             raw = await _maybe_await(lit_api.on_request, raw, meta)
@@ -368,7 +407,11 @@ async def _run_predict_async(lit_api: LitAPI, data: bytes, meta: RequestMeta, lo
             log.warning("on_request hook failed: %s", e)
             raise
 
-    # 2. decode_request
+    # 2. on_before_decode — Callback hook
+    if runner is not None:
+        raw = await runner.trigger_async("on_before_decode", raw, meta)
+
+    # 3. decode_request
     try:
         if hasattr(lit_api, "decode_request"):
             decoded = await _maybe_await(lit_api.decode_request, raw)
@@ -378,14 +421,30 @@ async def _run_predict_async(lit_api: LitAPI, data: bytes, meta: RequestMeta, lo
         log.warning("decode_request failed: %s", e)
         raise
 
-    # 3. predict
+    # 4. on_after_decode — Callback hook
+    if runner is not None:
+        decoded = await runner.trigger_async("on_after_decode", decoded, meta)
+
+    # 5. on_before_predict — Callback hook
+    if runner is not None:
+        decoded = await runner.trigger_async("on_before_predict", decoded, meta)
+
+    # 6. predict
     try:
         output = await _maybe_await(lit_api.predict, decoded)
     except Exception as e:
         log.error("predict failed: %s", e)
         raise
 
-    # 4. encode_response
+    # 7. on_after_predict — Callback hook
+    if runner is not None:
+        output = await runner.trigger_async("on_after_predict", output, meta)
+
+    # 8. on_before_encode — Callback hook
+    if runner is not None:
+        output = await runner.trigger_async("on_before_encode", output, meta)
+
+    # 9. encode_response
     try:
         if hasattr(lit_api, "encode_response"):
             encoded = await _maybe_await(lit_api.encode_response, output)
@@ -395,7 +454,11 @@ async def _run_predict_async(lit_api: LitAPI, data: bytes, meta: RequestMeta, lo
         log.warning("encode_response failed: %s", e)
         raise
 
-    # 5. on_response
+    # 10. on_after_encode — Callback hook
+    if runner is not None:
+        encoded = await runner.trigger_async("on_after_encode", encoded, meta)
+
+    # 11. on_response — LitAPI hook (backward compat)
     if hasattr(lit_api, "on_response"):
         try:
             encoded = await _maybe_await(lit_api.on_response, encoded, meta)
@@ -496,10 +559,20 @@ class _StreamTracker:
 
 def _consume_stream_generator(lit_api: LitAPI, generator, stream_id: str, socket: zmq.Socket, active_streams: _StreamTracker, log: logging.Logger, meta=None):
     """Background thread: consume a stream_predict generator and send chunks."""
+    runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
     try:
         for output in generator:
             active_streams.touch(stream_id)
+            # on_after_predict — Callback hook (per-chunk output)
+            if runner is not None:
+                output = runner.trigger("on_after_predict", output, meta)
+            # on_before_encode — Callback hook
+            if runner is not None:
+                output = runner.trigger("on_before_encode", output, meta)
             encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
+            # on_after_encode — Callback hook
+            if runner is not None:
+                encoded = runner.trigger("on_after_encode", encoded, meta)
             if hasattr(lit_api, "on_response") and meta is not None:
                 encoded = lit_api.on_response(encoded, meta)
             encoded, _ = _unwrap_response(encoded)
@@ -600,6 +673,7 @@ def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.
 
     # Normal uni-directional streaming: start generator
     raw = json.loads(data) if data else {}
+    runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
 
     if hasattr(lit_api, "on_request") and meta is not None:
         try:
@@ -612,7 +686,19 @@ def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.
             socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
             return
 
+    # on_before_decode — Callback hook
+    if runner is not None:
+        raw = runner.trigger("on_before_decode", raw, meta)
+
     decoded = lit_api.decode_request(raw) if hasattr(lit_api, "decode_request") else raw
+
+    # on_after_decode — Callback hook
+    if runner is not None:
+        decoded = runner.trigger("on_after_decode", decoded, meta)
+
+    # on_before_predict — Callback hook
+    if runner is not None:
+        decoded = runner.trigger("on_before_predict", decoded, meta)
 
     try:
         generator = lit_api.stream_predict(decoded)
@@ -656,7 +742,14 @@ def _handle_stream_chunk(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq
 
     if output is not None:
         try:
+            runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
+            # on_before_encode — Callback hook
+            if runner is not None:
+                output = runner.trigger("on_before_encode", output, meta)
             encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
+            # on_after_encode — Callback hook
+            if runner is not None:
+                encoded = runner.trigger("on_after_encode", encoded, meta)
             if hasattr(lit_api, "on_response") and meta is not None:
                 encoded = lit_api.on_response(encoded, meta)
             encoded, _ = _unwrap_response(encoded)
@@ -780,6 +873,7 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
         elif request.HasField("batch"):
             batch: BatchRequest = request.batch
             batch_items = batch.items
+            runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
 
             # Phase 1: per-item async on_request → decode
             decoded_map: dict[str, Any] = {}
@@ -790,10 +884,16 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
                     raw = json.loads(item.data) if item.data else {}
                     if hasattr(lit_api, "on_request"):
                         raw = await _maybe_await(lit_api.on_request, raw, meta)
+                    # on_before_decode — Callback hook
+                    if runner is not None:
+                        raw = await runner.trigger_async("on_before_decode", raw, meta)
                     if hasattr(lit_api, "decode_request"):
                         decoded = await _maybe_await(lit_api.decode_request, raw)
                     else:
                         decoded = raw
+                    # on_after_decode — Callback hook
+                    if runner is not None:
+                        decoded = await runner.trigger_async("on_after_decode", decoded, meta)
                     decoded_map[item.uid] = decoded
                 except Exception as e:
                     error_map[item.uid] = e
@@ -835,10 +935,16 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
 
             for item_uid, output in success_outputs.items():
                 try:
+                    # on_before_encode — Callback hook
+                    if runner is not None:
+                        output = await runner.trigger_async("on_before_encode", output, meta)
                     if hasattr(lit_api, "encode_response"):
                         encoded = await _maybe_await(lit_api.encode_response, output)
                     else:
                         encoded = output
+                    # on_after_encode — Callback hook
+                    if runner is not None:
+                        encoded = await runner.trigger_async("on_after_encode", encoded, meta)
                     if hasattr(lit_api, "on_response"):
                         encoded = await _maybe_await(lit_api.on_response, encoded, meta)
                     encoded, item_headers = _unwrap_response(encoded)
@@ -1042,6 +1148,7 @@ async def _handle_stream_open_async(
 
     # Normal uni-directional streaming
     raw = json.loads(data) if data else {}
+    runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
 
     if hasattr(lit_api, "on_request") and meta is not None:
         try:
@@ -1055,6 +1162,10 @@ async def _handle_stream_open_async(
             await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
             return
 
+    # on_before_decode — Callback hook
+    if runner is not None:
+        raw = await runner.trigger_async("on_before_decode", raw, meta)
+
     try:
         decoded = await _maybe_await(lit_api.decode_request, raw) if hasattr(lit_api, "decode_request") else raw
     except HTTPException as e:
@@ -1065,6 +1176,14 @@ async def _handle_stream_open_async(
         log.warning("decode_request failed for stream %s: %s", stream_id, e, exc_info=True)
         await socket.send(_make_stream_error(stream_id, f"decode failed: {e}").SerializeToString())
         return
+
+    # on_after_decode — Callback hook
+    if runner is not None:
+        decoded = await runner.trigger_async("on_after_decode", decoded, meta)
+
+    # on_before_predict — Callback hook
+    if runner is not None:
+        decoded = await runner.trigger_async("on_before_predict", decoded, meta)
 
     try:
         generator = await _maybe_await(lit_api.stream_predict, decoded)
@@ -1119,7 +1238,14 @@ async def _handle_stream_chunk_async(
 
     if output is not None:
         try:
+            runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
+            # on_before_encode — Callback hook
+            if runner is not None:
+                output = await runner.trigger_async("on_before_encode", output, meta)
             encoded = await _maybe_await(lit_api.encode_response, output) if hasattr(lit_api, "encode_response") else output
+            # on_after_encode — Callback hook
+            if runner is not None:
+                encoded = await runner.trigger_async("on_after_encode", encoded, meta)
             resp_bytes = json.dumps(encoded).encode()
             await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
         except HTTPException as e:
@@ -1139,10 +1265,20 @@ async def _consume_async_stream(
     meta=None,
 ):
     """Consume an async generator and send chunks."""
+    runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
     try:
         async for output in generator:
             try:
+                # on_after_predict — Callback hook (per-chunk)
+                if runner is not None:
+                    output = await runner.trigger_async("on_after_predict", output, meta)
+                # on_before_encode — Callback hook
+                if runner is not None:
+                    output = await runner.trigger_async("on_before_encode", output, meta)
                 encoded = await _maybe_await(lit_api.encode_response, output) if hasattr(lit_api, "encode_response") else output
+                # on_after_encode — Callback hook
+                if runner is not None:
+                    encoded = await runner.trigger_async("on_after_encode", encoded, meta)
                 if hasattr(lit_api, "on_response") and meta is not None:
                     encoded = await _maybe_await(lit_api.on_response, encoded, meta)
                 encoded, _ = _unwrap_response(encoded)
@@ -1184,6 +1320,7 @@ async def _consume_sync_stream_async(
     meta=None,
 ):
     """Consume a sync generator in a background thread and send chunks asynchronously."""
+    runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
 
     def _next_item():
         try:
@@ -1198,7 +1335,16 @@ async def _consume_sync_stream_async(
                 break
 
             try:
+                # on_after_predict — Callback hook (per-chunk)
+                if runner is not None:
+                    output = runner.trigger("on_after_predict", output, meta)
+                # on_before_encode — Callback hook
+                if runner is not None:
+                    output = runner.trigger("on_before_encode", output, meta)
                 encoded = await _maybe_await(lit_api.encode_response, output) if hasattr(lit_api, "encode_response") else output
+                # on_after_encode — Callback hook
+                if runner is not None:
+                    encoded = await runner.trigger_async("on_after_encode", encoded, meta)
                 if hasattr(lit_api, "on_response") and meta is not None:
                     encoded = await _maybe_await(lit_api.on_response, encoded, meta)
                 encoded, _ = _unwrap_response(encoded)
@@ -1284,6 +1430,7 @@ def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log:
             elif request.HasField("batch"):
                 batch: BatchRequest = request.batch
                 batch_items = batch.items
+                runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
 
                 # Phase 1: on_request → decode (per item)
                 decoded_map: dict[str, Any] = {}
@@ -1294,7 +1441,13 @@ def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log:
                         raw = json.loads(item.data) if item.data else {}
                         if hasattr(lit_api, "on_request"):
                             raw = lit_api.on_request(raw, meta)
+                        # on_before_decode — Callback hook
+                        if runner is not None:
+                            raw = runner.trigger("on_before_decode", raw, meta)
                         decoded = lit_api.decode_request(raw) if hasattr(lit_api, "decode_request") else raw
+                        # on_after_decode — Callback hook
+                        if runner is not None:
+                            decoded = runner.trigger("on_after_decode", decoded, meta)
                         decoded_map[item.uid] = decoded
                     except Exception as e:
                         log.warning("batch item %s on_request/decode failed: %s", item.uid, e, exc_info=True)
@@ -1335,7 +1488,13 @@ def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log:
 
                 for _uid, output in success_outputs.items():
                     try:
+                        # on_before_encode — Callback hook
+                        if runner is not None:
+                            output = runner.trigger("on_before_encode", output, meta)
                         encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
+                        # on_after_encode — Callback hook
+                        if runner is not None:
+                            encoded = runner.trigger("on_after_encode", encoded, meta)
                         if hasattr(lit_api, "on_response"):
                             encoded = lit_api.on_response(encoded, meta)
                         encoded, item_headers = _unwrap_response(encoded)
@@ -1651,6 +1810,10 @@ def _protect_stdout():
 
 
 def _run_teardown(lit_api, log):
+    # Fire callback teardown hooks
+    runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
+    if runner is not None:
+        runner.trigger_void("on_teardown", lit_api)
     if hasattr(lit_api, "teardown"):
         try:
             lit_api.teardown()

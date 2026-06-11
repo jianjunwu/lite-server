@@ -6,6 +6,7 @@ pub mod endpoint_proto {
     include!(concat!(env!("OUT_DIR"), "/lite_server.endpoint.v1.rs"));
 }
 
+use crate::callback::{CallbackRunner, ModelLifecycleContext};
 use crate::config::ModelConfig;
 use crate::error::AppError;
 use crate::inference_queue::{InferenceQueue, OutlierState, ReloadSignal, model_version_key, parse_model_version_key};
@@ -149,6 +150,8 @@ pub struct WorkerManager {
     respawn_rx: tokio::sync::Mutex<Option<mpsc::Receiver<RespawnSignal>>>,
     // Log level passed to Python workers
     log_level: String,
+    // Callback runner for lifecycle events
+    callback_runner: Arc<CallbackRunner>,
 }
 
 struct WorkerProcess {
@@ -163,6 +166,7 @@ impl WorkerManager {
         repo_path: PathBuf,
         inference_queue: Arc<InferenceQueue>,
         log_level: String,
+        callback_runner: Arc<CallbackRunner>,
     ) -> Self {
         let (reload_tx, reload_rx) = mpsc::channel::<ReloadSignal>(8);
         let (respawn_tx, respawn_rx) = mpsc::channel::<RespawnSignal>(8);
@@ -179,6 +183,7 @@ impl WorkerManager {
             respawn_tx,
             respawn_rx: tokio::sync::Mutex::new(Some(respawn_rx)),
             log_level,
+            callback_runner,
         }
     }
 
@@ -840,6 +845,14 @@ impl WorkerManager {
         crate::metrics::prometheus::set_active_workers(model_name, version, total_workers as f64);
 
         info!("Model {} version {} loaded with {} workers", model_name, version, total_workers);
+
+        // Fire ModelLoad callback
+        self.callback_runner.on_model_load(&ModelLifecycleContext {
+            model_name: model_name.to_string(),
+            version: version.to_string(),
+            device: config.devices.as_ref().and_then(|d| d.as_str().map(|s| s.to_string())),
+        }).await;
+
         Ok(())
     }
 
@@ -869,6 +882,13 @@ impl WorkerManager {
         version: &str,
     ) -> Result<(), AppError> {
         info!("Unloading {} version {}", model_name, version);
+
+        // Fire ModelUnload callback before unloading
+        self.callback_runner.on_model_unload(&ModelLifecycleContext {
+            model_name: model_name.to_string(),
+            version: version.to_string(),
+            device: None,
+        }).await;
 
         // Unregister inference queue first to stop accepting new requests
         self.inference_queue.unregister_model(model_name, version);
@@ -935,6 +955,13 @@ impl WorkerManager {
 
         self.load_model(model_name, &v, &config).await?;
         self.registry.activate_version(model_name, &v)?;
+
+        // Fire ModelReload callback
+        self.callback_runner.on_model_reload(&ModelLifecycleContext {
+            model_name: model_name.to_string(),
+            version: v.clone(),
+            device: config.devices.as_ref().and_then(|d| d.as_str().map(|s| s.to_string())),
+        }).await;
 
         info!("Model {} version {} reloaded", model_name, v);
         Ok(true)

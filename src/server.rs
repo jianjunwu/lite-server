@@ -1,3 +1,4 @@
+use crate::callback::{CallbackRunner, ServerContext};
 use crate::config::{Config, OrchestrationConfig, ModelStrategyConfig};
 use crate::error::AppError;
 use crate::http;
@@ -67,6 +68,7 @@ pub struct LiteServer {
     registry: Arc<ModelRegistry>,
     worker_manager: Arc<WorkerManager>,
     inference_queue: Arc<InferenceQueue>,
+    callback_runner: Arc<CallbackRunner>,
 }
 
 impl LiteServer {
@@ -74,11 +76,13 @@ impl LiteServer {
         let repo_path = PathBuf::from(&config.model_repository.path);
         let registry = Arc::new(ModelRegistry::new());
         let inference_queue = Arc::new(InferenceQueue::new());
+        let callback_runner = Arc::new(CallbackRunner::new());
         let worker_manager = Arc::new(WorkerManager::new(
             registry.clone(),
             repo_path,
             inference_queue.clone(),
             config.logging.level.clone(),
+            callback_runner.clone(),
         ));
 
         Self {
@@ -86,6 +90,7 @@ impl LiteServer {
             registry,
             worker_manager,
             inference_queue,
+            callback_runner,
         }
     }
 
@@ -103,6 +108,13 @@ impl LiteServer {
 
         // Load initial models
         self.load_initial_models().await?;
+
+        // Fire ServerStart callbacks
+        self.callback_runner.on_server_start(&ServerContext {
+            http_port: self.config.server.http_port,
+            grpc_port: self.config.server.grpc_port,
+            metrics_port: self.config.server.metrics_port,
+        }).await;
 
         // P2: Check if any loaded model has hot_reload enabled
         let has_hot_reload = Arc::new(AtomicBool::new(self.registry_has_hot_reload_models()));
@@ -143,6 +155,7 @@ impl LiteServer {
             endpoint_routes,
             http_shutdown_rx,
             shutdown_state.clone(),
+            self.callback_runner.clone(),
         ));
 
         // When HTTP uses a Unix socket, gRPC/metrics still need a TCP host.
@@ -170,6 +183,7 @@ impl LiteServer {
                 self.registry.clone(),
                 self.worker_manager.clone(),
                 self.config.features.streaming_metrics,
+                self.callback_runner.clone(),
             )))
         } else {
             None
@@ -257,6 +271,13 @@ impl LiteServer {
         };
 
         info!("{} received, starting graceful shutdown", shutdown_reason);
+
+        // Fire ServerEnd callbacks
+        self.callback_runner.on_server_end(&ServerContext {
+            http_port: self.config.server.http_port,
+            grpc_port: self.config.server.grpc_port,
+            metrics_port: self.config.server.metrics_port,
+        }).await;
 
         // Mark shutdown start for pending request tracking
         shutdown_state.mark_start();
@@ -922,11 +943,13 @@ mod tests {
 
         let registry = Arc::new(ModelRegistry::new());
         let inference_queue = Arc::new(InferenceQueue::new());
+        let callback_runner = Arc::new(CallbackRunner::new());
         let worker_manager = Arc::new(WorkerManager::new(
             registry,
             tmp_dir.clone(),
             inference_queue,
             "warn".to_string(),
+            callback_runner,
         ));
 
         let (tx, _rx) = mpsc::channel::<Vec<PathBuf>>(32);
@@ -957,11 +980,13 @@ mod tests {
 
         let registry = Arc::new(ModelRegistry::new());
         let inference_queue = Arc::new(InferenceQueue::new());
+        let callback_runner = Arc::new(CallbackRunner::new());
         let worker_manager = Arc::new(WorkerManager::new(
             registry,
             tmp_dir.clone(),
             inference_queue,
             "warn".to_string(),
+            callback_runner,
         ));
 
         let (tx, mut rx) = mpsc::channel::<Vec<PathBuf>>(32);

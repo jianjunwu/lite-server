@@ -1,3 +1,4 @@
+use crate::callback::CallbackRunner;
 use crate::config::Config;
 use crate::inference_queue::InferenceQueue;
 use crate::metrics::aggregator::{AlertEngine, AlertThresholds};
@@ -20,6 +21,7 @@ pub struct AppState {
     pub alert_engine: Arc<AlertEngine>,
     pub streaming_engine: Arc<StreamingEngine>,
     pub shutdown_state: Arc<ShutdownState>,
+    pub callback_runner: Arc<CallbackRunner>,
 }
 
 impl AppState {
@@ -30,6 +32,7 @@ impl AppState {
         endpoint_manager: Option<Arc<EndpointManager>>,
         config: Config,
         repo_path: PathBuf,
+        callback_runner: Arc<CallbackRunner>,
     ) -> Self {
         Self {
             registry,
@@ -41,6 +44,7 @@ impl AppState {
             alert_engine: Arc::new(AlertEngine::new(AlertThresholds::default())),
             streaming_engine: Arc::new(StreamingEngine::new()),
             shutdown_state: Arc::new(ShutdownState::new()),
+            callback_runner,
         }
     }
 }

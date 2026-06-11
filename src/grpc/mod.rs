@@ -1,3 +1,4 @@
+use crate::callback::CallbackRunner;
 use crate::error::AppError;
 use crate::proto::liteserver as pb;
 use crate::registry::ModelRegistry;
@@ -20,14 +21,21 @@ pub struct GrpcService {
     registry: Arc<ModelRegistry>,
     worker_manager: Arc<WorkerManager>,
     streaming_metrics: bool,
+    callback_runner: Arc<CallbackRunner>,
 }
 
 impl GrpcService {
-    pub fn new(registry: Arc<ModelRegistry>, worker_manager: Arc<WorkerManager>, streaming_metrics: bool) -> Self {
+    pub fn new(
+        registry: Arc<ModelRegistry>,
+        worker_manager: Arc<WorkerManager>,
+        streaming_metrics: bool,
+        callback_runner: Arc<CallbackRunner>,
+    ) -> Self {
         Self {
             registry,
             worker_manager,
             streaming_metrics,
+            callback_runner,
         }
     }
 }
@@ -175,7 +183,23 @@ impl LiteServer for GrpcService {
         let worker_id = crate::worker::pick_worker_random(clients.len());
         let client = &clients[worker_id];
 
-        let _start = Instant::now();
+        // Fire InferenceRequest callback
+        let req_ctx = crate::callback::InferenceContext {
+            model_name: model_name.to_string(),
+            version: resolved_version.clone(),
+            route: "/predict".to_string(),
+            protocol: crate::callback::Protocol::Grpc,
+            request_id: Uuid::new_v4().to_string(),
+            client_ip: String::new(),
+            elapsed_us: None,
+        };
+        let cb_runner = self.callback_runner.clone();
+        let req_ctx_clone = req_ctx.clone();
+        tokio::spawn(async move {
+            cb_runner.on_inference_request(&req_ctx_clone).await;
+        });
+
+        let start = Instant::now();
         let resp = client
             .send(internal_req)
             .await
@@ -218,6 +242,16 @@ impl LiteServer for GrpcService {
                             metrics: resp.metrics,
                         });
                         inject_grpc_metadata(response.metadata_mut(), &headers);
+
+                        // Fire InferenceResponse callback
+                        let duration = start.elapsed().as_secs_f64();
+                        let resp_ctx = crate::callback::InferenceContext {
+                            elapsed_us: Some((duration * 1_000_000.0) as u64),
+                            ..req_ctx.clone()
+                        };
+                        let cb_runner = self.callback_runner.clone();
+                        tokio::spawn(async move { cb_runner.on_inference_response(&resp_ctx).await; });
+
                         Ok(response)
                     }
                 }
@@ -658,12 +692,13 @@ pub async fn start_grpc_server(
     registry: Arc<ModelRegistry>,
     worker_manager: Arc<WorkerManager>,
     streaming_metrics: bool,
+    callback_runner: Arc<CallbackRunner>,
 ) -> Result<(), AppError> {
     let addr: std::net::SocketAddr = format!("{}:{}", host, port)
         .parse()
         .map_err(|e| AppError::Config(format!("invalid gRPC address: {}", e)))?;
 
-    let service = GrpcService::new(registry, worker_manager, streaming_metrics);
+    let service = GrpcService::new(registry, worker_manager, streaming_metrics, callback_runner);
     let server = LiteServerServer::new(service);
 
     tracing::info!("Starting gRPC server on {}", addr);

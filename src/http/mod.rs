@@ -41,9 +41,10 @@ pub async fn start_http_server(
     endpoint_routes: Vec<crate::worker::protocol::EndpointRoute>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     shutdown_state: Arc<crate::server::ShutdownState>,
+    callback_runner: Arc<crate::callback::CallbackRunner>,
 ) -> Result<(), AppError> {
     let repo_path = PathBuf::from(&config.model_repository.path);
-    let mut state = AppState::new(registry, worker_manager, inference_queue, endpoint_manager, config.clone(), repo_path);
+    let mut state = AppState::new(registry, worker_manager, inference_queue, endpoint_manager, config.clone(), repo_path, callback_runner);
     state.shutdown_state = shutdown_state;
 
     let app = create_routes(state, endpoint_routes);

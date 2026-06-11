@@ -495,6 +495,22 @@ async fn do_infer(
         .as_nanos() as i64;
     let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
 
+    // Fire InferenceRequest callback (before values are moved into meta)
+    let req_ctx = crate::callback::InferenceContext {
+        model_name: model_name.clone(),
+        version: resolved_version.clone(),
+        route: route.clone(),
+        protocol: crate::callback::Protocol::Http,
+        request_id: request_id.clone(),
+        client_ip: client_ip.clone(),
+        elapsed_us: None,
+    };
+    let cb_runner = state.callback_runner.clone();
+    let req_ctx_clone = req_ctx.clone();
+    tokio::spawn(async move {
+        cb_runner.on_inference_request(&req_ctx_clone).await;
+    });
+
     let meta = pb::RequestMeta {
         route,
         headers: header_map,
@@ -506,6 +522,7 @@ async fn do_infer(
 
     // All requests go through the unified inference queue
     let (response_tx, response_rx) = oneshot::channel();
+
     let item = crate::inference_queue::QueueItem {
         uid: uid.clone(),
         data: bytes::Bytes::from(meta.payload.clone()),
@@ -557,6 +574,13 @@ async fn do_infer(
             match code {
                 "Ok" => {
                     prometheus::record_request_end(&model_name, &resolved_version, "2xx", duration).await;
+                    // Fire InferenceResponse callback
+                    let resp_ctx = crate::callback::InferenceContext {
+                        elapsed_us: Some((duration * 1_000_000.0) as u64),
+                        ..req_ctx.clone()
+                    };
+                    let cb_runner = state.callback_runner.clone();
+                    tokio::spawn(async move { cb_runner.on_inference_response(&resp_ctx).await; });
                     let json_body = serde_json::to_string(&data).unwrap_or_default();
                     let builder = Response::builder()
                         .header("content-type", "application/json; charset=utf-8");
@@ -1530,11 +1554,13 @@ mod upload_download_tests {
     fn test_app_state(repo_path: std::path::PathBuf) -> Arc<AppState> {
         let registry = Arc::new(ModelRegistry::new());
         let inference_queue = Arc::new(InferenceQueue::new());
+        let callback_runner = Arc::new(crate::callback::CallbackRunner::new());
         let worker_manager = Arc::new(WorkerManager::new(
             registry.clone(),
             repo_path.clone(),
             inference_queue.clone(),
             "warn".to_string(),
+            callback_runner.clone(),
         ));
         Arc::new(AppState::new(
             registry,
@@ -1543,6 +1569,7 @@ mod upload_download_tests {
             None,
             Config::default(),
             repo_path,
+            callback_runner,
         ))
     }
 
