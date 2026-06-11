@@ -2209,7 +2209,7 @@ def worker_main():
         sys.exit(1)
 
     specs = [{"name": s.name, "metric_type": s.metric_type}
-             for s in lit_api._metric_specs]
+             for s in getattr(lit_api, '_metric_specs', [])]
     print(json.dumps({
         "status": "ready",
         "worker_id": args.worker_id,
