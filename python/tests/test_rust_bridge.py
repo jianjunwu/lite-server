@@ -3,12 +3,11 @@
 These tests exercise Rust logic through the Python bridge, covering:
 - validate_identifier
 - ModelRegistry (register, get, status, activate, remove, list)
-- StreamingEngine (register, has, cancel, finish)
 """
 
 import pytest
 
-from _lite_server import validate_identifier, ModelRegistry, StreamingEngine
+from _lite_server import validate_identifier, ModelRegistry
 
 
 # ---------------------------------------------------------------------------
@@ -229,55 +228,3 @@ class TestModelRegistryConfig:
         reg.register("m1", "1", {"max_batch_size": 1}, "lit_api", "/tmp/m1")
         mv = reg.get("m1", "1")
         assert mv["workers_count"] == 0
-
-
-# ---------------------------------------------------------------------------
-# StreamingEngine
-# ---------------------------------------------------------------------------
-
-class TestStreamingEngine:
-    def test_register_and_has(self):
-        eng = StreamingEngine()
-        assert not eng.has_stream("s1")
-        eng.register_stream("s1")
-        assert eng.has_stream("s1")
-
-    def test_cancel_removes(self):
-        eng = StreamingEngine()
-        eng.register_stream("s1")
-        assert eng.has_stream("s1")
-        eng.cancel_stream("s1")
-        assert not eng.has_stream("s1")
-
-    def test_finish_removes(self):
-        eng = StreamingEngine()
-        eng.register_stream("s1")
-        eng.finish_stream("s1")
-        assert not eng.has_stream("s1")
-
-    def test_cancel_nonexistent_is_noop(self):
-        eng = StreamingEngine()
-        eng.cancel_stream("nope")  # should not raise
-
-    def test_finish_nonexistent_is_noop(self):
-        eng = StreamingEngine()
-        eng.finish_stream("nope")  # should not raise
-
-    def test_has_sender(self):
-        eng = StreamingEngine()
-        eng.register_stream("s1")
-        assert eng.has_sender("s1")
-
-    def test_no_sender_for_nonexistent(self):
-        eng = StreamingEngine()
-        assert not eng.has_sender("nope")
-
-    def test_multiple_streams_independent(self):
-        eng = StreamingEngine()
-        eng.register_stream("s1")
-        eng.register_stream("s2")
-        assert eng.has_stream("s1")
-        assert eng.has_stream("s2")
-        eng.cancel_stream("s1")
-        assert not eng.has_stream("s1")
-        assert eng.has_stream("s2")

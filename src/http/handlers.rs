@@ -448,14 +448,10 @@ async fn do_infer(
         request_id = %request_id,
     );
     async move {
-    let resolved_version = match &version {
-        Some(v) => v.clone(),
-        None => state.registry.get_active_version(&model_name)
-            .ok_or_else(|| AppError::ModelNotFound(format!("{} has no active version", model_name)))?,
-    };
+    let resolved_version = resolve_version(&state, &model_name, version).await?;
 
     // Check ready
-    if !state.registry.is_ready(&model_name, version.as_deref()) {
+    if !state.registry.is_ready(&model_name, Some(&resolved_version)) {
         return Err(AppError::ModelNotReady(format!(
             "{} version {} is not ready",
             model_name, resolved_version
@@ -525,7 +521,7 @@ async fn do_infer(
 
     let item = crate::inference_queue::QueueItem {
         uid: uid.clone(),
-        data: bytes::Bytes::from(meta.payload.clone()),
+        data: meta.payload.clone(),
         meta: Some(std::sync::Arc::new(meta)),
         response_tx,
     };
@@ -742,8 +738,39 @@ pub async fn sse_infer_handler(
         )));
     }
 
+    sse_infer_impl(state, model_name, resolved_version, headers, payload).await
+}
+
+pub async fn sse_infer_version_handler(
+    State(state): State<Arc<AppState>>,
+    Path((model_name, version)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
+    crate::validation::validate_version(&version)?;
+    let resolved_version = resolve_version(&state, &model_name, Some(version)).await?;
+
+    if !state.registry.is_ready(&model_name, Some(&resolved_version)) {
+        return Err(AppError::ModelNotReady(format!(
+            "{} version {} is not ready",
+            model_name, resolved_version
+        )));
+    }
+
+    sse_infer_impl(state, model_name, resolved_version, headers, payload).await
+}
+
+async fn sse_infer_impl(
+    state: Arc<AppState>,
+    model_name: String,
+    resolved_version: String,
+    headers: HeaderMap,
+    payload: Value,
+) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, AppError> {
+
     let meta = build_request_meta(&headers, &payload, "/predict");
-    let payload_bytes = bytes::Bytes::from(serde_json::to_vec(&payload).unwrap_or_default());
+    let payload_bytes = meta.payload.clone();
     let (stream_id, mut chunk_rx) = open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await?;
 
     let stream_metrics = state.config.features.streaming_metrics;
@@ -801,88 +828,6 @@ pub async fn sse_infer_handler(
             prometheus::record_stream_close(&model_name, &resolved_version, "sse");
         }
         // Ensure stream is cleaned up on worker side
-        let cancel_req = streaming::build_stream_cancel(stream_id);
-        open_worker_stream_cancel(&state, &model_name, &resolved_version, cancel_req).await;
-    });
-
-    Ok(Sse::new(ReceiverStream::new(event_rx)))
-}
-
-pub async fn sse_infer_version_handler(
-    State(state): State<Arc<AppState>>,
-    Path((model_name, version)): Path<(String, String)>,
-    headers: HeaderMap,
-    Json(payload): Json<Value>,
-) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, AppError> {
-    crate::validation::validate_identifier(&model_name)?;
-    crate::validation::validate_version(&version)?;
-    let resolved_version = resolve_version(&state, &model_name, Some(version)).await?;
-
-    if !state.registry.is_ready(&model_name, Some(&resolved_version)) {
-        return Err(AppError::ModelNotReady(format!(
-            "{} version {} is not ready",
-            model_name, resolved_version
-        )));
-    }
-
-    let meta = build_request_meta(&headers, &payload, "/predict");
-    let payload_bytes = bytes::Bytes::from(serde_json::to_vec(&payload).unwrap_or_default());
-    let (stream_id, mut chunk_rx) = open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await?;
-
-    let stream_metrics = state.config.features.streaming_metrics;
-    if stream_metrics {
-        prometheus::record_stream_open(&model_name, &resolved_version, "sse");
-    }
-
-    let (event_tx, event_rx) = mpsc::channel(64);
-
-    tokio::spawn(async move {
-        let open_time = std::time::Instant::now();
-        let mut first_chunk = true;
-        let mut last_chunk_time = open_time;
-
-        while let Some(chunk) = chunk_rx.recv().await {
-            let event = match &chunk.payload {
-                Some(pb::stream_response::Payload::Chunk(c)) => {
-                    if stream_metrics {
-                        if first_chunk {
-                            prometheus::record_stream_ttft(&model_name, &resolved_version, "sse", open_time.elapsed().as_secs_f64());
-                            first_chunk = false;
-                        } else {
-                            prometheus::record_stream_tbt(&model_name, &resolved_version, "sse", last_chunk_time.elapsed().as_secs_f64());
-                        }
-                        last_chunk_time = std::time::Instant::now();
-                        prometheus::record_stream_chunk(&model_name, &resolved_version, "sse");
-                    }
-                    let data = String::from_utf8_lossy(&c.data);
-                    Event::default().data(data.to_string())
-                }
-                Some(pb::stream_response::Payload::Error(e)) => {
-                    // Try to parse as structured error from HTTPException
-                    let event_data = match serde_json::from_str::<serde_json::Value>(&e.message) {
-                        Ok(val) if val.get("error").and_then(|err| err.get("code")).is_some() => {
-                            json!({"error": val["error"]}).to_string()
-                        }
-                        _ => json!({"error": e.message}).to_string(),
-                    };
-                    Event::default().data(event_data)
-                }
-                Some(pb::stream_response::Payload::Done(done)) => {
-                    prometheus::record_worker_metrics(&model_name, done.metrics.as_ref());
-                    Event::default().data("[DONE]")
-                }
-                _ => continue,
-            };
-            if event_tx.send(Ok(event)).await.is_err() {
-                break;
-            }
-            if matches!(chunk.payload, Some(pb::stream_response::Payload::Done(_))) {
-                break;
-            }
-        }
-        if stream_metrics {
-            prometheus::record_stream_close(&model_name, &resolved_version, "sse");
-        }
         let cancel_req = streaming::build_stream_cancel(stream_id);
         open_worker_stream_cancel(&state, &model_name, &resolved_version, cancel_req).await;
     });
@@ -981,7 +926,7 @@ async fn handle_ws_stream(
 
     let headers = HeaderMap::new();
     let meta = build_request_meta(&headers, &payload, "/predict");
-    let payload_bytes = bytes::Bytes::from(serde_json::to_vec(&payload).unwrap_or_default());
+    let payload_bytes = meta.payload.clone();
 
     let (stream_id, mut chunk_rx) = match open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await {
         Ok(r) => r,
@@ -1831,5 +1776,37 @@ mod upload_download_tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn test_build_request_meta_payload_matches_serialized() {
+        // build_request_meta already serializes payload into meta.payload.
+        // This test proves that meta.payload is identical to direct serialization,
+        // confirming that streaming handlers don't need a separate serde_json::to_vec call.
+        let headers = HeaderMap::new();
+        let payload = serde_json::json!({"prompt": "hello", "max_tokens": 100});
+        let direct_bytes = bytes::Bytes::from(serde_json::to_vec(&payload).unwrap_or_default());
+
+        let meta = build_request_meta(&headers, &payload, "/predict");
+
+        assert_eq!(meta.payload, direct_bytes,
+            "meta.payload should equal direct serde_json::to_vec output");
+    }
+
+    #[test]
+    fn test_build_request_meta_returns_correct_route() {
+        let headers = HeaderMap::new();
+        let payload = serde_json::json!({"x": 1});
+        let meta = build_request_meta(&headers, &payload, "/custom");
+
+        assert_eq!(meta.route, "/custom");
+        assert_eq!(meta.client_ip, "");
+        assert!(!meta.request_id.is_empty());
     }
 }

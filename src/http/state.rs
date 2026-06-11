@@ -4,7 +4,6 @@ use crate::inference_queue::InferenceQueue;
 use crate::metrics::aggregator::{AlertEngine, AlertThresholds};
 use crate::registry::ModelRegistry;
 use crate::server::ShutdownState;
-use crate::streaming::StreamingEngine;
 use crate::worker::WorkerManager;
 use crate::worker::endpoint_manager::EndpointManager;
 use std::path::PathBuf;
@@ -19,7 +18,6 @@ pub struct AppState {
     pub config: Config,
     pub repo_path: PathBuf,
     pub alert_engine: Arc<AlertEngine>,
-    pub streaming_engine: Arc<StreamingEngine>,
     pub shutdown_state: Arc<ShutdownState>,
     pub callback_runner: Arc<CallbackRunner>,
 }
@@ -42,7 +40,6 @@ impl AppState {
             config,
             repo_path,
             alert_engine: Arc::new(AlertEngine::new(AlertThresholds::default())),
-            streaming_engine: Arc::new(StreamingEngine::new()),
             shutdown_state: Arc::new(ShutdownState::new()),
             callback_runner,
         }

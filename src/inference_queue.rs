@@ -261,7 +261,6 @@ impl InferenceQueue {
             adaptive,
             min_timeout,
             queue_threshold,
-            workers,
             zmq_clients.clone(),
             model_name.to_string(),
             version.to_string(),
@@ -713,7 +712,6 @@ async fn batch_collector(
     adaptive: bool,
     min_timeout: Duration,
     queue_threshold: usize,
-    _workers: Vec<WorkerInfo>,
     zmq_clients: Vec<Arc<WorkerZmqClient>>,
     model_name: String,
     version: String,
@@ -1168,6 +1166,21 @@ mod tests {
         let meta_ptr = item.meta.as_ref().unwrap().as_ref() as *const pb::RequestMeta;
         let clone_ptr = meta_clone.as_ref().unwrap().as_ref() as *const pb::RequestMeta;
         assert_eq!(meta_ptr, clone_ptr);
+    }
+
+    #[test]
+    fn test_bytes_from_bytes_is_zero_copy_equivalent_to_clone() {
+        // bytes::Bytes::from(Bytes) should be a zero-copy refcount bump,
+        // equivalent to .clone(). Proves the redundant wrapper is harmless but unnecessary.
+        let payload = Bytes::from(vec![0u8; 512]);
+        let via_from = Bytes::from(payload.clone());
+        let via_clone = payload.clone();
+
+        // Both share the same underlying buffer
+        assert_eq!(payload.as_ptr(), via_from.as_ptr());
+        assert_eq!(payload.as_ptr(), via_clone.as_ptr());
+        // They are logically equal
+        assert_eq!(via_from, via_clone);
     }
 
     #[tokio::test]

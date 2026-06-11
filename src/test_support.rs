@@ -1,7 +1,6 @@
 use crate::config::ModelConfig;
 use crate::registry::ModelRegistry;
 use crate::registry::types::*;
-use crate::streaming::StreamingEngine;
 use crate::validation;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -147,51 +146,6 @@ impl PyModelRegistry {
         self.inner
             .remove(name, version)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PyStreamingEngine — wraps the synchronous StreamingEngine
-// ---------------------------------------------------------------------------
-
-#[pyclass(name = "StreamingEngine")]
-pub struct PyStreamingEngine {
-    inner: StreamingEngine,
-}
-
-#[pymethods]
-impl PyStreamingEngine {
-    #[new]
-    fn new() -> Self {
-        Self {
-            inner: StreamingEngine::new(),
-        }
-    }
-
-    /// register_stream(stream_id) — registers a stream
-    fn register_stream(&self, stream_id: &str) {
-        // Drop the handle immediately — tests only need has_stream / cancel
-        let _handle = self.inner.register_stream(stream_id.to_string());
-    }
-
-    /// has_stream(stream_id) -> bool
-    fn has_stream(&self, stream_id: &str) -> bool {
-        self.inner.has_stream(stream_id)
-    }
-
-    /// cancel_stream(stream_id)
-    fn cancel_stream(&self, stream_id: &str) {
-        self.inner.cancel_stream(stream_id);
-    }
-
-    /// finish_stream(stream_id)
-    fn finish_stream(&self, stream_id: &str) {
-        self.inner.finish_stream(stream_id);
-    }
-
-    /// get_sender(stream_id) -> bool (whether sender exists)
-    fn has_sender(&self, stream_id: &str) -> bool {
-        self.inner.get_sender(stream_id).is_some()
     }
 }
 

@@ -192,6 +192,5 @@ fn _lite_server(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(serve, m)?)?;
     m.add_function(wrap_pyfunction!(test_support::validate_identifier, m)?)?;
     m.add_class::<test_support::PyModelRegistry>()?;
-    m.add_class::<test_support::PyStreamingEngine>()?;
     Ok(())
 }
