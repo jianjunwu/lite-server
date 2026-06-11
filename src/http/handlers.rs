@@ -13,7 +13,9 @@ use axum::http::header::{HeaderMap, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::response::sse::{Event, Sse};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
