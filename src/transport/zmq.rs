@@ -124,6 +124,8 @@ impl WorkerZmqClient {
                                                                     code: "Ok".to_string(),
                                                                     message: "".to_string(),
                                                                 }),
+                                                            
+                                                                ..Default::default()
                                                             },
                                                         )),
                                                         metrics: resp.metrics.clone(),
@@ -224,6 +226,8 @@ fn error_response(uid: &str, message: &str) -> pb::Response {
                 code: "Error".to_string(),
                 message: message.to_string(),
             }),
+        
+            ..Default::default()
         })),
         metrics: None,
     }

@@ -29,8 +29,11 @@ class RequestMeta:
     payload: Any  # decoded original request body
 
 
+from lite_server.response import Response
+
+
 @dataclass
-class ResponseWithHeaders:
+class ResponseWithHeaders(Response):
     """Return this from ``on_response`` to attach custom HTTP response headers.
 
     Example::
@@ -42,8 +45,12 @@ class ResponseWithHeaders:
             )
     """
 
-    body: Any
+    body: Any = None
     headers: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self):
+        # body is an alias for content
+        self.content = self.body
 
 
 @dataclass

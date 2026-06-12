@@ -215,6 +215,19 @@ async def handle_request(endpoints, req_data: dict) -> dict:
             if asyncio.iscoroutine(result):
                 result = await result
 
+        # Detect Response objects from lite_server.response
+        from lite_server.response import Response as LiteResponse
+        if isinstance(result, LiteResponse):
+            resp_headers = dict(result.headers) if result.headers else {}
+            if result.media_type and result.media_type != "application/json":
+                resp_headers["content-type"] = result.media_type
+            return {
+                "request_id": req_data.get("request_id", ""),
+                "status_code": result.status_code,
+                "headers": resp_headers if resp_headers else None,
+                "body": result.content,
+            }
+
         if not isinstance(result, dict):
             result = {"data": result}
 

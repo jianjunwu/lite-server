@@ -21,6 +21,7 @@ from lite_server.api import LitAPI, RequestMeta, BidiStreamHandler, ResponseWith
 from lite_server.api_async import AsyncLitAPI
 from lite_server.callback import CallbackRunner, load_callbacks
 from lite_server.exceptions import HTTPException
+from lite_server.response import Response as LiteResponse
 from lite_server.proto import (
     BatchItemResponse,
     BatchRequest,
@@ -185,10 +186,36 @@ def _unwrap_response(encoded: Any) -> tuple[Any, dict[str, str] | None]:
 
     Returns ``(body, headers)`` where headers is None if the value is a
     plain body, or the headers dict if it's a ResponseWithHeaders.
+
+    When *encoded* is a :class:`Response` (but not ResponseWithHeaders),
+    the response status_code and media_type are embedded in the headers
+    dict under private keys ``_sc`` and ``_mt`` for downstream extraction.
     """
     if isinstance(encoded, ResponseWithHeaders):
         return encoded.body, encoded.headers or None
+    if isinstance(encoded, LiteResponse):
+        body = encoded.content
+        hdrs = dict(encoded.headers) if encoded.headers else {}
+        if encoded.status_code != 200:
+            hdrs["_sc"] = str(encoded.status_code)
+        media_type = encoded.media_type or ""
+        if media_type and media_type != "application/json":
+            hdrs["_mt"] = media_type
+        return body, hdrs if hdrs else None
     return encoded, None
+
+
+def _extract_response_meta(headers: dict[str, str] | None) -> tuple[int, str, dict[str, str] | None]:
+    """Extract status_code and media_type from headers dict (embedded by _unwrap_response).
+
+    Returns ``(status_code, media_type, clean_headers)``.
+    """
+    if not headers:
+        return 0, "", None
+    sc = int(headers.get("_sc", "0") or "0")
+    mt = headers.get("_mt", "")
+    clean = {k: v for k, v in headers.items() if k not in ("_sc", "_mt")}
+    return sc, mt, clean if clean else None
 
 
 def _check_early_return(value: Any) -> tuple[Any, dict[str, str] | None, bool]:
@@ -199,7 +226,13 @@ def _check_early_return(value: Any) -> tuple[Any, dict[str, str] | None, bool]:
     *body* directly, and attach *headers* (if any) to the HTTP response.
     """
     if isinstance(value, ResponseWithHeaders):
-        return value.body, value.headers or None, True
+        hdrs = dict(value.headers) if value.headers else {}
+        if value.status_code != 200:
+            hdrs["_sc"] = str(value.status_code)
+        media_type = value.media_type or ""
+        if media_type and media_type != "application/json":
+            hdrs["_mt"] = media_type
+        return value.body, hdrs if hdrs else None, True
     return value, None, False
 
 
@@ -1087,9 +1120,11 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
                 )
             else:
                 resp_bytes, status, metrics, resp_headers = await _run_predict_async(lit_api, request.single.data, meta, log)
-                single_resp = SingleResponse(data=resp_bytes, status=status)
-                if resp_headers:
-                    single_resp.headers.update(resp_headers)
+                sc, mt, clean_headers = _extract_response_meta(resp_headers)
+                single_resp = SingleResponse(data=resp_bytes, status=status,
+                                             status_code=sc, media_type=mt)
+                if clean_headers:
+                    single_resp.headers.update(clean_headers)
                 response = Response(
                     uid=uid,
                     single=single_resp,
@@ -1767,9 +1802,11 @@ def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log:
                     )
                 else:
                     resp_bytes, status, metrics, resp_headers = _run_predict(lit_api, request.single.data, meta, log)
-                    single_resp = SingleResponse(data=resp_bytes, status=status)
-                    if resp_headers:
-                        single_resp.headers.update(resp_headers)
+                    sc, mt, clean_headers = _extract_response_meta(resp_headers)
+                    single_resp = SingleResponse(data=resp_bytes, status=status,
+                                                 status_code=sc, media_type=mt)
+                    if clean_headers:
+                        single_resp.headers.update(clean_headers)
                     response = Response(
                         uid=uid,
                         single=single_resp,
@@ -2095,9 +2132,11 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
                         encoded, resp_headers = _unwrap_response(encoded)
                         resp_bytes = json.dumps(encoded).encode()
                         metrics = _collect_metrics(lit_api)
-                        single_resp = SingleResponse(data=resp_bytes, status=_make_status(True))
-                        if resp_headers:
-                            single_resp.headers.update(resp_headers)
+                        sc, mt, clean_headers = _extract_response_meta(resp_headers)
+                        single_resp = SingleResponse(data=resp_bytes, status=_make_status(True),
+                                                     status_code=sc, media_type=mt)
+                        if clean_headers:
+                            single_resp.headers.update(clean_headers)
                         resp = Response(
                             uid=uid,
                             single=single_resp,

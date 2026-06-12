@@ -446,6 +446,8 @@ async fn do_send_batch(
                                 code: "Timeout".to_string(),
                                 message: "request timeout".to_string(),
                             }),
+                        
+                            ..Default::default()
                         })),
                         metrics: None,
                     });
@@ -483,6 +485,8 @@ async fn do_send_batch(
                                     data: resp_item.data.clone(),
                                     headers: Default::default(),
                                     status: resp_item.status.clone(),
+                                
+                                    ..Default::default()
                                 })),
                                 metrics: resp.metrics.clone(),
                             }
@@ -497,6 +501,8 @@ async fn do_send_batch(
                                         code: "Error".to_string(),
                                         message: "missing in batch response".to_string(),
                                     }),
+                                
+                                    ..Default::default()
                                 })),
                                 metrics: None,
                             }
@@ -545,6 +551,8 @@ async fn do_send_batch(
                                     code: "Error".to_string(),
                                     message: "unexpected response type".to_string(),
                                 }),
+                            
+                                ..Default::default()
                             })),
                             metrics: None,
                         });
@@ -570,6 +578,8 @@ async fn do_send_batch(
                             code: "Error".to_string(),
                             message: e.to_string(),
                         }),
+                    
+                        ..Default::default()
                     })),
                     metrics: None,
                 });
@@ -1216,6 +1226,8 @@ mod tests {
                 data: Bytes::from_static(b"ok"),
                 headers: Default::default(),
                 status: Some(pb::Status { code: "Ok".to_string(), message: String::new() }),
+            
+                ..Default::default()
             })),
             metrics: None,
         });

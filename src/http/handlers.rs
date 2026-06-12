@@ -591,8 +591,19 @@ async fn do_infer(
                     let cb_runner = state.callback_runner.clone();
                     tokio::spawn(async move { cb_runner.on_inference_response(&resp_ctx).await; });
                     let json_body = serde_json::to_string(&data).unwrap_or_default();
-                    let builder = Response::builder()
-                        .header("content-type", "application/json; charset=utf-8");
+                    let content_type = if single.media_type.is_empty() {
+                        "application/json; charset=utf-8"
+                    } else {
+                        &single.media_type
+                    };
+                    let mut builder = Response::builder()
+                        .header("content-type", content_type);
+                    if single.status_code > 0 {
+                        use axum::http::StatusCode;
+                        if let Ok(sc) = StatusCode::from_u16(single.status_code as u16) {
+                            builder = builder.status(sc);
+                        }
+                    }
                     let builder = inject_response_headers(builder, &single.headers);
                     builder
                         .body(axum::body::Body::from(json_body))
@@ -636,8 +647,19 @@ async fn do_infer(
                 _ => {
                     prometheus::record_request_end(&model_name, &resolved_version, "2xx", duration).await;
                     let json_body = serde_json::to_string(&data).unwrap_or_default();
-                    let builder = Response::builder()
-                        .header("content-type", "application/json; charset=utf-8");
+                    let content_type = if single.media_type.is_empty() {
+                        "application/json; charset=utf-8"
+                    } else {
+                        &single.media_type
+                    };
+                    let mut builder = Response::builder()
+                        .header("content-type", content_type);
+                    if single.status_code > 0 {
+                        use axum::http::StatusCode;
+                        if let Ok(sc) = StatusCode::from_u16(single.status_code as u16) {
+                            builder = builder.status(sc);
+                        }
+                    }
                     let builder = inject_response_headers(builder, &single.headers);
                     builder
                         .body(axum::body::Body::from(json_body))

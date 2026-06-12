@@ -17,6 +17,17 @@ from lite_server.api_async import AsyncLitAPI
 from lite_server.callback import Callback, CallbackRunner
 from lite_server.endpoint import endpoint, router
 from lite_server.middleware import cors, log_requests, rate_limit, require_api_key
+from lite_server.request import Client, Headers, QueryParams, Request, State, URL, UploadFile
+from lite_server.response import (
+    BackgroundTask,
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from lite_server.server_proxy import ServerProxy
 from lite_server.specs.openai import OpenAIEndpoint
 from lite_server.specs.base import EndpointSpec
@@ -38,4 +49,20 @@ __all__ = [
     "require_api_key",
     "router",
     "__version__",
+    # HTTP request / response
+    "Request",
+    "Response",
+    "JSONResponse",
+    "HTMLResponse",
+    "PlainTextResponse",
+    "RedirectResponse",
+    "FileResponse",
+    "StreamingResponse",
+    "BackgroundTask",
+    "URL",
+    "Headers",
+    "QueryParams",
+    "Client",
+    "State",
+    "UploadFile",
 ]
