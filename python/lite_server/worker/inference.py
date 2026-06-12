@@ -219,20 +219,20 @@ def _extract_response_meta(headers: dict[str, str] | None) -> tuple[int, str, di
 
 
 def _check_early_return(value: Any) -> tuple[Any, dict[str, str] | None, bool]:
-    """Check if a pipeline value is a ``ResponseWithHeaders`` early return.
+    """Check if a pipeline value is a :class:`Response` early return.
 
     Returns ``(body, headers, is_early)``.  When *is_early* is True the
     caller should short-circuit the remaining pipeline stages, serialize
     *body* directly, and attach *headers* (if any) to the HTTP response.
     """
-    if isinstance(value, ResponseWithHeaders):
+    if isinstance(value, LiteResponse):
         hdrs = dict(value.headers) if value.headers else {}
         if value.status_code != 200:
             hdrs["_sc"] = str(value.status_code)
         media_type = value.media_type or ""
         if media_type and media_type != "application/json":
             hdrs["_mt"] = media_type
-        return value.body, hdrs if hdrs else None, True
+        return value.content, hdrs if hdrs else None, True
     return value, None, False
 
 

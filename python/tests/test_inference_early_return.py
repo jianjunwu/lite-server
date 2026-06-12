@@ -4,6 +4,7 @@ import json
 import logging
 import pytest
 from lite_server.api import LitAPI, RequestMeta, ResponseWithHeaders
+from lite_server.response import Response
 from lite_server.callback import Callback, CallbackRunner
 
 
@@ -92,6 +93,44 @@ class TestCheckEarlyReturn:
         assert body == [1, 2, 3]
         assert headers is None
         assert is_early is False
+
+    # ---- Response (plain, not ResponseWithHeaders) ----
+
+    def test_response_detected_as_early_return(self):
+        from lite_server.worker.inference import _check_early_return
+
+        resp = Response(content={"msg": "error"}, status_code=401)
+        body, headers, is_early = _check_early_return(resp)
+        assert body == {"msg": "error"}
+        assert headers == {"_sc": "401"}
+        assert is_early is True
+
+    def test_response_status_200_no_sc_header(self):
+        from lite_server.worker.inference import _check_early_return
+
+        resp = Response(content={"msg": "ok"}, status_code=200)
+        body, headers, is_early = _check_early_return(resp)
+        assert body == {"msg": "ok"}
+        assert headers is None
+        assert is_early is True
+
+    def test_response_with_custom_headers(self):
+        from lite_server.worker.inference import _check_early_return
+
+        resp = Response(content="done", status_code=200, headers={"X-Custom": "1"})
+        body, headers, is_early = _check_early_return(resp)
+        assert body == "done"
+        assert headers == {"X-Custom": "1"}
+        assert is_early is True
+
+    def test_response_with_non_json_media_type(self):
+        from lite_server.worker.inference import _check_early_return
+
+        resp = Response(content="<h1>hi</h1>", media_type="text/html")
+        body, headers, is_early = _check_early_return(resp)
+        assert body == "<h1>hi</h1>"
+        assert headers == {"_mt": "text/html"}
+        assert is_early is True
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +390,33 @@ class TestRunPredictEarlyReturn:
         resp_bytes, status, metrics, headers = self._run(api)
         assert resp_bytes == b'{"final": true}'
         assert headers == {"X-Stage": "on_response"}
+
+    # ---- LitAPI decode_request with plain Response ----
+
+    def test_early_return_at_decode_request_with_plain_response(self):
+        api = _TrackerAPI()
+        api.decode_request = lambda req: Response(
+            content={"error": "bad input"}, status_code=400
+        )
+
+        resp_bytes, status, metrics, headers = self._run(api)
+        assert resp_bytes == b'{"error": "bad input"}'
+        assert headers == {"_sc": "400"}
+        assert "predict" not in api.calls
+        assert "encode_response" not in api.calls
+
+    # ---- LitAPI predict with plain Response ----
+
+    def test_early_return_at_predict_with_plain_response(self):
+        api = _TrackerAPI()
+        api.predict = lambda x: Response(
+            content={"rejected": True}, status_code=422
+        )
+
+        resp_bytes, status, metrics, headers = self._run(api)
+        assert resp_bytes == b'{"rejected": true}'
+        assert headers == {"_sc": "422"}
+        assert "encode_response" not in api.calls
 
     # ---- No early return (normal flow) ----
 
