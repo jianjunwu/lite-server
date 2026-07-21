@@ -27,6 +27,7 @@ logging:
   rotation: none               # none, size, daily, hourly
   max_size: 100                # 最大日志文件大小（MB），rotation=size 时生效
   backup_count: 7              # 保留的轮转日志文件数
+  hostname_in_log_name: false  # 注入系统主机名到文件名:server.log -> server-<host>.log
 
 grpc:
   enabled: true                # 启用 gRPC 服务
@@ -227,6 +228,7 @@ logging:
   rotation: size
   max_size: 100
   backup_count: 10
+  hostname_in_log_name: false
 ```
 
 ### LLM 推理（流式 + continuous batching）

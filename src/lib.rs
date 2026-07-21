@@ -84,6 +84,7 @@ pub fn run_server(
         &cfg.logging.rotation,
         cfg.logging.max_size,
         cfg.logging.backup_count,
+        cfg.logging.hostname_in_log_name,
     );
     info!("Starting lite-server v{}", env!("CARGO_PKG_VERSION"));
     info!("HTTP port: {}", cfg.server.http_port);

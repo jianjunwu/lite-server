@@ -27,6 +27,7 @@ logging:
   rotation: none               # none, size, daily, hourly
   max_size: 100                # Max log file size in MB (rotation=size)
   backup_count: 7              # Number of rotated log files to keep
+  hostname_in_log_name: false  # Inject system hostname: server.log -> server-<host>.log
 
 grpc:
   enabled: true                # Enable gRPC server
@@ -227,6 +228,7 @@ logging:
   rotation: size
   max_size: 100
   backup_count: 10
+  hostname_in_log_name: false
 ```
 
 ### LLM Serving (streaming + continuous batching)

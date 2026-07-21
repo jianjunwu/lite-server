@@ -1,6 +1,12 @@
 server:
   http_port: 8000
 
+logging:
+  level: info
+  info_output: ./logs/server.log   # written as ./logs/server-<hostname>.log
+  rotation: size
+  hostname_in_log_name: true
+
 model_repository:
   path: ./model_repo
 

@@ -90,6 +90,8 @@ pub struct LoggingConfig {
     pub max_size: usize,
     /// Number of rotated log files to keep
     pub backup_count: usize,
+    /// Inject the system hostname into log filenames (server.log -> server-<host>.log)
+    pub hostname_in_log_name: bool,
 }
 
 impl Default for LoggingConfig {
@@ -101,6 +103,7 @@ impl Default for LoggingConfig {
             rotation: "none".to_string(),
             max_size: 100,
             backup_count: 7,
+            hostname_in_log_name: false,
         }
     }
 }
@@ -617,6 +620,27 @@ mod tests {
         assert_eq!(parsed.server.http_port, cfg.server.http_port);
         assert_eq!(parsed.server.host, cfg.server.host);
         assert_eq!(parsed.grpc.enabled, cfg.grpc.enabled);
+    }
+
+    #[test]
+    fn test_logging_hostname_in_log_name_from_yaml() {
+        // Explicit `true` in server.yaml is honored.
+        let yaml = "logging:\n  hostname_in_log_name: true\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.logging.hostname_in_log_name);
+
+        // Omitting the field falls back to the serde default (false).
+        let yaml = "logging:\n  level: debug\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(!cfg.logging.hostname_in_log_name);
+    }
+
+    #[test]
+    fn test_examples_logging_yaml_loads_with_hostname() {
+        // The 11_logging example ships hostname_in_log_name: true; ensure it loads.
+        let cfg = load_config("examples/11_logging/server.yaml").unwrap();
+        assert!(cfg.logging.hostname_in_log_name);
+        assert!(cfg.logging.info_output.is_some());
     }
 
     #[test]

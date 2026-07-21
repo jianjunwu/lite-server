@@ -79,6 +79,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json"] }
 
 # Python interop
 pyo3 = { version = "0.24", features = ["serde", "abi3-py310", "extension-module"], optional = true }
+gethostname = "1.1.0"
 
 [features]
 default = []

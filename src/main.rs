@@ -190,6 +190,7 @@ fn main() {
                 &cfg.logging.rotation,
                 cfg.logging.max_size,
                 cfg.logging.backup_count,
+                cfg.logging.hostname_in_log_name,
             );
 
             info!("Starting lite-server v{}", env!("CARGO_PKG_VERSION"));

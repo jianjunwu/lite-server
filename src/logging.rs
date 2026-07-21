@@ -28,6 +28,7 @@ pub fn init(
     rotation: &str,
     max_size: usize,
     backup_count: usize,
+    include_hostname: bool,
 ) -> LogGuard {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("lite_server={},tokio=warn,hyper=warn", level)));
@@ -37,7 +38,7 @@ pub fn init(
 
     let mut info_guard = None;
     let info_layer = if let Some(path) = info_output {
-        match create_writer(path, rotation, max_size, backup_count) {
+        match create_writer(path, rotation, max_size, backup_count, include_hostname) {
             Ok((writer, guard)) => {
                 info_guard = Some(guard);
                 Some(
@@ -59,7 +60,7 @@ pub fn init(
     let mut error_guard = None;
     let error_filter = EnvFilter::new("error");
     let error_layer = if let Some(path) = error_output {
-        match create_writer(path, rotation, max_size, backup_count) {
+        match create_writer(path, rotation, max_size, backup_count, include_hostname) {
             Ok((writer, guard)) => {
                 error_guard = Some(guard);
                 Some(
@@ -91,41 +92,97 @@ pub fn init(
     }
 }
 
+/// Sanitize a hostname into filename-safe characters: keep `[A-Za-z0-9._-]`,
+/// replace anything else (spaces, slashes, colons, ...) with `-`.
+/// Dots are preserved so a FQDN like `node01.example.com` stays intact.
+fn sanitize_hostname(host: &str) -> String {
+    host.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Insert `hostname` into a filename as `{stem}-{hostname}.{ext}`, keeping the
+/// extension. Returns the original name unchanged when `hostname` is empty.
+fn with_hostname(file_name: &str, hostname: &str) -> String {
+    if hostname.is_empty() {
+        return file_name.to_string();
+    }
+    let p = std::path::Path::new(file_name);
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or(file_name);
+    match p.extension().and_then(|e| e.to_str()) {
+        Some(ext) if !ext.is_empty() => format!("{}-{}.{}", stem, hostname, ext),
+        _ => format!("{}-{}", stem, hostname),
+    }
+}
+
+/// Best-effort system hostname, sanitized for use in a filename.
+/// Returns `None` if the hostname cannot be read (never panics).
+fn current_hostname() -> Option<String> {
+    gethostname::gethostname()
+        .into_string()
+        .ok()
+        .map(|h| sanitize_hostname(&h))
+        .filter(|h| !h.is_empty())
+}
+
 fn create_writer(
     path: &str,
     rotation: &str,
     max_size: usize,
     backup_count: usize,
+    include_hostname: bool,
 ) -> Result<(NonBlocking, WorkerGuard), std::io::Error> {
     let path = std::path::Path::new(path);
     let parent = path.parent().unwrap_or(std::path::Path::new("."));
     std::fs::create_dir_all(parent)?;
 
-    let file_name = path
+    let original = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("lite-server.log");
 
+    // Optionally inject the system hostname into the basename, e.g. server.log -> server-<host>.log.
+    // `file_name` is the (possibly rewritten) basename used by daily/hourly appenders; `final_path`
+    // is the full path carrying that basename, used by size/none appenders.
+    let (file_name, final_path) = match (include_hostname, current_hostname()) {
+        (true, Some(host)) => {
+            let new_name = with_hostname(original, &host);
+            let new_path = parent.join(&new_name);
+            (new_name, new_path)
+        }
+        (true, None) => {
+            eprintln!("hostname unavailable, log filename left unchanged");
+            (original.to_string(), path.to_path_buf())
+        }
+        (false, _) => (original.to_string(), path.to_path_buf()),
+    };
+
     match rotation {
         "daily" => {
-            cleanup_old_logs(parent, file_name, backup_count);
-            let appender = tracing_appender::rolling::daily(parent, file_name);
+            cleanup_old_logs(parent, &file_name, backup_count);
+            let appender = tracing_appender::rolling::daily(parent, &file_name);
             let (writer, guard) = tracing_appender::non_blocking(appender);
             Ok((writer, guard))
         }
         "hourly" => {
-            cleanup_old_logs(parent, file_name, backup_count);
-            let appender = tracing_appender::rolling::hourly(parent, file_name);
+            cleanup_old_logs(parent, &file_name, backup_count);
+            let appender = tracing_appender::rolling::hourly(parent, &file_name);
             let (writer, guard) = tracing_appender::non_blocking(appender);
             Ok((writer, guard))
         }
         "size" => {
-            let appender = SizeRotatingAppender::new(path.to_path_buf(), max_size * 1024 * 1024, backup_count)?;
+            let appender = SizeRotatingAppender::new(final_path, max_size * 1024 * 1024, backup_count)?;
             let (writer, guard) = tracing_appender::non_blocking(appender);
             Ok((writer, guard))
         }
         _ => {
-            let file = OpenOptions::new().append(true).create(true).open(path)?;
+            let file = OpenOptions::new().append(true).create(true).open(&final_path)?;
             let (writer, guard) = tracing_appender::non_blocking(file);
             Ok((writer, guard))
         }
@@ -272,6 +329,83 @@ mod tests {
         assert!(result.is_ok(), "flush should succeed after mutex poisoning");
 
         // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_hostname_inserts_host_before_extension() {
+        assert_eq!(with_hostname("server.log", "node01"), "server-node01.log");
+    }
+
+    #[test]
+    fn with_hostname_appends_when_no_extension() {
+        assert_eq!(with_hostname("server", "node01"), "server-node01");
+    }
+
+    #[test]
+    fn with_hostname_preserves_dots_in_fqdn_host() {
+        assert_eq!(
+            with_hostname("server.log", "node01.example.com"),
+            "server-node01.example.com.log"
+        );
+    }
+
+    #[test]
+    fn with_hostname_returns_original_when_host_empty() {
+        assert_eq!(with_hostname("server.log", ""), "server.log");
+    }
+
+    #[test]
+    fn with_hostname_preserves_dashes_in_stem() {
+        assert_eq!(
+            with_hostname("lite-server.log", "node01"),
+            "lite-server-node01.log"
+        );
+    }
+
+    #[test]
+    fn sanitize_hostname_replaces_unsafe_chars_with_dash() {
+        assert_eq!(sanitize_hostname("node 01/ex"), "node-01-ex");
+    }
+
+    #[test]
+    fn sanitize_hostname_keeps_alnum_dot_dash_underscore() {
+        assert_eq!(
+            sanitize_hostname("node_01.example-2"),
+            "node_01.example-2"
+        );
+    }
+
+    #[test]
+    fn create_writer_includes_hostname_when_enabled() {
+        let dir = std::env::temp_dir()
+            .join(format!("lite-server-hostname-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("server.log");
+
+        let (_writer, _guard) =
+            create_writer(path.to_str().unwrap(), "none", 1, 1, true).unwrap();
+
+        match current_hostname() {
+            Some(host) => {
+                let expected = dir.join(format!("server-{}.log", host));
+                assert!(
+                    expected.exists(),
+                    "expected hostname-injected log file at {}",
+                    expected.display()
+                );
+                assert!(
+                    !path.exists(),
+                    "original filename must not be used when hostname is injected"
+                );
+            }
+            None => {
+                assert!(
+                    path.exists(),
+                    "should fall back to original filename when hostname is unavailable"
+                );
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
