@@ -360,9 +360,12 @@ class TestMakeErrorResponse:
         resp = inference._make_error_response("uid-1", "something broke")
         assert resp.uid == "uid-1"
         assert resp.single.status.code == "Error"
-        assert "something broke" in resp.single.status.message
+        # Default (no explicit status_code) is a structured 500 INTERNAL_ERROR
+        # so the client sees the real error instead of a sanitized WORKER_CRASHED.
+        assert resp.single.status.message == "500"
         body = json.loads(resp.single.data)
-        assert "error" in body
+        assert body["error"]["code"] == "INTERNAL_ERROR"
+        assert body["error"]["message"] == "something broke"
 
 
 class TestMetaFromProto:
@@ -864,7 +867,10 @@ class TestAsyncLoop:
         resp.ParseFromString(socket._msgs[0])
         assert resp.uid == "err-1"
         assert resp.single.status.code == "Error"
-        assert "boom" in resp.single.status.message
+        assert resp.single.status.message == "500"
+        body = json.loads(resp.single.data)
+        assert body["error"]["code"] == "INTERNAL_ERROR"
+        assert "boom" in body["error"]["message"]
 
     def test_async_stream_with_async_generator(self):
         import asyncio
@@ -1184,7 +1190,10 @@ class TestAsyncLoop:
         resp = Response()
         resp.ParseFromString(socket._msgs[0])
         assert resp.single.status.code == "Error"
-        assert "Protobuf parse" in resp.single.status.message
+        assert resp.single.status.message == "500"
+        body = json.loads(resp.single.data)
+        assert body["error"]["code"] == "INTERNAL_ERROR"
+        assert "Protobuf parse" in body["error"]["message"]
 
     def test_async_batch_partial_failure(self):
         import asyncio
@@ -3644,7 +3653,10 @@ class TestStandardLoopNonStreaming:
         resp = Response()
         resp.ParseFromString(socket._msgs[0])
         assert resp.single.status.code == "Error"
-        assert "predict boom" in resp.single.status.message
+        assert resp.single.status.message == "500"
+        body = json.loads(resp.single.data)
+        assert body["error"]["code"] == "INTERNAL_ERROR"
+        assert "predict boom" in body["error"]["message"]
 
     def test_standard_batch_partial_failure(self):
         import threading
@@ -3750,7 +3762,10 @@ class TestAsyncLoopNonStreaming:
         resp = Response()
         resp.ParseFromString(socket._msgs[0])
         assert resp.single.status.code == "Error"
-        assert "async predict boom" in resp.single.status.message
+        assert resp.single.status.message == "500"
+        body = json.loads(resp.single.data)
+        assert body["error"]["code"] == "INTERNAL_ERROR"
+        assert "async predict boom" in body["error"]["message"]
 
     def test_async_batch_partial_failure(self):
         import asyncio

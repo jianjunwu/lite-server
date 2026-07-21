@@ -267,18 +267,19 @@ def _batch_check_early(value: Any, uid: str,
 def _make_error_response(uid: str, message: str,
                          status_code: int | None = None,
                          error_code: str | None = None) -> Response:
-    if status_code is not None:
-        # Structured model error: client sees {"error": {"code": ..., "message": ...}}
-        # Status.message carries the HTTP status code so the Rust/tonic side
-        # can distinguish model-level errors from internal worker errors.
-        data = json.dumps({
-            "error": {"code": error_code or "MODEL_ERROR", "message": message}
-        }).encode()
-        status = Status(code="Error", message=str(status_code))
-    else:
-        # Internal/unexpected error: keep existing format, Rust will sanitize
-        data = json.dumps({"error": message}).encode()
-        status = Status(code="Error", message=message)
+    # Default unexpected worker exceptions to a structured 500 INTERNAL_ERROR.
+    # Carrying the HTTP status code in Status.message lets the Rust side route
+    # these through ModelError (handlers.rs) so the client sees the real error
+    # instead of a sanitized WORKER_CRASHED. WorkerCrashed must be reserved for
+    # cases where the worker process is actually dead.
+    if status_code is None:
+        status_code = 500
+        if error_code is None:
+            error_code = "INTERNAL_ERROR"
+    data = json.dumps({
+        "error": {"code": error_code or "MODEL_ERROR", "message": message}
+    }).encode()
+    status = Status(code="Error", message=str(status_code))
     return Response(
         uid=uid,
         single=SingleResponse(data=data, status=status),
@@ -1275,7 +1276,8 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
         log.warning("async request %s rejected: %s", uid, e.detail)
         response = _make_error_response(uid, e.detail, status_code=e.status_code, error_code=e.error_code)
     except Exception as e:
-        log.error("async request %s failed: %s", uid, e, exc_info=True)
+        log.error("async request %s failed: %s", uid, e)
+        log.debug("traceback for failed async request %s", uid, exc_info=True)
         response = _make_error_response(uid, f"{type(e).__name__}: {e}")
 
     await socket.send(response.SerializeToString())
@@ -1972,7 +1974,8 @@ def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log:
             log.warning("request %s rejected: %s", uid, e.detail)
             response = _make_error_response(uid, e.detail, status_code=e.status_code, error_code=e.error_code)
         except Exception as e:
-            log.error("request %s failed: %s", uid, e, exc_info=True)
+            log.error("request %s failed: %s", uid, e)
+            log.debug("traceback for failed request %s", uid, exc_info=True)
             response = _make_error_response(uid, f"{type(e).__name__}: {e}")
 
         socket.send(response.SerializeToString())
