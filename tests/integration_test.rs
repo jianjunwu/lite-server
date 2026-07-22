@@ -28,7 +28,10 @@ fn start_server(args: &[&str]) -> std::process::Child {
     let mut cmd = Command::new(lite_server_bin());
     cmd.arg("serve")
         .current_dir(project_root())
-        .stdout(Stdio::piped())
+        // Nobody reads the child's stdout: a pipe would fill its 64KB buffer
+        // and block the server on write. null also keeps the orphaned-server
+        // footprint minimal when cleanup never runs.
+        .stdout(Stdio::null())
         .stderr(Stdio::inherit());
 
     for arg in args {
@@ -220,8 +223,35 @@ async fn ensure_shared_server() {
         "--log-level", "warn",
     ]);
     *guard = Some(child);
+    register_shared_cleanup();
     drop(guard);
     wait_for_server(SHARED_PORT, 15).await;
+}
+
+/// Kill the shared server (and its whole process group, Python workers
+/// included) when the test binary exits. Statics never drop, so without this
+/// hook the server is orphaned (PPID=1) and keeps holding the inherited
+/// stderr pipe — background/CI runners then never see EOF and look hung.
+/// kill_stale_on_port remains the fallback for SIGKILLed test binaries.
+fn register_shared_cleanup() {
+    #[cfg(unix)]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            extern "C" fn cleanup() {
+                // A poisoned mutex means a panic raced with us; skip and let
+                // the next run's kill_stale_on_port handle leftovers.
+                if let Ok(guard) = SHARED_SERVER.lock() {
+                    if let Some(ref child) = *guard {
+                        unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                    }
+                }
+            }
+            unsafe { libc::atexit(cleanup) };
+        });
+    }
+    // Non-unix: no atexit/process-group kill — acceptable leak, these tests
+    // already depend on unix tooling (lsof in kill_stale_on_port).
 }
 
 async fn shared_base() -> String {
