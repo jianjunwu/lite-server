@@ -355,6 +355,221 @@ class TestRunPredictErrorLogging:
             f"expected pathname ending with inference.py, got: {error_records[0].pathname}"
 
 
+class TestOuterHandlerErrorTraceback:
+    """Outer request handlers must emit the traceback once at ERROR level.
+
+    The inner _run_predict stage logs stay exc_info-free (see
+    TestRunPredictErrorLogging) so the traceback is not duplicated; the
+    outer handler emits it exactly once at ERROR — visible at the default
+    INFO level so failures can be located in the user's model.py — while
+    the client still receives a structured 500 (no WORKER_CRASHED regression).
+    """
+
+    def test_standard_loop_logs_traceback_once_at_error(self, caplog):
+        import threading
+        import time
+        from lite_server.worker.inference import run_standard_loop
+        from lite_server.proto import Request, SingleRequest, Response
+
+        class BoomModel:
+            def predict(self, x):
+                return {"output": 1 / 0}  # ZeroDivisionError, like the user's 1/0
+
+            _metric_specs = []
+            _metric_values = []
+
+        class MockSocket:
+            def __init__(self):
+                self._msgs = []
+                self._incoming = []
+
+            def send(self, data):
+                self._msgs.append(data)
+
+            def recv(self):
+                while not self._incoming:
+                    time.sleep(0.001)
+                return self._incoming.pop(0)
+
+            def inject(self, data):
+                self._incoming.append(data)
+
+        socket = MockSocket()
+        log = logging.getLogger("test_outer_standard")
+        req = Request(uid="err-sync", single=SingleRequest(data=json.dumps({"input": 1}).encode()))
+        socket.inject(req.SerializeToString())
+
+        with caplog.at_level(logging.ERROR):
+            t = threading.Thread(target=run_standard_loop, args=(BoomModel(), socket, "echo", log))
+            t.start()
+            time.sleep(0.1)
+            socket.inject(b"")
+            t.join(timeout=0.2)
+
+        tb_records = [r for r in caplog.records
+                      if r.levelno >= logging.ERROR
+                      and "ZeroDivisionError" in r.getMessage()
+                      and "predict" in r.getMessage()]
+        assert len(tb_records) == 1, (
+            "expected exactly one ERROR record for the failure (no explosion), got "
+            f"{len(tb_records)}: {[r.getMessage() for r in caplog.records]}"
+        )
+        msg = tb_records[0].getMessage()
+        assert "\n" not in msg, "must stay a single line (Rust forwarder splits on newlines)"
+        assert "test_worker.py" in msg, f"location frame missing from: {msg}"
+
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.uid == "err-sync"
+        assert resp.single.status.code == "Error"
+        assert resp.single.status.message == "500"
+        assert json.loads(resp.single.data)["error"]["code"] == "INTERNAL_ERROR"
+
+    def test_async_loop_logs_traceback_once_at_error(self, caplog):
+        import asyncio
+        from lite_server.worker.inference import run_async_loop
+        from lite_server.proto import Request, SingleRequest, Response
+
+        class BoomModel:
+            async def predict(self, x):
+                return {"output": 1 / 0}
+
+            _metric_specs = []
+            _metric_values = []
+
+        class MockSocket:
+            def __init__(self):
+                self._msgs = []
+                self._incoming = []
+
+            async def send(self, data):
+                self._msgs.append(data)
+
+            async def recv(self):
+                while not self._incoming:
+                    await asyncio.sleep(0.001)
+                return self._incoming.pop(0)
+
+            def inject(self, data):
+                self._incoming.append(data)
+
+        socket = MockSocket()
+        log = logging.getLogger("test_outer_async")
+        req = Request(uid="err-async", single=SingleRequest(data=json.dumps({"input": 1}).encode()))
+        socket.inject(req.SerializeToString())
+
+        with caplog.at_level(logging.ERROR):
+            async def runner():
+                task = asyncio.create_task(run_async_loop(BoomModel(), socket, "echo", log))
+                await asyncio.sleep(0.05)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+            asyncio.run(runner())
+
+        tb_records = [r for r in caplog.records
+                      if r.levelno >= logging.ERROR
+                      and "ZeroDivisionError" in r.getMessage()
+                      and "predict" in r.getMessage()]
+        assert len(tb_records) == 1, (
+            "expected exactly one ERROR record for the failure (no explosion), got "
+            f"{len(tb_records)}: {[r.getMessage() for r in caplog.records]}"
+        )
+        msg = tb_records[0].getMessage()
+        assert "\n" not in msg, "must stay a single line (Rust forwarder splits on newlines)"
+        assert "test_worker.py" in msg, f"location frame missing from: {msg}"
+
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.uid == "err-async"
+        assert resp.single.status.code == "Error"
+        assert resp.single.status.message == "500"
+        assert json.loads(resp.single.data)["error"]["code"] == "INTERNAL_ERROR"
+
+    def test_cb_loop_logs_step_failure_as_one_error_line(self, caplog):
+        """Continuous-batching step() failure must also be one ERROR line."""
+        import threading
+        import time
+        from lite_server.worker.inference import run_cb_loop
+        from lite_server.proto import Request, Response
+
+        class BoomCBModel:
+            def __init__(self):
+                self._metric_specs = []
+                self._metric_values = []
+
+            def decode_request(self, req):
+                return req.get("input", 0)
+
+            def prefill(self, uid, decoded_input):
+                pass
+
+            def step(self, active_sequences):
+                return [1 / 0 for _ in active_sequences]  # ZeroDivisionError
+
+            def has_finished(self, uid, token, generated_sequence):
+                return True
+
+            def encode_response(self, output):
+                return output
+
+        class MockSocket:
+            def __init__(self):
+                self._msgs = []
+                self._incoming = []
+
+            def send(self, data):
+                self._msgs.append(data)
+
+            def recv(self):
+                while not self._incoming:
+                    time.sleep(0.001)
+                return self._incoming.pop(0)
+
+            def inject(self, data):
+                self._incoming.append(data)
+
+        socket = MockSocket()
+        log = logging.getLogger("test_outer_cb")
+        req = Request()
+        req.uid = "cb-err-1"
+        req.single.data = json.dumps({"input": 1}).encode()
+        socket.inject(req.SerializeToString())
+
+        with caplog.at_level(logging.ERROR):
+            t = threading.Thread(
+                target=run_cb_loop,
+                args=(BoomCBModel(), socket, "test", log),
+                daemon=True,
+            )
+            t.start()
+            deadline = time.time() + 5
+            while time.time() < deadline and not socket._msgs:
+                time.sleep(0.01)
+            time.sleep(0.3)  # let the ERROR log record settle
+
+        tb_records = [r for r in caplog.records
+                      if r.levelno >= logging.ERROR
+                      and "ZeroDivisionError" in r.getMessage()
+                      and "cb step error" in r.getMessage()]
+        assert len(tb_records) == 1, (
+            "expected exactly one ERROR record for the cb step failure, got "
+            f"{len(tb_records)}: {[r.getMessage() for r in caplog.records]}"
+        )
+        msg = tb_records[0].getMessage()
+        assert "\n" not in msg, "must stay a single line (Rust forwarder splits on newlines)"
+        assert "in step" in msg, f"location frame missing from: {msg}"
+
+        assert socket._msgs, "no error response sent for the failed sequence"
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.uid == "cb-err-1"
+        assert resp.single.status.code == "Error"
+
+
 class TestMakeErrorResponse:
     def test_error_response_structure(self):
         resp = inference._make_error_response("uid-1", "something broke")
