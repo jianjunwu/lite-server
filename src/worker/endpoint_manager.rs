@@ -7,7 +7,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::timeout;
 use tracing::{info, warn};
@@ -245,6 +245,16 @@ impl EndpointManager {
         let _ = tokio::fs::remove_file(&self.uds_path).await;
     }
 
+    #[cfg(test)]
+    async fn child_pid(&self) -> Option<u32> {
+        self.process.read().await.as_ref().and_then(|p| p.child.id())
+    }
+
+    #[cfg(test)]
+    fn set_uds_path(&mut self, path: PathBuf) {
+        self.uds_path = path;
+    }
+
     async fn spawn_endpoint_process(&self) -> Result<(), AppError> {
         // Ensure parent dir exists
         if let Some(parent) = self.uds_path.parent() {
@@ -254,19 +264,10 @@ impl EndpointManager {
         let _ = tokio::fs::remove_file(&self.uds_path).await;
 
         let python_path = WorkerManager::find_python_module_path().unwrap_or_default();
-        let mut cmd = Command::new("python");
-        if !python_path.is_empty() {
-            let current_pythonpath = std::env::var("PYTHONPATH").unwrap_or_default();
-            let new_pythonpath = if current_pythonpath.is_empty() {
-                python_path
-            } else {
-                #[cfg(windows)]
-                { format!("{};{}", current_pythonpath, python_path) }
-                #[cfg(not(windows))]
-                { format!("{}:{}", current_pythonpath, python_path) }
-            };
-            cmd.env("PYTHONPATH", new_pythonpath);
-        }
+        // kill_on_drop(true) via new_worker_command: orphan safety net for
+        // startup-failure early returns and panic/runtime-drop paths that
+        // never reach kill().
+        let mut cmd = super::new_worker_command(&python_path);
 
         let mut child = cmd
             .arg("-m")
@@ -397,3 +398,87 @@ impl EndpointManager {
 
 // Reuse the module path finder from WorkerManager
 use super::WorkerManager;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: dropping the manager without shutdown() must not orphan the
+    /// Python endpoint process. The kill_on_drop safety net on the spawn
+    /// command is the last resort for panic / runtime-drop / test-exit paths
+    /// that never run graceful shutdown (observed as PPID=1
+    /// `python -m lite_server.worker.endpoints` orphans).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_endpoint_manager_drop_leaves_no_orphan() {
+        let repo = std::env::temp_dir()
+            .join(format!("lite-server-ep-drop-test-{}", std::process::id()));
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let mut manager = EndpointManager::new(repo.clone(), registry);
+        manager.set_uds_path(std::env::temp_dir().join(format!(
+            "lite-server-{}-ep-drop-test.sock",
+            std::process::id()
+        )));
+        manager.start().await.unwrap();
+        let pid = manager
+            .child_pid()
+            .await
+            .expect("endpoint child should be running") as i32;
+
+        drop(manager);
+
+        // kill_on_drop sends SIGKILL on drop and tokio reaps in the
+        // background; poll briefly for the pid to disappear.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut alive = true;
+        while std::time::Instant::now() < deadline {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !alive,
+            "dropped endpoint process {} should be killed via kill_on_drop",
+            pid
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Graceful shutdown must reap the endpoint process before returning —
+    /// kill() is a synchronous kill+wait, so no process may outlive it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_shutdown_leaves_no_orphan_endpoint_process() {
+        let repo = std::env::temp_dir()
+            .join(format!("lite-server-ep-shutdown-test-{}", std::process::id()));
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let mut manager = EndpointManager::new(repo.clone(), registry);
+        manager.set_uds_path(std::env::temp_dir().join(format!(
+            "lite-server-{}-ep-shutdown-test.sock",
+            std::process::id()
+        )));
+        manager.start().await.unwrap();
+        let pid = manager
+            .child_pid()
+            .await
+            .expect("endpoint child should be running") as i32;
+
+        manager.shutdown().await;
+
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(
+            !alive,
+            "endpoint pid {} orphaned: still alive after shutdown returned",
+            pid
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+}
