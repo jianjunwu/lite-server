@@ -158,7 +158,14 @@ struct WorkerProcess {
     worker_id: u32,
     endpoint: String,
     shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Resolves once the worker process has been reaped. unload/shutdown must
+    /// await this so no orphaned worker survives to steal the re-bound socket.
+    done_rx: Option<oneshot::Receiver<()>>,
 }
+
+/// Max time to wait for a single worker to die after signaling shutdown.
+/// kill() is SIGKILL/TerminateProcess, so this only trips on a stuck OS call.
+const WORKER_KILL_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl WorkerManager {
     pub fn new(
@@ -308,26 +315,7 @@ impl WorkerManager {
         };
         let device = format!("{}:{}", accelerator, worker_id as usize % devices);
 
-        let python_path = Self::find_python_module_path().unwrap_or_default();
-        let python_module_dir = if python_path.is_empty() {
-            String::new()
-        } else {
-            format!("{}", python_path)
-        };
-
-        let mut cmd = Command::new("python");
-        if !python_module_dir.is_empty() {
-            let current_pythonpath = std::env::var("PYTHONPATH").unwrap_or_default();
-            let new_pythonpath = if current_pythonpath.is_empty() {
-                python_module_dir
-            } else {
-                #[cfg(windows)]
-                { format!("{};{}", current_pythonpath, python_module_dir) }
-                #[cfg(not(windows))]
-                { format!("{}:{}", current_pythonpath, python_module_dir) }
-            };
-            cmd.env("PYTHONPATH", new_pythonpath);
-        }
+        let mut cmd = new_worker_command(&Self::find_python_module_path().unwrap_or_default());
 
         let mut child = cmd
             .arg("-m")
@@ -468,7 +456,7 @@ impl WorkerManager {
         let hooks_arc = Arc::new(model_config.hooks.clone());
         let heartbeat_dur = Duration::from_secs_f32(model_config.heartbeat_interval);
         let heartbeat_timeout_dur = Duration::from_secs_f32(model_config.heartbeat_timeout);
-        spawn_worker_monitor(
+        let done_rx = spawn_worker_monitor(
             child, model_name, version, worker_id, shutdown_rx,
             move || {
                 #[cfg(unix)]
@@ -503,6 +491,7 @@ impl WorkerManager {
                     worker_id,
                     endpoint,
                     shutdown_tx: Some(shutdown_tx),
+                    done_rx: Some(done_rx),
                 });
             }
         }
@@ -643,27 +632,7 @@ impl WorkerManager {
             }
 
             // Find python module path
-            let python_path = Self::find_python_module_path().unwrap_or_default();
-            let python_module_dir = if python_path.is_empty() {
-                String::new()
-            } else {
-                format!("{}", python_path)
-            };
-
-            let mut cmd = Command::new("python");
-            if !python_module_dir.is_empty() {
-                let current_pythonpath = std::env::var("PYTHONPATH").unwrap_or_default();
-                let new_pythonpath = if current_pythonpath.is_empty() {
-                    python_module_dir
-                } else {
-                    #[cfg(windows)]
-                    { format!("{};{}", current_pythonpath, python_module_dir) }
-                    #[cfg(not(windows))]
-                    { format!("{}:{}", current_pythonpath, python_module_dir) }
-                };
-                cmd.env("PYTHONPATH", new_pythonpath);
-            }
-
+            let mut cmd = new_worker_command(&Self::find_python_module_path().unwrap_or_default());
             cmd.current_dir(&model_dir);
 
             let mut child = cmd
@@ -801,7 +770,7 @@ impl WorkerManager {
             let hooks_arc = Arc::new(model_config.hooks.clone());
             let heartbeat_dur = Duration::from_secs_f32(model_config.heartbeat_interval);
             let heartbeat_timeout_dur = Duration::from_secs_f32(model_config.heartbeat_timeout);
-            spawn_worker_monitor(
+            let done_rx = spawn_worker_monitor(
                 child, model_name, version, worker_id as u32, shutdown_rx,
                 move || {
                     // Best-effort socket cleanup on unexpected exit
@@ -832,6 +801,7 @@ impl WorkerManager {
                 worker_id: worker_id as u32,
                 endpoint,
                 shutdown_tx: Some(shutdown_tx),
+                done_rx: Some(done_rx),
             });
         }
 
@@ -913,27 +883,43 @@ impl WorkerManager {
             .set_status(model_name, version, VersionStatus::Unloading)?;
 
         let key = model_version_key(model_name, version);
-        {
+        let procs = {
             let mut workers = self.workers.write().await;
             let mut clients = self.zmq_clients.write().await;
             let mut outliers = self.outlier_states.write().await;
             outliers.remove(&key);
-            if let Some(mut procs) = workers.remove(&key) {
-                for mut proc in procs.drain(..) {
-                    // Signal the monitor task to kill the process
-                    if let Some(tx) = proc.shutdown_tx.take() {
-                        let _ = tx.send(());
-                    }
-                    // Clean up ZMQ socket file (Unix only)
-                    #[cfg(unix)]
-                    {
-                        let socket_str = proc.endpoint.strip_prefix("ipc://").unwrap_or(&proc.endpoint);
-                        let socket_path = std::path::Path::new(socket_str);
-                        let _ = tokio::fs::remove_file(socket_path).await;
-                    }
+            clients.remove(&key);
+            workers.remove(&key)
+        };
+
+        if let Some(mut procs) = procs {
+            // Signal every monitor to kill its worker first so the kills run
+            // concurrently, then wait for each monitor to confirm the process
+            // was reaped. Without this wait, unload/shutdown returns while a
+            // worker is still alive — an orphan whose ZMQ auto-reconnect
+            // steals the re-bound socket on reload/restart.
+            for proc in procs.iter_mut() {
+                if let Some(tx) = proc.shutdown_tx.take() {
+                    let _ = tx.send(());
                 }
             }
-            clients.remove(&key);
+            for proc in procs {
+                if let Some(done_rx) = proc.done_rx {
+                    if timeout(WORKER_KILL_TIMEOUT, done_rx).await.is_err() {
+                        error!(
+                            model = %model_name, version = %version, worker_id = proc.worker_id,
+                            "Timed out waiting for worker process to die; cleaning up anyway"
+                        );
+                    }
+                }
+                // Clean up ZMQ socket file (Unix only)
+                #[cfg(unix)]
+                {
+                    let socket_str = proc.endpoint.strip_prefix("ipc://").unwrap_or(&proc.endpoint);
+                    let socket_path = std::path::Path::new(socket_str);
+                    let _ = tokio::fs::remove_file(socket_path).await;
+                }
+            }
         }
 
         self.registry.remove(model_name, version)?;
@@ -1040,6 +1026,11 @@ impl WorkerManager {
 /// - If a shutdown signal is sent via `shutdown_rx`, kills the process and runs cleanup.
 /// - If heartbeat is enabled, periodically probes the worker via ZMQ and triggers respawn on timeout.
 /// - Fires lifecycle hooks (on_exit / on_error) if configured.
+///
+/// Returns a receiver that resolves once the child has been reaped (natural
+/// exit or kill confirmed). Callers that need orphan-free shutdown must await
+/// it; otherwise the process may outlive the server and steal the re-bound
+/// ZMQ socket after a restart.
 fn spawn_worker_monitor(
     mut child: Child,
     model_name: &str,
@@ -1053,7 +1044,8 @@ fn spawn_worker_monitor(
     heartbeat_timeout: Duration,
     heartbeat_max_failures: usize,
     respawn_tx: Option<mpsc::Sender<RespawnSignal>>,
-) {
+) -> oneshot::Receiver<()> {
+    let (done_tx, done_rx) = oneshot::channel::<()>();
     let model = model_name.to_string();
     let ver = version.to_string();
     let hook_vars: Vec<(String, String)> = vec![
@@ -1109,7 +1101,7 @@ fn spawn_worker_monitor(
                             }
                         }
                         on_exit();
-                        return;
+                        break;
                     }
                     _ = &mut shutdown_rx => {
                         info!(
@@ -1118,7 +1110,7 @@ fn spawn_worker_monitor(
                         );
                         let _ = child.kill().await;
                         on_exit();
-                        return;
+                        break;
                     }
                     _ = tokio::time::sleep(heartbeat_interval) => {
                         // Heartbeat probe: send empty request via ZMQ
@@ -1204,7 +1196,7 @@ fn spawn_worker_monitor(
                             }
 
                             on_exit();
-                            return;
+                            break;
                         }
                     }
                 }
@@ -1257,7 +1249,37 @@ fn spawn_worker_monitor(
             }
             on_exit();
         }
+
+        // Signal that the child has been reaped (kill confirmed or natural
+        // exit observed). Receivers that already dropped are fine.
+        let _ = done_tx.send(());
     });
+    done_rx
+}
+
+/// Build the Command for spawning a Python worker process, wiring PYTHONPATH
+/// to the bundled lite_server module.
+///
+/// kill_on_drop(true) is the orphan safety net for paths that bypass graceful
+/// shutdown (panic, runtime drop): the child is killed when the Child handle
+/// is dropped instead of outliving the server and stealing the re-bound
+/// ZMQ socket.
+fn new_worker_command(python_module_dir: &str) -> Command {
+    let mut cmd = Command::new("python");
+    if !python_module_dir.is_empty() {
+        let current_pythonpath = std::env::var("PYTHONPATH").unwrap_or_default();
+        let new_pythonpath = if current_pythonpath.is_empty() {
+            python_module_dir.to_string()
+        } else {
+            #[cfg(windows)]
+            { format!("{};{}", current_pythonpath, python_module_dir) }
+            #[cfg(not(windows))]
+            { format!("{}:{}", current_pythonpath, python_module_dir) }
+        };
+        cmd.env("PYTHONPATH", new_pythonpath);
+    }
+    cmd.kill_on_drop(true);
+    cmd
 }
 
 /// Build a platform-appropriate ZMQ endpoint for a worker.
@@ -1722,6 +1744,175 @@ heartbeat_max_failures: 5
         shutdown_tx.send(()).unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(done.load(Ordering::SeqCst), "monitor should exit on shutdown signal");
+    }
+
+    // ===== Orphan prevention: kill completion signal =====
+
+    /// Regression: shutdown/unload must not return before the worker process
+    /// is actually killed+reaped. Otherwise the child is orphaned and its ZMQ
+    /// socket auto-reconnect steals the re-bound socket after a restart.
+    #[tokio::test]
+    async fn test_monitor_signals_completion_after_shutdown_kill() {
+        let mut cmd = Command::new("python");
+        cmd.arg("-c").arg("import time; time.sleep(60)");
+        let child = cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        #[cfg(unix)]
+        let pid = child.id().unwrap() as i32;
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let done_rx = spawn_worker_monitor(
+            child, "test", "1", 0, shutdown_rx,
+            || {},
+            None, None, Duration::ZERO, Duration::from_secs(5), 3, None,
+        );
+
+        shutdown_tx.send(()).unwrap();
+
+        // Completion must arrive promptly — it may only be sent after
+        // kill().await has reaped the child.
+        timeout(Duration::from_secs(5), done_rx)
+            .await
+            .expect("monitor should signal completion promptly after kill")
+            .expect("completion channel should not be dropped without signal");
+
+        #[cfg(unix)]
+        {
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            assert!(!alive, "worker process {} should be dead once completion fires", pid);
+        }
+    }
+
+    /// Natural exit must also fire the completion signal (callers treat both
+    /// paths uniformly).
+    #[tokio::test]
+    async fn test_monitor_signals_completion_on_natural_exit() {
+        #[cfg(unix)]
+        let child = tokio::process::Command::new("false")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        #[cfg(windows)]
+        let child = tokio::process::Command::new("cmd")
+            .args(["/c", "exit", "1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let done_rx = spawn_worker_monitor(
+            child, "test", "1", 0, shutdown_rx,
+            || {},
+            None, None, Duration::ZERO, Duration::from_secs(5), 3, None,
+        );
+
+        timeout(Duration::from_secs(5), done_rx)
+            .await
+            .expect("monitor should signal completion after natural exit")
+            .expect("completion channel should not be dropped without signal");
+    }
+
+    /// Real-worker regression test: unload_model must not return before the
+    /// Python worker process is actually dead. An orphaned worker's ZMQ
+    /// socket auto-reconnect steals the re-bound socket on reload/restart
+    /// (root cause of flaky worker log loss).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_unload_model_leaves_no_orphan_worker() {
+        let repo = std::env::temp_dir()
+            .join(format!("lite-server-orphan-test-{}", std::process::id()));
+        let model_dir = repo.join("orphan_guard_model").join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(
+            model_dir.join("model.py"),
+            r#"from litserve import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+        )
+        .unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let wm = WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            Arc::new(InferenceQueue::new()),
+            "debug".to_string(),
+            Arc::new(CallbackRunner::new()),
+        );
+
+        wm.load_model("orphan_guard_model", "1", &ModelConfig::default())
+            .await
+            .unwrap();
+
+        let pids: Vec<u32> = registry
+            .get("orphan_guard_model", Some("1"))
+            .unwrap()
+            .workers
+            .iter()
+            .filter_map(|w| w.pid)
+            .collect();
+        assert!(!pids.is_empty(), "expected at least one worker pid");
+
+        wm.unload_model("orphan_guard_model", None).await.unwrap();
+
+        // When unload returns, every worker must already be reaped —
+        // a live (or zombie) process here means the orphan race is back.
+        for pid in pids {
+            let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+            assert!(!alive, "worker pid {} orphaned: still alive after unload_model returned", pid);
+        }
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Guard: workers must be spawned with kill_on_drop so a server panic or
+    /// runtime drop cannot orphan them — the Child handle is the last resort
+    /// when graceful shutdown never runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_worker_command_kills_child_on_drop() {
+        let child = new_worker_command("")
+            .arg("-c")
+            .arg("import time; time.sleep(60)")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap() as i32;
+
+        drop(child);
+
+        // kill_on_drop sends SIGKILL on drop and tokio reaps in the
+        // background; poll briefly for the pid to disappear.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut alive = true;
+        while std::time::Instant::now() < deadline {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!alive, "dropped worker process {} should be killed via kill_on_drop", pid);
     }
 
     // ===== Key format: underscore in model name / version =====
