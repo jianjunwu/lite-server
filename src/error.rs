@@ -50,6 +50,20 @@ pub enum AppError {
     #[error("internal error: {0}")]
     Internal(String),
 
+    /// No route matched the request path (router fallback).
+    #[error("route not found")]
+    RouteNotFound,
+
+    /// Route exists but does not support the request method.
+    #[error("method not allowed")]
+    MethodNotAllowed,
+
+    /// Request body could not be read or parsed as JSON (axum extractor
+    /// rejection). The detail is client-facing: it describes the client's
+    /// own request body and carries no internal information.
+    #[error("invalid request body: {0}")]
+    InvalidRequestBody(String),
+
     /// Model-initiated error with explicit HTTP status and client-facing message.
     /// Unlike WorkerCrashed, the message is NOT sanitized — the model author
     /// intentionally exposes it.
@@ -82,9 +96,22 @@ impl AppError {
             AppError::Serialization(_) => "serialization error",
             AppError::FrameTooLarge => "message too large",
             AppError::Internal(_) => "internal server error",
+            AppError::RouteNotFound => "route not found",
+            AppError::MethodNotAllowed => "method not allowed",
+            AppError::InvalidRequestBody(_) => "invalid request body",
             // ModelError is handled specially in IntoResponse
             // and never reaches this point, but provide a fallback.
             AppError::ModelError { .. } => "model error",
+        }
+    }
+
+    /// Return the message shown to the client. For most variants this is the
+    /// sanitized static message; InvalidRequestBody passes the parse detail
+    /// through because it describes the client's own request body.
+    fn client_message(&self) -> String {
+        match self {
+            AppError::InvalidRequestBody(detail) => detail.clone(),
+            _ => self.pub_error_message().to_string(),
         }
     }
 
@@ -106,6 +133,9 @@ impl AppError {
             AppError::Python(_) => "internal_error",
             AppError::Io(_) => "internal_error",
             AppError::Internal(_) => "internal_error",
+            AppError::RouteNotFound => "route_not_found",
+            AppError::MethodNotAllowed => "method_not_allowed",
+            AppError::InvalidRequestBody(_) => "invalid_request_body",
             // ModelError code comes from the Python worker; fallback to its error_type
             AppError::ModelError { code, error_type, .. } => {
                 code.as_deref().unwrap_or(error_type.as_str())
@@ -170,6 +200,9 @@ impl IntoResponse for AppError {
             AppError::Serialization(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
             AppError::FrameTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error"),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+            AppError::RouteNotFound => (StatusCode::NOT_FOUND, "not_found_error"),
+            AppError::MethodNotAllowed => (StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),
+            AppError::InvalidRequestBody(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
             // Handled above via early return; should never reach here.
             AppError::ModelError { .. } => unreachable!(),
         };
@@ -181,7 +214,7 @@ impl IntoResponse for AppError {
         let body = Json(json!({
             "error": {
                 "type": error_type,
-                "message": self.pub_error_message(),
+                "message": self.client_message(),
                 "code": self.error_code(),
                 "param": self.param(),
             }
@@ -440,5 +473,55 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["error"]["code"], "invalid_input");
         assert_eq!(body["error"]["param"], serde_json::Value::Null);
+    }
+
+    // ===== Framework-level errors (route/method/body) =====
+
+    #[tokio::test]
+    async fn test_route_not_found_response() {
+        use axum::response::IntoResponse;
+        let response = AppError::RouteNotFound.into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error"]["type"], "not_found_error");
+        assert_eq!(body["error"]["code"], "route_not_found");
+        assert_eq!(body["error"]["param"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn test_method_not_allowed_response() {
+        use axum::response::IntoResponse;
+        let response = AppError::MethodNotAllowed.into_response();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error"]["type"], "method_not_allowed");
+        assert_eq!(body["error"]["code"], "method_not_allowed");
+        assert_eq!(body["error"]["param"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_request_body_passthrough_detail() {
+        use axum::response::IntoResponse;
+        // Client should see the parse detail — it describes their own request
+        // body and carries no internal information.
+        let err = AppError::InvalidRequestBody(
+            "Failed to parse the request body as JSON: expected value at line 1 column 1".into());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "invalid_request_body");
+        assert!(body["error"]["message"].as_str().unwrap().contains("expected value"));
+        assert_eq!(body["error"]["param"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_framework_error_codes() {
+        assert_eq!(AppError::RouteNotFound.error_code(), "route_not_found");
+        assert_eq!(AppError::MethodNotAllowed.error_code(), "method_not_allowed");
+        assert_eq!(AppError::InvalidRequestBody("x".into()).error_code(), "invalid_request_body");
     }
 }
