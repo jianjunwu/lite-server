@@ -135,5 +135,11 @@ pub fn create_routes(state: AppState, endpoint_routes: Vec<EndpointRoute>) -> Ro
         }
     }
 
+    // Standardized error bodies for unmatched routes (404) and
+    // unmatched methods (405) — axum defaults are empty/plain-text.
+    router = router
+        .fallback(crate::http::route_fallback)
+        .method_not_allowed_fallback(crate::http::method_not_allowed_fallback);
+
     router.with_state(Arc::new(state))
 }

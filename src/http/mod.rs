@@ -43,8 +43,34 @@ impl std::fmt::Display for RequestId {
     }
 }
 
+#[axum::async_trait]
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for RequestId {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(parts
+            .extensions
+            .get::<RequestId>()
+            .cloned()
+            .unwrap_or_else(|| RequestId(Uuid::new_v4().to_string())))
+    }
+}
+
+/// Fallback for unmatched routes — standardized 404 error body.
+pub(crate) async fn route_fallback() -> AppError {
+    AppError::RouteNotFound
+}
+
+/// Fallback for unmatched methods on matched routes — standardized 405 body.
+pub(crate) async fn method_not_allowed_fallback() -> AppError {
+    AppError::MethodNotAllowed
+}
+
 /// Middleware that injects `x-request-id` and `x-processing-time-ms` into
-/// every response. Reads client-supplied `x-client-request-id` (max 512 ASCII
+/// every response. Reads client-supplied `x-client-request-id` (1–512 ASCII
 /// chars); falls back to UUID v4.
 ///
 /// The request ID is also stored in request extensions for downstream handlers.
@@ -56,7 +82,7 @@ async fn observability_middleware(mut request: Request, next: Next) -> Response 
         .headers()
         .get("x-client-request-id")
         .and_then(|v| v.to_str().ok())
-        .filter(|s| s.len() <= 512 && s.is_ascii())
+        .filter(|s| !s.is_empty() && s.len() <= 512 && s.is_ascii())
         .map(String::from)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
@@ -97,16 +123,17 @@ pub async fn start_http_server(
 
     let app = create_routes(state, endpoint_routes);
 
-    // Observability middleware (outermost — captures total wall-clock duration,
-    // sets x-request-id + x-processing-time-ms on ALL responses including errors)
-    let app = app.layer(axum::middleware::from_fn(observability_middleware));
-
-    // Keepalive middleware (innermost)
+    // Keepalive middleware (inner)
     let app = if config.server.keepalive_timeout <= 0.0 {
         app.layer(axum::middleware::from_fn(disable_keepalive_middleware))
     } else {
         app
     };
+
+    // Observability middleware (outermost — applied last so it captures total
+    // wall-clock duration and sets x-request-id + x-processing-time-ms on ALL
+    // responses including errors and fallbacks)
+    let app = app.layer(axum::middleware::from_fn(observability_middleware));
 
     if let Some(path) = unix_socket_path(&config.server.host) {
         #[cfg(unix)]
@@ -224,6 +251,68 @@ mod tests {
         assert!(connection.is_none() || connection != Some(&axum::http::HeaderValue::from_static("close")));
     }
 
+    // ===== fallback tests =====
+
+    #[tokio::test]
+    async fn test_fallback_route_not_found_standardized_body() {
+        let app = axum::Router::new()
+            .route("/test", axum::routing::get(|| async { "ok" }))
+            .fallback(route_fallback);
+
+        let response = app
+            .oneshot(Request::builder().uri("/no-such-route").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error"]["type"], "not_found_error");
+        assert_eq!(body["error"]["code"], "route_not_found");
+        assert_eq!(body["error"]["param"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn test_method_not_allowed_standardized_body() {
+        let app = axum::Router::new()
+            .route("/test", axum::routing::get(|| async { "ok" }))
+            .method_not_allowed_fallback(method_not_allowed_fallback);
+
+        let response = app
+            .oneshot(Request::builder().uri("/test").method("POST").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error"]["type"], "method_not_allowed");
+        assert_eq!(body["error"]["code"], "method_not_allowed");
+        assert_eq!(body["error"]["param"], serde_json::Value::Null);
+    }
+
+    // ===== RequestId extractor tests =====
+
+    #[tokio::test]
+    async fn test_request_id_extractor_generates_uuid_without_middleware() {
+        // Handlers must work without the observability middleware —
+        // the extractor falls back to a fresh UUID instead of failing.
+        async fn id_handler(RequestId(id): RequestId) -> String {
+            id
+        }
+        let app = axum::Router::new().route("/test", axum::routing::get(id_handler));
+
+        let response = app
+            .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let id = String::from_utf8(body_bytes.to_vec()).unwrap();
+        assert_eq!(id.len(), 36, "should fall back to UUID v4 (36 chars), got: {}", id);
+    }
+
     // ===== observability middleware tests =====
 
     #[tokio::test]
@@ -288,6 +377,28 @@ mod tests {
         let returned = response.headers().get("x-request-id").unwrap().to_str().unwrap();
         assert_ne!(returned, &long_id, "over-length client ID should be rejected");
         assert_eq!(returned.len(), 36, "should be UUID v4 (36 chars)");
+    }
+
+    #[tokio::test]
+    async fn test_x_client_request_id_empty_falls_back_to_uuid() {
+        let app = axum::Router::new()
+            .route("/test", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(observability_middleware));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/test")
+                    .header("x-client-request-id", "")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let returned = response.headers().get("x-request-id").unwrap().to_str().unwrap();
+        assert!(!returned.is_empty(), "empty client ID should be rejected");
+        assert_eq!(returned.len(), 36, "should fall back to UUID v4 (36 chars)");
     }
 
     #[tokio::test]
