@@ -72,13 +72,19 @@ fn create_test_model_repo() -> std::path::PathBuf {
         model_dir.join("model.py"),
         r#"from litserve import LitAPI
 
+from lite_server.exceptions import BadRequestError
+
 
 class TestAPI(LitAPI):
     def setup(self, device):
         pass
 
     def decode_request(self, request):
-        return request.get("input", 0)
+        value = request.get("input", 0)
+        if value is None:
+            raise BadRequestError(
+                "input must not be null", code="invalid_input", param="input")
+        return value
 
     def predict(self, x):
         return {"output": x * 2}
@@ -635,7 +641,8 @@ async fn test_infer_error_response_has_code_and_param() {
     // Load model first so the model route is active
     load_model(&base, MODEL, "1").await;
 
-    // Send invalid JSON to trigger a model-level validation error
+    // test_model raises BadRequestError(code="invalid_input", param="input")
+    // for null input — verifies the full Python → Rust → client chain.
     let resp = client
         .post(&format!("{}/v2/models/{}/infer", base, MODEL))
         .json(&json!({"input": null}))
@@ -643,30 +650,84 @@ async fn test_infer_error_response_has_code_and_param() {
         .await
         .unwrap();
 
-    // Save headers before consuming body
-    let has_x_request_id = resp.headers().get("x-request-id").is_some();
-    let has_x_processing_time = resp.headers().get("x-processing-time-ms").is_some();
-    let is_error = !resp.status().is_success();
+    assert_eq!(resp.status(), 400);
+    assert!(resp.headers().get("x-request-id").is_some(),
+        "x-request-id must be present");
+    assert!(resp.headers().get("x-processing-time-ms").is_some(),
+        "x-processing-time-ms must be present");
 
-    // Read body — may succeed (model just returns null) or fail
     let body: Value = resp.json().await.unwrap();
-
-    if is_error {
-        if let Some(err) = body.get("error") {
-            // Error body must have code and param fields
-            assert!(err.get("code").is_some(),
-                "error must have code field: {:?}", err);
-            // param should be present (at least null)
-            assert!(err.get("param").is_some(),
-                "error must have param field: {:?}", err);
-        }
-    }
-
-    // Headers must be present on any response
-    assert!(has_x_request_id, "x-request-id must be present");
-    assert!(has_x_processing_time, "x-processing-time-ms must be present");
+    let err = &body["error"];
+    assert_eq!(err["type"], "invalid_request_error");
+    assert_eq!(err["message"], "input must not be null");
+    assert_eq!(err["code"], "invalid_input");
+    assert_eq!(err["param"], "input");
 
     unload_model(&base, MODEL, "1").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_unknown_route_standardized_404() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(&format!("{}/no-such-route", base))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 404);
+    assert!(resp.headers().get("x-request-id").is_some());
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "not_found_error");
+    assert_eq!(body["error"]["code"], "route_not_found");
+    assert!(body["error"]["param"].is_null());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_method_not_allowed_standardized_405() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    // /health only supports GET
+    let resp = client
+        .post(&format!("{}/health", base))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 405);
+    assert!(resp.headers().get("x-request-id").is_some());
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "method_not_allowed");
+    assert_eq!(body["error"]["code"], "method_not_allowed");
+    assert!(body["error"]["param"].is_null());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_malformed_json_standardized_400() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    // Route exists; the ApiJson extractor rejects before any model lookup.
+    let resp = client
+        .post(&format!("{}/v2/models/any_model/infer", base))
+        .header("content-type", "application/json")
+        .body("{not valid json")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    assert!(resp.headers().get("x-request-id").is_some());
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["code"], "invalid_request_body");
+    assert!(body["error"]["param"].is_null());
 }
 
 // ---------------------------------------------------------------------------
