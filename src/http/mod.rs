@@ -12,6 +12,7 @@ use crate::worker::WorkerManager;
 use crate::worker::endpoint_manager::EndpointManager;
 use axum::extract::Request;
 use axum::http::header::CONNECTION;
+use axum::http::HeaderValue;
 use axum::middleware::Next;
 use axum::response::Response;
 use axum::Router;
@@ -19,7 +20,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::info;
+use uuid::Uuid;
 
 async fn disable_keepalive_middleware(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
@@ -27,6 +30,43 @@ async fn disable_keepalive_middleware(request: Request, next: Next) -> Response 
         CONNECTION,
         axum::http::HeaderValue::from_static("close"),
     );
+    response
+}
+
+/// Newtype for request ID extraction from extensions.
+#[derive(Clone, Debug)]
+pub struct RequestId(pub String);
+
+/// Middleware that injects `x-request-id` and `x-processing-time-ms` into
+/// every response. Reads client-supplied `x-client-request-id` (max 512 ASCII
+/// chars); falls back to UUID v4.
+///
+/// The request ID is also stored in request extensions for downstream handlers.
+async fn observability_middleware(mut request: Request, next: Next) -> Response {
+    let start = Instant::now();
+
+    // Extract or generate request ID
+    let request_id = request
+        .headers()
+        .get("x-client-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| s.len() <= 512 && s.is_ascii())
+        .map(String::from)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    request.extensions_mut().insert(RequestId(request_id.clone()));
+
+    let mut response = next.run(request).await;
+
+    // Overwrite headers — middleware is the authoritative source for these.
+    if let Ok(v) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert("x-request-id", v);
+    }
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    if let Ok(v) = HeaderValue::from_str(&elapsed_ms.to_string()) {
+        response.headers_mut().insert("x-processing-time-ms", v);
+    }
+
     response
 }
 
@@ -50,6 +90,12 @@ pub async fn start_http_server(
     state.shutdown_state = shutdown_state;
 
     let app = create_routes(state, endpoint_routes);
+
+    // Observability middleware (outermost — captures total wall-clock duration,
+    // sets x-request-id + x-processing-time-ms on ALL responses including errors)
+    let app = app.layer(axum::middleware::from_fn(observability_middleware));
+
+    // Keepalive middleware (innermost)
     let app = if config.server.keepalive_timeout <= 0.0 {
         app.layer(axum::middleware::from_fn(disable_keepalive_middleware))
     } else {
@@ -138,6 +184,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use axum::response::IntoResponse;
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -169,5 +216,93 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let connection = response.headers().get("connection");
         assert!(connection.is_none() || connection != Some(&axum::http::HeaderValue::from_static("close")));
+    }
+
+    // ===== observability middleware tests =====
+
+    #[tokio::test]
+    async fn test_observability_middleware_sets_headers() {
+        let app = axum::Router::new()
+            .route("/test", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(observability_middleware));
+
+        let response = app
+            .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("x-request-id").is_some(),
+            "x-request-id should be present");
+        assert!(response.headers().get("x-processing-time-ms").is_some(),
+            "x-processing-time-ms should be present");
+    }
+
+    #[tokio::test]
+    async fn test_x_client_request_id_propagation() {
+        let app = axum::Router::new()
+            .route("/test", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(observability_middleware));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/test")
+                    .header("x-client-request-id", "my-trace-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.headers().get("x-request-id").unwrap(),
+            "my-trace-123"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_x_client_request_id_too_long() {
+        let app = axum::Router::new()
+            .route("/test", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(observability_middleware));
+
+        let long_id = "a".repeat(513);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/test")
+                    .header("x-client-request-id", &long_id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let returned = response.headers().get("x-request-id").unwrap().to_str().unwrap();
+        assert_ne!(returned, &long_id, "over-length client ID should be rejected");
+        assert_eq!(returned.len(), 36, "should be UUID v4 (36 chars)");
+    }
+
+    #[tokio::test]
+    async fn test_observability_headers_on_error_responses() {
+        let app = axum::Router::new()
+            .route("/test", axum::routing::get(|| async {
+                let err: AppError = AppError::ModelNotFound("test".into());
+                err.into_response()
+            }))
+            .layer(axum::middleware::from_fn(observability_middleware));
+
+        let response = app
+            .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        // Headers MUST be present even on error responses
+        assert!(response.headers().get("x-request-id").is_some(),
+            "x-request-id must be on error responses too");
+        assert!(response.headers().get("x-processing-time-ms").is_some(),
+            "x-processing-time-ms must be on error responses too");
     }
 }
