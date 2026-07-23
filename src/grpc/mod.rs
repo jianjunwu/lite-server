@@ -71,7 +71,6 @@ fn error_type_to_grpc_code(error_type: &str) -> tonic::Code {
 }
 
 /// Parsed fields from a structured model error JSON payload.
-#[allow(dead_code)]
 struct ParsedModelError {
     error_type: String,
     message: String,
@@ -87,6 +86,26 @@ fn try_parse_model_error(data: &serde_json::Value) -> Option<ParsedModelError> {
     let code = err.get("code").and_then(|c| c.as_str()).map(String::from);
     let param = err.get("param").and_then(|p| p.as_str()).map(String::from);
     Some(ParsedModelError { error_type, message, code, param })
+}
+
+/// Build a gRPC Status from a parsed model error. The message keeps the
+/// legacy `[error_type] message` format; code/param are attached as standard
+/// gRPC ErrorInfo details so clients can read them programmatically.
+fn model_error_status(code: tonic::Code, parsed: &ParsedModelError) -> Status {
+    use tonic_types::{ErrorDetails, StatusExt};
+
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert("error_type".to_string(), parsed.error_type.clone());
+    if let Some(p) = &parsed.param {
+        metadata.insert("param".to_string(), p.clone());
+    }
+    // Same fallback as AppError::error_code() for ModelError
+    let reason = parsed.code.as_deref().unwrap_or(&parsed.error_type);
+    Status::with_error_details(
+        code,
+        format!("[{}] {}", parsed.error_type, parsed.message),
+        ErrorDetails::with_error_info(reason, "lite-server", metadata),
+    )
 }
 
 /// Headers that must not be set by user code (RFC 7230 §6.1 hop-by-hop headers
@@ -233,14 +252,14 @@ impl LiteServer for GrpcService {
                             let data: serde_json::Value =
                                 serde_json::from_slice(&single.data).unwrap_or(serde_json::json!({}));
                             let parsed = try_parse_model_error(&data);
-                            let error_type = parsed.as_ref()
-                                .map(|p| p.error_type.as_str()).unwrap_or("model_error");
-                            let error_message = parsed.as_ref()
-                                .map(|p| p.message.as_str()).unwrap_or(&msg);
-                            return Err(Status::new(
-                                http_status_to_grpc_code(http_status),
-                                format!("[{}] {}", error_type, error_message),
-                            ));
+                            return Err(match parsed {
+                                Some(p) => model_error_status(
+                                    http_status_to_grpc_code(http_status), &p),
+                                None => Status::new(
+                                    http_status_to_grpc_code(http_status),
+                                    format!("[model_error] {}", msg),
+                                ),
+                            });
                         }
                         // Not a numeric status code — internal worker error.
                         return Err(Status::internal(msg));
@@ -474,9 +493,9 @@ impl LiteServer for GrpcService {
                         let grpc_err = match serde_json::from_str::<serde_json::Value>(&e.message) {
                             Ok(val) => {
                                 if let Some(parsed) = try_parse_model_error(&val) {
-                                    Status::new(
+                                    model_error_status(
                                         error_type_to_grpc_code(&parsed.error_type),
-                                        format!("[{}] {}", parsed.error_type, parsed.message),
+                                        &parsed,
                                     )
                                 } else {
                                     Status::internal(e.message.clone())
@@ -659,9 +678,9 @@ impl LiteServer for GrpcService {
                         let grpc_err = match serde_json::from_str::<serde_json::Value>(&e.message) {
                             Ok(val) => {
                                 if let Some(parsed) = try_parse_model_error(&val) {
-                                    Status::new(
+                                    model_error_status(
                                         error_type_to_grpc_code(&parsed.error_type),
-                                        format!("[{}] {}", parsed.error_type, parsed.message),
+                                        &parsed,
                                     )
                                 } else {
                                     Status::internal(e.message.clone())
@@ -726,6 +745,7 @@ pub async fn start_grpc_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tonic_types::StatusExt;
 
     #[test]
     fn test_http_status_to_grpc_code() {
@@ -752,6 +772,41 @@ mod tests {
         assert_eq!(error_type_to_grpc_code("model_not_ready"), tonic::Code::Unavailable);
         // Unknown falls back to Internal
         assert_eq!(error_type_to_grpc_code("UNKNOWN_CODE"), tonic::Code::Internal);
+    }
+
+    #[test]
+    fn test_model_error_status_carries_error_info() {
+        let parsed = ParsedModelError {
+            error_type: "invalid_request_error".into(),
+            message: "bad input".into(),
+            code: Some("invalid_input".into()),
+            param: Some("temperature".into()),
+        };
+        let status = model_error_status(tonic::Code::InvalidArgument, &parsed);
+        // Message format unchanged for backward compatibility
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(status.message(), "[invalid_request_error] bad input");
+        // Structured details: standard gRPC ErrorInfo
+        let info = status.get_details_error_info().expect("should carry ErrorInfo");
+        assert_eq!(info.reason, "invalid_input");
+        assert_eq!(info.domain, "lite-server");
+        assert_eq!(info.metadata.get("error_type").map(String::as_str),
+            Some("invalid_request_error"));
+        assert_eq!(info.metadata.get("param").map(String::as_str), Some("temperature"));
+    }
+
+    #[test]
+    fn test_model_error_status_reason_falls_back_to_error_type() {
+        let parsed = ParsedModelError {
+            error_type: "model_error".into(),
+            message: "boom".into(),
+            code: None,
+            param: None,
+        };
+        let status = model_error_status(tonic::Code::Internal, &parsed);
+        let info = status.get_details_error_info().expect("should carry ErrorInfo");
+        assert_eq!(info.reason, "model_error");
+        assert!(info.metadata.get("param").is_none());
     }
 
     #[test]
