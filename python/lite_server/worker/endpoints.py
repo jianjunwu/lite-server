@@ -12,6 +12,8 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 
+from lite_server.exceptions import HTTPException
+
 MAX_FRAME_SIZE = 16 * 1024 * 1024  # 16 MiB
 
 logger = logging.getLogger("endpoint_worker")
@@ -236,6 +238,22 @@ async def handle_request(endpoints, req_data: dict) -> dict:
             "status_code": 200,
             "headers": None,
             "body": result,
+        }
+    except HTTPException as e:
+        logger.info("endpoint HTTP error for %s: %s (status=%d, type=%s)",
+                    route, e.detail, e.status_code, e.error_type)
+        # Four-field error body contract — same shape as the inference path.
+        error_body = {
+            "type": e.error_type,
+            "message": e.detail,
+            "code": e.code,
+            "param": e.param,
+        }
+        return {
+            "request_id": req_data.get("request_id", ""),
+            "status_code": e.status_code,
+            "headers": None,
+            "body": {"error": error_body},
         }
     except Exception as e:
         logger.error("handler error for %s: %s", route, e, exc_info=True)

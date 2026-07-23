@@ -34,15 +34,20 @@ class HTTPException(Exception):
         status_code: HTTP status code (400-599).
         detail: Human-readable error message, returned to the client.
         error_type: Machine-readable error type string (snake_case).
+        code: Optional machine-readable error code for programmatic handling.
+        param: Optional parameter name that caused the error.
     """
 
     def __init__(
-        self, status_code: int, detail: str, error_type: str = "model_error"
+        self, status_code: int, detail: str, error_type: str = "model_error",
+        code: str | None = None, param: str | None = None,
     ):
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
         self.error_type = error_type
+        self.code = code
+        self.param = param
 
 
 class BadRequestError(HTTPException):
@@ -53,29 +58,33 @@ class BadRequestError(HTTPException):
         raise BadRequestError("input must be non-negative", "invalid_input")
     """
 
-    def __init__(self, detail: str, error_type: str = "invalid_request_error"):
-        super().__init__(400, detail, error_type)
+    def __init__(self, detail: str, error_type: str = "invalid_request_error",
+                 code: str | None = None, param: str | None = None):
+        super().__init__(400, detail, error_type, code=code, param=param)
 
 
 class UnauthorizedError(HTTPException):
     """HTTP 401 — authentication required."""
 
-    def __init__(self, detail: str, error_type: str = "authentication_error"):
-        super().__init__(401, detail, error_type)
+    def __init__(self, detail: str, error_type: str = "authentication_error",
+                 code: str | None = None, param: str | None = None):
+        super().__init__(401, detail, error_type, code=code, param=param)
 
 
 class ForbiddenError(HTTPException):
     """HTTP 403 — access denied."""
 
-    def __init__(self, detail: str, error_type: str = "permission_denied_error"):
-        super().__init__(403, detail, error_type)
+    def __init__(self, detail: str, error_type: str = "permission_denied_error",
+                 code: str | None = None, param: str | None = None):
+        super().__init__(403, detail, error_type, code=code, param=param)
 
 
 class NotFoundError(HTTPException):
     """HTTP 404 — resource not found."""
 
-    def __init__(self, detail: str, error_type: str = "not_found_error"):
-        super().__init__(404, detail, error_type)
+    def __init__(self, detail: str, error_type: str = "not_found_error",
+                 code: str | None = None, param: str | None = None):
+        super().__init__(404, detail, error_type, code=code, param=param)
 
 
 class InternalServerError(HTTPException):
@@ -86,9 +95,10 @@ class InternalServerError(HTTPException):
     """
 
     def __init__(
-        self, detail: str = "internal server error", error_type: str = "server_error"
+        self, detail: str = "internal server error", error_type: str = "server_error",
+        code: str | None = None, param: str | None = None,
     ):
-        super().__init__(500, detail, error_type)
+        super().__init__(500, detail, error_type, code=code, param=param)
 
 
 class ServiceUnavailableError(HTTPException):
@@ -98,5 +108,7 @@ class ServiceUnavailableError(HTTPException):
         self,
         detail: str = "service unavailable",
         error_type: str = "service_unavailable",
+        code: str | None = None,
+        param: str | None = None,
     ):
-        super().__init__(503, detail, error_type)
+        super().__init__(503, detail, error_type, code=code, param=param)

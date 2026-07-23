@@ -70,14 +70,42 @@ fn error_type_to_grpc_code(error_type: &str) -> tonic::Code {
     }
 }
 
-/// Extract (error_type, message) from a structured model error JSON payload.
-fn try_parse_model_error(
-    data: &serde_json::Value,
-) -> Option<(String, String)> {
+/// Parsed fields from a structured model error JSON payload.
+struct ParsedModelError {
+    error_type: String,
+    message: String,
+    code: Option<String>,
+    param: Option<String>,
+}
+
+/// Extract structured error fields from a model error JSON payload.
+fn try_parse_model_error(data: &serde_json::Value) -> Option<ParsedModelError> {
     let err = data.get("error")?;
     let error_type = err.get("type")?.as_str()?.to_string();
     let message = err.get("message")?.as_str()?.to_string();
-    Some((error_type, message))
+    let code = err.get("code").and_then(|c| c.as_str()).map(String::from);
+    let param = err.get("param").and_then(|p| p.as_str()).map(String::from);
+    Some(ParsedModelError { error_type, message, code, param })
+}
+
+/// Build a gRPC Status from a parsed model error. The message keeps the
+/// legacy `[error_type] message` format; code/param are attached as standard
+/// gRPC ErrorInfo details so clients can read them programmatically.
+fn model_error_status(code: tonic::Code, parsed: &ParsedModelError) -> Status {
+    use tonic_types::{ErrorDetails, StatusExt};
+
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert("error_type".to_string(), parsed.error_type.clone());
+    if let Some(p) = &parsed.param {
+        metadata.insert("param".to_string(), p.clone());
+    }
+    // Same fallback as AppError::error_code() for ModelError
+    let reason = parsed.code.as_deref().unwrap_or(&parsed.error_type);
+    Status::with_error_details(
+        code,
+        format!("[{}] {}", parsed.error_type, parsed.message),
+        ErrorDetails::with_error_info(reason, "lite-server", metadata),
+    )
 }
 
 /// Headers that must not be set by user code (RFC 7230 §6.1 hop-by-hop headers
@@ -223,13 +251,15 @@ impl LiteServer for GrpcService {
                         if let Ok(http_status) = msg.parse::<u16>() {
                             let data: serde_json::Value =
                                 serde_json::from_slice(&single.data).unwrap_or(serde_json::json!({}));
-                            let (error_type, error_message) =
-                                try_parse_model_error(&data)
-                                    .unwrap_or_else(|| ("model_error".into(), msg));
-                            return Err(Status::new(
-                                http_status_to_grpc_code(http_status),
-                                format!("[{}] {}", error_type, error_message),
-                            ));
+                            let parsed = try_parse_model_error(&data);
+                            return Err(match parsed {
+                                Some(p) => model_error_status(
+                                    http_status_to_grpc_code(http_status), &p),
+                                None => Status::new(
+                                    http_status_to_grpc_code(http_status),
+                                    format!("[model_error] {}", msg),
+                                ),
+                            });
                         }
                         // Not a numeric status code — internal worker error.
                         return Err(Status::internal(msg));
@@ -462,10 +492,10 @@ impl LiteServer for GrpcService {
                     Some(pb::stream_response::Payload::Error(ref e)) => {
                         let grpc_err = match serde_json::from_str::<serde_json::Value>(&e.message) {
                             Ok(val) => {
-                                if let Some((error_type, error_message)) = try_parse_model_error(&val) {
-                                    Status::new(
-                                        error_type_to_grpc_code(&error_type),
-                                        format!("[{}] {}", error_type, error_message),
+                                if let Some(parsed) = try_parse_model_error(&val) {
+                                    model_error_status(
+                                        error_type_to_grpc_code(&parsed.error_type),
+                                        &parsed,
                                     )
                                 } else {
                                     Status::internal(e.message.clone())
@@ -647,10 +677,10 @@ impl LiteServer for GrpcService {
                         };
                         let grpc_err = match serde_json::from_str::<serde_json::Value>(&e.message) {
                             Ok(val) => {
-                                if let Some((error_type, error_message)) = try_parse_model_error(&val) {
-                                    Status::new(
-                                        error_type_to_grpc_code(&error_type),
-                                        format!("[{}] {}", error_type, error_message),
+                                if let Some(parsed) = try_parse_model_error(&val) {
+                                    model_error_status(
+                                        error_type_to_grpc_code(&parsed.error_type),
+                                        &parsed,
                                     )
                                 } else {
                                     Status::internal(e.message.clone())
@@ -715,6 +745,7 @@ pub async fn start_grpc_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tonic_types::StatusExt;
 
     #[test]
     fn test_http_status_to_grpc_code() {
@@ -744,18 +775,72 @@ mod tests {
     }
 
     #[test]
+    fn test_model_error_status_carries_error_info() {
+        let parsed = ParsedModelError {
+            error_type: "invalid_request_error".into(),
+            message: "bad input".into(),
+            code: Some("invalid_input".into()),
+            param: Some("temperature".into()),
+        };
+        let status = model_error_status(tonic::Code::InvalidArgument, &parsed);
+        // Message format unchanged for backward compatibility
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(status.message(), "[invalid_request_error] bad input");
+        // Structured details: standard gRPC ErrorInfo
+        let info = status.get_details_error_info().expect("should carry ErrorInfo");
+        assert_eq!(info.reason, "invalid_input");
+        assert_eq!(info.domain, "lite-server");
+        assert_eq!(info.metadata.get("error_type").map(String::as_str),
+            Some("invalid_request_error"));
+        assert_eq!(info.metadata.get("param").map(String::as_str), Some("temperature"));
+    }
+
+    #[test]
+    fn test_model_error_status_reason_falls_back_to_error_type() {
+        let parsed = ParsedModelError {
+            error_type: "model_error".into(),
+            message: "boom".into(),
+            code: None,
+            param: None,
+        };
+        let status = model_error_status(tonic::Code::Internal, &parsed);
+        let info = status.get_details_error_info().expect("should carry ErrorInfo");
+        assert_eq!(info.reason, "model_error");
+        assert!(!info.metadata.contains_key("param"));
+    }
+
+    #[test]
     fn test_try_parse_model_error_valid() {
         let data = serde_json::json!({
             "error": {
                 "type": "INVALID_INPUT",
-                "message": "input must be non-negative"
+                "message": "input must be non-negative",
+                "code": "invalid_input",
+                "param": "temperature",
             }
         });
         let result = try_parse_model_error(&data);
         assert!(result.is_some());
-        let (code, message) = result.unwrap();
-        assert_eq!(code, "INVALID_INPUT");
-        assert_eq!(message, "input must be non-negative");
+        let p = result.unwrap();
+        assert_eq!(p.error_type, "INVALID_INPUT");
+        assert_eq!(p.message, "input must be non-negative");
+        assert_eq!(p.code.as_deref(), Some("invalid_input"));
+        assert_eq!(p.param.as_deref(), Some("temperature"));
+    }
+
+    #[test]
+    fn test_try_parse_model_error_minimal() {
+        // Only required fields (type + message), no code/param — still valid
+        let data = serde_json::json!({
+            "error": {"type": "X", "message": "Y"}
+        });
+        let result = try_parse_model_error(&data);
+        assert!(result.is_some());
+        let p = result.unwrap();
+        assert_eq!(p.error_type, "X");
+        assert_eq!(p.message, "Y");
+        assert_eq!(p.code, None);
+        assert_eq!(p.param, None);
     }
 
     #[test]

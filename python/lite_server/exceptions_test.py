@@ -139,3 +139,40 @@ class TestCustomSubclass:
         assert e.status_code == 402
         assert e.error_type == "payment_required"
         assert isinstance(e, HTTPException)
+
+
+class TestCodeAndParam:
+    """New code/param fields for programmatic error handling."""
+
+    def test_http_exception_with_code_and_param(self):
+        e = HTTPException(400, "bad input", "invalid_request_error",
+                          code="invalid_input", param="temperature")
+        assert e.code == "invalid_input"
+        assert e.param == "temperature"
+
+    def test_http_exception_defaults(self):
+        e = HTTPException(400, "bad input")
+        assert e.code is None
+        assert e.param is None
+
+    def test_bad_request_error_with_code_and_param(self):
+        e = BadRequestError("bad input", code="invalid_input", param="temperature")
+        assert e.code == "invalid_input"
+        assert e.param == "temperature"
+        assert e.status_code == 400
+        assert e.error_type == "invalid_request_error"
+
+    def test_bad_request_error_defaults(self):
+        e = BadRequestError("bad input")
+        assert e.code is None
+        assert e.param is None
+
+    def test_internal_server_error_with_code_and_param(self):
+        e = InternalServerError("gpu oom", code="out_of_memory", param="gpu_id")
+        assert e.code == "out_of_memory"
+        assert e.param == "gpu_id"
+
+    def test_service_unavailable_with_code(self):
+        e = ServiceUnavailableError("model loading", code="model_not_loaded")
+        assert e.code == "model_not_loaded"
+        assert e.param is None

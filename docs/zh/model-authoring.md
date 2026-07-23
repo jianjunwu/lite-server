@@ -807,11 +807,24 @@ class MyModel(LitAPI):
 | `InternalServerError` | 500 | `server_error` |
 | `ServiceUnavailableError` | 503 | `service_unavailable` |
 
-所有异常类都接受自定义 `error_type` 作为第二个参数。客户端收到结构化响应：
+所有异常类都接受自定义 `error_type` 作为第二个参数，以及可选的 `code` 和 `param` 关键字参数用于程序化错误处理（OpenAI 惯例）：
+
+```python
+raise BadRequestError("input must be non-negative", code="invalid_input", param="value")
+```
+
+客户端始终收到四字段结构化响应：
 
 ```json
-{"error": {"type": "INVALID_INPUT", "message": "input must be non-negative"}}
+{"error": {"type": "INVALID_INPUT", "message": "input must be non-negative", "code": "invalid_input", "param": "value"}}
 ```
+
+- `code` — 机器可读错误码（snake_case），未设置时为 `null`。服务器生成的错误始终带有 code（如 `model_not_found`、`queue_full`、`invalid_request_body`）。
+- `param` — 导致错误的参数名，不适用时为 `null`。
+
+在 gRPC 上，`code`/`param` 以标准 [ErrorInfo](https://github.com/googleapis/googleapis/blob/master/google/rpc/error_details.proto) details 传递（`reason` = code，`metadata` = {error_type, param}），状态消息保持 `[error_type] message` 格式。
+
+`HTTPException` 在自定义端点处理器中同样有效 — 端点返回异常的状态码和相同的结构化错误体。
 
 可通过直接继承 `HTTPException` 支持自定义状态码：
 
@@ -822,6 +835,17 @@ class PaymentRequiredError(HTTPException):
     def __init__(self, detail, error_type="payment_required"):
         super().__init__(402, detail, error_type)
 ```
+
+#### 响应头
+
+每个 HTTP 响应（成功或错误）都携带：
+
+| 响应头 | 说明 |
+|--------|------|
+| `x-request-id` | 用于日志/追踪关联的请求 ID。客户端提供 `x-client-request-id`（1–512 ASCII 字符）时回显；否则生成 UUID v4。同一 ID 会传播到推理 worker 和回调。 |
+| `x-processing-time-ms` | 服务器端总处理时间（毫秒，墙钟）。 |
+
+框架层错误也已标准化：未知路由返回 404（`code: route_not_found`）、不支持的方法返回 405（`code: method_not_allowed`）、格式错误的 JSON 请求体返回 400（`code: invalid_request_body`）— 均为上述四字段格式。
 
 ### 性能
 
