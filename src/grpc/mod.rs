@@ -70,14 +70,22 @@ fn error_type_to_grpc_code(error_type: &str) -> tonic::Code {
     }
 }
 
-/// Extract (error_type, message) from a structured model error JSON payload.
-fn try_parse_model_error(
-    data: &serde_json::Value,
-) -> Option<(String, String)> {
+/// Parsed fields from a structured model error JSON payload.
+struct ParsedModelError {
+    error_type: String,
+    message: String,
+    code: Option<String>,
+    param: Option<String>,
+}
+
+/// Extract structured error fields from a model error JSON payload.
+fn try_parse_model_error(data: &serde_json::Value) -> Option<ParsedModelError> {
     let err = data.get("error")?;
     let error_type = err.get("type")?.as_str()?.to_string();
     let message = err.get("message")?.as_str()?.to_string();
-    Some((error_type, message))
+    let code = err.get("code").and_then(|c| c.as_str()).map(String::from);
+    let param = err.get("param").and_then(|p| p.as_str()).map(String::from);
+    Some(ParsedModelError { error_type, message, code, param })
 }
 
 /// Headers that must not be set by user code (RFC 7230 §6.1 hop-by-hop headers
@@ -223,9 +231,11 @@ impl LiteServer for GrpcService {
                         if let Ok(http_status) = msg.parse::<u16>() {
                             let data: serde_json::Value =
                                 serde_json::from_slice(&single.data).unwrap_or(serde_json::json!({}));
-                            let (error_type, error_message) =
-                                try_parse_model_error(&data)
-                                    .unwrap_or_else(|| ("model_error".into(), msg));
+                            let parsed = try_parse_model_error(&data);
+                            let error_type = parsed.as_ref()
+                                .map(|p| p.error_type.as_str()).unwrap_or("model_error");
+                            let error_message = parsed.as_ref()
+                                .map(|p| p.message.as_str()).unwrap_or(&msg);
                             return Err(Status::new(
                                 http_status_to_grpc_code(http_status),
                                 format!("[{}] {}", error_type, error_message),
@@ -462,10 +472,10 @@ impl LiteServer for GrpcService {
                     Some(pb::stream_response::Payload::Error(ref e)) => {
                         let grpc_err = match serde_json::from_str::<serde_json::Value>(&e.message) {
                             Ok(val) => {
-                                if let Some((error_type, error_message)) = try_parse_model_error(&val) {
+                                if let Some(parsed) = try_parse_model_error(&val) {
                                     Status::new(
-                                        error_type_to_grpc_code(&error_type),
-                                        format!("[{}] {}", error_type, error_message),
+                                        error_type_to_grpc_code(&parsed.error_type),
+                                        format!("[{}] {}", parsed.error_type, parsed.message),
                                     )
                                 } else {
                                     Status::internal(e.message.clone())
@@ -647,10 +657,10 @@ impl LiteServer for GrpcService {
                         };
                         let grpc_err = match serde_json::from_str::<serde_json::Value>(&e.message) {
                             Ok(val) => {
-                                if let Some((error_type, error_message)) = try_parse_model_error(&val) {
+                                if let Some(parsed) = try_parse_model_error(&val) {
                                     Status::new(
-                                        error_type_to_grpc_code(&error_type),
-                                        format!("[{}] {}", error_type, error_message),
+                                        error_type_to_grpc_code(&parsed.error_type),
+                                        format!("[{}] {}", parsed.error_type, parsed.message),
                                     )
                                 } else {
                                     Status::internal(e.message.clone())
@@ -748,14 +758,33 @@ mod tests {
         let data = serde_json::json!({
             "error": {
                 "type": "INVALID_INPUT",
-                "message": "input must be non-negative"
+                "message": "input must be non-negative",
+                "code": "invalid_input",
+                "param": "temperature",
             }
         });
         let result = try_parse_model_error(&data);
         assert!(result.is_some());
-        let (code, message) = result.unwrap();
-        assert_eq!(code, "INVALID_INPUT");
-        assert_eq!(message, "input must be non-negative");
+        let p = result.unwrap();
+        assert_eq!(p.error_type, "INVALID_INPUT");
+        assert_eq!(p.message, "input must be non-negative");
+        assert_eq!(p.code.as_deref(), Some("invalid_input"));
+        assert_eq!(p.param.as_deref(), Some("temperature"));
+    }
+
+    #[test]
+    fn test_try_parse_model_error_minimal() {
+        // Only required fields (type + message), no code/param — still valid
+        let data = serde_json::json!({
+            "error": {"type": "X", "message": "Y"}
+        });
+        let result = try_parse_model_error(&data);
+        assert!(result.is_some());
+        let p = result.unwrap();
+        assert_eq!(p.error_type, "X");
+        assert_eq!(p.message, "Y");
+        assert_eq!(p.code, None);
+        assert_eq!(p.param, None);
     }
 
     #[test]
