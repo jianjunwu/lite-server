@@ -6,10 +6,53 @@ use crate::proto::liteserver as pb;
 use crate::registry::types::ModelType;
 use crate::streaming;
 use axum::{
-    extract::{Extension, Multipart, Path, Query, State},
+    extract::{Multipart, Path, Query, State},
     response::{IntoResponse, Json, Response},
 };
 use axum::extract::ws::{Message, WebSocket};
+
+/// JSON body extractor that converts axum's plain-text `JsonRejection`
+/// into a standardized `AppError::InvalidRequestBody` response.
+pub struct ApiJson<T>(pub T);
+
+#[axum::async_trait]
+impl<S, T> axum::extract::FromRequest<S> for ApiJson<T>
+where
+    S: Send + Sync,
+    Json<T>: axum::extract::FromRequest<S, Rejection = axum::extract::rejection::JsonRejection>,
+{
+    type Rejection = AppError;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(ApiJson(value)),
+            Err(rejection) => Err(AppError::InvalidRequestBody(rejection.body_text())),
+        }
+    }
+}
+
+/// Query extractor that converts axum's plain-text `QueryRejection`
+/// into a standardized `AppError::InvalidQueryParam` response.
+pub struct ApiQuery<T>(pub T);
+
+#[axum::async_trait]
+impl<S, T> axum::extract::FromRequestParts<S> for ApiQuery<T>
+where
+    S: Send + Sync,
+    Query<T>: axum::extract::FromRequestParts<S, Rejection = axum::extract::rejection::QueryRejection>,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(value)) => Ok(ApiQuery(value)),
+            Err(rejection) => Err(AppError::InvalidQueryParam(rejection.body_text())),
+        }
+    }
+}
 use axum::http::header::{HeaderMap, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::response::sse::{Event, Sse};
 use serde::Deserialize;
@@ -99,7 +142,7 @@ pub async fn list_versions_handler(
 pub async fn model_ready_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
-    Query(query): Query<VersionQuery>,
+    ApiQuery(query): ApiQuery<VersionQuery>,
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     if let Some(ref v) = query.version {
@@ -120,7 +163,7 @@ pub async fn model_ready_handler(
 pub async fn model_health_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
-    Query(query): Query<VersionQuery>,
+    ApiQuery(query): ApiQuery<VersionQuery>,
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     if let Some(ref v) = query.version {
@@ -253,7 +296,7 @@ async fn scan_repository(repo_path: &std::path::Path) -> Vec<Value> {
 pub async fn load_model_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
-    Query(query): Query<VersionQuery>,
+    ApiQuery(query): ApiQuery<VersionQuery>,
 ) -> Result<Json<Value>, AppError> {
     let version = query.version.unwrap_or_else(|| "1".to_string());
     crate::validation::validate_identifier(&model_name)?;
@@ -288,7 +331,7 @@ pub async fn load_model_handler(
 pub async fn unload_model_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
-    Query(query): Query<VersionQuery>,
+    ApiQuery(query): ApiQuery<VersionQuery>,
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     if let Some(ref v) = query.version {
@@ -315,7 +358,7 @@ pub async fn unload_model_handler(
 pub async fn reload_model_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
-    Query(query): Query<VersionQuery>,
+    ApiQuery(query): ApiQuery<VersionQuery>,
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     if let Some(ref v) = query.version {
@@ -390,23 +433,23 @@ pub async fn infer_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
     headers: HeaderMap,
-    Extension(request_id): Extension<RequestId>,
-    Json(payload): Json<Value>,
+    RequestId(request_id): RequestId,
+    ApiJson(payload): ApiJson<Value>,
 ) -> Result<Response, AppError> {
     crate::validation::validate_identifier(&model_name)?;
-    do_infer(state, model_name, None, "/predict".to_string(), headers, payload, request_id.0).await
+    do_infer(state, model_name, None, "/predict".to_string(), headers, payload, request_id).await
 }
 
 pub async fn infer_version_handler(
     State(state): State<Arc<AppState>>,
     Path((model_name, version)): Path<(String, String)>,
     headers: HeaderMap,
-    Extension(request_id): Extension<RequestId>,
-    Json(payload): Json<Value>,
+    RequestId(request_id): RequestId,
+    ApiJson(payload): ApiJson<Value>,
 ) -> Result<Response, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
-    do_infer(state, model_name, Some(version), "/predict".to_string(), headers, payload, request_id.0).await
+    do_infer(state, model_name, Some(version), "/predict".to_string(), headers, payload, request_id).await
 }
 
 fn extract_client_ip(headers: &HeaderMap) -> String {
@@ -480,7 +523,7 @@ async fn do_infer(
 
     // Handle ensemble
     if mv.model_type == ModelType::Ensemble {
-        let result = crate::ensemble::execute_ensemble(state, &model_name, &resolved_version, payload).await?;
+        let result = crate::ensemble::execute_ensemble(state, &model_name, &resolved_version, payload, &request_id).await?;
         return Ok(Json(result).into_response());
     }
 
@@ -776,8 +819,8 @@ pub async fn sse_infer_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
     headers: HeaderMap,
-    Extension(request_id): Extension<RequestId>,
-    Json(payload): Json<Value>,
+    RequestId(request_id): RequestId,
+    ApiJson(payload): ApiJson<Value>,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     let resolved_version = resolve_version(&state, &model_name, None).await?;
@@ -789,15 +832,15 @@ pub async fn sse_infer_handler(
         )));
     }
 
-    sse_infer_impl(state, model_name, resolved_version, headers, payload, request_id.0).await
+    sse_infer_impl(state, model_name, resolved_version, headers, payload, request_id).await
 }
 
 pub async fn sse_infer_version_handler(
     State(state): State<Arc<AppState>>,
     Path((model_name, version)): Path<(String, String)>,
     headers: HeaderMap,
-    Extension(request_id): Extension<RequestId>,
-    Json(payload): Json<Value>,
+    RequestId(request_id): RequestId,
+    ApiJson(payload): ApiJson<Value>,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
@@ -810,7 +853,7 @@ pub async fn sse_infer_version_handler(
         )));
     }
 
-    sse_infer_impl(state, model_name, resolved_version, headers, payload, request_id.0).await
+    sse_infer_impl(state, model_name, resolved_version, headers, payload, request_id).await
 }
 
 async fn sse_infer_impl(
@@ -918,19 +961,19 @@ pub async fn ws_stream_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
     ws: axum::extract::WebSocketUpgrade,
-    Extension(request_id): Extension<RequestId>,
+    RequestId(request_id): RequestId,
 ) -> Response {
     if let Err(e) = crate::validation::validate_identifier(&model_name) {
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, socket, request_id.0))
+    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, socket, request_id))
 }
 
 pub async fn ws_stream_version_handler(
     State(state): State<Arc<AppState>>,
     Path((model_name, version)): Path<(String, String)>,
     ws: axum::extract::WebSocketUpgrade,
-    Extension(request_id): Extension<RequestId>,
+    RequestId(request_id): RequestId,
 ) -> Response {
     if let Err(e) = crate::validation::validate_identifier(&model_name) {
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
@@ -938,7 +981,7 @@ pub async fn ws_stream_version_handler(
     if let Err(e) = crate::validation::validate_version(&version) {
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), socket, request_id.0))
+    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), socket, request_id))
 }
 
 async fn handle_ws_stream(
@@ -1069,7 +1112,7 @@ async fn handle_ws_stream(
 
 pub async fn custom_endpoint_handler(
     State(state): State<Arc<AppState>>,
-    Extension(request_id): Extension<RequestId>,
+    RequestId(request_id): RequestId,
     request: axum::http::Request<axum::body::Body>,
 ) -> Result<Response, AppError> {
     let ep_mgr = match &state.endpoint_manager {
@@ -1198,7 +1241,7 @@ pub struct UploadQuery {
 pub async fn upload_model_handler(
     State(state): State<Arc<AppState>>,
     Path((model_name, version)): Path<(String, String)>,
-    Query(query): Query<UploadQuery>,
+    ApiQuery(query): ApiQuery<UploadQuery>,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
@@ -1325,7 +1368,7 @@ pub struct DownloadQuery {
 pub async fn download_model_handler(
     State(state): State<Arc<AppState>>,
     Path((model_name, version)): Path<(String, String)>,
-    Query(query): Query<DownloadQuery>,
+    ApiQuery(query): ApiQuery<DownloadQuery>,
 ) -> Result<Response, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
@@ -1502,7 +1545,7 @@ pub struct TimelineQuery {
 
 pub async fn timeline_model_handler(
     Path(model_name): Path<String>,
-    Query(query): Query<TimelineQuery>,
+    ApiQuery(query): ApiQuery<TimelineQuery>,
 ) -> Result<Json<Value>, AppError> {
     let version = query.version.unwrap_or_else(|| "1".to_string());
     crate::validation::validate_identifier(&model_name)?;
@@ -1867,5 +1910,84 @@ mod streaming_tests {
         assert_eq!(meta.route, "/custom");
         assert_eq!(meta.client_ip, "");
         assert_eq!(meta.request_id, "test-id-002");
+    }
+}
+
+#[cfg(test)]
+mod extractor_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    async fn read_error_body(response: Response) -> Value {
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        serde_json::from_slice(&body_bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_api_json_valid_body_passes() {
+        let app = axum::Router::new().route("/t", axum::routing::post(
+            |ApiJson(v): ApiJson<Value>| async move { v.to_string() }));
+
+        let response = app
+            .oneshot(Request::builder().uri("/t").method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"input": 1}"#)).unwrap())
+            .await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_api_json_malformed_body_standardized_error() {
+        let app = axum::Router::new().route("/t", axum::routing::post(
+            |ApiJson(v): ApiJson<Value>| async move { v.to_string() }));
+
+        let response = app
+            .oneshot(Request::builder().uri("/t").method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from("{not json")).unwrap())
+            .await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = read_error_body(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "invalid_request_body");
+        assert_eq!(body["error"]["param"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn test_api_json_missing_content_type_standardized_error() {
+        let app = axum::Router::new().route("/t", axum::routing::post(
+            |ApiJson(v): ApiJson<Value>| async move { v.to_string() }));
+
+        let response = app
+            .oneshot(Request::builder().uri("/t").method("POST")
+                .body(Body::from(r#"{"input": 1}"#)).unwrap())
+            .await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = read_error_body(response).await;
+        assert_eq!(body["error"]["code"], "invalid_request_body");
+    }
+
+    #[tokio::test]
+    async fn test_api_query_invalid_param_standardized_error() {
+        #[derive(serde::Deserialize)]
+        struct TestQuery { #[allow(dead_code)] flag: bool }
+
+        let app = axum::Router::new().route("/t", axum::routing::get(
+            |ApiQuery(q): ApiQuery<TestQuery>| async move { q.flag.to_string() }));
+
+        let response = app
+            .oneshot(Request::builder().uri("/t?flag=notabool").body(Body::empty()).unwrap())
+            .await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = read_error_body(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "invalid_query_param");
+        assert_eq!(body["error"]["param"], Value::Null);
     }
 }

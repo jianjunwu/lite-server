@@ -216,6 +216,7 @@ pub async fn execute_ensemble(
     model_name: &str,
     version: &str,
     payload: Value,
+    request_id: &str,
 ) -> Result<Value, AppError> {
     let model_dir = crate::validation::resolve_model_dir(
         &state.repo_path, model_name, version,
@@ -235,9 +236,10 @@ pub async fn execute_ensemble(
             let ctx = context.clone();
             let step = step.clone();
             let ensemble_name = model_name.to_string();
+            let request_id = request_id.to_string();
             futures.push(tokio::spawn(async move {
                 let start = Instant::now();
-                let result = execute_step(state, &step, &ctx).await;
+                let result = execute_step(state, &step, &ctx, &request_id).await;
                 let latency = start.elapsed().as_secs_f64();
                 crate::metrics::prometheus::record_ensemble_step_latency(
                     &ensemble_name, &step.name, &step.model, latency,
@@ -274,6 +276,7 @@ async fn execute_step(
     state: Arc<AppState>,
     step: &EnsembleStep,
     context: &HashMap<String, Value>,
+    request_id: &str,
 ) -> Result<Value, AppError> {
     // Resolve inputs
     let mut payload = serde_json::Map::new();
@@ -336,7 +339,9 @@ async fn execute_step(
         route: "/predict".to_string(),
         headers: HashMap::new(),
         client_ip: "".to_string(),
-        request_id: uid.clone(),
+        // Correlate sub-step requests with the client-facing request ID;
+        // the step-name suffix keeps each step uniquely identifiable.
+        request_id: format!("{}:{}", request_id, step.name),
         timestamp_ns: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

@@ -64,6 +64,11 @@ pub enum AppError {
     #[error("invalid request body: {0}")]
     InvalidRequestBody(String),
 
+    /// Query string could not be deserialized (axum extractor rejection).
+    /// The detail is client-facing for the same reason as InvalidRequestBody.
+    #[error("invalid query parameter: {0}")]
+    InvalidQueryParam(String),
+
     /// Model-initiated error with explicit HTTP status and client-facing message.
     /// Unlike WorkerCrashed, the message is NOT sanitized — the model author
     /// intentionally exposes it.
@@ -99,6 +104,7 @@ impl AppError {
             AppError::RouteNotFound => "route not found",
             AppError::MethodNotAllowed => "method not allowed",
             AppError::InvalidRequestBody(_) => "invalid request body",
+            AppError::InvalidQueryParam(_) => "invalid query parameter",
             // ModelError is handled specially in IntoResponse
             // and never reaches this point, but provide a fallback.
             AppError::ModelError { .. } => "model error",
@@ -111,6 +117,7 @@ impl AppError {
     fn client_message(&self) -> String {
         match self {
             AppError::InvalidRequestBody(detail) => detail.clone(),
+            AppError::InvalidQueryParam(detail) => detail.clone(),
             _ => self.pub_error_message().to_string(),
         }
     }
@@ -136,6 +143,7 @@ impl AppError {
             AppError::RouteNotFound => "route_not_found",
             AppError::MethodNotAllowed => "method_not_allowed",
             AppError::InvalidRequestBody(_) => "invalid_request_body",
+            AppError::InvalidQueryParam(_) => "invalid_query_param",
             // ModelError code comes from the Python worker; fallback to its error_type
             AppError::ModelError { code, error_type, .. } => {
                 code.as_deref().unwrap_or(error_type.as_str())
@@ -203,6 +211,7 @@ impl IntoResponse for AppError {
             AppError::RouteNotFound => (StatusCode::NOT_FOUND, "not_found_error"),
             AppError::MethodNotAllowed => (StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),
             AppError::InvalidRequestBody(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
+            AppError::InvalidQueryParam(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
             // Handled above via early return; should never reach here.
             AppError::ModelError { .. } => unreachable!(),
         };
@@ -518,10 +527,26 @@ mod tests {
         assert_eq!(body["error"]["param"], serde_json::Value::Null);
     }
 
+    #[tokio::test]
+    async fn test_invalid_query_param_passthrough_detail() {
+        use axum::response::IntoResponse;
+        let err = AppError::InvalidQueryParam(
+            "Failed to deserialize query string: invalid type".into());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "invalid_query_param");
+        assert!(body["error"]["message"].as_str().unwrap().contains("invalid type"));
+        assert_eq!(body["error"]["param"], serde_json::Value::Null);
+    }
+
     #[test]
     fn test_framework_error_codes() {
         assert_eq!(AppError::RouteNotFound.error_code(), "route_not_found");
         assert_eq!(AppError::MethodNotAllowed.error_code(), "method_not_allowed");
         assert_eq!(AppError::InvalidRequestBody("x".into()).error_code(), "invalid_request_body");
+        assert_eq!(AppError::InvalidQueryParam("x".into()).error_code(), "invalid_query_param");
     }
 }
