@@ -619,24 +619,37 @@ async fn do_infer(
                     // structured error body in `data`. Return it to the client
                     // without sanitization.
                     if let Ok(http_status) = msg.parse::<u16>() {
-                        let error_type = data
-                            .get("error")
+                        let err_obj = data.get("error");
+                        let error_type = err_obj
                             .and_then(|e| e.get("type"))
                             .and_then(|t| t.as_str())
                             .unwrap_or("model_error")
                             .to_string();
-                        let error_message = data
-                            .get("error")
+                        let error_message = err_obj
                             .and_then(|e| e.get("message"))
                             .and_then(|m| m.as_str())
                             .unwrap_or("model error")
                             .to_string();
+                        let error_code = err_obj
+                            .and_then(|e| e.get("code"))
+                            .and_then(|c| c.as_str())
+                            .map(|s| s.to_string());
+                        let error_param = err_obj
+                            .and_then(|e| e.get("param"))
+                            .and_then(|p| p.as_str())
+                            .map(|s| s.to_string());
                         let status_family = match http_status / 100 {
                             4 => "4xx",
                             _ => "5xx",
                         };
                         prometheus::record_request_end(&model_name, &resolved_version, status_family, duration).await;
-                        return Err(AppError::ModelError(http_status, error_type, error_message));
+                        return Err(AppError::ModelError {
+                            status_code: http_status,
+                            error_type,
+                            detail: error_message,
+                            code: error_code,
+                            param: error_param,
+                        });
                     }
 
                     // Not a numeric status code — internal worker error, sanitize.
