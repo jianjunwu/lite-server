@@ -798,19 +798,19 @@ class MyModel(LitAPI):
         return request
 ```
 
-| 异常类 | HTTP 状态码 | 默认 error_code |
+| 异常类 | HTTP 状态码 | 默认 error_type |
 |--------|------------|-----------------|
-| `BadRequestError` | 400 | `BAD_REQUEST` |
-| `UnauthorizedError` | 401 | `UNAUTHORIZED` |
-| `ForbiddenError` | 403 | `FORBIDDEN` |
-| `NotFoundError` | 404 | `NOT_FOUND` |
-| `InternalServerError` | 500 | `INTERNAL_ERROR` |
-| `ServiceUnavailableError` | 503 | `SERVICE_UNAVAILABLE` |
+| `BadRequestError` | 400 | `invalid_request_error` |
+| `UnauthorizedError` | 401 | `authentication_error` |
+| `ForbiddenError` | 403 | `permission_denied_error` |
+| `NotFoundError` | 404 | `not_found_error` |
+| `InternalServerError` | 500 | `server_error` |
+| `ServiceUnavailableError` | 503 | `service_unavailable` |
 
-所有异常类都接受自定义 `error_code` 作为第二个参数。客户端收到结构化响应：
+所有异常类都接受自定义 `error_type` 作为第二个参数。客户端收到结构化响应：
 
 ```json
-{"error": {"code": "INVALID_INPUT", "message": "input must be non-negative"}}
+{"error": {"type": "INVALID_INPUT", "message": "input must be non-negative"}}
 ```
 
 可通过直接继承 `HTTPException` 支持自定义状态码：
@@ -819,8 +819,8 @@ class MyModel(LitAPI):
 from lite_server.exceptions import HTTPException
 
 class PaymentRequiredError(HTTPException):
-    def __init__(self, detail, error_code="PAYMENT_REQUIRED"):
-        super().__init__(402, detail, error_code)
+    def __init__(self, detail, error_type="payment_required"):
+        super().__init__(402, detail, error_type)
 ```
 
 ### 性能

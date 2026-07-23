@@ -619,11 +619,11 @@ async fn do_infer(
                     // structured error body in `data`. Return it to the client
                     // without sanitization.
                     if let Ok(http_status) = msg.parse::<u16>() {
-                        let error_code = data
+                        let error_type = data
                             .get("error")
-                            .and_then(|e| e.get("code"))
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("MODEL_ERROR")
+                            .and_then(|e| e.get("type"))
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("model_error")
                             .to_string();
                         let error_message = data
                             .get("error")
@@ -636,7 +636,7 @@ async fn do_infer(
                             _ => "5xx",
                         };
                         prometheus::record_request_end(&model_name, &resolved_version, status_family, duration).await;
-                        return Err(AppError::ModelError(http_status, error_code, error_message));
+                        return Err(AppError::ModelError(http_status, error_type, error_message));
                     }
 
                     // Not a numeric status code — internal worker error, sanitize.
@@ -839,7 +839,7 @@ async fn sse_infer_impl(
                 Some(pb::stream_response::Payload::Error(e)) => {
                     // Try to parse as structured error from HTTPException
                     let event_data = match serde_json::from_str::<serde_json::Value>(&e.message) {
-                        Ok(val) if val.get("error").and_then(|err| err.get("code")).is_some() => {
+                        Ok(val) if val.get("error").and_then(|err| err.get("type")).is_some() => {
                             json!({"error": val["error"]}).to_string()
                         }
                         _ => json!({"error": e.message}).to_string(),
@@ -1005,7 +1005,7 @@ async fn handle_ws_stream(
                 Some(pb::stream_response::Payload::Error(e)) => {
                     // Try to parse as structured error from HTTPException
                     let event_data = match serde_json::from_str::<serde_json::Value>(&e.message) {
-                        Ok(val) if val.get("error").and_then(|err| err.get("code")).is_some() => {
+                        Ok(val) if val.get("error").and_then(|err| err.get("type")).is_some() => {
                             json!({"error": val["error"]}).to_string()
                         }
                         _ => json!({"error": e.message}).to_string(),

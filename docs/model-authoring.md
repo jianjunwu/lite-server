@@ -798,19 +798,19 @@ class MyModel(LitAPI):
         return request
 ```
 
-| Exception | HTTP Status | Default error_code |
+| Exception | HTTP Status | Default error_type |
 |-----------|-------------|--------------------|
-| `BadRequestError` | 400 | `BAD_REQUEST` |
-| `UnauthorizedError` | 401 | `UNAUTHORIZED` |
-| `ForbiddenError` | 403 | `FORBIDDEN` |
-| `NotFoundError` | 404 | `NOT_FOUND` |
-| `InternalServerError` | 500 | `INTERNAL_ERROR` |
-| `ServiceUnavailableError` | 503 | `SERVICE_UNAVAILABLE` |
+| `BadRequestError` | 400 | `invalid_request_error` |
+| `UnauthorizedError` | 401 | `authentication_error` |
+| `ForbiddenError` | 403 | `permission_denied_error` |
+| `NotFoundError` | 404 | `not_found_error` |
+| `InternalServerError` | 500 | `server_error` |
+| `ServiceUnavailableError` | 503 | `service_unavailable` |
 
-All accept a custom `error_code` as the second argument. The client receives a structured response:
+All accept a custom `error_type` as the second argument. The client receives a structured response:
 
 ```json
-{"error": {"code": "INVALID_INPUT", "message": "input must be non-negative"}}
+{"error": {"type": "INVALID_INPUT", "message": "input must be non-negative"}}
 ```
 
 Custom status codes are supported via subclassing `HTTPException` directly:
@@ -819,8 +819,8 @@ Custom status codes are supported via subclassing `HTTPException` directly:
 from lite_server.exceptions import HTTPException
 
 class PaymentRequiredError(HTTPException):
-    def __init__(self, detail, error_code="PAYMENT_REQUIRED"):
-        super().__init__(402, detail, error_code)
+    def __init__(self, detail, error_type="payment_required"):
+        super().__init__(402, detail, error_type)
 ```
 
 ### Performance

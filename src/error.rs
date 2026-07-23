@@ -54,7 +54,7 @@ pub enum AppError {
     /// Unlike WorkerCrashed, the message is NOT sanitized — the model author
     /// intentionally exposes it.
     #[error("model error ({0}): {2}")]
-    ModelError(u16, String, String),  // status_code, error_code, detail
+    ModelError(u16, String, String),  // status_code, error_type, detail
 }
 
 impl AppError {
@@ -87,52 +87,52 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         // Model errors carry a model-author-facing message — return it
         // directly without sanitization.
-        if let AppError::ModelError(status_code, error_code, message) = &self {
+        if let AppError::ModelError(status_code, error_type, message) = &self {
             let status = StatusCode::from_u16(*status_code)
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             // Log at info level — not a server fault, the model intentionally
             // rejected the request.
             tracing::info!(
                 status = %status_code,
-                error_code = %error_code,
+                error_type = %error_type,
                 detail = %message,
                 "model error"
             );
             let body = Json(json!({
                 "error": {
-                    "code": error_code,
+                    "type": error_type,
                     "message": message,
                 }
             }));
             return (status, body).into_response();
         }
 
-        let (status, code) = match &self {
-            AppError::ModelNotFound(_) => (StatusCode::NOT_FOUND, "MODEL_NOT_FOUND"),
-            AppError::ModelNotReady(_) => (StatusCode::SERVICE_UNAVAILABLE, "MODEL_NOT_READY"),
-            AppError::VersionNotFound(_, _) => (StatusCode::NOT_FOUND, "VERSION_NOT_FOUND"),
-            AppError::InferenceTimeout(_) => (StatusCode::GATEWAY_TIMEOUT, "INFERENCE_TIMEOUT"),
-            AppError::QueueFull(_) => (StatusCode::SERVICE_UNAVAILABLE, "QUEUE_FULL"),
-            AppError::WorkerCrashed(_) => (StatusCode::INTERNAL_SERVER_ERROR, "WORKER_CRASHED"),
-            AppError::Validation(_) => (StatusCode::BAD_REQUEST, "VALIDATION_ERROR"),
-            AppError::Config(_) => (StatusCode::BAD_REQUEST, "CONFIG_ERROR"),
-            AppError::Transport(_) => (StatusCode::INTERNAL_SERVER_ERROR, "TRANSPORT_ERROR"),
-            AppError::Python(_) => (StatusCode::INTERNAL_SERVER_ERROR, "PYTHON_ERROR"),
-            AppError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "IO_ERROR"),
-            AppError::Serialization(_) => (StatusCode::BAD_REQUEST, "SERIALIZATION_ERROR"),
-            AppError::FrameTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "FRAME_TOO_LARGE"),
-            AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
+        let (status, error_type) = match &self {
+            AppError::ModelNotFound(_) => (StatusCode::NOT_FOUND, "not_found_error"),
+            AppError::ModelNotReady(_) => (StatusCode::SERVICE_UNAVAILABLE, "model_not_ready"),
+            AppError::VersionNotFound(_, _) => (StatusCode::NOT_FOUND, "not_found_error"),
+            AppError::InferenceTimeout(_) => (StatusCode::GATEWAY_TIMEOUT, "server_error"),
+            AppError::QueueFull(_) => (StatusCode::SERVICE_UNAVAILABLE, "queue_full"),
+            AppError::WorkerCrashed(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+            AppError::Validation(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
+            AppError::Config(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
+            AppError::Transport(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+            AppError::Python(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+            AppError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+            AppError::Serialization(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
+            AppError::FrameTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error"),
+            AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
             // Handled above via early return; should never reach here.
             AppError::ModelError(..) => unreachable!(),
         };
 
         // Log full internal details for operational debugging.
         // The sanitized message is what goes to the client.
-        tracing::error!(error_code = %code, detail = %self.to_string(), "request error");
+        tracing::error!(error_type = %error_type, detail = %self.to_string(), "request error");
 
         let body = Json(json!({
             "error": {
-                "code": code,
+                "type": error_type,
                 "message": self.pub_error_message(),
             }
         }));
@@ -267,7 +267,7 @@ mod tests {
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(body["error"]["code"], "INVALID_INPUT");
+        assert_eq!(body["error"]["type"], "INVALID_INPUT");
         assert_eq!(body["error"]["message"], "input must be non-negative");
     }
 
@@ -304,7 +304,7 @@ mod tests {
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(body["error"]["code"], "WORKER_CRASHED");
+        assert_eq!(body["error"]["type"], "server_error");
         // Must NOT leak internal details
         assert!(body["error"]["message"].as_str().unwrap().contains("unavailable"));
         assert!(!body["error"]["message"].as_str().unwrap().contains("traceback"));

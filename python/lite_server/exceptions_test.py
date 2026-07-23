@@ -17,12 +17,12 @@ class TestHTTPException:
         e = HTTPException(400, "test msg", "TEST_CODE")
         assert e.status_code == 400
         assert e.detail == "test msg"
-        assert e.error_code == "TEST_CODE"
+        assert e.error_type == "TEST_CODE"
         assert str(e) == "test msg"
 
-    def test_default_error_code(self):
+    def test_default_error_type(self):
         e = HTTPException(418, "im a teapot")
-        assert e.error_code == "MODEL_ERROR"
+        assert e.error_type == "model_error"
 
     def test_str_returns_detail(self):
         e = HTTPException(500, "something broke")
@@ -33,44 +33,44 @@ class TestSubclassDefaults:
     def test_bad_request(self):
         e = BadRequestError("bad input")
         assert e.status_code == 400
-        assert e.error_code == "BAD_REQUEST"
+        assert e.error_type == "invalid_request_error"
         assert isinstance(e, HTTPException)
 
-    def test_bad_request_custom_code(self):
-        e = BadRequestError("bad input", "INVALID_INPUT")
+    def test_bad_request_custom_type(self):
+        e = BadRequestError("bad input", "invalid_input")
         assert e.status_code == 400
-        assert e.error_code == "INVALID_INPUT"
+        assert e.error_type == "invalid_input"
 
     def test_unauthorized(self):
         e = UnauthorizedError("token expired")
         assert e.status_code == 401
-        assert e.error_code == "UNAUTHORIZED"
+        assert e.error_type == "authentication_error"
 
     def test_forbidden(self):
         e = ForbiddenError("access denied")
         assert e.status_code == 403
-        assert e.error_code == "FORBIDDEN"
+        assert e.error_type == "permission_denied_error"
 
     def test_not_found(self):
         e = NotFoundError("item not in vocab")
         assert e.status_code == 404
-        assert e.error_code == "NOT_FOUND"
+        assert e.error_type == "not_found_error"
 
     def test_internal_server_error(self):
         e = InternalServerError("gpu oom")
         assert e.status_code == 500
-        assert e.error_code == "INTERNAL_ERROR"
+        assert e.error_type == "server_error"
 
     def test_internal_server_error_defaults(self):
         e = InternalServerError()
         assert e.status_code == 500
-        assert e.error_code == "INTERNAL_ERROR"
+        assert e.error_type == "server_error"
         assert e.detail == "internal server error"
 
     def test_service_unavailable(self):
         e = ServiceUnavailableError("model loading")
         assert e.status_code == 503
-        assert e.error_code == "SERVICE_UNAVAILABLE"
+        assert e.error_type == "service_unavailable"
 
     def test_service_unavailable_defaults(self):
         e = ServiceUnavailableError()
@@ -132,10 +132,10 @@ class TestCustomSubclass:
 
     def test_custom_status_code(self):
         class PaymentRequiredError(HTTPException):
-            def __init__(self, detail, error_code="PAYMENT_REQUIRED"):
-                super().__init__(402, detail, error_code)
+            def __init__(self, detail, error_type="payment_required"):
+                super().__init__(402, detail, error_type)
 
         e = PaymentRequiredError("need payment")
         assert e.status_code == 402
-        assert e.error_code == "PAYMENT_REQUIRED"
+        assert e.error_type == "payment_required"
         assert isinstance(e, HTTPException)

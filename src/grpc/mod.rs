@@ -58,26 +58,26 @@ fn http_status_to_grpc_code(http_status: u16) -> tonic::Code {
     }
 }
 
-/// Map an error_code string (from a structured stream error) to a gRPC code.
-fn error_code_to_grpc_code(code: &str) -> tonic::Code {
-    match code {
-        "BAD_REQUEST" | "INVALID_INPUT" | "VALIDATION_ERROR" => tonic::Code::InvalidArgument,
-        "UNAUTHORIZED" => tonic::Code::Unauthenticated,
-        "FORBIDDEN" => tonic::Code::PermissionDenied,
-        "NOT_FOUND" => tonic::Code::NotFound,
-        "SERVICE_UNAVAILABLE" | "MODEL_NOT_READY" => tonic::Code::Unavailable,
+/// Map an error_type string (from a structured stream error) to a gRPC code.
+fn error_type_to_grpc_code(error_type: &str) -> tonic::Code {
+    match error_type {
+        "invalid_request_error" => tonic::Code::InvalidArgument,
+        "authentication_error" => tonic::Code::Unauthenticated,
+        "permission_denied_error" => tonic::Code::PermissionDenied,
+        "not_found_error" => tonic::Code::NotFound,
+        "service_unavailable" | "model_not_ready" => tonic::Code::Unavailable,
         _ => tonic::Code::Internal,
     }
 }
 
-/// Extract (error_code, message) from a structured model error JSON payload.
+/// Extract (error_type, message) from a structured model error JSON payload.
 fn try_parse_model_error(
     data: &serde_json::Value,
 ) -> Option<(String, String)> {
     let err = data.get("error")?;
-    let code = err.get("code")?.as_str()?.to_string();
+    let error_type = err.get("type")?.as_str()?.to_string();
     let message = err.get("message")?.as_str()?.to_string();
-    Some((code, message))
+    Some((error_type, message))
 }
 
 /// Headers that must not be set by user code (RFC 7230 §6.1 hop-by-hop headers
@@ -223,12 +223,12 @@ impl LiteServer for GrpcService {
                         if let Ok(http_status) = msg.parse::<u16>() {
                             let data: serde_json::Value =
                                 serde_json::from_slice(&single.data).unwrap_or(serde_json::json!({}));
-                            let (error_code, error_message) =
+                            let (error_type, error_message) =
                                 try_parse_model_error(&data)
-                                    .unwrap_or_else(|| ("MODEL_ERROR".into(), msg));
+                                    .unwrap_or_else(|| ("model_error".into(), msg));
                             return Err(Status::new(
                                 http_status_to_grpc_code(http_status),
-                                format!("[{}] {}", error_code, error_message),
+                                format!("[{}] {}", error_type, error_message),
                             ));
                         }
                         // Not a numeric status code — internal worker error.
@@ -462,10 +462,10 @@ impl LiteServer for GrpcService {
                     Some(pb::stream_response::Payload::Error(ref e)) => {
                         let grpc_err = match serde_json::from_str::<serde_json::Value>(&e.message) {
                             Ok(val) => {
-                                if let Some((error_code, error_message)) = try_parse_model_error(&val) {
+                                if let Some((error_type, error_message)) = try_parse_model_error(&val) {
                                     Status::new(
-                                        error_code_to_grpc_code(&error_code),
-                                        format!("[{}] {}", error_code, error_message),
+                                        error_type_to_grpc_code(&error_type),
+                                        format!("[{}] {}", error_type, error_message),
                                     )
                                 } else {
                                     Status::internal(e.message.clone())
@@ -647,10 +647,10 @@ impl LiteServer for GrpcService {
                         };
                         let grpc_err = match serde_json::from_str::<serde_json::Value>(&e.message) {
                             Ok(val) => {
-                                if let Some((error_code, error_message)) = try_parse_model_error(&val) {
+                                if let Some((error_type, error_message)) = try_parse_model_error(&val) {
                                     Status::new(
-                                        error_code_to_grpc_code(&error_code),
-                                        format!("[{}] {}", error_code, error_message),
+                                        error_type_to_grpc_code(&error_type),
+                                        format!("[{}] {}", error_type, error_message),
                                     )
                                 } else {
                                     Status::internal(e.message.clone())
@@ -732,24 +732,22 @@ mod tests {
     }
 
     #[test]
-    fn test_error_code_to_grpc_code() {
-        assert_eq!(error_code_to_grpc_code("BAD_REQUEST"), tonic::Code::InvalidArgument);
-        assert_eq!(error_code_to_grpc_code("INVALID_INPUT"), tonic::Code::InvalidArgument);
-        assert_eq!(error_code_to_grpc_code("VALIDATION_ERROR"), tonic::Code::InvalidArgument);
-        assert_eq!(error_code_to_grpc_code("UNAUTHORIZED"), tonic::Code::Unauthenticated);
-        assert_eq!(error_code_to_grpc_code("FORBIDDEN"), tonic::Code::PermissionDenied);
-        assert_eq!(error_code_to_grpc_code("NOT_FOUND"), tonic::Code::NotFound);
-        assert_eq!(error_code_to_grpc_code("SERVICE_UNAVAILABLE"), tonic::Code::Unavailable);
-        assert_eq!(error_code_to_grpc_code("MODEL_NOT_READY"), tonic::Code::Unavailable);
+    fn test_error_type_to_grpc_code() {
+        assert_eq!(error_type_to_grpc_code("invalid_request_error"), tonic::Code::InvalidArgument);
+        assert_eq!(error_type_to_grpc_code("authentication_error"), tonic::Code::Unauthenticated);
+        assert_eq!(error_type_to_grpc_code("permission_denied_error"), tonic::Code::PermissionDenied);
+        assert_eq!(error_type_to_grpc_code("not_found_error"), tonic::Code::NotFound);
+        assert_eq!(error_type_to_grpc_code("service_unavailable"), tonic::Code::Unavailable);
+        assert_eq!(error_type_to_grpc_code("model_not_ready"), tonic::Code::Unavailable);
         // Unknown falls back to Internal
-        assert_eq!(error_code_to_grpc_code("UNKNOWN_CODE"), tonic::Code::Internal);
+        assert_eq!(error_type_to_grpc_code("UNKNOWN_CODE"), tonic::Code::Internal);
     }
 
     #[test]
     fn test_try_parse_model_error_valid() {
         let data = serde_json::json!({
             "error": {
-                "code": "INVALID_INPUT",
+                "type": "INVALID_INPUT",
                 "message": "input must be non-negative"
             }
         });
@@ -770,7 +768,7 @@ mod tests {
 
     #[test]
     fn test_try_parse_model_error_missing_fields() {
-        let data = serde_json::json!({"error": {"code": "X"}});
+        let data = serde_json::json!({"error": {"type": "X"}});
         assert!(try_parse_model_error(&data).is_none());
 
         let data = serde_json::json!({"error": {"message": "X"}});

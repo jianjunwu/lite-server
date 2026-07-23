@@ -423,7 +423,7 @@ class TestOuterHandlerErrorTraceback:
         assert resp.uid == "err-sync"
         assert resp.single.status.code == "Error"
         assert resp.single.status.message == "500"
-        assert json.loads(resp.single.data)["error"]["code"] == "INTERNAL_ERROR"
+        assert json.loads(resp.single.data)["error"]["type"] == "server_error"
 
     def test_async_loop_logs_traceback_once_at_error(self, caplog):
         import asyncio
@@ -487,7 +487,7 @@ class TestOuterHandlerErrorTraceback:
         assert resp.uid == "err-async"
         assert resp.single.status.code == "Error"
         assert resp.single.status.message == "500"
-        assert json.loads(resp.single.data)["error"]["code"] == "INTERNAL_ERROR"
+        assert json.loads(resp.single.data)["error"]["type"] == "server_error"
 
     def test_cb_loop_logs_step_failure_as_one_error_line(self, caplog):
         """Continuous-batching step() failure must also be one ERROR line."""
@@ -575,11 +575,11 @@ class TestMakeErrorResponse:
         resp = inference._make_error_response("uid-1", "something broke")
         assert resp.uid == "uid-1"
         assert resp.single.status.code == "Error"
-        # Default (no explicit status_code) is a structured 500 INTERNAL_ERROR
+        # Default (no explicit status_code) is a structured 500 server_error
         # so the client sees the real error instead of a sanitized WORKER_CRASHED.
         assert resp.single.status.message == "500"
         body = json.loads(resp.single.data)
-        assert body["error"]["code"] == "INTERNAL_ERROR"
+        assert body["error"]["type"] == "server_error"
         assert body["error"]["message"] == "something broke"
 
 
@@ -1084,7 +1084,7 @@ class TestAsyncLoop:
         assert resp.single.status.code == "Error"
         assert resp.single.status.message == "500"
         body = json.loads(resp.single.data)
-        assert body["error"]["code"] == "INTERNAL_ERROR"
+        assert body["error"]["type"] == "server_error"
         assert "boom" in body["error"]["message"]
 
     def test_async_stream_with_async_generator(self):
@@ -1407,7 +1407,7 @@ class TestAsyncLoop:
         assert resp.single.status.code == "Error"
         assert resp.single.status.message == "500"
         body = json.loads(resp.single.data)
-        assert body["error"]["code"] == "INTERNAL_ERROR"
+        assert body["error"]["type"] == "server_error"
         assert "Protobuf parse" in body["error"]["message"]
 
     def test_async_batch_partial_failure(self):
@@ -3870,7 +3870,7 @@ class TestStandardLoopNonStreaming:
         assert resp.single.status.code == "Error"
         assert resp.single.status.message == "500"
         body = json.loads(resp.single.data)
-        assert body["error"]["code"] == "INTERNAL_ERROR"
+        assert body["error"]["type"] == "server_error"
         assert "predict boom" in body["error"]["message"]
 
     def test_standard_batch_partial_failure(self):
@@ -3979,7 +3979,7 @@ class TestAsyncLoopNonStreaming:
         assert resp.single.status.code == "Error"
         assert resp.single.status.message == "500"
         body = json.loads(resp.single.data)
-        assert body["error"]["code"] == "INTERNAL_ERROR"
+        assert body["error"]["type"] == "server_error"
         assert "async predict boom" in body["error"]["message"]
 
     def test_async_batch_partial_failure(self):
