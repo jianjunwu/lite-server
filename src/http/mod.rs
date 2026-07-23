@@ -37,6 +37,12 @@ async fn disable_keepalive_middleware(request: Request, next: Next) -> Response 
 #[derive(Clone, Debug)]
 pub struct RequestId(pub String);
 
+impl std::fmt::Display for RequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// Middleware that injects `x-request-id` and `x-processing-time-ms` into
 /// every response. Reads client-supplied `x-client-request-id` (max 512 ASCII
 /// chars); falls back to UUID v4.

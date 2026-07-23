@@ -1,11 +1,12 @@
 use crate::error::AppError;
 use crate::http::state::AppState;
+use crate::http::RequestId;
 use crate::metrics::prometheus;
 use crate::proto::liteserver as pb;
 use crate::registry::types::ModelType;
 use crate::streaming;
 use axum::{
-    extract::{Multipart, Path, Query, State},
+    extract::{Extension, Multipart, Path, Query, State},
     response::{IntoResponse, Json, Response},
 };
 use axum::extract::ws::{Message, WebSocket};
@@ -389,21 +390,23 @@ pub async fn infer_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
     headers: HeaderMap,
+    Extension(request_id): Extension<RequestId>,
     Json(payload): Json<Value>,
 ) -> Result<Response, AppError> {
     crate::validation::validate_identifier(&model_name)?;
-    do_infer(state, model_name, None, "/predict".to_string(), headers, payload).await
+    do_infer(state, model_name, None, "/predict".to_string(), headers, payload, request_id.0).await
 }
 
 pub async fn infer_version_handler(
     State(state): State<Arc<AppState>>,
     Path((model_name, version)): Path<(String, String)>,
     headers: HeaderMap,
+    Extension(request_id): Extension<RequestId>,
     Json(payload): Json<Value>,
 ) -> Result<Response, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
-    do_infer(state, model_name, Some(version), "/predict".to_string(), headers, payload).await
+    do_infer(state, model_name, Some(version), "/predict".to_string(), headers, payload, request_id.0).await
 }
 
 fn extract_client_ip(headers: &HeaderMap) -> String {
@@ -452,8 +455,8 @@ async fn do_infer(
     route: String,
     headers: HeaderMap,
     payload: Value,
+    request_id: String,
 ) -> Result<Response, AppError> {
-    let request_id = Uuid::new_v4().to_string();
     let span = tracing::info_span!(
         "inference",
         model = %model_name,
@@ -703,13 +706,12 @@ async fn resolve_version(
     }
 }
 
-fn build_request_meta(headers: &HeaderMap, payload: &Value, route: &str) -> pb::RequestMeta {
+fn build_request_meta(headers: &HeaderMap, payload: &Value, route: &str, request_id: String) -> pb::RequestMeta {
     let header_map: HashMap<String, String> = headers
         .iter()
         .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), s.to_string())))
         .collect();
     let client_ip = extract_client_ip(headers);
-    let request_id = Uuid::new_v4().to_string();
     let timestamp_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -774,6 +776,7 @@ pub async fn sse_infer_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
     headers: HeaderMap,
+    Extension(request_id): Extension<RequestId>,
     Json(payload): Json<Value>,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
@@ -786,13 +789,14 @@ pub async fn sse_infer_handler(
         )));
     }
 
-    sse_infer_impl(state, model_name, resolved_version, headers, payload).await
+    sse_infer_impl(state, model_name, resolved_version, headers, payload, request_id.0).await
 }
 
 pub async fn sse_infer_version_handler(
     State(state): State<Arc<AppState>>,
     Path((model_name, version)): Path<(String, String)>,
     headers: HeaderMap,
+    Extension(request_id): Extension<RequestId>,
     Json(payload): Json<Value>,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
@@ -806,7 +810,7 @@ pub async fn sse_infer_version_handler(
         )));
     }
 
-    sse_infer_impl(state, model_name, resolved_version, headers, payload).await
+    sse_infer_impl(state, model_name, resolved_version, headers, payload, request_id.0).await
 }
 
 async fn sse_infer_impl(
@@ -815,9 +819,10 @@ async fn sse_infer_impl(
     resolved_version: String,
     headers: HeaderMap,
     payload: Value,
+    request_id: String,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, AppError> {
 
-    let meta = build_request_meta(&headers, &payload, "/predict");
+    let meta = build_request_meta(&headers, &payload, "/predict", request_id);
     let payload_bytes = meta.payload.clone();
     let (stream_id, mut chunk_rx) = open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await?;
 
@@ -913,17 +918,19 @@ pub async fn ws_stream_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
     ws: axum::extract::WebSocketUpgrade,
+    Extension(request_id): Extension<RequestId>,
 ) -> Response {
     if let Err(e) = crate::validation::validate_identifier(&model_name) {
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, socket))
+    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, socket, request_id.0))
 }
 
 pub async fn ws_stream_version_handler(
     State(state): State<Arc<AppState>>,
     Path((model_name, version)): Path<(String, String)>,
     ws: axum::extract::WebSocketUpgrade,
+    Extension(request_id): Extension<RequestId>,
 ) -> Response {
     if let Err(e) = crate::validation::validate_identifier(&model_name) {
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
@@ -931,7 +938,7 @@ pub async fn ws_stream_version_handler(
     if let Err(e) = crate::validation::validate_version(&version) {
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), socket))
+    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), socket, request_id.0))
 }
 
 async fn handle_ws_stream(
@@ -939,6 +946,7 @@ async fn handle_ws_stream(
     model_name: String,
     version: Option<String>,
     mut socket: WebSocket,
+    request_id: String,
 ) {
     let resolved_version = match resolve_version(&state, &model_name, version).await {
         Ok(v) => v,
@@ -973,7 +981,7 @@ async fn handle_ws_stream(
     };
 
     let headers = HeaderMap::new();
-    let meta = build_request_meta(&headers, &payload, "/predict");
+    let meta = build_request_meta(&headers, &payload, "/predict", request_id);
     let payload_bytes = meta.payload.clone();
 
     let (stream_id, mut chunk_rx) = match open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await {
@@ -1061,6 +1069,7 @@ async fn handle_ws_stream(
 
 pub async fn custom_endpoint_handler(
     State(state): State<Arc<AppState>>,
+    Extension(request_id): Extension<RequestId>,
     request: axum::http::Request<axum::body::Body>,
 ) -> Result<Response, AppError> {
     let ep_mgr = match &state.endpoint_manager {
@@ -1071,7 +1080,6 @@ pub async fn custom_endpoint_handler(
     let route = request.uri().path().to_string();
     let method = request.method().to_string();
 
-    let request_id = Uuid::new_v4().to_string();
     let span = tracing::info_span!(
         "endpoint_request",
         route = %route,
@@ -1121,7 +1129,7 @@ pub async fn custom_endpoint_handler(
     let snapshot = ep_mgr.build_snapshot().await;
 
     let req = crate::worker::protocol::EndpointRequest {
-        request_id: Uuid::new_v4().to_string(),
+        request_id: request_id.to_string(),
         route,
         method,
         headers,
@@ -1841,8 +1849,9 @@ mod streaming_tests {
         let headers = HeaderMap::new();
         let payload = serde_json::json!({"prompt": "hello", "max_tokens": 100});
         let direct_bytes = bytes::Bytes::from(serde_json::to_vec(&payload).unwrap_or_default());
+        let request_id = "test-id-001".to_string();
 
-        let meta = build_request_meta(&headers, &payload, "/predict");
+        let meta = build_request_meta(&headers, &payload, "/predict", request_id);
 
         assert_eq!(meta.payload, direct_bytes,
             "meta.payload should equal direct serde_json::to_vec output");
@@ -1852,10 +1861,11 @@ mod streaming_tests {
     fn test_build_request_meta_returns_correct_route() {
         let headers = HeaderMap::new();
         let payload = serde_json::json!({"x": 1});
-        let meta = build_request_meta(&headers, &payload, "/custom");
+        let request_id = "test-id-002".to_string();
+        let meta = build_request_meta(&headers, &payload, "/custom", request_id);
 
         assert_eq!(meta.route, "/custom");
         assert_eq!(meta.client_ip, "");
-        assert!(!meta.request_id.is_empty());
+        assert_eq!(meta.request_id, "test-id-002");
     }
 }
