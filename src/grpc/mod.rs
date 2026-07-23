@@ -71,6 +71,7 @@ fn error_type_to_grpc_code(error_type: &str) -> tonic::Code {
 }
 
 /// Parsed fields from a structured model error JSON payload.
+#[allow(dead_code)]
 struct ParsedModelError {
     error_type: String,
     message: String,

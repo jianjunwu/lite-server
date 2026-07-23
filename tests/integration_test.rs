@@ -545,6 +545,131 @@ async fn test_custom_endpoint_status() {
 }
 
 // ---------------------------------------------------------------------------
+// API Response Standardization — error body + observability headers
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn test_error_response_format() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    // POST to a nonexistent model — should get structured error
+    let resp = client
+        .post(&format!("{}/v2/models/nonexistent_model/infer", base))
+        .json(&json!({"input": 1}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 404);
+
+    // Verify response headers
+    assert!(resp.headers().get("x-request-id").is_some(),
+        "x-request-id must be present on error responses");
+    assert!(resp.headers().get("x-processing-time-ms").is_some(),
+        "x-processing-time-ms must be present on error responses");
+
+    // Verify error body: type, message, code, param
+    let body: Value = resp.json().await.unwrap();
+    let err = &body["error"];
+    assert!(err.is_object(), "error should be an object, got: {:?}", err);
+    assert_eq!(err["type"], "not_found_error");
+    assert!(err["message"].as_str().unwrap().len() > 0);
+    assert_eq!(err["code"], "model_not_found");
+    assert!(err["param"].is_null(),
+        "param should be null but was {}", err["param"]);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_observability_headers_on_success() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(&format!("{}/health", base))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get("x-request-id").is_some(),
+        "x-request-id must be present on success responses");
+    assert!(resp.headers().get("x-processing-time-ms").is_some(),
+        "x-processing-time-ms must be present on success responses");
+    // x-processing-time-ms should be a non-negative integer
+    let ms = resp.headers().get("x-processing-time-ms").unwrap().to_str().unwrap();
+    assert!(ms.parse::<u64>().is_ok(),
+        "x-processing-time-ms should be a u64, got: {}", ms);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_x_client_request_id_propagation() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+    let trace_id = "integration-test-001";
+
+    let resp = client
+        .get(&format!("{}/health", base))
+        .header("x-client-request-id", trace_id)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("x-request-id").unwrap().to_str().unwrap(),
+        trace_id,
+        "x-request-id should echo x-client-request-id"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_infer_error_response_has_code_and_param() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    // Load model first so the model route is active
+    load_model(&base, MODEL, "1").await;
+
+    // Send invalid JSON to trigger a model-level validation error
+    let resp = client
+        .post(&format!("{}/v2/models/{}/infer", base, MODEL))
+        .json(&json!({"input": null}))
+        .send()
+        .await
+        .unwrap();
+
+    // Save headers before consuming body
+    let has_x_request_id = resp.headers().get("x-request-id").is_some();
+    let has_x_processing_time = resp.headers().get("x-processing-time-ms").is_some();
+    let is_error = !resp.status().is_success();
+
+    // Read body — may succeed (model just returns null) or fail
+    let body: Value = resp.json().await.unwrap();
+
+    if is_error {
+        if let Some(err) = body.get("error") {
+            // Error body must have code and param fields
+            assert!(err.get("code").is_some(),
+                "error must have code field: {:?}", err);
+            // param should be present (at least null)
+            assert!(err.get("param").is_some(),
+                "error must have param field: {:?}", err);
+        }
+    }
+
+    // Headers must be present on any response
+    assert!(has_x_request_id, "x-request-id must be present");
+    assert!(has_x_processing_time, "x-processing-time-ms must be present");
+
+    unload_model(&base, MODEL, "1").await;
+}
+
+// ---------------------------------------------------------------------------
 // Hot reload (separate server with temp dir)
 // ---------------------------------------------------------------------------
 

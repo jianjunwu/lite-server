@@ -145,18 +145,12 @@ impl IntoResponse for AppError {
                 detail = %detail,
                 "model error"
             );
-            let mut error_obj = json!({
+            let error_obj = json!({
                 "type": error_type,
                 "message": detail,
+                "code": code,
+                "param": param,
             });
-            if let Some(c) = code {
-                error_obj["code"] = json!(c);
-            }
-            if let Some(p) = param {
-                error_obj["param"] = json!(p);
-            } else {
-                error_obj["param"] = json!(null);
-            }
             let body = Json(json!({ "error": error_obj }));
             return (status, body).into_response();
         }
