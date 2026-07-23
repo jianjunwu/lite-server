@@ -582,6 +582,40 @@ class TestMakeErrorResponse:
         assert body["error"]["type"] == "server_error"
         assert body["error"]["message"] == "something broke"
 
+    def test_error_response_with_code_and_param(self):
+        resp = inference._make_error_response(
+            "uid-1", "bad input", status_code=400,
+            error_type="invalid_request_error",
+            code="invalid_input", param="temperature")
+        body = json.loads(resp.single.data)
+        assert body["error"]["code"] == "invalid_input"
+        assert body["error"]["param"] == "temperature"
+
+    def test_error_response_code_param_always_present(self):
+        # Four-field error body contract: code/param are always present,
+        # null when not set — same shape as the Rust HTTP error responses.
+        resp = inference._make_error_response("uid-1", "boom")
+        body = json.loads(resp.single.data)
+        assert body["error"]["code"] is None
+        assert body["error"]["param"] is None
+
+
+class TestMakeStreamError:
+    def test_stream_error_with_code_and_param(self):
+        resp = inference._make_stream_error(
+            "sid-1", "bad input", error_type="invalid_request_error",
+            code="invalid_input", param="temperature")
+        body = json.loads(resp.stream.error.message)
+        assert body["error"]["type"] == "invalid_request_error"
+        assert body["error"]["code"] == "invalid_input"
+        assert body["error"]["param"] == "temperature"
+
+    def test_stream_error_code_param_always_present(self):
+        resp = inference._make_stream_error("sid-1", "boom", error_type="server_error")
+        body = json.loads(resp.stream.error.message)
+        assert body["error"]["code"] is None
+        assert body["error"]["param"] is None
+
 
 class TestMetaFromProto:
     def test_decodes_meta(self):

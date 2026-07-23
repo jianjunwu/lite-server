@@ -278,11 +278,14 @@ def _make_error_response(uid: str, message: str,
         status_code = 500
         if error_type is None:
             error_type = "server_error"
-    error_dict: dict = {"type": error_type or "model_error", "message": message}
-    if code is not None:
-        error_dict["code"] = code
-    if param is not None:
-        error_dict["param"] = param
+    # Four-field error body contract: code/param are always present (null
+    # when unset), matching the Rust HTTP error response shape.
+    error_dict: dict = {
+        "type": error_type or "model_error",
+        "message": message,
+        "code": code,
+        "param": param,
+    }
     data = json.dumps({"error": error_dict}).encode()
     status = Status(code="Error", message=str(status_code))
     return Response(
@@ -316,11 +319,13 @@ def _make_stream_error(stream_id: str, message: str,
         # Structured error for model-level HTTPException in streaming.
         # The StreamError.message contains a JSON object that the Rust/tonic
         # side parses to produce a structured error event.
-        error_dict: dict = {"type": error_type, "message": message}
-        if code is not None:
-            error_dict["code"] = code
-        if param is not None:
-            error_dict["param"] = param
+        # code/param are always present (null when unset) — see _make_error_response.
+        error_dict: dict = {
+            "type": error_type,
+            "message": message,
+            "code": code,
+            "param": param,
+        }
         msg = json.dumps({"error": error_dict})
     else:
         msg = message

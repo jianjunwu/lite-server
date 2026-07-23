@@ -242,14 +242,13 @@ async def handle_request(endpoints, req_data: dict) -> dict:
     except HTTPException as e:
         logger.info("endpoint HTTP error for %s: %s (status=%d, type=%s)",
                     route, e.detail, e.status_code, e.error_type)
+        # Four-field error body contract — same shape as the inference path.
         error_body = {
             "type": e.error_type,
             "message": e.detail,
+            "code": e.code,
+            "param": e.param,
         }
-        if e.code is not None:
-            error_body["code"] = e.code
-        if e.param is not None:
-            error_body["param"] = e.param
         return {
             "request_id": req_data.get("request_id", ""),
             "status_code": e.status_code,
