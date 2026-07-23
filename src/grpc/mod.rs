@@ -806,7 +806,7 @@ mod tests {
         let status = model_error_status(tonic::Code::Internal, &parsed);
         let info = status.get_details_error_info().expect("should carry ErrorInfo");
         assert_eq!(info.reason, "model_error");
-        assert!(info.metadata.get("param").is_none());
+        assert!(!info.metadata.contains_key("param"));
     }
 
     #[test]

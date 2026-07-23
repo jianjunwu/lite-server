@@ -562,7 +562,7 @@ async fn test_error_response_format() {
 
     // POST to a nonexistent model — should get structured error
     let resp = client
-        .post(&format!("{}/v2/models/nonexistent_model/infer", base))
+        .post(format!("{}/v2/models/nonexistent_model/infer", base))
         .json(&json!({"input": 1}))
         .send()
         .await
@@ -581,7 +581,7 @@ async fn test_error_response_format() {
     let err = &body["error"];
     assert!(err.is_object(), "error should be an object, got: {:?}", err);
     assert_eq!(err["type"], "not_found_error");
-    assert!(err["message"].as_str().unwrap().len() > 0);
+    assert!(!err["message"].as_str().unwrap().is_empty());
     assert_eq!(err["code"], "model_not_found");
     assert!(err["param"].is_null(),
         "param should be null but was {}", err["param"]);
@@ -594,7 +594,7 @@ async fn test_observability_headers_on_success() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .get(&format!("{}/health", base))
+        .get(format!("{}/health", base))
         .send()
         .await
         .unwrap();
@@ -618,7 +618,7 @@ async fn test_x_client_request_id_propagation() {
     let trace_id = "integration-test-001";
 
     let resp = client
-        .get(&format!("{}/health", base))
+        .get(format!("{}/health", base))
         .header("x-client-request-id", trace_id)
         .send()
         .await
@@ -644,7 +644,7 @@ async fn test_infer_error_response_has_code_and_param() {
     // test_model raises BadRequestError(code="invalid_input", param="input")
     // for null input — verifies the full Python → Rust → client chain.
     let resp = client
-        .post(&format!("{}/v2/models/{}/infer", base, MODEL))
+        .post(format!("{}/v2/models/{}/infer", base, MODEL))
         .json(&json!({"input": null}))
         .send()
         .await
@@ -673,7 +673,7 @@ async fn test_unknown_route_standardized_404() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .get(&format!("{}/no-such-route", base))
+        .get(format!("{}/no-such-route", base))
         .send()
         .await
         .unwrap();
@@ -694,7 +694,7 @@ async fn test_method_not_allowed_standardized_405() {
 
     // /health only supports GET
     let resp = client
-        .post(&format!("{}/health", base))
+        .post(format!("{}/health", base))
         .send()
         .await
         .unwrap();
@@ -715,7 +715,7 @@ async fn test_malformed_json_standardized_400() {
 
     // Route exists; the ApiJson extractor rejects before any model lookup.
     let resp = client
-        .post(&format!("{}/v2/models/any_model/infer", base))
+        .post(format!("{}/v2/models/any_model/infer", base))
         .header("content-type", "application/json")
         .body("{not valid json")
         .send()
