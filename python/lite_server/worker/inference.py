@@ -1,4 +1,10 @@
-"""Python inference worker entry point for lite-server (ZMQ + Protobuf)."""
+"""Python inference worker entry point for lite-server (ZMQ + Protobuf).
+
+All models run on a single unified asyncio loop.  Sync model methods are
+adapted at load time by the Pipeline (inline for fully-sync models, or a
+single-thread executor when anything is async), so there is exactly one
+request path for single / batch / streaming / bidi / continuous batching.
+"""
 
 import argparse
 import asyncio
@@ -17,33 +23,30 @@ from typing import Any
 import yaml
 import zmq
 
-from lite_server.api import LitAPI, RequestMeta, BidiStreamHandler, ResponseWithHeaders
-from lite_server.api_async import AsyncLitAPI
-from lite_server.callback import CallbackRunner, load_callbacks
+from lite_server.api import LitAPI, RequestMeta
+from lite_server.callback import load_callbacks
 from lite_server.exceptions import HTTPException
-from lite_server.response import Response as LiteResponse
+from lite_server.pipeline import (
+    Pipeline,
+    _adapt,
+    collect_metrics,
+    extract_response_meta,
+    unwrap_response,
+)
+from lite_server.callback import RequestContext
 from lite_server.proto import (
     BatchItemResponse,
     BatchRequest,
     BatchResponse,
     CBAddRequest,
-    CBCompletedResponse,
     CBRemoveRequest,
-    CompletedSequence,
-    Metrics,
-    MetricValue,
     Request,
     Response,
-    SingleRequest,
     SingleResponse,
     Status,
-    StreamCancel,
-    StreamChunk,
     StreamChunkResponse,
-    StreamClose,
     StreamDone,
     StreamError,
-    StreamOpen,
     StreamRequest,
     StreamResponse,
 )
@@ -116,6 +119,19 @@ def load_model_config(config_path: str):
         return yaml.safe_load(f) or {}
 
 
+def _get_pipeline(lit_api: LitAPI) -> Pipeline:
+    """Return the instance's Pipeline, building an empty one on demand.
+
+    ``load_litapi`` always builds the pipeline; the fallback keeps tests and
+    direct handler use working without the full loader.
+    """
+    pipe = getattr(lit_api, "_pipeline", None)
+    if pipe is None:
+        pipe = Pipeline.build(lit_api, [])
+        lit_api._pipeline = pipe
+    return pipe
+
+
 def load_litapi(model_py_path: str, config: dict, device: str = "cpu"):
     model_dir = os.path.dirname(os.path.abspath(model_py_path))
     spec = importlib.util.spec_from_file_location("model_module", model_py_path)
@@ -124,7 +140,7 @@ def load_litapi(model_py_path: str, config: dict, device: str = "cpu"):
     # Add model directory to path so callbacks can be imported
     sys.path.insert(0, model_dir)
     try:
-        callback_runner = load_callbacks(config)
+        callbacks = load_callbacks(config)
     finally:
         sys.path.remove(model_dir)
 
@@ -142,7 +158,7 @@ def load_litapi(model_py_path: str, config: dict, device: str = "cpu"):
         LitAPIClass = None
         for attr_name in dir(module):
             attr = getattr(module, attr_name)
-            if isinstance(attr, type) and attr_name != "LitAPI" and hasattr(attr, "predict"):
+            if isinstance(attr, type) and issubclass(attr, LitAPI) and attr is not LitAPI:
                 LitAPIClass = attr
                 break
 
@@ -153,115 +169,28 @@ def load_litapi(model_py_path: str, config: dict, device: str = "cpu"):
         batch_timeout = config.get("batch_timeout", 0.0)
         stream = config.get("stream", False)
 
-        # on_before_setup
-        callback_runner.trigger_void("on_before_setup", config, device)
-
         instance = LitAPIClass(
             max_batch_size=max_batch_size,
             batch_timeout=batch_timeout,
             stream=stream,
         )
         instance.config = config
+        pipeline = Pipeline.build(instance, callbacks)
+
+        pipeline.trigger_lifecycle("on_before_setup", config, device)
         if hasattr(instance, "pre_setup"):
             instance.pre_setup()
+        instance.setup(device)
+        pipeline.trigger_lifecycle("on_after_setup", instance)
 
-        if hasattr(instance, "setup"):
-            instance.setup(device)
-
-        # on_after_setup
-        callback_runner.trigger_void("on_after_setup", instance)
-
-    # Store callback runner on the instance for later use
-    instance._callback_runner = callback_runner
+    # Store pipeline on the instance for later use
+    instance._pipeline = pipeline
 
     return instance
 
 
 def _make_status(ok: bool, message: str = "") -> Status:
     return Status(code="Ok" if ok else "Error", message=message)
-
-
-def _unwrap_response(encoded: Any) -> tuple[Any, dict[str, str] | None]:
-    """Extract body and optional headers from on_response return value.
-
-    Returns ``(body, headers)`` where headers is None if the value is a
-    plain body, or the headers dict if it's a ResponseWithHeaders.
-
-    When *encoded* is a :class:`Response` (but not ResponseWithHeaders),
-    the response status_code and media_type are embedded in the headers
-    dict under private keys ``_sc`` and ``_mt`` for downstream extraction.
-    """
-    if isinstance(encoded, ResponseWithHeaders):
-        return encoded.body, encoded.headers or None
-    if isinstance(encoded, LiteResponse):
-        body = encoded.content
-        hdrs = dict(encoded.headers) if encoded.headers else {}
-        if encoded.status_code != 200:
-            hdrs["_sc"] = str(encoded.status_code)
-        media_type = encoded.media_type or ""
-        if media_type and media_type != "application/json":
-            hdrs["_mt"] = media_type
-        return body, hdrs if hdrs else None
-    return encoded, None
-
-
-def _extract_response_meta(headers: dict[str, str] | None) -> tuple[int, str, dict[str, str] | None]:
-    """Extract status_code and media_type from headers dict (embedded by _unwrap_response).
-
-    Returns ``(status_code, media_type, clean_headers)``.
-    """
-    if not headers:
-        return 0, "", None
-    sc = int(headers.get("_sc", "0") or "0")
-    mt = headers.get("_mt", "")
-    clean = {k: v for k, v in headers.items() if k not in ("_sc", "_mt")}
-    return sc, mt, clean if clean else None
-
-
-def _check_early_return(value: Any) -> tuple[Any, dict[str, str] | None, bool]:
-    """Check if a pipeline value is a :class:`Response` early return.
-
-    Returns ``(body, headers, is_early)``.  When *is_early* is True the
-    caller should short-circuit the remaining pipeline stages, serialize
-    *body* directly, and attach *headers* (if any) to the HTTP response.
-    """
-    if isinstance(value, LiteResponse):
-        hdrs = dict(value.headers) if value.headers else {}
-        if value.status_code != 200:
-            hdrs["_sc"] = str(value.status_code)
-        media_type = value.media_type or ""
-        if media_type and media_type != "application/json":
-            hdrs["_mt"] = media_type
-        return value.content, hdrs if hdrs else None, True
-    return value, None, False
-
-
-def _serialize_early_return(
-    body: Any, headers: dict[str, str] | None, lit_api: LitAPI
-) -> tuple[bytes, Status, Any, dict[str, str] | None]:
-    """Serialize an early-return body and collect metrics."""
-    resp_bytes = json.dumps(body).encode()
-    metrics = _collect_metrics(lit_api)
-    return resp_bytes, _make_status(True), metrics, headers
-
-
-def _batch_check_early(value: Any, uid: str,
-                       early_map: dict[str, bytes],
-                       early_headers: dict[str, str]) -> bool:
-    """Check for ``ResponseWithHeaders`` in a batch-item pipeline stage.
-
-    When *value* is a :class:`ResponseWithHeaders`, the body is serialized
-    into *early_map* and any headers are merged into *early_headers*.
-    Returns True if an early return was recorded (caller should ``continue``
-    to the next item).
-    """
-    body, headers, is_early = _check_early_return(value)
-    if is_early:
-        early_map[uid] = json.dumps(body).encode()
-        if headers:
-            early_headers.update(headers)
-        return True
-    return False
 
 
 def _make_error_response(uid: str, message: str,
@@ -370,714 +299,19 @@ def _meta_from_proto(meta_pb) -> RequestMeta:
     )
 
 
-def _collect_metrics(lit_api: LitAPI):
-    """Collect pre-registered custom metrics from the LitAPI instance."""
-    values = getattr(lit_api, "_metric_values", None)
-    if not values:
-        return None
-    specs = lit_api._metric_specs
-    gauges = []
-    counters = []
-    histograms = []
-    for mid, val in values:
-        if mid < len(specs):
-            spec = specs[mid]
-            mv = MetricValue(id=spec.metric_id, value=val)
-            if spec.metric_type == "gauge":
-                gauges.append(mv)
-            elif spec.metric_type == "counter":
-                counters.append(mv)
-            elif spec.metric_type == "histogram":
-                histograms.append(mv)
-    lit_api._metric_values = []
-    if not gauges and not counters and not histograms:
-        return None
-    return Metrics(gauges=gauges, counters=counters, histograms=histograms)
-
-
-def _has_batch_methods(lit_api) -> bool:
-    """Detect whether user has overridden batch/unbatch."""
-    import litserve as ls
-
-    batch_func = getattr(lit_api, "batch", None)
-    unbatch_func = getattr(lit_api, "unbatch", None)
-    if batch_func is None or unbatch_func is None:
-        return False
-    batch_overridden = batch_func.__code__ is not ls.LitAPI.batch.__code__
-    unbatch_overridden = unbatch_func.__code__ is not ls.LitAPI.unbatch.__code__
-    return batch_overridden and unbatch_overridden
-
-
-def _run_predict(lit_api: LitAPI, data: bytes, meta: RequestMeta, log: logging.Logger):
-    """Run the full predict pipeline with hooks.
-
-    After every stage the return value is checked for
-    :class:`ResponseWithHeaders`.  When detected the pipeline
-    short-circuits — later stages are skipped and the response is
-    serialized immediately.
-    """
-    raw = json.loads(data) if data else {}
-    runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
-
-    # 1. on_request (pre-decode) — LitAPI hook (backward compat)
-    if hasattr(lit_api, "on_request"):
-        try:
-            raw = lit_api.on_request(raw, meta)
-        except Exception as e:
-            log.warning("on_request hook failed: %s", e)
-            raise
-        raw, headers, early = _check_early_return(raw)
-        if early:
-            return _serialize_early_return(raw, headers, lit_api)
-
-    # 2. on_before_decode — Callback hook
-    if runner is not None:
-        raw = runner.trigger("on_before_decode", raw, meta)
-        raw, headers, early = _check_early_return(raw)
-        if early:
-            return _serialize_early_return(raw, headers, lit_api)
-
-    # 3. decode_request
-    try:
-        decoded = lit_api.decode_request(raw) if hasattr(lit_api, "decode_request") else raw
-    except Exception as e:
-        log.warning("decode_request failed: %s", e)
-        raise
-    decoded, headers, early = _check_early_return(decoded)
-    if early:
-        return _serialize_early_return(decoded, headers, lit_api)
-
-    # 4. on_after_decode — Callback hook
-    if runner is not None:
-        decoded = runner.trigger("on_after_decode", decoded, meta)
-        decoded, headers, early = _check_early_return(decoded)
-        if early:
-            return _serialize_early_return(decoded, headers, lit_api)
-
-    # 5. on_before_predict — Callback hook
-    if runner is not None:
-        decoded = runner.trigger("on_before_predict", decoded, meta)
-        decoded, headers, early = _check_early_return(decoded)
-        if early:
-            return _serialize_early_return(decoded, headers, lit_api)
-
-    # 6. predict
-    try:
-        output = lit_api.predict(decoded)
-    except Exception as e:
-        log.error("predict failed: %s", e)
-        raise
-    output, headers, early = _check_early_return(output)
-    if early:
-        return _serialize_early_return(output, headers, lit_api)
-
-    # 7. on_after_predict — Callback hook
-    if runner is not None:
-        output = runner.trigger("on_after_predict", output, meta)
-        output, headers, early = _check_early_return(output)
-        if early:
-            return _serialize_early_return(output, headers, lit_api)
-
-    # 8. on_before_encode — Callback hook
-    if runner is not None:
-        output = runner.trigger("on_before_encode", output, meta)
-        output, headers, early = _check_early_return(output)
-        if early:
-            return _serialize_early_return(output, headers, lit_api)
-
-    # 9. encode_response
-    try:
-        encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
-    except Exception as e:
-        log.warning("encode_response failed: %s", e)
-        raise
-    encoded, headers, early = _check_early_return(encoded)
-    if early:
-        return _serialize_early_return(encoded, headers, lit_api)
-
-    # 10. on_after_encode — Callback hook
-    if runner is not None:
-        encoded = runner.trigger("on_after_encode", encoded, meta)
-        encoded, headers, early = _check_early_return(encoded)
-        if early:
-            return _serialize_early_return(encoded, headers, lit_api)
-
-    # 11. on_response — LitAPI hook (backward compat)
-    if hasattr(lit_api, "on_response"):
-        try:
-            encoded = lit_api.on_response(encoded, meta)
-        except Exception as e:
-            log.warning("on_response hook failed: %s", e)
-            raise
-        encoded, headers, early = _check_early_return(encoded)
-        if early:
-            return _serialize_early_return(encoded, headers, lit_api)
-
-    encoded, resp_headers = _unwrap_response(encoded)
-    resp_bytes = json.dumps(encoded).encode()
-    metrics = _collect_metrics(lit_api)
-    return resp_bytes, _make_status(True), metrics, resp_headers
+def _build_single_response(uid: str, resp_bytes: bytes, status: Status,
+                           resp_headers: dict[str, str] | None, metrics) -> Response:
+    """Assemble a SingleResponse proto, unpacking embedded status/media type."""
+    sc, mt, clean_headers = extract_response_meta(resp_headers)
+    single_resp = SingleResponse(data=resp_bytes, status=status,
+                                 status_code=sc, media_type=mt)
+    if clean_headers:
+        single_resp.headers.update(clean_headers)
+    return Response(uid=uid, single=single_resp, metrics=metrics)
 
 
 # ---------------------------------------------------------------------------
-# Async Detection & Helpers
-# ---------------------------------------------------------------------------
-
-def _is_async_api(lit_api) -> bool:
-    """Detect whether the loaded API instance requires an async event loop."""
-    return (
-        isinstance(lit_api, AsyncLitAPI)
-        or getattr(lit_api, "enable_async", False)
-        or asyncio.iscoroutinefunction(lit_api.predict)
-        or inspect.isasyncgenfunction(getattr(lit_api, "stream_predict", None))
-    )
-
-
-async def _maybe_await(func, *args, **kwargs):
-    """Call ``func`` and await if it (or its return value) is a coroutine."""
-    if asyncio.iscoroutinefunction(func):
-        return await func(*args, **kwargs)
-    result = func(*args, **kwargs)
-    if asyncio.iscoroutine(result):
-        return await result
-    if inspect.isasyncgen(result):
-        return result
-    return result
-
-
-async def _run_predict_async(lit_api: LitAPI, data: bytes, meta: RequestMeta, log: logging.Logger):
-    """Async version of the full predict pipeline with hooks.
-
-    After every stage the return value is checked for
-    :class:`ResponseWithHeaders`.  When detected the pipeline
-    short-circuits.
-    """
-    raw = json.loads(data) if data else {}
-    runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
-
-    # 1. on_request (pre-decode) — LitAPI hook (backward compat)
-    if hasattr(lit_api, "on_request"):
-        try:
-            raw = await _maybe_await(lit_api.on_request, raw, meta)
-        except Exception as e:
-            log.warning("on_request hook failed: %s", e)
-            raise
-        raw, headers, early = _check_early_return(raw)
-        if early:
-            return _serialize_early_return(raw, headers, lit_api)
-
-    # 2. on_before_decode — Callback hook
-    if runner is not None:
-        raw = await runner.trigger_async("on_before_decode", raw, meta)
-        raw, headers, early = _check_early_return(raw)
-        if early:
-            return _serialize_early_return(raw, headers, lit_api)
-
-    # 3. decode_request
-    try:
-        if hasattr(lit_api, "decode_request"):
-            decoded = await _maybe_await(lit_api.decode_request, raw)
-        else:
-            decoded = raw
-    except Exception as e:
-        log.warning("decode_request failed: %s", e)
-        raise
-    decoded, headers, early = _check_early_return(decoded)
-    if early:
-        return _serialize_early_return(decoded, headers, lit_api)
-
-    # 4. on_after_decode — Callback hook
-    if runner is not None:
-        decoded = await runner.trigger_async("on_after_decode", decoded, meta)
-        decoded, headers, early = _check_early_return(decoded)
-        if early:
-            return _serialize_early_return(decoded, headers, lit_api)
-
-    # 5. on_before_predict — Callback hook
-    if runner is not None:
-        decoded = await runner.trigger_async("on_before_predict", decoded, meta)
-        decoded, headers, early = _check_early_return(decoded)
-        if early:
-            return _serialize_early_return(decoded, headers, lit_api)
-
-    # 6. predict
-    try:
-        output = await _maybe_await(lit_api.predict, decoded)
-    except Exception as e:
-        log.error("predict failed: %s", e)
-        raise
-    output, headers, early = _check_early_return(output)
-    if early:
-        return _serialize_early_return(output, headers, lit_api)
-
-    # 7. on_after_predict — Callback hook
-    if runner is not None:
-        output = await runner.trigger_async("on_after_predict", output, meta)
-        output, headers, early = _check_early_return(output)
-        if early:
-            return _serialize_early_return(output, headers, lit_api)
-
-    # 8. on_before_encode — Callback hook
-    if runner is not None:
-        output = await runner.trigger_async("on_before_encode", output, meta)
-        output, headers, early = _check_early_return(output)
-        if early:
-            return _serialize_early_return(output, headers, lit_api)
-
-    # 9. encode_response
-    try:
-        if hasattr(lit_api, "encode_response"):
-            encoded = await _maybe_await(lit_api.encode_response, output)
-        else:
-            encoded = output
-    except Exception as e:
-        log.warning("encode_response failed: %s", e)
-        raise
-    encoded, headers, early = _check_early_return(encoded)
-    if early:
-        return _serialize_early_return(encoded, headers, lit_api)
-
-    # 10. on_after_encode — Callback hook
-    if runner is not None:
-        encoded = await runner.trigger_async("on_after_encode", encoded, meta)
-        encoded, headers, early = _check_early_return(encoded)
-        if early:
-            return _serialize_early_return(encoded, headers, lit_api)
-
-    # 11. on_response — LitAPI hook (backward compat)
-    if hasattr(lit_api, "on_response"):
-        try:
-            encoded = await _maybe_await(lit_api.on_response, encoded, meta)
-        except Exception as e:
-            log.warning("on_response hook failed: %s", e)
-            raise
-        encoded, headers, early = _check_early_return(encoded)
-        if early:
-            return _serialize_early_return(encoded, headers, lit_api)
-
-    encoded, resp_headers = _unwrap_response(encoded)
-    resp_bytes = json.dumps(encoded).encode()
-    metrics = _collect_metrics(lit_api)
-    return resp_bytes, _make_status(True), metrics, resp_headers
-
-
-# ---------------------------------------------------------------------------
-# Streaming Support
-# ---------------------------------------------------------------------------
-
-def _has_stream_predict(lit_api: LitAPI) -> bool:
-    return hasattr(lit_api, "stream_predict") and callable(getattr(lit_api, "stream_predict"))
-
-
-def _has_bidi_stream(lit_api: LitAPI) -> bool:
-    """Detect whether the API implements bidirectional streaming.
-
-    Only returns True when the subclass actually overrides bidi_stream(),
-    not when it merely inherits the base NotImplementedError version.
-    """
-    if not hasattr(lit_api, "bidi_stream"):
-        return False
-    for cls in type(lit_api).__mro__:
-        if "bidi_stream" in cls.__dict__:
-            if cls is LitAPI:
-                return False
-            return callable(cls.__dict__["bidi_stream"])
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Stream Tracker — prevents unbounded active_streams growth
-# ---------------------------------------------------------------------------
-
-_STREAM_IDLE_TIMEOUT = 300.0  # 5 minutes
-
-
-class _StreamTracker:
-    """Thread-safe tracker for active streams with automatic timeout cleanup."""
-
-    def __init__(self, timeout: float = _STREAM_IDLE_TIMEOUT):
-        self._streams: dict[str, Any] = {}
-        self._timestamps: dict[str, float] = {}
-        self._lock = threading.Lock()
-        self._timeout = timeout
-
-    def add(self, stream_id: str, entry: Any):
-        with self._lock:
-            self._streams[stream_id] = entry
-            self._timestamps[stream_id] = time.monotonic()
-
-    def remove(self, stream_id: str) -> Any:
-        with self._lock:
-            self._timestamps.pop(stream_id, None)
-            return self._streams.pop(stream_id, None)
-
-    def get(self, stream_id: str) -> Any | None:
-        return self._streams.get(stream_id)
-
-    def touch(self, stream_id: str):
-        """Update last activity timestamp."""
-        with self._lock:
-            if stream_id in self._timestamps:
-                self._timestamps[stream_id] = time.monotonic()
-
-    def cleanup_expired(self) -> list[str]:
-        """Remove streams that have exceeded the idle timeout.
-        Returns list of expired stream IDs that were removed.
-        """
-        now = time.monotonic()
-        expired = []
-        with self._lock:
-            for sid, ts in list(self._timestamps.items()):
-                if now - ts > self._timeout:
-                    expired.append(sid)
-            for sid in expired:
-                entry = self._streams.pop(sid, None)
-                self._timestamps.pop(sid, None)
-                if isinstance(entry, BidiStreamHandler):
-                    try:
-                        entry.on_close()
-                    except Exception:
-                        pass
-                elif hasattr(entry, "close"):
-                    try:
-                        entry.close()
-                    except Exception:
-                        pass
-        return expired
-
-
-def _stream_early_return(body: Any, stream_id: str, socket: zmq.Socket, lit_api: LitAPI) -> bool:
-    """Send an early-return body as a stream chunk + StreamDone.
-    Returns True so callers can use ``return _stream_early_return(...)``.
-    """
-    resp_bytes = json.dumps(body).encode()
-    socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
-    metrics = _collect_metrics(lit_api)
-    socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
-    return True
-
-
-async def _stream_early_return_async(body: Any, stream_id: str, socket, lit_api: LitAPI) -> bool:
-    """Async version of :func:`_stream_early_return`."""
-    resp_bytes = json.dumps(body).encode()
-    await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
-    metrics = _collect_metrics(lit_api)
-    await socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
-    return True
-
-
-def _consume_stream_generator(lit_api: LitAPI, generator, stream_id: str, socket: zmq.Socket, active_streams: _StreamTracker, log: logging.Logger, meta=None):
-    """Background thread: consume a stream_predict generator and send chunks."""
-    runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
-    try:
-        for output in generator:
-            active_streams.touch(stream_id)
-            # on_after_predict — Callback hook (per-chunk output)
-            if runner is not None:
-                output = runner.trigger("on_after_predict", output, meta)
-                body, _headers, early = _check_early_return(output)
-                if early:
-                    _stream_early_return(body, stream_id, socket, lit_api)
-                    active_streams.remove(stream_id)
-                    return
-            # on_before_encode — Callback hook
-            if runner is not None:
-                output = runner.trigger("on_before_encode", output, meta)
-                body, _headers, early = _check_early_return(output)
-                if early:
-                    _stream_early_return(body, stream_id, socket, lit_api)
-                    active_streams.remove(stream_id)
-                    return
-            encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
-            body, _headers, early = _check_early_return(encoded)
-            if early:
-                _stream_early_return(body, stream_id, socket, lit_api)
-                active_streams.remove(stream_id)
-                return
-            # on_after_encode — Callback hook
-            if runner is not None:
-                encoded = runner.trigger("on_after_encode", encoded, meta)
-                body, _headers, early = _check_early_return(encoded)
-                if early:
-                    _stream_early_return(body, stream_id, socket, lit_api)
-                    active_streams.remove(stream_id)
-                    return
-            if hasattr(lit_api, "on_response") and meta is not None:
-                encoded = lit_api.on_response(encoded, meta)
-                body, _headers, early = _check_early_return(encoded)
-                if early:
-                    _stream_early_return(body, stream_id, socket, lit_api)
-                    active_streams.remove(stream_id)
-                    return
-            encoded, _ = _unwrap_response(encoded)
-            resp_bytes = json.dumps(encoded).encode()
-            socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
-    except HTTPException as e:
-        log.warning("stream_predict rejected for %s: %s", stream_id, e.detail)
-        socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-        active_streams.remove(stream_id)
-        return
-    except Exception as e:
-        log.error("stream_predict error for %s: %s", stream_id, e)
-        socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
-        active_streams.remove(stream_id)
-        return
-
-    metrics = _collect_metrics(lit_api)
-    socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
-    active_streams.remove(stream_id)
-
-
-def _handle_stream_open(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.Socket, active_streams: _StreamTracker, log: logging.Logger):
-    stream_id = stream_req.stream_id
-    open_req = stream_req.open
-    data = open_req.data if open_req else b""
-    meta = _meta_from_proto(open_req.meta) if open_req and open_req.HasField("meta") else None
-
-    # Try bidirectional streaming first
-    if _has_bidi_stream(lit_api):
-        raw = json.loads(data) if data else {}
-
-        if hasattr(lit_api, "on_request") and meta is not None:
-            try:
-                raw = lit_api.on_request(raw, meta)
-            except HTTPException as e:
-                log.warning("bidi on_request rejected for %s: %s", stream_id, e.detail)
-                socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-                return
-            except Exception as e:
-                socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
-                return
-            body, _headers, early = _check_early_return(raw)
-            if early:
-                _stream_early_return(body, stream_id, socket, lit_api)
-                return
-
-        decoded = lit_api.decode_request(raw) if hasattr(lit_api, "decode_request") else raw
-        body, _headers, early = _check_early_return(decoded)
-        if early:
-            _stream_early_return(body, stream_id, socket, lit_api)
-            return
-
-        try:
-            handler = lit_api.bidi_stream()
-        except HTTPException as e:
-            log.warning("bidi_stream rejected for %s: %s", stream_id, e.detail)
-            socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-            return
-        except Exception as e:
-            socket.send(_make_stream_error(stream_id, f"bidi_stream failed: {e}").SerializeToString())
-            return
-
-        active_streams.add(stream_id, handler)
-
-        try:
-            output = handler.on_open(decoded)
-        except HTTPException as e:
-            log.warning("bidi on_open rejected for %s: %s", stream_id, e.detail)
-            socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-            return
-        except Exception as e:
-            log.error("bidi on_open failed for %s: %s", stream_id, _format_exc_brief(e))
-            socket.send(_make_stream_error(stream_id, f"on_open failed: {e}").SerializeToString())
-            return
-
-        if output is not None:
-            try:
-                body, _headers, early = _check_early_return(output)
-                if early:
-                    _stream_early_return(body, stream_id, socket, lit_api)
-                    return
-                encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
-                body, _headers, early = _check_early_return(encoded)
-                if early:
-                    _stream_early_return(body, stream_id, socket, lit_api)
-                    return
-                if hasattr(lit_api, "on_response") and meta is not None:
-                    encoded = lit_api.on_response(encoded, meta)
-                    body, _headers, early = _check_early_return(encoded)
-                    if early:
-                        _stream_early_return(body, stream_id, socket, lit_api)
-                        return
-                encoded, _ = _unwrap_response(encoded)
-                resp_bytes = json.dumps(encoded).encode()
-                socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
-            except HTTPException as e:
-                log.warning("bidi on_open encode rejected for %s: %s", stream_id, e.detail)
-                socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-                return
-            except Exception as e:
-                log.error("bidi on_open encode failed for %s: %s", stream_id, _format_exc_brief(e))
-                socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
-                return
-        return
-
-    if not _has_stream_predict(lit_api):
-        # Fallback: predict() once, send as single chunk
-        try:
-            resp_bytes, status, metrics, _ = _run_predict(lit_api, data, meta, log)
-            socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=True).SerializeToString())
-            socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
-        except HTTPException as e:
-            log.warning("stream fallback predict rejected for %s: %s", stream_id, e.detail)
-            socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-        except Exception as e:
-            socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
-        return
-
-    # Normal uni-directional streaming: start generator
-    raw = json.loads(data) if data else {}
-    runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
-
-    if hasattr(lit_api, "on_request") and meta is not None:
-        try:
-            raw = lit_api.on_request(raw, meta)
-        except HTTPException as e:
-            log.warning("stream on_request rejected for %s: %s", stream_id, e.detail)
-            socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-            return
-        except Exception as e:
-            socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
-            return
-        body, _headers, early = _check_early_return(raw)
-        if early:
-            _stream_early_return(body, stream_id, socket, lit_api)
-            return
-
-    # on_before_decode — Callback hook
-    if runner is not None:
-        raw = runner.trigger("on_before_decode", raw, meta)
-        body, _headers, early = _check_early_return(raw)
-        if early:
-            _stream_early_return(body, stream_id, socket, lit_api)
-            return
-
-    decoded = lit_api.decode_request(raw) if hasattr(lit_api, "decode_request") else raw
-    body, _headers, early = _check_early_return(decoded)
-    if early:
-        _stream_early_return(body, stream_id, socket, lit_api)
-        return
-
-    # on_after_decode — Callback hook
-    if runner is not None:
-        decoded = runner.trigger("on_after_decode", decoded, meta)
-        body, _headers, early = _check_early_return(decoded)
-        if early:
-            _stream_early_return(body, stream_id, socket, lit_api)
-            return
-
-    # on_before_predict — Callback hook
-    if runner is not None:
-        decoded = runner.trigger("on_before_predict", decoded, meta)
-        body, _headers, early = _check_early_return(decoded)
-        if early:
-            _stream_early_return(body, stream_id, socket, lit_api)
-            return
-
-    try:
-        generator = lit_api.stream_predict(decoded)
-    except HTTPException as e:
-        log.warning("stream_predict rejected for %s: %s", stream_id, e.detail)
-        socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-        return
-    except Exception as e:
-        socket.send(_make_stream_error(stream_id, f"stream_predict failed: {e}").SerializeToString())
-        return
-
-    active_streams.add(stream_id, generator)
-    threading.Thread(
-        target=_consume_stream_generator,
-        args=(lit_api, generator, stream_id, socket, active_streams, log, meta),
-        daemon=True,
-    ).start()
-
-
-def _handle_stream_chunk(lit_api: LitAPI, stream_req: StreamRequest, socket: zmq.Socket, active_streams: _StreamTracker, log: logging.Logger, meta=None):
-    """Handle a mid-stream chunk for bidirectional streaming (sync worker)."""
-    stream_id = stream_req.stream_id
-    handler = active_streams.get(stream_id)
-    if handler is None:
-        socket.send(_make_stream_error(stream_id, "stream not found").SerializeToString())
-        return
-
-    data = stream_req.chunk.data if stream_req.chunk else b""
-    raw = json.loads(data) if data else {}
-
-    try:
-        output = handler.on_chunk(raw)
-    except HTTPException as e:
-        log.warning("bidi on_chunk rejected for %s: %s", stream_id, e.detail)
-        socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-        return
-    except Exception as e:
-        log.error("bidi on_chunk failed for %s: %s", stream_id, _format_exc_brief(e))
-        socket.send(_make_stream_error(stream_id, f"on_chunk failed: {e}").SerializeToString())
-        return
-
-    if output is not None:
-        try:
-            body, _headers, early = _check_early_return(output)
-            if early:
-                _stream_early_return(body, stream_id, socket, lit_api)
-                return
-            runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
-            # on_before_encode — Callback hook
-            if runner is not None:
-                output = runner.trigger("on_before_encode", output, meta)
-                body, _headers, early = _check_early_return(output)
-                if early:
-                    _stream_early_return(body, stream_id, socket, lit_api)
-                    return
-            encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
-            body, _headers, early = _check_early_return(encoded)
-            if early:
-                _stream_early_return(body, stream_id, socket, lit_api)
-                return
-            # on_after_encode — Callback hook
-            if runner is not None:
-                encoded = runner.trigger("on_after_encode", encoded, meta)
-                body, _headers, early = _check_early_return(encoded)
-                if early:
-                    _stream_early_return(body, stream_id, socket, lit_api)
-                    return
-            if hasattr(lit_api, "on_response") and meta is not None:
-                encoded = lit_api.on_response(encoded, meta)
-                body, _headers, early = _check_early_return(encoded)
-                if early:
-                    _stream_early_return(body, stream_id, socket, lit_api)
-                    return
-            encoded, _ = _unwrap_response(encoded)
-            resp_bytes = json.dumps(encoded).encode()
-            socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
-        except HTTPException as e:
-            log.warning("bidi encode rejected for %s: %s", stream_id, e.detail)
-            socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-        except Exception as e:
-            log.error("bidi encode failed for %s: %s", stream_id, _format_exc_brief(e))
-            socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
-
-
-def _handle_stream_close(stream_id: str, active_streams: _StreamTracker, socket: zmq.Socket, log: logging.Logger):
-    """Close a stream: cleanup generator or bidi handler, send StreamDone."""
-    entry = active_streams.remove(stream_id)
-    if entry is None:
-        return
-
-    if isinstance(entry, BidiStreamHandler):
-        try:
-            entry.on_close()
-        except Exception as e:
-            log.debug("bidi on_close error for %s: %s", stream_id, e)
-    else:
-        # It's a generator
-        try:
-            entry.close()
-        except Exception as e:
-            log.debug("stream %s close error: %s", stream_id, e)
-
-
-# ---------------------------------------------------------------------------
-# Async Loop
+# Main Loop (unified async)
 # ---------------------------------------------------------------------------
 
 async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.Logger):
@@ -1103,14 +337,20 @@ async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.
         if request.HasField("stream"):
             stream_id = request.stream.stream_id
             action = request.stream.WhichOneof("action")
-            task = asyncio.create_task(
-                _handle_stream_async(lit_api, request, socket, active_streams, log)
-            )
-            # Only register in active_streams for open; chunk/close/cancel
-            # must not overwrite the existing handler or consumption task.
+            # All stream actions are handled inline: bidi chunk/close
+            # ordering is protocol-significant (each chunk expects its ack
+            # in order), and open must register the session before the next
+            # message arrives.  Uni-directional consumption still runs in
+            # its own task, created by the open handler.
+            try:
+                await _handle_stream_async(lit_api, request, socket, active_streams, log)
+            except Exception as e:
+                log.error("stream %s action %s failed: %s", stream_id, action, _format_exc_brief(e))
             if action == "open":
-                active_streams[stream_id] = task
-            pending_tasks[request.uid] = task
+                # Track the consume task for exception retrieval / shutdown
+                entry = active_streams.get(stream_id)
+                if isinstance(entry, asyncio.Task):
+                    pending_tasks[f"stream-consume-{stream_id}"] = entry
         else:
             task = asyncio.create_task(
                 _handle_request_async(lit_api, request, socket, log)
@@ -1126,8 +366,10 @@ async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.
                 if stream_task is t:
                     active_streams.pop(sid, None)
                     break
+            if t.cancelled():
+                continue  # t.exception() raises CancelledError on cancelled tasks
             exc = t.exception()
-            if exc is not None and not isinstance(exc, asyncio.CancelledError):
+            if exc is not None:
                 log.error("async task %s failed: %s", uid, exc)
 
     # Cancel any pending tasks on shutdown
@@ -1141,9 +383,10 @@ async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.
 
 
 async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: logging.Logger):
-    """Process a single request (single / batch / stream) asynchronously."""
+    """Process a single request (single / batch) asynchronously."""
     uid = request.uid
     meta = _meta_from_proto(request.meta) if request.HasField("meta") else None
+    pipe = _get_pipeline(lit_api)
 
     try:
         if request.HasField("single"):
@@ -1154,154 +397,13 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
                     single=SingleResponse(data=b"{}", status=_make_status(True)),
                 )
             else:
-                resp_bytes, status, metrics, resp_headers = await _run_predict_async(lit_api, request.single.data, meta, log)
-                sc, mt, clean_headers = _extract_response_meta(resp_headers)
-                single_resp = SingleResponse(data=resp_bytes, status=status,
-                                             status_code=sc, media_type=mt)
-                if clean_headers:
-                    single_resp.headers.update(clean_headers)
-                response = Response(
-                    uid=uid,
-                    single=single_resp,
-                    metrics=metrics,
+                resp_bytes, status, metrics, resp_headers = await pipe.run_single(
+                    request.single.data, meta
                 )
+                response = _build_single_response(uid, resp_bytes, status, resp_headers, metrics)
 
         elif request.HasField("batch"):
-            batch: BatchRequest = request.batch
-            batch_items = batch.items
-            runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
-
-            # Phase 1: per-item async on_request → decode
-            decoded_map: dict[str, Any] = {}
-            error_map: dict[str, Exception] = {}
-            early_final_map: dict[str, bytes] = {}
-            batch_headers: dict[str, str] = {}
-
-            for item in batch_items:
-                try:
-                    raw = json.loads(item.data) if item.data else {}
-                    if hasattr(lit_api, "on_request"):
-                        raw = await _maybe_await(lit_api.on_request, raw, meta)
-                        if _batch_check_early(raw, item.uid, early_final_map, batch_headers):
-                            continue
-                    # on_before_decode — Callback hook
-                    if runner is not None:
-                        raw = await runner.trigger_async("on_before_decode", raw, meta)
-                        if _batch_check_early(raw, item.uid, early_final_map, batch_headers):
-                            continue
-                    if hasattr(lit_api, "decode_request"):
-                        decoded = await _maybe_await(lit_api.decode_request, raw)
-                    else:
-                        decoded = raw
-                    if _batch_check_early(decoded, item.uid, early_final_map, batch_headers):
-                        continue
-                    # on_after_decode — Callback hook
-                    if runner is not None:
-                        decoded = await runner.trigger_async("on_after_decode", decoded, meta)
-                        if _batch_check_early(decoded, item.uid, early_final_map, batch_headers):
-                            continue
-                    decoded_map[item.uid] = decoded
-                except Exception as e:
-                    error_map[item.uid] = e
-
-            # Phase 2: batch → predict → unbatch
-            success_outputs: dict[str, Any] = {}
-
-            if decoded_map and _has_batch_methods(lit_api):
-                decoded_uids = list(decoded_map.keys())
-                decodeds = [decoded_map[_uid] for _uid in decoded_uids]
-                try:
-                    batched = await _maybe_await(lit_api.batch, decodeds)
-                    output = await _maybe_await(lit_api.predict, batched)
-                    outputs = await _maybe_await(lit_api.unbatch, output)
-                    if len(outputs) != len(decoded_uids):
-                        raise ValueError(f"unbatch: {len(outputs)} vs {len(decoded_uids)}")
-                    for _uid, out in zip(decoded_uids, outputs):
-                        success_outputs[_uid] = out
-                except Exception as e:
-                    for _uid in decoded_uids:
-                        error_map[_uid] = e
-            else:
-                # Fallback: concurrent per-item predict
-                tasks = []
-                uid_list = []
-                for _uid, decoded in decoded_map.items():
-                    tasks.append(_maybe_await(lit_api.predict, decoded))
-                    uid_list.append(_uid)
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for _uid, result in zip(uid_list, results):
-                    if isinstance(result, Exception):
-                        error_map[_uid] = result
-                    else:
-                        success_outputs[_uid] = result
-
-            # Phase 3: per-item async encode → on_response
-            final_map: dict[str, bytes] = {}
-
-            for item_uid, output in success_outputs.items():
-                try:
-                    # on_before_encode — Callback hook
-                    if runner is not None:
-                        output = await runner.trigger_async("on_before_encode", output, meta)
-                        if _batch_check_early(output, item_uid, final_map, batch_headers):
-                            continue
-                    if hasattr(lit_api, "encode_response"):
-                        encoded = await _maybe_await(lit_api.encode_response, output)
-                    else:
-                        encoded = output
-                    if _batch_check_early(encoded, item_uid, final_map, batch_headers):
-                        continue
-                    # on_after_encode — Callback hook
-                    if runner is not None:
-                        encoded = await runner.trigger_async("on_after_encode", encoded, meta)
-                        if _batch_check_early(encoded, item_uid, final_map, batch_headers):
-                            continue
-                    if hasattr(lit_api, "on_response"):
-                        encoded = await _maybe_await(lit_api.on_response, encoded, meta)
-                        if _batch_check_early(encoded, item_uid, final_map, batch_headers):
-                            continue
-                    encoded, item_headers = _unwrap_response(encoded)
-                    if item_headers:
-                        batch_headers.update(item_headers)
-                    final_map[item_uid] = json.dumps(encoded).encode()
-                except Exception as e:
-                    error_map[item_uid] = e
-
-            # Merge early-return items from Phase 1 into final_map
-            final_map.update(early_final_map)
-
-            # Phase 4: assemble BatchResponse
-            items = []
-            for item in batch_items:
-                item_uid = item.uid
-                if item_uid in final_map:
-                    items.append(
-                        BatchItemResponse(
-                            uid=item_uid,
-                            data=final_map[item_uid],
-                            status=_make_status(True),
-                        )
-                    )
-                else:
-                    err = error_map.get(item_uid, Exception("unknown error"))
-                    err_bytes = json.dumps({"error": str(err)}).encode()
-                    items.append(
-                        BatchItemResponse(
-                            uid=item_uid,
-                            data=err_bytes,
-                            status=_make_status(False, str(err)),
-                        )
-                    )
-
-            metrics = _collect_metrics(lit_api)
-            batch_resp = BatchResponse(items=items)
-            if batch_headers:
-                batch_resp.headers.update(batch_headers)
-            response = Response(
-                uid=uid,
-                batch=batch_resp,
-                metrics=metrics,
-            )
+            response = await _handle_batch(pipe, uid, request.batch, meta, lit_api, log)
 
         else:
             response = _make_error_response(uid, "Unsupported payload type")
@@ -1319,9 +421,124 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
     await socket.send(response.SerializeToString())
 
 
+async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
+                        meta: RequestMeta | None, lit_api: LitAPI,
+                        log: logging.Logger) -> Response:
+    """Batch request: per-item preprocess → batched predict → per-item postprocess."""
+    error_map: dict[str, Exception] = {}
+    final_map: dict[str, bytes] = {}
+    batch_headers: dict[str, str] = {}
+    ctx_map: dict[str, RequestContext] = {}
+
+    # Phase 1: per-item on_request → decode → on_input
+    for item in batch.items:
+        ctx = RequestContext(meta=meta, request=json.loads(item.data) if item.data else {})
+        try:
+            await pipe.preprocess(ctx)
+        except Exception as e:
+            log.warning("batch item %s preprocess failed: %s", item.uid, _format_exc_brief(e))
+            error_map[item.uid] = e
+            continue
+        if ctx.early is not None:
+            body, headers = unwrap_response(ctx.early)
+            final_map[item.uid] = json.dumps(body).encode()
+            if headers:
+                batch_headers.update(headers)
+            continue
+        ctx_map[item.uid] = ctx
+
+    # Phase 2: batch → predict → unbatch (or per-item fallback)
+    if ctx_map and pipe.has_batch_methods:
+        decoded_uids = list(ctx_map.keys())
+        try:
+            outputs = await pipe.batch_predict([ctx_map[u].input for u in decoded_uids])
+            for u, out in zip(decoded_uids, outputs):
+                ctx_map[u].output = out
+        except Exception as e:
+            log.error("batch predict failed: %s", _format_exc_brief(e))
+            for u in decoded_uids:
+                error_map[u] = e
+    else:
+        results = await asyncio.gather(
+            *(pipe.predict_value(ctx_map[u]) for u in ctx_map),
+            return_exceptions=True,
+        )
+        for u, result in zip(list(ctx_map.keys()), results):
+            if isinstance(result, Exception):
+                log.error("predict failed for %s: %s", u, _format_exc_brief(result))
+                error_map[u] = result
+
+    # Phase 3: per-item on_output → encode → on_response
+    for item_uid, ctx in ctx_map.items():
+        if item_uid in error_map:
+            continue
+        try:
+            if ctx.early is None:
+                await pipe.postprocess(ctx)
+        except Exception as e:
+            log.warning("batch item %s postprocess failed: %s", item_uid, _format_exc_brief(e))
+            error_map[item_uid] = e
+            continue
+        value = ctx.early if ctx.early is not None else ctx.response
+        body, headers = unwrap_response(value)
+        if headers:
+            batch_headers.update(headers)
+        final_map[item_uid] = json.dumps(body).encode()
+
+    # Phase 4: assemble BatchResponse
+    items = []
+    for item in batch.items:
+        item_uid = item.uid
+        if item_uid in final_map:
+            items.append(
+                BatchItemResponse(
+                    uid=item_uid,
+                    data=final_map[item_uid],
+                    status=_make_status(True),
+                )
+            )
+        else:
+            err = error_map.get(item_uid, Exception("unknown error"))
+            err_bytes = json.dumps({"error": str(err)}).encode()
+            items.append(
+                BatchItemResponse(
+                    uid=item_uid,
+                    data=err_bytes,
+                    status=_make_status(False, str(err)),
+                )
+            )
+
+    metrics = collect_metrics(lit_api)
+    batch_resp = BatchResponse(items=items)
+    if batch_headers:
+        batch_resp.headers.update(batch_headers)
+    return Response(uid=uid, batch=batch_resp, metrics=metrics)
+
+
 # ---------------------------------------------------------------------------
-# Async Streaming Support
+# Streaming Support
 # ---------------------------------------------------------------------------
+
+class _BidiSession:
+    """Per-stream state for bidirectional streaming."""
+
+    __slots__ = ("handler", "on_chunk", "on_close", "ctx")
+
+    def __init__(self, handler, on_chunk, on_close, ctx: RequestContext):
+        self.handler = handler
+        self.on_chunk = on_chunk
+        self.on_close = on_close
+        self.ctx = ctx
+
+
+async def _send_stream_early(socket, stream_id: str, early_response, lit_api: LitAPI) -> None:
+    """Send an early-return response as a stream chunk + StreamDone."""
+    body, _headers = unwrap_response(early_response)
+    resp_bytes = json.dumps(body).encode()
+    await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
+    metrics = collect_metrics(lit_api)
+    await socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
+
 
 async def _handle_stream_async(
     lit_api: LitAPI,
@@ -1330,7 +547,7 @@ async def _handle_stream_async(
     active_streams: dict[str, Any],
     log: logging.Logger,
 ):
-    """Handle stream open/chunk/close/cancel in async loop."""
+    """Handle stream open/chunk/close/cancel."""
     stream_req = request.stream
     stream_id = stream_req.stream_id
     action = stream_req.WhichOneof("action")
@@ -1339,28 +556,16 @@ async def _handle_stream_async(
         await _handle_stream_open_async(lit_api, stream_req, socket, active_streams, log)
     elif action == "chunk":
         await _handle_stream_chunk_async(lit_api, stream_req, socket, active_streams, log)
-    elif action == "close":
+    elif action in ("close", "cancel"):
         entry = active_streams.pop(stream_id, None)
-        if isinstance(entry, BidiStreamHandler):
+        if isinstance(entry, _BidiSession):
             try:
-                await _maybe_await(entry.on_close)
+                await entry.on_close()
             except Exception as e:
                 log.debug("bidi on_close error for %s: %s", stream_id, e)
-            metrics = _collect_metrics(lit_api)
-            await socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
-        elif isinstance(entry, asyncio.Task):
-            entry.cancel()
-            try:
-                await entry
-            except asyncio.CancelledError:
-                pass
-    elif action == "cancel":
-        entry = active_streams.pop(stream_id, None)
-        if isinstance(entry, BidiStreamHandler):
-            try:
-                await _maybe_await(entry.on_close)
-            except Exception as e:
-                log.debug("bidi on_close error for %s: %s", stream_id, e)
+            if action == "close":
+                metrics = collect_metrics(lit_api)
+                await socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
         elif isinstance(entry, asyncio.Task):
             entry.cancel()
             try:
@@ -1376,49 +581,32 @@ async def _handle_stream_open_async(
     active_streams: dict[str, Any],
     log: logging.Logger,
 ):
-    """Open a stream in async loop."""
+    """Open a stream: bidi handler, stream_predict generator, or predict fallback."""
     stream_id = stream_req.stream_id
     open_req = stream_req.open
     data = open_req.data if open_req else b""
     meta = _meta_from_proto(open_req.meta) if open_req and open_req.HasField("meta") else None
+    pipe = _get_pipeline(lit_api)
 
-    # Try bidirectional streaming first
-    if _has_bidi_stream(lit_api):
-        raw = json.loads(data) if data else {}
-
-        if hasattr(lit_api, "on_request") and meta is not None:
-            try:
-                raw = await _maybe_await(lit_api.on_request, raw, meta)
-            except HTTPException as e:
-                log.warning("bidi on_request rejected for %s: %s", stream_id, e.detail)
-                await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-                return
-            except Exception as e:
-                log.warning("on_request hook failed for bidi %s: %s", stream_id, _format_exc_brief(e))
-                await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
-                return
-            body, _headers, early = _check_early_return(raw)
-            if early:
-                await _stream_early_return_async(body, stream_id, socket, lit_api)
-                return
-
+    # --- Bidirectional streaming ------------------------------------------
+    if pipe.has_bidi_stream:
+        ctx = RequestContext(meta=meta, request=json.loads(data) if data else {})
         try:
-            decoded = await _maybe_await(lit_api.decode_request, raw) if hasattr(lit_api, "decode_request") else raw
+            await pipe.preprocess(ctx)
         except HTTPException as e:
-            log.warning("bidi decode_request rejected for %s: %s", stream_id, e.detail)
+            log.warning("bidi preprocess rejected for %s: %s", stream_id, e.detail)
             await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
             return
         except Exception as e:
-            log.warning("decode_request failed for bidi %s: %s", stream_id, _format_exc_brief(e))
-            await socket.send(_make_stream_error(stream_id, f"decode failed: {e}").SerializeToString())
+            log.warning("bidi preprocess failed for %s: %s", stream_id, _format_exc_brief(e))
+            await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
             return
-        body, _headers, early = _check_early_return(decoded)
-        if early:
-            await _stream_early_return_async(body, stream_id, socket, lit_api)
+        if ctx.early is not None:
+            await _send_stream_early(socket, stream_id, ctx.early, lit_api)
             return
 
         try:
-            handler = await _maybe_await(lit_api.bidi_stream)
+            handler = await pipe.bidi_stream()
         except HTTPException as e:
             log.warning("bidi_stream rejected for %s: %s", stream_id, e.detail)
             await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
@@ -1428,10 +616,11 @@ async def _handle_stream_open_async(
             await socket.send(_make_stream_error(stream_id, f"bidi_stream failed: {e}").SerializeToString())
             return
 
-        active_streams[stream_id] = handler
+        on_open, on_chunk, on_close = pipe.adapt_handler(handler)
+        active_streams[stream_id] = _BidiSession(handler, on_chunk, on_close, ctx)
 
         try:
-            output = await _maybe_await(handler.on_open, decoded)
+            output = await on_open(ctx.input)
         except HTTPException as e:
             log.warning("bidi on_open rejected for %s: %s", stream_id, e.detail)
             await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
@@ -1442,25 +631,9 @@ async def _handle_stream_open_async(
             return
 
         if output is not None:
+            ctx.output = output
             try:
-                body, _headers, early = _check_early_return(output)
-                if early:
-                    await _stream_early_return_async(body, stream_id, socket, lit_api)
-                    return
-                encoded = await _maybe_await(lit_api.encode_response, output) if hasattr(lit_api, "encode_response") else output
-                body, _headers, early = _check_early_return(encoded)
-                if early:
-                    await _stream_early_return_async(body, stream_id, socket, lit_api)
-                    return
-                if hasattr(lit_api, "on_response") and meta is not None:
-                    encoded = await _maybe_await(lit_api.on_response, encoded, meta)
-                    body, _headers, early = _check_early_return(encoded)
-                    if early:
-                        await _stream_early_return_async(body, stream_id, socket, lit_api)
-                        return
-                encoded, _ = _unwrap_response(encoded)
-                resp_bytes = json.dumps(encoded).encode()
-                await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
+                await pipe.postprocess(ctx)
             except HTTPException as e:
                 log.warning("bidi on_open encode rejected for %s: %s", stream_id, e.detail)
                 await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
@@ -1469,12 +642,17 @@ async def _handle_stream_open_async(
                 log.error("bidi on_open encode failed for %s: %s", stream_id, _format_exc_brief(e))
                 await socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
                 return
+            if ctx.early is not None:
+                await _send_stream_early(socket, stream_id, ctx.early, lit_api)
+                return
+            body, _ = unwrap_response(ctx.response)
+            await socket.send(_make_stream_chunk(stream_id, json.dumps(body).encode(), is_final=False).SerializeToString())
         return
 
-    if not _has_stream_predict(lit_api):
-        # Fallback: predict() once, send as single chunk
+    # --- Fallback: predict() once, send as single chunk -------------------
+    if not pipe.has_stream_predict:
         try:
-            resp_bytes, status, metrics, _ = await _run_predict_async(lit_api, data, meta, log)
+            resp_bytes, status, metrics, _ = await pipe.run_single(data, meta)
             await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=True).SerializeToString())
             await socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
         except HTTPException as e:
@@ -1485,67 +663,24 @@ async def _handle_stream_open_async(
             await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
         return
 
-    # Normal uni-directional streaming
-    raw = json.loads(data) if data else {}
-    runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
-
-    if hasattr(lit_api, "on_request") and meta is not None:
-        try:
-            raw = await _maybe_await(lit_api.on_request, raw, meta)
-        except HTTPException as e:
-            log.warning("stream on_request rejected for %s: %s", stream_id, e.detail)
-            await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-            return
-        except Exception as e:
-            log.warning("on_request hook failed for stream %s: %s", stream_id, _format_exc_brief(e))
-            await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
-            return
-        body, _headers, early = _check_early_return(raw)
-        if early:
-            await _stream_early_return_async(body, stream_id, socket, lit_api)
-            return
-
-    # on_before_decode — Callback hook
-    if runner is not None:
-        raw = await runner.trigger_async("on_before_decode", raw, meta)
-        body, _headers, early = _check_early_return(raw)
-        if early:
-            await _stream_early_return_async(body, stream_id, socket, lit_api)
-            return
-
+    # --- Uni-directional streaming -----------------------------------------
+    ctx = RequestContext(meta=meta, request=json.loads(data) if data else {})
     try:
-        decoded = await _maybe_await(lit_api.decode_request, raw) if hasattr(lit_api, "decode_request") else raw
+        await pipe.preprocess(ctx)
     except HTTPException as e:
-        log.warning("stream decode_request rejected for %s: %s", stream_id, e.detail)
+        log.warning("stream preprocess rejected for %s: %s", stream_id, e.detail)
         await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
         return
     except Exception as e:
-        log.warning("decode_request failed for stream %s: %s", stream_id, _format_exc_brief(e))
-        await socket.send(_make_stream_error(stream_id, f"decode failed: {e}").SerializeToString())
+        log.warning("stream preprocess failed for %s: %s", stream_id, _format_exc_brief(e))
+        await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
         return
-    body, _headers, early = _check_early_return(decoded)
-    if early:
-        await _stream_early_return_async(body, stream_id, socket, lit_api)
+    if ctx.early is not None:
+        await _send_stream_early(socket, stream_id, ctx.early, lit_api)
         return
-
-    # on_after_decode — Callback hook
-    if runner is not None:
-        decoded = await runner.trigger_async("on_after_decode", decoded, meta)
-        body, _headers, early = _check_early_return(decoded)
-        if early:
-            await _stream_early_return_async(body, stream_id, socket, lit_api)
-            return
-
-    # on_before_predict — Callback hook
-    if runner is not None:
-        decoded = await runner.trigger_async("on_before_predict", decoded, meta)
-        body, _headers, early = _check_early_return(decoded)
-        if early:
-            await _stream_early_return_async(body, stream_id, socket, lit_api)
-            return
 
     try:
-        generator = await _maybe_await(lit_api.stream_predict, decoded)
+        generator = await pipe.stream_predict(ctx.input)
     except HTTPException as e:
         log.warning("stream_predict rejected for %s: %s", stream_id, e.detail)
         await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
@@ -1555,15 +690,9 @@ async def _handle_stream_open_async(
         await socket.send(_make_stream_error(stream_id, f"stream_predict failed: {e}").SerializeToString())
         return
 
-    if inspect.isasyncgen(generator):
-        task = asyncio.create_task(
-            _consume_async_stream(lit_api, generator, stream_id, socket, log, meta)
-        )
-    else:
-        task = asyncio.create_task(
-            _consume_sync_stream_async(lit_api, generator, stream_id, socket, log, meta)
-        )
-
+    task = asyncio.create_task(
+        _consume_stream(lit_api, pipe, generator, stream_id, socket, log, ctx)
+    )
     active_streams[stream_id] = task
 
 
@@ -1574,18 +703,19 @@ async def _handle_stream_chunk_async(
     active_streams: dict[str, Any],
     log: logging.Logger,
 ):
-    """Handle a mid-stream chunk for bidirectional streaming (async loop)."""
+    """Handle a mid-stream chunk for bidirectional streaming."""
     stream_id = stream_req.stream_id
-    handler = active_streams.get(stream_id)
-    if handler is None or not isinstance(handler, BidiStreamHandler):
+    session = active_streams.get(stream_id)
+    if not isinstance(session, _BidiSession):
         await socket.send(_make_stream_error(stream_id, "bidi stream not found").SerializeToString())
         return
 
+    pipe = _get_pipeline(lit_api)
     data = stream_req.chunk.data if stream_req.chunk else b""
     raw = json.loads(data) if data else {}
 
     try:
-        output = await _maybe_await(handler.on_chunk, raw)
+        output = await session.on_chunk(raw)
     except HTTPException as e:
         log.warning("bidi on_chunk rejected for %s: %s", stream_id, e.detail)
         await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
@@ -1595,437 +725,106 @@ async def _handle_stream_chunk_async(
         await socket.send(_make_stream_error(stream_id, f"on_chunk failed: {e}").SerializeToString())
         return
 
-    if output is not None:
-        try:
-            body, _headers, early = _check_early_return(output)
-            if early:
-                await _stream_early_return_async(body, stream_id, socket, lit_api)
-                return
-            runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
-            # on_before_encode — Callback hook
-            if runner is not None:
-                output = await runner.trigger_async("on_before_encode", output, meta)
-                body, _headers, early = _check_early_return(output)
-                if early:
-                    await _stream_early_return_async(body, stream_id, socket, lit_api)
-                    return
-            encoded = await _maybe_await(lit_api.encode_response, output) if hasattr(lit_api, "encode_response") else output
-            body, _headers, early = _check_early_return(encoded)
-            if early:
-                await _stream_early_return_async(body, stream_id, socket, lit_api)
-                return
-            # on_after_encode — Callback hook
-            if runner is not None:
-                encoded = await runner.trigger_async("on_after_encode", encoded, meta)
-                body, _headers, early = _check_early_return(encoded)
-                if early:
-                    await _stream_early_return_async(body, stream_id, socket, lit_api)
-                    return
-            if hasattr(lit_api, "on_response") and meta is not None:
-                encoded = await _maybe_await(lit_api.on_response, encoded, meta)
-                body, _headers, early = _check_early_return(encoded)
-                if early:
-                    await _stream_early_return_async(body, stream_id, socket, lit_api)
-                    return
-            encoded, _ = _unwrap_response(encoded)
-            resp_bytes = json.dumps(encoded).encode()
-            await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
-        except HTTPException as e:
-            log.warning("bidi encode rejected for %s: %s", stream_id, e.detail)
-            await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-        except Exception as e:
-            log.error("bidi encode failed for %s: %s", stream_id, _format_exc_brief(e))
-            await socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
+    if output is None:
+        return
 
-
-async def _consume_async_stream(
-    lit_api: LitAPI,
-    generator,
-    stream_id: str,
-    socket,
-    log: logging.Logger,
-    meta=None,
-):
-    """Consume an async generator and send chunks."""
-    runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
+    ctx = session.ctx
+    ctx.output = output
+    ctx.early = None
     try:
-        async for output in generator:
-            try:
-                # on_after_predict — Callback hook (per-chunk)
-                if runner is not None:
-                    output = await runner.trigger_async("on_after_predict", output, meta)
-                    body, _headers, early = _check_early_return(output)
-                    if early:
-                        await _stream_early_return_async(body, stream_id, socket, lit_api)
-                        return
-                # on_before_encode — Callback hook
-                if runner is not None:
-                    output = await runner.trigger_async("on_before_encode", output, meta)
-                    body, _headers, early = _check_early_return(output)
-                    if early:
-                        await _stream_early_return_async(body, stream_id, socket, lit_api)
-                        return
-                encoded = await _maybe_await(lit_api.encode_response, output) if hasattr(lit_api, "encode_response") else output
-                body, _headers, early = _check_early_return(encoded)
-                if early:
-                    await _stream_early_return_async(body, stream_id, socket, lit_api)
-                    return
-                # on_after_encode — Callback hook
-                if runner is not None:
-                    encoded = await runner.trigger_async("on_after_encode", encoded, meta)
-                    body, _headers, early = _check_early_return(encoded)
-                    if early:
-                        await _stream_early_return_async(body, stream_id, socket, lit_api)
-                        return
-                if hasattr(lit_api, "on_response") and meta is not None:
-                    encoded = await _maybe_await(lit_api.on_response, encoded, meta)
-                    body, _headers, early = _check_early_return(encoded)
-                    if early:
-                        await _stream_early_return_async(body, stream_id, socket, lit_api)
-                        return
-                encoded, _ = _unwrap_response(encoded)
-                resp_bytes = json.dumps(encoded).encode()
-                await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
-            except HTTPException as e:
-                log.warning("stream encode rejected for %s: %s", stream_id, e.detail)
-                await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-                return
-            except Exception as e:
-                log.error("encode/on_response failed for stream %s: %s", stream_id, _format_exc_brief(e))
-                await socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
-                return
-    except asyncio.CancelledError:
-        # Propagate cancellation so the task is properly cancelled
-        raise
+        await pipe.postprocess(ctx)
     except HTTPException as e:
-        log.warning("async stream_predict rejected for %s: %s", stream_id, e.detail)
+        log.warning("bidi encode rejected for %s: %s", stream_id, e.detail)
         await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
         return
     except Exception as e:
-        log.error("async stream_predict error for %s: %s", stream_id, _format_exc_brief(e))
-        await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
+        log.error("bidi encode failed for %s: %s", stream_id, _format_exc_brief(e))
+        await socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
         return
-
-    metrics = _collect_metrics(lit_api)
-    await socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
+    if ctx.early is not None:
+        await _send_stream_early(socket, stream_id, ctx.early, lit_api)
+        return
+    body, _ = unwrap_response(ctx.response)
+    await socket.send(_make_stream_chunk(stream_id, json.dumps(body).encode(), is_final=False).SerializeToString())
 
 
 _SENTINEL = object()
 
 
-async def _consume_sync_stream_async(
+def _next_or_sentinel(generator):
+    try:
+        return next(generator)
+    except StopIteration:
+        return _SENTINEL
+
+
+async def _process_stream_chunk(
+    lit_api: LitAPI, pipe: Pipeline, ctx: RequestContext, output: Any,
+    stream_id: str, socket, log: logging.Logger,
+) -> bool:
+    """Run postprocess for one chunk and send it.  Returns False if the
+    stream should stop (early return sent, or an error was emitted)."""
+    ctx.output = output
+    ctx.early = None
+    try:
+        await pipe.postprocess(ctx)
+    except HTTPException as e:
+        log.warning("stream encode rejected for %s: %s", stream_id, e.detail)
+        await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
+        return False
+    except Exception as e:
+        log.error("encode failed for stream %s: %s", stream_id, _format_exc_brief(e))
+        await socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
+        return False
+    if ctx.early is not None:
+        await _send_stream_early(socket, stream_id, ctx.early, lit_api)
+        return False
+    body, _ = unwrap_response(ctx.response)
+    await socket.send(_make_stream_chunk(stream_id, json.dumps(body).encode(), is_final=False).SerializeToString())
+    return True
+
+
+async def _consume_stream(
     lit_api: LitAPI,
+    pipe: Pipeline,
     generator,
     stream_id: str,
     socket,
     log: logging.Logger,
-    meta=None,
+    ctx: RequestContext,
 ):
-    """Consume a sync generator in a background thread and send chunks asynchronously."""
-    runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
-
-    def _next_item():
-        try:
-            return next(generator)
-        except StopIteration:
-            return _SENTINEL
-
+    """Consume a sync or async generator and send chunks + StreamDone."""
     try:
-        while True:
-            output = await asyncio.to_thread(_next_item)
-            if output is _SENTINEL:
-                break
-
-            try:
-                # on_after_predict — Callback hook (per-chunk)
-                if runner is not None:
-                    output = runner.trigger("on_after_predict", output, meta)
-                    body, _headers, early = _check_early_return(output)
-                    if early:
-                        await _stream_early_return_async(body, stream_id, socket, lit_api)
-                        return
-                # on_before_encode — Callback hook
-                if runner is not None:
-                    output = runner.trigger("on_before_encode", output, meta)
-                    body, _headers, early = _check_early_return(output)
-                    if early:
-                        await _stream_early_return_async(body, stream_id, socket, lit_api)
-                        return
-                encoded = await _maybe_await(lit_api.encode_response, output) if hasattr(lit_api, "encode_response") else output
-                body, _headers, early = _check_early_return(encoded)
-                if early:
-                    await _stream_early_return_async(body, stream_id, socket, lit_api)
+        if inspect.isasyncgen(generator):
+            async for output in generator:
+                if not await _process_stream_chunk(lit_api, pipe, ctx, output, stream_id, socket, log):
                     return
-                # on_after_encode — Callback hook
-                if runner is not None:
-                    encoded = await runner.trigger_async("on_after_encode", encoded, meta)
-                    body, _headers, early = _check_early_return(encoded)
-                    if early:
-                        await _stream_early_return_async(body, stream_id, socket, lit_api)
-                        return
-                if hasattr(lit_api, "on_response") and meta is not None:
-                    encoded = await _maybe_await(lit_api.on_response, encoded, meta)
-                    body, _headers, early = _check_early_return(encoded)
-                    if early:
-                        await _stream_early_return_async(body, stream_id, socket, lit_api)
-                        return
-                encoded, _ = _unwrap_response(encoded)
-                resp_bytes = json.dumps(encoded).encode()
-                await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
-            except HTTPException as e:
-                log.warning("stream encode rejected for %s: %s", stream_id, e.detail)
-                await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-                return
-            except Exception as e:
-                log.error("encode/on_response failed for stream %s: %s", stream_id, _format_exc_brief(e))
-                await socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
-                return
+        else:
+            while True:
+                output = await asyncio.to_thread(_next_or_sentinel, generator)
+                if output is _SENTINEL:
+                    break
+                if not await _process_stream_chunk(lit_api, pipe, ctx, output, stream_id, socket, log):
+                    return
     except asyncio.CancelledError:
-        # Try to close the generator; don't wait indefinitely
-        try:
-            await asyncio.to_thread(generator.close)
-        except Exception:
-            pass
+        # Propagate cancellation; try to close the generator without waiting
+        if not inspect.isasyncgen(generator):
+            try:
+                await asyncio.to_thread(generator.close)
+            except Exception:
+                pass
         raise
     except HTTPException as e:
-        log.warning("sync stream_predict rejected for %s: %s", stream_id, e.detail)
+        log.warning("stream_predict rejected for %s: %s", stream_id, e.detail)
         await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
         return
     except Exception as e:
-        log.error("sync stream_predict error for %s: %s", stream_id, _format_exc_brief(e))
+        log.error("stream_predict error for %s: %s", stream_id, _format_exc_brief(e))
         await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
         return
 
-    metrics = _collect_metrics(lit_api)
+    metrics = collect_metrics(lit_api)
     await socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
-
-
-# ---------------------------------------------------------------------------
-# Standard Loop
-# ---------------------------------------------------------------------------
-
-def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: logging.Logger):
-    """Handle single + batch + stream requests synchronously."""
-    active_streams = _StreamTracker()
-    last_cleanup = time.monotonic()
-
-    while True:
-        try:
-            req_bytes = socket.recv()
-        except zmq.ZMQError as e:
-            if e.errno == zmq.ETERM:
-                break
-            continue
-
-        try:
-            request = Request()
-            request.ParseFromString(req_bytes)
-        except Exception as e:
-            socket.send(_make_error_response("", f"Protobuf parse: {e}").SerializeToString())
-            continue
-
-        uid = request.uid
-        meta = _meta_from_proto(request.meta) if request.HasField("meta") else None
-
-        try:
-            if request.HasField("single"):
-                # Health check: empty data → skip predict pipeline
-                if not request.single.data:
-                    response = Response(
-                        uid=uid,
-                        single=SingleResponse(
-                            data=b"{}",
-                            status=_make_status(True),
-                        ),
-                    )
-                else:
-                    resp_bytes, status, metrics, resp_headers = _run_predict(lit_api, request.single.data, meta, log)
-                    sc, mt, clean_headers = _extract_response_meta(resp_headers)
-                    single_resp = SingleResponse(data=resp_bytes, status=status,
-                                                 status_code=sc, media_type=mt)
-                    if clean_headers:
-                        single_resp.headers.update(clean_headers)
-                    response = Response(
-                        uid=uid,
-                        single=single_resp,
-                        metrics=metrics,
-                    )
-
-            elif request.HasField("batch"):
-                batch: BatchRequest = request.batch
-                batch_items = batch.items
-                runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
-
-                # Phase 1: on_request → decode (per item)
-                decoded_map: dict[str, Any] = {}
-                error_map: dict[str, Exception] = {}
-                early_final_map: dict[str, bytes] = {}
-                batch_headers: dict[str, str] = {}
-
-                for item in batch_items:
-                    try:
-                        raw = json.loads(item.data) if item.data else {}
-                        if hasattr(lit_api, "on_request"):
-                            raw = lit_api.on_request(raw, meta)
-                            if _batch_check_early(raw, item.uid, early_final_map, batch_headers):
-                                continue
-                        # on_before_decode — Callback hook
-                        if runner is not None:
-                            raw = runner.trigger("on_before_decode", raw, meta)
-                            if _batch_check_early(raw, item.uid, early_final_map, batch_headers):
-                                continue
-                        decoded = lit_api.decode_request(raw) if hasattr(lit_api, "decode_request") else raw
-                        if _batch_check_early(decoded, item.uid, early_final_map, batch_headers):
-                            continue
-                        # on_after_decode — Callback hook
-                        if runner is not None:
-                            decoded = runner.trigger("on_after_decode", decoded, meta)
-                            if _batch_check_early(decoded, item.uid, early_final_map, batch_headers):
-                                continue
-                        decoded_map[item.uid] = decoded
-                    except Exception as e:
-                        log.warning("batch item %s on_request/decode failed: %s", item.uid, _format_exc_brief(e))
-                        error_map[item.uid] = e
-
-                # Phase 2: batch → predict → unbatch
-                success_outputs: dict[str, Any] = {}
-
-                if decoded_map and _has_batch_methods(lit_api):
-                    decoded_uids = list(decoded_map.keys())
-                    decodeds = [decoded_map[_uid] for _uid in decoded_uids]
-                    try:
-                        batched = lit_api.batch(decodeds)
-                        output = lit_api.predict(batched)
-                        outputs = lit_api.unbatch(output)
-                        if len(outputs) != len(decoded_uids):
-                            raise ValueError(
-                                f"unbatch returned {len(outputs)} outputs, expected {len(decoded_uids)}"
-                            )
-                        for _uid, out in zip(decoded_uids, outputs):
-                            success_outputs[_uid] = out
-                    except Exception as e:
-                        log.error("batch predict failed: %s", _format_exc_brief(e))
-                        for _uid in decoded_uids:
-                            error_map[_uid] = e
-                else:
-                    # Fallback: per-item predict
-                    for _uid, decoded in decoded_map.items():
-                        try:
-                            success_outputs[_uid] = lit_api.predict(decoded)
-                        except Exception as e:
-                            log.error("predict failed for %s: %s", _uid, _format_exc_brief(e))
-                            error_map[_uid] = e
-
-                # Phase 3: encode → on_response (per item)
-                final_map: dict[str, bytes] = {}
-
-                for _uid, output in success_outputs.items():
-                    try:
-                        # on_before_encode — Callback hook
-                        if runner is not None:
-                            output = runner.trigger("on_before_encode", output, meta)
-                            if _batch_check_early(output, _uid, final_map, batch_headers):
-                                continue
-                        encoded = lit_api.encode_response(output) if hasattr(lit_api, "encode_response") else output
-                        if _batch_check_early(encoded, _uid, final_map, batch_headers):
-                            continue
-                        # on_after_encode — Callback hook
-                        if runner is not None:
-                            encoded = runner.trigger("on_after_encode", encoded, meta)
-                            if _batch_check_early(encoded, _uid, final_map, batch_headers):
-                                continue
-                        if hasattr(lit_api, "on_response"):
-                            encoded = lit_api.on_response(encoded, meta)
-                            if _batch_check_early(encoded, _uid, final_map, batch_headers):
-                                continue
-                        encoded, item_headers = _unwrap_response(encoded)
-                        if item_headers:
-                            batch_headers.update(item_headers)
-                        final_map[_uid] = json.dumps(encoded).encode()
-                    except Exception as e:
-                        log.warning("encode/on_response failed for %s: %s", _uid, _format_exc_brief(e))
-                        error_map[_uid] = e
-
-                # Merge early-return items from Phase 1 into final_map
-                final_map.update(early_final_map)
-
-                # Phase 4: assemble BatchResponse
-                items = []
-                for item in batch_items:
-                    item_uid = item.uid
-                    if item_uid in final_map:
-                        items.append(
-                            BatchItemResponse(
-                                uid=item_uid,
-                                data=final_map[item_uid],
-                                status=_make_status(True),
-                            )
-                        )
-                    else:
-                        err = error_map.get(item_uid, Exception("unknown error"))
-                        err_bytes = json.dumps({"error": str(err)}).encode()
-                        items.append(
-                            BatchItemResponse(
-                                uid=item_uid,
-                                data=err_bytes,
-                                status=_make_status(False, str(err)),
-                            )
-                        )
-
-                metrics = _collect_metrics(lit_api)
-                batch_resp = BatchResponse(items=items)
-                if batch_headers:
-                    batch_resp.headers.update(batch_headers)
-                response = Response(
-                    uid=uid,
-                    batch=batch_resp,
-                    metrics=metrics,
-                )
-
-            elif request.HasField("stream"):
-                stream_req: StreamRequest = request.stream
-                action = stream_req.WhichOneof("action")
-
-                if action == "open":
-                    _handle_stream_open(lit_api, stream_req, socket, active_streams, log)
-                    continue  # chunks sent asynchronously
-                elif action == "chunk":
-                    _handle_stream_chunk(lit_api, stream_req, socket, active_streams, log, meta=None)
-                    continue
-                elif action == "close":
-                    _handle_stream_close(stream_req.stream_id, active_streams, socket, log)
-                    metrics = _collect_metrics(lit_api)
-                    socket.send(_make_stream_done(stream_req.stream_id, metrics).SerializeToString())
-                    continue
-                elif action == "cancel":
-                    _handle_stream_close(stream_req.stream_id, active_streams, socket, log)
-                    continue
-                else:
-                    response = _make_error_response(uid, f"Unsupported stream action: {action}")
-
-            else:
-                response = _make_error_response(uid, "Unsupported payload type")
-
-        except HTTPException as e:
-            log.warning("request %s rejected: %s", uid, e.detail)
-            response = _make_error_response(uid, e.detail, status_code=e.status_code, error_type=e.error_type, code=e.code, param=e.param)
-        except Exception as e:
-            # One short ERROR line: message + where it raised (deepest frame).
-            # A multi-line traceback would be split into many events by the
-            # Rust stderr forwarder (it splits on newlines), so we log only
-            # the locator.
-            log.error("request %s failed: %s", uid, _format_exc_brief(e))
-            response = _make_error_response(uid, f"{type(e).__name__}: {e}")
-
-        socket.send(response.SerializeToString())
-
-        # Periodic stream expiration cleanup (~every 30s)
-        now = time.monotonic()
-        if now - last_cleanup > 30.0:
-            expired = active_streams.cleanup_expired()
-            if expired:
-                log.info("Cleaned up %d expired streams: %s", len(expired), expired)
-            last_cleanup = now
 
 
 # ---------------------------------------------------------------------------
@@ -2033,66 +832,49 @@ def run_standard_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log:
 # ---------------------------------------------------------------------------
 
 class CBState:
-    def __init__(self, uid: str, decoded_input, meta: RequestMeta):
+    def __init__(self, uid: str, ctx: RequestContext):
         self.uid = uid
-        self.input = decoded_input
+        self.ctx = ctx
+        self.input = ctx.input
         self.output = []
-        self.meta = meta
+        self.meta = ctx.meta
         self.prefilled = False
-
-
-def _has_async_methods(lit_api) -> bool:
-    """Check whether any of the hooks/methods on ``lit_api`` are async."""
-    names = ["decode_request", "on_request", "prefill", "step", "has_finished", "encode_response", "on_response"]
-    for name in names:
-        func = getattr(lit_api, name, None)
-        if func is not None and asyncio.iscoroutinefunction(func):
-            return True
-    return False
 
 
 def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: logging.Logger):
     """Autonomous continuous batching loop.
 
-    Supports both sync and async ``prefill`` / ``step`` / ``has_finished`` /
-    ``encode_response`` / ``on_request`` / ``on_response`` / ``decode_request``.
-    When async methods are detected a dedicated event loop is created inside
-    the step thread.
+    ``prefill`` / ``step`` / ``has_finished`` may be sync or async; all are
+    driven on a dedicated event loop inside the step thread.  Requests flow
+    through the Pipeline, so CB gets the same hook coverage (on_request →
+    decode → on_input on add; on_output → encode → on_response on complete)
+    and early-return support as every other mode.
     """
     active: dict[str, CBState] = {}
     lock = threading.Lock()
+    pipe = _get_pipeline(lit_api)
+    cb_loop = asyncio.new_event_loop()
 
-    use_async = _has_async_methods(lit_api)
-    cb_loop: asyncio.AbstractEventLoop | None = None
-    if use_async:
-        cb_loop = asyncio.new_event_loop()
-
-    def _call_async(coro):
-        if cb_loop is None:
-            raise RuntimeError("No event loop available for async CB method")
+    def _drive(coro):
         return cb_loop.run_until_complete(coro)
 
-    def _invoke_method(func, *args, **kwargs):
-        """Invoke ``func`` synchronously, driving it via the CB event loop when async."""
-        if func is None:
-            return None
-        if asyncio.iscoroutinefunction(func):
-            return _call_async(_maybe_await(func, *args, **kwargs))
-        result = func(*args, **kwargs)
-        if asyncio.iscoroutine(result):
-            return _call_async(result)
-        return result
+    prefill = _adapt(lit_api.prefill, None)
+    step_fn = _adapt(lit_api.step, None)
+    has_finished = _adapt(lit_api.has_finished, None)
+
+    def _send_ctx_response(uid: str, ctx: RequestContext):
+        resp_bytes, status, metrics, resp_headers = pipe.finalize(ctx)
+        response = _build_single_response(uid, resp_bytes, status, resp_headers, metrics)
+        socket.send(response.SerializeToString())
 
     def _handle_add(cb_add: CBAddRequest):
         raw = json.loads(cb_add.data) if cb_add.data else {}
         meta = _meta_from_proto(cb_add.meta) if cb_add.HasField("meta") else RequestMeta(
             route="", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=raw,
         )
-
-        # on_request moved before decode
+        ctx = RequestContext(meta=meta, request=raw)
         try:
-            if hasattr(lit_api, "on_request"):
-                raw = _invoke_method(lit_api.on_request, raw, meta)
+            _drive(pipe.preprocess(ctx))
         except HTTPException as e:
             err_resp = _make_error_response(cb_add.uid, e.detail, status_code=e.status_code, error_type=e.error_type, code=e.code, param=e.param)
             socket.send(err_resp.SerializeToString())
@@ -2101,17 +883,17 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
             err_resp = _make_error_response(cb_add.uid, str(e))
             socket.send(err_resp.SerializeToString())
             return
+        if ctx.early is not None:
+            # Early return (e.g. cache hit in on_request): respond now,
+            # skip prefill entirely.
+            _send_ctx_response(cb_add.uid, ctx)
+            return
 
-        if hasattr(lit_api, "decode_request"):
-            decoded = _invoke_method(lit_api.decode_request, raw)
-        else:
-            decoded = raw
-
-        state = CBState(cb_add.uid, decoded, meta)
+        state = CBState(cb_add.uid, ctx)
         active[cb_add.uid] = state
 
         try:
-            _invoke_method(lit_api.prefill, cb_add.uid, decoded)
+            _drive(prefill(cb_add.uid, ctx.input))
             state.prefilled = True
         except HTTPException as e:
             del active[cb_add.uid]
@@ -2126,8 +908,7 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
         active.pop(cb_remove.uid, None)
 
     def step_loop():
-        if cb_loop is not None:
-            asyncio.set_event_loop(cb_loop)
+        asyncio.set_event_loop(cb_loop)
         while True:
             with lock:
                 if not active:
@@ -2140,7 +921,7 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
                     continue
 
                 try:
-                    outputs = _invoke_method(lit_api.step, ready)
+                    outputs = _drive(step_fn(ready))
                 except HTTPException as e:
                     log.warning("cb step rejected: %s", e.detail)
                     for state in list(active.values()):
@@ -2159,32 +940,16 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
                 completed = []
                 for state, token in zip(ready, outputs):
                     state.output.append(token)
-                    if _invoke_method(lit_api.has_finished, state.uid, token, state.output):
+                    if _drive(has_finished(state.uid, token, state.output)):
                         completed.append(state.uid)
 
                 for uid in completed:
                     state = active.pop(uid)
+                    state.ctx.output = state.output
+                    state.ctx.early = None
                     try:
-                        if hasattr(lit_api, "encode_response"):
-                            encoded = _invoke_method(lit_api.encode_response, state.output)
-                        else:
-                            encoded = state.output
-                        if hasattr(lit_api, "on_response"):
-                            encoded = _invoke_method(lit_api.on_response, encoded, state.meta)
-                        encoded, resp_headers = _unwrap_response(encoded)
-                        resp_bytes = json.dumps(encoded).encode()
-                        metrics = _collect_metrics(lit_api)
-                        sc, mt, clean_headers = _extract_response_meta(resp_headers)
-                        single_resp = SingleResponse(data=resp_bytes, status=_make_status(True),
-                                                     status_code=sc, media_type=mt)
-                        if clean_headers:
-                            single_resp.headers.update(clean_headers)
-                        resp = Response(
-                            uid=uid,
-                            single=single_resp,
-                            metrics=metrics,
-                        )
-                        socket.send(resp.SerializeToString())
+                        _drive(pipe.postprocess(state.ctx))
+                        _send_ctx_response(uid, state.ctx)
                     except HTTPException as e:
                         log.warning("cb encode rejected for %s: %s", uid, e.detail)
                         err_resp = _make_error_response(uid, e.detail, status_code=e.status_code, error_type=e.error_type, code=e.code, param=e.param)
@@ -2229,8 +994,7 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
                         cb_add.meta.CopyFrom(request.meta)
                     _handle_add(cb_add)
     finally:
-        if cb_loop is not None:
-            cb_loop.close()
+        cb_loop.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2261,14 +1025,15 @@ def _protect_stdout():
 
 def _run_teardown(lit_api, log):
     # Fire callback teardown hooks
-    runner: CallbackRunner = getattr(lit_api, "_callback_runner", None)
-    if runner is not None:
-        runner.trigger_void("on_teardown", lit_api)
-    if hasattr(lit_api, "teardown"):
-        try:
-            lit_api.teardown()
-        except Exception as e:
-            log.error(f"teardown error: {e}")
+    pipe = getattr(lit_api, "_pipeline", None)
+    if pipe is not None:
+        pipe.trigger_lifecycle("on_teardown", lit_api)
+    try:
+        lit_api.teardown()
+    except Exception as e:
+        log.error(f"teardown error: {e}")
+    if pipe is not None:
+        pipe.close()
 
 
 def worker_main():
@@ -2311,7 +1076,7 @@ def worker_main():
             _run_teardown(lit_api, log)
             socket.close()
             context.term()
-    elif _is_async_api(lit_api):
+    else:
         import zmq.asyncio
 
         async_context = zmq.asyncio.Context()
@@ -2327,20 +1092,6 @@ def worker_main():
             _run_teardown(lit_api, log)
             async_socket.close()
             async_context.term()
-    else:
-        context = zmq.Context()
-        socket = context.socket(zmq.PAIR)
-        try:
-            socket.connect(args.endpoint)
-            socket.setsockopt(zmq.LINGER, 0)
-            log.info(f"Connected ZMQ PAIR to {args.endpoint}")
-            run_standard_loop(lit_api, socket, args.model_name, log)
-        except KeyboardInterrupt:
-            log.info("Interrupted, shutting down")
-        finally:
-            _run_teardown(lit_api, log)
-            socket.close()
-            context.term()
 
 
 if __name__ == "__main__":

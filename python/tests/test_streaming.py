@@ -1,97 +1,89 @@
-"""Tests for streaming inference in lite_server.worker.inference.
+"""Tests for streaming inference in the unified async worker loop.
 
-All tests use threading.Event for synchronization — no time.sleep race conditions.
+Covers stream open (fallback / stream_predict / bidi), per-chunk hooks,
+early return, cancellation, and the full run_async_loop integration.
 """
 
+import asyncio
 import json
 import logging
-import threading
-from unittest.mock import MagicMock
-from lite_server.worker.inference import _StreamTracker
 
 import pytest
 
-from lite_server.worker import inference
+from lite_server.api import BidiStreamHandler, LitAPI, RequestMeta
+from lite_server.callback import Callback
+from lite_server.pipeline import Pipeline
 from lite_server.proto import (
     Request,
     Response,
-    StreamRequest,
-    StreamOpen,
+    RequestMeta as ProtoMeta,
     StreamCancel,
     StreamClose,
-    RequestMeta as ProtoMeta,
+    StreamOpen,
+    StreamRequest,
 )
-from lite_server.api import RequestMeta
-
+from lite_server.worker import inference
 
 log = logging.getLogger("test_streaming")
 
 
-class SyncSocket:
-    """Thread-safe mock socket that signals when messages arrive."""
+class AsyncSocket:
+    """Async fake socket capturing sent Response protos."""
 
     def __init__(self):
         self.sent: list[Response] = []
-        self._lock = threading.Lock()
-        self._event = threading.Event()  # signaled on each send
+        self._event = asyncio.Event()
 
-    def send(self, data: bytes):
+    async def send(self, data: bytes):
         resp = Response()
         resp.ParseFromString(data)
-        with self._lock:
-            self.sent.append(resp)
+        self.sent.append(resp)
         self._event.set()
 
-    def wait_for(self, predicate, timeout=5.0):
-        """Block until predicate(sent) is truthy. Returns matching responses."""
-        deadline = threading.Event()
-
-        def watchdog():
-            deadline.wait(timeout)
-            deadline.set()
-
-        threading.Thread(target=watchdog, daemon=True).start()
-
-        while not deadline.is_set():
-            with self._lock:
+    async def wait_for(self, predicate, timeout=5.0):
+        async def _poll():
+            while True:
                 matches = [r for r in self.sent if predicate(r)]
-            if matches:
-                return matches
-            self._event.clear()
-            self._event.wait(timeout=0.05)
-        with self._lock:
-            return [r for r in self.sent if predicate(r)]
+                if matches:
+                    return matches
+                self._event.clear()
+                await asyncio.sleep(0.005)
 
-    def get_stream_responses(self, stream_id: str) -> list[Response]:
-        with self._lock:
-            return [r for r in self.sent if r.HasField("stream") and r.stream.stream_id == stream_id]
+        return await asyncio.wait_for(_poll(), timeout)
+
+    def stream_responses(self, stream_id: str) -> list[Response]:
+        return [
+            r for r in self.sent
+            if r.HasField("stream") and r.stream.stream_id == stream_id
+        ]
+
+
+def _stream_req(stream_id: str, data: bytes = b"{}", meta=None) -> StreamRequest:
+    open_kw = {"data": data}
+    if meta is not None:
+        open_kw["meta"] = meta
+    return StreamRequest(stream_id=stream_id, open=StreamOpen(**open_kw))
+
+
+class EchoAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def predict(self, x):
+        return x
+
+
+def _is_done(r, stream_id):
+    return r.HasField("stream") and r.stream.HasField("done") and r.stream.stream_id == stream_id
+
+
+def _is_error(r, stream_id):
+    return r.HasField("stream") and r.stream.HasField("error") and r.stream.stream_id == stream_id
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Stream proto helpers
 # ---------------------------------------------------------------------------
-
-class TestHasStreamPredict:
-    def test_returns_true_when_stream_predict_defined(self):
-        class StreamAPI:
-            def stream_predict(self, x):
-                yield 1
-
-        assert inference._has_stream_predict(StreamAPI()) is True
-
-    def test_returns_false_when_no_stream_predict(self):
-        class PlainAPI:
-            def predict(self, x):
-                return x
-
-        assert inference._has_stream_predict(PlainAPI()) is False
-
-    def test_returns_false_when_stream_predict_not_callable(self):
-        class WeirdAPI:
-            stream_predict = "not a method"
-
-        assert inference._has_stream_predict(WeirdAPI()) is False
-
 
 class TestMakeStreamHelpers:
     def test_make_stream_chunk(self):
@@ -108,7 +100,6 @@ class TestMakeStreamHelpers:
     def test_make_stream_done(self):
         resp = inference._make_stream_done("s1")
         assert resp.uid == "stream-done-s1"
-        assert resp.stream.stream_id == "s1"
         assert resp.stream.HasField("done")
 
     def test_make_stream_error(self):
@@ -119,211 +110,167 @@ class TestMakeStreamHelpers:
 
 
 # ---------------------------------------------------------------------------
-# Fallback (no stream_predict)
+# Fallback (no stream_predict → single chunk + done)
 # ---------------------------------------------------------------------------
 
-class TestHandleStreamOpenFallback:
-    """When LitAPI has no stream_predict, _handle_stream_open falls back to predict()."""
-
-    def test_sends_single_chunk_then_done(self):
-        class PlainAPI:
+class TestStreamOpenFallback:
+    @pytest.mark.asyncio
+    async def test_sends_single_chunk_then_done(self):
+        class PlainAPI(EchoAPI):
             def predict(self, x):
                 return {"result": x.get("val", 0) * 3}
 
-        sock = SyncSocket()
-        stream_req = StreamRequest(
-            stream_id="s-fallback",
-            open=StreamOpen(data=json.dumps({"val": 4}).encode()),
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            PlainAPI(), _stream_req("s-fb", json.dumps({"val": 4}).encode()), sock, {}, log
         )
-        inference._handle_stream_open(PlainAPI(), stream_req, sock, _StreamTracker(), log)
-
-        # Wait for done signal — deterministic, no sleep race
-        done_resps = sock.wait_for(
-            lambda r: r.HasField("stream") and r.stream.HasField("done") and r.stream.stream_id == "s-fallback"
-        )
-        assert len(done_resps) >= 1
-
-        responses = sock.get_stream_responses("s-fallback")
+        responses = sock.stream_responses("s-fb")
         assert len(responses) == 2
-        # First: chunk with is_final=True
         assert responses[0].stream.HasField("chunk")
         assert responses[0].stream.chunk.is_final is True
-        body = json.loads(responses[0].stream.chunk.data)
-        assert body["result"] == 12
-        # Second: done
+        assert json.loads(responses[0].stream.chunk.data)["result"] == 12
         assert responses[1].stream.HasField("done")
 
-    def test_fallback_with_empty_data(self):
-        class EchoAPI:
-            def predict(self, x):
-                return x
-
-        sock = SyncSocket()
-        stream_req = StreamRequest(
-            stream_id="s-empty",
-            open=StreamOpen(data=b""),
+    @pytest.mark.asyncio
+    async def test_fallback_with_empty_data(self):
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            EchoAPI(), _stream_req("s-empty", b""), sock, {}, log
         )
-        inference._handle_stream_open(EchoAPI(), stream_req, sock, _StreamTracker(), log)
-
-        done_resps = sock.wait_for(
-            lambda r: r.HasField("stream") and r.stream.HasField("done") and r.stream.stream_id == "s-empty"
-        )
-        assert len(done_resps) >= 1
-
-        responses = sock.get_stream_responses("s-empty")
+        responses = sock.stream_responses("s-empty")
         assert len(responses) == 2
         assert responses[0].stream.chunk.is_final is True
 
-    def test_fallback_predict_error_sends_stream_error(self):
-        class BadAPI:
+    @pytest.mark.asyncio
+    async def test_fallback_predict_error_sends_stream_error(self):
+        class BadAPI(EchoAPI):
             def predict(self, x):
                 raise RuntimeError("predict failed")
 
-        sock = SyncSocket()
-        stream_req = StreamRequest(
-            stream_id="s-err",
-            open=StreamOpen(data=b'{"x": 1}'),
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            BadAPI(), _stream_req("s-err", b'{"x": 1}'), sock, {}, log
         )
-        inference._handle_stream_open(BadAPI(), stream_req, sock, _StreamTracker(), log)
-
-        err_resps = sock.wait_for(
-            lambda r: r.HasField("stream") and r.stream.HasField("error") and r.stream.stream_id == "s-err"
-        )
-        assert len(err_resps) == 1
-        assert "predict failed" in err_resps[0].stream.error.message
+        err = [r for r in sock.stream_responses("s-err") if r.stream.HasField("error")]
+        assert len(err) == 1
+        assert "predict failed" in err[0].stream.error.message
 
 
 # ---------------------------------------------------------------------------
-# Normal streaming (with stream_predict)
+# Normal streaming (stream_predict)
 # ---------------------------------------------------------------------------
 
-class TestHandleStreamOpen:
-    """When LitAPI has stream_predict, _handle_stream_open starts a generator."""
-
-    def test_streams_multiple_chunks_then_done(self):
-        class StreamAPI:
+class TestStreamOpen:
+    @pytest.mark.asyncio
+    async def test_streams_multiple_chunks_then_done(self):
+        class StreamAPI(EchoAPI):
             def stream_predict(self, x):
                 for i in range(3):
                     yield {"chunk": i}
 
-        sock = SyncSocket()
-        stream_req = StreamRequest(
-            stream_id="s-ok",
-            open=StreamOpen(data=json.dumps({"prompt": "go"}).encode()),
+        sock = AsyncSocket()
+        active = {}
+        await inference._handle_stream_open_async(
+            StreamAPI(), _stream_req("s-ok", b'{"prompt": "go"}'), sock, active, log
         )
-        inference._handle_stream_open(StreamAPI(), stream_req, sock, _StreamTracker(), log)
-
-        done_resps = sock.wait_for(
-            lambda r: r.HasField("stream") and r.stream.HasField("done") and r.stream.stream_id == "s-ok"
-        )
-        assert len(done_resps) >= 1
-
-        responses = sock.get_stream_responses("s-ok")
-        assert len(responses) == 4  # 3 chunks + 1 done
+        await sock.wait_for(lambda r: _is_done(r, "s-ok"))
+        responses = sock.stream_responses("s-ok")
+        assert len(responses) == 4  # 3 chunks + done
         for i in range(3):
-            assert responses[i].stream.HasField("chunk")
-            body = json.loads(responses[i].stream.chunk.data)
-            assert body["chunk"] == i
+            assert json.loads(responses[i].stream.chunk.data)["chunk"] == i
         assert responses[3].stream.HasField("done")
 
-    def test_stream_registered_in_active_streams(self):
-        class StreamAPI:
+    @pytest.mark.asyncio
+    async def test_stream_task_registered_in_active_streams(self):
+        class StreamAPI(EchoAPI):
             def stream_predict(self, x):
                 yield "a"
                 yield "b"
 
-        sock = SyncSocket()
-        active = _StreamTracker()
-        stream_req = StreamRequest(
-            stream_id="s-reg",
-            open=StreamOpen(data=b'{}'),
+        sock = AsyncSocket()
+        active = {}
+        await inference._handle_stream_open_async(
+            StreamAPI(), _stream_req("s-reg"), sock, active, log
         )
-        inference._handle_stream_open(StreamAPI(), stream_req, sock, active, log)
-        # Stream is registered immediately, then consumed by background thread.
-        # Wait for done signal to verify the stream was processed.
-        sock.wait_for(
-            lambda r: r.HasField("stream") and r.stream.HasField("done") and r.stream.stream_id == "s-reg"
-        )
-        # Verify stream was cleaned up after completion
-        assert "s-reg" not in active._streams
+        assert "s-reg" in active
+        assert isinstance(active["s-reg"], asyncio.Task)
+        await sock.wait_for(lambda r: _is_done(r, "s-reg"))
 
-    def test_stream_predict_error_sends_stream_error(self):
-        class ErrorStreamAPI:
+    @pytest.mark.asyncio
+    async def test_stream_predict_mid_stream_error(self):
+        class ErrorStreamAPI(EchoAPI):
             def stream_predict(self, x):
                 yield "ok"
                 raise RuntimeError("mid-stream failure")
 
-        sock = SyncSocket()
-        stream_req = StreamRequest(
-            stream_id="s-mid-err",
-            open=StreamOpen(data=b'{}'),
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            ErrorStreamAPI(), _stream_req("s-mid"), sock, {}, log
         )
-        inference._handle_stream_open(ErrorStreamAPI(), stream_req, sock, _StreamTracker(), log)
+        await sock.wait_for(lambda r: _is_error(r, "s-mid"))
+        responses = sock.stream_responses("s-mid")
+        chunks = [r for r in responses if r.stream.HasField("chunk")]
+        errors = [r for r in responses if r.stream.HasField("error")]
+        assert len(chunks) == 1
+        assert len(errors) == 1
+        assert "mid-stream failure" in errors[0].stream.error.message
 
-        err_resps = sock.wait_for(
-            lambda r: r.HasField("stream") and r.stream.HasField("error") and r.stream.stream_id == "s-mid-err"
-        )
-        assert len(err_resps) >= 1
-
-        responses = sock.get_stream_responses("s-mid-err")
-        # chunk("ok") + error
-        chunk_resps = [r for r in responses if r.stream.HasField("chunk")]
-        error_resps = [r for r in responses if r.stream.HasField("error")]
-        assert len(chunk_resps) == 1
-        assert len(error_resps) == 1
-        assert "mid-stream failure" in error_resps[0].stream.error.message
-
-    def test_stream_predict_init_error(self):
-        class InitFailAPI:
+    @pytest.mark.asyncio
+    async def test_stream_predict_init_error(self):
+        class InitFailAPI(EchoAPI):
             def stream_predict(self, x):
                 raise RuntimeError("cannot start")
                 yield  # noqa: make it a generator function
 
-        sock = SyncSocket()
-        stream_req = StreamRequest(
-            stream_id="s-init-err",
-            open=StreamOpen(data=b'{}'),
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            InitFailAPI(), _stream_req("s-init"), sock, {}, log
         )
-        inference._handle_stream_open(InitFailAPI(), stream_req, sock, _StreamTracker(), log)
+        err = await sock.wait_for(lambda r: _is_error(r, "s-init"))
+        assert len(err) == 1
+        assert "cannot start" in err[0].stream.error.message
 
-        err_resps = sock.wait_for(
-            lambda r: r.HasField("stream") and r.stream.HasField("error") and r.stream.stream_id == "s-init-err"
+    @pytest.mark.asyncio
+    async def test_async_generator_streaming(self):
+        class AsyncGenAPI(EchoAPI):
+            async def stream_predict(self, x):
+                for i in range(2):
+                    yield {"n": i}
+
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            AsyncGenAPI(), _stream_req("s-ag"), sock, {}, log
         )
-        assert len(err_resps) == 1
-        assert "cannot start" in err_resps[0].stream.error.message
+        await sock.wait_for(lambda r: _is_done(r, "s-ag"))
+        responses = sock.stream_responses("s-ag")
+        assert len(responses) == 3  # 2 chunks + done
 
 
 # ---------------------------------------------------------------------------
-# Streaming with hooks
+# Streaming with hooks (LitAPI + Callback)
 # ---------------------------------------------------------------------------
 
-class TestHandleStreamOpenWithHooks:
-    def test_decode_request_applied(self):
-        class DecodeStreamAPI:
+class TestStreamHooks:
+    @pytest.mark.asyncio
+    async def test_decode_request_applied(self):
+        class DecodeStreamAPI(EchoAPI):
             def decode_request(self, raw):
                 return {"decoded": True, "val": raw.get("val", 0)}
 
             def stream_predict(self, x):
                 yield {"out": x["val"] + 10}
 
-        sock = SyncSocket()
-        stream_req = StreamRequest(
-            stream_id="s-dec",
-            open=StreamOpen(data=json.dumps({"val": 5}).encode()),
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            DecodeStreamAPI(), _stream_req("s-dec", json.dumps({"val": 5}).encode()), sock, {}, log
         )
-        inference._handle_stream_open(DecodeStreamAPI(), stream_req, sock, _StreamTracker(), log)
+        await sock.wait_for(lambda r: _is_done(r, "s-dec"))
+        body = json.loads(sock.stream_responses("s-dec")[0].stream.chunk.data)
+        assert body["out"] == 15
 
-        done_resps = sock.wait_for(
-            lambda r: r.HasField("stream") and r.stream.HasField("done") and r.stream.stream_id == "s-dec"
-        )
-        assert len(done_resps) >= 1
-
-        responses = sock.get_stream_responses("s-dec")
-        chunk_body = json.loads(responses[0].stream.chunk.data)
-        assert chunk_body["out"] == 15
-
-    def test_on_request_hook_applied(self):
-        class HookStreamAPI:
+    @pytest.mark.asyncio
+    async def test_on_request_hook_applied(self):
+        class HookStreamAPI(EchoAPI):
             def on_request(self, request, meta):
                 request["injected"] = True
                 return request
@@ -331,47 +278,35 @@ class TestHandleStreamOpenWithHooks:
             def stream_predict(self, x):
                 yield x
 
-        sock = SyncSocket()
+        sock = AsyncSocket()
         meta = ProtoMeta(route="/predict", headers={}, client_ip="", request_id="r1", timestamp_ns=0)
-        stream_req = StreamRequest(
-            stream_id="s-hook",
-            open=StreamOpen(data=json.dumps({"q": 1}).encode(), meta=meta),
+        await inference._handle_stream_open_async(
+            HookStreamAPI(), _stream_req("s-hook", b'{"q": 1}', meta), sock, {}, log
         )
-        inference._handle_stream_open(HookStreamAPI(), stream_req, sock, _StreamTracker(), log)
+        await sock.wait_for(lambda r: _is_done(r, "s-hook"))
+        body = json.loads(sock.stream_responses("s-hook")[0].stream.chunk.data)
+        assert body["injected"] is True
 
-        done_resps = sock.wait_for(
-            lambda r: r.HasField("stream") and r.stream.HasField("done") and r.stream.stream_id == "s-hook"
-        )
-        assert len(done_resps) >= 1
-
-        responses = sock.get_stream_responses("s-hook")
-        chunk_body = json.loads(responses[0].stream.chunk.data)
-        assert chunk_body["injected"] is True
-
-    def test_on_request_reject_sends_error(self):
-        class RejectStreamAPI:
+    @pytest.mark.asyncio
+    async def test_on_request_reject_sends_error(self):
+        class RejectStreamAPI(EchoAPI):
             def on_request(self, request, meta):
                 raise ValueError("auth failed")
 
             def stream_predict(self, x):
                 yield x
 
-        sock = SyncSocket()
+        sock = AsyncSocket()
         meta = ProtoMeta(route="/predict", headers={}, client_ip="", request_id="r1", timestamp_ns=0)
-        stream_req = StreamRequest(
-            stream_id="s-reject",
-            open=StreamOpen(data=b'{}', meta=meta),
+        await inference._handle_stream_open_async(
+            RejectStreamAPI(), _stream_req("s-rej", b"{}", meta), sock, {}, log
         )
-        inference._handle_stream_open(RejectStreamAPI(), stream_req, sock, _StreamTracker(), log)
+        err = await sock.wait_for(lambda r: _is_error(r, "s-rej"))
+        assert "auth failed" in err[0].stream.error.message
 
-        err_resps = sock.wait_for(
-            lambda r: r.HasField("stream") and r.stream.HasField("error") and r.stream.stream_id == "s-reject"
-        )
-        assert len(err_resps) == 1
-        assert "auth failed" in err_resps[0].stream.error.message
-
-    def test_on_response_hook_applied(self):
-        class OnResponseStreamAPI:
+    @pytest.mark.asyncio
+    async def test_on_response_hook_applied_per_chunk(self):
+        class OnResponseStreamAPI(EchoAPI):
             def on_response(self, response, meta):
                 response["tagged"] = meta.route
                 return response
@@ -380,196 +315,271 @@ class TestHandleStreamOpenWithHooks:
                 yield {"a": 1}
                 yield {"b": 2}
 
-        sock = SyncSocket()
+        sock = AsyncSocket()
         meta = ProtoMeta(route="/stream", headers={}, client_ip="", request_id="r2", timestamp_ns=0)
-        stream_req = StreamRequest(
-            stream_id="s-onresp",
-            open=StreamOpen(data=b'{}', meta=meta),
+        await inference._handle_stream_open_async(
+            OnResponseStreamAPI(), _stream_req("s-onresp", b"{}", meta), sock, {}, log
         )
-        inference._handle_stream_open(OnResponseStreamAPI(), stream_req, sock, _StreamTracker(), log)
+        await sock.wait_for(lambda r: _is_done(r, "s-onresp"))
+        chunks = [r for r in sock.stream_responses("s-onresp") if r.stream.HasField("chunk")]
+        assert len(chunks) == 2
+        assert json.loads(chunks[0].stream.chunk.data)["tagged"] == "/stream"
+        assert json.loads(chunks[1].stream.chunk.data)["tagged"] == "/stream"
 
-        done_resps = sock.wait_for(
-            lambda r: r.HasField("stream") and r.stream.HasField("done") and r.stream.stream_id == "s-onresp"
+    @pytest.mark.asyncio
+    async def test_callback_hooks_run_on_stream(self):
+        calls = []
+
+        class StreamCB(Callback):
+            def on_request(self, ctx):
+                calls.append("on_request")
+
+            def on_output(self, ctx):
+                calls.append("on_output")
+
+        class StreamAPI(EchoAPI):
+            def stream_predict(self, x):
+                yield {"n": 1}
+                yield {"n": 2}
+
+        api = StreamAPI()
+        api._pipeline = Pipeline.build(api, [StreamCB()])
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            api, _stream_req("s-cb"), sock, {}, log
         )
-        assert len(done_resps) >= 1
+        await sock.wait_for(lambda r: _is_done(r, "s-cb"))
+        assert calls == ["on_request", "on_output", "on_output"]
 
-        responses = sock.get_stream_responses("s-onresp")
-        chunk_resps = [r for r in responses if r.stream.HasField("chunk")]
-        assert len(chunk_resps) == 2
+    @pytest.mark.asyncio
+    async def test_callback_early_return_at_open(self):
+        class CacheCB(Callback):
+            def on_request(self, ctx):
+                ctx.respond({"cached": True})
 
-        body0 = json.loads(chunk_resps[0].stream.chunk.data)
-        assert body0["a"] == 1
-        assert body0["tagged"] == "/stream"
+        class StreamAPI(EchoAPI):
+            def stream_predict(self, x):
+                raise AssertionError("must not be called")
+                yield
 
-        body1 = json.loads(chunk_resps[1].stream.chunk.data)
-        assert body1["b"] == 2
-        assert body1["tagged"] == "/stream"
+        api = StreamAPI()
+        api._pipeline = Pipeline.build(api, [CacheCB()])
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            api, _stream_req("s-cache"), sock, {}, log
+        )
+        responses = sock.stream_responses("s-cache")
+        assert len(responses) == 2  # early chunk + done
+        assert json.loads(responses[0].stream.chunk.data) == {"cached": True}
+        assert responses[1].stream.HasField("done")
 
 
 # ---------------------------------------------------------------------------
-# Cancel
+# Bidirectional streaming
 # ---------------------------------------------------------------------------
 
-class TestHandleStreamCancel:
-    def test_cancel_removes_from_active(self):
-        gen = iter([1, 2, 3])
-        sock = SyncSocket()
-        active = _StreamTracker()
-        active.add("s1", gen)
-        inference._handle_stream_close("s1", active, sock, log)
-        assert "s1" not in active._streams
+class _UpperHandler(BidiStreamHandler):
+    def on_open(self, initial_data):
+        return {"opened": initial_data}
 
-    def test_cancel_nonexistent_is_noop(self):
-        sock = SyncSocket()
-        active = _StreamTracker()
-        inference._handle_stream_close("nope", active, sock, log)
-        assert "nope" not in active._streams
+    def on_chunk(self, chunk):
+        return {"echo": chunk}
 
-    def test_cancel_closes_generator(self):
-        closed = threading.Event()
+    def on_close(self):
+        pass
 
-        def gen():
-            try:
-                yield 1
-                yield 2
-            except GeneratorExit:
+
+class TestBidiStreaming:
+    @pytest.mark.asyncio
+    async def test_open_sends_on_open_output(self):
+        class BidiAPI(EchoAPI):
+            def bidi_stream(self):
+                return _UpperHandler()
+
+        sock = AsyncSocket()
+        active = {}
+        await inference._handle_stream_open_async(
+            BidiAPI(), _stream_req("s-bidi", b'{"start": 1}'), sock, active, log
+        )
+        assert "s-bidi" in active
+        chunks = [r for r in sock.stream_responses("s-bidi") if r.stream.HasField("chunk")]
+        assert len(chunks) == 1
+        assert json.loads(chunks[0].stream.chunk.data) == {"opened": {"start": 1}}
+
+    @pytest.mark.asyncio
+    async def test_chunk_roundtrip_and_close(self):
+        closed = asyncio.Event()
+
+        class H(BidiStreamHandler):
+            def on_chunk(self, chunk):
+                return {"echo": chunk}
+
+            def on_close(self):
                 closed.set()
-                raise
 
-        g = gen()
-        next(g)
-        sock = SyncSocket()
-        active = _StreamTracker()
-        active.add("s-close", g)
-        inference._handle_stream_close("s-close", active, sock, log)
-        assert closed.wait(timeout=2.0)
+        class BidiAPI(EchoAPI):
+            def bidi_stream(self):
+                return H()
+
+        sock = AsyncSocket()
+        active = {}
+        api = BidiAPI()
+        await inference._handle_stream_open_async(
+            api, _stream_req("s-b2"), sock, active, log
+        )
+        # on_open returned None → no chunk yet
+        assert sock.stream_responses("s-b2") == []
+
+        from lite_server.proto import StreamChunk
+
+        chunk_req = Request(
+            uid="c1",
+            stream=StreamRequest(
+                stream_id="s-b2",
+                chunk=StreamChunk(data=b'{"tok": 7}'),
+            ),
+        )
+        await inference._handle_stream_async(api, chunk_req, sock, active, log)
+        chunks = [r for r in sock.stream_responses("s-b2") if r.stream.HasField("chunk")]
+        assert len(chunks) == 1
+        assert json.loads(chunks[0].stream.chunk.data) == {"echo": {"tok": 7}}
+
+        close_req = Request(
+            uid="c2",
+            stream=StreamRequest(stream_id="s-b2", close=StreamClose()),
+        )
+        await inference._handle_stream_async(api, close_req, sock, active, log)
+        assert closed.is_set()
+        assert "s-b2" not in active
+        # close sends StreamDone for bidi sessions
+        assert any(_is_done(r, "s-b2") for r in sock.sent)
+
+    @pytest.mark.asyncio
+    async def test_chunk_for_unknown_stream_sends_error(self):
+        from lite_server.proto import StreamChunk
+
+        sock = AsyncSocket()
+        chunk_req = Request(
+            uid="c1",
+            stream=StreamRequest(
+                stream_id="nope",
+                chunk=StreamChunk(data=b"{}"),
+            ),
+        )
+        await inference._handle_stream_async(EchoAPI(), chunk_req, sock, {}, log)
+        assert any(_is_error(r, "nope") for r in sock.sent)
 
 
 # ---------------------------------------------------------------------------
-# run_standard_loop with streaming
+# run_async_loop integration
 # ---------------------------------------------------------------------------
 
-class TestRunStandardLoopStream:
-    """Integration: run_standard_loop handling stream requests."""
+class _LoopSocket:
+    """Fake zmq.asyncio socket feeding scripted requests then ETERM."""
 
-    def _make_stream_open_bytes(self, stream_id: str, data: bytes = b"{}") -> bytes:
-        req = Request(
-            uid=f"stream-open-{stream_id}",
-            stream=StreamRequest(
-                stream_id=stream_id,
-                open=StreamOpen(data=data),
-            ),
-        )
-        return req.SerializeToString()
+    def __init__(self, script):
+        self.script = list(script)  # list of bytes or callables -> bytes
+        self.sent: list[Response] = []
+        self._event = asyncio.Event()
 
-    def _make_stream_cancel_bytes(self, stream_id: str) -> bytes:
-        req = Request(
-            uid=f"stream-cancel-{stream_id}",
-            stream=StreamRequest(
-                stream_id=stream_id,
-                cancel=StreamCancel(),
-            ),
-        )
-        return req.SerializeToString()
+    async def recv(self):
+        await asyncio.sleep(0)
+        if self.script:
+            item = self.script.pop(0)
+            if callable(item):
+                item = item()
+            if asyncio.iscoroutine(item):
+                item = await item
+            if item is not None:
+                return item
+        # Script exhausted: give in-flight streams a short window to drain
+        # (ETERM cancels pending tasks on shutdown).  Exits early once a
+        # terminal frame (done/error) is seen.
+        for _ in range(200):
+            if any(
+                r.HasField("stream") and (r.stream.HasField("done") or r.stream.HasField("error"))
+                for r in self.sent
+            ):
+                break
+            await asyncio.sleep(0.005)
+        import zmq
 
-    def test_stream_open_then_done(self):
-        """Stream request with stream_predict yields chunks then done."""
-        done_event = threading.Event()
+        raise zmq.ZMQError(zmq.ETERM)
 
-        class StreamAPI:
+    async def send(self, data: bytes):
+        resp = Response()
+        resp.ParseFromString(data)
+        self.sent.append(resp)
+        self._event.set()
+
+    async def wait_for(self, predicate, timeout=5.0):
+        async def _poll():
+            while True:
+                matches = [r for r in self.sent if predicate(r)]
+                if matches:
+                    return matches
+                self._event.clear()
+                await asyncio.sleep(0.005)
+
+        return await asyncio.wait_for(_poll(), timeout)
+
+
+def _open_bytes(stream_id: str, data: bytes = b"{}"):
+    return Request(
+        uid=f"open-{stream_id}",
+        stream=StreamRequest(stream_id=stream_id, open=StreamOpen(data=data)),
+    ).SerializeToString()
+
+
+def _cancel_bytes(stream_id: str):
+    return Request(
+        uid=f"cancel-{stream_id}",
+        stream=StreamRequest(stream_id=stream_id, cancel=StreamCancel()),
+    ).SerializeToString()
+
+
+class TestRunAsyncLoopStream:
+    @pytest.mark.asyncio
+    async def test_stream_open_then_done(self):
+        class StreamAPI(EchoAPI):
             def stream_predict(self, x):
                 for i in range(2):
                     yield {"n": i}
 
-        sent_responses = []
-        lock = threading.Lock()
+        sock = _LoopSocket([_open_bytes("s-loop")])
+        await inference.run_async_loop(StreamAPI(), sock, "test-model", log)
+        stream_resps = [r for r in sock.sent if r.HasField("stream") and r.stream.stream_id == "s-loop"]
+        chunks = [r for r in stream_resps if r.stream.HasField("chunk")]
+        dones = [r for r in stream_resps if r.stream.HasField("done")]
+        assert len(chunks) == 2
+        assert len(dones) == 1
 
-        def capture_send(data):
-            resp = Response()
-            resp.ParseFromString(data)
-            with lock:
-                sent_responses.append(resp)
-            if resp.HasField("stream") and resp.stream.HasField("done"):
-                done_event.set()
+    @pytest.mark.asyncio
+    async def test_stream_cancel_mid_stream(self):
+        block_generator = asyncio.Event()
 
-        socket = MagicMock()
-        socket.send.side_effect = capture_send
-
-        recv_count = {"n": 0}
-
-        def mock_recv():
-            recv_count["n"] += 1
-            if recv_count["n"] == 1:
-                return self._make_stream_open_bytes("s-loop")
-            # Wait for stream to finish before exiting
-            done_event.wait(timeout=5.0)
-            raise KeyboardInterrupt()
-
-        socket.recv.side_effect = mock_recv
-
-        with pytest.raises(KeyboardInterrupt):
-            inference.run_standard_loop(StreamAPI(), socket, "test-model", log)
-
-        with lock:
-            stream_resps = [r for r in sent_responses if r.HasField("stream") and r.stream.stream_id == "s-loop"]
-        chunk_resps = [r for r in stream_resps if r.stream.HasField("chunk")]
-        done_resps = [r for r in stream_resps if r.stream.HasField("done")]
-        assert len(chunk_resps) == 2
-        assert len(done_resps) == 1
-
-    def test_stream_cancel_during_streaming(self):
-        """Cancel a stream mid-flight."""
-        first_chunk_sent = threading.Event()
-        block_generator = threading.Event()  # not set → generator blocks
-
-        class SlowStreamAPI:
-            def stream_predict(self, x):
+        class SlowStreamAPI(EchoAPI):
+            async def stream_predict(self, x):
                 yield "first"
-                # Block here until test signals to finish
-                block_generator.wait(timeout=5.0)
+                await block_generator.wait()
                 yield "second"
 
-        sent_responses = []
-        lock = threading.Lock()
+        async def cancel_after_first_chunk():
+            # Deliver the cancel only once the first chunk is on the wire —
+            # deterministic: open has completed, consume task is registered.
+            while not any(
+                r.HasField("stream") and r.stream.HasField("chunk")
+                and r.stream.chunk.data == b'"first"'
+                for r in sock.sent
+            ):
+                await asyncio.sleep(0.005)
+            return _cancel_bytes("s-cancel")
 
-        def capture_send(data):
-            resp = Response()
-            resp.ParseFromString(data)
-            with lock:
-                sent_responses.append(resp)
-            # Signal after first chunk is sent
-            if (resp.HasField("stream") and resp.stream.HasField("chunk")
-                    and resp.stream.chunk.data == b'"first"'):
-                first_chunk_sent.set()
-
-        socket = MagicMock()
-        socket.send.side_effect = capture_send
-
-        recv_count = {"n": 0}
-
-        def mock_recv():
-            recv_count["n"] += 1
-            if recv_count["n"] == 1:
-                return self._make_stream_open_bytes("s-cancel")
-            elif recv_count["n"] == 2:
-                # Wait for first chunk to be sent, then send cancel
-                first_chunk_sent.wait(timeout=5.0)
-                return self._make_stream_cancel_bytes("s-cancel")
-            else:
-                # Let generator finish (in case cancel didn't close it)
-                block_generator.set()
-                raise KeyboardInterrupt()
-
-        socket.recv.side_effect = mock_recv
-
-        with pytest.raises(KeyboardInterrupt):
-            inference.run_standard_loop(SlowStreamAPI(), socket, "test-model", log)
-
-        # Unblock generator in case it's still waiting
-        block_generator.set()
-
-        with lock:
-            stream_resps = [r for r in sent_responses if r.HasField("stream") and r.stream.stream_id == "s-cancel"]
-        chunk_resps = [r for r in stream_resps if r.stream.HasField("chunk")]
-        # Only the first chunk should arrive (second blocked by block_generator)
-        assert len(chunk_resps) == 1
+        sock = _LoopSocket([_open_bytes("s-cancel"), cancel_after_first_chunk])
+        await inference.run_async_loop(SlowStreamAPI(), sock, "test-model", log)
+        chunks = [
+            r for r in sock.sent
+            if r.HasField("stream") and r.stream.stream_id == "s-cancel" and r.stream.HasField("chunk")
+        ]
+        # Only the first chunk arrives; the consume task is cancelled while waiting
+        assert len(chunks) == 1

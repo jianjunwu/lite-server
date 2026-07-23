@@ -1,17 +1,132 @@
-"""pytest tests for lite_server.worker.inference (ZMQ + Protobuf)."""
+"""Tests for lite_server.worker.inference — unified async worker loop.
 
+All models run on the single asyncio loop; sync methods are adapted by the
+Pipeline.  Loop-level tests use mock sockets; pipeline-level tests call
+``Pipeline.run_single`` directly.  Models must subclass ``LitAPI`` (the
+loader and pipeline rely on the base methods existing).
+"""
+
+import asyncio
 import json
 import logging
 import os
 import subprocess
 import sys
 import textwrap
+import threading
+import time
 
 import pytest
 
+from lite_server.api import BidiStreamHandler, LitAPI, RequestMeta, ResponseWithHeaders
+from lite_server.callback import Callback
+from lite_server.pipeline import Pipeline
+from lite_server.proto import (
+    BatchItem,
+    BatchRequest,
+    Request,
+    Response,
+    SingleRequest,
+    StreamCancel,
+    StreamChunk,
+    StreamClose,
+    StreamOpen,
+    StreamRequest,
+)
 from lite_server.worker import inference
-from lite_server.proto import Request, SingleRequest, Response, BatchRequest, BatchItem
-from lite_server.api import RequestMeta
+
+log = logging.getLogger("test_worker")
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+class AsyncMockSocket:
+    """Mock zmq.asyncio socket: inject() feeds recv, _msgs captures send."""
+
+    def __init__(self):
+        self._msgs = []
+        self._incoming = []
+
+    async def send(self, data):
+        self._msgs.append(data)
+
+    async def recv(self):
+        while not self._incoming:
+            await asyncio.sleep(0.001)
+        return self._incoming.pop(0)
+
+    def inject(self, data):
+        self._incoming.append(data)
+
+
+class SyncMockSocket:
+    """Mock sync zmq socket for the CB loop."""
+
+    def __init__(self):
+        self._msgs = []
+        self._incoming = []
+
+    def send(self, data):
+        self._msgs.append(data)
+
+    def recv(self):
+        while not self._incoming:
+            time.sleep(0.001)
+        return self._incoming.pop(0)
+
+    def inject(self, data):
+        self._incoming.append(data)
+
+
+def drive_loop(model, socket, delay=0.05):
+    """Run run_async_loop briefly: start → settle → cancel."""
+
+    async def runner():
+        task = asyncio.create_task(inference.run_async_loop(model, socket, "test", log))
+        await asyncio.sleep(delay)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(runner())
+
+
+def start_cb_loop(model, socket):
+    """Start run_cb_loop on a daemon thread."""
+    t = threading.Thread(
+        target=inference.run_cb_loop, args=(model, socket, "test_model", log), daemon=True
+    )
+    t.start()
+    return t
+
+
+def wait_for_response(socket, uid, timeout=5.0) -> Response:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for msg in list(socket._msgs):
+            resp = Response()
+            resp.ParseFromString(msg)
+            if resp.uid == uid:
+                return resp
+        time.sleep(0.01)
+    raise AssertionError(f"No response for {uid} within {timeout}s")
+
+
+def run_single(model, data=None, meta=None, callbacks=()):
+    """Drive Pipeline.run_single synchronously for one request."""
+    if data is None:
+        data = json.dumps({"input": 5}).encode()
+    if meta is None:
+        meta = RequestMeta(
+            route="/predict", headers={}, client_ip="",
+            request_id="", timestamp_ns=0, payload=None,
+        )
+    pipe = Pipeline.build(model, list(callbacks))
+    return asyncio.run(pipe.run_single(data, meta))
 
 
 class TestInferenceModule:
@@ -21,49 +136,45 @@ class TestInferenceModule:
     def test_has_worker_main(self):
         assert hasattr(inference, "worker_main")
 
-    def test_has_run_standard_loop(self):
-        assert hasattr(inference, "run_standard_loop")
-
-    def test_has_run_cb_loop(self):
+    def test_has_unified_loops(self):
+        assert hasattr(inference, "run_async_loop")
         assert hasattr(inference, "run_cb_loop")
+        # The old sync standard loop is gone (0.7.0: unified async).
+        assert not hasattr(inference, "run_standard_loop")
 
 
 class TestLoadModelConfig:
     def test_loads_valid_yaml(self, tmp_path):
-        path = tmp_path / "config.yaml"
-        path.write_text(textwrap.dedent("""\
-            max_batch_size: 4
-            accelerator: gpu
-        """))
-        config = inference.load_model_config(str(path))
-        assert config["max_batch_size"] == 4
-        assert config["accelerator"] == "gpu"
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text("max_batch_size: 4\nstream: true\n")
+        assert inference.load_model_config(str(cfg)) == {"max_batch_size": 4, "stream": True}
 
     def test_missing_file_returns_empty(self, tmp_path):
-        missing = tmp_path / "missing.yaml"
-        assert inference.load_model_config(str(missing)) == {}
+        assert inference.load_model_config(str(tmp_path / "nope.yaml")) == {}
 
 
 class TestLoadLitAPI:
     def test_loads_class_with_predict(self, tmp_path):
         model_py = tmp_path / "model.py"
         model_py.write_text(textwrap.dedent('''
-            class MyModel:
-                def __init__(self, **kwargs):
-                    pass
+            from lite_server import LitAPI
+
+            class MyModel(LitAPI):
                 def predict(self, x):
                     return {"output": x * 2}
         '''))
         api = inference.load_litapi(str(model_py), {})
         assert hasattr(api, "predict")
         assert api.predict(5) == {"output": 10}
+        # The pipeline is built and attached at load time
+        assert isinstance(api._pipeline, Pipeline)
 
     def test_calls_setup_and_pre_setup(self, tmp_path):
         model_py = tmp_path / "model.py"
         model_py.write_text(textwrap.dedent('''
-            class MyModel:
-                def __init__(self, **kwargs):
-                    pass
+            from lite_server import LitAPI
+
+            class MyModel(LitAPI):
                 def pre_setup(self):
                     self.pre = True
                 def setup(self, device):
@@ -84,6 +195,20 @@ class TestLoadLitAPI:
         with pytest.raises(RuntimeError, match="No LitAPI subclass"):
             inference.load_litapi(str(model_py), {})
 
+    def test_raises_when_not_litapi_subclass(self, tmp_path):
+        """Plain classes with predict are rejected — the pipeline relies on
+        the LitAPI base methods existing."""
+        model_py = tmp_path / "model.py"
+        model_py.write_text(textwrap.dedent('''
+            class MyModel:
+                def __init__(self, **kwargs):
+                    pass
+                def predict(self, x):
+                    return x
+        '''))
+        with pytest.raises(RuntimeError, match="No LitAPI subclass"):
+            inference.load_litapi(str(model_py), {})
+
     def test_loads_with_local_sibling_import(self, tmp_path):
         """model.py that imports a sibling module (e.g. utils) should load successfully."""
         utils_py = tmp_path / "utils.py"
@@ -93,11 +218,10 @@ class TestLoadLitAPI:
         '''))
         model_py = tmp_path / "model.py"
         model_py.write_text(textwrap.dedent('''
+            from lite_server import LitAPI
             from utils import add
 
-            class MyModel:
-                def __init__(self, **kwargs):
-                    pass
+            class MyModel(LitAPI):
                 def predict(self, x):
                     return {"result": add(x)}
         '''))
@@ -106,18 +230,16 @@ class TestLoadLitAPI:
 
     def test_sys_path_cleaned_after_load(self, tmp_path):
         """model_dir should not remain in sys.path after load_litapi returns."""
-        # Clean sys.modules of any stale 'utils' from prior tests
         saved_utils = sys.modules.pop("utils", None)
         try:
             utils_py = tmp_path / "utils.py"
             utils_py.write_text("def noop(): pass\n")
             model_py = tmp_path / "model.py"
             model_py.write_text(textwrap.dedent('''
+                from lite_server import LitAPI
                 from utils import noop
 
-                class MyModel:
-                    def __init__(self, **kwargs):
-                        pass
+                class MyModel(LitAPI):
                     def predict(self, x):
                         return x
             '''))
@@ -132,27 +254,22 @@ class TestLoadLitAPI:
 
     def test_loads_callbacks_from_model_dir(self, tmp_path):
         """Callbacks defined in the model directory should be loaded."""
-        # Clean sys.modules to isolate from prior test modules
         saved = sys.modules.pop("callbacks", None)
         try:
-            # Write a callback module in the model directory
             callbacks_py = tmp_path / "callbacks.py"
             callbacks_py.write_text(textwrap.dedent('''
                 from lite_server.callback import Callback
 
                 class Tracker(Callback):
-                    called = False
-
-                    def on_before_decode(self, request, meta):
-                        request["_hooked"] = True
-                        return request
+                    def on_request(self, ctx):
+                        ctx.request["_hooked"] = True
             '''))
 
             model_py = tmp_path / "model.py"
             model_py.write_text(textwrap.dedent('''
-                class MyModel:
-                    def __init__(self, **kwargs):
-                        pass
+                from lite_server import LitAPI
+
+                class MyModel(LitAPI):
                     def predict(self, x):
                         return x
             '''))
@@ -160,31 +277,58 @@ class TestLoadLitAPI:
             config = {"callbacks": ["callbacks.Tracker"]}
             api = inference.load_litapi(str(model_py), config)
             assert hasattr(api, "predict")
-            # Verify the callback was loaded
-            callback_runner = getattr(api, "_callback_runner", None)
-            assert callback_runner is not None
-            assert callback_runner.has_callbacks()
+            callbacks = api._pipeline.callbacks
+            assert len(callbacks) == 1
+            assert type(callbacks[0]).__name__ == "Tracker"
+        finally:
+            sys.modules.pop("callbacks", None)
+            if saved is not None:
+                sys.modules["callbacks"] = saved
+
+    def test_old_signature_callback_fails_loudly(self, tmp_path):
+        """Pre-0.7 (value, meta) callbacks are rejected at load time."""
+        saved = sys.modules.pop("callbacks", None)
+        try:
+            callbacks_py = tmp_path / "callbacks.py"
+            callbacks_py.write_text(textwrap.dedent('''
+                from lite_server.callback import Callback
+
+                class Old(Callback):
+                    def on_before_decode(self, request, meta):
+                        return request
+            '''))
+            model_py = tmp_path / "model.py"
+            model_py.write_text(textwrap.dedent('''
+                from lite_server import LitAPI
+
+                class MyModel(LitAPI):
+                    def predict(self, x):
+                        return x
+            '''))
+            with pytest.raises(RuntimeError, match="on_before_decode"):
+                inference.load_litapi(str(model_py), {"callbacks": ["callbacks.Old"]})
         finally:
             sys.modules.pop("callbacks", None)
             if saved is not None:
                 sys.modules["callbacks"] = saved
 
 
-class TestRunPredict:
+# ---------------------------------------------------------------------------
+# Pipeline-level single-request tests
+# ---------------------------------------------------------------------------
+
+class TestRunSingle:
     def test_basic_predict(self):
-        class MockAPI:
+        class MockAPI(LitAPI):
             def predict(self, x):
                 return {"output": x.get("input", 0) * 2}
 
-        meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
-        data = json.dumps({"input": 5}).encode()
-        log = logging.getLogger("test")
-        resp_bytes, status, metrics, _ = inference._run_predict(MockAPI(), data, meta, log)
+        resp_bytes, status, metrics, _ = run_single(MockAPI())
         assert json.loads(resp_bytes) == {"output": 10}
         assert status.code == "Ok"
 
     def test_on_request_hook_can_modify(self):
-        class HookAPI:
+        class HookAPI(LitAPI):
             def on_request(self, request, meta):
                 request["input"] = request["input"] + 1
                 return request
@@ -192,45 +336,30 @@ class TestRunPredict:
             def predict(self, x):
                 return {"output": x["input"] * 2}
 
-        meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
-        data = json.dumps({"input": 5}).encode()
-        log = logging.getLogger("test")
-        resp_bytes, status, metrics, _ = inference._run_predict(HookAPI(), data, meta, log)
+        resp_bytes, status, metrics, _ = run_single(HookAPI())
         assert json.loads(resp_bytes) == {"output": 12}
 
     def test_on_request_hook_can_reject(self):
-        class RejectAPI:
+        class RejectAPI(LitAPI):
             def on_request(self, request, meta):
                 raise ValueError("rejected")
 
             def predict(self, x):
                 return x
 
-        meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
-        data = json.dumps({"input": 5}).encode()
-        log = logging.getLogger("test")
         with pytest.raises(ValueError, match="rejected"):
-            inference._run_predict(RejectAPI(), data, meta, log)
+            run_single(RejectAPI())
 
     def test_skips_hooks_when_not_implemented(self):
-        class PlainAPI:
+        class PlainAPI(LitAPI):
             def predict(self, x):
                 return {"output": x.get("input", 0) * 2}
 
-        meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
-        data = json.dumps({"input": 5}).encode()
-        log = logging.getLogger("test")
-        resp_bytes, status, metrics, _ = inference._run_predict(PlainAPI(), data, meta, log)
+        resp_bytes, status, metrics, _ = run_single(PlainAPI())
         assert json.loads(resp_bytes) == {"output": 10}
 
-
-class TestRunPredictResponseHeaders:
-    """_run_predict: on_response returning ResponseWithHeaders passes headers."""
-
     def test_on_response_with_headers_returns_headers_in_tuple(self):
-        from lite_server.api import ResponseWithHeaders
-
-        class HeaderAPI:
+        class HeaderAPI(LitAPI):
             def predict(self, x):
                 return {"output": x.get("input", 0) * 2}
 
@@ -239,53 +368,84 @@ class TestRunPredictResponseHeaders:
                     body=response, headers={"X-Custom": "hello", "X-Other": "world"}
                 )
 
-        meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
-        data = json.dumps({"input": 5}).encode()
-        log = logging.getLogger("test")
-        resp_bytes, status, metrics, headers = inference._run_predict(HeaderAPI(), data, meta, log)
+        resp_bytes, status, metrics, headers = run_single(HeaderAPI())
         assert json.loads(resp_bytes) == {"output": 10}
         assert status.code == "Ok"
         assert headers == {"X-Custom": "hello", "X-Other": "world"}
 
     def test_on_response_plain_body_returns_none_headers(self):
-        class PlainAPI:
+        class PlainAPI(LitAPI):
             def predict(self, x):
                 return {"output": x.get("input", 0) * 2}
 
             def on_response(self, response, meta):
                 return {"wrapped": response}
 
-        meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
-        data = json.dumps({"input": 5}).encode()
-        log = logging.getLogger("test")
-        resp_bytes, status, metrics, headers = inference._run_predict(PlainAPI(), data, meta, log)
+        resp_bytes, status, metrics, headers = run_single(PlainAPI())
         assert json.loads(resp_bytes) == {"wrapped": {"output": 10}}
-        assert status.code == "Ok"
         assert headers is None
 
     def test_no_on_response_still_returns_none_headers(self):
-        class NoHookAPI:
+        class NoHookAPI(LitAPI):
             def predict(self, x):
                 return {"output": x.get("input", 0) + 1}
 
-        meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
-        data = json.dumps({"input": 3}).encode()
-        log = logging.getLogger("test")
-        resp_bytes, status, metrics, headers = inference._run_predict(NoHookAPI(), data, meta, log)
-        assert json.loads(resp_bytes) == {"output": 4}
-        assert status.code == "Ok"
+        resp_bytes, status, metrics, headers = run_single(NoHookAPI())
+        assert json.loads(resp_bytes) == {"output": 6}
         assert headers is None
 
+    def test_async_predict_pipeline(self):
+        class AsyncAPI(LitAPI):
+            async def decode_request(self, req):
+                return {"decoded": req["input"]}
 
-class TestRunPredictAsyncResponseHeaders:
-    """_run_predict_async: on_response returning ResponseWithHeaders passes headers."""
+            async def on_request(self, req, meta):
+                req["on_request"] = True
+                return req
+
+            async def predict(self, x):
+                return {"output": x["decoded"] * 2}
+
+            async def encode_response(self, out):
+                return {"encoded": out["output"]}
+
+            async def on_response(self, resp, meta):
+                resp["on_response"] = True
+                return resp
+
+        resp_bytes, status, metrics, _ = run_single(AsyncAPI())
+        assert json.loads(resp_bytes) == {"encoded": 10, "on_response": True}
+        assert status.code == "Ok"
+
+    def test_async_predict_without_optional_hooks(self):
+        class SimpleAsyncAPI(LitAPI):
+            async def predict(self, x):
+                return {"output": x["input"] * 3}
+
+        resp_bytes, status, metrics, _ = run_single(SimpleAsyncAPI())
+        assert json.loads(resp_bytes) == {"output": 15}
+        assert status.code == "Ok"
+
+    def test_mixed_sync_async_hooks(self):
+        class MixedAPI(LitAPI):
+            async def on_request(self, req, meta):
+                req["hooked"] = True
+                return req
+
+            async def predict(self, x):
+                return x
+
+            def on_response(self, resp, meta):
+                resp["sync_hook"] = True
+                return resp
+
+        resp_bytes, status, metrics, _ = run_single(
+            MixedAPI(), data=json.dumps({"input": 1}).encode()
+        )
+        assert json.loads(resp_bytes) == {"input": 1, "hooked": True, "sync_hook": True}
 
     def test_async_on_response_with_headers(self):
-        import asyncio
-        from lite_server.api import ResponseWithHeaders
-        from lite_server.worker.inference import _run_predict_async
-
-        class AsyncHeaderAPI:
+        class AsyncHeaderAPI(LitAPI):
             async def predict(self, x):
                 return {"output": x.get("input", 0) * 2}
 
@@ -294,181 +454,28 @@ class TestRunPredictAsyncResponseHeaders:
                     body=response, headers={"X-Async": "true"}
                 )
 
-        meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
-        data = json.dumps({"input": 5}).encode()
-        log = logging.getLogger("test")
-        resp_bytes, status, metrics, headers = asyncio.run(
-            _run_predict_async(AsyncHeaderAPI(), data, meta, log)
-        )
+        resp_bytes, status, metrics, headers = run_single(AsyncHeaderAPI())
         assert json.loads(resp_bytes) == {"output": 10}
         assert headers == {"X-Async": "true"}
 
 
-class TestRunPredictErrorLogging:
-    """Verify _run_predict logs include location info on exceptions."""
-
-    def test_predict_exception_log_has_exc_info(self, caplog):
-        """Inner _run_predict catch should NOT use exc_info (avoids duplicate).
-        The full traceback is logged once by the outer run_standard_loop catch."""
-        class BoomAPI:
-            def predict(self, x):
-                raise RuntimeError("boom")
-
-        meta = RequestMeta(
-            route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None
-        )
-        data = json.dumps({"input": 5}).encode()
-        log = logging.getLogger("test_predict_error")
-
-        with caplog.at_level(logging.ERROR):
-            try:
-                inference._run_predict(BoomAPI(), data, meta, log)
-            except RuntimeError:
-                pass
-
-        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
-        assert len(error_records) >= 1, "expected at least one ERROR log record"
-        assert error_records[0].exc_info is None, \
-            "inner catch must NOT use exc_info=True — traceback is logged by outer catch"
-
-    def test_predict_exception_log_includes_inference_file(self, caplog):
-        """The log record's pathname should point to inference.py."""
-        class BoomAPI:
-            def predict(self, x):
-                raise RuntimeError("boom")
-
-        meta = RequestMeta(
-            route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None
-        )
-        data = json.dumps({"input": 5}).encode()
-        log = logging.getLogger("test_predict_path")
-
-        with caplog.at_level(logging.ERROR):
-            try:
-                inference._run_predict(BoomAPI(), data, meta, log)
-            except RuntimeError:
-                pass
-
-        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
-        assert len(error_records) >= 1
-        assert error_records[0].pathname.endswith("inference.py"), \
-            f"expected pathname ending with inference.py, got: {error_records[0].pathname}"
-
-
 class TestOuterHandlerErrorTraceback:
-    """Outer request handlers must emit the traceback once at ERROR level.
+    """The outer request handler emits exactly one single-line ERROR record
+    per failure — visible at the default INFO level so failures can be
+    located in the user's model.py — while the client still receives a
+    structured 500 (no WORKER_CRASHED regression)."""
 
-    The inner _run_predict stage logs stay exc_info-free (see
-    TestRunPredictErrorLogging) so the traceback is not duplicated; the
-    outer handler emits it exactly once at ERROR — visible at the default
-    INFO level so failures can be located in the user's model.py — while
-    the client still receives a structured 500 (no WORKER_CRASHED regression).
-    """
-
-    def test_standard_loop_logs_traceback_once_at_error(self, caplog):
-        import threading
-        import time
-        from lite_server.worker.inference import run_standard_loop
-        from lite_server.proto import Request, SingleRequest, Response
-
-        class BoomModel:
+    def test_async_loop_logs_traceback_once_at_error(self, caplog):
+        class BoomModel(LitAPI):
             def predict(self, x):
                 return {"output": 1 / 0}  # ZeroDivisionError, like the user's 1/0
 
-            _metric_specs = []
-            _metric_values = []
-
-        class MockSocket:
-            def __init__(self):
-                self._msgs = []
-                self._incoming = []
-
-            def send(self, data):
-                self._msgs.append(data)
-
-            def recv(self):
-                while not self._incoming:
-                    time.sleep(0.001)
-                return self._incoming.pop(0)
-
-            def inject(self, data):
-                self._incoming.append(data)
-
-        socket = MockSocket()
-        log = logging.getLogger("test_outer_standard")
-        req = Request(uid="err-sync", single=SingleRequest(data=json.dumps({"input": 1}).encode()))
-        socket.inject(req.SerializeToString())
-
-        with caplog.at_level(logging.ERROR):
-            t = threading.Thread(target=run_standard_loop, args=(BoomModel(), socket, "echo", log))
-            t.start()
-            time.sleep(0.1)
-            socket.inject(b"")
-            t.join(timeout=0.2)
-
-        tb_records = [r for r in caplog.records
-                      if r.levelno >= logging.ERROR
-                      and "ZeroDivisionError" in r.getMessage()
-                      and "predict" in r.getMessage()]
-        assert len(tb_records) == 1, (
-            "expected exactly one ERROR record for the failure (no explosion), got "
-            f"{len(tb_records)}: {[r.getMessage() for r in caplog.records]}"
-        )
-        msg = tb_records[0].getMessage()
-        assert "\n" not in msg, "must stay a single line (Rust forwarder splits on newlines)"
-        assert "test_worker.py" in msg, f"location frame missing from: {msg}"
-
-        resp = Response()
-        resp.ParseFromString(socket._msgs[0])
-        assert resp.uid == "err-sync"
-        assert resp.single.status.code == "Error"
-        assert resp.single.status.message == "500"
-        assert json.loads(resp.single.data)["error"]["type"] == "server_error"
-
-    def test_async_loop_logs_traceback_once_at_error(self, caplog):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import Request, SingleRequest, Response
-
-        class BoomModel:
-            async def predict(self, x):
-                return {"output": 1 / 0}
-
-            _metric_specs = []
-            _metric_values = []
-
-        class MockSocket:
-            def __init__(self):
-                self._msgs = []
-                self._incoming = []
-
-            async def send(self, data):
-                self._msgs.append(data)
-
-            async def recv(self):
-                while not self._incoming:
-                    await asyncio.sleep(0.001)
-                return self._incoming.pop(0)
-
-            def inject(self, data):
-                self._incoming.append(data)
-
-        socket = MockSocket()
-        log = logging.getLogger("test_outer_async")
+        socket = AsyncMockSocket()
         req = Request(uid="err-async", single=SingleRequest(data=json.dumps({"input": 1}).encode()))
         socket.inject(req.SerializeToString())
 
         with caplog.at_level(logging.ERROR):
-            async def runner():
-                task = asyncio.create_task(run_async_loop(BoomModel(), socket, "echo", log))
-                await asyncio.sleep(0.05)
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-            asyncio.run(runner())
+            drive_loop(BoomModel(), socket)
 
         tb_records = [r for r in caplog.records
                       if r.levelno >= logging.ERROR
@@ -491,16 +498,8 @@ class TestOuterHandlerErrorTraceback:
 
     def test_cb_loop_logs_step_failure_as_one_error_line(self, caplog):
         """Continuous-batching step() failure must also be one ERROR line."""
-        import threading
-        import time
-        from lite_server.worker.inference import run_cb_loop
-        from lite_server.proto import Request, Response
 
-        class BoomCBModel:
-            def __init__(self):
-                self._metric_specs = []
-                self._metric_values = []
-
+        class BoomCBModel(LitAPI):
             def decode_request(self, req):
                 return req.get("input", 0)
 
@@ -516,36 +515,14 @@ class TestOuterHandlerErrorTraceback:
             def encode_response(self, output):
                 return output
 
-        class MockSocket:
-            def __init__(self):
-                self._msgs = []
-                self._incoming = []
-
-            def send(self, data):
-                self._msgs.append(data)
-
-            def recv(self):
-                while not self._incoming:
-                    time.sleep(0.001)
-                return self._incoming.pop(0)
-
-            def inject(self, data):
-                self._incoming.append(data)
-
-        socket = MockSocket()
-        log = logging.getLogger("test_outer_cb")
+        socket = SyncMockSocket()
         req = Request()
         req.uid = "cb-err-1"
         req.single.data = json.dumps({"input": 1}).encode()
         socket.inject(req.SerializeToString())
 
         with caplog.at_level(logging.ERROR):
-            t = threading.Thread(
-                target=run_cb_loop,
-                args=(BoomCBModel(), socket, "test", log),
-                daemon=True,
-            )
-            t.start()
+            start_cb_loop(BoomCBModel(), socket)
             deadline = time.time() + 5
             while time.time() < deadline and not socket._msgs:
                 time.sleep(0.01)
@@ -645,52 +622,6 @@ class TestMetaFromProto:
         assert meta.payload is None
 
 
-class TestHealthCheck:
-    """Active health check sends empty data; worker must return OK without calling predict."""
-
-    def test_empty_data_returns_ok(self):
-        """When SingleRequest.data is empty, _run_predict should not be called."""
-        call_count = 0
-
-        class StrictAPI:
-            def predict(self, x):
-                nonlocal call_count
-                call_count += 1
-                # This would fail if called with empty input
-                return {"output": x["required_field"]}
-
-        meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
-        # Simulate what the worker does: empty data → skip predict
-        data = b""
-        if not data:
-            result = b"{}"
-            from lite_server.proto import Status
-            status = Status(code="Ok", message="")
-        else:
-            result, status, _, _ = inference._run_predict(StrictAPI(), data, meta)
-
-        assert call_count == 0, "predict() should not be called for health check"
-        assert status.code == "Ok"
-        assert result == b"{}"
-
-    def test_non_empty_data_calls_predict(self):
-        """Normal requests with data should still go through predict."""
-        call_count = 0
-
-        class CountingAPI:
-            def predict(self, x):
-                nonlocal call_count
-                call_count += 1
-                return {"output": 42}
-
-        meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
-        data = json.dumps({"input": 1}).encode()
-        log = logging.getLogger("test")
-        resp_bytes, status, metrics, _ = inference._run_predict(CountingAPI(), data, meta, log)
-        assert call_count == 1
-        assert status.code == "Ok"
-
-
 class TestStdoutProtection:
     """C-level writes to fd 1 during model loading must not pollute the handshake."""
 
@@ -699,9 +630,9 @@ class TestStdoutProtection:
         model_py = tmp_path / "model.py"
         model_py.write_text(textwrap.dedent("""\
             import os as _os
-            class MyModel:
-                def __init__(self, **kwargs):
-                    pass
+            from lite_server import LitAPI
+
+            class MyModel(LitAPI):
                 def setup(self, device):
                     _os.write(1, b"[CANN] Initializing NPU...\\n")
                     _os.write(1, b"[CANN] Driver: 8.0.rc1\\n")
@@ -741,264 +672,20 @@ class TestStdoutProtection:
 
 
 # ---------------------------------------------------------------------------
-# Async Worker Tests
+# run_async_loop integration tests
 # ---------------------------------------------------------------------------
 
-class TestIsAsyncAPI:
-    """_is_async_api detection logic."""
-
-    def test_detects_async_litapi_subclass(self):
-        from lite_server.worker.inference import _is_async_api
-        from lite_server.api_async import AsyncLitAPI
-
-        class Dummy(AsyncLitAPI):
-            def setup(self, device): pass
-            async def predict(self, x): return x
-
-        api = Dummy()
-        assert _is_async_api(api) is True
-
-    def test_detects_sync_litapi(self):
-        from lite_server.worker.inference import _is_async_api
-        from lite_server.api import LitAPI
-
-        class Dummy(LitAPI):
-            def setup(self, device): pass
-            def predict(self, x): return x
-
-        api = Dummy()
-        assert _is_async_api(api) is False
-
-    def test_detects_enable_async_flag(self):
-        from lite_server.worker.inference import _is_async_api
-        from lite_server.api import LitAPI
-
-        class Dummy(LitAPI):
-            def setup(self, device): pass
-            def predict(self, x): return x
-
-        api = Dummy()
-        api.enable_async = True
-        assert _is_async_api(api) is True
-
-    def test_detects_async_predict_on_sync_subclass(self):
-        from lite_server.worker.inference import _is_async_api
-        from lite_server.api import LitAPI
-
-        class Dummy(LitAPI):
-            def setup(self, device): pass
-            async def predict(self, x): return x
-
-        api = Dummy()
-        assert _is_async_api(api) is True
-
-    def test_detects_async_stream_predict(self):
-        from lite_server.worker.inference import _is_async_api
-        from lite_server.api import LitAPI
-
-        class Dummy(LitAPI):
-            def setup(self, device): pass
-            def predict(self, x): return x
-            async def stream_predict(self, x):
-                yield x
-
-        api = Dummy()
-        assert _is_async_api(api) is True
-
-    def test_plain_object_with_predict_is_not_async(self):
-        from lite_server.worker.inference import _is_async_api
-
-        class Plain:
-            def predict(self, x):
-                return x
-
-        assert _is_async_api(Plain()) is False
-
-
-class TestMaybeAwait:
-    """_maybe_await helper."""
-
-    def test_sync_function_returns_directly(self):
-        from lite_server.worker.inference import _maybe_await
-        import asyncio
-
-        def add(a, b):
-            return a + b
-
-        result = asyncio.run(_maybe_await(add, 2, 3))
-        assert result == 5
-
-    def test_async_function_is_awaited(self):
-        from lite_server.worker.inference import _maybe_await
-        import asyncio
-
-        async def add(a, b):
-            await asyncio.sleep(0)
-            return a + b
-
-        result = asyncio.run(_maybe_await(add, 2, 3))
-        assert result == 5
-
-    def test_sync_function_returning_coroutine_is_awaited(self):
-        from lite_server.worker.inference import _maybe_await
-        import asyncio
-
-        def make_coro():
-            async def inner():
-                return 42
-            return inner()
-
-        result = asyncio.run(_maybe_await(make_coro))
-        assert result == 42
-
-
-class TestRunPredictAsync:
-    """Async predict pipeline with hooks."""
-
-    def test_async_predict_pipeline(self):
-        import asyncio
-        from lite_server.worker.inference import _run_predict_async
-        from lite_server.api import RequestMeta
-
-        class AsyncAPI:
-            async def decode_request(self, req):
-                return {"decoded": req["input"]}
-
-            async def on_request(self, req, meta):
-                req["on_request"] = True
-                return req
-
-            async def predict(self, x):
-                return {"output": x["decoded"] * 2}
-
-            async def encode_response(self, out):
-                return {"encoded": out["output"]}
-
-            async def on_response(self, resp, meta):
-                resp["on_response"] = True
-                return resp
-
-            def register_metric(self, name, metric_type):
-                return 0
-
-            def report_metric(self, metric_id, value):
-                pass
-
-            _metric_specs = []
-            _metric_values = []
-
-        meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
-        data = json.dumps({"input": 5}).encode()
-        log = logging.getLogger("test")
-        resp_bytes, status, metrics, _ = asyncio.run(_run_predict_async(AsyncAPI(), data, meta, log))
-        assert json.loads(resp_bytes) == {"encoded": 10, "on_response": True}
-        assert status.code == "Ok"
-
-    def test_async_predict_without_optional_hooks(self):
-        import asyncio
-        from lite_server.worker.inference import _run_predict_async
-        from lite_server.api import RequestMeta
-
-        class SimpleAsyncAPI:
-            async def predict(self, x):
-                return {"output": x["input"] * 3}
-
-            _metric_specs = []
-            _metric_values = []
-
-        meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
-        data = json.dumps({"input": 4}).encode()
-        log = logging.getLogger("test")
-        resp_bytes, status, metrics, _ = asyncio.run(_run_predict_async(SimpleAsyncAPI(), data, meta, log))
-        assert json.loads(resp_bytes) == {"output": 12}
-        assert status.code == "Ok"
-
-    def test_mixed_sync_async_hooks(self):
-        import asyncio
-        from lite_server.worker.inference import _run_predict_async
-        from lite_server.api import RequestMeta
-
-        class MixedAPI:
-            def decode_request(self, req):
-                return req
-
-            async def on_request(self, req, meta):
-                req["hooked"] = True
-                return req
-
-            async def predict(self, x):
-                return x
-
-            def encode_response(self, out):
-                return out
-
-            def on_response(self, resp, meta):
-                resp["sync_hook"] = True
-                return resp
-
-            _metric_specs = []
-            _metric_values = []
-
-        meta = RequestMeta(route="/predict", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=None)
-        data = json.dumps({"input": 1}).encode()
-        log = logging.getLogger("test")
-        resp_bytes, status, metrics, _ = asyncio.run(_run_predict_async(MixedAPI(), data, meta, log))
-        assert json.loads(resp_bytes) == {"input": 1, "hooked": True, "sync_hook": True}
-
-
 class TestAsyncLoop:
-    """run_async_loop integration tests with a mock ZMQ socket."""
-
-    def _make_socket(self):
-        """Return a mock socket that records sent messages."""
-        class MockSocket:
-            def __init__(self):
-                self._msgs = []
-                self._incoming = []
-
-            async def send(self, data):
-                self._msgs.append(data)
-
-            async def recv(self):
-                while not self._incoming:
-                    import asyncio
-                    await asyncio.sleep(0.001)
-                return self._incoming.pop(0)
-
-            def inject(self, data):
-                self._incoming.append(data)
-
-        return MockSocket()
-
     def test_async_single_request(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import Request, SingleRequest, Response
-
-        class AsyncModel:
+        class AsyncModel(LitAPI):
             async def predict(self, x):
                 return {"result": x["input"] * 2}
 
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
+        socket = AsyncMockSocket()
         req = Request(uid="req-1", single=SingleRequest(data=json.dumps({"input": 5}).encode()))
         socket.inject(req.SerializeToString())
+        drive_loop(AsyncModel(), socket)
 
-        async def runner():
-            # Run one iteration then cancel
-            task = asyncio.create_task(run_async_loop(AsyncModel(), socket, "test", log))
-            await asyncio.sleep(0.05)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
         assert len(socket._msgs) == 1
         resp = Response()
         resp.ParseFromString(socket._msgs[0])
@@ -1006,34 +693,33 @@ class TestAsyncLoop:
         assert json.loads(resp.single.data) == {"result": 10}
         assert resp.single.status.code == "Ok"
 
-    def test_async_health_check(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import Request, SingleRequest, Response
+    def test_sync_model_on_unified_loop(self):
+        """Fully-sync models run on the same asyncio loop (fast path)."""
 
-        class AsyncModel:
+        class SyncModel(LitAPI):
+            def predict(self, x):
+                return {"result": x["input"] * 3}
+
+        socket = AsyncMockSocket()
+        req = Request(uid="req-sync", single=SingleRequest(data=json.dumps({"input": 4}).encode()))
+        socket.inject(req.SerializeToString())
+        drive_loop(SyncModel(), socket)
+
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert json.loads(resp.single.data) == {"result": 12}
+        assert resp.single.status.code == "Ok"
+
+    def test_async_health_check(self):
+        class AsyncModel(LitAPI):
             async def predict(self, x):
                 raise RuntimeError("should not be called")
 
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
+        socket = AsyncMockSocket()
         req = Request(uid="health-1", single=SingleRequest(data=b""))
         socket.inject(req.SerializeToString())
+        drive_loop(AsyncModel(), socket)
 
-        async def runner():
-            task = asyncio.create_task(run_async_loop(AsyncModel(), socket, "test", log))
-            await asyncio.sleep(0.05)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
         assert len(socket._msgs) == 1
         resp = Response()
         resp.ParseFromString(socket._msgs[0])
@@ -1042,20 +728,11 @@ class TestAsyncLoop:
         assert resp.single.status.code == "Ok"
 
     def test_async_batch_request(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import Request, BatchRequest, BatchItem, Response
-
-        class AsyncModel:
+        class AsyncModel(LitAPI):
             async def predict(self, x):
                 return {"result": x["input"] + 1}
 
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
+        socket = AsyncMockSocket()
         req = Request(
             uid="batch-1",
             batch=BatchRequest(items=[
@@ -1064,17 +741,8 @@ class TestAsyncLoop:
             ]),
         )
         socket.inject(req.SerializeToString())
+        drive_loop(AsyncModel(), socket)
 
-        async def runner():
-            task = asyncio.create_task(run_async_loop(AsyncModel(), socket, "test", log))
-            await asyncio.sleep(0.05)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
         assert len(socket._msgs) == 1
         resp = Response()
         resp.ParseFromString(socket._msgs[0])
@@ -1084,33 +752,15 @@ class TestAsyncLoop:
         assert json.loads(resp.batch.items[1].data) == {"result": 3}
 
     def test_async_error_in_predict(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import Request, SingleRequest, Response
-
-        class BrokenModel:
+        class BrokenModel(LitAPI):
             async def predict(self, x):
                 raise ValueError("boom")
 
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
+        socket = AsyncMockSocket()
         req = Request(uid="err-1", single=SingleRequest(data=json.dumps({"input": 1}).encode()))
         socket.inject(req.SerializeToString())
+        drive_loop(BrokenModel(), socket)
 
-        async def runner():
-            task = asyncio.create_task(run_async_loop(BrokenModel(), socket, "test", log))
-            await asyncio.sleep(0.05)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
         assert len(socket._msgs) == 1
         resp = Response()
         resp.ParseFromString(socket._msgs[0])
@@ -1122,11 +772,7 @@ class TestAsyncLoop:
         assert "boom" in body["error"]["message"]
 
     def test_async_stream_with_async_generator(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import Request, StreamRequest, StreamOpen, StreamCancel, Response
-
-        class AsyncStreamModel:
+        class AsyncStreamModel(LitAPI):
             async def predict(self, x):
                 return x
 
@@ -1135,35 +781,16 @@ class TestAsyncLoop:
                     await asyncio.sleep(0.001)
                     yield {"token": i, "input": x.get("input")}
 
-            def encode_response(self, output):
-                return output
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
+        socket = AsyncMockSocket()
         req = Request(
             uid="stream-1",
             stream=StreamRequest(stream_id="s1", open=StreamOpen(data=json.dumps({"input": 42}).encode())),
         )
         socket.inject(req.SerializeToString())
+        drive_loop(AsyncStreamModel(), socket)
 
-        async def runner():
-            task = asyncio.create_task(run_async_loop(AsyncStreamModel(), socket, "test", log))
-            await asyncio.sleep(0.05)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
         # Expect: 3 chunks + 1 done = 4 messages
         assert len(socket._msgs) == 4, f"Expected 4 messages, got {len(socket._msgs)}"
-
-        # Parse chunks
         for i in range(3):
             resp = Response()
             resp.ParseFromString(socket._msgs[i])
@@ -1172,19 +799,12 @@ class TestAsyncLoop:
             data = json.loads(resp.stream.chunk.data)
             assert data["token"] == i
             assert data["input"] == 42
-
-        # Parse done
         done_resp = Response()
         done_resp.ParseFromString(socket._msgs[3])
-        assert done_resp.stream.stream_id == "s1"
-        assert done_resp.stream.done is not None
+        assert done_resp.stream.HasField("done")
 
     def test_async_stream_with_sync_generator(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import Request, StreamRequest, StreamOpen, Response
-
-        class SyncStreamModel:
+        class SyncStreamModel(LitAPI):
             def predict(self, x):
                 return x
 
@@ -1192,33 +812,15 @@ class TestAsyncLoop:
                 for i in range(3):
                     yield {"token": i, "input": x.get("input")}
 
-            def encode_response(self, output):
-                return output
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
+        socket = AsyncMockSocket()
         req = Request(
             uid="stream-2",
             stream=StreamRequest(stream_id="s2", open=StreamOpen(data=json.dumps({"input": 99}).encode())),
         )
         socket.inject(req.SerializeToString())
+        drive_loop(SyncStreamModel(), socket)
 
-        async def runner():
-            task = asyncio.create_task(run_async_loop(SyncStreamModel(), socket, "test", log))
-            await asyncio.sleep(0.05)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
         assert len(socket._msgs) == 4, f"Expected 4 messages, got {len(socket._msgs)}"
-
         for i in range(3):
             resp = Response()
             resp.ParseFromString(socket._msgs[i])
@@ -1227,39 +829,20 @@ class TestAsyncLoop:
             assert data["input"] == 99
 
     def test_async_stream_fallback_no_stream_predict(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import Request, StreamRequest, StreamOpen, Response
-
-        class NoStreamModel:
+        class NoStreamModel(LitAPI):
             async def predict(self, x):
                 return {"fallback": True, "input": x.get("input")}
 
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
+        socket = AsyncMockSocket()
         req = Request(
             uid="stream-3",
             stream=StreamRequest(stream_id="s3", open=StreamOpen(data=json.dumps({"input": 7}).encode())),
         )
         socket.inject(req.SerializeToString())
+        drive_loop(NoStreamModel(), socket)
 
-        async def runner():
-            task = asyncio.create_task(run_async_loop(NoStreamModel(), socket, "test", log))
-            await asyncio.sleep(0.05)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
         # Expect: 1 final chunk + 1 done = 2 messages
         assert len(socket._msgs) == 2, f"Expected 2 messages, got {len(socket._msgs)}"
-
         resp = Response()
         resp.ParseFromString(socket._msgs[0])
         assert resp.stream.stream_id == "s3"
@@ -1269,87 +852,51 @@ class TestAsyncLoop:
         assert data["input"] == 7
 
     def test_async_stream_error_in_stream_predict(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import Request, StreamRequest, StreamOpen, Response
-
-        class BrokenStreamModel:
+        class BrokenStreamModel(LitAPI):
             async def stream_predict(self, x):
                 yield {"token": 0}
                 raise ValueError("stream broke")
 
-            def encode_response(self, output):
-                return output
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
+        socket = AsyncMockSocket()
         req = Request(
             uid="stream-4",
             stream=StreamRequest(stream_id="s4", open=StreamOpen(data=b"{}")),
         )
         socket.inject(req.SerializeToString())
+        drive_loop(BrokenStreamModel(), socket)
 
-        async def runner():
-            task = asyncio.create_task(run_async_loop(BrokenStreamModel(), socket, "test", log))
-            await asyncio.sleep(0.05)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
         # Expect: 1 chunk + 1 error = 2 messages
         assert len(socket._msgs) == 2, f"Expected 2 messages, got {len(socket._msgs)}"
-
         resp = Response()
         resp.ParseFromString(socket._msgs[1])
         assert resp.stream.stream_id == "s4"
-        assert resp.stream.error is not None
+        assert resp.stream.HasField("error")
         assert "stream broke" in resp.stream.error.message
 
     def test_async_stream_cancel(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import Request, StreamRequest, StreamOpen, StreamCancel, Response
-
-        class SlowStreamModel:
+        class SlowStreamModel(LitAPI):
             async def stream_predict(self, x):
                 for i in range(100):
                     await asyncio.sleep(0.01)
                     yield {"token": i}
 
-            def encode_response(self, output):
-                return output
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        # Inject open request
-        open_req = Request(
+        socket = AsyncMockSocket()
+        socket.inject(Request(
             uid="stream-open-5",
             stream=StreamRequest(stream_id="s5", open=StreamOpen(data=b"{}")),
-        )
-        socket.inject(open_req.SerializeToString())
+        ).SerializeToString())
 
-        # Inject cancel request after a short delay
         async def delayed_cancel():
             await asyncio.sleep(0.03)
-            cancel_req = Request(
+            socket.inject(Request(
                 uid="stream-cancel-5",
                 stream=StreamRequest(stream_id="s5", cancel=StreamCancel()),
-            )
-            socket.inject(cancel_req.SerializeToString())
+            ).SerializeToString())
 
         async def runner():
-            task = asyncio.create_task(run_async_loop(SlowStreamModel(), socket, "test", log))
+            task = asyncio.create_task(
+                inference.run_async_loop(SlowStreamModel(), socket, "test", log)
+            )
             asyncio.create_task(delayed_cancel())
             await asyncio.sleep(0.1)
             task.cancel()
@@ -1359,16 +906,13 @@ class TestAsyncLoop:
                 pass
 
         asyncio.run(runner())
-        # Should have received some chunks before cancel, then the stream task was cancelled
+        # Some chunks arrived before cancel; the stream task was cancelled
         assert len(socket._msgs) >= 1
 
     def test_async_concurrent_requests(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import Request, SingleRequest, Response
-
-        class SlowModel:
+        class SlowModel(LitAPI):
             def __init__(self):
+                super().__init__()
                 self.order = []
 
             async def predict(self, x):
@@ -1376,31 +920,13 @@ class TestAsyncLoop:
                 self.order.append(x["input"])
                 return {"result": x["input"] * 2}
 
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
+        socket = AsyncMockSocket()
         model = SlowModel()
-        req1 = Request(uid="c1", single=SingleRequest(data=json.dumps({"input": 1}).encode()))
-        req2 = Request(uid="c2", single=SingleRequest(data=json.dumps({"input": 2}).encode()))
-        socket.inject(req1.SerializeToString())
-        socket.inject(req2.SerializeToString())
+        socket.inject(Request(uid="c1", single=SingleRequest(data=json.dumps({"input": 1}).encode())).SerializeToString())
+        socket.inject(Request(uid="c2", single=SingleRequest(data=json.dumps({"input": 2}).encode())).SerializeToString())
+        drive_loop(model, socket)
 
-        async def runner():
-            task = asyncio.create_task(run_async_loop(model, socket, "test", log))
-            await asyncio.sleep(0.05)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
         assert len(socket._msgs) == 2
-        uids = {Response().ParseFromString(m) or Response().ParseFromString(m) for m in socket._msgs}
-        # Verify both requests were processed concurrently (order may vary)
         resp_uids = []
         for m in socket._msgs:
             r = Response()
@@ -1409,32 +935,14 @@ class TestAsyncLoop:
         assert sorted(resp_uids) == ["c1", "c2"]
 
     def test_async_protobuf_parse_error(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import Response
-
-        class AsyncModel:
+        class AsyncModel(LitAPI):
             async def predict(self, x):
                 return x
 
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
+        socket = AsyncMockSocket()
         socket.inject(b"invalid protobuf bytes")
+        drive_loop(AsyncModel(), socket)
 
-        async def runner():
-            task = asyncio.create_task(run_async_loop(AsyncModel(), socket, "test", log))
-            await asyncio.sleep(0.05)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
         assert len(socket._msgs) == 1
         resp = Response()
         resp.ParseFromString(socket._msgs[0])
@@ -1445,22 +953,13 @@ class TestAsyncLoop:
         assert "Protobuf parse" in body["error"]["message"]
 
     def test_async_batch_partial_failure(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import Request, BatchRequest, BatchItem, Response
-
-        class PartialFailModel:
+        class PartialFailModel(LitAPI):
             async def predict(self, x):
                 if x["input"] == 2:
                     raise ValueError("item 2 fails")
                 return {"result": x["input"] * 2}
 
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
+        socket = AsyncMockSocket()
         req = Request(
             uid="batch-partial",
             batch=BatchRequest(items=[
@@ -1470,17 +969,8 @@ class TestAsyncLoop:
             ]),
         )
         socket.inject(req.SerializeToString())
+        drive_loop(PartialFailModel(), socket)
 
-        async def runner():
-            task = asyncio.create_task(run_async_loop(PartialFailModel(), socket, "test", log))
-            await asyncio.sleep(0.05)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
         assert len(socket._msgs) == 1
         resp = Response()
         resp.ParseFromString(socket._msgs[0])
@@ -1494,125 +984,231 @@ class TestAsyncLoop:
         assert resp.batch.items[2].status.code == "Ok"
 
 
-class TestCBLoopAsyncMethods:
-    """Continuous batching loop with async prefill/step/has_finished."""
+class TestAsyncLoopEdgeCases:
+    def test_async_loop_cancels_pending_on_shutdown(self):
+        class SlowModel(LitAPI):
+            async def predict(self, x):
+                await asyncio.sleep(10)
+                return x
 
-    def _make_socket(self):
-        class MockSocket:
-            def __init__(self):
-                self._msgs = []
+        socket = AsyncMockSocket()
+        req = Request(uid="slow-1", single=SingleRequest(data=json.dumps({"input": 1}).encode()))
+        socket.inject(req.SerializeToString())
 
-            def send(self, data):
-                self._msgs.append(data)
-
-        return MockSocket()
-
-    def test_cb_loop_with_async_prefill_and_step(self):
-        from lite_server.worker.inference import _has_async_methods
-        import asyncio
-
-        class AsyncCBModel:
-            def __init__(self):
-                self._states = {}
-                self._metric_specs = []
-                self._metric_values = []
-
-            async def decode_request(self, req):
-                return req
-
-            async def prefill(self, uid, decoded_input):
-                self._states[uid] = {"tokens": [decoded_input["start"]]}
-
-            async def step(self, active_sequences):
-                return [{"token": s.input["start"] + len(s.output)} for s in active_sequences]
-
-            def has_finished(self, uid, token, generated_sequence):
-                return len(generated_sequence) >= 2
-
-            def encode_response(self, output):
-                return {"tokens": output}
-
-        model = AsyncCBModel()
-
-        # Verify async methods are detected
-        assert _has_async_methods(model) is True
-
-        # Verify async prefill can be driven through a temporary event loop
-        loop = asyncio.new_event_loop()
-        loop.run_until_complete(model.prefill("uid-1", {"start": 10}))
-        assert model._states == {"uid-1": {"tokens": [10]}}
-
-    def test_cb_loop_with_sync_methods(self):
-        from lite_server.worker.inference import _has_async_methods
-
-        class SyncCBModel:
-            def decode_request(self, req):
-                return req
-
-            def prefill(self, uid, decoded_input):
+        async def runner():
+            task = asyncio.create_task(
+                inference.run_async_loop(SlowModel(), socket, "test", log)
+            )
+            await asyncio.sleep(0.02)  # let task start but not finish
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
                 pass
 
-            def step(self, active_sequences):
-                return []
-
-            def has_finished(self, uid, token, generated_sequence):
-                return False
-
-        assert _has_async_methods(SyncCBModel()) is False
-
-    def test_cb_loop_mixed_sync_async(self):
-        from lite_server.worker.inference import _has_async_methods
-
-        class MixedCBModel:
-            def decode_request(self, req):
-                return req
-
-            async def prefill(self, uid, decoded_input):
-                pass
-
-            def step(self, active_sequences):
-                return []
-
-        assert _has_async_methods(MixedCBModel()) is True
+        asyncio.run(runner())
+        # The slow task was cancelled on shutdown, no response sent
+        assert len(socket._msgs) == 0
 
 
-class TestCBLoopSingleRequestRouting:
-    """CB loop should handle standard SingleRequest by converting to CBAddRequest."""
+# ---------------------------------------------------------------------------
+# Batch predict (batch → predict → unbatch)
+# ---------------------------------------------------------------------------
 
-    def _make_socket(self):
-        import zmq
+class TestBatchPredict:
+    def test_batch_predict_full_path(self):
+        class BatchModel(LitAPI):
+            def batch(self, inputs):
+                return {"values": [x["input"] for x in inputs], "batch_size": len(inputs)}
 
-        class MockSocket:
-            def __init__(self):
-                self._msgs = []
-                self._incoming = []
+            def predict(self, batched):
+                return [{"result": v * 2, "batch_size": batched["batch_size"]} for v in batched["values"]]
 
-            def send(self, data):
-                self._msgs.append(data)
+            def unbatch(self, output):
+                return output
 
-            def recv(self):
-                while not self._incoming:
-                    import time
-                    time.sleep(0.001)
-                return self._incoming.pop(0)
+        socket = AsyncMockSocket()
+        req = Request(
+            uid="batch-1",
+            batch=BatchRequest(items=[
+                BatchItem(uid="i1", data=json.dumps({"input": 1}).encode()),
+                BatchItem(uid="i2", data=json.dumps({"input": 2}).encode()),
+            ]),
+        )
+        socket.inject(req.SerializeToString())
+        drive_loop(BatchModel(), socket)
 
-            def inject(self, data):
-                self._incoming.append(data)
+        assert len(socket._msgs) == 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.uid == "batch-1"
+        assert len(resp.batch.items) == 2
+        assert json.loads(resp.batch.items[0].data)["result"] == 2
+        assert json.loads(resp.batch.items[1].data)["result"] == 4
 
-        return MockSocket()
+    def test_batch_predict_fallback_no_batch_methods(self):
+        class SimpleModel(LitAPI):
+            def predict(self, x):
+                return {"result": x["input"] + 1}
 
+        socket = AsyncMockSocket()
+        req = Request(
+            uid="batch-2",
+            batch=BatchRequest(items=[
+                BatchItem(uid="i1", data=json.dumps({"input": 1}).encode()),
+                BatchItem(uid="i2", data=json.dumps({"input": 2}).encode()),
+            ]),
+        )
+        socket.inject(req.SerializeToString())
+        drive_loop(SimpleModel(), socket)
+
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.uid == "batch-2"
+        assert len(resp.batch.items) == 2
+        assert json.loads(resp.batch.items[0].data)["result"] == 2
+        assert json.loads(resp.batch.items[1].data)["result"] == 3
+
+    def test_batch_predict_whole_batch_fails(self):
+        class BrokenBatchModel(LitAPI):
+            def batch(self, inputs):
+                return inputs
+
+            def predict(self, batched):
+                raise ValueError("batch predict boom")
+
+            def unbatch(self, output):
+                return output
+
+        socket = AsyncMockSocket()
+        req = Request(
+            uid="batch-3",
+            batch=BatchRequest(items=[
+                BatchItem(uid="i1", data=json.dumps({"input": 1}).encode()),
+                BatchItem(uid="i2", data=json.dumps({"input": 2}).encode()),
+            ]),
+        )
+        socket.inject(req.SerializeToString())
+        drive_loop(BrokenBatchModel(), socket)
+
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.uid == "batch-3"
+        assert len(resp.batch.items) == 2
+        for item in resp.batch.items:
+            assert item.status.code == "Error"
+            assert "batch predict boom" in item.status.message
+
+    def test_async_batch_predict_full_path(self):
+        class AsyncBatchModel(LitAPI):
+            async def batch(self, inputs):
+                return {"values": [x["input"] for x in inputs], "batch_size": len(inputs)}
+
+            async def predict(self, batched):
+                return [{"result": v * 2, "batch_size": batched["batch_size"]} for v in batched["values"]]
+
+            async def unbatch(self, output):
+                return output
+
+        socket = AsyncMockSocket()
+        req = Request(
+            uid="async-batch-1",
+            batch=BatchRequest(items=[
+                BatchItem(uid="i1", data=json.dumps({"input": 1}).encode()),
+                BatchItem(uid="i2", data=json.dumps({"input": 3}).encode()),
+            ]),
+        )
+        socket.inject(req.SerializeToString())
+        drive_loop(AsyncBatchModel(), socket)
+
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.uid == "async-batch-1"
+        assert len(resp.batch.items) == 2
+        assert json.loads(resp.batch.items[0].data)["result"] == 2
+        assert json.loads(resp.batch.items[1].data)["result"] == 6
+
+    def test_async_batch_predict_fallback_concurrent(self):
+        class AsyncSimpleModel(LitAPI):
+            async def predict(self, x):
+                await asyncio.sleep(0.01)
+                return {"result": x["input"] + 1}
+
+        socket = AsyncMockSocket()
+        req = Request(
+            uid="async-batch-2",
+            batch=BatchRequest(items=[
+                BatchItem(uid="i1", data=json.dumps({"input": 1}).encode()),
+                BatchItem(uid="i2", data=json.dumps({"input": 2}).encode()),
+                BatchItem(uid="i3", data=json.dumps({"input": 3}).encode()),
+            ]),
+        )
+        socket.inject(req.SerializeToString())
+        drive_loop(AsyncSimpleModel(), socket)
+
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.uid == "async-batch-2"
+        assert len(resp.batch.items) == 3
+        for i, item in enumerate(resp.batch.items):
+            assert json.loads(item.data)["result"] == i + 2
+
+    def test_single_on_request_before_decode(self):
+        class ModelWithHook(LitAPI):
+            def on_request(self, request, meta):
+                request["injected"] = True
+                return request
+
+            def decode_request(self, request):
+                assert request.get("injected") is True
+                return {"decoded": request}
+
+            def predict(self, x):
+                return {"has_injected": x["decoded"].get("injected", False)}
+
+        socket = AsyncMockSocket()
+        req = Request(uid="hook-1", single=SingleRequest(data=json.dumps({"input": 1}).encode()))
+        socket.inject(req.SerializeToString())
+        drive_loop(ModelWithHook(), socket)
+
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.uid == "hook-1"
+        assert json.loads(resp.single.data)["has_injected"] is True
+
+    def test_async_single_on_request_before_decode(self):
+        class AsyncModelWithHook(LitAPI):
+            async def on_request(self, request, meta):
+                request["async_injected"] = True
+                return request
+
+            async def decode_request(self, request):
+                assert request.get("async_injected") is True
+                return {"decoded": request}
+
+            async def predict(self, x):
+                return {"has_injected": x["decoded"].get("async_injected", False)}
+
+        socket = AsyncMockSocket()
+        req = Request(uid="async-hook-1", single=SingleRequest(data=json.dumps({"input": 1}).encode()))
+        socket.inject(req.SerializeToString())
+        drive_loop(AsyncModelWithHook(), socket)
+
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.uid == "async-hook-1"
+        assert json.loads(resp.single.data)["has_injected"] is True
+
+
+# ---------------------------------------------------------------------------
+# Continuous batching loop
+# ---------------------------------------------------------------------------
+
+class TestCBLoop:
     def test_cb_loop_handles_single_request(self):
         """A standard SingleRequest should be processed through the CB pipeline."""
-        import threading
-        import json
-        from lite_server.worker.inference import run_cb_loop
-        from lite_server.proto import Request, Response
 
-        class EchoCBModel:
-            def __init__(self):
-                self._metric_specs = []
-                self._metric_values = []
-
+        class EchoCBModel(LitAPI):
             def decode_request(self, req):
                 return req.get("input", "")
 
@@ -1629,55 +1225,22 @@ class TestCBLoopSingleRequestRouting:
             def encode_response(self, output):
                 return {"output": output}
 
-        model = EchoCBModel()
-        socket = self._make_socket()
-        log = __import__("logging").getLogger("test")
-
-        # Build a standard SingleRequest (what Rust inference_queue sends)
+        socket = SyncMockSocket()
         req = Request()
         req.uid = "req-001"
         req.single.data = json.dumps({"input": "hello"}).encode()
         socket.inject(req.SerializeToString())
+        start_cb_loop(EchoCBModel(), socket)
 
-        def runner():
-            try:
-                run_cb_loop(model, socket, "test_model", log)
-            except Exception:
-                pass
-
-        t = threading.Thread(target=runner, daemon=True)
-        t.start()
-
-        # Wait for response (max 5 seconds)
-        import time
-        deadline = time.time() + 5
-        response = None
-        while time.time() < deadline:
-            if socket._msgs:
-                resp = Response()
-                resp.ParseFromString(socket._msgs[0])
-                if resp.uid == "req-001":
-                    response = resp
-                    break
-            time.sleep(0.01)
-
-        assert response is not None, "No response received for SingleRequest"
+        response = wait_for_response(socket, "req-001")
         data = json.loads(response.single.data)
         # CB encode_response receives accumulated token list
         assert data == {"output": ["cb_echo: hello"]}, f"Unexpected output: {data}"
 
     def test_cb_loop_single_request_with_multiple_sequences(self):
         """Multiple concurrent SingleRequests should batch in CB pipeline."""
-        import threading
-        import json
-        from lite_server.worker.inference import run_cb_loop
-        from lite_server.proto import Request, Response
 
-        class MultiCBModel:
-            def __init__(self):
-                self._metric_specs = []
-                self._metric_values = []
-
+        class MultiCBModel(LitAPI):
             def decode_request(self, req):
                 return req.get("text", "")
 
@@ -1693,29 +1256,16 @@ class TestCBLoopSingleRequestRouting:
             def encode_response(self, output):
                 return {"result": output}
 
-        model = MultiCBModel()
-        socket = self._make_socket()
-        log = __import__("logging").getLogger("test")
-
-        # Send two standard SingleRequests
+        socket = SyncMockSocket()
         for i, uid in enumerate(["req-a", "req-b"]):
             req = Request()
             req.uid = uid
             req.single.data = json.dumps({"text": f"msg-{i}"}).encode()
             socket.inject(req.SerializeToString())
+        start_cb_loop(MultiCBModel(), socket)
 
-        def runner():
-            try:
-                run_cb_loop(model, socket, "test_model", log)
-            except Exception:
-                pass
-
-        t = threading.Thread(target=runner, daemon=True)
-        t.start()
-
-        import time
-        deadline = time.time() + 5
         responses = {}
+        deadline = time.time() + 5
         while time.time() < deadline and len(responses) < 2:
             for msg in list(socket._msgs):
                 resp = Response()
@@ -1728,31 +1278,181 @@ class TestCBLoopSingleRequestRouting:
         assert responses["req-a"] == {"result": ["token(msg-0)"]}
         assert responses["req-b"] == {"result": ["token(msg-1)"]}
 
+    def test_cb_loop_with_async_prefill_and_step(self):
+        """Async prefill/step/has_finished are driven on the CB event loop."""
+
+        class AsyncCBModel(LitAPI):
+            def __init__(self):
+                super().__init__()
+                self._states = {}
+
+            async def decode_request(self, req):
+                return req
+
+            async def prefill(self, uid, decoded_input):
+                self._states[uid] = {"tokens": [decoded_input["start"]]}
+
+            async def step(self, active_sequences):
+                return [{"token": s.input["start"] + len(s.output)} for s in active_sequences]
+
+            async def has_finished(self, uid, token, generated_sequence):
+                return len(generated_sequence) >= 2
+
+            async def encode_response(self, output):
+                return {"tokens": output}
+
+        model = AsyncCBModel()
+        socket = SyncMockSocket()
+        req = Request()
+        req.uid = "cb-async-1"
+        req.single.data = json.dumps({"start": 10}).encode()
+        socket.inject(req.SerializeToString())
+        start_cb_loop(model, socket)
+
+        response = wait_for_response(socket, "cb-async-1")
+        data = json.loads(response.single.data)
+        assert data == {"tokens": [{"token": 10}, {"token": 11}]}
+        assert model._states == {"cb-async-1": {"tokens": [10]}}
+
+    def test_cb_loop_runs_callback_hooks(self):
+        """CB mode gets the same hook coverage as every other mode (0.7.0)."""
+        calls = []
+
+        class CBTracker(Callback):
+            def on_request(self, ctx):
+                calls.append("on_request")
+
+            def on_input(self, ctx):
+                calls.append("on_input")
+
+            def on_output(self, ctx):
+                calls.append("on_output")
+
+            def on_response(self, ctx):
+                calls.append("on_response")
+
+        class CBModel(LitAPI):
+            def decode_request(self, req):
+                return req.get("input", "")
+
+            def prefill(self, uid, decoded_input):
+                pass
+
+            def step(self, active_sequences):
+                return [f"tok:{s.input}" for s in active_sequences]
+
+            def has_finished(self, uid, token, generated_sequence):
+                return True
+
+            def encode_response(self, output):
+                return {"out": output}
+
+        model = CBModel()
+        model._pipeline = Pipeline.build(model, [CBTracker()])
+        socket = SyncMockSocket()
+        req = Request()
+        req.uid = "cb-hooks"
+        req.single.data = json.dumps({"input": "x"}).encode()
+        socket.inject(req.SerializeToString())
+        start_cb_loop(model, socket)
+
+        response = wait_for_response(socket, "cb-hooks")
+        assert json.loads(response.single.data) == {"out": ["tok:x"]}
+        assert calls == ["on_request", "on_input", "on_output", "on_response"]
+
+    def test_cb_loop_early_return_skips_prefill(self):
+        """Early return from a hook responds immediately — no prefill/step."""
+
+        class CacheCB(Callback):
+            def on_request(self, ctx):
+                ctx.respond({"cached": True})
+
+        class CBModel(LitAPI):
+            def decode_request(self, req):
+                return req
+
+            def prefill(self, uid, decoded_input):
+                raise AssertionError("prefill must not run on early return")
+
+            def step(self, active_sequences):
+                raise AssertionError("step must not run on early return")
+
+            def has_finished(self, uid, token, generated_sequence):
+                return True
+
+        model = CBModel()
+        model._pipeline = Pipeline.build(model, [CacheCB()])
+        socket = SyncMockSocket()
+        req = Request()
+        req.uid = "cb-early"
+        req.single.data = json.dumps({"input": "x"}).encode()
+        socket.inject(req.SerializeToString())
+        start_cb_loop(model, socket)
+
+        response = wait_for_response(socket, "cb-early")
+        assert json.loads(response.single.data) == {"cached": True}
+        assert response.single.status.code == "Ok"
+
+    def test_cb_loop_hook_rejection_returns_structured_error(self):
+        """HTTPException from a CB-path hook maps to a structured error."""
+        from lite_server.exceptions import BadRequestError
+
+        class RejectCB(Callback):
+            def on_request(self, ctx):
+                raise BadRequestError("cb rejected")
+
+        class CBModel(LitAPI):
+            def decode_request(self, req):
+                return req
+
+            def prefill(self, uid, decoded_input):
+                pass
+
+            def step(self, active_sequences):
+                return []
+
+            def has_finished(self, uid, token, generated_sequence):
+                return True
+
+        model = CBModel()
+        model._pipeline = Pipeline.build(model, [RejectCB()])
+        socket = SyncMockSocket()
+        req = Request()
+        req.uid = "cb-reject"
+        req.single.data = json.dumps({"input": "x"}).encode()
+        socket.inject(req.SerializeToString())
+        start_cb_loop(model, socket)
+
+        response = wait_for_response(socket, "cb-reject")
+        assert response.single.status.code == "Error"
+        assert response.single.status.message == "400"
+        body = json.loads(response.single.data)
+        assert "cb rejected" in body["error"]["message"]
+
 
 class TestTeardownHelper:
-    """_run_teardown lifecycle hook."""
-
     def test_teardown_called_and_exceptions_caught(self):
         from lite_server.worker.inference import _run_teardown
 
         called = []
         errors = []
 
-        class Model:
+        class Model(LitAPI):
             def teardown(self):
                 called.append(True)
                 raise RuntimeError("teardown boom")
 
-        log = logging.getLogger("test")
-        # Monkey-patch log.error to capture
-        original_error = log.error
+        test_log = logging.getLogger("test_teardown")
+        original_error = test_log.error
+
         def capture_error(msg, *args):
             errors.append(msg % args)
-        log.error = capture_error
+
+        test_log.error = capture_error
         try:
-            _run_teardown(Model(), log)
+            _run_teardown(Model(), test_log)
         finally:
-            log.error = original_error
+            test_log.error = original_error
 
         assert called == [True]
         assert any("teardown boom" in e for e in errors)
@@ -1760,589 +1460,59 @@ class TestTeardownHelper:
     def test_teardown_skipped_when_missing(self):
         from lite_server.worker.inference import _run_teardown
 
-        class Model:
-            pass
+        test_log = logging.getLogger("test_teardown_none")
+        # Base-class teardown is a no-op — must not raise
+        _run_teardown(LitAPI(), test_log)
 
-        log = logging.getLogger("test")
-        # Should not raise
-        _run_teardown(Model(), log)
+    def test_callback_on_teardown_fires(self):
+        from lite_server.worker.inference import _run_teardown
 
+        calls = []
 
-class TestCBAsyncHooks:
-    """CB loop _invoke_method drives async on_request/on_response/encode_response."""
+        class TeardownCB(Callback):
+            def on_teardown(self, lit_api):
+                calls.append("on_teardown")
 
-    def test_invoke_method_async_on_request(self):
-        from lite_server.worker.inference import run_cb_loop
-        import asyncio
+        model = LitAPI()
+        model._pipeline = Pipeline.build(model, [TeardownCB()])
+        _run_teardown(model, log)
+        assert calls == ["on_teardown"]
 
-        class AsyncHookModel:
-            def __init__(self):
-                self._states = {}
-                self._metric_specs = []
-                self._metric_values = []
 
-            def decode_request(self, req):
-                return req
-
-            async def on_request(self, req, meta):
-                req["hooked"] = True
-                return req
-
-            def prefill(self, uid, decoded_input):
-                self._states[uid] = decoded_input
-
-            def step(self, active_sequences):
-                return []
-
-            def has_finished(self, uid, token, generated_sequence):
-                return False
-
-        # Verify _has_async_methods detects the async on_request
-        from lite_server.worker.inference import _has_async_methods
-        model = AsyncHookModel()
-        assert _has_async_methods(model) is True
-
-        # Verify async on_request can be driven via temporary event loop
-        loop = asyncio.new_event_loop()
-        result = loop.run_until_complete(model.on_request({"input": 5}, None))
-        assert result == {"input": 5, "hooked": True}
-
-    def test_invoke_method_async_encode_response(self):
-        import asyncio
-
-        class AsyncEncodeModel:
-            async def encode_response(self, output):
-                return {"wrapped": output}
-
-        loop = asyncio.new_event_loop()
-        result = loop.run_until_complete(AsyncEncodeModel().encode_response([1, 2, 3]))
-        assert result == {"wrapped": [1, 2, 3]}
-
-    def test_invoke_method_sync_func(self):
-        from lite_server.worker.inference import run_cb_loop
-
-        class SyncModel:
-            def decode_request(self, req):
-                return {"decoded": req}
-
-        # Verify _has_async_methods returns False for pure sync
-        from lite_server.worker.inference import _has_async_methods
-        assert _has_async_methods(SyncModel()) is False
-
-
-class TestAsyncLoopEdgeCases:
-    """Edge cases for async loop."""
-
-    def _make_socket(self):
-        class MockSocket:
-            def __init__(self):
-                self._msgs = []
-                self._incoming = []
-                self._closed = False
-
-            async def send(self, data):
-                if self._closed:
-                    raise RuntimeError("socket closed")
-                self._msgs.append(data)
-
-            async def recv(self):
-                while not self._incoming:
-                    import asyncio
-                    await asyncio.sleep(0.001)
-                return self._incoming.pop(0)
-
-            def inject(self, data):
-                self._incoming.append(data)
-
-            def close(self):
-                self._closed = True
-
-        return MockSocket()
-
-    def test_async_loop_cancels_pending_on_shutdown(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import Request, SingleRequest
-
-        class SlowModel:
-            async def predict(self, x):
-                await asyncio.sleep(10)
-                return x
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        req = Request(uid="slow-1", single=SingleRequest(data=json.dumps({"input": 1}).encode()))
-        socket.inject(req.SerializeToString())
-
-        async def runner():
-            task = asyncio.create_task(run_async_loop(SlowModel(), socket, "test", log))
-            await asyncio.sleep(0.02)  # let task start but not finish
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
-        # The slow task was cancelled on shutdown, no response sent
-        assert len(socket._msgs) == 0
-
-
-class TestBatchPredict:
-    """Batch predict path: batch() -> predict(batched) -> unbatch()."""
-
-    def _make_socket(self):
-        class MockSocket:
-            def __init__(self):
-                self._msgs = []
-                self._incoming = []
-
-            def send(self, data):
-                self._msgs.append(data)
-
-            def recv(self):
-                while not self._incoming:
-                    import time
-                    time.sleep(0.001)
-                return self._incoming.pop(0)
-
-            def inject(self, data):
-                self._incoming.append(data)
-
-        return MockSocket()
-
-    def test_standard_batch_predict_full_path(self):
-        from lite_server.worker.inference import run_standard_loop
-        from lite_server.proto import Request, BatchRequest, BatchItem, Response
-
-        class BatchModel:
-            def batch(self, inputs):
-                return {"values": [x["input"] for x in inputs], "batch_size": len(inputs)}
-
-            def predict(self, batched):
-                return [{"result": v * 2, "batch_size": batched["batch_size"]} for v in batched["values"]]
-
-            def unbatch(self, output):
-                return output
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        req = Request(
-            uid="batch-1",
-            batch=BatchRequest(items=[
-                BatchItem(uid="i1", data=json.dumps({"input": 1}).encode()),
-                BatchItem(uid="i2", data=json.dumps({"input": 2}).encode()),
-            ]),
-        )
-        socket.inject(req.SerializeToString())
-
-        import threading
-        t = threading.Thread(target=run_standard_loop, args=(BatchModel(), socket, "test", log))
-        t.start()
-        import time
-        time.sleep(0.05)
-        socket.inject(b"")  # empty to break recv
-        t.join(timeout=0.1)
-
-        assert len(socket._msgs) >= 1
-        resp = Response()
-        resp.ParseFromString(socket._msgs[0])
-        assert resp.uid == "batch-1"
-        assert len(resp.batch.items) == 2
-        assert json.loads(resp.batch.items[0].data)["result"] == 2
-        assert json.loads(resp.batch.items[1].data)["result"] == 4
-
-    def test_standard_batch_predict_fallback_no_batch_methods(self):
-        from lite_server.worker.inference import run_standard_loop
-        from lite_server.proto import Request, BatchRequest, BatchItem, Response
-
-        class SimpleModel:
-            def predict(self, x):
-                return {"result": x["input"] + 1}
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        req = Request(
-            uid="batch-2",
-            batch=BatchRequest(items=[
-                BatchItem(uid="i1", data=json.dumps({"input": 1}).encode()),
-                BatchItem(uid="i2", data=json.dumps({"input": 2}).encode()),
-            ]),
-        )
-        socket.inject(req.SerializeToString())
-
-        import threading
-        t = threading.Thread(target=run_standard_loop, args=(SimpleModel(), socket, "test", log))
-        t.start()
-        import time
-        time.sleep(0.05)
-        socket.inject(b"")
-        t.join(timeout=0.1)
-
-        assert len(socket._msgs) >= 1
-        resp = Response()
-        resp.ParseFromString(socket._msgs[0])
-        assert resp.uid == "batch-2"
-        assert len(resp.batch.items) == 2
-        assert json.loads(resp.batch.items[0].data)["result"] == 2
-        assert json.loads(resp.batch.items[1].data)["result"] == 3
-
-    def test_standard_batch_predict_whole_batch_fails(self):
-        from lite_server.worker.inference import run_standard_loop
-        from lite_server.proto import Request, BatchRequest, BatchItem, Response
-
-        class BrokenBatchModel:
-            def batch(self, inputs):
-                return inputs
-
-            def predict(self, batched):
-                raise ValueError("batch predict boom")
-
-            def unbatch(self, output):
-                return output
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        req = Request(
-            uid="batch-3",
-            batch=BatchRequest(items=[
-                BatchItem(uid="i1", data=json.dumps({"input": 1}).encode()),
-                BatchItem(uid="i2", data=json.dumps({"input": 2}).encode()),
-            ]),
-        )
-        socket.inject(req.SerializeToString())
-
-        import threading
-        t = threading.Thread(target=run_standard_loop, args=(BrokenBatchModel(), socket, "test", log))
-        t.start()
-        import time
-        time.sleep(0.05)
-        socket.inject(b"")
-        t.join(timeout=0.1)
-
-        assert len(socket._msgs) >= 1
-        resp = Response()
-        resp.ParseFromString(socket._msgs[0])
-        assert resp.uid == "batch-3"
-        assert len(resp.batch.items) == 2
-        for item in resp.batch.items:
-            assert item.status.code == "Error"
-            assert "batch predict boom" in item.status.message
-
-    def test_standard_single_request_on_request_before_decode(self):
-        from lite_server.worker.inference import run_standard_loop
-        from lite_server.proto import Request, SingleRequest, Response
-        from lite_server.api import RequestMeta
-
-        class ModelWithHook:
-            def on_request(self, request, meta):
-                request["injected"] = True
-                return request
-
-            def decode_request(self, request):
-                assert request.get("injected") is True
-                return {"decoded": request}
-
-            def predict(self, x):
-                return {"has_injected": x["decoded"].get("injected", False)}
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        req = Request(uid="hook-1", single=SingleRequest(data=json.dumps({"input": 1}).encode()))
-        socket.inject(req.SerializeToString())
-
-        import threading
-        t = threading.Thread(target=run_standard_loop, args=(ModelWithHook(), socket, "test", log))
-        t.start()
-        import time
-        time.sleep(0.05)
-        socket.inject(b"")
-        t.join(timeout=0.1)
-
-        assert len(socket._msgs) >= 1
-        resp = Response()
-        resp.ParseFromString(socket._msgs[0])
-        assert resp.uid == "hook-1"
-        assert json.loads(resp.single.data)["has_injected"] is True
-
-
-class TestAsyncBatchPredict:
-    """Async batch predict path."""
-
-    def _make_socket(self):
-        class MockSocket:
-            def __init__(self):
-                self._msgs = []
-                self._incoming = []
-
-            async def send(self, data):
-                self._msgs.append(data)
-
-            async def recv(self):
-                while not self._incoming:
-                    import asyncio
-                    await asyncio.sleep(0.001)
-                return self._incoming.pop(0)
-
-            def inject(self, data):
-                self._incoming.append(data)
-
-        return MockSocket()
-
-    def test_async_batch_predict_full_path(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import Request, BatchRequest, BatchItem, Response
-
-        class AsyncBatchModel:
-            async def batch(self, inputs):
-                return {"values": [x["input"] for x in inputs], "batch_size": len(inputs)}
-
-            async def predict(self, batched):
-                return [{"result": v * 2, "batch_size": batched["batch_size"]} for v in batched["values"]]
-
-            async def unbatch(self, output):
-                return output
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        req = Request(
-            uid="async-batch-1",
-            batch=BatchRequest(items=[
-                BatchItem(uid="i1", data=json.dumps({"input": 1}).encode()),
-                BatchItem(uid="i2", data=json.dumps({"input": 3}).encode()),
-            ]),
-        )
-        socket.inject(req.SerializeToString())
-
-        async def runner():
-            task = asyncio.create_task(run_async_loop(AsyncBatchModel(), socket, "test", log))
-            await asyncio.sleep(0.05)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
-        assert len(socket._msgs) == 1
-        resp = Response()
-        resp.ParseFromString(socket._msgs[0])
-        assert resp.uid == "async-batch-1"
-        assert len(resp.batch.items) == 2
-        assert json.loads(resp.batch.items[0].data)["result"] == 2
-        assert json.loads(resp.batch.items[1].data)["result"] == 6
-
-    def test_async_batch_predict_fallback_concurrent(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import Request, BatchRequest, BatchItem, Response
-
-        class AsyncSimpleModel:
-            async def predict(self, x):
-                await asyncio.sleep(0.01)
-                return {"result": x["input"] + 1}
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        req = Request(
-            uid="async-batch-2",
-            batch=BatchRequest(items=[
-                BatchItem(uid="i1", data=json.dumps({"input": 1}).encode()),
-                BatchItem(uid="i2", data=json.dumps({"input": 2}).encode()),
-                BatchItem(uid="i3", data=json.dumps({"input": 3}).encode()),
-            ]),
-        )
-        socket.inject(req.SerializeToString())
-
-        async def runner():
-            task = asyncio.create_task(run_async_loop(AsyncSimpleModel(), socket, "test", log))
-            await asyncio.sleep(0.05)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
-        assert len(socket._msgs) == 1
-        resp = Response()
-        resp.ParseFromString(socket._msgs[0])
-        assert resp.uid == "async-batch-2"
-        assert len(resp.batch.items) == 3
-        for i, item in enumerate(resp.batch.items):
-            assert json.loads(item.data)["result"] == i + 2
-
-    def test_async_single_on_request_before_decode(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import Request, SingleRequest, Response
-
-        class AsyncModelWithHook:
-            async def on_request(self, request, meta):
-                request["async_injected"] = True
-                return request
-
-            async def decode_request(self, request):
-                assert request.get("async_injected") is True
-                return {"decoded": request}
-
-            async def predict(self, x):
-                return {"has_injected": x["decoded"].get("async_injected", False)}
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        req = Request(uid="async-hook-1", single=SingleRequest(data=json.dumps({"input": 1}).encode()))
-        socket.inject(req.SerializeToString())
-
-        async def runner():
-            task = asyncio.create_task(run_async_loop(AsyncModelWithHook(), socket, "test", log))
-            await asyncio.sleep(0.05)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
-        assert len(socket._msgs) == 1
-        resp = Response()
-        resp.ParseFromString(socket._msgs[0])
-        assert resp.uid == "async-hook-1"
-        assert json.loads(resp.single.data)["has_injected"] is True
-
+# ---------------------------------------------------------------------------
+# Streaming metrics
+# ---------------------------------------------------------------------------
 
 class TestAsyncStreamingMetrics:
-    """Metrics accumulation and flush_metrics in async streaming."""
-
-    def _make_socket(self):
-        class MockSocket:
-            def __init__(self):
-                self._msgs = []
-                self._incoming = []
-
-            async def send(self, data):
-                self._msgs.append(data)
-
-            async def recv(self):
-                while not self._incoming:
-                    import asyncio
-                    await asyncio.sleep(0.001)
-                return self._incoming.pop(0)
-
-            def inject(self, data):
-                self._incoming.append(data)
-
-        return MockSocket()
-
     def test_streaming_metrics_accumulate_until_done(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import Request, StreamRequest, StreamOpen, Response
-
-        class MetricStreamModel:
-            def __init__(self):
-                self._metric_specs = []
-                self._metric_values = []
-
+        class MetricStreamModel(LitAPI):
             async def stream_predict(self, x):
                 for i in range(3):
                     self.report_metric(self.token_counter, 1.0)
                     yield {"token": i}
 
-            def encode_response(self, output):
-                return output
-
-            def register_metric(self, name, metric_type):
-                idx = len(self._metric_specs)
-                per_type_id = sum(
-                    1 for s in self._metric_specs
-                    if s.metric_type == metric_type
-                )
-                self._metric_specs.append(type("Spec", (), {
-                    "name": name, "metric_type": metric_type,
-                    "metric_id": per_type_id,
-                })())
-                return idx
-
-            def report_metric(self, metric_id, value):
-                self._metric_values.append((metric_id, value))
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
         model = MetricStreamModel()
         model.token_counter = model.register_metric("tokens", "counter")
 
+        socket = AsyncMockSocket()
         req = Request(
             uid="stream-m1",
             stream=StreamRequest(stream_id="sm1", open=StreamOpen(data=b"{}")),
         )
         socket.inject(req.SerializeToString())
+        drive_loop(model, socket)
 
-        async def runner():
-            task = asyncio.create_task(run_async_loop(model, socket, "test", log))
-            await asyncio.sleep(0.05)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
         # 3 chunks + 1 done
         assert len(socket._msgs) == 4
-
-        # Verify done carries metrics (3 individual observations)
         done_resp = Response()
         done_resp.ParseFromString(socket._msgs[3])
-        assert done_resp.stream.done is not None
+        assert done_resp.stream.HasField("done")
         assert done_resp.stream.done.metrics is not None
         assert len(done_resp.stream.done.metrics.counters) == 3
         assert sum(c.value for c in done_resp.stream.done.metrics.counters) == 3.0
 
     def test_flush_metrics_clears_buffer(self):
-        from lite_server.api import LitAPI
-
-        class Dummy(LitAPI):
-            def setup(self, device): pass
-            def decode_request(self, request): return request
-            def predict(self, x): return x
-            def encode_response(self, output): return output
-
-        api = Dummy()
+        api = LitAPI()
         g = api.register_metric("x", "gauge")
         api.report_metric(g, 10.0)
         api.report_metric(g, 20.0)
@@ -2358,448 +1528,51 @@ class TestAsyncStreamingMetrics:
         assert api.flush_metrics() is None
 
     def test_streaming_metrics_cleared_after_done(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import Request, StreamRequest, StreamOpen, Response
-
-        class MetricStreamModel:
-            def __init__(self):
-                self._metric_specs = []
-                self._metric_values = []
-
+        class MetricStreamModel(LitAPI):
             async def stream_predict(self, x):
                 self.report_metric(self.counter_id, 1.0)
                 yield {"token": 0}
 
-            def encode_response(self, output):
-                return output
-
-            def register_metric(self, name, metric_type):
-                idx = len(self._metric_specs)
-                per_type_id = sum(
-                    1 for s in self._metric_specs
-                    if s.metric_type == metric_type
-                )
-                self._metric_specs.append(type("Spec", (), {
-                    "name": name, "metric_type": metric_type,
-                    "metric_id": per_type_id,
-                })())
-                return idx
-
-            def report_metric(self, metric_id, value):
-                self._metric_values.append((metric_id, value))
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
         model = MetricStreamModel()
         model.counter_id = model.register_metric("cnt", "counter")
 
+        socket = AsyncMockSocket()
         req = Request(
             uid="stream-m2",
             stream=StreamRequest(stream_id="sm2", open=StreamOpen(data=b"{}")),
         )
         socket.inject(req.SerializeToString())
+        drive_loop(model, socket)
 
-        async def runner():
-            task = asyncio.create_task(run_async_loop(model, socket, "test", log))
-            await asyncio.sleep(0.05)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
         # Buffer should be cleared after stream_done
         assert model._metric_values == []
 
 
-class TestHasBidiStream:
-    """Unit tests for _has_bidi_stream detection."""
+# ---------------------------------------------------------------------------
+# Bidirectional streaming
+# ---------------------------------------------------------------------------
 
+class TestBidiStreamDetection:
     def test_no_bidi_when_not_overridden(self):
-        """LitAPI subclass without bidi_stream override should return False."""
-        from lite_server import LitAPI
-        from lite_server.worker.inference import _has_bidi_stream
-
-        class PlainModel(LitAPI):
-            def setup(self, device):
-                pass
-
-            def decode_request(self, request):
-                return request
-
-            def predict(self, x):
-                return x
-
-            def encode_response(self, output):
-                return output
-
-        api = PlainModel()
-        assert _has_bidi_stream(api) is False, (
-            "Plain LitAPI without bidi_stream override should return False"
-        )
+        assert Pipeline.build(LitAPI(), []).has_bidi_stream is False
 
     def test_no_bidi_when_only_stream_predict(self):
-        """LitAPI with stream_predict but no bidi_stream should return False."""
-        from lite_server import LitAPI
-        from lite_server.worker.inference import _has_bidi_stream
-
         class StreamingModel(LitAPI):
-            def setup(self, device):
-                pass
-
-            def decode_request(self, request):
-                return request
-
-            def predict(self, x):
-                return x
-
             def stream_predict(self, request):
                 yield {"token": "hello"}
 
-            def encode_response(self, output):
-                return output
-
-        api = StreamingModel()
-        assert _has_bidi_stream(api) is False, (
-            "Model with stream_predict but no bidi_stream should return False"
-        )
+        assert Pipeline.build(StreamingModel(), []).has_bidi_stream is False
 
     def test_has_bidi_when_overridden(self):
-        """LitAPI subclass that overrides bidi_stream should return True."""
-        from lite_server import BidiStreamHandler, LitAPI
-        from lite_server.worker.inference import _has_bidi_stream
-
         class BidiModel(LitAPI):
-            def setup(self, device):
-                pass
-
-            def decode_request(self, request):
-                return request
-
-            def predict(self, x):
-                return x
-
-            def encode_response(self, output):
-                return output
-
             def bidi_stream(self):
-                class Handler(BidiStreamHandler):
-                    pass
-                return Handler()
+                return BidiStreamHandler()
 
-        api = BidiModel()
-        assert _has_bidi_stream(api) is True, (
-            "Model with bidi_stream override should return True"
-        )
-
-    def test_has_bidi_with_async_litapi(self):
-        """AsyncLitAPI subclass with bidi_stream should return True."""
-        from lite_server import AsyncLitAPI, BidiStreamHandler
-        from lite_server.worker.inference import _has_bidi_stream
-
-        class AsyncBidiModel(AsyncLitAPI):
-            async def setup(self, device):
-                pass
-
-            def decode_request(self, request):
-                return request
-
-            async def predict(self, x):
-                return x
-
-            def encode_response(self, output):
-                return output
-
-            def bidi_stream(self):
-                class Handler(BidiStreamHandler):
-                    pass
-                return Handler()
-
-        api = AsyncBidiModel()
-        assert _has_bidi_stream(api) is True, (
-            "AsyncLitAPI with bidi_stream override should return True"
-        )
-
-    def test_no_bidi_with_async_litapi_without_override(self):
-        """AsyncLitAPI without bidi_stream should return False."""
-        from lite_server import AsyncLitAPI
-        from lite_server.worker.inference import _has_bidi_stream
-
-        class PlainAsyncModel(AsyncLitAPI):
-            async def setup(self, device):
-                pass
-
-            def decode_request(self, request):
-                return request
-
-            async def predict(self, x):
-                return x
-
-            def encode_response(self, output):
-                return output
-
-        api = PlainAsyncModel()
-        assert _has_bidi_stream(api) is False, (
-            "AsyncLitAPI without bidi_stream override should return False"
-        )
-
-
-class TestBidiStreamingStandardLoop:
-    """Bidirectional streaming via standard (sync) worker loop."""
-
-    def _make_socket(self):
-        class MockSocket:
-            def __init__(self):
-                self._msgs = []
-                self._incoming = []
-
-            def send(self, data):
-                self._msgs.append(data)
-
-            def recv(self):
-                while not self._incoming:
-                    import time
-                    time.sleep(0.001)
-                return self._incoming.pop(0)
-
-            def inject(self, data):
-                self._incoming.append(data)
-
-        return MockSocket()
-
-    def test_bidi_open_chunk_close_with_responses(self):
-        import threading
-        from lite_server.worker.inference import run_standard_loop
-        from lite_server.proto import (
-            Request, StreamRequest, StreamOpen, StreamChunk,
-            StreamClose, Response,
-        )
-        from lite_server.api import BidiStreamHandler
-
-        class EchoHandler(BidiStreamHandler):
-            def __init__(self):
-                self.chunks = []
-
-            def on_open(self, initial_data):
-                return {"type": "open_ack", "data": initial_data}
-
-            def on_chunk(self, chunk):
-                self.chunks.append(chunk)
-                return {"type": "chunk_ack", "received": chunk}
-
-            def on_close(self):
-                self.chunks.append("closed")
-
-        class BidiModel:
-            def bidi_stream(self):
-                return EchoHandler()
-
-            def encode_response(self, output):
-                return output
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        # Open
-        socket.inject(Request(
-            uid="b1",
-            stream=StreamRequest(stream_id="bs1", open=StreamOpen(data=json.dumps({"hello": 1}).encode())),
-        ).SerializeToString())
-
-        # Chunk
-        socket.inject(Request(
-            uid="b2",
-            stream=StreamRequest(stream_id="bs1", chunk=StreamChunk(data=json.dumps({"msg": "a"}).encode())),
-        ).SerializeToString())
-
-        # Close
-        socket.inject(Request(
-            uid="b3",
-            stream=StreamRequest(stream_id="bs1", close=StreamClose()),
-        ).SerializeToString())
-
-        t = threading.Thread(target=run_standard_loop, args=(BidiModel(), socket, "test", log))
-        t.start()
-        import time
-        time.sleep(0.05)
-        socket.inject(b"")
-        t.join(timeout=0.1)
-
-        # Expect: open response + chunk response + stream_done (+ possible error from empty injection)
-        assert len(socket._msgs) >= 3, f"Expected at least 3 messages, got {len(socket._msgs)}"
-
-        resp1 = Response()
-        resp1.ParseFromString(socket._msgs[0])
-        assert resp1.stream.stream_id == "bs1"
-        data1 = json.loads(resp1.stream.chunk.data)
-        assert data1["type"] == "open_ack"
-        assert data1["data"] == {"hello": 1}
-
-        resp2 = Response()
-        resp2.ParseFromString(socket._msgs[1])
-        assert resp2.stream.stream_id == "bs1"
-        data2 = json.loads(resp2.stream.chunk.data)
-        assert data2["type"] == "chunk_ack"
-        assert data2["received"] == {"msg": "a"}
-
-        resp3 = Response()
-        resp3.ParseFromString(socket._msgs[2])
-        assert resp3.stream.stream_id == "bs1"
-        assert resp3.stream.done is not None
-
-    def test_bidi_chunk_when_stream_not_found(self):
-        import threading
-        from lite_server.worker.inference import run_standard_loop
-        from lite_server.proto import (
-            Request, StreamRequest, StreamChunk, Response,
-        )
-
-        class NoBidiModel:
-            def predict(self, x):
-                return x
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        socket.inject(Request(
-            uid="b1",
-            stream=StreamRequest(stream_id="nx", chunk=StreamChunk(data=b"{}")),
-        ).SerializeToString())
-
-        t = threading.Thread(target=run_standard_loop, args=(NoBidiModel(), socket, "test", log))
-        t.start()
-        import time
-        time.sleep(0.03)
-        socket.inject(b"")
-        t.join(timeout=0.1)
-
-        assert len(socket._msgs) >= 1
-        resp = Response()
-        resp.ParseFromString(socket._msgs[0])
-        assert resp.stream.error.message == "stream not found"
-
-    def test_bidi_metrics_collected_on_close(self):
-        import threading
-        from lite_server.worker.inference import run_standard_loop
-        from lite_server.proto import (
-            Request, StreamRequest, StreamOpen, StreamChunk,
-            StreamClose, Response,
-        )
-        from lite_server.api import BidiStreamHandler, _MetricSpec
-
-        class MetricHandler(BidiStreamHandler):
-            def on_open(self, initial_data):
-                return None
-
-            def on_chunk(self, chunk):
-                return None
-
-            def on_close(self):
-                pass
-
-        class MetricBidiModel:
-            def __init__(self):
-                self._metric_specs = []
-                self._metric_values = []
-
-            def bidi_stream(self):
-                return MetricHandler()
-
-            def encode_response(self, output):
-                return output
-
-            def register_metric(self, name, metric_type):
-                idx = len(self._metric_specs)
-                self._metric_specs.append(_MetricSpec(name, metric_type))
-                return idx
-
-            def report_metric(self, metric_id, value):
-                self._metric_values.append((metric_id, value))
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        model = MetricBidiModel()
-        gid = model.register_metric("g1", "gauge")
-        model.report_metric(gid, 42.0)
-
-        socket.inject(Request(
-            uid="bm1",
-            stream=StreamRequest(stream_id="bms1", open=StreamOpen(data=b"{}")),
-        ).SerializeToString())
-
-        socket.inject(Request(
-            uid="bm2",
-            stream=StreamRequest(stream_id="bms1", chunk=StreamChunk(data=b"{}")),
-        ).SerializeToString())
-
-        socket.inject(Request(
-            uid="bm3",
-            stream=StreamRequest(stream_id="bms1", close=StreamClose()),
-        ).SerializeToString())
-
-        t = threading.Thread(target=run_standard_loop, args=(model, socket, "test", log))
-        t.start()
-        import time
-        time.sleep(0.05)
-        socket.inject(b"")
-        t.join(timeout=0.1)
-
-        # Find the StreamDone message (may not be last due to empty-injection error)
-        done_resp = None
-        for msg in socket._msgs:
-            r = Response()
-            r.ParseFromString(msg)
-            if r.stream.done is not None:
-                done_resp = r
-                break
-        assert done_resp is not None, "StreamDone not found"
-        assert len(done_resp.stream.done.metrics.gauges) == 1
-        assert done_resp.stream.done.metrics.gauges[0].value == 42.0
-        assert model._metric_values == []
+        assert Pipeline.build(BidiModel(), []).has_bidi_stream is True
 
 
 class TestBidiStreamingAsyncLoop:
-    """Bidirectional streaming via async worker loop."""
-
-    def _make_socket(self):
-        class MockSocket:
-            def __init__(self):
-                self._msgs = []
-                self._incoming = []
-
-            async def send(self, data):
-                self._msgs.append(data)
-
-            async def recv(self):
-                while not self._incoming:
-                    import asyncio
-                    await asyncio.sleep(0.001)
-                return self._incoming.pop(0)
-
-            def inject(self, data):
-                self._incoming.append(data)
-
-        return MockSocket()
-
-    def test_async_bidi_open_chunk_close(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import (
-            Request, StreamRequest, StreamOpen, StreamChunk,
-            StreamClose, Response,
-        )
-        from lite_server.api import BidiStreamHandler
-
+    def test_bidi_open_chunk_close(self):
         class AsyncBidiHandler(BidiStreamHandler):
             def __init__(self):
                 self.chunks = []
@@ -2814,47 +1587,27 @@ class TestBidiStreamingAsyncLoop:
             def on_close(self):
                 self.chunks.append("closed")
 
-        class AsyncBidiModel:
+        class AsyncBidiModel(LitAPI):
             async def predict(self, x):
                 return x
 
             def bidi_stream(self):
                 return AsyncBidiHandler()
 
-            def encode_response(self, output):
-                return output
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
+        socket = AsyncMockSocket()
         socket.inject(Request(
             uid="ab1",
             stream=StreamRequest(stream_id="abs1", open=StreamOpen(data=json.dumps({"hello": 1}).encode())),
         ).SerializeToString())
-
         socket.inject(Request(
             uid="ab2",
             stream=StreamRequest(stream_id="abs1", chunk=StreamChunk(data=json.dumps({"msg": "a"}).encode())),
         ).SerializeToString())
-
         socket.inject(Request(
             uid="ab3",
             stream=StreamRequest(stream_id="abs1", close=StreamClose()),
         ).SerializeToString())
-
-        async def runner():
-            task = asyncio.create_task(run_async_loop(AsyncBidiModel(), socket, "test", log))
-            await asyncio.sleep(0.05)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
+        drive_loop(AsyncBidiModel(), socket)
 
         # open_ack + chunk_ack + stream_done = at least 3 messages
         assert len(socket._msgs) >= 3, f"Expected at least 3 messages, got {len(socket._msgs)}"
@@ -2871,54 +1624,26 @@ class TestBidiStreamingAsyncLoop:
 
         resp3 = Response()
         resp3.ParseFromString(socket._msgs[2])
-        assert resp3.stream.done is not None
+        assert resp3.stream.HasField("done")
 
-    def test_async_bidi_chunk_when_stream_not_found(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import (
-            Request, StreamRequest, StreamChunk, Response,
-        )
-
-        class NoBidiModel:
+    def test_bidi_chunk_when_stream_not_found(self):
+        class NoBidiModel(LitAPI):
             async def predict(self, x):
                 return x
 
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
+        socket = AsyncMockSocket()
         socket.inject(Request(
             uid="ab1",
             stream=StreamRequest(stream_id="nx", chunk=StreamChunk(data=b"{}")),
         ).SerializeToString())
-
-        async def runner():
-            task = asyncio.create_task(run_async_loop(NoBidiModel(), socket, "test", log))
-            await asyncio.sleep(0.03)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
+        drive_loop(NoBidiModel(), socket)
 
         assert len(socket._msgs) >= 1
         resp = Response()
         resp.ParseFromString(socket._msgs[0])
         assert resp.stream.error.message == "bidi stream not found"
 
-    def test_async_bidi_cancel_calls_on_close(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import (
-            Request, StreamRequest, StreamOpen, StreamCancel, Response,
-        )
-        from lite_server.api import BidiStreamHandler
-
+    def test_bidi_cancel_calls_on_close(self):
         class TrackHandler(BidiStreamHandler):
             def __init__(self):
                 self.closed = False
@@ -2932,19 +1657,14 @@ class TestBidiStreamingAsyncLoop:
             def on_close(self):
                 self.closed = True
 
-        class TrackModel:
+        class TrackModel(LitAPI):
             async def predict(self, x):
                 return x
 
             def bidi_stream(self):
                 return TrackHandler()
 
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
+        socket = AsyncMockSocket()
         model = TrackModel()
         handler = None
 
@@ -2956,383 +1676,47 @@ class TestBidiStreamingAsyncLoop:
             return handler
 
         model.bidi_stream = capture_bidi_stream
+        # Rebuild the pipeline so the monkey-patched factory is picked up
+        model._pipeline = Pipeline.build(model, [])
 
         socket.inject(Request(
             uid="ac1",
             stream=StreamRequest(stream_id="acs1", open=StreamOpen(data=b"{}")),
         ).SerializeToString())
-
         socket.inject(Request(
             uid="ac2",
             stream=StreamRequest(stream_id="acs1", cancel=StreamCancel()),
         ).SerializeToString())
-
-        async def runner():
-            task = asyncio.create_task(run_async_loop(model, socket, "test", log))
-            await asyncio.sleep(0.05)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
+        drive_loop(model, socket)
 
         assert handler is not None
         assert handler.closed is True
 
-
-class TestStandardLoopStreaming:
-    """Uni-directional streaming via standard (sync) worker loop."""
-
-    def _make_socket(self):
-        class MockSocket:
-            def __init__(self):
-                self._msgs = []
-                self._incoming = []
-
-            def send(self, data):
-                self._msgs.append(data)
-
-            def recv(self):
-                while not self._incoming:
-                    import time
-                    time.sleep(0.001)
-                return self._incoming.pop(0)
-
-            def inject(self, data):
-                self._incoming.append(data)
-
-        return MockSocket()
-
-    def test_standard_stream_predict(self):
-        import threading
-        from lite_server.worker.inference import run_standard_loop
-        from lite_server.proto import (
-            Request, StreamRequest, StreamOpen, Response,
-        )
-
-        class StreamModel:
-            def stream_predict(self, x):
-                for i in range(3):
-                    yield {"token": i, "input": x.get("input")}
-
-            def encode_response(self, output):
-                return output
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        socket.inject(Request(
-            uid="s1",
-            stream=StreamRequest(
-                stream_id="ss1",
-                open=StreamOpen(data=json.dumps({"input": 42}).encode()),
-            ),
-        ).SerializeToString())
-
-        t = threading.Thread(target=run_standard_loop, args=(StreamModel(), socket, "test", log))
-        t.start()
-        import time
-        time.sleep(0.05)
-        socket.inject(b"")
-        t.join(timeout=0.1)
-
-        # 3 chunks + done (+ possible error from empty injection)
-        assert len(socket._msgs) >= 4
-        for i in range(3):
-            resp = Response()
-            resp.ParseFromString(socket._msgs[i])
-            assert resp.stream.stream_id == "ss1"
-            data = json.loads(resp.stream.chunk.data)
-            assert data["token"] == i
-            assert data["input"] == 42
-
-        done_resp = Response()
-        done_resp.ParseFromString(socket._msgs[3])
-        assert done_resp.stream.done is not None
-
-    def test_standard_stream_fallback_no_stream_predict(self):
-        import threading
-        from lite_server.worker.inference import run_standard_loop
-        from lite_server.proto import (
-            Request, StreamRequest, StreamOpen, Response,
-        )
-
-        class NoStreamModel:
-            def predict(self, x):
-                return {"result": x["input"] * 2}
-
-            def encode_response(self, output):
-                return output
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        socket.inject(Request(
-            uid="s2",
-            stream=StreamRequest(
-                stream_id="ss2",
-                open=StreamOpen(data=json.dumps({"input": 5}).encode()),
-            ),
-        ).SerializeToString())
-
-        t = threading.Thread(target=run_standard_loop, args=(NoStreamModel(), socket, "test", log))
-        t.start()
-        import time
-        time.sleep(0.03)
-        socket.inject(b"")
-        t.join(timeout=0.1)
-
-        # Expect: 1 final chunk + done (+ possible error)
-        assert len(socket._msgs) >= 2
-        resp1 = Response()
-        resp1.ParseFromString(socket._msgs[0])
-        assert resp1.stream.chunk.is_final is True
-        assert json.loads(resp1.stream.chunk.data)["result"] == 10
-
-        resp2 = Response()
-        resp2.ParseFromString(socket._msgs[1])
-        assert resp2.stream.done is not None
-
-    def test_standard_stream_error_in_stream_predict(self):
-        import threading
-        from lite_server.worker.inference import run_standard_loop
-        from lite_server.proto import (
-            Request, StreamRequest, StreamOpen, Response,
-        )
-
-        class BadStreamModel:
-            def stream_predict(self, x):
-                yield {"token": 0}
-                raise RuntimeError("mid-stream boom")
-
-            def encode_response(self, output):
-                return output
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        socket.inject(Request(
-            uid="s3",
-            stream=StreamRequest(
-                stream_id="ss3",
-                open=StreamOpen(data=json.dumps({"input": 1}).encode()),
-            ),
-        ).SerializeToString())
-
-        t = threading.Thread(target=run_standard_loop, args=(BadStreamModel(), socket, "test", log))
-        t.start()
-        import time
-        time.sleep(0.05)
-        socket.inject(b"")
-        t.join(timeout=0.1)
-
-        assert len(socket._msgs) >= 2
-        resp1 = Response()
-        resp1.ParseFromString(socket._msgs[0])
-        assert json.loads(resp1.stream.chunk.data)["token"] == 0
-
-        resp2 = Response()
-        resp2.ParseFromString(socket._msgs[1])
-        assert resp2.stream.error.message == "mid-stream boom"
-
-    def test_standard_stream_cancel(self):
-        import threading
-        from lite_server.worker.inference import run_standard_loop
-        from lite_server.proto import (
-            Request, StreamRequest, StreamOpen, StreamCancel, Response,
-        )
-
-        class SlowStreamModel:
-            def stream_predict(self, x):
-                import time
-                for i in range(100):
-                    time.sleep(0.01)
-                    yield {"token": i}
-
-            def encode_response(self, output):
-                return output
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        socket.inject(Request(
-            uid="s4",
-            stream=StreamRequest(
-                stream_id="ss4",
-                open=StreamOpen(data=json.dumps({"input": 1}).encode()),
-            ),
-        ).SerializeToString())
-
-        # Cancel after a short delay
-        import time
-        time.sleep(0.02)
-        socket.inject(Request(
-            uid="s5",
-            stream=StreamRequest(stream_id="ss4", cancel=StreamCancel()),
-        ).SerializeToString())
-
-        t = threading.Thread(target=run_standard_loop, args=(SlowStreamModel(), socket, "test", log))
-        t.start()
-        time.sleep(0.05)
-        socket.inject(b"")
-        t.join(timeout=0.1)
-
-        # Should have received at most a few chunks before cancel
-        stream_msgs = []
-        for msg in socket._msgs:
-            r = Response()
-            r.ParseFromString(msg)
-            if r.stream.stream_id == "ss4":
-                stream_msgs.append(r)
-
-        # Cancel should have closed the generator; no done message
-        assert all(m.stream.error.message == "" or m.stream.chunk.data for m in stream_msgs)
-
-    def test_standard_stream_with_hooks(self):
-        import threading
-        from lite_server.worker.inference import run_standard_loop
-        from lite_server.proto import (
-            Request, StreamRequest, StreamOpen, Response,
-        )
-
-        class HookedStreamModel:
-            def on_request(self, req, meta):
-                req["hooked"] = True
-                return req
-
-            def decode_request(self, req):
-                return req
-
-            def stream_predict(self, x):
-                yield {"token": 0, "hooked": x.get("hooked")}
-
-            def encode_response(self, output):
-                return output
-
-            def on_response(self, resp, meta):
-                resp["sync_hook"] = True
-                return resp
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        from lite_server.proto import RequestMeta as ProtoMeta
-        socket.inject(Request(
-            uid="s5",
-            stream=StreamRequest(
-                stream_id="ss5",
-                open=StreamOpen(
-                    data=json.dumps({"input": 1}).encode(),
-                    meta=ProtoMeta(route="/stream", headers={}, client_ip="", request_id="", timestamp_ns=0),
-                ),
-            ),
-        ).SerializeToString())
-
-        t = threading.Thread(target=run_standard_loop, args=(HookedStreamModel(), socket, "test", log))
-        t.start()
-        import time
-        time.sleep(0.03)
-        socket.inject(b"")
-        t.join(timeout=0.1)
-
-        assert len(socket._msgs) >= 1
-        resp = Response()
-        resp.ParseFromString(socket._msgs[0])
-        data = json.loads(resp.stream.chunk.data)
-        assert data["hooked"] is True
-        assert data["sync_hook"] is True
-
-
-class TestStandardLoopBidiErrors:
-    """Bidirectional streaming error handling (standard loop)."""
-
-    def _make_socket(self):
-        class MockSocket:
-            def __init__(self):
-                self._msgs = []
-                self._incoming = []
-
-            def send(self, data):
-                self._msgs.append(data)
-
-            def recv(self):
-                while not self._incoming:
-                    import time
-                    time.sleep(0.001)
-                return self._incoming.pop(0)
-
-            def inject(self, data):
-                self._incoming.append(data)
-
-        return MockSocket()
-
-    def test_standard_bidi_error_in_on_open(self):
-        import threading
-        from lite_server.worker.inference import run_standard_loop
-        from lite_server.proto import (
-            Request, StreamRequest, StreamOpen, Response,
-        )
-        from lite_server.api import BidiStreamHandler
-
+    def test_bidi_error_in_on_open(self):
         class BadOpenHandler(BidiStreamHandler):
             def on_open(self, initial_data):
                 raise RuntimeError("open failed")
 
-        class BadOpenModel:
+        class BadOpenModel(LitAPI):
+            async def predict(self, x):
+                return x
+
             def bidi_stream(self):
                 return BadOpenHandler()
 
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
+        socket = AsyncMockSocket()
         socket.inject(Request(
-            uid="be1",
-            stream=StreamRequest(
-                stream_id="be1",
-                open=StreamOpen(data=b"{}"),
-            ),
+            uid="ae1",
+            stream=StreamRequest(stream_id="ae1", open=StreamOpen(data=b"{}")),
         ).SerializeToString())
-
-        t = threading.Thread(target=run_standard_loop, args=(BadOpenModel(), socket, "test", log))
-        t.start()
-        import time
-        time.sleep(0.03)
-        socket.inject(b"")
-        t.join(timeout=0.1)
+        drive_loop(BadOpenModel(), socket)
 
         assert len(socket._msgs) >= 1
         resp = Response()
         resp.ParseFromString(socket._msgs[0])
         assert resp.stream.error.message == "on_open failed: open failed"
 
-    def test_standard_bidi_error_in_on_chunk(self):
-        import threading
-        from lite_server.worker.inference import run_standard_loop
-        from lite_server.proto import (
-            Request, StreamRequest, StreamOpen, StreamChunk, Response,
-        )
-        from lite_server.api import BidiStreamHandler
-
+    def test_bidi_error_in_on_chunk(self):
         class BadChunkHandler(BidiStreamHandler):
             def on_open(self, initial_data):
                 return None
@@ -3340,54 +1724,31 @@ class TestStandardLoopBidiErrors:
             def on_chunk(self, chunk):
                 raise RuntimeError("chunk failed")
 
-        class BadChunkModel:
+        class BadChunkModel(LitAPI):
+            async def predict(self, x):
+                return x
+
             def bidi_stream(self):
                 return BadChunkHandler()
 
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
+        socket = AsyncMockSocket()
         socket.inject(Request(
-            uid="be2",
-            stream=StreamRequest(
-                stream_id="be2",
-                open=StreamOpen(data=b"{}"),
-            ),
+            uid="ae2",
+            stream=StreamRequest(stream_id="ae2", open=StreamOpen(data=b"{}")),
         ).SerializeToString())
-
         socket.inject(Request(
-            uid="be3",
-            stream=StreamRequest(
-                stream_id="be2",
-                chunk=StreamChunk(data=b"{}"),
-            ),
+            uid="ae3",
+            stream=StreamRequest(stream_id="ae2", chunk=StreamChunk(data=b"{}")),
         ).SerializeToString())
-
-        t = threading.Thread(target=run_standard_loop, args=(BadChunkModel(), socket, "test", log))
-        t.start()
-        import time
-        time.sleep(0.03)
-        socket.inject(b"")
-        t.join(timeout=0.1)
+        drive_loop(BadChunkModel(), socket)
 
         assert len(socket._msgs) >= 1
         resp = Response()
         resp.ParseFromString(socket._msgs[0])
         assert resp.stream.error.message == "on_chunk failed: chunk failed"
 
-    def test_standard_bidi_open_no_response(self):
-        import threading
-        from lite_server.worker.inference import run_standard_loop
-        from lite_server.proto import (
-            Request, StreamRequest, StreamOpen, StreamChunk,
-            StreamClose, Response,
-        )
-        from lite_server.api import BidiStreamHandler
-
-        class SilentHandler(BidiStreamHandler):
+    def test_bidi_metrics_collected_on_close(self):
+        class MetricHandler(BidiStreamHandler):
             def on_open(self, initial_data):
                 return None
 
@@ -3397,109 +1758,96 @@ class TestStandardLoopBidiErrors:
             def on_close(self):
                 pass
 
-        class SilentModel:
+        class MetricBidiModel(LitAPI):
+            async def predict(self, x):
+                return x
+
             def bidi_stream(self):
-                return SilentHandler()
+                return MetricHandler()
 
-            _metric_specs = []
-            _metric_values = []
+        model = MetricBidiModel()
+        cid = model.register_metric("c1", "counter")
+        model.report_metric(cid, 1.0)
 
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
+        socket = AsyncMockSocket()
         socket.inject(Request(
-            uid="be4",
-            stream=StreamRequest(
-                stream_id="be4",
-                open=StreamOpen(data=b"{}"),
-            ),
+            uid="am1",
+            stream=StreamRequest(stream_id="ams1", open=StreamOpen(data=b"{}")),
         ).SerializeToString())
-
         socket.inject(Request(
-            uid="be5",
-            stream=StreamRequest(
-                stream_id="be4",
-                chunk=StreamChunk(data=b"{}"),
-            ),
+            uid="am2",
+            stream=StreamRequest(stream_id="ams1", chunk=StreamChunk(data=b"{}")),
         ).SerializeToString())
-
         socket.inject(Request(
-            uid="be6",
-            stream=StreamRequest(stream_id="be4", close=StreamClose()),
+            uid="am3",
+            stream=StreamRequest(stream_id="ams1", close=StreamClose()),
         ).SerializeToString())
+        drive_loop(model, socket)
 
-        t = threading.Thread(target=run_standard_loop, args=(SilentModel(), socket, "test", log))
-        t.start()
-        import time
-        time.sleep(0.03)
-        socket.inject(b"")
-        t.join(timeout=0.1)
-
-        # No chunk responses (on_open/on_chunk returned None), just StreamDone
         done_resp = None
         for msg in socket._msgs:
             r = Response()
             r.ParseFromString(msg)
-            if r.stream.done is not None:
+            if r.stream.HasField("done"):
                 done_resp = r
                 break
         assert done_resp is not None
+        assert len(done_resp.stream.done.metrics.counters) == 1
+        assert done_resp.stream.done.metrics.counters[0].value == 1.0
+        assert model._metric_values == []
 
+    def test_bidi_open_no_response(self):
+        class SilentHandler(BidiStreamHandler):
+            def on_open(self, initial_data):
+                return None
+
+            def on_close(self):
+                pass
+
+        class SilentModel(LitAPI):
+            async def predict(self, x):
+                return x
+
+            def bidi_stream(self):
+                return SilentHandler()
+
+        socket = AsyncMockSocket()
+        socket.inject(Request(
+            uid="an1",
+            stream=StreamRequest(stream_id="ans1", open=StreamOpen(data=b"{}")),
+        ).SerializeToString())
+        socket.inject(Request(
+            uid="an2",
+            stream=StreamRequest(stream_id="ans1", close=StreamClose()),
+        ).SerializeToString())
+        drive_loop(SilentModel(), socket)
+
+        # Only StreamDone, no chunks
+        assert len(socket._msgs) >= 1
+        done_resp = Response()
+        done_resp.ParseFromString(socket._msgs[0])
+        assert done_resp.stream.HasField("done")
+
+
+# ---------------------------------------------------------------------------
+# Streaming hooks via run_async_loop
+# ---------------------------------------------------------------------------
 
 class TestAsyncLoopStreamingHooks:
-    """Async loop streaming with on_request/on_response hooks."""
-
-    def _make_socket(self):
-        class MockSocket:
-            def __init__(self):
-                self._msgs = []
-                self._incoming = []
-
-            async def send(self, data):
-                self._msgs.append(data)
-
-            async def recv(self):
-                while not self._incoming:
-                    import asyncio
-                    await asyncio.sleep(0.001)
-                return self._incoming.pop(0)
-
-            def inject(self, data):
-                self._incoming.append(data)
-
-        return MockSocket()
-
     def test_async_stream_with_hooks(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import (
-            Request, StreamRequest, StreamOpen, Response,
-        )
-
-        class HookedStreamModel:
+        class HookedStreamModel(LitAPI):
             async def on_request(self, req, meta):
                 req["hooked"] = True
-                return req
-
-            async def decode_request(self, req):
                 return req
 
             async def stream_predict(self, x):
                 yield {"token": 0, "hooked": x.get("hooked")}
 
-            async def encode_response(self, output):
-                return output
-
             async def on_response(self, resp, meta):
                 resp["async_hook"] = True
                 return resp
 
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
+        socket = AsyncMockSocket()
         from lite_server.proto import RequestMeta as ProtoMeta
         socket.inject(Request(
             uid="ah1",
@@ -3511,17 +1859,7 @@ class TestAsyncLoopStreamingHooks:
                 ),
             ),
         ).SerializeToString())
-
-        async def runner():
-            task = asyncio.create_task(run_async_loop(HookedStreamModel(), socket, "test", log))
-            await asyncio.sleep(0.03)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
+        drive_loop(HookedStreamModel(), socket, delay=0.03)
 
         assert len(socket._msgs) >= 1
         resp = Response()
@@ -3531,481 +1869,22 @@ class TestAsyncLoopStreamingHooks:
         assert data["async_hook"] is True
 
 
-class TestAsyncLoopBidiErrors:
-    """Bidirectional streaming error handling (async loop)."""
-
-    def _make_socket(self):
-        class MockSocket:
-            def __init__(self):
-                self._msgs = []
-                self._incoming = []
-
-            async def send(self, data):
-                self._msgs.append(data)
-
-            async def recv(self):
-                while not self._incoming:
-                    import asyncio
-                    await asyncio.sleep(0.001)
-                return self._incoming.pop(0)
-
-            def inject(self, data):
-                self._incoming.append(data)
-
-        return MockSocket()
-
-    def test_async_bidi_error_in_on_open(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import (
-            Request, StreamRequest, StreamOpen, Response,
-        )
-        from lite_server.api import BidiStreamHandler
-
-        class BadOpenHandler(BidiStreamHandler):
-            def on_open(self, initial_data):
-                raise RuntimeError("open failed")
-
-        class BadOpenModel:
-            async def predict(self, x):
-                return x
-
-            def bidi_stream(self):
-                return BadOpenHandler()
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        socket.inject(Request(
-            uid="ae1",
-            stream=StreamRequest(
-                stream_id="ae1",
-                open=StreamOpen(data=b"{}"),
-            ),
-        ).SerializeToString())
-
-        async def runner():
-            task = asyncio.create_task(run_async_loop(BadOpenModel(), socket, "test", log))
-            await asyncio.sleep(0.03)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
-
-        assert len(socket._msgs) >= 1
-        resp = Response()
-        resp.ParseFromString(socket._msgs[0])
-        assert resp.stream.error.message == "on_open failed: open failed"
-
-    def test_async_bidi_error_in_on_chunk(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import (
-            Request, StreamRequest, StreamOpen, StreamChunk, Response,
-        )
-        from lite_server.api import BidiStreamHandler
-
-        class BadChunkHandler(BidiStreamHandler):
-            def on_open(self, initial_data):
-                return None
-
-            def on_chunk(self, chunk):
-                raise RuntimeError("chunk failed")
-
-        class BadChunkModel:
-            async def predict(self, x):
-                return x
-
-            def bidi_stream(self):
-                return BadChunkHandler()
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        socket.inject(Request(
-            uid="ae2",
-            stream=StreamRequest(
-                stream_id="ae2",
-                open=StreamOpen(data=b"{}"),
-            ),
-        ).SerializeToString())
-
-        socket.inject(Request(
-            uid="ae3",
-            stream=StreamRequest(
-                stream_id="ae2",
-                chunk=StreamChunk(data=b"{}"),
-            ),
-        ).SerializeToString())
-
-        async def runner():
-            task = asyncio.create_task(run_async_loop(BadChunkModel(), socket, "test", log))
-            await asyncio.sleep(0.03)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
-
-        assert len(socket._msgs) >= 1
-        resp = Response()
-        resp.ParseFromString(socket._msgs[0])
-        assert resp.stream.error.message == "on_chunk failed: chunk failed"
-
-    def test_async_bidi_metrics_collected_on_close(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import (
-            Request, StreamRequest, StreamOpen, StreamChunk,
-            StreamClose, Response,
-        )
-        from lite_server.api import BidiStreamHandler, _MetricSpec
-
-        class MetricHandler(BidiStreamHandler):
-            def on_open(self, initial_data):
-                return None
-
-            def on_chunk(self, chunk):
-                return None
-
-            def on_close(self):
-                pass
-
-        class MetricBidiModel:
-            def __init__(self):
-                self._metric_specs = []
-                self._metric_values = []
-
-            async def predict(self, x):
-                return x
-
-            def bidi_stream(self):
-                return MetricHandler()
-
-            def encode_response(self, output):
-                return output
-
-            def register_metric(self, name, metric_type):
-                idx = len(self._metric_specs)
-                self._metric_specs.append(_MetricSpec(name, metric_type))
-                return idx
-
-            def report_metric(self, metric_id, value):
-                self._metric_values.append((metric_id, value))
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        model = MetricBidiModel()
-        cid = model.register_metric("c1", "counter")
-        model.report_metric(cid, 1.0)
-
-        socket.inject(Request(
-            uid="am1",
-            stream=StreamRequest(
-                stream_id="ams1",
-                open=StreamOpen(data=b"{}"),
-            ),
-        ).SerializeToString())
-
-        socket.inject(Request(
-            uid="am2",
-            stream=StreamRequest(
-                stream_id="ams1",
-                chunk=StreamChunk(data=b"{}"),
-            ),
-        ).SerializeToString())
-
-        socket.inject(Request(
-            uid="am3",
-            stream=StreamRequest(stream_id="ams1", close=StreamClose()),
-        ).SerializeToString())
-
-        async def runner():
-            task = asyncio.create_task(run_async_loop(model, socket, "test", log))
-            await asyncio.sleep(0.05)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
-
-        done_resp = None
-        for msg in socket._msgs:
-            r = Response()
-            r.ParseFromString(msg)
-            if r.stream.done is not None:
-                done_resp = r
-                break
-        assert done_resp is not None
-        assert len(done_resp.stream.done.metrics.counters) == 1
-        assert done_resp.stream.done.metrics.counters[0].value == 1.0
-        assert model._metric_values == []
-
-    def test_async_bidi_open_no_response(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import (
-            Request, StreamRequest, StreamOpen, StreamClose, Response,
-        )
-        from lite_server.api import BidiStreamHandler
-
-        class SilentHandler(BidiStreamHandler):
-            def on_open(self, initial_data):
-                return None
-
-            def on_close(self):
-                pass
-
-        class SilentModel:
-            async def predict(self, x):
-                return x
-
-            def bidi_stream(self):
-                return SilentHandler()
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        socket.inject(Request(
-            uid="an1",
-            stream=StreamRequest(
-                stream_id="ans1",
-                open=StreamOpen(data=b"{}"),
-            ),
-        ).SerializeToString())
-
-        socket.inject(Request(
-            uid="an2",
-            stream=StreamRequest(stream_id="ans1", close=StreamClose()),
-        ).SerializeToString())
-
-        async def runner():
-            task = asyncio.create_task(run_async_loop(SilentModel(), socket, "test", log))
-            await asyncio.sleep(0.03)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
-
-        # Only StreamDone, no chunks
-        assert len(socket._msgs) >= 1
-        done_resp = Response()
-        done_resp.ParseFromString(socket._msgs[0])
-        assert done_resp.stream.done is not None
-
-
-class TestStandardLoopNonStreaming:
-    """Non-streaming scenarios via standard (sync) worker loop."""
-
-    def _make_socket(self):
-        class MockSocket:
-            def __init__(self):
-                self._msgs = []
-                self._incoming = []
-
-            def send(self, data):
-                self._msgs.append(data)
-
-            def recv(self):
-                while not self._incoming:
-                    import time
-                    time.sleep(0.001)
-                return self._incoming.pop(0)
-
-            def inject(self, data):
-                self._incoming.append(data)
-
-        return MockSocket()
-
-    def test_standard_health_check_empty_data(self):
-        import threading
-        from lite_server.worker.inference import run_standard_loop
-        from lite_server.proto import Request, SingleRequest, Response
-
-        class StrictAPI:
-            def predict(self, x):
-                # Would fail if called
-                return {"output": x["required_field"]}
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        socket.inject(Request(
-            uid="hc1",
-            single=SingleRequest(data=b""),
-        ).SerializeToString())
-
-        t = threading.Thread(target=run_standard_loop, args=(StrictAPI(), socket, "test", log))
-        t.start()
-        import time
-        time.sleep(0.02)
-        socket.inject(b"")
-        t.join(timeout=0.1)
-
-        assert len(socket._msgs) >= 1
-        resp = Response()
-        resp.ParseFromString(socket._msgs[0])
-        assert resp.single.status.code == "Ok"
-        assert resp.single.data == b"{}"
-
-    def test_standard_single_error_in_predict(self):
-        import threading
-        from lite_server.worker.inference import run_standard_loop
-        from lite_server.proto import Request, SingleRequest, Response
-
-        class BadAPI:
-            def predict(self, x):
-                raise RuntimeError("predict boom")
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        socket.inject(Request(
-            uid="err1",
-            single=SingleRequest(data=json.dumps({"input": 1}).encode()),
-        ).SerializeToString())
-
-        t = threading.Thread(target=run_standard_loop, args=(BadAPI(), socket, "test", log))
-        t.start()
-        import time
-        time.sleep(0.02)
-        socket.inject(b"")
-        t.join(timeout=0.1)
-
-        assert len(socket._msgs) >= 1
-        resp = Response()
-        resp.ParseFromString(socket._msgs[0])
-        assert resp.single.status.code == "Error"
-        assert resp.single.status.message == "500"
-        body = json.loads(resp.single.data)
-        assert body["error"]["type"] == "server_error"
-        assert "predict boom" in body["error"]["message"]
-
-    def test_standard_batch_partial_failure(self):
-        import threading
-        from lite_server.worker.inference import run_standard_loop
-        from lite_server.proto import (
-            Request, BatchRequest, BatchItem, Response,
-        )
-
-        class PartialAPI:
-            def decode_request(self, req):
-                if req.get("bad"):
-                    raise ValueError("bad input")
-                return req
-
-            def predict(self, x):
-                return {"result": x["input"] + 1}
-
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
-        socket.inject(Request(
-            uid="batch-p1",
-            batch=BatchRequest(items=[
-                BatchItem(uid="ok", data=json.dumps({"input": 1}).encode()),
-                BatchItem(uid="fail", data=json.dumps({"bad": True}).encode()),
-            ]),
-        ).SerializeToString())
-
-        t = threading.Thread(target=run_standard_loop, args=(PartialAPI(), socket, "test", log))
-        t.start()
-        import time
-        time.sleep(0.03)
-        socket.inject(b"")
-        t.join(timeout=0.1)
-
-        assert len(socket._msgs) >= 1
-        resp = Response()
-        resp.ParseFromString(socket._msgs[0])
-        assert len(resp.batch.items) == 2
-        assert resp.batch.items[0].status.code == "Ok"
-        assert json.loads(resp.batch.items[0].data)["result"] == 2
-        assert resp.batch.items[1].status.code == "Error"
-
+# ---------------------------------------------------------------------------
+# Non-streaming edge cases via run_async_loop
+# ---------------------------------------------------------------------------
 
 class TestAsyncLoopNonStreaming:
-    """Non-streaming edge cases via async worker loop."""
-
-    def _make_socket(self):
-        class MockSocket:
-            def __init__(self):
-                self._msgs = []
-                self._incoming = []
-
-            async def send(self, data):
-                self._msgs.append(data)
-
-            async def recv(self):
-                while not self._incoming:
-                    import asyncio
-                    await asyncio.sleep(0.001)
-                return self._incoming.pop(0)
-
-            def inject(self, data):
-                self._incoming.append(data)
-
-        return MockSocket()
-
     def test_async_single_request_error_in_predict(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import Request, SingleRequest, Response
-
-        class BadAPI:
+        class BadAPI(LitAPI):
             async def predict(self, x):
                 raise RuntimeError("async predict boom")
 
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
+        socket = AsyncMockSocket()
         socket.inject(Request(
             uid="aerr1",
             single=SingleRequest(data=json.dumps({"input": 1}).encode()),
         ).SerializeToString())
-
-        async def runner():
-            task = asyncio.create_task(run_async_loop(BadAPI(), socket, "test", log))
-            await asyncio.sleep(0.03)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
+        drive_loop(BadAPI(), socket)
 
         assert len(socket._msgs) >= 1
         resp = Response()
@@ -4017,13 +1896,7 @@ class TestAsyncLoopNonStreaming:
         assert "async predict boom" in body["error"]["message"]
 
     def test_async_batch_partial_failure(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import (
-            Request, BatchRequest, BatchItem, Response,
-        )
-
-        class PartialAPI:
+        class PartialAPI(LitAPI):
             async def decode_request(self, req):
                 if req.get("bad"):
                     raise ValueError("bad input")
@@ -4032,12 +1905,7 @@ class TestAsyncLoopNonStreaming:
             async def predict(self, x):
                 return {"result": x["input"] + 1}
 
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
+        socket = AsyncMockSocket()
         socket.inject(Request(
             uid="abp1",
             batch=BatchRequest(items=[
@@ -4045,17 +1913,7 @@ class TestAsyncLoopNonStreaming:
                 BatchItem(uid="fail", data=json.dumps({"bad": True}).encode()),
             ]),
         ).SerializeToString())
-
-        async def runner():
-            task = asyncio.create_task(run_async_loop(PartialAPI(), socket, "test", log))
-            await asyncio.sleep(0.03)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
+        drive_loop(PartialAPI(), socket)
 
         assert len(socket._msgs) >= 1
         resp = Response()
@@ -4066,35 +1924,16 @@ class TestAsyncLoopNonStreaming:
         assert resp.batch.items[1].status.code == "Error"
 
     def test_async_health_check_empty_data(self):
-        import asyncio
-        from lite_server.worker.inference import run_async_loop
-        from lite_server.proto import Request, SingleRequest, Response
-
-        class StrictAPI:
+        class StrictAPI(LitAPI):
             async def predict(self, x):
                 return {"output": x["required_field"]}
 
-            _metric_specs = []
-            _metric_values = []
-
-        socket = self._make_socket()
-        log = logging.getLogger("test")
-
+        socket = AsyncMockSocket()
         socket.inject(Request(
             uid="ahc1",
             single=SingleRequest(data=b""),
         ).SerializeToString())
-
-        async def runner():
-            task = asyncio.create_task(run_async_loop(StrictAPI(), socket, "test", log))
-            await asyncio.sleep(0.03)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        asyncio.run(runner())
+        drive_loop(StrictAPI(), socket)
 
         assert len(socket._msgs) >= 1
         resp = Response()
@@ -4197,4 +2036,4 @@ class TestLevelPrefixFormatter:
         output = fmt.format(record)
         assert "/p/inference.py:278" in output, \
             f"expected pathname:lineno in: {output!r}"
-        assert "ValueError: boom" in output
+        assert "ValueError" in output

@@ -1826,7 +1826,7 @@ heartbeat_max_failures: 5
         std::fs::create_dir_all(&model_dir).unwrap();
         std::fs::write(
             model_dir.join("model.py"),
-            r#"from litserve import LitAPI
+            r#"from lite_server import LitAPI
 
 
 class TestAPI(LitAPI):

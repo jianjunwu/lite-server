@@ -13,8 +13,7 @@ except ImportError:
     serve = None  # fallback when extension is not built
 
 from lite_server.api import BidiStreamHandler, LitAPI, ResponseWithHeaders
-from lite_server.api_async import AsyncLitAPI
-from lite_server.callback import Callback, CallbackRunner
+from lite_server.callback import Callback, RequestContext
 from lite_server.endpoint import endpoint, router
 from lite_server.middleware import cors, log_requests, rate_limit, require_api_key
 from lite_server.request import Client, Headers, QueryParams, Request, State, URL, UploadFile
@@ -35,10 +34,9 @@ from lite_server.specs.base import EndpointSpec
 __all__ = [
     "serve",
     "LitAPI",
-    "AsyncLitAPI",
     "BidiStreamHandler",
     "Callback",
-    "CallbackRunner",
+    "RequestContext",
     "OpenAIEndpoint",
     "EndpointSpec",
     "ServerProxy",

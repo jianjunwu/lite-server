@@ -28,7 +28,7 @@ class TestLitAPIBasics:
         api = Dummy()
         assert api is not None
 
-    def test_default_params_forwarded_to_litserve(self):
+    def test_constructor_params_stored(self):
         from lite_server.api import LitAPI
 
         class Dummy(LitAPI):
@@ -278,16 +278,16 @@ class TestCustomMetrics:
 
 
 class TestCollectMetrics:
-    """_collect_metrics() gathers metric values into a Metrics proto."""
+    """collect_metrics() gathers metric values into a Metrics proto."""
 
     def test_collect_returns_none_when_empty(self):
-        from lite_server.worker.inference import _collect_metrics
+        from lite_server.pipeline import collect_metrics
 
         api = self._make_api()
-        assert _collect_metrics(api) is None
+        assert collect_metrics(api) is None
 
     def test_collect_returns_metrics_proto(self):
-        from lite_server.worker.inference import _collect_metrics
+        from lite_server.pipeline import collect_metrics
         from lite_server.proto import Metrics
 
         api = self._make_api()
@@ -298,7 +298,7 @@ class TestCollectMetrics:
         api.report_metric(c, 20.0)
         api.report_metric(h, 30.0)
 
-        m = _collect_metrics(api)
+        m = collect_metrics(api)
         assert isinstance(m, Metrics)
         assert len(m.gauges) == 1
         assert m.gauges[0].id == 0  # per-type index: first gauge
@@ -311,21 +311,21 @@ class TestCollectMetrics:
         assert m.histograms[0].value == 30.0
 
     def test_collect_clears_buffer(self):
-        from lite_server.worker.inference import _collect_metrics
+        from lite_server.pipeline import collect_metrics
 
         api = self._make_api()
         g = api.register_metric("x", "gauge")
         api.report_metric(g, 1.0)
-        _collect_metrics(api)
+        collect_metrics(api)
         assert api._metric_values == []
 
     def test_collect_returns_none_when_no_specs(self):
-        from lite_server.worker.inference import _collect_metrics
+        from lite_server.pipeline import collect_metrics
 
         api = self._make_api()
         # Manually add a value without registering — should be ignored
         api._metric_values.append((99, 1.0))
-        assert _collect_metrics(api) is None
+        assert collect_metrics(api) is None
 
     def _make_api(self):
         from lite_server.api import LitAPI
@@ -337,56 +337,6 @@ class TestCollectMetrics:
             def encode_response(self, output): return output
 
         return Dummy()
-
-
-class TestAsyncLitAPI:
-    """AsyncLitAPI subclassing and constraints."""
-
-    def test_async_litapi_does_not_force_max_batch_size(self):
-        from lite_server.api_async import AsyncLitAPI
-
-        class Dummy(AsyncLitAPI):
-            def setup(self, device): pass
-            async def predict(self, x): return x
-
-        api = Dummy(max_batch_size=8)
-        assert api.max_batch_size == 8
-
-    def test_async_litapi_sets_enable_async(self):
-        from lite_server.api_async import AsyncLitAPI
-
-        class Dummy(AsyncLitAPI):
-            def setup(self, device): pass
-            async def predict(self, x): return x
-
-        api = Dummy()
-        assert api.enable_async is True
-
-    def test_async_predict_must_be_implemented(self):
-        from lite_server.api_async import AsyncLitAPI
-
-        class Dummy(AsyncLitAPI):
-            def setup(self, device): pass
-
-        api = Dummy()
-        import asyncio
-        with pytest.raises(NotImplementedError):
-            asyncio.run(api.predict({}))
-
-    def test_async_litapi_is_instance_of_litapi(self):
-        from lite_server.api import LitAPI
-        from lite_server.api_async import AsyncLitAPI
-
-        class Dummy(AsyncLitAPI):
-            def setup(self, device): pass
-            async def predict(self, x): return x
-
-        api = Dummy()
-        assert isinstance(api, LitAPI)
-
-    def test_async_litapi_exported_from_package(self):
-        from lite_server import AsyncLitAPI
-        assert AsyncLitAPI is not None
 
 
 class TestResponseWithHeaders:
@@ -418,14 +368,14 @@ class TestUnwrapResponse:
     """_unwrap_response: extract body and headers from on_response result."""
 
     def test_unwrap_plain_body_returns_none_headers(self):
-        from lite_server.worker.inference import _unwrap_response
+        from lite_server.pipeline import unwrap_response as _unwrap_response
         body, headers = _unwrap_response({"output": 1})
         assert body == {"output": 1}
         assert headers is None
 
     def test_unwrap_response_with_headers_extracts_both(self):
         from lite_server.api import ResponseWithHeaders
-        from lite_server.worker.inference import _unwrap_response
+        from lite_server.pipeline import unwrap_response as _unwrap_response
         body, headers = _unwrap_response(
             ResponseWithHeaders(body={"out": 99}, headers={"X-Trace": "abc"})
         )
@@ -433,13 +383,13 @@ class TestUnwrapResponse:
         assert headers == {"X-Trace": "abc"}
 
     def test_unwrap_none_body(self):
-        from lite_server.worker.inference import _unwrap_response
+        from lite_server.pipeline import unwrap_response as _unwrap_response
         body, headers = _unwrap_response(None)
         assert body is None
         assert headers is None
 
     def test_unwrap_string_body(self):
-        from lite_server.worker.inference import _unwrap_response
+        from lite_server.pipeline import unwrap_response as _unwrap_response
         body, headers = _unwrap_response("plain string")
         assert body == "plain string"
         assert headers is None

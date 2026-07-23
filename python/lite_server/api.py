@@ -1,20 +1,22 @@
-"""Enhanced LitAPI with lifecycle hooks for lite-server.
+"""LitAPI base class for lite-server.
 
-Model authors subclass ``lite_server.api.LitAPI`` instead of
-``litserve.LitAPI`` to gain access to framework-level hooks
-(teardown, on_file_changed, logger, on_request, on_response).
+Model authors subclass ``lite_server.LitAPI`` and implement ``setup`` /
+``predict`` (plus optional ``decode_request`` / ``encode_response`` /
+``batch`` / ``unbatch`` / streaming and lifecycle hooks).
+
+Since 0.7.0 this class is self-contained (no litserve dependency) and every
+model runs on the worker's unified async loop: sync and async methods are
+adapted automatically at load time.  ``setup`` stays synchronous.
 """
 
 from __future__ import annotations
 
 import logging
+import warnings
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Iterator, List, Tuple
+from typing import Any, Iterator, List, Tuple
 
-import litserve as ls
-
-if TYPE_CHECKING:
-    from litserve.specs.base import LitSpec
+from lite_server.response import Response
 
 
 @dataclass
@@ -27,9 +29,6 @@ class RequestMeta:
     request_id: str
     timestamp_ns: int
     payload: Any  # decoded original request body
-
-
-from lite_server.response import Response
 
 
 @dataclass
@@ -67,6 +66,7 @@ class BidiStreamHandler:
 
     Override :meth:`on_open`, :meth:`on_chunk`, and :meth:`on_close`
     to process client input and optionally produce output chunks.
+    All three may be sync or async.
     """
 
     def on_open(self, initial_data: Any) -> Any | None:
@@ -97,10 +97,10 @@ class BidiStreamHandler:
         pass
 
 
-class LitAPI(ls.LitAPI):
-    """Drop-in replacement for ``ls.LitAPI`` with lite-server hooks.
+class LitAPI:
+    """Base class for lite-server inference APIs.
 
-    Usage is identical to ``ls.LitAPI``::
+    Minimal usage::
 
         from lite_server import LitAPI
 
@@ -110,6 +110,9 @@ class LitAPI(ls.LitAPI):
 
             def predict(self, x):
                 return self.model(x)
+
+    ``predict`` (and any other method except ``setup``) may be ``async def``;
+    the worker adapts automatically — no separate base class is needed.
     """
 
     def __init__(
@@ -117,20 +120,27 @@ class LitAPI(ls.LitAPI):
         max_batch_size: int = 1,
         batch_timeout: float = 0.0,
         stream: bool = False,
-        loop: Any = "auto",
-        spec: LitSpec | None = None,
-        mcp: Any = None,
         enable_async: bool = False,
     ):
-        super().__init__(
-            max_batch_size=max_batch_size,
-            batch_timeout=batch_timeout,
-            stream=stream,
-            loop=loop,
-            spec=spec,
-            mcp=mcp,
-            enable_async=enable_async,
-        )
+        if max_batch_size <= 0:
+            raise ValueError("max_batch_size must be greater than 0")
+        if batch_timeout < 0:
+            raise ValueError("batch_timeout must be greater than or equal to 0")
+
+        batch_overridden = type(self).batch.__code__ is not LitAPI.batch.__code__
+        unbatch_overridden = type(self).unbatch.__code__ is not LitAPI.unbatch.__code__
+        if batch_overridden and unbatch_overridden and max_batch_size == 1:
+            warnings.warn(
+                "Both batch and unbatch are implemented, but max_batch_size "
+                "was not set (default 1 — batching disabled)."
+            )
+
+        self.max_batch_size = max_batch_size
+        self.batch_timeout = batch_timeout
+        self.stream = stream
+        # Accepted for backward compatibility; ignored — every model runs on
+        # the unified async loop since 0.7.0.
+        self.enable_async = enable_async
         self.config: dict[str, Any] = {}
         self._logger: logging.Logger | None = None
         self._metric_specs: List[_MetricSpec] = []
@@ -144,6 +154,40 @@ class LitAPI(ls.LitAPI):
                 self.__class__.__module__ + "." + self.__class__.__name__
             )
         return self._logger
+
+    # ===== Core inference methods =====
+
+    def setup(self, device: str) -> None:
+        """Load the model and resources. Called once per worker, synchronously."""
+        pass
+
+    def decode_request(self, request: Any) -> Any:
+        """Convert the raw request payload to your model input."""
+        return request
+
+    def batch(self, inputs: list) -> Any:
+        """Convert a list of decoded inputs to a batched input."""
+        if hasattr(inputs[0], "__torch_function__"):
+            import torch
+
+            return torch.stack(inputs)
+        if inputs[0].__class__.__name__ == "ndarray":
+            import numpy
+
+            return numpy.stack(inputs)
+        return inputs
+
+    def predict(self, x: Any) -> Any:
+        """Run the model on the input and return the output."""
+        raise NotImplementedError("predict is not implemented")
+
+    def unbatch(self, output: Any) -> list:
+        """Convert a batched output back to a list of per-input outputs."""
+        return list(output)
+
+    def encode_response(self, output: Any) -> Any:
+        """Convert the model output to a response payload."""
+        return output
 
     # ===== Custom Metrics =====
 
@@ -191,14 +235,14 @@ class LitAPI(ls.LitAPI):
         streaming hooks when you want per-chunk metrics instead of
         waiting for the stream to finish.
         """
-        from lite_server.worker.inference import _collect_metrics
+        from lite_server.pipeline import collect_metrics
 
-        return _collect_metrics(self)
+        return collect_metrics(self)
 
     # ===== Streaming Hooks (optional) =====
 
     def stream_predict(self, request: Any) -> Iterator[Any]:
-        """Generator for server-side streaming.
+        """Generator for server-side streaming (sync or async).
 
         Override to enable streaming output. Each yielded value is sent
         as a chunk to the client via SSE/WebSocket/gRPC.
@@ -224,7 +268,8 @@ class LitAPI(ls.LitAPI):
 
         Override to modify the raw request, perform auth checks, inject
         context, or log request metadata.  Raising an exception rejects the
-        request and returns an Error response to the client.
+        request and returns an Error response to the client.  Returning a
+        :class:`Response` short-circuits the pipeline (early return).
 
         Args:
             request: The raw request payload (JSON dict from HTTP body).

@@ -70,7 +70,7 @@ fn create_test_model_repo() -> std::path::PathBuf {
 
     std::fs::write(
         model_dir.join("model.py"),
-        r#"from litserve import LitAPI
+        r#"from lite_server import LitAPI
 
 from lite_server.exceptions import BadRequestError
 
@@ -738,7 +738,7 @@ async fn test_malformed_json_standardized_400() {
 #[serial]
 #[ignore] // flaky on CI: filesystem watcher timeout on macOS runners
 async fn test_hot_reload() {
-    let original = r#"from litserve import LitAPI
+    let original = r#"from lite_server import LitAPI
 
 
 class TestAPI(LitAPI):
