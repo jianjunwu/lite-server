@@ -807,11 +807,24 @@ class MyModel(LitAPI):
 | `InternalServerError` | 500 | `server_error` |
 | `ServiceUnavailableError` | 503 | `service_unavailable` |
 
-All accept a custom `error_type` as the second argument. The client receives a structured response:
+All accept a custom `error_type` as the second argument, plus optional `code` and `param` keyword arguments for programmatic error handling (OpenAI convention):
+
+```python
+raise BadRequestError("input must be non-negative", code="invalid_input", param="value")
+```
+
+The client always receives a four-field structured response:
 
 ```json
-{"error": {"type": "INVALID_INPUT", "message": "input must be non-negative"}}
+{"error": {"type": "INVALID_INPUT", "message": "input must be non-negative", "code": "invalid_input", "param": "value"}}
 ```
+
+- `code` — machine-readable error code (snake_case), `null` when not set. Server-generated errors always carry one (e.g. `model_not_found`, `queue_full`, `invalid_request_body`).
+- `param` — name of the parameter that caused the error, `null` when not applicable.
+
+On gRPC, `code`/`param` are delivered as standard [ErrorInfo](https://github.com/googleapis/googleapis/blob/master/google/rpc/error_details.proto) details (`reason` = code, `metadata` = {error_type, param}) alongside the `[error_type] message` status message.
+
+`HTTPException` works in custom endpoint handlers too — the endpoint returns the exception's status code with the same structured error body.
 
 Custom status codes are supported via subclassing `HTTPException` directly:
 
@@ -822,6 +835,17 @@ class PaymentRequiredError(HTTPException):
     def __init__(self, detail, error_type="payment_required"):
         super().__init__(402, detail, error_type)
 ```
+
+#### Response Headers
+
+Every HTTP response (success or error) carries:
+
+| Header | Description |
+|--------|-------------|
+| `x-request-id` | Request ID for log/tracing correlation. Echoes the client's `x-client-request-id` (1–512 ASCII chars) when provided; otherwise a UUID v4. The same ID propagates to inference workers and callbacks. |
+| `x-processing-time-ms` | Total server-side wall-clock processing time in milliseconds. |
+
+Framework-level errors are standardized as well: unknown routes return 404 (`code: route_not_found`), unsupported methods 405 (`code: method_not_allowed`), and malformed JSON bodies 400 (`code: invalid_request_body`) — all in the four-field format above.
 
 ### Performance
 
