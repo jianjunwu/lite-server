@@ -128,6 +128,15 @@ def parse_args():
 from lite_server.server_proxy import ServerProxy
 
 
+class HandlerSignatureError(RuntimeError):
+    """Endpoint handler signature violates the 0.7.0 ctx contract (loud).
+
+    A misconfigured endpoint must not be silently swallowed — it fails
+    load_endpoints so the worker reports a startup error instead of dropping
+    every route while still reporting ready.
+    """
+
+
 def _validate_handler_signature(fn, route: str) -> None:
     """Reject pre-0.7 (request, server) handlers at load time."""
     import inspect as _inspect
@@ -145,7 +154,7 @@ def _validate_handler_signature(fn, route: str) -> None:
     ]
     if len(required) == 1 and required[0].name not in ("request", "server"):
         return
-    raise RuntimeError(
+    raise HandlerSignatureError(
         f"Endpoint handler for {route} must take exactly one argument "
         f"(ctx: RequestContext); got signature {fn}. Since 0.7.0: "
         f"request['body'] → ctx.request, request['query'] → ctx.meta.query, "
@@ -214,26 +223,29 @@ def load_endpoints(repo_path: str):
                         "methods": [m.upper() for m in methods],
                     }
                     continue
+            except HandlerSignatureError:
+                raise  # signature violations must be loud — not swallowed per-file
             except Exception as e:
                 logger.error("Failed to load subdirectory endpoint %s: %s", py_file, e, exc_info=True)
 
     # ---- Mode 2: Decorator-registered routes ----
-    try:
-        from lite_server.endpoint import router as _global_router
-        for route_def in _global_router.routes:
-            handler = route_def.handler
-            _validate_handler_signature(handler, route_def.path)
-            pipeline = None
-            if route_def.callbacks:
-                pipeline = Pipeline.for_endpoint(route_def.callbacks)
-            endpoints[route_def.path] = {
-                "handler": handler,
-                "methods": route_def.methods,
-                "callbacks": route_def.callbacks,
-                "pipeline": pipeline,
-            }
-    except Exception as e:
-        logger.debug("No decorator routes collected: %s", e)
+    # Signature / Pipeline errors are FATAL (0.7.0 loud-error contract): a
+    # misconfigured endpoint must not silently drop every route while the
+    # worker still reports ready. (Import failure is impossible here —
+    # lite_server.endpoint is an in-package module.)
+    from lite_server.endpoint import router as _global_router
+    for route_def in _global_router.routes:
+        handler = route_def.handler
+        _validate_handler_signature(handler, route_def.path)
+        pipeline = (
+            Pipeline.for_endpoint(route_def.callbacks) if route_def.callbacks else None
+        )
+        endpoints[route_def.path] = {
+            "handler": handler,
+            "methods": route_def.methods,
+            "callbacks": route_def.callbacks,
+            "pipeline": pipeline,
+        }
 
     return endpoints
 
@@ -409,9 +421,16 @@ async def worker_main():
     setup_logging()
     args = parse_args()
 
-    # Load endpoints
-    with _protect_stdout():
-        endpoints = load_endpoints(args.repo_path)
+    # Load endpoints. Signature/pipeline errors are loud (A3): on failure the
+    # worker reports an error handshake and exits instead of reporting ready
+    # with no routes.
+    try:
+        with _protect_stdout():
+            endpoints = load_endpoints(args.repo_path)
+    except Exception as e:
+        logger.error("Failed to load endpoints: %s", e)
+        print(json.dumps({"status": "error", "message": str(e)}), flush=True)
+        sys.exit(1)
 
     # Build routes with per-route policies
     routes_with_policies = []

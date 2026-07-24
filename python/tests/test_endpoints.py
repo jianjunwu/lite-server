@@ -652,3 +652,51 @@ class TestResponseFrameContract:
         resp = await handle_request(ep, self._req(headers={"x-api-key": "secret"}))
         assert resp["status_code"] == 200
         assert resp["body"] == {"result": "authorized"}
+
+
+# ===== A3: loud handler-signature failure =====
+
+
+class TestHandlerSignatureLoud:
+    """A3: a bad handler signature must fail LOUD — not be silently swallowed
+    and drop every decorator route while the worker still reports ready."""
+
+    def test_decorator_bad_signature_raises_handler_signature_error(self, tmp_path):
+        from lite_server.endpoint import router
+        from lite_server.worker.endpoints import HandlerSignatureError
+
+        router._routes.clear()
+        try:
+            @router.get("/good")
+            def good(ctx):
+                return {"ok": True}
+
+            @router.get("/bad")
+            def bad(request, server):  # pre-0.7 signature
+                return {"ok": True}
+
+            with pytest.raises(HandlerSignatureError) as ei:
+                load_endpoints(str(tmp_path))
+            # Migration guidance is embedded in the message.
+            assert "0.7.0" in str(ei.value)
+        finally:
+            router._routes.clear()
+
+    def test_all_valid_decorator_routes_loaded(self, tmp_path):
+        from lite_server.endpoint import router
+
+        router._routes.clear()
+        try:
+            @router.get("/a")
+            def a(ctx):
+                return {"a": 1}
+
+            @router.get("/b")
+            def b(ctx):
+                return {"b": 2}
+
+            endpoints = load_endpoints(str(tmp_path))
+            assert "/a" in endpoints
+            assert "/b" in endpoints
+        finally:
+            router._routes.clear()
