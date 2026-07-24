@@ -24,6 +24,10 @@ from __future__ import annotations
 import importlib
 import inspect
 import logging
+import math
+import os
+import threading
+import time
 from typing import TYPE_CHECKING, Any
 
 from lite_server.context import RequestContext
@@ -101,6 +105,17 @@ class Callback:
         """
         pass
 
+    # ---- Error hook (exception-isolated) ----
+
+    def on_error(self, ctx: RequestContext, exc: Exception) -> None:
+        """Called when the request fails (a hook or stage raised).
+
+        Driven exception-isolated: a failing on_error is logged, never
+        masks the original error.  Return value ignored.  May be sync
+        or async.  Streaming paths drive it once per failed chunk.
+        """
+        pass
+
     # ---- Setup / Teardown (lifecycle hooks, exception-isolated) ----
 
     def on_before_setup(self, config: dict[str, Any], device: str) -> None:
@@ -128,6 +143,8 @@ _REMOVED_HOOKS = {
 }
 
 _DATA_HOOKS = ("on_request", "on_input", "on_output", "on_response")
+
+_ERROR_HOOKS = ("on_error",)
 
 _LIFECYCLE_HOOKS = ("on_before_setup", "on_after_setup", "on_teardown")
 
@@ -195,6 +212,30 @@ def validate_callback(cb: Callback) -> None:
     for name in _DATA_HOOKS:
         if _overrides(cls, name, Callback):
             _check_single_ctx_param(getattr(cb, name), f"Callback {cls.__name__}", name)
+    # on_error takes (self, ctx, exc) — two required positional params after self
+    if _overrides(cls, "on_error", Callback):
+        _check_on_error_sig(getattr(cb, "on_error"), f"Callback {cls.__name__}")
+
+
+def _check_on_error_sig(fn: callable, owner: str) -> None:
+    """Require exactly two required positional params (ctx, exc) for on_error."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return
+    required = [
+        p
+        for p in params.values()
+        if p.default is inspect.Parameter.empty
+        and p.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    if len(required) == 2:
+        return
+    raise RuntimeError(
+        f"{owner}.on_error must take exactly two arguments "
+        f"(ctx: RequestContext, exc: Exception); got signature {fn}."
+    )
 
 
 def _field_for(hook_name: str) -> str:
@@ -206,23 +247,30 @@ def _field_for(hook_name: str) -> str:
     }[hook_name]
 
 
-def load_callbacks(config: dict[str, Any]) -> list[Callback]:
-    """Load and validate callback instances from model config.
+def load_callbacks(
+    config: dict[str, Any], lit_api: "LitAPI | None" = None
+) -> list[Callback]:
+    """Load and validate callback instances from config + LitAPI class attribute.
 
-    Expects a ``callbacks`` key in config containing a list of
-    fully-qualified class paths::
+    ``LitAPI.callbacks`` class attribute takes priority — it supports
+    constructor arguments.  ``config.yaml`` callbacks are appended
+    (fully-qualified class paths, no-arg constructible).
 
-        callbacks:
-          - my_package.callbacks.AuditLogger
-          - my_package.callbacks.MetricsCollector
-
-    Each class must be a no-arg constructible :class:`Callback` subclass.
-    Loading fails loudly (RuntimeError) on import errors, non-Callback
-    classes, or pre-0.7 hook signatures — a silently skipped callback could
-    mean auth/validation logic that never runs.
+    Both sources pass through :func:`validate_callback` — a silently skipped
+    callback could mean auth/validation logic that never runs.
     """
     logger = logging.getLogger("lite_server.callback")
     instances: list[Callback] = []
+
+    # Class attribute (priority) — supports constructor arguments
+    if lit_api is not None:
+        class_callbacks = getattr(type(lit_api), "callbacks", ()) or ()
+        for cb in class_callbacks:
+            validate_callback(cb)
+            instances.append(cb)
+            logger.debug("Loaded callback %s from LitAPI.callbacks", type(cb).__name__)
+
+    # config.yaml (append)
     for path in config.get("callbacks", []) or []:
         try:
             module_path, class_name = path.rsplit(".", 1)
@@ -245,3 +293,215 @@ def load_callbacks(config: dict[str, Any]) -> list[Callback]:
         instances.append(instance)
         logger.debug("Loaded callback %s", path)
     return instances
+
+
+# ---------------------------------------------------------------------------
+# Built-in Callback classes
+# ---------------------------------------------------------------------------
+
+_POLICY_MANAGED_ENV = "LITE_POLICY_MANAGED"
+
+
+def _rust_managed() -> bool:
+    """True when the Rust HTTP layer executes RateLimit/Cors policies.
+
+    Set via env at worker spawn (new_worker_command).  Read per-instance at
+    construction so unit tests can monkeypatch os.environ.
+    """
+    return os.environ.get(_POLICY_MANAGED_ENV) == "1"
+
+
+class _TokenBucket:
+    """Thread-safe token bucket for local rate limiting fallback."""
+
+    def __init__(self, rate: float, capacity: float):
+        self.rate = rate
+        self.capacity = capacity
+        self.tokens = capacity
+        self.last_update = time.monotonic()
+        self.last_access = self.last_update
+        self._lock = threading.Lock()
+
+    def acquire(self, tokens: float = 1.0) -> bool:
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self.last_update
+            self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+            self.last_update = now
+            self.last_access = now
+            if self.tokens >= tokens:
+                self.tokens -= tokens
+                return True
+            return False
+
+
+class RequireApiKey(Callback):
+    """Reject requests without a valid API key.
+
+    Usage::
+
+        RequireApiKey(header="X-API-Key", keys=["sk-xxx"])
+        RequireApiKey(header="Authorization")  # empty keys → any non-empty value passes
+    """
+
+    def __init__(self, *, header: str = "X-API-Key", keys: list[str] | None = None):
+        self._header = header
+        self._keys: frozenset[str] | None = frozenset(keys) if keys else None
+
+    def on_request(self, ctx):
+        from lite_server.exceptions import UnauthorizedError
+
+        value = ctx.meta.headers.get(self._header, "")
+        if not value:
+            raise UnauthorizedError("missing API key", param=self._header)
+        if self._keys is not None and value not in self._keys:
+            raise UnauthorizedError("invalid API key", param=self._header)
+
+
+class RateLimit(Callback):
+    """Rate-limit policy declaration. Executed in the Rust HTTP layer.
+
+    When the process runs outside a Rust-managed worker (unit tests, local
+    dev), falls back to a per-instance local bucket set sharded by ``key``.
+    The fallback is per-process and does NOT share state — it exists so the
+    policy is testable, not as a production limiter.
+    """
+
+    _MAX_BUCKETS = 500
+
+    def __init__(
+        self,
+        *,
+        requests_per_minute: int = 60,
+        key: str = "route",
+        burst: float | None = None,
+    ):
+        if key not in ("route", "ip"):
+            raise ValueError(f"RateLimit key must be 'route' or 'ip', got {key!r}")
+        self.requests_per_minute = requests_per_minute
+        self.key = key
+        self.burst = float(burst) if burst is not None else requests_per_minute * 1.5
+        self._managed = _rust_managed()
+        self._buckets: dict[str, _TokenBucket] = {}
+        self._lock = threading.Lock()
+
+    def on_request(self, ctx):
+        from lite_server.exceptions import HTTPException
+
+        if self._managed:
+            return  # Rust 已执行；本实例仅为声明
+        bucket_key = ctx.meta.client_ip if self.key == "ip" else ctx.meta.route
+        with self._lock:
+            bucket = self._buckets.get(bucket_key)
+            if bucket is None:
+                bucket = _TokenBucket(
+                    rate=self.requests_per_minute / 60.0, capacity=self.burst
+                )
+                self._buckets[bucket_key] = bucket
+                if len(self._buckets) > self._MAX_BUCKETS:
+                    self._evict_stale()
+        if not bucket.acquire():
+            retry = max(1, math.ceil((1.0 - bucket.tokens) / bucket.rate))
+            raise HTTPException(
+                429, "rate limit exceeded",
+                error_type="rate_limit_exceeded",
+                headers={"Retry-After": str(retry)},
+            )
+
+    def _evict_stale(self) -> None:
+        now = time.monotonic()
+        stale = [k for k, b in self._buckets.items() if now - b.last_access > 300]
+        for k in stale:
+            self._buckets.pop(k, None)
+
+
+class LogRequests(Callback):
+    """Log method, route, status, and elapsed time — including rejections."""
+
+    def __init__(self, *, logger_name: str = "lite_server.requests"):
+        self._logger = logging.getLogger(logger_name)
+        self._key = f"_logreq_start_{id(self)}"
+
+    def on_request(self, ctx):
+        ctx.state[self._key] = time.monotonic()
+
+    def on_response(self, ctx):
+        status = ctx.early.status_code if ctx.early is not None else 200
+        self._log(ctx, status)
+
+    def on_error(self, ctx, exc):
+        from lite_server.exceptions import HTTPException
+
+        status = exc.status_code if isinstance(exc, HTTPException) else 500
+        self._log(ctx, status)
+
+    def _log(self, ctx, status: int) -> None:
+        start = ctx.state.pop(self._key, None)
+        if start is None:
+            return
+        elapsed_ms = (time.monotonic() - start) * 1000
+        self._logger.info(
+            "%s %s → %d %.2fms", ctx.meta.method, ctx.meta.route, status, elapsed_ms
+        )
+
+
+class Cors(Callback):
+    """CORS policy declaration. Executed in the Rust HTTP layer.
+
+    Rust attaches the headers to every response of the route (success, error,
+    and stream start) and answers OPTIONS preflight directly.  Outside a
+    Rust-managed worker, falls back to stashing ctx.response_headers.
+    """
+
+    def __init__(
+        self,
+        *,
+        allow_origins: list[str] | None = None,
+        allow_methods: list[str] | None = None,
+        allow_headers: list[str] | None = None,
+    ):
+        self.allow_origins = list(allow_origins or ["*"])
+        self.allow_methods = list(
+            allow_methods or ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+        )
+        self.allow_headers = list(allow_headers or ["Content-Type", "Authorization"])
+        self._managed = _rust_managed()
+        self._header_dict = {
+            "Access-Control-Allow-Origin": ", ".join(self.allow_origins),
+            "Access-Control-Allow-Methods": ", ".join(self.allow_methods),
+            "Access-Control-Allow-Headers": ", ".join(self.allow_headers),
+        }
+
+    def on_request(self, ctx):
+        if self._managed:
+            return  # Rust 附加 header 并应答 preflight
+        ctx.response_headers.update(self._header_dict)
+        if ctx.meta.method == "OPTIONS":
+            ctx.respond("", status_code=204, headers=dict(self._header_dict))
+
+
+# ---------------------------------------------------------------------------
+# Policy extraction for worker handshake
+# ---------------------------------------------------------------------------
+
+
+def extract_policies(callbacks: list[Callback]) -> dict[str, Any]:
+    """Pull Rust-executed policies out of the merged callback list.
+
+    Embedded in the worker startup handshake.  Last declaration wins.
+    """
+    policies: dict[str, Any] = {}
+    for cb in callbacks:
+        if isinstance(cb, RateLimit):
+            policies["rate_limit"] = {
+                "requests_per_minute": cb.requests_per_minute,
+                "key": cb.key,
+                "burst": cb.burst,
+            }
+        elif isinstance(cb, Cors):
+            policies["cors"] = {
+                "allow_origins": cb.allow_origins,
+                "allow_methods": cb.allow_methods,
+                "allow_headers": cb.allow_headers,
+            }
+    return policies

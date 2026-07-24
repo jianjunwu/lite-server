@@ -15,7 +15,7 @@ import logging
 import threading
 import warnings
 from dataclasses import dataclass
-from typing import Any, Iterator, List, Tuple
+from typing import Any, ClassVar, Iterator, List, Tuple
 
 from lite_server.context import RequestContext
 
@@ -109,6 +109,11 @@ class LitAPI:
     ``predict`` (and any other method except ``setup``) may be ``async def``;
     the worker adapts automatically — no separate base class is needed.
     """
+
+    # Callbacks declared on the class support constructor arguments and
+    # take priority over config.yaml entries.  Use a *tuple* — never a
+    # mutable list — to avoid sharing state across instances.
+    callbacks: ClassVar[tuple[Any, ...]] = ()
 
     def __init__(
         self,

@@ -34,6 +34,7 @@ from typing import Any, Awaitable, Callable
 from lite_server.api import LitAPI
 from lite_server.callback import (
     _DATA_HOOKS,
+    _ERROR_HOOKS,
     _LIFECYCLE_HOOKS,
     Callback,
     _check_single_ctx_param,
@@ -374,11 +375,110 @@ class Pipeline:
                 if _overrides(type(cb), name, Callback):
                     self._lifecycle[name].append(cb)
 
+        # Error hooks: exception-isolated, driven when a request fails.
+        self._error_hooks = [
+            _adapt(getattr(cb, "on_error"), self._executor)
+            for cb in self.callbacks
+            if _overrides(type(cb), "on_error", Callback)
+        ]
+
     # ---- Construction ----------------------------------------------------
 
     @classmethod
     def build(cls, lit_api: LitAPI, callbacks: list[Callback]) -> "Pipeline":
         return cls(lit_api, callbacks)
+
+    @classmethod
+    def for_endpoint(cls, callbacks: list[Callback]) -> "Pipeline":
+        """Build a hook-only pipeline for custom endpoints.
+
+        Loud rejection (load time): endpoints have no decode/predict/encode
+        stages, so on_input/on_output hooks would silently never run.
+        """
+        for cb in callbacks:
+            from lite_server.callback import validate_callback as _vc
+            _vc(cb)
+            cls_type = type(cb)
+            if _overrides(cls_type, "on_input", Callback):
+                raise RuntimeError(
+                    f"Callback {cls_type.__name__} defines 'on_input', but "
+                    f"endpoints have no decode stage — only on_request, "
+                    f"on_response, and on_error run. Move the logic into "
+                    f"one of those hooks."
+                )
+            if _overrides(cls_type, "on_output", Callback):
+                raise RuntimeError(
+                    f"Callback {cls_type.__name__} defines 'on_output', but "
+                    f"endpoints have no encode stage — only on_request, "
+                    f"on_response, and on_error run. Move the logic into "
+                    f"one of those hooks."
+                )
+
+        pipe = cls.__new__(cls)
+        pipe.lit_api = None                      # 端点无模型
+        pipe.callbacks = list(callbacks)
+
+        # Async detection: only hooks, no model stages.
+        candidate_fns: list[Callable] = []
+        for cb in callbacks:
+            for name in _DATA_HOOKS:
+                candidate_fns.append(getattr(cb, name))
+            if _overrides(type(cb), "on_error", Callback):
+                candidate_fns.append(getattr(cb, "on_error"))
+
+        pipe.any_async = any(_is_asyncish(f) for f in candidate_fns)
+        pipe._executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="ep-sync")
+            if pipe.any_async
+            else None
+        )
+
+        # Hook chains: on_request → handler → on_response
+        pipe._chains = {name: [] for name in _DATA_HOOKS}
+        for cb in callbacks:
+            for name in _DATA_HOOKS:
+                if _overrides(type(cb), name, Callback):
+                    pipe._chains[name].append(
+                        pipe._wrap_hook(getattr(cb, name), name)
+                    )
+        pipe._error_hooks = [
+            _adapt(getattr(cb, "on_error"), pipe._executor)
+            for cb in callbacks
+            if _overrides(type(cb), "on_error", Callback)
+        ]
+        pipe._lifecycle = {name: [] for name in _LIFECYCLE_HOOKS}
+        return pipe
+
+    async def run_endpoint(self, ctx: RequestContext, handler: Callable) -> None:
+        """on_request → handler(ctx) → on_response; on_error on failure."""
+        try:
+            await self._run_chain("on_request", ctx)
+            if ctx.early is not None:
+                return
+            if self._executor is not None and not inspect.iscoroutinefunction(handler):
+                result = await self.run_blocking(handler, ctx)
+            else:
+                result = handler(ctx)
+                if asyncio.iscoroutine(result):
+                    result = await result
+            from lite_server.response import Response as LiteResponse
+            if isinstance(result, LiteResponse):
+                ctx.early = result
+            else:
+                ctx.response = result
+            if ctx.early is None:
+                await self._run_chain("on_response", ctx)
+        except Exception as e:
+            await self.run_on_error(ctx, e)
+            raise
+
+    async def run_on_error(self, ctx: RequestContext, exc: Exception) -> None:
+        """Drive on_error hooks, exception-isolated (never masks *exc*)."""
+        for hook in self._error_hooks:
+            try:
+                await hook(ctx, exc)
+            except Exception:
+                logger.warning("on_error hook failed", exc_info=True)
 
     # ---- Capability detection (override-based, resolved at load) ---------
 
@@ -468,11 +568,15 @@ class Pipeline:
         the pre-0.7 ``_run_predict*`` functions.
         """
         ctx = RequestContext(meta=meta, request=json.loads(data) if data else {})
-        await self.preprocess(ctx)
-        if ctx.early is None:
-            await self.predict_value(ctx)
-        if ctx.early is None:
-            await self.postprocess(ctx)
+        try:
+            await self.preprocess(ctx)
+            if ctx.early is None:
+                await self.predict_value(ctx)
+            if ctx.early is None:
+                await self.postprocess(ctx)
+        except Exception as e:
+            await self.run_on_error(ctx, e)
+            raise
         return self.finalize(ctx)
 
     def finalize(
@@ -481,8 +585,17 @@ class Pipeline:
         """Serialize the terminal value (early response or ctx.response)."""
         value = ctx.early if ctx.early is not None else ctx.response
         body, headers = unwrap_response(value)
+        # Merge ctx.response_headers (e.g. from Cors): explicit headers win.
+        merged = dict(ctx.response_headers)
+        if headers:
+            merged.update(headers)
         resp_bytes = json.dumps(body).encode()
-        return resp_bytes, Status(code="Ok"), collect_metrics(self.lit_api), headers
+        return (
+            resp_bytes,
+            Status(code="Ok"),
+            collect_metrics(self.lit_api) if self.lit_api is not None else None,
+            merged if merged else None,
+        )
 
     # ---- Model stage access (batch / stream / CB paths) ------------------
 

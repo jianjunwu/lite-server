@@ -79,6 +79,8 @@ class RequestMeta:
     client_ip: str
     request_id: str
     timestamp_ns: int
+    method: str = "POST"                  # HTTP method; POST for inference, from wire for endpoints
+    query: dict[str, str] = field(default_factory=dict)  # URL query parameters (endpoints only)
 
 
 @dataclass
@@ -98,6 +100,8 @@ class RequestContext:
     response: Any = None  # encode_response output
     state: dict[str, Any] = field(default_factory=dict)
     early: Response | None = None  # set → pipeline short-circuits
+    server: Any = None  # ServerProxy for endpoint handlers; None for inference
+    response_headers: dict[str, str] = field(default_factory=dict)  # merged into final response
 
     def respond(
         self,
