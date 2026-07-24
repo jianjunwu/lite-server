@@ -74,6 +74,11 @@ def setup_logging() -> logging.Logger:
         handler = logging.StreamHandler(sys.stderr)
         handler.setFormatter(_LevelPrefixFormatter())
         logger.addHandler(handler)
+    # Ensure lite_server namespace has a path to stderr for builtin callbacks
+    ls_logger = logging.getLogger("lite_server")
+    ls_logger.setLevel(logging.INFO)
+    if not ls_logger.handlers:
+        ls_logger.addHandler(handler)
     return logger
 
 

@@ -401,7 +401,10 @@ class RateLimit(Callback):
                 if len(self._buckets) > self._MAX_BUCKETS:
                     self._evict_stale()
         if not bucket.acquire():
-            retry = max(1, math.ceil((1.0 - bucket.tokens) / bucket.rate))
+            if bucket.rate > 0:
+                retry = max(1, math.ceil((1.0 - bucket.tokens) / bucket.rate))
+            else:
+                retry = 60  # zero-rate → effectively disabled
             raise HTTPException(
                 429, "rate limit exceeded",
                 error_type="rate_limit_exceeded",

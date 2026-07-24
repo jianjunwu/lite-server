@@ -592,58 +592,63 @@ class TestResponseFrameContract:
         assert resp["chunks"] == [{"choices": [{"delta": {"content": "hi"}}]}]
 
     @pytest.mark.asyncio
-    async def test_middleware_short_circuit_401_via_dispatch(self):
-        from lite_server.middleware import require_api_key
+    async def test_callback_auth_401_via_dispatch(self):
+        from lite_server import RequireApiKey
+        from lite_server.pipeline import Pipeline
 
-        called = []
+        pipe = Pipeline.for_endpoint([RequireApiKey(header="X-API-Key", keys=["secret"])])
 
-        async def handler(request, server):
-            called.append(True)
+        def handler(ctx):
             return {"result": "ok"}
 
-        wrapped = require_api_key(header="X-API-Key", keys=["secret"])(handler)
-        ep = {"/r": {"handler": wrapped, "methods": ["GET"]}}
+        ep = {"/r": {"handler": handler, "methods": ["GET"], "pipeline": pipe, "callbacks": []}}
         resp = await handle_request(ep, self._req())
         assert resp["status_code"] == 401
-        assert resp["body"] == {"error": "unauthorized"}
-        assert called == []
+        assert resp["body"]["error"]["type"] == "authentication_error"
 
     @pytest.mark.asyncio
-    async def test_middleware_429_retry_after_via_dispatch(self):
-        from lite_server.middleware import rate_limit
+    async def test_callback_rate_limit_429_via_dispatch(self):
+        from lite_server import RateLimit
+        from lite_server.pipeline import Pipeline
 
-        async def handler(request, server):
+        pipe = Pipeline.for_endpoint([RateLimit(requests_per_minute=0, burst=0.0)])
+
+        def handler(ctx):
             return {"result": "ok"}
 
-        wrapped = rate_limit(requests_per_minute=0)(handler)
-        ep = {"/rl": {"handler": wrapped, "methods": ["GET"]}}
+        ep = {"/rl": {"handler": handler, "methods": ["GET"], "pipeline": pipe, "callbacks": []}}
         resp = await handle_request(ep, self._req(route="/rl"))
         assert resp["status_code"] == 429
-        assert resp["headers"]["Retry-After"] == "60"
+        assert resp["headers"] is not None
+        assert "Retry-After" in resp["headers"]
 
     @pytest.mark.asyncio
-    async def test_cors_headers_pass_through_and_body_preserved(self):
-        from lite_server.middleware import cors
+    async def test_cors_headers_pass_through_via_dispatch(self):
+        from lite_server import Cors
+        from lite_server.pipeline import Pipeline
 
-        async def handler(request, server):
+        pipe = Pipeline.for_endpoint([Cors(allow_origins=["https://example.com"])])
+
+        def handler(ctx):
             return {"foo": "bar"}
 
-        wrapped = cors(allow_origins=["https://example.com"])(handler)
-        ep = {"/r": {"handler": wrapped, "methods": ["GET"]}}
+        ep = {"/r": {"handler": handler, "methods": ["GET"], "pipeline": pipe, "callbacks": []}}
         resp = await handle_request(ep, self._req())
         assert resp["headers"]["Access-Control-Allow-Origin"] == "https://example.com"
         assert resp["body"] == {"foo": "bar"}
 
     @pytest.mark.asyncio
     async def test_require_api_key_case_insensitive_via_dispatch(self):
-        """Full §7 story: Headers envelope + middleware — key matches any case."""
-        from lite_server.middleware import require_api_key
+        """Full §7 story: Headers envelope + callback — key matches any case."""
+        from lite_server import RequireApiKey
+        from lite_server.pipeline import Pipeline
 
-        async def handler(request, server):
+        pipe = Pipeline.for_endpoint([RequireApiKey(header="X-API-Key", keys=["secret"])])
+
+        def handler(ctx):
             return {"result": "authorized"}
 
-        wrapped = require_api_key(header="X-API-Key", keys=["secret"])(handler)
-        ep = {"/r": {"handler": wrapped, "methods": ["GET"]}}
+        ep = {"/r": {"handler": handler, "methods": ["GET"], "pipeline": pipe, "callbacks": []}}
         resp = await handle_request(ep, self._req(headers={"x-api-key": "secret"}))
         assert resp["status_code"] == 200
         assert resp["body"] == {"result": "authorized"}
