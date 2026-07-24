@@ -56,7 +56,7 @@ class TestLoadEndpoints:
         ep_file = ep_dir / "status.py"
         ep_file.write_text(textwrap.dedent('''
             methods = ["GET", "POST"]
-            def handler(request, server):
+            def handler(ctx):
                 return {"status": "ok"}
         '''))
         endpoints = load_endpoints(str(tmp_path))
@@ -78,7 +78,7 @@ class TestLoadEndpoints:
         ep_dir.mkdir()
         ep_file = ep_dir / "hello.py"
         ep_file.write_text(textwrap.dedent('''
-            def handler(request, server):
+            def handler(ctx):
                 return "hello"
         '''))
         endpoints = load_endpoints(str(tmp_path))
@@ -108,7 +108,7 @@ class TestLoadEndpoints:
         ep_file = tmp_path / "status.py"
         ep_file.write_text(textwrap.dedent('''
             methods = ["GET", "POST"]
-            def handler(request, server):
+            def handler(ctx):
                 return {"status": "ok"}
         '''))
         endpoints = load_endpoints(str(tmp_path))
@@ -778,3 +778,34 @@ class TestDispatchStyleDetection:
         ep = {"/r": {"handler": h, "methods": ["GET"]}}
         await handle_request(ep, self._req())
         assert ep["/r"]["style"] == "ctx"
+
+
+# ===== C4: Mode-1 plain handler signature validation =====
+
+
+class TestMode1PlainHandlerSignature:
+    """C4: Mode-1 plain-handler files get the same load-time signature
+    validation as decorator routes — a pre-0.7 plain handler fails loud."""
+
+    def test_plain_handler_old_signature_raises(self, tmp_path):
+        ep_dir = tmp_path / "endpoints"
+        ep_dir.mkdir()
+        (ep_dir / "legacy.py").write_text(textwrap.dedent('''
+            def handler(request, server):  # pre-0.7 signature
+                return {"ok": True}
+        '''))
+        from lite_server.worker.endpoints import HandlerSignatureError
+
+        with pytest.raises(HandlerSignatureError):
+            load_endpoints(str(tmp_path))
+
+    def test_plain_handler_ctx_signature_loads(self, tmp_path):
+        ep_dir = tmp_path / "endpoints"
+        ep_dir.mkdir()
+        (ep_dir / "modern.py").write_text(textwrap.dedent('''
+            def handler(ctx):
+                return {"ok": True}
+        '''))
+        endpoints = load_endpoints(str(tmp_path))
+        assert "/modern" in endpoints
+        assert endpoints["/modern"]["style"] == "ctx"

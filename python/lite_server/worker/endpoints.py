@@ -236,6 +236,7 @@ def load_endpoints(repo_path: str):
                 handler = getattr(mod, "handler", None)
                 if handler is not None and callable(handler):
                     route = f"/{py_file.stem}"
+                    _validate_handler_signature(handler, route)  # C4: loud on pre-0.7 signature
                     methods = getattr(mod, "methods", ["GET"])
                     if isinstance(methods, str):
                         methods = [methods]
