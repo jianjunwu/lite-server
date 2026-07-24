@@ -754,10 +754,12 @@ async def _handle_stream_open_async(
         generator = await pipe.stream_predict(ctx.input, ctx=ctx)
     except HTTPException as e:
         log.warning("stream_predict rejected for %s: %s", stream_id, e.detail)
+        await pipe.run_on_error(ctx, e)
         await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
         return
     except Exception as e:
         log.error("stream_predict failed for %s: %s", stream_id, _format_exc_brief(e))
+        await pipe.run_on_error(ctx, e)
         await socket.send(_make_stream_error(stream_id, f"stream_predict failed: {e}").SerializeToString())
         return
 
@@ -789,10 +791,12 @@ async def _handle_stream_chunk_async(
         output = await session.on_chunk(raw, ctx=session.ctx)
     except HTTPException as e:
         log.warning("bidi on_chunk rejected for %s: %s", stream_id, e.detail)
+        await pipe.run_on_error(session.ctx, e)
         await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
         return
     except Exception as e:
         log.error("bidi on_chunk failed for %s: %s", stream_id, _format_exc_brief(e))
+        await pipe.run_on_error(session.ctx, e)
         await socket.send(_make_stream_error(stream_id, f"on_chunk failed: {e}").SerializeToString())
         return
 
@@ -806,10 +810,12 @@ async def _handle_stream_chunk_async(
         await pipe.postprocess(ctx)
     except HTTPException as e:
         log.warning("bidi encode rejected for %s: %s", stream_id, e.detail)
+        await pipe.run_on_error(ctx, e)
         await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
         return
     except Exception as e:
         log.error("bidi encode failed for %s: %s", stream_id, _format_exc_brief(e))
+        await pipe.run_on_error(ctx, e)
         await socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
         return
     if ctx.early is not None:

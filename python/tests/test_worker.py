@@ -898,6 +898,36 @@ class TestAsyncLoop:
         assert resp.stream.HasField("error")
         assert "stream broke" in resp.stream.error.message
 
+    def test_stream_predict_open_failure_drives_on_error(self):
+        """B5: stream_predict failing at open drives on_error; the stream
+        error frame is still sent unchanged."""
+        from lite_server.exceptions import HTTPException
+
+        seen = []
+
+        class ErrCB(Callback):
+            def on_error(self, ctx, exc):
+                seen.append(exc)
+
+        class FailStreamModel(LitAPI):
+            def stream_predict(self, x):
+                raise HTTPException(400, "stream rejected")
+
+        model = FailStreamModel()
+        model._pipeline = Pipeline.build(model, [ErrCB()])
+        socket = AsyncMockSocket()
+        socket.inject(Request(
+            uid="sf", stream=StreamRequest(stream_id="sf", open=StreamOpen(data=b"{}")),
+        ).SerializeToString())
+        drive_loop(model, socket)
+
+        assert len(seen) == 1
+        assert isinstance(seen[0], HTTPException)
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.stream.HasField("error")
+        assert "stream rejected" in resp.stream.error.message
+
     def test_async_stream_cancel(self):
         class SlowStreamModel(LitAPI):
             async def stream_predict(self, x):
@@ -1992,6 +2022,102 @@ class TestBidiStreamingAsyncLoop:
         resp = Response()
         resp.ParseFromString(socket._msgs[0])
         assert resp.stream.error.message == "bidi stream not found"
+
+    def test_bidi_on_chunk_failure_drives_on_error(self):
+        """B5: a failing bidi on_chunk drives on_error; error frame still sent."""
+        seen = []
+
+        class ErrCB(Callback):
+            def on_error(self, ctx, exc):
+                seen.append(exc)
+
+        class FailChunkHandler(BidiStreamHandler):
+            def on_open(self, initial_data):
+                return None
+
+            def on_chunk(self, chunk):
+                raise ValueError("chunk boom")
+
+            def on_close(self):
+                return None
+
+        class BidiModel(LitAPI):
+            async def predict(self, x):
+                return x
+
+            def bidi_stream(self):
+                return FailChunkHandler()
+
+        model = BidiModel()
+        model._pipeline = Pipeline.build(model, [ErrCB()])
+        socket = AsyncMockSocket()
+        socket.inject(Request(
+            uid="o", stream=StreamRequest(stream_id="bc", open=StreamOpen(data=b"{}")),
+        ).SerializeToString())
+        socket.inject(Request(
+            uid="c", stream=StreamRequest(stream_id="bc", chunk=StreamChunk(data=b"{}")),
+        ).SerializeToString())
+        drive_loop(model, socket)
+
+        assert len(seen) == 1
+        assert isinstance(seen[0], ValueError)
+        messages = []
+        for m in socket._msgs:
+            r = Response()
+            r.ParseFromString(m)
+            if r.stream.HasField("error"):
+                messages.append(r.stream.error.message)
+        assert any("chunk boom" in msg for msg in messages)
+
+    def test_bidi_encode_failure_drives_on_error(self):
+        """B5: a failing encode (postprocess) on a bidi chunk drives on_error."""
+        seen = []
+
+        class ErrCB(Callback):
+            def on_error(self, ctx, exc):
+                seen.append(exc)
+
+        class AckHandler(BidiStreamHandler):
+            def on_open(self, initial_data):
+                return None
+
+            def on_chunk(self, chunk):
+                return {"echo": chunk}
+
+            def on_close(self):
+                return None
+
+        class FailEncodeModel(LitAPI):
+            async def predict(self, x):
+                return x
+
+            def bidi_stream(self):
+                return AckHandler()
+
+            def encode_response(self, output):
+                raise ValueError("encode boom")
+
+        model = FailEncodeModel()
+        model._pipeline = Pipeline.build(model, [ErrCB()])
+        socket = AsyncMockSocket()
+        socket.inject(Request(
+            uid="o", stream=StreamRequest(stream_id="be", open=StreamOpen(data=b"{}")),
+        ).SerializeToString())
+        socket.inject(Request(
+            uid="c",
+            stream=StreamRequest(stream_id="be", chunk=StreamChunk(data=json.dumps({"m": 1}).encode())),
+        ).SerializeToString())
+        drive_loop(model, socket)
+
+        assert len(seen) == 1
+        assert isinstance(seen[0], ValueError)
+        messages = []
+        for m in socket._msgs:
+            r = Response()
+            r.ParseFromString(m)
+            if r.stream.HasField("error"):
+                messages.append(r.stream.error.message)
+        assert any("encode" in msg for msg in messages)
 
     def test_bidi_cancel_calls_on_close(self):
         class TrackHandler(BidiStreamHandler):
