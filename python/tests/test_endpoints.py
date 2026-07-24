@@ -393,38 +393,27 @@ class TestEndpointMiddlewareApplied:
     """0.7.0: RouteDef.middleware was previously collected but never applied.
     load_endpoints now wraps middleware at load time."""
 
-    def test_decorator_middleware_applied_via_load_endpoints(self, tmp_path):
-        """Middleware registered via @router.get(middleware=[...]) must be
-        applied at load time."""
+    def test_decorator_callbacks_applied_via_load_endpoints(self, tmp_path):
+        """Callbacks registered via @router.get(callbacks=[...]) are loaded
+        into a Pipeline at load time."""
         ep_dir = tmp_path / "endpoints"
         ep_dir.mkdir()
         ep_file = ep_dir / "mw_test.py"
         ep_file.write_text(textwrap.dedent("""\
             from lite_server.endpoint import router
 
-            def add_header(handler):
-                async def wrapper(request, server):
-                    result = await handler(request, server)
-                    if isinstance(result, dict):
-                        result.setdefault("headers", {})
-                        result["headers"]["X-MW"] = "applied"
-                    return result
-                return wrapper
-
-            @router.get("/mw", middleware=[add_header])
-            async def mw_handler(request, server):
+            @router.get("/mw", callbacks=[])
+            def mw_handler(ctx):
                 return {"body": "ok"}
         """))
 
-        # Need to clear router first (global state from other tests)
         router._routes.clear()
         try:
             endpoints = load_endpoints(str(tmp_path))
             assert "/mw" in endpoints
-            # The handler should already be wrapped with middleware
-            handler = endpoints["/mw"]["handler"]
-            # middleware key should NOT be in the endpoint dict (applied, not stored)
-            assert "middleware" not in endpoints["/mw"]
+            ep = endpoints["/mw"]
+            assert ep["callbacks"] == []
+            assert ep["pipeline"] is None  # empty callbacks → no pipeline
         finally:
             router._routes.clear()
 

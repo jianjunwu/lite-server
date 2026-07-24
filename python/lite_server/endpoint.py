@@ -3,21 +3,28 @@
 Provides a FastAPI-style decorator API for registering custom endpoints.
 Endpoints are discovered from the ``endpoints/`` subdirectory or via
 decorator registration on the global router.
+
+Since 0.7.0 the ``callbacks`` parameter replaces ``middleware`` and
+accepts :class:`Callback` instances (RequireApiKey, RateLimit, LogRequests,
+Cors, or custom).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, TypedDict
 
 from lite_server.context import Headers
 
+if TYPE_CHECKING:
+    from lite_server.callback import Callback as CallbackType
+
 
 class EndpointRequest(TypedDict, total=False):
-    """Request object passed to endpoint handlers and middleware.
+    """Request object passed to endpoint handlers (legacy dict shape).
 
-    The endpoint worker protocol is JSON (v0): the body arrives pre-parsed
-    and binary/form uploads are not supported at this layer.
+    Since 0.7.0 handlers receive a :class:`RequestContext` instead.
+    This TypedDict is retained for documentation only.
     """
 
     method: str            # HTTP method, upper-case
@@ -33,7 +40,7 @@ class RouteDef:
     path: str
     methods: List[str]
     handler: Callable
-    middleware: List[Callable] = field(default_factory=list)
+    callbacks: List[Any] = field(default_factory=list)
 
 
 class EndpointRouter:
@@ -42,23 +49,23 @@ class EndpointRouter:
     def __init__(self):
         self._routes: List[RouteDef] = []
 
-    def get(self, path: str, *, middleware: Optional[List[Callable]] = None):
-        return self._route(path, ["GET"], middleware=middleware)
+    def get(self, path: str, *, callbacks: Optional[List[Any]] = None):
+        return self._route(path, ["GET"], callbacks=callbacks)
 
-    def post(self, path: str, *, middleware: Optional[List[Callable]] = None):
-        return self._route(path, ["POST"], middleware=middleware)
+    def post(self, path: str, *, callbacks: Optional[List[Any]] = None):
+        return self._route(path, ["POST"], callbacks=callbacks)
 
-    def put(self, path: str, *, middleware: Optional[List[Callable]] = None):
-        return self._route(path, ["PUT"], middleware=middleware)
+    def put(self, path: str, *, callbacks: Optional[List[Any]] = None):
+        return self._route(path, ["PUT"], callbacks=callbacks)
 
-    def delete(self, path: str, *, middleware: Optional[List[Callable]] = None):
-        return self._route(path, ["DELETE"], middleware=middleware)
+    def delete(self, path: str, *, callbacks: Optional[List[Any]] = None):
+        return self._route(path, ["DELETE"], callbacks=callbacks)
 
-    def patch(self, path: str, *, middleware: Optional[List[Callable]] = None):
-        return self._route(path, ["PATCH"], middleware=middleware)
+    def patch(self, path: str, *, callbacks: Optional[List[Any]] = None):
+        return self._route(path, ["PATCH"], callbacks=callbacks)
 
     def _route(
-        self, path: str, methods: List[str], middleware: Optional[List[Callable]] = None
+        self, path: str, methods: List[str], callbacks: Optional[List[Any]] = None
     ):
         def decorator(fn):
             self._routes.append(
@@ -66,7 +73,7 @@ class EndpointRouter:
                     path=path,
                     methods=methods,
                     handler=fn,
-                    middleware=middleware or [],
+                    callbacks=callbacks or [],
                 )
             )
             return fn

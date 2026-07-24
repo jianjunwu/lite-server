@@ -22,8 +22,10 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 
-from lite_server.context import Headers
+from lite_server.callback import extract_policies
+from lite_server.context import Headers, RequestContext, RequestMeta
 from lite_server.exceptions import HTTPException
+from lite_server.pipeline import Pipeline
 
 MAX_FRAME_SIZE = 16 * 1024 * 1024  # 16 MiB
 
@@ -121,6 +123,31 @@ def parse_args():
 from lite_server.server_proxy import ServerProxy
 
 
+def _validate_handler_signature(fn, route: str) -> None:
+    """Reject pre-0.7 (request, server) handlers at load time."""
+    import inspect as _inspect
+
+    try:
+        params = list(_inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        return  # C-level callable: let the call site fail
+    required = [
+        p
+        for p in params
+        if p.default is _inspect.Parameter.empty
+        and p.kind
+        in (_inspect.Parameter.POSITIONAL_ONLY, _inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    if len(required) == 1 and required[0].name not in ("request", "server"):
+        return
+    raise RuntimeError(
+        f"Endpoint handler for {route} must take exactly one argument "
+        f"(ctx: RequestContext); got signature {fn}. Since 0.7.0: "
+        f"request['body'] → ctx.request, request['query'] → ctx.meta.query, "
+        f"request['headers'] → ctx.meta.headers, server → ctx.server."
+    )
+
+
 def load_endpoints(repo_path: str):
     """Scan repo for endpoint modules.
 
@@ -190,11 +217,15 @@ def load_endpoints(repo_path: str):
         from lite_server.endpoint import router as _global_router
         for route_def in _global_router.routes:
             handler = route_def.handler
-            for mw in reversed(route_def.middleware):
-                handler = mw(handler)
+            _validate_handler_signature(handler, route_def.path)
+            pipeline = None
+            if route_def.callbacks:
+                pipeline = Pipeline.for_endpoint(route_def.callbacks)
             endpoints[route_def.path] = {
                 "handler": handler,
                 "methods": route_def.methods,
+                "callbacks": route_def.callbacks,
+                "pipeline": pipeline,
             }
     except Exception as e:
         logger.debug("No decorator routes collected: %s", e)
@@ -216,48 +247,82 @@ async def handle_request(endpoints, req_data: dict) -> dict:
 
     handler = ep["handler"]
     server = ServerProxy(req_data.get("server_state", {}))
+    pipeline = ep.get("pipeline")
 
-    # Build endpoint request with Headers (case-insensitive)
-    request: dict = {
-        "method": req_data.get("method", "GET"),
-        "route": route,
-        "headers": Headers(req_data.get("headers") or {}),
-        "query": req_data.get("query", {}),
-        "body": req_data.get("body"),
-        "request_id": req_data.get("request_id", ""),
-    }
+    # Build RequestContext (unified ctx contract since 0.7.0)
+    meta = RequestMeta(
+        route=route,
+        headers=Headers(req_data.get("headers") or {}),
+        client_ip=req_data.get("client_ip", ""),
+        request_id=req_data.get("request_id", ""),
+        timestamp_ns=req_data.get("timestamp_ns", 0),
+        method=req_data.get("method", "GET"),
+        query=req_data.get("query", {}),
+    )
+    ctx = RequestContext(meta=meta, request=req_data.get("body"), server=server)
 
     try:
-        if asyncio.iscoroutinefunction(handler):
-            result = await handler(request, server)
+        if pipeline is not None:
+            # New-style: drive through Pipeline (on_request → handler → on_response)
+            await pipeline.run_endpoint(ctx, handler)
         else:
-            result = handler(request, server)
-            # Handler may return a coroutine (e.g. from async lambda wrapper)
-            if asyncio.iscoroutine(result):
-                result = await result
+            # Legacy: handler(ctx) or handler(request_dict, server)
+            # EndpointSpec handlers still use the old (request_dict, server) contract.
+            import inspect as _inspect
+            sig_params = list(_inspect.signature(handler).parameters.values())
+            if len(sig_params) == 1:
+                # New-style handler(ctx)
+                if asyncio.iscoroutinefunction(handler):
+                    result = await handler(ctx)
+                else:
+                    result = handler(ctx)
+                    if asyncio.iscoroutine(result):
+                        result = await result
+            else:
+                # Legacy handler(request_dict, server)
+                request_dict = {
+                    "method": req_data.get("method", "GET"),
+                    "route": route,
+                    "headers": Headers(req_data.get("headers") or {}),
+                    "query": req_data.get("query", {}),
+                    "body": req_data.get("body"),
+                    "request_id": req_data.get("request_id", ""),
+                }
+                if asyncio.iscoroutinefunction(handler):
+                    result = await handler(request_dict, server)
+                else:
+                    result = handler(request_dict, server)
+                    if asyncio.iscoroutine(result):
+                        result = await result
 
-        # Detect Response objects from lite_server.response
+            # Detect Response objects
+            from lite_server.response import Response as LiteResponse
+            if isinstance(result, LiteResponse):
+                ctx.early = result
+            else:
+                ctx.response = result
+
+        # Marshal result from ctx
         from lite_server.response import Response as LiteResponse
-        if isinstance(result, LiteResponse):
-            resp_headers = dict(result.headers) if result.headers else {}
-            if result.media_type and result.media_type != "application/json":
-                resp_headers["content-type"] = result.media_type
+        value = ctx.early if ctx.early is not None else ctx.response
+        if isinstance(value, LiteResponse):
+            resp_headers = dict(value.headers) if value.headers else {}
+            if value.media_type and value.media_type != "application/json":
+                resp_headers["content-type"] = value.media_type
+            # Merge ctx.response_headers (e.g. from Cors)
+            merged_hdrs = {**ctx.response_headers, **resp_headers}
             return {
                 "request_id": req_data.get("request_id", ""),
-                "status_code": result.status_code,
-                "headers": resp_headers if resp_headers else None,
-                "body": result.content,
+                "status_code": value.status_code,
+                "headers": merged_hdrs if merged_hdrs else None,
+                "body": value.content,
             }
 
+        result = value
         if not isinstance(result, dict):
             result = {"data": result}
 
         if any(k in result for k in _RESPONSE_FRAME_TRIGGER_KEYS):
-            # Response frame: unpack fields instead of nesting the whole
-            # dict into the body.  Middleware short-circuits (401/429),
-            # EndpointSpec frames, and streaming frames all take this path.
-            # Without a "body" key the remaining non-frame keys are the body
-            # (e.g. cors annotating a plain data dict).
             resp = {
                 "request_id": req_data.get("request_id", ""),
                 "status_code": result.get("status_code", 200),
@@ -275,28 +340,37 @@ async def handle_request(endpoints, req_data: dict) -> dict:
             if result.get("stream"):
                 resp["stream"] = True
                 resp["chunks"] = result.get("chunks", [])
+            # Merge ctx.response_headers into frame headers
+            if ctx.response_headers:
+                existing = resp["headers"] or {}
+                resp["headers"] = {**ctx.response_headers, **existing}
             return resp
 
+        # Merge ctx.response_headers into plain response
+        resp_hdrs = dict(ctx.response_headers) if ctx.response_headers else None
         return {
             "request_id": req_data.get("request_id", ""),
             "status_code": 200,
-            "headers": None,
+            "headers": resp_hdrs,
             "body": result,
         }
     except HTTPException as e:
         logger.info("endpoint HTTP error for %s: %s (status=%d, type=%s)",
                     route, e.detail, e.status_code, e.error_type)
-        # Four-field error body contract — same shape as the inference path.
         error_body = {
             "type": e.error_type,
             "message": e.detail,
             "code": e.code,
             "param": e.param,
         }
+        # Merge ctx.response_headers and e.headers
+        error_hdrs = dict(ctx.response_headers)
+        if e.headers:
+            error_hdrs.update(e.headers)
         return {
             "request_id": req_data.get("request_id", ""),
             "status_code": e.status_code,
-            "headers": None,
+            "headers": error_hdrs if error_hdrs else None,
             "body": {"error": error_body},
         }
     except Exception as e:
@@ -304,7 +378,7 @@ async def handle_request(endpoints, req_data: dict) -> dict:
         return {
             "request_id": req_data.get("request_id", ""),
             "status_code": 500,
-            "headers": None,
+            "headers": dict(ctx.response_headers) if ctx.response_headers else None,
             "body": {"error": _sanitize_error(e)},
         }
 
@@ -333,12 +407,20 @@ async def worker_main():
     # Load endpoints
     with _protect_stdout():
         endpoints = load_endpoints(args.repo_path)
-    routes = [{"route": r, "methods": ep["methods"]} for r, ep in endpoints.items()]
+
+    # Build routes with per-route policies
+    routes_with_policies = []
+    for r, ep in endpoints.items():
+        entry = {"route": r, "methods": ep["methods"]}
+        # Extract RateLimit/Cors policies for Rust execution
+        callbacks_list = ep.get("callbacks", []) or []
+        entry.update(extract_policies(callbacks_list))
+        routes_with_policies.append(entry)
 
     # Send startup signal with protocol version
     startup = {
         "status": "ready",
-        "routes": routes,
+        "routes": routes_with_policies,
         "protocol_version": "v0",  # JSON only for now; v1 = Protobuf
     }
     print(json.dumps(startup), flush=True)
