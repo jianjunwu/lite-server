@@ -172,29 +172,42 @@ class TestLoadCallbacks:
 class TestTokenBucket:
     def test_acquire_succeeds_when_tokens_available(self):
         tb = _TokenBucket(rate=10.0, capacity=10.0)
-        assert tb.acquire() is True
+        allowed, wait = tb.acquire()
+        assert allowed is True
+        assert wait == 0.0
 
-    def test_acquire_fails_when_exhausted(self):
+    def test_acquire_fails_when_exhausted_zero_rate(self):
         tb = _TokenBucket(rate=0.0, capacity=1.0)
-        assert tb.acquire() is True
-        assert tb.acquire() is False
+        assert tb.acquire()[0] is True
+        allowed, wait = tb.acquire()
+        assert allowed is False
+        assert wait == 0.0  # zero rate → no finite refill wait
+
+    def test_acquire_fails_reports_refill_wait(self):
+        """C2: on rejection, acquire returns the wait for the next token
+        (computed under the lock) instead of just a bool."""
+        tb = _TokenBucket(rate=10.0, capacity=1.0)  # 10 tokens/s
+        assert tb.acquire()[0] is True  # exhaust the 1-token burst
+        allowed, wait = tb.acquire()
+        assert allowed is False
+        assert 0.0 < wait <= 0.1  # ~1 token at 10/s
 
     def test_refill_over_time(self):
         tb = _TokenBucket(rate=100.0, capacity=5.0)
         # Consume all tokens
         for _ in range(5):
-            assert tb.acquire() is True
-        assert tb.acquire() is False
+            assert tb.acquire()[0] is True
+        assert tb.acquire()[0] is False
         # Wait for refill
         time.sleep(0.02)  # 100 tokens/s → 2 tokens in 0.02s
-        assert tb.acquire() is True
+        assert tb.acquire()[0] is True
 
     def test_burst_capacity_upper_bound(self):
         tb = _TokenBucket(rate=1000.0, capacity=5.0)
         time.sleep(0.1)  # would be 100 tokens without cap
         for _ in range(5):
-            assert tb.acquire() is True
-        assert tb.acquire() is False
+            assert tb.acquire()[0] is True
+        assert tb.acquire()[0] is False
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +316,16 @@ class TestRateLimit:
         assert exc_info.value.status_code == 429
         assert exc_info.value.headers is not None
         assert "Retry-After" in exc_info.value.headers
+
+    def test_rejected_request_retry_after_is_positive_integer(self):
+        """C2: Retry-After is a positive integer derived from the bucket's
+        refill wait (snapshots under the lock), not a stale out-of-lock read."""
+        cb = RateLimit(requests_per_minute=6, burst=1.0)  # 0.1 tokens/s
+        cb.on_request(self._ctx())  # consume the burst token
+        with pytest.raises(HTTPException) as exc_info:
+            cb.on_request(self._ctx())
+        retry = int(exc_info.value.headers["Retry-After"])
+        assert retry >= 1
 
     def test_fallback_buckets_by_route(self):
         cb = RateLimit(requests_per_minute=6, key="route", burst=1.0)

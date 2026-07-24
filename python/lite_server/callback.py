@@ -327,7 +327,13 @@ class _TokenBucket:
         self.last_access = self.last_update
         self._lock = threading.Lock()
 
-    def acquire(self, tokens: float = 1.0) -> bool:
+    def acquire(self, tokens: float = 1.0) -> tuple[bool, float]:
+        """Try to take *tokens*. Returns ``(allowed, wait_secs)``.
+
+        ``wait_secs`` is the time until enough tokens have refilled for this
+        request, computed UNDER the lock so Retry-After callers don't read a
+        stale ``tokens``/``rate`` snapshot after the lock released (C2).
+        """
         with self._lock:
             now = time.monotonic()
             elapsed = now - self.last_update
@@ -336,8 +342,9 @@ class _TokenBucket:
             self.last_access = now
             if self.tokens >= tokens:
                 self.tokens -= tokens
-                return True
-            return False
+                return True, 0.0
+            wait = 0.0 if self.rate <= 0 else (tokens - self.tokens) / self.rate
+            return False, wait
 
 
 class RequireApiKey(Callback):
@@ -411,11 +418,11 @@ class RateLimit(Callback):
                 self._buckets[bucket_key] = bucket
                 if len(self._buckets) > self._MAX_BUCKETS:
                     self._evict_stale()
-        if not bucket.acquire():
-            if bucket.rate > 0:
-                retry = max(1, math.ceil((1.0 - bucket.tokens) / bucket.rate))
-            else:
-                retry = 60  # zero-rate → effectively disabled
+        allowed, wait = bucket.acquire()
+        if not allowed:
+            # wait was snapshotted under the bucket lock (C2); C1 guarantees
+            # rate > 0, so a rejection always yields a positive finite wait.
+            retry = max(1, math.ceil(wait)) if wait > 0 else 1
             raise HTTPException(
                 429, "rate limit exceeded",
                 error_type="rate_limit_exceeded",
