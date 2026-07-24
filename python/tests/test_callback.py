@@ -231,6 +231,12 @@ class TestRequireApiKey:
         with pytest.raises(UnauthorizedError):
             cb.on_request(self._ctx({"Authorization": ""}))
 
+    def test_header_case_insensitive(self):
+        """Headers wrapper is case-insensitive — 'x-api-key' matches 'X-API-Key'."""
+        cb = RequireApiKey(header="X-API-Key", keys=["secret"])
+        # lower-case in headers dict should still match
+        cb.on_request(self._ctx({"x-api-key": "secret"}))  # no raise
+
 
 # ---------------------------------------------------------------------------
 # RateLimit
