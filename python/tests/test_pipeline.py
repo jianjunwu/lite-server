@@ -10,8 +10,9 @@ import threading
 
 import pytest
 
-from lite_server.api import LitAPI, RequestMeta, ResponseWithHeaders
-from lite_server.callback import Callback, RequestContext
+from lite_server.api import LitAPI
+from lite_server.callback import Callback
+from lite_server.context import RequestContext, RequestMeta
 from lite_server.exceptions import BadRequestError, HTTPException
 from lite_server.pipeline import (
     Pipeline,
@@ -22,14 +23,13 @@ from lite_server.pipeline import (
 from lite_server.response import Response
 
 
-def _make_meta(route="/predict", payload=None):
+def _make_meta(route="/predict"):
     return RequestMeta(
         route=route,
         headers={"content-type": "application/json"},
         client_ip="127.0.0.1",
         request_id="req-1",
         timestamp_ns=123456789,
-        payload=payload if payload is not None else {"input": "hello"},
     )
 
 
@@ -57,9 +57,9 @@ class TestHookOrder:
         meta = _make_meta()
 
         class Ordered(EchoAPI):
-            def on_request(self, request, meta):
+            def on_request(self, ctx):
                 order.append("api.on_request")
-                return request
+                return ctx.request
 
             def decode_request(self, request):
                 order.append("decode")
@@ -73,9 +73,9 @@ class TestHookOrder:
                 order.append("encode")
                 return output
 
-            def on_response(self, response, meta):
+            def on_response(self, ctx):
                 order.append("api.on_response")
-                return response
+                return ctx.response
 
         class CB(Callback):
             def on_request(self, ctx):
@@ -197,7 +197,7 @@ class TestEarlyReturn:
     async def test_decode_returning_response_short_circuits(self):
         class API(EchoAPI):
             def decode_request(self, request):
-                return ResponseWithHeaders(body={"early": True}, headers={"X-E": "1"})
+                return Response(content={"early": True}, headers={"X-E": "1"})
 
             def predict(self, x):
                 raise AssertionError("predict must not run")
@@ -262,7 +262,7 @@ class TestErrorPropagation:
     @pytest.mark.asyncio
     async def test_http_exception_from_api_on_request_propagates(self):
         class API(EchoAPI):
-            def on_request(self, request, meta):
+            def on_request(self, ctx):
                 raise BadRequestError("rejected")
 
         pipe = Pipeline.build(API(), [])
@@ -334,9 +334,6 @@ class TestContextState:
         captured = []
 
         class API(EchoAPI):
-            def on_response(self, response, meta):
-                return response
-
             def predict(self, x):
                 return x
 
@@ -618,8 +615,8 @@ class TestFinalize:
         assert unwrap_response({"a": 1}) == ({"a": 1}, None)
 
     def test_unwrap_response_with_headers(self):
-        rwh = ResponseWithHeaders(body={"b": 2}, headers={"X-1": "v"})
-        assert unwrap_response(rwh) == ({"b": 2}, {"X-1": "v"})
+        r = Response(content={"b": 2}, headers={"X-1": "v"})
+        assert unwrap_response(r) == ({"b": 2}, {"X-1": "v"})
 
     def test_collect_metrics_empty(self):
         assert collect_metrics(EchoAPI()) is None
@@ -777,7 +774,7 @@ class TestCtxInjection:
         resp_bytes, *_ = await pipe.run_single(b'{"q": "hello"}', _make_meta())
         assert len(captured) == 1
         assert captured[0].meta.request_id == "req-1"
-        assert _body(resp_bytes) == {"echo": {"prompt": "hello", "uid": "req-1"}}
+        assert _body(resp_bytes) == {"prompt": "hello", "uid": "req-1"}
 
     @pytest.mark.asyncio
     async def test_encode_response_ctx_injection(self):
@@ -822,7 +819,7 @@ class TestCtxInjection:
 
         pipe = Pipeline.build(API(), [])
         resp_bytes, *_ = await pipe.run_single(b'{"x": 1}', _make_meta())
-        assert _body(resp_bytes) == {"echo": {"x": 1}}
+        assert _body(resp_bytes) == {"x": 1}
 
     @pytest.mark.asyncio
     async def test_state_threaded_on_request_to_decode(self):
@@ -839,7 +836,7 @@ class TestCtxInjection:
 
         pipe = Pipeline.build(API(), [])
         resp_bytes, *_ = await pipe.run_single(b'{"q": "hi"}', _make_meta())
-        assert _body(resp_bytes)["echo"]["user"] == "alice"
+        assert _body(resp_bytes)["user"] == "alice"
 
     @pytest.mark.asyncio
     async def test_on_response_respond_attaches_headers(self):
@@ -909,17 +906,17 @@ class TestCtxForbidden:
         """A positional-only 'ctx' parameter (/) cannot be injected — the
         wrapper passes ctx as a keyword, so this must fail at load time."""
 
-        # We can't define positional-only params with a regular def, but we
-        # can test that the validation catches it via a mock.
-        # Use a callable object with __call__ that has a positional-only param.
-        class PosOnlyCallable:
-            def __call__(self, x, /, ctx=None):
-                return x
+        # Create a callable whose ctx parameter is positional-only.
+        # We use exec to define a function with positional-only ctx at runtime.
+        namespace: dict = {}
+        exec(
+            "def _pos_only_fn(self, x, ctx, /):\n    return x\n",
+            namespace,
+        )
+        pos_only_fn = namespace["_pos_only_fn"]
 
         # Monkey-patch decode_request on an instance
         api = EchoAPI()
-        api.decode_request = PosOnlyCallable()
-        # _validate_ctx_injection won't catch this (it only checks batch/unbatch/step).
-        # But _wrap_ctx_method should catch it.
+        api.decode_request = pos_only_fn.__get__(api, type(api))
         with pytest.raises(RuntimeError, match="positional-only"):
             Pipeline.build(api, [])

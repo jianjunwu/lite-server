@@ -12,11 +12,12 @@ try:
 except ImportError:
     serve = None  # fallback when extension is not built
 
-from lite_server.api import BidiStreamHandler, LitAPI, ResponseWithHeaders
-from lite_server.callback import Callback, RequestContext
+from lite_server.api import BidiStreamHandler, LitAPI
+from lite_server.callback import Callback
+from lite_server.context import CBSequence, Headers, RequestContext, RequestMeta
 from lite_server.endpoint import endpoint, router
 from lite_server.middleware import cors, log_requests, rate_limit, require_api_key
-from lite_server.request import Client, Headers, QueryParams, Request, State, URL, UploadFile
+from lite_server.request import Client, QueryParams, Request, State, URL, UploadFile
 from lite_server.response import (
     BackgroundTask,
     FileResponse,
@@ -37,6 +38,8 @@ __all__ = [
     "BidiStreamHandler",
     "Callback",
     "RequestContext",
+    "RequestMeta",
+    "CBSequence",
     "OpenAIEndpoint",
     "EndpointSpec",
     "ServerProxy",

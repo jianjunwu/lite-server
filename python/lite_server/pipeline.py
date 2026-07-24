@@ -31,14 +31,15 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Awaitable, Callable
 
-from lite_server.api import LitAPI, RequestMeta
+from lite_server.api import LitAPI
 from lite_server.callback import (
     _DATA_HOOKS,
     _LIFECYCLE_HOOKS,
     Callback,
-    RequestContext,
+    _check_single_ctx_param,
     _overrides,
 )
+from lite_server.context import RequestContext, RequestMeta
 from lite_server.proto import Metrics, MetricValue, Status
 from lite_server.response import Response as LiteResponse
 
@@ -68,8 +69,8 @@ def _adapt(fn: Callable, executor: ThreadPoolExecutor | None) -> Callable[..., A
         return fn
     if executor is None:
 
-        async def call_inline(*args):
-            result = fn(*args)
+        async def call_inline(*args, **kwargs):
+            result = fn(*args, **kwargs)
             # Runtime check — not redundant with the iscoroutinefunction
             # guard above.  A sync function may return a coroutine object
             # (e.g. a sync wrapper that delegates to an async inner), and
@@ -81,9 +82,11 @@ def _adapt(fn: Callable, executor: ThreadPoolExecutor | None) -> Callable[..., A
 
         return call_inline
 
-    async def call_in_executor(*args):
+    async def call_in_executor(*args, **kwargs):
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(executor, functools.partial(fn, *args))
+        result = await loop.run_in_executor(
+            executor, functools.partial(fn, *args, **kwargs)
+        )
         # Same runtime guard — see call_inline comment.
         if asyncio.iscoroutine(result):
             return await result
@@ -98,20 +101,107 @@ def _adapt_producer(fn: Callable, executor: ThreadPoolExecutor | None) -> Callab
     yields the (sync or async) generator itself."""
     if inspect.isasyncgenfunction(fn):
 
-        async def call(*args):
-            return fn(*args)
+        async def call(*args, **kwargs):
+            return fn(*args, **kwargs)
 
         return call
     inner = _adapt(fn, executor)
 
-    async def call(*args):
-        return await inner(*args)
+    async def call(*args, **kwargs):
+        return await inner(*args, **kwargs)
 
     return call
 
 
 def _is_asyncish(fn: Callable) -> bool:
     return inspect.iscoroutinefunction(fn) or inspect.isasyncgenfunction(fn)
+
+
+# ---------------------------------------------------------------------------
+# Ctx injection infrastructure (0.7.0 context unification)
+# ---------------------------------------------------------------------------
+
+# Methods with a per-item/per-session context — declaring ``ctx`` opts in.
+_CTX_INJECTABLE = {
+    "decode_request", "predict", "encode_response", "stream_predict",
+    "prefill", "has_finished", "bidi_stream",
+    "on_open", "on_chunk", "on_close",
+}
+# Methods operating across items/sequences — declaring ``ctx`` is a load-time error.
+_CTX_FORBIDDEN = ("batch", "unbatch", "step")
+
+# Error message fragment for LitAPI hooks that haven't been migrated to ctx.
+_API_HOOK_MIGRATION = (
+    "Since 0.7.0, LitAPI hooks receive a single RequestContext — same as "
+    "Callback hooks. Migrate: 'request' → ctx.request, 'meta' → ctx.meta, "
+    "early return via ctx.respond(...) (returning a Response still works)."
+)
+
+
+def _ctx_param(fn: Callable) -> inspect.Parameter | None:
+    """Return the parameter named ``ctx`` declared by *fn*, or None."""
+    try:
+        return inspect.signature(fn).parameters.get("ctx")
+    except (TypeError, ValueError):
+        return None
+
+
+def _validate_ctx_injection(lit_api: LitAPI) -> None:
+    """Reject ctx declarations on methods that have no per-item context."""
+    for name in _CTX_FORBIDDEN:
+        if _ctx_param(getattr(lit_api, name)) is not None:
+            raise RuntimeError(
+                f"LitAPI.{name} declares a 'ctx' parameter, but {name} "
+                f"operates across items/sequences and has no per-request "
+                f"context. Remove the parameter; thread per-request data "
+                f"through the decoded input (decode_request supports ctx) "
+                f"or read CBSequence.state in step."
+            )
+
+
+def _wrap_ctx_method(fn: Callable, name: str, executor) -> Callable:
+    """Adapt *fn* into an async callable with optional ctx injection.
+
+    *fn* receives its declared arguments by default; declaring a parameter
+    named exactly ``ctx`` opts into receiving the current RequestContext
+    as a keyword argument.  Detection happens once here — never on the
+    hot path.  The returned callable always accepts a ``ctx=`` keyword
+    (ignored when *fn* didn't declare it).
+    """
+    call = _adapt(fn, executor)
+    p = _ctx_param(fn)
+    if p is None:
+
+        async def wrapped(*args, ctx=None):
+            return await call(*args)
+
+        return wrapped
+    if p.kind is inspect.Parameter.POSITIONAL_ONLY:
+        raise RuntimeError(
+            f"{name}: 'ctx' must be a normal or keyword-only parameter, "
+            f"not positional-only."
+        )
+
+    async def wrapped(*args, ctx=None):
+        return await call(*args, ctx=ctx)
+
+    return wrapped
+
+
+def _wrap_ctx_producer(fn: Callable, executor) -> Callable:
+    """Same as _wrap_ctx_method but for ``stream_predict`` (generator)."""
+    inner = _adapt_producer(fn, executor)
+    if _ctx_param(fn) is None:
+
+        async def wrapped(*args, ctx=None):
+            return await inner(*args)
+
+        return wrapped
+
+    async def wrapped(*args, ctx=None):
+        return await inner(*args, ctx=ctx)
+
+    return wrapped
 
 
 # ---------------------------------------------------------------------------
@@ -124,8 +214,7 @@ def unwrap_response(encoded: Any) -> tuple[Any, dict[str, str] | None]:
 
     A :class:`Response` contributes its status_code / media_type via the
     private ``_sc`` / ``_mt`` header keys for downstream extraction; plain
-    values pass through with no headers.  ``ResponseWithHeaders`` is covered
-    by the generic ``Response`` branch (its ``content`` aliases ``body``).
+    values pass through with no headers.
     """
     if isinstance(encoded, LiteResponse):
         body = encoded.content
@@ -201,11 +290,9 @@ class Pipeline:
 
         # --- Load-time introspection: async detection ---------------------
         candidate_fns: list[Callable] = [
-            lit_api.on_request,
             lit_api.decode_request,
             lit_api.predict,
             lit_api.encode_response,
-            lit_api.on_response,
             lit_api.batch,
             lit_api.unbatch,
         ]
@@ -214,6 +301,12 @@ class Pipeline:
         for cb in self.callbacks:
             for name in _DATA_HOOKS:
                 candidate_fns.append(getattr(cb, name))
+        # API hooks (when overridden) also participate in async detection.
+        api_cls = type(lit_api)
+        if _overrides(api_cls, "on_request", LitAPI):
+            candidate_fns.append(lit_api.on_request)
+        if _overrides(api_cls, "on_response", LitAPI):
+            candidate_fns.append(lit_api.on_response)
 
         # All-sync fast path: everything runs inline on the event loop
         # (no await points → natural serialization, zero executor overhead).
@@ -225,39 +318,60 @@ class Pipeline:
             else None
         )
 
+        # --- Ctx injection validation (load-time) -------------------------
+        _validate_ctx_injection(lit_api)
+        if _ctx_param(lit_api.predict) is not None and self.has_batch_methods:
+            raise RuntimeError(
+                "LitAPI.predict declares a 'ctx' parameter, but batch/unbatch "
+                "are overridden: predict runs once per batch and has no "
+                "per-request context. Remove 'ctx' from predict and thread "
+                "per-request data through the decoded input (decode_request "
+                "supports ctx), or drop batch/unbatch."
+            )
+
         # --- Model stages (adapted once) ----------------------------------
-        self._decode = _adapt(lit_api.decode_request, self._executor)
-        self._predict = _adapt(lit_api.predict, self._executor)
-        self._encode = _adapt(lit_api.encode_response, self._executor)
+        self._decode = _wrap_ctx_method(lit_api.decode_request, "decode_request", self._executor)
+        self._predict = _wrap_ctx_method(lit_api.predict, "predict", self._executor)
+        self._encode = _wrap_ctx_method(lit_api.encode_response, "encode_response", self._executor)
         self._batch_fn = _adapt(lit_api.batch, self._executor)
         self._unbatch_fn = _adapt(lit_api.unbatch, self._executor)
         self._stream_producer = (
-            _adapt_producer(lit_api.stream_predict, self._executor)
+            _wrap_ctx_producer(lit_api.stream_predict, self._executor)
             if self.has_stream_predict
             else None
         )
         self._bidi_factory = (
-            _adapt(lit_api.bidi_stream, self._executor)
+            _wrap_ctx_method(lit_api.bidi_stream, "bidi_stream", self._executor)
             if self.has_bidi_stream
             else None
         )
 
-        # --- Hook chains --------------------------------------------------
-        # LitAPI.on_request runs first, LitAPI.on_response last — same order
-        # as the pre-0.7 worker.
+        # --- Hook chains: one wrapper for LitAPI and Callback hooks -------
         self._chains: dict[str, list[Callable]] = {name: [] for name in _DATA_HOOKS}
-        self._chains["on_request"].append(
-            self._wrap_api_hook(lit_api.on_request, "request")
-        )
+        # Base implementations are skipped so a model that doesn't override
+        # them costs zero calls per request.
+        if _overrides(api_cls, "on_request", LitAPI):
+            _check_single_ctx_param(
+                lit_api.on_request, f"LitAPI {api_cls.__name__}",
+                "on_request", migration=_API_HOOK_MIGRATION,
+            )
+            self._chains["on_request"].append(
+                self._wrap_hook(lit_api.on_request, "on_request")
+            )
         for cb in self.callbacks:
             for name in _DATA_HOOKS:
                 if _overrides(type(cb), name, Callback):
                     self._chains[name].append(
-                        self._wrap_cb_hook(getattr(cb, name), name)
+                        self._wrap_hook(getattr(cb, name), name)
                     )
-        self._chains["on_response"].append(
-            self._wrap_api_hook(lit_api.on_response, "response")
-        )
+        if _overrides(api_cls, "on_response", LitAPI):
+            _check_single_ctx_param(
+                lit_api.on_response, f"LitAPI {api_cls.__name__}",
+                "on_response", migration=_API_HOOK_MIGRATION,
+            )
+            self._chains["on_response"].append(
+                self._wrap_hook(lit_api.on_response, "on_response")
+            )
 
         # Lifecycle hooks: exception-isolated, run outside the event loop.
         self._lifecycle: dict[str, list[Callback]] = {name: [] for name in _LIFECYCLE_HOOKS}
@@ -290,21 +404,12 @@ class Pipeline:
 
     # ---- Hook wrapping ---------------------------------------------------
 
-    def _wrap_cb_hook(self, hook: Callable, name: str) -> Callable:
+    def _wrap_hook(self, hook: Callable, name: str) -> Callable:
         field = _HOOK_FIELD[name]
         call = _adapt(hook, self._executor)
 
         async def wrapped(ctx: RequestContext) -> None:
             self._assign(ctx, field, await call(ctx))
-
-        return wrapped
-
-    def _wrap_api_hook(self, hook: Callable, field: str) -> Callable:
-        """Adapt a LitAPI ``(value, meta)`` hook into the ctx chain."""
-        call = _adapt(hook, self._executor)
-
-        async def wrapped(ctx: RequestContext) -> None:
-            self._assign(ctx, field, await call(getattr(ctx, field), ctx.meta))
 
         return wrapped
 
@@ -326,7 +431,7 @@ class Pipeline:
             await hook(ctx)
 
     async def _stage(self, fn: Callable, value: Any, ctx: RequestContext, field: str) -> None:
-        result = await fn(value)
+        result = await fn(value, ctx=ctx)
         if isinstance(result, LiteResponse):
             ctx.early = result
         else:
@@ -387,11 +492,12 @@ class Pipeline:
 
     # ---- Model stage access (batch / stream / CB paths) ------------------
 
-    async def predict_one(self, x: Any) -> Any:
-        return await self._predict(x)
-
     async def batch_predict(self, decodeds: list[Any]) -> list[Any]:
-        """batch → predict → unbatch with arity check."""
+        """batch → predict → unbatch with arity check.
+
+        Load-time guard ensures predict never declares ctx on this path —
+        there is no per-item context for a batch.
+        """
         batched = await self._batch_fn(decodeds)
         output = await self._predict(batched)
         outputs = await self._unbatch_fn(output)
@@ -401,20 +507,20 @@ class Pipeline:
             )
         return list(outputs)
 
-    async def stream_predict(self, x: Any):
+    async def stream_predict(self, x: Any, ctx: RequestContext):
         """Return the user's (sync or async) generator for streaming."""
-        return await self._stream_producer(x)
+        return await self._stream_producer(x, ctx=ctx)
 
     def adapt_handler(self, handler: Any) -> tuple[Callable, Callable, Callable]:
-        """Adapt a BidiStreamHandler's on_open/on_chunk/on_close for the loop."""
+        """Adapt a BidiStreamHandler's hooks; each may optionally declare ctx."""
         return (
-            _adapt(handler.on_open, self._executor),
-            _adapt(handler.on_chunk, self._executor),
-            _adapt(handler.on_close, self._executor),
+            _wrap_ctx_method(handler.on_open, "on_open", self._executor),
+            _wrap_ctx_method(handler.on_chunk, "on_chunk", self._executor),
+            _wrap_ctx_method(handler.on_close, "on_close", self._executor),
         )
 
-    async def bidi_stream(self) -> Any:
-        return await self._bidi_factory()
+    async def bidi_stream(self, ctx: RequestContext) -> Any:
+        return await self._bidi_factory(ctx=ctx)
 
     # ---- Lifecycle hooks (sync context, exception-isolated) ---------------
 

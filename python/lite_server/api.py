@@ -14,43 +14,11 @@ from __future__ import annotations
 import logging
 import threading
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Iterator, List, Tuple
 
+from lite_server.context import RequestContext
 from lite_server.response import Response
-
-
-@dataclass
-class RequestMeta:
-    """Metadata about the original HTTP request, passed to hooks."""
-
-    route: str
-    headers: dict[str, str]
-    client_ip: str
-    request_id: str
-    timestamp_ns: int
-    payload: Any  # decoded original request body
-
-
-@dataclass
-class ResponseWithHeaders(Response):
-    """Return this from ``on_response`` to attach custom HTTP response headers.
-
-    Example::
-
-        def on_response(self, response, meta):
-            return ResponseWithHeaders(
-                body=response,
-                headers={"X-Cache-Hit": "1", "X-Request-ID": meta.request_id},
-            )
-    """
-
-    body: Any = None
-    headers: dict[str, str] = field(default_factory=dict)
-
-    def __post_init__(self):
-        # body is an alias for content
-        self.content = self.body
 
 
 @dataclass
@@ -164,11 +132,23 @@ class LitAPI:
         pass
 
     def decode_request(self, request: Any) -> Any:
-        """Convert the raw request payload to your model input."""
+        """Convert the raw request payload to your model input.
+
+        To access per-request context, declare a second parameter named
+        exactly ``ctx`` — detected once at load time::
+
+            def decode_request(self, request, ctx):
+                return {"prompt": request["prompt"],
+                        "user_id": ctx.state.get("user_id")}
+        """
         return request
 
     def batch(self, inputs: list) -> Any:
-        """Convert a list of decoded inputs to a batched input."""
+        """Convert a list of decoded inputs to a batched input.
+
+        Operates across items — declaring ``ctx`` is a load-time error.
+        Thread per-request data through the decoded input instead.
+        """
         if hasattr(inputs[0], "__torch_function__"):
             import torch
 
@@ -180,11 +160,22 @@ class LitAPI:
         return inputs
 
     def predict(self, x: Any) -> Any:
-        """Run the model on the input and return the output."""
+        """Run the model on the input and return the output.
+
+        To access per-request context, declare a second parameter named
+        exactly ``ctx``.  **Not compatible with** ``batch`` + ``unbatch``:
+        when batch is overridden, predict runs once per batch and has no
+        per-request context — declaring ``ctx`` is a load-time error.
+        Thread per-request data through the decoded input instead
+        (``decode_request`` supports ctx).
+        """
         raise NotImplementedError("predict is not implemented")
 
     def unbatch(self, output: Any) -> list:
-        """Convert a batched output back to a list of per-input outputs."""
+        """Convert a batched output back to a list of per-input outputs.
+
+        Operates across items — declaring ``ctx`` is a load-time error.
+        """
         return list(output)
 
     def encode_response(self, output: Any) -> Any:
@@ -259,58 +250,50 @@ class LitAPI:
     def bidi_stream(self) -> "BidiStreamHandler":
         """Return a handler for bidirectional streaming (e.g. ASR).
 
-        The handler must implement:
-          - on_chunk(chunk) -> Optional[output_chunk]
-          - on_close()
+        To access the per-session context (metadata, state, decoded open
+        payload), declare a parameter named exactly ``ctx``::
+
+            def bidi_stream(self, ctx):
+                return MyHandler(ctx.state.get("session_config"))
+
+        The handler must implement ``on_open``, ``on_chunk``, and
+        ``on_close`` — each may also declare ``ctx``.
         """
         raise NotImplementedError
 
     # ===== Request/Response Hooks =====
 
-    def on_request(self, request: Any, meta: RequestMeta) -> Any:
-        """Called before decode_request.
+    def on_request(self, ctx: RequestContext) -> Any | None:
+        """Called before decode_request.  Same contract as Callback hooks.
 
-        Override to modify the raw request, perform auth checks, inject
-        context, or log request metadata.  Raising an exception rejects the
-        request and returns an Error response to the client.  Returning a
-        :class:`Response` short-circuits the pipeline (early return).
-
-        Args:
-            request: The raw request payload (JSON dict from HTTP body).
-            meta: Original HTTP request metadata (headers, route, ip, etc.).
+        The place for auth, schema validation, and cache lookups.  Read
+        ``ctx.request`` (raw payload) and ``ctx.meta`` (headers, route,
+        client IP, request ID); share data with later stages via
+        ``ctx.state`` — never via ``self`` attributes.  Raising an
+        exception rejects the request with an Error response.
 
         Returns:
-            The (possibly modified) raw request to pass to decode_request.
+            Replacement for ``ctx.request``, a :class:`Response` (or
+            ``ctx.respond(...)``) for early return, or None to pass through.
         """
-        return request
+        return None
 
-    def on_response(self, response: Any, meta: RequestMeta) -> Any:
-        """Called after encode_response, before sending to the client.
+    def on_response(self, ctx: RequestContext) -> Any | None:
+        """Called after encode_response — the last hook before sending.
 
-        Override to modify the response, inject headers, or log.
+        To attach custom HTTP response headers::
 
-        To attach custom HTTP response headers, return a
-        :class:`ResponseWithHeaders` instead of the raw value::
-
-            def on_response(self, response, meta):
-                return ResponseWithHeaders(
-                    body=response,
-                    headers={"X-Request-ID": meta.request_id},
+            def on_response(self, ctx):
+                return ctx.respond(
+                    ctx.response,
+                    headers={"X-Request-ID": ctx.meta.request_id},
                 )
 
-        Hop-by-hop and transport headers (content-type, content-length,
-        connection, etc.) are filtered by the server.
-
-        Args:
-            response: The encoded response (output of encode_response).
-            meta: Original HTTP request metadata.
-
         Returns:
-            The (possibly modified) response to send to the client.
-            Return a :class:`ResponseWithHeaders` to include custom
-            HTTP headers.
+            Replacement for ``ctx.response``, a :class:`Response` (or
+            ``ctx.respond(...)``), or None to pass through.
         """
-        return response
+        return None
 
     # ===== Continuous Batching Hooks (optional) =====
 
@@ -320,17 +303,29 @@ class LitAPI:
         Called when a new request arrives in CB mode.  Implement this to
         perform the initial forward pass (e.g. KV-cache prefill).
 
+        To access per-request context, declare a fourth parameter named
+        exactly ``ctx`` — detected once at session build time::
+
+            def prefill(self, uid, decoded_input, ctx):
+                ctx.state["kv_cache"] = allocate_cache(decoded_input)
+
         Args:
             uid: Unique request identifier.
             decoded_input: Output of decode_request.
         """
         pass
 
-    def step(self, active_sequences: list[dict]) -> list[Any]:
+    def step(self, active_sequences: list) -> list[Any]:
         """Run one generation step for all active sequences.
 
-        Each element in ``active_sequences`` is a dict with keys:
-        ``uid``, ``input``, ``output`` (list of tokens so far).
+        Each element in ``active_sequences`` is a :class:`CBSequence`
+        with attributes ``uid``, ``input``, ``output`` (list of tokens so
+        far), ``state`` (per-sequence user data), ``meta`` (request
+        metadata), and ``ctx`` (full RequestContext).
+
+        Declaring ``ctx`` on ``step`` is a load-time error — it operates
+        across sequences and has no single per-request context.  Read
+        per-sequence data from ``CBSequence.state`` / ``.meta`` instead.
 
         Returns:
             A list of new tokens, one per active sequence.
@@ -341,6 +336,12 @@ class LitAPI:
         self, uid: str, token: Any, generated_sequence: list[Any]
     ) -> bool:
         """Check whether a sequence has finished generating.
+
+        To access per-sequence context, declare a fifth parameter named
+        exactly ``ctx``::
+
+            def has_finished(self, uid, token, generated_sequence, ctx):
+                return len(generated_sequence) >= ctx.state.get("max_tokens", 100)
 
         Returns True when the sequence should be removed from the active
         batch and its final response sent to the client.

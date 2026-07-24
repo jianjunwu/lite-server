@@ -339,31 +339,6 @@ class TestCollectMetrics:
         return Dummy()
 
 
-class TestResponseWithHeaders:
-    """ResponseWithHeaders: on_response can attach custom HTTP headers."""
-
-    def test_can_import(self):
-        from lite_server.api import ResponseWithHeaders
-        assert ResponseWithHeaders is not None
-
-    def test_stores_body_and_headers(self):
-        from lite_server.api import ResponseWithHeaders
-        r = ResponseWithHeaders(body={"result": 42}, headers={"X-Custom": "val"})
-        assert r.body == {"result": 42}
-        assert r.headers == {"X-Custom": "val"}
-
-    def test_empty_headers(self):
-        from lite_server.api import ResponseWithHeaders
-        r = ResponseWithHeaders(body="data", headers={})
-        assert r.body == "data"
-        assert r.headers == {}
-
-    def test_is_dataclass(self):
-        from dataclasses import is_dataclass
-        from lite_server.api import ResponseWithHeaders
-        assert is_dataclass(ResponseWithHeaders)
-
-
 class TestUnwrapResponse:
     """_unwrap_response: extract body and headers from on_response result."""
 
@@ -374,10 +349,10 @@ class TestUnwrapResponse:
         assert headers is None
 
     def test_unwrap_response_with_headers_extracts_both(self):
-        from lite_server.api import ResponseWithHeaders
+        from lite_server.response import Response
         from lite_server.pipeline import unwrap_response as _unwrap_response
         body, headers = _unwrap_response(
-            ResponseWithHeaders(body={"out": 99}, headers={"X-Trace": "abc"})
+            Response(content={"out": 99}, headers={"X-Trace": "abc"})
         )
         assert body == {"out": 99}
         assert headers == {"X-Trace": "abc"}

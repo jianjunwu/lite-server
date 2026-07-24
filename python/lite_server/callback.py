@@ -24,54 +24,13 @@ from __future__ import annotations
 import importlib
 import inspect
 import logging
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from lite_server.response import Response
+from lite_server.context import RequestContext
 
 if TYPE_CHECKING:
-    from lite_server.api import LitAPI, RequestMeta
-
-
-@dataclass
-class RequestContext:
-    """Per-request state flowing through the inference pipeline.
-
-    One instance per request (per stream in streaming mode, per batch item
-    in batch mode).  Callbacks pass data between hook points via
-    :attr:`state` — never via ``self`` attributes, which are shared across
-    concurrent requests.
-    """
-
-    meta: "RequestMeta"
-    request: Any = None  # raw payload (pre-decode)
-    input: Any = None  # decode_request output
-    output: Any = None  # predict output
-    response: Any = None  # encode_response output
-    state: dict[str, Any] = field(default_factory=dict)
-    early: Response | None = None  # set → pipeline short-circuits
-
-    def respond(
-        self,
-        body: Any,
-        *,
-        status_code: int = 200,
-        headers: dict[str, str] | None = None,
-        media_type: str = "application/json",
-    ) -> Response:
-        """Short-circuit the pipeline with an immediate response.
-
-        Later stages (decode/predict/encode and remaining hooks) are skipped;
-        *body* is serialized and sent to the client with the given status and
-        headers.
-        """
-        self.early = Response(
-            content=body,
-            status_code=status_code,
-            headers=dict(headers or {}),
-            media_type=media_type,
-        )
-        return self.early
+    from lite_server.api import LitAPI
+    from lite_server.context import RequestMeta
 
 
 class Callback:
@@ -183,6 +142,37 @@ def _overrides(cls: type, name: str, base: type) -> bool:
     return False
 
 
+def _check_single_ctx_param(
+    fn: callable, owner: str, name: str, *, migration: str = ""
+) -> None:
+    """Require exactly one required positional argument (the ctx).
+
+    A single parameter named ``request``/``meta`` is rejected too — that
+    shape is the pre-0.7 hook signature with a default, and accepting it
+    would silently bind the ctx to the wrong name.
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return  # C-level or weird callables: let the call site fail
+    required = [
+        p
+        for p in params.values()
+        if p.default is inspect.Parameter.empty
+        and p.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    if len(required) == 1 and required[0].name not in ("request", "meta"):
+        return
+    msg = (
+        f"{owner}.{name} must take exactly one argument "
+        f"(ctx: RequestContext); got signature {fn}."
+    )
+    if migration:
+        msg += f" {migration}"
+    raise RuntimeError(msg)
+
+
 def validate_callback(cb: Callback) -> None:
     """Reject pre-0.7 callback shapes with a loud migration error.
 
@@ -204,23 +194,7 @@ def validate_callback(cb: Callback) -> None:
             )
     for name in _DATA_HOOKS:
         if _overrides(cls, name, Callback):
-            hook = getattr(cb, name)
-            try:
-                params = inspect.signature(hook).parameters
-            except (TypeError, ValueError):
-                continue  # C-level or weird callables: let the call site fail
-            required = [
-                p
-                for p in params.values()
-                if p.default is inspect.Parameter.empty
-                and p.kind
-                in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-            ]
-            if len(required) != 1:
-                raise RuntimeError(
-                    f"Callback {cls.__name__}.{name} must take exactly one "
-                    f"argument (ctx: RequestContext); got signature {hook}."
-                )
+            _check_single_ctx_param(getattr(cb, name), f"Callback {cls.__name__}", name)
 
 
 def _field_for(hook_name: str) -> str:

@@ -2,7 +2,7 @@
 
 import pytest
 
-from lite_server.api import RequestMeta
+from lite_server.context import Headers, RequestMeta
 from lite_server.callback import (
     Callback,
     RequestContext,
@@ -14,11 +14,10 @@ from lite_server.callback import (
 def _make_meta():
     return RequestMeta(
         route="/predict",
-        headers={},
+        headers=Headers({}),
         client_ip="127.0.0.1",
         request_id="req-1",
         timestamp_ns=1,
-        payload=None,
     )
 
 
