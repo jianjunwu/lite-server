@@ -145,8 +145,15 @@ def extract_response_meta(headers: dict[str, str] | None) -> tuple[int, str, dic
 
 
 def collect_metrics(lit_api: LitAPI) -> Metrics | None:
-    """Collect pre-registered custom metrics from the LitAPI instance."""
-    values = getattr(lit_api, "_metric_values", None)
+    """Collect pre-registered custom metrics from the LitAPI instance.
+
+    The swap (read + reset) is protected by ``_metric_lock`` so concurrent
+    ``report_metric`` calls from the executor thread cannot land in the
+    window between iteration-end and reset.
+    """
+    with lit_api._metric_lock:
+        values = getattr(lit_api, "_metric_values", None) or []
+        lit_api._metric_values = []
     if not values:
         return None
     specs = lit_api._metric_specs
@@ -161,7 +168,6 @@ def collect_metrics(lit_api: LitAPI) -> Metrics | None:
                 counters.append(mv)
             elif spec.metric_type == "histogram":
                 histograms.append(mv)
-    lit_api._metric_values = []
     if not gauges and not counters and not histograms:
         return None
     return Metrics(gauges=gauges, counters=counters, histograms=histograms)

@@ -12,6 +12,7 @@ adapted automatically at load time.  ``setup`` stays synchronous.
 from __future__ import annotations
 
 import logging
+import threading
 import warnings
 from dataclasses import dataclass, field
 from typing import Any, Iterator, List, Tuple
@@ -145,6 +146,7 @@ class LitAPI:
         self._logger: logging.Logger | None = None
         self._metric_specs: List[_MetricSpec] = []
         self._metric_values: List[Tuple[int, float]] = []
+        self._metric_lock = threading.Lock()
 
     @property
     def logger(self) -> logging.Logger:
@@ -220,13 +222,15 @@ class LitAPI:
         streaming mode this means values from all chunks are aggregated into
         a single Metrics proto sent with ``StreamDone``.
 
-        Hot path — only ``list.append((int, float))``, ~50 ns.
+        Thread-safe: acquires ``_metric_lock`` so concurrent reports from
+        the executor thread and collects from the loop thread are serialized.
 
         Args:
             metric_id: ID returned by :meth:`register_metric`.
             value: Metric value.
         """
-        self._metric_values.append((metric_id, value))
+        with self._metric_lock:
+            self._metric_values.append((metric_id, value))
 
     def flush_metrics(self):
         """Immediately collect and clear the metric buffer.

@@ -393,3 +393,166 @@ class TestUnwrapResponse:
         body, headers = _unwrap_response("plain string")
         assert body == "plain string"
         assert headers is None
+
+
+# ---------------------------------------------------------------------------
+# F1: Metrics race condition — _metric_values cross-thread safety
+# ---------------------------------------------------------------------------
+
+
+class TestMetricsRaceCondition:
+    """F1: ``_metric_values`` list is mutated by ``report_metric`` (potentially
+    on the executor thread in mixed mode) and read/reset by ``collect_metrics``
+    (on the loop thread) without synchronization.  A ``report_metric`` that
+    lands between iteration-end and reset is silently lost."""
+
+    def test_report_during_collect_reset_window_is_not_lost(self):
+        """Deterministic reproduction of the race window.
+
+        An instrumented LitAPI subclass blocks inside the ``_metric_values``
+        setter (the reset), creating a controlled window.  A concurrent
+        ``report_metric`` during this window must land in *either* the
+        current collect or the next one — never be silently dropped.
+        """
+        import threading
+
+        from lite_server.api import LitAPI
+        from lite_server.pipeline import collect_metrics
+
+        block_reset = threading.Event()
+        in_reset = threading.Event()
+
+        class _InstrumentedAPI(LitAPI):
+            def __init__(self):
+                self._real_values = []
+                self._in_reset = in_reset
+                self._block_reset = block_reset
+                self._init_done = False
+                super().__init__()
+                self._init_done = True
+
+            @property
+            def _metric_values(self):
+                return self._real_values
+
+            @_metric_values.setter
+            def _metric_values(self, new):
+                if self._init_done:
+                    self._in_reset.set()
+                    self._block_reset.wait()
+                self._real_values = new
+
+        api = _InstrumentedAPI()
+        api._in_reset.clear()  # clear the init-time trigger
+        g = api.register_metric("g", "gauge")
+        api.report_metric(g, 1.0)  # pre-populate so collect is non-empty
+
+        collected_first = None
+        collected_second = None
+
+        def _do_collect():
+            nonlocal collected_first
+            collected_first = collect_metrics(api)
+
+        t = threading.Thread(target=_do_collect)
+        t.start()
+
+        # Wait until collect_metrics has iterated and is about to reset
+        in_reset.wait()
+
+        # Concurrent report from a *separate* thread — lands in the window
+        # between iteration-end and reset.  Without a lock this append hits
+        # the old list that is about to be discarded.  With the lock, this
+        # thread blocks until collect releases the lock after the swap, so
+        # the value lands in the new list.
+        report_done = threading.Event()
+
+        def _do_report():
+            api.report_metric(g, 2.0)
+            report_done.set()
+
+        rt = threading.Thread(target=_do_report)
+        rt.start()
+
+        # Release the reset barrier — collect thread can now swap and
+        # release the lock, unblocking the report thread.
+        block_reset.set()
+        t.join()
+        rt.join()
+
+        # Second collect — with the lock fix the 2.0 should be here
+        # (blocked until after the swap, then appended to the new list).
+        collected_second = collect_metrics(api)
+
+        found_in_first = (
+            collected_first is not None
+            and len(collected_first.gauges) >= 2
+            and any(mv.value == 2.0 for mv in collected_first.gauges)
+        )
+        found_in_second = (
+            collected_second is not None
+            and len(collected_second.gauges) >= 1
+            and any(mv.value == 2.0 for mv in collected_second.gauges)
+        )
+
+        assert found_in_first or found_in_second, (
+            f"reported value 2.0 was silently lost! "
+            f"first={collected_first}, second={collected_second}"
+        )
+
+    def test_concurrent_report_and_collect_conservation(self):
+        """Stress test: N threads reporting + concurrent collects must not
+        lose or duplicate any metric value.  Σcollected == Σreported."""
+        import threading
+
+        from lite_server.api import LitAPI
+        from lite_server.pipeline import collect_metrics
+
+        api = LitAPI()
+        g = api.register_metric("g", "gauge")
+        c = api.register_metric("c", "counter")
+
+        total_reported = 0
+        total_collected = 0
+        report_lock = threading.Lock()
+        done = threading.Event()
+
+        def _reporter():
+            nonlocal total_reported
+            for _ in range(500):
+                api.report_metric(g, 1.0)
+                api.report_metric(c, 1.0)
+                with report_lock:
+                    total_reported += 2
+
+        def _collector():
+            nonlocal total_collected
+            while not done.is_set():
+                m = collect_metrics(api)
+                if m is not None:
+                    n = (len(m.gauges) + len(m.counters) +
+                         len(m.histograms))
+                    total_collected += n
+
+        threads = [threading.Thread(target=_reporter) for _ in range(4)]
+        coll = threading.Thread(target=_collector)
+
+        for t in threads:
+            t.start()
+        coll.start()
+
+        for t in threads:
+            t.join()
+        done.set()
+        coll.join()
+
+        # Drain remaining buffered values
+        m = collect_metrics(api)
+        if m is not None:
+            total_collected += (len(m.gauges) + len(m.counters) +
+                              len(m.histograms))
+
+        assert total_collected == total_reported, (
+            f"metrics lost or duplicated: "
+            f"collected={total_collected}, reported={total_reported}"
+        )
