@@ -418,6 +418,20 @@ class TestSyncAsyncAdaptation:
         pipe.close()
 
     @pytest.mark.asyncio
+    async def test_async_on_error_callback_sets_any_async(self):
+        """C6: an async on_error callback must count toward async detection
+        on the inference pipeline, so the single-thread executor exists when
+        it is driven."""
+        class AsyncErrCB(Callback):
+            async def on_error(self, ctx, exc):
+                pass
+
+        pipe = Pipeline.build(EchoAPI(), [AsyncErrCB()])
+        assert pipe.any_async is True
+        assert pipe._executor is not None
+        pipe.close()
+
+    @pytest.mark.asyncio
     async def test_concurrent_sync_predicts_are_serialized_in_mixed_mode(self):
         """Sync code must never run concurrently (pre-0.7 standard-loop
         semantics preserved)."""

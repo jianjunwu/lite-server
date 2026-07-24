@@ -311,6 +311,8 @@ class Pipeline:
         for cb in self.callbacks:
             for name in _DATA_HOOKS:
                 candidate_fns.append(getattr(cb, name))
+            for name in _ERROR_HOOKS:
+                candidate_fns.append(getattr(cb, name))
         # API hooks (when overridden) also participate in async detection.
         api_cls = type(lit_api)
         if _overrides(api_cls, "on_request", LitAPI):
@@ -391,11 +393,11 @@ class Pipeline:
                     self._lifecycle[name].append(cb)
 
         # Error hooks: exception-isolated, driven when a request fails.
-        self._error_hooks = [
-            _adapt(getattr(cb, "on_error"), self._executor)
-            for cb in self.callbacks
-            if _overrides(type(cb), "on_error", Callback)
-        ]
+        self._error_hooks = []
+        for cb in self.callbacks:
+            for name in _ERROR_HOOKS:
+                if _overrides(type(cb), name, Callback):
+                    self._error_hooks.append(_adapt(getattr(cb, name), self._executor))
 
     # ---- Construction ----------------------------------------------------
 
@@ -438,8 +440,8 @@ class Pipeline:
         for cb in callbacks:
             for name in _DATA_HOOKS:
                 candidate_fns.append(getattr(cb, name))
-            if _overrides(type(cb), "on_error", Callback):
-                candidate_fns.append(getattr(cb, "on_error"))
+            for name in _ERROR_HOOKS:
+                candidate_fns.append(getattr(cb, name))
 
         pipe.any_async = any(_is_asyncish(f) for f in candidate_fns)
         pipe._executor = (
@@ -456,11 +458,11 @@ class Pipeline:
                     pipe._chains[name].append(
                         pipe._wrap_hook(getattr(cb, name), name)
                     )
-        pipe._error_hooks = [
-            _adapt(getattr(cb, "on_error"), pipe._executor)
-            for cb in callbacks
-            if _overrides(type(cb), "on_error", Callback)
-        ]
+        pipe._error_hooks = []
+        for cb in callbacks:
+            for name in _ERROR_HOOKS:
+                if _overrides(type(cb), name, Callback):
+                    pipe._error_hooks.append(_adapt(getattr(cb, name), pipe._executor))
         pipe._lifecycle = {name: [] for name in _LIFECYCLE_HOOKS}
         return pipe
 
