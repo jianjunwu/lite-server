@@ -236,7 +236,24 @@ impl IntoResponse for AppError {
 
         // Log full internal details for operational debugging.
         // The sanitized message is what goes to the client.
-        tracing::error!(error_type = %error_type, code = %self.error_code(), detail = %self.to_string(), "request error");
+        // C7: client errors (4xx, including 429 rate-limit) log at info so a
+        // saturated rate limiter doesn't flood the logs at error level; only
+        // server faults (5xx) are treated as operational errors.
+        if status.is_server_error() {
+            tracing::error!(
+                error_type = %error_type,
+                code = %self.error_code(),
+                detail = %self.to_string(),
+                "request error"
+            );
+        } else {
+            tracing::info!(
+                error_type = %error_type,
+                code = %self.error_code(),
+                detail = %self.to_string(),
+                "request error"
+            );
+        }
 
         let body = Json(json!({
             "error": {
@@ -600,5 +617,68 @@ mod tests {
         assert_eq!(AppError::MethodNotAllowed.error_code(), "method_not_allowed");
         assert_eq!(AppError::InvalidRequestBody("x".into()).error_code(), "invalid_request_body");
         assert_eq!(AppError::InvalidQueryParam("x".into()).error_code(), "invalid_query_param");
+    }
+
+    // ===== C7: client errors (incl. 429) log at info, server errors at error =====
+
+    #[derive(Default, Clone)]
+    struct Counters {
+        error: u64,
+        warn: u64,
+        info: u64,
+    }
+
+    /// A `tracing` layer that tallies emitted events by level, so tests can
+    /// assert which log macro the IntoResponse path actually invoked.
+    struct LevelCounter {
+        inner: std::sync::Arc<std::sync::Mutex<Counters>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LevelCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut c = self.inner.lock().unwrap();
+            match *event.metadata().level() {
+                tracing::Level::ERROR => c.error += 1,
+                tracing::Level::WARN => c.warn += 1,
+                tracing::Level::INFO => c.info += 1,
+                _ => {}
+            }
+        }
+    }
+
+    fn event_counts<F: FnOnce()>(run: F) -> Counters {
+        use tracing_subscriber::prelude::*;
+        let counters = std::sync::Arc::new(std::sync::Mutex::new(Counters::default()));
+        let layer = LevelCounter { inner: counters.clone() };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, run);
+        let c = counters.lock().unwrap().clone();
+        c
+    }
+
+    #[tokio::test]
+    async fn test_client_errors_log_at_info_not_error() {
+        use axum::response::IntoResponse;
+        // 429 (rate limit) must not spam at ERROR under load — log at INFO.
+        let c = event_counts(|| { let _ = AppError::RateLimitExceeded { retry_after_secs: 1 }.into_response(); });
+        assert_eq!(c.error, 0, "429 must not log at error");
+        assert_eq!(c.info, 1, "429 should log at info");
+
+        // 4xx validation likewise.
+        let c = event_counts(|| { let _ = AppError::InvalidRequestBody("bad".into()).into_response(); });
+        assert_eq!(c.error, 0);
+        assert_eq!(c.info, 1);
+    }
+
+    #[tokio::test]
+    async fn test_server_errors_still_log_at_error() {
+        use axum::response::IntoResponse;
+        let c = event_counts(|| { let _ = AppError::WorkerCrashed("boom".into()).into_response(); });
+        assert_eq!(c.error, 1, "5xx must still log at error");
+        assert_eq!(c.info, 0);
     }
 }
