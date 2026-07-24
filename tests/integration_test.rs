@@ -349,26 +349,29 @@ fn kill_stale_on_port(port: u16) {
 
 /// Start the shared server once. Safe to call from async context.
 async fn ensure_shared_server() {
-    let mut guard = SHARED_SERVER.lock().unwrap();
-    if guard.is_some() {
-        // Already started — wait for it to be ready
-        drop(guard);
-        wait_for_server(SHARED_PORT, 10).await;
-        return;
-    }
-    kill_stale_on_port(SHARED_PORT);
-    let repo = test_model_repo();
-    let child = start_server(&[
-        "--port", &SHARED_PORT.to_string(),
-        "--model-repo", &repo.to_string_lossy(),
-        "--no-metrics",
-        "--no-grpc",
-        "--log-level", "warn",
-    ]);
-    *guard = Some(child);
-    register_shared_cleanup();
-    drop(guard);
-    wait_for_server(SHARED_PORT, 15).await;
+    // Scope the mutex guard to a block so it is dropped before we await —
+    // holding a std MutexGuard across an await risks deadlock and trips
+    // clippy::await_holding_lock.
+    let already_started = {
+        let mut guard = SHARED_SERVER.lock().unwrap();
+        if guard.is_some() {
+            true
+        } else {
+            kill_stale_on_port(SHARED_PORT);
+            let repo = test_model_repo();
+            let child = start_server(&[
+                "--port", &SHARED_PORT.to_string(),
+                "--model-repo", &repo.to_string_lossy(),
+                "--no-metrics",
+                "--no-grpc",
+                "--log-level", "warn",
+            ]);
+            *guard = Some(child);
+            register_shared_cleanup();
+            false
+        }
+    };
+    wait_for_server(SHARED_PORT, if already_started { 10 } else { 15 }).await;
 }
 
 /// Kill the shared server (and its whole process group, Python workers

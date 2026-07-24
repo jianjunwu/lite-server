@@ -15,6 +15,12 @@ use tracing::{info, warn};
 
 const ENDPOINT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Per-route policy table: axum-form route → (rate limit, pre-built CORS headers).
+type RoutePolicyMap = HashMap<
+    String,
+    (Option<crate::worker::protocol::RateLimitPolicy>, Option<Arc<axum::http::HeaderMap>>),
+>;
+
 /// Manages the custom endpoint Python subprocess.
 pub struct EndpointManager {
     repo_path: PathBuf,
@@ -25,9 +31,8 @@ pub struct EndpointManager {
     /// Per-route policies keyed by axum-form route (e.g. "/pets/:id").
     /// The CORS value is a pre-built `Arc<HeaderMap>` (B9) — built once at
     /// ingest, Arc-shared per request.
-    route_policies: RwLock<
-        HashMap<String, (Option<crate::worker::protocol::RateLimitPolicy>, Option<Arc<axum::http::HeaderMap>>)>,
-    >,
+    route_policies: RwLock<RoutePolicyMap>,
+    /// Prevents concurrent restarts from multiple requests.
     /// Prevents concurrent restarts from multiple requests.
     restart_lock: Mutex<()>,
 }
