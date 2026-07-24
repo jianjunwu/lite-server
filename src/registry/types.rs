@@ -47,6 +47,11 @@ pub struct ModelVersion {
     pub workers: Vec<WorkerInfo>,
     #[serde(default)]
     pub policies: crate::worker::protocol::ModelPolicies,
+    /// Pre-built CORS header map, cached at policy ingest (B9) so responses
+    /// avoid a per-request `String::join` + `HeaderValue::from_str` round.
+    /// `#[serde(skip)]`: a Rust-side cache, never serialized over the wire.
+    #[serde(skip)]
+    pub cors_headers: Option<std::sync::Arc<axum::http::HeaderMap>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

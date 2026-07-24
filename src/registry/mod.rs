@@ -6,6 +6,7 @@ use crate::error::AppError;
 use crate::registry::types::*;
 use dashmap::DashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct ModelRegistry {
@@ -97,6 +98,7 @@ impl ModelRegistry {
             model_dir,
             workers: vec![],
             policies: Default::default(),
+            cors_headers: None,
         };
         entry.versions.insert(version.to_string(), mv);
         Ok(())
@@ -233,20 +235,23 @@ impl ModelRegistry {
             let _key = format!("{}/{}", model_name, version);
             if let Some(mut entry) = self.models.get_mut(model_name) {
                 if let Some(mv) = entry.versions.get_mut(version) {
+                    // Pre-build the CORS HeaderMap once (B9) so the hot response
+                    // path only Arc-clones instead of re-joining/parsing strings.
+                    mv.cors_headers = p.cors.as_ref().map(|c| Arc::new(c.header_map()));
                     mv.policies = p;
                 }
             }
         }
     }
 
-    pub fn active_cors_policy(
+    pub fn active_cors_headers(
         &self,
         model_name: &str,
-    ) -> Option<crate::worker::protocol::CorsPolicy> {
+    ) -> Option<Arc<axum::http::HeaderMap>> {
         let active_version = self.active_versions.get(model_name)?;
         let model = self.models.get(model_name)?;
         let mv = model.versions.get(active_version.value())?;
-        mv.policies.cors.clone()
+        mv.cors_headers.clone()
     }
 
     pub fn active_rate_limit_policy(

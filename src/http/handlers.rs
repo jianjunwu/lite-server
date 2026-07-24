@@ -111,9 +111,9 @@ pub async fn inference_options_handler(
     let Some(model_name) = params.get("model_name") else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match state.registry.active_cors_policy(model_name) {
-        Some(policy) => {
-            (StatusCode::NO_CONTENT, cors_header_map(&policy)).into_response()
+    match state.registry.active_cors_headers(model_name) {
+        Some(headers) => {
+            (StatusCode::NO_CONTENT, (*headers).clone()).into_response()
         }
         None => StatusCode::METHOD_NOT_ALLOWED.into_response(),
     }
@@ -134,8 +134,8 @@ pub async fn endpoint_options_handler(
         .map(|mp| mp.as_str().to_string())
         .unwrap_or_default();
     if let Some(mgr) = &state.endpoint_manager {
-        if let Some(cors) = mgr.cors_policy(&pattern).await {
-            return (StatusCode::NO_CONTENT, cors_header_map(&cors)).into_response();
+        if let Some(cors) = mgr.cors_headers(&pattern).await {
+            return (StatusCode::NO_CONTENT, (*cors).clone()).into_response();
         }
     }
     AppError::MethodNotAllowed.into_response()
@@ -589,32 +589,19 @@ fn attach_cors_headers(
         Ok(r) => r,
         Err(e) => e.into_response(),
     };
-    if let Some(cors) = state.registry.active_cors_policy(model) {
-        resp.headers_mut().extend(cors_header_map(&cors));
+    if let Some(cors) = state.registry.active_cors_headers(model) {
+        extend_cors_headers(resp.headers_mut(), &cors);
     }
     resp
 }
 
-/// Build a CORS header map from a CorsPolicy.
-pub(crate) fn cors_header_map(policy: &crate::worker::protocol::CorsPolicy) -> axum::http::HeaderMap {
-    use axum::http::{HeaderMap, HeaderName, HeaderValue};
-    let mut headers = HeaderMap::new();
-    let _ = HeaderValue::from_str(&policy.allow_origins.join(", ")).map(|v| {
-        headers.insert(HeaderName::from_static("access-control-allow-origin"), v)
-    });
-    let _ = HeaderValue::from_str(&policy.allow_methods.join(", ")).map(|v| {
-        headers.insert(
-            HeaderName::from_static("access-control-allow-methods"),
-            v,
-        )
-    });
-    let _ = HeaderValue::from_str(&policy.allow_headers.join(", ")).map(|v| {
-        headers.insert(
-            HeaderName::from_static("access-control-allow-headers"),
-            v,
-        )
-    });
-    headers
+/// Copy pre-built CORS headers (Arc-shared, cached at policy ingest — B9) into
+/// a response in place. Entries are cloned since the source is shared behind an
+/// `Arc<HeaderMap>`.
+fn extend_cors_headers(target: &mut HeaderMap, src: &axum::http::HeaderMap) {
+    for (name, value) in src {
+        target.append(name.clone(), value.clone());
+    }
 }
 
 fn inject_response_headers(
@@ -1346,8 +1333,8 @@ pub async fn custom_endpoint_handler(
     // error) — previously only the non-stream success branch attached it, so
     // early `?` returns and streaming responses leaked without CORS headers.
     if let Some(mgr) = &state.endpoint_manager {
-        if let Some(cors) = mgr.cors_policy(&route_pattern).await {
-            resp.headers_mut().extend(cors_header_map(&cors));
+        if let Some(cors) = mgr.cors_headers(&route_pattern).await {
+            extend_cors_headers(resp.headers_mut(), &cors);
         }
     }
     resp

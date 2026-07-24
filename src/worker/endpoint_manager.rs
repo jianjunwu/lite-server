@@ -43,8 +43,10 @@ pub struct EndpointManager {
     process: RwLock<Option<EndpointProcess>>,
     routes: RwLock<Vec<EndpointRoute>>,
     /// Per-route policies keyed by axum-form route (e.g. "/pets/:id").
+    /// The CORS value is a pre-built `Arc<HeaderMap>` (B9) — built once at
+    /// ingest, Arc-shared per request.
     route_policies: RwLock<
-        HashMap<String, (Option<crate::worker::protocol::RateLimitPolicy>, Option<crate::worker::protocol::CorsPolicy>)>,
+        HashMap<String, (Option<crate::worker::protocol::RateLimitPolicy>, Option<Arc<axum::http::HeaderMap>>)>,
     >,
     /// Prevents concurrent restarts from multiple requests.
     restart_lock: Mutex<()>,
@@ -78,11 +80,11 @@ impl EndpointManager {
         policies.get(route).and_then(|(rl, _)| rl.clone())
     }
 
-    /// Look up the Cors policy for a route (axum-form key).
-    pub async fn cors_policy(
+    /// Look up the pre-built CORS headers for a route (axum-form key).
+    pub async fn cors_headers(
         &self,
         route: &str,
-    ) -> Option<crate::worker::protocol::CorsPolicy> {
+    ) -> Option<Arc<axum::http::HeaderMap>> {
         let policies = self.route_policies.read().await;
         policies.get(route).and_then(|(_, c)| c.clone())
     }
@@ -377,9 +379,10 @@ impl EndpointManager {
             policies.clear();
             for ep in &startup.routes {
                 let axum_route = convert_path_params(&ep.route);
+                let cors_headers = ep.cors.as_ref().map(|c| Arc::new(c.header_map()));
                 policies.insert(
                     axum_route,
-                    (ep.rate_limit.clone(), ep.cors.clone()),
+                    (ep.rate_limit.clone(), cors_headers),
                 );
             }
             *routes = startup.routes;

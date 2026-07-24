@@ -50,16 +50,29 @@ impl RateLimiter {
     /// The short synchronous scope that clones the `Arc` avoids holding the
     /// DashMap guard across `.await`, which would make the future `!Send`.
     pub async fn acquire(&self, key: &str, rpm: f64, burst: f64) -> AcquireResult {
-        let bucket = self
-            .buckets
-            .entry(key.to_string())
-            .or_insert_with(|| {
-                Arc::new(tokio::sync::Mutex::new(TokenBucket::new(
-                    rpm / 60.0,
-                    burst,
-                )))
-            })
-            .clone();
+        // C1: a non-positive rpm is a misconfigured policy. Fail closed with a
+        // sane Retry-After — otherwise the bucket drains its burst tokens and
+        // later requests compute retry_after = (1-0)/0, saturating to u64::MAX.
+        if rpm <= 0.0 {
+            return AcquireResult::Rejected { retry_after_secs: 1 };
+        }
+
+        // Fast path: an existing bucket is read under DashMap's shard lock and
+        // Arc-cloned with zero allocation. Only a brand-new key takes the write
+        // path (entry + or_insert_with) to create the bucket.
+        let bucket = match self.buckets.get(key) {
+            Some(b) => b.clone(),
+            None => self
+                .buckets
+                .entry(key.to_string())
+                .or_insert_with(|| {
+                    Arc::new(tokio::sync::Mutex::new(TokenBucket::new(
+                        rpm / 60.0,
+                        burst,
+                    )))
+                })
+                .clone(),
+        };
 
         let mut b = bucket.lock().await;
 
@@ -206,5 +219,23 @@ mod tests {
         let removed = limiter.cleanup_stale(Duration::from_secs(0)); // everything stale
         assert_eq!(removed, 0); // in-use bucket preserved
         assert!(limiter.buckets.contains_key("inuse"));
+    }
+
+    #[tokio::test]
+    async fn test_acquire_rejects_misconfigured_nonpositive_rpm() {
+        // C1: rpm <= 0 is a misconfigured policy. Previously the first request
+        // drained the burst bucket and later requests computed retry_after =
+        // (1-0)/0 → saturated to u64::MAX. Fail closed with a sane Retry-After.
+        let limiter = RateLimiter::new();
+        let result = limiter.acquire("zero-rpm", 0.0, 1.0).await;
+        assert!(
+            matches!(result, AcquireResult::Rejected { retry_after_secs: 1 }),
+            "zero rpm must be rejected immediately"
+        );
+        let result = limiter.acquire("neg-rpm", -5.0, 1.0).await;
+        assert!(
+            matches!(result, AcquireResult::Rejected { retry_after_secs: 1 }),
+            "negative rpm must be rejected immediately"
+        );
     }
 }
