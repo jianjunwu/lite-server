@@ -11,6 +11,23 @@ use axum::{
 };
 use axum::extract::ws::{Message, WebSocket};
 
+/// Map an HTTP status code to its Prometheus label family.
+///
+/// ``Status.code`` in the worker protocol describes *execution* state
+/// (Ok = pipeline completed normally, Error = exception), while
+/// ``SingleResponse.status_code`` carries the HTTP status.  This
+/// function bridges the two so early 4xx / 5xx responses are recorded
+/// under the correct Prometheus label rather than hardcoded "2xx".
+fn status_family(status_code: i32) -> &'static str {
+    match status_code / 100 {
+        2 => "2xx",
+        3 => "3xx",
+        4 => "4xx",
+        5 => "5xx",
+        _ => "2xx", // 0 (unset) counts as success
+    }
+}
+
 /// JSON body extractor that converts axum's plain-text `JsonRejection`
 /// into a standardized `AppError::InvalidRequestBody` response.
 pub struct ApiJson<T>(pub T);
@@ -628,7 +645,7 @@ async fn do_infer(
             let code = single.status.as_ref().map(|s| s.code.as_str()).unwrap_or("Ok");
             match code {
                 "Ok" => {
-                    prometheus::record_request_end(&model_name, &resolved_version, "2xx", duration).await;
+                    prometheus::record_request_end(&model_name, &resolved_version, status_family(single.status_code), duration).await;
                     // Fire InferenceResponse callback
                     let resp_ctx = crate::callback::InferenceContext {
                         elapsed_us: Some((duration * 1_000_000.0) as u64),
@@ -704,7 +721,7 @@ async fn do_infer(
                     Err(AppError::WorkerCrashed(msg))
                 }
                 _ => {
-                    prometheus::record_request_end(&model_name, &resolved_version, "2xx", duration).await;
+                    prometheus::record_request_end(&model_name, &resolved_version, status_family(single.status_code), duration).await;
                     let json_body = serde_json::to_string(&data).unwrap_or_default();
                     let content_type = if single.media_type.is_empty() {
                         "application/json; charset=utf-8"
@@ -1989,5 +2006,22 @@ mod extractor_tests {
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["code"], "invalid_query_param");
         assert_eq!(body["error"]["param"], Value::Null);
+    }
+}
+
+#[cfg(test)]
+mod status_family_tests {
+    use super::status_family;
+
+    #[test]
+    fn test_status_family_mapping() {
+        assert_eq!(status_family(0), "2xx");     // unset → success
+        assert_eq!(status_family(200), "2xx");
+        assert_eq!(status_family(201), "2xx");
+        assert_eq!(status_family(302), "3xx");
+        assert_eq!(status_family(400), "4xx");
+        assert_eq!(status_family(404), "4xx");
+        assert_eq!(status_family(500), "5xx");
+        assert_eq!(status_family(503), "5xx");
     }
 }
