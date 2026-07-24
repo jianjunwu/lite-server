@@ -469,7 +469,11 @@ pub async fn infer_handler(
     ApiJson(payload): ApiJson<Value>,
 ) -> Result<Response, AppError> {
     crate::validation::validate_identifier(&model_name)?;
-    do_infer(state, model_name, None, "/predict".to_string(), headers, payload, request_id).await
+    let result = do_infer(
+        state.clone(), model_name.clone(), None,
+        "/predict".to_string(), headers, payload, request_id,
+    ).await;
+    Ok(attach_cors_headers(state, &model_name, result))
 }
 
 pub async fn infer_version_handler(
@@ -481,7 +485,11 @@ pub async fn infer_version_handler(
 ) -> Result<Response, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
-    do_infer(state, model_name, Some(version), "/predict".to_string(), headers, payload, request_id).await
+    let result = do_infer(
+        state.clone(), model_name.clone(), Some(version),
+        "/predict".to_string(), headers, payload, request_id,
+    ).await;
+    Ok(attach_cors_headers(state, &model_name, result))
 }
 
 fn extract_client_ip(headers: &HeaderMap) -> String {
@@ -509,8 +517,24 @@ const BLOCKED_RESPONSE_HEADERS: &[&str] = &[
     "upgrade",
 ];
 
+/// Attach CORS headers to an inference response (success or error).
+fn attach_cors_headers(
+    state: Arc<AppState>,
+    model: &str,
+    result: Result<Response, AppError>,
+) -> Response {
+    let mut resp = match result {
+        Ok(r) => r,
+        Err(e) => e.into_response(),
+    };
+    if let Some(cors) = state.registry.active_cors_policy(model) {
+        resp.headers_mut().extend(cors_header_map(&cors));
+    }
+    resp
+}
+
 /// Build a CORS header map from a CorsPolicy.
-fn cors_header_map(policy: &crate::worker::protocol::CorsPolicy) -> axum::http::HeaderMap {
+pub(crate) fn cors_header_map(policy: &crate::worker::protocol::CorsPolicy) -> axum::http::HeaderMap {
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
     let mut headers = HeaderMap::new();
     let _ = HeaderValue::from_str(&policy.allow_origins.join(", ")).map(|v| {
@@ -1183,6 +1207,7 @@ async fn handle_ws_stream(
 pub async fn custom_endpoint_handler(
     State(state): State<Arc<AppState>>,
     RequestId(request_id): RequestId,
+    matched_path: Option<axum::extract::MatchedPath>,
     request: axum::http::Request<axum::body::Body>,
 ) -> Result<Response, AppError> {
     let ep_mgr = match &state.endpoint_manager {
@@ -1192,6 +1217,11 @@ pub async fn custom_endpoint_handler(
 
     let route = request.uri().path().to_string();
     let method = request.method().to_string();
+    // Use the matched axum route pattern for policy lookups
+    let route_pattern = matched_path
+        .as_ref()
+        .map(|mp| mp.as_str().to_string())
+        .unwrap_or_else(|| route.clone());
 
     let span = tracing::info_span!(
         "endpoint_request",
@@ -1246,12 +1276,12 @@ pub async fn custom_endpoint_handler(
 
     // Rate limit check for custom endpoints
     if let Some(rl) = ep_mgr
-        .rate_limit_policy(&route)
+        .rate_limit_policy(&route_pattern)
         .await
     {
         let scope = match rl.key.as_str() {
             "ip" => client_ip.clone(),
-            _ => route.clone(),
+            _ => route_pattern.clone(),
         };
         let burst = rl.burst.unwrap_or(rl.requests_per_minute * 1.5);
         let key = format!("ep:{}", scope);
@@ -1319,9 +1349,14 @@ pub async fn custom_endpoint_handler(
                 builder = builder.header(k, v);
             }
         }
-        let resp = builder
+        let mut resp = builder
             .body(axum::body::Body::from(response.body.to_string()))
             .map_err(|e| AppError::Internal(format!("build response: {}", e)))?;
+
+        // Attach CORS headers from the endpoint's declared Cors policy
+        if let Some(cors) = ep_mgr.cors_policy(&route_pattern).await {
+            resp.headers_mut().extend(cors_header_map(&cors));
+        }
 
         Ok(resp)
     }
