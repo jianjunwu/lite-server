@@ -125,7 +125,7 @@ If `stream_predict()` is not implemented, the server falls back to `predict()` a
 
 #### `on_request(self, request, meta)`
 
-Called after `decode_request()`, before `predict()`. Use for auth, logging, or request modification.
+Called before `decode_request()`, on the raw request. Use for auth, logging, or request modification.
 
 ```python
 def on_request(self, request, meta):
@@ -542,6 +542,11 @@ Enable in config:
 ```yaml
 bidirectional: true
 ```
+
+> **Note:** During a bidi session, ``ctx.request`` and ``ctx.input`` in hooks
+> always hold the original open payload — they do not change as individual
+> chunks arrive.  The per-chunk data is available via the handler's
+> ``on_chunk(chunk)`` argument.
 
 ## Custom Metrics
 

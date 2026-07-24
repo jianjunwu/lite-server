@@ -70,6 +70,11 @@ def _adapt(fn: Callable, executor: ThreadPoolExecutor | None) -> Callable[..., A
 
         async def call_inline(*args):
             result = fn(*args)
+            # Runtime check — not redundant with the iscoroutinefunction
+            # guard above.  A sync function may return a coroutine object
+            # (e.g. a sync wrapper that delegates to an async inner), and
+            # a callable object with async __call__ is invisible to
+            # iscoroutinefunction.
             if asyncio.iscoroutine(result):
                 return await result
             return result
@@ -79,6 +84,7 @@ def _adapt(fn: Callable, executor: ThreadPoolExecutor | None) -> Callable[..., A
     async def call_in_executor(*args):
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(executor, functools.partial(fn, *args))
+        # Same runtime guard — see call_inline comment.
         if asyncio.iscoroutine(result):
             return await result
         return result

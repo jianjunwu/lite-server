@@ -117,6 +117,10 @@ class Callback:
 
         In streaming mode this runs once per yielded chunk.
 
+        During a bidirectional (bidi) session ``ctx.request`` and
+        ``ctx.input`` always hold the open payload; they do not change
+        as chunks arrive.
+
         Returns:
             Replacement for ``ctx.output``, a ``Response`` for early return,
             or None to pass through.
@@ -127,6 +131,10 @@ class Callback:
         """Called after ``encode_response`` — the last hook before sending.
 
         In streaming mode this runs once per yielded chunk.
+
+        During a bidirectional (bidi) session ``ctx.request`` and
+        ``ctx.input`` always hold the open payload; they do not change
+        as chunks arrive.
 
         Returns:
             Replacement for ``ctx.response``, a ``Response`` for early

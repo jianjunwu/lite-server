@@ -125,7 +125,7 @@ stream: true
 
 #### `on_request(self, request, meta)`
 
-在 `decode_request()` 之后、`predict()` 之前调用。用于鉴权、日志或请求修改。
+在 `decode_request()` 之前对原始请求调用。用于鉴权、日志或请求修改。
 
 ```python
 def on_request(self, request, meta):
@@ -544,6 +544,10 @@ class ASRModel(LitAPI):
 ```yaml
 bidirectional: true
 ```
+
+> **注意：** 在双向（bidi）会话期间，钩子中的 ``ctx.request`` 和 ``ctx.input``
+> 始终指向初始的 open 负载——它们不会随 chunk 到达而变化。每个 chunk 的数据
+> 通过 handler 的 ``on_chunk(chunk)`` 参数获取。
 
 ## 自定义指标
 
