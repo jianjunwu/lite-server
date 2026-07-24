@@ -1202,6 +1202,88 @@ async fn test_inference_options_preflight_all_routes() {
 }
 
 // ---------------------------------------------------------------------------
+// Inference CORS on success + rate-limit error — covers A8
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn test_infer_cors_success_and_rate_limit_error() {
+    // Dedicated server: policy_model's rate-limit bucket (burst=3) is shared
+    // across tests on the shared server, so a fresh process gives a clean bucket.
+    let port = 18042;
+    kill_stale_on_port(port);
+    let repo = test_model_repo();
+    let _server = ServerGuard::start(&[
+        "--port",
+        &port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-metrics",
+        "--no-grpc",
+        "--log-level",
+        "warn",
+    ]);
+    wait_for_server(port, 15).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+    load_model(&base, POLICY_MODEL, "1").await;
+
+    // Success: 200 + ACAO (attach_cors_headers wraps unary infer too).
+    let resp = client
+        .post(format!("{}/v2/models/{}/infer", base, POLICY_MODEL))
+        .json(&json!({"input": 5}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "https://app.example.com"
+    );
+    assert_eq!(resp.json::<Value>().await.unwrap()["output"], 10);
+
+    // 2nd + 3rd requests stay within burst=3.
+    for _ in 0..2 {
+        let resp = client
+            .post(format!("{}/v2/models/{}/infer", base, POLICY_MODEL))
+            .json(&json!({"input": 1}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    // 4th: rate-limited → 429 + Retry-After. The error response must still
+    // carry ACAO (attach_cors_headers wraps the Err path), and Retry-After
+    // must be a sane 1..=60 seconds (C1 Rust defense against rpm<=0 → u64::MAX).
+    let resp = client
+        .post(format!("{}/v2/models/{}/infer", base, POLICY_MODEL))
+        .json(&json!({"input": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429);
+    let retry = resp
+        .headers()
+        .get("retry-after")
+        .expect("429 must carry Retry-After");
+    let secs: u64 = retry.to_str().unwrap().parse().unwrap();
+    assert!((1..=60).contains(&secs), "Retry-After {} out of range", secs);
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "https://app.example.com"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Hot reload (separate server with temp dir)
 // ---------------------------------------------------------------------------
 
