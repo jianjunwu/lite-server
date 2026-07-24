@@ -77,8 +77,8 @@ curl -X POST http://localhost:8000/v2/models/my_model/infer \
   ┌─────────────────┐     ┌──────────────────┐
   │   Rust 内核      │     │  Python Workers   │
   │  (axum/tokio)    │────►│  (子进程)          │
-  │                  │ZMQ  │                   │
-  │  ┌────────────┐  │/UDS │  ┌─────────────┐  │
+  │                  │ZMQ/ │                   │
+  │  ┌────────────┐  │Protobuf ┌─────────────┐│
   │  │ 推理队列    │  │     │  │  model.py   │  │
   │  │ (per model)│  │     │  │  (LitAPI)   │  │
   │  └────────────┘  │     │  └─────────────┘  │
@@ -105,11 +105,13 @@ Rust 内核处理所有 I/O（HTTP、gRPC、IPC、指标、文件监听），Pyt
 | 心跳 + 自动重启 | ZMQ 探测，自动重启卡死 worker | 不支持 | 不支持 | 不支持 | 不支持 |
 | 生命周期钩子 | Shell + HTTP 回调 | 不支持 | 不支持 | 不支持 | 不支持 |
 | 流式输出 | SSE + WebSocket + gRPC | 支持 | 不支持 | 支持 | 支持 |
-| 最小开销 | ~10MB | ~500MB | ~200MB | ~50MB | ~100MB |
+| 最小开销 | ~15MB | ~500MB | ~200MB | ~50MB | ~100MB |
 
 详见 [docs/zh/comparison.md](docs/zh/comparison.md)。
 
 ## 性能基准
+
+> **注意：** 以下数据为初步占位数据，数据点有限。详见 [docs/zh/benchmark.md](docs/zh/benchmark.md) 了解背景和复现步骤。
 
 2 worker、4 并发测试（1ms CPU mock 模型）：
 

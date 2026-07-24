@@ -18,7 +18,7 @@
 |--------|------------|--------|------------|---------|-----------|
 | HTTP core | Rust (axum/tokio) | C++ (custom) | Java (Netty) | Python (FastAPI) | Python (uvicorn) |
 | Inference layer | Python subprocess | C++ plugins | Python subprocess | Python | Python Actor |
-| IPC mechanism | ZMQ/UDS | Shared memory | TorchServe protocol | HTTP | Ray object store |
+| IPC mechanism | ZMQ/Protobuf | Shared memory | TorchServe protocol | HTTP | Ray object store |
 | Process model | Per-worker subprocess | Single process, backends | Java + Python workers | Per-deployment | Distributed actors |
 
 ### Installation & Dependencies
@@ -108,6 +108,6 @@ lite-server's performance advantage comes from:
 2. **Zero-copy data path** — `Bytes` shared buffers and `Arc<RequestMeta>` avoid data copying in the hot path
 3. **DashMap lock-free concurrency** — model registry and pending response map use concurrent hash maps instead of mutexes
 4. **Adaptive batching** — dynamically adjusts batch timeout based on queue pressure, dispatching immediately under high load
-5. **ZMQ/UDS IPC** — Unix domain sockets avoid TCP overhead for local worker communication
+5. **ZMQ IPC** — Unix domain sockets (UDS) on Unix, TCP on Windows; Protobuf serialization avoids JSON overhead
 
 See [benchmark.md](benchmark.md) for measured performance data.

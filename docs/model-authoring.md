@@ -527,7 +527,7 @@ class CustomResponseModel(OpenAIEndpoint):
 | Streaming | `stream_predict()` async generator | `stream_predict()` generator |
 | Use case | OpenAI-compatible APIs | Custom inference endpoints |
 
-See [examples/08_openai_compatible](../examples/08_openai_compatible/) for a runnable demo.
+> **Note:** The OpenAI endpoint example is coming soon. For now, see [examples/README.md](../examples/README.md) for available examples and the `OpenAIEndpoint` source at `python/lite_server/specs/openai.py`.
 
 ## Bidirectional Streaming
 

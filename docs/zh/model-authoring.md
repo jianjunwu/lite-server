@@ -529,7 +529,7 @@ class CustomResponseModel(OpenAIEndpoint):
 | 流式 | `stream_predict()` 异步生成器 | `stream_predict()` 生成器 |
 | 使用场景 | OpenAI 兼容 API | 自定义推理端点 |
 
-参见 [examples/08_openai_compatible](../examples/08_openai_compatible/) 获取可运行的示例。
+> **注意：** OpenAI 端点示例即将推出。当前可参见 [examples/README.md](../examples/README.md) 获取可用示例，以及 `python/lite_server/specs/openai.py` 中的 `OpenAIEndpoint` 源码。
 
 ## 双向流式
 

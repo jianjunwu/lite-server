@@ -44,12 +44,12 @@ endpoints_dir: ./endpoints     # Custom HTTP endpoints directory (optional)
 
 features:
   timeline: false              # Enable historical metric timeline
-  system_overview: true        # Enable system overview in dashboard
-  custom_metrics: false        # Enable custom user-defined metrics
-  benchmarks: true             # Enable built-in benchmarking
-  playground: false            # Enable API playground in dashboard
+  system_overview: true        # (reserved — not yet implemented)
+  custom_metrics: false        # (reserved — not yet implemented)
+  benchmarks: true             # (reserved — not yet implemented)
+  playground: false            # (reserved — not yet implemented)
   alerts: true                 # Enable alert engine
-  version_compare: false       # Enable version comparison
+  version_compare: false       # (reserved — not yet implemented)
   streaming: true              # Enable streaming endpoints
   grpc_streaming: true         # Enable gRPC streaming
   sse: true                    # Enable SSE streaming

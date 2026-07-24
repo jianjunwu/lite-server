@@ -18,7 +18,7 @@
 |------|------------|--------|------------|---------|-----------|
 | HTTP 层 | Rust (axum/tokio) | C++ (自研) | Java (Netty) | Python (FastAPI) | Python (uvicorn) |
 | 推理层 | Python 子进程 | C++ 插件 | Python 子进程 | Python | Python Actor |
-| IPC 机制 | ZMQ/UDS | 共享内存 | TorchServe 协议 | HTTP | Ray 对象存储 |
+| IPC 机制 | ZMQ/Protobuf | 共享内存 | TorchServe 协议 | HTTP | Ray 对象存储 |
 | 进程模型 | 每 worker 独立子进程 | 单进程多后端 | Java + Python worker | 每部署一个进程 | 分布式 Actor |
 
 ### 安装与依赖
@@ -108,6 +108,6 @@ lite-server 的性能优势来自：
 2. **零拷贝数据路径** — `Bytes` 共享缓冲区和 `Arc<RequestMeta>` 在热路径避免数据拷贝
 3. **DashMap 无锁并发** — 模型注册表和 pending 响应表使用并发哈希表代替互斥锁
 4. **自适应 batching** — 根据队列压力动态调整 batch 超时，高负载下立即派发
-5. **ZMQ/UDS IPC** — Unix 域套接字避免本地 worker 通信的 TCP 开销
+5. **ZMQ IPC** — Unix 上使用域套接字（UDS），Windows 上使用 TCP；Protobuf 序列化避免 JSON 开销
 
 详见 [benchmark.md](benchmark.md) 的实测性能数据。

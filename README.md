@@ -78,8 +78,8 @@ Available templates: `empty`, `llm`, `cv-classify`, `cv-detect`, `nlp`. Use `--w
   ┌─────────────────┐     ┌──────────────────┐
   │   Rust Core      │     │  Python Workers   │
   │  (axum/tokio)    │────►│  (subprocesses)   │
-  │                  │ZMQ  │                   │
-  │  ┌────────────┐  │/UDS │  ┌─────────────┐  │
+  │                  │ZMQ/ │                   │
+  │  ┌────────────┐  │Protobuf ┌─────────────┐│
   │  │ Inference  │  │     │  │  model.py   │  │
   │  │ Queue      │  │     │  │  (LitAPI)   │  │
   │  └────────────┘  │     │  └─────────────┘  │
@@ -107,11 +107,13 @@ See [docs/architecture.md](docs/architecture.md) for details.
 | Heartbeat + Respawn | ZMQ probe, auto-restart hung workers | No | No | No | No |
 | Lifecycle Hooks | Shell + HTTP callbacks | No | No | No | No |
 | Streaming | SSE + WebSocket + gRPC | Yes | No | Yes | Yes |
-| Min. Overhead | ~10MB | ~500MB | ~200MB | ~50MB | ~100MB |
+| Min. Overhead | ~15MB | ~500MB | ~200MB | ~50MB | ~100MB |
 
 See [docs/comparison.md](docs/comparison.md) for detailed analysis.
 
 ## Benchmarks
+
+> **Note:** The data below is a preliminary placeholder with limited data points. See [docs/benchmark.md](docs/benchmark.md) for context and reproduction steps.
 
 2-worker, 4-concurrency test (1ms CPU mock model):
 

@@ -44,12 +44,12 @@ endpoints_dir: ./endpoints     # 自定义 HTTP 端点目录（可选）
 
 features:
   timeline: false              # 启用历史指标时间线
-  system_overview: true        # 启用系统概览
-  custom_metrics: false        # 启用自定义用户指标
-  benchmarks: true             # 启用内置基准测试
-  playground: false            # 启用 API 沙盒
+  system_overview: true        # （预留 — 尚未实现）
+  custom_metrics: false        # （预留 — 尚未实现）
+  benchmarks: true             # （预留 — 尚未实现）
+  playground: false            # （预留 — 尚未实现）
   alerts: true                 # 启用告警引擎
-  version_compare: false       # 启用版本对比
+  version_compare: false       # （预留 — 尚未实现）
   streaming: true              # 启用流式端点
   grpc_streaming: true         # 启用 gRPC 流式
   sse: true                    # 启用 SSE 流式

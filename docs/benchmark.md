@@ -2,7 +2,9 @@
 
 [中文版](zh/benchmark.md)
 
-Performance comparison of lite-server vs LitServe using `wrk`.
+> **Note:** The benchmark data below is a preliminary placeholder with limited data points (2 worker configurations × 1 concurrency level). Comprehensive benchmarks covering more configurations, hardware platforms, and real model workloads are planned. Use as a rough reference only.
+
+Performance comparison of lite-server vs LitServe using `wrk` (preliminary data).
 
 ## Test Environment
 

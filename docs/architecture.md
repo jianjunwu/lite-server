@@ -27,7 +27,7 @@ lite-server is a hybrid Rust + Python inference server. The Rust core handles al
                           │  └──────────┘         │          │
                           └───────────────────────┼──────────┘
                                                   │
-                              ZMQ / UDS transport  │
+                           ZMQ / Protobuf IPC      │
                                                   ▼
                           ┌─────────────────────────────────┐
                           │       Python Workers             │
@@ -58,14 +58,14 @@ A single inference request follows this path:
    (least-loaded worker selected)
         │
         ▼
-5. Worker picks up request via ZMQ/UDS
+5. Worker picks up request via ZMQ
         │
         ▼
 6. Python worker executes:
    decode_request() → predict() → encode_response()
         │
         ▼
-7. Response sent back via ZMQ/UDS
+7. Response sent back via ZMQ
         │
         ▼
 8. Rust core returns HTTP response to client
@@ -116,15 +116,16 @@ When `stream: true` and model implements `stream_predict()`:
 | Inference Queue | `inference_queue.rs` | Per-model request queue, batch formation, worker dispatch |
 | Model Registry | `registry/` | Model/version lifecycle, hot reload, load policies |
 | Worker Manager | `worker/` | Worker process spawning, health monitoring, outlier detection |
-| Transport | `transport/` | ZMQ and UDS IPC between core and workers |
+| Transport | `transport/` | ZMQ IPC between core and workers (UDS on Unix, TCP on Windows) |
+| Streaming | `streaming/` | Protobuf streaming request builders (open/chunk/close/cancel) |
 | Metrics | `metrics/` | Prometheus metrics, timeline aggregation, alert engine |
-| Watcher | `server.rs` | File system watcher for hot reload |
 | Ensemble | `ensemble.rs` | DAG-based multi-model pipeline orchestration |
+| Callback | `callback.rs` | Server and inference lifecycle callbacks (Rust side) |
 | Config | `config.rs` | YAML config loading, CLI override application |
-| Server | `server.rs` | Main server lifecycle, graceful shutdown |
+| Server | `server.rs` | Main server lifecycle, graceful shutdown, file watching |
 | Endpoint Worker | `worker/endpoint_manager.rs` | Custom HTTP endpoint worker process management |
 
-**Custom Endpoints.** The Rust core spawns a dedicated Python endpoint worker that loads user-defined HTTP routes from the `endpoints/` directory or decorator-registered routes. The endpoint worker communicates with the Rust core via UDS (Unix domain socket) or TCP (Windows), using a length-prefixed JSON/Protobuf protocol. This isolates custom endpoint logic from inference workers.
+**Custom Endpoints.** The Rust core spawns a dedicated Python endpoint worker that loads user-defined HTTP routes from the `endpoints/` directory or decorator-registered routes. The endpoint worker communicates with the Rust core via UDS (Unix domain socket) or TCP (Windows), using a length-prefixed JSON protocol. This isolates custom endpoint logic from inference workers.
 
 ### Python Package (`python/`)
 
@@ -154,14 +155,14 @@ lite-server-core (main process)
 ```
 
 - Each worker is an independent Python subprocess
-- Workers communicate with the core via ZMQ or UDS
+- Workers communicate with the core via ZMQ PAIR sockets (UDS on Unix, TCP on Windows)
 - Workers are automatically restarted on crash
 - `max_requests` triggers periodic restart to prevent memory leaks
 - Outlier detection ejects unhealthy workers (Envoy-style consecutive error counting)
 
 ## IPC Protocol
 
-Workers communicate with the Rust core using ZeroMQ PAIR sockets with protobuf serialization.
+Workers communicate with the Rust core using ZeroMQ PAIR sockets with protobuf serialization. On Unix, the transport uses `ipc://` (Unix domain sockets); on Windows, it falls back to `tcp://127.0.0.1:<port>`. Custom endpoint workers use a separate length-prefixed JSON protocol over UDS (Unix) or TCP (Windows).
 
 ## Data Path
 
@@ -175,16 +176,16 @@ Rust: parse → Bytes (zero-copy reference)
 InferenceQueue: Arc<RequestMeta> (no data copy)
     │
     ▼
-ZMQ/UDS: bincode serialize → send to worker
+ZMQ: protobuf serialize → send to worker
     │
     ▼
-Python: bincode deserialize → decode_request() → predict() → encode_response()
+Python: protobuf deserialize → decode_request() → predict() → encode_response()
     │
     ▼
-ZMQ/UDS: bincode serialize → send back
+ZMQ: protobuf serialize → send back
     │
     ▼
-Rust: bincode deserialize → HTTP response
+Rust: protobuf deserialize → HTTP response
 ```
 
 The hot path avoids unnecessary data copies using `Bytes` (shared buffers) and `Arc<RequestMeta>` (shared metadata).

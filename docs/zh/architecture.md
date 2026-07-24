@@ -27,7 +27,7 @@ lite-server 是 Rust + Python 混合架构的推理服务器。Rust 内核处理
                           │  └──────────┘         │          │
                           └───────────────────────┼──────────┘
                                                   │
-                              ZMQ / UDS 传输       │
+                           ZMQ / Protobuf IPC      │
                                                   ▼
                           ┌─────────────────────────────────┐
                           │       Python Workers             │
@@ -58,14 +58,14 @@ lite-server 是 Rust + Python 混合架构的推理服务器。Rust 内核处理
    （选择最空闲的 worker）
         │
         ▼
-5. Worker 通过 ZMQ/UDS 获取请求
+5. Worker 通过 ZMQ 获取请求
         │
         ▼
 6. Python worker 执行：
    decode_request() → predict() → encode_response()
         │
         ▼
-7. 响应通过 ZMQ/UDS 返回
+7. 响应通过 ZMQ 返回
         │
         ▼
 8. Rust 内核返回 HTTP 响应给客户端
@@ -116,15 +116,16 @@ lite-server 是 Rust + Python 混合架构的推理服务器。Rust 内核处理
 | 推理队列 | `inference_queue.rs` | 每模型请求队列、batch 组装、worker 分发 |
 | 模型注册表 | `registry/` | 模型/版本生命周期、热重载、加载策略 |
 | Worker 管理器 | `worker/` | Worker 进程管理、健康监控、异常检测 |
-| 传输层 | `transport/` | ZMQ 和 UDS 进程间通信 |
+| 传输层 | `transport/` | ZMQ 进程间通信（Unix 上用 UDS，Windows 上用 TCP） |
+| 流式 | `streaming/` | Protobuf 流式请求构建器（open/chunk/close/cancel） |
 | 指标 | `metrics/` | Prometheus 指标、时间线聚合、告警引擎 |
-| 文件监听 | `server.rs` | 热重载文件系统监听器 |
 | Ensemble | `ensemble.rs` | DAG 多模型流水线编排 |
+| Callback | `callback.rs` | 服务器和推理生命周期回调（Rust 侧） |
 | 配置 | `config.rs` | YAML 配置加载、CLI 参数覆盖 |
-| 服务器 | `server.rs` | 主服务器生命周期、优雅关闭 |
+| 服务器 | `server.rs` | 主服务器生命周期、优雅关闭、文件监听 |
 | 端点 Worker | `worker/endpoint_manager.rs` | 自定义 HTTP 端点的 Worker 进程管理 |
 
-**自定义端点。** Rust 内核会启动一个独立的 Python 端点 Worker，从 `endpoints/` 目录或装饰器注册的路由加载用户自定义 HTTP 端点。端点 Worker 通过 UDS（Unix 域套接字）或 TCP（Windows）与 Rust 内核通信，使用长度前缀 JSON/Protobuf 协议。这样将自定义端点逻辑与推理 Worker 隔离。
+**自定义端点。** Rust 内核会启动一个独立的 Python 端点 Worker，从 `endpoints/` 目录或装饰器注册的路由加载用户自定义 HTTP 端点。端点 Worker 通过 UDS（Unix 域套接字）或 TCP（Windows）与 Rust 内核通信，使用长度前缀 JSON 协议。这样将自定义端点逻辑与推理 Worker 隔离。
 
 ### Python 包（`python/`）
 
@@ -154,7 +155,7 @@ lite-server-core（主进程）
 ```
 
 - 每个 worker 是独立的 Python 子进程
-- Worker 通过 ZMQ 或 UDS 与内核通信
+- Worker 通过 ZMQ PAIR 套接字与内核通信（Unix 上用 UDS，Windows 上用 TCP）
 - Worker 崩溃后自动重启
 - `max_requests` 触发定期重启防止内存泄漏
 - 异常检测剔除不健康 worker（Envoy 风格的连续错误计数）
@@ -163,7 +164,7 @@ lite-server-core（主进程）
 
 ## IPC 协议
 
-Worker 使用 ZeroMQ PAIR 套接字与 Rust 内核通信，协议为 protobuf 序列化。
+Worker 使用 ZeroMQ PAIR 套接字与 Rust 内核通信，序列化协议为 protobuf。Unix 上传输层使用 `ipc://`（Unix 域套接字），Windows 上回退到 `tcp://127.0.0.1:<port>`。自定义端点 Worker 使用独立的长度前缀 JSON 协议，通过 UDS（Unix）或 TCP（Windows）通信。
 
 ## 数据路径
 
@@ -177,16 +178,16 @@ Rust：解析 → Bytes（零拷贝引用）
 InferenceQueue：Arc<RequestMeta>（无数据拷贝）
     │
     ▼
-ZMQ/UDS：bincode 序列化 → 发送给 worker
+ZMQ：protobuf 序列化 → 发送给 worker
     │
     ▼
-Python：bincode 反序列化 → decode_request() → predict() → encode_response()
+Python：protobuf 反序列化 → decode_request() → predict() → encode_response()
     │
     ▼
-ZMQ/UDS：bincode 序列化 → 发回
+ZMQ：protobuf 序列化 → 发回
     │
     ▼
-Rust：bincode 反序列化 → HTTP 响应
+Rust：protobuf 反序列化 → HTTP 响应
 ```
 
 热路径使用 `Bytes`（共享缓冲区）和 `Arc<RequestMeta>`（共享元数据）避免不必要的数据拷贝。

@@ -2,7 +2,9 @@
 
 [English](../benchmark.md)
 
-lite-server 与 LitServe 的 `wrk` 性能对比。
+> **注意：** 以下基准数据为初步占位数据，仅包含有限的数据点（2 种 worker 配置 × 1 种并发级别）。涵盖更多配置、硬件平台和真实模型负载的全面基准测试正在计划中。仅供参考。
+
+lite-server 与 LitServe 的 `wrk` 性能对比（初步数据）。
 
 ## 测试环境
 
