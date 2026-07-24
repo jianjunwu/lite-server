@@ -895,7 +895,7 @@ class TestStreamFallbackMeta:
         captured_meta = []
 
         class FallbackAPI(EchoAPI):
-            def decode_request(self, request, ctx):
+            def decode_request(self, request, ctx: RequestContext | None = None):
                 captured_meta.append(ctx.meta)
                 return request
 

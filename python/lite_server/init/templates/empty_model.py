@@ -10,7 +10,7 @@ Declare a ``ctx`` parameter on ``decode_request``, ``predict``, and
 client_ip, request_id) and ``ctx.state`` (per-request scratch dict).
 """
 
-from lite_server import LitAPI
+from lite_server import LitAPI, RequestContext
 
 
 class MyAPI(LitAPI):
@@ -18,7 +18,7 @@ class MyAPI(LitAPI):
         """Load model weights and initialize state (always synchronous)."""
         self.model = lambda x: x * 2
 
-    async def decode_request(self, request, ctx):
+    async def decode_request(self, request, ctx: RequestContext | None = None):
         """Convert HTTP request JSON to model input.
 
         ``ctx`` provides:
@@ -30,7 +30,7 @@ class MyAPI(LitAPI):
         """
         return request.get("input", 0)
 
-    async def predict(self, x, ctx):
+    async def predict(self, x, ctx: RequestContext | None = None):
         """Run inference.  x is a list when batching is enabled.
 
         ``async def`` is the recommended default since 0.7.0 — ideal for
@@ -42,7 +42,7 @@ class MyAPI(LitAPI):
             return [self.model(item) for item in x]
         return self.model(x)
 
-    async def encode_response(self, output, ctx):
+    async def encode_response(self, output, ctx: RequestContext | None = None):
         """Convert model output to HTTP response JSON.
 
         Use ``ctx.respond(output, headers=...)`` to attach custom headers

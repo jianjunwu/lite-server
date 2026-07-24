@@ -783,7 +783,7 @@ class TestCtxInjection:
         captured = []
 
         class API(EchoAPI):
-            def decode_request(self, request, ctx):
+            def decode_request(self, request, ctx: RequestContext | None = None):
                 captured.append(ctx)
                 return {"prompt": request.get("q"), "uid": ctx.meta.request_id}
 
@@ -801,7 +801,7 @@ class TestCtxInjection:
         captured = []
 
         class API(EchoAPI):
-            def encode_response(self, output, ctx):
+            def encode_response(self, output, ctx: RequestContext | None = None):
                 captured.append(ctx.meta.route)
                 return {"result": output, "route": ctx.meta.route}
 
@@ -815,7 +815,7 @@ class TestCtxInjection:
         captured = []
 
         class API(EchoAPI):
-            def predict(self, x, ctx):
+            def predict(self, x, ctx: RequestContext | None = None):
                 captured.append(ctx.meta.request_id)
                 return {"echo": x, "req": ctx.meta.request_id}
 
@@ -829,11 +829,11 @@ class TestCtxInjection:
         """Keyword-only 'ctx' parameter (e.g. `*, ctx`) is supported."""
 
         class API(EchoAPI):
-            def decode_request(self, request, *, ctx):
+            def decode_request(self, request, *, ctx: RequestContext | None = None):
                 ctx.state["from_decode"] = True
                 return request
 
-            def predict(self, x, *, ctx):
+            def predict(self, x, *, ctx: RequestContext | None = None):
                 assert ctx.state["from_decode"] is True
                 return x
 
@@ -848,7 +848,7 @@ class TestCtxInjection:
                 ctx.state["user"] = "alice"
                 return ctx.request
 
-            def decode_request(self, request, ctx):
+            def decode_request(self, request, ctx: RequestContext | None = None):
                 return {"user": ctx.state["user"], **request}
 
             def predict(self, x):
@@ -898,7 +898,7 @@ class TestCtxForbidden:
             def unbatch(self, output):
                 return output
 
-            def predict(self, x, ctx):
+            def predict(self, x, ctx: RequestContext | None = None):
                 return x
 
         with pytest.raises(RuntimeError, match="predict.*ctx.*batch"):
