@@ -97,6 +97,21 @@ pub async fn health_handler() -> impl IntoResponse {
     "ok"
 }
 
+// ===== OPTIONS preflight for inference routes =====
+
+pub async fn inference_options_handler(
+    State(state): State<Arc<AppState>>,
+    Path(model_name): Path<String>,
+) -> Response {
+    use axum::http::StatusCode;
+    match state.registry.active_cors_policy(&model_name) {
+        Some(policy) => {
+            (StatusCode::NO_CONTENT, cors_header_map(&policy)).into_response()
+        }
+        None => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+    }
+}
+
 // ===== Info =====
 
 pub async fn info_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -494,6 +509,28 @@ const BLOCKED_RESPONSE_HEADERS: &[&str] = &[
     "upgrade",
 ];
 
+/// Build a CORS header map from a CorsPolicy.
+fn cors_header_map(policy: &crate::worker::protocol::CorsPolicy) -> axum::http::HeaderMap {
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+    let mut headers = HeaderMap::new();
+    let _ = HeaderValue::from_str(&policy.allow_origins.join(", ")).map(|v| {
+        headers.insert(HeaderName::from_static("access-control-allow-origin"), v)
+    });
+    let _ = HeaderValue::from_str(&policy.allow_methods.join(", ")).map(|v| {
+        headers.insert(
+            HeaderName::from_static("access-control-allow-methods"),
+            v,
+        )
+    });
+    let _ = HeaderValue::from_str(&policy.allow_headers.join(", ")).map(|v| {
+        headers.insert(
+            HeaderName::from_static("access-control-allow-headers"),
+            v,
+        )
+    });
+    headers
+}
+
 fn inject_response_headers(
     builder: axum::http::response::Builder,
     headers: &std::collections::HashMap<String, String>,
@@ -537,6 +574,22 @@ async fn do_infer(
     // Get model version info
     let mv = state.registry.get(&model_name, Some(&resolved_version))
         .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", model_name, resolved_version)))?;
+
+    // Rate limit check (before ensemble, after mv resolution)
+    if let Some(ref rl) = mv.policies.rate_limit {
+        let scope = match rl.key.as_str() {
+            "ip" => extract_client_ip(&headers),
+            _ => route.clone(),
+        };
+        let burst = rl.burst.unwrap_or(rl.requests_per_minute * 1.5);
+        let key = format!("{}:{}", model_name, scope);
+        match state.rate_limiter.acquire(&key, rl.requests_per_minute, burst).await {
+            crate::rate_limit::AcquireResult::Rejected { retry_after_secs } => {
+                return Err(AppError::RateLimitExceeded { retry_after_secs });
+            }
+            crate::rate_limit::AcquireResult::Allowed => {}
+        }
+    }
 
     // Handle ensemble
     if mv.model_type == ModelType::Ensemble {
@@ -1159,8 +1212,13 @@ pub async fn custom_endpoint_handler(
         })
         .unwrap_or_default();
 
-    // Extract headers
+    // Extract headers + client IP before consuming the request body
     let mut headers = HashMap::new();
+    let client_ip = extract_client_ip(request.headers());
+    let timestamp_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
     for (key, value) in request.headers() {
         if let Ok(v) = value.to_str() {
             headers.insert(key.to_string(), v.to_string());
@@ -1186,6 +1244,25 @@ pub async fn custom_endpoint_handler(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // Rate limit check for custom endpoints
+    if let Some(rl) = ep_mgr
+        .rate_limit_policy(&route)
+        .await
+    {
+        let scope = match rl.key.as_str() {
+            "ip" => client_ip.clone(),
+            _ => route.clone(),
+        };
+        let burst = rl.burst.unwrap_or(rl.requests_per_minute * 1.5);
+        let key = format!("ep:{}", scope);
+        match state.rate_limiter.acquire(&key, rl.requests_per_minute, burst).await {
+            crate::rate_limit::AcquireResult::Rejected { retry_after_secs } => {
+                return Err(AppError::RateLimitExceeded { retry_after_secs });
+            }
+            crate::rate_limit::AcquireResult::Allowed => {}
+        }
+    }
+
     let snapshot = ep_mgr.build_snapshot().await;
 
     let req = crate::worker::protocol::EndpointRequest {
@@ -1196,6 +1273,8 @@ pub async fn custom_endpoint_handler(
         query,
         body,
         server_state: snapshot,
+        client_ip,
+        timestamp_ns,
     };
 
     if is_stream {
@@ -1632,6 +1711,7 @@ mod upload_download_tests {
             repo_path,
             callback_runner,
             Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::rate_limit::RateLimiter::new()),
         ))
     }
 

@@ -2,6 +2,7 @@ use crate::error::AppError;
 use crate::registry::ModelRegistry;
 use crate::worker::protocol::{EndpointRequest, EndpointResponse, EndpointRoute, EndpointStartup};
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -12,6 +13,26 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::timeout;
 use tracing::{info, warn};
 
+/// Convert Python `{param}` placeholders to axum `:param` syntax.
+fn convert_path_params(route: &str) -> String {
+    let mut result = String::with_capacity(route.len());
+    let mut chars = route.chars();
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            result.push(':');
+            for c2 in chars.by_ref() {
+                if c2 == '}' {
+                    break;
+                }
+                result.push(c2);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 const ENDPOINT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Manages the custom endpoint Python subprocess.
@@ -21,6 +42,10 @@ pub struct EndpointManager {
     uds_path: PathBuf,
     process: RwLock<Option<EndpointProcess>>,
     routes: RwLock<Vec<EndpointRoute>>,
+    /// Per-route policies keyed by axum-form route (e.g. "/pets/:id").
+    route_policies: RwLock<
+        HashMap<String, (Option<crate::worker::protocol::RateLimitPolicy>, Option<crate::worker::protocol::CorsPolicy>)>,
+    >,
     /// Prevents concurrent restarts from multiple requests.
     restart_lock: Mutex<()>,
 }
@@ -39,8 +64,27 @@ impl EndpointManager {
             uds_path,
             process: RwLock::new(None),
             routes: RwLock::new(Vec::new()),
+            route_policies: RwLock::new(HashMap::new()),
             restart_lock: Mutex::new(()),
         }
+    }
+
+    /// Look up the RateLimit policy for a route (axum-form key).
+    pub async fn rate_limit_policy(
+        &self,
+        route: &str,
+    ) -> Option<crate::worker::protocol::RateLimitPolicy> {
+        let policies = self.route_policies.read().await;
+        policies.get(route).and_then(|(rl, _)| rl.clone())
+    }
+
+    /// Look up the Cors policy for a route (axum-form key).
+    pub async fn cors_policy(
+        &self,
+        route: &str,
+    ) -> Option<crate::worker::protocol::CorsPolicy> {
+        let policies = self.route_policies.read().await;
+        policies.get(route).and_then(|(_, c)| c.clone())
     }
 
     pub async fn start(&self) -> Result<(), AppError> {
@@ -326,9 +370,18 @@ impl EndpointManager {
             proto_ver
         );
 
-        // Store routes
+        // Store routes + per-route policies (axum-form keys)
         {
             let mut routes = self.routes.write().await;
+            let mut policies = self.route_policies.write().await;
+            policies.clear();
+            for ep in &startup.routes {
+                let axum_route = convert_path_params(&ep.route);
+                policies.insert(
+                    axum_route,
+                    (ep.rate_limit.clone(), ep.cors.clone()),
+                );
+            }
             *routes = startup.routes;
         }
 

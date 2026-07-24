@@ -96,6 +96,7 @@ impl ModelRegistry {
             model_type,
             model_dir,
             workers: vec![],
+            policies: Default::default(),
         };
         entry.versions.insert(version.to_string(), mv);
         Ok(())
@@ -220,6 +221,42 @@ impl ModelRegistry {
         }
 
         Ok(())
+    }
+
+    pub fn set_policies(
+        &self,
+        model_name: &str,
+        version: &str,
+        policies: Option<crate::worker::protocol::ModelPolicies>,
+    ) {
+        if let Some(p) = policies {
+            let _key = format!("{}/{}", model_name, version);
+            if let Some(mut entry) = self.models.get_mut(model_name) {
+                if let Some(mv) = entry.versions.get_mut(version) {
+                    mv.policies = p;
+                }
+            }
+        }
+    }
+
+    pub fn active_cors_policy(
+        &self,
+        model_name: &str,
+    ) -> Option<crate::worker::protocol::CorsPolicy> {
+        let active_version = self.active_versions.get(model_name)?;
+        let model = self.models.get(model_name)?;
+        let mv = model.versions.get(active_version.value())?;
+        mv.policies.cors.clone()
+    }
+
+    pub fn active_rate_limit_policy(
+        &self,
+        model_name: &str,
+    ) -> Option<crate::worker::protocol::RateLimitPolicy> {
+        let active_version = self.active_versions.get(model_name)?;
+        let model = self.models.get(model_name)?;
+        let mv = model.versions.get(active_version.value())?;
+        mv.policies.rate_limit.clone()
     }
 
     pub fn set_strategy(

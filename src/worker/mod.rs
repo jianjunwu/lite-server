@@ -382,6 +382,10 @@ impl WorkerManager {
             crate::metrics::prometheus::register_custom_metrics(&spec_refs);
         }
 
+        // Store RateLimit / Cors policies from the worker handshake
+        self.registry
+            .set_policies(model_name, version, startup.policies);
+
         info!("Worker {} for {} v{} respawned (pid={:?})", worker_id, model_name, version, child.id());
 
         // Fire on_ready lifecycle hook
@@ -702,6 +706,10 @@ impl WorkerManager {
                     .collect();
                 crate::metrics::prometheus::register_custom_metrics(&spec_refs);
             }
+
+            // Store RateLimit / Cors policies from the worker handshake
+            self.registry
+                .set_policies(model_name, version, startup.policies);
 
             info!("Worker {} for {} v{} ready (pid={:?})", worker_id, model_name, version, child.id());
 
@@ -1278,6 +1286,9 @@ fn new_worker_command(python_module_dir: &str) -> Command {
         };
         cmd.env("PYTHONPATH", new_pythonpath);
     }
+    // Signal the Python side that Rust manages RateLimit/Cors policies —
+    // prevents double-execution (Python on_request becomes a declaration-only no-op).
+    cmd.env("LITE_POLICY_MANAGED", "1");
     cmd.kill_on_drop(true);
     cmd
 }

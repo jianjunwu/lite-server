@@ -69,6 +69,10 @@ pub enum AppError {
     #[error("invalid query parameter: {0}")]
     InvalidQueryParam(String),
 
+    /// Rate limit exceeded — HTTP 429 with Retry-After header.
+    #[error("rate limit exceeded")]
+    RateLimitExceeded { retry_after_secs: u64 },
+
     /// Model-initiated error with explicit HTTP status and client-facing message.
     /// Unlike WorkerCrashed, the message is NOT sanitized — the model author
     /// intentionally exposes it.
@@ -105,6 +109,7 @@ impl AppError {
             AppError::MethodNotAllowed => "method not allowed",
             AppError::InvalidRequestBody(_) => "invalid request body",
             AppError::InvalidQueryParam(_) => "invalid query parameter",
+            AppError::RateLimitExceeded { .. } => "rate limit exceeded",
             // ModelError is handled specially in IntoResponse
             // and never reaches this point, but provide a fallback.
             AppError::ModelError { .. } => "model error",
@@ -144,6 +149,7 @@ impl AppError {
             AppError::MethodNotAllowed => "method_not_allowed",
             AppError::InvalidRequestBody(_) => "invalid_request_body",
             AppError::InvalidQueryParam(_) => "invalid_query_param",
+            AppError::RateLimitExceeded { .. } => "rate_limit_exceeded",
             // ModelError code comes from the Python worker; fallback to its error_type
             AppError::ModelError { code, error_type, .. } => {
                 code.as_deref().unwrap_or(error_type.as_str())
@@ -212,6 +218,7 @@ impl IntoResponse for AppError {
             AppError::MethodNotAllowed => (StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),
             AppError::InvalidRequestBody(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
             AppError::InvalidQueryParam(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
+            AppError::RateLimitExceeded { .. } => (StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded"),
             // Handled above via early return; should never reach here.
             AppError::ModelError { .. } => unreachable!(),
         };
@@ -237,6 +244,15 @@ impl IntoResponse for AppError {
                 "retry-after",
                 axum::http::HeaderValue::from_static("1"),
             );
+        }
+
+        // Add Retry-After header for 429 responses (rate limit)
+        if let AppError::RateLimitExceeded { retry_after_secs } = &self {
+            if let Ok(val) = axum::http::HeaderValue::from_str(
+                &retry_after_secs.to_string(),
+            ) {
+                response.headers_mut().insert("retry-after", val);
+            }
         }
 
         response

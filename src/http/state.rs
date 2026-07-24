@@ -2,6 +2,7 @@ use crate::callback::CallbackRunner;
 use crate::config::Config;
 use crate::inference_queue::InferenceQueue;
 use crate::metrics::aggregator::{AlertEngine, AlertThresholds};
+use crate::rate_limit::RateLimiter;
 use crate::registry::ModelRegistry;
 use crate::server::ShutdownState;
 use crate::worker::WorkerManager;
@@ -22,6 +23,7 @@ pub struct AppState {
     pub shutdown_state: Arc<ShutdownState>,
     pub callback_runner: Arc<CallbackRunner>,
     pub has_hot_reload: Arc<AtomicBool>,
+    pub rate_limiter: Arc<RateLimiter>,
 }
 
 impl AppState {
@@ -34,6 +36,7 @@ impl AppState {
         repo_path: PathBuf,
         callback_runner: Arc<CallbackRunner>,
         has_hot_reload: Arc<AtomicBool>,
+        rate_limiter: Arc<RateLimiter>,
     ) -> Self {
         Self {
             registry,
@@ -46,6 +49,7 @@ impl AppState {
             shutdown_state: Arc::new(ShutdownState::new()),
             callback_runner,
             has_hot_reload,
+            rate_limiter,
         }
     }
 }

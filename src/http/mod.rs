@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::info;
 use uuid::Uuid;
 
@@ -118,7 +118,23 @@ pub async fn start_http_server(
     has_hot_reload: Arc<AtomicBool>,
 ) -> Result<(), AppError> {
     let repo_path = PathBuf::from(&config.model_repository.path);
-    let mut state = AppState::new(registry, worker_manager, inference_queue, endpoint_manager, config.clone(), repo_path, callback_runner, has_hot_reload);
+    let rate_limiter = Arc::new(crate::rate_limit::RateLimiter::new());
+    let mut state = AppState::new(registry, worker_manager, inference_queue, endpoint_manager, config.clone(), repo_path, callback_runner, has_hot_reload, rate_limiter.clone());
+
+    // Background cleanup: evict stale rate-limit buckets every 60s
+    {
+        let limiter = rate_limiter.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                let removed = limiter.cleanup_stale(Duration::from_secs(600));
+                if removed > 0 {
+                    tracing::debug!(removed, "rate limiter: evicted stale buckets");
+                }
+            }
+        });
+    }
     state.shutdown_state = shutdown_state;
 
     let app = create_routes(state, endpoint_routes);

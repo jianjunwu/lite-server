@@ -1,5 +1,6 @@
 pub mod callback;
 pub mod config;
+pub mod rate_limit;
 pub mod ensemble;
 pub mod error;
 pub mod grpc;

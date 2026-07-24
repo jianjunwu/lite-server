@@ -45,6 +45,8 @@ pub struct ModelVersion {
     pub model_type: ModelType,
     pub model_dir: PathBuf,
     pub workers: Vec<WorkerInfo>,
+    #[serde(default)]
+    pub policies: crate::worker::protocol::ModelPolicies,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

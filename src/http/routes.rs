@@ -3,7 +3,7 @@ use crate::http::handlers::*;
 use crate::http::state::AppState;
 use crate::worker::protocol::EndpointRoute;
 use axum::{
-    routing::{delete, get, post},
+    routing::{delete, get, options, post},
     Router,
 };
 use std::sync::Arc;
@@ -92,11 +92,11 @@ pub fn create_routes(state: AppState, endpoint_routes: Vec<EndpointRoute>) -> Ro
         // Admin: activate version
         .route("/v2/models/:model_name/versions/:version/activate", post(activate_version_handler))
         // Inference
-        .route("/v2/models/:model_name/infer", post(infer_handler))
-        .route("/v2/models/:model_name/versions/:version/infer", post(infer_version_handler))
+        .route("/v2/models/:model_name/infer", post(infer_handler).options(inference_options_handler))
+        .route("/v2/models/:model_name/versions/:version/infer", post(infer_version_handler).options(inference_options_handler))
         // SSE streaming
-        .route("/v2/models/:model_name/events", post(sse_infer_handler))
-        .route("/v2/models/:model_name/versions/:version/events", post(sse_infer_version_handler))
+        .route("/v2/models/:model_name/events", post(sse_infer_handler).options(inference_options_handler))
+        .route("/v2/models/:model_name/versions/:version/events", post(sse_infer_version_handler).options(inference_options_handler))
         // WebSocket streaming
         .route("/v2/models/:model_name/stream", get(ws_stream_handler))
         .route("/v2/models/:model_name/versions/:version/stream", get(ws_stream_version_handler));
@@ -123,8 +123,8 @@ pub fn create_routes(state: AppState, endpoint_routes: Vec<EndpointRoute>) -> Ro
 
     // Register custom endpoint routes
     for ep in endpoint_routes {
-        for method in ep.methods {
-            let route = convert_path_params(&ep.route);
+        let route = convert_path_params(&ep.route);
+        for method in &ep.methods {
             let method_upper = method.to_uppercase();
             router = match method_upper.as_str() {
                 "GET" => router.route(&route, get(custom_endpoint_handler)),
@@ -132,6 +132,10 @@ pub fn create_routes(state: AppState, endpoint_routes: Vec<EndpointRoute>) -> Ro
                 "DELETE" => router.route(&route, delete(custom_endpoint_handler)),
                 _ => router.route(&route, get(custom_endpoint_handler)),
             };
+        }
+        // If the endpoint declares CORS, register an OPTIONS handler
+        if ep.cors.is_some() {
+            router = router.route(&route, options(custom_endpoint_handler));
         }
     }
 

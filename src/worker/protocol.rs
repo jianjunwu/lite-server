@@ -120,20 +120,11 @@ pub struct WorkerStartup {
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metric_specs: Option<Vec<MetricSpec>>,
+    #[serde(default)]
+    pub policies: Option<ModelPolicies>,
 }
 
 // ===== Endpoint Protocol =====
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EndpointRequest {
-    pub request_id: String,
-    pub route: String,
-    pub method: String,
-    pub headers: HashMap<String, String>,
-    pub query: HashMap<String, String>,
-    pub body: Option<serde_json::Value>,
-    pub server_state: ServerSnapshot,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerSnapshot {
@@ -168,6 +159,55 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[PROTOCOL_VERSION_V0, PROTOCOL
 pub struct EndpointRoute {
     pub route: String,
     pub methods: Vec<String>,
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitPolicy>,
+    #[serde(default)]
+    pub cors: Option<CorsPolicy>,
+}
+
+// ===== Policy structures (Python → Rust handshake) =====
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitPolicy {
+    pub requests_per_minute: f64,
+    #[serde(default = "default_rl_key")]
+    pub key: String, // "route" | "ip"
+    #[serde(default)]
+    pub burst: Option<f64>, // None → 1.5× rpm
+}
+
+fn default_rl_key() -> String {
+    "route".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorsPolicy {
+    pub allow_origins: Vec<String>,
+    pub allow_methods: Vec<String>,
+    pub allow_headers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelPolicies {
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitPolicy>,
+    #[serde(default)]
+    pub cors: Option<CorsPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EndpointRequest {
+    pub request_id: String,
+    pub route: String,
+    pub method: String,
+    pub headers: HashMap<String, String>,
+    pub query: HashMap<String, String>,
+    pub body: Option<serde_json::Value>,
+    pub server_state: ServerSnapshot,
+    #[serde(default)]
+    pub client_ip: String,
+    #[serde(default)]
+    pub timestamp_ns: u64,
 }
 
 #[cfg(test)]
@@ -268,6 +308,8 @@ mod tests {
                 loaded_models: vec![],
                 config: json!({}),
             },
+            client_ip: "127.0.0.1".to_string(),
+            timestamp_ns: 0,
         };
         let json_str = serde_json::to_string(&req).unwrap();
         assert!(json_str.contains("stream"));
