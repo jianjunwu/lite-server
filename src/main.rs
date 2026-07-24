@@ -12,6 +12,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // clap subcommand enums are intentionally flat arg structs
 enum Commands {
     /// Start the inference server
     Serve {

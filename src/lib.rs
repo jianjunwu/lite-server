@@ -22,31 +22,62 @@ pub mod worker;
 use pyo3::prelude::*;
 use tracing::info;
 
+/// CLI overrides grouped to keep `run_server`'s signature readable
+/// (clippy::too_many_arguments). Mirrors the `serve()` pyo3 kwargs.
+pub struct ServerOptions {
+    pub config: Option<String>,
+    pub port: Option<u16>,
+    pub host: Option<String>,
+    pub model_repo: Option<String>,
+    pub endpoints_dir: Option<String>,
+    pub threads: Option<usize>,
+    pub timeout: Option<f32>,
+    pub log_level: Option<String>,
+    pub log_info_output: Option<String>,
+    pub log_error_output: Option<String>,
+    pub log_rotation: Option<String>,
+    pub metrics_port: Option<u16>,
+    pub no_metrics: Option<bool>,
+    pub grpc_port: Option<u16>,
+    pub no_grpc: Option<bool>,
+    pub no_streaming_metrics: Option<bool>,
+    pub max_queue_size: Option<usize>,
+    pub max_requests: Option<usize>,
+    pub max_requests_jitter: Option<usize>,
+    pub request_timeout: Option<f32>,
+    pub health_check_interval: Option<f32>,
+    pub graceful_timeout: Option<f32>,
+    pub keepalive_timeout: Option<f32>,
+}
+
 pub fn run_server(
-    config: Option<String>,
-    port: Option<u16>,
-    host: Option<String>,
-    model_repo: Option<String>,
-    endpoints_dir: Option<String>,
-    threads: Option<usize>,
-    timeout: Option<f32>,
-    log_level: Option<String>,
-    log_info_output: Option<String>,
-    log_error_output: Option<String>,
-    log_rotation: Option<String>,
-    metrics_port: Option<u16>,
-    no_metrics: Option<bool>,
-    grpc_port: Option<u16>,
-    no_grpc: Option<bool>,
-    no_streaming_metrics: Option<bool>,
-    max_queue_size: Option<usize>,
-    max_requests: Option<usize>,
-    max_requests_jitter: Option<usize>,
-    request_timeout: Option<f32>,
-    health_check_interval: Option<f32>,
-    graceful_timeout: Option<f32>,
-    keepalive_timeout: Option<f32>,
+    opts: ServerOptions,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ServerOptions {
+        config,
+        port,
+        host,
+        model_repo,
+        endpoints_dir,
+        threads,
+        timeout,
+        log_level,
+        log_info_output,
+        log_error_output,
+        log_rotation,
+        metrics_port,
+        no_metrics,
+        grpc_port,
+        no_grpc,
+        no_streaming_metrics,
+        max_queue_size,
+        max_requests,
+        max_requests_jitter,
+        request_timeout,
+        health_check_interval,
+        graceful_timeout,
+        keepalive_timeout,
+    } = opts;
     let mut cfg = if let Some(config_path) = config {
         config::load_config(&config_path)?
     } else {
@@ -176,13 +207,13 @@ fn serve(
 ) -> PyResult<()> {
     pyo3::Python::with_gil(|py| {
         py.allow_threads(|| {
-            run_server(
+            run_server(ServerOptions {
                 config, port, host, model_repo, endpoints_dir, threads, timeout, log_level,
                 log_info_output, log_error_output, log_rotation,
                 metrics_port, no_metrics, grpc_port, no_grpc, no_streaming_metrics,
                 max_queue_size, max_requests, max_requests_jitter, request_timeout,
                 health_check_interval, graceful_timeout, keepalive_timeout,
-            )
+            })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })
     })
