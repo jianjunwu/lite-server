@@ -1449,6 +1449,7 @@ async fn custom_endpoint_impl(
         server_state: snapshot,
         client_ip,
         timestamp_ns,
+        route_pattern: route_pattern.clone(),
     };
 
     if is_stream {

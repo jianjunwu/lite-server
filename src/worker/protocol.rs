@@ -208,6 +208,11 @@ pub struct EndpointRequest {
     pub client_ip: String,
     #[serde(default)]
     pub timestamp_ns: u64,
+    /// Matched axum route pattern (e.g. "/pets/:id") so the Python side can
+    /// dispatch parameterized routes whose declared path uses `{id}`. Empty
+    /// when no matched pattern is available (old clients omit it via default).
+    #[serde(default)]
+    pub route_pattern: String,
 }
 
 #[cfg(test)]
@@ -296,6 +301,15 @@ mod tests {
     }
 
     #[test]
+    fn test_endpoint_request_route_pattern_defaults_when_absent() {
+        // Backward compat: old workers omit route_pattern; #[serde(default)]
+        // must decode it to an empty string rather than rejecting the frame.
+        let json_str = r#"{"request_id":"r","route":"/x","method":"GET","headers":{},"query":{},"body":null,"server_state":{"loaded_models":[],"config":{}}}"#;
+        let decoded: EndpointRequest = serde_json::from_str(json_str).unwrap();
+        assert_eq!(decoded.route_pattern, "");
+    }
+
+    #[test]
     fn test_endpoint_request_serde() {
         let req = EndpointRequest {
             request_id: "r1".to_string(),
@@ -310,6 +324,7 @@ mod tests {
             },
             client_ip: "127.0.0.1".to_string(),
             timestamp_ns: 0,
+            route_pattern: "/v1/chat/:completions".to_string(),
         };
         let json_str = serde_json::to_string(&req).unwrap();
         assert!(json_str.contains("stream"));
@@ -317,6 +332,7 @@ mod tests {
 
         let decoded: EndpointRequest = serde_json::from_str(&json_str).unwrap();
         assert_eq!(decoded.request_id, "r1");
+        assert_eq!(decoded.route_pattern, "/v1/chat/:completions");
         let body = decoded.body.unwrap();
         assert_eq!(body["stream"], true);
     }
