@@ -18,9 +18,11 @@ import time
 
 import pytest
 
-from lite_server.api import BidiStreamHandler, LitAPI, RequestMeta, ResponseWithHeaders
+from lite_server.api import BidiStreamHandler, LitAPI
 from lite_server.callback import Callback
+from lite_server.context import Headers, RequestContext, RequestMeta
 from lite_server.pipeline import Pipeline
+from lite_server.response import Response as LiteResponse
 from lite_server.proto import (
     BatchItem,
     BatchRequest,
@@ -122,8 +124,8 @@ def run_single(model, data=None, meta=None, callbacks=()):
         data = json.dumps({"input": 5}).encode()
     if meta is None:
         meta = RequestMeta(
-            route="/predict", headers={}, client_ip="",
-            request_id="", timestamp_ns=0, payload=None,
+            route="/predict", headers=Headers(), client_ip="",
+            request_id="", timestamp_ns=0,
         )
     pipe = Pipeline.build(model, list(callbacks))
     return asyncio.run(pipe.run_single(data, meta))
@@ -329,9 +331,9 @@ class TestRunSingle:
 
     def test_on_request_hook_can_modify(self):
         class HookAPI(LitAPI):
-            def on_request(self, request, meta):
-                request["input"] = request["input"] + 1
-                return request
+            def on_request(self, ctx):
+                ctx.request["input"] = ctx.request["input"] + 1
+                return ctx.request
 
             def predict(self, x):
                 return {"output": x["input"] * 2}
@@ -341,7 +343,7 @@ class TestRunSingle:
 
     def test_on_request_hook_can_reject(self):
         class RejectAPI(LitAPI):
-            def on_request(self, request, meta):
+            def on_request(self, ctx):
                 raise ValueError("rejected")
 
             def predict(self, x):
@@ -363,9 +365,10 @@ class TestRunSingle:
             def predict(self, x):
                 return {"output": x.get("input", 0) * 2}
 
-            def on_response(self, response, meta):
-                return ResponseWithHeaders(
-                    body=response, headers={"X-Custom": "hello", "X-Other": "world"}
+            def on_response(self, ctx):
+                return ctx.respond(
+                    ctx.response,
+                    headers={"X-Custom": "hello", "X-Other": "world"},
                 )
 
         resp_bytes, status, metrics, headers = run_single(HeaderAPI())
@@ -373,13 +376,54 @@ class TestRunSingle:
         assert status.code == "Ok"
         assert headers == {"X-Custom": "hello", "X-Other": "world"}
 
-    def test_on_response_plain_body_returns_none_headers(self):
+    def test_async_on_response_with_headers(self):
+        class AsyncHeaderAPI(LitAPI):
+            async def predict(self, x):
+                return {"output": x.get("input", 0) * 2}
+
+            async def on_response(self, ctx):
+                return ctx.respond(
+                    ctx.response, headers={"X-Async": "true"},
+                )
+
+        resp_bytes, status, metrics, headers = run_single(AsyncHeaderAPI())
+        assert json.loads(resp_bytes) == {"output": 10}
+        assert headers == {"X-Async": "true"}
+
+    def test_async_predict_with_optional_hooks(self):
+        class SimpleAsyncAPI(LitAPI):
+            async def predict(self, x):
+                return {"output": x["input"] * 3}
+
+        resp_bytes, status, metrics, _ = run_single(SimpleAsyncAPI())
+        assert json.loads(resp_bytes) == {"output": 15}
+        assert status.code == "Ok"
+
+    def test_mixed_sync_async_hooks(self):
+        class MixedAPI(LitAPI):
+            async def on_request(self, ctx):
+                ctx.request["hooked"] = True
+                return ctx.request
+
+            async def predict(self, x):
+                return x
+
+            def on_response(self, ctx):
+                ctx.response["sync_hook"] = True
+                return ctx.response
+
+        resp_bytes, status, metrics, _ = run_single(
+            MixedAPI(), data=json.dumps({"input": 1}).encode()
+        )
+        assert json.loads(resp_bytes) == {"input": 1, "hooked": True, "sync_hook": True}
+
+    def test_async_predict_without_optional_hooks(self):
         class PlainAPI(LitAPI):
             def predict(self, x):
                 return {"output": x.get("input", 0) * 2}
 
-            def on_response(self, response, meta):
-                return {"wrapped": response}
+            def on_response(self, ctx):
+                return {"wrapped": ctx.response}
 
         resp_bytes, status, metrics, headers = run_single(PlainAPI())
         assert json.loads(resp_bytes) == {"wrapped": {"output": 10}}
@@ -399,9 +443,9 @@ class TestRunSingle:
             async def decode_request(self, req):
                 return {"decoded": req["input"]}
 
-            async def on_request(self, req, meta):
-                req["on_request"] = True
-                return req
+            async def on_request(self, ctx):
+                ctx.request["on_request"] = True
+                return ctx.request
 
             async def predict(self, x):
                 return {"output": x["decoded"] * 2}
@@ -409,54 +453,13 @@ class TestRunSingle:
             async def encode_response(self, out):
                 return {"encoded": out["output"]}
 
-            async def on_response(self, resp, meta):
-                resp["on_response"] = True
-                return resp
+            async def on_response(self, ctx):
+                ctx.response["on_response"] = True
+                return ctx.response
 
         resp_bytes, status, metrics, _ = run_single(AsyncAPI())
         assert json.loads(resp_bytes) == {"encoded": 10, "on_response": True}
         assert status.code == "Ok"
-
-    def test_async_predict_without_optional_hooks(self):
-        class SimpleAsyncAPI(LitAPI):
-            async def predict(self, x):
-                return {"output": x["input"] * 3}
-
-        resp_bytes, status, metrics, _ = run_single(SimpleAsyncAPI())
-        assert json.loads(resp_bytes) == {"output": 15}
-        assert status.code == "Ok"
-
-    def test_mixed_sync_async_hooks(self):
-        class MixedAPI(LitAPI):
-            async def on_request(self, req, meta):
-                req["hooked"] = True
-                return req
-
-            async def predict(self, x):
-                return x
-
-            def on_response(self, resp, meta):
-                resp["sync_hook"] = True
-                return resp
-
-        resp_bytes, status, metrics, _ = run_single(
-            MixedAPI(), data=json.dumps({"input": 1}).encode()
-        )
-        assert json.loads(resp_bytes) == {"input": 1, "hooked": True, "sync_hook": True}
-
-    def test_async_on_response_with_headers(self):
-        class AsyncHeaderAPI(LitAPI):
-            async def predict(self, x):
-                return {"output": x.get("input", 0) * 2}
-
-            async def on_response(self, response, meta):
-                return ResponseWithHeaders(
-                    body=response, headers={"X-Async": "true"}
-                )
-
-        resp_bytes, status, metrics, headers = run_single(AsyncHeaderAPI())
-        assert json.loads(resp_bytes) == {"output": 10}
-        assert headers == {"X-Async": "true"}
 
 
 class TestOuterHandlerErrorTraceback:
@@ -604,22 +607,22 @@ class TestMetaFromProto:
             client_ip="127.0.0.1",
             request_id="req-1",
             timestamp_ns=123456789,
-            payload=b'{"extra": true}',
         )
         meta = inference._meta_from_proto(meta_pb)
         assert meta.route == "/predict"
-        assert meta.headers == {"x-auth": "token"}
+        assert meta.headers.get("x-auth") == "token"
         assert meta.client_ip == "127.0.0.1"
         assert meta.request_id == "req-1"
         assert meta.timestamp_ns == 123456789
-        assert meta.payload == {"extra": True}
+        assert not hasattr(meta, "payload")
 
-    def test_empty_payload(self):
+    def test_empty_meta(self):
         from lite_server.proto import RequestMeta as ProtoMeta
 
         meta_pb = ProtoMeta(route="/", headers={}, client_ip="", request_id="", timestamp_ns=0)
         meta = inference._meta_from_proto(meta_pb)
-        assert meta.payload is None
+        assert meta.route == "/"
+        assert meta.request_id == ""
 
 
 class TestStdoutProtection:
@@ -1183,10 +1186,9 @@ class TestBatchPredict:
                         content="<p>ok</p>", media_type="text/html",
                     )
                 if uid == "i3":
-                    # custom headers via ResponseWithHeaders
-                    from lite_server.api import ResponseWithHeaders
-                    return ResponseWithHeaders(
-                        body={"result": "z"}, headers={"X-Custom": "v3"},
+                    # custom headers via Response
+                    return LiteResponse(
+                        content={"result": "z"}, headers={"X-Custom": "v3"},
                     )
                 return output
 
@@ -1219,7 +1221,7 @@ class TestBatchPredict:
         assert i2.media_type == "text/html"
         assert i2.data == b'"<p>ok</p>"'
 
-        # Item 3 (uid=i3): ResponseWithHeaders custom header
+        # Item 3 (uid=i3): custom headers via Response
         i3 = resp.batch.items[2]
         assert i3.uid == "i3"
         assert dict(i3.headers) == {"X-Custom": "v3"}
@@ -1231,9 +1233,9 @@ class TestBatchPredict:
 
     def test_single_on_request_before_decode(self):
         class ModelWithHook(LitAPI):
-            def on_request(self, request, meta):
-                request["injected"] = True
-                return request
+            def on_request(self, ctx):
+                ctx.request["injected"] = True
+                return ctx.request
 
             def decode_request(self, request):
                 assert request.get("injected") is True
@@ -1254,9 +1256,9 @@ class TestBatchPredict:
 
     def test_async_single_on_request_before_decode(self):
         class AsyncModelWithHook(LitAPI):
-            async def on_request(self, request, meta):
-                request["async_injected"] = True
-                return request
+            async def on_request(self, ctx):
+                ctx.request["async_injected"] = True
+                return ctx.request
 
             async def decode_request(self, request):
                 assert request.get("async_injected") is True
@@ -2095,16 +2097,16 @@ class TestBidiStreamingAsyncLoop:
 class TestAsyncLoopStreamingHooks:
     def test_async_stream_with_hooks(self):
         class HookedStreamModel(LitAPI):
-            async def on_request(self, req, meta):
-                req["hooked"] = True
-                return req
+            async def on_request(self, ctx):
+                ctx.request["hooked"] = True
+                return ctx.request
 
             async def stream_predict(self, x):
                 yield {"token": 0, "hooked": x.get("hooked")}
 
-            async def on_response(self, resp, meta):
-                resp["async_hook"] = True
-                return resp
+            async def on_response(self, ctx):
+                ctx.response["async_hook"] = True
+                return ctx.response
 
         socket = AsyncMockSocket()
         from lite_server.proto import RequestMeta as ProtoMeta

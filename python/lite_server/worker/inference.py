@@ -23,17 +23,18 @@ from typing import Any
 import yaml
 import zmq
 
-from lite_server.api import LitAPI, RequestMeta
+from lite_server.api import LitAPI
 from lite_server.callback import load_callbacks
+from lite_server.context import CBSequence, Headers, RequestContext, RequestMeta
 from lite_server.exceptions import HTTPException
 from lite_server.pipeline import (
     Pipeline,
     _adapt,
+    _wrap_ctx_method,
     collect_metrics,
     extract_response_meta,
     unwrap_response,
 )
-from lite_server.callback import RequestContext
 from lite_server.proto import (
     BatchItemResponse,
     BatchRequest,
@@ -288,14 +289,12 @@ def _make_stream_done(stream_id: str, metrics=None) -> Response:
 
 
 def _meta_from_proto(meta_pb) -> RequestMeta:
-    payload = json.loads(meta_pb.payload) if meta_pb.payload else None
     return RequestMeta(
         route=meta_pb.route,
-        headers=dict(meta_pb.headers),
+        headers=Headers(dict(meta_pb.headers)),
         client_ip=meta_pb.client_ip,
         request_id=meta_pb.request_id,
         timestamp_ns=meta_pb.timestamp_ns,
-        payload=payload,
     )
 
 
@@ -385,7 +384,9 @@ async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.
 async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: logging.Logger):
     """Process a single request (single / batch) asynchronously."""
     uid = request.uid
-    meta = _meta_from_proto(request.meta) if request.HasField("meta") else None
+    meta = _meta_from_proto(request.meta) if request.HasField("meta") else RequestMeta(
+        route="", headers=Headers(), client_ip="", request_id="", timestamp_ns=0,
+    )
     pipe = _get_pipeline(lit_api)
 
     try:
@@ -422,7 +423,7 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
 
 
 async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
-                        meta: RequestMeta | None, lit_api: LitAPI,
+                        meta: RequestMeta, lit_api: LitAPI,
                         log: logging.Logger) -> Response:
     """Batch request: per-item preprocess → batched predict → per-item postprocess.
 
@@ -568,7 +569,7 @@ async def _handle_stream_async(
         entry = active_streams.pop(stream_id, None)
         if isinstance(entry, _BidiSession):
             try:
-                await entry.on_close()
+                await entry.on_close(ctx=entry.ctx)
             except Exception as e:
                 log.debug("bidi on_close error for %s: %s", stream_id, e)
             if action == "close":
@@ -598,6 +599,10 @@ async def _handle_stream_open_async(
 
     # --- Bidirectional streaming ------------------------------------------
     if pipe.has_bidi_stream:
+        if meta is None:
+            meta = RequestMeta(
+                route="", headers=Headers(), client_ip="", request_id="", timestamp_ns=0,
+            )
         ctx = RequestContext(meta=meta, request=json.loads(data) if data else {})
         try:
             await pipe.preprocess(ctx)
@@ -614,7 +619,7 @@ async def _handle_stream_open_async(
             return
 
         try:
-            handler = await pipe.bidi_stream()
+            handler = await pipe.bidi_stream(ctx=ctx)
         except HTTPException as e:
             log.warning("bidi_stream rejected for %s: %s", stream_id, e.detail)
             await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
@@ -628,7 +633,7 @@ async def _handle_stream_open_async(
         active_streams[stream_id] = _BidiSession(handler, on_chunk, on_close, ctx)
 
         try:
-            output = await on_open(ctx.input)
+            output = await on_open(ctx.input, ctx=ctx)
         except HTTPException as e:
             log.warning("bidi on_open rejected for %s: %s", stream_id, e.detail)
             await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
@@ -672,6 +677,10 @@ async def _handle_stream_open_async(
         return
 
     # --- Uni-directional streaming -----------------------------------------
+    if meta is None:
+        meta = RequestMeta(
+            route="", headers=Headers(), client_ip="", request_id="", timestamp_ns=0,
+        )
     ctx = RequestContext(meta=meta, request=json.loads(data) if data else {})
     try:
         await pipe.preprocess(ctx)
@@ -688,7 +697,7 @@ async def _handle_stream_open_async(
         return
 
     try:
-        generator = await pipe.stream_predict(ctx.input)
+        generator = await pipe.stream_predict(ctx.input, ctx=ctx)
     except HTTPException as e:
         log.warning("stream_predict rejected for %s: %s", stream_id, e.detail)
         await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
@@ -723,7 +732,7 @@ async def _handle_stream_chunk_async(
     raw = json.loads(data) if data else {}
 
     try:
-        output = await session.on_chunk(raw)
+        output = await session.on_chunk(raw, ctx=session.ctx)
     except HTTPException as e:
         log.warning("bidi on_chunk rejected for %s: %s", stream_id, e.detail)
         await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
@@ -839,16 +848,6 @@ async def _consume_stream(
 # Continuous Batching Loop
 # ---------------------------------------------------------------------------
 
-class CBState:
-    def __init__(self, uid: str, ctx: RequestContext):
-        self.uid = uid
-        self.ctx = ctx
-        self.input = ctx.input
-        self.output = []
-        self.meta = ctx.meta
-        self.prefilled = False
-
-
 def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: logging.Logger):
     """Autonomous continuous batching loop.
 
@@ -858,7 +857,7 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
     decode → on_input on add; on_output → encode → on_response on complete)
     and early-return support as every other mode.
     """
-    active: dict[str, CBState] = {}
+    active: dict[str, CBSequence] = {}
     lock = threading.Lock()
     pipe = _get_pipeline(lit_api)
     cb_loop = asyncio.new_event_loop()
@@ -866,9 +865,9 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
     def _drive(coro):
         return cb_loop.run_until_complete(coro)
 
-    prefill = _adapt(lit_api.prefill, None)
-    step_fn = _adapt(lit_api.step, None)
-    has_finished = _adapt(lit_api.has_finished, None)
+    prefill = _wrap_ctx_method(lit_api.prefill, "prefill", None)
+    step_fn = _adapt(lit_api.step, None)  # step prohibits ctx (validated at load)
+    has_finished = _wrap_ctx_method(lit_api.has_finished, "has_finished", None)
 
     def _send_ctx_response(uid: str, ctx: RequestContext):
         resp_bytes, status, metrics, resp_headers = pipe.finalize(ctx)
@@ -878,7 +877,7 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
     def _handle_add(cb_add: CBAddRequest):
         raw = json.loads(cb_add.data) if cb_add.data else {}
         meta = _meta_from_proto(cb_add.meta) if cb_add.HasField("meta") else RequestMeta(
-            route="", headers={}, client_ip="", request_id="", timestamp_ns=0, payload=raw,
+            route="", headers=Headers(), client_ip="", request_id="", timestamp_ns=0,
         )
         ctx = RequestContext(meta=meta, request=raw)
         try:
@@ -897,11 +896,11 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
             _send_ctx_response(cb_add.uid, ctx)
             return
 
-        state = CBState(cb_add.uid, ctx)
+        state = CBSequence(cb_add.uid, ctx)
         active[cb_add.uid] = state
 
         try:
-            _drive(prefill(cb_add.uid, ctx.input))
+            _drive(prefill(cb_add.uid, ctx.input, ctx=ctx))
             state.prefilled = True
         except HTTPException as e:
             del active[cb_add.uid]
@@ -948,7 +947,7 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
                 completed = []
                 for state, token in zip(ready, outputs):
                     state.output.append(token)
-                    if _drive(has_finished(state.uid, token, state.output)):
+                    if _drive(has_finished(state.uid, token, state.output, ctx=state.ctx)):
                         completed.append(state.uid)
 
                 for uid in completed:

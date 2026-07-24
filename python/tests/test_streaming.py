@@ -10,8 +10,9 @@ import logging
 
 import pytest
 
-from lite_server.api import BidiStreamHandler, LitAPI, RequestMeta
-from lite_server.callback import Callback, RequestContext
+from lite_server.api import BidiStreamHandler, LitAPI
+from lite_server.callback import Callback
+from lite_server.context import Headers, RequestContext, RequestMeta
 from lite_server.pipeline import Pipeline
 from lite_server.proto import (
     Request,
@@ -271,9 +272,9 @@ class TestStreamHooks:
     @pytest.mark.asyncio
     async def test_on_request_hook_applied(self):
         class HookStreamAPI(EchoAPI):
-            def on_request(self, request, meta):
-                request["injected"] = True
-                return request
+            def on_request(self, ctx):
+                ctx.request["injected"] = True
+                return ctx.request
 
             def stream_predict(self, x):
                 yield x
@@ -290,7 +291,7 @@ class TestStreamHooks:
     @pytest.mark.asyncio
     async def test_on_request_reject_sends_error(self):
         class RejectStreamAPI(EchoAPI):
-            def on_request(self, request, meta):
+            def on_request(self, ctx):
                 raise ValueError("auth failed")
 
             def stream_predict(self, x):
@@ -307,9 +308,9 @@ class TestStreamHooks:
     @pytest.mark.asyncio
     async def test_on_response_hook_applied_per_chunk(self):
         class OnResponseStreamAPI(EchoAPI):
-            def on_response(self, response, meta):
-                response["tagged"] = meta.route
-                return response
+            def on_response(self, ctx):
+                ctx.response["tagged"] = ctx.meta.route
+                return ctx.response
 
             def stream_predict(self, x):
                 yield {"a": 1}
@@ -638,12 +639,12 @@ class TestStreamExecutorIsolation:
 
         # Preprocess to get a decoded input
         meta1 = RequestMeta(
-            route="/", headers={}, client_ip="", request_id="r1",
-            timestamp_ns=0, payload={},
+            route="/", headers=Headers(), client_ip="", request_id="r1",
+            timestamp_ns=0,
         )
         ctx = RequestContext(meta=meta1, request={})
         await pipe.preprocess(ctx)
-        generator = await pipe.stream_predict(ctx.input)
+        generator = await pipe.stream_predict(ctx.input, ctx=ctx)
 
         # Start consuming the sync generator in a background task
         sock = AsyncSocket()
@@ -659,8 +660,8 @@ class TestStreamExecutorIsolation:
         # thread pool → overlap_detected = True.  After fix: queued on the
         # same single-thread executor → overlap_detected stays False.
         meta2 = RequestMeta(
-            route="/", headers={}, client_ip="", request_id="r2",
-            timestamp_ns=0, payload={},
+            route="/", headers=Headers(), client_ip="", request_id="r2",
+            timestamp_ns=0,
         )
         single_task = asyncio.create_task(pipe.run_single(b"{}", meta2))
 
@@ -726,13 +727,13 @@ class TestStreamExecutorIsolation:
 
         ctx = RequestContext(
             meta=RequestMeta(
-                route="/", headers={}, client_ip="", request_id="r1",
-                timestamp_ns=0, payload={},
+                route="/", headers=Headers(), client_ip="", request_id="r1",
+                timestamp_ns=0,
             ),
             request={},
         )
         await pipe.preprocess(ctx)
-        generator = await pipe.stream_predict(ctx.input)
+        generator = await pipe.stream_predict(ctx.input, ctx=ctx)
 
         sock = AsyncSocket()
         consume_task = asyncio.create_task(
