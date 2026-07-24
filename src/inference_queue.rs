@@ -378,6 +378,41 @@ fn pick_worker_least_loaded(inflight: &[Arc<AtomicUsize>], outlier: &OutlierStat
         .unwrap_or(0)
 }
 
+/// Map one item of a worker BatchResponse to the pb::Response delivered to
+/// its caller.  `resp_item` of None means the worker omitted this uid.
+/// Per-item status / status_code / media_type / headers propagate so each
+/// caller of an aggregated batch sees its own response metadata.
+fn batch_item_to_single_response(
+    uid: String,
+    resp_item: Option<&pb::BatchItemResponse>,
+    metrics: Option<pb::Metrics>,
+) -> pb::Response {
+    match resp_item {
+        Some(item) => pb::Response {
+            uid,
+            payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+                data: item.data.clone(),
+                headers: item.headers.clone(),
+                status: item.status.clone(),
+                status_code: item.status_code,
+                media_type: item.media_type.clone(),
+            })),
+            metrics,
+        },
+        None => pb::Response {
+            uid,
+            payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+                status: Some(pb::Status {
+                    code: "Error".to_string(),
+                    message: "missing in batch response".to_string(),
+                }),
+                ..Default::default()
+            })),
+            metrics: None,
+        },
+    }
+}
+
 /// Send a batch to a single worker. Returns Err on transport/worker failure.
 /// On success, all items are drained and responses sent to callers.
 /// On error, the batch is drained with error responses and Err is returned.
@@ -475,39 +510,20 @@ async fn do_send_batch(
 
                     let mut all_ok = true;
                     for queue_item in batch.drain(..) {
-                        let single_resp = if let Some(resp_item) = resp_map.get(&queue_item.uid) {
-                            if resp_item.status.as_ref().map(|s| s.code.as_str()) == Some("Error") {
-                                all_ok = false;
-                            }
-                            pb::Response {
-                                uid: queue_item.uid,
-                                payload: Some(pb::response::Payload::Single(pb::SingleResponse {
-                                    data: resp_item.data.clone(),
-                                    headers: resp_item.headers.clone(),
-                                    status: resp_item.status.clone(),
-                                    status_code: resp_item.status_code,
-                                    media_type: resp_item.media_type.clone(),
-                                    ..Default::default()
-                                })),
-                                metrics: resp.metrics.clone(),
-                            }
-                        } else {
+                        let resp_item = resp_map.get(&queue_item.uid);
+                        let item_failed = resp_item.is_none()
+                            || resp_item
+                                .and_then(|item| item.status.as_ref())
+                                .map(|s| s.code.as_str())
+                                == Some("Error");
+                        if item_failed {
                             all_ok = false;
-                            pb::Response {
-                                uid: queue_item.uid,
-                                payload: Some(pb::response::Payload::Single(pb::SingleResponse {
-                                    data: Default::default(),
-                                    headers: Default::default(),
-                                    status: Some(pb::Status {
-                                        code: "Error".to_string(),
-                                        message: "missing in batch response".to_string(),
-                                    }),
-                                
-                                    ..Default::default()
-                                })),
-                                metrics: None,
-                            }
-                        };
+                        }
+                        let single_resp = batch_item_to_single_response(
+                            queue_item.uid,
+                            resp_item,
+                            resp.metrics.clone(),
+                        );
                         let _ = queue_item.response_tx.send(single_resp);
                     }
 
@@ -1235,6 +1251,54 @@ mod tests {
 
         let resp = resp_rx.await.unwrap();
         assert_eq!(resp.uid, "req-1");
+    }
+
+    // ===== batch_item_to_single_response: per-item field propagation =====
+
+    #[test]
+    fn test_batch_item_to_single_propagates_per_item_fields() {
+        // A batch item carrying its own status_code / media_type / headers
+        // (e.g. early 400 from on_request, custom headers from on_response)
+        // must reach the caller's SingleResponse intact.
+        let headers = std::collections::HashMap::from([(
+            "x-item".to_string(),
+            "bad".to_string(),
+        )]);
+        let item = pb::BatchItemResponse {
+            uid: "u1".to_string(),
+            data: Bytes::from_static(b"{\"error\":\"bad\"}"),
+            status: Some(pb::Status {
+                code: "Ok".to_string(),
+                message: String::new(),
+            }),
+            status_code: 400,
+            media_type: "text/html".to_string(),
+            headers,
+        };
+
+        let resp = batch_item_to_single_response("u1".to_string(), Some(&item), None);
+        let Some(pb::response::Payload::Single(single)) = resp.payload else {
+            panic!("expected Single payload");
+        };
+        assert_eq!(single.status.unwrap().code, "Ok");
+        assert_eq!(single.status_code, 400);
+        assert_eq!(single.media_type, "text/html");
+        assert_eq!(single.headers.get("x-item").map(|s| s.as_str()), Some("bad"));
+        assert_eq!(single.data, Bytes::from_static(b"{\"error\":\"bad\"}"));
+    }
+
+    #[test]
+    fn test_batch_item_to_single_missing_item_is_error() {
+        // A uid absent from the worker's BatchResponse maps to an Error
+        // SingleResponse (and must not inherit batch metrics).
+        let resp = batch_item_to_single_response("u2".to_string(), None, None);
+        let Some(pb::response::Payload::Single(single)) = resp.payload else {
+            panic!("expected Single payload");
+        };
+        let status = single.status.unwrap();
+        assert_eq!(status.code, "Error");
+        assert_eq!(status.message, "missing in batch response");
+        assert!(resp.metrics.is_none());
     }
 
     // ===== Phase 2: Arc<RequestMeta> zero-copy tests =====

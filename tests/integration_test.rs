@@ -109,6 +109,49 @@ class TestAPI(LitAPI):
     )
     .unwrap();
 
+    // batch_model: max_batch_size=2 so concurrent requests aggregate into
+    // one BatchRequest.  predict() records the aggregated batch size in each
+    // item's body; encode_response() gives the "bad" item its own 400 status
+    // and X-Item header.
+    let batch_dir = tmp.join("batch_model/1");
+    std::fs::create_dir_all(&batch_dir).unwrap();
+    std::fs::write(
+        batch_dir.join("model.py"),
+        r#"from lite_server import LitAPI
+from lite_server.response import Response
+
+
+class BatchAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def batch(self, inputs):
+        return inputs
+
+    def predict(self, batched):
+        n = len(batched)
+        return [dict(item, batch_size=n) for item in batched]
+
+    def unbatch(self, output):
+        return output
+
+    def encode_response(self, output):
+        if output.get("kind") == "bad":
+            return Response(
+                content={"error": "bad item"},
+                status_code=400,
+                headers={"X-Item": "bad"},
+            )
+        return output
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        batch_dir.join("config.yaml"),
+        "max_batch_size: 2\nbatch_timeout: 0.1\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+
     tmp
 }
 
@@ -401,6 +444,54 @@ async fn test_model_repository_index() {
     assert!(!models.is_empty(), "repository index should not be empty");
 
     unload_model(&base, MODEL, "1").await;
+}
+
+// ---------------------------------------------------------------------------
+// Batch aggregation: per-item status codes / headers must stay independent
+// ---------------------------------------------------------------------------
+
+const BATCH_MODEL: &str = "batch_model";
+
+#[tokio::test]
+#[serial]
+async fn test_batch_aggregation_per_item_status_and_headers() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+    load_model(&base, BATCH_MODEL, "1").await;
+
+    // Fire two concurrent requests — with max_batch_size=2 and
+    // batch_timeout=0.1 they aggregate into ONE BatchRequest.
+    let bad = client
+        .post(&format!("{}/v2/models/{}/infer", base, BATCH_MODEL))
+        .json(&json!({"kind": "bad"}))
+        .send();
+    let ok = client
+        .post(&format!("{}/v2/models/{}/infer", base, BATCH_MODEL))
+        .json(&json!({"kind": "ok"}))
+        .send();
+    let (bad_resp, ok_resp) = tokio::join!(bad, ok);
+    let bad_resp = bad_resp.unwrap();
+    let ok_resp = ok_resp.unwrap();
+
+    // Per-item status codes travel independently: the bad item is a 400,
+    // the ok item stays a 200 (both would have been 200 before the fix).
+    assert_eq!(bad_resp.status(), 400);
+    assert_eq!(ok_resp.status(), 200);
+
+    // Per-item headers likewise: only the bad item carries X-Item.
+    assert_eq!(bad_resp.headers().get("x-item").unwrap(), "bad");
+    assert!(ok_resp.headers().get("x-item").is_none());
+
+    // batch_size=2 proves the two requests really did aggregate into one
+    // BatchRequest rather than two Single requests.
+    let ok_body: Value = ok_resp.json().await.unwrap();
+    assert_eq!(ok_body["batch_size"], 2);
+    assert_eq!(ok_body["kind"], "ok");
+
+    let bad_body: Value = bad_resp.json().await.unwrap();
+    assert_eq!(bad_body["error"], "bad item");
+
+    unload_model(&base, BATCH_MODEL, "1").await;
 }
 
 // ---------------------------------------------------------------------------
