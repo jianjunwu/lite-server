@@ -1,21 +1,56 @@
+"""Minimal LitAPI example.
+
+Since 0.7.0, every model runs on the unified async loop — sync and async
+methods are adapted automatically.  Use ``async def`` for I/O-bound work
+(database lookups, downstream API calls); the pipeline runs sync methods
+on a thread executor so they never block the event loop.
+
+Declare a ``ctx`` parameter on ``decode_request``, ``predict``, and
+``encode_response`` to access per-request metadata (headers, route,
+client_ip, request_id) and ``ctx.state`` (per-request scratch dict).
+"""
+
 from lite_server import LitAPI
 
 
 class MyAPI(LitAPI):
     def setup(self, device):
-        """Load model weights and initialize state."""
+        """Load model weights and initialize state (always synchronous)."""
         self.model = lambda x: x * 2
 
-    def decode_request(self, request):
-        """Convert HTTP request JSON to model input."""
+    async def decode_request(self, request, ctx):
+        """Convert HTTP request JSON to model input.
+
+        ``ctx`` provides:
+        - ``ctx.meta`` — immutable request metadata (headers, route,
+          client_ip, request_id)
+        - ``ctx.state`` — per-request scratch dict (safe under concurrency)
+        - ``ctx.respond(...)`` — short-circuit the pipeline with an early
+          response (auth failures, cache hits, validation errors)
+        """
         return request.get("input", 0)
 
-    def predict(self, x, **kwargs):
-        """Run inference. x is a list when batching is enabled."""
+    async def predict(self, x, ctx):
+        """Run inference.  x is a list when batching is enabled.
+
+        ``async def`` is the recommended default since 0.7.0 — ideal for
+        I/O-bound work like downstream API calls or database lookups.
+        For CPU-bound inference, just use ``def`` and the pipeline runs
+        it on a thread executor without blocking the event loop.
+        """
         if isinstance(x, list):
             return [self.model(item) for item in x]
         return self.model(x)
 
-    def encode_response(self, output):
-        """Convert model output to HTTP response JSON."""
+    async def encode_response(self, output, ctx):
+        """Convert model output to HTTP response JSON.
+
+        Use ``ctx.respond(output, headers=...)`` to attach custom headers
+        or override the status code::
+
+            return ctx.respond(
+                {"result": output},
+                headers={"X-Request-ID": ctx.meta.request_id},
+            )
+        """
         return {"result": output}

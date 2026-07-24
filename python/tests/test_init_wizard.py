@@ -13,8 +13,8 @@ class TestRunWizard:
     """Interactive wizard with mocked input."""
 
     def test_generates_project_with_defaults(self, tmp_path, monkeypatch):
-        # project_name, template(default=empty), model_name(default=my_model),
-        # grpc(y), metrics(y), batch(n), stream(n)
+        # project_name, model_name(default=my_model),
+        # grpc(y), metrics(y), batch(n), stream(n), confirm(y)
         inputs = iter(["myproj", "", "", "", "", "", ""])
         monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
 
@@ -37,7 +37,7 @@ class TestRunWizard:
         assert "class MyAPI" in text or "class MyModel" in text
 
     def test_custom_model_name(self, tmp_path, monkeypatch):
-        inputs = iter(["myproj", "", "classifier", "", "", "", ""])
+        inputs = iter(["myproj", "classifier", "", "", "", "", ""])
         monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
 
         run_wizard(output_dir=str(tmp_path))
@@ -46,7 +46,7 @@ class TestRunWizard:
         assert (root / "model_repo" / "classifier").exists()
 
     def test_enables_features_when_yes(self, tmp_path, monkeypatch):
-        inputs = iter(["myproj", "", "", "y", "y", "y", "y"])
+        inputs = iter(["myproj", "", "y", "y", "y", "y", ""])
         monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
 
         run_wizard(output_dir=str(tmp_path))
@@ -56,7 +56,7 @@ class TestRunWizard:
         assert "enabled: true" in cfg
 
     def test_skips_features_when_no(self, tmp_path, monkeypatch):
-        inputs = iter(["myproj", "", "", "n", "n", "n", "n"])
+        inputs = iter(["myproj", "", "n", "n", "n", "n", ""])
         monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
 
         run_wizard(output_dir=str(tmp_path))
@@ -82,13 +82,22 @@ class TestRunWizard:
         with pytest.raises(SystemExit):
             run_wizard(output_dir=str(tmp_path))
 
+    def test_confirm_no_aborts_without_generating(self, tmp_path, monkeypatch):
+        # all defaults, then decline the summary confirmation
+        inputs = iter(["myproj", "", "", "", "", "", "n"])
+        monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
+
+        with pytest.raises(SystemExit):
+            run_wizard(output_dir=str(tmp_path))
+        assert not (tmp_path / "myproj").exists()
+
 
 class TestWizardOptionsPropagation:
     """Wizard batch/stream options must affect model config.yaml."""
 
     def test_batch_yes_sets_max_batch_size(self, tmp_path, monkeypatch):
-        # proj, template(empty), model_name, grpc(y), metrics(y), batch(y), stream(n)
-        inputs = iter(["myproj", "", "", "", "", "y", ""])
+        # proj, model_name(my_model), grpc(y), metrics(y), batch(y), stream(n), confirm(y)
+        inputs = iter(["myproj", "", "", "", "y", "", ""])
         monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
 
         run_wizard(output_dir=str(tmp_path))
@@ -103,8 +112,8 @@ class TestWizardOptionsPropagation:
         pytest.fail("max_batch_size should be uncommented when batch=yes")
 
     def test_stream_yes_sets_stream_true(self, tmp_path, monkeypatch):
-        # proj, template(empty), model_name, grpc(y), metrics(y), batch(n), stream(y)
-        inputs = iter(["myproj", "", "", "", "", "", "y"])
+        # proj, model_name(my_model), grpc(y), metrics(y), batch(n), stream(y), confirm(y)
+        inputs = iter(["myproj", "", "", "", "", "y", ""])
         monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
 
         run_wizard(output_dir=str(tmp_path))

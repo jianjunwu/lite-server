@@ -112,7 +112,7 @@ class TestConfigYamlStructure:
         text = (root / "model_repo" / "my_model" / "1" / "config.yaml").read_text()
         lines = text.splitlines()
         active_lines = [l for l in lines if l.strip() and not l.strip().startswith("#")]
-        assert len(active_lines) >= 3, "Active config should have at least a few uncommented lines"
+        assert len(active_lines) >= 1, "Active config should not be entirely commented out"
 
     def test_contains_request_timeout(self, tmp_path):
         gen = ProjectGenerator("p", "empty", tmp_path)
@@ -311,8 +311,9 @@ class TestModelPySafety:
                 break
         assert api_cls is not None
         instance = api_cls()
-        # Should not raise KeyError when "input" is missing
-        result = instance.decode_request({"other": "value"})
+        # Since 0.7.0 decode_request is async and takes a ctx argument.
+        import asyncio
+        result = asyncio.run(instance.decode_request({"other": "value"}, None))
         assert result is not None  # Safe default, not a crash
 
 
@@ -336,3 +337,20 @@ class TestTestRequestPy:
         # because the template itself is a regular string, not an f-string.
         assert "{{BASE_URL}}" not in text, "f-string braces are double-escaped"
         assert "{{e}}" not in text, "f-string braces are double-escaped"
+
+
+class TestCallbacksPy:
+    """callbacks.py example is always generated alongside model.py."""
+
+    def test_callbacks_py_generated(self, tmp_path):
+        gen = ProjectGenerator("p", "empty", tmp_path)
+        root = gen.generate()
+        cb = root / "model_repo" / "my_model" / "1" / "callbacks.py"
+        assert cb.exists()
+
+    def test_callbacks_py_defines_callback_subclass(self, tmp_path):
+        gen = ProjectGenerator("p", "empty", tmp_path)
+        root = gen.generate()
+        text = (root / "model_repo" / "my_model" / "1" / "callbacks.py").read_text()
+        compile(text, "callbacks.py", "exec")
+        assert "Callback" in text

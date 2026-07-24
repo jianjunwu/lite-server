@@ -37,6 +37,8 @@ def _render_config_yaml(
         "#",
         "# This file controls inference behavior for this specific version.",
         "# All fields are optional. Omitted fields use system defaults.",
+        "# Fields shown commented out are at their default value — uncomment",
+        "# to override.",
         "#",
         "# TIP: All fields are accessible in model.py via self.config:",
         "#   value = self.config.get('my_custom_param', 'default_value')",
@@ -67,12 +69,18 @@ def _render_config_yaml(
     lines.extend([
         "",
         "# ===== Queue & Timeout =====",
-        "max_queue_size: 1000",
-        "queue_mode: per_worker     # per_worker | shared",
-        "request_timeout: 30.0      # 0 = no limit (not recommended for production)",
+        "# max_queue_size: 1000       # Max pending requests per worker",
+        "# queue_mode: per_worker     # per_worker | shared",
+        "request_timeout: 30.0        # 0 = no limit (not recommended for production)",
         "",
         "# ===== Lifecycle =====",
-        "health_check_interval: 15.0",
+        "# health_check_interval: 15.0  # Active health check interval (0 = disabled)",
+        "",
+        "# ===== Callbacks =====",
+        "# Register callback classes to hook into the inference pipeline.",
+        "# Each class must be a lite_server.Callback subclass (no-arg constructible).",
+        "# callbacks:",
+        "#   - callbacks.AuditLogger",
         "",
         "# ===== Custom Parameters =====",
         "# Add your own parameters below. Access them in model.py via self.config.get('key')",
@@ -141,6 +149,15 @@ CONFIG_YAML_EXAMPLE = textwrap.dedent("""\
     #   - "*.py"
     # hot_reload_interval: 1.0     # Polling interval in seconds
 
+    # ===== Callbacks (Inference Pipeline) =====
+    # List of fully-qualified Callback subclass paths.  Each class must be
+    # no-arg constructible.  Callbacks chain in registration order and are
+    # validated at load time (pre-0.7 function-style signatures are rejected).
+    # See callbacks.py for an example.
+    # callbacks:
+    #   - "callbacks.AuditLogger"
+    #   - "my_package.callbacks.CustomAuth"
+
     # ===== Custom Parameters =====
     # Add your own parameters below. Access them in model.py via self.config.get('key')
     # my_model_path: /opt/models/weights.pt
@@ -166,24 +183,9 @@ TEMPLATES = {
 
 SERVER_YAML = textwrap.dedent("""\
     # lite-server configuration
-    # Docs: https://github.com/your-org/lite-server/docs
     #
-    # Quick reference for common fields:
-    #   server.host          - Bind address (0.0.0.0 = all interfaces)
-    #   server.http_port     - HTTP REST API port
-    #   server.grpc_port     - gRPC service port (requires grpc.enabled=true)
-    #   server.metrics_port  - Prometheus /metrics endpoint port
-    #   server.timeout       - Per-request timeout in seconds
-    #   server.threads       - Tokio worker threads (None = auto = num CPUs)
-    #
-    #   model_repository.path - Root directory for model versions
-    #
-    #   orchestration.control_mode - How to load models:
-    #     "explicit" = only load models listed in load_models
-    #     "poll"     = auto-detect repo changes
-    #     "all"      = load every discovered model on startup
-    #
-    #   orchestration.load_models  - List of model names to auto-load
+    # Every supported parameter is listed below.  Parameters shown commented
+    # out are at their default value — uncomment and change as needed.
     #
     # Per-model settings go in model_repo/<name>/<version>/config.yaml
 
@@ -192,43 +194,58 @@ SERVER_YAML = textwrap.dedent("""\
       http_port: 8000
       grpc_port: 8001
       metrics_port: 8002
-      timeout: 30.0               # Request timeout in seconds
-      # threads: null             # Tokio threads (None = auto = CPU cores)
-      graceful_timeout: 30.0      # Max seconds for graceful shutdown
-      keepalive_timeout: 5.0      # HTTP keep-alive timeout (0 = disable)
+      # timeout: 30.0               # Per-request timeout in seconds
+      # threads: null               # Tokio worker threads (null = auto = CPU cores)
+      # cache_registry: false       # Cache model/version lookups in HTTP layer
+      # graceful_timeout: 30.0      # Max seconds for graceful shutdown
+      # keepalive_timeout: 5.0      # HTTP keep-alive timeout (0 = disable)
 
     grpc:
       enabled: {grpc}
+      # max_workers: 10             # Max concurrent gRPC request handlers
 
     metrics:
       enabled: {metrics}
 
     logging:
-      level: info
-      # info_output: null           # Info log file path
-      # error_output: null          # Error log file path
-      # rotation: none              # none, size, daily, hourly
-      # max_size: 100               # Max log file size in MB (rotation=size)
+      # level: info                 # Log level: trace, debug, info, warn, error
+      # info_output: null           # Info log file path (null = stdout)
+      # error_output: null          # Error log file path (null = stderr)
+      # rotation: none              # Rotation strategy: none, size, daily, hourly
+      # max_size: 100               # Max log file size in MB (when rotation=size)
       # backup_count: 7             # Number of rotated log files to keep
+      # hostname_in_log_name: false # Include hostname in log filenames
 
     model_repository:
       path: ./model_repo
 
+    # Custom endpoint directory.  When unset, defaults to model_repository.path
+    # (the repo root) — NOT a nested endpoints/ subdir.  Set to ./endpoints to
+    # use a dedicated dir; @endpoint.get(...) modules are auto-discovered here.
+    # endpoints_dir: ./endpoints
+
     orchestration:
-      control_mode: explicit
+      control_mode: explicit        # explicit | poll | all
       load_models:
         - {model_name}
+      # poll_interval: 5            # Seconds between repo scans (control_mode=poll)
+      # models:                     # Per-model strategy overrides (advanced)
+      #   - name: my_model
+      #     load_policy: explicit   # explicit | all | latest
+      #     versions_to_load: ["1"]
+      #     default_version: "1"
+      #     max_loaded_versions: 3  # Max versions kept loaded (null = unlimited)
 
-    # Model-level defaults applied to every loaded model.
-    # These override the per-model config.yaml values when set (non-null).
+    # Global defaults applied to every loaded model.  When set (non-null),
+    # these override the corresponding per-model config.yaml values.
     model_defaults:
-      # max_queue_size: null
-      # request_timeout: null
-      # max_requests: null          # Auto-restart worker after N requests
-      # max_requests_jitter: null   # Random jitter for max_requests
-      # health_check_interval: null
+      # max_queue_size: null          # Override per-model queue depth
+      # request_timeout: null         # Override per-model request timeout (seconds)
+      # max_requests: null            # Override per-model max requests before recycle
+      # max_requests_jitter: null     # Override per-model recycle jitter
+      # health_check_interval: null   # Override per-model health check interval
 
-    # Feature flags for the admin UI and API.
+    # Admin UI and API feature toggles.
     features:
       # timeline: false
       system_overview: true
@@ -243,6 +260,46 @@ SERVER_YAML = textwrap.dedent("""\
       websocket_streaming: true
       streaming_metrics: true
 """)
+
+CALLBACKS_PY = textwrap.dedent('''\
+    """Example callbacks for the inference pipeline.
+
+    Since 0.7.0, callbacks replace the old middleware system. Each data hook
+    receives a single ``ctx`` (RequestContext) argument and may be sync or async.
+
+    To activate, uncomment the ``callbacks`` key in config.yaml::
+
+        callbacks:
+          - callbacks.AuditLogger
+
+    You can also declare callbacks directly on your LitAPI class::
+
+        from lite_server import LitAPI, RequireApiKey
+
+        class MyAPI(LitAPI):
+            callbacks = (RequireApiKey(keys=["sk-xxx"]),)
+    """
+    import time
+
+    from lite_server import Callback
+
+
+    class AuditLogger(Callback):
+        """Logs request method, route, and elapsed time for every request."""
+
+        def on_request(self, ctx):
+            ctx.state["_start_ns"] = time.time_ns()
+
+        def on_response(self, ctx):
+            start = ctx.state.pop("_start_ns", None)
+            if start is None:
+                return
+            elapsed_ms = (time.time_ns() - start) / 1_000_000
+            print(
+                f"[AuditLogger] {ctx.meta.method} {ctx.meta.route} "
+                f"→ {elapsed_ms:.2f}ms"
+            )
+''')
 
 TEST_REQUEST_PY = textwrap.dedent('''\
     """Test script for the {model_name} model."""
@@ -269,6 +326,8 @@ TEST_REQUEST_PY = textwrap.dedent('''\
             sys.exit(1)
         except requests.exceptions.HTTPError as e:
             print(f"HTTP Error: {e}")
+            if e.response is not None:
+                print("Body:", e.response.text)
             sys.exit(1)
 
 
@@ -293,19 +352,15 @@ TEST_REQUEST_PY = textwrap.dedent('''\
 README_MD = textwrap.dedent("""\
     # {project_name}
 
-    Lite-server project initialized with `{template}` template.
+    Generated by lite-server.  All files are ready to run — no extra setup needed.
 
     ## Quick Start
 
     ```bash
-    # Start the server
-    make serve
-    # or
+    # Terminal 1: start the server
     lite-server serve --config server.yaml
 
-    # In another terminal, run the test
-    make test
-    # or
+    # Terminal 2: send a test request
     python test_request.py
     ```
 
@@ -313,32 +368,63 @@ README_MD = textwrap.dedent("""\
 
     ```
     {project_name}/
-    ├── server.yaml              # Server configuration
-    ├── Dockerfile               # Container image
-    ├── docker-compose.yml       # Local orchestration
-    ├── Makefile                 # Common commands
-    ├── test_request.py          # Quick test script
-    ├── requirements.txt         # Python dependencies
-    ├── .gitignore               # Git ignore rules
+    ├── server.yaml                # Server configuration (ports, logging, orchestration)
+    ├── Dockerfile                 # Container image
+    ├── docker-compose.yml         # Local orchestration with healthcheck
+    ├── Makefile                   # Common commands
+    ├── test_request.py            # Quick test script
+    ├── requirements.txt           # Python dependencies
+    ├── .gitignore                 # Git ignore rules
     ├── model_repo/
     │   └── {model_name}/
     │       └── 1/
-    │           ├── model.py           # LitAPI implementation
-    │           ├── config.yaml        # Active model config
-    │           └── config.yaml.example # Full reference
+    │           ├── model.py             # LitAPI implementation (async + ctx)
+    │           ├── callbacks.py         # Callback examples (auth, logging, rate limit)
+    │           ├── config.yaml          # Active model config
+    │           └── config.yaml.example  # Full parameter reference
     └── .github/
         └── workflows/
-            └── ci.yml           # GitHub Actions CI
+            └── ci.yml             # GitHub Actions CI
     ```
+
+    ## Key Concepts (since 0.7.0)
+
+    - **Async-first pipeline** — `decode_request`, `predict`, and `encode_response`
+      support `async def` out of the box.  No separate base class needed.
+    - **`ctx` parameter** — declare a `ctx` parameter in any method to access
+      request metadata (headers, route, client IP, request ID) and per-request
+      state via `ctx.state` / `ctx.respond(...)`.
+    - **Callbacks** — `callbacks.py` shows how to hook into the inference pipeline
+      (logging, auth, rate limiting).  Uncomment the `callbacks` key in
+      `config.yaml` to activate.
+    - **Custom endpoints** — add `@endpoint.get(...)` modules in a directory
+      and point `endpoints_dir` (in `server.yaml`) at it; auto-discovered at
+      startup.  When `endpoints_dir` is unset, the model repo root is scanned.
+
+    ## Customizing
+
+    | Goal | Where to look |
+    |---|---|
+    | Change ports / logging / model list | `server.yaml` |
+    | Enable batching or streaming | `config.yaml` (see `config.yaml.example` for all options) |
+    | Add auth / rate limiting / logging | `callbacks.py`, then uncomment `callbacks` in `config.yaml` |
+    | Custom HTTP endpoints | create `endpoints/` directory with `@endpoint.get(...)` modules |
+    | Use GPU / change device count | `config.yaml` → `accelerator` / `devices` / `workers_per_device` |
 
     ## Commands
 
     | Command | Description |
-    |---------|-------------|
-    | `make serve` | Start the server |
-    | `make test` | Send a test request |
-    | `make benchmark` | Run benchmark |
-    | `make clean` | Clean caches |
+    |---|---|
+    | `lite-server serve --config server.yaml` | Start the server |
+    | `python test_request.py` | Send a test inference request |
+    | `lite-server benchmark --model {model_name}` | Run performance benchmark |
+    | `lite-server config-check server.yaml` | Validate configuration |
+
+    ## Learn More
+
+    - [Model Authoring Guide](https://github.com/nic/lite-server/blob/main/docs/model-authoring.md)
+    - [Configuration Reference](https://github.com/nic/lite-server/blob/main/docs/configuration.md)
+    - [Examples](https://github.com/nic/lite-server/tree/main/examples)
 """)
 
 DOCKERFILE = textwrap.dedent("""\
@@ -360,7 +446,10 @@ DOCKERFILE = textwrap.dedent("""\
 """)
 
 MAKEFILE = textwrap.dedent("""\
-    .PHONY: serve test benchmark clean
+    .PHONY: install serve test benchmark clean
+
+    install:
+    \tpip install -r requirements.txt
 
     serve:
     \tlite-server serve --config server.yaml
@@ -490,7 +579,7 @@ CI_YML = textwrap.dedent("""\
             run: |
               python -m py_compile model_repo/{model_name}/1/model.py
               pip install ruff
-              ruff check model_repo/{model_name}/1/model.py || true
+              ruff check model_repo/{model_name}/1/model.py
 """)
 
 # ---------------------------------------------------------------------------
@@ -546,6 +635,9 @@ class ProjectGenerator:
         (model_dir / "config.yaml").write_text(config_yaml)
         (model_dir / "config.yaml.example").write_text(CONFIG_YAML_EXAMPLE)
 
+        # Callbacks example (always generated; uncomment callbacks in config.yaml to activate)
+        (model_dir / "callbacks.py").write_text(CALLBACKS_PY)
+
         # Server config
         grpc = str(self.options.get("grpc", True)).lower()
         metrics = str(self.options.get("metrics", True)).lower()
@@ -564,7 +656,6 @@ class ProjectGenerator:
         (root / "README.md").write_text(
             README_MD.format(
                 project_name=self.project_name,
-                template=self.template,
                 model_name=self.model_name,
             )
         )

@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 from typing import Any
 
-from lite_server.init.generator import ProjectGenerator, TEMPLATES
+from lite_server.init.generator import ProjectGenerator
 
 
 def _ask(question: str, default: str = "") -> str:
@@ -29,28 +29,6 @@ def _ask_yn(question: str, default: bool = True) -> bool:
     return answer.startswith("y")
 
 
-def _ask_choice(question: str, choices: list[str], default: str = "") -> str:
-    print(f"\n{question}")
-    for i, choice in enumerate(choices, 1):
-        mark = " (default)" if choice == default else ""
-        print(f"  {i}. {choice}{mark}")
-    answer = _ask("Enter number or name", default)
-    # Try number
-    try:
-        idx = int(answer) - 1
-        if 0 <= idx < len(choices):
-            return choices[idx]
-    except ValueError:
-        pass
-    # Try exact match
-    if answer in choices:
-        return answer
-    # Fallback to default
-    if default:
-        return default
-    return choices[0]
-
-
 def run_wizard(output_dir: str = ".") -> None:
     """Run the interactive project initialization wizard."""
     print("=" * 50)
@@ -64,12 +42,8 @@ def run_wizard(output_dir: str = ".") -> None:
         print("Project name is required.", file=sys.stderr)
         sys.exit(1)
 
-    # Template
-    template = _ask_choice(
-        "Choose a template:",
-        list(TEMPLATES),
-        default="empty",
-    )
+    # Template (only one available since 0.7.0)
+    template = "empty"
 
     # Model name
     model_name = _ask("Model name", "my_model")
@@ -81,6 +55,22 @@ def run_wizard(output_dir: str = ".") -> None:
     print("\n--- Inference Features ---")
     batch = _ask_yn("Enable dynamic batching?", default=False)
     stream = _ask_yn("Enable streaming responses?", default=False)
+
+    # --- Summary & confirmation ---
+    print("\n" + "=" * 50)
+    print("  Summary")
+    print("=" * 50)
+    print(f"  Project:    {project_name}")
+    print(f"  Model:      {model_name}")
+    print(f"  gRPC:       {'yes' if grpc else 'no'}")
+    print(f"  Metrics:    {'yes' if metrics else 'no'}")
+    print(f"  Streaming:  {'yes' if stream else 'no'}")
+    print(f"  Batching:   {'yes' if batch else 'no'}")
+    print("=" * 50)
+    confirmed = _ask_yn("Create project?", default=True)
+    if not confirmed:
+        print("Aborted.", file=sys.stderr)
+        sys.exit(0)
 
     options: dict[str, Any] = {
         "grpc": grpc,
