@@ -105,6 +105,12 @@ class TestValidateCallback:
 
         validate_callback(LC())  # must not raise
 
+    def test_non_callback_instance_is_rejected(self):
+        """C3: a non-Callback object gets a friendly, specific error."""
+        for bad in (object(), "not a callback", 42, lambda ctx: None):
+            with pytest.raises(RuntimeError, match="lite_server.Callback"):
+                validate_callback(bad)
+
 
 class TestLoadCallbacks:
     def test_empty_config_returns_empty_list(self):

@@ -198,6 +198,11 @@ def validate_callback(cb: Callback) -> None:
     behavior changes (exceptions now reject requests), so we fail at load
     time with exact rename instructions instead.
     """
+    if not isinstance(cb, Callback):
+        raise RuntimeError(
+            f"{cb!r} is not a lite_server.Callback instance — subclasses of "
+            f"Callback are the only objects allowed in callbacks=[...]."
+        )
     cls = type(cb)
     for old_name, new_name in _REMOVED_HOOKS.items():
         if _overrides(cls, old_name, Callback):
