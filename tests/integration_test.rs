@@ -62,6 +62,27 @@ fn stop_server(mut child: std::process::Child) {
     let _ = child.wait();
 }
 
+/// RAII guard that kills a dedicated server on drop — including when the test
+/// panics before an explicit `stop_server()`. Without it, a failing
+/// dedicated-server test orphans the server, which inherits the test's stderr
+/// pipe (the `2>&1 | tail` of the runner) so the pipe never sees EOF and the
+/// whole test command hangs.
+struct ServerGuard(Option<std::process::Child>);
+
+impl ServerGuard {
+    fn start(args: &[&str]) -> Self {
+        ServerGuard(Some(start_server(args)))
+    }
+}
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.take() {
+            stop_server(child);
+        }
+    }
+}
+
 /// Create a self-contained model_repo in a temp directory with test_model and status_endpoint.
 fn create_test_model_repo() -> std::path::PathBuf {
     let tmp = std::env::temp_dir().join(format!("lite-server-test-{}", std::process::id()));
@@ -855,6 +876,66 @@ async fn test_malformed_json_standardized_400() {
     assert_eq!(body["error"]["type"], "invalid_request_error");
     assert_eq!(body["error"]["code"], "invalid_request_body");
     assert!(body["error"]["param"].is_null());
+}
+
+// ---------------------------------------------------------------------------
+// SSE streaming must carry CORS headers — covers A2
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn test_sse_rate_limit_returns_429() {
+    // Dedicated server: the rate-limit bucket is shared across tests on the
+    // shared server (key model:/predict, burst=3), so a fresh process gives a
+    // deterministic starting bucket.
+    let port = 18040;
+    kill_stale_on_port(port);
+    let repo = test_model_repo();
+    let _server = ServerGuard::start(&[
+        "--port",
+        &port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-metrics",
+        "--no-grpc",
+        "--log-level",
+        "warn",
+    ]);
+    wait_for_server(port, 15).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+    load_model(&base, POLICY_MODEL, "1").await;
+
+    // policy_model: RateLimit(rpm=3, burst=3). First 3 SSE requests allowed,
+    // 4th rejected with 429 + sane Retry-After.
+    for i in 0..3 {
+        let resp = client
+            .post(format!("{}/v2/models/{}/events", base, POLICY_MODEL))
+            .json(&json!({"input": i}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "SSE request {} should be allowed", i);
+    }
+    let resp = client
+        .post(format!("{}/v2/models/{}/events", base, POLICY_MODEL))
+        .json(&json!({"input": 9}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429);
+    let retry = resp
+        .headers()
+        .get("retry-after")
+        .expect("429 must carry Retry-After");
+    let secs: u64 = retry.to_str().unwrap().parse().unwrap();
+    assert!(
+        (1..=60).contains(&secs),
+        "Retry-After {} out of sane range",
+        secs
+    );
+
+    // _server guard kills the process group on drop (incl. panic path).
 }
 
 // ---------------------------------------------------------------------------

@@ -508,6 +508,39 @@ fn extract_client_ip(headers: &HeaderMap) -> String {
         .to_string()
 }
 
+/// Acquire a rate-limit token for a model. Shared by unary infer, SSE, and WS.
+///
+/// `scope` derives from the policy key: `"ip"` → client IP from headers,
+/// otherwise the constant `"/predict"` route scope so all inference paths for
+/// a model share one bucket. Returns `RateLimitExceeded` (429 + Retry-After)
+/// when the bucket is empty.
+async fn enforce_rate_limit(
+    state: &Arc<AppState>,
+    rl: Option<&crate::worker::protocol::RateLimitPolicy>,
+    model_name: &str,
+    headers: &HeaderMap,
+) -> Result<(), AppError> {
+    let Some(rl) = rl else {
+        return Ok(());
+    };
+    let scope = match rl.key.as_str() {
+        "ip" => extract_client_ip(headers),
+        _ => "/predict".to_string(),
+    };
+    let burst = rl.burst.unwrap_or(rl.requests_per_minute * 1.5);
+    let key = format!("{}:{}", model_name, scope);
+    match state
+        .rate_limiter
+        .acquire(&key, rl.requests_per_minute, burst)
+        .await
+    {
+        crate::rate_limit::AcquireResult::Rejected { retry_after_secs } => {
+            Err(AppError::RateLimitExceeded { retry_after_secs })
+        }
+        crate::rate_limit::AcquireResult::Allowed => Ok(()),
+    }
+}
+
 /// Headers that must NOT be overridden by user code — managed by the HTTP
 /// library or carry hop-by-hop semantics (RFC 7230 §6.1).
 const BLOCKED_RESPONSE_HEADERS: &[&str] = &[
@@ -607,20 +640,7 @@ async fn do_infer(
         .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", model_name, resolved_version)))?;
 
     // Rate limit check (before ensemble, after mv resolution)
-    if let Some(ref rl) = mv.policies.rate_limit {
-        let scope = match rl.key.as_str() {
-            "ip" => extract_client_ip(&headers),
-            _ => route.clone(),
-        };
-        let burst = rl.burst.unwrap_or(rl.requests_per_minute * 1.5);
-        let key = format!("{}:{}", model_name, scope);
-        match state.rate_limiter.acquire(&key, rl.requests_per_minute, burst).await {
-            crate::rate_limit::AcquireResult::Rejected { retry_after_secs } => {
-                return Err(AppError::RateLimitExceeded { retry_after_secs });
-            }
-            crate::rate_limit::AcquireResult::Allowed => {}
-        }
-    }
+    enforce_rate_limit(&state, mv.policies.rate_limit.as_ref(), &model_name, &headers).await?;
 
     // Handle ensemble
     if mv.model_type == ModelType::Ensemble {
@@ -964,6 +984,10 @@ async fn sse_infer_entry(
             model_name, resolved_version
         )));
     }
+    // Rate limit (shares the /predict bucket with unary infer).
+    if let Some(mv) = state.registry.get(model_name, Some(&resolved_version)) {
+        enforce_rate_limit(state, mv.policies.rate_limit.as_ref(), model_name, &headers).await?;
+    }
     let sse = sse_infer_impl(
         state.clone(),
         model_name.to_string(),
@@ -1122,6 +1146,30 @@ async fn handle_ws_stream(
     if !state.registry.is_ready(&model_name, None) {
         let _ = socket.close().await;
         return;
+    }
+
+    // Rate limit (same logic as HTTP infer). The upgraded WebSocket has no
+    // HTTP headers, so key="ip" collapses every connection to one shared
+    // bucket per model — a known limitation; front WS with a reverse proxy
+    // for per-client limiting. Rejection closes the socket with an error frame.
+    if let Some(mv) = state.registry.get(&model_name, Some(&resolved_version)) {
+        if enforce_rate_limit(
+            &state,
+            mv.policies.rate_limit.as_ref(),
+            &model_name,
+            &HeaderMap::new(),
+        )
+        .await
+        .is_err()
+        {
+            let _ = socket
+                .send(Message::Text(
+                    json!({"error": "rate limit exceeded"}).to_string(),
+                ))
+                .await;
+            let _ = socket.close().await;
+            return;
+        }
     }
 
     // Wait for first message from client (the request payload)
