@@ -130,6 +130,28 @@ class TestAPI(LitAPI):
     )
     .unwrap();
 
+    // status_ep: decorator endpoint with RateLimit + Cors (non-stream).
+    std::fs::write(
+        endpoints_dir.join("status_ep.py"),
+        r#""""Decorator endpoint with RateLimit + Cors callbacks (non-stream)."""
+
+from lite_server import Cors, RateLimit
+from lite_server.endpoint import endpoint
+
+
+@endpoint.get(
+    "/status_ep",
+    callbacks=[
+        RateLimit(requests_per_minute=2, burst=2),
+        Cors(allow_origins=["https://endpoint.example.com"]),
+    ],
+)
+def status_ep_handler(ctx):
+    return {"server": "lite-server", "endpoint": "status_ep"}
+"#,
+    )
+    .unwrap();
+
     // batch_model: max_batch_size=2 so concurrent requests aggregate into
     // one BatchRequest.  predict() records the aggregated batch size in each
     // item's body; encode_response() gives the "bad" item its own 400 status
@@ -876,6 +898,78 @@ async fn test_malformed_json_standardized_400() {
     assert_eq!(body["error"]["type"], "invalid_request_error");
     assert_eq!(body["error"]["code"], "invalid_request_body");
     assert!(body["error"]["param"].is_null());
+}
+
+// ---------------------------------------------------------------------------
+// Custom endpoint responses carry CORS on every path — covers B2
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn test_endpoint_responses_carry_cors() {
+    // Dedicated server: status_ep's RateLimit bucket (burst=2) is shared
+    // across tests on the shared server, so a fresh process gives a clean
+    // starting bucket.
+    let port = 18041;
+    kill_stale_on_port(port);
+    let repo = test_model_repo();
+    let _server = ServerGuard::start(&[
+        "--port",
+        &port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-metrics",
+        "--no-grpc",
+        "--log-level",
+        "warn",
+    ]);
+    wait_for_server(port, 15).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+
+    // status_ep: RateLimit(burst=2) + Cors. Success response carries ACAO.
+    let resp = client
+        .get(format!("{}/status_ep", base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "https://endpoint.example.com"
+    );
+    let _ = resp.text().await.unwrap();
+
+    // 2nd request still within burst.
+    let resp = client
+        .get(format!("{}/status_ep", base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let _ = resp.text().await.unwrap();
+
+    // 3rd request: rate-limited → 429. Before B2 the early Err return (rate
+    // limit) propagated without CORS; the outer wrapper now attaches ACAO to
+    // the 429 as well.
+    let resp = client
+        .get(format!("{}/status_ep", base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429);
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "https://endpoint.example.com"
+    );
 }
 
 // ---------------------------------------------------------------------------

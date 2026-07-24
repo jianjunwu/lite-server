@@ -1283,6 +1283,33 @@ pub async fn custom_endpoint_handler(
     RequestId(request_id): RequestId,
     matched_path: Option<axum::extract::MatchedPath>,
     request: axum::http::Request<axum::body::Body>,
+) -> Response {
+    let route_pattern = matched_path
+        .as_ref()
+        .map(|mp| mp.as_str().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
+    let result =
+        custom_endpoint_impl(state.clone(), request_id, route_pattern.clone(), request).await;
+    let mut resp = match result {
+        Ok(r) => r,
+        Err(e) => e.into_response(),
+    };
+    // CORS wraps every endpoint response (success, 429, stream start, transport
+    // error) — previously only the non-stream success branch attached it, so
+    // early `?` returns and streaming responses leaked without CORS headers.
+    if let Some(mgr) = &state.endpoint_manager {
+        if let Some(cors) = mgr.cors_policy(&route_pattern).await {
+            resp.headers_mut().extend(cors_header_map(&cors));
+        }
+    }
+    resp
+}
+
+async fn custom_endpoint_impl(
+    state: Arc<AppState>,
+    request_id: String,
+    route_pattern: String,
+    request: axum::http::Request<axum::body::Body>,
 ) -> Result<Response, AppError> {
     let ep_mgr = match &state.endpoint_manager {
         Some(mgr) => mgr,
@@ -1291,11 +1318,6 @@ pub async fn custom_endpoint_handler(
 
     let route = request.uri().path().to_string();
     let method = request.method().to_string();
-    // Use the matched axum route pattern for policy lookups
-    let route_pattern = matched_path
-        .as_ref()
-        .map(|mp| mp.as_str().to_string())
-        .unwrap_or_else(|| route.clone());
 
     let span = tracing::info_span!(
         "endpoint_request",
@@ -1423,14 +1445,9 @@ pub async fn custom_endpoint_handler(
                 builder = builder.header(k, v);
             }
         }
-        let mut resp = builder
+        let resp = builder
             .body(axum::body::Body::from(response.body.to_string()))
             .map_err(|e| AppError::Internal(format!("build response: {}", e)))?;
-
-        // Attach CORS headers from the endpoint's declared Cors policy
-        if let Some(cors) = ep_mgr.cors_policy(&route_pattern).await {
-            resp.headers_mut().extend(cors_header_map(&cors));
-        }
 
         Ok(resp)
     }
