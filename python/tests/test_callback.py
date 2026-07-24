@@ -275,6 +275,21 @@ class TestRateLimit:
         with pytest.raises(ValueError, match="key"):
             RateLimit(key="host")
 
+    def test_zero_or_negative_rpm_raises(self):
+        """C1: a non-positive rate silently rejects every request — reject
+        the misconfiguration at construction instead."""
+        with pytest.raises(ValueError, match="requests_per_minute"):
+            RateLimit(requests_per_minute=0)
+        with pytest.raises(ValueError, match="requests_per_minute"):
+            RateLimit(requests_per_minute=-5)
+
+    def test_zero_or_negative_burst_raises(self):
+        """C1: an explicit non-positive burst is a misconfiguration."""
+        with pytest.raises(ValueError, match="burst"):
+            RateLimit(requests_per_minute=60, burst=0)
+        with pytest.raises(ValueError, match="burst"):
+            RateLimit(requests_per_minute=60, burst=-1.5)
+
     def test_fallback_allows_under_limit(self):
         cb = RateLimit(requests_per_minute=6000)  # 100/s
         for _ in range(10):
@@ -304,7 +319,8 @@ class TestRateLimit:
 
     def test_managed_mode_noop(self, monkeypatch):
         monkeypatch.setenv("LITE_POLICY_MANAGED", "1")
-        cb = RateLimit(requests_per_minute=1, burst=0.0)  # would fail immediately
+        # burst < 1 token ⇒ unmanaged, the very first request would be rejected.
+        cb = RateLimit(requests_per_minute=1, burst=0.5)
         cb.on_request(self._ctx())  # no raise — Rust handles it
         cb.on_request(self._ctx())  # still no raise
 

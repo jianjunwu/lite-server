@@ -383,6 +383,12 @@ class RateLimit(Callback):
     ):
         if key not in ("route", "ip"):
             raise ValueError(f"RateLimit key must be 'route' or 'ip', got {key!r}")
+        if requests_per_minute <= 0:
+            raise ValueError(
+                f"RateLimit requests_per_minute must be > 0, got {requests_per_minute}"
+            )
+        if burst is not None and burst <= 0:
+            raise ValueError(f"RateLimit burst must be > 0 when set, got {burst}")
         self.requests_per_minute = requests_per_minute
         self.key = key
         self.burst = float(burst) if burst is not None else requests_per_minute * 1.5
