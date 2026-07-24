@@ -1718,6 +1718,47 @@ class TestCBLoop:
         assert response.single.status.code == "Error"
         assert response.single.headers["x-cb"] == "yes"
 
+    def test_cb_has_finished_failure_does_not_kill_step_thread(self):
+        """B8: has_finished raising must not escape and kill the step thread —
+        the offending sequence gets an error response (and on_error) instead of
+        hanging every subsequent CB request."""
+        seen = []
+
+        class ErrCB(Callback):
+            def on_error(self, ctx, exc):
+                seen.append(exc)
+
+        class CBModel(LitAPI):
+            def decode_request(self, req):
+                return req
+
+            def prefill(self, uid, decoded_input):
+                pass
+
+            def step(self, active_sequences):
+                return ["tok" for _ in active_sequences]
+
+            def has_finished(self, uid, token, generated_sequence):
+                raise RuntimeError("has_finished broke")
+
+            def encode_response(self, output):
+                return {"out": output}
+
+        model = CBModel()
+        model._pipeline = Pipeline.build(model, [ErrCB()])
+        socket = SyncMockSocket()
+        req = Request()
+        req.uid = "cb-hf"
+        req.single.data = json.dumps({"input": "x"}).encode()
+        socket.inject(req.SerializeToString())
+        start_cb_loop(model, socket)
+
+        response = wait_for_response(socket, "cb-hf")
+        assert response.single.status.code == "Error"
+        assert "has_finished" in json.loads(response.single.data)["error"]["message"]
+        assert len(seen) == 1
+        assert isinstance(seen[0], RuntimeError)
+
 
 # ---------------------------------------------------------------------------
 # CB ctx injection (0.7.0 context unification)

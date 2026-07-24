@@ -1036,7 +1036,21 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
                 completed = []
                 for state, token in zip(ready, outputs):
                     state.output.append(token)
-                    if _drive(has_finished(state.uid, token, state.output, ctx=state.ctx)):
+                    # B8: has_finished raising must not escape — the step loop
+                    # runs on a daemon thread, so an uncaught exception here
+                    # would kill it and hang every subsequent CB request.
+                    try:
+                        finished = _drive(has_finished(state.uid, token, state.output, ctx=state.ctx))
+                    except Exception as e:
+                        log.error("cb has_finished error for %s: %s", state.uid, _format_exc_brief(e))
+                        _drive(pipe.run_on_error(state.ctx, e))
+                        active.pop(state.uid, None)
+                        socket.send(_make_error_response(
+                            state.uid, f"has_finished failed: {e}",
+                            headers=_merge_err_headers(state.ctx, e),
+                        ).SerializeToString())
+                        continue
+                    if finished:
                         completed.append(state.uid)
 
                 for uid in completed:
