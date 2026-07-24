@@ -906,6 +906,40 @@ async fn test_malformed_json_standardized_400() {
 
 #[tokio::test]
 #[serial]
+async fn test_endpoint_options_preflight_runtime_lookup() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    // status_ep declares Cors → OPTIONS preflight returns 204 + ACAO.
+    // B3 moved this from a startup snapshot closure to a runtime policy
+    // lookup; this guards that the equivalence holds.
+    let resp = client
+        .request(reqwest::Method::OPTIONS, format!("{}/status_ep", base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "https://endpoint.example.com"
+    );
+
+    // /status (legacy, no Cors) → 405 either way (fallback before B3,
+    // handler after B3).
+    let resp = client
+        .request(reqwest::Method::OPTIONS, format!("{}/status", base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 405);
+}
+
+#[tokio::test]
+#[serial]
 async fn test_endpoint_responses_carry_cors() {
     // Dedicated server: status_ep's RateLimit bucket (burst=2) is shared
     // across tests on the shared server, so a fresh process gives a clean

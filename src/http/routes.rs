@@ -133,19 +133,17 @@ pub fn create_routes(state: AppState, endpoint_routes: Vec<EndpointRoute>) -> Ro
                 _ => router.route(&route, get(custom_endpoint_handler)),
             };
         }
-        // If the endpoint declares CORS, answer OPTIONS preflight directly
-        // at the Rust layer (no need to forward to Python).
-        if let Some(ref cors) = ep.cors {
-            let cors = cors.clone();
-            router = router.route(
-                &route,
-                options(move || {
-                    let headers = cors_header_map(&cors);
-                    async move {
-                        (axum::http::StatusCode::NO_CONTENT, headers)
-                    }
-                }),
-            );
+        // OPTIONS preflight is answered at the Rust layer with a RUNTIME
+        // policy lookup, so an endpoint restart that changes a Cors
+        // declaration takes effect without re-registering routes. Register
+        // OPTIONS for every endpoint (the handler returns 405 when no Cors
+        // policy is declared), unless the endpoint declares OPTIONS itself.
+        let declares_options = ep
+            .methods
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case("OPTIONS"));
+        if !declares_options {
+            router = router.route(&route, options(endpoint_options_handler));
         }
     }
 

@@ -119,6 +119,28 @@ pub async fn inference_options_handler(
     }
 }
 
+// ===== OPTIONS preflight for custom endpoint routes =====
+
+/// Answer OPTIONS preflight for a custom endpoint with a RUNTIME Cors policy
+/// lookup (not a startup snapshot), so endpoint restarts that change a Cors
+/// declaration take effect without re-registering routes. Returns 405 when the
+/// route has no Cors policy.
+pub async fn endpoint_options_handler(
+    State(state): State<Arc<AppState>>,
+    matched_path: Option<axum::extract::MatchedPath>,
+) -> Response {
+    use axum::http::StatusCode;
+    let pattern = matched_path
+        .map(|mp| mp.as_str().to_string())
+        .unwrap_or_default();
+    if let Some(mgr) = &state.endpoint_manager {
+        if let Some(cors) = mgr.cors_policy(&pattern).await {
+            return (StatusCode::NO_CONTENT, cors_header_map(&cors)).into_response();
+        }
+    }
+    AppError::MethodNotAllowed.into_response()
+}
+
 // ===== Info =====
 
 pub async fn info_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
