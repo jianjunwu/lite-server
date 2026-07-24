@@ -24,7 +24,7 @@ import yaml
 import zmq
 
 from lite_server.api import LitAPI
-from lite_server.callback import load_callbacks
+from lite_server.callback import extract_policies, load_callbacks
 from lite_server.context import CBSequence, Headers, RequestContext, RequestMeta
 from lite_server.exceptions import HTTPException
 from lite_server.pipeline import (
@@ -102,6 +102,8 @@ def setup_logging(worker_id: int, level_str: str = "info"):
 
     Configures the root logger so that all child loggers (including the
     user's model logger via ``LitAPI.logger``) inherit the handler and level.
+    Also ensures the ``lite_server`` namespace logger has a handler so builtin
+    callbacks (e.g. LogRequests) are never silently lost.
     """
     level = getattr(logging, level_str.upper(), logging.INFO)
     root = logging.getLogger()
@@ -110,6 +112,11 @@ def setup_logging(worker_id: int, level_str: str = "info"):
         handler = logging.StreamHandler(sys.stderr)
         handler.setFormatter(_LevelPrefixFormatter())
         root.addHandler(handler)
+    # Ensure lite_server namespace has a path to stderr
+    ls_logger = logging.getLogger("lite_server")
+    ls_logger.setLevel(level)
+    if not ls_logger.handlers:
+        ls_logger.addHandler(handler)
     return logging.getLogger("inference_worker")
 
 
@@ -135,15 +142,6 @@ def _get_pipeline(lit_api: LitAPI) -> Pipeline:
 
 def load_litapi(model_py_path: str, config: dict, device: str = "cpu"):
     model_dir = os.path.dirname(os.path.abspath(model_py_path))
-    spec = importlib.util.spec_from_file_location("model_module", model_py_path)
-    module = importlib.util.module_from_spec(spec)
-
-    # Add model directory to path so callbacks can be imported
-    sys.path.insert(0, model_dir)
-    try:
-        callbacks = load_callbacks(config)
-    finally:
-        sys.path.remove(model_dir)
 
     # Protect stdout during model module import and setup.
     # C-level inference libraries (CANN, ONNX Runtime, MagicMind, etc.) may
@@ -152,6 +150,8 @@ def load_litapi(model_py_path: str, config: dict, device: str = "cpu"):
     with _protect_stdout():
         sys.path.insert(0, model_dir)
         try:
+            spec = importlib.util.spec_from_file_location("model_module", model_py_path)
+            module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
         finally:
             sys.path.remove(model_dir)
@@ -176,6 +176,16 @@ def load_litapi(model_py_path: str, config: dict, device: str = "cpu"):
             stream=stream,
         )
         instance.config = config
+
+        # Load callbacks AFTER the class attribute (LitAPI.callbacks) is
+        # readable — class-attr callbacks support constructor arguments
+        # and take priority over config.yaml entries.
+        sys.path.insert(0, model_dir)
+        try:
+            callbacks = load_callbacks(config, instance)
+        finally:
+            sys.path.remove(model_dir)
+
         pipeline = Pipeline.build(instance, callbacks)
 
         pipeline.trigger_lifecycle("on_before_setup", config, device)
@@ -706,10 +716,12 @@ async def _handle_stream_open_async(
         await pipe.preprocess(ctx)
     except HTTPException as e:
         log.warning("stream preprocess rejected for %s: %s", stream_id, e.detail)
+        await pipe.run_on_error(ctx, e)
         await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
         return
     except Exception as e:
         log.warning("stream preprocess failed for %s: %s", stream_id, _format_exc_brief(e))
+        await pipe.run_on_error(ctx, e)
         await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
         return
     if ctx.early is not None:
@@ -807,10 +819,12 @@ async def _process_stream_chunk(
         await pipe.postprocess(ctx)
     except HTTPException as e:
         log.warning("stream encode rejected for %s: %s", stream_id, e.detail)
+        await pipe.run_on_error(ctx, e)
         await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
         return False
     except Exception as e:
         log.error("encode failed for stream %s: %s", stream_id, _format_exc_brief(e))
+        await pipe.run_on_error(ctx, e)
         await socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
         return False
     if ctx.early is not None:
@@ -853,10 +867,12 @@ async def _consume_stream(
         raise
     except HTTPException as e:
         log.warning("stream_predict rejected for %s: %s", stream_id, e.detail)
+        await pipe.run_on_error(ctx, e)
         await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
         return
     except Exception as e:
         log.error("stream_predict error for %s: %s", stream_id, _format_exc_brief(e))
+        await pipe.run_on_error(ctx, e)
         await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
         return
 
@@ -1083,10 +1099,12 @@ def worker_main():
 
     specs = [{"name": s.name, "metric_type": s.metric_type}
              for s in getattr(lit_api, '_metric_specs', [])]
+    pipeline = getattr(lit_api, "_pipeline", None)
     print(json.dumps({
         "status": "ready",
         "worker_id": args.worker_id,
         "metric_specs": specs,
+        "policies": extract_policies(pipeline.callbacks) if pipeline is not None else {},
     }), flush=True)
 
     if args.continuous_batching or config.get("continuous_batching", False):
