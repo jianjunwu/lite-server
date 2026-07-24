@@ -13,26 +13,6 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::timeout;
 use tracing::{info, warn};
 
-/// Convert Python `{param}` placeholders to axum `:param` syntax.
-fn convert_path_params(route: &str) -> String {
-    let mut result = String::with_capacity(route.len());
-    let mut chars = route.chars();
-    while let Some(c) = chars.next() {
-        if c == '{' {
-            result.push(':');
-            for c2 in chars.by_ref() {
-                if c2 == '}' {
-                    break;
-                }
-                result.push(c2);
-            }
-        } else {
-            result.push(c);
-        }
-    }
-    result
-}
-
 const ENDPOINT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Manages the custom endpoint Python subprocess.
@@ -378,7 +358,7 @@ impl EndpointManager {
             let mut policies = self.route_policies.write().await;
             policies.clear();
             for ep in &startup.routes {
-                let axum_route = convert_path_params(&ep.route);
+                let axum_route = crate::worker::protocol::convert_path_params(&ep.route);
                 let cors_headers = ep.cors.as_ref().map(|c| Arc::new(c.header_map()));
                 policies.insert(
                     axum_route,

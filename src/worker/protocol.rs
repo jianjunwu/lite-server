@@ -165,6 +165,28 @@ pub struct EndpointRoute {
     pub cors: Option<CorsPolicy>,
 }
 
+/// Convert Python `{param}` placeholders (from endpoint decorators) to axum
+/// `:param` route syntax. Shared by route registration and endpoint-policy
+/// keying so both sides agree on the same route string (C10 dedup).
+pub fn convert_path_params(route: &str) -> String {
+    let mut result = String::with_capacity(route.len());
+    let mut chars = route.chars();
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            result.push(':');
+            for c2 in chars.by_ref() {
+                if c2 == '}' {
+                    break;
+                }
+                result.push(c2);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 // ===== Policy structures (Python → Rust handshake) =====
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -482,5 +504,17 @@ mod tests {
         );
         assert_eq!(hm.get("access-control-allow-methods").unwrap(), "GET");
         assert_eq!(hm.get("access-control-allow-headers").unwrap(), "x-trace");
+    }
+
+    // ===== convert_path_params (C10) =====
+
+    #[test]
+    fn test_convert_path_params() {
+        assert_eq!(convert_path_params("/pets"), "/pets");
+        assert_eq!(convert_path_params("/pets/{id}"), "/pets/:id");
+        assert_eq!(
+            convert_path_params("/pets/{id}/owner/{oid}"),
+            "/pets/:id/owner/:oid"
+        );
     }
 }

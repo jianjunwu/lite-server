@@ -103,29 +103,9 @@ pub fn create_routes(state: AppState, endpoint_routes: Vec<EndpointRoute>) -> Ro
         .route("/v2/models/:model_name/stream", get(ws_stream_handler))
         .route("/v2/models/:model_name/versions/:version/stream", get(ws_stream_version_handler));
 
-    /// Convert `{param}` placeholders (from Python decorators) to axum `:param`.
-    fn convert_path_params(route: &str) -> String {
-        let mut result = String::with_capacity(route.len());
-        let mut chars = route.chars();
-        while let Some(c) = chars.next() {
-            if c == '{' {
-                result.push(':');
-                for c2 in chars.by_ref() {
-                    if c2 == '}' {
-                        break;
-                    }
-                    result.push(c2);
-                }
-            } else {
-                result.push(c);
-            }
-        }
-        result
-    }
-
     // Register custom endpoint routes
     for ep in endpoint_routes {
-        let route = convert_path_params(&ep.route);
+        let route = crate::worker::protocol::convert_path_params(&ep.route);
         for method in &ep.methods {
             let method_upper = method.to_uppercase();
             router = match method_upper.as_str() {
