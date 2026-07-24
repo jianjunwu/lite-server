@@ -485,6 +485,7 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
         except Exception as e:
             log.error("batch predict failed: %s", _format_exc_brief(e))
             for u in decoded_uids:
+                await pipe.run_on_error(ctx_map[u], e)
                 error_map[u] = e
     else:
         results = await asyncio.gather(
@@ -494,6 +495,7 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
         for u, result in zip(list(ctx_map.keys()), results):
             if isinstance(result, Exception):
                 log.error("predict failed for %s: %s", u, _format_exc_brief(result))
+                await pipe.run_on_error(ctx_map[u], result)
                 error_map[u] = result
 
     # Phase 3: per-item on_output → encode → on_response

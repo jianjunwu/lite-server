@@ -1102,6 +1102,73 @@ class TestBatchPredict:
             assert item.status.code == "Error"
             assert "batch predict boom" in item.status.message
 
+    def test_whole_batch_predict_failure_drives_on_error_per_item(self):
+        """A5: when batched predict fails, every item's on_error must fire."""
+        seen = []
+
+        class ErrCB(Callback):
+            def on_error(self, ctx, exc):
+                seen.append(exc)
+
+        class BrokenBatchModel(LitAPI):
+            def batch(self, inputs):
+                return inputs
+
+            def predict(self, batched):
+                raise ValueError("batch predict boom")
+
+            def unbatch(self, output):
+                return output
+
+        pipe = Pipeline.build(BrokenBatchModel(), [ErrCB()])
+        batch = BatchRequest(items=[
+            BatchItem(uid="i1", data=json.dumps({"input": 1}).encode()),
+            BatchItem(uid="i2", data=json.dumps({"input": 2}).encode()),
+        ])
+        meta = RequestMeta(
+            route="/predict", headers=Headers(), client_ip="",
+            request_id="b1", timestamp_ns=0,
+        )
+        resp = asyncio.run(
+            inference._handle_batch(pipe, "b1", batch, meta, BrokenBatchModel(), log)
+        )
+        assert len(seen) == 2  # one on_error per item
+        assert all(isinstance(e, ValueError) for e in seen)
+        for item in resp.batch.items:
+            assert item.status.code == "Error"
+
+    def test_per_item_predict_failure_drives_on_error_only_for_failed(self):
+        """A5: in the per-item fallback, a single failed item drives on_error
+        exactly once; successful items are unaffected."""
+        seen = []
+
+        class ErrCB(Callback):
+            def on_error(self, ctx, exc):
+                seen.append(ctx.request)
+
+        class SimpleModel(LitAPI):
+            def predict(self, x):
+                if x["input"] == 2:
+                    raise ValueError("per-item boom")
+                return {"result": x["input"]}
+
+        pipe = Pipeline.build(SimpleModel(), [ErrCB()])
+        batch = BatchRequest(items=[
+            BatchItem(uid="i1", data=json.dumps({"input": 1}).encode()),
+            BatchItem(uid="i2", data=json.dumps({"input": 2}).encode()),
+        ])
+        meta = RequestMeta(
+            route="/predict", headers=Headers(), client_ip="",
+            request_id="b2", timestamp_ns=0,
+        )
+        resp = asyncio.run(
+            inference._handle_batch(pipe, "b2", batch, meta, SimpleModel(), log)
+        )
+        assert len(seen) == 1
+        assert seen[0] == {"input": 2}
+        codes = {item.uid: item.status.code for item in resp.batch.items}
+        assert codes == {"i1": "Ok", "i2": "Error"}
+
     def test_async_batch_predict_full_path(self):
         class AsyncBatchModel(LitAPI):
             async def batch(self, inputs):
