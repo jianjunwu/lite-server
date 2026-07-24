@@ -15,9 +15,8 @@ except ImportError:
 from lite_server.api import BidiStreamHandler, LitAPI
 from lite_server.callback import Callback
 from lite_server.context import CBSequence, Headers, RequestContext, RequestMeta
-from lite_server.endpoint import endpoint, router
+from lite_server.endpoint import EndpointRequest, endpoint, router
 from lite_server.middleware import cors, log_requests, rate_limit, require_api_key
-from lite_server.request import Client, QueryParams, Request, State, URL, UploadFile
 from lite_server.response import (
     BackgroundTask,
     FileResponse,
@@ -40,6 +39,7 @@ __all__ = [
     "RequestContext",
     "RequestMeta",
     "CBSequence",
+    "EndpointRequest",
     "OpenAIEndpoint",
     "EndpointSpec",
     "ServerProxy",
@@ -51,7 +51,6 @@ __all__ = [
     "router",
     "__version__",
     # HTTP request / response
-    "Request",
     "Response",
     "JSONResponse",
     "HTMLResponse",
@@ -60,10 +59,5 @@ __all__ = [
     "FileResponse",
     "StreamingResponse",
     "BackgroundTask",
-    "URL",
     "Headers",
-    "QueryParams",
-    "Client",
-    "State",
-    "UploadFile",
 ]

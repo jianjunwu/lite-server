@@ -8,7 +8,23 @@ decorator registration on the global router.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, TypedDict
+
+from lite_server.context import Headers
+
+
+class EndpointRequest(TypedDict, total=False):
+    """Request object passed to endpoint handlers and middleware.
+
+    The endpoint worker protocol is JSON (v0): the body arrives pre-parsed
+    and binary/form uploads are not supported at this layer.
+    """
+
+    method: str            # HTTP method, upper-case
+    route: str             # matched route path, e.g. "/health"
+    headers: Headers       # case-insensitive
+    query: dict[str, str]
+    body: Any              # parsed JSON body (None when absent)
 
 
 @dataclass

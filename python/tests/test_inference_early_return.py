@@ -1,7 +1,7 @@
 """Early-return tests for the unified Pipeline engine.
 
 Any stage (LitAPI method or callback hook) may short-circuit the pipeline by
-returning a ``Response`` / ``ResponseWithHeaders``, or via ``ctx.respond()``.
+returning a ``Response``, or via ``ctx.respond()``.
 Later stages and remaining hooks are skipped; the response is serialized with
 its status code and headers.
 """
@@ -10,20 +10,20 @@ import json
 
 import pytest
 
-from lite_server.api import LitAPI, RequestMeta, ResponseWithHeaders
+from lite_server.api import LitAPI
 from lite_server.callback import Callback
+from lite_server.context import Headers, RequestMeta
 from lite_server.pipeline import Pipeline
 from lite_server.response import Response
 
 
-def _make_meta(route="/predict", payload=None):
+def _make_meta(route="/predict"):
     return RequestMeta(
         route=route,
-        headers={"content-type": "application/json"},
+        headers=Headers({"content-type": "application/json"}),
         client_ip="127.0.0.1",
         request_id="req-1",
         timestamp_ns=123456789,
-        payload=payload if payload is not None else {"input": "hello"},
     )
 
 
@@ -46,13 +46,13 @@ class _TrackerAPI(LitAPI):
         self.calls.append("encode_response")
         return output
 
-    def on_request(self, request, meta):
+    def on_request(self, ctx):
         self.calls.append("on_request")
-        return request
+        return ctx.request
 
-    def on_response(self, response, meta):
+    def on_response(self, ctx):
         self.calls.append("on_response")
-        return response
+        return ctx.response
 
 
 def _pipeline(api, callbacks=()):
@@ -77,8 +77,8 @@ class TestEarlyReturnPoints:
     @pytest.mark.asyncio
     async def test_early_return_at_api_on_request(self):
         api = _TrackerAPI()
-        api.on_request = lambda req, meta: ResponseWithHeaders(
-            body={"early": True}, headers={"X-Stage": "on_request"}
+        api.on_request = lambda ctx: Response(
+            content={"early": True}, headers={"X-Stage": "on_request"}
         )
 
         resp_bytes, status, metrics, headers = await _run(api)
@@ -92,7 +92,7 @@ class TestEarlyReturnPoints:
     async def test_early_return_at_callback_on_request(self):
         class EarlyCB(Callback):
             def on_request(self, ctx):
-                return ResponseWithHeaders(body={"from_cb": 1}, headers={"X-Cb": "on_request"})
+                return Response(content={"from_cb": 1}, headers={"X-Cb": "on_request"})
 
         api = _TrackerAPI()
         resp_bytes, status, metrics, headers = await _run(api, [EarlyCB()])
@@ -104,8 +104,8 @@ class TestEarlyReturnPoints:
     @pytest.mark.asyncio
     async def test_early_return_at_decode_request(self):
         api = _TrackerAPI()
-        api.decode_request = lambda req: ResponseWithHeaders(
-            body={"decoded": True}, headers={"X-Stage": "decode_request"}
+        api.decode_request = lambda req: Response(
+            content={"decoded": True}, headers={"X-Stage": "decode_request"}
         )
 
         resp_bytes, status, metrics, headers = await _run(api)
@@ -118,7 +118,7 @@ class TestEarlyReturnPoints:
     async def test_early_return_at_callback_on_input(self):
         class EarlyCB(Callback):
             def on_input(self, ctx):
-                return ResponseWithHeaders(body={"from_cb": 2}, headers={"X-Cb": "on_input"})
+                return Response(content={"from_cb": 2}, headers={"X-Cb": "on_input"})
 
         api = _TrackerAPI()
         resp_bytes, status, metrics, headers = await _run(api, [EarlyCB()])
@@ -129,8 +129,8 @@ class TestEarlyReturnPoints:
     @pytest.mark.asyncio
     async def test_early_return_at_predict(self):
         api = _TrackerAPI()
-        api.predict = lambda x: ResponseWithHeaders(
-            body={"predicted": True}, headers={"X-Stage": "predict"}
+        api.predict = lambda x: Response(
+            content={"predicted": True}, headers={"X-Stage": "predict"}
         )
 
         resp_bytes, status, metrics, headers = await _run(api)
@@ -142,7 +142,7 @@ class TestEarlyReturnPoints:
     async def test_early_return_at_callback_on_output(self):
         class EarlyCB(Callback):
             def on_output(self, ctx):
-                return ResponseWithHeaders(body={"from_cb": 4}, headers={"X-Cb": "on_output"})
+                return Response(content={"from_cb": 4}, headers={"X-Cb": "on_output"})
 
         api = _TrackerAPI()
         resp_bytes, status, metrics, headers = await _run(api, [EarlyCB()])
@@ -153,8 +153,8 @@ class TestEarlyReturnPoints:
     @pytest.mark.asyncio
     async def test_early_return_at_encode_response(self):
         api = _TrackerAPI()
-        api.encode_response = lambda out: ResponseWithHeaders(
-            body={"encoded": True}, headers={"X-Stage": "encode_response"}
+        api.encode_response = lambda out: Response(
+            content={"encoded": True}, headers={"X-Stage": "encode_response"}
         )
 
         resp_bytes, status, metrics, headers = await _run(api)
@@ -165,7 +165,7 @@ class TestEarlyReturnPoints:
     async def test_early_return_at_callback_on_response(self):
         class EarlyCB(Callback):
             def on_response(self, ctx):
-                return ResponseWithHeaders(body={"from_cb": 6}, headers={"X-Cb": "on_response"})
+                return Response(content={"from_cb": 6}, headers={"X-Cb": "on_response"})
 
         api = _TrackerAPI()
         resp_bytes, status, metrics, headers = await _run(api, [EarlyCB()])
@@ -175,8 +175,8 @@ class TestEarlyReturnPoints:
     @pytest.mark.asyncio
     async def test_early_return_at_api_on_response(self):
         api = _TrackerAPI()
-        api.on_response = lambda resp, meta: ResponseWithHeaders(
-            body={"final": True}, headers={"X-Stage": "on_response"}
+        api.on_response = lambda ctx: Response(
+            content={"final": True}, headers={"X-Stage": "on_response"}
         )
 
         resp_bytes, status, metrics, headers = await _run(api)
@@ -304,7 +304,7 @@ class TestEarlyReturnFlow:
 
             async def predict(self, x):
                 self.calls.append("predict")
-                return ResponseWithHeaders(body={"pred": True}, headers={"X-S": "p"})
+                return Response(content={"pred": True}, headers={"X-S": "p"})
 
             async def encode_response(self, output):
                 self.calls.append("encode_response")
@@ -320,7 +320,7 @@ class TestEarlyReturnFlow:
     async def test_async_callback_early_return(self):
         class AsyncEarlyCB(Callback):
             async def on_input(self, ctx):
-                return ResponseWithHeaders(body={"cb": 2}, headers={"X-Cb": "async"})
+                return Response(content={"cb": 2}, headers={"X-Cb": "async"})
 
         api = _TrackerAPI()
         resp_bytes, status, metrics, headers = await _run(api, [AsyncEarlyCB()])

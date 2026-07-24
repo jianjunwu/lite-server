@@ -12,6 +12,7 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 
+from lite_server.context import Headers
 from lite_server.exceptions import HTTPException
 
 MAX_FRAME_SIZE = 16 * 1024 * 1024  # 16 MiB
@@ -173,10 +174,12 @@ def load_endpoints(repo_path: str):
     try:
         from lite_server.endpoint import router as _global_router
         for route_def in _global_router.routes:
+            handler = route_def.handler
+            for mw in reversed(route_def.middleware):
+                handler = mw(handler)
             endpoints[route_def.path] = {
-                "handler": route_def.handler,
+                "handler": handler,
                 "methods": route_def.methods,
-                "middleware": route_def.middleware,
             }
     except Exception as e:
         logger.debug("No decorator routes collected: %s", e)
@@ -199,11 +202,11 @@ async def handle_request(endpoints, req_data: dict) -> dict:
     handler = ep["handler"]
     server = ServerProxy(req_data.get("server_state", {}))
 
-    # Build a simple request object
-    request = {
+    # Build endpoint request with Headers (case-insensitive)
+    request: dict = {
         "method": req_data.get("method", "GET"),
         "route": route,
-        "headers": req_data.get("headers", {}),
+        "headers": Headers(req_data.get("headers") or {}),
         "query": req_data.get("query", {}),
         "body": req_data.get("body"),
     }

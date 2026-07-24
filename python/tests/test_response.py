@@ -331,31 +331,3 @@ class TestStreamingResponse:
             yield "data"
         r = StreamingResponse(content=gen(), headers={"x-stream": "1"})
         assert r.headers["x-stream"] == "1"
-
-
-# ============================================================================
-# ResponseWithHeaders backward compatibility
-# ============================================================================
-
-class TestResponseWithHeaders:
-    def test_body_maps_to_content(self):
-        from lite_server.api import ResponseWithHeaders
-        r = ResponseWithHeaders(body={"result": 1})
-        assert r.content == {"result": 1}
-
-    def test_headers_passed_through(self):
-        from lite_server.api import ResponseWithHeaders
-        r = ResponseWithHeaders(body="data", headers={"x-key": "v"})
-        assert r.content == "data"
-        assert r.headers["x-key"] == "v"
-
-    def test_default_media_type(self):
-        from lite_server.api import ResponseWithHeaders
-        r = ResponseWithHeaders(body={"a": 1})
-        assert r.media_type == "application/json"
-
-    def test_isinstance_of_response(self):
-        from lite_server.api import ResponseWithHeaders
-        from lite_server.response import Response as LiteResponse
-        r = ResponseWithHeaders(body="test")
-        assert isinstance(r, LiteResponse)
