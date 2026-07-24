@@ -611,7 +611,7 @@ class TestResponseFrameContract:
         from lite_server import RateLimit
         from lite_server.pipeline import Pipeline
 
-        pipe = Pipeline.for_endpoint([RateLimit(requests_per_minute=0, burst=0.0)])
+        pipe = Pipeline.for_endpoint([RateLimit(requests_per_minute=1, burst=0.5)])
 
         def handler(ctx):
             return {"result": "ok"}
