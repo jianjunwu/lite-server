@@ -1,7 +1,8 @@
 """Contract tests for the unified Pipeline engine.
 
 Covers hook ordering, early return, error propagation, ctx.state,
-sync/async adaptation, capability detection, and lifecycle hooks.
+sync/async adaptation, capability detection, lifecycle hooks, and
+ctx injection (0.7.0 context unification).
 """
 
 import json
@@ -633,3 +634,292 @@ class TestFinalize:
         assert m.gauges[0].value == 1.5
         # buffer cleared after collection
         assert collect_metrics(api) is None
+
+
+# ---------------------------------------------------------------------------
+# Ctx injection: API hooks unified with Callback hooks (0.7.0)
+# ---------------------------------------------------------------------------
+
+
+class TestApiHookCtxUnification:
+    """LitAPI.on_request / on_response receive the same RequestContext as
+    Callback hooks — single ctx parameter, no more (request, meta)."""
+
+    @pytest.mark.asyncio
+    async def test_api_hook_receives_same_ctx_as_callbacks(self):
+        api_ctx = []
+        cb_ctx = []
+
+        class API(EchoAPI):
+            def on_request(self, ctx):
+                api_ctx.append(ctx)
+                return ctx.request
+
+            def on_response(self, ctx):
+                api_ctx.append(ctx)
+                return ctx.response
+
+        class CB(Callback):
+            def on_request(self, ctx):
+                cb_ctx.append(ctx)
+
+            def on_response(self, ctx):
+                cb_ctx.append(ctx)
+
+        pipe = Pipeline.build(API(), [CB()])
+        await pipe.run_single(b"{}", _make_meta())
+        assert len(api_ctx) == 2
+        assert len(cb_ctx) == 2
+        # All four hooks see the same ctx object
+        assert api_ctx[0] is cb_ctx[0] is api_ctx[1] is cb_ctx[1]
+
+    @pytest.mark.asyncio
+    async def test_api_hook_early_return_via_respond(self):
+        """on_request returns ctx.respond(...) — pipeline short-circuits."""
+        called = []
+
+        class API(EchoAPI):
+            def on_request(self, ctx):
+                return ctx.respond({"denied": True}, status_code=401)
+
+            def decode_request(self, request):
+                called.append("decode")
+                return request
+
+            def predict(self, x):
+                called.append("predict")
+                return x
+
+        pipe = Pipeline.build(API(), [])
+        resp_bytes, status, metrics, headers = await pipe.run_single(b"{}", _make_meta())
+        assert called == []
+        assert _body(resp_bytes) == {"denied": True}
+        sc, mt, clean = extract_response_meta(headers)
+        assert sc == 401
+
+    def test_old_two_arg_api_hook_fails_at_build(self):
+        class OldAPI(EchoAPI):
+            def on_request(self, request, meta):
+                return request
+
+        with pytest.raises(RuntimeError, match="on_request"):
+            Pipeline.build(OldAPI(), [])
+
+    def test_old_two_arg_on_response_fails_at_build(self):
+        class OldAPI(EchoAPI):
+            def on_response(self, response, meta):
+                return response
+
+        with pytest.raises(RuntimeError, match="on_response"):
+            Pipeline.build(OldAPI(), [])
+
+    def test_single_param_named_request_fails_at_build(self):
+        """A hook with a single 'request' param (old shape with default meta)
+        must be rejected — silently binding ctx to 'request' is wrong."""
+
+        class BadAPI(EchoAPI):
+            def on_request(self, request, meta=None):
+                return request
+
+        with pytest.raises(RuntimeError, match="on_request"):
+            Pipeline.build(BadAPI(), [])
+
+
+class TestUnoverriddenApiHooksSkipped:
+    """When a LitAPI subclass does NOT override on_request/on_response,
+    the base no-ops must not be added to the hook chain — saves 2 async
+    calls per request."""
+
+    def test_unoverridden_api_hooks_not_in_chain(self):
+        pipe = Pipeline.build(EchoAPI(), [])
+        assert pipe._chains["on_request"] == []
+        assert pipe._chains["on_response"] == []
+
+    def test_overridden_on_request_added_to_chain(self):
+        class API(EchoAPI):
+            def on_request(self, ctx):
+                return ctx.request
+
+        pipe = Pipeline.build(API(), [])
+        assert len(pipe._chains["on_request"]) == 1
+
+    def test_overridden_on_response_added_to_chain(self):
+        class API(EchoAPI):
+            def on_response(self, ctx):
+                return ctx.response
+
+        pipe = Pipeline.build(API(), [])
+        assert len(pipe._chains["on_response"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Ctx injection: decode / predict / encode
+# ---------------------------------------------------------------------------
+
+
+class TestCtxInjection:
+    """Declaring a parameter named 'ctx' on decode_request / predict /
+    encode_response opts into receiving the RequestContext."""
+
+    @pytest.mark.asyncio
+    async def test_decode_request_ctx_injection(self):
+        captured = []
+
+        class API(EchoAPI):
+            def decode_request(self, request, ctx):
+                captured.append(ctx)
+                return {"prompt": request.get("q"), "uid": ctx.meta.request_id}
+
+            def predict(self, x):
+                return x
+
+        pipe = Pipeline.build(API(), [])
+        resp_bytes, *_ = await pipe.run_single(b'{"q": "hello"}', _make_meta())
+        assert len(captured) == 1
+        assert captured[0].meta.request_id == "req-1"
+        assert _body(resp_bytes) == {"echo": {"prompt": "hello", "uid": "req-1"}}
+
+    @pytest.mark.asyncio
+    async def test_encode_response_ctx_injection(self):
+        captured = []
+
+        class API(EchoAPI):
+            def encode_response(self, output, ctx):
+                captured.append(ctx.meta.route)
+                return {"result": output, "route": ctx.meta.route}
+
+        pipe = Pipeline.build(API(), [])
+        resp_bytes, *_ = await pipe.run_single(b'{"x": 1}', _make_meta())
+        assert captured == ["/predict"]
+        assert _body(resp_bytes)["route"] == "/predict"
+
+    @pytest.mark.asyncio
+    async def test_predict_ctx_injection_single(self):
+        captured = []
+
+        class API(EchoAPI):
+            def predict(self, x, ctx):
+                captured.append(ctx.meta.request_id)
+                return {"echo": x, "req": ctx.meta.request_id}
+
+        pipe = Pipeline.build(API(), [])
+        resp_bytes, *_ = await pipe.run_single(b'{"x": 1}', _make_meta())
+        assert captured == ["req-1"]
+        assert _body(resp_bytes)["req"] == "req-1"
+
+    @pytest.mark.asyncio
+    async def test_keyword_only_ctx_injection(self):
+        """Keyword-only 'ctx' parameter (e.g. `*, ctx`) is supported."""
+
+        class API(EchoAPI):
+            def decode_request(self, request, *, ctx):
+                ctx.state["from_decode"] = True
+                return request
+
+            def predict(self, x, *, ctx):
+                assert ctx.state["from_decode"] is True
+                return x
+
+        pipe = Pipeline.build(API(), [])
+        resp_bytes, *_ = await pipe.run_single(b'{"x": 1}', _make_meta())
+        assert _body(resp_bytes) == {"echo": {"x": 1}}
+
+    @pytest.mark.asyncio
+    async def test_state_threaded_on_request_to_decode(self):
+        class API(EchoAPI):
+            def on_request(self, ctx):
+                ctx.state["user"] = "alice"
+                return ctx.request
+
+            def decode_request(self, request, ctx):
+                return {"user": ctx.state["user"], **request}
+
+            def predict(self, x):
+                return x
+
+        pipe = Pipeline.build(API(), [])
+        resp_bytes, *_ = await pipe.run_single(b'{"q": "hi"}', _make_meta())
+        assert _body(resp_bytes)["echo"]["user"] == "alice"
+
+    @pytest.mark.asyncio
+    async def test_on_response_respond_attaches_headers(self):
+        """on_response can use ctx.respond() to attach custom headers —
+        replaces the old ResponseWithHeaders pattern."""
+
+        class API(EchoAPI):
+            def predict(self, x):
+                return {"result": x.get("val")}
+
+            def on_response(self, ctx):
+                return ctx.respond(
+                    ctx.response,
+                    headers={"X-Request-ID": ctx.meta.request_id, "X-Cache": "HIT"},
+                )
+
+        pipe = Pipeline.build(API(), [])
+        resp_bytes, status, metrics, headers = await pipe.run_single(
+            b'{"val": 42}', _make_meta()
+        )
+        assert _body(resp_bytes) == {"result": 42}
+        assert headers == {"X-Request-ID": "req-1", "X-Cache": "HIT"}
+
+
+# ---------------------------------------------------------------------------
+# Ctx injection: forbidden methods (batch / unbatch / step)
+# ---------------------------------------------------------------------------
+
+
+class TestCtxForbidden:
+    """Declaring 'ctx' on batch, unbatch, or step is a load-time error —
+    these methods operate across items/sequences and have no single context."""
+
+    def test_predict_ctx_with_batch_unbatch_fails_at_build(self):
+        class API(EchoAPI):
+            def batch(self, inputs):
+                return inputs
+
+            def unbatch(self, output):
+                return output
+
+            def predict(self, x, ctx):
+                return x
+
+        with pytest.raises(RuntimeError, match="predict.*ctx.*batch"):
+            Pipeline.build(API(), [])
+
+    @pytest.mark.parametrize("method_name", ["batch", "unbatch", "step"])
+    def test_ctx_forbidden_methods_fail_at_build(self, method_name):
+        # Create a class that overrides the forbidden method with a ctx param
+        overrides = {
+            method_name: lambda self, x, ctx: x,
+        }
+        # step needs prefill + has_finished to be a valid CB model
+        if method_name == "step":
+            overrides["prefill"] = lambda self, uid, inp: None
+            overrides["has_finished"] = lambda self, uid, tok, seq: True
+        # batch needs unbatch too
+        if method_name == "batch":
+            overrides["unbatch"] = lambda self, x: x
+
+        BadAPI = type("BadAPI", (EchoAPI,), overrides)
+        with pytest.raises(RuntimeError, match=method_name):
+            Pipeline.build(BadAPI(), [])
+
+    def test_positional_only_ctx_fails_at_build(self):
+        """A positional-only 'ctx' parameter (/) cannot be injected — the
+        wrapper passes ctx as a keyword, so this must fail at load time."""
+
+        # We can't define positional-only params with a regular def, but we
+        # can test that the validation catches it via a mock.
+        # Use a callable object with __call__ that has a positional-only param.
+        class PosOnlyCallable:
+            def __call__(self, x, /, ctx=None):
+                return x
+
+        # Monkey-patch decode_request on an instance
+        api = EchoAPI()
+        api.decode_request = PosOnlyCallable()
+        # _validate_ctx_injection won't catch this (it only checks batch/unbatch/step).
+        # But _wrap_ctx_method should catch it.
+        with pytest.raises(RuntimeError, match="positional-only"):
+            Pipeline.build(api, [])

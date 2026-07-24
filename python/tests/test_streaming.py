@@ -756,3 +756,129 @@ class TestStreamExecutorIsolation:
             "close is using the wrong executor"
         )
         pipe.close()
+
+
+# ---------------------------------------------------------------------------
+# Bidi ctx injection (0.7.0 context unification)
+# ---------------------------------------------------------------------------
+
+
+class TestBidiCtxInjection:
+    """bidi_stream factory and handler hooks support ctx injection."""
+
+    @pytest.mark.asyncio
+    async def test_bidi_factory_ctx_injection(self):
+        captured_ctx = []
+
+        class H(BidiStreamHandler):
+            def on_open(self, initial_data):
+                return {"opened": True}
+
+            def on_chunk(self, chunk):
+                return None
+
+            def on_close(self):
+                pass
+
+        class BidiAPI(EchoAPI):
+            def bidi_stream(self, ctx):
+                captured_ctx.append(ctx)
+                return H()
+
+        sock = AsyncSocket()
+        active = {}
+        await inference._handle_stream_open_async(
+            BidiAPI(), _stream_req("s-bf-ctx", b'{"start": 1}'), sock, active, log
+        )
+        assert len(captured_ctx) == 1
+        assert captured_ctx[0].meta is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("hook_name,expected_key", [
+        ("on_open", "from_open"),
+        ("on_chunk", "from_chunk"),
+        ("on_close", "from_close"),
+    ])
+    async def test_bidi_handler_hooks_ctx_injection(self, hook_name, expected_key):
+        captured = {}
+
+        class H(BidiStreamHandler):
+            def on_open(self, initial_data, ctx):
+                captured["on_open_ctx"] = ctx
+                ctx.state["from_open"] = True
+                return None
+
+            def on_chunk(self, chunk, ctx):
+                captured["on_chunk_ctx"] = ctx
+                ctx.state["from_chunk"] = True
+                return None
+
+            def on_close(self, ctx):
+                captured["on_close_ctx"] = ctx
+                ctx.state["from_close"] = True
+
+        class BidiAPI(EchoAPI):
+            def bidi_stream(self):
+                return H()
+
+        sock = AsyncSocket()
+        active = {}
+        api = BidiAPI()
+        await inference._handle_stream_open_async(
+            api, _stream_req("s-bh-ctx"), sock, active, log
+        )
+        assert "on_open_ctx" in captured
+        assert captured["on_open_ctx"].state.get("from_open") is True
+
+        from lite_server.proto import StreamChunk
+        chunk_req = Request(
+            uid="c1",
+            stream=StreamRequest(
+                stream_id="s-bh-ctx",
+                chunk=StreamChunk(data=b'{"tok": 1}'),
+            ),
+        )
+        await inference._handle_stream_async(api, chunk_req, sock, active, log)
+        assert "on_chunk_ctx" in captured
+        assert captured["on_chunk_ctx"].state.get("from_chunk") is True
+
+        from lite_server.proto import StreamClose
+        close_req = Request(
+            uid="c2",
+            stream=StreamRequest(stream_id="s-bh-ctx", close=StreamClose()),
+        )
+        await inference._handle_stream_async(api, close_req, sock, active, log)
+        assert "on_close_ctx" in captured
+        assert captured["on_close_ctx"].state.get("from_close") is True
+
+    @pytest.mark.asyncio
+    async def test_bidi_open_without_meta_gets_empty_meta(self):
+        """When proto has no meta field, meta must NOT be None —
+        RequestContext.meta is always a RequestMeta (empty default)."""
+        captured_meta = []
+
+        class H(BidiStreamHandler):
+            def on_open(self, initial_data, ctx):
+                captured_meta.append(ctx.meta)
+                return None
+
+            def on_chunk(self, chunk, ctx):
+                return None
+
+            def on_close(self, ctx):
+                pass
+
+        class BidiAPI(EchoAPI):
+            def bidi_stream(self):
+                return H()
+
+        sock = AsyncSocket()
+        active = {}
+        # _stream_req without meta= kwarg produces a StreamRequest with no meta
+        await inference._handle_stream_open_async(
+            BidiAPI(), _stream_req("s-no-meta", b"{}"), sock, active, log
+        )
+        assert len(captured_meta) == 1
+        assert captured_meta[0] is not None
+        assert captured_meta[0].route == ""
+        assert captured_meta[0].request_id == ""

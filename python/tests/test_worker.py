@@ -1506,6 +1506,189 @@ class TestCBLoop:
         assert "cb rejected" in body["error"]["message"]
 
 
+# ---------------------------------------------------------------------------
+# CB ctx injection (0.7.0 context unification)
+# ---------------------------------------------------------------------------
+
+
+class TestCBCtxInjection:
+    """prefill / has_finished support ctx injection; step receives CBSequence."""
+
+    def test_cb_prefill_ctx_injection(self):
+        captured_ctx = []
+        captured_state = []
+
+        class CBModel(LitAPI):
+            def decode_request(self, req):
+                return req.get("input", "")
+
+            def prefill(self, uid, decoded_input, ctx):
+                captured_ctx.append(ctx)
+                ctx.state["prefill_seen"] = True
+
+            def step(self, active_sequences):
+                captured_state.append(active_sequences[0].state.get("prefill_seen"))
+                return [f"ok({s.input})" for s in active_sequences]
+
+            def has_finished(self, uid, token, generated_sequence):
+                return True
+
+            def encode_response(self, output):
+                return {"out": output}
+
+        model = CBModel()
+        socket = SyncMockSocket()
+        req = Request()
+        req.uid = "cb-ctx-1"
+        req.single.data = json.dumps({"input": "hello"}).encode()
+        socket.inject(req.SerializeToString())
+        start_cb_loop(model, socket)
+
+        response = wait_for_response(socket, "cb-ctx-1")
+        assert len(captured_ctx) == 1
+        assert captured_ctx[0].meta is not None
+        assert captured_state == [True]
+
+    def test_cb_has_finished_ctx_injection(self):
+        captured = []
+
+        class CBModel(LitAPI):
+            def decode_request(self, req):
+                return req.get("input", "")
+
+            def prefill(self, uid, decoded_input):
+                pass
+
+            def step(self, active_sequences):
+                return [f"t({s.input})" for s in active_sequences]
+
+            def has_finished(self, uid, token, generated_sequence, ctx):
+                captured.append((uid, ctx.meta.request_id))
+                return True
+
+            def encode_response(self, output):
+                return {"out": output}
+
+        model = CBModel()
+        socket = SyncMockSocket()
+        req = Request()
+        req.uid = "cb-hf-1"
+        req.single.data = json.dumps({"input": "x"}).encode()
+        socket.inject(req.SerializeToString())
+        start_cb_loop(model, socket)
+
+        response = wait_for_response(socket, "cb-hf-1")
+        assert len(captured) == 1
+        assert captured[0][0] == "cb-hf-1"
+
+    def test_cb_step_receives_cbsequence(self):
+        """step() elements are CBSequence objects with attribute access,
+        NOT dicts — fixes the docstring/impl mismatch."""
+        captured_type = []
+        captured_attrs = []
+
+        class CBModel(LitAPI):
+            def decode_request(self, req):
+                return req
+
+            def prefill(self, uid, decoded_input):
+                pass
+
+            def step(self, active_sequences):
+                s = active_sequences[0]
+                captured_type.append(type(s).__name__)
+                captured_attrs.append(
+                    (hasattr(s, "uid"), hasattr(s, "input"),
+                     hasattr(s, "output"), hasattr(s, "state"),
+                     hasattr(s, "meta"), hasattr(s, "ctx"))
+                )
+                return [f"r({s.input['val']})"]
+
+            def has_finished(self, uid, token, generated_sequence):
+                return True
+
+            def encode_response(self, output):
+                return {"out": output}
+
+        model = CBModel()
+        socket = SyncMockSocket()
+        req = Request()
+        req.uid = "cb-seq-1"
+        req.single.data = json.dumps({"val": 42}).encode()
+        socket.inject(req.SerializeToString())
+        start_cb_loop(model, socket)
+
+        response = wait_for_response(socket, "cb-seq-1")
+        assert captured_type == ["CBSequence"]
+        assert captured_attrs == [(True, True, True, True, True, True)]
+
+    def test_cb_methods_run_without_pipeline_executor(self):
+        """CB prefill/step/has_finished run inline on the cb_loop (executor=None)
+        — never on the Pipeline's ThreadPoolExecutor.  This is the concurrency
+        model invariant: step and prefill must never run concurrently with
+        each other or with model state access."""
+
+        class CBModel(LitAPI):
+            def decode_request(self, req):
+                return req.get("input", "")
+
+            def prefill(self, uid, decoded_input):
+                pass
+
+            def step(self, active_sequences):
+                return ["tok" for _ in active_sequences]
+
+            def has_finished(self, uid, token, generated_sequence):
+                return True
+
+            def encode_response(self, output):
+                return output
+
+        model = CBModel()
+        socket = SyncMockSocket()
+        req = Request()
+        req.uid = "cb-exec-1"
+        req.single.data = json.dumps({"input": "x"}).encode()
+        socket.inject(req.SerializeToString())
+        start_cb_loop(model, socket)
+
+        response = wait_for_response(socket, "cb-exec-1")
+        assert response.single.status.code == "Ok"
+
+    def test_cb_sequence_state_is_ctx_state(self):
+        """CBSequence.state is the same dict as ctx.state — mutations
+        made in prefill (via ctx) are visible in step (via seq.state)."""
+        step_seen = []
+
+        class CBModel(LitAPI):
+            def decode_request(self, req):
+                return req.get("input", "")
+
+            def prefill(self, uid, decoded_input, ctx):
+                ctx.state["marker"] = f"set-by-{uid}"
+
+            def step(self, active_sequences):
+                step_seen.append(active_sequences[0].state["marker"])
+                return ["ok"]
+
+            def has_finished(self, uid, token, generated_sequence):
+                return True
+
+            def encode_response(self, output):
+                return output
+
+        model = CBModel()
+        socket = SyncMockSocket()
+        req = Request()
+        req.uid = "cb-state-1"
+        req.single.data = json.dumps({"input": "x"}).encode()
+        socket.inject(req.SerializeToString())
+        start_cb_loop(model, socket)
+
+        response = wait_for_response(socket, "cb-state-1")
+        assert step_seen == ["set-by-cb-state-1"]
+
+
 class TestTeardownHelper:
     def test_teardown_called_and_exceptions_caught(self):
         from lite_server.worker.inference import _run_teardown

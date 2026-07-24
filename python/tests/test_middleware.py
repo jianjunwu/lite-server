@@ -2,9 +2,18 @@
 
 import time
 import threading
+
 import pytest
 
-from lite_server.middleware import TokenBucket, _rate_limiters, _rate_limiters_lock
+from lite_server.middleware import (
+    TokenBucket,
+    _rate_limiters,
+    _rate_limiters_lock,
+    cors,
+    log_requests,
+    rate_limit,
+    require_api_key,
+)
 
 
 class TestTokenBucket:
@@ -106,3 +115,111 @@ class TestRateLimitCleanup:
 
         with _rate_limiters_lock:
             assert "/recent" in _rate_limiters
+
+
+# ============================================================================
+# Middleware chain integration (0.7.0: middleware actually applied)
+# ============================================================================
+
+
+class TestMiddlewareChainIntegration:
+    """Middleware decorators applied in order; short-circuit on rejection."""
+
+    @pytest.mark.asyncio
+    async def test_require_api_key_rejects_missing_key(self):
+        handler_called = []
+
+        @require_api_key(header="X-Api-Key", keys=["secret"])
+        async def handler(request, server):
+            handler_called.append(True)
+            return {"body": "ok"}
+
+        result = await handler({"headers": {}}, None)
+        assert result["status_code"] == 401
+        assert result["body"]["error"] == "unauthorized"
+        assert handler_called == []
+
+    @pytest.mark.asyncio
+    async def test_require_api_key_passes_with_valid_key(self):
+        @require_api_key(header="X-Api-Key", keys=["secret"])
+        async def handler(request, server):
+            return {"body": "authorized"}
+
+        result = await handler({"headers": {"X-Api-Key": "secret"}}, None)
+        assert result["body"] == "authorized"
+
+    @pytest.mark.asyncio
+    async def test_require_api_key_case_sensitive_header(self):
+        """With Headers (case-insensitive), 'x-api-key' matches header 'X-Api-Key'.
+        The dict-based headers in middleware currently ARE case-sensitive, so
+        this test documents the current behavior — after the endpoint dict
+        switches to Headers (§7), middleware will become case-insensitive."""
+        @require_api_key(header="x-api-key", keys=["s3kr3t"])
+        async def handler(request, server):
+            return {"body": "ok"}
+
+        # dict headers are case-sensitive; must match exactly
+        result = await handler({"headers": {"x-api-key": "s3kr3t"}}, None)
+        assert result["body"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_middleware_applied_in_order(self):
+        """Middleware wraps in list order: first in list = outermost = runs first."""
+        calls = []
+
+        def mw_a(handler):
+            async def wrapper(request, server):
+                calls.append("a_before")
+                result = await handler(request, server)
+                calls.append("a_after")
+                return result
+            return wrapper
+
+        def mw_b(handler):
+            async def wrapper(request, server):
+                calls.append("b_before")
+                result = await handler(request, server)
+                calls.append("b_after")
+                return result
+            return wrapper
+
+        async def handler(request, server):
+            calls.append("handler")
+            return {"body": "done"}
+
+        # Simulate load_endpoints middleware wrapping (reversed order)
+        wrapped = handler
+        for mw in reversed([mw_a, mw_b]):
+            wrapped = mw(wrapped)
+
+        result = await wrapped({}, None)
+        assert calls == ["a_before", "b_before", "handler", "b_after", "a_after"]
+        assert result["body"] == "done"
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_does_not_block_normal_requests(self):
+        @rate_limit(requests_per_minute=1000)
+        async def handler(request, server):
+            return {"body": "ok"}
+
+        result = await handler({"route": "/test"}, None)
+        assert result["body"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_cors_adds_headers(self):
+        @cors(allow_origins=["https://example.com"])
+        async def handler(request, server):
+            return {"body": "data"}
+
+        result = await handler({}, None)
+        assert result["headers"]["Access-Control-Allow-Origin"] == "https://example.com"
+        assert "Access-Control-Allow-Methods" in result["headers"]
+
+    @pytest.mark.asyncio
+    async def test_log_requests_calls_handler(self):
+        @log_requests
+        async def handler(request, server):
+            return {"body": "logged"}
+
+        result = await handler({"route": "/test", "method": "GET"}, None)
+        assert result["body"] == "logged"
