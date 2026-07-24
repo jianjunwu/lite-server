@@ -202,14 +202,19 @@ pub struct ReloadSignal {
     pub model_name: String,
 }
 
+/// Per-(model, version) queue state held in [`InferenceQueue::queues`].
+/// Factored out of an anonymous tuple so the field types are self-documenting.
+struct VersionQueue {
+    tx: mpsc::Sender<QueueItem>,
+    collector: std::sync::Arc<tokio::task::JoinHandle<()>>,
+    outlier: Arc<OutlierState>,
+    /// Health-checker task handle (abortable); `None` if health checks disabled.
+    health_checker: Option<std::sync::Arc<tokio::task::JoinHandle<()>>>,
+}
+
 /// Per-model-version inference queue with batch aggregation.
 pub struct InferenceQueue {
-    queues: DashMap<String, (
-        mpsc::Sender<QueueItem>,
-        std::sync::Arc<tokio::task::JoinHandle<()>>,
-        Arc<OutlierState>,
-        Option<std::sync::Arc<tokio::task::JoinHandle<()>>>, // health_checker (abortable)
-    )>,
+    queues: DashMap<String, VersionQueue>,
 }
 
 impl Default for InferenceQueue {
@@ -239,9 +244,9 @@ impl InferenceQueue {
         let key = model_version_key(model_name, version);
 
         // Abort and remove stale collector + health checker if exists
-        if let Some((_, (_, old_handle, _, old_health))) = self.queues.remove(&key) {
-            old_handle.abort();
-            if let Some(h) = old_health {
+        if let Some((_, v)) = self.queues.remove(&key) {
+            v.collector.abort();
+            if let Some(h) = v.health_checker {
                 h.abort();
             }
         }
@@ -290,7 +295,15 @@ impl InferenceQueue {
             None
         };
 
-        self.queues.insert(key, (tx, std::sync::Arc::new(handle), outlier, health_handle));
+        self.queues.insert(
+            key,
+            VersionQueue {
+                tx,
+                collector: std::sync::Arc::new(handle),
+                outlier,
+                health_checker: health_handle,
+            },
+        );
         info!(
             model = %model_name,
             version = %version,
@@ -303,9 +316,9 @@ impl InferenceQueue {
     /// Unregister a model version and stop its collector + health checker.
     pub fn unregister_model(&self, model_name: &str, version: &str) {
         let key = model_version_key(model_name, version);
-        if let Some((_, (_, batch_handle, _, health_handle))) = self.queues.remove(&key) {
-            batch_handle.abort();
-            if let Some(h) = health_handle {
+        if let Some((_, v)) = self.queues.remove(&key) {
+            v.collector.abort();
+            if let Some(h) = v.health_checker {
                 h.abort();
             }
             info!(model = %model_name, version = %version, "model unregistered");
@@ -326,7 +339,7 @@ impl InferenceQueue {
                 .queues
                 .get(&key)
                 .ok_or(QueueError::NotFound)?;
-            entry.0.clone()
+            entry.tx.clone()
         };
         sender
             .try_send(item)
@@ -351,7 +364,7 @@ impl InferenceQueue {
     /// Get outlier detection state for a model version.
     pub fn get_outlier_state(&self, model_name: &str, version: &str) -> Option<Arc<OutlierState>> {
         let key = model_version_key(model_name, version);
-        self.queues.get(&key).map(|entry| entry.2.clone())
+        self.queues.get(&key).map(|entry| entry.outlier.clone())
     }
 }
 
@@ -1080,13 +1093,13 @@ mod tests {
 
         let outlier = Arc::new(OutlierState::new(0));
         queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx.clone(), outlier);
-        let first_handle = queue.queues.get(&model_version_key("test_model", "1")).unwrap().1.clone();
+        let first_handle = queue.queues.get(&model_version_key("test_model", "1")).unwrap().collector.clone();
         assert!(!first_handle.is_finished());
 
         // Re-register should abort the first collector
         let outlier = Arc::new(OutlierState::new(0));
         queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx, outlier);
-        let second_handle = queue.queues.get(&model_version_key("test_model", "1")).unwrap().1.clone();
+        let second_handle = queue.queues.get(&model_version_key("test_model", "1")).unwrap().collector.clone();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(first_handle.is_finished(), "old collector should be aborted");
@@ -1109,7 +1122,7 @@ mod tests {
 
         let outlier = Arc::new(OutlierState::new(0));
         queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx, outlier);
-        let handle = queue.queues.get(&model_version_key("test_model", "1")).unwrap().1.clone();
+        let handle = queue.queues.get(&model_version_key("test_model", "1")).unwrap().collector.clone();
         assert!(!handle.is_finished());
 
         queue.unregister_model("test_model", "1");
