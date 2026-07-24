@@ -840,18 +840,20 @@ async fn do_infer(
                             _ => "5xx",
                         };
                         prometheus::record_request_end(&model_name, &resolved_version, status_family, duration).await;
-                        return Err(AppError::ModelError {
-                            status_code: http_status,
-                            error_type,
-                            detail: error_message,
-                            code: error_code,
-                            param: error_param,
-                            headers: if single.headers.is_empty() {
-                                None
-                            } else {
-                                Some(single.headers.clone())
+                        return Err(AppError::ModelError(Box::new(
+                            crate::error::ModelErrorData {
+                                status_code: http_status,
+                                error_type,
+                                detail: error_message,
+                                code: error_code,
+                                param: error_param,
+                                headers: if single.headers.is_empty() {
+                                    None
+                                } else {
+                                    Some(single.headers.clone())
+                                },
                             },
-                        });
+                        )));
                     }
 
                     // Not a numeric status code — internal worker error, sanitize.

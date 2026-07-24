@@ -76,19 +76,32 @@ pub enum AppError {
 
     /// Model-initiated error with explicit HTTP status and client-facing message.
     /// Unlike WorkerCrashed, the message is NOT sanitized — the model author
-    /// intentionally exposes it.
-    #[error("model error ({status_code}): {detail}")]
-    ModelError {
-        status_code: u16,
-        error_type: String,
-        detail: String,
-        code: Option<String>,
-        param: Option<String>,
-        /// Extra response headers from the model's HTTPException (e.g.
-        /// Retry-After on 429/503), forwarded to the client verbatim minus
-        /// hop-by-hop / library-managed headers.
-        headers: Option<HashMap<String, String>>,
-    },
+    /// intentionally exposes it. Boxed so `AppError` stays small (this payload
+    /// carries several Strings + a header map — without boxing it dominates the
+    /// enum size and every `Result<_, AppError>` blows past the large-Err
+    /// threshold).
+    #[error("{0}")]
+    ModelError(Box<ModelErrorData>),
+}
+
+/// Owned payload for [`AppError::ModelError`].
+#[derive(Debug)]
+pub struct ModelErrorData {
+    pub status_code: u16,
+    pub error_type: String,
+    pub detail: String,
+    pub code: Option<String>,
+    pub param: Option<String>,
+    /// Extra response headers from the model's HTTPException (e.g.
+    /// Retry-After on 429/503), forwarded to the client verbatim minus
+    /// hop-by-hop / library-managed headers.
+    pub headers: Option<HashMap<String, String>>,
+}
+
+impl std::fmt::Display for ModelErrorData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "model error ({}): {}", self.status_code, self.detail)
+    }
 }
 
 impl AppError {
@@ -117,7 +130,7 @@ impl AppError {
             AppError::RateLimitExceeded { .. } => "rate limit exceeded",
             // ModelError is handled specially in IntoResponse
             // and never reaches this point, but provide a fallback.
-            AppError::ModelError { .. } => "model error",
+            AppError::ModelError(_) => "model error",
         }
     }
 
@@ -156,16 +169,14 @@ impl AppError {
             AppError::InvalidQueryParam(_) => "invalid_query_param",
             AppError::RateLimitExceeded { .. } => "rate_limit_exceeded",
             // ModelError code comes from the Python worker; fallback to its error_type
-            AppError::ModelError { code, error_type, .. } => {
-                code.as_deref().unwrap_or(error_type.as_str())
-            }
+            AppError::ModelError(d) => d.code.as_deref().unwrap_or(d.error_type.as_str()),
         }
     }
 
     /// Return the parameter name that caused the error, if applicable.
     pub fn param(&self) -> Option<&str> {
         match self {
-            AppError::ModelError { param, .. } => param.as_deref(),
+            AppError::ModelError(d) => d.param.as_deref(),
             _ => None,
         }
     }
@@ -175,36 +186,28 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         // Model errors carry a model-author-facing message — return it
         // directly without sanitization.
-        if let AppError::ModelError {
-            status_code,
-            error_type,
-            detail,
-            ref code,
-            ref param,
-            ref headers,
-        } = &self
-        {
-            let status = StatusCode::from_u16(*status_code)
+        if let AppError::ModelError(d) = &self {
+            let status = StatusCode::from_u16(d.status_code)
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             // Log at info level — not a server fault, the model intentionally
             // rejected the request.
             tracing::info!(
-                status = %status_code,
-                error_type = %error_type,
-                code = ?code,
-                detail = %detail,
+                status = %d.status_code,
+                error_type = %d.error_type,
+                code = ?d.code,
+                detail = %d.detail,
                 "model error"
             );
             let error_obj = json!({
-                "type": error_type,
-                "message": detail,
-                "code": code,
-                "param": param,
+                "type": d.error_type,
+                "message": d.detail,
+                "code": d.code,
+                "param": d.param,
             });
             let body = Json(json!({ "error": error_obj }));
             let mut resp = (status, body).into_response();
             // Forward model-authored headers (e.g. Retry-After) to the client.
-            if let Some(hdrs) = headers {
+            if let Some(hdrs) = &d.headers {
                 crate::http::handlers::inject_response_headers_into(resp.headers_mut(), hdrs);
             }
             return resp;
@@ -231,7 +234,7 @@ impl IntoResponse for AppError {
             AppError::InvalidQueryParam(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
             AppError::RateLimitExceeded { .. } => (StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded"),
             // Handled above via early return; should never reach here.
-            AppError::ModelError { .. } => unreachable!(),
+            AppError::ModelError(_) => unreachable!(),
         };
 
         // Log full internal details for operational debugging.
@@ -390,14 +393,14 @@ mod tests {
     #[tokio::test]
     async fn test_model_error_passthrough_message() {
         use axum::response::IntoResponse;
-        let err = AppError::ModelError {
+        let err = AppError::ModelError(Box::new(ModelErrorData {
             status_code: 400,
             error_type: "INVALID_INPUT".to_string(),
             detail: "input must be non-negative".to_string(),
             code: None,
             param: None,
             headers: None,
-        };
+        }));
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
@@ -414,26 +417,26 @@ mod tests {
     async fn test_model_error_various_status_codes() {
         use axum::response::IntoResponse;
         // 503
-        let err = AppError::ModelError {
+        let err = AppError::ModelError(Box::new(ModelErrorData {
             status_code: 503,
             error_type: "MODEL_NOT_READY".to_string(),
             detail: "model loading".to_string(),
             code: None,
             param: None,
             headers: None,
-        };
+        }));
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         // 404
-        let err = AppError::ModelError {
+        let err = AppError::ModelError(Box::new(ModelErrorData {
             status_code: 404,
             error_type: "NOT_FOUND".to_string(),
             detail: "item not in vocab".to_string(),
             code: None,
             param: None,
             headers: None,
-        };
+        }));
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
@@ -500,14 +503,14 @@ mod tests {
     #[tokio::test]
     async fn test_model_error_with_code_and_param() {
         use axum::response::IntoResponse;
-        let err = AppError::ModelError {
+        let err = AppError::ModelError(Box::new(ModelErrorData {
             status_code: 400,
             error_type: "invalid_request_error".into(),
             detail: "bad input".into(),
             code: Some("invalid_input".into()),
             param: Some("temperature".into()),
             headers: None,
-        };
+        }));
         let response = err.into_response();
         let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
@@ -518,14 +521,14 @@ mod tests {
     #[tokio::test]
     async fn test_model_error_with_code_no_param() {
         use axum::response::IntoResponse;
-        let err = AppError::ModelError {
+        let err = AppError::ModelError(Box::new(ModelErrorData {
             status_code: 400,
             error_type: "invalid_request_error".into(),
             detail: "bad input".into(),
             code: Some("invalid_input".into()),
             param: None,
             headers: None,
-        };
+        }));
         let response = err.into_response();
         let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
@@ -539,14 +542,14 @@ mod tests {
         let mut hdrs = std::collections::HashMap::new();
         hdrs.insert("retry-after".to_string(), "5".to_string());
         hdrs.insert("x-trace".to_string(), "abc".to_string());
-        let err = AppError::ModelError {
+        let err = AppError::ModelError(Box::new(ModelErrorData {
             status_code: 503,
             error_type: "model_error".to_string(),
             detail: "overloaded".to_string(),
             code: None,
             param: None,
             headers: Some(hdrs),
-        };
+        }));
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers().get("retry-after").unwrap(), "5");
