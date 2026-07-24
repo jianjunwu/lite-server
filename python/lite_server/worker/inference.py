@@ -208,7 +208,8 @@ def _make_error_response(uid: str, message: str,
                          status_code: int | None = None,
                          error_type: str | None = None,
                          code: str | None = None,
-                         param: str | None = None) -> Response:
+                         param: str | None = None,
+                         headers: dict[str, str] | None = None) -> Response:
     # Default unexpected worker exceptions to a structured 500 server_error.
     # Carrying the HTTP status code in Status.message lets the Rust side route
     # these through ModelError (handlers.rs) so the client sees the real error
@@ -228,10 +229,10 @@ def _make_error_response(uid: str, message: str,
     }
     data = json.dumps({"error": error_dict}).encode()
     status = Status(code="Error", message=str(status_code))
-    return Response(
-        uid=uid,
-        single=SingleResponse(data=data, status=status),
-    )
+    single = SingleResponse(data=data, status=status)
+    if headers:
+        single.headers.update({str(k): str(v) for k, v in headers.items()})
+    return Response(uid=uid, single=single)
 
 
 def _format_exc_brief(exc: BaseException) -> str:
@@ -431,7 +432,16 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
 
     except HTTPException as e:
         log.warning("async request %s rejected: %s", uid, e.detail)
-        response = _make_error_response(uid, e.detail, status_code=e.status_code, error_type=e.error_type, code=e.code, param=e.param)
+        # Merge response headers: ctx.response_headers (threaded onto the
+        # exception by run_single as _response_headers — see B6) first, then
+        # the exception's own headers (e.g. Retry-After) win.
+        hdrs = dict(getattr(e, "_response_headers", None) or {})
+        if e.headers:
+            hdrs.update(e.headers)
+        response = _make_error_response(
+            uid, e.detail, status_code=e.status_code, error_type=e.error_type,
+            code=e.code, param=e.param, headers=hdrs or None,
+        )
     except Exception as e:
         # One short ERROR line: message + where it raised (deepest frame).
         # A multi-line traceback would be split into many events by the Rust

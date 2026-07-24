@@ -774,6 +774,28 @@ class TestAsyncLoop:
         assert body["error"]["type"] == "server_error"
         assert "boom" in body["error"]["message"]
 
+    def test_async_http_exception_carries_response_headers(self):
+        """A6: HTTPException headers (e.g. Retry-After) reach the unary error
+        response instead of being silently dropped."""
+        from lite_server.exceptions import HTTPException
+
+        class RateLimitedModel(LitAPI):
+            async def predict(self, x):
+                raise HTTPException(
+                    503, "slow down", headers={"Retry-After": "5"}
+                )
+
+        socket = AsyncMockSocket()
+        req = Request(uid="rl-1", single=SingleRequest(data=json.dumps({"input": 1}).encode()))
+        socket.inject(req.SerializeToString())
+        drive_loop(RateLimitedModel(), socket)
+
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.single.status.code == "Error"
+        assert resp.single.status.message == "503"
+        assert resp.single.headers["Retry-After"] == "5"
+
     def test_async_stream_with_async_generator(self):
         class AsyncStreamModel(LitAPI):
             async def predict(self, x):
