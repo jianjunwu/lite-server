@@ -1,4 +1,14 @@
-"""Python custom endpoint worker for lite-server."""
+"""Python custom endpoint worker for lite-server.
+
+Handler/middleware contract::
+
+    (request: EndpointRequest, server: ServerProxy) -> dict | Response
+
+A returned dict carrying ``status_code`` / ``headers`` / ``stream`` /
+``chunks`` keys is unpacked as a response frame; any other dict becomes
+the response body with status 200.  Middleware are decorator-style
+wrappers applied once at load time (list order = execution order).
+"""
 
 import argparse
 import asyncio
@@ -16,6 +26,11 @@ from lite_server.context import Headers
 from lite_server.exceptions import HTTPException
 
 MAX_FRAME_SIZE = 16 * 1024 * 1024  # 16 MiB
+
+# A dict result carrying any of these keys is a response frame, not plain
+# data: the fields are unpacked into the wire response (§7.2-4 contract).
+# "body" alone is NOT a trigger — it stays usable as a plain data key.
+_RESPONSE_FRAME_TRIGGER_KEYS = ("status_code", "headers", "stream", "chunks")
 
 logger = logging.getLogger("endpoint_worker")
 
@@ -235,6 +250,31 @@ async def handle_request(endpoints, req_data: dict) -> dict:
 
         if not isinstance(result, dict):
             result = {"data": result}
+
+        if any(k in result for k in _RESPONSE_FRAME_TRIGGER_KEYS):
+            # Response frame: unpack fields instead of nesting the whole
+            # dict into the body.  Middleware short-circuits (401/429),
+            # EndpointSpec frames, and streaming frames all take this path.
+            # Without a "body" key the remaining non-frame keys are the body
+            # (e.g. cors annotating a plain data dict).
+            resp = {
+                "request_id": req_data.get("request_id", ""),
+                "status_code": result.get("status_code", 200),
+                "headers": result.get("headers"),
+                "body": result.get(
+                    "body",
+                    {
+                        k: v
+                        for k, v in result.items()
+                        if k not in _RESPONSE_FRAME_TRIGGER_KEYS
+                        and k != "request_id"
+                    },
+                ),
+            }
+            if result.get("stream"):
+                resp["stream"] = True
+                resp["chunks"] = result.get("chunks", [])
+            return resp
 
         return {
             "request_id": req_data.get("request_id", ""),

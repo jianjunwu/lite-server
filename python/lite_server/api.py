@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from typing import Any, Iterator, List, Tuple
 
 from lite_server.context import RequestContext
-from lite_server.response import Response
 
 
 @dataclass
@@ -36,10 +35,25 @@ class BidiStreamHandler:
     Override :meth:`on_open`, :meth:`on_chunk`, and :meth:`on_close`
     to process client input and optionally produce output chunks.
     All three may be sync or async.
+
+    Each hook may declare a parameter named exactly ``ctx`` to receive the
+    per-session :class:`RequestContext` (detected once when the session is
+    established)::
+
+        def on_chunk(self, chunk, ctx):
+            count = ctx.state.get("chunks", 0)
+            ctx.state["chunks"] = count + 1
+
+    ``ctx.state`` is shared across ``on_open`` / ``on_chunk`` / ``on_close``
+    of the same session; ``ctx.meta`` is the request metadata from the
+    stream-open request.
     """
 
     def on_open(self, initial_data: Any) -> Any | None:
         """Called with the initial payload when the stream opens.
+
+        May declare a ``ctx`` parameter for the session context (see class
+        docstring).
 
         Args:
             initial_data: Decoded output of ``decode_request`` for the open
@@ -53,6 +67,9 @@ class BidiStreamHandler:
     def on_chunk(self, chunk: Any) -> Any | None:
         """Called with each incoming chunk from the client.
 
+        May declare a ``ctx`` parameter for the session context (see class
+        docstring).
+
         Args:
             chunk: Decoded chunk data (JSON dict from the client).
 
@@ -62,7 +79,11 @@ class BidiStreamHandler:
         return None
 
     def on_close(self) -> None:
-        """Called when the stream is closed by the client or server."""
+        """Called when the stream is closed by the client or server.
+
+        May declare a ``ctx`` parameter for the session context (see class
+        docstring).
+        """
         pass
 
 
@@ -179,7 +200,14 @@ class LitAPI:
         return list(output)
 
     def encode_response(self, output: Any) -> Any:
-        """Convert the model output to a response payload."""
+        """Convert the model output to a response payload.
+
+        To access per-request context, declare a second parameter named
+        exactly ``ctx`` — detected once at load time::
+
+            def encode_response(self, output, ctx):
+                return {"result": output, "request_id": ctx.meta.request_id}
+        """
         return output
 
     # ===== Custom Metrics =====
@@ -244,6 +272,13 @@ class LitAPI:
 
         If not overridden, the worker automatically falls back to
         predict() and sends the result as a single chunk.
+
+        To access the per-stream context, declare a second parameter named
+        exactly ``ctx`` — detected once at load time::
+
+            def stream_predict(self, request, ctx):
+                for token in self.model.stream(request):
+                    yield {"token": token, "request_id": ctx.meta.request_id}
         """
         raise NotImplementedError
 

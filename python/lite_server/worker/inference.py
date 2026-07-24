@@ -289,6 +289,9 @@ def _make_stream_done(stream_id: str, metrics=None) -> Response:
 
 
 def _meta_from_proto(meta_pb) -> RequestMeta:
+    # meta.payload is no longer decoded: nothing in the framework reads it,
+    # and the body is already decoded once from item data.  (Proto field
+    # stays on the wire; Rust may stop sending it in a later release.)
     return RequestMeta(
         route=meta_pb.route,
         headers=Headers(dict(meta_pb.headers)),
@@ -594,15 +597,15 @@ async def _handle_stream_open_async(
     stream_id = stream_req.stream_id
     open_req = stream_req.open
     data = open_req.data if open_req else b""
-    meta = _meta_from_proto(open_req.meta) if open_req and open_req.HasField("meta") else None
+    # §6.3: meta fallback is unified across bidi / predict-fallback /
+    # uni-stream — RequestContext.meta is never None.
+    meta = _meta_from_proto(open_req.meta) if open_req and open_req.HasField("meta") else RequestMeta(
+        route="", headers=Headers(), client_ip="", request_id="", timestamp_ns=0,
+    )
     pipe = _get_pipeline(lit_api)
 
     # --- Bidirectional streaming ------------------------------------------
     if pipe.has_bidi_stream:
-        if meta is None:
-            meta = RequestMeta(
-                route="", headers=Headers(), client_ip="", request_id="", timestamp_ns=0,
-            )
         ctx = RequestContext(meta=meta, request=json.loads(data) if data else {})
         try:
             await pipe.preprocess(ctx)
@@ -677,10 +680,6 @@ async def _handle_stream_open_async(
         return
 
     # --- Uni-directional streaming -----------------------------------------
-    if meta is None:
-        meta = RequestMeta(
-            route="", headers=Headers(), client_ip="", request_id="", timestamp_ns=0,
-        )
     ctx = RequestContext(meta=meta, request=json.loads(data) if data else {})
     try:
         await pipe.preprocess(ctx)

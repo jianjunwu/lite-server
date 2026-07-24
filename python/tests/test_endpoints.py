@@ -516,3 +516,143 @@ class TestRequestModuleRemoved:
         """Headers moves to lite_server.context, re-exported from lite_server."""
         from lite_server import Headers
         assert Headers is not None
+
+
+# ===== 0.7.0 response-frame contract at dispatch =====
+
+
+class TestResponseFrameContract:
+    """handle_request unpacks handler-returned response frames (§7.2-4).
+
+    A dict carrying status_code/headers/stream/chunks keys is a response
+    frame ("body" is interpreted inside frames but is not a trigger, so it
+    stays usable as a plain data key); a plain data dict is wrapped as the
+    body with status 200 (unchanged legacy behavior).
+    """
+
+    @staticmethod
+    def _req(route="/r", headers=None):
+        return {
+            "request_id": "r1",
+            "route": route,
+            "method": "GET",
+            "headers": headers or {},
+            "query": {},
+            "body": None,
+            "server_state": {},
+        }
+
+    @pytest.mark.asyncio
+    async def test_plain_dict_wrapped_as_body_unchanged(self):
+        def handler(request, server):
+            return {"foo": "bar"}
+
+        ep = {"/r": {"handler": handler, "methods": ["GET"]}}
+        resp = await handle_request(ep, self._req())
+        assert resp["status_code"] == 200
+        assert resp["headers"] is None
+        assert resp["body"] == {"foo": "bar"}
+
+    @pytest.mark.asyncio
+    async def test_frame_dict_status_code_and_headers_honored(self):
+        def handler(request, server):
+            return {"status_code": 201, "headers": {"X-A": "b"}, "body": {"ok": True}}
+
+        ep = {"/r": {"handler": handler, "methods": ["GET"]}}
+        resp = await handle_request(ep, self._req())
+        assert resp["status_code"] == 201
+        assert resp["headers"] == {"X-A": "b"}
+        assert resp["body"] == {"ok": True}
+
+    @pytest.mark.asyncio
+    async def test_spec_frame_not_double_wrapped(self):
+        """EndpointSpec.handle returns a full frame; dispatch must not nest it."""
+        def handler(request, server):
+            return {
+                "request_id": "ignored",
+                "status_code": 200,
+                "headers": None,
+                "body": {"object": "chat.completion"},
+            }
+
+        ep = {"/r": {"handler": handler, "methods": ["GET"]}}
+        resp = await handle_request(ep, self._req())
+        assert resp["status_code"] == 200
+        assert resp["body"] == {"object": "chat.completion"}
+        # Dispatch owns the envelope request_id.
+        assert resp["request_id"] == "r1"
+
+    @pytest.mark.asyncio
+    async def test_streaming_frame_passes_through(self):
+        """OpenAIEndpoint-style stream frames keep stream/chunks for
+        handle_connection's streaming branch."""
+        def handler(request, server):
+            return {
+                "request_id": "s1",
+                "status_code": 200,
+                "stream": True,
+                "chunks": [{"choices": [{"delta": {"content": "hi"}}]}],
+            }
+
+        ep = {"/r": {"handler": handler, "methods": ["GET"]}}
+        resp = await handle_request(ep, self._req())
+        assert resp["status_code"] == 200
+        assert resp["stream"] is True
+        assert resp["chunks"] == [{"choices": [{"delta": {"content": "hi"}}]}]
+
+    @pytest.mark.asyncio
+    async def test_middleware_short_circuit_401_via_dispatch(self):
+        from lite_server.middleware import require_api_key
+
+        called = []
+
+        async def handler(request, server):
+            called.append(True)
+            return {"result": "ok"}
+
+        wrapped = require_api_key(header="X-API-Key", keys=["secret"])(handler)
+        ep = {"/r": {"handler": wrapped, "methods": ["GET"]}}
+        resp = await handle_request(ep, self._req())
+        assert resp["status_code"] == 401
+        assert resp["body"] == {"error": "unauthorized"}
+        assert called == []
+
+    @pytest.mark.asyncio
+    async def test_middleware_429_retry_after_via_dispatch(self):
+        from lite_server.middleware import rate_limit
+
+        async def handler(request, server):
+            return {"result": "ok"}
+
+        wrapped = rate_limit(requests_per_minute=0)(handler)
+        ep = {"/rl": {"handler": wrapped, "methods": ["GET"]}}
+        resp = await handle_request(ep, self._req(route="/rl"))
+        assert resp["status_code"] == 429
+        assert resp["headers"]["Retry-After"] == "60"
+
+    @pytest.mark.asyncio
+    async def test_cors_headers_pass_through_and_body_preserved(self):
+        from lite_server.middleware import cors
+
+        async def handler(request, server):
+            return {"foo": "bar"}
+
+        wrapped = cors(allow_origins=["https://example.com"])(handler)
+        ep = {"/r": {"handler": wrapped, "methods": ["GET"]}}
+        resp = await handle_request(ep, self._req())
+        assert resp["headers"]["Access-Control-Allow-Origin"] == "https://example.com"
+        assert resp["body"] == {"foo": "bar"}
+
+    @pytest.mark.asyncio
+    async def test_require_api_key_case_insensitive_via_dispatch(self):
+        """Full §7 story: Headers envelope + middleware — key matches any case."""
+        from lite_server.middleware import require_api_key
+
+        async def handler(request, server):
+            return {"result": "authorized"}
+
+        wrapped = require_api_key(header="X-API-Key", keys=["secret"])(handler)
+        ep = {"/r": {"handler": wrapped, "methods": ["GET"]}}
+        resp = await handle_request(ep, self._req(headers={"x-api-key": "secret"}))
+        assert resp["status_code"] == 200
+        assert resp["body"] == {"result": "authorized"}

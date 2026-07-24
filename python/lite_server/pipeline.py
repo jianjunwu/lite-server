@@ -121,12 +121,6 @@ def _is_asyncish(fn: Callable) -> bool:
 # Ctx injection infrastructure (0.7.0 context unification)
 # ---------------------------------------------------------------------------
 
-# Methods with a per-item/per-session context — declaring ``ctx`` opts in.
-_CTX_INJECTABLE = {
-    "decode_request", "predict", "encode_response", "stream_predict",
-    "prefill", "has_finished", "bidi_stream",
-    "on_open", "on_chunk", "on_close",
-}
 # Methods operating across items/sequences — declaring ``ctx`` is a load-time error.
 _CTX_FORBIDDEN = ("batch", "unbatch", "step")
 

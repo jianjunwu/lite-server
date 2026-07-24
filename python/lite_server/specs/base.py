@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
+from lite_server.endpoint import EndpointRequest
+
 _SPEC_REGISTRY: list[type[EndpointSpec]] = []
 
 
@@ -44,7 +46,7 @@ class EndpointSpec(ABC):
         ...
 
     @abstractmethod
-    async def handle(self, request: dict) -> dict:
+    async def handle(self, request: EndpointRequest) -> dict:
         """Handle a single request and return a response dict.
 
         The response dict must contain:

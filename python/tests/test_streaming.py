@@ -883,3 +883,29 @@ class TestBidiCtxInjection:
         assert captured_meta[0] is not None
         assert captured_meta[0].route == ""
         assert captured_meta[0].request_id == ""
+
+
+class TestStreamFallbackMeta:
+    """Predict-fallback stream open: meta invariant holds on all paths (§6.3)."""
+
+    @pytest.mark.asyncio
+    async def test_fallback_predict_without_meta_gets_empty_meta(self):
+        """Model without stream_predict/bidi falls back to run_single;
+        meta absent on the wire must become an empty RequestMeta, not None."""
+        captured_meta = []
+
+        class FallbackAPI(EchoAPI):
+            def decode_request(self, request, ctx):
+                captured_meta.append(ctx.meta)
+                return request
+
+        sock = AsyncSocket()
+        active = {}
+        # _stream_req without meta= kwarg produces a StreamRequest with no meta
+        await inference._handle_stream_open_async(
+            FallbackAPI(), _stream_req("s-fb-no-meta", b"{}"), sock, active, log
+        )
+        assert len(captured_meta) == 1
+        assert isinstance(captured_meta[0], RequestMeta)
+        assert captured_meta[0].request_id == ""
+        assert captured_meta[0].route == ""
