@@ -96,6 +96,8 @@ message SingleResponse {
 
 message BatchResponse {
   repeated BatchItemResponse items = 1;
+  // Deprecated: retained for wire compatibility, no longer populated.
+  // Per-item status/status_code/media_type/headers live on BatchItemResponse.
   map<string, string> headers = 2;
 }
 
@@ -140,6 +142,11 @@ message StreamError {
   string message = 1;
 }
 
+// code describes worker *execution* state ("Ok" = the pipeline completed
+// normally, "Error" = an exception / worker failure).  The HTTP status of a
+// successful response travels separately in SingleResponse.status_code /
+// BatchItemResponse.status_code — an "Ok" Status may still carry a 4xx/5xx
+// status_code (e.g. early return with Response(status_code=400)).
 message Status {
   string code = 1;
   string message = 2;
