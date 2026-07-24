@@ -673,8 +673,14 @@ class Pipeline:
         """
         if self._executor is not None:
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(self._executor, fn, *args)
-        return fn(*args)
+            result = await loop.run_in_executor(self._executor, fn, *args)
+        else:
+            result = fn(*args)
+        # Sync callable may still return a coroutine (e.g. an object with
+        # async __call__) — same runtime guard as _adapt.
+        if asyncio.iscoroutine(result):
+            result = await result
+        return result
 
     def close(self) -> None:
         """Shut down the sync-stage executor (worker teardown)."""

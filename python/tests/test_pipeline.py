@@ -1106,6 +1106,30 @@ class TestRunEndpoint:
         await pipe.run_endpoint(ctx, handler=sync_handler)
         assert ctx.response == {"sync": True}
 
+    @pytest.mark.asyncio
+    async def test_sync_handler_returning_coroutine_is_awaited(self):
+        """B7: a sync callable that returns a coroutine (e.g. an object with
+        async __call__, invisible to iscoroutinefunction) runs through
+        run_blocking and must be awaited — not stored raw on ctx.response.
+        Mirrors the runtime guard already present in _adapt."""
+        import asyncio
+
+        class AsyncCB(Callback):
+            async def on_request(self, ctx):
+                pass
+
+        pipe = Pipeline.for_endpoint([AsyncCB()])
+        assert pipe._executor is not None  # mixed mode -> run_blocking path
+        ctx = RequestContext(meta=_make_endpoint_meta())
+
+        class CallableObj:
+            async def __call__(self, ctx_arg):
+                return {"answered": True}
+
+        await pipe.run_endpoint(ctx, handler=CallableObj())
+        assert ctx.response == {"answered": True}
+        assert not asyncio.iscoroutine(ctx.response)
+
 
 # ---------------------------------------------------------------------------
 # run_single + on_error
