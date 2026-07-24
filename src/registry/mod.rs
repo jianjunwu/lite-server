@@ -232,7 +232,6 @@ impl ModelRegistry {
         policies: Option<crate::worker::protocol::ModelPolicies>,
     ) {
         if let Some(p) = policies {
-            let _key = format!("{}/{}", model_name, version);
             if let Some(mut entry) = self.models.get_mut(model_name) {
                 if let Some(mv) = entry.versions.get_mut(version) {
                     // Pre-build the CORS HeaderMap once (B9) so the hot response
@@ -252,16 +251,6 @@ impl ModelRegistry {
         let model = self.models.get(model_name)?;
         let mv = model.versions.get(active_version.value())?;
         mv.cors_headers.clone()
-    }
-
-    pub fn active_rate_limit_policy(
-        &self,
-        model_name: &str,
-    ) -> Option<crate::worker::protocol::RateLimitPolicy> {
-        let active_version = self.active_versions.get(model_name)?;
-        let model = self.models.get(model_name)?;
-        let mv = model.versions.get(active_version.value())?;
-        mv.policies.rate_limit.clone()
     }
 
     pub fn set_strategy(
