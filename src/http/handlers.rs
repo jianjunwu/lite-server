@@ -101,10 +101,17 @@ pub async fn health_handler() -> impl IntoResponse {
 
 pub async fn inference_options_handler(
     State(state): State<Arc<AppState>>,
-    Path(model_name): Path<String>,
+    Path(params): Path<HashMap<String, String>>,
 ) -> Response {
     use axum::http::StatusCode;
-    match state.registry.active_cors_policy(&model_name) {
+    // The handler is registered on both 1-param (`/v2/models/:model_name/infer`)
+    // and 2-param (`/v2/models/:model_name/versions/:version/infer`) routes.
+    // Path<String> only accepts exactly one captured param, so the versioned
+    // routes returned 500. HashMap captures all params regardless of count.
+    let Some(model_name) = params.get("model_name") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match state.registry.active_cors_policy(model_name) {
         Some(policy) => {
             (StatusCode::NO_CONTENT, cors_header_map(&policy)).into_response()
         }

@@ -152,6 +152,42 @@ class BatchAPI(LitAPI):
     )
     .unwrap();
 
+    // policy_model: declares RateLimit + Cors callbacks so the Rust HTTP
+    // layer executes rate limiting and attaches CORS headers / answers
+    // preflight (LITE_POLICY_MANAGED=1 makes the Python side a declaration).
+    let policy_dir = tmp.join("policy_model/1");
+    std::fs::create_dir_all(&policy_dir).unwrap();
+    std::fs::write(
+        policy_dir.join("model.py"),
+        r#"from lite_server import LitAPI, RateLimit, Cors
+
+
+class PolicyAPI(LitAPI):
+    callbacks = (
+        RateLimit(requests_per_minute=3, burst=3),
+        Cors(allow_origins=["https://app.example.com"]),
+    )
+
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x * 2}
+
+    def encode_response(self, output):
+        return output
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        policy_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+
     tmp
 }
 
@@ -819,6 +855,66 @@ async fn test_malformed_json_standardized_400() {
     assert_eq!(body["error"]["type"], "invalid_request_error");
     assert_eq!(body["error"]["code"], "invalid_request_body");
     assert!(body["error"]["param"].is_null());
+}
+
+// ---------------------------------------------------------------------------
+// OPTIONS preflight (CORS) on inference routes — covers A1
+// ---------------------------------------------------------------------------
+
+const POLICY_MODEL: &str = "policy_model";
+
+#[tokio::test]
+#[serial]
+async fn test_inference_options_preflight_all_routes() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    // policy_model declares Cors(allow_origins=["https://app.example.com"]).
+    load_model(&base, POLICY_MODEL, "1").await;
+
+    // All four inference routes (incl. the two versioned ones) must answer
+    // OPTIONS preflight with 204 + ACAO. The versioned routes used to 500
+    // because inference_options_handler took Path<String> on a 2-param route.
+    let routes = [
+        format!("/v2/models/{}/infer", POLICY_MODEL),
+        format!("/v2/models/{}/versions/1/infer", POLICY_MODEL),
+        format!("/v2/models/{}/events", POLICY_MODEL),
+        format!("/v2/models/{}/versions/1/events", POLICY_MODEL),
+    ];
+    for path in &routes {
+        let resp = client
+            .request(reqwest::Method::OPTIONS, format!("{}{}", base, path))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            204,
+            "OPTIONS {} should be 204, got {}",
+            path,
+            resp.status()
+        );
+        let acao = resp
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap_or_else(|| panic!("ACAO missing on OPTIONS {}", path));
+        assert_eq!(acao.to_str().unwrap(), "https://app.example.com");
+    }
+
+    // A model WITHOUT a Cors declaration answers OPTIONS with 405.
+    load_model(&base, MODEL, "1").await;
+    let resp = client
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/v2/models/{}/infer", base, MODEL),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 405);
+
+    unload_model(&base, POLICY_MODEL, "1").await;
+    unload_model(&base, MODEL, "1").await;
 }
 
 // ---------------------------------------------------------------------------
