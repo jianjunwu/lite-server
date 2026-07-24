@@ -466,6 +466,7 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
             await pipe.preprocess(ctx)
         except Exception as e:
             log.warning("batch item %s preprocess failed: %s", item.uid, _format_exc_brief(e))
+            await pipe.run_on_error(ctx, e)
             error_map[item.uid] = e
             continue
         if ctx.early is not None:
@@ -504,6 +505,7 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
                 await pipe.postprocess(ctx)
         except Exception as e:
             log.warning("batch item %s postprocess failed: %s", item_uid, _format_exc_brief(e))
+            await pipe.run_on_error(ctx, e)
             error_map[item_uid] = e
             continue
         value = ctx.early if ctx.early is not None else ctx.response
@@ -919,10 +921,12 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
         try:
             _drive(pipe.preprocess(ctx))
         except HTTPException as e:
+            _drive(pipe.run_on_error(ctx, e))
             err_resp = _make_error_response(cb_add.uid, e.detail, status_code=e.status_code, error_type=e.error_type, code=e.code, param=e.param)
             socket.send(err_resp.SerializeToString())
             return
         except Exception as e:
+            _drive(pipe.run_on_error(ctx, e))
             err_resp = _make_error_response(cb_add.uid, str(e))
             socket.send(err_resp.SerializeToString())
             return
@@ -940,10 +944,12 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
             state.prefilled = True
         except HTTPException as e:
             del active[cb_add.uid]
+            _drive(pipe.run_on_error(ctx, e))
             err_resp = _make_error_response(cb_add.uid, e.detail, status_code=e.status_code, error_type=e.error_type, code=e.code, param=e.param)
             socket.send(err_resp.SerializeToString())
         except Exception as e:
             del active[cb_add.uid]
+            _drive(pipe.run_on_error(ctx, e))
             err_resp = _make_error_response(cb_add.uid, f"prefill failed: {e}")
             socket.send(err_resp.SerializeToString())
 
@@ -968,6 +974,7 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
                 except HTTPException as e:
                     log.warning("cb step rejected: %s", e.detail)
                     for state in list(active.values()):
+                        _drive(pipe.run_on_error(state.ctx, e))
                         err_resp = _make_error_response(state.uid, e.detail, status_code=e.status_code, error_type=e.error_type, code=e.code, param=e.param)
                         socket.send(err_resp.SerializeToString())
                     active.clear()
@@ -975,6 +982,7 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
                 except Exception as e:
                     log.error("cb step error: %s", _format_exc_brief(e))
                     for state in list(active.values()):
+                        _drive(pipe.run_on_error(state.ctx, e))
                         err_resp = _make_error_response(state.uid, f"step failed: {e}")
                         socket.send(err_resp.SerializeToString())
                     active.clear()
@@ -995,10 +1003,12 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
                         _send_ctx_response(uid, state.ctx)
                     except HTTPException as e:
                         log.warning("cb encode rejected for %s: %s", uid, e.detail)
+                        _drive(pipe.run_on_error(state.ctx, e))
                         err_resp = _make_error_response(uid, e.detail, status_code=e.status_code, error_type=e.error_type, code=e.code, param=e.param)
                         socket.send(err_resp.SerializeToString())
                     except Exception as e:
                         log.error("cb encode error for %s: %s", uid, _format_exc_brief(e))
+                        _drive(pipe.run_on_error(state.ctx, e))
                         err_resp = _make_error_response(uid, f"encode failed: {e}")
                         socket.send(err_resp.SerializeToString())
 
