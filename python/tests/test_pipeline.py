@@ -559,6 +559,39 @@ class TestLifecycleHooks:
         pipe.trigger_lifecycle("on_after_setup", EchoAPI())
         assert called == ["async setup"]
 
+    def test_multiple_async_lifecycle_hooks_all_driven(self):
+        """F5: all async lifecycle hooks are drained in a single event loop."""
+        called = []
+
+        class LC1(Callback):
+            async def on_teardown(self, lit_api):
+                called.append("lc1")
+
+        class LC2(Callback):
+            async def on_teardown(self, lit_api):
+                called.append("lc2")
+
+        pipe = Pipeline.build(EchoAPI(), [LC1(), LC2()])
+        pipe.trigger_lifecycle("on_teardown", EchoAPI())
+        assert called == ["lc1", "lc2"]
+
+    def test_async_lifecycle_exception_isolation(self):
+        """F5: an exception in one async hook does not prevent others."""
+        called = []
+
+        class BadLC(Callback):
+            async def on_teardown(self, lit_api):
+                raise RuntimeError("boom")
+
+        class GoodLC(Callback):
+            async def on_teardown(self, lit_api):
+                called.append("good")
+
+        pipe = Pipeline.build(EchoAPI(), [BadLC(), GoodLC()])
+        # Must not raise
+        pipe.trigger_lifecycle("on_teardown", EchoAPI())
+        assert called == ["good"]
+
 
 # ---------------------------------------------------------------------------
 # finalize / helpers

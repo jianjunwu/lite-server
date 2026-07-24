@@ -421,18 +421,35 @@ class Pipeline:
     def trigger_lifecycle(self, name: str, *args: Any) -> None:
         """Run a lifecycle hook on all registered callbacks.
 
+        Must be called from a synchronous context.  Sync hooks run inline;
+        async hooks are collected and drained in a single ``asyncio.run``
+        call rather than one event loop per hook.
+
         Lifecycle failures are logged, never propagated — teardown must not
         crash shutdown, and setup hooks must not mask the real setup error.
         """
+        pending: list = []
         for cb in self._lifecycle.get(name, ()):
             try:
                 result = getattr(cb, name)(*args)
                 if asyncio.iscoroutine(result):
-                    asyncio.run(result)
+                    pending.append(result)
             except Exception:
                 logger.warning(
                     "Callback %s.%s failed", type(cb).__name__, name, exc_info=True
                 )
+        if pending:
+
+            async def _drain() -> None:
+                for coro in pending:
+                    try:
+                        await coro
+                    except Exception:
+                        logger.warning(
+                            "Async lifecycle %s failed", name, exc_info=True
+                        )
+
+            asyncio.run(_drain())
 
     async def run_blocking(self, fn: Callable, *args: Any) -> Any:
         """Run a sync callable under the stage rules.
