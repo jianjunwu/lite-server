@@ -24,7 +24,7 @@ def status_handler(ctx):
 
     Requires X-API-Key header, rate-limited to 10 req/min.
     """
-    models = ctx.server.registry.list_models() if ctx.server else []
+    models = ctx.server.registry.list_loaded() if ctx.server else []
     return {
         "server": "lite-server",
         "loaded_models": models,
