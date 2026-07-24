@@ -74,10 +74,10 @@ pub fn resolve_model_dir(
     if model_dir.exists() {
         let canonical = model_dir
             .canonicalize()
-            .map_err(|e| AppError::Io(e))?;
+            .map_err(AppError::Io)?;
         let canonical_repo = repo_path
             .canonicalize()
-            .map_err(|e| AppError::Io(e))?;
+            .map_err(AppError::Io)?;
         if !canonical.starts_with(&canonical_repo) {
             return Err(AppError::ModelNotFound(format!(
                 "{} version {} not found",

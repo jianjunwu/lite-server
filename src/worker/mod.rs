@@ -358,7 +358,7 @@ impl WorkerManager {
         let n = timeout(Duration::from_secs(60), reader.read_line(&mut ready_line))
             .await
             .map_err(|_| AppError::InferenceTimeout("worker startup timeout".to_string()))?
-            .map_err(|e| AppError::Io(e))?;
+            .map_err(AppError::Io)?;
         if n == 0 {
             return Err(AppError::WorkerCrashed("worker exited before ready".to_string()));
         }
@@ -683,7 +683,7 @@ impl WorkerManager {
             let n = timeout(Duration::from_secs(60), reader.read_line(&mut ready_line))
                 .await
                 .map_err(|_| AppError::InferenceTimeout("worker startup timeout".to_string()))?
-                .map_err(|e| AppError::Io(e))?;
+                .map_err(AppError::Io)?;
             if n == 0 {
                 return Err(AppError::WorkerCrashed("worker exited before ready".to_string()));
             }

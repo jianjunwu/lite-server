@@ -212,6 +212,12 @@ pub struct InferenceQueue {
     )>,
 }
 
+impl Default for InferenceQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InferenceQueue {
     pub fn new() -> Self {
         Self {
@@ -1200,7 +1206,7 @@ mod tests {
         // bytes::Bytes::from(Bytes) should be a zero-copy refcount bump,
         // equivalent to .clone(). Proves the redundant wrapper is harmless but unnecessary.
         let payload = Bytes::from(vec![0u8; 512]);
-        let via_from = Bytes::from(payload.clone());
+        let via_from = payload.clone();
         let via_clone = payload.clone();
 
         // Both share the same underlying buffer
@@ -1690,7 +1696,7 @@ mod tests {
         // With max_requests=100, jitter=10, result should be in [90, 110]
         for _ in 0..200 {
             let result = compute_jittered_max_requests(100, 10);
-            assert!(result >= 90 && result <= 110,
+            assert!((90..=110).contains(&result),
                 "jittered value {} out of expected range [90, 110]", result);
         }
     }

@@ -1,4 +1,3 @@
-use reqwest;
 use serde_json::{json, Value};
 use serial_test::serial;
 use std::process::{Child, Command, Stdio};
@@ -295,7 +294,7 @@ async fn wait_model_ready(base: &str, model: &str, timeout_secs: u64) -> bool {
 async fn load_model(base: &str, model: &str, version: &str) {
     let client = reqwest::Client::new();
     let resp = client
-        .post(&format!("{}/v2/repository/models/{}/load?version={}", base, model, version))
+        .post(format!("{}/v2/repository/models/{}/load?version={}", base, model, version))
         .send()
         .await
         .expect("load request failed");
@@ -311,7 +310,7 @@ async fn load_model(base: &str, model: &str, version: &str) {
 async fn unload_model(base: &str, model: &str, version: &str) {
     let client = reqwest::Client::new();
     let _ = client
-        .post(&format!("{}/v2/repository/models/{}/unload?version={}", base, model, version))
+        .post(format!("{}/v2/repository/models/{}/unload?version={}", base, model, version))
         .send()
         .await;
 }
@@ -413,7 +412,7 @@ async fn test_health_endpoint() {
     let base = shared_base().await;
     let client = reqwest::Client::new();
 
-    let resp = client.get(&format!("{}/health", base)).send().await.unwrap();
+    let resp = client.get(format!("{}/health", base)).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.unwrap(), "ok");
 }
@@ -424,7 +423,7 @@ async fn test_info_endpoint() {
     let base = shared_base().await;
     let client = reqwest::Client::new();
 
-    let resp = client.get(&format!("{}/info", base)).send().await.unwrap();
+    let resp = client.get(format!("{}/info", base)).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["server"], "lite-server");
@@ -447,14 +446,14 @@ async fn test_model_load_ready_infer_unload() {
 
     // Ready check
     let resp = client
-        .get(&format!("{}/v2/models/{}/ready", base, MODEL))
+        .get(format!("{}/v2/models/{}/ready", base, MODEL))
         .send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["ready"], true);
 
     // List models
-    let resp = client.get(&format!("{}/v2/models", base)).send().await.unwrap();
+    let resp = client.get(format!("{}/v2/models", base)).send().await.unwrap();
     let body: Value = resp.json().await.unwrap();
     let models: Vec<&str> = body["models"].as_array().unwrap()
         .iter().filter_map(|m| m["name"].as_str()).collect();
@@ -462,7 +461,7 @@ async fn test_model_load_ready_infer_unload() {
 
     // Infer
     let resp = client
-        .post(&format!("{}/v2/models/{}/infer", base, MODEL))
+        .post(format!("{}/v2/models/{}/infer", base, MODEL))
         .json(&json!({"input": 5}))
         .send().await.unwrap();
     assert_eq!(resp.status(), 200);
@@ -474,7 +473,7 @@ async fn test_model_load_ready_infer_unload() {
 
     // Verify gone
     let resp = client
-        .get(&format!("{}/v2/models/{}/ready", base, MODEL))
+        .get(format!("{}/v2/models/{}/ready", base, MODEL))
         .send().await.unwrap();
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["ready"], false);
@@ -489,7 +488,7 @@ async fn test_model_list_versions() {
     load_model(&base, MODEL, "1").await;
 
     let resp = client
-        .get(&format!("{}/v2/models/{}/versions", base, MODEL))
+        .get(format!("{}/v2/models/{}/versions", base, MODEL))
         .send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
@@ -508,7 +507,7 @@ async fn test_model_infer_versioned() {
     load_model(&base, MODEL, "1").await;
 
     let resp = client
-        .post(&format!("{}/v2/models/{}/versions/1/infer", base, MODEL))
+        .post(format!("{}/v2/models/{}/versions/1/infer", base, MODEL))
         .json(&json!({"input": 7}))
         .send().await.unwrap();
     assert_eq!(resp.status(), 200);
@@ -528,7 +527,7 @@ async fn test_model_repository_index() {
     load_model(&base, MODEL, "1").await;
 
     let resp = client
-        .post(&format!("{}/v2/repository/index", base))
+        .post(format!("{}/v2/repository/index", base))
         .send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
@@ -557,11 +556,11 @@ async fn test_batch_aggregation_per_item_status_and_headers() {
     // Fire two concurrent requests — with max_batch_size=2 and
     // batch_timeout=0.1 they aggregate into ONE BatchRequest.
     let bad = client
-        .post(&format!("{}/v2/models/{}/infer", base, BATCH_MODEL))
+        .post(format!("{}/v2/models/{}/infer", base, BATCH_MODEL))
         .json(&json!({"kind": "bad"}))
         .send();
     let ok = client
-        .post(&format!("{}/v2/models/{}/infer", base, BATCH_MODEL))
+        .post(format!("{}/v2/models/{}/infer", base, BATCH_MODEL))
         .json(&json!({"kind": "ok"}))
         .send();
     let (bad_resp, ok_resp) = tokio::join!(bad, ok);
@@ -603,7 +602,7 @@ async fn test_sse_streaming() {
 
     // SSE endpoint expects POST with streaming response
     let resp = client
-        .post(&format!("{}/v2/models/{}/events", base, MODEL))
+        .post(format!("{}/v2/models/{}/events", base, MODEL))
         .json(&json!({"input": 3}))
         .send().await.unwrap();
     assert_eq!(resp.status(), 200);
@@ -702,7 +701,7 @@ async fn test_metrics_endpoint() {
     load_model(&format!("http://127.0.0.1:{}", port), "test_model", "1").await;
 
     let resp = client
-        .get(&format!("http://127.0.0.1:{}/metrics", metrics_port))
+        .get(format!("http://127.0.0.1:{}/metrics", metrics_port))
         .send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
@@ -726,7 +725,7 @@ async fn test_custom_endpoint_status() {
     load_model(&base, "test_model", "1").await;
 
     let resp = client
-        .get(&format!("{}/status", base))
+        .get(format!("{}/status", base))
         .send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
@@ -1339,7 +1338,7 @@ class TestAPI(LitAPI):
     // Load and verify initial behavior (x * 2)
     load_model(&base, "test_model", "1").await;
     let resp = client
-        .post(&format!("{}/v2/models/test_model/infer", base))
+        .post(format!("{}/v2/models/test_model/infer", base))
         .json(&json!({"input": 5}))
         .send().await.unwrap();
     assert_eq!(resp.status(), 200);
@@ -1355,7 +1354,7 @@ class TestAPI(LitAPI):
     let mut reloaded = false;
     while tokio::time::Instant::now() < deadline {
         let resp = client
-            .post(&format!("{}/v2/models/test_model/infer", base))
+            .post(format!("{}/v2/models/test_model/infer", base))
             .json(&json!({"input": 5}))
             .send().await.unwrap();
         if resp.status() == 200 {

@@ -454,7 +454,7 @@ pub async fn delete_version_handler(
     if version_dir.exists() {
         tokio::fs::remove_dir_all(&version_dir)
             .await
-            .map_err(|e| AppError::Io(e))?;
+            .map_err(AppError::Io)?;
     }
 
     Ok(Json(json!({
@@ -1074,7 +1074,7 @@ async fn sse_infer_impl(
                         prometheus::record_stream_chunk(&model_name, &resolved_version, "sse");
                     }
                     let data = String::from_utf8_lossy(&c.data);
-                    Event::default().data(data.to_string())
+                    Event::default().data(&data)
                 }
                 Some(pb::stream_response::Payload::Error(e)) => {
                     // Try to parse as structured error from HTTPException
@@ -1648,8 +1648,8 @@ pub async fn download_model_handler(
         }
         let file_path = model_dir.join(file_name);
         // Ensure resolved path is inside model_dir
-        let canonical_file = file_path.canonicalize().map_err(|e| AppError::Io(e))?;
-        let canonical_dir = model_dir.canonicalize().map_err(|e| AppError::Io(e))?;
+        let canonical_file = file_path.canonicalize().map_err(AppError::Io)?;
+        let canonical_dir = model_dir.canonicalize().map_err(AppError::Io)?;
         if !canonical_file.starts_with(&canonical_dir) {
             return Err(AppError::Validation("path traversal rejected".to_string()));
         }

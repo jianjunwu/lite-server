@@ -468,7 +468,7 @@ async fn start_metrics_server(host: String, port: u16) -> Result<(), AppError> {
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .map_err(|e| AppError::Io(e))?;
+        .map_err(AppError::Io)?;
 
     info!("Starting metrics server on {}", addr);
 
@@ -708,7 +708,7 @@ async fn process_watch_events(
             if components.len() >= 2 {
                 // Expected: model_name/version/file
                 if let (Some(model_name), Some(version)) = (
-                    components.get(0).and_then(|c| match c {
+                    components.first().and_then(|c| match c {
                         std::path::Component::Normal(s) => s.to_str(),
                         _ => None,
                     }),
@@ -920,7 +920,7 @@ async fn start_file_watcher(
                         // Deduplicate
                         pending_paths.sort();
                         pending_paths.dedup();
-                        let paths: Vec<PathBuf> = pending_paths.drain(..).collect();
+                        let paths: Vec<PathBuf> = std::mem::take(&mut pending_paths);
                         let _ = tx.send(paths).await;
                         debounce_deadline = None;
                     }

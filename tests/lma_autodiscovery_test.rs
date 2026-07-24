@@ -1,4 +1,3 @@
-use reqwest;
 use serde_json::json;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -210,7 +209,7 @@ orchestration:
     let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < ready_deadline {
         if let Ok(resp) = client
-            .get(&format!("{}/v2/models/my_model/ready", base))
+            .get(format!("{}/v2/models/my_model/ready", base))
             .timeout(Duration::from_secs(2))
             .send()
             .await
@@ -233,7 +232,7 @@ orchestration:
 
     // 8. Inference should work
     let resp = client
-        .post(&format!("{}/v2/models/my_model/infer", base))
+        .post(format!("{}/v2/models/my_model/infer", base))
         .json(&json!({"input": 5}))
         .send()
         .await

@@ -318,7 +318,7 @@ impl EndpointManager {
         let n = timeout(Duration::from_secs(30), reader.read_line(&mut startup_line))
             .await
             .map_err(|_| AppError::InferenceTimeout("endpoint startup timeout".to_string()))?
-            .map_err(|e| AppError::Io(e))?;
+            .map_err(AppError::Io)?;
         if n == 0 {
             return Err(AppError::WorkerCrashed("endpoint worker exited before ready".to_string()));
         }

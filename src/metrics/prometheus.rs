@@ -310,7 +310,7 @@ pub fn record_worker_metrics(model: &str, metrics: Option<&crate::proto::liteser
                 let _ = REGISTRY.register(Box::new(g.clone()));
                 g
             });
-            let _ = gauge.with_label_values(&[model]).set(m.prefill_ms as f64);
+            gauge.with_label_values(&[model]).set(m.prefill_ms as f64);
         }
         if m.decode_ms > 0.0 {
             let mut guard = CUSTOM_GAUGES.lock().unwrap();
@@ -322,7 +322,7 @@ pub fn record_worker_metrics(model: &str, metrics: Option<&crate::proto::liteser
                 let _ = REGISTRY.register(Box::new(g.clone()));
                 g
             });
-            let _ = gauge.with_label_values(&[model]).set(m.decode_ms as f64);
+            gauge.with_label_values(&[model]).set(m.decode_ms as f64);
         }
         if m.tokens_generated > 0 {
             let mut guard = CUSTOM_COUNTERS.lock().unwrap();
@@ -334,7 +334,7 @@ pub fn record_worker_metrics(model: &str, metrics: Option<&crate::proto::liteser
                 let _ = REGISTRY.register(Box::new(c.clone()));
                 c
             });
-            let _ = counter.with_label_values(&[model]).inc_by(m.tokens_generated as f64);
+            counter.with_label_values(&[model]).inc_by(m.tokens_generated as f64);
         }
         // Pre-registered custom metrics (numeric ID path)
         record_custom_metrics(model, &m.gauges, &m.counters, &m.histograms);
@@ -416,7 +416,7 @@ pub fn record_custom_metrics(
         let guard = CUSTOM_GAUGE_OBJECTS.lock().unwrap();
         for mv in gauges {
             if let Some(g) = guard.get(mv.id as usize) {
-                let _ = g.with_label_values(&[model]).set(mv.value as f64);
+                g.with_label_values(&[model]).set(mv.value as f64);
             }
         }
     }
@@ -424,7 +424,7 @@ pub fn record_custom_metrics(
         let guard = CUSTOM_COUNTER_OBJECTS.lock().unwrap();
         for mv in counters {
             if let Some(c) = guard.get(mv.id as usize) {
-                let _ = c.with_label_values(&[model]).inc_by(mv.value as f64);
+                c.with_label_values(&[model]).inc_by(mv.value as f64);
             }
         }
     }
@@ -432,7 +432,7 @@ pub fn record_custom_metrics(
         let guard = CUSTOM_HISTOGRAM_OBJECTS.lock().unwrap();
         for mv in histograms {
             if let Some(h) = guard.get(mv.id as usize) {
-                let _ = h.with_label_values(&[model]).observe(mv.value as f64);
+                h.with_label_values(&[model]).observe(mv.value as f64);
             }
         }
     }

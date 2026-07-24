@@ -25,17 +25,14 @@ pub struct ModelEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum LoadPolicy {
+    #[default]
     Explicit,
     All,
     Latest,
 }
 
-impl Default for LoadPolicy {
-    fn default() -> Self {
-        LoadPolicy::Explicit
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelVersion {

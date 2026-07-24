@@ -38,6 +38,12 @@ pub struct RateLimiter {
     buckets: DashMap<String, Arc<tokio::sync::Mutex<TokenBucket>>>,
 }
 
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RateLimiter {
     pub fn new() -> Self {
         Self {

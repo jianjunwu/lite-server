@@ -76,7 +76,7 @@ fn validate_dag(steps: &[EnsembleStep]) -> Result<(), AppError> {
     // Build dependency graph
     let mut dependencies: HashMap<&str, HashSet<&str>> = HashMap::new();
     for step in steps {
-        let deps = dependencies.entry(&step.name).or_insert_with(HashSet::new);
+        let deps = dependencies.entry(&step.name).or_default();
         for ref_str in step.inputs.values() {
             let caps = REF_RE.captures(ref_str).ok_or_else(|| {
                 AppError::Config(format!("invalid reference format: {}", ref_str))
@@ -133,7 +133,7 @@ fn validate_dag(steps: &[EnsembleStep]) -> Result<(), AppError> {
 fn topological_layers(steps: &[EnsembleStep]) -> Vec<Vec<&EnsembleStep>> {
     let mut dependencies: HashMap<&str, HashSet<&str>> = HashMap::new();
     for step in steps {
-        let deps = dependencies.entry(&step.name).or_insert_with(HashSet::new);
+        let deps = dependencies.entry(&step.name).or_default();
         for ref_str in step.inputs.values() {
             if let Some(caps) = REF_RE.captures(ref_str) {
                 let source = caps.get(1).unwrap().as_str();

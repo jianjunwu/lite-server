@@ -43,6 +43,12 @@ pub struct TimelineAggregator {
     last_check: Mutex<HashMap<String, f64>>,
 }
 
+impl Default for TimelineAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TimelineAggregator {
     pub fn new() -> Self {
         Self {
@@ -438,7 +444,7 @@ mod tests {
         agg.record_latency("m", "1", 0.10);
 
         let p99 = agg.compute_p99_ms("m_1");
-        assert!(p99 >= 50.0 && p99 <= 110.0, "p99 should be around 100ms, got {}", p99);
+        assert!((50.0..=110.0).contains(&p99), "p99 should be around 100ms, got {}", p99);
     }
 
     #[test]
