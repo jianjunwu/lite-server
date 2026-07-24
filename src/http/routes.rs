@@ -1,9 +1,8 @@
-use crate::error::AppError;
 use crate::http::handlers::*;
 use crate::http::state::AppState;
 use crate::worker::protocol::EndpointRoute;
 use axum::{
-    routing::{delete, get, options, post},
+    routing::{delete, get, head, options, patch, post, put},
     Router,
 };
 use std::sync::Arc;
@@ -27,25 +26,28 @@ fn is_system_route(route: &str) -> bool {
     })
 }
 
-/// Validate that no custom endpoint conflicts with system routes.
-pub fn validate_endpoint_routes(endpoint_routes: &[EndpointRoute]) -> Result<(), AppError> {
-    for ep in endpoint_routes {
-        if is_system_route(&ep.route) {
-            return Err(AppError::Config(format!(
-                "custom endpoint '{}' conflicts with a system route",
-                ep.route
-            )));
-        }
-    }
-    Ok(())
+/// Drop custom endpoints whose route collides with a system route. axum
+/// panics when the same path+method is registered twice, so a conflicting
+/// endpoint would crash startup; warn and skip it instead.
+fn filter_system_route_conflicts(routes: Vec<EndpointRoute>) -> Vec<EndpointRoute> {
+    routes
+        .into_iter()
+        .filter(|ep| {
+            if is_system_route(&ep.route) {
+                tracing::warn!(
+                    "custom endpoint '{}' conflicts with a system route — skipped",
+                    ep.route
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .collect()
 }
 
 pub fn create_routes(state: AppState, endpoint_routes: Vec<EndpointRoute>) -> Router {
-    // Validate no custom endpoint conflicts with system routes
-    if let Err(e) = validate_endpoint_routes(&endpoint_routes) {
-        // Log and continue, filtering out conflicting routes
-        tracing::warn!("{}", e);
-    }
+    let endpoint_routes = filter_system_route_conflicts(endpoint_routes);
 
     let has_health_endpoint = endpoint_routes.iter().any(|r| r.route == "/health");
 
@@ -129,8 +131,19 @@ pub fn create_routes(state: AppState, endpoint_routes: Vec<EndpointRoute>) -> Ro
             router = match method_upper.as_str() {
                 "GET" => router.route(&route, get(custom_endpoint_handler)),
                 "POST" => router.route(&route, post(custom_endpoint_handler)),
+                "PUT" => router.route(&route, put(custom_endpoint_handler)),
+                "PATCH" => router.route(&route, patch(custom_endpoint_handler)),
                 "DELETE" => router.route(&route, delete(custom_endpoint_handler)),
-                _ => router.route(&route, get(custom_endpoint_handler)),
+                "HEAD" => router.route(&route, head(custom_endpoint_handler)),
+                "OPTIONS" => router.route(&route, options(custom_endpoint_handler)),
+                other => {
+                    tracing::warn!(
+                        route = %route,
+                        method = %other,
+                        "unsupported endpoint method — skipped"
+                    );
+                    router
+                }
             };
         }
         // OPTIONS preflight is answered at the Rust layer with a RUNTIME
@@ -154,4 +167,32 @@ pub fn create_routes(state: AppState, endpoint_routes: Vec<EndpointRoute>) -> Ro
         .method_not_allowed_fallback(crate::http::method_not_allowed_fallback);
 
     router.with_state(Arc::new(state))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::protocol::EndpointRoute;
+
+    fn ep(route: &str) -> EndpointRoute {
+        EndpointRoute {
+            route: route.to_string(),
+            methods: vec!["GET".to_string()],
+            rate_limit: None,
+            cors: None,
+        }
+    }
+
+    #[test]
+    fn test_filter_system_route_conflicts() {
+        let routes = vec![
+            ep("/v2/models"),       // exact system route
+            ep("/v2/models/index"), // system-route prefix
+            ep("/ok"),              // custom, kept
+            ep("/health"),          // not a system route — kept
+        ];
+        let kept = filter_system_route_conflicts(routes);
+        let kept_routes: Vec<String> = kept.into_iter().map(|r| r.route).collect();
+        assert_eq!(kept_routes, vec!["/ok".to_string(), "/health".to_string()]);
+    }
 }

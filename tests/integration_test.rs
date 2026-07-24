@@ -152,6 +152,22 @@ def status_ep_handler(ctx):
     )
     .unwrap();
 
+    // put_ep: PUT endpoint exercising P2 method registration (was silently
+    // registered as GET before P2).
+    std::fs::write(
+        endpoints_dir.join("put_ep.py"),
+        r#""""PUT endpoint exercising P2 method registration."""
+
+from lite_server.endpoint import endpoint
+
+
+@endpoint.put("/put_ep")
+def put_ep_handler(ctx):
+    return {"method": "PUT", "body": ctx.request}
+"#,
+    )
+    .unwrap();
+
     // batch_model: max_batch_size=2 so concurrent requests aggregate into
     // one BatchRequest.  predict() records the aggregated batch size in each
     // item's body; encode_response() gives the "bad" item its own 400 status
@@ -898,6 +914,30 @@ async fn test_malformed_json_standardized_400() {
     assert_eq!(body["error"]["type"], "invalid_request_error");
     assert_eq!(body["error"]["code"], "invalid_request_body");
     assert!(body["error"]["param"].is_null());
+}
+
+// ---------------------------------------------------------------------------
+// Custom endpoint PUT method registration — covers P2
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn test_endpoint_put_method_registered() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    // P2: @endpoint.put registers PUT (previously silently registered as GET,
+    // so a PUT request got 405).
+    let resp = client
+        .put(format!("{}/put_ep", base))
+        .json(&json!({"x": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["method"], "PUT");
+    assert_eq!(body["body"]["x"], 1);
 }
 
 // ---------------------------------------------------------------------------
