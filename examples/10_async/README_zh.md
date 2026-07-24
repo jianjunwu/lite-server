@@ -1,6 +1,6 @@
 # 10 异步模型
 
-演示 `AsyncLitAPI`，用于涉及异步 I/O 的推理流水线（如远程 API 调用、异步模型库）。
+演示统一异步流水线：任何方法都可以是 `async def` — 不需要单独的基类（0.7.0 起 `AsyncLitAPI` 已移除，所有模型运行在同一个 asyncio 事件循环上）。
 
 [English](README.md)
 
@@ -33,8 +33,7 @@ wait
 
 ## 学习要点
 
-- 继承 `AsyncLitAPI` 而非 `LitAPI`
-- `predict()` 必须是 `async def`
-- `decode_request` / `encode_response` / 钩子可以是同步或异步 — worker 自动适配
-- `max_batch_size` 强制为 1（异步不支持批处理）
+- 继承 `LitAPI` 并把 `predict()` 写成 `async def` — 仅此而已
+- `decode_request` / `encode_response` / 钩子各自可以是同步或异步 — worker 在加载时自动适配
+- `setup()` 始终保持同步
 - 使用 `asyncio.sleep` 或 `await` 进行 I/O 密集型操作以保持事件循环响应

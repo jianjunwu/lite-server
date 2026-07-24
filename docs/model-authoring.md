@@ -176,45 +176,68 @@ Callbacks are a **composable, declarative** way to intercept the inference reque
 
 ### Callback Base Class
 
-Subclass `Callback` and override the hooks you care about. All hooks have default no-op implementations — only define the methods you need.
+Subclass `Callback` and override the hooks you care about. All hooks have default no-op implementations — only define the methods you need. Data hooks receive a single `ctx` (`RequestContext`) and may be sync or `async def`.
 
 ```python
 from lite_server import Callback
 
 class MyCallback(Callback):
-    def on_before_decode(self, request, meta):
-        """Called before decode_request. Return modified request."""
-        request["_timestamp"] = meta.timestamp_ns
-        return request
+    def on_request(self, ctx):
+        """Called on the raw request, before decode_request."""
+        ctx.request["_timestamp"] = ctx.meta.timestamp_ns
 
-    def on_after_predict(self, output, meta):
-        """Called after predict. Return modified output."""
-        output["_latency_ns"] = time.time_ns() - meta.timestamp_ns
-        return output
+    def on_output(self, ctx):
+        """Called after predict, before encode_response."""
+        ctx.output["_latency_ns"] = time.time_ns() - ctx.meta.timestamp_ns
 ```
 
-**9 hooks** (in request lifecycle order):
+**Hook points** (pipeline order):
 
-| Hook | When | Signature |
-|------|------|-----------|
+```
+on_request → decode_request → on_input → predict → on_output → encode_response → on_response
+```
+
+| Hook | When | Reads / writes |
+|------|------|----------------|
+| `on_request` | Raw request, before `decode_request` | `ctx.request` |
+| `on_input` | After `decode_request`, before `predict` | `ctx.input` |
+| `on_output` | After `predict`, before `encode_response` (per chunk when streaming) | `ctx.output` |
+| `on_response` | After `encode_response`, before sending (per chunk when streaming) | `ctx.response` |
 | `on_before_setup` | Before `LitAPI.setup()` | `(config, device)` |
 | `on_after_setup` | After `LitAPI.setup()` succeeds | `(lit_api)` |
 | `on_teardown` | Model unload / worker shutdown | `(lit_api)` |
-| `on_before_decode` | Before `decode_request` | `(request, meta)` |
-| `on_after_decode` | After `decode_request`, before `predict` | `(decoded, meta)` |
-| `on_before_predict` | Before `predict` | `(decoded, meta)` |
-| `on_after_predict` | After `predict`, before `encode_response` | `(output, meta)` |
-| `on_before_encode` | Before `encode_response` | `(output, meta)` |
-| `on_after_encode` | After `encode_response`, before sending | `(encoded, meta)` |
 
-Data-transforming hooks (decode/predict/encode series) may return a modified value to transform data flowing through the pipeline. Return `None` to pass through unchanged.
+A data hook may mutate `ctx` in place or return a replacement value (`None` = pass through).
 
-### CallbackRunner Features
+### RequestContext
 
-- **Exception isolation**: a failing callback does not prevent other callbacks from executing
-- **Data transformation chain**: multiple callbacks chain their transformations in registration order
-- **Async support**: callbacks can be `async def` — `trigger_async` auto-detects and awaits them
-- **Pre-computed index**: the `_hooked` dict pre-computes which callbacks override which hooks, avoiding `getattr` lookups on the hot path
+| Field | Content |
+|-------|---------|
+| `ctx.meta` | `RequestMeta`: HTTP headers, route, client IP, request ID, timestamp |
+| `ctx.request` / `ctx.input` / `ctx.output` / `ctx.response` | Pipeline values at each stage |
+| `ctx.state` | Per-request scratch dict shared across hooks — use this, **never** `self` attributes (shared across concurrent requests) |
+| `ctx.early` | Set → pipeline short-circuits |
+
+### Early Return and Validation
+
+- **Early return** (e.g. cache hit): call `ctx.respond(body, status_code=..., headers=...)` or return a `Response` from any hook. Later stages and remaining hooks are skipped.
+- **Validation / rejection**: raise `HTTPException` (`BadRequestError`, `UnauthorizedError`, ...) from any hook. The client receives the structured error with the exception's status code — data-hook exceptions are **not** swallowed.
+- Lifecycle hooks (`on_before_setup` / `on_after_setup` / `on_teardown`) stay exception-isolated: failures are logged, never propagated.
+
+```python
+from lite_server import Callback, BadRequestError
+
+class Validator(Callback):
+    def on_request(self, ctx):
+        if "input" not in (ctx.request or {}):
+            raise BadRequestError("missing field", param="input")
+
+class Cache(Callback):
+    def on_request(self, ctx):
+        hit = self._cache.get(key(ctx))
+        if hit is not None:
+            ctx.respond(hit, headers={"X-Cache-Hit": "1"})
+```
 
 ### Declarative Loading
 
@@ -227,7 +250,7 @@ callbacks:
   - my_package.callbacks.MetricsCollector
 ```
 
-Each class must be a no-arg constructible `Callback` subclass.
+Each class must be a no-arg constructible `Callback` subclass. Loading fails loudly on import errors or pre-0.7 hook signatures — a silently skipped callback could mean auth/validation logic that never runs.
 
 ### Complete Example: Audit Logger
 
@@ -237,15 +260,13 @@ import time
 from lite_server import Callback
 
 class AuditLogger(Callback):
-    def on_before_decode(self, request, meta):
-        self._start_ns = time.time_ns()
-        request["_audit_id"] = meta.request_id
-        return request
+    def on_request(self, ctx):
+        ctx.state["start_ns"] = time.time_ns()  # per-request, concurrency-safe
+        ctx.request["_audit_id"] = ctx.meta.request_id
 
-    def on_after_predict(self, output, meta):
-        elapsed_ms = (time.time_ns() - self._start_ns) / 1_000_000
-        print(f"[AUDIT] request_id={meta.request_id} latency={elapsed_ms:.2f}ms")
-        return output
+    def on_output(self, ctx):
+        elapsed_ms = (time.time_ns() - ctx.state["start_ns"]) / 1_000_000
+        print(f"[AUDIT] request_id={ctx.meta.request_id} latency={elapsed_ms:.2f}ms")
 
     def on_teardown(self, lit_api):
         print(f"[AUDIT] model torn down, total handled: {lit_api.call_count}")
@@ -259,23 +280,25 @@ class AuditLogger(Callback):
 | Reusability | Shared across models | Per-model implementation |
 | Composability | Multiple callbacks chain together | Single implementation per model |
 | Registration | `callbacks:` field in config.yaml | Override method in model code |
-| Exception isolation | Automatic, others still run | Exception propagates directly |
+| Exceptions | `HTTPException` → structured error response | same |
+| Position | Registered order | `on_request` first, `on_response` last |
 
 See [examples/14_lifecycle_hooks](../examples/14_lifecycle_hooks/) for a runnable demo.
 
-## AsyncLitAPI
+## Async Models
 
-For inference pipelines that involve async I/O — such as calling external APIs, using async model libraries, or awaiting coroutines — use `AsyncLitAPI` instead of `LitAPI`.
+Every model runs on the worker's unified asyncio loop — there is no separate async base class (the pre-0.7 `AsyncLitAPI` is gone). Any method except `setup()` may be `async def`; the worker adapts at load time.
 
 ### Usage
 
 ```python
 import asyncio
-from lite_server import AsyncLitAPI
+from lite_server import LitAPI
 
-class AsyncModel(AsyncLitAPI):
-    async def setup(self, device):
-        self.client = await create_async_client()
+class AsyncModel(LitAPI):
+    def setup(self, device):
+        # setup() is always synchronous
+        self.client = create_client()
 
     async def decode_request(self, request):
         return request.get("input", "")
@@ -289,30 +312,11 @@ class AsyncModel(AsyncLitAPI):
         return output
 ```
 
-### Constraints
+### How It Works
 
-- `predict()` must be `async def`.
-- `max_batch_size` is forced to `1` — async does not support batching.
-- `enable_async` is automatically set to `True`.
-
-### Mixed Sync/Async Hooks
-
-`decode_request`, `encode_response`, `on_request`, and `on_response` may be **sync or async**. The worker adapts automatically:
-
-```python
-class MixedHooksModel(AsyncLitAPI):
-    def decode_request(self, request):          # sync is fine
-        return request["input"]
-
-    async def predict(self, x):                  # must be async
-        await asyncio.sleep(0.05)
-        return {"output": x}
-
-    def encode_response(self, output):           # sync is fine
-        return output
-```
-
-See [examples/10_async](../examples/10_async/) for a runnable demo.
+- **Fully-sync models** run inline on the event loop — zero adaptation overhead, same behavior as the pre-0.7 standard loop.
+- **When anything is async** (any model method or callback hook), sync model stages run on a single-thread executor: sync code never executes concurrently (thread-safety assumptions preserved) and never blocks the event loop.
+- Batching, streaming, bidirectional streaming, and continuous batching all work with sync or async methods.
 
 ## Continuous Batching (LLM)
 

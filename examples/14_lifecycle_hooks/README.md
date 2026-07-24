@@ -1,6 +1,6 @@
 # 14 Lifecycle Hooks
 
-Demonstrates both worker lifecycle hooks and the new Callback system for inference request interception.
+Demonstrates both worker lifecycle hooks and the Callback system for inference request interception.
 
 [中文](README_zh.md)
 
@@ -8,13 +8,13 @@ Demonstrates both worker lifecycle hooks and the new Callback system for inferen
 
 **Worker lifecycle hooks** (`hooks:` in config.yaml): shell commands and HTTP callbacks for `on_ready`, `on_error`, and `on_exit` events. Environment variables like `$MODEL`, `$WORKER_ID`, `$DEVICE`, `$REASON`, `$EXIT_CODE` are available in shell command templates.
 
-**Inference callbacks** (`callbacks:` in config.yaml): Python `Callback` subclasses that intercept the inference request pipeline. Callbacks are composable, reusable across models, and have automatic exception isolation.
+**Inference callbacks** (`callbacks:` in config.yaml): Python `Callback` subclasses that intercept the inference request pipeline. Callbacks are composable and reusable across models.
 
 Two example callbacks are provided in the model's `callbacks.py`:
 - `AuditLogger`: records request timing and logs each inference call
 - `ResponseEnricher`: adds request metadata (`_meta`) to each response
 
-Note: Callback exceptions are intentionally swallowed (exception isolation). Callbacks should transform data or produce side effects — use `LitAPI.on_request()` to reject requests.
+Since 0.7.0, callback data hooks receive a single `ctx` (RequestContext). Per-request data belongs in `ctx.state` (not `self` attributes, which are shared across concurrent requests). A hook can validate and reject a request by raising `HTTPException`, or short-circuit it with `ctx.respond(...)` — exceptions from data hooks are **not** swallowed. Lifecycle hooks (`on_before_setup` / `on_after_setup` / `on_teardown`) remain exception-isolated (failures are logged, never propagated).
 
 ## Run
 
@@ -52,5 +52,4 @@ curl -X POST http://localhost:8000/v2/models/hooked_model/infer \
 - How to configure HTTP callback hooks: `hooks.on_ready_http`, `hooks.on_error_http`
 - Available shell template variables: `$MODEL`, `$WORKER_ID`, `$DEVICE`, `$REASON`, `$EXIT_CODE`, `$EXIT_SIGNAL`
 - How to write and register `Callback` subclasses for inference pipeline interception
-- How callbacks chain with exception isolation via `callbacks:` in config.yaml
-- The 9 available callback hooks: `on_before_setup`, `on_after_setup`, `on_teardown`, `on_before_decode`, `on_after_decode`, `on_before_predict`, `on_after_predict`, `on_before_encode`, `on_after_encode`
+- The callback hook points: `on_request` → decode → `on_input` → predict → `on_output` → encode → `on_response`, plus lifecycle hooks `on_before_setup`, `on_after_setup`, `on_teardown`

@@ -1,6 +1,6 @@
 # 10 Async Model
 
-Demonstrates `AsyncLitAPI` for inference pipelines that involve async I/O (e.g. remote API calls, async model libraries).
+Demonstrates the unified async pipeline: any method may be `async def` — no separate base class is needed (since 0.7.0 `AsyncLitAPI` is gone; every model runs on the same asyncio loop).
 
 ## Run
 
@@ -31,8 +31,7 @@ wait
 
 ## What You Learn
 
-- Subclass `AsyncLitAPI` instead of `LitAPI`
-- `predict()` must be `async def`
-- `decode_request` / `encode_response` / hooks can be sync or async — worker adapts automatically
-- `max_batch_size` is forced to 1 (async does not support batching)
+- Subclass `LitAPI` and make `predict()` an `async def` — that's all
+- `decode_request` / `encode_response` / hooks can each be sync or async — the worker adapts automatically at load time
+- `setup()` always stays synchronous
 - Use `asyncio.sleep` or `await` for I/O-bound operations to keep the event loop responsive

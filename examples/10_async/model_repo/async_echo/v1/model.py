@@ -1,17 +1,18 @@
-"""Async echo model demonstrating AsyncLitAPI."""
+"""Async echo model demonstrating the unified async pipeline."""
 
 import asyncio
 
-from lite_server import AsyncLitAPI
+from lite_server import LitAPI
 
 
-class AsyncEchoAPI(AsyncLitAPI):
-    async def setup(self, device):
+class AsyncEchoAPI(LitAPI):
+    def setup(self, device):
+        # setup is always synchronous (called once at worker start)
         self.device = device
         self.logger.info("AsyncEchoAPI setup on device=%s", device)
 
     async def decode_request(self, request):
-        # decode_request may also be async
+        # decode_request may be sync or async — the worker adapts automatically
         await asyncio.sleep(0)
         return request.get("input", "")
 

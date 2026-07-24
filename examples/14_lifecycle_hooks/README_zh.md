@@ -1,6 +1,6 @@
 # 14 生命周期钩子
 
-演示 Worker 生命周期钩子和新的 Callback 推理请求拦截系统。
+演示 Worker 生命周期钩子和 Callback 推理请求拦截系统。
 
 [English](README.md)
 
@@ -8,13 +8,13 @@
 
 **Worker 生命周期钩子**（`hooks:` 在 config.yaml 中）：`on_ready`、`on_error`、`on_exit` 事件的 shell 命令和 HTTP 回调。shell 命令模板中可使用 `$MODEL`、`$WORKER_ID`、`$DEVICE`、`$REASON`、`$EXIT_CODE` 等环境变量。
 
-**推理 Callback**（`callbacks:` 在 config.yaml 中）：Python `Callback` 子类，拦截推理请求管线。Callback 可组合、可跨模型复用，并具有自动异常隔离。
+**推理 Callback**（`callbacks:` 在 config.yaml 中）：Python `Callback` 子类，拦截推理请求管线。Callback 可组合、可跨模型复用。
 
 模型目录中的 `callbacks.py` 提供了两个示例 callback：
 - `AuditLogger`：记录请求时序和每次推理调用的日志
 - `ResponseEnricher`：为每个响应添加请求元数据（`_meta` 字段）
 
-注意：Callback 中的异常会因异常隔离机制被有意吞掉。Callback 应用于数据转换或产生副作用 — 使用 `LitAPI.on_request()` 来拒绝请求。
+0.7.0 起，callback 的数据钩子接收单个 `ctx`（RequestContext）参数。每个请求的临时数据放在 `ctx.state`（不要放在 `self` 属性上——它在并发请求间共享）。钩子可以抛出 `HTTPException` 做参数校验并拒绝请求，也可以用 `ctx.respond(...)` 短路返回——数据钩子的异常**不会**被吞掉。生命周期钩子（`on_before_setup` / `on_after_setup` / `on_teardown`）仍保持异常隔离（失败只记日志，不传播）。
 
 ## 运行
 
@@ -52,5 +52,4 @@ curl -X POST http://localhost:8000/v2/models/hooked_model/infer \
 - 如何配置 HTTP 回调钩子：`hooks.on_ready_http`、`hooks.on_error_http`
 - 可用的模板变量：`$MODEL`、`$WORKER_ID`、`$DEVICE`、`$REASON`、`$EXIT_CODE`、`$EXIT_SIGNAL`
 - 如何编写和注册 `Callback` 子类来拦截推理管线
-- 如何通过 config.yaml 中的 `callbacks:` 实现 callback 链式调用与异常隔离
-- 9 个可用的 callback 钩子：`on_before_setup`、`on_after_setup`、`on_teardown`、`on_before_decode`、`on_after_decode`、`on_before_predict`、`on_after_predict`、`on_before_encode`、`on_after_encode`
+- callback 钩子点：`on_request` → decode → `on_input` → predict → `on_output` → encode → `on_response`，以及生命周期钩子 `on_before_setup`、`on_after_setup`、`on_teardown`

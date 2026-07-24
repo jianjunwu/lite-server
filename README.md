@@ -217,7 +217,7 @@ See [examples/](examples/) for runnable model repositories:
 | 06 | [custom_endpoint](examples/06_custom_endpoint/) | Custom HTTP endpoint |
 | 07 | [custom_params](examples/07_custom_params/) | Config-driven model behavior |
 | 09 | [custom_metrics](examples/09_custom_metrics/) | Custom Prometheus metrics (gauge/counter/histogram) |
-| 10 | [async](examples/10_async/) | Asynchronous inference (AsyncLitAPI) |
+| 10 | [async](examples/10_async/) | Asynchronous inference (unified async pipeline) |
 | 11 | [logging](examples/11_logging/) | Structured logging at every stage |
 | 12 | [continuous_batching](examples/12_continuous_batching/) | LLM continuous batching (prefill/step/has_finished) |
 | 13 | [bidi_streaming](examples/13_bidi_streaming/) | Bidirectional streaming for ASR |
@@ -316,7 +316,7 @@ lite-server uses a Rust HTTP core (axum/tokio) instead of Python's uvicorn, givi
 No. `pip install` and run directly. Works on Linux, macOS, and Windows.
 
 **Q: Can I use my existing LitAPI code?**
-Yes. `from lite_server import LitAPI` is a drop-in replacement for `litserve.LitAPI` with additional hooks (streaming, continuous batching, lifecycle).
+`from lite_server import LitAPI` works for any model with `setup` + `predict`. Since 0.7.0 it's a self-contained base class — no litserve dependency. Async methods are supported natively; just write `async def predict(self, x)`.
 
 **Q: How do I deploy multiple models?**
 Put each model in its own directory under `model_repo/` and list them in `server.yaml`. See [examples/05_ensemble](examples/05_ensemble/) for multi-model pipelines.

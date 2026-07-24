@@ -48,7 +48,7 @@
 
 ```bash
 # 1. 安装
-pip install lite-server  # lite-server 依赖 litserve 的 LitAPI
+pip install lite-server
 
 # 2. 脚手架创建项目
 python -m lite_server init my_project --template empty
@@ -215,7 +215,7 @@ lite-server init my_project           # 脚手架创建项目
 | 06 | [custom_endpoint](examples/06_custom_endpoint/) | 自定义 HTTP 端点 |
 | 07 | [custom_params](examples/07_custom_params/) | 配置驱动的模型行为 |
 | 09 | [custom_metrics](examples/09_custom_metrics/) | 自定义 Prometheus 指标（Gauge/Counter/Histogram） |
-| 10 | [async](examples/10_async/) | 异步推理（AsyncLitAPI） |
+| 10 | [async](examples/10_async/) | 异步推理（统一异步管线） |
 | 11 | [logging](examples/11_logging/) | 各阶段结构化日志 |
 | 12 | [continuous_batching](examples/12_continuous_batching/) | LLM 连续批处理（prefill/step/has_finished） |
 | 13 | [bidi_streaming](examples/13_bidi_streaming/) | 双向流式通信（ASR） |
@@ -314,7 +314,7 @@ lite-server 用 Rust HTTP 内核（axum/tokio）替代了 Python 的 uvicorn，�
 不需要。`pip install` 后直接运行。支持 Linux、macOS、Windows。
 
 **Q: 能直接用现有的 LitAPI 代码吗？**
-可以。`from lite_server import LitAPI` 是 `litserve.LitAPI` 的即插即用替代品，额外提供了流式输出、continuous batching、生命周期钩子。
+`from lite_server import LitAPI` 适用于所有有 `setup` + `predict` 的模型。0.7.0 起为独立基类（不依赖 litserve），原生支持异步方法——把 `predict` 写成 `async def` 即可。
 
 **Q: 怎么部署多个模型？**
 每个模型放在 `model_repo/` 下独立目录，在 `server.yaml` 的 `orchestration` 段落中声明。详见 [examples/05_ensemble](examples/05_ensemble/)。

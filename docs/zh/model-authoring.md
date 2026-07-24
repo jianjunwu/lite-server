@@ -176,45 +176,68 @@ Callbacks 是一种**可组合的、声明式的**拦截推理请求生命周期
 
 ### Callback 基类
 
-继承 `Callback` 并覆盖你关心的钩子。所有钩子都有默认的 no-op 实现 — 只定义你需要的方法。
+继承 `Callback` 并覆盖你关心的钩子。所有钩子都有默认的 no-op 实现 — 只定义你需要的方法。数据钩子接收单个 `ctx`（`RequestContext`）参数，可以是同步或 `async def`。
 
 ```python
 from lite_server import Callback
 
 class MyCallback(Callback):
-    def on_before_decode(self, request, meta):
-        """在 decode_request 之前调用。返回修改后的请求。"""
-        request["_timestamp"] = meta.timestamp_ns
-        return request
+    def on_request(self, ctx):
+        """在 decode_request 之前对原始请求调用。"""
+        ctx.request["_timestamp"] = ctx.meta.timestamp_ns
 
-    def on_after_predict(self, output, meta):
-        """在 predict 之后调用。返回修改后的输出。"""
-        output["_latency_ns"] = time.time_ns() - meta.timestamp_ns
-        return output
+    def on_output(self, ctx):
+        """在 predict 之后、encode_response 之前调用。"""
+        ctx.output["_latency_ns"] = time.time_ns() - ctx.meta.timestamp_ns
 ```
 
-**9 个钩子**（按请求生命周期顺序）：
+**钩子点**（管线顺序）：
 
-| 钩子 | 触发时机 | 参数 |
-|------|---------|------|
+```
+on_request → decode_request → on_input → predict → on_output → encode_response → on_response
+```
+
+| 钩子 | 触发时机 | 读写字段 |
+|------|---------|---------|
+| `on_request` | 原始请求，`decode_request` 之前 | `ctx.request` |
+| `on_input` | `decode_request` 之后，`predict` 之前 | `ctx.input` |
+| `on_output` | `predict` 之后，`encode_response` 之前（流式时每个 chunk） | `ctx.output` |
+| `on_response` | `encode_response` 之后，发送前（流式时每个 chunk） | `ctx.response` |
 | `on_before_setup` | `LitAPI.setup()` 之前 | `(config, device)` |
 | `on_after_setup` | `LitAPI.setup()` 完成后 | `(lit_api)` |
 | `on_teardown` | 模型卸载 / worker 关闭时 | `(lit_api)` |
-| `on_before_decode` | `decode_request` 之前 | `(request, meta)` |
-| `on_after_decode` | `decode_request` 之后 | `(decoded, meta)` |
-| `on_before_predict` | `predict` 之前 | `(decoded, meta)` |
-| `on_after_predict` | `predict` 之后 | `(output, meta)` |
-| `on_before_encode` | `encode_response` 之前 | `(output, meta)` |
-| `on_after_encode` | `encode_response` 之后，发送前 | `(encoded, meta)` |
 
-数据转换钩子（decode/predict/encode 系列）可返回修改后的值来转换流经管线的数据，返回 `None` 保持不变。
+数据钩子可以原地修改 `ctx`，也可以返回替换值（返回 `None` 表示透传）。
 
-### CallbackRunner 特性
+### RequestContext
 
-- **异常隔离**：一个 callback 失败不影响其他 callback 执行
-- **数据转换链**：多个 callback 按注册顺序链式转换数据
-- **异步支持**：callback 可以是 `async def`，`trigger_async` 自动检测并等待
-- **预计算索引**：`_hooked` 字典预先计算哪些 callback 覆盖了哪些钩子，避免热路径上的 `getattr` 查找
+| 字段 | 内容 |
+|------|------|
+| `ctx.meta` | `RequestMeta`：HTTP 头、路由、客户端 IP、请求 ID、时间戳 |
+| `ctx.request` / `ctx.input` / `ctx.output` / `ctx.response` | 各阶段的管线值 |
+| `ctx.state` | 跨钩子共享的**每请求**暂存字典 — 用它，**不要**用 `self` 属性（在并发请求间共享） |
+| `ctx.early` | 设置后管线短路 |
+
+### Early Return 与参数校验
+
+- **Early return**（如缓存命中）：在任意钩子中调用 `ctx.respond(body, status_code=..., headers=...)` 或返回一个 `Response`。后续阶段和剩余钩子被跳过。
+- **参数校验 / 拒绝**：在任意钩子中抛出 `HTTPException`（`BadRequestError`、`UnauthorizedError` 等）。客户端收到对应状态码的结构化错误 — 数据钩子的异常**不会**被吞掉。
+- 生命周期钩子（`on_before_setup` / `on_after_setup` / `on_teardown`）保持异常隔离：失败只记日志，不传播。
+
+```python
+from lite_server import Callback, BadRequestError
+
+class Validator(Callback):
+    def on_request(self, ctx):
+        if "input" not in (ctx.request or {}):
+            raise BadRequestError("missing field", param="input")
+
+class Cache(Callback):
+    def on_request(self, ctx):
+        hit = self._cache.get(key(ctx))
+        if hit is not None:
+            ctx.respond(hit, headers={"X-Cache-Hit": "1"})
+```
 
 ### 声明式加载
 
@@ -227,7 +250,7 @@ callbacks:
   - my_package.callbacks.MetricsCollector
 ```
 
-每个类必须是无参构造的 `Callback` 子类。
+每个类必须是无参构造的 `Callback` 子类。导入失败或 0.7 之前的旧钩子签名会在加载时响亮报错 — 被静默跳过的 callback 可能意味着鉴权/校验逻辑从未执行。
 
 ### 完整示例：审计日志
 
@@ -237,15 +260,13 @@ import time
 from lite_server import Callback
 
 class AuditLogger(Callback):
-    def on_before_decode(self, request, meta):
-        self._start_ns = time.time_ns()
-        request["_audit_id"] = meta.request_id
-        return request
+    def on_request(self, ctx):
+        ctx.state["start_ns"] = time.time_ns()  # 每请求存储，并发安全
+        ctx.request["_audit_id"] = ctx.meta.request_id
 
-    def on_after_predict(self, output, meta):
-        elapsed_ms = (time.time_ns() - self._start_ns) / 1_000_000
-        print(f"[AUDIT] request_id={meta.request_id} latency={elapsed_ms:.2f}ms")
-        return output
+    def on_output(self, ctx):
+        elapsed_ms = (time.time_ns() - ctx.state["start_ns"]) / 1_000_000
+        print(f"[AUDIT] request_id={ctx.meta.request_id} latency={elapsed_ms:.2f}ms")
 
     def on_teardown(self, lit_api):
         print(f"[AUDIT] model torn down, total handled: {lit_api.call_count}")
@@ -259,23 +280,25 @@ class AuditLogger(Callback):
 | 复用性 | 可跨模型共享 | 每个模型单独实现 |
 | 组合性 | 多个 callback 可链式组合 | 只能在模型内实现一次 |
 | 注册方式 | config.yaml 中 `callbacks:` 字段 | 模型代码中覆盖方法 |
-| 异常隔离 | 自动隔离，不影响其他 callback | 异常直接传播 |
+| 异常 | `HTTPException` → 结构化错误响应 | 相同 |
+| 位置 | 按注册顺序 | `on_request` 在最前，`on_response` 在最后 |
 
 参见 [examples/14_lifecycle_hooks](../examples/14_lifecycle_hooks/) 获取可运行示例。
 
-## AsyncLitAPI
+## 异步模型
 
-对于涉及异步 I/O 的推理流程 —— 例如调用外部 API、使用异步模型库或等待协程 —— 使用 `AsyncLitAPI` 替代 `LitAPI`。
+所有模型都运行在 worker 的统一 asyncio 事件循环上 — 不再有单独的异步基类（0.7 之前的 `AsyncLitAPI` 已移除）。除 `setup()` 外，任何方法都可以是 `async def`，worker 在加载时自动适配。
 
 ### 用法
 
 ```python
 import asyncio
-from lite_server import AsyncLitAPI
+from lite_server import LitAPI
 
-class AsyncModel(AsyncLitAPI):
-    async def setup(self, device):
-        self.client = await create_async_client()
+class AsyncModel(LitAPI):
+    def setup(self, device):
+        # setup() 始终保持同步
+        self.client = create_client()
 
     async def decode_request(self, request):
         return request.get("input", "")
@@ -289,28 +312,11 @@ class AsyncModel(AsyncLitAPI):
         return output
 ```
 
-### 约束
+### 工作原理
 
-- `predict()` 必须是 `async def`。
-- `max_batch_size` 强制为 `1` —— 异步不支持批处理。
-- `enable_async` 自动设置为 `True`。
-
-### 混合 Sync/Async Hook
-
-`decode_request`、`encode_response`、`on_request` 和 `on_response` 可以是**同步或异步**。worker 自动适配：
-
-```python
-class MixedHooksModel(AsyncLitAPI):
-    def decode_request(self, request):          # 同步也可以
-        return request["input"]
-
-    async def predict(self, x):                  # 必须是异步
-        await asyncio.sleep(0.05)
-        return {"output": x}
-
-    def encode_response(self, output):           # 同步也可以
-        return output
-```
+- **全同步模型**在事件循环内联执行 — 零适配开销，行为与 0.7 之前的 standard loop 一致。
+- **只要存在异步方法**（任意模型方法或 callback 钩子），同步模型阶段就在单线程 executor 上执行：同步代码绝不并发运行（保持线程安全假设），也绝不阻塞事件循环。
+- 批处理、流式、双向流式、连续批处理都同时支持同步和异步方法。
 
 参见 [examples/10_async](../examples/10_async/) 获取可运行的示例。
 

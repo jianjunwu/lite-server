@@ -35,7 +35,7 @@ Start from example 01 and work your way up. Each example builds on concepts from
 | 06 | [custom_endpoint](06_custom_endpoint/) | Custom HTTP routes | `endpoints/` directory scan, decorator routes, server context access |
 | 07 | [custom_params](07_custom_params/) | Config-driven behavior | `self.config`, custom YAML fields |
 | 09 | [custom_metrics](09_custom_metrics/) | Custom Prometheus metrics | `register_metric()`, `report_metric()`, gauge/counter/histogram |
-| 10 | [async](10_async/) | Asynchronous inference | `AsyncLitAPI`, `async def predict()`, sync/async mixed hooks |
+| 10 | [async](10_async/) | Asynchronous inference | `async def predict()`, unified async pipeline, mixed sync/async |
 | 11 | [logging](11_logging/) | Structured logging at every stage | `self.logger`, per-request tracing, `--log-level` |
 
 ### Production
