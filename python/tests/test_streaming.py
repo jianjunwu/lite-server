@@ -909,3 +909,123 @@ class TestStreamFallbackMeta:
         assert isinstance(captured_meta[0], RequestMeta)
         assert captured_meta[0].request_id == ""
         assert captured_meta[0].route == ""
+
+
+class TestBidiSessionLifecycle:
+    """Session registration timing + the on_close exactly-once contract:
+    a completed on_open is always balanced by exactly one on_close
+    (close/cancel, worker shutdown, or abandoned open); a failed on_open
+    never creates a session and never calls on_close."""
+
+    @pytest.mark.asyncio
+    async def test_on_open_failure_leaves_no_session(self):
+        closed = []
+
+        class H(BidiStreamHandler):
+            def on_open(self, initial_data):
+                raise RuntimeError("open boom")
+
+            def on_chunk(self, chunk):
+                return None
+
+            def on_close(self):
+                closed.append(True)
+
+        class BidiAPI(EchoAPI):
+            def bidi_stream(self):
+                return H()
+
+        sock = AsyncSocket()
+        active = {}
+        await inference._handle_stream_open_async(
+            BidiAPI(), _stream_req("s-open-fail"), sock, active, log
+        )
+        assert "s-open-fail" not in active
+        assert closed == []
+        assert any(_is_error(r, "s-open-fail") for r in sock.sent)
+
+    @pytest.mark.asyncio
+    async def test_postprocess_failure_after_on_open_calls_on_close(self):
+        closed = []
+
+        class H(BidiStreamHandler):
+            def on_open(self, initial_data):
+                return {"greet": True}
+
+            def on_chunk(self, chunk):
+                return None
+
+            def on_close(self):
+                closed.append(True)
+
+        class BidiAPI(EchoAPI):
+            def bidi_stream(self):
+                return H()
+
+            def encode_response(self, output):
+                raise RuntimeError("encode boom")
+
+        sock = AsyncSocket()
+        active = {}
+        await inference._handle_stream_open_async(
+            BidiAPI(), _stream_req("s-enc-fail"), sock, active, log
+        )
+        assert "s-enc-fail" not in active
+        assert closed == [True]
+        assert any(_is_error(r, "s-enc-fail") for r in sock.sent)
+
+    @pytest.mark.asyncio
+    async def test_early_return_after_on_open_calls_on_close(self):
+        closed = []
+
+        class H(BidiStreamHandler):
+            def on_open(self, initial_data):
+                return {"greet": True}
+
+            def on_chunk(self, chunk):
+                return None
+
+            def on_close(self):
+                closed.append(True)
+
+        class EarlyCb(Callback):
+            def on_output(self, ctx):
+                return ctx.respond({"final": True})
+
+        class BidiAPI(EchoAPI):
+            def bidi_stream(self):
+                return H()
+
+        api = BidiAPI()
+        api._pipeline = Pipeline.build(api, [EarlyCb()])
+        sock = AsyncSocket()
+        active = {}
+        await inference._handle_stream_open_async(
+            api, _stream_req("s-early"), sock, active, log
+        )
+        assert "s-early" not in active
+        assert closed == [True]
+        # Early response was sent as chunk + StreamDone.
+        assert any(_is_done(r, "s-early") for r in sock.sent)
+
+    @pytest.mark.asyncio
+    async def test_session_closed_on_shutdown(self):
+        closed = []
+
+        class H(BidiStreamHandler):
+            def on_open(self, initial_data):
+                return None
+
+            def on_chunk(self, chunk):
+                return None
+
+            def on_close(self):
+                closed.append(True)
+
+        class BidiAPI(EchoAPI):
+            def bidi_stream(self):
+                return H()
+
+        sock = _LoopSocket([_open_bytes("s-shutdown")])
+        await inference.run_async_loop(BidiAPI(), sock, "test-model", log)
+        assert closed == [True]

@@ -383,6 +383,13 @@ async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.
             except asyncio.CancelledError:
                 pass
 
+    # Close bidi sessions still open at shutdown so handlers can release
+    # per-session resources (on_close is exception-isolated).
+    for sid, entry in list(active_streams.items()):
+        if isinstance(entry, _BidiSession):
+            await _close_bidi_quietly(entry.on_close, entry.ctx, sid, log)
+            active_streams.pop(sid, None)
+
 
 async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: logging.Logger):
     """Process a single request (single / batch) asynchronously."""
@@ -543,6 +550,16 @@ class _BidiSession:
         self.ctx = ctx
 
 
+async def _close_bidi_quietly(on_close, ctx, stream_id, log) -> None:
+    """Best-effort bidi ``on_close`` (exception-isolated): balances a
+    completed ``on_open`` exactly once — close/cancel, worker shutdown,
+    or an abandoned open."""
+    try:
+        await on_close(ctx=ctx)
+    except Exception:
+        log.debug("bidi on_close error for %s", stream_id, exc_info=True)
+
+
 async def _send_stream_early(socket, stream_id: str, early_response, lit_api: LitAPI) -> None:
     """Send an early-return response as a stream chunk + StreamDone."""
     body, _headers = unwrap_response(early_response)
@@ -571,10 +588,7 @@ async def _handle_stream_async(
     elif action in ("close", "cancel"):
         entry = active_streams.pop(stream_id, None)
         if isinstance(entry, _BidiSession):
-            try:
-                await entry.on_close(ctx=entry.ctx)
-            except Exception as e:
-                log.debug("bidi on_close error for %s: %s", stream_id, e)
+            await _close_bidi_quietly(entry.on_close, entry.ctx, stream_id, log)
             if action == "close":
                 metrics = collect_metrics(lit_api)
                 await socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
@@ -633,7 +647,6 @@ async def _handle_stream_open_async(
             return
 
         on_open, on_chunk, on_close = pipe.adapt_handler(handler)
-        active_streams[stream_id] = _BidiSession(handler, on_chunk, on_close, ctx)
 
         try:
             output = await on_open(ctx.input, ctx=ctx)
@@ -653,16 +666,24 @@ async def _handle_stream_open_async(
             except HTTPException as e:
                 log.warning("bidi on_open encode rejected for %s: %s", stream_id, e.detail)
                 await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
+                await _close_bidi_quietly(on_close, ctx, stream_id, log)
                 return
             except Exception as e:
                 log.error("bidi on_open encode failed for %s: %s", stream_id, _format_exc_brief(e))
                 await socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
+                await _close_bidi_quietly(on_close, ctx, stream_id, log)
                 return
             if ctx.early is not None:
                 await _send_stream_early(socket, stream_id, ctx.early, lit_api)
+                await _close_bidi_quietly(on_close, ctx, stream_id, log)
                 return
             body, _ = unwrap_response(ctx.response)
+            # Register only after the open fully succeeded — a failed open
+            # must not leave a half-open session behind.
+            active_streams[stream_id] = _BidiSession(handler, on_chunk, on_close, ctx)
             await socket.send(_make_stream_chunk(stream_id, json.dumps(body).encode(), is_final=False).SerializeToString())
+            return
+        active_streams[stream_id] = _BidiSession(handler, on_chunk, on_close, ctx)
         return
 
     # --- Fallback: predict() once, send as single chunk -------------------

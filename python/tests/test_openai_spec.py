@@ -8,6 +8,18 @@ import pytest
 from lite_server.specs.openai import OpenAIEndpoint
 
 
+def _envelope(body: dict, request_id: str = "") -> dict:
+    """The EndpointRequest envelope handle() receives at dispatch time."""
+    return {
+        "method": "POST",
+        "route": "/v1/chat/completions",
+        "headers": {},
+        "query": {},
+        "body": body,
+        "request_id": request_id,
+    }
+
+
 # ===== Minimal test model =====
 
 class EchoChatEndpoint(OpenAIEndpoint):
@@ -108,7 +120,7 @@ class TestRequestHandling:
         request = {
             "messages": [{"role": "user", "content": "Hello"}],
         }
-        response = await endpoint.handle(request)
+        response = await endpoint.handle(_envelope(request))
         assert response["status_code"] == 200
         body = response["body"]
         assert body["object"] == "chat.completion"
@@ -118,10 +130,9 @@ class TestRequestHandling:
     @pytest.mark.asyncio
     async def test_preserves_request_id(self, endpoint):
         request = {
-            "request_id": "req-123",
             "messages": [{"role": "user", "content": "Hi"}],
         }
-        response = await endpoint.handle(request)
+        response = await endpoint.handle(_envelope(request, request_id="req-123"))
         assert response["request_id"] == "req-123"
 
     @pytest.mark.asyncio
@@ -134,7 +145,7 @@ class TestRequestHandling:
                 {"role": "user", "content": "Second"},
             ],
         }
-        response = await endpoint.handle(request)
+        response = await endpoint.handle(_envelope(request))
         assert response["status_code"] == 200
         assert response["body"]["choices"][0]["message"]["content"] == "Echo: Second"
 
@@ -147,20 +158,20 @@ class TestRequestHandling:
             "temperature": 0.3,
         }
         # Should not raise — params are passed through decode_request
-        response = await endpoint.handle(request)
+        response = await endpoint.handle(_envelope(request))
         assert response["status_code"] == 200
 
     @pytest.mark.asyncio
     async def test_empty_messages_returns_error(self, endpoint):
         request = {"messages": []}
-        response = await endpoint.handle(request)
+        response = await endpoint.handle(_envelope(request))
         assert response["status_code"] == 400
         assert "error" in response["body"]
 
     @pytest.mark.asyncio
     async def test_missing_messages_returns_error(self, endpoint):
         request = {}
-        response = await endpoint.handle(request)
+        response = await endpoint.handle(_envelope(request))
         assert response["status_code"] == 400
 
     @pytest.mark.asyncio
@@ -180,7 +191,7 @@ class TestRequestHandling:
 
         ep = BrokenEndpoint()
         request = {"messages": [{"role": "user", "content": "Hi"}]}
-        response = await ep.handle(request)
+        response = await ep.handle(_envelope(request))
         assert response["status_code"] == 500
         assert "model exploded" in response["body"]["error"]
 
@@ -192,7 +203,7 @@ class TestDefaultEncodeResponse:
     async def test_string_predict_wrapped_in_openai_format(self):
         ep = MinimalEndpoint()
         request = {"messages": [{"role": "user", "content": "test"}]}
-        response = await ep.handle(request)
+        response = await ep.handle(_envelope(request))
         assert response["status_code"] == 200
         body = response["body"]
         assert body["object"] == "chat.completion"
@@ -213,7 +224,7 @@ class TestDefaultEncodeResponse:
 
         ep = DictEndpoint()
         request = {"messages": [{"role": "user", "content": "Hi"}]}
-        response = await ep.handle(request)
+        response = await ep.handle(_envelope(request))
         body = response["body"]
         assert body["choices"][0]["message"]["content"] == "result"
         assert body["usage"]["prompt_tokens"] == 1
@@ -226,7 +237,7 @@ class TestResponseFormat:
     async def test_response_has_required_fields(self, ):
         ep = EchoChatEndpoint()
         request = {"messages": [{"role": "user", "content": "Hi"}]}
-        response = await ep.handle(request)
+        response = await ep.handle(_envelope(request))
         body = response["body"]
 
         # Required fields per OpenAI spec
@@ -260,7 +271,7 @@ class TestResponseFormat:
 
         ep = ModelFieldEndpoint()
         request = {"messages": [{"role": "user", "content": "Hi"}]}
-        response = await ep.handle(request)
+        response = await ep.handle(_envelope(request))
         assert response["body"]["model"] == "test-model-v1"
 
 
@@ -430,3 +441,70 @@ class TestRegistryAutoRegistration:
         """_SPEC_REGISTRY should be a list supporting iteration."""
         from lite_server.specs.base import _SPEC_REGISTRY
         assert isinstance(_SPEC_REGISTRY, list)
+
+
+# ===== Dispatch-level e2e (load_endpoints → handle_request) =====
+
+class TestDispatchE2E:
+    """OpenAIEndpoint through the real dispatch: envelope in, frame out."""
+
+    @staticmethod
+    def _repo(tmp_path):
+        ep_dir = tmp_path / "endpoints"
+        ep_dir.mkdir()
+        (ep_dir / "chat.py").write_text(
+            "from lite_server.specs.openai import OpenAIEndpoint\n"
+            "\n"
+            "class ChatEndpoint(OpenAIEndpoint):\n"
+            "    def setup(self): pass\n"
+            "    def decode_request(self, request):\n"
+            "        return request.get('messages', [{}])[-1].get('content', '')\n"
+            "    def predict(self, x):\n"
+            "        return f'echo: {x}'\n"
+        )
+        from lite_server.worker.endpoints import load_endpoints
+        return load_endpoints(str(tmp_path))
+
+    @staticmethod
+    def _req(body):
+        return {
+            "request_id": "req-e2e",
+            "route": "/v1/chat/completions",
+            "method": "POST",
+            "headers": {},
+            "query": {},
+            "body": body,
+            "server_state": {},
+        }
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_not_nested(self, tmp_path):
+        from lite_server.worker.endpoints import handle_request
+        endpoints = self._repo(tmp_path)
+        resp = await handle_request(endpoints, self._req(
+            {"messages": [{"role": "user", "content": "hi"}]}
+        ))
+        assert resp["status_code"] == 200
+        # The OpenAI completion is the body directly — no frame nesting.
+        assert resp["body"]["object"] == "chat.completion"
+        assert resp["body"]["choices"][0]["message"]["content"] == "echo: hi"
+        assert resp["request_id"] == "req-e2e"
+
+    @pytest.mark.asyncio
+    async def test_empty_messages_400(self, tmp_path):
+        from lite_server.worker.endpoints import handle_request
+        endpoints = self._repo(tmp_path)
+        resp = await handle_request(endpoints, self._req({"messages": []}))
+        assert resp["status_code"] == 400
+        assert "error" in resp["body"]
+
+    @pytest.mark.asyncio
+    async def test_streaming_frame_via_dispatch(self, tmp_path):
+        from lite_server.worker.endpoints import handle_request
+        endpoints = self._repo(tmp_path)
+        resp = await handle_request(endpoints, self._req(
+            {"messages": [{"role": "user", "content": "hi"}], "stream": True}
+        ))
+        assert resp["status_code"] == 200
+        assert resp["stream"] is True
+        assert len(resp["chunks"]) >= 1

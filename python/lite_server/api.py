@@ -47,6 +47,11 @@ class BidiStreamHandler:
     ``ctx.state`` is shared across ``on_open`` / ``on_chunk`` / ``on_close``
     of the same session; ``ctx.meta`` is the request metadata from the
     stream-open request.
+
+    A successfully completed ``on_open`` is always balanced by exactly one
+    ``on_close`` — on normal close/cancel, at worker shutdown, or when the
+    open is abandoned (post-open failure or early return).  A failed
+    ``on_open`` never creates a session and never triggers ``on_close``.
     """
 
     def on_open(self, initial_data: Any) -> Any | None:

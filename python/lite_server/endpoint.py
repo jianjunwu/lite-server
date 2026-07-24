@@ -25,6 +25,7 @@ class EndpointRequest(TypedDict, total=False):
     headers: Headers       # case-insensitive
     query: dict[str, str]
     body: Any              # parsed JSON body (None when absent)
+    request_id: str        # wire request id, for tracing/log correlation
 
 
 @dataclass

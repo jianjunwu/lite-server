@@ -12,6 +12,18 @@ import pytest
 from lite_server.specs.openai import OpenAIEndpoint
 
 
+def _envelope(body: dict, request_id: str = "") -> dict:
+    """The EndpointRequest envelope handle() receives at dispatch time."""
+    return {
+        "method": "POST",
+        "route": "/v1/chat/completions",
+        "headers": {},
+        "query": {},
+        "body": body,
+        "request_id": request_id,
+    }
+
+
 # ===== Streaming Test Models =====
 
 class StreamingChatEndpoint(OpenAIEndpoint):
@@ -77,7 +89,7 @@ class TestStreamPredict:
             "messages": [{"role": "user", "content": "hello world"}],
             "stream": True,
         }
-        response = await ep.handle(request)
+        response = await ep.handle(_envelope(request))
 
         # Should indicate streaming
         assert response["status_code"] == 200
@@ -94,7 +106,7 @@ class TestStreamPredict:
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
-        response = await ep.handle(request)
+        response = await ep.handle(_envelope(request))
         chunks = response["chunks"]
 
         # Each chunk should have OpenAI streaming format
@@ -110,7 +122,7 @@ class TestStreamPredict:
             "messages": [{"role": "user", "content": "test"}],
             "stream": True,
         }
-        response = await ep.handle(request)
+        response = await ep.handle(_envelope(request))
         chunks = response["chunks"]
         last_chunk = chunks[-1]
         assert last_chunk["choices"][0].get("finish_reason") == "stop"
@@ -123,7 +135,7 @@ class TestStreamPredict:
             "messages": [{"role": "user", "content": "test"}],
             "stream": True,
         }
-        response = await ep.handle(request)
+        response = await ep.handle(_envelope(request))
         # Should fall back to single response wrapped as stream
         assert response["status_code"] == 200
         assert response["stream"] is True
@@ -138,7 +150,7 @@ class TestStreamPredict:
             "messages": [{"role": "user", "content": "test"}],
             "stream": False,
         }
-        response = await ep.handle(request)
+        response = await ep.handle(_envelope(request))
         assert response["status_code"] == 200
         assert "stream" not in response
         assert "body" in response
@@ -151,7 +163,7 @@ class TestStreamPredict:
             "messages": [{"role": "user", "content": "test"}],
             "stream": True,
         }
-        response = await ep.handle(request)
+        response = await ep.handle(_envelope(request))
         assert response["status_code"] == 200
         assert response["stream"] is True
         chunks = response["chunks"]
@@ -163,18 +175,17 @@ class TestStreamPredict:
     async def test_stream_preserves_request_id(self):
         ep = StreamingChatEndpoint()
         request = {
-            "request_id": "req-abc",
             "messages": [{"role": "user", "content": "test"}],
             "stream": True,
         }
-        response = await ep.handle(request)
+        response = await ep.handle(_envelope(request, request_id="req-abc"))
         assert response["request_id"] == "req-abc"
 
     @pytest.mark.asyncio
     async def test_stream_empty_messages_returns_error(self):
         ep = StreamingChatEndpoint()
         request = {"request_id": "s7", "messages": [], "stream": True}
-        response = await ep.handle(request)
+        response = await ep.handle(_envelope(request))
         assert response["status_code"] == 400
 
 

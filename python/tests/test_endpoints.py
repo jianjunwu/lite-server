@@ -471,6 +471,7 @@ class TestEndpointHeaders:
                 "has_headers": "headers" in request,
                 "has_query": "query" in request,
                 "has_body": "body" in request,
+                "has_request_id": "request_id" in request,
             }
 
         ep = {"/contract": {"handler": handler, "methods": ["GET"]}}
@@ -490,6 +491,7 @@ class TestEndpointHeaders:
         assert body["has_headers"] is True
         assert body["has_query"] is True
         assert body["has_body"] is True
+        assert body["has_request_id"] is True
 
 
 class TestRequestModuleRemoved:

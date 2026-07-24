@@ -12,6 +12,7 @@ import time
 import uuid
 from typing import Any, AsyncIterator
 
+from lite_server.endpoint import EndpointRequest
 from lite_server.specs.base import EndpointSpec
 
 
@@ -20,7 +21,9 @@ class OpenAIEndpoint(EndpointSpec):
 
     Subclasses must implement:
       - setup(): initialize model/resources
-      - decode_request(request) -> decoded input for predict
+      - decode_request(request) -> decoded input for predict; *request* is
+        the OpenAI request body (``messages`` / ``stream`` / ``max_tokens``
+        / ... at the top level)
       - predict(x) -> model output (str or dict with "text" key)
 
     Optionally override:
@@ -147,14 +150,22 @@ class OpenAIEndpoint(EndpointSpec):
             ],
         }
 
-    async def handle(self, request: dict[str, Any]) -> dict[str, Any]:
-        """Full request lifecycle: validate -> decode -> predict/stream_predict -> encode."""
+    async def handle(self, request: EndpointRequest) -> dict[str, Any]:
+        """Full request lifecycle: validate -> decode -> predict/stream_predict -> encode.
+
+        *request* is the endpoint envelope (``EndpointRequest``); the OpenAI
+        fields (``messages`` / ``stream`` / ``max_tokens`` / ...) live in
+        ``request["body"]`` — the same dict passed to ``decode_request``.
+        """
         request_id = request.get("request_id", "")
-        is_stream = request.get("stream", False)
+        body = request.get("body")
+        if not isinstance(body, dict):
+            body = {}
+        is_stream = bool(body.get("stream", False))
 
         try:
             # Validate: must have messages
-            messages = request.get("messages")
+            messages = body.get("messages")
             if not messages or not isinstance(messages, list) or len(messages) == 0:
                 return {
                     "request_id": request_id,
@@ -163,8 +174,8 @@ class OpenAIEndpoint(EndpointSpec):
                     "body": {"error": "messages is required and must be a non-empty list"},
                 }
 
-            # Decode
-            decoded = self.decode_request(request)
+            # Decode — decode_request receives the OpenAI request body.
+            decoded = self.decode_request(body)
 
             if is_stream:
                 return await self._handle_stream(request_id, decoded)

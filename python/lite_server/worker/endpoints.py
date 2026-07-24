@@ -224,6 +224,7 @@ async def handle_request(endpoints, req_data: dict) -> dict:
         "headers": Headers(req_data.get("headers") or {}),
         "query": req_data.get("query", {}),
         "body": req_data.get("body"),
+        "request_id": req_data.get("request_id", ""),
     }
 
     try:
