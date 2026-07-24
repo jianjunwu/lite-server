@@ -235,6 +235,17 @@ def _make_error_response(uid: str, message: str,
     return Response(uid=uid, single=single)
 
 
+def _merge_err_headers(ctx: RequestContext, e: Exception) -> dict[str, str] | None:
+    """Headers to attach to an error frame: ctx.response_headers (e.g. from a
+    Cors callback) first, then the exception's own headers (e.g. Retry-After
+    on 429/503) win. Returns None when neither is set."""
+    hdrs = dict(ctx.response_headers)
+    extra = getattr(e, "headers", None)
+    if extra:
+        hdrs.update(extra)
+    return hdrs or None
+
+
 def _format_exc_brief(exc: BaseException) -> str:
     """Exception type, message, and where it raised — on one short line.
 
@@ -461,6 +472,8 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
     :class:`BatchItemResponse` fields — no batch-level header merging.
     """
     error_map: dict[str, Exception] = {}
+    # item_uid → response headers to attach to a failed item (B6)
+    err_headers_map: dict[str, dict[str, str] | None] = {}
     # (item_uid → (body_bytes, status_code, media_type, headers))
     final_map: dict[str, tuple[bytes, int, str, dict[str, str] | None]] = {}
     ctx_map: dict[str, RequestContext] = {}
@@ -477,6 +490,7 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
         except Exception as e:
             log.warning("batch item %s preprocess failed: %s", item.uid, _format_exc_brief(e))
             await pipe.run_on_error(ctx, e)
+            err_headers_map[item.uid] = _merge_err_headers(ctx, e)
             error_map[item.uid] = e
             continue
         if ctx.early is not None:
@@ -496,6 +510,7 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
             log.error("batch predict failed: %s", _format_exc_brief(e))
             for u in decoded_uids:
                 await pipe.run_on_error(ctx_map[u], e)
+                err_headers_map[u] = _merge_err_headers(ctx_map[u], e)
                 error_map[u] = e
     else:
         results = await asyncio.gather(
@@ -506,6 +521,7 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
             if isinstance(result, Exception):
                 log.error("predict failed for %s: %s", u, _format_exc_brief(result))
                 await pipe.run_on_error(ctx_map[u], result)
+                err_headers_map[u] = _merge_err_headers(ctx_map[u], result)
                 error_map[u] = result
 
     # Phase 3: per-item on_output → encode → on_response
@@ -518,6 +534,7 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
         except Exception as e:
             log.warning("batch item %s postprocess failed: %s", item_uid, _format_exc_brief(e))
             await pipe.run_on_error(ctx, e)
+            err_headers_map[item_uid] = _merge_err_headers(ctx, e)
             error_map[item_uid] = e
             continue
         value = ctx.early if ctx.early is not None else ctx.response
@@ -543,13 +560,15 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
         else:
             err = error_map.get(item_uid, Exception("unknown error"))
             err_bytes = json.dumps({"error": str(err)}).encode()
-            items.append(
-                BatchItemResponse(
-                    uid=item_uid,
-                    data=err_bytes,
-                    status=_make_status(False, str(err)),
-                )
+            bir = BatchItemResponse(
+                uid=item_uid,
+                data=err_bytes,
+                status=_make_status(False, str(err)),
             )
+            hdrs = err_headers_map.get(item_uid)
+            if hdrs:
+                bir.headers.update(hdrs)
+            items.append(bir)
 
     metrics = collect_metrics(lit_api)
     # BatchResponse.headers is retained for wire compatibility but no
@@ -948,12 +967,12 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
             _drive(pipe.preprocess(ctx))
         except HTTPException as e:
             _drive(pipe.run_on_error(ctx, e))
-            err_resp = _make_error_response(cb_add.uid, e.detail, status_code=e.status_code, error_type=e.error_type, code=e.code, param=e.param)
+            err_resp = _make_error_response(cb_add.uid, e.detail, status_code=e.status_code, error_type=e.error_type, code=e.code, param=e.param, headers=_merge_err_headers(ctx, e))
             socket.send(err_resp.SerializeToString())
             return
         except Exception as e:
             _drive(pipe.run_on_error(ctx, e))
-            err_resp = _make_error_response(cb_add.uid, str(e))
+            err_resp = _make_error_response(cb_add.uid, str(e), headers=_merge_err_headers(ctx, e))
             socket.send(err_resp.SerializeToString())
             return
         if ctx.early is not None:
@@ -971,12 +990,12 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
         except HTTPException as e:
             del active[cb_add.uid]
             _drive(pipe.run_on_error(ctx, e))
-            err_resp = _make_error_response(cb_add.uid, e.detail, status_code=e.status_code, error_type=e.error_type, code=e.code, param=e.param)
+            err_resp = _make_error_response(cb_add.uid, e.detail, status_code=e.status_code, error_type=e.error_type, code=e.code, param=e.param, headers=_merge_err_headers(ctx, e))
             socket.send(err_resp.SerializeToString())
         except Exception as e:
             del active[cb_add.uid]
             _drive(pipe.run_on_error(ctx, e))
-            err_resp = _make_error_response(cb_add.uid, f"prefill failed: {e}")
+            err_resp = _make_error_response(cb_add.uid, f"prefill failed: {e}", headers=_merge_err_headers(ctx, e))
             socket.send(err_resp.SerializeToString())
 
     def _handle_remove(cb_remove: CBRemoveRequest):
@@ -1001,7 +1020,7 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
                     log.warning("cb step rejected: %s", e.detail)
                     for state in list(active.values()):
                         _drive(pipe.run_on_error(state.ctx, e))
-                        err_resp = _make_error_response(state.uid, e.detail, status_code=e.status_code, error_type=e.error_type, code=e.code, param=e.param)
+                        err_resp = _make_error_response(state.uid, e.detail, status_code=e.status_code, error_type=e.error_type, code=e.code, param=e.param, headers=_merge_err_headers(state.ctx, e))
                         socket.send(err_resp.SerializeToString())
                     active.clear()
                     continue
@@ -1009,7 +1028,7 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
                     log.error("cb step error: %s", _format_exc_brief(e))
                     for state in list(active.values()):
                         _drive(pipe.run_on_error(state.ctx, e))
-                        err_resp = _make_error_response(state.uid, f"step failed: {e}")
+                        err_resp = _make_error_response(state.uid, f"step failed: {e}", headers=_merge_err_headers(state.ctx, e))
                         socket.send(err_resp.SerializeToString())
                     active.clear()
                     continue
@@ -1030,12 +1049,12 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
                     except HTTPException as e:
                         log.warning("cb encode rejected for %s: %s", uid, e.detail)
                         _drive(pipe.run_on_error(state.ctx, e))
-                        err_resp = _make_error_response(uid, e.detail, status_code=e.status_code, error_type=e.error_type, code=e.code, param=e.param)
+                        err_resp = _make_error_response(uid, e.detail, status_code=e.status_code, error_type=e.error_type, code=e.code, param=e.param, headers=_merge_err_headers(state.ctx, e))
                         socket.send(err_resp.SerializeToString())
                     except Exception as e:
                         log.error("cb encode error for %s: %s", uid, _format_exc_brief(e))
                         _drive(pipe.run_on_error(state.ctx, e))
-                        err_resp = _make_error_response(uid, f"encode failed: {e}")
+                        err_resp = _make_error_response(uid, f"encode failed: {e}", headers=_merge_err_headers(state.ctx, e))
                         socket.send(err_resp.SerializeToString())
 
             time.sleep(0.001)

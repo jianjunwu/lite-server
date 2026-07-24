@@ -796,6 +796,32 @@ class TestAsyncLoop:
         assert resp.single.status.message == "503"
         assert resp.single.headers["Retry-After"] == "5"
 
+    def test_unary_error_carries_ctx_response_headers(self):
+        """B6: ctx.response_headers set by a callback reach the unary error
+        response via the run_single _response_headers channel."""
+        from lite_server.exceptions import HTTPException
+
+        class HeaderCB(Callback):
+            def on_request(self, ctx):
+                ctx.response_headers["x-uni"] = "1"
+
+        class FailModel(LitAPI):
+            async def predict(self, x):
+                raise HTTPException(503, "no")
+
+        model = FailModel()
+        model._pipeline = Pipeline.build(model, [HeaderCB()])
+        socket = AsyncMockSocket()
+        socket.inject(Request(
+            uid="u", single=SingleRequest(data=json.dumps({"input": 1}).encode()),
+        ).SerializeToString())
+        drive_loop(model, socket)
+
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.single.status.code == "Error"
+        assert resp.single.headers["x-uni"] == "1"
+
     def test_async_stream_with_async_generator(self):
         class AsyncStreamModel(LitAPI):
             async def predict(self, x):
@@ -1221,6 +1247,37 @@ class TestBatchPredict:
         codes = {item.uid: item.status.code for item in resp.batch.items}
         assert codes == {"i1": "Ok", "i2": "Error"}
 
+    def test_batch_error_item_carries_response_headers(self):
+        """B6: ctx.response_headers set by a callback reach the failed item."""
+        class HeaderCB(Callback):
+            def on_request(self, ctx):
+                ctx.response_headers["x-batch"] = "1"
+
+        class BrokenBatchModel(LitAPI):
+            def batch(self, inputs):
+                return inputs
+
+            def predict(self, batched):
+                raise ValueError("boom")
+
+            def unbatch(self, output):
+                return output
+
+        pipe = Pipeline.build(BrokenBatchModel(), [HeaderCB()])
+        batch = BatchRequest(items=[
+            BatchItem(uid="i1", data=json.dumps({"input": 1}).encode()),
+        ])
+        meta = RequestMeta(
+            route="/predict", headers=Headers(), client_ip="",
+            request_id="bh", timestamp_ns=0,
+        )
+        resp = asyncio.run(
+            inference._handle_batch(pipe, "bh", batch, meta, BrokenBatchModel(), log)
+        )
+        item = resp.batch.items[0]
+        assert item.status.code == "Error"
+        assert item.headers["x-batch"] == "1"
+
     def test_async_batch_predict_full_path(self):
         class AsyncBatchModel(LitAPI):
             async def batch(self, inputs):
@@ -1625,6 +1682,41 @@ class TestCBLoop:
         assert response.single.status.message == "400"
         body = json.loads(response.single.data)
         assert "cb rejected" in body["error"]["message"]
+
+    def test_cb_error_carries_response_headers(self):
+        """B6: ctx.response_headers set on the CB path reach the error response."""
+        from lite_server.exceptions import BadRequestError
+
+        class HeaderCB(Callback):
+            def on_request(self, ctx):
+                ctx.response_headers["x-cb"] = "yes"
+                raise BadRequestError("cb rejected")
+
+        class CBModel(LitAPI):
+            def decode_request(self, req):
+                return req
+
+            def prefill(self, uid, decoded_input):
+                pass
+
+            def step(self, active_sequences):
+                return []
+
+            def has_finished(self, uid, token, generated_sequence):
+                return True
+
+        model = CBModel()
+        model._pipeline = Pipeline.build(model, [HeaderCB()])
+        socket = SyncMockSocket()
+        req = Request()
+        req.uid = "cb-hdr"
+        req.single.data = json.dumps({"input": "x"}).encode()
+        socket.inject(req.SerializeToString())
+        start_cb_loop(model, socket)
+
+        response = wait_for_response(socket, "cb-hdr")
+        assert response.single.status.code == "Error"
+        assert response.single.headers["x-cb"] == "yes"
 
 
 # ---------------------------------------------------------------------------
