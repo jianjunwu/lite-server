@@ -1,13 +1,24 @@
 """Python custom endpoint worker for lite-server.
 
-Handler/middleware contract::
+Since 0.7.0 the handler contract is::
 
-    (request: EndpointRequest, server: ServerProxy) -> dict | Response
+    handler(ctx: RequestContext) -> dict | Response
 
-A returned dict carrying ``status_code`` / ``headers`` / ``stream`` /
-``chunks`` keys is unpacked as a response frame; any other dict becomes
-the response body with status 200.  Middleware are decorator-style
-wrappers applied once at load time (list order = execution order).
+``ctx.request`` is the parsed JSON body, ``ctx.meta`` carries route /
+headers / query / method / request_id, and ``ctx.server`` is the
+ServerProxy. A returned dict carrying ``status_code`` / ``headers`` /
+``stream`` / ``chunks`` keys is unpacked as a response frame; any other
+dict becomes the response body with status 200. Callbacks (RequireApiKey,
+RateLimit, Cors, LogRequests, or custom) attach via ``callbacks=[...]``
+and are applied once at load time as a Pipeline (list order = execution
+order). EndpointSpec subclasses keep the legacy ``(request_dict, server)``
+contract and are dispatched as such.
+
+Three loading modes (in order):
+  1. Subdirectory scan: endpoints/**/*.py (recursive) — a module-level
+     ``handler(ctx)`` function, or EndpointSpec subclasses that
+     auto-register.
+  2. Decorator: routes collected from the global EndpointRouter.
 """
 
 import argparse
