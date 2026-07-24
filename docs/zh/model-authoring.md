@@ -123,28 +123,38 @@ stream: true
 
 如果未实现 `stream_predict()`，服务器回退到 `predict()` 并将结果作为单个 chunk 发送。
 
-#### `on_request(self, request, meta)`
+#### `on_request(self, ctx)`
 
-在 `decode_request()` 之前对原始请求调用。用于鉴权、日志或请求修改。
+在 `decode_request()` 之前对原始请求调用。用于鉴权、日志或请求修改。接收单个 :class:`RequestContext` 参数（与 Callback 钩子契约一致）。
 
 ```python
-def on_request(self, request, meta):
-    self.logger.info(f"Request from {meta.client_ip}: {meta.request_id}")
-    if not self._check_auth(meta.headers):
+def on_request(self, ctx):
+    self.logger.info(f"Request from {ctx.meta.client_ip}: {ctx.meta.request_id}")
+    if not self._check_auth(ctx.meta.headers):
         raise PermissionError("Unauthorized")
-    return request
+    return ctx.request
 ```
 
-`meta` 是 `RequestMeta` 对象，包含：`route`、`headers`、`client_ip`、`request_id`、`timestamp_ns`、`payload`。
+``ctx.meta`` 是 `RequestMeta` 对象，包含：`route`、`headers`、`client_ip`、`request_id`、`timestamp_ns`。
 
-#### `on_response(self, response, meta)`
+#### `on_response(self, ctx)`
 
 在 `encode_response()` 之后、发送给客户端之前调用。用于响应修改或日志。流式路径中也会调用（每个 chunk 编码后）。
 
 ```python
-def on_response(self, response, meta):
-    response["latency_ms"] = (time.time_ns() - meta.timestamp_ns) / 1_000_000
-    return response
+def on_response(self, ctx):
+    ctx.response["latency_ms"] = (time.time_ns() - ctx.meta.timestamp_ns) / 1_000_000
+    return ctx.response
+```
+
+要附加自定义 HTTP 响应头，使用 :meth:`ctx.respond() <lite_server.RequestContext.respond>`：
+
+```python
+def on_response(self, ctx):
+    return ctx.respond(
+        ctx.response,
+        headers={"X-Request-ID": ctx.meta.request_id},
+    )
 ```
 
 #### `on_file_changed(self, changed_files)`
@@ -746,23 +756,23 @@ server:
 使用 `on_request` 和 `on_response` 记录请求元数据：
 
 ```python
-def on_request(self, request, meta):
+def on_request(self, ctx):
     self.logger.info(
         "Request from %s | route=%s | request_id=%s",
-        meta.client_ip, meta.route, meta.request_id,
+        ctx.meta.client_ip, ctx.meta.route, ctx.meta.request_id,
     )
-    return request
+    return ctx.request
 
-def on_response(self, response, meta):
+def on_response(self, ctx):
     self.logger.info(
         "Response ready | request_id=%s | latency_ms=%.2f",
-        meta.request_id,
-        (time.time_ns() - meta.timestamp_ns) / 1_000_000,
+        ctx.meta.request_id,
+        (time.time_ns() - ctx.meta.timestamp_ns) / 1_000_000,
     )
-    return response
+    return ctx.response
 ```
 
-`meta` 是一个 `RequestMeta` 对象，包含：`route`、`headers`、`client_ip`、`request_id`、`timestamp_ns`、`payload`。
+``ctx.meta`` 是一个 `RequestMeta` 对象，包含：`route`、`headers`、`client_ip`、`request_id`、`timestamp_ns`。
 
 参见 [examples/11_logging](../examples/11_logging/) 获取可运行的示例。
 
@@ -802,10 +812,10 @@ class MyModel(LitAPI):
             raise ServiceUnavailableError("model not loaded yet")
         return self.model(x)
 
-    def on_request(self, request, meta):
-        if not self._check_auth(meta.headers):
+    def on_request(self, ctx):
+        if not self._check_auth(ctx.meta.headers):
             raise UnauthorizedError("invalid or missing token")
-        return request
+        return ctx.request
 ```
 
 | 异常类 | HTTP 状态码 | 默认 error_type |

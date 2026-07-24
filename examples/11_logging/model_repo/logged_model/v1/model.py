@@ -1,9 +1,9 @@
 """Model demonstrating structured logging at different stages, plus
-response headers via :class:`~lite_server.api.ResponseWithHeaders`."""
+response headers via :meth:`~lite_server.RequestContext.respond`."""
 
 import time
 
-from lite_server import LitAPI, ResponseWithHeaders
+from lite_server import LitAPI
 
 
 class LoggedModelAPI(LitAPI):
@@ -38,22 +38,22 @@ class LoggedModelAPI(LitAPI):
         self.logger.debug("Debug: encode_response output=%s", output)
         return output
 
-    def on_request(self, request, meta):
+    def on_request(self, ctx):
         self.logger.info(
             "Info: request from %s | route=%s | request_id=%s",
-            meta.client_ip, meta.route, meta.request_id,
+            ctx.meta.client_ip, ctx.meta.route, ctx.meta.request_id,
         )
-        return request
+        return ctx.request
 
-    def on_response(self, response, meta):
+    def on_response(self, ctx):
         self.logger.info(
             "Info: response ready | request_id=%s | output=%s",
-            meta.request_id, response,
+            ctx.meta.request_id, ctx.response,
         )
-        return ResponseWithHeaders(
-            body=response,
+        return ctx.respond(
+            ctx.response,
             headers={
-                "X-Request-ID": meta.request_id,
+                "X-Request-ID": ctx.meta.request_id,
                 "X-Call-Count": str(self.call_count),
             },
         )

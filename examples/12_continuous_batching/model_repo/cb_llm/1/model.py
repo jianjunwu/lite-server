@@ -23,7 +23,7 @@ class CBLlmAPI(LitAPI):
     def step(self, active_sequences):
         """Generate one token per active sequence.
 
-        active_sequences elements are CBState objects with:
+        active_sequences elements are :class:`~lite_server.CBSequence` objects with:
           - .uid: request id
           - .input: decoded_input (the prompt string)
           - .output: list of tokens generated so far

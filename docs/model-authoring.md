@@ -123,28 +123,38 @@ stream: true
 
 If `stream_predict()` is not implemented, the server falls back to `predict()` and sends the result as a single chunk.
 
-#### `on_request(self, request, meta)`
+#### `on_request(self, ctx)`
 
-Called before `decode_request()`, on the raw request. Use for auth, logging, or request modification.
+Called before `decode_request()`, on the raw request. Use for auth, logging, or request modification. Receives a single :class:`RequestContext` argument (same contract as Callback hooks).
 
 ```python
-def on_request(self, request, meta):
-    self.logger.info(f"Request from {meta.client_ip}: {meta.request_id}")
-    if not self._check_auth(meta.headers):
+def on_request(self, ctx):
+    self.logger.info(f"Request from {ctx.meta.client_ip}: {ctx.meta.request_id}")
+    if not self._check_auth(ctx.meta.headers):
         raise PermissionError("Unauthorized")
-    return request
+    return ctx.request
 ```
 
-`meta` is a `RequestMeta` object with: `route`, `headers`, `client_ip`, `request_id`, `timestamp_ns`, `payload`.
+``ctx.meta`` is a `RequestMeta` object with: `route`, `headers`, `client_ip`, `request_id`, `timestamp_ns`.
 
-#### `on_response(self, response, meta)`
+#### `on_response(self, ctx)`
 
 Called after `encode_response()`, before sending to client. Use for response modification or logging. Also called in the streaming path (after each chunk is encoded).
 
 ```python
-def on_response(self, response, meta):
-    response["latency_ms"] = (time.time_ns() - meta.timestamp_ns) / 1_000_000
-    return response
+def on_response(self, ctx):
+    ctx.response["latency_ms"] = (time.time_ns() - ctx.meta.timestamp_ns) / 1_000_000
+    return ctx.response
+```
+
+To attach custom HTTP response headers, use :meth:`ctx.respond() <lite_server.RequestContext.respond>`:
+
+```python
+def on_response(self, ctx):
+    return ctx.respond(
+        ctx.response,
+        headers={"X-Request-ID": ctx.meta.request_id},
+    )
 ```
 
 #### `on_file_changed(self, changed_files)`
@@ -745,23 +755,23 @@ server:
 Use `on_request` and `on_response` to log request metadata:
 
 ```python
-def on_request(self, request, meta):
+def on_request(self, ctx):
     self.logger.info(
         "Request from %s | route=%s | request_id=%s",
-        meta.client_ip, meta.route, meta.request_id,
+        ctx.meta.client_ip, ctx.meta.route, ctx.meta.request_id,
     )
-    return request
+    return ctx.request
 
-def on_response(self, response, meta):
+def on_response(self, ctx):
     self.logger.info(
         "Response ready | request_id=%s | latency_ms=%.2f",
-        meta.request_id,
-        (time.time_ns() - meta.timestamp_ns) / 1_000_000,
+        ctx.meta.request_id,
+        (time.time_ns() - ctx.meta.timestamp_ns) / 1_000_000,
     )
-    return response
+    return ctx.response
 ```
 
-`meta` is a `RequestMeta` object with: `route`, `headers`, `client_ip`, `request_id`, `timestamp_ns`, `payload`.
+``ctx.meta`` is a `RequestMeta` object with: `route`, `headers`, `client_ip`, `request_id`, `timestamp_ns`.
 
 See [examples/11_logging](../examples/11_logging/) for a runnable demo.
 
@@ -801,10 +811,10 @@ class MyModel(LitAPI):
             raise ServiceUnavailableError("model not loaded yet")
         return self.model(x)
 
-    def on_request(self, request, meta):
-        if not self._check_auth(meta.headers):
+    def on_request(self, ctx):
+        if not self._check_auth(ctx.meta.headers):
             raise UnauthorizedError("invalid or missing token")
-        return request
+        return ctx.request
 ```
 
 | Exception | HTTP Status | Default error_type |
