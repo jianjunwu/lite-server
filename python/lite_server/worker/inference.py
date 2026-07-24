@@ -424,11 +424,19 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
 async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
                         meta: RequestMeta | None, lit_api: LitAPI,
                         log: logging.Logger) -> Response:
-    """Batch request: per-item preprocess → batched predict → per-item postprocess."""
+    """Batch request: per-item preprocess → batched predict → per-item postprocess.
+
+    Each item carries its own status_code, media_type, and headers via
+    :class:`BatchItemResponse` fields — no batch-level header merging.
+    """
     error_map: dict[str, Exception] = {}
-    final_map: dict[str, bytes] = {}
-    batch_headers: dict[str, str] = {}
+    # (item_uid → (body_bytes, status_code, media_type, headers))
+    final_map: dict[str, tuple[bytes, int, str, dict[str, str] | None]] = {}
     ctx_map: dict[str, RequestContext] = {}
+
+    def _store_result(item_uid: str, body: Any, headers: dict[str, str] | None) -> None:
+        sc, mt, clean = extract_response_meta(headers)
+        final_map[item_uid] = (json.dumps(body).encode(), sc, mt, clean)
 
     # Phase 1: per-item on_request → decode → on_input
     for item in batch.items:
@@ -441,9 +449,7 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
             continue
         if ctx.early is not None:
             body, headers = unwrap_response(ctx.early)
-            final_map[item.uid] = json.dumps(body).encode()
-            if headers:
-                batch_headers.update(headers)
+            _store_result(item.uid, body, headers)
             continue
         ctx_map[item.uid] = ctx
 
@@ -481,22 +487,24 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
             continue
         value = ctx.early if ctx.early is not None else ctx.response
         body, headers = unwrap_response(value)
-        if headers:
-            batch_headers.update(headers)
-        final_map[item_uid] = json.dumps(body).encode()
+        _store_result(item_uid, body, headers)
 
-    # Phase 4: assemble BatchResponse
+    # Phase 4: assemble BatchResponse — per-item fields, no batch headers
     items = []
     for item in batch.items:
         item_uid = item.uid
         if item_uid in final_map:
-            items.append(
-                BatchItemResponse(
-                    uid=item_uid,
-                    data=final_map[item_uid],
-                    status=_make_status(True),
-                )
+            body_bytes, sc, mt, hdrs = final_map[item_uid]
+            bir = BatchItemResponse(
+                uid=item_uid,
+                data=body_bytes,
+                status=_make_status(True),
+                status_code=sc,
+                media_type=mt or "",
             )
+            if hdrs:
+                bir.headers.update(hdrs)
+            items.append(bir)
         else:
             err = error_map.get(item_uid, Exception("unknown error"))
             err_bytes = json.dumps({"error": str(err)}).encode()
@@ -509,9 +517,9 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
             )
 
     metrics = collect_metrics(lit_api)
+    # BatchResponse.headers is retained for wire compatibility but no
+    # longer populated — per-item headers carry everything.
     batch_resp = BatchResponse(items=items)
-    if batch_headers:
-        batch_resp.headers.update(batch_headers)
     return Response(uid=uid, batch=batch_resp, metrics=metrics)
 
 

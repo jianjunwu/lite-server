@@ -483,9 +483,10 @@ async fn do_send_batch(
                                 uid: queue_item.uid,
                                 payload: Some(pb::response::Payload::Single(pb::SingleResponse {
                                     data: resp_item.data.clone(),
-                                    headers: Default::default(),
+                                    headers: resp_item.headers.clone(),
                                     status: resp_item.status.clone(),
-                                
+                                    status_code: resp_item.status_code,
+                                    media_type: resp_item.media_type.clone(),
                                     ..Default::default()
                                 })),
                                 metrics: resp.metrics.clone(),

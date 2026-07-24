@@ -1153,6 +1153,82 @@ class TestBatchPredict:
         for i, item in enumerate(resp.batch.items):
             assert json.loads(item.data)["result"] == i + 2
 
+    def test_batch_per_item_status_code_and_headers(self):
+        """F10: each batch item must carry its own status_code, media_type,
+        and headers.  BatchResponse.headers must be empty (no cross-item
+        leakage, no _sc/_mt internal keys)."""
+        from lite_server.response import Response as LiteResponse
+
+        class BatchModel(LitAPI):
+            def batch(self, inputs):
+                return inputs
+
+            def predict(self, batched):
+                return batched
+
+            def unbatch(self, output):
+                return output
+
+            def encode_response(self, output):
+                uid = output.get("uid")
+                if uid == "i1":
+                    # early 400 + custom header
+                    return LiteResponse(
+                        content={"error": "bad"}, status_code=400,
+                        headers={"X-Item": "1"},
+                    )
+                if uid == "i2":
+                    # non-JSON media type
+                    return LiteResponse(
+                        content="<p>ok</p>", media_type="text/html",
+                    )
+                if uid == "i3":
+                    # custom headers via ResponseWithHeaders
+                    from lite_server.api import ResponseWithHeaders
+                    return ResponseWithHeaders(
+                        body={"result": "z"}, headers={"X-Custom": "v3"},
+                    )
+                return output
+
+        socket = AsyncMockSocket()
+        items = [
+            BatchItem(uid="i1", data=json.dumps({"uid": "i1", "value": "x"}).encode()),
+            BatchItem(uid="i2", data=json.dumps({"uid": "i2", "value": "y"}).encode()),
+            BatchItem(uid="i3", data=json.dumps({"uid": "i3", "value": "z"}).encode()),
+        ]
+        req = Request(uid="batch-hdr", batch=BatchRequest(items=items))
+        socket.inject(req.SerializeToString())
+        drive_loop(BatchModel(), socket)
+
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.uid == "batch-hdr"
+        assert len(resp.batch.items) == 3
+
+        # Item 1 (uid=i1): early 400, custom header
+        i1 = resp.batch.items[0]
+        assert i1.uid == "i1"
+        assert i1.status_code == 400
+        assert json.loads(i1.data) == {"error": "bad"}
+        assert dict(i1.headers) == {"X-Item": "1"}
+
+        # Item 2 (uid=i2): text/html media type
+        i2 = resp.batch.items[1]
+        assert i2.uid == "i2"
+        assert i2.status_code == 0  # not set → default
+        assert i2.media_type == "text/html"
+        assert i2.data == b'"<p>ok</p>"'
+
+        # Item 3 (uid=i3): ResponseWithHeaders custom header
+        i3 = resp.batch.items[2]
+        assert i3.uid == "i3"
+        assert dict(i3.headers) == {"X-Custom": "v3"}
+
+        # Batch-level headers must be empty (no cross-contamination)
+        assert dict(resp.batch.headers) == {}, (
+            f"batch-level headers must be empty, got {dict(resp.batch.headers)}"
+        )
+
     def test_single_on_request_before_decode(self):
         class ModelWithHook(LitAPI):
             def on_request(self, request, meta):

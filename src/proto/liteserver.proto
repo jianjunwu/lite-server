@@ -105,6 +105,7 @@ message BatchItemResponse {
   Status status = 3;
   int32 status_code = 4;
   string media_type = 5;
+  map<string, string> headers = 6;
 }
 
 message CBCompletedResponse {
