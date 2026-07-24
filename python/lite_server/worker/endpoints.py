@@ -458,6 +458,14 @@ def _protect_stdout():
         os.close(saved)
 
 
+def _close_endpoint_pipelines(endpoints: dict) -> None:
+    """Close every endpoint Pipeline (e.g. its thread executor) on shutdown."""
+    for ep in endpoints.values():
+        pipe = ep.get("pipeline")
+        if pipe is not None:
+            pipe.close()
+
+
 async def worker_main():
     setup_logging()
     args = parse_args()
@@ -509,6 +517,7 @@ async def worker_main():
 
             asyncio.create_task(handle_connection(conn, endpoints, pattern_index))
     finally:
+        _close_endpoint_pipelines(endpoints)
         server.close()
 
 

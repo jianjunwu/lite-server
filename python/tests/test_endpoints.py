@@ -885,3 +885,31 @@ class TestParameterizedRouteDispatch:
             {}, {"route": "/nope", "request_id": "r1"}, pattern_index={}
         )
         assert resp["status_code"] == 404
+
+
+# ===== C8: close endpoint pipelines on shutdown =====
+
+
+class TestEndpointPipelineClose:
+    """C8: the endpoint worker closes every Pipeline (e.g. its thread
+    executor) on shutdown — no resource leak."""
+
+    def test_close_endpoint_pipelines_closes_only_those_with_pipeline(self):
+        from lite_server.worker.endpoints import _close_endpoint_pipelines
+
+        closed = []
+
+        class FakePipe:
+            def close(self):
+                closed.append(True)
+
+        endpoints = {
+            "/no_pipe": {"handler": lambda ctx: None, "methods": ["GET"]},
+            "/pipe": {
+                "handler": lambda ctx: None,
+                "methods": ["GET"],
+                "pipeline": FakePipe(),
+            },
+        }
+        _close_endpoint_pipelines(endpoints)
+        assert closed == [True]
