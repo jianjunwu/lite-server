@@ -480,7 +480,7 @@ pub async fn infer_handler(
         state.clone(), model_name.clone(), None,
         "/predict".to_string(), headers, payload, request_id,
     ).await;
-    Ok(attach_cors_headers(state, &model_name, result))
+    Ok(attach_cors_headers(&state, &model_name, result))
 }
 
 pub async fn infer_version_handler(
@@ -496,7 +496,7 @@ pub async fn infer_version_handler(
         state.clone(), model_name.clone(), Some(version),
         "/predict".to_string(), headers, payload, request_id,
     ).await;
-    Ok(attach_cors_headers(state, &model_name, result))
+    Ok(attach_cors_headers(&state, &model_name, result))
 }
 
 fn extract_client_ip(headers: &HeaderMap) -> String {
@@ -526,7 +526,7 @@ const BLOCKED_RESPONSE_HEADERS: &[&str] = &[
 
 /// Attach CORS headers to an inference response (success or error).
 fn attach_cors_headers(
-    state: Arc<AppState>,
+    state: &AppState,
     model: &str,
     result: Result<Response, AppError>,
 ) -> Response {
@@ -922,18 +922,10 @@ pub async fn sse_infer_handler(
     headers: HeaderMap,
     RequestId(request_id): RequestId,
     ApiJson(payload): ApiJson<Value>,
-) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, AppError> {
-    crate::validation::validate_identifier(&model_name)?;
-    let resolved_version = resolve_version(&state, &model_name, None).await?;
-
-    if !state.registry.is_ready(&model_name, None) {
-        return Err(AppError::ModelNotReady(format!(
-            "{} version {} is not ready",
-            model_name, resolved_version
-        )));
-    }
-
-    sse_infer_impl(state, model_name, resolved_version, headers, payload, request_id).await
+) -> Response {
+    let result =
+        sse_infer_entry(&state, &model_name, None, headers, payload, request_id).await;
+    attach_cors_headers(&state, &model_name, result)
 }
 
 pub async fn sse_infer_version_handler(
@@ -942,19 +934,46 @@ pub async fn sse_infer_version_handler(
     headers: HeaderMap,
     RequestId(request_id): RequestId,
     ApiJson(payload): ApiJson<Value>,
-) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, AppError> {
-    crate::validation::validate_identifier(&model_name)?;
-    crate::validation::validate_version(&version)?;
-    let resolved_version = resolve_version(&state, &model_name, Some(version)).await?;
+) -> Response {
+    let result = sse_infer_entry(
+        &state, &model_name, Some(version), headers, payload, request_id,
+    )
+    .await;
+    attach_cors_headers(&state, &model_name, result)
+}
 
-    if !state.registry.is_ready(&model_name, Some(&resolved_version)) {
+/// Shared entry for SSE inference: validation, ready check, rate limiting,
+/// and stream setup. Returns a `Response` so the caller can uniformly wrap
+/// CORS around both the success stream-start and any early error.
+async fn sse_infer_entry(
+    state: &Arc<AppState>,
+    model_name: &str,
+    version: Option<String>,
+    headers: HeaderMap,
+    payload: Value,
+    request_id: String,
+) -> Result<Response, AppError> {
+    crate::validation::validate_identifier(model_name)?;
+    if let Some(ref v) = version {
+        crate::validation::validate_version(v)?;
+    }
+    let resolved_version = resolve_version(state, model_name, version).await?;
+    if !state.registry.is_ready(model_name, Some(&resolved_version)) {
         return Err(AppError::ModelNotReady(format!(
             "{} version {} is not ready",
             model_name, resolved_version
         )));
     }
-
-    sse_infer_impl(state, model_name, resolved_version, headers, payload, request_id).await
+    let sse = sse_infer_impl(
+        state.clone(),
+        model_name.to_string(),
+        resolved_version,
+        headers,
+        payload,
+        request_id,
+    )
+    .await?;
+    Ok(sse.into_response())
 }
 
 async fn sse_infer_impl(

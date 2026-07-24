@@ -858,6 +858,41 @@ async fn test_malformed_json_standardized_400() {
 }
 
 // ---------------------------------------------------------------------------
+// SSE streaming must carry CORS headers — covers A2
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn test_sse_response_carries_cors_headers() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    load_model(&base, POLICY_MODEL, "1").await;
+
+    // SSE success path must carry CORS headers (attach_cors_headers wraps the
+    // whole entry, including the stream-start response).
+    let resp = client
+        .post(format!("{}/v2/models/{}/events", base, POLICY_MODEL))
+        .json(&json!({"input": 3}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "https://app.example.com"
+    );
+    // Drain the SSE body
+    let _ = resp.text().await.unwrap();
+
+    unload_model(&base, POLICY_MODEL, "1").await;
+}
+
+// ---------------------------------------------------------------------------
 // OPTIONS preflight (CORS) on inference routes — covers A1
 // ---------------------------------------------------------------------------
 
