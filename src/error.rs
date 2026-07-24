@@ -4,6 +4,7 @@ use axum::{
     Json,
 };
 use serde_json::json;
+use std::collections::HashMap;
 use std::io;
 
 #[derive(thiserror::Error, Debug)]
@@ -83,6 +84,10 @@ pub enum AppError {
         detail: String,
         code: Option<String>,
         param: Option<String>,
+        /// Extra response headers from the model's HTTPException (e.g.
+        /// Retry-After on 429/503), forwarded to the client verbatim minus
+        /// hop-by-hop / library-managed headers.
+        headers: Option<HashMap<String, String>>,
     },
 }
 
@@ -176,6 +181,7 @@ impl IntoResponse for AppError {
             detail,
             ref code,
             ref param,
+            ref headers,
         } = &self
         {
             let status = StatusCode::from_u16(*status_code)
@@ -196,7 +202,12 @@ impl IntoResponse for AppError {
                 "param": param,
             });
             let body = Json(json!({ "error": error_obj }));
-            return (status, body).into_response();
+            let mut resp = (status, body).into_response();
+            // Forward model-authored headers (e.g. Retry-After) to the client.
+            if let Some(hdrs) = headers {
+                crate::http::handlers::inject_response_headers_into(resp.headers_mut(), hdrs);
+            }
+            return resp;
         }
 
         let (status, error_type) = match &self {
@@ -368,6 +379,7 @@ mod tests {
             detail: "input must be non-negative".to_string(),
             code: None,
             param: None,
+            headers: None,
         };
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -391,6 +403,7 @@ mod tests {
             detail: "model loading".to_string(),
             code: None,
             param: None,
+            headers: None,
         };
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -402,6 +415,7 @@ mod tests {
             detail: "item not in vocab".to_string(),
             code: None,
             param: None,
+            headers: None,
         };
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -475,6 +489,7 @@ mod tests {
             detail: "bad input".into(),
             code: Some("invalid_input".into()),
             param: Some("temperature".into()),
+            headers: None,
         };
         let response = err.into_response();
         let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
@@ -492,12 +507,33 @@ mod tests {
             detail: "bad input".into(),
             code: Some("invalid_input".into()),
             param: None,
+            headers: None,
         };
         let response = err.into_response();
         let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["error"]["code"], "invalid_input");
         assert_eq!(body["error"]["param"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn test_model_error_forwards_headers() {
+        use axum::response::IntoResponse;
+        let mut hdrs = std::collections::HashMap::new();
+        hdrs.insert("retry-after".to_string(), "5".to_string());
+        hdrs.insert("x-trace".to_string(), "abc".to_string());
+        let err = AppError::ModelError {
+            status_code: 503,
+            error_type: "model_error".to_string(),
+            detail: "overloaded".to_string(),
+            code: None,
+            param: None,
+            headers: Some(hdrs),
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get("retry-after").unwrap(), "5");
+        assert_eq!(response.headers().get("x-trace").unwrap(), "abc");
     }
 
     // ===== Framework-level errors (route/method/body) =====

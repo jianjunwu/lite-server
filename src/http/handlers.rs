@@ -631,6 +631,27 @@ fn inject_response_headers(
     builder
 }
 
+/// Inject response headers into an existing `HeaderMap` in place — the
+/// error-response path builds via `into_response()` (no Builder), so it needs
+/// this mutating variant. Skips hop-by-hop / library-managed headers and
+/// silently drops headers with invalid names/values.
+pub(crate) fn inject_response_headers_into(
+    map: &mut HeaderMap,
+    headers: &std::collections::HashMap<String, String>,
+) {
+    for (k, v) in headers {
+        if BLOCKED_RESPONSE_HEADERS.contains(&k.to_ascii_lowercase().as_str()) {
+            continue;
+        }
+        if let (Ok(name), Ok(val)) = (
+            k.parse::<axum::http::HeaderName>(),
+            axum::http::HeaderValue::from_str(v),
+        ) {
+            map.insert(name, val);
+        }
+    }
+}
+
 async fn do_infer(
     state: Arc<AppState>,
     model_name: String,
@@ -838,6 +859,11 @@ async fn do_infer(
                             detail: error_message,
                             code: error_code,
                             param: error_param,
+                            headers: if single.headers.is_empty() {
+                                None
+                            } else {
+                                Some(single.headers.clone())
+                            },
                         });
                     }
 
