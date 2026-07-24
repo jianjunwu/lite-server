@@ -41,6 +41,7 @@ from lite_server.callback import (
     _overrides,
 )
 from lite_server.context import RequestContext, RequestMeta
+from lite_server.exceptions import HTTPException
 from lite_server.proto import Metrics, MetricValue, Status
 from lite_server.response import Response as LiteResponse
 
@@ -57,6 +58,20 @@ _HOOK_FIELD = {
 # ---------------------------------------------------------------------------
 # Callable adaptation (sync → async)
 # ---------------------------------------------------------------------------
+
+
+def _parse_request_json(data: bytes | None) -> dict:
+    """Parse request JSON, raising HTTPException(400) on invalid JSON so the
+    failure flows through run_single's error handling (P3). Empty body → {}."""
+    if not data:
+        return {}
+    try:
+        return json.loads(data)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            400, f"invalid JSON in request body: {e}",
+            error_type="invalid_request_error", code="invalid_json",
+        ) from e
 
 
 def _adapt(fn: Callable, executor: ThreadPoolExecutor | None) -> Callable[..., Awaitable]:
@@ -567,8 +582,9 @@ class Pipeline:
         Returns ``(body_bytes, status, metrics, headers)`` — same shape as
         the pre-0.7 ``_run_predict*`` functions.
         """
-        ctx = RequestContext(meta=meta, request=json.loads(data) if data else {})
+        ctx = RequestContext(meta=meta, request={})
         try:
+            ctx.request = _parse_request_json(data)
             await self.preprocess(ctx)
             if ctx.early is None:
                 await self.predict_value(ctx)

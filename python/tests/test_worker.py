@@ -822,6 +822,36 @@ class TestAsyncLoop:
         assert resp.single.status.code == "Error"
         assert resp.single.headers["x-uni"] == "1"
 
+    def test_unary_invalid_json_returns_400_and_drives_on_error(self):
+        """P3: invalid JSON on the unary path yields a 400 (not 500) and
+        drives on_error instead of escaping before the pipeline try."""
+        from lite_server.exceptions import HTTPException
+
+        seen = []
+
+        class ErrCB(Callback):
+            def on_error(self, ctx, exc):
+                seen.append(exc)
+
+        class EchoModel(LitAPI):
+            async def predict(self, x):
+                return x
+
+        model = EchoModel()
+        model._pipeline = Pipeline.build(model, [ErrCB()])
+        socket = AsyncMockSocket()
+        socket.inject(Request(
+            uid="bad", single=SingleRequest(data=b"{not json"),
+        ).SerializeToString())
+        drive_loop(model, socket)
+
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.single.status.code == "Error"
+        assert resp.single.status.message == "400"
+        assert len(seen) == 1
+        assert isinstance(seen[0], HTTPException)
+
     def test_async_stream_with_async_generator(self):
         class AsyncStreamModel(LitAPI):
             async def predict(self, x):
@@ -953,6 +983,35 @@ class TestAsyncLoop:
         resp.ParseFromString(socket._msgs[0])
         assert resp.stream.HasField("error")
         assert "stream rejected" in resp.stream.error.message
+
+    def test_stream_open_invalid_json_drives_on_error(self):
+        """P3: invalid JSON at stream open drives on_error and sends a stream
+        error frame instead of escaping."""
+        from lite_server.exceptions import HTTPException
+
+        seen = []
+
+        class ErrCB(Callback):
+            def on_error(self, ctx, exc):
+                seen.append(exc)
+
+        class StreamModel(LitAPI):
+            async def stream_predict(self, x):
+                yield {"t": 1}
+
+        model = StreamModel()
+        model._pipeline = Pipeline.build(model, [ErrCB()])
+        socket = AsyncMockSocket()
+        socket.inject(Request(
+            uid="so", stream=StreamRequest(stream_id="so", open=StreamOpen(data=b"{bad")),
+        ).SerializeToString())
+        drive_loop(model, socket)
+
+        assert len(seen) == 1
+        assert isinstance(seen[0], HTTPException)
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.stream.HasField("error")
 
     def test_async_stream_cancel(self):
         class SlowStreamModel(LitAPI):
@@ -1277,6 +1336,35 @@ class TestBatchPredict:
         item = resp.batch.items[0]
         assert item.status.code == "Error"
         assert item.headers["x-batch"] == "1"
+
+    def test_batch_invalid_json_item_drives_on_error(self):
+        """P3: invalid JSON in a batch item drives on_error and yields an
+        error item instead of crashing the batch."""
+        from lite_server.exceptions import HTTPException
+
+        seen = []
+
+        class ErrCB(Callback):
+            def on_error(self, ctx, exc):
+                seen.append(exc)
+
+        class EchoModel(LitAPI):
+            def predict(self, x):
+                return x
+
+        pipe = Pipeline.build(EchoModel(), [ErrCB()])
+        batch = BatchRequest(items=[BatchItem(uid="i1", data=b"{not json")])
+        meta = RequestMeta(
+            route="/predict", headers=Headers(), client_ip="",
+            request_id="bj", timestamp_ns=0,
+        )
+        resp = asyncio.run(
+            inference._handle_batch(pipe, "bj", batch, meta, EchoModel(), log)
+        )
+        item = resp.batch.items[0]
+        assert item.status.code == "Error"
+        assert len(seen) == 1
+        assert isinstance(seen[0], HTTPException)
 
     def test_async_batch_predict_full_path(self):
         class AsyncBatchModel(LitAPI):
@@ -1758,6 +1846,45 @@ class TestCBLoop:
         assert "has_finished" in json.loads(response.single.data)["error"]["message"]
         assert len(seen) == 1
         assert isinstance(seen[0], RuntimeError)
+
+    def test_cb_add_invalid_json_returns_400_and_drives_on_error(self):
+        """P3: invalid JSON on a CB add yields a 400 error frame and drives
+        on_error instead of crashing the add handler."""
+        from lite_server.exceptions import HTTPException
+
+        seen = []
+
+        class ErrCB(Callback):
+            def on_error(self, ctx, exc):
+                seen.append(exc)
+
+        class CBModel(LitAPI):
+            def decode_request(self, req):
+                return req
+
+            def prefill(self, uid, decoded_input):
+                pass
+
+            def step(self, active_sequences):
+                return []
+
+            def has_finished(self, uid, token, generated_sequence):
+                return True
+
+        model = CBModel()
+        model._pipeline = Pipeline.build(model, [ErrCB()])
+        socket = SyncMockSocket()
+        req = Request()
+        req.uid = "cb-bad"
+        req.single.data = b"{not json"
+        socket.inject(req.SerializeToString())
+        start_cb_loop(model, socket)
+
+        response = wait_for_response(socket, "cb-bad")
+        assert response.single.status.code == "Error"
+        assert response.single.status.message == "400"
+        assert len(seen) == 1
+        assert isinstance(seen[0], HTTPException)
 
 
 # ---------------------------------------------------------------------------
@@ -2251,6 +2378,55 @@ class TestBidiStreamingAsyncLoop:
             if r.stream.HasField("error"):
                 messages.append(r.stream.error.message)
         assert any("encode" in msg for msg in messages)
+
+    def test_bidi_chunk_invalid_json_drives_on_error(self):
+        """P3: invalid JSON in a bidi chunk drives on_error and replies with a
+        stream error frame (one-for-one chunk ack preserved)."""
+        from lite_server.exceptions import HTTPException
+
+        seen = []
+
+        class ErrCB(Callback):
+            def on_error(self, ctx, exc):
+                seen.append(exc)
+
+        class AckHandler(BidiStreamHandler):
+            def on_open(self, initial_data):
+                return None
+
+            def on_chunk(self, chunk):
+                return None
+
+            def on_close(self):
+                return None
+
+        class BidiModel(LitAPI):
+            async def predict(self, x):
+                return x
+
+            def bidi_stream(self):
+                return AckHandler()
+
+        model = BidiModel()
+        model._pipeline = Pipeline.build(model, [ErrCB()])
+        socket = AsyncMockSocket()
+        socket.inject(Request(
+            uid="o", stream=StreamRequest(stream_id="bj", open=StreamOpen(data=b"{}")),
+        ).SerializeToString())
+        socket.inject(Request(
+            uid="c", stream=StreamRequest(stream_id="bj", chunk=StreamChunk(data=b"{bad")),
+        ).SerializeToString())
+        drive_loop(model, socket)
+
+        assert len(seen) == 1
+        assert isinstance(seen[0], HTTPException)
+        messages = []
+        for m in socket._msgs:
+            r = Response()
+            r.ParseFromString(m)
+            if r.stream.HasField("error"):
+                messages.append(r.stream.error.message)
+        assert messages  # a stream error frame was sent for the bad chunk
 
     def test_bidi_cancel_calls_on_close(self):
         class TrackHandler(BidiStreamHandler):

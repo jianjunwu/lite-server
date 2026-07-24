@@ -246,6 +246,21 @@ def _merge_err_headers(ctx: RequestContext, e: Exception) -> dict[str, str] | No
     return hdrs or None
 
 
+def _parse_json_payload(data: bytes | None) -> dict:
+    """Parse request JSON, raising HTTPException(400) on invalid JSON so the
+    failure flows through normal error handling (on_error + error frame)
+    instead of escaping the pipeline try (P3). Empty/absent body → {}."""
+    if not data:
+        return {}
+    try:
+        return json.loads(data)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            400, f"invalid JSON in request body: {e}",
+            error_type="invalid_request_error", code="invalid_json",
+        ) from e
+
+
 def _format_exc_brief(exc: BaseException) -> str:
     """Exception type, message, and where it raised — on one short line.
 
@@ -484,8 +499,9 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
 
     # Phase 1: per-item on_request → decode → on_input
     for item in batch.items:
-        ctx = RequestContext(meta=meta, request=json.loads(item.data) if item.data else {})
+        ctx = RequestContext(meta=meta, request={})
         try:
+            ctx.request = _parse_json_payload(item.data)
             await pipe.preprocess(ctx)
         except Exception as e:
             log.warning("batch item %s preprocess failed: %s", item.uid, _format_exc_brief(e))
@@ -663,8 +679,9 @@ async def _handle_stream_open_async(
 
     # --- Bidirectional streaming ------------------------------------------
     if pipe.has_bidi_stream:
-        ctx = RequestContext(meta=meta, request=json.loads(data) if data else {})
+        ctx = RequestContext(meta=meta, request={})
         try:
+            ctx.request = _parse_json_payload(data)
             await pipe.preprocess(ctx)
         except HTTPException as e:
             log.warning("bidi preprocess rejected for %s: %s", stream_id, e.detail)
@@ -752,8 +769,9 @@ async def _handle_stream_open_async(
         return
 
     # --- Uni-directional streaming -----------------------------------------
-    ctx = RequestContext(meta=meta, request=json.loads(data) if data else {})
+    ctx = RequestContext(meta=meta, request={})
     try:
+        ctx.request = _parse_json_payload(data)
         await pipe.preprocess(ctx)
     except HTTPException as e:
         log.warning("stream preprocess rejected for %s: %s", stream_id, e.detail)
@@ -804,9 +822,9 @@ async def _handle_stream_chunk_async(
 
     pipe = _get_pipeline(lit_api)
     data = stream_req.chunk.data if stream_req.chunk else b""
-    raw = json.loads(data) if data else {}
 
     try:
+        raw = _parse_json_payload(data)
         output = await session.on_chunk(raw, ctx=session.ctx)
     except HTTPException as e:
         log.warning("bidi on_chunk rejected for %s: %s", stream_id, e.detail)
@@ -958,12 +976,12 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
         socket.send(response.SerializeToString())
 
     def _handle_add(cb_add: CBAddRequest):
-        raw = json.loads(cb_add.data) if cb_add.data else {}
         meta = _meta_from_proto(cb_add.meta) if cb_add.HasField("meta") else RequestMeta(
             route="", headers=Headers(), client_ip="", request_id="", timestamp_ns=0,
         )
-        ctx = RequestContext(meta=meta, request=raw)
+        ctx = RequestContext(meta=meta, request={})
         try:
+            ctx.request = _parse_json_payload(cb_add.data)
             _drive(pipe.preprocess(ctx))
         except HTTPException as e:
             _drive(pipe.run_on_error(ctx, e))
