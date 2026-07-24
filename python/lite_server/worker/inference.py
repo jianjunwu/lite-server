@@ -801,7 +801,7 @@ async def _consume_stream(
                     return
         else:
             while True:
-                output = await asyncio.to_thread(_next_or_sentinel, generator)
+                output = await pipe.run_blocking(_next_or_sentinel, generator)
                 if output is _SENTINEL:
                     break
                 if not await _process_stream_chunk(lit_api, pipe, ctx, output, stream_id, socket, log):
@@ -810,7 +810,7 @@ async def _consume_stream(
         # Propagate cancellation; try to close the generator without waiting
         if not inspect.isasyncgen(generator):
             try:
-                await asyncio.to_thread(generator.close)
+                await pipe.run_blocking(generator.close)
             except Exception:
                 pass
         raise

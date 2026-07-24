@@ -11,7 +11,7 @@ import logging
 import pytest
 
 from lite_server.api import BidiStreamHandler, LitAPI, RequestMeta
-from lite_server.callback import Callback
+from lite_server.callback import Callback, RequestContext
 from lite_server.pipeline import Pipeline
 from lite_server.proto import (
     Request,
@@ -583,3 +583,176 @@ class TestRunAsyncLoopStream:
         ]
         # Only the first chunk arrives; the consume task is cancelled while waiting
         assert len(chunks) == 1
+
+
+# ---------------------------------------------------------------------------
+# F2: Stream executor isolation — sync generator must use pipe._executor
+# ---------------------------------------------------------------------------
+
+
+class TestStreamExecutorIsolation:
+    """F2: sync generator ``__next__`` / ``close`` must dispatch to the
+    pipeline's single-thread executor, NOT ``asyncio.to_thread``'s default
+    pool.  Otherwise sync code from stream consumption and sync code from
+    other requests (predict, encode) can run concurrently, violating the
+    core invariant that sync code never runs concurrently."""
+
+    @pytest.mark.asyncio
+    async def test_sync_generator_and_predict_never_overlap(self):
+        """Deterministic concurrency test: a blocking sync generator holds the
+        executor while a concurrent single request's sync predict is
+        dispatched.  Before the fix (generator __next__ on default pool),
+        predict runs on pipe._executor in parallel → overlap.  After the fix
+        (both on pipe._executor), predict is queued behind the generator."""
+        import asyncio
+        import threading
+        import time
+
+        in_generator = threading.Event()
+        release_generator = threading.Event()
+        overlap_detected = False
+
+        class StreamAPI(LitAPI):
+            def setup(self, device):
+                pass
+
+            async def decode_request(self, request):
+                # async method → forces executor mode (any_async = True)
+                return request
+
+            def predict(self, x):
+                if in_generator.is_set():
+                    nonlocal overlap_detected
+                    overlap_detected = True
+                return x
+
+            def stream_predict(self, x):
+                in_generator.set()
+                release_generator.wait()  # block the executor thread
+                in_generator.clear()
+                yield {"done": True}
+
+        api = StreamAPI()
+        pipe = Pipeline.build(api, [])
+        assert pipe._executor is not None, "mixed mode must create executor"
+
+        # Preprocess to get a decoded input
+        meta1 = RequestMeta(
+            route="/", headers={}, client_ip="", request_id="r1",
+            timestamp_ns=0, payload={},
+        )
+        ctx = RequestContext(meta=meta1, request={})
+        await pipe.preprocess(ctx)
+        generator = await pipe.stream_predict(ctx.input)
+
+        # Start consuming the sync generator in a background task
+        sock = AsyncSocket()
+        consume_task = asyncio.create_task(
+            inference._consume_stream(api, pipe, generator, "s1", sock, log, ctx)
+        )
+
+        # Wait until the generator body has been entered and is blocking
+        await asyncio.to_thread(in_generator.wait)
+
+        # Issue a concurrent single request — its sync predict will be
+        # dispatched to pipe._executor.  Before fix: runs on a different
+        # thread pool → overlap_detected = True.  After fix: queued on the
+        # same single-thread executor → overlap_detected stays False.
+        meta2 = RequestMeta(
+            route="/", headers={}, client_ip="", request_id="r2",
+            timestamp_ns=0, payload={},
+        )
+        single_task = asyncio.create_task(pipe.run_single(b"{}", meta2))
+
+        # Give the single request time to queue up on the executor
+        await asyncio.sleep(0.1)
+
+        # Release the generator
+        release_generator.set()
+
+        # Both tasks should complete
+        await asyncio.wait_for(consume_task, timeout=5.0)
+        await asyncio.wait_for(single_task, timeout=5.0)
+
+        assert not overlap_detected, (
+            "sync generator __next__ ran on a different executor than sync predict — "
+            "generator is bypassing the pipeline's single-thread executor"
+        )
+        pipe.close()
+
+    @pytest.mark.asyncio
+    async def test_generator_close_uses_pipeline_executor(self):
+        """Cancelling a stream must call ``generator.close()`` through the
+        pipeline executor, not the default thread pool."""
+        import asyncio
+        import threading
+
+        close_thread_name = None
+        entered = threading.Event()
+        release = threading.Event()
+
+        class CloseTrackingGenerator:
+            """A generator-like object that records which thread close() runs on."""
+
+            def __init__(self):
+                self._closed = False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                entered.set()
+                release.wait()
+                raise StopIteration
+
+            def close(self):
+                nonlocal close_thread_name
+                close_thread_name = threading.current_thread().name
+                self._closed = True
+
+        class StreamAPI(LitAPI):
+            def setup(self, device):
+                pass
+
+            async def decode_request(self, request):
+                return request
+
+            def stream_predict(self, x):
+                return CloseTrackingGenerator()
+
+        api = StreamAPI()
+        pipe = Pipeline.build(api, [])
+        assert pipe._executor is not None
+
+        ctx = RequestContext(
+            meta=RequestMeta(
+                route="/", headers={}, client_ip="", request_id="r1",
+                timestamp_ns=0, payload={},
+            ),
+            request={},
+        )
+        await pipe.preprocess(ctx)
+        generator = await pipe.stream_predict(ctx.input)
+
+        sock = AsyncSocket()
+        consume_task = asyncio.create_task(
+            inference._consume_stream(api, pipe, generator, "s-close", sock, log, ctx)
+        )
+
+        # Wait for the generator body to be entered
+        await asyncio.to_thread(entered.wait)
+
+        # Cancel the consume task — this triggers the CancelledError handler
+        # which calls generator.close()
+        consume_task.cancel()
+        release.set()  # let __next__ raise StopIteration first, then cancel
+
+        with pytest.raises(asyncio.CancelledError):
+            await consume_task
+
+        assert close_thread_name is not None, "generator.close() was never called"
+        assert "lite-sync" in close_thread_name, (
+            f"generator.close() ran on {close_thread_name}, expected lite-sync thread — "
+            "close is using the wrong executor"
+        )
+        pipe.close()

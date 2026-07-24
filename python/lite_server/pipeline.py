@@ -422,6 +422,18 @@ class Pipeline:
                     "Callback %s.%s failed", type(cb).__name__, name, exc_info=True
                 )
 
+    async def run_blocking(self, fn: Callable, *args: Any) -> Any:
+        """Run a sync callable under the stage rules.
+
+        When a single-thread executor is present, *fn* is dispatched there
+        so sync code never runs concurrently and never blocks the event loop.
+        Otherwise (all-sync fast path) *fn* runs inline on the loop thread.
+        """
+        if self._executor is not None:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(self._executor, fn, *args)
+        return fn(*args)
+
     def close(self) -> None:
         """Shut down the sync-stage executor (worker teardown)."""
         if self._executor is not None:
