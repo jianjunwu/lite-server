@@ -17,6 +17,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import socket
 import struct
 import sys
@@ -274,10 +275,34 @@ def load_endpoints(repo_path: str):
     return endpoints
 
 
-async def handle_request(endpoints, req_data: dict) -> dict:
+def _to_axum_pattern(route: str) -> str:
+    """/pets/{id} → /pets/:id (aligned with Rust's convert_path_params)."""
+    return re.sub(r"\{([^}]+)\}", r":\1", route)
+
+
+def build_pattern_index(endpoints: dict) -> dict:
+    """Reverse index: axum route pattern → declared route.
+
+    Rust sends the matched axum pattern (e.g. /pets/:id) as route_pattern;
+    this maps it back to the declared route (/pets/{id}) so parameterized
+    routes dispatch correctly and meta.route is stable for logging and
+    rate-limit bucket aggregation.
+    """
+    return {_to_axum_pattern(r): r for r in endpoints}
+
+
+async def handle_request(endpoints, req_data: dict, pattern_index=None) -> dict:
     """Dispatch an endpoint request to the appropriate handler."""
     route = req_data.get("route", "")
     ep = endpoints.get(route)
+    if ep is None and pattern_index:
+        # Parameterized route: Rust sends the raw URI as `route` and the
+        # matched axum pattern as `route_pattern`. Map it back to the
+        # declared route so the handler resolves and meta.route is stable.
+        declared = pattern_index.get(req_data.get("route_pattern", ""))
+        if declared is not None:
+            route = declared
+            ep = endpoints.get(declared)
     if not ep:
         return {
             "request_id": req_data.get("request_id", ""),
@@ -448,6 +473,9 @@ async def worker_main():
         print(json.dumps({"status": "error", "message": str(e)}), flush=True)
         sys.exit(1)
 
+    # Pattern index for parameterized-route dispatch (P1)
+    pattern_index = build_pattern_index(endpoints)
+
     # Build routes with per-route policies
     routes_with_policies = []
     for r, ep in endpoints.items():
@@ -479,7 +507,7 @@ async def worker_main():
                 logger.debug("accept failed: %s", e)
                 continue
 
-            asyncio.create_task(handle_connection(conn, endpoints))
+            asyncio.create_task(handle_connection(conn, endpoints, pattern_index))
     finally:
         server.close()
 
@@ -491,7 +519,7 @@ async def _send_frame(loop, conn, data: dict):
     await loop.sock_sendall(conn, len_prefix + payload)
 
 
-async def handle_connection(conn, endpoints):
+async def handle_connection(conn, endpoints, pattern_index=None):
     """Handle a single connection."""
     loop = asyncio.get_running_loop()
     try:
@@ -530,7 +558,7 @@ async def handle_connection(conn, endpoints):
                 continue
 
             # Handle request
-            response = await handle_request(endpoints, req_data)
+            response = await handle_request(endpoints, req_data, pattern_index)
 
             if response.get("stream"):
                 # Streaming: send header, then each chunk, then done

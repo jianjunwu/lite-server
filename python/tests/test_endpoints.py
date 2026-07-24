@@ -809,3 +809,79 @@ class TestMode1PlainHandlerSignature:
         endpoints = load_endpoints(str(tmp_path))
         assert "/modern" in endpoints
         assert endpoints["/modern"]["style"] == "ctx"
+
+
+# ===== P1: parameterized route dispatch (/pets/{id}) =====
+
+
+class TestParameterizedRouteDispatch:
+    """P1: parameterized routes (/pets/{id}) dispatch via the axum route
+    pattern. Rust sends route=raw URI (/pets/123) + route_pattern (/pets/:id);
+    Python maps the pattern back to the declared route so the handler resolves
+    (instead of 404) and meta.route is stable for logging/rate-limit buckets."""
+
+    def test_to_axum_pattern(self):
+        from lite_server.worker.endpoints import _to_axum_pattern
+
+        assert _to_axum_pattern("/pets/{id}") == "/pets/:id"
+        assert _to_axum_pattern("/pets/{id}/owner/{oid}") == "/pets/:id/owner/:oid"
+        assert _to_axum_pattern("/health") == "/health"
+
+    def test_build_pattern_index(self):
+        from lite_server.worker.endpoints import build_pattern_index
+
+        eps = {"/pets/{id}": {}, "/health": {}}
+        assert build_pattern_index(eps) == {
+            "/pets/:id": "/pets/{id}",
+            "/health": "/health",
+        }
+
+    @pytest.mark.asyncio
+    async def test_parameterized_route_dispatches_and_normalizes_meta_route(self):
+        seen = {}
+
+        def handler(ctx):
+            seen["route"] = ctx.meta.route
+            return {"ok": True}
+
+        ep = {"/pets/{id}": {"handler": handler, "methods": ["GET"], "style": "ctx"}}
+        pattern_index = {"/pets/:id": "/pets/{id}"}
+        req = {
+            "request_id": "r1",
+            "route": "/pets/123",  # raw URI from Rust
+            "route_pattern": "/pets/:id",  # matched axum pattern from Rust
+            "method": "GET",
+            "headers": {},
+            "query": {},
+            "body": None,
+            "server_state": {},
+        }
+        resp = await handle_request(ep, req, pattern_index)
+        assert resp["status_code"] == 200
+        assert seen["route"] == "/pets/{id}"  # normalized to declared route
+
+    @pytest.mark.asyncio
+    async def test_exact_route_without_pattern_index_unchanged(self):
+        """Backward compat: no pattern_index → exact route match only."""
+        def handler(ctx):
+            return {"ok": True}
+
+        ep = {"/health": {"handler": handler, "methods": ["GET"], "style": "ctx"}}
+        req = {
+            "request_id": "r1",
+            "route": "/health",
+            "method": "GET",
+            "headers": {},
+            "query": {},
+            "body": None,
+            "server_state": {},
+        }
+        resp = await handle_request(ep, req)
+        assert resp["status_code"] == 200
+
+    @pytest.mark.asyncio
+    async def test_unknown_route_still_404(self):
+        resp = await handle_request(
+            {}, {"route": "/nope", "request_id": "r1"}, pattern_index={}
+        )
+        assert resp["status_code"] == 404
