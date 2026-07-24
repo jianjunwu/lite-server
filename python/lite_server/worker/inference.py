@@ -108,13 +108,17 @@ def setup_logging(worker_id: int, level_str: str = "info"):
     level = getattr(logging, level_str.upper(), logging.INFO)
     root = logging.getLogger()
     root.setLevel(level)
-    if not root.handlers:
+    if root.handlers:
+        handler = root.handlers[0]  # reuse an existing handler (e.g. basicConfig)
+    else:
         handler = logging.StreamHandler(sys.stderr)
         handler.setFormatter(_LevelPrefixFormatter())
         root.addHandler(handler)
-    # Ensure lite_server namespace has a path to stderr
+    # Ensure lite_server namespace has a path to stderr, without double-emitting
+    # via root propagation (B4).
     ls_logger = logging.getLogger("lite_server")
     ls_logger.setLevel(level)
+    ls_logger.propagate = False
     if not ls_logger.handlers:
         ls_logger.addHandler(handler)
     return logging.getLogger("inference_worker")

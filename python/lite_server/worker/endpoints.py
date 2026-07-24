@@ -84,13 +84,17 @@ def setup_logging() -> logging.Logger:
     Returns the configured logger instance.
     """
     logger.setLevel(logging.INFO)
-    if not logger.handlers:
+    if logger.handlers:
+        handler = logger.handlers[0]  # reuse an existing handler
+    else:
         handler = logging.StreamHandler(sys.stderr)
         handler.setFormatter(_LevelPrefixFormatter())
         logger.addHandler(handler)
-    # Ensure lite_server namespace has a path to stderr for builtin callbacks
+    # Ensure lite_server namespace has a path to stderr for builtin callbacks,
+    # without double-emitting via root propagation (B4).
     ls_logger = logging.getLogger("lite_server")
     ls_logger.setLevel(logging.INFO)
+    ls_logger.propagate = False
     if not ls_logger.handlers:
         ls_logger.addHandler(handler)
     return logger

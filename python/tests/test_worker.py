@@ -2822,3 +2822,34 @@ class TestLevelPrefixFormatter:
         assert "/p/inference.py:278" in output, \
             f"expected pathname:lineno in: {output!r}"
         assert "ValueError" in output
+
+
+class TestSetupLogging:
+    """B4: setup_logging must reuse an existing root/worker handler (no
+    NameError when one is already present) and detach the lite_server logger
+    from root so builtin-callback logs don't print twice."""
+
+    def _run(self, setup_fn):
+        root = logging.getLogger()
+        ls = logging.getLogger("lite_server")
+        saved = (list(root.handlers), list(ls.handlers),
+                 ls.propagate, ls.level, root.level)
+        try:
+            # Precondition: root already has a handler (pytest / basicConfig).
+            if not root.handlers:
+                root.addHandler(logging.StreamHandler())
+            setup_fn()  # must not raise NameError
+            assert ls.propagate is False  # no double output via root
+        finally:
+            root.handlers = list(saved[0])
+            ls.handlers = list(saved[1])
+            ls.propagate = saved[2]
+            ls.setLevel(saved[3])
+            root.setLevel(saved[4])
+
+    def test_inference_setup_logging_handles_existing_handler(self):
+        self._run(lambda: inference.setup_logging(0, "info"))
+
+    def test_endpoints_setup_logging_handles_existing_handler(self):
+        from lite_server.worker import endpoints
+        self._run(endpoints.setup_logging)
