@@ -700,3 +700,81 @@ class TestHandlerSignatureLoud:
             assert "/b" in endpoints
         finally:
             router._routes.clear()
+
+
+# ===== A4: dispatch style follows the load-time signature contract =====
+
+
+class TestDispatchStyleDetection:
+    """A4: dispatch style follows the same contract as load-time validation —
+    exactly one REQUIRED positional arg → ctx; everything else → legacy. The
+    detector runs once per handler and the result is cached on the ep dict
+    (no per-request inspect.signature)."""
+
+    @staticmethod
+    def _req(route="/r"):
+        return {
+            "request_id": "r1",
+            "route": route,
+            "method": "GET",
+            "headers": {},
+            "query": {},
+            "body": None,
+            "server_state": {},
+        }
+
+    @pytest.mark.asyncio
+    async def test_ctx_with_optional_kwarg_dispatches_as_ctx(self):
+        """def h(ctx, debug=False): two params, one required → ctx.
+
+        The buggy detector counted ALL params (len==2) and wrongly routed
+        this to the legacy (request_dict, server) branch."""
+        def h(ctx, debug=False):
+            return {"arg": type(ctx).__name__}
+
+        ep = {"/r": {"handler": h, "methods": ["GET"]}}
+        resp = await handle_request(ep, self._req())
+        assert resp["body"]["arg"] == "RequestContext"
+
+    @pytest.mark.asyncio
+    async def test_ctx_with_var_args_dispatches_as_ctx(self):
+        """def h(ctx, *args): one required positional → ctx."""
+        def h(ctx, *args):
+            return {"arg": type(ctx).__name__}
+
+        ep = {"/r": {"handler": h, "methods": ["GET"]}}
+        resp = await handle_request(ep, self._req())
+        assert resp["body"]["arg"] == "RequestContext"
+
+    @pytest.mark.asyncio
+    async def test_async_callable_object_dispatched_and_awaited(self):
+        """Object with async __call__(self, ctx): one required positional
+        (self bound) → ctx, and the returned coroutine is awaited."""
+        class H:
+            async def __call__(self, ctx):
+                return {"arg": type(ctx).__name__}
+
+        ep = {"/r": {"handler": H(), "methods": ["GET"]}}
+        resp = await handle_request(ep, self._req())
+        assert resp["body"]["arg"] == "RequestContext"
+
+    @pytest.mark.asyncio
+    async def test_legacy_two_arg_handler_still_legacy(self):
+        """def h(request, server): two required positionals → legacy."""
+        def h(request, server):
+            return {"legacy": True, "has_method": "method" in request}
+
+        ep = {"/r": {"handler": h, "methods": ["GET"]}}
+        resp = await handle_request(ep, self._req())
+        assert resp["body"]["legacy"] is True
+        assert resp["body"]["has_method"] is True
+
+    @pytest.mark.asyncio
+    async def test_resolved_style_cached_on_ep_dict(self):
+        """Detector runs once; the resolved style is written back to ep."""
+        def h(ctx, debug=False):
+            return {"ok": True}
+
+        ep = {"/r": {"handler": h, "methods": ["GET"]}}
+        await handle_request(ep, self._req())
+        assert ep["/r"]["style"] == "ctx"

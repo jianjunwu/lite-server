@@ -13,6 +13,7 @@ wrappers applied once at load time (list order = execution order).
 import argparse
 import asyncio
 import importlib.util
+import inspect
 import json
 import logging
 import os
@@ -26,6 +27,7 @@ from lite_server.callback import extract_policies
 from lite_server.context import Headers, RequestContext, RequestMeta
 from lite_server.exceptions import HTTPException
 from lite_server.pipeline import Pipeline
+from lite_server.response import Response as LiteResponse
 
 MAX_FRAME_SIZE = 16 * 1024 * 1024  # 16 MiB
 
@@ -162,6 +164,24 @@ def _validate_handler_signature(fn, route: str) -> None:
     )
 
 
+def _takes_single_ctx_arg(fn) -> bool:
+    """Same contract as _validate_handler_signature: exactly one required
+    positional parameter → ctx handler; everything else → legacy. Used to
+    resolve (and cache) the dispatch style once per handler."""
+    try:
+        params = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        return False  # C-level callable: let the call site fail
+    required = [
+        p
+        for p in params
+        if p.default is inspect.Parameter.empty
+        and p.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    return len(required) == 1
+
+
 def load_endpoints(repo_path: str):
     """Scan repo for endpoint modules.
 
@@ -206,6 +226,7 @@ def load_endpoints(repo_path: str):
                             endpoints[r] = {
                                 "handler": lambda request, _srv, _ep=instance: _ep.handle(request),
                                 "methods": methods,
+                                "style": "legacy",
                             }
                             spec_matched = True
                 if spec_matched:
@@ -221,6 +242,7 @@ def load_endpoints(repo_path: str):
                     endpoints[route] = {
                         "handler": handler,
                         "methods": [m.upper() for m in methods],
+                        "style": "ctx" if _takes_single_ctx_arg(handler) else "legacy",
                     }
                     continue
             except HandlerSignatureError:
@@ -245,6 +267,7 @@ def load_endpoints(repo_path: str):
             "methods": route_def.methods,
             "callbacks": route_def.callbacks,
             "pipeline": pipeline,
+            "style": "ctx",
         }
 
     return endpoints
@@ -283,20 +306,18 @@ async def handle_request(endpoints, req_data: dict) -> dict:
             # New-style: drive through Pipeline (on_request → handler → on_response)
             await pipeline.run_endpoint(ctx, handler)
         else:
-            # Legacy: handler(ctx) or handler(request_dict, server)
-            # EndpointSpec handlers still use the old (request_dict, server) contract.
-            import inspect as _inspect
-            sig_params = list(_inspect.signature(handler).parameters.values())
-            if len(sig_params) == 1:
-                # New-style handler(ctx)
-                if asyncio.iscoroutinefunction(handler):
-                    result = await handler(ctx)
-                else:
-                    result = handler(ctx)
-                    if asyncio.iscoroutine(result):
-                        result = await result
+            style = ep.get("style")
+            if style is None:
+                # Directly-constructed ep dict (tests) — detect once and cache so
+                # inspect.signature never runs on the request hot path.
+                style = "ctx" if _takes_single_ctx_arg(handler) else "legacy"
+                ep["style"] = style
+            if style == "ctx":
+                result = handler(ctx)
+                if asyncio.iscoroutine(result):
+                    result = await result
             else:
-                # Legacy handler(request_dict, server)
+                # Legacy (request_dict, server) — EndpointSpec contract
                 request_dict = {
                     "method": req_data.get("method", "GET"),
                     "route": route,
@@ -305,22 +326,16 @@ async def handle_request(endpoints, req_data: dict) -> dict:
                     "body": req_data.get("body"),
                     "request_id": req_data.get("request_id", ""),
                 }
-                if asyncio.iscoroutinefunction(handler):
-                    result = await handler(request_dict, server)
-                else:
-                    result = handler(request_dict, server)
-                    if asyncio.iscoroutine(result):
-                        result = await result
+                result = handler(request_dict, server)
+                if asyncio.iscoroutine(result):
+                    result = await result
 
-            # Detect Response objects
-            from lite_server.response import Response as LiteResponse
             if isinstance(result, LiteResponse):
                 ctx.early = result
             else:
                 ctx.response = result
 
         # Marshal result from ctx
-        from lite_server.response import Response as LiteResponse
         value = ctx.early if ctx.early is not None else ctx.response
         if isinstance(value, LiteResponse):
             resp_headers = dict(value.headers) if value.headers else {}
