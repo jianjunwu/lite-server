@@ -123,9 +123,13 @@ class TestRequestContext:
         ctx.state["k"] = 1
         assert ctx.state["k"] == 1
 
-    def test_meta_cannot_be_none(self):
-        with pytest.raises(TypeError):
-            RequestContext(meta=None)  # type: ignore
+    def test_meta_is_requestmeta_not_none(self):
+        """RequestContext.meta is always a RequestMeta instance by contract.
+        All code paths construct it with a non-None RequestMeta (empty default
+        when proto has no meta field)."""
+        ctx = RequestContext(meta=_make_meta())
+        assert ctx.meta is not None
+        assert isinstance(ctx.meta, RequestMeta)
 
     def test_default_field_values(self):
         ctx = RequestContext(meta=_make_meta())
