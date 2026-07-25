@@ -60,7 +60,7 @@ class TestHookOrder:
     @pytest.mark.asyncio
     async def test_full_order_single_request(self):
         order = []
-        meta = _make_endpoint_meta()
+        meta = _make_route_meta()
 
         class Ordered(EchoAPI):
             def on_request(self, ctx):
@@ -127,7 +127,7 @@ class TestHookOrder:
                 order.append("c2")
 
         pipe = Pipeline.build(EchoAPI(), [C1(), C2()])
-        await pipe.run_single(b"{}", _make_endpoint_meta())
+        await pipe.run_single(b"{}", _make_route_meta())
         assert order == ["c1", "c2"]
 
 
@@ -153,7 +153,7 @@ class TestEarlyReturn:
                 return x
 
         pipe = Pipeline.build(API(), [CacheCB()])
-        resp_bytes, status, metrics, headers = await pipe.run_single(b"{}", _make_endpoint_meta())
+        resp_bytes, status, metrics, headers = await pipe.run_single(b"{}", _make_route_meta())
         assert called == []
         assert _body(resp_bytes) == {"cached": True}
         assert headers == {"X-Cache": "1"}
@@ -176,7 +176,7 @@ class TestEarlyReturn:
                 return x
 
         pipe = Pipeline.build(API(), [Validator()])
-        resp_bytes, status, metrics, headers = await pipe.run_single(b"{}", _make_endpoint_meta())
+        resp_bytes, status, metrics, headers = await pipe.run_single(b"{}", _make_route_meta())
         assert called == []
         assert _body(resp_bytes) == {"error": "missing x"}
         sc, mt, clean = extract_response_meta(headers)
@@ -195,7 +195,7 @@ class TestEarlyReturn:
                 return output
 
         pipe = Pipeline.build(API(), [])
-        resp_bytes, *_ = await pipe.run_single(b"{}", _make_endpoint_meta())
+        resp_bytes, *_ = await pipe.run_single(b"{}", _make_route_meta())
         assert called == []
         assert _body(resp_bytes) == {"direct": True}
 
@@ -209,7 +209,7 @@ class TestEarlyReturn:
                 raise AssertionError("predict must not run")
 
         pipe = Pipeline.build(API(), [])
-        resp_bytes, status, metrics, headers = await pipe.run_single(b"{}", _make_endpoint_meta())
+        resp_bytes, status, metrics, headers = await pipe.run_single(b"{}", _make_route_meta())
         assert _body(resp_bytes) == {"early": True}
         assert headers == {"X-E": "1"}
 
@@ -230,7 +230,7 @@ class TestEarlyReturn:
                 order.append("second.output")
 
         pipe = Pipeline.build(EchoAPI(), [First(), Second()])
-        resp_bytes, *_ = await pipe.run_single(b"{}", _make_endpoint_meta())
+        resp_bytes, *_ = await pipe.run_single(b"{}", _make_route_meta())
         assert order == ["first"]
         assert _body(resp_bytes) == {"stop": True}
 
@@ -249,7 +249,7 @@ class TestErrorPropagation:
 
         pipe = Pipeline.build(EchoAPI(), [Auth()])
         with pytest.raises(HTTPException) as exc_info:
-            await pipe.run_single(b"{}", _make_endpoint_meta())
+            await pipe.run_single(b"{}", _make_route_meta())
         assert exc_info.value.status_code == 400
         assert exc_info.value.param == "x"
 
@@ -263,7 +263,7 @@ class TestErrorPropagation:
 
         pipe = Pipeline.build(EchoAPI(), [Boom()])
         with pytest.raises(ValueError):
-            await pipe.run_single(b"{}", _make_endpoint_meta())
+            await pipe.run_single(b"{}", _make_route_meta())
 
     @pytest.mark.asyncio
     async def test_http_exception_from_api_on_request_propagates(self):
@@ -273,7 +273,7 @@ class TestErrorPropagation:
 
         pipe = Pipeline.build(API(), [])
         with pytest.raises(HTTPException):
-            await pipe.run_single(b"{}", _make_endpoint_meta())
+            await pipe.run_single(b"{}", _make_route_meta())
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +294,7 @@ class TestContextState:
                 seen["t0"] = ctx.state["t0"]
 
         pipe = Pipeline.build(EchoAPI(), [Tracer()])
-        await pipe.run_single(b"{}", _make_endpoint_meta())
+        await pipe.run_single(b"{}", _make_route_meta())
         assert seen["t0"] == 123
 
     @pytest.mark.asyncio
@@ -311,7 +311,7 @@ class TestContextState:
                 return request
 
         pipe = Pipeline.build(API(), [Rewrite()])
-        await pipe.run_single(b"{}", _make_endpoint_meta())
+        await pipe.run_single(b"{}", _make_route_meta())
         assert seen["request"] == {"replaced": True}
 
     @pytest.mark.asyncio
@@ -328,7 +328,7 @@ class TestContextState:
                 return x
 
         pipe = Pipeline.build(API(), [Mutate()])
-        await pipe.run_single(json.dumps({"a": 1}).encode(), _make_endpoint_meta())
+        await pipe.run_single(json.dumps({"a": 1}).encode(), _make_route_meta())
         assert seen["input"] == {"a": 1, "extra": 1}
 
     @pytest.mark.asyncio
@@ -344,8 +344,8 @@ class TestContextState:
                 return x
 
         pipe = Pipeline.build(API(), [Counter()])
-        ctx1 = RequestContext(meta=_make_endpoint_meta(), request={"n": 1})
-        ctx2 = RequestContext(meta=_make_endpoint_meta(), request={"n": 2})
+        ctx1 = RequestContext(meta=_make_route_meta(), request={"n": 1})
+        ctx2 = RequestContext(meta=_make_route_meta(), request={"n": 2})
         await pipe.preprocess(ctx1)
         await pipe.preprocess(ctx2)
         assert ctx1.state["n"] == 1
@@ -363,7 +363,7 @@ class TestSyncAsyncAdaptation:
         pipe = Pipeline.build(EchoAPI(), [])
         assert pipe.any_async is False
         assert pipe._executor is None
-        resp_bytes, *_ = await pipe.run_single(b'{"x": 1}', _make_endpoint_meta())
+        resp_bytes, *_ = await pipe.run_single(b'{"x": 1}', _make_route_meta())
         assert _body(resp_bytes) == {"echo": {"x": 1}}
 
     @pytest.mark.asyncio
@@ -374,7 +374,7 @@ class TestSyncAsyncAdaptation:
 
         pipe = Pipeline.build(AsyncAPI(), [])
         assert pipe.any_async is True
-        resp_bytes, *_ = await pipe.run_single(b'{"x": 1}', _make_endpoint_meta())
+        resp_bytes, *_ = await pipe.run_single(b'{"x": 1}', _make_route_meta())
         assert _body(resp_bytes) == {"async": {"x": 1}}
 
     @pytest.mark.asyncio
@@ -395,7 +395,7 @@ class TestSyncAsyncAdaptation:
 
         pipe = Pipeline.build(Mixed(), [])
         assert pipe.any_async is True
-        resp_bytes, *_ = await pipe.run_single(b'{"x": 1}', _make_endpoint_meta())
+        resp_bytes, *_ = await pipe.run_single(b'{"x": 1}', _make_route_meta())
         assert _body(resp_bytes) == {"x": 1}
         # Both sync stages ran on the SAME executor thread, not the loop thread
         assert len(threads) == 2
@@ -413,7 +413,7 @@ class TestSyncAsyncAdaptation:
 
         pipe = Pipeline.build(EchoAPI(), [AsyncCB()])
         assert pipe.any_async is True
-        await pipe.run_single(b"{}", _make_endpoint_meta())
+        await pipe.run_single(b"{}", _make_route_meta())
         assert order == ["async.on_request"]
         pipe.close()
 
@@ -456,7 +456,7 @@ class TestSyncAsyncAdaptation:
 
         pipe = Pipeline.build(Mixed(), [])
         await asyncio.gather(
-            *[pipe.run_single(b'{"x": 1}', _make_endpoint_meta()) for _ in range(5)]
+            *[pipe.run_single(b'{"x": 1}', _make_route_meta()) for _ in range(5)]
         )
         assert max_active == 1
         pipe.close()
@@ -625,7 +625,7 @@ class TestFinalize:
                 return Response(content="plain", status_code=201, media_type="text/plain")
 
         pipe = Pipeline.build(API(), [])
-        resp_bytes, status, metrics, headers = await pipe.run_single(b"{}", _make_endpoint_meta())
+        resp_bytes, status, metrics, headers = await pipe.run_single(b"{}", _make_route_meta())
         sc, mt, clean = extract_response_meta(headers)
         assert sc == 201
         assert mt == "text/plain"
@@ -685,7 +685,7 @@ class TestApiHookCtxUnification:
                 cb_ctx.append(ctx)
 
         pipe = Pipeline.build(API(), [CB()])
-        await pipe.run_single(b"{}", _make_endpoint_meta())
+        await pipe.run_single(b"{}", _make_route_meta())
         assert len(api_ctx) == 2
         assert len(cb_ctx) == 2
         # All four hooks see the same ctx object
@@ -709,7 +709,7 @@ class TestApiHookCtxUnification:
                 return x
 
         pipe = Pipeline.build(API(), [])
-        resp_bytes, status, metrics, headers = await pipe.run_single(b"{}", _make_endpoint_meta())
+        resp_bytes, status, metrics, headers = await pipe.run_single(b"{}", _make_route_meta())
         assert called == []
         assert _body(resp_bytes) == {"denied": True}
         sc, mt, clean = extract_response_meta(headers)
@@ -792,7 +792,7 @@ class TestCtxInjection:
                 return x
 
         pipe = Pipeline.build(API(), [])
-        resp_bytes, *_ = await pipe.run_single(b'{"q": "hello"}', _make_endpoint_meta())
+        resp_bytes, *_ = await pipe.run_single(b'{"q": "hello"}', _make_route_meta())
         assert len(captured) == 1
         assert captured[0].meta.request_id == "req-1"
         assert _body(resp_bytes) == {"prompt": "hello", "uid": "req-1"}
@@ -807,7 +807,7 @@ class TestCtxInjection:
                 return {"result": output, "route": ctx.meta.route}
 
         pipe = Pipeline.build(API(), [])
-        resp_bytes, *_ = await pipe.run_single(b'{"x": 1}', _make_endpoint_meta())
+        resp_bytes, *_ = await pipe.run_single(b'{"x": 1}', _make_route_meta())
         assert captured == ["/predict"]
         assert _body(resp_bytes)["route"] == "/predict"
 
@@ -821,7 +821,7 @@ class TestCtxInjection:
                 return {"echo": x, "req": ctx.meta.request_id}
 
         pipe = Pipeline.build(API(), [])
-        resp_bytes, *_ = await pipe.run_single(b'{"x": 1}', _make_endpoint_meta())
+        resp_bytes, *_ = await pipe.run_single(b'{"x": 1}', _make_route_meta())
         assert captured == ["req-1"]
         assert _body(resp_bytes)["req"] == "req-1"
 
@@ -839,7 +839,7 @@ class TestCtxInjection:
                 return x
 
         pipe = Pipeline.build(API(), [])
-        resp_bytes, *_ = await pipe.run_single(b'{"x": 1}', _make_endpoint_meta())
+        resp_bytes, *_ = await pipe.run_single(b'{"x": 1}', _make_route_meta())
         assert _body(resp_bytes) == {"x": 1}
 
     @pytest.mark.asyncio
@@ -856,7 +856,7 @@ class TestCtxInjection:
                 return x
 
         pipe = Pipeline.build(API(), [])
-        resp_bytes, *_ = await pipe.run_single(b'{"q": "hi"}', _make_endpoint_meta())
+        resp_bytes, *_ = await pipe.run_single(b'{"q": "hi"}', _make_route_meta())
         assert _body(resp_bytes)["user"] == "alice"
 
     @pytest.mark.asyncio
@@ -876,7 +876,7 @@ class TestCtxInjection:
 
         pipe = Pipeline.build(API(), [])
         resp_bytes, status, metrics, headers = await pipe.run_single(
-            b'{"val": 42}', _make_endpoint_meta()
+            b'{"val": 42}', _make_route_meta()
         )
         assert _body(resp_bytes) == {"result": 42}
         assert headers == {"X-Request-ID": "req-1", "X-Cache": "HIT"}
@@ -1024,7 +1024,7 @@ class TestBatchCtxInjection:
         assert ctxs[1].state["tag"] == "t1"
 
 
-def _make_endpoint_meta(**kwargs):
+def _make_route_meta(**kwargs):
     defaults = dict(
         route="/predict",
         headers=Headers({}),
@@ -1038,18 +1038,18 @@ def _make_endpoint_meta(**kwargs):
 
 
 # ---------------------------------------------------------------------------
-# for_endpoint
+# for_route
 # ---------------------------------------------------------------------------
 
 
-class TestForEndpoint:
+class TestForRoute:
     def test_rejects_on_input_hook(self):
         class BadCB(Callback):
             def on_input(self, ctx):
                 pass
 
         with pytest.raises(RuntimeError, match="on_input"):
-            Pipeline.for_endpoint([BadCB()])
+            Pipeline.for_route([BadCB()])
 
     def test_rejects_on_output_hook(self):
         class BadCB(Callback):
@@ -1057,7 +1057,7 @@ class TestForEndpoint:
                 pass
 
         with pytest.raises(RuntimeError, match="on_output"):
-            Pipeline.for_endpoint([BadCB()])
+            Pipeline.for_route([BadCB()])
 
     def test_accepts_on_request_and_on_response(self):
         class GoodCB(Callback):
@@ -1067,12 +1067,12 @@ class TestForEndpoint:
             def on_response(self, ctx):
                 pass
 
-        pipe = Pipeline.for_endpoint([GoodCB()])
+        pipe = Pipeline.for_route([GoodCB()])
         assert pipe.lit_api is None
         assert len(pipe.callbacks) == 1
 
     def test_accepts_builtin_callbacks(self):
-        pipe = Pipeline.for_endpoint([
+        pipe = Pipeline.for_route([
             RequireApiKey(keys=["sk-123"]),
             RateLimit(requests_per_minute=60),
             LogRequests(),
@@ -1082,7 +1082,7 @@ class TestForEndpoint:
 
 
 # ---------------------------------------------------------------------------
-# run_endpoint
+# run_route
 # ---------------------------------------------------------------------------
 
 
@@ -1091,17 +1091,17 @@ class DummyLitAPI(LitAPI):
         return x
 
 
-class TestRunEndpoint:
+class TestRunRoute:
     @pytest.mark.asyncio
     async def test_handler_called_with_ctx(self):
-        pipe = Pipeline.for_endpoint([])
-        ctx = RequestContext(meta=_make_endpoint_meta(), request={"k": "v"})
+        pipe = Pipeline.for_route([])
+        ctx = RequestContext(meta=_make_route_meta(), request={"k": "v"})
         called = []
 
         async def handler(ctx_arg):
             called.append(ctx_arg)
 
-        await pipe.run_endpoint(ctx, handler)
+        await pipe.run_route(ctx, handler)
         assert len(called) == 1
         assert called[0] is ctx
 
@@ -1111,28 +1111,28 @@ class TestRunEndpoint:
             def on_request(self, ctx):
                 ctx.respond({"blocked": True}, status_code=403)
 
-        pipe = Pipeline.for_endpoint([EarlyCB()])
-        ctx = RequestContext(meta=_make_endpoint_meta())
+        pipe = Pipeline.for_route([EarlyCB()])
+        ctx = RequestContext(meta=_make_route_meta())
         called = False
 
         async def handler(ctx_arg):
             nonlocal called
             called = True
 
-        await pipe.run_endpoint(ctx, handler)
+        await pipe.run_route(ctx, handler)
         assert not called
         assert ctx.early is not None
         assert ctx.early.status_code == 403
 
     @pytest.mark.asyncio
     async def test_handler_result_stored_as_response(self):
-        pipe = Pipeline.for_endpoint([])
-        ctx = RequestContext(meta=_make_endpoint_meta())
+        pipe = Pipeline.for_route([])
+        ctx = RequestContext(meta=_make_route_meta())
 
         async def handler(ctx_arg):
             return {"result": "ok"}
 
-        await pipe.run_endpoint(ctx, handler)
+        await pipe.run_route(ctx, handler)
         assert ctx.response == {"result": "ok"}
 
     @pytest.mark.asyncio
@@ -1143,13 +1143,13 @@ class TestRunEndpoint:
             def on_response(self, ctx):
                 responses.append(ctx.response)
 
-        pipe = Pipeline.for_endpoint([TrackCB()])
-        ctx = RequestContext(meta=_make_endpoint_meta())
+        pipe = Pipeline.for_route([TrackCB()])
+        ctx = RequestContext(meta=_make_route_meta())
 
         async def handler(ctx_arg):
             return {"x": 1}
 
-        await pipe.run_endpoint(ctx, handler)
+        await pipe.run_route(ctx, handler)
         assert responses == [{"x": 1}]
 
     @pytest.mark.asyncio
@@ -1160,14 +1160,14 @@ class TestRunEndpoint:
             def on_error(self, ctx, exc):
                 errors.append(exc)
 
-        pipe = Pipeline.for_endpoint([ErrCB()])
-        ctx = RequestContext(meta=_make_endpoint_meta())
+        pipe = Pipeline.for_route([ErrCB()])
+        ctx = RequestContext(meta=_make_route_meta())
 
         async def handler(ctx_arg):
             raise HTTPException(400, "bad")
 
         with pytest.raises(HTTPException):
-            await pipe.run_endpoint(ctx, handler)
+            await pipe.run_route(ctx, handler)
         assert len(errors) == 1
         assert isinstance(errors[0], HTTPException)
 
@@ -1177,14 +1177,14 @@ class TestRunEndpoint:
             def on_error(self, ctx, exc):
                 raise RuntimeError("boom")
 
-        pipe = Pipeline.for_endpoint([ExplodingCB()])
-        ctx = RequestContext(meta=_make_endpoint_meta())
+        pipe = Pipeline.for_route([ExplodingCB()])
+        ctx = RequestContext(meta=_make_route_meta())
 
         async def handler(ctx_arg):
             raise HTTPException(400, "bad")
 
         with pytest.raises(HTTPException):  # original, not RuntimeError
-            await pipe.run_endpoint(ctx, handler)
+            await pipe.run_route(ctx, handler)
 
     @pytest.mark.asyncio
     async def test_sync_handler_in_async_pipeline(self):
@@ -1193,13 +1193,13 @@ class TestRunEndpoint:
             async def on_request(self, ctx):
                 pass
 
-        pipe = Pipeline.for_endpoint([AsyncCB()])
-        ctx = RequestContext(meta=_make_endpoint_meta())
+        pipe = Pipeline.for_route([AsyncCB()])
+        ctx = RequestContext(meta=_make_route_meta())
 
         def sync_handler(ctx_arg):
             return {"sync": True}
 
-        await pipe.run_endpoint(ctx, handler=sync_handler)
+        await pipe.run_route(ctx, handler=sync_handler)
         assert ctx.response == {"sync": True}
 
     @pytest.mark.asyncio
@@ -1214,15 +1214,15 @@ class TestRunEndpoint:
             async def on_request(self, ctx):
                 pass
 
-        pipe = Pipeline.for_endpoint([AsyncCB()])
+        pipe = Pipeline.for_route([AsyncCB()])
         assert pipe._executor is not None  # mixed mode -> run_blocking path
-        ctx = RequestContext(meta=_make_endpoint_meta())
+        ctx = RequestContext(meta=_make_route_meta())
 
         class CallableObj:
             async def __call__(self, ctx_arg):
                 return {"answered": True}
 
-        await pipe.run_endpoint(ctx, handler=CallableObj())
+        await pipe.run_route(ctx, handler=CallableObj())
         assert ctx.response == {"answered": True}
         assert not asyncio.iscoroutine(ctx.response)
 
@@ -1247,7 +1247,7 @@ class TestRunSingleOnError:
 
         api = DummyLitAPI()
         pipe = Pipeline.build(api, [ErrCB(), FailingCB()])
-        meta = _make_endpoint_meta()
+        meta = _make_route_meta()
 
         with pytest.raises(HTTPException):
             await pipe.run_single(b'{"x": 1}', meta)
@@ -1268,7 +1268,7 @@ class TestRunSingleOnError:
 
         api = FailingAPI()
         pipe = Pipeline.build(api, [ErrCB()])
-        meta = _make_endpoint_meta()
+        meta = _make_route_meta()
 
         with pytest.raises(RuntimeError):
             await pipe.run_single(b'{"x": 1}', meta)
@@ -1282,7 +1282,7 @@ class TestRunSingleOnError:
 
 class TestFinalizeResponseHeaders:
     def test_response_headers_merged(self):
-        ctx = RequestContext(meta=_make_endpoint_meta(), response={"result": "ok"})
+        ctx = RequestContext(meta=_make_route_meta(), response={"result": "ok"})
         ctx.response_headers["X-Custom"] = "val1"
         ctx.response_headers["X-Shared"] = "from_ctx"
 
@@ -1297,7 +1297,7 @@ class TestFinalizeResponseHeaders:
     def test_response_explicit_header_overrides_response_headers(self):
         from lite_server.response import Response as LiteResponse
 
-        ctx = RequestContext(meta=_make_endpoint_meta())
+        ctx = RequestContext(meta=_make_route_meta())
         ctx.response_headers["X-Custom"] = "from_ctx"
         ctx.response = LiteResponse(
             content={"ok": True}, headers={"X-Custom": "from_resp", "X-New": "new_val"}
@@ -1314,7 +1314,7 @@ class TestFinalizeResponseHeaders:
     def test_response_headers_preserved_with_early(self):
         from lite_server.response import Response as LiteResponse
 
-        ctx = RequestContext(meta=_make_endpoint_meta())
+        ctx = RequestContext(meta=_make_route_meta())
         ctx.response_headers["X-Ctx"] = "ctx_val"
         ctx.early = LiteResponse(content={"early": True}, headers={"X-Early": "early_val"})
 

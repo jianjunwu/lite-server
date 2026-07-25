@@ -10,7 +10,7 @@ integration lands.
 
 import pytest
 
-from lite_server.endpoint import router
+from lite_server.route import router
 from lite_server.server_proxy import RegistryProxy, ServerProxy
 
 

@@ -406,10 +406,10 @@ class Pipeline:
         return cls(lit_api, callbacks)
 
     @classmethod
-    def for_endpoint(cls, callbacks: list[Callback]) -> "Pipeline":
-        """Build a hook-only pipeline for custom endpoints.
+    def for_route(cls, callbacks: list[Callback]) -> "Pipeline":
+        """Build a hook-only pipeline for custom routes.
 
-        Loud rejection (load time): endpoints have no decode/predict/encode
+        Loud rejection (load time): routes have no decode/predict/encode
         stages, so on_input/on_output hooks would silently never run.
         """
         for cb in callbacks:
@@ -419,20 +419,20 @@ class Pipeline:
             if _overrides(cls_type, "on_input", Callback):
                 raise RuntimeError(
                     f"Callback {cls_type.__name__} defines 'on_input', but "
-                    f"endpoints have no decode stage — only on_request, "
+                    f"routes have no decode stage — only on_request, "
                     f"on_response, and on_error run. Move the logic into "
                     f"one of those hooks."
                 )
             if _overrides(cls_type, "on_output", Callback):
                 raise RuntimeError(
                     f"Callback {cls_type.__name__} defines 'on_output', but "
-                    f"endpoints have no encode stage — only on_request, "
+                    f"routes have no encode stage — only on_request, "
                     f"on_response, and on_error run. Move the logic into "
                     f"one of those hooks."
                 )
 
         pipe = cls.__new__(cls)
-        pipe.lit_api = None                      # 端点无模型
+        pipe.lit_api = None                      # 路由无模型
         pipe.callbacks = list(callbacks)
 
         # Async detection: only hooks, no model stages.
@@ -466,7 +466,7 @@ class Pipeline:
         pipe._lifecycle = {name: [] for name in _LIFECYCLE_HOOKS}
         return pipe
 
-    async def run_endpoint(self, ctx: RequestContext, handler: Callable) -> None:
+    async def run_route(self, ctx: RequestContext, handler: Callable) -> None:
         """on_request → handler(ctx) → on_response; on_error on failure."""
         try:
             await self._run_chain("on_request", ctx)

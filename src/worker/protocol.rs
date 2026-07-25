@@ -125,11 +125,11 @@ pub struct WorkerStartup {
 }
 
 // ===== Route declarations =====
-// EndpointRoute survives the standalone-routes removal: it is reused by the
-// model-worker route integration (renamed RouteDecl in a later phase).
+// Route declaration shared between the Rust HTTP layer and the Python
+// model-worker route integration (phase 2).
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EndpointRoute {
+pub struct RouteDecl {
     pub route: String,
     pub methods: Vec<String>,
     #[serde(default)]
@@ -138,8 +138,8 @@ pub struct EndpointRoute {
     pub cors: Option<CorsPolicy>,
 }
 
-/// Convert Python `{param}` placeholders (from endpoint decorators) to axum
-/// `:param` route syntax. Shared by route registration and endpoint-policy
+/// Convert Python `{param}` placeholders (from route decorators) to axum
+/// `:param` route syntax. Shared by route registration and route-policy
 /// keying so both sides agree on the same route string (C10 dedup).
 pub fn convert_path_params(route: &str) -> String {
     let mut result = String::with_capacity(route.len());

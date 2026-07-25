@@ -1,4 +1,4 @@
-"""Tests for unified callback system on endpoints (previously middleware).
+"""Tests for unified callback system on routes (previously middleware).
 
 Since 0.7.0, middleware is replaced by the unified Callback API.
 TokenBucket tests moved to test_callback.py.
@@ -15,7 +15,7 @@ from lite_server.callback import (
     RateLimit,
     RequireApiKey,
 )
-from lite_server.endpoint import _validate_handler_signature
+from lite_server.route import _validate_handler_signature
 
 
 # ---------------------------------------------------------------------------
@@ -59,16 +59,16 @@ class TestHandlerSignatureValidation:
 
 
 # ---------------------------------------------------------------------------
-# Endpoint callback integration (using Pipeline.for_endpoint)
+# Route callback integration (using Pipeline.for_route)
 # ---------------------------------------------------------------------------
 
 
-class TestEndpointCallbackIntegration:
+class TestRouteCallbackIntegration:
     @pytest.mark.asyncio
     async def test_require_api_key_rejects_missing_key(self):
         from lite_server.pipeline import Pipeline
 
-        pipe = Pipeline.for_endpoint([RequireApiKey(keys=["sk-123"])])
+        pipe = Pipeline.for_route([RequireApiKey(keys=["sk-123"])])
 
         async def handler(ctx):
             return {"body": "ok"}
@@ -84,13 +84,13 @@ class TestEndpointCallbackIntegration:
             )
         )
         with pytest.raises(UnauthorizedError):
-            await pipe.run_endpoint(ctx, handler)
+            await pipe.run_route(ctx, handler)
 
     @pytest.mark.asyncio
     async def test_require_api_key_passes_with_valid_key(self):
         from lite_server.pipeline import Pipeline
 
-        pipe = Pipeline.for_endpoint([RequireApiKey(keys=["sk-123"])])
+        pipe = Pipeline.for_route([RequireApiKey(keys=["sk-123"])])
 
         async def handler(ctx):
             return {"body": "ok"}
@@ -105,14 +105,14 @@ class TestEndpointCallbackIntegration:
                 method="POST",
             )
         )
-        await pipe.run_endpoint(ctx, handler)
+        await pipe.run_route(ctx, handler)
         assert ctx.response == {"body": "ok"}
 
     @pytest.mark.asyncio
     async def test_cors_adds_response_headers(self):
         from lite_server.pipeline import Pipeline
 
-        pipe = Pipeline.for_endpoint([Cors(allow_origins=["https://app.com"])])
+        pipe = Pipeline.for_route([Cors(allow_origins=["https://app.com"])])
 
         async def handler(ctx):
             return {"data": "ok"}
@@ -127,7 +127,7 @@ class TestEndpointCallbackIntegration:
                 method="POST",
             )
         )
-        await pipe.run_endpoint(ctx, handler)
+        await pipe.run_route(ctx, handler)
         assert "Access-Control-Allow-Origin" in ctx.response_headers
         assert ctx.response_headers["Access-Control-Allow-Origin"] == "https://app.com"
 
@@ -135,7 +135,7 @@ class TestEndpointCallbackIntegration:
     async def test_rate_limit_does_not_block_normal_requests(self):
         from lite_server.pipeline import Pipeline
 
-        pipe = Pipeline.for_endpoint([RateLimit(requests_per_minute=6000)])
+        pipe = Pipeline.for_route([RateLimit(requests_per_minute=6000)])
 
         async def handler(ctx):
             return {"body": "ok"}
@@ -150,7 +150,7 @@ class TestEndpointCallbackIntegration:
                 method="POST",
             )
         )
-        await pipe.run_endpoint(ctx, handler)
+        await pipe.run_route(ctx, handler)
         assert ctx.response == {"body": "ok"}
 
     @pytest.mark.asyncio
@@ -161,7 +161,7 @@ class TestEndpointCallbackIntegration:
         caplog.set_level(logging.INFO)
         logging.getLogger("lite_server.requests").setLevel(logging.INFO)
 
-        pipe = Pipeline.for_endpoint([LogRequests()])
+        pipe = Pipeline.for_route([LogRequests()])
 
         async def handler(ctx):
             return {"body": "ok"}
@@ -176,7 +176,7 @@ class TestEndpointCallbackIntegration:
                 method="GET",
             )
         )
-        await pipe.run_endpoint(ctx, handler)
+        await pipe.run_route(ctx, handler)
         log_records = [r for r in caplog.records if r.name == "lite_server.requests"]
         assert len(log_records) == 1
         assert "GET" in log_records[0].getMessage()

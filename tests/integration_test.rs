@@ -82,7 +82,7 @@ impl Drop for ServerGuard {
     }
 }
 
-/// Create a self-contained model_repo in a temp directory with test_model and status_endpoint.
+/// Create a self-contained model_repo in a temp directory with test_model.
 fn create_test_model_repo() -> std::path::PathBuf {
     let tmp = std::env::temp_dir().join(format!("lite-server-test-{}", std::process::id()));
     let model_dir = tmp.join("test_model/1");
@@ -118,52 +118,6 @@ class TestAPI(LitAPI):
     std::fs::write(
         model_dir.join("config.yaml"),
         "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
-    )
-    .unwrap();
-
-    let endpoints_dir = tmp.join("endpoints");
-    std::fs::create_dir_all(&endpoints_dir).unwrap();
-    std::fs::write(
-        endpoints_dir.join("status.py"),
-        "'''Custom endpoint example - GET /status returns server overview.'''\n\nmethods = [\"GET\"]\n\n\ndef handler(ctx):\n    '''Return a quick status overview of the server.'''\n    models = ctx.server.registry.list_loaded() if ctx.server else []\n    return {\n        \"server\": \"lite-server\",\n        \"loaded_models_count\": len(models),\n        \"loaded_models\": models,\n    }\n",
-    )
-    .unwrap();
-
-    // status_ep: decorator endpoint with RateLimit + Cors (non-stream).
-    std::fs::write(
-        endpoints_dir.join("status_ep.py"),
-        r#""""Decorator endpoint with RateLimit + Cors callbacks (non-stream)."""
-
-from lite_server import Cors, RateLimit
-from lite_server.endpoint import endpoint
-
-
-@endpoint.get(
-    "/status_ep",
-    callbacks=[
-        RateLimit(requests_per_minute=2, burst=2),
-        Cors(allow_origins=["https://endpoint.example.com"]),
-    ],
-)
-def status_ep_handler(ctx):
-    return {"server": "lite-server", "endpoint": "status_ep"}
-"#,
-    )
-    .unwrap();
-
-    // put_ep: PUT endpoint exercising P2 method registration (was silently
-    // registered as GET before P2).
-    std::fs::write(
-        endpoints_dir.join("put_ep.py"),
-        r#""""PUT endpoint exercising P2 method registration."""
-
-from lite_server.endpoint import endpoint
-
-
-@endpoint.put("/put_ep")
-def put_ep_handler(ctx):
-    return {"method": "PUT", "body": ctx.request}
-"#,
     )
     .unwrap();
 
@@ -714,31 +668,6 @@ async fn test_metrics_endpoint() {
 }
 
 // ---------------------------------------------------------------------------
-// Custom endpoint
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-#[serial]
-async fn test_custom_endpoint_status() {
-    let base = shared_base().await;
-    let client = reqwest::Client::new();
-
-    // test_model is already loaded by the shared server or another test
-    // Load it here to be safe
-    load_model(&base, "test_model", "1").await;
-
-    let resp = client
-        .get(format!("{}/status", base))
-        .send().await.unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["server"], "lite-server");
-    assert!(body["loaded_models_count"].as_u64().unwrap_or(0) >= 1);
-
-    unload_model(&base, "test_model", "1").await;
-}
-
-// ---------------------------------------------------------------------------
 // API Response Standardization — error body + observability headers
 // ---------------------------------------------------------------------------
 
@@ -916,136 +845,6 @@ async fn test_malformed_json_standardized_400() {
     assert_eq!(body["error"]["type"], "invalid_request_error");
     assert_eq!(body["error"]["code"], "invalid_request_body");
     assert!(body["error"]["param"].is_null());
-}
-
-// ---------------------------------------------------------------------------
-// Custom endpoint PUT method registration — covers P2
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-#[serial]
-async fn test_endpoint_put_method_registered() {
-    let base = shared_base().await;
-    let client = reqwest::Client::new();
-
-    // P2: @endpoint.put registers PUT (previously silently registered as GET,
-    // so a PUT request got 405).
-    let resp = client
-        .put(format!("{}/put_ep", base))
-        .json(&json!({"x": 1}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["method"], "PUT");
-    assert_eq!(body["body"]["x"], 1);
-}
-
-// ---------------------------------------------------------------------------
-// Custom endpoint responses carry CORS on every path — covers B2
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-#[serial]
-async fn test_endpoint_options_preflight_runtime_lookup() {
-    let base = shared_base().await;
-    let client = reqwest::Client::new();
-
-    // status_ep declares Cors → OPTIONS preflight returns 204 + ACAO.
-    // B3 moved this from a startup snapshot closure to a runtime policy
-    // lookup; this guards that the equivalence holds.
-    let resp = client
-        .request(reqwest::Method::OPTIONS, format!("{}/status_ep", base))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 204);
-    assert_eq!(
-        resp.headers()
-            .get("access-control-allow-origin")
-            .unwrap()
-            .to_str()
-            .unwrap(),
-        "https://endpoint.example.com"
-    );
-
-    // /status (legacy, no Cors) → 405 either way (fallback before B3,
-    // handler after B3).
-    let resp = client
-        .request(reqwest::Method::OPTIONS, format!("{}/status", base))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 405);
-}
-
-#[tokio::test]
-#[serial]
-async fn test_endpoint_responses_carry_cors() {
-    // Dedicated server: status_ep's RateLimit bucket (burst=2) is shared
-    // across tests on the shared server, so a fresh process gives a clean
-    // starting bucket.
-    let port = 18041;
-    kill_stale_on_port(port);
-    let repo = test_model_repo();
-    let _server = ServerGuard::start(&[
-        "--port",
-        &port.to_string(),
-        "--model-repo",
-        &repo.to_string_lossy(),
-        "--no-metrics",
-        "--no-grpc",
-        "--log-level",
-        "warn",
-    ]);
-    wait_for_server(port, 15).await;
-    let base = format!("http://127.0.0.1:{}", port);
-    let client = reqwest::Client::new();
-
-    // status_ep: RateLimit(burst=2) + Cors. Success response carries ACAO.
-    let resp = client
-        .get(format!("{}/status_ep", base))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    assert_eq!(
-        resp.headers()
-            .get("access-control-allow-origin")
-            .unwrap()
-            .to_str()
-            .unwrap(),
-        "https://endpoint.example.com"
-    );
-    let _ = resp.text().await.unwrap();
-
-    // 2nd request still within burst.
-    let resp = client
-        .get(format!("{}/status_ep", base))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let _ = resp.text().await.unwrap();
-
-    // 3rd request: rate-limited → 429. Before B2 the early Err return (rate
-    // limit) propagated without CORS; the outer wrapper now attaches ACAO to
-    // the 429 as well.
-    let resp = client
-        .get(format!("{}/status_ep", base))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 429);
-    assert_eq!(
-        resp.headers()
-            .get("access-control-allow-origin")
-            .unwrap()
-            .to_str()
-            .unwrap(),
-        "https://endpoint.example.com"
-    );
 }
 
 // ---------------------------------------------------------------------------

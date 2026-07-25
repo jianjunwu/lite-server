@@ -21,7 +21,7 @@ from lite_server.callback import (
     RequireApiKey,
 )
 from lite_server.context import CBSequence, Headers, RequestContext, RequestMeta
-from lite_server.endpoint import EndpointRequest, endpoint, router
+from lite_server.route import RouteRequest, route, router
 from lite_server.response import (
     BackgroundTask,
     FileResponse,
@@ -46,9 +46,9 @@ __all__ = [
     "RequestContext",
     "RequestMeta",
     "CBSequence",
-    "EndpointRequest",
+    "RouteRequest",
     "ServerProxy",
-    "endpoint",
+    "route",
     "router",
     "__version__",
     # HTTP request / response

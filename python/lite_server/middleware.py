@@ -11,7 +11,7 @@ built-in Callback classes instead:
       log_requests                           LogRequests
       cors                                   Cors
 
-    @endpoint.get("/p",                     @endpoint.get("/p",
+    @route.get("/p",                     @route.get("/p",
       middleware=[...])                       callbacks=[...])
 
     async def handler(request, server):     def handler(ctx):

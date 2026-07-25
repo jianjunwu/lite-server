@@ -12,7 +12,7 @@ limitations introduced during the 0.7.0 hardening pass (R1–P3).
 
 ## What changed
 
-- **`middleware=[...]` → `callbacks=[...]`** on `@endpoint.get/post/...`.
+- **`middleware=[...]` → `callbacks=[...]`** on `@route.get/post/...`.
 - **Middleware factories → callback classes**: `require_api_key(...)` →
   `RequireApiKey(...)`, `rate_limit(...)` → `RateLimit(...)`, `cors(...)` →
   `Cors(...)`, `log_requests()` → `LogRequests()`.
@@ -37,7 +37,7 @@ limitations introduced during the 0.7.0 hardening pass (R1–P3).
 | `rate_limit(requests_per_minute=N)` | `RateLimit(requests_per_minute=N, key="route"\|"ip", burst=...)` |
 | `cors(allow_origins=[...])` | `Cors(allow_origins=[...])` |
 | `log_requests()` | `LogRequests()` |
-| `@endpoint.get("/p", middleware=[...])` | `@endpoint.get("/p", callbacks=[...])` |
+| `@route.get("/p", middleware=[...])` | `@route.get("/p", callbacks=[...])` |
 | `async def handler(request, server):` | `def handler(ctx):` |
 | `request["body"]` | `ctx.request` |
 | `request["query"]` | `ctx.meta.query` |
@@ -52,12 +52,12 @@ limitations introduced during the 0.7.0 hardening pass (R1–P3).
 
 ```python
 # Before
-@endpoint.get("/status", middleware=[require_api_key(keys=["s"])])
+@route.get("/status", middleware=[require_api_key(keys=["s"])])
 async def handler(request: dict, server):
     return {"status": "ok"}
 
 # After
-@endpoint.get("/status", callbacks=[RequireApiKey(keys=["s"]), Cors()])
+@route.get("/status", callbacks=[RequireApiKey(keys=["s"]), Cors()])
 def handler(ctx):
     models = ctx.server.registry.list_loaded() if ctx.server else []
     return {"status": "ok", "models": models, "request_id": ctx.meta.request_id}

@@ -146,7 +146,7 @@ See [docs/benchmark.md](docs/benchmark.md) for full results and reproduction ste
 ### Custom Endpoints
 
 - **Directory-based discovery** — place Python files in `endpoints/` for auto-registration
-- **Decorator routing** — `@endpoint.get("/status")` for explicit control
+- **Decorator routing** — `@route.get("/status")` for explicit control
 - **Server context access** — `server.registry`, `server.infer()`, `server.metrics` from handlers
 - **Middleware chain** — per-route or global middleware (auth, rate limiting, CORS)
 - **Streaming support** — chunked and SSE responses from custom endpoints

@@ -93,7 +93,7 @@ def _delete_cookie_header(
 class Response:
     """HTTP response with full control over status, headers, and media type.
 
-    Return this from a LitAPI hook or endpoint handler to control the
+    Return this from a LitAPI hook or route handler to control the
     full HTTP response sent to the client.
     """
 

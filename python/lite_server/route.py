@@ -1,8 +1,7 @@
-"""Declarative endpoint routing for lite-server.
+"""Declarative route declaration for lite-server.
 
-Provides a FastAPI-style decorator API for registering custom endpoints.
-Endpoints are discovered from the ``endpoints/`` subdirectory or via
-decorator registration on the global router.
+Provides a FastAPI-style decorator API for registering custom routes on
+the global router.
 
 Since 0.7.0 the ``callbacks`` parameter replaces ``middleware`` and
 accepts :class:`Callback` instances (RequireApiKey, RateLimit, LogRequests,
@@ -21,8 +20,8 @@ if TYPE_CHECKING:
     from lite_server.callback import Callback as CallbackType
 
 
-class EndpointRequest(TypedDict, total=False):
-    """Request object passed to endpoint handlers (legacy dict shape).
+class RouteRequest(TypedDict, total=False):
+    """Request object passed to route handlers (legacy dict shape).
 
     Since 0.7.0 handlers receive a :class:`RequestContext` instead.
     This TypedDict is retained for documentation only.
@@ -76,8 +75,8 @@ def _validate_handler_signature(fn, route: str) -> None:
     )
 
 
-class EndpointRouter:
-    """Global router for decorator-based endpoint registration."""
+class Router:
+    """Global router for decorator-based route registration."""
 
     def __init__(self):
         self._routes: List[RouteDef] = []
@@ -140,8 +139,8 @@ class EndpointRouter:
                 spec.loader.exec_module(mod)
 
 
-# Global singleton — imported by endpoint modules
-router = EndpointRouter()
+# Global singleton — imported by route modules
+router = Router()
 
 # Convenience alias matching user-facing API
-endpoint = router
+route = router
