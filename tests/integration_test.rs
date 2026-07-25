@@ -1394,3 +1394,192 @@ async fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// gRPC unary infer routes through the InferenceQueue (#1)
+// ---------------------------------------------------------------------------
+
+/// Two concurrent gRPC `Infer` RPCs against batch_model (max_batch_size=2,
+/// batch_timeout=0.1) must aggregate into ONE BatchRequest, so each response
+/// carries batch_size=2. Before #1, gRPC sent each request directly to a worker
+/// via client.send(), bypassing the queue, so both would report batch_size=1.
+#[tokio::test]
+#[serial]
+async fn test_grpc_infer_aggregates_into_batch() {
+    use bytes::Bytes;
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+    use std::collections::HashMap;
+
+    // Dedicated server WITH gRPC enabled (the shared server runs --no-grpc).
+    let http_port = 18070u16;
+    let grpc_port = 18071u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = test_model_repo();
+    let _server = ServerGuard::start(&[
+        "--port",
+        &http_port.to_string(),
+        "--grpc-port",
+        &grpc_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-metrics",
+        "--log-level",
+        "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, BATCH_MODEL, "1").await;
+
+    let client = LiteServerClient::connect(format!("http://127.0.0.1:{}", grpc_port))
+        .await
+        .expect("gRPC client must connect");
+
+    let payload = Bytes::from(serde_json::to_vec(&json!({"input": 1})).unwrap());
+    let mk_req = || InferRequest {
+        model_name: BATCH_MODEL.to_string(),
+        version: "1".to_string(),
+        data: payload.clone(),
+        headers: HashMap::new(),
+    };
+    // infer() takes &mut self, so clone the client for concurrent calls.
+    let mut c1 = client.clone();
+    let mut c2 = client.clone();
+    let (a, b) = tokio::join!(c1.infer(mk_req()), c2.infer(mk_req()));
+    let ra = a.expect("infer A must succeed").into_inner();
+    let rb = b.expect("infer B must succeed").into_inner();
+
+    let ja: Value = serde_json::from_slice(&ra.data).expect("infer A data is JSON");
+    let jb: Value = serde_json::from_slice(&rb.data).expect("infer B data is JSON");
+    assert_eq!(ja["batch_size"], 2, "gRPC infer A must be batched into size 2");
+    assert_eq!(jb["batch_size"], 2, "gRPC infer B must be batched into size 2");
+
+    unload_model(&base, BATCH_MODEL, "1").await;
+}
+
+// ---------------------------------------------------------------------------
+// Ensemble total timeout bounds serial layers (#3)
+// ---------------------------------------------------------------------------
+
+/// Write a sub-model whose predict() sleeps 1.5s, returning {"out": x}.
+fn write_slow_submodel(repo: &std::path::Path, name: &str) {
+    let dir = repo.join(format!("{}/1", name));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("model.py"),
+        r#"import time
+from lite_server import LitAPI
+
+
+class SlowAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request
+
+    def predict(self, x):
+        time.sleep(1.5)
+        return {"out": x.get("x", 0) if isinstance(x, dict) else x}
+
+    def encode_response(self, output):
+        return output
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+}
+
+/// A 3-step serial ensemble (a→b→c), each step sleeping 1.5s, runs ~4.5s total.
+/// With `--timeout 2.0` the outer total-timeout (#3) must abort it at ~2.0s
+/// with an error — whereas the per-step timeout (also 2.0s) never fires
+/// because no single step exceeds it. Before #3 there was no outer bound, so
+/// the chain completed successfully (~4.5s, HTTP 200).
+#[tokio::test]
+#[serial]
+async fn test_ensemble_total_timeout_bounds_serial_layers() {
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-ensemble-timeout-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    write_slow_submodel(&repo, "a");
+    write_slow_submodel(&repo, "b");
+    write_slow_submodel(&repo, "c");
+
+    let ens_dir = repo.join("slow_ensemble/1");
+    std::fs::create_dir_all(&ens_dir).unwrap();
+    std::fs::write(
+        ens_dir.join("config.yaml"),
+        r#"
+ensemble:
+  steps:
+    - name: a
+      model: a
+      version: "1"
+      inputs:
+        x: "$request.x"
+    - name: b
+      model: b
+      version: "1"
+      inputs:
+        x: "$a.out"
+    - name: c
+      model: c
+      version: "1"
+      inputs:
+        x: "$b.out"
+"#,
+    )
+    .unwrap();
+
+    let http_port = 18080u16;
+    kill_stale_on_port(http_port);
+    let _server = ServerGuard::start(&[
+        "--port",
+        &http_port.to_string(),
+        "--timeout",
+        "2.0",
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-grpc",
+        "--no-metrics",
+        "--log-level",
+        "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+
+    // Preload sub-models so execute_step skips auto-load; the timeout must
+    // come from serial step accumulation, not worker spawn latency.
+    load_model(&base, "a", "1").await;
+    load_model(&base, "b", "1").await;
+    load_model(&base, "c", "1").await;
+    load_model(&base, "slow_ensemble", "1").await;
+
+    let client = reqwest::Client::new();
+    let start = std::time::Instant::now();
+    let resp = client
+        .post(format!("{}/v2/models/slow_ensemble/infer", base))
+        .json(&json!({"x": 1}))
+        .send()
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(
+        !resp.status().is_success(),
+        "ensemble must error on total timeout, got status {}",
+        resp.status()
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "ensemble must abort within the total budget (~2s), took {:?}",
+        elapsed
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
