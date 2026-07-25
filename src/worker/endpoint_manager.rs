@@ -14,6 +14,11 @@ use tokio::time::timeout;
 use tracing::{info, warn};
 
 const ENDPOINT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Max time to wait for the endpoint child to exit after SIGKILL. `kill()` is
+/// SIGKILL/TerminateProcess, so this only trips on a stuck OS call — but
+/// without it, a hung `wait()` would block `shutdown()` (and thus the whole
+/// server) indefinitely. Mirrors `worker/mod.rs::WORKER_KILL_TIMEOUT`.
+const ENDPOINT_KILL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Per-route policy table: axum-form route → (rate limit, pre-built CORS headers).
 type RoutePolicyMap = HashMap<
@@ -270,7 +275,15 @@ impl EndpointManager {
         let mut proc = self.process.write().await;
         if let Some(mut p) = proc.take() {
             let _ = p.child.kill().await;
-            let _ = p.child.wait().await;
+            // Bound the reap so a stuck OS call can't hang shutdown(). SIGKILL
+            // makes the normal path return almost instantly, so this deadline
+            // is a pure safety net — same rationale as WORKER_KILL_TIMEOUT.
+            if timeout(ENDPOINT_KILL_TIMEOUT, p.child.wait()).await.is_err() {
+                warn!(
+                    timeout = ?ENDPOINT_KILL_TIMEOUT,
+                    "endpoint child did not exit within deadline; leaving to OS reaper"
+                );
+            }
         }
         #[cfg(unix)]
         let _ = tokio::fs::remove_file(&self.uds_path).await;
