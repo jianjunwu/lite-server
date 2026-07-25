@@ -510,8 +510,12 @@ class Pipeline:
 
     @property
     def has_batch_methods(self) -> bool:
-        cls = type(self.lit_api)
-        return _overrides(cls, "batch", LitAPI) and _overrides(cls, "unbatch", LitAPI)
+        # Batching is governed by max_batch_size: whenever it is greater than
+        # one, the server groups requests and predict() receives them as a
+        # list.  The default batch() (returns the list) / unbatch()
+        # (list(output)) already do the right thing for any list-aware
+        # predict(); overriding them is only needed to reshape the batch.
+        return self.lit_api.max_batch_size > 1
 
     # ---- Hook wrapping ---------------------------------------------------
 
