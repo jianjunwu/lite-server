@@ -321,6 +321,17 @@ impl WorkerManager {
             }
         }
 
+        // #12: on Windows the worker transport is TCP on a deterministic port
+        // (derive_port_from_path). The just-killed worker may not have released
+        // that port yet when the new worker rebinds the same endpoint, and a
+        // failed bind leaves the new worker silently broken. A brief pause
+        // (mirroring reload_model's 500ms) lets the OS free the port. Unix uses
+        // IPC sockets, recycled by the remove_file above, so it's unaffected.
+        #[cfg(windows)]
+        {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
         // Spawn new worker
         let accelerator = model_config.accelerator.as_deref().unwrap_or("cpu");
         let devices = match &model_config.devices {
