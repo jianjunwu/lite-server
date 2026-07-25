@@ -510,12 +510,20 @@ class Pipeline:
 
     @property
     def has_batch_methods(self) -> bool:
-        # Batching is governed by max_batch_size: whenever it is greater than
-        # one, the server groups requests and predict() receives them as a
-        # list.  The default batch() (returns the list) / unbatch()
-        # (list(output)) already do the right thing for any list-aware
-        # predict(); overriding them is only needed to reshape the batch.
-        return self.lit_api.max_batch_size > 1
+        # The worker batch-predicts (batch → predict → unbatch) when EITHER
+        # the server is configured to group requests (max_batch_size > 1) OR
+        # the model overrides batch()/unbatch() to reshape the batch.
+        #   - max_batch_size > 1: a list-aware predict() receives the batch via
+        #     the default batch() (returns the list) / unbatch() (list(output)),
+        #     without forcing authors to override the defaults.
+        #   - overrides: preserves the explicit opt-in for custom reshaping,
+        #     even at max_batch_size == 1 (e.g. a model that packs the batch
+        #     into tensors itself).
+        cls = type(self.lit_api)
+        return (
+            self.lit_api.max_batch_size > 1
+            or (_overrides(cls, "batch", LitAPI) and _overrides(cls, "unbatch", LitAPI))
+        )
 
     # ---- Hook wrapping ---------------------------------------------------
 
