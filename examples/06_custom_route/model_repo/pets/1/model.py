@@ -46,3 +46,22 @@ class PetsAPI(LitAPI):
         # ctx.server queries the hosting server over loopback HTTP.
         # Note: infer() back into this same model is rejected (deadlock).
         return {"loaded": ctx.server.registry.list_loaded()}
+
+    @route.get("/ticks")
+    def ticks(self, ctx):
+        # Streaming route: each yielded item becomes one SSE event
+        # (default text/event-stream media type).
+        from lite_server.response import StreamingResponse
+
+        async def gen():
+            for n in range(3):
+                yield {"n": n}
+
+        return StreamingResponse(content=gen())
+
+    @route.get("/request_count")
+    def request_count(self, ctx):
+        # ctx.server.metrics scrapes the server's /metrics endpoint.
+        total = ctx.server.metrics.query(
+            "liteserver_requests_total", model="pets", version="1")
+        return {"requests": total}

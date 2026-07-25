@@ -360,6 +360,7 @@ Route handlers can query the hosting server over loopback HTTP:
 | `ctx.server.registry.list_loaded()` | Live list of loaded models: `[{"name", "version", "status", "model_type", "workers"}, ...]` |
 | `ctx.server.registry.get(name)` | First entry for one model, or `None` |
 | `await ctx.server.inference.infer(model_name, input_data, version=None)` | Run inference on another model; returns the model's JSON output |
+| `ctx.server.metrics.query(name, **labels)` | Current value of a Prometheus metric (scrapes `/metrics`); `None` when absent |
 
 ```python
 @route.get("/models")
@@ -376,11 +377,44 @@ async def embed_query(self, ctx):
   worker thread; async handlers should wrap them in `asyncio.to_thread`).
 - `inference.infer` is **async**. A sync handler can drive it with
   `asyncio.run(...)` (sync handlers run on a thread without a running loop).
+- `metrics.query` is **synchronous** and suited to counters/gauges;
+  histograms are exposed as separate `<name>_bucket` / `_sum` / `_count`
+  samples.
 - **Self-inference is rejected.** A route handler occupies its worker, so
   calling `infer` back into the same model+version would deadlock with a
   single worker — `infer()` raises `ValueError` for the handler's own
   model/version. Call a *different* model, or use a direct method call for
   own-model logic.
+
+### Streaming routes
+
+Return a `StreamingResponse` to stream the body chunk by chunk:
+
+```python
+from lite_server.response import StreamingResponse
+
+@route.get("/ticks")
+def ticks(self, ctx):
+    async def gen():
+        for n in range(10):
+            yield {"n": n}
+    return StreamingResponse(content=gen())
+```
+
+- `content` may be an async iterator or a plain (sync) iterable — sync
+  iterables are pulled on a thread so a slow `next()` never blocks the
+  worker loop.
+- Each yielded item is serialized per chunk: `bytes` verbatim, `str` as
+  UTF-8, anything else as JSON.
+- With the default `text/event-stream` media type, each chunk is framed as
+  one SSE event (one `data:` line per payload line). Any other
+  `media_type="..."` passes chunk bytes through verbatim with that
+  content-type — e.g. `application/octet-stream` for file-like downloads.
+- `status_code` / `headers` on the `StreamingResponse` become the HTTP
+  response head; they must be set before the first chunk is yielded.
+- Raising `HTTPException` mid-stream sends a terminal structured error
+  event (SSE mode) or truncates the body (other media types) — the status
+  line is already on the wire by then.
 
 See [examples/06_custom_route](../examples/06_custom_route/) for a runnable demo.
 

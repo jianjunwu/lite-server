@@ -6,7 +6,7 @@ over the same ZMQ channel as inference (no separate process).
 
 ## What this does
 
-`model.py` declares four custom routes on `PetsAPI`:
+`model.py` declares six custom routes on `PetsAPI`:
 
 | Route | Method | Path | Purpose |
 |-------|--------|------|---------|
@@ -14,6 +14,8 @@ over the same ZMQ channel as inference (no separate process).
 | `get_pet` | GET | `/v2/models/pets/pets/{pet_id}` | path param, 404 when missing |
 | `create_pet` | POST | `/v2/models/pets/pets` | JSON body, returns 201 |
 | `models` | GET | `/v2/models/pets/models` | `ctx.server` registry query |
+| `ticks` | GET | `/v2/models/pets/ticks` | streaming route (SSE) |
+| `request_count` | GET | `/v2/models/pets/request_count` | `ctx.server` metrics query |
 
 Handlers receive a `RequestContext`:
 
@@ -57,6 +59,16 @@ curl -X POST http://localhost:8000/v2/models/pets/pets \
 curl http://localhost:8000/v2/models/pets/models
 # → {"loaded": [{"name": "pets", "version": "1", "status": "Ready", ...}]}
 
+# streaming route: one SSE event per yielded item
+curl -N http://localhost:8000/v2/models/pets/ticks
+# → data: {"n": 0}
+#   data: {"n": 1}
+#   data: {"n": 2}
+
+# ctx.server: metric lookup from the server's /metrics
+curl http://localhost:8000/v2/models/pets/request_count
+# → {"requests": 5}
+
 # inference still works on the same model
 curl -X POST http://localhost:8000/v2/models/pets/infer \
   -H 'content-type: application/json' -d '{"input": 5}'
@@ -69,5 +81,8 @@ curl -X POST http://localhost:8000/v2/models/pets/infer \
   `versions`, `compare`) are reserved: declaring `@route` at one of them is
   skipped with a warning at load time — you cannot shadow the inference
   contract.
+- Return a `StreamingResponse` to stream chunk by chunk: with the default
+  `text/event-stream` media type each chunk becomes one SSE event; any other
+  `media_type` passes chunk bytes through verbatim.
 - Per-route auth / rate-limit / CORS are out of scope (gateway concern);
   custom routes share the model's global callback chain.

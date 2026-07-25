@@ -355,6 +355,7 @@ class PetsAPI(LitAPI):
 | `ctx.server.registry.list_loaded()` | 实时返回已加载模型列表：`[{"name", "version", "status", "model_type", "workers"}, ...]` |
 | `ctx.server.registry.get(name)` | 返回某个模型的首个条目，不存在时为 `None` |
 | `await ctx.server.inference.infer(model_name, input_data, version=None)` | 对另一个模型执行推理，返回模型的 JSON 输出 |
+| `ctx.server.metrics.query(name, **labels)` | 查询某个 Prometheus 指标的当前值（抓取 `/metrics`）；不存在时为 `None` |
 
 ```python
 @route.get("/models")
@@ -371,9 +372,39 @@ async def embed_query(self, ctx):
   处理器请用 `asyncio.to_thread` 包装）。
 - `inference.infer` 是**异步**的。同步处理器可用 `asyncio.run(...)`
   驱动（同步处理器所在线程没有运行中的事件循环）。
+- `metrics.query` 是**同步**的，适合 counter/gauge 类指标；histogram
+  以 `<name>_bucket` / `_sum` / `_count` 等独立样本暴露。
 - **禁止自推理。** 路由处理器本身占用着 worker，若 `infer` 调回同模型同
   版本，单 worker 时会死锁 — 因此 `infer()` 对本模型/版本直接抛出
   `ValueError`。请改调*其他*模型，或对本模型逻辑直接调用方法。
+
+### 流式路由
+
+返回 `StreamingResponse` 即可逐 chunk 流式输出响应体：
+
+```python
+from lite_server.response import StreamingResponse
+
+@route.get("/ticks")
+def ticks(self, ctx):
+    async def gen():
+        for n in range(10):
+            yield {"n": n}
+    return StreamingResponse(content=gen())
+```
+
+- `content` 可以是异步迭代器，也可以是普通（同步）可迭代对象 — 同步
+  可迭代对象会在线程上逐项拉取，慢速 `next()` 不会阻塞 worker 事件循环。
+- 每个 yield 的项按 chunk 序列化：`bytes` 原样、`str` 按 UTF-8 编码、
+  其他一律 JSON。
+- 默认 `text/event-stream` media type 下，每个 chunk 封装为一个 SSE
+  事件（payload 的每一行各成一条 `data:` 行）。指定其他
+  `media_type="..."` 则 chunk 字节原样透传并使用该 content-type —
+  例如用 `application/octet-stream` 做类文件下载。
+- `StreamingResponse` 上的 `status_code` / `headers` 会成为 HTTP 响应
+  头；它们必须在第一个 chunk yield 之前确定。
+- 流式中途抛出 `HTTPException` 会发送一个终止性的结构化错误事件（SSE
+  模式）或直接截断响应体（其他 media type）— 此时状态行已经发出。
 
 参见 [examples/06_custom_route](../examples/06_custom_route/) 获取可运行示例。
 

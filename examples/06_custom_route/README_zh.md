@@ -6,7 +6,7 @@ worker（不需要独立进程）。
 
 ## 功能
 
-`model.py` 在 `PetsAPI` 上声明了四个自定义路由：
+`model.py` 在 `PetsAPI` 上声明了六个自定义路由：
 
 | 路由 | 方法 | 路径 | 用途 |
 |------|------|------|------|
@@ -14,6 +14,8 @@ worker（不需要独立进程）。
 | `get_pet` | GET | `/v2/models/pets/pets/{pet_id}` | 路径参数，缺失时 404 |
 | `create_pet` | POST | `/v2/models/pets/pets` | JSON body，返回 201 |
 | `models` | GET | `/v2/models/pets/models` | `ctx.server` 查询注册表 |
+| `ticks` | GET | `/v2/models/pets/ticks` | 流式路由（SSE） |
+| `request_count` | GET | `/v2/models/pets/request_count` | `ctx.server` 查询指标 |
 
 handler 接收一个 `RequestContext`：
 
@@ -57,6 +59,16 @@ curl -X POST http://localhost:8000/v2/models/pets/pets \
 curl http://localhost:8000/v2/models/pets/models
 # → {"loaded": [{"name": "pets", "version": "1", "status": "Ready", ...}]}
 
+# 流式路由：每个 yield 的项对应一个 SSE 事件
+curl -N http://localhost:8000/v2/models/pets/ticks
+# → data: {"n": 0}
+#   data: {"n": 1}
+#   data: {"n": 2}
+
+# ctx.server：从服务器的 /metrics 查询指标
+curl http://localhost:8000/v2/models/pets/request_count
+# → {"requests": 5}
+
 # 同一个模型上推理仍然可用
 curl -X POST http://localhost:8000/v2/models/pets/infer \
   -H 'content-type: application/json' -d '{"input": 5}'
@@ -68,5 +80,8 @@ curl -X POST http://localhost:8000/v2/models/pets/infer \
 - 系统路由（`infer`、`events`、`stream`、`ready`、`health`、`reload`、
   `versions`、`compare`）为保留项：在这些路径上声明 `@route` 会在加载时
   被跳过并告警 —— 无法覆盖推理契约。
+- 返回 `StreamingResponse` 可逐 chunk 流式输出：默认
+  `text/event-stream` media type 下每个 chunk 封装为一个 SSE 事件；
+  指定其他 `media_type` 则 chunk 字节原样透传。
 - 路由级 auth / 限流 / CORS 不在范围内（网关层职责）；自定义路由共享模型
   的全局 callback 链。
