@@ -238,17 +238,23 @@ impl WorkerManager {
             tokio::spawn(async move {
                 let mut reloading = std::collections::HashSet::new();
                 while let Some(signal) = rx.recv().await {
-                    let key = signal.model_name.clone();
+                    // Dedup per (model, version): two versions of the same
+                    // model recycle independently.
+                    let key = model_version_key(&signal.model_name, &signal.version);
                     if !reloading.insert(key.clone()) {
                         continue; // already reloading
                     }
                     if let Some(wm) = wm.upgrade() {
-                        info!("Auto-recycling model {} (max_requests reached)", signal.model_name);
-                        let result = wm.reload_model(&signal.model_name, None).await;
+                        info!("Auto-recycling model {} version {} (max_requests reached)",
+                            signal.model_name, signal.version);
+                        let result = wm.reload_model(&signal.model_name, Some(&signal.version)).await;
                         match result {
-                            Ok(true) => info!("Model {} auto-recycled successfully", signal.model_name),
-                            Ok(false) => warn!("Model {} not found for auto-recycle", signal.model_name),
-                            Err(e) => error!("Model {} auto-recycle failed: {}", signal.model_name, e),
+                            Ok(true) => info!("Model {} version {} auto-recycled successfully",
+                                signal.model_name, signal.version),
+                            Ok(false) => warn!("Model {} version {} not found for auto-recycle",
+                                signal.model_name, signal.version),
+                            Err(e) => error!("Model {} version {} auto-recycle failed: {}",
+                                signal.model_name, signal.version, e),
                         }
                         reloading.remove(&key);
                     } else {
@@ -2022,14 +2028,17 @@ mod tests {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             tx.send(crate::inference_queue::ReloadSignal {
                 model_name: "test".to_string(),
+                version: "1".to_string(),
             }).await.unwrap();
 
             let signal = rx.recv().await.unwrap();
             assert_eq!(signal.model_name, "test");
+            assert_eq!(signal.version, "1");
 
             // Clone also works
             tx2.send(crate::inference_queue::ReloadSignal {
                 model_name: "test2".to_string(),
+                version: "1".to_string(),
             }).await.unwrap();
             let signal2 = rx.recv().await.unwrap();
             assert_eq!(signal2.model_name, "test2");
@@ -2038,23 +2047,28 @@ mod tests {
 
     #[test]
     fn test_reload_signal_dedup() {
-        // Simulate the dedup logic from start_reload_listener
+        // Simulate the dedup logic from start_reload_listener: the key is
+        // per (model, version) so two versions of the same model recycle
+        // independently.
         let mut reloading = std::collections::HashSet::new();
 
-        // First signal for model_a → should process
-        assert!(reloading.insert("model_a".to_string()));
+        let a1 = model_version_key("model_a", "1");
+        let a2 = model_version_key("model_a", "2");
 
-        // Second signal for model_a while reloading → should skip
-        assert!(!reloading.insert("model_a".to_string()));
+        // First signal for model_a v1 → should process
+        assert!(reloading.insert(a1.clone()));
 
-        // Different model → should process
-        assert!(reloading.insert("model_b".to_string()));
+        // Second signal for model_a v1 while reloading → should skip
+        assert!(!reloading.insert(a1.clone()));
 
-        // After model_a finishes reloading
-        reloading.remove("model_a");
+        // Same model, different version → independent, should process
+        assert!(reloading.insert(a2.clone()));
 
-        // model_a can be reloaded again
-        assert!(reloading.insert("model_a".to_string()));
+        // After model_a v1 finishes reloading
+        reloading.remove(&a1);
+
+        // model_a v1 can be reloaded again
+        assert!(reloading.insert(a1.clone()));
     }
 
     #[tokio::test]
@@ -2065,11 +2079,13 @@ mod tests {
         // First send succeeds
         assert!(tx.try_send(crate::inference_queue::ReloadSignal {
             model_name: "m1".to_string(),
+            version: "1".to_string(),
         }).is_ok());
 
         // Second send should fail (channel full) — not block
         assert!(tx.try_send(crate::inference_queue::ReloadSignal {
             model_name: "m2".to_string(),
+            version: "1".to_string(),
         }).is_err());
     }
 

@@ -1680,6 +1680,139 @@ class TestAPI(LitAPI):
 }
 
 // ---------------------------------------------------------------------------
+// §4.1: max_requests reload must target the triggering version
+// ---------------------------------------------------------------------------
+
+/// v1 hits max_requests while v2 is the active version: the auto-recycle must
+/// reload v1 and leave the active v2 untouched. (The old ReloadSignal carried
+/// only the model name, so the listener reloaded the *active* version.)
+#[tokio::test]
+async fn test_max_requests_reload_targets_triggering_version() {
+    let model_py = r#"from lite_server import LitAPI
+
+
+class ReloadAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x * 2}
+
+    def encode_response(self, output):
+        return output
+"#;
+
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-reloadver-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let base_cfg = "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n";
+    for (v, cfg) in [("1", format!("{}max_requests: 1\n", base_cfg)), ("2", base_cfg.to_string())] {
+        let dir = tmp_dir.join("reload_model").join(v);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.py"), model_py).unwrap();
+        std::fs::write(dir.join("config.yaml"), cfg).unwrap();
+    }
+
+    let port = 18090;
+    kill_stale_on_port(port);
+    let _server = ServerGuard::start(&[
+        "--port", &port.to_string(),
+        "--model-repo", &tmp_dir.to_string_lossy(),
+        "--no-metrics",
+        "--no-grpc",
+        "--log-level", "warn",
+    ]);
+    wait_for_server(port, 30).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+
+    let health_entry = |body: &Value, v: &str| {
+        body["models"].as_array().unwrap().iter()
+            .find(|m| m["name"] == "reload_model" && m["version"] == v)
+            .cloned()
+    };
+    let get_health = || async {
+        let resp = client.get(format!("{}/health", base)).send().await.unwrap();
+        resp.json::<Value>().await.unwrap()
+    };
+
+    // Load both versions explicitly (default control_mode loads nothing at
+    // startup). Loading v1 auto-activates it (no active version yet).
+    load_model(&base, "reload_model", "1").await;
+    load_model(&base, "reload_model", "2").await;
+
+    // load_model waits on the bare /ready (active version); poll /health until
+    // v2 itself reports ready.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut v2 = None;
+    while tokio::time::Instant::now() < deadline {
+        let body = get_health().await;
+        v2 = health_entry(&body, "2").filter(|e| e["status"] == "ready");
+        if v2.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    let v2 = v2.expect("v2 did not become ready");
+    let v2_loaded_at = v2["loaded_at"].clone();
+    assert!(v2_loaded_at.as_u64().is_some(), "v2 loaded_at: {:?}", v2);
+    let body = get_health().await;
+    let v1_loaded_at = health_entry(&body, "1").expect("v1 loaded")["loaded_at"].clone();
+    assert!(v1_loaded_at.as_u64().is_some(), "v1 loaded_at: {:?}", v1_loaded_at);
+
+    // Make v2 the active version — the buggy code reloaded the active one.
+    let resp = client
+        .post(format!("{}/v2/models/reload_model/versions/2/activate", base))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Hit v1's max_requests via the versioned path.
+    let resp = client
+        .post(format!("{}/v2/models/reload_model/versions/1/infer", base))
+        .json(&json!({"input": 21}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Poll: v1 must be observed recycling (entry briefly unregistered, or
+    // re-registered with a new loaded_at) while v2 stays ready with its
+    // original loaded_at throughout.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut v1_recycled = false;
+    while tokio::time::Instant::now() < deadline {
+        let body = get_health().await;
+        let v2 = health_entry(&body, "2").expect("v2 must stay registered");
+        assert_eq!(v2["status"], "ready", "active v2 must be untouched: {:?}", v2);
+        assert_eq!(v2["loaded_at"], v2_loaded_at, "active v2 must not be reloaded");
+        match health_entry(&body, "1") {
+            None => { v1_recycled = true; break; } // unload phase of the recycle
+            Some(v1) if v1["loaded_at"] != v1_loaded_at => { v1_recycled = true; break; }
+            _ => {}
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(v1_recycled, "v1 was not recycled within 60s of hitting max_requests");
+
+    // v1 comes back ready; v2 still untouched.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut v1_back = false;
+    while tokio::time::Instant::now() < deadline {
+        let body = get_health().await;
+        let v2 = health_entry(&body, "2").expect("v2 must stay registered");
+        assert_eq!(v2["loaded_at"], v2_loaded_at, "active v2 must not be reloaded");
+        if health_entry(&body, "1").is_some_and(|v1| v1["status"] == "ready") {
+            v1_back = true;
+            break;
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    assert!(v1_back, "v1 did not return to ready after recycle");
+
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

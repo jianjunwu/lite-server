@@ -110,6 +110,15 @@ impl ModelRegistry {
             .entry(model_name.to_string())
             .or_insert_with(|| ModelEntry::new(model_name));
 
+        // Refuse to silently overwrite: the old version's workers/queues would
+        // be orphaned. Callers must unload first (§4.1).
+        if entry.versions.contains_key(version) {
+            return Err(AppError::VersionAlreadyLoaded(
+                model_name.to_string(),
+                version.to_string(),
+            ));
+        }
+
         let mv = ModelVersion {
             version: version.to_string(),
             status: VersionStatus::Pending,
@@ -388,6 +397,26 @@ mod tests {
         assert_eq!(mv.version, "1");
         assert_eq!(mv.status, VersionStatus::Pending);
         assert_eq!(mv.loaded_at, None);
+    }
+
+    #[test]
+    fn test_register_duplicate_version_rejected() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+
+        // Silent overwrite would orphan the old version's workers/queues.
+        let err = reg
+            .register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::VersionAlreadyLoaded(ref m, ref v) if m == "m1" && v == "1"),
+            "duplicate register must be rejected, got {err:?}"
+        );
+
+        // A different version of the same model is fine.
+        reg.register("m1", "2", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
     }
 
     // --- Explicit state machine ---

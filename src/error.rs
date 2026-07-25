@@ -18,6 +18,9 @@ pub enum AppError {
     #[error("model version not found: {0}/{1}")]
     VersionNotFound(String, String),
 
+    #[error("model version already loaded: {0}/{1}")]
+    VersionAlreadyLoaded(String, String),
+
     #[error("inference timeout: {0}")]
     InferenceTimeout(String),
 
@@ -112,6 +115,7 @@ impl AppError {
             AppError::ModelNotFound(_) => "model not found",
             AppError::ModelNotReady(_) => "model not ready",
             AppError::VersionNotFound(_, _) => "model version not found",
+            AppError::VersionAlreadyLoaded(_, _) => "model version already loaded",
             AppError::InferenceTimeout(_) => "inference timeout",
             AppError::QueueFull(_) => "queue full",
             AppError::WorkerCrashed(_) => "service temporarily unavailable",
@@ -152,6 +156,7 @@ impl AppError {
             AppError::ModelNotFound(_) => "model_not_found",
             AppError::ModelNotReady(_) => "model_not_ready",
             AppError::VersionNotFound(_, _) => "version_not_found",
+            AppError::VersionAlreadyLoaded(_, _) => "version_already_loaded",
             AppError::InferenceTimeout(_) => "timeout",
             AppError::QueueFull(_) => "queue_full",
             AppError::WorkerCrashed(_) => "internal_error",
@@ -217,6 +222,7 @@ impl IntoResponse for AppError {
             AppError::ModelNotFound(_) => (StatusCode::NOT_FOUND, "not_found_error"),
             AppError::ModelNotReady(_) => (StatusCode::SERVICE_UNAVAILABLE, "model_not_ready"),
             AppError::VersionNotFound(_, _) => (StatusCode::NOT_FOUND, "not_found_error"),
+            AppError::VersionAlreadyLoaded(_, _) => (StatusCode::CONFLICT, "conflict_error"),
             AppError::InferenceTimeout(_) => (StatusCode::GATEWAY_TIMEOUT, "server_error"),
             AppError::QueueFull(_) => (StatusCode::SERVICE_UNAVAILABLE, "queue_full"),
             AppError::WorkerCrashed(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
@@ -480,6 +486,7 @@ mod tests {
         assert_eq!(AppError::ModelNotFound("x".into()).error_code(), "model_not_found");
         assert_eq!(AppError::ModelNotReady("x".into()).error_code(), "model_not_ready");
         assert_eq!(AppError::VersionNotFound("a".into(), "b".into()).error_code(), "version_not_found");
+        assert_eq!(AppError::VersionAlreadyLoaded("a".into(), "b".into()).error_code(), "version_already_loaded");
         assert_eq!(AppError::InferenceTimeout("x".into()).error_code(), "timeout");
         assert_eq!(AppError::QueueFull("x".into()).error_code(), "queue_full");
         assert_eq!(AppError::WorkerCrashed("x".into()).error_code(), "internal_error");
@@ -579,6 +586,19 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["error"]["type"], "method_not_allowed");
         assert_eq!(body["error"]["code"], "method_not_allowed");
+        assert_eq!(body["error"]["param"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn test_version_already_loaded_response() {
+        use axum::response::IntoResponse;
+        let err = AppError::VersionAlreadyLoaded("m1".into(), "1".into());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error"]["type"], "conflict_error");
+        assert_eq!(body["error"]["code"], "version_already_loaded");
         assert_eq!(body["error"]["param"], serde_json::Value::Null);
     }
 

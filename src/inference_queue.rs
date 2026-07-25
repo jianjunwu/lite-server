@@ -200,6 +200,9 @@ const MAX_RETRIES: usize = 3;
 #[derive(Debug)]
 pub struct ReloadSignal {
     pub model_name: String,
+    /// The version whose queue hit max_requests. The listener must recycle
+    /// exactly this version — not the model's active version.
+    pub version: String,
 }
 
 /// Per-(model, version) queue state held in [`InferenceQueue::queues`].
@@ -704,6 +707,7 @@ async fn check_max_requests(
         info!("Worker hit max_requests ({}), signaling reload for {} {}", max_requests, model_name, version);
         let _ = reload_tx.try_send(ReloadSignal {
             model_name: model_name.to_string(),
+            version: version.to_string(),
         });
     }
 }
@@ -1593,6 +1597,9 @@ mod tests {
         check_max_requests(&counter, 3, 5, "model_a", "1", &tx).await;
         let signal = rx.try_recv().unwrap();
         assert_eq!(signal.model_name, "model_a");
+        // The signal must name the version that hit the threshold, so the
+        // listener recycles that version instead of the active one.
+        assert_eq!(signal.version, "1");
     }
 
     #[tokio::test]
@@ -1630,9 +1637,10 @@ mod tests {
         let counter = AtomicUsize::new(0);
 
         // Single batch that exactly hits max_requests
-        check_max_requests(&counter, 10, 10, "exact", "1", &tx).await;
+        check_max_requests(&counter, 10, 10, "exact", "2", &tx).await;
         let signal = rx.try_recv().unwrap();
         assert_eq!(signal.model_name, "exact");
+        assert_eq!(signal.version, "2");
     }
 
     // ===== Shared OutlierState tests =====
