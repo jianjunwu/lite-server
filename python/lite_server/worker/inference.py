@@ -492,8 +492,9 @@ async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.
 
 
 async def _handle_route_call(
-    lit_api: LitAPI, uid: str, request: Request, meta: RequestMeta, log: logging.Logger
-) -> Response:
+    lit_api: LitAPI, uid: str, request: Request, meta: RequestMeta, socket,
+    log: logging.Logger
+) -> Response | None:
     """Dispatch a ``route_call`` to its discovered ``@route`` handler.
 
     Reuses ``Pipeline.run_route`` (on_request → handler → on_response, with
@@ -502,7 +503,13 @@ async def _handle_route_call(
     ``ctx.server`` carries the worker-level ``ServerProxy`` (built at startup
     from ``--server-http``); ``None`` when the server did not pass one (e.g.
     unix-socket HTTP deployments or standalone runs).
+
+    A handler returning ``StreamingResponse`` instead streams inline over
+    ``socket`` (start → chunks → done, stream_id == uid) and this returns
+    ``None`` — the caller must not send a further reply.
     """
+    from lite_server.response import StreamingResponse
+
     rc = request.route_call
     handlers = getattr(lit_api, "_route_handlers", {})
     route_pipe = getattr(lit_api, "_route_pipeline", None)
@@ -519,7 +526,74 @@ async def _handle_route_call(
     )
     ctx.server = getattr(lit_api, "_server_proxy", None)
     await route_pipe.run_route(ctx, handler)
+    if isinstance(ctx.early, StreamingResponse):
+        await _send_route_stream(socket, uid, ctx.early, ctx, log)
+        return None
     return _build_route_response(uid, ctx)
+
+
+def _serialize_route_chunk(item) -> bytes:
+    """One streamed item → wire bytes: bytes verbatim, str utf-8, else JSON."""
+    if isinstance(item, (bytes, bytearray)):
+        return bytes(item)
+    if isinstance(item, str):
+        return item.encode()
+    return json.dumps(item).encode()
+
+
+async def _send_route_stream(socket, stream_id: str, resp, ctx: RequestContext,
+                             log: logging.Logger) -> None:
+    """Stream a route handler's ``StreamingResponse`` over the worker channel.
+
+    Frame sequence mirrors inference streaming, prefixed with a ``start``
+    frame carrying the handler-chosen HTTP metadata (status / headers /
+    media_type) so the Rust side can build the response head before the
+    first body chunk. Sync iterators are pulled via ``asyncio.to_thread``
+    so a slow ``next()`` never blocks the worker loop.
+    """
+    from lite_server.exceptions import HTTPException
+    from lite_server.proto.liteserver_pb2 import StreamStart
+
+    headers = dict(resp.headers)
+    headers.update(ctx.response_headers or {})
+    start = StreamStart(status_code=resp.status_code,
+                        media_type=resp.media_type or "text/event-stream")
+    for k, v in headers.items():
+        start.headers[str(k)] = str(v)
+    await socket.send(Response(
+        uid=f"stream-start-{stream_id}",
+        stream=StreamResponse(stream_id=stream_id, start=start),
+    ).SerializeToString())
+
+    content = resp.content
+    try:
+        if hasattr(content, "__aiter__"):
+            async for item in content:
+                await socket.send(
+                    _make_stream_chunk(stream_id, _serialize_route_chunk(item))
+                    .SerializeToString())
+        else:
+            it = iter(content)
+            sentinel = object()
+            while True:
+                item = await asyncio.to_thread(next, it, sentinel)
+                if item is sentinel:
+                    break
+                await socket.send(
+                    _make_stream_chunk(stream_id, _serialize_route_chunk(item))
+                    .SerializeToString())
+    except HTTPException as e:
+        await socket.send(
+            _make_stream_error(stream_id, e.detail, error_type=e.error_type,
+                               code=e.code, param=e.param).SerializeToString())
+        return
+    except Exception as e:
+        log.warning("route stream %s failed mid-iteration: %s",
+                    stream_id, _format_exc_brief(e))
+        await socket.send(
+            _make_stream_error(stream_id, str(e)).SerializeToString())
+        return
+    await socket.send(_make_stream_done(stream_id).SerializeToString())
 
 
 def _build_route_response(uid: str, ctx: RequestContext) -> Response:
@@ -574,7 +648,9 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
 
     try:
         if request.HasField("route_call"):
-            response = await _handle_route_call(lit_api, uid, request, meta, log)
+            response = await _handle_route_call(lit_api, uid, request, meta, socket, log)
+            if response is None:
+                return  # streaming route already replied inline over socket
 
         elif request.HasField("single"):
             # Health check: empty data → skip predict pipeline

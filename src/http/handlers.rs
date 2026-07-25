@@ -1072,13 +1072,119 @@ pub async fn dispatch_custom_route(
         ..Default::default()
     };
 
-    let response = client.send(request).await?;
+    let (mut resp_rx, mut chunk_rx) = client.send_route_or_stream(request).await?;
 
-    // Decode the SingleResponse (routes reuse the inference response shape).
-    match response.payload {
-        Some(pb::response::Payload::Single(single)) => build_route_http_response(single),
-        _ => Err(AppError::WorkerCrashed("unexpected response type".to_string())),
+    // The handler picks the reply shape: a plain/Response result answers with
+    // one SingleResponse; a StreamingResponse result answers with a
+    // start→chunks→done frame sequence. Race the first arrival, bounded like
+    // a unary send so a dead worker can't hang the request.
+    enum RouteReply {
+        Unary(Option<pb::Response>),
+        Stream(pb::StreamResponse),
     }
+    let first = tokio::time::timeout(ROUTE_FIRST_FRAME_TIMEOUT, async {
+        tokio::select! {
+            unary = &mut resp_rx => RouteReply::Unary(unary.ok()),
+            frame = chunk_rx.recv() => match frame {
+                Some(f) => RouteReply::Stream(f),
+                // Chunk sender dropped with no frames sent: the unary reply
+                // arrived first (its delivery frees the unused stream route,
+                // which is what closed this channel). Wait for the unary
+                // reply instead of treating the close as a stream failure —
+                // select! would otherwise pick between two ready arms at
+                // random.
+                None => RouteReply::Unary(resp_rx.await.ok()),
+            },
+        }
+    })
+    .await
+    .map_err(|_| AppError::InferenceTimeout("route response timeout".to_string()))?;
+
+    match first {
+        RouteReply::Unary(Some(response)) => match response.payload {
+            // Decode the SingleResponse (routes reuse the inference response shape).
+            Some(pb::response::Payload::Single(single)) => build_route_http_response(single),
+            _ => Err(AppError::WorkerCrashed("unexpected response type".to_string())),
+        },
+        RouteReply::Unary(None) => Err(AppError::WorkerCrashed(
+            "route reply channel closed".to_string(),
+        )),
+        RouteReply::Stream(frame) => match frame.payload {
+            Some(pb::stream_response::Payload::Start(start)) => {
+                build_route_stream_http_response(start, chunk_rx)
+            }
+            _ => Err(AppError::WorkerCrashed(
+                "route stream missing start frame".to_string(),
+            )),
+        },
+    }
+}
+
+/// Bound on waiting for a route call's first reply frame (unary or stream
+/// start). Mirrors the transport's unary response timeout.
+const ROUTE_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Build the HTTP response for a streaming route reply. The `start` frame
+/// carries the handler-chosen status/headers/media_type; subsequent `chunk`
+/// frames form the body. For `text/event-stream` each chunk is framed as one
+/// SSE event; other media types pass chunk bytes through verbatim. A
+/// mid-stream `error` frame ends the body (as a final SSE event in SSE
+/// mode), since the status line is already on the wire.
+fn build_route_stream_http_response(
+    start: pb::StreamStart,
+    chunk_rx: mpsc::Receiver<pb::StreamResponse>,
+) -> Result<Response, AppError> {
+    let is_sse = start.media_type.starts_with("text/event-stream");
+    let content_type = if start.media_type.is_empty() {
+        "text/event-stream"
+    } else {
+        start.media_type.as_str()
+    };
+    let body = futures::stream::unfold((chunk_rx, false), move |(mut rx, ended)| async move {
+        if ended {
+            return None;
+        }
+        match rx.recv().await.map(|f| f.payload) {
+            Some(Some(pb::stream_response::Payload::Chunk(c))) => {
+                let data = if is_sse { sse_frame(&c.data) } else { c.data.to_vec() };
+                Some((Ok::<_, Infallible>(bytes::Bytes::from(data)), (rx, false)))
+            }
+            Some(Some(pb::stream_response::Payload::Error(e))) => {
+                warn!("route stream error: {}", e.message);
+                if is_sse {
+                    let event = sse_frame(e.message.as_bytes());
+                    Some((Ok(bytes::Bytes::from(event)), (rx, true)))
+                } else {
+                    None
+                }
+            }
+            // Done, channel closed, or an unexpected frame — end the body.
+            _ => None,
+        }
+    });
+    let mut builder = Response::builder().header("content-type", content_type);
+    if start.status_code > 0 {
+        if let Ok(sc) = axum::http::StatusCode::from_u16(start.status_code as u16) {
+            builder = builder.status(sc);
+        }
+    }
+    let builder = inject_response_headers(builder, &start.headers);
+    builder
+        .body(axum::body::Body::from_stream(body))
+        .map_err(|e| AppError::Internal(format!("build response: {}", e)))
+}
+
+/// Frame one payload as an SSE event: every line becomes its own `data:`
+/// line (embedded newlines would otherwise corrupt the event stream).
+fn sse_frame(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 8);
+    for line in data.split(|b| *b == b'\n') {
+        out.extend_from_slice(b"data: ");
+        out.extend_from_slice(line);
+        out.push(b'\n');
+    }
+    out.push(b'\n');
+    out
 }
 
 /// Map a worker `SingleResponse` (from a route call) onto an HTTP response.

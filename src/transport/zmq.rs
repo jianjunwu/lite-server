@@ -29,6 +29,17 @@ enum ZmqCommand {
     Raw {
         request: pb::Request,
     },
+    /// Custom-route call whose reply shape is not known up front: a plain
+    /// handler result answers with one `SingleResponse`, a `StreamingResponse`
+    /// result answers with a start→chunks→done `StreamResponse` sequence.
+    /// Registers both a pending unary slot and a stream route under the
+    /// request uid; whichever shape arrives uses its channel, the other is
+    /// cleaned up on arrival (or by the pending sweep if never used).
+    RouteOrStream {
+        request: pb::Request,
+        response_tx: oneshot::Sender<pb::Response>,
+        chunk_tx: mpsc::Sender<pb::StreamResponse>,
+    },
 }
 
 pub struct WorkerZmqClient {
@@ -106,6 +117,20 @@ impl WorkerZmqClient {
                                 error!("ZMQ raw send error: {}", e);
                             }
                         }
+                        Ok(ZmqCommand::RouteOrStream { request, response_tx, chunk_tx }) => {
+                            let uid = request.uid.clone();
+                            let bytes = request.encode_to_vec();
+                            match socket.send(&bytes, 0) {
+                                Ok(_) => {
+                                    pending.insert(uid.clone(), response_tx);
+                                    stream_routes.insert(uid, chunk_tx);
+                                }
+                                Err(e) => {
+                                    error!("ZMQ send error: {}", e);
+                                    let _ = response_tx.send(error_response(&uid, &format!("ZMQ send: {}", e)));
+                                }
+                            }
+                        }
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => {
                             info!("ZMQ command channel closed, draining pending and shutting down");
@@ -162,7 +187,19 @@ impl WorkerZmqClient {
                                                     stream_routes.remove(sid);
                                                 }
                                             }
+                                            // A streaming route reply leaves its
+                                            // unused unary slot behind — free it
+                                            // once the stream terminates.
+                                            if matches!(stream_resp.payload,
+                                                Some(pb::stream_response::Payload::Done(_))
+                                                | Some(pb::stream_response::Payload::Error(_)))
+                                            {
+                                                pending.remove(sid);
+                                            }
                                         } else if let Some(tx) = pending.remove(&resp.uid) {
+                                            // A unary route reply leaves its
+                                            // unused stream route behind.
+                                            stream_routes.remove(&resp.uid);
                                             let _ = tx.send(resp);
                                         } else {
                                             warn!("Received response for unknown uid: {}", resp.uid);
@@ -242,6 +279,23 @@ impl WorkerZmqClient {
             .map_err(|_| AppError::Transport("ZMQ command channel closed".to_string()))?;
 
         Ok(chunk_rx)
+    }
+
+    /// Send a custom-route call whose reply shape is decided by the handler:
+    /// a plain result comes back on the oneshot (one `SingleResponse`), a
+    /// `StreamingResponse` result comes back as stream frames on the channel.
+    /// Exactly one of the two produces output.
+    pub async fn send_route_or_stream(
+        &self,
+        request: pb::Request,
+    ) -> Result<(oneshot::Receiver<pb::Response>, mpsc::Receiver<pb::StreamResponse>), AppError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        let (chunk_tx, chunk_rx) = mpsc::channel(STREAM_CHANNEL_SIZE);
+        self.cmd_tx
+            .send(ZmqCommand::RouteOrStream { request, response_tx, chunk_tx })
+            .await
+            .map_err(|_| AppError::Transport("ZMQ command channel closed".to_string()))?;
+        Ok((response_rx, chunk_rx))
     }
 
     /// Fire-and-forget send: deliver `request` without awaiting a reply.

@@ -255,6 +255,27 @@ class RouteAPI(LitAPI):
         # self-inference must raise ValueError (deadlock guard, phase 2b)
         out = await ctx.server.inference.infer("route_model", {"input": 7})
         return {"self_out": out}
+
+    @route.get("/ticks")
+    def ticks(self, ctx):
+        # StreamingResponse: SSE framing by default media type (phase 3)
+        from lite_server.response import StreamingResponse
+
+        async def gen():
+            for n in (1, 2, 3):
+                yield {"n": n}
+
+        return StreamingResponse(content=gen(), headers={"X-Route": "ticks"})
+
+    @route.get("/download")
+    def download(self, ctx):
+        # non-SSE media type: chunk bytes pass through verbatim (phase 3)
+        from lite_server.response import StreamingResponse
+
+        return StreamingResponse(
+            content=iter([b"chunk1-", b"chunk2"]),
+            media_type="application/octet-stream",
+        )
 "#,
     )
     .unwrap();
@@ -780,6 +801,46 @@ async fn test_custom_route_ctx_server_self_infer_rejected() {
         .json(&json!({}))
         .send().await.unwrap();
     assert_eq!(resp.status(), 500);
+
+    unload_model(&base, ROUTE_MODEL, "1").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_custom_route_streaming() {
+    // StreamingResponse from a @route handler (phase 3): the default media
+    // type frames each chunk as one SSE event; other media types pass chunk
+    // bytes through verbatim.
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    load_model(&base, ROUTE_MODEL, "1").await;
+
+    let resp = client
+        .get(format!("{}/v2/models/{}/ticks", base, ROUTE_MODEL))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
+    assert_eq!(resp.headers().get("x-route").unwrap(), "ticks");
+    let body = resp.text().await.unwrap();
+    assert_eq!(
+        body,
+        "data: {\"n\": 1}\n\ndata: {\"n\": 2}\n\ndata: {\"n\": 3}\n\n"
+    );
+
+    let resp = client
+        .get(format!("{}/v2/models/{}/download", base, ROUTE_MODEL))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/octet-stream"
+    );
+    let body = resp.text().await.unwrap();
+    assert_eq!(body, "chunk1-chunk2");
 
     unload_model(&base, ROUTE_MODEL, "1").await;
 }

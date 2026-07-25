@@ -53,7 +53,7 @@ class TestRouteCallServerInjection:
             request_id="", timestamp_ns=0, method="GET",
         )
         resp = await _handle_route_call(
-            inst, "u1", req, meta, logging.getLogger("test"))
+            inst, "u1", req, meta, None, logging.getLogger("test"))
         assert json.loads(resp.single.data) == {"has_server": True}
 
     @pytest.mark.asyncio
@@ -89,8 +89,189 @@ class TestRouteCallServerInjection:
             request_id="", timestamp_ns=0, method="GET",
         )
         resp = await _handle_route_call(
-            inst, "u1", req, meta, logging.getLogger("test"))
+            inst, "u1", req, meta, None, logging.getLogger("test"))
         assert json.loads(resp.single.data) == {"server_is_none": True}
+
+
+class TestRouteStreaming:
+    """``@route`` handlers returning ``StreamingResponse`` stream over the
+    worker channel: a ``start`` frame (status/headers/media_type), one
+    ``chunk`` frame per yielded item, then ``done`` (or ``error``). The
+    handler's uid doubles as the stream_id so the Rust side can demux."""
+
+    @staticmethod
+    def _fake_socket():
+        class FakeSocket:
+            def __init__(self):
+                self.frames = []
+
+            async def send(self, data):
+                self.frames.append(data)
+
+        return FakeSocket()
+
+    @staticmethod
+    def _decode(socket):
+        from lite_server.proto import liteserver_pb2 as pb
+        out = []
+        for frame in socket.frames:
+            resp = pb.Response()
+            resp.ParseFromString(frame)
+            out.append(resp)
+        return out
+
+    def _make_inst(self, handler):
+        from lite_server.pipeline import Pipeline
+        from lite_server.worker.inference import _discover_routes
+
+        class M(LitAPI):
+            def setup(self, device):
+                pass
+
+            def predict(self, x):
+                return x
+
+        M.events = route.get("/events")(handler)
+        inst = M(max_batch_size=1, batch_timeout=0.0, stream=False)
+        _discover_routes(inst)
+        inst._route_pipeline = Pipeline.for_route([])
+        return inst
+
+    async def _call(self, inst, socket):
+        import logging
+
+        from lite_server import Headers, RequestMeta
+        from lite_server.proto import liteserver_pb2 as pb
+        from lite_server.worker.inference import _handle_route_call
+
+        req = pb.Request(uid="u1")
+        req.meta.route = "/events"
+        req.meta.method = "GET"
+        req.route_call.data = b"{}"
+        meta = RequestMeta(
+            route="/events", headers=Headers(), client_ip="",
+            request_id="", timestamp_ns=0, method="GET",
+        )
+        return await _handle_route_call(
+            inst, "u1", req, meta, socket, logging.getLogger("test"))
+
+    @pytest.mark.asyncio
+    async def test_async_generator_sends_start_chunks_done(self):
+        from lite_server.response import StreamingResponse
+
+        async def gen():
+            yield {"n": 1}
+            yield {"n": 2}
+
+        def handler(self, ctx):
+            return StreamingResponse(content=gen())
+
+        socket = self._fake_socket()
+        result = await self._call(self._make_inst(handler), socket)
+
+        assert result is None  # streaming replies inline, no SingleResponse
+        frames = self._decode(socket)
+        kinds = [f.stream.WhichOneof("payload") for f in frames]
+        assert kinds == ["start", "chunk", "chunk", "done"]
+        assert all(f.stream.stream_id == "u1" for f in frames)
+        assert frames[0].stream.start.status_code == 200
+        assert frames[0].stream.start.media_type == "text/event-stream"
+        assert json.loads(frames[1].stream.chunk.data) == {"n": 1}
+        assert json.loads(frames[2].stream.chunk.data) == {"n": 2}
+
+    @pytest.mark.asyncio
+    async def test_sync_generator_streams(self):
+        from lite_server.response import StreamingResponse
+
+        def handler(self, ctx):
+            return StreamingResponse(content=iter([{"a": 1}, {"a": 2}]))
+
+        socket = self._fake_socket()
+        await self._call(self._make_inst(handler), socket)
+
+        frames = self._decode(socket)
+        kinds = [f.stream.WhichOneof("payload") for f in frames]
+        assert kinds == ["start", "chunk", "chunk", "done"]
+
+    @pytest.mark.asyncio
+    async def test_chunk_serialization_rules(self):
+        """bytes pass through, str encodes utf-8, anything else is JSON."""
+        from lite_server.response import StreamingResponse
+
+        async def gen():
+            yield b"\x00\x01"
+            yield "hello"
+            yield [1, 2]
+
+        def handler(self, ctx):
+            return StreamingResponse(content=gen())
+
+        socket = self._fake_socket()
+        await self._call(self._make_inst(handler), socket)
+
+        chunks = [f.stream.chunk.data for f in self._decode(socket)
+                  if f.stream.WhichOneof("payload") == "chunk"]
+        assert chunks == [b"\x00\x01", b"hello", b"[1, 2]"]
+
+    @pytest.mark.asyncio
+    async def test_start_frame_carries_status_headers_and_ctx_headers(self):
+        from lite_server.response import StreamingResponse
+
+        async def gen():
+            yield 1
+
+        def handler(self, ctx):
+            ctx.response_headers["X-Cb"] = "1"
+            return StreamingResponse(
+                content=gen(), status_code=201, headers={"X-H": "2"})
+
+        socket = self._fake_socket()
+        await self._call(self._make_inst(handler), socket)
+
+        start = self._decode(socket)[0].stream.start
+        assert start.status_code == 201
+        assert start.headers["X-H"] == "2"
+        assert start.headers["X-Cb"] == "1"
+
+    @pytest.mark.asyncio
+    async def test_http_exception_mid_stream_sends_structured_error(self):
+        from lite_server.exceptions import HTTPException
+        from lite_server.response import StreamingResponse
+
+        async def gen():
+            yield {"ok": 1}
+            raise HTTPException(status_code=429, detail="slow down")
+
+        def handler(self, ctx):
+            return StreamingResponse(content=gen())
+
+        socket = self._fake_socket()
+        await self._call(self._make_inst(handler), socket)
+
+        frames = self._decode(socket)
+        kinds = [f.stream.WhichOneof("payload") for f in frames]
+        assert kinds == ["start", "chunk", "error"]
+        err = json.loads(frames[-1].stream.error.message)
+        assert err["error"]["message"] == "slow down"
+
+    @pytest.mark.asyncio
+    async def test_generic_exception_mid_stream_sends_error(self):
+        from lite_server.response import StreamingResponse
+
+        async def gen():
+            yield 1
+            raise ValueError("boom")
+
+        def handler(self, ctx):
+            return StreamingResponse(content=gen())
+
+        socket = self._fake_socket()
+        await self._call(self._make_inst(handler), socket)
+
+        frames = self._decode(socket)
+        kinds = [f.stream.WhichOneof("payload") for f in frames]
+        assert kinds == ["start", "chunk", "error"]
+        assert "boom" in frames[-1].stream.error.message
 
 
 class TestRouterDecorator:
