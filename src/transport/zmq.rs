@@ -3,6 +3,7 @@ use crate::proto::liteserver as pb;
 use prost::Message;
 use std::collections::HashMap;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
@@ -70,6 +71,7 @@ impl WorkerZmqClient {
 
             let mut pending: HashMap<String, oneshot::Sender<pb::Response>> = HashMap::new();
             let mut stream_routes: HashMap<String, mpsc::Sender<pb::StreamResponse>> = HashMap::new();
+            let mut last_pending_sweep = Instant::now();
 
             loop {
                 loop {
@@ -186,6 +188,18 @@ impl WorkerZmqClient {
                         std::thread::sleep(Duration::from_millis(100));
                     }
                 }
+
+                // #5: periodically evict pending senders whose caller already
+                // timed out and dropped the receiver, so a worker that never
+                // replies can't leak entries until disconnect. The poll loop
+                // ticks ~every 100ms; gating on elapsed time bounds sweep cost.
+                if last_pending_sweep.elapsed() >= Duration::from_secs(5) {
+                    let removed = sweep_dead_pending(&mut pending);
+                    if removed > 0 {
+                        warn!("Swept {} orphaned pending ZMQ response(s)", removed);
+                    }
+                    last_pending_sweep = Instant::now();
+                }
             }
         });
 
@@ -260,9 +274,50 @@ fn error_response(uid: &str, message: &str) -> pb::Response {
     }
 }
 
+/// Drop pending-response senders whose receiver has gone away — i.e. the
+/// caller already timed out and dropped `response_rx`. Such entries otherwise
+/// linger in the map until the worker finally replies or the whole client is
+/// dropped (#5). Returns the number evicted.
+fn sweep_dead_pending(pending: &mut HashMap<String, oneshot::Sender<pb::Response>>) -> usize {
+    let before = pending.len();
+    pending.retain(|_, tx| !tx.is_closed());
+    before - pending.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sweep_dead_pending_removes_senders_whose_receiver_dropped() {
+        // #5: a request whose caller timed out (response_rx dropped) leaves a
+        // dead oneshot::Sender in the pending map. Its is_closed() is true, so
+        // a periodic sweep must evict it while keeping live senders intact.
+        let mut pending: HashMap<String, oneshot::Sender<pb::Response>> = HashMap::new();
+        let (live_tx, _live_rx) = oneshot::channel();
+        let (dead_tx, dead_rx) = oneshot::channel();
+        drop(dead_rx);
+        pending.insert("live".to_string(), live_tx);
+        pending.insert("dead".to_string(), dead_tx);
+
+        let removed = sweep_dead_pending(&mut pending);
+        assert_eq!(removed, 1);
+        assert!(pending.contains_key("live"));
+        assert!(!pending.contains_key("dead"));
+    }
+
+    #[test]
+    fn sweep_dead_pending_keeps_all_when_all_live() {
+        let mut pending: HashMap<String, oneshot::Sender<pb::Response>> = HashMap::new();
+        let (tx1, _rx1) = oneshot::channel();
+        let (tx2, _rx2) = oneshot::channel();
+        pending.insert("a".to_string(), tx1);
+        pending.insert("b".to_string(), tx2);
+
+        let removed = sweep_dead_pending(&mut pending);
+        assert_eq!(removed, 0);
+        assert_eq!(pending.len(), 2);
+    }
 
     #[tokio::test]
     async fn test_zmq_client_cleanup_does_not_panic() {
