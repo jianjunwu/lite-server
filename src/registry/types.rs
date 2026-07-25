@@ -1,13 +1,36 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Explicit lifecycle state machine for a model version.
+///
+/// ```text
+/// Pending ──spawn──▶ Loading ──handshake──▶ Ready ◀──▶ Degraded
+///                      │                     ▲            │
+///                      └──load failure──▶ Failed     (coordinator
+///                                                     reconciles)
+/// ```
+///
+/// `Failed` is only set during load (startup crash / timeout); runtime worker
+/// loss is `Degraded` (outlier ejection auto-recovers). The status coordinator
+/// is the sole writer of `Ready`/`Degraded` transitions at runtime; `Loading`
+/// →`Ready` stays event-driven at the worker handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VersionStatus {
+    /// Registered, workers not yet spawned.
+    Pending,
+    /// Workers spawning / model weights loading.
     Loading,
+    /// All workers healthy, serving traffic.
     Ready,
+    /// Serving but impaired (some/all workers ejected).
+    Degraded,
+    /// Load failed; does not accept requests.
+    Failed,
+    /// Unload in progress.
     Unloading,
-    Error,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +65,10 @@ pub struct ModelVersion {
     pub model_type: ModelType,
     pub model_dir: PathBuf,
     pub workers: Vec<WorkerInfo>,
+    /// When the version first entered `Ready` (handshake completed). `None`
+    /// while still Pending/Loading and preserved across Ready↔Degraded.
+    #[serde(default)]
+    pub loaded_at: Option<SystemTime>,
     #[serde(default)]
     pub policies: crate::worker::protocol::ModelPolicies,
     /// Pre-built CORS header map, cached at policy ingest (B9) so responses
@@ -65,7 +92,6 @@ pub enum WorkerStatus {
     Starting,
     Ready,
     Busy,
-    Error,
     Stopped,
 }
 

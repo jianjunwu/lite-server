@@ -77,7 +77,7 @@ class TestModelRegistryLifecycle:
         mv = reg.get("m1", "1")
         assert mv is not None
         assert mv["version"] == "1"
-        assert mv["status"] == "Loading"
+        assert mv["status"] == "Pending"
 
     def test_get_nonexistent_returns_none(self):
         reg = ModelRegistry()

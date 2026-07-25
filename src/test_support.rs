@@ -79,7 +79,7 @@ impl PyModelRegistry {
     }
 
     /// set_status(name, version, status)
-    /// status: "Loading" | "Ready" | "Unloading" | "Error"
+    /// status: "Pending" | "Loading" | "Ready" | "Degraded" | "Failed" | "Unloading"
     fn set_status(&self, name: &str, version: &str, status: &str) -> PyResult<()> {
         let vs = parse_status(status)?;
         self.inner
@@ -164,12 +164,14 @@ fn python_dict_to_json(dict: &Bound<'_, PyDict>) -> PyResult<serde_json::Value> 
 
 fn parse_status(s: &str) -> PyResult<VersionStatus> {
     match s {
+        "Pending" => Ok(VersionStatus::Pending),
         "Loading" => Ok(VersionStatus::Loading),
         "Ready" => Ok(VersionStatus::Ready),
+        "Degraded" => Ok(VersionStatus::Degraded),
+        "Failed" => Ok(VersionStatus::Failed),
         "Unloading" => Ok(VersionStatus::Unloading),
-        "Error" => Ok(VersionStatus::Error),
         _ => Err(pyo3::exceptions::PyValueError::new_err(
-            format!("unknown status: {}; expected Loading|Ready|Unloading|Error", s),
+            format!("unknown status: {}; expected Pending|Loading|Ready|Degraded|Failed|Unloading", s),
         )),
     }
 }

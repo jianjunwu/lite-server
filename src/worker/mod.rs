@@ -156,6 +156,11 @@ pub struct WorkerManager {
     log_level: String,
     // Callback runner for lifecycle events
     callback_runner: Arc<CallbackRunner>,
+    // Status coordinator tasks per model version (phase 3). Reconciles
+    // Ready/Degraded from the outlier-ejection state at the version's
+    // health_check_interval cadence; no task when the interval is 0
+    // (status then stays purely event-driven).
+    status_coordinators: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
     // Loopback HTTP base URL of this server (e.g. http://127.0.0.1:8000),
     // passed to workers as --server-http so @route handlers can query the
     // hosting server via ctx.server (phase 2b). None for unix-socket HTTP.
@@ -200,6 +205,7 @@ impl WorkerManager {
             respawn_rx: tokio::sync::Mutex::new(Some(respawn_rx)),
             log_level,
             callback_runner,
+            status_coordinators: Arc::new(RwLock::new(HashMap::new())),
             server_http: None,
         }
     }
@@ -344,6 +350,13 @@ impl WorkerManager {
         }
 
         // Spawn new worker
+        //
+        // The version dips to Loading while the replacement starts; the
+        // handshake marks it Ready again, a startup failure marks it
+        // Degraded (runtime worker loss, not a load failure — Failed is
+        // load-phase only).
+        self.registry
+            .set_status(model_name, version, VersionStatus::Loading)?;
         let accelerator = model_config.accelerator.as_deref().unwrap_or("cpu");
         let devices = match &model_config.devices {
             Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(1) as usize,
@@ -386,29 +399,36 @@ impl WorkerManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| AppError::Python(format!("failed to spawn worker: {}", e)))?;
+            .map_err(|e| AppError::Python(format!("failed to spawn worker: {}", e)))
+            .inspect_err(|_| self.mark_degraded(model_name, version))?;
 
         let stdout = child.stdout.take()
-            .ok_or_else(|| AppError::Internal("worker stdout not piped".to_string()))?;
+            .ok_or_else(|| AppError::Internal("worker stdout not piped".to_string()))
+            .inspect_err(|_| self.mark_degraded(model_name, version))?;
         let stderr = child.stderr.take()
-            .ok_or_else(|| AppError::Internal("worker stderr not piped".to_string()))?;
+            .ok_or_else(|| AppError::Internal("worker stderr not piped".to_string()))
+            .inspect_err(|_| self.mark_degraded(model_name, version))?;
 
         // Wait for "ready" signal
         let mut reader = BufReader::new(stdout);
         let mut ready_line = String::new();
         let n = timeout(Duration::from_secs(60), reader.read_line(&mut ready_line))
             .await
-            .map_err(|_| AppError::InferenceTimeout("worker startup timeout".to_string()))?
-            .map_err(AppError::Io)?;
+            .map_err(|_| AppError::InferenceTimeout("worker startup timeout".to_string()))
+            .and_then(|r| r.map_err(AppError::Io))
+            .inspect_err(|_| self.mark_degraded(model_name, version))?;
         if n == 0 {
+            self.mark_degraded(model_name, version);
             return Err(AppError::WorkerCrashed("worker exited before ready".to_string()));
         }
         let stdout = reader.into_inner();
 
         let startup: WorkerStartup = serde_json::from_str(ready_line.trim())
-            .map_err(|e| AppError::Internal(format!("worker startup JSON parse error: {}", e)))?;
+            .map_err(|e| AppError::Internal(format!("worker startup JSON parse error: {}", e)))
+            .inspect_err(|_| self.mark_degraded(model_name, version))?;
 
         if startup.status != "ready" {
+            self.mark_degraded(model_name, version);
             return Err(AppError::WorkerCrashed(format!(
                 "worker {} startup failed: {:?}",
                 worker_id, startup.message
@@ -544,6 +564,9 @@ impl WorkerManager {
             }
         }
 
+        // Replacement worker is up: Loading → Ready (loaded_at preserved).
+        self.registry.mark_ready(model_name, version)?;
+
         // Record metric
         crate::metrics::prometheus::WORKER_RESPAWNS_TOTAL
             .with_label_values(&[model_name, version, "heartbeat_timeout"])
@@ -576,6 +599,71 @@ impl WorkerManager {
         let key = model_version_key(model_name, version);
         let guard = self.outlier_states.read().await;
         guard.get(&key).cloned()
+    }
+
+    /// Mark a version Failed during load (startup crash / timeout). Failed is
+    /// load-phase only; runtime impairment is Degraded via the coordinator.
+    fn mark_load_failed(&self, model_name: &str, version: &str) {
+        if let Err(e) = self.registry.set_status(model_name, version, VersionStatus::Failed) {
+            warn!(model = %model_name, version = %version, "failed to mark version failed: {}", e);
+        }
+    }
+
+    /// Mark a version Degraded after a runtime worker loss (e.g. respawn
+    /// failure). The coordinator takes it from there; outlier recovery can
+    /// bring it back to Ready.
+    fn mark_degraded(&self, model_name: &str, version: &str) {
+        if let Err(e) = self.registry.set_status(model_name, version, VersionStatus::Degraded) {
+            warn!(model = %model_name, version = %version, "failed to mark version degraded: {}", e);
+        }
+    }
+
+    /// Start the status coordinator for a model version: every `interval`,
+    /// reconcile Ready/Degraded from the outlier-ejection state. Called at
+    /// load when `health_check_interval > 0`; an interval of 0 means no
+    /// periodic coordination — status is then purely event-driven.
+    async fn start_status_coordinator(&self, model_name: &str, version: &str, interval: Duration) {
+        let key = model_version_key(model_name, version);
+        let task_key = key.clone();
+        let registry = self.registry.clone();
+        let outlier_states = self.outlier_states.clone();
+        let model = model_name.to_string();
+        let ver = version.to_string();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                let outlier = {
+                    let guard = outlier_states.read().await;
+                    guard.get(&task_key).cloned()
+                };
+                if let Some(new_status) =
+                    reconcile_version_status(&registry, &model, &ver, outlier.as_deref())
+                {
+                    info!(
+                        model = %model, version = %ver, status = ?new_status,
+                        "status coordinator: version status changed"
+                    );
+                    if let Err(e) = registry.set_status(&model, &ver, new_status) {
+                        // Version unloaded mid-tick; the task is aborted on
+                        // unload, so losing this race is expected and benign.
+                        tracing::debug!(
+                            model = %model, version = %ver,
+                            "status coordinator: set_status failed: {}", e
+                        );
+                    }
+                }
+            }
+        });
+        self.status_coordinators.write().await.insert(key, handle);
+    }
+
+    /// Stop the status coordinator for a model version (on unload).
+    async fn stop_status_coordinator(&self, model_name: &str, version: &str) {
+        let key = model_version_key(model_name, version);
+        if let Some(handle) = self.status_coordinators.write().await.remove(&key) {
+            handle.abort();
+        }
     }
 
     /// Upsert custom @route declarations for a model version, received from the
@@ -679,11 +767,15 @@ impl WorkerManager {
         if is_ensemble {
             // Ensemble: no workers, just mark ready
             self.registry
-                .set_status(model_name, version, VersionStatus::Ready)?;
+                .mark_ready(model_name, version)?;
             crate::metrics::prometheus::record_model_load(model_name, version, true);
             info!("Ensemble {} version {} loaded", model_name, version);
             return Ok(());
         }
+
+        // Workers are about to spawn: Pending → Loading.
+        self.registry
+            .set_status(model_name, version, VersionStatus::Loading)?;
 
         // Launch workers
         let accelerator = model_config.accelerator.as_deref().unwrap_or("cpu");
@@ -762,29 +854,36 @@ impl WorkerManager {
                 .map_err(|e| {
                     warn!(model = %model_name, version = %version, worker_id, "failed to spawn worker: {}", e);
                     AppError::Python(format!("failed to spawn worker: {}", e))
-                })?;
+                })
+                .inspect_err(|_| self.mark_load_failed(model_name, version))?;
 
             let stdout = child.stdout.take()
-                .ok_or_else(|| AppError::Internal("worker stdout not piped".to_string()))?;
+                .ok_or_else(|| AppError::Internal("worker stdout not piped".to_string()))
+                .inspect_err(|_| self.mark_load_failed(model_name, version))?;
             let stderr = child.stderr.take()
-                .ok_or_else(|| AppError::Internal("worker stderr not piped".to_string()))?;
+                .ok_or_else(|| AppError::Internal("worker stderr not piped".to_string()))
+                .inspect_err(|_| self.mark_load_failed(model_name, version))?;
 
             // Wait for "ready" signal
             let mut reader = BufReader::new(stdout);
             let mut ready_line = String::new();
             let n = timeout(Duration::from_secs(60), reader.read_line(&mut ready_line))
                 .await
-                .map_err(|_| AppError::InferenceTimeout("worker startup timeout".to_string()))?
-                .map_err(AppError::Io)?;
+                .map_err(|_| AppError::InferenceTimeout("worker startup timeout".to_string()))
+                .and_then(|r| r.map_err(AppError::Io))
+                .inspect_err(|_| self.mark_load_failed(model_name, version))?;
             if n == 0 {
+                self.mark_load_failed(model_name, version);
                 return Err(AppError::WorkerCrashed("worker exited before ready".to_string()));
             }
             let stdout = reader.into_inner();
 
             let startup: WorkerStartup = serde_json::from_str(ready_line.trim())
-                .map_err(|e| AppError::Internal(format!("worker startup JSON parse error: {}", e)))?;
+                .map_err(|e| AppError::Internal(format!("worker startup JSON parse error: {}", e)))
+                .inspect_err(|_| self.mark_load_failed(model_name, version))?;
 
             if startup.status != "ready" {
+                self.mark_load_failed(model_name, version);
                 return Err(AppError::WorkerCrashed(format!(
                     "worker {} startup failed: {:?}",
                     worker_id, startup.message
@@ -911,7 +1010,7 @@ impl WorkerManager {
         self.registry
             .set_workers(model_name, version, worker_infos.clone())?;
         self.registry
-            .set_status(model_name, version, VersionStatus::Ready)?;
+            .mark_ready(model_name, version)?;
 
         // Create shared OutlierState — single instance for batch_collector, health_checker, and streaming
         let outlier = Arc::new(OutlierState::new(total_workers));
@@ -928,6 +1027,17 @@ impl WorkerManager {
             workers.insert(key.clone(), worker_processes);
             clients.insert(key.clone(), zmq_clients_for_model);
             outliers.insert(key, outlier);
+        }
+
+        // Status coordinator: periodic Ready/Degraded reconciliation at the
+        // configured cadence; 0 disables it (status stays event-driven).
+        if model_config.health_check_interval > 0.0 {
+            self.start_status_coordinator(
+                model_name,
+                version,
+                Duration::from_secs_f32(model_config.health_check_interval),
+            )
+            .await;
         }
 
         crate::metrics::prometheus::record_model_load(model_name, version, true);
@@ -971,6 +1081,10 @@ impl WorkerManager {
         version: &str,
     ) -> Result<(), AppError> {
         info!("Unloading {} version {}", model_name, version);
+
+        // Stop the status coordinator first so it can't tick against a
+        // half-torn-down version.
+        self.stop_status_coordinator(model_name, version).await;
 
         // Fire ModelUnload callback before unloading
         self.callback_runner.on_model_unload(&ModelLifecycleContext {
@@ -1437,6 +1551,43 @@ pub fn pick_worker_skip_ejected(num_workers: usize, outlier: &OutlierState) -> u
     start
 }
 
+/// Compute the reconciled status for a version from its outlier-ejection
+/// state (status coordinator, phase 3).
+///
+/// Returns `Some(new_status)` only when the status should change. Versions in
+/// Pending/Loading/Failed/Unloading are event-driven and return `None` —
+/// Failed in particular is load-phase only and must not be rewritten at
+/// runtime (outlier ejection auto-recovers, so runtime impairment is always
+/// Degraded). A missing outlier state means "no ejection info" and counts
+/// every worker as healthy.
+fn reconcile_version_status(
+    registry: &ModelRegistry,
+    model_name: &str,
+    version: &str,
+    outlier: Option<&OutlierState>,
+) -> Option<VersionStatus> {
+    let mv = registry.get(model_name, Some(version))?;
+    match mv.status {
+        VersionStatus::Ready | VersionStatus::Degraded => {}
+        _ => return None,
+    }
+    let total = mv.workers.len();
+    let healthy = match outlier {
+        Some(o) => mv
+            .workers
+            .iter()
+            .filter(|w| !o.is_ejected(w.worker_id as usize))
+            .count(),
+        None => total,
+    };
+    let target = if total > 0 && healthy == total {
+        VersionStatus::Ready
+    } else {
+        VersionStatus::Degraded
+    };
+    (target != mv.status).then_some(target)
+}
+
 /// Classify a stderr line from the Python worker into a tracing level.
 fn classify_stderr_line(line: &str) -> tracing::Level {
     let trimmed = line.trim();
@@ -1590,6 +1741,111 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(cleaned_up.load(Ordering::SeqCst), "monitor should have triggered cleanup");
+    }
+
+    // ===== status coordinator (reconcile_version_status) =====
+
+    /// Registry with one version in Ready and `workers` ready workers.
+    fn ready_registry(workers: u32) -> ModelRegistry {
+        let reg = ModelRegistry::new();
+        reg.register(
+            "m",
+            "1",
+            crate::config::ModelConfig::default(),
+            ModelType::LitAPI,
+            std::env::temp_dir(),
+        )
+        .unwrap();
+        reg.set_workers(
+            "m",
+            "1",
+            (0..workers)
+                .map(|i| WorkerInfo {
+                    worker_id: i,
+                    device: "cpu:0".to_string(),
+                    endpoint: format!("ipc:///tmp/reconcile-test-{}.sock", i),
+                    pid: None,
+                    status: WorkerStatus::Ready,
+                })
+                .collect(),
+        )
+        .unwrap();
+        reg.mark_ready("m", "1").unwrap();
+        reg
+    }
+
+    #[test]
+    fn reconcile_ready_all_healthy_no_change() {
+        let reg = ready_registry(2);
+        let outlier = OutlierState::new(2);
+        assert_eq!(reconcile_version_status(&reg, "m", "1", Some(&outlier)), None);
+    }
+
+    #[test]
+    fn reconcile_ready_with_ejected_worker_degrades() {
+        let reg = ready_registry(2);
+        let outlier = OutlierState::new(2);
+        for _ in 0..3 {
+            outlier.record_error(0);
+        }
+        assert!(outlier.is_ejected(0));
+        assert_eq!(
+            reconcile_version_status(&reg, "m", "1", Some(&outlier)),
+            Some(VersionStatus::Degraded)
+        );
+    }
+
+    #[test]
+    fn reconcile_degraded_recovers_to_ready() {
+        let reg = ready_registry(2);
+        reg.set_status("m", "1", VersionStatus::Degraded).unwrap();
+        let outlier = OutlierState::new(2);
+        assert_eq!(
+            reconcile_version_status(&reg, "m", "1", Some(&outlier)),
+            Some(VersionStatus::Ready)
+        );
+    }
+
+    #[test]
+    fn reconcile_failed_is_not_rewritten_at_runtime() {
+        let reg = ready_registry(2);
+        reg.set_status("m", "1", VersionStatus::Failed).unwrap();
+        let outlier = OutlierState::new(2);
+        for _ in 0..3 {
+            outlier.record_error(0);
+        }
+        assert_eq!(reconcile_version_status(&reg, "m", "1", Some(&outlier)), None);
+    }
+
+    #[test]
+    fn reconcile_loading_is_event_driven_not_reconciled() {
+        let reg = ready_registry(2);
+        reg.set_status("m", "1", VersionStatus::Loading).unwrap();
+        let outlier = OutlierState::new(2);
+        assert_eq!(reconcile_version_status(&reg, "m", "1", Some(&outlier)), None);
+    }
+
+    #[test]
+    fn reconcile_without_outlier_state_counts_all_healthy() {
+        let reg = ready_registry(2);
+        assert_eq!(reconcile_version_status(&reg, "m", "1", None), None);
+    }
+
+    #[test]
+    fn reconcile_ready_with_zero_workers_degrades() {
+        let reg = ready_registry(0);
+        let outlier = OutlierState::new(0);
+        assert_eq!(
+            reconcile_version_status(&reg, "m", "1", Some(&outlier)),
+            Some(VersionStatus::Degraded)
+        );
+    }
+
+    #[test]
+    fn reconcile_unloaded_version_no_change() {
+        let reg = ModelRegistry::new();
+        let outlier = OutlierState::new(1);
+        assert_eq!(reconcile_version_status(&reg, "m", "1", Some(&outlier)), None);
     }
 
     // ===== pick_worker_skip_ejected tests =====

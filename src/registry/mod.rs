@@ -92,11 +92,12 @@ impl ModelRegistry {
 
         let mv = ModelVersion {
             version: version.to_string(),
-            status: VersionStatus::Loading,
+            status: VersionStatus::Pending,
             config,
             model_type,
             model_dir,
             workers: vec![],
+            loaded_at: None,
             policies: Default::default(),
             cors_headers: None,
         };
@@ -119,6 +120,25 @@ impl ModelRegistry {
             .get_mut(version)
             .ok_or_else(|| AppError::VersionNotFound(model_name.to_string(), version.to_string()))?;
         mv.status = status;
+        Ok(())
+    }
+
+    /// Transition a version to `Ready`, stamping `loaded_at` on the first
+    /// arrival only. `Ready`→`Ready` (e.g. worker respawn) preserves the
+    /// original load timestamp.
+    pub fn mark_ready(&self, model_name: &str, version: &str) -> Result<(), AppError> {
+        let mut entry = self
+            .models
+            .get_mut(model_name)
+            .ok_or_else(|| AppError::ModelNotFound(model_name.to_string()))?;
+        let mv = entry
+            .versions
+            .get_mut(version)
+            .ok_or_else(|| AppError::VersionNotFound(model_name.to_string(), version.to_string()))?;
+        mv.status = VersionStatus::Ready;
+        if mv.loaded_at.is_none() {
+            mv.loaded_at = Some(std::time::SystemTime::now());
+        }
         Ok(())
     }
 
@@ -346,7 +366,52 @@ mod tests {
 
         let mv = reg.get("m1", Some("1")).unwrap();
         assert_eq!(mv.version, "1");
-        assert_eq!(mv.status, VersionStatus::Loading);
+        assert_eq!(mv.status, VersionStatus::Pending);
+        assert_eq!(mv.loaded_at, None);
+    }
+
+    // --- Explicit state machine ---
+
+    #[test]
+    fn version_status_serializes_snake_case() {
+        let cases = [
+            (VersionStatus::Pending, "pending"),
+            (VersionStatus::Loading, "loading"),
+            (VersionStatus::Ready, "ready"),
+            (VersionStatus::Degraded, "degraded"),
+            (VersionStatus::Failed, "failed"),
+            (VersionStatus::Unloading, "unloading"),
+        ];
+        for (status, expected) in cases {
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(json, format!("\"{}\"", expected));
+            let back: VersionStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, status);
+        }
+    }
+
+    #[test]
+    fn test_mark_ready_stamps_loaded_at_once() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+
+        reg.mark_ready("m1", "1").unwrap();
+        let first = reg.get("m1", Some("1")).unwrap();
+        assert_eq!(first.status, VersionStatus::Ready);
+        let stamped = first.loaded_at.expect("loaded_at stamped on first Ready");
+
+        // Degraded → Ready (coordinator / respawn path) preserves the stamp.
+        reg.set_status("m1", "1", VersionStatus::Degraded).unwrap();
+        reg.mark_ready("m1", "1").unwrap();
+        let second = reg.get("m1", Some("1")).unwrap();
+        assert_eq!(second.loaded_at, Some(stamped));
+    }
+
+    #[test]
+    fn test_mark_ready_nonexistent_errors() {
+        let reg = ModelRegistry::new();
+        assert!(reg.mark_ready("nope", "1").is_err());
     }
 
     #[test]
