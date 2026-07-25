@@ -229,41 +229,58 @@ pub async fn execute_ensemble(
     let mut context: HashMap<String, Value> = HashMap::new();
     context.insert("request".to_string(), payload);
 
-    for layer in layers {
-        let mut futures = Vec::new();
-        for step in layer {
-            let state = state.clone();
-            let ctx = context.clone();
-            let step = step.clone();
-            let ensemble_name = model_name.to_string();
-            let request_id = request_id.to_string();
-            futures.push(tokio::spawn(async move {
-                let start = Instant::now();
-                let result = execute_step(state, &step, &ctx, &request_id).await;
-                let latency = start.elapsed().as_secs_f64();
-                crate::metrics::prometheus::record_ensemble_step_latency(
-                    &ensemble_name, &step.name, &step.model, latency,
-                );
-                (step.name, result)
-            }));
-        }
+    // #3: bound the WHOLE ensemble by a single deadline equal to one request's
+    // budget (server.timeout). Layers run serially, so without this an N-layer
+    // ensemble could otherwise run up to N × server.timeout — far longer than
+    // the parent request that triggered it (itself capped at server.timeout;
+    // see http/handlers.rs). The per-step timeout in execute_step stays as an
+    // inner safety net; this outer deadline is what actually bounds the total.
+    let total_budget = Duration::from_secs_f64(state.config.server.timeout as f64);
+    let ensemble_run = async {
+        for layer in layers {
+            let mut futures = Vec::new();
+            for step in layer {
+                let state = state.clone();
+                let ctx = context.clone();
+                let step = step.clone();
+                let ensemble_name = model_name.to_string();
+                let request_id = request_id.to_string();
+                futures.push(tokio::spawn(async move {
+                    let start = Instant::now();
+                    let result = execute_step(state, &step, &ctx, &request_id).await;
+                    let latency = start.elapsed().as_secs_f64();
+                    crate::metrics::prometheus::record_ensemble_step_latency(
+                        &ensemble_name, &step.name, &step.model, latency,
+                    );
+                    (step.name, result)
+                }));
+            }
 
-        for handle in futures {
-            let (name, result) = handle.await.map_err(|e| {
-                AppError::Internal(format!("ensemble step join error: {}", e))
-            })?;
-            match result {
-                Ok(value) => {
-                    context.insert(name, value);
-                }
-                Err(e) => {
-                    return Err(AppError::Internal(format!(
-                        "ensemble step failed: {}", e
-                    )));
+            for handle in futures {
+                let (name, result) = handle.await.map_err(|e| {
+                    AppError::Internal(format!("ensemble step join error: {}", e))
+                })?;
+                match result {
+                    Ok(value) => {
+                        context.insert(name, value);
+                    }
+                    Err(e) => {
+                        return Err(AppError::Internal(format!(
+                            "ensemble step failed: {}", e
+                        )));
+                    }
                 }
             }
         }
-    }
+        Ok::<(), AppError>(())
+    };
+
+    tokio::time::timeout(total_budget, ensemble_run)
+        .await
+        .map_err(|_| AppError::InferenceTimeout(format!(
+            "ensemble {} {} exceeded total timeout of {:.1}s",
+            model_name, version, total_budget.as_secs_f64()
+        )))??;
 
     // Return last step's output
     steps.last()
