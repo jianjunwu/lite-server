@@ -14,6 +14,25 @@ pip install -e .
 pip install pyyaml
 ```
 
+## Run All Examples (one command)
+
+Verify every example starts and matches its README output — sequentially
+(examples share port 8000, so they run one at a time):
+
+```bash
+pip install grpcio          # required: example 13 uses gRPC bidi
+python run_all.py           # from the examples/ directory
+# (or: python examples/run_all.py from the project root)
+```
+
+This starts each example's server, waits for readiness, checks the README
+behavior, then shuts it down cleanly — printing a `PASS`/`FAIL` summary and
+exiting non-zero if any example fails. Run a subset by name:
+
+```bash
+python run_all.py 01_basic 03_streaming 13_bidi_streaming
+```
+
 ## Learning Path
 
 Start from example 01 and work your way up. Each example builds on concepts from the previous ones.
