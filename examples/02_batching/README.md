@@ -84,12 +84,49 @@ wait
 # Each response: {"output": <N * 0.5>, "batch_size": 4}
 ```
 
+### `ctx_batch` — Per-request context inside the batch
+
+`batch`, `unbatch`, and `predict` may declare `ctx` to receive a
+`list[RequestContext]` aligned with the batch items — useful for logging,
+tracing, or grouping without threading data through the decoded input.
+
+```python
+def batch(self, inputs, ctx):
+    for c in ctx:                                    # ctx[i] <-> inputs[i]
+        self.logger.info("batching request_id=%s", c.meta.request_id)
+    return inputs
+
+def predict(self, batched, ctx):
+    return [{"output": v * 2, "request_id": c.meta.request_id}
+            for v, c in zip(batched, ctx)]           # per-item context in predict
+
+def unbatch(self, output, ctx):
+    return list(output)
+```
+
+`ctx[i]` always aligns with `inputs[i]` — don't reorder the inputs, or
+results go back to the wrong requests.
+
+Test:
+
+```bash
+for i in $(seq 1 4); do
+  curl -s -X POST http://localhost:8000/v2/models/ctx_batch/infer \
+    -H 'Content-Type: application/json' \
+    -d "{\"input\": $i}" &
+done
+wait
+
+# Each response: {"output": <N * 2>, "request_id": "<server-assigned id>"}
+```
+
 ## What You Learn
 
 - How `max_batch_size` and `batch_timeout` enable automatic batching
 - How `predict()` receives a list when batching is active (default path)
 - How to override `batch()` to reshape inputs before prediction
 - How to override `unbatch()` to split outputs back to per-request responses
+- How `batch` / `unbatch` / `predict` can declare `ctx` for per-request context
 - How adaptive batching adjusts timeout based on queue pressure
 
 ## Key Config

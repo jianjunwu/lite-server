@@ -1,0 +1,6 @@
+max_batch_size: 8
+batch_timeout: 0.01
+stream: false
+accelerator: cpu
+devices: 1
+workers_per_device: 1

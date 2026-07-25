@@ -9,3 +9,4 @@ orchestration:
   load_models:
     - batched
     - custom_batch
+    - ctx_batch
