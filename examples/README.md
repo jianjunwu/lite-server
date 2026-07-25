@@ -219,14 +219,16 @@ curl -X POST http://localhost:8000/v2/models/cb_llm/infer \
 
 ### 13 Bidirectional Streaming
 
+Bidirectional streaming runs over gRPC (the `/stream` WebSocket path is
+server-side only). From the example directory:
+
 ```bash
-websocat ws://localhost:8000/v2/models/asr/stream
-> {"text": "hello"}
-< {"partial": "hello", "is_final": false}
-> {"text": "world"}
-< {"partial": "hello world", "is_final": false}
-# Close connection to trigger on_close()
-< {"final": "hello world", "is_final": true, "buffer": ["hello", "world"]}
+pip install grpcio   # if not already installed
+python test_bidi.py
+# open  : {"status": "ready", "sample_rate": 16000}
+# chunk : {"partial": "hello", "is_final": false}
+# chunk : {"partial": "hello world", "is_final": false}
+# close : {"final": "hello world", "is_final": true, "buffer": ["hello", "world"]}
 ```
 
 ### 14 Lifecycle Hooks

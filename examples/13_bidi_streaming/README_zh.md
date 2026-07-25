@@ -20,19 +20,21 @@ python -m lite_server serve --config server.yaml
 
 ## 测试
 
-```bash
-# 通过 WebSocket 进行双向流通信
-websocat ws://localhost:8000/v2/models/asr/stream
+双向流通过 **gRPC**（端口 8001）传输 —— `/stream` 的 WebSocket 路径仅支持单向流。自带的客户端会建立一个会话并触发全部三个钩子：
 
-# 发送消息（在 WebSocket 中输入）：
-> {"text": "hello"}
-< {"partial": "hello", "is_final": false}
-> {"text": "world"}
-< {"partial": "hello world", "is_final": false}
-> {"text": "test"}
-< {"partial": "hello world test", "is_final": false}
-# 关闭连接以触发 on_close()
-< {"final": "hello world test", "is_final": true, "buffer": ["hello", "world", "test"]}
+```bash
+pip install grpcio          # 如未安装
+python test_bidi.py
+```
+
+预期输出（每个钩子一帧 —— `on_open`、每次 `on_chunk`、`on_close`）：
+
+```
+open  : {"status": "ready", "sample_rate": 16000}
+chunk : {"partial": "hello", "is_final": false}
+chunk : {"partial": "hello world", "is_final": false}
+chunk : {"partial": "hello world test", "is_final": false}
+close : {"final": "hello world test", "is_final": true, "buffer": ["hello", "world", "test"]}
 ```
 
 ## 学习要点

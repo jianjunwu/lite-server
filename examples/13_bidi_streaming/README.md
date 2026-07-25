@@ -20,20 +20,23 @@ python -m lite_server serve --config server.yaml
 
 ## Test
 
-```bash
-# Bidirectional streaming via WebSocket
-# Connect to the bidi stream endpoint, then send chunks interactively:
-websocat ws://localhost:8000/v2/models/asr/stream
+Bidirectional streaming runs over **gRPC** (port 8001) — the `/stream`
+WebSocket path is server-side streaming only. The included client opens a
+session and exercises all three hooks:
 
-# Send messages (type in the WebSocket):
-> {"text": "hello"}
-< {"partial": "hello", "is_final": false}
-> {"text": "world"}
-< {"partial": "hello world", "is_final": false}
-> {"text": "test"}
-< {"partial": "hello world test", "is_final": false}
-# Close the connection to trigger on_close()
-< {"final": "hello world test", "is_final": true, "buffer": ["hello", "world", "test"]}
+```bash
+pip install grpcio          # only if not already installed
+python test_bidi.py
+```
+
+Expected output (one frame per hook — `on_open`, each `on_chunk`, `on_close`):
+
+```
+open  : {"status": "ready", "sample_rate": 16000}
+chunk : {"partial": "hello", "is_final": false}
+chunk : {"partial": "hello world", "is_final": false}
+chunk : {"partial": "hello world test", "is_final": false}
+close : {"final": "hello world test", "is_final": true, "buffer": ["hello", "world", "test"]}
 ```
 
 ## What You Learn
