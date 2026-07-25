@@ -201,6 +201,14 @@ impl WorkerManager {
         }
     }
 
+    /// Accessor for the unified inference queue. Used by the gRPC service to
+    /// route unary inference through the same queue as REST (#1), so gRPC
+    /// inherits batching, least-loaded selection, outlier ejection, retry, and
+    /// max_requests recycling.
+    pub fn inference_queue(&self) -> &Arc<InferenceQueue> {
+        &self.inference_queue
+    }
+
     /// Start the reload listener. Must be called once after construction.
     pub async fn start_reload_listener(self: &Arc<Self>) {
         let mut rx_guard = self.reload_rx.lock().await;

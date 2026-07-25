@@ -6,8 +6,10 @@ use crate::streaming;
 use crate::worker::WorkerManager;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tracing::warn;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
@@ -22,6 +24,9 @@ pub struct GrpcService {
     worker_manager: Arc<WorkerManager>,
     streaming_metrics: bool,
     callback_runner: Arc<CallbackRunner>,
+    /// Per-request inference deadline. Mirrors the REST path's
+    /// `config.server.timeout` so gRPC and HTTP share one request budget.
+    server_timeout: Duration,
 }
 
 impl GrpcService {
@@ -30,12 +35,14 @@ impl GrpcService {
         worker_manager: Arc<WorkerManager>,
         streaming_metrics: bool,
         callback_runner: Arc<CallbackRunner>,
+        server_timeout: Duration,
     ) -> Self {
         Self {
             registry,
             worker_manager,
             streaming_metrics,
             callback_runner,
+            server_timeout,
         }
     }
 }
@@ -190,26 +197,6 @@ impl LiteServer for GrpcService {
         };
 
         let uid = format!("grpc-{}-{}", model_name, Uuid::new_v4());
-        let internal_req = pb::Request {
-            uid,
-            meta: Some(meta),
-            payload: Some(pb::request::Payload::Single(pb::SingleRequest {
-                data: req.data,
-            })),
-        };
-
-        let clients = self
-            .worker_manager
-            .get_zmq_clients(model_name, &resolved_version)
-            .await
-            .ok_or_else(|| Status::unavailable("no workers available"))?;
-
-        if clients.is_empty() {
-            return Err(Status::unavailable("no workers available"));
-        }
-
-        let worker_id = crate::worker::pick_worker_random(clients.len());
-        let client = &clients[worker_id];
 
         // Fire InferenceRequest callback
         let req_ctx = crate::callback::InferenceContext {
@@ -227,11 +214,48 @@ impl LiteServer for GrpcService {
             cb_runner.on_inference_request(&req_ctx_clone).await;
         });
 
+        // #1: route unary infer through the unified InferenceQueue — the same
+        // path as REST — so gRPC inherits batch aggregation, least-loaded
+        // worker selection, outlier ejection, retry, and max_requests
+        // recycling, all of which the previous direct client.send() bypassed.
+        // (batch_infer and streaming keep their direct path; REST streaming
+        // bypasses the queue too, so behavior stays consistent.)
         let start = Instant::now();
-        let resp = client
-            .send(internal_req)
-            .await
-            .map_err(|e| Status::internal(format!("worker error: {}", e)))?;
+        let (response_tx, response_rx) = oneshot::channel();
+        let item = crate::inference_queue::QueueItem {
+            uid,
+            data: meta.payload.clone(),
+            meta: Some(std::sync::Arc::new(meta)),
+            response_tx,
+        };
+        let resp = match self
+            .worker_manager
+            .inference_queue()
+            .try_submit(model_name, &resolved_version, item)
+        {
+            Ok(()) => match tokio::time::timeout(self.server_timeout, response_rx).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(_)) => return Err(Status::internal("response channel closed")),
+                Err(_) => {
+                    return Err(Status::deadline_exceeded(format!(
+                        "inference timed out after {:.1}s",
+                        self.server_timeout.as_secs_f64()
+                    )));
+                }
+            },
+            Err(crate::inference_queue::QueueError::Full) => {
+                return Err(Status::resource_exhausted(format!(
+                    "queue full for {} {}",
+                    model_name, resolved_version
+                )));
+            }
+            Err(_) => {
+                return Err(Status::unavailable(format!(
+                    "queue not available for {} {}",
+                    model_name, resolved_version
+                )));
+            }
+        };
 
         match resp.payload {
             Some(pb::response::Payload::Single(single)) => {
@@ -713,7 +737,9 @@ impl LiteServer for GrpcService {
                 crate::metrics::prometheus::record_stream_close(&metrics_model, &metrics_version, "grpc");
             }
 
-            incoming_task.abort();
+            // #8: observe the incoming task so a panic is logged, not silently
+            // dropped by a bare abort().
+            observe_or_abort(incoming_task).await;
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -728,12 +754,19 @@ pub async fn start_grpc_server(
     worker_manager: Arc<WorkerManager>,
     streaming_metrics: bool,
     callback_runner: Arc<CallbackRunner>,
+    server_timeout: Duration,
 ) -> Result<(), AppError> {
     let addr: std::net::SocketAddr = format!("{}:{}", host, port)
         .parse()
         .map_err(|e| AppError::Config(format!("invalid gRPC address: {}", e)))?;
 
-    let service = GrpcService::new(registry, worker_manager, streaming_metrics, callback_runner);
+    let service = GrpcService::new(
+        registry,
+        worker_manager,
+        streaming_metrics,
+        callback_runner,
+        server_timeout,
+    );
     let server = LiteServerServer::new(service);
 
     tracing::info!("Starting gRPC server on {}", addr);
@@ -747,10 +780,49 @@ pub async fn start_grpc_server(
     Ok(())
 }
 
+/// Observe a spawned bidi helper task instead of silently dropping its handle
+/// (#8). `abort()` alone discards any panic payload; awaiting the handle first
+/// — bounded by a short grace — surfaces a panic as a `JoinError` so we can
+/// log it. If the task is still running when the grace expires, abort it to
+/// release the client stream promptly. Returns `true` if the task panicked
+/// (kept as a return value so the panic-detection path is unit-testable).
+async fn observe_or_abort(mut task: tokio::task::JoinHandle<()>) -> bool {
+    match tokio::time::timeout(Duration::from_millis(500), &mut task).await {
+        Ok(Ok(())) => false,
+        Ok(Err(join_err)) if join_err.is_panic() => {
+            warn!("bidi incoming task panicked during shutdown");
+            true
+        }
+        _ => {
+            task.abort();
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tonic_types::StatusExt;
+
+    #[tokio::test]
+    async fn observe_or_abort_detects_panicked_task() {
+        // #8: a panic inside the bidi incoming task must be observable. abort()
+        // alone discards the panic payload; awaiting the handle (bounded by a
+        // grace) surfaces it as a JoinError with is_panic() == true.
+        let task = tokio::spawn(async {
+            panic!("boom");
+        });
+        let panicked = observe_or_abort(task).await;
+        assert!(panicked, "a panicked task must report panicked=true");
+    }
+
+    #[tokio::test]
+    async fn observe_or_abort_clean_finish_is_not_panic() {
+        let task = tokio::spawn(async {});
+        let panicked = observe_or_abort(task).await;
+        assert!(!panicked);
+    }
 
     #[test]
     fn test_http_status_to_grpc_code() {
