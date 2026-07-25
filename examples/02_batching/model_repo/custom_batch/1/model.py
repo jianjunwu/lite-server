@@ -6,14 +6,14 @@ individual requests and the batched predict() call.
 Pipeline: decode_request -> batch -> predict -> unbatch -> encode_response
 """
 
-from lite_server import LitAPI
+from lite_server import LitAPI, RequestContext
 
 
 class CustomBatchAPI(LitAPI):
     def setup(self, device):
         self.device = device
 
-    def decode_request(self, request):
+    async def decode_request(self, request, ctx: RequestContext | None = None):
         return {"value": request["input"], "weight": request.get("weight", 1.0)}
 
     def batch(self, inputs):
@@ -28,7 +28,7 @@ class CustomBatchAPI(LitAPI):
             "batch_size": len(inputs),
         }
 
-    def predict(self, batch):
+    async def predict(self, batch):
         """Run inference on the packed batch.
 
         When multiple requests are queued, predict() receives the dict
@@ -56,5 +56,5 @@ class CustomBatchAPI(LitAPI):
             for r in output["results"]
         ]
 
-    def encode_response(self, output):
+    async def encode_response(self, output, ctx: RequestContext | None = None):
         return output

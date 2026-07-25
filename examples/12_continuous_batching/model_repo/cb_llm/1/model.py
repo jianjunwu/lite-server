@@ -4,7 +4,7 @@ Implements the three CB hooks: prefill(), step(), has_finished().
 Each request generates a sequence of tokens, one per step.
 """
 
-from lite_server import LitAPI
+from lite_server import LitAPI, RequestContext
 
 
 class CBLlmAPI(LitAPI):
@@ -13,7 +13,7 @@ class CBLlmAPI(LitAPI):
     def setup(self, device):
         self.max_tokens = self.config.get("max_tokens_per_seq", 5)
 
-    def decode_request(self, request):
+    async def decode_request(self, request, ctx: RequestContext | None = None):
         return request.get("prompt", "")
 
     def prefill(self, uid, decoded_input):
@@ -27,6 +27,9 @@ class CBLlmAPI(LitAPI):
           - .uid: request id
           - .input: decoded_input (the prompt string)
           - .output: list of tokens generated so far
+          - .state / .meta / .ctx: per-sequence context (0.7.0)
+
+        step() operates across sequences, so it has no single per-request ctx.
         """
         new_tokens = []
         for seq in active_sequences:
@@ -43,7 +46,7 @@ class CBLlmAPI(LitAPI):
         """Stop when max tokens reached or EOS generated."""
         return len(generated_sequence) >= self.max_tokens or token == self.EOS_TOKEN
 
-    def encode_response(self, output):
+    async def encode_response(self, output, ctx: RequestContext | None = None):
         # output is the accumulated list of tokens
         return {"tokens": output, "text": " ".join(output)}
 

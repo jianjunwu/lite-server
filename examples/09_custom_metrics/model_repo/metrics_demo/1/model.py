@@ -2,7 +2,7 @@
 
 import time
 
-from lite_server import LitAPI
+from lite_server import LitAPI, RequestContext
 
 
 class MetricsDemoAPI(LitAPI):
@@ -12,10 +12,13 @@ class MetricsDemoAPI(LitAPI):
         self.c_predictions = self.register_metric("demo_predictions_total", "counter")
         self.h_latency = self.register_metric("demo_inference_ms", "histogram")
 
-    def decode_request(self, request):
+    async def decode_request(self, request, ctx: RequestContext | None = None):
         return request.get("input", 0)
 
-    def predict(self, x):
+    async def predict(self, x):
+        # max_batch_size > 1 in config.yaml → the server batches concurrent
+        # requests and x is a list here. predict has no per-request ctx on the
+        # batch path; thread per-request data through decode_request instead.
         start = time.time()
 
         if isinstance(x, list):
@@ -34,5 +37,5 @@ class MetricsDemoAPI(LitAPI):
 
         return result
 
-    def encode_response(self, output):
+    async def encode_response(self, output, ctx: RequestContext | None = None):
         return output

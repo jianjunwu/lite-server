@@ -4,20 +4,20 @@ The model provides standard inference. Custom endpoints (endpoints/status.py)
 demonstrate middleware chains.
 """
 
-from lite_server import LitAPI
+from lite_server import LitAPI, RequestContext
 
 
 class ProtectedAPI(LitAPI):
     def setup(self, device):
         self.device = device
 
-    def decode_request(self, request):
+    async def decode_request(self, request, ctx: RequestContext | None = None):
         return request.get("input", "")
 
-    def predict(self, x):
+    async def predict(self, x, ctx: RequestContext | None = None):
         if isinstance(x, list):
             return [{"output": f"protected: {item}"} for item in x]
         return {"output": f"protected: {x}"}
 
-    def encode_response(self, output):
+    async def encode_response(self, output, ctx: RequestContext | None = None):
         return output

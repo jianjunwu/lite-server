@@ -1,19 +1,20 @@
 """Sequence model recall."""
 
-from lite_server import LitAPI
+import time
+
+from lite_server import LitAPI, RequestContext
 
 
 class SeqRecallAPI(LitAPI):
     def setup(self, device):
         self.device = device
 
-    def decode_request(self, request):
+    async def decode_request(self, request, ctx: RequestContext | None = None):
         return request.get("history", [])
 
-    def predict(self, x):
-        import time
+    async def predict(self, x, ctx: RequestContext | None = None):
         time.sleep(0.05)
         return {"items": [f"seq_item_{i}" for i in range(3)]}
 
-    def encode_response(self, output):
+    async def encode_response(self, output, ctx: RequestContext | None = None):
         return output

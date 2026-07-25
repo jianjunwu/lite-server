@@ -1,19 +1,19 @@
 """Multi-version model v1: simple addition."""
 
-from lite_server import LitAPI
+from lite_server import LitAPI, RequestContext
 
 
 class MyAPI(LitAPI):
     def setup(self, device):
         self.version = "v1"
 
-    def decode_request(self, request):
+    async def decode_request(self, request, ctx: RequestContext | None = None):
         return request.get("input", 0)
 
-    def predict(self, x):
+    async def predict(self, x, ctx: RequestContext | None = None):
         if isinstance(x, list):
             return [{"output": item + 1, "version": self.version} for item in x]
         return {"output": x + 1, "version": self.version}
 
-    def encode_response(self, output):
+    async def encode_response(self, output, ctx: RequestContext | None = None):
         return output

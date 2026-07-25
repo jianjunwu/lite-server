@@ -6,26 +6,26 @@ Override stream_predict() to yield chunks.
 
 import time
 
-from lite_server import LitAPI
+from lite_server import LitAPI, RequestContext
 
 
 class StreamingAPI(LitAPI):
     def setup(self, device):
         self.device = device
 
-    def decode_request(self, request):
+    async def decode_request(self, request, ctx: RequestContext | None = None):
         return {
             "prompt": request.get("prompt", ""),
             "max_tokens": request.get("max_tokens", 5),
         }
 
-    def predict(self, x, **kwargs):
+    async def predict(self, x, ctx: RequestContext | None = None):
         # Non-streaming fallback
         if isinstance(x, list):
             return [self._generate(item) for item in x]
         return self._generate(x)
 
-    def stream_predict(self, request):
+    def stream_predict(self, request, ctx: RequestContext | None = None):
         """Yield tokens one at a time for streaming output."""
         words = request.get("prompt", "hello").split()
         max_tokens = request.get("max_tokens", 5)
@@ -33,7 +33,7 @@ class StreamingAPI(LitAPI):
             time.sleep(0.05)  # simulate token generation latency
             yield {"token": words[i], "index": i}
 
-    def encode_response(self, output):
+    async def encode_response(self, output, ctx: RequestContext | None = None):
         return output
 
     def _generate(self, x):

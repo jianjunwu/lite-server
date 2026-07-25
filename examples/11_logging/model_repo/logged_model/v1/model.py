@@ -3,7 +3,7 @@ response headers via :meth:`~lite_server.RequestContext.respond`."""
 
 import time
 
-from lite_server import LitAPI
+from lite_server import LitAPI, RequestContext
 
 
 class LoggedModelAPI(LitAPI):
@@ -16,11 +16,11 @@ class LoggedModelAPI(LitAPI):
         self.logger.info("Info: model loading on device=%s", device)
         self.logger.warning("Warning: this is a demo model, not for production")
 
-    def decode_request(self, request):
+    async def decode_request(self, request, ctx: RequestContext | None = None):
         self.logger.debug("Debug: decode_request input=%s", request)
         return request.get("input", 0)
 
-    def predict(self, x):
+    async def predict(self, x, ctx: RequestContext | None = None):
         self.call_count += 1
         start = time.time()
 
@@ -34,7 +34,7 @@ class LoggedModelAPI(LitAPI):
         )
         return {"output": result, "call_count": self.call_count}
 
-    def encode_response(self, output):
+    async def encode_response(self, output, ctx: RequestContext | None = None):
         self.logger.debug("Debug: encode_response output=%s", output)
         return output
 

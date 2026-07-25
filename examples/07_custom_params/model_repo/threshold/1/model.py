@@ -3,7 +3,7 @@
 All fields in config.yaml are accessible via self.config.get(key, default).
 """
 
-from lite_server import LitAPI
+from lite_server import LitAPI, RequestContext
 
 
 class ThresholdClassifier(LitAPI):
@@ -13,13 +13,13 @@ class ThresholdClassifier(LitAPI):
         self.label = self.config.get("label", "positive")
         self.negative_label = self.config.get("negative_label", "negative")
 
-    def decode_request(self, request):
+    async def decode_request(self, request, ctx: RequestContext | None = None):
         return request.get("score", 0.0)
 
-    def predict(self, score):
+    async def predict(self, score, ctx: RequestContext | None = None):
         if score >= self.threshold:
             return {"label": self.label, "score": score, "threshold": self.threshold}
         return {"label": self.negative_label, "score": score, "threshold": self.threshold}
 
-    def encode_response(self, output):
+    async def encode_response(self, output, ctx: RequestContext | None = None):
         return output
