@@ -7,6 +7,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub grpc: GrpcConfig,
     pub metrics: MetricsConfig,
+    pub rate_limit: RateLimitConfig,
     pub logging: LoggingConfig,
     pub model_repository: ModelRepositoryConfig,
     pub features: FeaturesConfig,
@@ -75,6 +76,22 @@ pub struct MetricsConfig {
 impl Default for MetricsConfig {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+/// Server-wide rate-limiter tuning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RateLimitConfig {
+    /// Hard cap on the number of distinct rate-limit buckets (per IP / route
+    /// key). Bounds memory under spoofed-source floods where every request
+    /// carries a new source IP. 0 = unbounded.
+    pub max_buckets: usize,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self { max_buckets: 65_536 }
     }
 }
 
@@ -1017,5 +1034,24 @@ heartbeat_max_failures: 5
         assert_eq!(cfg.heartbeat_interval, 10.0);
         assert_eq!(cfg.heartbeat_timeout, 3.0);
         assert_eq!(cfg.heartbeat_max_failures, 5);
+    }
+
+    // --- rate_limit config (#7) ---
+
+    #[test]
+    fn test_rate_limit_config_defaults() {
+        let cfg = Config::default();
+        assert_eq!(cfg.rate_limit.max_buckets, 65_536);
+    }
+
+    #[test]
+    fn test_rate_limit_config_yaml_roundtrip() {
+        let cfg = Config {
+            rate_limit: RateLimitConfig { max_buckets: 4096 },
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        let parsed: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.rate_limit.max_buckets, 4096);
     }
 }

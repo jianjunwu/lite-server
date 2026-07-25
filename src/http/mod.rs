@@ -118,7 +118,9 @@ pub async fn start_http_server(
     has_hot_reload: Arc<AtomicBool>,
 ) -> Result<(), AppError> {
     let repo_path = PathBuf::from(&config.model_repository.path);
-    let rate_limiter = Arc::new(crate::rate_limit::RateLimiter::new());
+    let rate_limiter = Arc::new(crate::rate_limit::RateLimiter::new(
+        config.rate_limit.max_buckets,
+    ));
     let mut state = AppState::new(registry, worker_manager, inference_queue, endpoint_manager, config.clone(), repo_path, callback_runner, has_hot_reload, rate_limiter.clone());
 
     // Background cleanup: evict stale rate-limit buckets every 60s

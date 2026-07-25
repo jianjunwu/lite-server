@@ -554,7 +554,6 @@ async fn enforce_rate_limit(
     match state
         .rate_limiter
         .acquire(&key, rl.requests_per_minute, burst)
-        .await
     {
         crate::rate_limit::AcquireResult::Rejected { retry_after_secs } => {
             Err(AppError::RateLimitExceeded { retry_after_secs })
@@ -1418,7 +1417,7 @@ async fn custom_endpoint_impl(
         };
         let burst = rl.burst.unwrap_or(rl.requests_per_minute * 1.5);
         let key = format!("ep:{}", scope);
-        match state.rate_limiter.acquire(&key, rl.requests_per_minute, burst).await {
+        match state.rate_limiter.acquire(&key, rl.requests_per_minute, burst) {
             crate::rate_limit::AcquireResult::Rejected { retry_after_secs } => {
                 return Err(AppError::RateLimitExceeded { retry_after_secs });
             }
@@ -1875,7 +1874,7 @@ mod upload_download_tests {
             repo_path,
             callback_runner,
             Arc::new(AtomicBool::new(false)),
-            Arc::new(crate::rate_limit::RateLimiter::new()),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
         ))
     }
 

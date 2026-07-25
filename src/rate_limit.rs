@@ -1,11 +1,11 @@
 //! Thread-safe rate limiter for lite-server.
 //!
-//! Uses a DashMap of tokio::Mutex-wrapped TokenBuckets so concurrent
+//! Uses a DashMap of std::sync::Mutex-wrapped TokenBuckets so concurrent
 //! requests can acquire tokens without contention on separate keys.
 //!
-//! The `acquire` method avoids holding the DashMap guard across `.await`
-//! (which would make the future `!Send`), and supports in-place policy
-//! hot-reload when rpm or burst parameters change (worker respawn).
+//! The critical section is await-free, so a blocking std::sync::Mutex is
+//! correct and cheaper than a tokio::sync::Mutex. `acquire` clones the
+//! bucket Arc out from under the DashMap shard lock before locking it.
 
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -35,27 +35,35 @@ impl TokenBucket {
 }
 
 pub struct RateLimiter {
-    buckets: DashMap<String, Arc<tokio::sync::Mutex<TokenBucket>>>,
+    buckets: DashMap<String, Arc<std::sync::Mutex<TokenBucket>>>,
+    /// Max distinct buckets before new keys are rejected. 0 = unbounded.
+    /// Bounds memory under spoofed-source floods where every request is a new
+    /// source IP. Default mirrors `config::RateLimitConfig::max_buckets`.
+    max_buckets: usize,
 }
 
 impl Default for RateLimiter {
     fn default() -> Self {
-        Self::new()
+        // Keep in sync with config::RateLimitConfig::max_buckets default.
+        Self::new(65_536)
     }
 }
 
 impl RateLimiter {
-    pub fn new() -> Self {
+    pub fn new(max_buckets: usize) -> Self {
         Self {
             buckets: DashMap::new(),
+            max_buckets,
         }
     }
 
     /// Try to acquire one token for *key*.
     ///
-    /// The short synchronous scope that clones the `Arc` avoids holding the
-    /// DashMap guard across `.await`, which would make the future `!Send`.
-    pub async fn acquire(&self, key: &str, rpm: f64, burst: f64) -> AcquireResult {
+    /// The bucket `Arc` is cloned out from under the DashMap shard lock before
+    /// the (blocking) bucket lock is taken, so no DashMap guard is held during
+    /// contention on a single bucket. The whole critical section is synchronous
+    /// math, hence std::sync::Mutex rather than tokio::sync::Mutex.
+    pub fn acquire(&self, key: &str, rpm: f64, burst: f64) -> AcquireResult {
         // C1: a non-positive rpm is a misconfigured policy. Fail closed with a
         // sane Retry-After — otherwise the bucket drains its burst tokens and
         // later requests compute retry_after = (1-0)/0, saturating to u64::MAX.
@@ -68,19 +76,33 @@ impl RateLimiter {
         // path (entry + or_insert_with) to create the bucket.
         let bucket = match self.buckets.get(key) {
             Some(b) => b.clone(),
-            None => self
-                .buckets
-                .entry(key.to_string())
-                .or_insert_with(|| {
-                    Arc::new(tokio::sync::Mutex::new(TokenBucket::new(
-                        rpm / 60.0,
-                        burst,
-                    )))
-                })
-                .clone(),
+            None => {
+                // #7: bound total buckets to protect memory under spoofed-source
+                // floods. The len() check races with concurrent inserts across
+                // DashMap shards, so the cap is approximate — a handful of
+                // buckets over is harmless; enforcing it exactly would need a
+                // global lock that defeats the DashMap's whole point.
+                if self.max_buckets != 0 && self.buckets.len() >= self.max_buckets {
+                    return AcquireResult::Rejected { retry_after_secs: 1 };
+                }
+                self.buckets
+                    .entry(key.to_string())
+                    .or_insert_with(|| {
+                        Arc::new(std::sync::Mutex::new(TokenBucket::new(
+                            rpm / 60.0,
+                            burst,
+                        )))
+                    })
+                    .clone()
+            }
         };
 
-        let mut b = bucket.lock().await;
+        // std::sync::Mutex: poison only occurs after a panic while holding the
+        // lock (none here — pure math), so recover the inner guard rather than
+        // unwinding the request path.
+        let mut b = bucket
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
 
         // Policy hot-reload: refresh rate/capacity when they change.
         let rate = rpm / 60.0;
@@ -130,56 +152,56 @@ impl RateLimiter {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_acquire_and_refill() {
-        let limiter = RateLimiter::new();
+    #[test]
+    fn test_acquire_and_refill() {
+        let limiter = RateLimiter::default();
         // 60 RPM = 1 token/sec, burst = 1
-        let result = limiter.acquire("test", 60.0, 1.0).await;
+        let result = limiter.acquire("test", 60.0, 1.0);
         assert!(matches!(result, AcquireResult::Allowed));
         // Bucket exhausted
-        let result = limiter.acquire("test", 60.0, 1.0).await;
+        let result = limiter.acquire("test", 60.0, 1.0);
         assert!(matches!(result, AcquireResult::Rejected { .. }));
     }
 
-    #[tokio::test]
-    async fn test_burst_exceeds_rate() {
-        let limiter = RateLimiter::new();
+    #[test]
+    fn test_burst_exceeds_rate() {
+        let limiter = RateLimiter::default();
         // burst = 5
         for _ in 0..5 {
-            let result = limiter.acquire("burst", 60.0, 5.0).await;
+            let result = limiter.acquire("burst", 60.0, 5.0);
             assert!(matches!(result, AcquireResult::Allowed));
         }
-        let result = limiter.acquire("burst", 60.0, 5.0).await;
+        let result = limiter.acquire("burst", 60.0, 5.0);
         assert!(matches!(result, AcquireResult::Rejected { .. }));
     }
 
     #[tokio::test]
     async fn test_policy_hot_reload() {
-        let limiter = RateLimiter::new();
+        let limiter = RateLimiter::default();
         // High rate (6000/min = 100/sec), burst = 1
-        limiter.acquire("reload", 6000.0, 1.0).await;
-        let result = limiter.acquire("reload", 6000.0, 1.0).await;
+        limiter.acquire("reload", 6000.0, 1.0);
+        let result = limiter.acquire("reload", 6000.0, 1.0);
         assert!(matches!(result, AcquireResult::Rejected { .. }));
 
         // Policy hot-reload: burst changes but tokens don't reset.
         // With 100 tokens/sec, after 20ms we get ~2 tokens.
         tokio::time::sleep(Duration::from_millis(20)).await;
-        let result = limiter.acquire("reload", 6000.0, 10.0).await;
+        let result = limiter.acquire("reload", 6000.0, 10.0);
         assert!(matches!(result, AcquireResult::Allowed));
     }
 
     #[tokio::test]
     async fn test_concurrent_no_overshoot() {
         use std::sync::Arc;
-        let limiter = Arc::new(RateLimiter::new());
+        let limiter = Arc::new(RateLimiter::default());
         let mut handles = vec![];
         // 60 RPM, burst=10 — all 10 should succeed, 11th fails
         let key = Arc::new("concurrent".to_string());
         for _ in 0..12 {
             let limiter = limiter.clone();
             let key = key.clone();
-            handles.push(tokio::spawn(async move {
-                limiter.acquire(&key, 60.0, 10.0).await
+            handles.push(tokio::task::spawn_blocking(move || {
+                limiter.acquire(&key, 60.0, 10.0)
             }));
         }
         let mut allowed = 0;
@@ -194,16 +216,16 @@ mod tests {
         assert_eq!(rejected, 2);
     }
 
-    #[tokio::test]
-    async fn test_cleanup_stale_removes_idle_buckets() {
-        let limiter = RateLimiter::new();
-        limiter.acquire("keep", 60.0, 1.0).await;
-        limiter.acquire("stale", 60.0, 1.0).await;
+    #[test]
+    fn test_cleanup_stale_removes_idle_buckets() {
+        let limiter = RateLimiter::default();
+        limiter.acquire("keep", 60.0, 1.0);
+        limiter.acquire("stale", 60.0, 1.0);
 
         // Manually expire the "stale" bucket
         {
             let bucket = limiter.buckets.get("stale").unwrap().clone();
-            let mut b = bucket.lock().await;
+            let mut b = bucket.lock().unwrap_or_else(|p| p.into_inner());
             b.last_update = Instant::now() - Duration::from_secs(1200);
         }
 
@@ -213,35 +235,66 @@ mod tests {
         assert!(!limiter.buckets.contains_key("stale"));
     }
 
-    #[tokio::test]
-    async fn test_cleanup_preserves_in_use_buckets() {
-        let limiter = Arc::new(RateLimiter::new());
-        limiter.acquire("inuse", 60.0, 1.0).await;
+    #[test]
+    fn test_cleanup_preserves_in_use_buckets() {
+        let limiter = Arc::new(RateLimiter::default());
+        limiter.acquire("inuse", 60.0, 1.0);
 
         // Hold the lock while cleaning up
         let bucket = limiter.buckets.get("inuse").unwrap().clone();
-        let _guard = bucket.lock().await;
+        let _guard = bucket.lock().unwrap_or_else(|p| p.into_inner());
 
         let removed = limiter.cleanup_stale(Duration::from_secs(0)); // everything stale
         assert_eq!(removed, 0); // in-use bucket preserved
         assert!(limiter.buckets.contains_key("inuse"));
     }
 
-    #[tokio::test]
-    async fn test_acquire_rejects_misconfigured_nonpositive_rpm() {
+    #[test]
+    fn test_acquire_rejects_misconfigured_nonpositive_rpm() {
         // C1: rpm <= 0 is a misconfigured policy. Previously the first request
         // drained the burst bucket and later requests computed retry_after =
         // (1-0)/0 → saturated to u64::MAX. Fail closed with a sane Retry-After.
-        let limiter = RateLimiter::new();
-        let result = limiter.acquire("zero-rpm", 0.0, 1.0).await;
+        let limiter = RateLimiter::default();
+        let result = limiter.acquire("zero-rpm", 0.0, 1.0);
         assert!(
             matches!(result, AcquireResult::Rejected { retry_after_secs: 1 }),
             "zero rpm must be rejected immediately"
         );
-        let result = limiter.acquire("neg-rpm", -5.0, 1.0).await;
+        let result = limiter.acquire("neg-rpm", -5.0, 1.0);
         assert!(
             matches!(result, AcquireResult::Rejected { retry_after_secs: 1 }),
             "negative rpm must be rejected immediately"
         );
+    }
+
+    #[test]
+    fn test_max_buckets_rejects_new_keys_beyond_cap() {
+        // #7: under a spoofed-source flood every request is a new key and thus
+        // a new bucket. A hard cap must fail closed (reject) once reached so
+        // memory cannot grow unbounded between cleanup sweeps.
+        //
+        // burst is large so token exhaustion never interferes with the
+        // bucket-count assertions below.
+        let limiter = RateLimiter::new(2);
+        assert!(matches!(limiter.acquire("a", 60.0, 100.0), AcquireResult::Allowed));
+        assert!(matches!(limiter.acquire("b", 60.0, 100.0), AcquireResult::Allowed));
+        // Cap reached — a brand-new key is rejected, not admitted as a 3rd bucket.
+        assert!(matches!(
+            limiter.acquire("c", 60.0, 100.0),
+            AcquireResult::Rejected { .. }
+        ));
+        // Existing keys take the fast path and bypass the cap, so they still
+        // acquire even though the bucket count is at the limit.
+        assert!(matches!(limiter.acquire("a", 60.0, 100.0), AcquireResult::Allowed));
+    }
+
+    #[test]
+    fn test_max_buckets_zero_means_unbounded() {
+        // max_buckets = 0 disables the cap entirely (opt-out).
+        let limiter = RateLimiter::new(0);
+        for i in 0..1000 {
+            let key = format!("k{}", i);
+            assert!(matches!(limiter.acquire(&key, 60.0, 1.0), AcquireResult::Allowed));
+        }
     }
 }
