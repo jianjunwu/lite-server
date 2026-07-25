@@ -145,6 +145,9 @@ pub struct RouteDecl {
 /// `create_routes`.
 pub const SYSTEM_ROUTE_LEAVES: &[&str] = &[
     "compare", "versions", "ready", "health", "reload", "infer", "events", "stream",
+    // Server-level health probes (phase 3) — not model-namespace collisions,
+    // but reserved so custom routes can't masquerade as probe endpoints.
+    "livez", "readyz", "startupz",
 ];
 
 /// True if a declared route tail (e.g. "/status", "/infer", "/pets/{id}")
@@ -408,6 +411,10 @@ mod tests {
         for leaf in ["infer", "events", "stream", "versions", "ready", "health", "reload", "compare"] {
             assert!(is_reserved_route(&format!("/{leaf}")), "{leaf} should be reserved");
             assert!(is_reserved_route(leaf), "{leaf} (no slash) should be reserved");
+        }
+        // server-level health probes are also reserved (phase 3)
+        for leaf in ["livez", "readyz", "startupz"] {
+            assert!(is_reserved_route(&format!("/{leaf}")), "{leaf} should be reserved");
         }
         // a reserved first segment with deeper tail is still reserved
         assert!(is_reserved_route("/versions/v2/status"));

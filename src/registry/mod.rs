@@ -73,6 +73,26 @@ impl ModelRegistry {
         }
     }
 
+    /// Server-wide health rollup for the /health, /readyz and /startupz
+    /// handlers and gRPC Health sync. Entries are sorted by (name, version)
+    /// so responses are deterministic.
+    pub fn server_status(&self) -> ServerStatus {
+        let mut entries = Vec::new();
+        for entry in self.models.iter() {
+            for mv in entry.versions.values() {
+                entries.push(ServerStatusEntry {
+                    name: entry.name.clone(),
+                    version: mv.version.clone(),
+                    status: mv.status,
+                    workers: mv.workers.len(),
+                    loaded_at: mv.loaded_at,
+                });
+            }
+        }
+        entries.sort_by(|a, b| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
+        ServerStatus { entries }
+    }
+
     pub fn get_active_version(&self, model_name: &str) -> Option<String> {
         self.active_versions.get(model_name).map(|r| r.clone())
     }
@@ -412,6 +432,67 @@ mod tests {
     fn test_mark_ready_nonexistent_errors() {
         let reg = ModelRegistry::new();
         assert!(reg.mark_ready("nope", "1").is_err());
+    }
+
+    // --- Server-wide status rollup ---
+
+    #[test]
+    fn server_status_empty_registry_not_serving_nor_initializing() {
+        let reg = ModelRegistry::new();
+        let status = reg.server_status();
+        assert!(!status.has_serving());
+        assert!(status.initializing().is_empty());
+        assert!(status.serving_model_names().is_empty());
+    }
+
+    #[test]
+    fn server_status_degraded_counts_as_serving() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.set_status("m1", "1", VersionStatus::Degraded).unwrap();
+        let status = reg.server_status();
+        assert!(status.has_serving());
+        assert_eq!(status.serving_model_names(), vec!["m1".to_string()]);
+        assert!(status.initializing().is_empty());
+    }
+
+    #[test]
+    fn server_status_pending_and_loading_are_initializing() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap(); // Pending
+        reg.register("m1", "2", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.set_status("m1", "2", VersionStatus::Loading).unwrap();
+        let status = reg.server_status();
+        assert!(!status.has_serving());
+        let mut init = status.initializing();
+        init.sort();
+        assert_eq!(
+            init,
+            vec![
+                ("m1".to_string(), "1".to_string()),
+                ("m1".to_string(), "2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn server_status_sorted_and_carries_workers_and_loaded_at() {
+        let reg = ModelRegistry::new();
+        reg.register("b", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.register("a", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.mark_ready("a", "1").unwrap();
+        let status = reg.server_status();
+        let names: Vec<&str> = status.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+        let a = &status.entries[0];
+        assert_eq!(a.status, VersionStatus::Ready);
+        assert!(a.loaded_at.is_some());
+        assert_eq!(a.workers, 0);
     }
 
     #[test]

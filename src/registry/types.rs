@@ -118,3 +118,52 @@ impl ModelEntry {
             .max_by_key(|v| &v.version)
     }
 }
+
+/// One model version's health summary (server-wide status rollup, phase 3).
+#[derive(Debug, Clone)]
+pub struct ServerStatusEntry {
+    pub name: String,
+    pub version: String,
+    pub status: VersionStatus,
+    pub workers: usize,
+    pub loaded_at: Option<SystemTime>,
+}
+
+/// Server-wide health rollup consumed by the /health, /readyz and /startupz
+/// handlers and the gRPC Health sync. Built by
+/// [`crate::registry::ModelRegistry::server_status`]; sorted by (name,
+/// version) for deterministic output.
+#[derive(Debug, Clone, Default)]
+pub struct ServerStatus {
+    pub entries: Vec<ServerStatusEntry>,
+}
+
+impl ServerStatus {
+    /// Any version able to serve traffic (Ready or Degraded).
+    pub fn has_serving(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|e| matches!(e.status, VersionStatus::Ready | VersionStatus::Degraded))
+    }
+
+    /// Versions still initializing (Pending or Loading), as (name, version).
+    pub fn initializing(&self) -> Vec<(String, String)> {
+        self.entries
+            .iter()
+            .filter(|e| matches!(e.status, VersionStatus::Pending | VersionStatus::Loading))
+            .map(|e| (e.name.clone(), e.version.clone()))
+            .collect()
+    }
+
+    /// Names of models with at least one serving version (deduped).
+    pub fn serving_model_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| matches!(e.status, VersionStatus::Ready | VersionStatus::Degraded))
+            .map(|e| e.name.clone())
+            .collect();
+        names.dedup(); // entries sorted by name, so dedup suffices
+        names
+    }
+}

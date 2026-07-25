@@ -9,7 +9,13 @@ use std::sync::Arc;
 pub fn create_routes(state: AppState) -> Router {
     let mut router = Router::new();
 
-    router = router.route("/health", get(health_handler));
+    // Built-in health probes (phase 3) — fixed HTTP-layer endpoints, not
+    // overridable by @route declarations.
+    router = router
+        .route("/health", get(health_handler))
+        .route("/livez", get(livez_handler))
+        .route("/readyz", get(readyz_handler))
+        .route("/startupz", get(startupz_handler));
 
     router = router
         // Info

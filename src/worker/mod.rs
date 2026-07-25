@@ -161,6 +161,9 @@ pub struct WorkerManager {
     // health_check_interval cadence; no task when the interval is 0
     // (status then stays purely event-driven).
     status_coordinators: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    // gRPC Health reporter, installed by start_grpc_server (phase 3).
+    // None until the gRPC server is up; pushes are no-ops before that.
+    grpc_health: GrpcHealthHandle,
     // Loopback HTTP base URL of this server (e.g. http://127.0.0.1:8000),
     // passed to workers as --server-http so @route handlers can query the
     // hosting server via ctx.server (phase 2b). None for unix-socket HTTP.
@@ -206,6 +209,7 @@ impl WorkerManager {
             log_level,
             callback_runner,
             status_coordinators: Arc::new(RwLock::new(HashMap::new())),
+            grpc_health: Arc::new(RwLock::new(None)),
             server_http: None,
         }
     }
@@ -566,6 +570,7 @@ impl WorkerManager {
 
         // Replacement worker is up: Loading → Ready (loaded_at preserved).
         self.registry.mark_ready(model_name, version)?;
+        self.sync_grpc_health().await;
 
         // Record metric
         crate::metrics::prometheus::WORKER_RESPAWNS_TOTAL
@@ -607,6 +612,7 @@ impl WorkerManager {
         if let Err(e) = self.registry.set_status(model_name, version, VersionStatus::Failed) {
             warn!(model = %model_name, version = %version, "failed to mark version failed: {}", e);
         }
+        self.queue_grpc_health_sync();
     }
 
     /// Mark a version Degraded after a runtime worker loss (e.g. respawn
@@ -616,6 +622,7 @@ impl WorkerManager {
         if let Err(e) = self.registry.set_status(model_name, version, VersionStatus::Degraded) {
             warn!(model = %model_name, version = %version, "failed to mark version degraded: {}", e);
         }
+        self.queue_grpc_health_sync();
     }
 
     /// Start the status coordinator for a model version: every `interval`,
@@ -627,6 +634,7 @@ impl WorkerManager {
         let task_key = key.clone();
         let registry = self.registry.clone();
         let outlier_states = self.outlier_states.clone();
+        let grpc_health = self.grpc_health.clone();
         let model = model_name.to_string();
         let ver = version.to_string();
         let handle = tokio::spawn(async move {
@@ -653,6 +661,9 @@ impl WorkerManager {
                         );
                     }
                 }
+                // Keep gRPC Health fresh even when no transition happened —
+                // the overall "" service depends on every version.
+                sync_grpc_health(&registry, &grpc_health).await;
             }
         });
         self.status_coordinators.write().await.insert(key, handle);
@@ -664,6 +675,33 @@ impl WorkerManager {
         if let Some(handle) = self.status_coordinators.write().await.remove(&key) {
             handle.abort();
         }
+    }
+
+    /// Install the gRPC Health reporter (called once by start_grpc_server).
+    pub async fn set_grpc_health_reporter(
+        &self,
+        reporter: tonic_health::server::HealthReporter,
+    ) {
+        *self.grpc_health.write().await = Some(GrpcHealthState {
+            reporter,
+            known_models: std::collections::HashSet::new(),
+        });
+    }
+
+    /// Push the current registry health to the gRPC Health service. No-op
+    /// until the reporter is installed.
+    pub async fn sync_grpc_health(&self) {
+        sync_grpc_health(&self.registry, &self.grpc_health).await;
+    }
+
+    /// Fire-and-forget variant for sync contexts (error paths that can't
+    /// await, e.g. `inspect_err` closures).
+    fn queue_grpc_health_sync(&self) {
+        let registry = self.registry.clone();
+        let handle = self.grpc_health.clone();
+        tokio::spawn(async move {
+            sync_grpc_health(&registry, &handle).await;
+        });
     }
 
     /// Upsert custom @route declarations for a model version, received from the
@@ -769,6 +807,7 @@ impl WorkerManager {
             self.registry
                 .mark_ready(model_name, version)?;
             crate::metrics::prometheus::record_model_load(model_name, version, true);
+            self.sync_grpc_health().await;
             info!("Ensemble {} version {} loaded", model_name, version);
             return Ok(());
         }
@@ -1039,6 +1078,7 @@ impl WorkerManager {
             )
             .await;
         }
+        self.sync_grpc_health().await;
 
         crate::metrics::prometheus::record_model_load(model_name, version, true);
         crate::metrics::prometheus::set_active_workers(model_name, version, total_workers as f64);
@@ -1142,6 +1182,7 @@ impl WorkerManager {
         }
 
         self.registry.remove(model_name, version)?;
+        self.sync_grpc_health().await;
 
         crate::metrics::prometheus::record_model_unload(model_name, version);
         crate::metrics::prometheus::set_active_workers(model_name, version, 0.0);
@@ -1549,6 +1590,73 @@ pub fn pick_worker_skip_ejected(num_workers: usize, outlier: &OutlierState) -> u
 
     // All ejected — fall back to random
     start
+}
+
+/// gRPC Health reporter state: the tonic reporter plus the set of per-model
+/// services currently published, so unloaded models can be cleared.
+struct GrpcHealthState {
+    reporter: tonic_health::server::HealthReporter,
+    known_models: std::collections::HashSet<String>,
+}
+
+/// Shared handle to the optional gRPC Health state (None until the gRPC
+/// server installs its reporter).
+type GrpcHealthHandle = Arc<RwLock<Option<GrpcHealthState>>>;
+
+/// Push registry health to the gRPC Health service (phase 3):
+/// - service `""` — whole server: SERVING while any version is Ready/Degraded
+/// - service `"{model}"` — SERVING when the model's active version is
+///   Ready/Degraded; Loading/Failed/no-active → NOT_SERVING
+/// Degraded counts as SERVING: it still takes traffic. Services for models
+/// no longer in the registry are cleared.
+async fn sync_grpc_health(registry: &ModelRegistry, handle: &GrpcHealthHandle) {
+    use tonic_health::ServingStatus;
+
+    let mut guard = handle.write().await;
+    let Some(state) = guard.as_mut() else {
+        return;
+    };
+    let status = registry.server_status();
+
+    let overall = if status.has_serving() {
+        ServingStatus::Serving
+    } else {
+        ServingStatus::NotServing
+    };
+    state.reporter.set_service_status("", overall).await;
+
+    let mut current: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for name in status.entries.iter().map(|e| e.name.clone()) {
+        if !current.insert(name.clone()) {
+            continue; // already pushed this model
+        }
+        let serving = registry
+            .get_active_version(&name)
+            .and_then(|v| {
+                status
+                    .entries
+                    .iter()
+                    .find(|e| e.name == name && e.version == v)
+            })
+            .map(|e| matches!(e.status, VersionStatus::Ready | VersionStatus::Degraded))
+            .unwrap_or(false);
+        let svc_status = if serving {
+            ServingStatus::Serving
+        } else {
+            ServingStatus::NotServing
+        };
+        state.reporter.set_service_status(name, svc_status).await;
+    }
+
+    let stale: Vec<String> = state
+        .known_models
+        .difference(&current)
+        .cloned()
+        .collect();
+    for name in stale {
+        state.reporter.clear_service_status(&name).await;
+    }
+    state.known_models = current;
 }
 
 /// Compute the reconciled status for a version from its outlier-ejection

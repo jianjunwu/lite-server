@@ -766,17 +766,25 @@ pub async fn start_grpc_server(
 
     let service = GrpcService::new(
         registry,
-        worker_manager,
+        worker_manager.clone(),
         streaming_metrics,
         callback_runner,
         server_timeout,
     );
     let server = LiteServerServer::new(service);
 
+    // Standard gRPC health checking (grpc.health.v1): the reporter lives in
+    // the WorkerManager, which syncs "" and per-model services on every
+    // status transition and coordinator tick (phase 3).
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    worker_manager.set_grpc_health_reporter(health_reporter).await;
+    worker_manager.sync_grpc_health().await;
+
     tracing::info!("Starting gRPC server on {}", addr);
 
     tonic::transport::Server::builder()
         .add_service(server)
+        .add_service(health_service)
         .serve(addr)
         .await
         .map_err(|e| AppError::Internal(format!("gRPC server error: {}", e)))?;

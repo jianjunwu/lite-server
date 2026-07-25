@@ -472,7 +472,7 @@ DOCKER_COMPOSE = textwrap.dedent("""\
           # - RUST_LOG=info         # Server log level
         restart: unless-stopped
         healthcheck:
-          test: ["CMD", "curl", "-f", "http://localhost:8000/v2/health/ready"]
+          test: ["CMD", "curl", "-f", "http://localhost:8000/readyz"]
           interval: 30s
           timeout: 5s
           retries: 3

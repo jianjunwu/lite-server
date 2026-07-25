@@ -239,6 +239,10 @@ class RouteAPI(LitAPI):
     def shadow(self, ctx):
         return {"shadowed": True}
 
+    @route.get("/livez")  # reserved probe leaf (phase 3) → skipped at ingest
+    def livez(self, ctx):
+        return {"alive": True}
+
     @route.get("/models")
     def models(self, ctx):
         # ctx.server: live registry of the hosting server (phase 2b)
@@ -490,7 +494,137 @@ async fn test_health_endpoint() {
 
     let resp = client.get(format!("{}/health", base)).send().await.unwrap();
     assert_eq!(resp.status(), 200);
-    assert_eq!(resp.text().await.unwrap(), "ok");
+    // Structured JSON since phase 3 (no plain-text "ok" compat).
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["status"].is_string());
+    assert!(body["models"].is_array());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_health_probes() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    // livez: checks nothing, always 200
+    let resp = client.get(format!("{}/livez", base)).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "alive");
+
+    // startupz: nothing Pending/Loading → 200
+    let resp = client.get(format!("{}/startupz", base)).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "started");
+
+    load_model(&base, MODEL, "1").await;
+
+    // readyz: a serving model exists → 200 and the model is listed
+    let resp = client.get(format!("{}/readyz", base)).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "ready");
+    let models: Vec<&str> = body["models"].as_array().unwrap()
+        .iter().filter_map(|m| m.as_str()).collect();
+    assert!(models.contains(&MODEL), "readyz models: {:?}", models);
+
+    // /health: per-version status (snake_case serde) + loaded_at epoch secs
+    let resp = client.get(format!("{}/health", base)).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "ready");
+    let entry = body["models"].as_array().unwrap().iter()
+        .find(|m| m["name"] == MODEL && m["version"] == "1")
+        .expect("test_model/1 must appear in /health");
+    assert_eq!(entry["status"], "ready");
+    assert!(entry["loaded_at"].as_u64().is_some(),
+        "loaded_at must be epoch seconds: {:?}", entry);
+
+    unload_model(&base, MODEL, "1").await;
+}
+
+/// With zero loaded models: readyz 503, startupz/livez still green,
+/// /health reports not_ready with an empty model list.
+#[tokio::test]
+async fn test_readyz_503_when_no_models() {
+    let http_port = 18072u16;
+    kill_stale_on_port(http_port);
+    let repo = test_model_repo();
+    let _server = ServerGuard::start(&[
+        "--port", &http_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-metrics",
+        "--no-grpc",
+        "--log-level", "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    let client = reqwest::Client::new();
+
+    let resp = client.get(format!("{}/readyz", base)).send().await.unwrap();
+    assert_eq!(resp.status(), 503);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "not_ready");
+
+    let resp = client.get(format!("{}/startupz", base)).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = client.get(format!("{}/livez", base)).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client.get(format!("{}/health", base)).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "not_ready");
+    assert_eq!(body["models"].as_array().unwrap().len(), 0);
+}
+
+/// Model-level health: field renamed model→name, workers carry `ejected`;
+/// /v2/models status is snake_case serde rather than Debug formatting.
+#[tokio::test]
+#[serial]
+async fn test_model_health_fields() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+    load_model(&base, MODEL, "1").await;
+
+    let resp = client
+        .get(format!("{}/v2/models/{}/health", base, MODEL))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["name"], MODEL);
+    assert!(body.get("model").is_none(), "field must be renamed to name");
+    let workers = body["workers"].as_array().unwrap();
+    assert!(!workers.is_empty());
+    assert_eq!(workers[0]["ejected"], false);
+
+    let resp = client.get(format!("{}/v2/models", base)).send().await.unwrap();
+    let body: Value = resp.json().await.unwrap();
+    let entry = body["models"].as_array().unwrap().iter()
+        .find(|m| m["name"] == MODEL)
+        .expect("test_model must appear in /v2/models");
+    assert_eq!(entry["status"], "ready");
+
+    unload_model(&base, MODEL, "1").await;
+}
+
+/// route_model declares @route.get("/livez") — a reserved probe leaf. It is
+/// skipped at ingest, so the path falls through to the standardized 404.
+#[tokio::test]
+#[serial]
+async fn test_custom_route_probe_leaf_skipped() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    load_model(&base, ROUTE_MODEL, "1").await;
+
+    let resp = client
+        .get(format!("{}/v2/models/{}/livez", base, ROUTE_MODEL))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 404, "reserved probe leaf must be skipped at ingest");
+
+    unload_model(&base, ROUTE_MODEL, "1").await;
 }
 
 #[tokio::test]
@@ -1626,6 +1760,82 @@ async fn test_grpc_infer_aggregates_into_batch() {
     assert_eq!(jb["batch_size"], 2, "gRPC infer B must be batched into size 2");
 
     unload_model(&base, BATCH_MODEL, "1").await;
+}
+
+// ---------------------------------------------------------------------------
+// gRPC health checking (grpc.health.v1, phase 3)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_grpc_health_service() {
+    use tonic_health::pb::health_check_response::ServingStatus;
+    use tonic_health::pb::health_client::HealthClient;
+    use tonic_health::pb::HealthCheckRequest;
+
+    // Dedicated server WITH gRPC enabled (the shared server runs --no-grpc).
+    let http_port = 18074u16;
+    let grpc_port = 18075u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = test_model_repo();
+    let _server = ServerGuard::start(&[
+        "--port",
+        &http_port.to_string(),
+        "--grpc-port",
+        &grpc_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-metrics",
+        "--log-level",
+        "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+
+    let channel = tonic::transport::Endpoint::new(format!("http://127.0.0.1:{}", grpc_port))
+        .expect("valid gRPC address")
+        .connect()
+        .await
+        .expect("health channel must connect");
+    let mut client = HealthClient::new(channel);
+
+    // No models loaded: overall NOT_SERVING.
+    let resp = client
+        .check(HealthCheckRequest { service: String::new() })
+        .await.unwrap().into_inner();
+    assert_eq!(resp.status(), ServingStatus::NotServing);
+
+    load_model(&base, MODEL, "1").await;
+
+    // Overall and per-model services go SERVING (load syncs before the
+    // admin call returns, so no polling needed).
+    let resp = client
+        .check(HealthCheckRequest { service: String::new() })
+        .await.unwrap().into_inner();
+    assert_eq!(resp.status(), ServingStatus::Serving);
+    let resp = client
+        .check(HealthCheckRequest { service: MODEL.to_string() })
+        .await.unwrap().into_inner();
+    assert_eq!(resp.status(), ServingStatus::Serving);
+
+    // Unknown service → NotFound per the health-check spec.
+    let err = client
+        .check(HealthCheckRequest { service: "no_such_model".to_string() })
+        .await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    unload_model(&base, MODEL, "1").await;
+
+    // After unload the per-model service is cleared and the overall
+    // service flips back to NOT_SERVING.
+    let err = client
+        .check(HealthCheckRequest { service: MODEL.to_string() })
+        .await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound);
+    let resp = client
+        .check(HealthCheckRequest { service: String::new() })
+        .await.unwrap().into_inner();
+    assert_eq!(resp.status(), ServingStatus::NotServing);
 }
 
 // ---------------------------------------------------------------------------

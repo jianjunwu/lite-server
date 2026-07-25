@@ -27,6 +27,7 @@ prost-types = "0.13"
 
 # gRPC
 tonic = "0.12"
+tonic-health = { version = "0.12", features = ["transport"] }
 tokio-stream = "0.1"
 
 # transport

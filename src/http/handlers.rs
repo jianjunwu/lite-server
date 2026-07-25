@@ -8,6 +8,7 @@ use crate::streaming;
 use crate::worker::protocol::RouteDecl;
 use axum::{
     extract::{Multipart, Path, Query, State},
+    http::StatusCode,
     response::{IntoResponse, Json, Response},
 };
 use axum::extract::ws::{Message, WebSocket};
@@ -94,8 +95,75 @@ pub struct VersionQuery {
 
 // ===== Health =====
 
-pub async fn health_handler() -> impl IntoResponse {
-    "ok"
+/// Liveness: the process is up — deliberately checks nothing else (no
+/// models/ZMQ/DB) so a model failure never cascades into a pod restart.
+pub async fn livez_handler() -> impl IntoResponse {
+    Json(json!({"status": "alive"}))
+}
+
+/// Readiness: 200 while at least one version can serve (Ready or Degraded);
+/// 503 otherwise. A single failed model never takes readiness down.
+pub async fn readyz_handler(State(state): State<Arc<AppState>>) -> Response {
+    let status = state.registry.server_status();
+    if status.has_serving() {
+        (
+            StatusCode::OK,
+            Json(json!({"status": "ready", "models": status.serving_model_names()})),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "not_ready", "reason": "no models available"})),
+        )
+            .into_response()
+    }
+}
+
+/// Startup: 503 while any version is Pending/Loading so slow model loads
+/// don't trip liveness (pair with K8s startupProbe.failureThreshold).
+pub async fn startupz_handler(State(state): State<Arc<AppState>>) -> Response {
+    let pending: Vec<String> = state
+        .registry
+        .server_status()
+        .initializing()
+        .into_iter()
+        .map(|(name, version)| format!("{}/{}", name, version))
+        .collect();
+    if pending.is_empty() {
+        (StatusCode::OK, Json(json!({"status": "started"}))).into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "initializing", "pending": pending})),
+        )
+            .into_response()
+    }
+}
+
+/// Combined summary: always 200 (informational), per-version status and
+/// loaded_at. `status` mirrors the readyz predicate.
+pub async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let status = state.registry.server_status();
+    let models: Vec<Value> = status
+        .entries
+        .iter()
+        .map(|e| {
+            json!({
+                "name": e.name,
+                "version": e.version,
+                "status": e.status,
+                "workers": e.workers,
+                "loaded_at": e.loaded_at
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs()),
+            })
+        })
+        .collect();
+    Json(json!({
+        "status": if status.has_serving() { "ready" } else { "not_ready" },
+        "models": models,
+    }))
 }
 
 // ===== OPTIONS preflight for inference routes =====
@@ -104,7 +172,6 @@ pub async fn inference_options_handler(
     State(state): State<Arc<AppState>>,
     Path(params): Path<HashMap<String, String>>,
 ) -> Response {
-    use axum::http::StatusCode;
     // The handler is registered on both 1-param (`/v2/models/:model_name/infer`)
     // and 2-param (`/v2/models/:model_name/versions/:version/infer`) routes.
     // Path<String> only accepts exactly one captured param, so the versioned
@@ -152,7 +219,7 @@ pub async fn list_models_handler(State(state): State<Arc<AppState>>) -> impl Int
             json!({
                 "name": name,
                 "version": version,
-                "status": format!("{:?}", mv.status),
+                "status": mv.status,
                 "model_type": format!("{:?}", mv.model_type),
                 "workers": mv.workers.len(),
             })
@@ -225,17 +292,18 @@ pub async fn model_health_handler(
         let mut workers_json = Vec::with_capacity(total_workers);
         let mut healthy_count = 0usize;
         for i in 0..total_workers {
-            let healthy = !outlier.is_ejected(i);
-            if healthy {
+            let ejected = outlier.is_ejected(i);
+            if !ejected {
                 healthy_count += 1;
             }
             workers_json.push(json!({
                 "worker_id": i,
-                "healthy": healthy,
+                "healthy": !ejected,
+                "ejected": ejected,
             }));
         }
         Ok(Json(json!({
-            "model": model_name,
+            "name": model_name,
             "version": resolved_version,
             "healthy_workers": healthy_count,
             "total_workers": total_workers,
@@ -244,10 +312,10 @@ pub async fn model_health_handler(
     } else {
         // No outlier state means no active queue — report all unknown
         let workers_json: Vec<Value> = (0..total_workers)
-            .map(|i| json!({"worker_id": i, "healthy": true}))
+            .map(|i| json!({"worker_id": i, "healthy": true, "ejected": false}))
             .collect();
         Ok(Json(json!({
-            "model": model_name,
+            "name": model_name,
             "version": resolved_version,
             "healthy_workers": total_workers,
             "total_workers": total_workers,

@@ -250,14 +250,17 @@ See [examples/README.md](examples/README.md) for learning path and usage details
 | GET | `/v2/repository/models/{name}/versions/{v}/files` | List version directory contents |
 | POST | `/v2/models/{name}/reload` | Hot reload |
 | POST | `/v2/models/{name}/versions/{v}/activate` | Activate version |
-| GET | `/health` | Health check |
+| GET | `/health` | Health summary (JSON: per-version status, workers, loaded_at) |
+| GET | `/livez` | Liveness probe (always 200) |
+| GET | `/readyz` | Readiness probe (503 until a model can serve) |
+| GET | `/startupz` | Startup probe (503 while models load) |
 | GET | `/info` | Server info |
 | GET | `/metrics` | Prometheus metrics |
 | GET | `/metrics/timeline` | Historical metric timeline |
 | GET | `/metrics/timeline/{name}` | Per-model metric timeline |
 | GET | `/metrics/alerts` | Alert rules and status |
 
-**Custom routes** declared with `@route` on `LitAPI` methods are served under `/v2/models/{name}/<tail>`. System tails (`infer`, `events`, `stream`, `ready`, `health`, `reload`, `versions`, `compare`) are reserved and cannot be overridden.
+**Custom routes** declared with `@route` on `LitAPI` methods are served under `/v2/models/{name}/<tail>`. System tails (`infer`, `events`, `stream`, `ready`, `health`, `reload`, `versions`, `compare`, `livez`, `readyz`, `startupz`) are reserved and cannot be overridden.
 
 ## Configuration
 
