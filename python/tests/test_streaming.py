@@ -456,6 +456,42 @@ class TestBidiStreaming:
         assert any(_is_done(r, "s-b2") for r in sock.sent)
 
     @pytest.mark.asyncio
+    async def test_close_delivers_on_close_output_as_final_chunk(self):
+        """on_close's return value is sent as a chunk before StreamDone,
+        symmetric with on_open/on_chunk (previously discarded)."""
+        class H(BidiStreamHandler):
+            def on_open(self, initial_data):
+                return None  # no open chunk
+
+            def on_close(self):
+                return {"final": "hello world"}
+
+        class BidiAPI(EchoAPI):
+            def bidi_stream(self):
+                return H()
+
+        sock = AsyncSocket()
+        active = {}
+        api = BidiAPI()
+        await inference._handle_stream_open_async(
+            api, _stream_req("s-cl", b"{}"), sock, active, log
+        )
+        # on_open returned None → no chunk sent yet
+        assert not [r for r in sock.stream_responses("s-cl") if r.stream.HasField("chunk")]
+
+        close_req = Request(
+            uid="cl1",
+            stream=StreamRequest(stream_id="s-cl", close=StreamClose()),
+        )
+        await inference._handle_stream_async(api, close_req, sock, active, log)
+
+        chunks = [r for r in sock.stream_responses("s-cl") if r.stream.HasField("chunk")]
+        assert len(chunks) == 1, f"expected on_close output as 1 chunk, got {len(chunks)}"
+        assert json.loads(chunks[0].stream.chunk.data) == {"final": "hello world"}
+        # ...and Done is still sent after the final chunk
+        assert any(_is_done(r, "s-cl") for r in sock.sent)
+
+    @pytest.mark.asyncio
     async def test_chunk_for_unknown_stream_sends_error(self):
         from lite_server.proto import StreamChunk
 

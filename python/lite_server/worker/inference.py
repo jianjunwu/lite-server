@@ -613,14 +613,43 @@ class _BidiSession:
         self.ctx = ctx
 
 
-async def _close_bidi_quietly(on_close, ctx, stream_id, log) -> None:
+async def _close_bidi_quietly(on_close, ctx, stream_id, log) -> Any:
     """Best-effort bidi ``on_close`` (exception-isolated): balances a
     completed ``on_open`` exactly once — close/cancel, worker shutdown,
-    or an abandoned open."""
+    or an abandoned open.
+
+    Returns the ``on_close`` output (or ``None`` on exception / when the
+    handler returns ``None``) so the caller can deliver it as a final chunk,
+    symmetric with ``on_open`` / ``on_chunk``.
+    """
     try:
-        await on_close(ctx=ctx)
+        return await on_close(ctx=ctx)
     except Exception:
         log.debug("bidi on_close error for %s", stream_id, exc_info=True)
+        return None
+
+
+async def _send_bidi_final_chunk(
+    lit_api, ctx: RequestContext, output: Any, stream_id: str, socket, log
+) -> None:
+    """Encode ``on_close``'s output and send it as a bidi chunk (best-effort).
+
+    Mirrors the ``on_open`` / ``on_chunk`` encode path (postprocess → encode
+    → chunk).  Exception-isolated: a failure skips the chunk but the caller
+    still sends ``StreamDone``.
+    """
+    ctx.output = output
+    ctx.early = None
+    try:
+        pipe = _get_pipeline(lit_api)
+        await pipe.postprocess(ctx)
+    except Exception as e:
+        log.warning("bidi on_close encode failed for %s: %s", stream_id, _format_exc_brief(e))
+        return
+    body, _headers = unwrap_response(ctx.response)
+    await socket.send(
+        _make_stream_chunk(stream_id, json.dumps(body).encode(), is_final=False).SerializeToString()
+    )
 
 
 async def _send_stream_early(socket, stream_id: str, early_response, lit_api: LitAPI) -> None:
@@ -651,8 +680,17 @@ async def _handle_stream_async(
     elif action in ("close", "cancel"):
         entry = active_streams.pop(stream_id, None)
         if isinstance(entry, _BidiSession):
-            await _close_bidi_quietly(entry.on_close, entry.ctx, stream_id, log)
+            on_close_output = await _close_bidi_quietly(
+                entry.on_close, entry.ctx, stream_id, log
+            )
             if action == "close":
+                # Deliver on_close's return as a final chunk (symmetric with
+                # on_open/on_chunk) before Done.  Encoding failures are
+                # isolated — Done is still sent below.
+                if on_close_output is not None:
+                    await _send_bidi_final_chunk(
+                        lit_api, entry.ctx, on_close_output, stream_id, socket, log
+                    )
                 metrics = collect_metrics(lit_api)
                 await socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
         elif isinstance(entry, asyncio.Task):
