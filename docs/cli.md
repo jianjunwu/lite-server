@@ -51,7 +51,7 @@ lite-server serve [OPTIONS]
 | `--grpc-port` | int | 8001 | gRPC server port |
 | `--metrics-port` | int | 8002 | Prometheus `/metrics` endpoint port |
 
-#### Model Repository & Endpoints
+#### Model Repository
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|

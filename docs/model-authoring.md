@@ -835,7 +835,7 @@ The client always receives a four-field structured response:
 
 On gRPC, `code`/`param` are delivered as standard [ErrorInfo](https://github.com/googleapis/googleapis/blob/master/google/rpc/error_details.proto) details (`reason` = code, `metadata` = {error_type, param}) alongside the `[error_type] message` status message.
 
-`HTTPException` works in custom endpoint handlers too — the endpoint returns the exception's status code with the same structured error body.
+`HTTPException` works in custom route handlers too — the route returns the exception's status code with the same structured error body.
 
 Custom status codes are supported via subclassing `HTTPException` directly:
 

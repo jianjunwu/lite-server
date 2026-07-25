@@ -16,7 +16,7 @@ High-performance model inference server — Rust core for I/O, Python for infere
   - [Features](#features)
     - [Inference Modes](#inference-modes)
     - [Model Management](#model-management)
-    - [Custom Endpoints](#custom-endpoints)
+    - [Custom Routes](#custom-routes)
     - [Worker Resilience](#worker-resilience)
     - [Observability](#observability)
   - [Installation](#installation)
@@ -30,7 +30,6 @@ High-performance model inference server — Rust core for I/O, Python for infere
   - [Multi-Platform](#multi-platform)
   - [Development](#development)
     - [Project Structure](#project-structure)
-  - [TODO](#todo)
   - [License](#license)
 
 
@@ -143,13 +142,12 @@ See [docs/benchmark.md](docs/benchmark.md) for full results and reproduction ste
 - **Model packing** — `.lma` format with SHA256 + HMAC signature
 - **Model upload/download** — upload `.lma` artifacts or raw files via HTTP API, with auto-load support
 
-### Custom Endpoints
+### Custom Routes
 
-- **Directory-based discovery** — place Python files in `endpoints/` for auto-registration
-- **Decorator routing** — `@route.get("/status")` for explicit control
-- **Server context access** — `server.registry`, `server.infer()`, `server.metrics` from handlers
-- **Middleware chain** — per-route or global middleware (auth, rate limiting, CORS)
-- **Streaming support** — chunked and SSE responses from custom endpoints
+- **Decorator routing** — `@route.get("/status")` on `LitAPI` methods, served under `/v2/models/<model>/<tail>`
+- **Same channel as inference** — route handlers run in the model worker; no separate process
+- **Server context access** — `ctx.server.registry` and cross-model `ctx.server.inference.infer()` from handlers
+- **Callback chain** — model-level callbacks (auth, rate limiting, CORS, logging) cover inference and custom routes alike
 
 ### Worker Resilience
 
@@ -252,14 +250,14 @@ See [examples/README.md](examples/README.md) for learning path and usage details
 | GET | `/v2/repository/models/{name}/versions/{v}/files` | List version directory contents |
 | POST | `/v2/models/{name}/reload` | Hot reload |
 | POST | `/v2/models/{name}/versions/{v}/activate` | Activate version |
-| GET | `/health` | Health check (overridable by custom endpoints) |
+| GET | `/health` | Health check |
 | GET | `/info` | Server info |
 | GET | `/metrics` | Prometheus metrics |
 | GET | `/metrics/timeline` | Historical metric timeline |
 | GET | `/metrics/timeline/{name}` | Per-model metric timeline |
 | GET | `/metrics/alerts` | Alert rules and status |
 
-**Custom endpoints** (loaded from `endpoints/` directory or decorator-registered) are registered dynamically alongside built-in routes. System routes (`/info`, `/metrics`, `/v2/models`, `/v2/repository`) cannot be overridden.
+**Custom routes** declared with `@route` on `LitAPI` methods are served under `/v2/models/{name}/<tail>`. System tails (`infer`, `events`, `stream`, `ready`, `health`, `reload`, `versions`, `compare`) are reserved and cannot be overridden.
 
 ## Configuration
 
@@ -369,10 +367,6 @@ cd python && python -m pytest tests/
 ├── Cargo.toml        # Rust manifest
 └── pyproject.toml    # Python packaging (maturin)
 ```
-
-## TODO
-
-- [ ] `server.infer()` — wire up so custom endpoint handlers can call loaded LitAPI models
 
 ## License
 

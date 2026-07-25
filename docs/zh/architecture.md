@@ -161,7 +161,9 @@ lite-server-core（主进程）
 
 ## IPC 协议
 
-Worker 使用 ZeroMQ PAIR 套接字与 Rust 内核通信，序列化协议为 protobuf。Unix 上传输层使用 `ipc://`（Unix 域套接字），Windows 上回退到 `tcp://127.0.0.1:<port>`。自定义端点 Worker 使用独立的长度前缀 JSON 协议，通过 UDS（Unix）或 TCP（Windows）通信。
+Worker 使用 ZeroMQ PAIR 套接字与 Rust 内核通信，序列化协议为 protobuf。Unix 上传输层使用 `ipc://`（Unix 域套接字），Windows 上回退到 `tcp://127.0.0.1:<port>`。
+
+自定义 `@route` handler 运行在模型 worker 内，共用同一通道：未匹配到系统路由的 `/v2/models/<model>/<tail>` 路径会落到 fallback handler，进入该模型的 InferenceQueue，像推理请求一样分发到 worker。路由 handler 可通过 `ctx.server` 经 loopback HTTP 回连 Rust 内核（registry 查询、跨模型推理）。
 
 ## 数据路径
 

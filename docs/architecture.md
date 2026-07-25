@@ -159,7 +159,9 @@ lite-server-core (main process)
 
 ## IPC Protocol
 
-Workers communicate with the Rust core using ZeroMQ PAIR sockets with protobuf serialization. On Unix, the transport uses `ipc://` (Unix domain sockets); on Windows, it falls back to `tcp://127.0.0.1:<port>`. Custom endpoint workers use a separate length-prefixed JSON protocol over UDS (Unix) or TCP (Windows).
+Workers communicate with the Rust core using ZeroMQ PAIR sockets with protobuf serialization. On Unix, the transport uses `ipc://` (Unix domain sockets); on Windows, it falls back to `tcp://127.0.0.1:<port>`.
+
+Custom `@route` handlers run inside the model worker and share this channel: an unmatched `/v2/models/<model>/<tail>` HTTP path falls through to a fallback handler, is enqueued to the model's InferenceQueue, and is dispatched to the worker like an inference request. From a route handler, `ctx.server` reaches back into the Rust core over loopback HTTP (registry queries, cross-model inference).
 
 ## Data Path
 

@@ -16,7 +16,7 @@
   - [功能特性](#功能特性)
     - [推理模式](#推理模式)
     - [模型管理](#模型管理)
-    - [自定义端点](#自定义端点)
+    - [自定义路由](#自定义路由)
     - [Worker 韧性](#worker-韧性)
     - [可观测性](#可观测性)
   - [安装](#安装)
@@ -30,7 +30,6 @@
   - [多平台支持](#多平台支持)
   - [开发](#开发)
     - [项目结构](#项目结构)
-  - [TODO](#todo)
   - [License](#license)
 
 ## 为什么选 lite-server？
@@ -141,13 +140,12 @@ Rust 内核处理所有 I/O（HTTP、gRPC、IPC、指标、文件监听），Pyt
 - **模型打包** — `.lma` 格式，SHA256 + HMAC 签名验证
 - **模型上传/下载** — 通过 HTTP API 上传 `.lma` 包或原始文件，支持自动加载
 
-### 自定义端点
+### 自定义路由
 
-- **目录自动发现** — 将 Python 文件放入 `endpoints/` 目录即可自动注册
-- **装饰器路由** — `@endpoint.get("/status")` 精确控制路由
-- **服务器上下文访问** — handler 中可使用 `server.registry`、`server.infer()`、`server.metrics`
-- **中间件链** — 支持按路由或全局中间件（认证、限流、CORS）
-- **流式响应** — 自定义端点支持 chunked 和 SSE 流式输出
+- **装饰器路由** — 在 `LitAPI` 方法上用 `@route.get("/status")` 声明，挂在 `/v2/models/<model>/<tail>` 下
+- **与推理同通道** — 路由 handler 运行在模型 worker 内，无独立进程
+- **服务器上下文访问** — handler 中可使用 `ctx.server.registry` 和跨模型 `ctx.server.inference.infer()`
+- **回调链** — 模型级回调（认证、限流、CORS、日志）同时覆盖推理和自定义路由
 
 ### Worker 韧性
 
@@ -250,14 +248,14 @@ lite-server init my_project           # 脚手架创建项目
 | GET | `/v2/repository/models/{name}/versions/{v}/files` | 列出版本目录文件 |
 | POST | `/v2/models/{name}/reload` | 热重载 |
 | POST | `/v2/models/{name}/versions/{v}/activate` | 激活版本 |
-| GET | `/health` | 健康检查（可被自定义端点覆盖） |
+| GET | `/health` | 健康检查 |
 | GET | `/info` | 服务器信息 |
 | GET | `/metrics` | Prometheus 指标 |
 | GET | `/metrics/timeline` | 历史指标时间线 |
 | GET | `/metrics/timeline/{name}` | 单模型指标时间线 |
 | GET | `/metrics/alerts` | 告警规则与状态 |
 
-**自定义端点**（从 `endpoints/` 目录加载或装饰器注册）与内置路由一起动态注册。系统路由（`/info`、`/metrics`、`/v2/models`、`/v2/repository`）不可覆盖。
+**自定义路由**通过 `LitAPI` 方法上的 `@route` 装饰器声明，挂在 `/v2/models/{name}/<tail>` 下。系统保留字（`infer`、`events`、`stream`、`ready`、`health`、`reload`、`versions`、`compare`）不可覆盖。
 
 ## 配置
 
@@ -367,10 +365,6 @@ cd python && python -m pytest tests/
 ├── Cargo.toml        # Rust 清单
 └── pyproject.toml    # Python 打包（maturin）
 ```
-
-## TODO
-
-- [ ] `server.infer()` — 实现后使自定义端点可以调用已加载的 LitAPI 模型
 
 ## License
 

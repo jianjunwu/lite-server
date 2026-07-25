@@ -290,13 +290,19 @@ def check_14():
 
 
 def check_15():
-    st1, r1 = http_json("GET", "/public")
-    st2, _ = http_json("GET", "/status")
-    st3, r3 = http_json("GET", "/status", headers={"X-API-Key": "secret-api-key-123"})
-    ok = (st1 == 200 and "public" in str(r1).lower()
-          and st2 == 401
-          and st3 == 200 and isinstance(r3, dict))
-    return ok, f"/public HTTP {st1} | /status no-key HTTP {st2} | /status key HTTP {st3}"
+    # Model-level callback chain guards every route of the model — inference
+    # and custom @route handlers alike. No key → 401; valid key → 200.
+    key = {"X-API-Key": "secret-api-key-123"}
+    st1, _ = http_json("POST", "/v2/models/protected/infer", {"input": "hello"})
+    st2, r2 = http_json("POST", "/v2/models/protected/infer", {"input": "hello"}, headers=key)
+    st3, _ = http_json("GET", "/v2/models/protected/status")
+    st4, r4 = http_json("GET", "/v2/models/protected/status", headers=key)
+    ok = (st1 == 401
+          and st2 == 200 and isinstance(r2, dict) and r2.get("output") == "protected: hello"
+          and st3 == 401
+          and st4 == 200 and isinstance(r4, dict))
+    return ok, (f"infer no-key HTTP {st1} | infer key HTTP {st2} | "
+                f"status no-key HTTP {st3} | status key HTTP {st4}")
 
 
 def check_16():

@@ -18,7 +18,7 @@ class PetsAPI(LitAPI):
         self.pets = {1: {"id": 1, "name": "Fido"}, 2: {"id": 2, "name": "Rex"}}
 
     def predict(self, x):
-        return {"output": x * 2}
+        return {"output": x["input"] * 2}
 
     # ---- custom routes (served under /v2/models/pets/<tail>) ----
 

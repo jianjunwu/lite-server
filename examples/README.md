@@ -51,6 +51,7 @@ Start from example 01 and work your way up. Each example builds on concepts from
 |---|---------|-------------|-------------|
 | 04 | [multi_version](04_multi_version/) | Version switching | `server.yaml`, activate/deactivate versions at runtime |
 | 05 | [ensemble](05_ensemble/) | Multi-model DAG pipeline | Ensemble config, parallel step execution, `$request`/`$step` refs |
+| 06 | [custom_route](06_custom_route/) | Custom HTTP routes on a model | `@route` decorator, path params, `ctx.server` registry queries |
 | 07 | [custom_params](07_custom_params/) | Config-driven behavior | `self.config`, custom YAML fields |
 | 09 | [custom_metrics](09_custom_metrics/) | Custom Prometheus metrics | `register_metric()`, `report_metric()`, gauge/counter/histogram |
 | 10 | [async](10_async/) | Asynchronous inference | `async def predict()`, unified async pipeline, mixed sync/async |
@@ -63,7 +64,7 @@ Start from example 01 and work your way up. Each example builds on concepts from
 | 12 | [continuous_batching](12_continuous_batching/) | LLM continuous batching | `prefill()` / `step()` / `has_finished()` hooks |
 | 13 | [bidi_streaming](13_bidi_streaming/) | Bidirectional streaming (ASR) | `BidiStreamHandler`, `on_open` / `on_chunk` / `on_close` |
 | 14 | [lifecycle_hooks](14_lifecycle_hooks/) | Worker lifecycle hooks | `on_ready` / `on_error` / `on_exit` shell + HTTP callbacks |
-| 15 | [middleware](15_middleware/) | Endpoint middleware chain | `require_api_key`, `rate_limit`, `cors`, `log_requests` |
+| 15 | [middleware](15_middleware/) | Model-level callback chain | `RequireApiKey`, `RateLimit`, `Cors`, `LogRequests` |
 | 16 | [grpc](16_grpc/) | gRPC inference endpoints | `grpc_port`, auto-generated gRPC from LitAPI |
 
 ## Running Any Example
@@ -150,18 +151,25 @@ curl -X POST http://localhost:8000/v2/models/pipeline/infer \
 # => {"output": "preprocessed(hello) -> done"}
 ```
 
-### 06 Custom Endpoint
+### 06 Custom Routes
 
 ```bash
 # Standard inference still works
-curl -X POST http://localhost:8000/v2/models/echo/infer \
+curl -X POST http://localhost:8000/v2/models/pets/infer \
   -H 'Content-Type: application/json' \
   -d '{"input": 21}'
 # => {"output": 42}
 
-# Custom status endpoint
-curl http://localhost:8000/status
-# => {"server": "lite-server", "loaded_models_count": 1, "loaded_models": [...]}
+# Custom routes live under /v2/models/<model>/<tail>
+curl http://localhost:8000/v2/models/pets/status
+# => {"model_loaded": true, "method": "GET"}
+
+curl http://localhost:8000/v2/models/pets/pets/1
+# => {"id": 1, "name": "Fido"}
+
+# ctx.server registry query from a route handler
+curl http://localhost:8000/v2/models/pets/models
+# => {"loaded": [{"name": "pets", "version": "1", "status": "Ready", ...}]}
 ```
 
 ### 07 Custom Parameters
@@ -259,19 +267,25 @@ curl -X POST http://localhost:8000/v2/models/hooked_model/infer \
 # Console shows hook commands executing (echo statements)
 ```
 
-### 15 Middleware
+### 15 Callbacks
 
 ```bash
-# Public endpoint — no auth needed
-curl http://localhost:8000/public
-# => {"message": "this endpoint is public"}
+# Inference — requires API key
+curl -X POST http://localhost:8000/v2/models/protected/infer \
+  -H 'Content-Type: application/json' -d '{"input": "hello"}'
+# => {"error": {"type": "authentication_error", "message": "missing API key", ...}}  (401)
 
-# Protected endpoint — requires API key
-curl http://localhost:8000/status
-# => {"error": "unauthorized"}  (401)
+curl -X POST http://localhost:8000/v2/models/protected/infer \
+  -H 'Content-Type: application/json' -H "X-API-Key: secret-api-key-123" \
+  -d '{"input": "hello"}'
+# => {"output": "protected: hello"}
 
-curl -H "X-API-Key: secret-api-key-123" http://localhost:8000/status
-# => {"server": "lite-server", "loaded_models": ["protected"], ...}
+# Custom route — guarded by the same model-level chain
+curl http://localhost:8000/v2/models/protected/status
+# => 401
+
+curl -H "X-API-Key: secret-api-key-123" http://localhost:8000/v2/models/protected/status
+# => {"server": "lite-server", "loaded_models": [{"name": "protected", ...}], ...}
 ```
 
 ### 16 gRPC

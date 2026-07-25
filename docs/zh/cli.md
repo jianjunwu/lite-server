@@ -51,7 +51,7 @@ lite-server serve [选项]
 | `--grpc-port` | int | 8001 | gRPC 服务端口 |
 | `--metrics-port` | int | 8002 | Prometheus `/metrics` 端点端口 |
 
-#### 模型仓库与自定义端点
+#### 模型仓库
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|

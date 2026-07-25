@@ -829,7 +829,7 @@ raise BadRequestError("input must be non-negative", code="invalid_input", param=
 
 在 gRPC 上，`code`/`param` 以标准 [ErrorInfo](https://github.com/googleapis/googleapis/blob/master/google/rpc/error_details.proto) details 传递（`reason` = code，`metadata` = {error_type, param}），状态消息保持 `[error_type] message` 格式。
 
-`HTTPException` 在自定义端点处理器中同样有效 — 端点返回异常的状态码和相同的结构化错误体。
+`HTTPException` 在自定义路由处理器中同样有效 — 路由返回异常的状态码和相同的结构化错误体。
 
 可通过直接继承 `HTTPException` 支持自定义状态码：
 
