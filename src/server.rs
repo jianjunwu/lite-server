@@ -82,7 +82,7 @@ impl LiteServer {
             inference_queue.clone(),
             config.logging.level.clone(),
             callback_runner.clone(),
-        ));
+        ).with_server_http(Self::loopback_http_base(&config)));
 
         Self {
             config,
@@ -91,6 +91,21 @@ impl LiteServer {
             inference_queue,
             callback_runner,
         }
+    }
+
+    /// Loopback HTTP base URL handed to workers as --server-http so @route
+    /// handlers can reach this server via ctx.server (phase 2b). Wildcard
+    /// binds collapse to 127.0.0.1; unix-socket HTTP has no TCP loopback and
+    /// yields None (ctx.server stays None in that deployment).
+    fn loopback_http_base(config: &Config) -> Option<String> {
+        if config.server.host.starts_with("unix:") {
+            return None;
+        }
+        let host = match config.server.host.as_str() {
+            "" | "0.0.0.0" | "::" => "127.0.0.1",
+            h => h,
+        };
+        Some(format!("http://{}:{}", host, config.server.http_port))
     }
 
     pub async fn run(&self) -> Result<(), AppError> {

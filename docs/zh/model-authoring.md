@@ -313,6 +313,70 @@ class AuditLogger(Callback):
 
 参见 [examples/14_lifecycle_hooks](../examples/14_lifecycle_hooks/) 获取可运行示例。
 
+## 自定义路由（`@route`）
+
+用 `@route` 装饰器在模型上声明额外的 HTTP 端点。它们挂载在
+`/v2/models/<model>/<tail>` 下，通过与推理相同的通道分发到该模型的
+worker — 不需要独立进程。
+
+```python
+from lite_server import LitAPI, route
+from lite_server.response import Response
+
+class PetsAPI(LitAPI):
+    @route.get("/pets/{pet_id}")
+    def get_pet(self, ctx):
+        pet_id = int(ctx.state["path_params"]["pet_id"])
+        pet = self.pets.get(pet_id)
+        if pet is None:
+            return Response(content={"error": "pet not found"}, status_code=404)
+        return pet
+```
+
+处理器接收一个 `RequestContext`:
+
+- `ctx.request` — 解析后的 JSON body（dict，无 body 时为 `{}`)
+- `ctx.meta.method` / `ctx.meta.query` / `ctx.meta.headers` — HTTP 元数据
+- `ctx.state["path_params"]` — 从 `{name}` 段提取的路径参数
+- `ctx.server` — 指向宿主服务器的 `ServerProxy`（见下文）
+- 返回普通值（→ `200 application/json`）或 `Response`（自定义
+  状态码 / 响应头 / media type)
+
+系统路由（`infer`、`events`、`stream`、`ready`、`health`、`reload`、
+`versions`、`compare`）为保留路由：在这些路径上声明 `@route` 会在加载时
+跳过并告警。
+
+### `ctx.server`(ServerProxy)
+
+路由处理器可以通过 loopback HTTP 查询宿主服务器：
+
+| API | 行为 |
+|-----|------|
+| `ctx.server.registry.list_loaded()` | 实时返回已加载模型列表：`[{"name", "version", "status", "model_type", "workers"}, ...]` |
+| `ctx.server.registry.get(name)` | 返回某个模型的首个条目，不存在时为 `None` |
+| `await ctx.server.inference.infer(model_name, input_data, version=None)` | 对另一个模型执行推理，返回模型的 JSON 输出 |
+
+```python
+@route.get("/models")
+def models(self, ctx):
+    return {"loaded": ctx.server.registry.list_loaded()}
+
+@route.post("/embed_query")
+async def embed_query(self, ctx):
+    out = await ctx.server.inference.infer("embedder", {"text": ctx.request["q"]})
+    return {"embedding": out["output"]}
+```
+
+- registry 方法是**同步**的（同步处理器运行在线程中，可直接调用；异步
+  处理器请用 `asyncio.to_thread` 包装）。
+- `inference.infer` 是**异步**的。同步处理器可用 `asyncio.run(...)`
+  驱动（同步处理器所在线程没有运行中的事件循环）。
+- **禁止自推理。** 路由处理器本身占用着 worker，若 `infer` 调回同模型同
+  版本，单 worker 时会死锁 — 因此 `infer()` 对本模型/版本直接抛出
+  `ValueError`。请改调*其他*模型，或对本模型逻辑直接调用方法。
+
+参见 [examples/06_custom_route](../examples/06_custom_route/) 获取可运行示例。
+
 ## 异步模型
 
 所有模型都运行在 worker 的统一 asyncio 事件循环上 — 不再有单独的异步基类（0.7 之前的 `AsyncLitAPI` 已移除）。除 `setup()` 外，任何方法都可以是 `async def`，worker 在加载时自动适配。

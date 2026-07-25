@@ -4,7 +4,8 @@ Routes are declared with the ``@route`` decorator on LitAPI methods and are
 served under ``/v2/models/<model>/<tail>`` over the same channel as inference.
 ``ctx`` is a :class:`RequestContext`: ``ctx.request`` (parsed JSON body),
 ``ctx.meta.method`` / ``ctx.meta.query`` / ``ctx.meta.headers``,
-``ctx.state["path_params"]`` (path params), and ``ctx.server`` (phase 2b).
+``ctx.state["path_params"]`` (path params), and ``ctx.server`` (a ServerProxy
+for the hosting server — registry queries and cross-model inference).
 """
 
 from lite_server import LitAPI, route
@@ -39,3 +40,9 @@ class PetsAPI(LitAPI):
         pet_id = max(self.pets, default=0) + 1
         self.pets[pet_id] = {"id": pet_id, "name": body.get("name", "unnamed")}
         return Response(content=self.pets[pet_id], status_code=201)
+
+    @route.get("/models")
+    def models(self, ctx):
+        # ctx.server queries the hosting server over loopback HTTP.
+        # Note: infer() back into this same model is rejected (deadlock).
+        return {"loaded": ctx.server.registry.list_loaded()}

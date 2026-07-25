@@ -6,19 +6,25 @@ worker（不需要独立进程）。
 
 ## 功能
 
-`model.py` 在 `PetsAPI` 上声明了三个自定义路由：
+`model.py` 在 `PetsAPI` 上声明了四个自定义路由：
 
 | 路由 | 方法 | 路径 | 用途 |
 |------|------|------|------|
 | `status` | GET | `/v2/models/pets/status` | 返回模型状态 |
 | `get_pet` | GET | `/v2/models/pets/pets/{pet_id}` | 路径参数，缺失时 404 |
 | `create_pet` | POST | `/v2/models/pets/pets` | JSON body，返回 201 |
+| `models` | GET | `/v2/models/pets/models` | `ctx.server` 查询注册表 |
 
 handler 接收一个 `RequestContext`：
 
 - `ctx.request` — 解析后的 JSON body（dict，缺失时为 `{}`）
 - `ctx.meta.method` / `ctx.meta.query` / `ctx.meta.headers` — HTTP 元数据
 - `ctx.state["path_params"]` — 从 `{name}` 段提取的路径参数
+- `ctx.server` — 指向宿主服务器的 `ServerProxy`:
+  `ctx.server.registry.list_loaded()` 列出已加载模型，
+  `await ctx.server.inference.infer(model, input)` 调用*其他*模型的推理
+  （调回本模型同版本会抛 `ValueError` —— handler 占用着自己的 worker，
+  自推理会死锁）
 - 返回普通值（→ `200 application/json`）或 `Response`（自定义
   status / headers / media type）
 
@@ -46,6 +52,10 @@ curl http://localhost:8000/v2/models/pets/pets/99
 curl -X POST http://localhost:8000/v2/models/pets/pets \
   -H 'content-type: application/json' -d '{"name": "Buddy"}'
 # → 201 {"id": 3, "name": "Buddy"}
+
+# ctx.server：实时查询宿主服务器的注册表
+curl http://localhost:8000/v2/models/pets/models
+# → {"loaded": [{"name": "pets", "version": "1", "status": "Ready", ...}]}
 
 # 同一个模型上推理仍然可用
 curl -X POST http://localhost:8000/v2/models/pets/infer \

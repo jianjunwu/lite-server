@@ -100,7 +100,7 @@ class RequestContext:
     response: Any = None  # encode_response output
     state: dict[str, Any] = field(default_factory=dict)
     early: Response | None = None  # set → pipeline short-circuits
-    server: Any = None  # ServerProxy for endpoint handlers; None for inference
+    server: Any = None  # ServerProxy for @route handlers; None for inference
     response_headers: dict[str, str] = field(default_factory=dict)  # merged into final response
 
     def respond(

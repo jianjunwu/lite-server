@@ -156,6 +156,10 @@ pub struct WorkerManager {
     log_level: String,
     // Callback runner for lifecycle events
     callback_runner: Arc<CallbackRunner>,
+    // Loopback HTTP base URL of this server (e.g. http://127.0.0.1:8000),
+    // passed to workers as --server-http so @route handlers can query the
+    // hosting server via ctx.server (phase 2b). None for unix-socket HTTP.
+    server_http: Option<String>,
 }
 
 struct WorkerProcess {
@@ -196,7 +200,16 @@ impl WorkerManager {
             respawn_rx: tokio::sync::Mutex::new(Some(respawn_rx)),
             log_level,
             callback_runner,
+            server_http: None,
         }
+    }
+
+    /// Set the loopback HTTP base URL workers receive as --server-http
+    /// (ctx.server for @route handlers). Builder-style so existing
+    /// WorkerManager::new call sites stay untouched.
+    pub fn with_server_http(mut self, server_http: Option<String>) -> Self {
+        self.server_http = server_http;
+        self
     }
 
     /// Accessor for the unified inference queue. Used by the gRPC service to
@@ -363,6 +376,10 @@ impl WorkerManager {
 
         if model_config.continuous_batching {
             child = child.arg("--continuous-batching");
+        }
+
+        if let Some(ref server_http) = self.server_http {
+            child = child.arg("--server-http").arg(server_http);
         }
 
         let mut child = child
@@ -732,6 +749,10 @@ impl WorkerManager {
 
             if model_config.continuous_batching {
                 child = child.arg("--continuous-batching");
+            }
+
+            if let Some(ref server_http) = self.server_http {
+                child = child.arg("--server-http").arg(server_http);
             }
 
             let mut child = child

@@ -318,6 +318,72 @@ class AuditLogger(Callback):
 
 See [examples/14_lifecycle_hooks](../examples/14_lifecycle_hooks/) for a runnable demo.
 
+## Custom Routes (`@route`)
+
+Declare extra HTTP endpoints on a model with the `@route` decorator. They are
+served under `/v2/models/<model>/<tail>` and dispatched to the model's worker
+over the same channel as inference — no separate process.
+
+```python
+from lite_server import LitAPI, route
+from lite_server.response import Response
+
+class PetsAPI(LitAPI):
+    @route.get("/pets/{pet_id}")
+    def get_pet(self, ctx):
+        pet_id = int(ctx.state["path_params"]["pet_id"])
+        pet = self.pets.get(pet_id)
+        if pet is None:
+            return Response(content={"error": "pet not found"}, status_code=404)
+        return pet
+```
+
+Handlers receive a `RequestContext`:
+
+- `ctx.request` — parsed JSON body (dict, or `{}` when absent)
+- `ctx.meta.method` / `ctx.meta.query` / `ctx.meta.headers` — HTTP metadata
+- `ctx.state["path_params"]` — path params from `{name}` segments
+- `ctx.server` — a `ServerProxy` for the hosting server (see below)
+- return a plain value (→ `200 application/json`) or a `Response` (custom
+  status / headers / media type)
+
+System routes (`infer`, `events`, `stream`, `ready`, `health`, `reload`,
+`versions`, `compare`) are reserved: declaring `@route` at one of them is
+skipped with a warning at load time.
+
+### `ctx.server` (ServerProxy)
+
+Route handlers can query the hosting server over loopback HTTP:
+
+| API | Behavior |
+|-----|----------|
+| `ctx.server.registry.list_loaded()` | Live list of loaded models: `[{"name", "version", "status", "model_type", "workers"}, ...]` |
+| `ctx.server.registry.get(name)` | First entry for one model, or `None` |
+| `await ctx.server.inference.infer(model_name, input_data, version=None)` | Run inference on another model; returns the model's JSON output |
+
+```python
+@route.get("/models")
+def models(self, ctx):
+    return {"loaded": ctx.server.registry.list_loaded()}
+
+@route.post("/embed_query")
+async def embed_query(self, ctx):
+    out = await ctx.server.inference.infer("embedder", {"text": ctx.request["q"]})
+    return {"embedding": out["output"]}
+```
+
+- Registry methods are **synchronous** (safe in sync handlers, which run on a
+  worker thread; async handlers should wrap them in `asyncio.to_thread`).
+- `inference.infer` is **async**. A sync handler can drive it with
+  `asyncio.run(...)` (sync handlers run on a thread without a running loop).
+- **Self-inference is rejected.** A route handler occupies its worker, so
+  calling `infer` back into the same model+version would deadlock with a
+  single worker — `infer()` raises `ValueError` for the handler's own
+  model/version. Call a *different* model, or use a direct method call for
+  own-model logic.
+
+See [examples/06_custom_route](../examples/06_custom_route/) for a runnable demo.
+
 ## Async Models
 
 Every model runs on the worker's unified asyncio loop — there is no separate async base class (the pre-0.7 `AsyncLitAPI` is gone). Any method except `setup()` may be `async def`; the worker adapts at load time.

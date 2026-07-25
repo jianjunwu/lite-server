@@ -6,19 +6,25 @@ over the same ZMQ channel as inference (no separate process).
 
 ## What this does
 
-`model.py` declares three custom routes on `PetsAPI`:
+`model.py` declares four custom routes on `PetsAPI`:
 
 | Route | Method | Path | Purpose |
 |-------|--------|------|---------|
 | `status` | GET | `/v2/models/pets/status` | returns model state |
 | `get_pet` | GET | `/v2/models/pets/pets/{pet_id}` | path param, 404 when missing |
 | `create_pet` | POST | `/v2/models/pets/pets` | JSON body, returns 201 |
+| `models` | GET | `/v2/models/pets/models` | `ctx.server` registry query |
 
 Handlers receive a `RequestContext`:
 
 - `ctx.request` — parsed JSON body (dict, or `{}` when absent)
 - `ctx.meta.method` / `ctx.meta.query` / `ctx.meta.headers` — HTTP metadata
 - `ctx.state["path_params"]` — path params extracted from `{name}` segments
+- `ctx.server` — a `ServerProxy` for the hosting server:
+  `ctx.server.registry.list_loaded()` lists loaded models, and
+  `await ctx.server.inference.infer(model, input)` calls *another* model's
+  inference (calling back into the same model+version raises `ValueError` —
+  the handler occupies its worker, so self-inference would deadlock)
 - return a plain value (→ `200 application/json`) or a `Response` (custom
   status / headers / media type)
 
@@ -46,6 +52,10 @@ curl http://localhost:8000/v2/models/pets/pets/99
 curl -X POST http://localhost:8000/v2/models/pets/pets \
   -H 'content-type: application/json' -d '{"name": "Buddy"}'
 # → 201 {"id": 3, "name": "Buddy"}
+
+# ctx.server: live registry of the hosting server
+curl http://localhost:8000/v2/models/pets/models
+# → {"loaded": [{"name": "pets", "version": "1", "status": "Ready", ...}]}
 
 # inference still works on the same model
 curl -X POST http://localhost:8000/v2/models/pets/infer \

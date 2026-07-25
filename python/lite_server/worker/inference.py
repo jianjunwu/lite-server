@@ -64,6 +64,10 @@ def parse_args():
     parser.add_argument("--endpoint", required=True, help="ZMQ PAIR endpoint, e.g. ipc:///tmp/lite-server/...")
     parser.add_argument("--continuous-batching", action="store_true", default=False)
     parser.add_argument("--log-level", default="info", help="Logging level: debug, info, warn, error")
+    parser.add_argument("--server-http", default=None,
+                        help="Loopback HTTP base URL of the hosting server "
+                             "(e.g. http://127.0.0.1:8000); backs ctx.server "
+                             "for @route handlers")
     return parser.parse_args()
 
 
@@ -495,7 +499,9 @@ async def _handle_route_call(
     Reuses ``Pipeline.run_route`` (on_request → handler → on_response, with
     on_error on failure). The handler result is encoded as a ``SingleResponse``
     (routes and inference share the response shape — phase 2 unification).
-    ``ctx.server`` stays ``None`` until 2b.
+    ``ctx.server`` carries the worker-level ``ServerProxy`` (built at startup
+    from ``--server-http``); ``None`` when the server did not pass one (e.g.
+    unix-socket HTTP deployments or standalone runs).
     """
     rc = request.route_call
     handlers = getattr(lit_api, "_route_handlers", {})
@@ -511,7 +517,7 @@ async def _handle_route_call(
     ctx.state["path_params"] = (
         dict(request.meta.path_params) if request.HasField("meta") else {}
     )
-    ctx.server = None  # 2b: ServerProxy.for_model(...)
+    ctx.server = getattr(lit_api, "_server_proxy", None)
     await route_pipe.run_route(ctx, handler)
     return _build_route_response(uid, ctx)
 
@@ -1359,6 +1365,13 @@ def worker_main():
         log.error(f"Failed to load model: {e}")
         print(json.dumps({"status": "error", "worker_id": args.worker_id, "message": str(e)}), flush=True)
         sys.exit(1)
+
+    # One ServerProxy per worker, shared by all @route calls (cheap: no I/O
+    # at construction; queries go out lazily per call).
+    if args.server_http:
+        from lite_server.server_proxy import ServerProxy
+        lit_api._server_proxy = ServerProxy.for_model(
+            args.server_http, args.model_name, args.version)
 
     specs = [{"name": s.name, "metric_type": s.metric_type}
              for s in getattr(lit_api, '_metric_specs', [])]

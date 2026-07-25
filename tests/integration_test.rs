@@ -238,6 +238,23 @@ class RouteAPI(LitAPI):
     @route.post("/infer")  # reserved leaf → skipped at ingest (warn)
     def shadow(self, ctx):
         return {"shadowed": True}
+
+    @route.get("/models")
+    def models(self, ctx):
+        # ctx.server: live registry of the hosting server (phase 2b)
+        return {"loaded": ctx.server.registry.list_loaded()}
+
+    @route.post("/call_test_model")
+    async def call_test_model(self, ctx):
+        # cross-model inference through ctx.server (phase 2b)
+        out = await ctx.server.inference.infer("test_model", {"input": 7})
+        return {"test_model_out": out}
+
+    @route.post("/call_self")
+    async def call_self(self, ctx):
+        # self-inference must raise ValueError (deadlock guard, phase 2b)
+        out = await ctx.server.inference.infer("route_model", {"input": 7})
+        return {"self_out": out}
 "#,
     )
     .unwrap();
@@ -700,6 +717,71 @@ async fn test_custom_route_multi_version_isolation() {
 
     unload_model(&base, ROUTE_MODEL, "1").await;
     unload_model(&base, ROUTE_MODEL, "2").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_custom_route_ctx_server_registry() {
+    // ctx.server.registry.list_loaded() queries the hosting server live
+    // (phase 2b: worker → loopback HTTP GET /v2/models).
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    load_model(&base, ROUTE_MODEL, "1").await;
+
+    let resp = client
+        .get(format!("{}/v2/models/{}/models", base, ROUTE_MODEL))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let names: Vec<&str> = body["loaded"]
+        .as_array().expect("loaded must be an array")
+        .iter().filter_map(|m| m["name"].as_str()).collect();
+    assert!(names.contains(&ROUTE_MODEL), "loaded={:?}", names);
+
+    unload_model(&base, ROUTE_MODEL, "1").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_custom_route_ctx_server_cross_model_infer() {
+    // ctx.server.inference.infer() runs inference on a *different* model via
+    // loopback HTTP POST /v2/models/:m/infer (phase 2b).
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    load_model(&base, MODEL, "1").await;
+    load_model(&base, ROUTE_MODEL, "1").await;
+
+    let resp = client
+        .post(format!("{}/v2/models/{}/call_test_model", base, ROUTE_MODEL))
+        .json(&json!({}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["test_model_out"]["output"], 14);
+
+    unload_model(&base, ROUTE_MODEL, "1").await;
+    unload_model(&base, MODEL, "1").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_custom_route_ctx_server_self_infer_rejected() {
+    // infer() back into the handler's own model+version must raise ValueError
+    // (deadlock guard) → handler failure → structured 500.
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    load_model(&base, ROUTE_MODEL, "1").await;
+
+    let resp = client
+        .post(format!("{}/v2/models/{}/call_self", base, ROUTE_MODEL))
+        .json(&json!({}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 500);
+
+    unload_model(&base, ROUTE_MODEL, "1").await;
 }
 
 #[tokio::test]

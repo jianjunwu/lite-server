@@ -12,34 +12,85 @@ import pytest
 from lite_server import LitAPI, route
 from lite_server.response import Response
 from lite_server.route import HandlerSignatureError, RouteDef
-from lite_server.server_proxy import RegistryProxy, ServerProxy
 
 
-class TestRegistryProxy:
-    def test_list_loaded(self):
-        snapshot = {"loaded_models": [{"name": "m1", "version": "1"}]}
-        reg = RegistryProxy(snapshot)
-        assert reg.list_loaded() == [{"name": "m1", "version": "1"}]
+class TestRouteCallServerInjection:
+    """``_handle_route_call`` injects the worker-level ServerProxy into ctx."""
 
-    def test_list_loaded_empty(self):
-        reg = RegistryProxy({})
-        assert reg.list_loaded() == []
+    @pytest.mark.asyncio
+    async def test_ctx_server_reaches_handler(self):
+        import logging
 
+        from lite_server import Headers, RequestMeta
+        from lite_server.pipeline import Pipeline
+        from lite_server.proto import liteserver_pb2 as pb
+        from lite_server.worker.inference import _discover_routes, _handle_route_call
 
-class TestServerProxy:
-    def test_registry(self):
-        snapshot = {"loaded_models": [{"name": "m1"}], "config": {"port": 8080}}
-        srv = ServerProxy(snapshot)
-        assert srv.registry.list_loaded() == [{"name": "m1"}]
+        sentinel = object()
 
-    def test_config(self):
-        snapshot = {"config": {"debug": True}}
-        srv = ServerProxy(snapshot)
-        assert srv.config["debug"] is True
+        class M(LitAPI):
+            def setup(self, device):
+                pass
 
-    def test_config_default(self):
-        srv = ServerProxy({})
-        assert srv.config == {}
+            def predict(self, x):
+                return x
+
+            @route.get("/who")
+            def who(self, ctx):
+                return {"has_server": ctx.server is sentinel}
+
+        inst = M(max_batch_size=1, batch_timeout=0.0, stream=False)
+        _discover_routes(inst)
+        inst._route_pipeline = Pipeline.for_route([])
+        inst._server_proxy = sentinel
+
+        req = pb.Request(uid="u1")
+        req.meta.route = "/who"
+        req.meta.method = "GET"
+        req.route_call.data = b"{}"
+        meta = RequestMeta(
+            route="/who", headers=Headers(), client_ip="",
+            request_id="", timestamp_ns=0, method="GET",
+        )
+        resp = await _handle_route_call(
+            inst, "u1", req, meta, logging.getLogger("test"))
+        assert json.loads(resp.single.data) == {"has_server": True}
+
+    @pytest.mark.asyncio
+    async def test_ctx_server_defaults_to_none(self):
+        import logging
+
+        from lite_server import Headers, RequestMeta
+        from lite_server.pipeline import Pipeline
+        from lite_server.proto import liteserver_pb2 as pb
+        from lite_server.worker.inference import _discover_routes, _handle_route_call
+
+        class M(LitAPI):
+            def setup(self, device):
+                pass
+
+            def predict(self, x):
+                return x
+
+            @route.get("/who")
+            def who(self, ctx):
+                return {"server_is_none": ctx.server is None}
+
+        inst = M(max_batch_size=1, batch_timeout=0.0, stream=False)
+        _discover_routes(inst)
+        inst._route_pipeline = Pipeline.for_route([])
+
+        req = pb.Request(uid="u1")
+        req.meta.route = "/who"
+        req.meta.method = "GET"
+        req.route_call.data = b"{}"
+        meta = RequestMeta(
+            route="/who", headers=Headers(), client_ip="",
+            request_id="", timestamp_ns=0, method="GET",
+        )
+        resp = await _handle_route_call(
+            inst, "u1", req, meta, logging.getLogger("test"))
+        assert json.loads(resp.single.data) == {"server_is_none": True}
 
 
 class TestRouterDecorator:
