@@ -6,9 +6,10 @@ over loopback HTTP (the worker receives the server's HTTP address via
 
 - ``registry`` — live view of loaded models (``GET /v2/models``)
 - ``inference`` — cross-model inference (``POST /v2/models/<m>/infer``)
+- ``metrics`` — scalar metric lookups (``GET /metrics``, Prometheus format)
 
-Remote admin ops (``load_model`` / ``unload_model`` / ``metrics``) stay
-unimplemented stubs.
+Remote admin ops (``load_model`` / ``unload_model``) stay unimplemented
+stubs.
 
 Transport is stdlib ``urllib`` — no extra runtime dependency. Registry
 methods are synchronous (safe in sync handlers, which run on a worker
@@ -58,6 +59,49 @@ def _request_json(url: str, *, payload: Any = None, timeout: float) -> Any:
         ) from e
     except (urllib.error.URLError, OSError) as e:
         raise ServerProxyError(f"server unreachable at {url}: {e}") from e
+
+
+def _request_text(url: str, *, timeout: float) -> str:
+    """Plain-text GET over stdlib urllib; same error policy as _request_json."""
+    req = urllib.request.Request(url)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")[:500]
+        raise ServerProxyError(
+            f"server returned {e.code} for {url}: {body}", status_code=e.code
+        ) from e
+    except (urllib.error.URLError, OSError) as e:
+        raise ServerProxyError(f"server unreachable at {url}: {e}") from e
+
+
+def _parse_prometheus(text: str) -> List[tuple]:
+    """Parse the Prometheus text exposition format.
+
+    Returns ``[(name, labels, value), ...]`` for every sample line; comment
+    (``#``) and blank lines are skipped, malformed samples ignored. Label
+    values are unquoted but not unescaped (the server's own metrics don't
+    escape)."""
+    samples = []
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        head, _, rest = line.partition(" ")
+        try:
+            value = float(rest.split()[0])
+        except (ValueError, IndexError):
+            continue
+        if "{" in head:
+            name, _, label_str = head.partition("{")
+            labels = {}
+            for part in label_str.rstrip("}").split(","):
+                k, _, v = part.partition("=")
+                labels[k] = v.strip('"')
+        else:
+            name, labels = head, {}
+        samples.append((name, labels, value))
+    return samples
 
 
 class RegistryProxy:
@@ -120,10 +164,27 @@ class InferenceProxy:
 
 
 class MetricsProxy:
-    """Proxy for ``server.metrics`` (stub)."""
+    """Proxy for ``server.metrics`` — scrapes the server's ``/metrics``
+    endpoint (Prometheus text format) over loopback HTTP."""
+
+    def __init__(self, base_url: str):
+        self._base_url = base_url
 
     def query(self, name: str, **labels) -> Optional[float]:
-        # TODO: wire up via internal admin channel
+        """Current value of metric *name*, or ``None`` when absent.
+
+        With ``**labels``, returns the first sample whose label set matches
+        (exact value equality on each given label). Suited to counters and
+        gauges; histograms are exposed as separate ``<name>_bucket`` /
+        ``_sum`` / ``_count`` samples. Scrapes are live — no caching."""
+        text = _request_text(
+            f"{self._base_url}/metrics", timeout=REGISTRY_TIMEOUT_S)
+        want = {k: str(v) for k, v in labels.items()}
+        for m_name, m_labels, value in _parse_prometheus(text):
+            if m_name != name:
+                continue
+            if all(m_labels.get(k) == v for k, v in want.items()):
+                return value
         return None
 
 
@@ -135,7 +196,7 @@ class ServerProxy:
         self._model_name = model_name
         self._version = version
         self._registry = RegistryProxy(self._base_url)
-        self._metrics = MetricsProxy()
+        self._metrics = MetricsProxy(self._base_url)
         self._inference = InferenceProxy(self._base_url, model_name, version)
 
     @classmethod

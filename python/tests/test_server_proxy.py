@@ -16,6 +16,8 @@ class _Handler(BaseHTTPRequestHandler):
     models_status = 200
     infer_status = 200
     infer_response: dict = {}
+    metrics_text = ""
+    metrics_status = 200
     requests: list = []
 
     @classmethod
@@ -27,6 +29,15 @@ class _Handler(BaseHTTPRequestHandler):
         cls.models_status = 200
         cls.infer_status = 200
         cls.infer_response = {"output": 42}
+        cls.metrics_text = (
+            "# HELP lite_server_infer_requests_total Total inference requests\n"
+            "# TYPE lite_server_infer_requests_total counter\n"
+            'lite_server_infer_requests_total{model="pets",version="1"} 42\n'
+            'lite_server_infer_requests_total{model="cats",version="1"} 7\n'
+            "# TYPE lite_server_uptime_seconds gauge\n"
+            "lite_server_uptime_seconds 3600.5\n"
+        )
+        cls.metrics_status = 200
         cls.requests = []
 
     def _json(self, code: int, payload):
@@ -41,6 +52,13 @@ class _Handler(BaseHTTPRequestHandler):
         type(self).requests.append(("GET", self.path, None))
         if self.path == "/v2/models":
             self._json(type(self).models_status, {"models": type(self).models})
+        elif self.path == "/metrics":
+            data = type(self).metrics_text.encode()
+            self.send_response(type(self).metrics_status)
+            self.send_header("content-type", "text/plain; charset=utf-8")
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
         else:
             self._json(404, {"error": "not found"})
 
@@ -137,6 +155,40 @@ class TestInferenceProxy:
         srv = ServerProxy.for_model(base_url, "pets", "1")
         with pytest.raises(ServerProxyError):
             await srv.inference.infer("adder", {"input": 5})
+
+
+class TestMetricsProxy:
+    """``server.metrics.query`` scrapes the server's ``/metrics`` (Prometheus
+    text format) and returns the first sample matching name + labels."""
+
+    def test_query_by_name_returns_value(self, base_url):
+        srv = ServerProxy.for_model(base_url, "pets", "1")
+        assert srv.metrics.query("lite_server_uptime_seconds") == 3600.5
+        assert ("GET", "/metrics", None) in _Handler.requests
+
+    def test_query_with_labels_matches_sample(self, base_url):
+        srv = ServerProxy.for_model(base_url, "pets", "1")
+        assert srv.metrics.query(
+            "lite_server_infer_requests_total", model="cats") == 7.0
+
+    def test_query_first_match_when_unlabeled(self, base_url):
+        srv = ServerProxy.for_model(base_url, "pets", "1")
+        assert srv.metrics.query("lite_server_infer_requests_total") == 42.0
+
+    def test_query_unknown_metric_returns_none(self, base_url):
+        srv = ServerProxy.for_model(base_url, "pets", "1")
+        assert srv.metrics.query("no_such_metric") is None
+
+    def test_query_label_mismatch_returns_none(self, base_url):
+        srv = ServerProxy.for_model(base_url, "pets", "1")
+        assert srv.metrics.query(
+            "lite_server_infer_requests_total", model="dogs") is None
+
+    def test_query_http_error_raises(self, base_url):
+        _Handler.metrics_status = 500
+        srv = ServerProxy.for_model(base_url, "pets", "1")
+        with pytest.raises(ServerProxyError):
+            srv.metrics.query("lite_server_uptime_seconds")
 
 
 class TestAdminStubs:
