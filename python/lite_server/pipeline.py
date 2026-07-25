@@ -137,8 +137,11 @@ def _is_asyncish(fn: Callable) -> bool:
 # Ctx injection infrastructure (0.7.0 context unification)
 # ---------------------------------------------------------------------------
 
-# Methods operating across items/sequences — declaring ``ctx`` is a load-time error.
-_CTX_FORBIDDEN = ("batch", "unbatch", "step")
+# Methods operating across sequences — declaring ``ctx`` is a load-time error.
+# batch / unbatch / predict DO receive ctx in batch mode (a list[RequestContext]
+# aligned with the inputs); only step is forbidden — its active_sequences
+# already carry per-sequence ctx via CBSequence.
+_CTX_FORBIDDEN = ("step",)
 
 # Error message fragment for LitAPI hooks that haven't been migrated to ctx.
 _API_HOOK_MIGRATION = (
@@ -162,10 +165,10 @@ def _validate_ctx_injection(lit_api: LitAPI) -> None:
         if _ctx_param(getattr(lit_api, name)) is not None:
             raise RuntimeError(
                 f"LitAPI.{name} declares a 'ctx' parameter, but {name} "
-                f"operates across items/sequences and has no per-request "
-                f"context. Remove the parameter; thread per-request data "
-                f"through the decoded input (decode_request supports ctx) "
-                f"or read CBSequence.state in step."
+                f"operates across sequences and has no single per-request "
+                f"context. Remove the parameter; read per-sequence data "
+                f"from CBSequence.state / .meta (each active_sequence "
+                f"carries its own ctx)."
             )
 
 
@@ -332,21 +335,18 @@ class Pipeline:
 
         # --- Ctx injection validation (load-time) -------------------------
         _validate_ctx_injection(lit_api)
-        if _ctx_param(lit_api.predict) is not None and self.has_batch_methods:
-            raise RuntimeError(
-                "LitAPI.predict declares a 'ctx' parameter, but batch/unbatch "
-                "are overridden: predict runs once per batch and has no "
-                "per-request context. Remove 'ctx' from predict and thread "
-                "per-request data through the decoded input (decode_request "
-                "supports ctx), or drop batch/unbatch."
-            )
+        # predict may declare ctx in BOTH modes: single-request mode injects
+        # one RequestContext, batch mode injects a list[RequestContext] aligned
+        # with the batch (see batch_predict). No load-time guard needed.
 
         # --- Model stages (adapted once) ----------------------------------
         self._decode = _wrap_ctx_method(lit_api.decode_request, "decode_request", self._executor)
         self._predict = _wrap_ctx_method(lit_api.predict, "predict", self._executor)
         self._encode = _wrap_ctx_method(lit_api.encode_response, "encode_response", self._executor)
-        self._batch_fn = _adapt(lit_api.batch, self._executor)
-        self._unbatch_fn = _adapt(lit_api.unbatch, self._executor)
+        # batch / unbatch use the same ctx-injecting wrapper: in batch mode
+        # the caller passes a list[RequestContext] aligned with the inputs.
+        self._batch_fn = _wrap_ctx_method(lit_api.batch, "batch", self._executor)
+        self._unbatch_fn = _wrap_ctx_method(lit_api.unbatch, "unbatch", self._executor)
         self._stream_producer = (
             _wrap_ctx_producer(lit_api.stream_predict, self._executor)
             if self.has_stream_predict
@@ -634,15 +634,19 @@ class Pipeline:
 
     # ---- Model stage access (batch / stream / CB paths) ------------------
 
-    async def batch_predict(self, decodeds: list[Any]) -> list[Any]:
+    async def batch_predict(
+        self, decodeds: list[Any], ctx_list: list[RequestContext]
+    ) -> list[Any]:
         """batch → predict → unbatch with arity check.
 
-        Load-time guard ensures predict never declares ctx on this path —
-        there is no per-item context for a batch.
+        *ctx_list* is a per-item RequestContext list aligned positionally
+        with *decodeds*.  It is forwarded to batch / predict / unbatch when
+        they declare a ``ctx`` parameter (injected as a list); methods that
+        don't declare ``ctx`` ignore it (backward compatible).
         """
-        batched = await self._batch_fn(decodeds)
-        output = await self._predict(batched)
-        outputs = await self._unbatch_fn(output)
+        batched = await self._batch_fn(decodeds, ctx=ctx_list)
+        output = await self._predict(batched, ctx=ctx_list)
+        outputs = await self._unbatch_fn(output, ctx=ctx_list)
         if len(outputs) != len(decodeds):
             raise ValueError(
                 f"unbatch returned {len(outputs)} outputs, expected {len(decodeds)}"

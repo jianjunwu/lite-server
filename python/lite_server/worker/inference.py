@@ -523,7 +523,12 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
     if ctx_map and pipe.has_batch_methods:
         decoded_uids = list(ctx_map.keys())
         try:
-            outputs = await pipe.batch_predict([ctx_map[u].input for u in decoded_uids])
+            # ctx_list items are the same ctx_map objects, so per-item state
+            # set inside batch/predict/unbatch stays visible to postprocess.
+            ctx_list = [ctx_map[u] for u in decoded_uids]
+            outputs = await pipe.batch_predict(
+                [ctx_map[u].input for u in decoded_uids], ctx_list
+            )
             for u, out in zip(decoded_uids, outputs):
                 ctx_map[u].output = out
         except Exception as e:

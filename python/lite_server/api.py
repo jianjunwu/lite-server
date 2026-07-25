@@ -177,8 +177,18 @@ class LitAPI:
     def batch(self, inputs: list) -> Any:
         """Convert a list of decoded inputs to a batched input.
 
-        Operates across items — declaring ``ctx`` is a load-time error.
-        Thread per-request data through the decoded input instead.
+        To access each request's context, declare a parameter named
+        exactly ``ctx`` — detected once at load time and injected as a
+        ``list[RequestContext]`` aligned positionally with *inputs*
+        (one per item)::
+
+            def batch(self, inputs, ctx):
+                for c in ctx:
+                    self.logger.info("batching %s", c.meta.request_id)
+                return torch.stack(inputs)
+
+        Keep ``ctx[i]`` aligned with ``inputs[i]`` — do not reorder the
+        inputs, or results will be written back to the wrong requests.
         """
         if hasattr(inputs[0], "__torch_function__"):
             import torch
@@ -194,18 +204,23 @@ class LitAPI:
         """Run the model on the input and return the output.
 
         To access per-request context, declare a second parameter named
-        exactly ``ctx``.  **Not compatible with** ``batch`` + ``unbatch``:
-        when batch is overridden, predict runs once per batch and has no
-        per-request context — declaring ``ctx`` is a load-time error.
-        Thread per-request data through the decoded input instead
-        (``decode_request`` supports ctx).
+        exactly ``ctx``.  In single-request mode ``ctx`` is one
+        :class:`RequestContext`; in batch mode (when ``batch`` /
+        ``unbatch`` are overridden) it is a ``list[RequestContext]``
+        aligned with the batch, and ``x`` is the batched input.
         """
         raise NotImplementedError("predict is not implemented")
 
     def unbatch(self, output: Any) -> list:
         """Convert a batched output back to a list of per-input outputs.
 
-        Operates across items — declaring ``ctx`` is a load-time error.
+        To access each request's context, declare a parameter named exactly
+        ``ctx`` — injected as a ``list[RequestContext]`` aligned with the
+        original inputs (same order ``batch`` received).  The returned list
+        must match that order one-for-one::
+
+            def unbatch(self, output, ctx):
+                return list(output)
         """
         return list(output)
 

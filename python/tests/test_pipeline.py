@@ -518,8 +518,9 @@ class TestCapabilityDetection:
                 return output[:1]  # wrong arity
 
         pipe = Pipeline.build(Bad(), [])
+        ctxs = [RequestContext(meta=_make_meta()) for _ in range(3)]
         with pytest.raises(ValueError, match="unbatch"):
-            await pipe.batch_predict([1, 2, 3])
+            await pipe.batch_predict([1, 2, 3], ctxs)
 
 
 # ---------------------------------------------------------------------------
@@ -882,41 +883,29 @@ class TestCtxInjection:
 
 
 # ---------------------------------------------------------------------------
-# Ctx injection: forbidden methods (batch / unbatch / step)
+# Ctx injection: forbidden methods (step only)
 # ---------------------------------------------------------------------------
 
 
 class TestCtxForbidden:
-    """Declaring 'ctx' on batch, unbatch, or step is a load-time error —
-    these methods operate across items/sequences and have no single context."""
+    """Declaring 'ctx' on step is a load-time error — it operates across
+    sequences and has no single per-request context.
 
-    def test_predict_ctx_with_batch_unbatch_fails_at_build(self):
-        class API(EchoAPI):
-            def batch(self, inputs):
-                return inputs
+    batch / unbatch / predict may declare ctx: in batch mode the framework
+    injects a ``list[RequestContext]`` aligned with the inputs (see
+    :class:`TestBatchCtxInjection`).  step is different — its
+    ``active_sequences`` already carry per-sequence ctx via CBSequence."""
 
-            def unbatch(self, output):
-                return output
-
-            def predict(self, x, ctx: RequestContext | None = None):
-                return x
-
-        with pytest.raises(RuntimeError, match="predict.*ctx.*batch"):
-            Pipeline.build(API(), [])
-
-    @pytest.mark.parametrize("method_name", ["batch", "unbatch", "step"])
+    @pytest.mark.parametrize("method_name", ["step"])
     def test_ctx_forbidden_methods_fail_at_build(self, method_name):
-        # Create a class that overrides the forbidden method with a ctx param
+        # Override the forbidden method with a ctx param.
         overrides = {
             method_name: lambda self, x, ctx: x,
         }
-        # step needs prefill + has_finished to be a valid CB model
+        # step needs prefill + has_finished to be a valid CB model.
         if method_name == "step":
             overrides["prefill"] = lambda self, uid, inp: None
             overrides["has_finished"] = lambda self, uid, tok, seq: True
-        # batch needs unbatch too
-        if method_name == "batch":
-            overrides["unbatch"] = lambda self, x: x
 
         BadAPI = type("BadAPI", (EchoAPI,), overrides)
         with pytest.raises(RuntimeError, match=method_name):
@@ -940,6 +929,99 @@ class TestCtxForbidden:
         api.decode_request = pos_only_fn.__get__(api, type(api))
         with pytest.raises(RuntimeError, match="positional-only"):
             Pipeline.build(api, [])
+
+
+# ---------------------------------------------------------------------------
+# Ctx injection: batch / unbatch / predict (list[RequestContext])
+# ---------------------------------------------------------------------------
+
+
+class TestBatchCtxInjection:
+    """In batch mode, declaring ``ctx`` on batch / unbatch / predict
+    receives a ``list[RequestContext]`` aligned positionally with the
+    inputs/outputs — no need to thread per-request data through the
+    decoded input."""
+
+    @staticmethod
+    def _ctx(rid: str) -> RequestContext:
+        return RequestContext(
+            meta=RequestMeta(
+                route="/predict",
+                headers=Headers({}),
+                client_ip="127.0.0.1",
+                request_id=rid,
+                timestamp_ns=1,
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_batch_unbatch_predict_receive_aligned_ctx_list(self):
+        seen: dict[str, list[str]] = {}
+
+        class M(LitAPI):
+            def batch(self, inputs, ctx):
+                seen["batch"] = [c.meta.request_id for c in ctx]
+                assert len(ctx) == len(inputs)
+                return inputs
+
+            def predict(self, batched, ctx):
+                seen["predict"] = [c.meta.request_id for c in ctx]
+                # Echo each request_id to prove end-to-end alignment.
+                return [c.meta.request_id for c in ctx]
+
+            def unbatch(self, output, ctx):
+                seen["unbatch"] = [c.meta.request_id for c in ctx]
+                return list(output)
+
+        pipe = Pipeline.build(M(max_batch_size=2), [])
+        ctxs = [self._ctx("a"), self._ctx("b"), self._ctx("c")]
+        outputs = await pipe.batch_predict([1, 2, 3], ctxs)
+        assert seen["batch"] == ["a", "b", "c"]
+        assert seen["predict"] == ["a", "b", "c"]
+        assert seen["unbatch"] == ["a", "b", "c"]
+        assert outputs == ["a", "b", "c"]
+
+    @pytest.mark.asyncio
+    async def test_methods_without_ctx_param_ignore_injected_list(self):
+        """Backward compat: not declaring ctx behaves exactly as before."""
+
+        class M(LitAPI):
+            def batch(self, inputs):
+                return inputs
+
+            def predict(self, x):
+                return [v * 10 for v in x]
+
+            def unbatch(self, output):
+                return list(output)
+
+        pipe = Pipeline.build(M(max_batch_size=2), [])
+        ctxs = [self._ctx("a"), self._ctx("b")]
+        outputs = await pipe.batch_predict([1, 2], ctxs)
+        assert outputs == [10, 20]
+
+    @pytest.mark.asyncio
+    async def test_predict_in_batch_mode_may_mutate_per_item_state(self):
+        """ctx list items are the same objects written back to ctx_map:
+        state set in predict stays visible per item."""
+
+        class M(LitAPI):
+            def batch(self, inputs, ctx):
+                return inputs
+
+            def predict(self, batched, ctx):
+                for i, c in enumerate(ctx):
+                    c.state["tag"] = f"t{i}"
+                return list(batched)
+
+            def unbatch(self, output, ctx):
+                return list(output)
+
+        pipe = Pipeline.build(M(max_batch_size=2), [])
+        ctxs = [self._ctx("a"), self._ctx("b")]
+        await pipe.batch_predict([1, 2], ctxs)
+        assert ctxs[0].state["tag"] == "t0"
+        assert ctxs[1].state["tag"] == "t1"
 
 
 def _make_endpoint_meta(**kwargs):

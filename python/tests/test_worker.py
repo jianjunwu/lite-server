@@ -1186,6 +1186,51 @@ class TestBatchPredict:
         assert json.loads(resp.batch.items[0].data)["result"] == 2
         assert json.loads(resp.batch.items[1].data)["result"] == 4
 
+    def test_batch_predict_ctx_list_aligned_to_items(self):
+        """batch/unbatch/predict may declare ctx; in batch mode they receive
+        a list[RequestContext] aligned positionally with the batch items,
+        end-to-end through the worker loop."""
+        seen: dict = {}
+
+        class CtxBatchModel(LitAPI):
+            def batch(self, inputs, ctx):
+                seen["batch_len"] = len(ctx)
+                seen["batch_ctx_requests"] = [c.request for c in ctx]
+                return inputs
+
+            def predict(self, batched, ctx):
+                seen["predict_len"] = len(ctx)
+                # Use ctx (aligned with items) to produce per-item output.
+                return [{"result": c.request["input"] * 2} for c in ctx]
+
+            def unbatch(self, output, ctx):
+                seen["unbatch_len"] = len(ctx)
+                return list(output)
+
+        socket = AsyncMockSocket()
+        req = Request(
+            uid="batch-ctx",
+            batch=BatchRequest(items=[
+                BatchItem(uid="i1", data=json.dumps({"input": 1}).encode()),
+                BatchItem(uid="i2", data=json.dumps({"input": 2}).encode()),
+            ]),
+        )
+        socket.inject(req.SerializeToString())
+        drive_loop(CtxBatchModel(), socket)
+
+        # ctx[i] aligns with inputs[i] / item i.
+        assert seen["batch_len"] == 2
+        assert seen["batch_ctx_requests"] == [{"input": 1}, {"input": 2}]
+        assert seen["predict_len"] == 2
+        assert seen["unbatch_len"] == 2
+
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.uid == "batch-ctx"
+        # Results written back to the correct items (no misalignment).
+        assert json.loads(resp.batch.items[0].data)["result"] == 2
+        assert json.loads(resp.batch.items[1].data)["result"] == 4
+
     def test_batch_predict_fallback_no_batch_methods(self):
         class SimpleModel(LitAPI):
             def predict(self, x):
