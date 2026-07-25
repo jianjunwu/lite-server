@@ -97,6 +97,7 @@ libc = "0.2"
 tokio-tungstenite = "0.24"
 serial_test = "3"
 tower = { version = "0.4", features = ["util"] }
+bytes = "1.8"
 
 [lib]
 name = "lite_server"
