@@ -46,6 +46,16 @@ fn replace_hook_vars(template: &str, vars: &[(String, String)]) -> String {
 
 /// Execute a worker lifecycle hook (shell command + optional HTTP callback).
 /// Both are fire-and-forget: spawned as background tasks, never block the caller.
+/// Process-wide HTTP client for worker lifecycle hooks. Cloning a
+/// reqwest::Client is cheap (it is Arc internally) and reuses the underlying
+/// connection pool, so build it once instead of on every hook firing (#4).
+static HTTP_HOOK_CLIENT: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync::Lazy::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_default()
+});
+
 pub fn execute_hook(
     hook_type: &str,
     hooks: &crate::config::WorkerHooksConfig,
@@ -102,10 +112,7 @@ pub fn execute_hook(
         let body = http.body_template.as_deref().map(|t| replace_hook_vars(t, &vars));
         let hook_name = hook_type.to_string();
         tokio::spawn(async move {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap_or_default();
+            let client = HTTP_HOOK_CLIENT.clone();
             let result = match method.to_uppercase().as_str() {
                 "GET" => client.get(&url).send().await,
                 _ => {
