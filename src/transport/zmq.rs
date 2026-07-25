@@ -19,6 +19,15 @@ enum ZmqCommand {
         chunk_tx: mpsc::Sender<pb::StreamResponse>,
         stream_id: String,
     },
+    /// Fire-and-forget send: emit `request` with no pending reply slot.
+    ///
+    /// Used for bidirectional stream chunks/closes, whose responses come back
+    /// later as `StreamResponse`s routed through the stream's registered
+    /// channel (set up at open).  A plain `send()` here would deadlock for
+    /// `ZMQ_RESPONSE_TIMEOUT` waiting for a unary reply that never matches.
+    Raw {
+        request: pb::Request,
+    },
 }
 
 pub struct WorkerZmqClient {
@@ -87,6 +96,12 @@ impl WorkerZmqClient {
                                 Err(e) => {
                                     error!("ZMQ stream send error: {}", e);
                                 }
+                            }
+                        }
+                        Ok(ZmqCommand::Raw { request }) => {
+                            let bytes = request.encode_to_vec();
+                            if let Err(e) = socket.send(&bytes, 0) {
+                                error!("ZMQ raw send error: {}", e);
                             }
                         }
                         Err(mpsc::error::TryRecvError::Empty) => break,
@@ -214,6 +229,18 @@ impl WorkerZmqClient {
 
         Ok(chunk_rx)
     }
+
+    /// Fire-and-forget send: deliver `request` without awaiting a reply.
+    ///
+    /// For bidirectional stream chunks/closes — their responses arrive as
+    /// `StreamResponse`s on the stream's registered channel, so there is no
+    /// unary reply to wait for.  See `ZmqCommand::Raw`.
+    pub async fn send_raw(&self, request: pb::Request) -> Result<(), AppError> {
+        self.cmd_tx
+            .send(ZmqCommand::Raw { request })
+            .await
+            .map_err(|_| AppError::Transport("ZMQ command channel closed".to_string()))
+    }
 }
 
 fn error_response(uid: &str, message: &str) -> pb::Response {
@@ -278,5 +305,120 @@ mod tests {
         } else {
             panic!("Expected Single response with error status");
         }
+    }
+
+    // Bidirectional stream chunks must be sent fire-and-forget: the worker's
+    // reply to a chunk is a StreamResponse routed through the stream channel
+    // (registered at open), NOT a unary Response matched by uid.  Using send()
+    // for chunks therefore deadlocks for ZMQ_RESPONSE_TIMEOUT waiting for a
+    // reply that never matches — which is the bidi multi-chunk stall bug.
+    // send_raw emits the request with no pending reply slot.
+    #[tokio::test]
+    async fn send_raw_is_fire_and_forget_for_bidi_chunks() {
+        #[cfg(unix)]
+        let endpoint = {
+            let sock = std::env::temp_dir().join(format!(
+                "lite-server-zmq-bidi-{}.sock",
+                std::process::id()
+            ));
+            format!("ipc://{}", sock.display())
+        };
+        #[cfg(windows)]
+        let endpoint = format!("tcp://127.0.0.1:{}", 33000 + std::process::id() % 1000);
+
+        let ep_for_worker = endpoint.clone();
+        let worker = std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&ep_for_worker).expect("worker connect");
+            let _ = s.set_rcvtimeo(3000);
+            loop {
+                let bytes = match s.recv_bytes(0) {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let stream = match req.payload {
+                    Some(pb::request::Payload::Stream(st)) => st,
+                    _ => continue,
+                };
+                // Reply on the stream channel (as a bidi worker would for
+                // on_open / on_chunk) — never as a unary Response by uid.
+                let resp = pb::Response {
+                    payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                        stream_id: stream.stream_id.clone(),
+                        payload: Some(pb::stream_response::Payload::Chunk(
+                            pb::StreamChunkResponse {
+                                data: bytes::Bytes::from_static(b"{\"ok\":true}"),
+                                is_final: false,
+                            },
+                        )),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                let _ = s.send(resp.encode_to_vec(), 0);
+            }
+        });
+
+        let client = WorkerZmqClient::new(endpoint);
+        // Let the bind + worker connect establish the PAIR.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let sid = "bidi-test".to_string();
+        let open_req = pb::Request {
+            uid: "open".to_string(),
+            meta: None,
+            payload: Some(pb::request::Payload::Stream(pb::StreamRequest {
+                stream_id: sid.clone(),
+                action: Some(pb::stream_request::Action::Open(pb::StreamOpen {
+                    data: bytes::Bytes::from_static(b"{}"),
+                    meta: None,
+                })),
+            })),
+        };
+        let mut chunk_rx = client
+            .send_stream(open_req, sid.clone())
+            .await
+            .expect("open stream");
+
+        // on_open reply arrives via the stream channel.
+        tokio::time::timeout(Duration::from_secs(3), chunk_rx.recv())
+            .await
+            .expect("on_open response timed out")
+            .expect("stream channel closed");
+
+        // Two bidi chunks via send_raw: each must return promptly and its
+        // reply must arrive on the stream channel within a couple seconds.
+        for i in 0..2u8 {
+            let chunk_req = pb::Request {
+                uid: format!("chunk-{i}"),
+                meta: None,
+                payload: Some(pb::request::Payload::Stream(pb::StreamRequest {
+                    stream_id: sid.clone(),
+                    action: Some(pb::stream_request::Action::Chunk(pb::StreamChunk {
+                        data: bytes::Bytes::from(vec![i]),
+                    })),
+                })),
+            };
+            let t0 = std::time::Instant::now();
+            client.send_raw(chunk_req).await.expect("send_raw");
+            assert!(
+                t0.elapsed() < Duration::from_secs(3),
+                "send_raw blocked for {:?} on chunk {i}; bidi chunk must be fire-and-forget",
+                t0.elapsed()
+            );
+            tokio::time::timeout(Duration::from_secs(3), chunk_rx.recv())
+                .await
+                .expect("chunk response timed out")
+                .expect("stream channel closed");
+        }
+
+        drop(client);
+        drop(chunk_rx);
+        let _ = worker.join();
     }
 }

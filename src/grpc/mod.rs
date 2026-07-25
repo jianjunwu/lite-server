@@ -621,7 +621,12 @@ impl LiteServer for GrpcService {
         // Spawn forwarder: worker chunks -> gRPC stream
         let stream_id_for_incoming = stream_id.clone();
         tokio::spawn(async move {
-            // Forward incoming bidi chunks to worker as StreamRequest::Chunk
+            // Forward incoming bidi chunks to worker as StreamRequest::Chunk.
+            // These are fire-and-forget: the worker's response to each chunk
+            // comes back as a StreamResponse routed through the stream's
+            // channel (registered at open), so we must NOT use send() — that
+            // would await a unary reply that never matches and stall for
+            // ZMQ_RESPONSE_TIMEOUT between chunks.
             let incoming_task = tokio::spawn(async move {
                 while let Some(Ok(chunk)) = stream.message().await.transpose() {
                     match chunk.payload {
@@ -630,11 +635,11 @@ impl LiteServer for GrpcService {
                                 stream_id_for_incoming.clone(),
                                 data.data,
                             );
-                            let _ = worker_client.send(chunk_req).await;
+                            let _ = worker_client.send_raw(chunk_req).await;
                         }
                         Some(pb::bidi_chunk::Payload::Close(_)) => {
                             let close_req = streaming::build_stream_close(stream_id_for_incoming.clone());
-                            let _ = worker_client.send(close_req).await;
+                            let _ = worker_client.send_raw(close_req).await;
                             break;
                         }
                         _ => {}
