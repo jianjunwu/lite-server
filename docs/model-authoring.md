@@ -92,6 +92,29 @@ def predict(self, x):
     return self._infer(x)
 ```
 
+**Accessing per-request context in batch mode.** `batch`, `unbatch`, and
+`predict` (when batching is active) may all declare a `ctx` parameter —
+injected as a `list[RequestContext]` aligned positionally with the inputs
+(one entry per batched request):
+
+```python
+def batch(self, inputs, ctx):
+    for c in ctx:
+        self.logger.info("batching request %s", c.meta.request_id)
+    return torch.stack(inputs)
+
+def predict(self, batched, ctx):
+    # ctx[i] corresponds to inputs[i]; ctx[i].state writes are per-item
+    return self.model(batched)
+
+def unbatch(self, output, ctx):
+    return list(output)
+```
+
+`ctx[i]` always aligns with `inputs[i]` — **do not reorder** the inputs
+inside `batch`, or results are written back to the wrong requests. Not
+declaring `ctx` behaves exactly as before (the list is ignored).
+
 #### `encode_response(self, output)`
 
 Format the prediction output into an HTTP response body (must be JSON-serializable).

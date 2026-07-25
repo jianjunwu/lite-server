@@ -92,6 +92,24 @@ def predict(self, x):
     return self._infer(x)
 ```
 
+**批处理模式下访问每请求上下文。** `batch`、`unbatch` 以及 `predict`（批处理激活时）都可以声明 `ctx` 参数 —— 注入的是与输入**按位置对齐**的 `list[RequestContext]`（每个批内请求对应一项）：
+
+```python
+def batch(self, inputs, ctx):
+    for c in ctx:
+        self.logger.info("batching request %s", c.meta.request_id)
+    return torch.stack(inputs)
+
+def predict(self, batched, ctx):
+    # ctx[i] 对应 inputs[i]；写入 ctx[i].state 是逐项隔离的
+    return self.model(batched)
+
+def unbatch(self, output, ctx):
+    return list(output)
+```
+
+`ctx[i]` 始终与 `inputs[i]` 对齐 —— **不要**在 `batch` 内重排输入，否则结果会写回错误的请求。不声明 `ctx` 时行为与之前完全一致（该列表被忽略）。
+
 #### `encode_response(self, output)`
 
 将预测输出格式化为 HTTP 响应体（必须可 JSON 序列化）。
