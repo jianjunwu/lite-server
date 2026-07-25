@@ -1,62 +1,15 @@
 use crate::http::handlers::*;
 use crate::http::state::AppState;
-use crate::worker::protocol::EndpointRoute;
 use axum::{
-    routing::{delete, get, head, options, patch, post, put},
+    routing::{delete, get, post},
     Router,
 };
 use std::sync::Arc;
 
-/// System routes that cannot be overridden by custom endpoints.
-/// Note: "/health" is intentionally excluded — custom health endpoints are allowed.
-const SYSTEM_ROUTES: &[&str] = &[
-    "/info",
-    "/metrics",
-    "/metrics/timeline",
-    "/metrics/alerts",
-    "/v2/models",
-    "/v2/repository",
-    "/v2/repository/index",
-    "/v2/repository/models",
-];
-
-fn is_system_route(route: &str) -> bool {
-    SYSTEM_ROUTES.iter().any(|sys| {
-        route == *sys || route.starts_with(&format!("{}/", sys))
-    })
-}
-
-/// Drop custom endpoints whose route collides with a system route. axum
-/// panics when the same path+method is registered twice, so a conflicting
-/// endpoint would crash startup; warn and skip it instead.
-fn filter_system_route_conflicts(routes: Vec<EndpointRoute>) -> Vec<EndpointRoute> {
-    routes
-        .into_iter()
-        .filter(|ep| {
-            if is_system_route(&ep.route) {
-                tracing::warn!(
-                    "custom endpoint '{}' conflicts with a system route — skipped",
-                    ep.route
-                );
-                false
-            } else {
-                true
-            }
-        })
-        .collect()
-}
-
-pub fn create_routes(state: AppState, endpoint_routes: Vec<EndpointRoute>) -> Router {
-    let endpoint_routes = filter_system_route_conflicts(endpoint_routes);
-
-    let has_health_endpoint = endpoint_routes.iter().any(|r| r.route == "/health");
-
+pub fn create_routes(state: AppState) -> Router {
     let mut router = Router::new();
 
-    // Default health (skip if overridden by custom endpoint)
-    if !has_health_endpoint {
-        router = router.route("/health", get(health_handler));
-    }
+    router = router.route("/health", get(health_handler));
 
     router = router
         // Info
@@ -103,43 +56,6 @@ pub fn create_routes(state: AppState, endpoint_routes: Vec<EndpointRoute>) -> Ro
         .route("/v2/models/:model_name/stream", get(ws_stream_handler))
         .route("/v2/models/:model_name/versions/:version/stream", get(ws_stream_version_handler));
 
-    // Register custom endpoint routes
-    for ep in endpoint_routes {
-        let route = crate::worker::protocol::convert_path_params(&ep.route);
-        for method in &ep.methods {
-            let method_upper = method.to_uppercase();
-            router = match method_upper.as_str() {
-                "GET" => router.route(&route, get(custom_endpoint_handler)),
-                "POST" => router.route(&route, post(custom_endpoint_handler)),
-                "PUT" => router.route(&route, put(custom_endpoint_handler)),
-                "PATCH" => router.route(&route, patch(custom_endpoint_handler)),
-                "DELETE" => router.route(&route, delete(custom_endpoint_handler)),
-                "HEAD" => router.route(&route, head(custom_endpoint_handler)),
-                "OPTIONS" => router.route(&route, options(custom_endpoint_handler)),
-                other => {
-                    tracing::warn!(
-                        route = %route,
-                        method = %other,
-                        "unsupported endpoint method — skipped"
-                    );
-                    router
-                }
-            };
-        }
-        // OPTIONS preflight is answered at the Rust layer with a RUNTIME
-        // policy lookup, so an endpoint restart that changes a Cors
-        // declaration takes effect without re-registering routes. Register
-        // OPTIONS for every endpoint (the handler returns 405 when no Cors
-        // policy is declared), unless the endpoint declares OPTIONS itself.
-        let declares_options = ep
-            .methods
-            .iter()
-            .any(|m| m.eq_ignore_ascii_case("OPTIONS"));
-        if !declares_options {
-            router = router.route(&route, options(endpoint_options_handler));
-        }
-    }
-
     // Standardized error bodies for unmatched routes (404) and
     // unmatched methods (405) — axum defaults are empty/plain-text.
     router = router
@@ -147,32 +63,4 @@ pub fn create_routes(state: AppState, endpoint_routes: Vec<EndpointRoute>) -> Ro
         .method_not_allowed_fallback(crate::http::method_not_allowed_fallback);
 
     router.with_state(Arc::new(state))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::worker::protocol::EndpointRoute;
-
-    fn ep(route: &str) -> EndpointRoute {
-        EndpointRoute {
-            route: route.to_string(),
-            methods: vec!["GET".to_string()],
-            rate_limit: None,
-            cors: None,
-        }
-    }
-
-    #[test]
-    fn test_filter_system_route_conflicts() {
-        let routes = vec![
-            ep("/v2/models"),       // exact system route
-            ep("/v2/models/index"), // system-route prefix
-            ep("/ok"),              // custom, kept
-            ep("/health"),          // not a system route — kept
-        ];
-        let kept = filter_system_route_conflicts(routes);
-        let kept_routes: Vec<String> = kept.into_iter().map(|r| r.route).collect();
-        assert_eq!(kept_routes, vec!["/ok".to_string(), "/health".to_string()]);
-    }
 }

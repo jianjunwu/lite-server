@@ -6,7 +6,6 @@ use crate::inference_queue::InferenceQueue;
 use crate::metrics::prometheus;
 use crate::registry::ModelRegistry;
 use crate::worker::WorkerManager;
-use crate::worker::endpoint_manager::EndpointManager;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -124,22 +123,9 @@ impl LiteServer {
             info!("Hot reload: no enabled models, file watcher will start on demand");
         }
 
-        // Start endpoint manager
         let repo_path = PathBuf::from(&self.config.model_repository.path)
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(&self.config.model_repository.path));
-        let ep_dir = self.config.endpoints_dir.as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| repo_path.clone());
-        let ep_dir = ep_dir.canonicalize().unwrap_or(ep_dir);
-        let endpoint_manager = Arc::new(EndpointManager::new(ep_dir, self.registry.clone()));
-        let endpoint_routes = match endpoint_manager.start().await {
-            Ok(()) => endpoint_manager.routes().await,
-            Err(e) => {
-                warn!("Failed to start endpoint manager: {}", e);
-                Vec::new()
-            }
-        };
 
         // Create shared shutdown state for pending request tracking
         let shutdown_state = Arc::new(ShutdownState::new());
@@ -152,8 +138,6 @@ impl LiteServer {
             self.registry.clone(),
             self.worker_manager.clone(),
             self.inference_queue.clone(),
-            Some(endpoint_manager.clone()),
-            endpoint_routes,
             http_shutdown_rx,
             shutdown_state.clone(),
             self.callback_runner.clone(),
@@ -349,7 +333,6 @@ impl LiteServer {
             h.abort();
         }
 
-        let _ = endpoint_manager.shutdown().await;
         self.worker_manager.shutdown().await;
 
         Ok(())

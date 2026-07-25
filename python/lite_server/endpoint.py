@@ -11,6 +11,7 @@ Cors, or custom).
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, TypedDict
 
@@ -41,6 +42,38 @@ class RouteDef:
     methods: List[str]
     handler: Callable
     callbacks: List[Any] = field(default_factory=list)
+
+
+class HandlerSignatureError(RuntimeError):
+    """Route handler signature violates the 0.7.0 ctx contract (loud).
+
+    A misconfigured route must not be silently swallowed — it fails route
+    discovery so the worker reports a startup error instead of dropping
+    every route while still reporting ready.
+    """
+
+
+def _validate_handler_signature(fn, route: str) -> None:
+    """Reject pre-0.7 (request, server) handlers at discovery time."""
+    try:
+        params = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        return  # C-level callable: let the call site fail
+    required = [
+        p
+        for p in params
+        if p.default is inspect.Parameter.empty
+        and p.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    if len(required) == 1 and required[0].name not in ("request", "server"):
+        return
+    raise HandlerSignatureError(
+        f"Route handler for {route} must take exactly one argument "
+        f"(ctx: RequestContext); got signature {fn}. Since 0.7.0: "
+        f"request['body'] → ctx.request, request['query'] → ctx.meta.query, "
+        f"request['headers'] → ctx.meta.headers, server → ctx.server."
+    )
 
 
 class EndpointRouter:

@@ -4,8 +4,6 @@ server:
 model_repository:
   path: ./model_repo
 
-endpoints_dir: ./endpoints
-
 orchestration:
   control_mode: explicit
   load_models:

@@ -56,7 +56,6 @@ lite-server serve [选项]
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--model-repo` | string | ./model_repo | 模型仓库目录 |
-| `--endpoints-dir` | string | — | 自定义端点目录（覆盖 server.yaml 中的 `endpoints_dir`） |
 
 #### 功能开关
 

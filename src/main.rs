@@ -32,10 +32,6 @@ enum Commands {
         #[arg(long)]
         model_repo: Option<String>,
 
-        /// Custom endpoint directory (overrides model_repository.path for endpoints)
-        #[arg(long)]
-        endpoints_dir: Option<String>,
-
         /// Number of Tokio worker threads (null = auto = CPU cores)
         #[arg(long)]
         threads: Option<usize>,
@@ -125,7 +121,6 @@ fn main() {
             port,
             host,
             model_repo,
-            endpoints_dir,
             threads,
             timeout,
             log_level,
@@ -162,7 +157,6 @@ fn main() {
                 port,
                 host,
                 model_repo,
-                endpoints_dir,
                 threads,
                 timeout,
                 log_level: log_level.clone(),

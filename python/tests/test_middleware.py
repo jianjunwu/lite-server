@@ -15,7 +15,7 @@ from lite_server.callback import (
     RateLimit,
     RequireApiKey,
 )
-from lite_server.worker.endpoints import _validate_handler_signature
+from lite_server.endpoint import _validate_handler_signature
 
 
 # ---------------------------------------------------------------------------

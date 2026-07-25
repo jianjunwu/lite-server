@@ -216,7 +216,6 @@ See [examples/](examples/) for runnable model repositories:
 | 03 | [streaming](examples/03_streaming/) | Token-by-token streaming via SSE/WebSocket |
 | 04 | [multi_version](examples/04_multi_version/) | Two versions with activation switching |
 | 05 | [ensemble](examples/05_ensemble/) | DAG-based multi-model pipeline |
-| 06 | [custom_endpoint](examples/06_custom_endpoint/) | Custom HTTP endpoint |
 | 07 | [custom_params](examples/07_custom_params/) | Config-driven model behavior |
 | 09 | [custom_metrics](examples/09_custom_metrics/) | Custom Prometheus metrics (gauge/counter/histogram) |
 | 10 | [async](examples/10_async/) | Asynchronous inference (unified async pipeline) |
@@ -233,7 +232,6 @@ See [examples/README.md](examples/README.md) for learning path and usage details
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/v1/chat/completions` | OpenAI-compatible chat completion |
 | POST | `/v2/models/{name}/infer` | Inference (active version) |
 | POST | `/v2/models/{name}/versions/{v}/infer` | Inference (specific version) |
 | POST | `/v2/models/{name}/events` | SSE streaming |
@@ -274,9 +272,6 @@ server:
 
 model_repository:
   path: ./model_repo
-
-# Optional: custom HTTP endpoints directory
-endpoints_dir: ./endpoints
 ```
 
 Per-model config (`model_repo/my_model/1/config.yaml`):
@@ -377,7 +372,6 @@ cd python && python -m pytest tests/
 
 ## TODO
 
-- [ ] OpenAI-compatible endpoint example — reimplement with decorator pattern (`@endpoint.post("/v1/chat/completions")`) replacing the removed `08_openai_compatible`
 - [ ] `server.infer()` — wire up so custom endpoint handlers can call loaded LitAPI models
 
 ## License

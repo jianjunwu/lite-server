@@ -214,7 +214,6 @@ lite-server init my_project           # 脚手架创建项目
 | 03 | [streaming](examples/03_streaming/) | 逐 token 流式输出（SSE/WebSocket） |
 | 04 | [multi_version](examples/04_multi_version/) | 双版本切换演示 |
 | 05 | [ensemble](examples/05_ensemble/) | DAG 多模型流水线 |
-| 06 | [custom_endpoint](examples/06_custom_endpoint/) | 自定义 HTTP 端点 |
 | 07 | [custom_params](examples/07_custom_params/) | 配置驱动的模型行为 |
 | 09 | [custom_metrics](examples/09_custom_metrics/) | 自定义 Prometheus 指标（Gauge/Counter/Histogram） |
 | 10 | [async](examples/10_async/) | 异步推理（统一异步管线） |
@@ -231,7 +230,6 @@ lite-server init my_project           # 脚手架创建项目
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/v1/chat/completions` | OpenAI 兼容聊天完成 |
 | POST | `/v2/models/{name}/infer` | 推理（活跃版本） |
 | POST | `/v2/models/{name}/versions/{v}/infer` | 推理（指定版本） |
 | POST | `/v2/models/{name}/events` | SSE 流式 |
@@ -272,9 +270,6 @@ server:
 
 model_repository:
   path: ./model_repo
-
-# 可选：自定义 HTTP 端点目录
-endpoints_dir: ./endpoints
 ```
 
 单模型配置（`model_repo/my_model/1/config.yaml`）：
@@ -375,7 +370,6 @@ cd python && python -m pytest tests/
 
 ## TODO
 
-- [ ] OpenAI 兼容端点示例 — 用装饰器模式 (`@endpoint.post("/v1/chat/completions")`) 重新实现，替代已删除的 `08_openai_compatible`
 - [ ] `server.infer()` — 实现后使自定义端点可以调用已加载的 LitAPI 模型
 
 ## License

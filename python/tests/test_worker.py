@@ -2894,7 +2894,3 @@ class TestSetupLogging:
 
     def test_inference_setup_logging_handles_existing_handler(self):
         self._run(lambda: inference.setup_logging(0, "info"))
-
-    def test_endpoints_setup_logging_handles_existing_handler(self):
-        from lite_server.worker import endpoints
-        self._run(endpoints.setup_logging)

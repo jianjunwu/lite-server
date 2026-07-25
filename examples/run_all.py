@@ -196,13 +196,6 @@ def check_05():
     return st == 200 and r.get("output") == "preprocessed(hello) -> done", f"HTTP {st} -> {r}"
 
 
-def check_06():
-    st1, r1 = http_json("POST", "/v2/models/echo/infer", {"input": 21})
-    st2, r2 = http_json("GET", "/status")
-    ok = st1 == 200 and r1.get("output") == 42 and st2 == 200 and "loaded_models" in r2
-    return ok, f"echo HTTP {st1} -> {r1} | /status HTTP {st2} -> {r2}"
-
-
 def check_07():
     st1, r1 = http_json("POST", "/v2/models/threshold/infer", {"score": 0.8})
     st2, r2 = http_json("POST", "/v2/models/threshold/infer", {"score": 0.3})
@@ -318,7 +311,6 @@ SPECS = {
     "03_streaming": ("streaming", check_03),
     "04_multi_version": ("multi_version", check_04),
     "05_ensemble": ("pipeline", check_05),
-    "06_custom_endpoint": ("echo", check_06),
     "07_custom_params": ("threshold", check_07),
     "09_custom_metrics": ("metrics_demo", check_09),
     "10_async": ("async_echo", check_10),

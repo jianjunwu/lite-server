@@ -25,7 +25,6 @@ def main(argv=None):
     serve_parser.add_argument("--port", type=int, help="HTTP server port")
     serve_parser.add_argument("--host", help="Bind address")
     serve_parser.add_argument("--model-repo", help="Model repository path")
-    serve_parser.add_argument("--endpoints-dir", help="Custom endpoint directory (overrides model_repository.path for endpoints)")
     serve_parser.add_argument("--timeout", type=float, help="Request timeout")
     serve_parser.add_argument("--log-level", help="Log level")
     serve_parser.add_argument("--log-info-output", help="Info log file path")
@@ -118,7 +117,6 @@ def _cmd_serve(args):
             port=args.port,
             host=args.host,
             model_repo=args.model_repo,
-            endpoints_dir=args.endpoints_dir,
             threads=args.threads,
             timeout=args.timeout,
             log_level=args.log_level,

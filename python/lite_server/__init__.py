@@ -33,8 +33,6 @@ from lite_server.response import (
     StreamingResponse,
 )
 from lite_server.server_proxy import ServerProxy
-from lite_server.specs.openai import OpenAIEndpoint
-from lite_server.specs.base import EndpointSpec
 
 __all__ = [
     "serve",
@@ -49,8 +47,6 @@ __all__ = [
     "RequestMeta",
     "CBSequence",
     "EndpointRequest",
-    "OpenAIEndpoint",
-    "EndpointSpec",
     "ServerProxy",
     "endpoint",
     "router",

@@ -9,7 +9,6 @@ use crate::http::state::AppState;
 use crate::inference_queue::InferenceQueue;
 use crate::registry::ModelRegistry;
 use crate::worker::WorkerManager;
-use crate::worker::endpoint_manager::EndpointManager;
 use axum::extract::Request;
 use axum::http::header::CONNECTION;
 use axum::http::HeaderValue;
@@ -110,8 +109,6 @@ pub async fn start_http_server(
     registry: Arc<ModelRegistry>,
     worker_manager: Arc<WorkerManager>,
     inference_queue: Arc<InferenceQueue>,
-    endpoint_manager: Option<Arc<EndpointManager>>,
-    endpoint_routes: Vec<crate::worker::protocol::EndpointRoute>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     shutdown_state: Arc<crate::server::ShutdownState>,
     callback_runner: Arc<crate::callback::CallbackRunner>,
@@ -121,7 +118,7 @@ pub async fn start_http_server(
     let rate_limiter = Arc::new(crate::rate_limit::RateLimiter::new(
         config.rate_limit.max_buckets,
     ));
-    let mut state = AppState::new(registry, worker_manager, inference_queue, endpoint_manager, config.clone(), repo_path, callback_runner, has_hot_reload, rate_limiter.clone());
+    let mut state = AppState::new(registry, worker_manager, inference_queue, config.clone(), repo_path, callback_runner, has_hot_reload, rate_limiter.clone());
 
     // Background cleanup: evict stale rate-limit buckets every 60s
     {
@@ -139,7 +136,7 @@ pub async fn start_http_server(
     }
     state.shutdown_state = shutdown_state;
 
-    let app = create_routes(state, endpoint_routes);
+    let app = create_routes(state);
 
     // Keepalive middleware (inner)
     let app = if config.server.keepalive_timeout <= 0.0 {

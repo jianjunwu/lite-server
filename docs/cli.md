@@ -56,7 +56,6 @@ lite-server serve [OPTIONS]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--model-repo` | string | ./model_repo | Model repository directory |
-| `--endpoints-dir` | string | — | Custom endpoints directory (overrides `endpoints_dir` in server.yaml) |
 
 #### Feature Toggles
 

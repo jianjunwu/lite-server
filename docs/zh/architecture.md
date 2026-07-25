@@ -123,9 +123,6 @@ lite-server 是 Rust + Python 混合架构的推理服务器。Rust 内核处理
 | Callback | `callback.rs` | 服务器和推理生命周期回调（Rust 侧） |
 | 配置 | `config.rs` | YAML 配置加载、CLI 参数覆盖 |
 | 服务器 | `server.rs` | 主服务器生命周期、优雅关闭、文件监听 |
-| 端点 Worker | `worker/endpoint_manager.rs` | 自定义 HTTP 端点的 Worker 进程管理 |
-
-**自定义端点。** Rust 内核会启动一个独立的 Python 端点 Worker，从 `endpoints/` 目录或装饰器注册的路由加载用户自定义 HTTP 端点。端点 Worker 通过 UDS（Unix 域套接字）或 TCP（Windows）与 Rust 内核通信，使用长度前缀 JSON 协议。这样将自定义端点逻辑与推理 Worker 隔离。
 
 ### Python 包（`python/`）
 

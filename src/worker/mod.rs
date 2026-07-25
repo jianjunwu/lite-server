@@ -1,10 +1,4 @@
 pub mod protocol;
-pub mod endpoint_manager;
-
-/// Generated protobuf types for endpoint protocol.
-pub mod endpoint_proto {
-    include!(concat!(env!("OUT_DIR"), "/lite_server.endpoint.v1.rs"));
-}
 
 use crate::callback::{CallbackRunner, ModelLifecycleContext};
 use crate::config::ModelConfig;

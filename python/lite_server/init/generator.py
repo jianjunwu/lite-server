@@ -219,11 +219,6 @@ SERVER_YAML = textwrap.dedent("""\
     model_repository:
       path: ./model_repo
 
-    # Custom endpoint directory.  When unset, defaults to model_repository.path
-    # (the repo root) — NOT a nested endpoints/ subdir.  Set to ./endpoints to
-    # use a dedicated dir; @endpoint.get(...) modules are auto-discovered here.
-    # endpoints_dir: ./endpoints
-
     orchestration:
       control_mode: explicit        # explicit | poll | all
       load_models:
@@ -399,9 +394,6 @@ README_MD = textwrap.dedent("""\
     - **Callbacks** — `callbacks.py` shows how to hook into the inference pipeline
       (logging, auth, rate limiting).  Uncomment the `callbacks` key in
       `config.yaml` to activate.
-    - **Custom endpoints** — add `@endpoint.get(...)` modules in a directory
-      and point `endpoints_dir` (in `server.yaml`) at it; auto-discovered at
-      startup.  When `endpoints_dir` is unset, the model repo root is scanned.
 
     ## Customizing
 
@@ -410,7 +402,6 @@ README_MD = textwrap.dedent("""\
     | Change ports / logging / model list | `server.yaml` |
     | Enable batching or streaming | `config.yaml` (see `config.yaml.example` for all options) |
     | Add auth / rate limiting / logging | `callbacks.py`, then uncomment `callbacks` in `config.yaml` |
-    | Custom HTTP endpoints | create `endpoints/` directory with `@endpoint.get(...)` modules |
     | Use GPU / change device count | `config.yaml` → `accelerator` / `devices` / `workers_per_device` |
 
     ## Commands
