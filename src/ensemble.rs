@@ -373,6 +373,7 @@ async fn execute_step(
         data: bytes::Bytes::from(payload_bytes),
         meta: Some(std::sync::Arc::new(meta)),
         response_tx,
+        inflight_guard: None,
     };
 
     match state.inference_queue.try_submit(&step.model, &step.version, item) {

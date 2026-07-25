@@ -70,6 +70,40 @@ pub struct LiteServer {
     callback_runner: Arc<CallbackRunner>,
 }
 
+/// Lenient semver parse for version directory names (§4.2): tolerates a
+/// leading `v` and missing minor/patch components (`v2` → 2.0.0, `1.2` →
+/// 1.2.0). Returns `None` for non-numeric schemes like `nightly`.
+fn parse_lenient_semver(v: &str) -> Option<semver::Version> {
+    let v = v.strip_prefix('v').unwrap_or(v);
+    if let Ok(parsed) = semver::Version::parse(v) {
+        return Some(parsed);
+    }
+    match v.split('.').count() {
+        1 => semver::Version::parse(&format!("{}.0.0", v)).ok(),
+        2 => semver::Version::parse(&format!("{}.0", v)).ok(),
+        _ => None,
+    }
+}
+
+/// Pick the "latest" version for `load_policy = "latest"` (§4.2). Semver
+/// comparison when *every* candidate parses (fixing the lexicographic
+/// `"v10" < "v2"` bug); any unparseable candidate falls the whole set back
+/// to lexicographic order — predictable for mixed naming schemes.
+fn pick_latest_version(versions: &[String]) -> Option<String> {
+    let parsed: Option<Vec<semver::Version>> = versions
+        .iter()
+        .map(|v| parse_lenient_semver(v))
+        .collect();
+    match parsed {
+        Some(sems) => versions
+            .iter()
+            .zip(sems.iter())
+            .max_by_key(|(_, sem)| *sem)
+            .map(|(orig, _)| orig.clone()),
+        None => versions.iter().max().cloned(),
+    }
+}
+
 impl LiteServer {
     pub fn new(config: Config) -> Self {
         let repo_path = PathBuf::from(&config.model_repository.path);
@@ -82,7 +116,8 @@ impl LiteServer {
             inference_queue.clone(),
             config.logging.level.clone(),
             callback_runner.clone(),
-        ).with_server_http(Self::loopback_http_base(&config)));
+        ).with_server_http(Self::loopback_http_base(&config))
+         .with_unload_grace(Duration::from_secs_f32(config.server.timeout)));
 
         Self {
             config,
@@ -395,7 +430,9 @@ impl LiteServer {
 
             let models = by_model.get(&name).cloned().unwrap_or_default();
             let mut versions_loaded = Vec::new();
-            let max_version = models.iter().map(|m| &m.version).max().cloned();
+            let max_version = pick_latest_version(
+                &models.iter().map(|m| m.version.clone()).collect::<Vec<_>>(),
+            );
 
             for m in &models {
                 let version = m.version.clone();
@@ -936,6 +973,31 @@ mod tests {
     use crate::inference_queue::InferenceQueue;
     use crate::registry::ModelRegistry;
     use crate::worker::WorkerManager;
+
+    #[test]
+    fn test_pick_latest_version_semver_v_prefix() {
+        // The lexicographic bug: "v10" < "v2" as strings.
+        let versions = vec!["v2".to_string(), "v10".to_string(), "v1".to_string()];
+        assert_eq!(pick_latest_version(&versions), Some("v10".to_string()));
+    }
+
+    #[test]
+    fn test_pick_latest_version_semver_dotted() {
+        let versions = vec!["1.2.0".to_string(), "1.10.0".to_string(), "1.2".to_string()];
+        assert_eq!(pick_latest_version(&versions), Some("1.10.0".to_string()));
+    }
+
+    #[test]
+    fn test_pick_latest_version_fallback_lexicographic_when_mixed() {
+        // Any unparseable candidate falls the whole set back to lexicographic.
+        let versions = vec!["v2".to_string(), "nightly".to_string()];
+        assert_eq!(pick_latest_version(&versions), Some("v2".to_string()));
+    }
+
+    #[test]
+    fn test_pick_latest_version_empty() {
+        assert_eq!(pick_latest_version(&[]), None);
+    }
 
     #[tokio::test]
     async fn test_file_watcher_aborts_cleanly() {

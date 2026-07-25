@@ -97,6 +97,44 @@ impl ModelRegistry {
         self.active_versions.get(model_name).map(|r| r.clone())
     }
 
+    /// Stamp `last_used_at` for LRU eviction (§4.2). Coarse by design: a touch
+    /// within 1s of the previous stamp is a no-op, so the request hot path
+    /// stays on a shared read and pays a write at most once per second.
+    /// Missing model/version is a silent no-op.
+    pub fn touch_last_used(&self, model_name: &str, version: &str) {
+        const COALESCE: std::time::Duration = std::time::Duration::from_secs(1);
+        let now = std::time::SystemTime::now();
+
+        let fresh = self
+            .models
+            .get(model_name)
+            .and_then(|entry| entry.versions.get(version).and_then(|v| v.last_used_at))
+            .is_some_and(|t| now.duration_since(t).unwrap_or_default() < COALESCE);
+        if fresh {
+            return;
+        }
+
+        if let Some(mut entry) = self.models.get_mut(model_name) {
+            if let Some(mv) = entry.versions.get_mut(version) {
+                mv.last_used_at = Some(now);
+            }
+        }
+    }
+
+    /// Pick the least-recently-used non-active version for LRU eviction.
+    /// Never-used versions (`last_used_at = None`) are the first candidates;
+    /// the active version is never a candidate.
+    pub fn lru_eviction_candidate(&self, model_name: &str) -> Option<String> {
+        let entry = self.models.get(model_name)?;
+        let active = self.active_versions.get(model_name).map(|a| a.clone());
+        entry
+            .versions
+            .values()
+            .filter(|v| active.as_ref() != Some(&v.version))
+            .min_by_key(|v| v.last_used_at)
+            .map(|v| v.version.clone())
+    }
+
     pub fn register(
         &self,
         model_name: &str,
@@ -127,6 +165,7 @@ impl ModelRegistry {
             model_dir,
             workers: vec![],
             loaded_at: None,
+            last_used_at: None,
             policies: Default::default(),
             cors_headers: None,
         };
@@ -461,6 +500,69 @@ mod tests {
     fn test_mark_ready_nonexistent_errors() {
         let reg = ModelRegistry::new();
         assert!(reg.mark_ready("nope", "1").is_err());
+    }
+
+    // --- LRU last_used_at (§4.2) ---
+
+    #[test]
+    fn test_touch_last_used_sets_and_coalesces() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        assert!(reg.get("m1", Some("1")).unwrap().last_used_at.is_none());
+
+        reg.touch_last_used("m1", "1");
+        let first = reg
+            .get("m1", Some("1"))
+            .unwrap()
+            .last_used_at
+            .expect("touch must set last_used_at");
+
+        // Coarse (1s): an immediate second touch is a no-op, keeping the hot
+        // path on a shared read instead of a per-request write.
+        reg.touch_last_used("m1", "1");
+        let second = reg.get("m1", Some("1")).unwrap().last_used_at.unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn test_touch_last_used_missing_is_noop() {
+        let reg = ModelRegistry::new();
+        reg.touch_last_used("nope", "1"); // unknown model — must not panic
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.touch_last_used("m1", "2"); // unknown version — must not panic
+        assert!(reg.get("m1", Some("1")).unwrap().last_used_at.is_none());
+    }
+
+    #[test]
+    fn test_lru_eviction_candidate_skips_active_prefers_never_used() {
+        let reg = ModelRegistry::new();
+        for v in ["1", "2", "3"] {
+            reg.register("m1", v, test_config(), ModelType::LitAPI, tmp_dir())
+                .unwrap();
+            reg.mark_ready("m1", v).unwrap();
+        }
+        reg.activate_version("m1", "3").unwrap();
+
+        // "2" never used → first candidate; active "3" is never picked.
+        reg.touch_last_used("m1", "1");
+        assert_eq!(reg.lru_eviction_candidate("m1"), Some("2".to_string()));
+
+        // All non-active used → candidate is one of them, never active "3".
+        reg.touch_last_used("m1", "2");
+        let c = reg.lru_eviction_candidate("m1").unwrap();
+        assert!(c == "1" || c == "2", "active version must never be a candidate");
+    }
+
+    #[test]
+    fn test_lru_eviction_candidate_none_when_only_active_loaded() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.mark_ready("m1", "1").unwrap();
+        reg.activate_version("m1", "1").unwrap();
+        assert_eq!(reg.lru_eviction_candidate("m1"), None);
     }
 
     // --- Server-wide status rollup ---

@@ -50,6 +50,20 @@ pub struct QueueItem {
     pub data: Bytes, // JSON-encoded request body (zero-copy shared buffer)
     pub meta: Option<Arc<pb::RequestMeta>>, // shared via Arc (refcount-cloned)
     pub response_tx: oneshot::Sender<pb::Response>,
+    /// RAII decrement for the per-version in-flight counter, attached by
+    /// [`InferenceQueue::try_submit`] on acceptance. Drops with the item —
+    /// after its response is sent, or when the item is discarded — so no
+    /// completion path can leak the count (§4.2 graceful drain).
+    pub inflight_guard: Option<InflightGuard>,
+}
+
+/// Decrements the per-version in-flight counter on drop (§4.2).
+pub struct InflightGuard(Arc<AtomicUsize>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Error types for queue operations.
@@ -213,6 +227,37 @@ struct VersionQueue {
     outlier: Arc<OutlierState>,
     /// Health-checker task handle (abortable); `None` if health checks disabled.
     health_checker: Option<std::sync::Arc<tokio::task::JoinHandle<()>>>,
+    /// Requests accepted but not yet completed (§4.2 graceful drain).
+    inflight_requests: Arc<AtomicUsize>,
+}
+
+/// Handle to a draining queue (§4.2). The collector stays alive so
+/// already-accepted items finish; call [`DrainHandle::wait_idle`] to await
+/// completion, then [`DrainHandle::abort`] to stop the collector + health
+/// checker for good.
+pub struct DrainHandle {
+    inflight_requests: Arc<AtomicUsize>,
+    collector: std::sync::Arc<tokio::task::JoinHandle<()>>,
+    health_checker: Option<std::sync::Arc<tokio::task::JoinHandle<()>>>,
+}
+
+impl DrainHandle {
+    /// Wait until every accepted request has completed. No timeout of its
+    /// own — callers wrap with `tokio::time::timeout` to enforce a grace
+    /// period.
+    pub async fn wait_idle(&self) {
+        while self.inflight_requests.load(Ordering::Relaxed) > 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Stop the collector and health checker.
+    pub fn abort(self) {
+        self.collector.abort();
+        if let Some(h) = self.health_checker {
+            h.abort();
+        }
+    }
 }
 
 /// Per-model-version inference queue with batch aggregation.
@@ -305,6 +350,7 @@ impl InferenceQueue {
                 collector: std::sync::Arc::new(handle),
                 outlier,
                 health_checker: health_handle,
+                inflight_requests: Arc::new(AtomicUsize::new(0)),
             },
         );
         info!(
@@ -316,16 +362,20 @@ impl InferenceQueue {
         );
     }
 
-    /// Unregister a model version and stop its collector + health checker.
-    pub fn unregister_model(&self, model_name: &str, version: &str) {
+    /// Begin a graceful drain (§4.2): remove the queue from the registry so
+    /// new submissions fail with [`QueueError::NotFound`], but keep the
+    /// collector alive to finish already-accepted items. The returned handle
+    /// reports in-flight completion and owns the final abort.
+    pub fn begin_drain(&self, model_name: &str, version: &str) -> Option<DrainHandle> {
         let key = model_version_key(model_name, version);
-        if let Some((_, v)) = self.queues.remove(&key) {
-            v.collector.abort();
-            if let Some(h) = v.health_checker {
-                h.abort();
+        self.queues.remove(&key).map(|(_, v)| {
+            info!(model = %model_name, version = %version, "model queue draining");
+            DrainHandle {
+                inflight_requests: v.inflight_requests,
+                collector: v.collector,
+                health_checker: v.health_checker,
             }
-            info!(model = %model_name, version = %version, "model unregistered");
-        }
+        })
     }
 
     /// Submit a single request to the queue (non-blocking).
@@ -334,16 +384,20 @@ impl InferenceQueue {
         &self,
         model_name: &str,
         version: &str,
-        item: QueueItem,
+        mut item: QueueItem,
     ) -> Result<(), QueueError> {
         let key = model_version_key(model_name, version);
-        let sender = {
+        let (sender, counter) = {
             let entry = self
                 .queues
                 .get(&key)
                 .ok_or(QueueError::NotFound)?;
-            entry.tx.clone()
+            (entry.tx.clone(), entry.inflight_requests.clone())
         };
+        // Count from acceptance (not dispatch) so a drain starting right after
+        // try_submit returns still observes this request.
+        counter.fetch_add(1, Ordering::Relaxed);
+        item.inflight_guard = Some(InflightGuard(counter));
         sender
             .try_send(item)
             .map_err(|e| match e {
@@ -1110,8 +1164,59 @@ mod tests {
         assert!(!second_handle.is_finished(), "new collector should still be running");
     }
 
+    // ===== Graceful drain tests (§4.2) =====
+
+    fn drain_test_endpoint(name: &str) -> String {
+        #[cfg(unix)]
+        {
+            format!(
+                "ipc://{}",
+                std::env::temp_dir()
+                    .join(format!("lite-server-dq-{}-{}.sock", name, std::process::id()))
+                    .display()
+            )
+        }
+        #[cfg(windows)]
+        {
+            format!("tcp://127.0.0.1:{}", 34000 + std::process::id() % 1000)
+        }
+    }
+
+    /// Spawn a PAIR-socket worker that answers every unary request with an
+    /// empty Single response after `delay` (simulating in-flight work).
+    fn spawn_echo_worker(endpoint: String, delay: Duration) -> std::thread::JoinHandle<()> {
+        use prost::Message;
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(5000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                std::thread::sleep(delay);
+                let resp = pb::Response {
+                    uid: req.uid,
+                    payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+                        data: Bytes::new(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                if s.send(resp.encode_to_vec(), 0).is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
     #[tokio::test]
-    async fn test_unregister_model_aborts_collector() {
+    async fn test_begin_drain_rejects_new_but_completes_inflight() {
+        let endpoint = drain_test_endpoint("drain");
+        let _worker = spawn_echo_worker(endpoint.clone(), Duration::from_millis(300));
+
         let queue = InferenceQueue::new();
         let config = ModelConfig {
             max_queue_size: 10,
@@ -1120,6 +1225,92 @@ mod tests {
             adaptive_batching: false,
             min_batch_timeout: 0.0,
             adaptive_queue_threshold: 0,
+            health_check_interval: 0.0,
+            ..Default::default()
+        };
+        let (reload_tx, _reload_rx) = mpsc::channel(8);
+        let outlier = Arc::new(OutlierState::new(1));
+        let client = Arc::new(WorkerZmqClient::new(endpoint));
+        queue.register_model("m", "1", &config, vec![], vec![client], reload_tx, outlier);
+        // Let the PAIR connect establish.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Submit a request; the echo worker holds it ~300ms.
+        let (resp_tx, resp_rx) = oneshot::channel();
+        queue
+            .try_submit("m", "1", QueueItem {
+                uid: "inflight".to_string(),
+                data: Bytes::new(),
+                meta: None,
+                response_tx: resp_tx,
+                inflight_guard: None,
+            })
+            .unwrap();
+
+        // Drain: new submissions are rejected immediately...
+        let drain = queue.begin_drain("m", "1").expect("queue must exist");
+        let (late_tx, _late_rx) = oneshot::channel();
+        let err = queue
+            .try_submit("m", "1", QueueItem {
+                uid: "late".to_string(),
+                data: Bytes::new(),
+                meta: None,
+                response_tx: late_tx,
+                inflight_guard: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, QueueError::NotFound));
+
+        // ...while the in-flight request still gets its real response.
+        tokio::time::timeout(Duration::from_secs(5), drain.wait_idle())
+            .await
+            .expect("in-flight request must drain");
+        let resp = tokio::time::timeout(Duration::from_secs(1), resp_rx)
+            .await
+            .expect("response must arrive promptly after drain")
+            .expect("in-flight response channel must not be dropped");
+        assert!(matches!(resp.payload, Some(pb::response::Payload::Single(_))));
+        drain.abort();
+    }
+
+    #[tokio::test]
+    async fn test_begin_drain_idle_queue_drains_immediately() {
+        let queue = InferenceQueue::new();
+        let config = ModelConfig {
+            max_queue_size: 10,
+            max_batch_size: 1,
+            batch_timeout: 0.0,
+            adaptive_batching: false,
+            min_batch_timeout: 0.0,
+            adaptive_queue_threshold: 0,
+            health_check_interval: 0.0,
+            ..Default::default()
+        };
+        let (reload_tx, _reload_rx) = mpsc::channel(8);
+        let outlier = Arc::new(OutlierState::new(0));
+        queue.register_model("m", "1", &config, vec![], vec![], reload_tx, outlier);
+
+        let drain = queue.begin_drain("m", "1").expect("queue must exist");
+        tokio::time::timeout(Duration::from_millis(500), drain.wait_idle())
+            .await
+            .expect("idle queue must drain immediately");
+
+        // Draining an unknown version yields no handle.
+        assert!(queue.begin_drain("m", "2").is_none());
+        drain.abort();
+    }
+
+    #[tokio::test]
+    async fn test_drain_abort_stops_collector() {
+        let queue = InferenceQueue::new();
+        let config = ModelConfig {
+            max_queue_size: 10,
+            max_batch_size: 1,
+            batch_timeout: 0.0,
+            adaptive_batching: false,
+            min_batch_timeout: 0.0,
+            adaptive_queue_threshold: 0,
+            health_check_interval: 0.0,
             ..Default::default()
         };
         let (reload_tx, _reload_rx) = mpsc::channel(8);
@@ -1129,10 +1320,11 @@ mod tests {
         let handle = queue.queues.get(&model_version_key("test_model", "1")).unwrap().collector.clone();
         assert!(!handle.is_finished());
 
-        queue.unregister_model("test_model", "1");
+        let drain = queue.begin_drain("test_model", "1").expect("queue must exist");
+        drain.abort();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(handle.is_finished(), "collector should be aborted after unregister");
+        assert!(handle.is_finished(), "collector should be aborted after drain abort");
     }
 
     // ===== Phase 1: Bytes-based zero-copy tests =====
@@ -1147,6 +1339,7 @@ mod tests {
             data: data.clone(),
             meta: None,
             response_tx: tx,
+                  inflight_guard: None,
         };
         // Bytes::clone shares the same underlying buffer
         let cloned_data = item.data.clone();
@@ -1206,6 +1399,7 @@ mod tests {
             data: payload_bytes.clone(),
             meta: Some(meta),
             response_tx: tx,
+                  inflight_guard: None,
         };
 
         // Cloning the item's data is zero-copy
@@ -1247,6 +1441,7 @@ mod tests {
             data: payload.clone(),
             meta: None,
             response_tx: resp_tx,
+                  inflight_guard: None,
         };
         tx.try_send(item).unwrap();
 
@@ -1349,6 +1544,7 @@ mod tests {
             data: Bytes::new(),
             meta: Some(Arc::new(meta)),
             response_tx: tx,
+                  inflight_guard: None,
         };
         // Cloning meta should be a refcount bump, not a deep copy
         let meta_clone = item.meta.clone();

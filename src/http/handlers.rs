@@ -520,6 +520,7 @@ pub async fn activate_version_handler(
     crate::validation::validate_version(&version)?;
 
     info!(model = %model_name, version = %version, "activate version requested");
+    let previous = state.registry.get_active_version(&model_name);
     let success = state.registry.activate_version(&model_name, &version)?;
     if !success {
         return Err(AppError::ModelNotReady(format!(
@@ -527,7 +528,18 @@ pub async fn activate_version_handler(
             model_name, version
         )));
     }
-    prometheus::record_version_switch(&model_name);
+    // A switch is counted only when a different version was active before —
+    // first activation and re-activation of the same version are not switches.
+    if let Some(from) = previous {
+        if from != version {
+            prometheus::record_version_switch(&model_name, &from, &version);
+        }
+    }
+    state.callback_runner.on_model_activate(&crate::callback::ModelLifecycleContext {
+        model_name: model_name.clone(),
+        version: version.clone(),
+        device: None,
+    }).await;
     Ok(Json(json!({
         "success": true,
         "message": format!("Model {} version {} is now active", model_name, version),
@@ -781,6 +793,7 @@ async fn do_infer(
         data: meta.payload.clone(),
         meta: Some(std::sync::Arc::new(meta)),
         response_tx,
+        inflight_guard: None,
     };
 
     match state.inference_queue.try_submit(&model_name, &resolved_version, item) {
@@ -946,12 +959,15 @@ async fn resolve_version(
     model_name: &str,
     version: Option<String>,
 ) -> Result<String, AppError> {
-    match version {
-        Some(v) => Ok(v),
+    let resolved = match version {
+        Some(v) => v,
         None => state.registry.get_active_version(model_name).ok_or_else(|| {
             AppError::ModelNotFound(format!("{} has no active version", model_name))
-        }),
-    }
+        })?,
+    };
+    // LRU touch (§4.2): coarse, no-op for unknown versions.
+    state.registry.touch_last_used(model_name, &resolved);
+    Ok(resolved)
 }
 
 fn build_request_meta(headers: &HeaderMap, payload: &Value, route: &str, request_id: String) -> pb::RequestMeta {

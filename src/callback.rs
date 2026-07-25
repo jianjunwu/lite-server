@@ -101,6 +101,9 @@ pub trait Callback: Send + Sync + 'static {
     /// Called when a model version is hot-reloaded.
     async fn on_model_reload(&self, _ctx: &ModelLifecycleContext) {}
 
+    /// Called when a model version becomes the active version (§4.2).
+    async fn on_model_activate(&self, _ctx: &ModelLifecycleContext) {}
+
     /// Called when an inference request arrives (before queueing).
     async fn on_inference_request(&self, _ctx: &InferenceContext) {}
 
@@ -206,6 +209,14 @@ impl CallbackRunner {
         }).await;
     }
 
+    pub async fn on_model_activate(&self, ctx: &ModelLifecycleContext) {
+        let ctx = ctx.clone();
+        self.trigger_sequential("on_model_activate", move |cb| {
+            let ctx = ctx.clone();
+            Box::pin(async move { cb.on_model_activate(&ctx).await })
+        }).await;
+    }
+
     pub async fn on_inference_request(&self, ctx: &InferenceContext) {
         let ctx = ctx.clone();
         self.trigger_sequential("on_inference_request", move |cb| {
@@ -305,6 +316,38 @@ mod tests {
         };
         runner.on_model_load(&ctx).await;
         assert_eq!(cb.load_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_model_activate_callback() {
+        #[derive(Default)]
+        struct ActivateCallback {
+            activations: AtomicUsize,
+            last: std::sync::Mutex<Option<(String, String)>>,
+        }
+        #[async_trait::async_trait]
+        impl Callback for ActivateCallback {
+            async fn on_model_activate(&self, ctx: &ModelLifecycleContext) {
+                self.activations.fetch_add(1, Ordering::Relaxed);
+                *self.last.lock().unwrap() =
+                    Some((ctx.model_name.clone(), ctx.version.clone()));
+            }
+        }
+
+        let cb = Arc::new(ActivateCallback::default());
+        let runner = CallbackRunner::new();
+        runner.register(cb.clone()).await;
+
+        runner.on_model_activate(&ModelLifecycleContext {
+            model_name: "m".into(),
+            version: "2".into(),
+            device: None,
+        }).await;
+        assert_eq!(cb.activations.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            cb.last.lock().unwrap().clone(),
+            Some(("m".to_string(), "2".to_string()))
+        );
     }
 
     #[tokio::test]

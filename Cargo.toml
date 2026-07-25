@@ -25,6 +25,9 @@ bincode = "1.3"
 prost = "0.13"
 prost-types = "0.13"
 
+# version ordering for load_policy = "latest"
+semver = "1.0"
+
 # gRPC
 tonic = "0.12"
 tonic-health = { version = "0.12", features = ["transport"] }

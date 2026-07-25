@@ -168,6 +168,10 @@ pub struct WorkerManager {
     // passed to workers as --server-http so @route handlers can query the
     // hosting server via ctx.server (phase 2b). None for unix-socket HTTP.
     server_http: Option<String>,
+    // Grace period for draining in-flight requests on unload (§4.2).
+    // Defaults to the server.timeout default; overridden via
+    // `set_unload_grace` at startup.
+    unload_grace: Duration,
 }
 
 struct WorkerProcess {
@@ -211,6 +215,7 @@ impl WorkerManager {
             status_coordinators: Arc::new(RwLock::new(HashMap::new())),
             grpc_health: Arc::new(RwLock::new(None)),
             server_http: None,
+            unload_grace: Duration::from_secs(30),
         }
     }
 
@@ -219,6 +224,12 @@ impl WorkerManager {
     /// WorkerManager::new call sites stay untouched.
     pub fn with_server_http(mut self, server_http: Option<String>) -> Self {
         self.server_http = server_http;
+        self
+    }
+
+    /// Set the unload drain grace period (§4.2), from `server.timeout`.
+    pub fn with_unload_grace(mut self, grace: Duration) -> Self {
+        self.unload_grace = grace;
         self
     }
 
@@ -805,6 +816,11 @@ impl WorkerManager {
             ModelType::LitAPI
         };
 
+        // Evict LRU non-active versions if the model is at its
+        // max_loaded_versions limit (§4.2). Placed after the on-disk checks
+        // above so a doomed load never evicts a healthy version.
+        self.enforce_max_loaded_versions(model_name).await?;
+
         self.registry
             .register(model_name, version, model_config.clone(), model_type, model_dir.clone())?;
 
@@ -1121,6 +1137,43 @@ impl WorkerManager {
         }
     }
 
+    /// Enforce the model's `max_loaded_versions` strategy (§4.2): evict
+    /// least-recently-used non-active versions until there is room for one
+    /// more. The active version is never evicted; if it is the only version
+    /// left, the limit is exceeded with a warning rather than blocking the
+    /// load (e.g. limit=1 must not break "load v2 → activate v2" cutover).
+    async fn enforce_max_loaded_versions(&self, model_name: &str) -> Result<(), AppError> {
+        let max = self
+            .registry
+            .get_strategy(model_name)
+            .and_then(|s| s.max_loaded_versions);
+        let Some(max) = max else { return Ok(()) };
+
+        loop {
+            let loaded = self.registry.list_versions(model_name).len();
+            if loaded < max {
+                return Ok(());
+            }
+            match self.registry.lru_eviction_candidate(model_name) {
+                Some(victim) => {
+                    info!(
+                        model = %model_name, version = %victim,
+                        max_loaded_versions = max,
+                        "evicting LRU version to satisfy max_loaded_versions"
+                    );
+                    self.unload_version(model_name, &victim).await?;
+                }
+                None => {
+                    warn!(
+                        model = %model_name, max_loaded_versions = max,
+                        "max_loaded_versions exceeded: only the active version remains"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     async fn unload_version(
         &self,
         model_name: &str,
@@ -1139,8 +1192,21 @@ impl WorkerManager {
             device: None,
         }).await;
 
-        // Unregister inference queue first to stop accepting new requests
-        self.inference_queue.unregister_model(model_name, version);
+        // Unregister the inference queue first to stop accepting new
+        // requests, then wait for in-flight requests to drain before killing
+        // workers (§4.2). On grace timeout, proceed anyway — a stuck request
+        // must not block unloading forever.
+        let drain = self.inference_queue.begin_drain(model_name, version);
+        if let Some(drain) = drain {
+            if timeout(self.unload_grace, drain.wait_idle()).await.is_err() {
+                warn!(
+                    model = %model_name, version = %version,
+                    grace_secs = self.unload_grace.as_secs(),
+                    "drain timed out with in-flight requests; unloading anyway"
+                );
+            }
+            drain.abort();
+        }
 
         self.registry
             .set_status(model_name, version, VersionStatus::Unloading)?;
@@ -2087,6 +2153,79 @@ mod tests {
             model_name: "m2".to_string(),
             version: "1".to_string(),
         }).is_err());
+    }
+
+    // ===== LRU eviction tests (§4.2) =====
+
+    fn lru_test_manager(registry: &Arc<ModelRegistry>) -> WorkerManager {
+        WorkerManager::new(
+            registry.clone(),
+            std::path::PathBuf::new(),
+            Arc::new(InferenceQueue::new()),
+            "warn".to_string(),
+            Arc::new(CallbackRunner::new()),
+        )
+    }
+
+    fn lru_strategy(max: Option<usize>) -> crate::config::ModelStrategyConfig {
+        crate::config::ModelStrategyConfig {
+            name: "m".to_string(),
+            load_policy: "explicit".to_string(),
+            versions_to_load: vec![],
+            default_version: None,
+            max_loaded_versions: max,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_enforce_max_loaded_versions_evicts_lru_non_active() {
+        let registry = Arc::new(ModelRegistry::new());
+        registry.set_strategy("m", &lru_strategy(Some(2))).unwrap();
+        for v in ["1", "2"] {
+            registry
+                .register("m", v, ModelConfig::default(), ModelType::LitAPI, std::path::PathBuf::new())
+                .unwrap();
+            registry.mark_ready("m", v).unwrap();
+        }
+        registry.activate_version("m", "2").unwrap();
+
+        let wm = lru_test_manager(&registry);
+        wm.enforce_max_loaded_versions("m").await.unwrap();
+
+        assert!(registry.get("m", Some("1")).is_none(), "LRU non-active version evicted");
+        assert!(registry.get("m", Some("2")).is_some(), "active version preserved");
+    }
+
+    #[tokio::test]
+    async fn test_enforce_max_loaded_versions_keeps_active_when_no_candidate() {
+        let registry = Arc::new(ModelRegistry::new());
+        registry.set_strategy("m", &lru_strategy(Some(1))).unwrap();
+        registry
+            .register("m", "1", ModelConfig::default(), ModelType::LitAPI, std::path::PathBuf::new())
+            .unwrap();
+        registry.mark_ready("m", "1").unwrap();
+        registry.activate_version("m", "1").unwrap();
+
+        // Only the active version is loaded: limit is exceeded with a
+        // warning rather than evicting active or failing the load.
+        let wm = lru_test_manager(&registry);
+        wm.enforce_max_loaded_versions("m").await.unwrap();
+        assert!(registry.get("m", Some("1")).is_some(), "active version must never be evicted");
+    }
+
+    #[tokio::test]
+    async fn test_enforce_max_loaded_versions_no_limit_is_noop() {
+        let registry = Arc::new(ModelRegistry::new());
+        registry.set_strategy("m", &lru_strategy(None)).unwrap();
+        for v in ["1", "2", "3"] {
+            registry
+                .register("m", v, ModelConfig::default(), ModelType::LitAPI, std::path::PathBuf::new())
+                .unwrap();
+        }
+
+        let wm = lru_test_manager(&registry);
+        wm.enforce_max_loaded_versions("m").await.unwrap();
+        assert_eq!(registry.list_versions("m").len(), 3, "no limit → nothing evicted");
     }
 
     // ===== Lifecycle Hooks tests =====

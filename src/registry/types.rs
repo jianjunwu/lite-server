@@ -69,6 +69,10 @@ pub struct ModelVersion {
     /// while still Pending/Loading and preserved across Ready↔Degraded.
     #[serde(default)]
     pub loaded_at: Option<SystemTime>,
+    /// Last time a request was routed to this version (coarse, 1s granularity;
+    /// see [`super::ModelRegistry::touch_last_used`]). Drives LRU eviction.
+    #[serde(default)]
+    pub last_used_at: Option<SystemTime>,
     #[serde(default)]
     pub policies: crate::worker::protocol::ModelPolicies,
     /// Pre-built CORS header map, cached at policy ingest (B9) so responses

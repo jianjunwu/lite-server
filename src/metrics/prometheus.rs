@@ -47,7 +47,7 @@ lazy_static! {
             "liteserver_version_switches_total",
             "Active version changes"
         ),
-        &["model"]
+        &["model", "from", "to"]
     ).unwrap();
 
     pub static ref ACTIVE_WORKERS: GaugeVec = GaugeVec::new(
@@ -252,8 +252,8 @@ pub fn set_active_workers(model: &str, version: &str, count: f64) {
     ACTIVE_WORKERS.with_label_values(&[model, version]).set(count);
 }
 
-pub fn record_version_switch(model: &str) {
-    VERSION_SWITCHES_TOTAL.with_label_values(&[model]).inc();
+pub fn record_version_switch(model: &str, from: &str, to: &str) {
+    VERSION_SWITCHES_TOTAL.with_label_values(&[model, from, to]).inc();
 }
 
 // ===== Ensemble metrics =====

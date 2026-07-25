@@ -175,6 +175,7 @@ impl LiteServer for GrpcService {
                 .get_active_version(model_name)
                 .ok_or_else(|| Status::not_found(format!("{} has no active version", model_name)))?,
         };
+        self.registry.touch_last_used(model_name, &resolved_version);
 
         if !self.registry.is_ready(model_name, version) {
             return Err(Status::unavailable(format!(
@@ -228,6 +229,7 @@ impl LiteServer for GrpcService {
             data: meta.payload.clone(),
             meta: Some(std::sync::Arc::new(meta)),
             response_tx,
+            inflight_guard: None,
         };
         let resp = match self
             .worker_manager
@@ -338,6 +340,7 @@ impl LiteServer for GrpcService {
                 .get_active_version(model_name)
                 .ok_or_else(|| Status::not_found(format!("{} has no active version", model_name)))?,
         };
+        self.registry.touch_last_used(model_name, &resolved_version);
 
         if !self.registry.is_ready(model_name, version) {
             return Err(Status::unavailable(format!(
@@ -438,6 +441,7 @@ impl LiteServer for GrpcService {
                 .get_active_version(model_name)
                 .ok_or_else(|| Status::not_found(format!("{} has no active version", model_name)))?,
         };
+        self.registry.touch_last_used(model_name, &resolved_version);
 
         if !self.registry.is_ready(model_name, version) {
             return Err(Status::unavailable(format!(

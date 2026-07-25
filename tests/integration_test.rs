@@ -1813,6 +1813,95 @@ class ReloadAPI(LitAPI):
 }
 
 // ---------------------------------------------------------------------------
+// §4.2: max_loaded_versions LRU eviction
+// ---------------------------------------------------------------------------
+
+/// With max_loaded_versions=2 and v1 active, loading a third version must
+/// evict the least-recently-used non-active version (v2) while the active
+/// version stays untouched.
+#[tokio::test]
+async fn test_max_loaded_versions_lru_eviction() {
+    let model_py = r#"from lite_server import LitAPI
+
+
+class LruAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x * 2}
+
+    def encode_response(self, output):
+        return output
+"#;
+
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-lru-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let cfg = "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n";
+    for v in ["1", "2", "3"] {
+        let dir = tmp_dir.join("lru_model").join(v);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.py"), model_py).unwrap();
+        std::fs::write(dir.join("config.yaml"), cfg).unwrap();
+    }
+    std::fs::write(
+        tmp_dir.join("orchestration.yaml"),
+        "control_mode: explicit\nmodels:\n  - name: lru_model\n    load_policy: explicit\n    max_loaded_versions: 2\n",
+    )
+    .unwrap();
+
+    let port = 18091;
+    kill_stale_on_port(port);
+    let _server = ServerGuard::start(&[
+        "--port", &port.to_string(),
+        "--model-repo", &tmp_dir.to_string_lossy(),
+        "--no-metrics",
+        "--no-grpc",
+        "--log-level", "warn",
+    ]);
+    wait_for_server(port, 30).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+
+    let health_versions = |body: &Value| -> Vec<String> {
+        body["models"].as_array().unwrap().iter()
+            .filter(|m| m["name"] == "lru_model")
+            .map(|m| m["version"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // v1 loads first and becomes active (no active version yet); v2 loads
+    // next without taking over active.
+    load_model(&base, "lru_model", "1").await;
+    load_model(&base, "lru_model", "2").await;
+
+    // Loading v3 exceeds max_loaded_versions=2 → v2 (the only non-active
+    // version) is evicted; active v1 must survive.
+    load_model(&base, "lru_model", "3").await;
+
+    let resp = client.get(format!("{}/health", base)).send().await.unwrap();
+    let body: Value = resp.json().await.unwrap();
+    let mut versions = health_versions(&body);
+    versions.sort();
+    assert_eq!(versions, vec!["1".to_string(), "3".to_string()],
+        "v2 must be evicted, active v1 and new v3 remain: {:?}", body["models"]);
+
+    // Active v1 still serves.
+    let resp = client
+        .post(format!("{}/v2/models/lru_model/infer", base))
+        .json(&json!({"input": 21}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["output"], 42);
+
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
