@@ -142,6 +142,9 @@ pub struct WorkerManager {
     zmq_clients: Arc<RwLock<HashMap<String, Vec<Arc<WorkerZmqClient>>>>>,
     // Outlier detection state per model version (shared with batch_collector)
     outlier_states: Arc<RwLock<HashMap<String, Arc<OutlierState>>>>,
+    // Custom @route declarations per model version (phase 2). Keyed by
+    // model_version_key; upserted at worker handshake, cleared on unload.
+    route_table: Arc<RwLock<HashMap<String, Vec<RouteDecl>>>>,
     // Reload channel for max_requests auto-recycle
     reload_tx: mpsc::Sender<ReloadSignal>,
     reload_rx: tokio::sync::Mutex<Option<mpsc::Receiver<ReloadSignal>>>,
@@ -186,6 +189,7 @@ impl WorkerManager {
             inference_queue,
             zmq_clients: Arc::new(RwLock::new(HashMap::new())),
             outlier_states: Arc::new(RwLock::new(HashMap::new())),
+            route_table: Arc::new(RwLock::new(HashMap::new())),
             reload_tx,
             reload_rx: tokio::sync::Mutex::new(Some(reload_rx)),
             respawn_tx,
@@ -406,6 +410,9 @@ impl WorkerManager {
         self.registry
             .set_policies(model_name, version, startup.policies);
 
+        // Register custom @route declarations (phase 2)
+        self.upsert_routes(model_name, version, startup.custom_routes).await;
+
         info!("Worker {} for {} v{} respawned (pid={:?})", worker_id, model_name, version, child.id());
 
         // Fire on_ready lifecycle hook
@@ -552,6 +559,50 @@ impl WorkerManager {
         let key = model_version_key(model_name, version);
         let guard = self.outlier_states.read().await;
         guard.get(&key).cloned()
+    }
+
+    /// Upsert custom @route declarations for a model version, received from the
+    /// Python worker handshake. Routes colliding with a system-reserved leaf
+    /// (`is_reserved_route`) are skipped with a warning — they must not shadow
+    /// the inference / admin / streaming contract. Idempotent across workers of
+    /// the same version (all run identical LitAPI code).
+    pub async fn upsert_routes(
+        &self,
+        model_name: &str,
+        version: &str,
+        routes: Vec<RouteDecl>,
+    ) {
+        let mut accepted: Vec<RouteDecl> = Vec::with_capacity(routes.len());
+        for r in routes {
+            if is_reserved_route(&r.route) {
+                tracing::warn!(
+                    model = %model_name, version = %version, route = %r.route,
+                    "custom route rejected: collides with a system-reserved leaf"
+                );
+                continue;
+            }
+            accepted.push(r);
+        }
+        let key = model_version_key(model_name, version);
+        let mut guard = self.route_table.write().await;
+        guard.insert(key, accepted);
+    }
+
+    /// Custom routes declared for a model version (empty if none / unloaded).
+    pub async fn get_routes(&self, model_name: &str, version: &str) -> Vec<RouteDecl> {
+        let key = model_version_key(model_name, version);
+        self.route_table
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Drop custom routes for a model version (on unload / removal).
+    pub async fn clear_routes(&self, model_name: &str, version: &str) {
+        let key = model_version_key(model_name, version);
+        self.route_table.write().await.remove(&key);
     }
 
     pub async fn load_model(
@@ -730,6 +781,9 @@ impl WorkerManager {
             // Store RateLimit / Cors policies from the worker handshake
             self.registry
                 .set_policies(model_name, version, startup.policies);
+
+            // Register custom @route declarations (phase 2)
+            self.upsert_routes(model_name, version, startup.custom_routes).await;
 
             info!("Worker {} for {} v{} ready (pid={:?})", worker_id, model_name, version, child.id());
 
@@ -915,8 +969,10 @@ impl WorkerManager {
             let mut workers = self.workers.write().await;
             let mut clients = self.zmq_clients.write().await;
             let mut outliers = self.outlier_states.write().await;
+            let mut routes = self.route_table.write().await;
             outliers.remove(&key);
             clients.remove(&key);
+            routes.remove(&key);
             workers.remove(&key)
         };
 
@@ -2014,5 +2070,35 @@ class TestAPI(LitAPI):
         let fixed_check = sub_second > Duration::ZERO;
         assert!(fixed_check,
             "FIX: > Duration::ZERO correctly detects non-zero sub-second intervals");
+    }
+
+    #[tokio::test]
+    async fn test_route_table_upsert_get_clear_and_reserved_skip() {
+        let registry = Arc::new(ModelRegistry::new());
+        let inference_queue = Arc::new(InferenceQueue::new());
+        let wm = WorkerManager::new(
+            registry,
+            std::path::PathBuf::new(),
+            inference_queue,
+            "info".to_string(),
+            Arc::new(CallbackRunner::new()),
+        );
+
+        let routes = vec![
+            RouteDecl { route: "/status".to_string(), methods: vec!["GET".to_string()] },
+            // reserved leaf → skipped at ingest
+            RouteDecl { route: "/infer".to_string(), methods: vec!["POST".to_string()] },
+        ];
+        wm.upsert_routes("m", "1", routes).await;
+
+        let got = wm.get_routes("m", "1").await;
+        assert_eq!(got.len(), 1, "reserved leaf must be skipped");
+        assert_eq!(got[0].route, "/status");
+        // version isolation
+        assert!(wm.get_routes("m", "2").await.is_empty());
+
+        // clear on unload removes them
+        wm.clear_routes("m", "1").await;
+        assert!(wm.get_routes("m", "1").await.is_empty());
     }
 }

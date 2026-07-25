@@ -1,23 +1,24 @@
 """Declarative route declaration for lite-server.
 
-Provides a FastAPI-style decorator API for registering custom routes on
-the global router.
+Provides a decorator API (``@route.get`` / ``@route.post`` / ...) for declaring
+custom HTTP routes on a :class:`LitAPI` subclass. Routes are discovered by the
+model worker at startup (see ``worker/inference.py``: ``_discover_routes``)
+and served under ``/v2/models/:m/<tail>`` over the same ZMQ channel as
+inference.
 
-Since 0.7.0 the ``callbacks`` parameter replaces ``middleware`` and
-accepts :class:`Callback` instances (RequireApiKey, RateLimit, LogRequests,
-Cors, or custom).
+The ``route`` object is a *stateless* namespace — decorators only annotate the
+wrapped function (``fn.__route_defs__``); no process-global route table is
+kept. ``@route`` is intended for LitAPI methods only; module-level decorated
+functions have no discovery path.
 """
 
 from __future__ import annotations
 
 import inspect
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, TypedDict
+from dataclasses import dataclass
+from typing import Any, List, TypedDict
 
 from lite_server.context import Headers
-
-if TYPE_CHECKING:
-    from lite_server.callback import Callback as CallbackType
 
 
 class RouteRequest(TypedDict, total=False):
@@ -37,10 +38,15 @@ class RouteRequest(TypedDict, total=False):
 
 @dataclass
 class RouteDef:
+    """A declared route's metadata (path pattern + HTTP methods).
+
+    The bound handler is resolved at discovery time from the LitAPI instance
+    (so the same function can serve a path once ``self`` is bound); it is not
+    stored here.
+    """
+
     path: str
     methods: List[str]
-    handler: Callable
-    callbacks: List[Any] = field(default_factory=list)
 
 
 class HandlerSignatureError(RuntimeError):
@@ -53,7 +59,11 @@ class HandlerSignatureError(RuntimeError):
 
 
 def _validate_handler_signature(fn, route: str) -> None:
-    """Reject pre-0.7 (request, server) handlers at discovery time."""
+    """Reject pre-0.7 (request, server) handlers at discovery time.
+
+    Pass the *bound* method (``instance.method``) so ``self`` is already
+    consumed and the reported signature is just the handler's own params.
+    """
     try:
         params = list(inspect.signature(fn).parameters.values())
     except (TypeError, ValueError):
@@ -76,71 +86,38 @@ def _validate_handler_signature(fn, route: str) -> None:
 
 
 class Router:
-    """Global router for decorator-based route registration."""
+    """Stateless decorator namespace for ``@route`` declarations.
 
-    def __init__(self):
-        self._routes: List[RouteDef] = []
+    Each decorator attaches a ``__route_defs__`` list of :class:`RouteDef` to
+    the wrapped function (stacking decorators on one method unions their
+    methods). The worker's ``_discover_routes`` collects these off a LitAPI
+    instance and binds ``self``. No routes are stored on the router itself.
+    """
 
-    def get(self, path: str, *, callbacks: Optional[List[Any]] = None):
-        return self._route(path, ["GET"], callbacks=callbacks)
+    def get(self, path: str):
+        return self._route(path, ["GET"])
 
-    def post(self, path: str, *, callbacks: Optional[List[Any]] = None):
-        return self._route(path, ["POST"], callbacks=callbacks)
+    def post(self, path: str):
+        return self._route(path, ["POST"])
 
-    def put(self, path: str, *, callbacks: Optional[List[Any]] = None):
-        return self._route(path, ["PUT"], callbacks=callbacks)
+    def put(self, path: str):
+        return self._route(path, ["PUT"])
 
-    def delete(self, path: str, *, callbacks: Optional[List[Any]] = None):
-        return self._route(path, ["DELETE"], callbacks=callbacks)
+    def delete(self, path: str):
+        return self._route(path, ["DELETE"])
 
-    def patch(self, path: str, *, callbacks: Optional[List[Any]] = None):
-        return self._route(path, ["PATCH"], callbacks=callbacks)
+    def patch(self, path: str):
+        return self._route(path, ["PATCH"])
 
-    def _route(
-        self, path: str, methods: List[str], callbacks: Optional[List[Any]] = None
-    ):
+    def _route(self, path: str, methods: List[str]):
         def decorator(fn):
-            self._routes.append(
-                RouteDef(
-                    path=path,
-                    methods=methods,
-                    handler=fn,
-                    callbacks=callbacks or [],
-                )
-            )
+            defs = list(getattr(fn, "__route_defs__", []))
+            defs.append(RouteDef(path=path, methods=methods))
+            fn.__route_defs__ = defs
             return fn
 
         return decorator
 
-    @property
-    def routes(self) -> List[RouteDef]:
-        return list(self._routes)
 
-    def scan(self, directory: str) -> None:
-        """Recursively scan a directory for endpoint modules.
-
-        Modules are loaded and any decorator-registered routes are collected.
-        """
-        import importlib.util
-        from pathlib import Path
-
-        base = Path(directory)
-        if not base.exists():
-            return
-
-        for py_file in base.rglob("*.py"):
-            if py_file.name.startswith("_"):
-                continue
-            spec = importlib.util.spec_from_file_location(
-                f"ep_scan_{py_file.stem}", py_file
-            )
-            if spec and spec.loader:
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-
-
-# Global singleton — imported by route modules
-router = Router()
-
-# Convenience alias matching user-facing API
-route = router
+# Stateless namespace imported by user code as `from lite_server import route`.
+route = Router()

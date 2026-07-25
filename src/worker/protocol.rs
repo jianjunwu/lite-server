@@ -122,6 +122,10 @@ pub struct WorkerStartup {
     pub metric_specs: Option<Vec<MetricSpec>>,
     #[serde(default)]
     pub policies: Option<ModelPolicies>,
+    /// Custom `@route` declarations emitted by the Python worker at handshake
+    /// (phase 2). Empty list when the model declares no routes.
+    #[serde(default)]
+    pub custom_routes: Vec<RouteDecl>,
 }
 
 // ===== Route declarations =====
@@ -132,10 +136,22 @@ pub struct WorkerStartup {
 pub struct RouteDecl {
     pub route: String,
     pub methods: Vec<String>,
-    #[serde(default)]
-    pub rate_limit: Option<RateLimitPolicy>,
-    #[serde(default)]
-    pub cors: Option<CorsPolicy>,
+}
+
+/// Reserved first-segment leaves under `/v2/models/:model_name/` — registered
+/// as exact axum routes (see `src/http/routes.rs`). A `@route` whose tail
+/// starts with one of these would shadow a system route, so `is_reserved_route`
+/// gates ingestion (warn + skip). Source of truth: the `.route(...)` calls in
+/// `create_routes`.
+pub const SYSTEM_ROUTE_LEAVES: &[&str] = &[
+    "compare", "versions", "ready", "health", "reload", "infer", "events", "stream",
+];
+
+/// True if a declared route tail (e.g. "/status", "/infer", "/pets/{id}")
+/// collides with a system-reserved leaf. Matches on the first path segment.
+pub fn is_reserved_route(route: &str) -> bool {
+    let first = route.trim_start_matches('/').split('/').next().unwrap_or("");
+    !first.is_empty() && SYSTEM_ROUTE_LEAVES.contains(&first)
 }
 
 /// Convert Python `{param}` placeholders (from route decorators) to axum
@@ -383,5 +399,65 @@ mod tests {
             convert_path_params("/pets/{id}/owner/{oid}"),
             "/pets/:id/owner/:oid"
         );
+    }
+
+    // ===== system-route guard + custom_routes handshake (phase 2) =====
+
+    #[test]
+    fn test_is_reserved_route_reserved_leaves() {
+        for leaf in ["infer", "events", "stream", "versions", "ready", "health", "reload", "compare"] {
+            assert!(is_reserved_route(&format!("/{leaf}")), "{leaf} should be reserved");
+            assert!(is_reserved_route(leaf), "{leaf} (no slash) should be reserved");
+        }
+        // a reserved first segment with deeper tail is still reserved
+        assert!(is_reserved_route("/versions/v2/status"));
+        assert!(is_reserved_route("/infer/sub"));
+    }
+
+    #[test]
+    fn test_is_reserved_route_custom_routes_pass() {
+        assert!(!is_reserved_route("/status"));
+        assert!(!is_reserved_route("/pets/{id}"));
+        assert!(!is_reserved_route("/pets/123"));
+        assert!(!is_reserved_route("/custom-infer"));
+        assert!(!is_reserved_route("")); // empty → not reserved (no first segment)
+    }
+
+    #[test]
+    fn test_worker_startup_custom_routes_roundtrip() {
+        let json = r#"{
+            "status": "ready",
+            "worker_id": 0,
+            "custom_routes": [
+                {"route": "/status", "methods": ["GET"]},
+                {"route": "/pets/{id}", "methods": ["GET", "POST"]}
+            ]
+        }"#;
+        let startup: WorkerStartup = serde_json::from_str(json).unwrap();
+        assert_eq!(startup.custom_routes.len(), 2);
+        assert_eq!(startup.custom_routes[0].route, "/status");
+        assert_eq!(startup.custom_routes[0].methods, vec!["GET".to_string()]);
+        assert_eq!(
+            startup.custom_routes[1].methods,
+            vec!["GET".to_string(), "POST".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_worker_startup_custom_routes_default_empty() {
+        let json = r#"{"status": "ready", "worker_id": 0}"#;
+        let startup: WorkerStartup = serde_json::from_str(json).unwrap();
+        assert!(startup.custom_routes.is_empty());
+    }
+
+    #[test]
+    fn test_route_decl_ignores_unknown_fields() {
+        // Slimmed RouteDecl has no rate_limit/cors; serde ignores unknown
+        // fields (no deny_unknown_fields), so a stale emitter that still adds
+        // them will not break the handshake.
+        let json = r#"{"route":"/x","methods":["GET"],"rate_limit":{"requests_per_minute":10}}"#;
+        let decl: RouteDecl = serde_json::from_str(json).unwrap();
+        assert_eq!(decl.route, "/x");
+        assert_eq!(decl.methods, vec!["GET".to_string()]);
     }
 }

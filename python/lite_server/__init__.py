@@ -21,7 +21,7 @@ from lite_server.callback import (
     RequireApiKey,
 )
 from lite_server.context import CBSequence, Headers, RequestContext, RequestMeta
-from lite_server.route import RouteRequest, route, router
+from lite_server.route import RouteRequest, route
 from lite_server.response import (
     BackgroundTask,
     FileResponse,
@@ -49,7 +49,6 @@ __all__ = [
     "RouteRequest",
     "ServerProxy",
     "route",
-    "router",
     "__version__",
     # HTTP request / response
     "Response",

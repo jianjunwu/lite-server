@@ -364,6 +364,7 @@ async fn execute_step(
             .unwrap_or_default()
             .as_nanos() as i64,
         payload: bytes::Bytes::from(payload_bytes.clone()),
+        ..Default::default()
     };
 
     let (response_tx, response_rx) = oneshot::channel();

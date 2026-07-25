@@ -9,12 +9,13 @@ use crate::http::state::AppState;
 use crate::inference_queue::InferenceQueue;
 use crate::registry::ModelRegistry;
 use crate::worker::WorkerManager;
-use axum::extract::Request;
+use axum::extract::{FromRequestParts, Query, Request, State};
 use axum::http::header::CONNECTION;
 use axum::http::HeaderValue;
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::Router;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -58,10 +59,59 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for RequestId {
     }
 }
 
-/// Fallback for unmatched routes — standardized 404 error body.
-pub(crate) async fn route_fallback() -> AppError {
-    AppError::RouteNotFound
+/// Fallback for unmatched routes. A `/v2/models/<model>/<tail>` path that no
+/// exact route matched is dispatched as a custom `@route` (phase 2); everything
+/// else returns the standardized 404. (A catch-all `/{*tail}` route is rejected
+/// by matchit because `:model_name` already has deeper registered children, so
+/// custom-route dispatch rides the fallback instead.)
+pub(crate) async fn route_fallback(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Response {
+    // Only `/v2/models/<model>/<tail>` paths are candidates for custom routes.
+    let path = request.uri().path();
+    let Some(rest) = path.strip_prefix("/v2/models/") else {
+        return AppError::RouteNotFound.into_response();
+    };
+    let (model, tail) = match rest.split_once('/') {
+        Some((m, t)) if !m.is_empty() => (m.to_string(), t.to_string()),
+        _ => return AppError::RouteNotFound.into_response(), // bare /v2/models/<model>
+    };
+
+    // Split parts/body so the query extractor can run before the body is read.
+    let (mut parts, body) = request.into_parts();
+    let query = Query::<HashMap<String, String>>::from_request_parts(&mut parts, &state)
+        .await
+        .map(|q| q.0)
+        .unwrap_or_default();
+    let method = parts.method.clone();
+    let request_id = parts
+        .extensions
+        .get::<RequestId>()
+        .cloned()
+        .map(|r| r.0)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let headers = parts.headers.clone();
+    let body = match axum::body::to_bytes(body, ROUTE_BODY_LIMIT).await {
+        Ok(b) => b,
+        Err(_) => {
+            return AppError::Internal("failed to read request body".into()).into_response()
+        }
+    };
+
+    match crate::http::handlers::dispatch_custom_route(
+        &state, &model, &tail, &method, query, &headers, body, request_id,
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => e.into_response(),
+    }
 }
+
+/// Max request body size for custom-route dispatch (mirrors a typical JSON body
+/// cap). Inference uses its own ApiJson extractor limit.
+const ROUTE_BODY_LIMIT: usize = 10 * 1024 * 1024;
 
 /// Fallback for unmatched methods on matched routes — standardized 405 body.
 pub(crate) async fn method_not_allowed_fallback() -> AppError {
@@ -235,6 +285,37 @@ mod tests {
     use axum::response::IntoResponse;
     use tower::ServiceExt;
 
+    /// Minimal AppState for fallback tests (empty registry / no workers).
+    fn test_state() -> Arc<AppState> {
+        use crate::callback::CallbackRunner;
+        use crate::config::Config;
+        use crate::inference_queue::InferenceQueue;
+        use crate::rate_limit::RateLimiter;
+        use crate::registry::ModelRegistry;
+        use crate::worker::WorkerManager;
+        use std::path::PathBuf;
+        let registry = Arc::new(ModelRegistry::new());
+        let inference_queue = Arc::new(InferenceQueue::new());
+        let callback_runner = Arc::new(CallbackRunner::new());
+        let worker_manager = Arc::new(WorkerManager::new(
+            registry.clone(),
+            PathBuf::new(),
+            inference_queue.clone(),
+            "info".to_string(),
+            callback_runner.clone(),
+        ));
+        Arc::new(AppState::new(
+            registry,
+            worker_manager,
+            inference_queue,
+            Config::default(),
+            PathBuf::new(),
+            callback_runner,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(RateLimiter::new(1024)),
+        ))
+    }
+
     #[tokio::test]
     async fn test_disable_keepalive_middleware_adds_connection_close() {
         let app = axum::Router::new()
@@ -272,7 +353,8 @@ mod tests {
     async fn test_fallback_route_not_found_standardized_body() {
         let app = axum::Router::new()
             .route("/test", axum::routing::get(|| async { "ok" }))
-            .fallback(route_fallback);
+            .fallback(route_fallback)
+            .with_state(test_state());
 
         let response = app
             .oneshot(Request::builder().uri("/no-such-route").body(Body::empty()).unwrap())

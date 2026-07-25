@@ -9,6 +9,12 @@ message RequestMeta {
   string request_id = 4;
   int64 timestamp_ns = 5;
   bytes payload = 6;
+  // Phase 2: HTTP method / query / path params. Carried for custom routes
+  // (route_call) and available to inference handlers too. Defaults: method=""
+  // (worker treats empty as POST for inference), query/path_params empty.
+  string method = 7;
+  map<string, string> query = 8;
+  map<string, string> path_params = 9;
 }
 
 // ===== Request Payloads =====
@@ -18,6 +24,11 @@ message Request {
   oneof payload {
     SingleRequest single = 10;
     BatchRequest batch = 11;
+    // Custom @route invocation: reuses the SingleRequest body type; the
+    // route_call tag discriminates dispatch in the worker (run_route vs
+    // run_single). Route pattern / method / query / path_params live on
+    // RequestMeta; HTTP headers ride the outer meta as for inference.
+    SingleRequest route_call = 12;
     CBAddRequest cb_add = 20;
     CBRemoveRequest cb_remove = 21;
     StreamRequest stream = 30;

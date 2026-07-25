@@ -55,6 +55,12 @@ pub fn create_routes(state: AppState) -> Router {
         // WebSocket streaming
         .route("/v2/models/:model_name/stream", get(ws_stream_handler))
         .route("/v2/models/:model_name/versions/:version/stream", get(ws_stream_version_handler));
+    // Custom @route dispatch (phase 2) is handled by the fallback handler
+    // (see http::route_fallback): exact system leaves above are matched by
+    // axum; any other `/v2/models/:m/<tail>` path falls through to it and is
+    // matched against the model version's declared routes. (A catch-all
+    // `/{*tail}` route is rejected by matchit because `:model_name` already
+    // has deeper registered children.)
 
     // Standardized error bodies for unmatched routes (404) and
     // unmatched methods (405) — axum defaults are empty/plain-text.

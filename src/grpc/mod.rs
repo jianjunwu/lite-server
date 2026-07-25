@@ -194,6 +194,7 @@ impl LiteServer for GrpcService {
                 .unwrap_or_default()
                 .as_nanos() as i64,
             payload: req.data.clone(),
+            ..Default::default()
         };
 
         let uid = format!("grpc-{}-{}", model_name, Uuid::new_v4());
@@ -356,6 +357,7 @@ impl LiteServer for GrpcService {
                 .unwrap_or_default()
                 .as_nanos() as i64,
             payload: Default::default(),
+            ..Default::default()
         };
 
         let items: Vec<pb::BatchItem> = req
@@ -455,6 +457,7 @@ impl LiteServer for GrpcService {
                 .unwrap_or_default()
                 .as_nanos() as i64,
             payload: req.data.clone(),
+            ..Default::default()
         };
 
         let stream_id = format!("grpc-stream-{}", Uuid::new_v4());
@@ -610,6 +613,7 @@ impl LiteServer for GrpcService {
                 .unwrap_or_default()
                 .as_nanos() as i64,
             payload: initial_data.clone(),
+            ..Default::default()
         };
 
         let open_req = streaming::build_stream_open(stream_id.clone(), initial_data, Some(meta));

@@ -1,0 +1,41 @@
+"""Custom routes example: @route handlers served alongside inference.
+
+Routes are declared with the ``@route`` decorator on LitAPI methods and are
+served under ``/v2/models/<model>/<tail>`` over the same channel as inference.
+``ctx`` is a :class:`RequestContext`: ``ctx.request`` (parsed JSON body),
+``ctx.meta.method`` / ``ctx.meta.query`` / ``ctx.meta.headers``,
+``ctx.state["path_params"]`` (path params), and ``ctx.server`` (phase 2b).
+"""
+
+from lite_server import LitAPI, route
+from lite_server.response import Response
+
+
+class PetsAPI(LitAPI):
+    def setup(self, device):
+        self.loaded = True
+        self.pets = {1: {"id": 1, "name": "Fido"}, 2: {"id": 2, "name": "Rex"}}
+
+    def predict(self, x):
+        return {"output": x * 2}
+
+    # ---- custom routes (served under /v2/models/pets/<tail>) ----
+
+    @route.get("/status")
+    def status(self, ctx):
+        return {"model_loaded": self.loaded, "method": ctx.meta.method}
+
+    @route.get("/pets/{pet_id}")
+    def get_pet(self, ctx):
+        pet_id = int(ctx.state["path_params"]["pet_id"])
+        pet = self.pets.get(pet_id)
+        if pet is None:
+            return Response(content={"error": "pet not found"}, status_code=404)
+        return pet
+
+    @route.post("/pets")
+    def create_pet(self, ctx):
+        body = ctx.request or {}
+        pet_id = max(self.pets, default=0) + 1
+        self.pets[pet_id] = {"id": pet_id, "name": body.get("name", "unnamed")}
+        return Response(content=self.pets[pet_id], status_code=201)

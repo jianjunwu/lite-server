@@ -144,6 +144,52 @@ def _get_pipeline(lit_api: LitAPI) -> Pipeline:
     return pipe
 
 
+def _discover_routes(instance: LitAPI) -> None:
+    """Collect ``@route``-decorated methods onto ``instance._route_handlers``.
+
+    Scans the instance for attributes carrying ``__route_defs__`` (set by the
+    ``@route`` decorator on the underlying function; bound methods delegate the
+    lookup). Validates each handler's signature against the 0.7 ctx contract,
+    binds ``self``, and unions methods when decorators are stacked on one
+    method. Result:
+
+      ``instance._route_handlers`` — ``dict[path, (bound_handler, [methods])]``
+
+    Raises :class:`HandlerSignatureError` on a bad signature or on two distinct
+    handlers declaring the same path — both fail worker startup loudly.
+    """
+    from lite_server.route import HandlerSignatureError, _validate_handler_signature
+
+    handlers: dict[str, list] = {}  # path -> [bound_handler, methods_list]
+    for name in dir(instance):
+        try:
+            bound = getattr(instance, name)
+        except AttributeError:
+            continue
+        defs = getattr(bound, "__route_defs__", None)
+        if not defs:
+            continue
+        func = getattr(bound, "__func__", bound)
+        for rd in defs:
+            _validate_handler_signature(bound, rd.path)
+            existing = handlers.get(rd.path)
+            if existing is None:
+                handlers[rd.path] = [bound, list(rd.methods)]
+            elif getattr(existing[0], "__func__", existing[0]) is func:
+                # Same method, stacked decorators (e.g. @route.get + .post):
+                # union the HTTP methods.
+                for m in rd.methods:
+                    if m not in existing[1]:
+                        existing[1].append(m)
+            else:
+                raise HandlerSignatureError(
+                    f"Route {rd.path!r} is declared on multiple handlers "
+                    f"({existing[0].__func__.__qualname__}, "
+                    f"{func.__qualname__}); one handler per path."
+                )
+    instance._route_handlers = {p: (h, ms) for p, (h, ms) in handlers.items()}
+
+
 def load_litapi(model_py_path: str, config: dict, device: str = "cpu"):
     model_dir = os.path.dirname(os.path.abspath(model_py_path))
 
@@ -200,6 +246,12 @@ def load_litapi(model_py_path: str, config: dict, device: str = "cpu"):
 
     # Store pipeline on the instance for later use
     instance._pipeline = pipeline
+
+    # Discover @route handlers and build the shared route pipeline (reuses the
+    # model's global callback chain; per-route callbacks are out of scope —
+    # constraint #3, gateway concern).
+    _discover_routes(instance)
+    instance._route_pipeline = Pipeline.for_route(callbacks)
 
     return instance
 
@@ -333,12 +385,15 @@ def _meta_from_proto(meta_pb) -> RequestMeta:
     # meta.payload is no longer decoded: nothing in the framework reads it,
     # and the body is already decoded once from item data.  (Proto field
     # stays on the wire; Rust may stop sending it in a later release.)
+    # method defaults to POST when unset (inference never sets it; routes do).
     return RequestMeta(
         route=meta_pb.route,
         headers=Headers(dict(meta_pb.headers)),
         client_ip=meta_pb.client_ip,
         request_id=meta_pb.request_id,
         timestamp_ns=meta_pb.timestamp_ns,
+        method=meta_pb.method or "POST",
+        query=dict(meta_pb.query),
     )
 
 
@@ -432,6 +487,77 @@ async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.
             active_streams.pop(sid, None)
 
 
+async def _handle_route_call(
+    lit_api: LitAPI, uid: str, request: Request, meta: RequestMeta, log: logging.Logger
+) -> Response:
+    """Dispatch a ``route_call`` to its discovered ``@route`` handler.
+
+    Reuses ``Pipeline.run_route`` (on_request → handler → on_response, with
+    on_error on failure). The handler result is encoded as a ``SingleResponse``
+    (routes and inference share the response shape — phase 2 unification).
+    ``ctx.server`` stays ``None`` until 2b.
+    """
+    rc = request.route_call
+    handlers = getattr(lit_api, "_route_handlers", {})
+    route_pipe = getattr(lit_api, "_route_pipeline", None)
+    entry = handlers.get(meta.route)
+    if entry is None or route_pipe is None:
+        return _make_error_response(
+            uid, f"No route handler for {meta.route!r}", status_code=404
+        )
+    handler, _methods = entry
+    body = json.loads(rc.data) if rc.data else {}
+    ctx = RequestContext(meta=meta, request=body)
+    ctx.state["path_params"] = (
+        dict(request.meta.path_params) if request.HasField("meta") else {}
+    )
+    ctx.server = None  # 2b: ServerProxy.for_model(...)
+    await route_pipe.run_route(ctx, handler)
+    return _build_route_response(uid, ctx)
+
+
+def _build_route_response(uid: str, ctx: RequestContext) -> Response:
+    """Encode a route handler's result (ctx.early / ctx.response) as a
+    ``SingleResponse``. Mirrors how inference packs SingleResponse, but the
+    route handler's ``Response`` (status_code / media_type / headers) is
+    honored directly rather than extracted from header conventions.
+    """
+    from lite_server.response import Response as LiteResponse
+
+    early = ctx.early
+    if isinstance(early, LiteResponse):
+        status_code = early.status_code
+        media_type = early.media_type or "application/json"
+        headers = dict(early.headers)
+        content = early.content
+    else:
+        # Bare return value → JSON body, 200.
+        status_code = 200
+        media_type = "application/json"
+        headers = {}
+        content = ctx.response
+    headers.update(ctx.response_headers or {})
+
+    if isinstance(content, (bytes, bytearray)):
+        data = bytes(content)
+    elif isinstance(content, str):
+        data = content.encode()
+    else:
+        data = json.dumps(content).encode()
+
+    # Status.code reflects pipeline execution ("Ok" = no exception), separate
+    # from the HTTP status_code the handler chose (may be 4xx/5xx).
+    single = SingleResponse(
+        data=data,
+        status=_make_status(True),
+        status_code=status_code,
+        media_type=media_type,
+    )
+    for k, v in headers.items():
+        single.headers[str(k)] = str(v)
+    return Response(uid=uid, single=single)
+
+
 async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: logging.Logger):
     """Process a single request (single / batch) asynchronously."""
     uid = request.uid
@@ -441,7 +567,10 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
     pipe = _get_pipeline(lit_api)
 
     try:
-        if request.HasField("single"):
+        if request.HasField("route_call"):
+            response = await _handle_route_call(lit_api, uid, request, meta, log)
+
+        elif request.HasField("single"):
             # Health check: empty data → skip predict pipeline
             if not request.single.data:
                 response = Response(
@@ -1234,11 +1363,16 @@ def worker_main():
     specs = [{"name": s.name, "metric_type": s.metric_type}
              for s in getattr(lit_api, '_metric_specs', [])]
     pipeline = getattr(lit_api, "_pipeline", None)
+    custom_routes = [
+        {"route": path, "methods": methods}
+        for path, (_handler, methods) in getattr(lit_api, "_route_handlers", {}).items()
+    ]
     print(json.dumps({
         "status": "ready",
         "worker_id": args.worker_id,
         "metric_specs": specs,
         "policies": extract_policies(pipeline.callbacks) if pipeline is not None else {},
+        "custom_routes": custom_routes,
     }), flush=True)
 
     if args.continuous_batching or config.get("continuous_batching", False):

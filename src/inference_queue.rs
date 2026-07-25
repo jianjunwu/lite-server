@@ -1194,6 +1194,7 @@ mod tests {
             request_id: "req-1".to_string(),
             timestamp_ns: 0,
             payload: payload_bytes.clone(),
+            ..Default::default()
         });
 
         let item = QueueItem {
@@ -1336,6 +1337,7 @@ mod tests {
             request_id: "req-1".to_string(),
             timestamp_ns: 1234567890,
             payload: Bytes::from_static(&[1u8, 2, 3]),
+            ..Default::default()
         };
         let (tx, _rx) = oneshot::channel();
         let item = QueueItem {
@@ -1368,6 +1370,7 @@ mod tests {
             request_id: "req-batch".to_string(),
             timestamp_ns: 9999999,
             payload: Bytes::from(vec![0u8; 4096]), // 4KB payload
+            ..Default::default()
         });
 
         // Simulate batch items each holding Arc<RequestMeta>

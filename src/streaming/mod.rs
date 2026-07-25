@@ -120,6 +120,7 @@ mod tests {
             request_id: "r1".to_string(),
             timestamp_ns: 100,
             payload: Default::default(),
+            ..Default::default()
         };
         let req = build_stream_open("s1".to_string(), bytes::Bytes::from_static(b"d"), Some(meta));
         match req.payload {

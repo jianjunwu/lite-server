@@ -200,6 +200,87 @@ class PolicyAPI(LitAPI):
     )
     .unwrap();
 
+    // route_model: declares @route custom routes (phase 2). /status, /pets/{id}
+    // (path params), /echo (POST body). The shadow @route.post("/infer") hits a
+    // reserved leaf and must be skipped at ingest so it never shadows inference.
+    let route_dir = tmp.join("route_model/1");
+    std::fs::create_dir_all(&route_dir).unwrap();
+    std::fs::write(
+        route_dir.join("model.py"),
+        r#"from lite_server import LitAPI, route
+
+
+class RouteAPI(LitAPI):
+    def setup(self, device):
+        self.loaded = True
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x * 2}
+
+    def encode_response(self, output):
+        return output
+
+    @route.get("/status")
+    def status(self, ctx):
+        return {"model_loaded": self.loaded, "method": ctx.meta.method, "version": "v1"}
+
+    @route.get("/pets/{pet_id}")
+    def get_pet(self, ctx):
+        return {"pet_id": ctx.state["path_params"]["pet_id"]}
+
+    @route.post("/echo")
+    def echo(self, ctx):
+        return {"echo": ctx.request, "method": ctx.meta.method}
+
+    @route.post("/infer")  # reserved leaf → skipped at ingest (warn)
+    def shadow(self, ctx):
+        return {"shadowed": True}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        route_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+
+    // route_model v2: same route paths, different handler behavior — used to
+    // verify versioned /v2/models/:m/versions/:v/<tail> dispatch isolation.
+    let route_v2_dir = tmp.join("route_model/2");
+    std::fs::create_dir_all(&route_v2_dir).unwrap();
+    std::fs::write(
+        route_v2_dir.join("model.py"),
+        r#"from lite_server import LitAPI, route
+
+
+class RouteAPI(LitAPI):
+    def setup(self, device):
+        self.loaded = True
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x * 2}
+
+    def encode_response(self, output):
+        return output
+
+    @route.get("/status")
+    def status(self, ctx):
+        return {"model_loaded": self.loaded, "method": ctx.meta.method, "version": "v2"}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        route_v2_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+
     tmp
 }
 
@@ -391,6 +472,7 @@ async fn test_info_endpoint() {
 // ---------------------------------------------------------------------------
 
 const MODEL: &str = "test_model";
+const ROUTE_MODEL: &str = "route_model";
 
 #[tokio::test]
 #[serial]
@@ -472,6 +554,152 @@ async fn test_model_infer_versioned() {
     assert_eq!(body["output"], 14);
 
     unload_model(&base, MODEL, "1").await;
+}
+
+// ---------------------------------------------------------------------------
+// Custom routes (@route, phase 2)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn test_custom_route_status() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    load_model(&base, ROUTE_MODEL, "1").await;
+
+    let resp = client
+        .get(format!("{}/v2/models/{}/status", base, ROUTE_MODEL))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["model_loaded"], true);
+    assert_eq!(body["method"], "GET");
+
+    unload_model(&base, ROUTE_MODEL, "1").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_custom_route_path_params() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    load_model(&base, ROUTE_MODEL, "1").await;
+
+    let resp = client
+        .get(format!("{}/v2/models/{}/pets/123", base, ROUTE_MODEL))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["pet_id"], "123");
+
+    unload_model(&base, ROUTE_MODEL, "1").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_custom_route_post_body_and_method() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    load_model(&base, ROUTE_MODEL, "1").await;
+
+    let resp = client
+        .post(format!("{}/v2/models/{}/echo", base, ROUTE_MODEL))
+        .json(&json!({"hello": "world"}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["echo"], json!({"hello": "world"}));
+    assert_eq!(body["method"], "POST");
+
+    unload_model(&base, ROUTE_MODEL, "1").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_custom_route_reserved_leaf_does_not_shadow_inference() {
+    // route_model declares @route.post("/infer") — a reserved leaf. It is
+    // skipped at ingest, so /infer must still run real inference, not the
+    // custom handler.
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    load_model(&base, ROUTE_MODEL, "1").await;
+
+    let resp = client
+        .post(format!("{}/v2/models/{}/infer", base, ROUTE_MODEL))
+        .json(&json!({"input": 5}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["output"], 10);
+    assert!(body.get("shadowed").is_none(), "custom /infer must not shadow");
+
+    unload_model(&base, ROUTE_MODEL, "1").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_custom_route_unknown_tail_404() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    load_model(&base, ROUTE_MODEL, "1").await;
+
+    let resp = client
+        .get(format!("{}/v2/models/{}/no-such-route", base, ROUTE_MODEL))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 404);
+
+    unload_model(&base, ROUTE_MODEL, "1").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_custom_route_wrong_method_405() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    load_model(&base, ROUTE_MODEL, "1").await;
+
+    // /status is GET-only → POST must return 405 (not 404).
+    let resp = client
+        .post(format!("{}/v2/models/{}/status", base, ROUTE_MODEL))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 405);
+
+    unload_model(&base, ROUTE_MODEL, "1").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_custom_route_multi_version_isolation() {
+    // v1 and v2 declare /status with different handlers. Versioned paths must
+    // dispatch to each version's own handler (RouteTable keyed by version).
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    load_model(&base, ROUTE_MODEL, "1").await;
+    load_model(&base, ROUTE_MODEL, "2").await;
+
+    let resp = client
+        .get(format!("{}/v2/models/{}/versions/1/status", base, ROUTE_MODEL))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["version"], "v1");
+
+    let resp = client
+        .get(format!("{}/v2/models/{}/versions/2/status", base, ROUTE_MODEL))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["version"], "v2");
+
+    unload_model(&base, ROUTE_MODEL, "1").await;
+    unload_model(&base, ROUTE_MODEL, "2").await;
 }
 
 #[tokio::test]
