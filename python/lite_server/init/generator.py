@@ -393,7 +393,9 @@ README_MD = textwrap.dedent("""\
       support `async def` out of the box.  No separate base class needed.
     - **`ctx` parameter** — declare a `ctx` parameter in any method to access
       request metadata (headers, route, client IP, request ID) and per-request
-      state via `ctx.state` / `ctx.respond(...)`.
+      state via `ctx.state` / `ctx.respond(...)`.  In batch mode, `batch` /
+      `unbatch` / `predict` receive a `list[RequestContext]` aligned with the
+      batch items..
     - **Callbacks** — `callbacks.py` shows how to hook into the inference pipeline
       (logging, auth, rate limiting).  Uncomment the `callbacks` key in
       `config.yaml` to activate.

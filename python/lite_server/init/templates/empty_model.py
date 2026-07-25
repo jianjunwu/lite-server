@@ -5,9 +5,11 @@ methods are adapted automatically.  Use ``async def`` for I/O-bound work
 (database lookups, downstream API calls); the pipeline runs sync methods
 on a thread executor so they never block the event loop.
 
-Declare a ``ctx`` parameter on ``decode_request``, ``predict``, and
-``encode_response`` to access per-request metadata (headers, route,
-client_ip, request_id) and ``ctx.state`` (per-request scratch dict).
+Declare a ``ctx`` parameter on ``decode_request``, ``predict``,
+``encode_response``, ``batch``, and ``unbatch`` to access per-request
+metadata (headers, route, client_ip, request_id) and ``ctx.state``
+(per-request scratch dict).  In batch mode, ``batch`` / ``unbatch`` /
+``predict`` receive a ``list[RequestContext]`` aligned with the inputs.
 """
 
 from lite_server import LitAPI, RequestContext
