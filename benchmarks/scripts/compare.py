@@ -306,6 +306,41 @@ def main() -> int:
 
     rows: list[dict] = []
 
+    def _run_server(name: str, port: int, extra_args: list[str] | None = None) -> dict[str, float]:
+        """Start one server, run wrk, return parsed metrics.  Returns empty dict on failure."""
+        url = f"http://127.0.0.1:{port}/v2/models/{args.model}/infer"
+        script = lite_script  # run_liteserver.py for lite-server and lite-server-core
+        if name == "LitServe":
+            script = lit_script
+        cmd = [
+            sys.executable,
+            str(script),
+            "--port", str(port),
+            "--workers", str(workers),
+            "--duration", str(args.duration + 10),
+            *model_repo_arg,
+            *model_arg,
+        ]
+        if extra_args:
+            cmd.extend(extra_args)
+
+        print(f"[{name}] Starting...")
+        try:
+            with _managed_popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ):
+                if not wait_for_server(url, timeout=60):
+                    print(f"ERROR: {name} failed to start", file=sys.stderr)
+                    return {}
+                time.sleep(args.warmup)
+                print(f"[{name}] wrk -c{conc} -d{int(args.duration)}s ...")
+                return run_wrk(args.wrk, url, conc, args.duration, lua_script)
+        except Exception as exc:
+            print(f"ERROR: {name} exception: {exc}", file=sys.stderr)
+            return {}
+
     for workers in workers_list:
         for conc in concurrency_list:
             banner = f"Workers={workers}, Concurrency={conc}"
@@ -313,84 +348,9 @@ def main() -> int:
             print(banner)
             print(f"{'=' * 60}")
 
-            # ---- lite-server ----
-            print("[lite-server] Starting...")
-            with _managed_popen(
-                [
-                    sys.executable,
-                    str(lite_script),
-                    "--port",
-                    "8000",
-                    "--workers",
-                    str(workers),
-                    "--duration",
-                    str(args.duration + 10),
-                    *model_repo_arg,
-                    *model_arg,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            ) as lite_proc:
-                if not wait_for_server(lite_url, timeout=60):
-                    print("ERROR: lite-server failed to start", file=sys.stderr)
-                    continue
-
-                time.sleep(args.warmup)
-                print(f"[lite-server] wrk -c{conc} -d{int(args.duration)}s ...")
-                lite_res = run_wrk(args.wrk, lite_url, conc, args.duration, lua_script)
-
-            # ---- LitServe ----
-            print("[LitServe] Starting...")
-            with _managed_popen(
-                [
-                    sys.executable,
-                    str(lit_script),
-                    "--port",
-                    "8001",
-                    "--workers",
-                    str(workers),
-                    "--duration",
-                    str(args.duration + 10),
-                    *model_repo_arg,
-                    *model_arg,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            ) as lit_proc:
-                if not wait_for_server(lit_url, timeout=60):
-                    print("ERROR: LitServe failed to start", file=sys.stderr)
-                    continue
-
-                time.sleep(args.warmup)
-                print(f"[LitServe] wrk -c{conc} -d{int(args.duration)}s ...")
-                lit_res = run_wrk(args.wrk, lit_url, conc, args.duration, lua_script)
-
-            # ---- lite-server-core ----
-            print("[lite-server-core] Starting...")
-            with _managed_popen(
-                [
-                    sys.executable,
-                    str(lite_script),
-                    "--port",
-                    "8002",
-                    "--workers",
-                    str(workers),
-                    "--duration",
-                    str(args.duration + 10),
-                    "--core",
-                    *model_repo_arg,
-                    *model_arg,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            ) as core_proc:
-                if not wait_for_server(core_url, timeout=60):
-                    print("ERROR: lite-server-core failed to start", file=sys.stderr)
-                    continue
-
-                time.sleep(args.warmup)
-                print(f"[lite-server-core] wrk -c{conc} -d{int(args.duration)}s ...")
-                core_res = run_wrk(args.wrk, core_url, conc, args.duration, lua_script)
+            lite_res = _run_server("lite-server", 8000)
+            lit_res = _run_server("LitServe", 8001)
+            core_res = _run_server("lite-server-core", 8002, extra_args=["--core"])
 
             row = {
                 "workers": workers,

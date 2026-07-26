@@ -81,11 +81,23 @@ def _load_model_from_repo(repo_path: Path, target_name: str | None = None):
     return None, None
 
 
-class _BuiltinSleepAPI(ls.LitAPI):
-    """Fallback CPU-bound mock model when no model_repo is provided."""
+# Mapping from model name → sleep_ms for built-in fallback when the model
+# repo contains lite_server models (which inherit from lite_server.LitAPI,
+# not litserve.LitAPI, and therefore cannot be loaded directly by LitServe).
+_BUILTIN_SLEEP_MAP = {
+    "sleep_1ms_model": 1,
+    "sleep_model": 10,
+}
 
-    def __init__(self):
-        super().__init__(api_path="/v2/models/sleep_1ms_model/infer")
+
+class _BuiltinSleepAPI(ls.LitAPI):
+    """CPU-bound mock model with configurable sleep duration."""
+
+    def __init__(self, sleep_ms: float = 1):
+        self._sleep_sec = sleep_ms / 1000.0
+        super().__init__(
+            api_path=f"/v2/models/{'sleep_1ms_model' if sleep_ms == 1 else 'sleep_model'}/infer"
+        )
 
     def setup(self, device):
         self.device = device
@@ -94,10 +106,10 @@ class _BuiltinSleepAPI(ls.LitAPI):
         return request.get("input", "")
 
     def predict(self, inputs, **kwargs):
-        time.sleep(0.001)  # 1ms per request
+        time.sleep(self._sleep_sec)
         if isinstance(inputs, list):
-            return [{"output": i, "sleep_ms": 1} for i in inputs]
-        return {"output": inputs, "sleep_ms": 1}
+            return [{"output": i, "sleep_ms": self._sleep_sec * 1000} for i in inputs]
+        return {"output": inputs, "sleep_ms": self._sleep_sec * 1000}
 
     def encode_response(self, output, **kwargs):
         return output
@@ -131,10 +143,18 @@ def main() -> int:
             return 1
         loaded_name, api = _load_model_from_repo(repo_path, target_name=args.model)
         if api is None:
-            print(f"ERROR: No LitAPI subclass found in {repo_path}", file=sys.stderr)
-            return 1
-        model_name = loaded_name
-        print(f"Loaded model '{model_name}' from {repo_path}")
+            # Model is likely a lite_server model (inherits from lite_server.LitAPI,
+            # not litserve.LitAPI).  Use built-in with equivalent workload.
+            sleep_ms = _BUILTIN_SLEEP_MAP.get(args.model, 1)
+            api = _BuiltinSleepAPI(sleep_ms=sleep_ms)
+            model_name = args.model
+            print(
+                f"No litserve-compatible LitAPI found; "
+                f"using built-in {sleep_ms}ms sleep model (equivalent workload)"
+            )
+        else:
+            model_name = loaded_name
+            print(f"Loaded model '{model_name}' from {repo_path}")
     else:
         api = _BuiltinSleepAPI()
         print("Using built-in 1ms sleep model")
