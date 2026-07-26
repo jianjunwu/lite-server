@@ -131,7 +131,7 @@ async fn observability_middleware(mut request: Request, next: Next) -> Response 
         .headers()
         .get("x-client-request-id")
         .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty() && s.len() <= 512 && s.is_ascii())
+        .filter(|s| crate::validation::is_valid_request_id(s))
         .map(String::from)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 

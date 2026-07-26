@@ -8,6 +8,13 @@ lazy_static::lazy_static! {
 
 const MAX_IDENTIFIER_LEN: usize = 64;
 
+/// Client-supplied request IDs are echoed into logs, traces, and response
+/// headers — bound length and charset to keep them safe to handle.
+/// Rules: non-empty, ≤ 512 chars, ASCII only. Shared by HTTP and gRPC paths.
+pub fn is_valid_request_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 512 && s.is_ascii()
+}
+
 /// Validate that a model name contains only safe characters.
 /// Allowed: alphanumeric, underscore, hyphen. Length: 1-64.
 pub fn validate_identifier(s: &str) -> Result<(), AppError> {
@@ -94,6 +101,15 @@ pub fn resolve_model_dir(
 mod tests {
     use super::*;
     
+
+    #[test]
+    fn test_is_valid_request_id() {
+        assert!(is_valid_request_id("my-trace-123"));
+        assert!(is_valid_request_id(&"x".repeat(512)));
+        assert!(!is_valid_request_id(""));
+        assert!(!is_valid_request_id(&"x".repeat(513)));
+        assert!(!is_valid_request_id("trace-id-中文"));
+    }
 
     #[test]
     fn test_validate_identifier_accepts_valid() {
