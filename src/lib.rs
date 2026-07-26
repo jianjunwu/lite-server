@@ -214,10 +214,32 @@ fn serve(
     })
 }
 
+/// Validate a server config file with the same serde path used at startup,
+/// so `config-check` rejects anything `serve --config` would reject.
+#[cfg(feature = "python")]
+#[pyfunction]
+fn validate_server_config(path: &str) -> PyResult<()> {
+    crate::config::load_config(path)
+        .map(|_| ())
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
+/// Validate a per-model config file (model repo `config.yaml`) with the same
+/// serde path used when the server loads a model.
+#[cfg(feature = "python")]
+#[pyfunction]
+fn validate_model_config(path: &str) -> PyResult<()> {
+    crate::config::load_model_config(std::path::Path::new(path))
+        .map(|_| ())
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
 #[cfg(feature = "python")]
 #[pymodule]
 fn _lite_server(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(serve, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_server_config, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_model_config, m)?)?;
     m.add_function(wrap_pyfunction!(test_support::validate_identifier, m)?)?;
     m.add_class::<test_support::PyModelRegistry>()?;
     Ok(())

@@ -145,12 +145,26 @@ def _cmd_serve(args):
 
 
 def _cmd_config_check(args):
+    from lite_server import validate_model_config, validate_server_config
+
     try:
         import yaml
         with open(args.config, "r") as f:
             cfg = yaml.safe_load(f)
         if cfg is None:
             cfg = {}
+        # Delegate value/type validation to the Rust serde path so that a
+        # config passing config-check is guaranteed loadable by the server.
+        if "server" in cfg:
+            if validate_server_config is None:
+                _logger.warning("lite-server Rust extension not built; type validation skipped.")
+            else:
+                validate_server_config(args.config)
+        else:
+            if validate_model_config is None:
+                _logger.warning("lite-server Rust extension not built; type validation skipped.")
+            else:
+                validate_model_config(args.config)
         print(f"Configuration OK: {args.config}")
         if "server" in cfg:
             s = cfg["server"]

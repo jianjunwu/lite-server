@@ -8,9 +8,11 @@ except Exception:
     __version__ = "0.0.0"
 
 try:
-    from _lite_server import serve
+    from _lite_server import serve, validate_model_config, validate_server_config
 except ImportError:
     serve = None  # fallback when extension is not built
+    validate_server_config = None
+    validate_model_config = None
 
 from lite_server.api import BidiStreamHandler, LitAPI
 from lite_server.callback import (
@@ -36,6 +38,8 @@ from lite_server.server_proxy import ServerProxy
 
 __all__ = [
     "serve",
+    "validate_server_config",
+    "validate_model_config",
     "LitAPI",
     "BidiStreamHandler",
     "Callback",

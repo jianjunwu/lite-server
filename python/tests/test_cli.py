@@ -338,6 +338,44 @@ class TestConfigCheck:
         args = type("Args", (), {"config": str(config)})()
         assert cli._cmd_config_check(args) == 0
 
+    def test_config_check_rejects_non_integer_port(self, tmp_path):
+        """config-check should reject http_port when it's not an integer.
+
+        Rust serde deserialization fails on type mismatch (e.g. u16 ← string),
+        but the Python config-check only validates YAML syntax, not value types.
+        A config that passes config-check should be loadable by the server.
+        """
+        config = tmp_path / "bad_port.yaml"
+        config.write_text("server:\n  http_port: not_a_number\n")
+        args = type("Args", (), {"config": str(config)})()
+        result = cli._cmd_config_check(args)
+        assert result == 1, (
+            f"Expected config-check to reject non-integer http_port, got exit code {result}. "
+            "The server (Rust serde) would reject this config at startup."
+        )
+
+    def test_config_check_rejects_non_bool_stream(self, tmp_path):
+        """config-check should reject model config stream field when it's not a bool."""
+        config = tmp_path / "bad_stream.yaml"
+        config.write_text("stream: yes_i_am_a_string\n")
+        args = type("Args", (), {"config": str(config)})()
+        result = cli._cmd_config_check(args)
+        assert result == 1, (
+            f"Expected config-check to reject non-boolean stream value, got exit code {result}. "
+            "The server (Rust serde) would reject this config at startup."
+        )
+
+    def test_config_check_rejects_non_integer_max_batch_size(self, tmp_path):
+        """config-check should reject max_batch_size when it's not an integer."""
+        config = tmp_path / "bad_batch.yaml"
+        config.write_text("max_batch_size: large\n")
+        args = type("Args", (), {"config": str(config)})()
+        result = cli._cmd_config_check(args)
+        assert result == 1, (
+            f"Expected config-check to reject non-integer max_batch_size, got exit code {result}. "
+            "The server (Rust serde) would reject this config at startup."
+        )
+
 
 class TestInit:
     def test_init_empty_template(self, tmp_path, monkeypatch):
