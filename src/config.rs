@@ -206,6 +206,27 @@ pub struct ModelDefaults {
     pub health_check_interval: Option<f32>,
 }
 
+impl ModelDefaults {
+    /// Apply these defaults to a ModelConfig (per-model at load time).
+    pub fn apply_to(&self, model: &mut ModelConfig) {
+        if let Some(v) = self.max_queue_size {
+            model.max_queue_size = v;
+        }
+        if let Some(v) = self.max_requests {
+            model.max_requests = v;
+        }
+        if let Some(v) = self.max_requests_jitter {
+            model.max_requests_jitter = v;
+        }
+        if let Some(v) = self.request_timeout {
+            model.request_timeout = v;
+        }
+        if let Some(v) = self.health_check_interval {
+            model.health_check_interval = v;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelStrategyConfig {
@@ -359,6 +380,16 @@ pub fn load_model_config(path: &Path) -> anyhow::Result<ModelConfig> {
     Ok(config)
 }
 
+/// Structural ensemble detection: true only when the config.yaml content has a
+/// top-level `ensemble` key. A string-contains check would false-positive on
+/// YAML comments or description strings mentioning "ensemble:".
+pub fn config_content_is_ensemble(content: &str) -> bool {
+    serde_yaml::from_str::<serde_yaml::Value>(content)
+        .ok()
+        .and_then(|v| v.get("ensemble").map(|_| ()))
+        .is_some()
+}
+
 /// CLI 参数覆盖集。None/bool 默认值 = 不覆盖（保持 YAML 或内置默认值）。
 #[derive(Debug, Clone, Default)]
 pub struct CliOverrides {
@@ -455,21 +486,7 @@ impl Config {
 
     /// Apply CLI model defaults to a ModelConfig (called per-model at load time).
     pub fn apply_model_defaults(&self, model: &mut ModelConfig) {
-        if let Some(v) = self.model_defaults.max_queue_size {
-            model.max_queue_size = v;
-        }
-        if let Some(v) = self.model_defaults.max_requests {
-            model.max_requests = v;
-        }
-        if let Some(v) = self.model_defaults.max_requests_jitter {
-            model.max_requests_jitter = v;
-        }
-        if let Some(v) = self.model_defaults.request_timeout {
-            model.request_timeout = v;
-        }
-        if let Some(v) = self.model_defaults.health_check_interval {
-            model.health_check_interval = v;
-        }
+        self.model_defaults.apply_to(model);
     }
 }
 

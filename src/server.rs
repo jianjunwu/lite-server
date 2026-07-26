@@ -656,13 +656,7 @@ async fn scan_repo_models(repo_path: &Path) -> Vec<RepoModel> {
                 let mut is_ensemble = false;
                 if config_yaml.exists() {
                     if let Ok(content) = tokio::fs::read_to_string(&config_yaml).await {
-                        // Structural check: parse YAML and look for a top-level
-                        // `ensemble` key. String-contains would false-positive on
-                        // comments or description strings mentioning "ensemble:".
-                        is_ensemble = serde_yaml::from_str::<serde_yaml::Value>(&content)
-                            .ok()
-                            .and_then(|v| v.get("ensemble").map(|_| ()))
-                            .is_some();
+                        is_ensemble = crate::config::config_content_is_ensemble(&content);
                     }
                 }
 
@@ -832,10 +826,7 @@ async fn process_watch_events(
             let config_path = repo_path.join(&name).join(&version).join("config.yaml");
             if config_path.exists() {
                 let mut config = crate::config::load_model_config(&config_path).unwrap_or_default();
-                if let Some(v) = model_defaults.max_queue_size { config.max_queue_size = v; }
-                if let Some(v) = model_defaults.max_requests { config.max_requests = v; }
-                if let Some(v) = model_defaults.request_timeout { config.request_timeout = v; }
-                if let Some(v) = model_defaults.health_check_interval { config.health_check_interval = v; }
+                model_defaults.apply_to(&mut config);
 
                 // P0: Only auto-load if hot_reload is enabled
                 if !config.hot_reload {

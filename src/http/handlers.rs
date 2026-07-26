@@ -426,7 +426,7 @@ async fn scan_repository(repo_path: &std::path::Path) -> Vec<Value> {
                 let mut is_ensemble = false;
                 if config_yaml.exists() {
                     if let Ok(content) = tokio::fs::read_to_string(&config_yaml).await {
-                        is_ensemble = content.contains("ensemble:");
+                        is_ensemble = crate::config::config_content_is_ensemble(&content);
                     }
                 }
 
@@ -479,7 +479,10 @@ pub async fn load_model_handler(
 
     // Load model config
     let config_path = state.repo_path.join(&model_name).join(&version).join("config.yaml");
-    let config = crate::config::load_model_config(&config_path).unwrap_or_default();
+    let mut config = crate::config::load_model_config(&config_path).unwrap_or_default();
+    // Apply CLI model-default overrides, same as initial load (server.rs) and
+    // hot reload — otherwise --max-queue-size etc. silently don't apply here.
+    state.config.apply_model_defaults(&mut config);
 
     info!(model = %model_name, version = %version, "load model requested");
     state.worker_manager.load_model(&model_name, &version, &config).await?;
@@ -3461,5 +3464,104 @@ mod custom_route_callback_tests {
             do_infer_body.iter().any(|l| l.contains("on_inference_response")),
             "do_infer must fire on_inference_response (sanity check)"
         );
+    }
+}
+
+// ===== B2: ensemble detection via string-contains in scan_repository =====
+
+#[cfg(test)]
+mod scan_repository_ensemble_tests {
+    use super::*;
+
+    /// B2 (P1): `scan_repository` detects ensemble models via
+    /// `content.contains("ensemble:")` rather than structural YAML parsing.
+    /// A config.yaml with "ensemble:" appearing ONLY in a YAML comment or
+    /// description string is incorrectly classified as `type: "ensemble"`,
+    /// breaking the repository index API.
+    #[tokio::test]
+    async fn test_scan_repository_ensemble_detection_false_positive_on_comment() {
+        let repo = std::env::temp_dir().join(format!(
+            "lite-server-scan-ensemble-fp-{}",
+            std::process::id()
+        ));
+        let model_dir = repo.join("test_model").join("1");
+        tokio::fs::create_dir_all(&model_dir).await.unwrap();
+
+        // A model.py exists — this is a LitAPI model.
+        tokio::fs::write(model_dir.join("model.py"), "# dummy model")
+            .await
+            .unwrap();
+
+        // config.yaml where "ensemble:" appears only in a YAML comment.
+        // A properly-structured check would classify this as LitAPI.
+        tokio::fs::write(
+            model_dir.join("config.yaml"),
+            "# ensemble: this is only a comment, not a real ensemble\nmax_batch_size: 4\n",
+        )
+        .await
+        .unwrap();
+
+        let result = scan_repository(&repo).await;
+
+        // The directory should be discovered (model.py exists).
+        assert_eq!(result.len(), 1, "model with model.py must be discovered");
+
+        let entry = &result[0];
+        assert_eq!(entry["name"], "test_model");
+        assert_eq!(entry["version"], "1");
+
+        // BUG: the comment "ensemble:" triggers the string-contains check,
+        // so the type is incorrectly reported as "ensemble".
+        assert_eq!(
+            entry["type"].as_str().unwrap(),
+            "litapi",
+            "B2 REGRESSION: model with model.py and 'ensemble:' in a comment \
+             must be classified as 'litapi', not '{}'. The string-contains \
+             check at handlers.rs:429 matched a YAML comment.",
+            entry["type"].as_str().unwrap_or("")
+        );
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    /// B2b (P1): pure false positive — no model.py, only config.yaml with
+    /// "ensemble:" in a comment. scan_repository incorrectly treats this as
+    /// an ensemble model.
+    #[tokio::test]
+    async fn test_scan_repository_ensemble_detection_pure_false_positive() {
+        let repo = std::env::temp_dir().join(format!(
+            "lite-server-scan-ensemble-fp2-{}",
+            std::process::id()
+        ));
+        let model_dir = repo.join("no_py_model").join("1");
+        tokio::fs::create_dir_all(&model_dir).await.unwrap();
+
+        // config.yaml where "ensemble:" only appears in a YAML comment.
+        // No model.py — a genuine ensemble would have `ensemble:` as a YAML
+        // key; this has it only in a comment/description.
+        tokio::fs::write(
+            model_dir.join("config.yaml"),
+            "description: \"This is NOT an ensemble\"\n# ensemble:\n#   steps: ...\nmax_batch_size: 4\n",
+        )
+        .await
+        .unwrap();
+
+        let result = scan_repository(&repo).await;
+
+        // BUG: `content.contains("ensemble:")` matches the comment
+        // "# ensemble:", so this directory is incorrectly discovered as
+        // an ensemble model even though it has no model.py and the
+        // ensemble key is commented out.
+        assert!(
+            result.is_empty(),
+            "B2b REGRESSION: directory with 'ensemble:' in a comment and no \
+             model.py must NOT be discovered as a model. scan_repository uses \
+             string-contains which matches commented-out ensemble keys. \
+             Got {} entry(s): {:?}",
+            result.len(),
+            result.iter().map(|e| format!("{}:{}", e["name"], e["version"])).collect::<Vec<_>>()
+        );
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
     }
 }

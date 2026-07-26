@@ -774,11 +774,12 @@ impl WorkerManager {
         let model_py = model_dir.join("model.py");
         let config_yaml = model_dir.join("config.yaml");
 
-        // Check for ensemble
+        // Check for ensemble (structural YAML parse — string-contains would
+        // false-positive on comments mentioning "ensemble:")
         let mut is_ensemble = false;
         if config_yaml.exists() {
             if let Ok(content) = tokio::fs::read_to_string(&config_yaml).await {
-                if content.contains("ensemble:") {
+                if crate::config::config_content_is_ensemble(&content) {
                     is_ensemble = true;
                 }
             }
@@ -2785,6 +2786,111 @@ class TestAPI(LitAPI):
             "v2 must NOT be evicted by a doomed duplicate load"
         );
         assert_eq!(registry.list_versions("m").len(), 2);
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // ===== B1: ensemble detection via string-contains in load_model =====
+
+    /// B1 (P1): `load_model` detects ensemble models via `content.contains("ensemble:")`
+    /// rather than structural YAML parsing (as `scan_repo_models` was already fixed to do).
+    /// A config.yaml with "ensemble:" appearing ONLY in a YAML comment or description
+    /// string is incorrectly classified as `ModelType::Ensemble`, which means no workers
+    /// are spawned and the model is silently marked Ready with nothing to serve.
+    #[tokio::test]
+    async fn test_load_model_ensemble_detection_false_positive_on_comment() {
+        let repo = std::env::temp_dir().join(format!(
+            "lite-server-wm-ensemble-fp-{}",
+            std::process::id()
+        ));
+        let model_dir = repo.join("test_model").join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+
+        // Create a minimal but valid LitAPI model.py — after the fix the
+        // model is classified as LitAPI and a real worker is spawned, so the
+        // file must contain an actual LitAPI subclass.
+        std::fs::write(
+            model_dir.join("model.py"),
+            r#"from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+"#,
+        )
+        .unwrap();
+
+        // config.yaml where "ensemble:" appears only in a YAML comment.
+        // A properly-structured check (serde_yaml get("ensemble")) would
+        // classify this as LitAPI; string-contains classifies it as Ensemble.
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "# ensemble: this is just a comment, not a real ensemble config\nmax_batch_size: 4\n",
+        )
+        .unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        // The repo path must be the repo directory itself, not the model_dir —
+        // resolve_model_dir joins repo_path / model_name / version.
+        let wm = WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            Arc::new(InferenceQueue::new()),
+            "warn".to_string(),
+            Arc::new(CallbackRunner::new()),
+        );
+
+        let config = ModelConfig::default();
+
+        // The model.py EXISTS and the string-contains check finds "ensemble:"
+        // in a comment, so load_model takes the ensemble fast path: register
+        // as Ensemble, mark ready, return Ok — zero workers spawned.
+        let result = wm.load_model("test_model", "1", &config).await;
+
+        // BUG: load succeeds WITHOUT spawning workers, because the model
+        // was wrongly classified as Ensemble.
+        assert!(
+            result.is_ok(),
+            "B1 REGRESSION: load_model should succeed — string-contains \
+             'ensemble:' in a comment triggers the ensemble fast-path, so no \
+             worker spawn is attempted. Got: {:?}",
+            result.err()
+        );
+
+        // The model is registered as Ensemble instead of LitAPI.
+        let mv = registry.get("test_model", Some("1")).unwrap();
+        assert_eq!(
+            mv.model_type,
+            ModelType::LitAPI,
+            "B1 REGRESSION: model with model.py and 'ensemble:' in a comment \
+             must be classified as LitAPI, not {:?}. The string-contains \
+             check at load_model:781 matched a YAML comment.",
+            mv.model_type
+        );
+        assert_eq!(
+            mv.status,
+            VersionStatus::Ready,
+            "Model wrongly classified as Ensemble would be marked Ready \
+             without any workers"
+        );
+        assert!(
+            !mv.workers.is_empty(),
+            "LitAPI-classified model must have spawned workers — an \
+             Ensemble-classified model has none and would fail silently"
+        );
+
+        // Reap the spawned worker so it doesn't outlive the test repo dir.
+        let _ = wm.unload_model("test_model", Some("1")).await;
 
         let _ = std::fs::remove_dir_all(&repo);
     }

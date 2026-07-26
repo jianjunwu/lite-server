@@ -108,8 +108,6 @@ async fn test_init_project_runs_end_to_end() {
         .arg("lite_server.cli")
         .arg("init")
         .arg("test_proj")
-        .arg("--template")
-        .arg("empty")
         .current_dir(&tmp_dir)
         .output()
         .expect("failed to run lite-server init");
