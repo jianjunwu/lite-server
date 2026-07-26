@@ -376,10 +376,10 @@ pub fn record_worker_metrics(model: &str, version: &str, metrics: Option<&crate:
 /// Each spec is (name, type) where type is "gauge", "counter", or "histogram".
 /// Objects are stored in order — the index IS the numeric ID used at record time.
 pub fn register_custom_metrics(specs: &[(&str, &str)]) {
-    let mut gauges = CUSTOM_GAUGE_OBJECTS.lock().unwrap();
-    let mut counters = CUSTOM_COUNTER_OBJECTS.lock().unwrap();
-    let mut histograms = CUSTOM_HISTOGRAM_OBJECTS.lock().unwrap();
-    let mut index = CUSTOM_METRIC_INDEX.lock().unwrap();
+    let mut gauges = CUSTOM_GAUGE_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut counters = CUSTOM_COUNTER_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut histograms = CUSTOM_HISTOGRAM_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut index = CUSTOM_METRIC_INDEX.lock().unwrap_or_else(|e| e.into_inner());
 
     for (name, metric_type) in specs {
         let key = format!("{}:{}", name, metric_type);
