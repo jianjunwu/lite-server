@@ -1,6 +1,6 @@
 use lazy_static::lazy_static;
 use prometheus::{
-    Counter, CounterVec, GaugeVec, HistogramOpts, HistogramVec, Registry, TextEncoder,
+    CounterVec, GaugeVec, HistogramOpts, HistogramVec, Registry, TextEncoder,
 };
 use std::collections::HashMap;
 
@@ -72,13 +72,16 @@ lazy_static! {
             "liteserver_ensemble_step_latency_seconds",
             "Per-step latency in ensemble DAG"
         ).buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]),
-        &["ensemble", "step", "model"]
+        &["ensemble", "step", "model", "version"]
     ).unwrap();
 
     // Outlier detection metrics
-    pub static ref WORKER_EJECTIONS_TOTAL: Counter = Counter::new(
-        "liteserver_worker_ejections_total",
-        "Total worker ejections due to consecutive failures"
+    pub static ref WORKER_EJECTIONS_TOTAL: CounterVec = CounterVec::new(
+        prometheus::Opts::new(
+            "liteserver_worker_ejections_total",
+            "Total worker ejections due to consecutive failures"
+        ),
+        &["model", "version"]
     ).unwrap();
 
     pub static ref RETRIES_TOTAL: CounterVec = CounterVec::new(
@@ -228,8 +231,8 @@ pub async fn record_request_end(model: &str, version: &str, status: &str, durati
 
 // ===== Outlier detection metrics =====
 
-pub fn inc_worker_ejection() {
-    WORKER_EJECTIONS_TOTAL.inc();
+pub fn inc_worker_ejection(model: &str, version: &str) {
+    WORKER_EJECTIONS_TOTAL.with_label_values(&[model, version]).inc();
 }
 
 pub fn inc_retry(model: &str, version: &str) {
@@ -275,8 +278,8 @@ pub fn record_version_switch(model: &str, from: &str, to: &str) {
 
 // ===== Ensemble metrics =====
 
-pub fn record_ensemble_step_latency(ensemble: &str, step: &str, model: &str, latency_secs: f64) {
-    ENSEMBLE_STEP_LATENCY.with_label_values(&[ensemble, step, model]).observe(latency_secs);
+pub fn record_ensemble_step_latency(ensemble: &str, step: &str, model: &str, version: &str, latency_secs: f64) {
+    ENSEMBLE_STEP_LATENCY.with_label_values(&[ensemble, step, model, version]).observe(latency_secs);
 }
 
 // ===== Streaming metrics =====
@@ -298,9 +301,9 @@ lazy_static! {
     pub static ref INFERENCE_DURATION: HistogramVec = HistogramVec::new(
         HistogramOpts::new(
             "liteserver_inference_duration_seconds",
-            "Time inside predict()"
+            "Worker round-trip latency (queue dispatch → response)"
         ).buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
-        &["model"]
+        &["model", "version"]
     ).unwrap();
 
     pub static ref BATCH_SIZE: HistogramVec = HistogramVec::new(
@@ -308,53 +311,62 @@ lazy_static! {
             "liteserver_batch_size",
             "Actual batch size processed"
         ).buckets(vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]),
-        &["model"]
+        &["model", "version"]
     ).unwrap();
+}
+
+pub fn observe_inference_duration(model: &str, version: &str, secs: f64) {
+    INFERENCE_DURATION.with_label_values(&[model, version]).observe(secs);
+}
+
+pub fn observe_batch_size(model: &str, version: &str, size: usize) {
+    BATCH_SIZE.with_label_values(&[model, version]).observe(size as f64);
 }
 
 // ===== Custom metrics from Python workers =====
 
-/// Record metrics reported by a Python worker.
-pub fn record_worker_metrics(model: &str, metrics: Option<&crate::proto::liteserver::Metrics>) {
+/// Record metrics reported by a Python worker, tagged by the serving
+/// (model, version) of the response (§4.6).
+pub fn record_worker_metrics(model: &str, version: &str, metrics: Option<&crate::proto::liteserver::Metrics>) {
     if let Some(m) = metrics {
         if m.prefill_ms > 0.0 {
             let mut guard = CUSTOM_GAUGES.lock().unwrap();
             let gauge = guard.entry("prefill_ms".to_string()).or_insert_with(|| {
                 let g = GaugeVec::new(
                     prometheus::Opts::new("lite_server_prefill_ms", "Prefill latency in ms"),
-                    &["model"],
+                    &["model", "version"],
                 ).unwrap();
                 let _ = REGISTRY.register(Box::new(g.clone()));
                 g
             });
-            gauge.with_label_values(&[model]).set(m.prefill_ms as f64);
+            gauge.with_label_values(&[model, version]).set(m.prefill_ms as f64);
         }
         if m.decode_ms > 0.0 {
             let mut guard = CUSTOM_GAUGES.lock().unwrap();
             let gauge = guard.entry("decode_ms".to_string()).or_insert_with(|| {
                 let g = GaugeVec::new(
                     prometheus::Opts::new("lite_server_decode_ms", "Decode latency in ms"),
-                    &["model"],
+                    &["model", "version"],
                 ).unwrap();
                 let _ = REGISTRY.register(Box::new(g.clone()));
                 g
             });
-            gauge.with_label_values(&[model]).set(m.decode_ms as f64);
+            gauge.with_label_values(&[model, version]).set(m.decode_ms as f64);
         }
         if m.tokens_generated > 0 {
             let mut guard = CUSTOM_COUNTERS.lock().unwrap();
             let counter = guard.entry("tokens_generated".to_string()).or_insert_with(|| {
                 let c = CounterVec::new(
                     prometheus::Opts::new("lite_server_tokens_generated_total", "Total tokens generated"),
-                    &["model"],
+                    &["model", "version"],
                 ).unwrap();
                 let _ = REGISTRY.register(Box::new(c.clone()));
                 c
             });
-            counter.with_label_values(&[model]).inc_by(m.tokens_generated as f64);
+            counter.with_label_values(&[model, version]).inc_by(m.tokens_generated as f64);
         }
         // Pre-registered custom metrics (numeric ID path)
-        record_custom_metrics(model, &m.gauges, &m.counters, &m.histograms);
+        record_custom_metrics(model, version, &m.gauges, &m.counters, &m.histograms);
     }
 }
 
@@ -382,7 +394,7 @@ pub fn register_custom_metrics(specs: &[(&str, &str)]) {
                         format!("lite_server_{}", name),
                         format!("Custom gauge: {}", name),
                     ),
-                    &["model"],
+                    &["model", "version"],
                 ).unwrap();
                 let _ = REGISTRY.register(Box::new(g.clone()));
                 gauges.push(g);
@@ -395,7 +407,7 @@ pub fn register_custom_metrics(specs: &[(&str, &str)]) {
                         format!("lite_server_{}_total", name),
                         format!("Custom counter: {}", name),
                     ),
-                    &["model"],
+                    &["model", "version"],
                 ).unwrap();
                 let _ = REGISTRY.register(Box::new(c.clone()));
                 counters.push(c);
@@ -411,7 +423,7 @@ pub fn register_custom_metrics(specs: &[(&str, &str)]) {
                     .buckets(vec![
                         0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
                     ]),
-                    &["model"],
+                    &["model", "version"],
                 ).unwrap();
                 let _ = REGISTRY.register(Box::new(h.clone()));
                 histograms.push(h);
@@ -425,6 +437,7 @@ pub fn register_custom_metrics(specs: &[(&str, &str)]) {
 /// Record pre-registered custom metrics — hot path, O(1) per metric, no HashMap.
 pub fn record_custom_metrics(
     model: &str,
+    version: &str,
     gauges: &[crate::proto::liteserver::MetricValue],
     counters: &[crate::proto::liteserver::MetricValue],
     histograms: &[crate::proto::liteserver::MetricValue],
@@ -433,7 +446,7 @@ pub fn record_custom_metrics(
         let guard = CUSTOM_GAUGE_OBJECTS.lock().unwrap();
         for mv in gauges {
             if let Some(g) = guard.get(mv.id as usize) {
-                g.with_label_values(&[model]).set(mv.value as f64);
+                g.with_label_values(&[model, version]).set(mv.value as f64);
             }
         }
     }
@@ -441,7 +454,7 @@ pub fn record_custom_metrics(
         let guard = CUSTOM_COUNTER_OBJECTS.lock().unwrap();
         for mv in counters {
             if let Some(c) = guard.get(mv.id as usize) {
-                c.with_label_values(&[model]).inc_by(mv.value as f64);
+                c.with_label_values(&[model, version]).inc_by(mv.value as f64);
             }
         }
     }
@@ -449,7 +462,7 @@ pub fn record_custom_metrics(
         let guard = CUSTOM_HISTOGRAM_OBJECTS.lock().unwrap();
         for mv in histograms {
             if let Some(h) = guard.get(mv.id as usize) {
-                h.with_label_values(&[model]).observe(mv.value as f64);
+                h.with_label_values(&[model, version]).observe(mv.value as f64);
             }
         }
     }
@@ -571,9 +584,9 @@ mod tests {
         let m = Some(&metrics);
 
         // Must compile and run without .await — proves std::sync::Mutex not tokio::sync::Mutex
-        record_worker_metrics("sync_m1", m);
-        record_worker_metrics("sync_m2", m);
-        record_worker_metrics("sync_m3", m);
+        record_worker_metrics("sync_m1", "1", m);
+        record_worker_metrics("sync_m2", "1", m);
+        record_worker_metrics("sync_m3", "1", m);
     }
 
     #[test]
@@ -596,7 +609,7 @@ mod tests {
         let gauges = vec![MetricValue { id: gauge_id as i32, value: 42.0 }];
         let counters = vec![MetricValue { id: counter_id as i32, value: 5.0 }];
         let histograms = vec![MetricValue { id: histogram_id as i32, value: 0.15 }];
-        record_custom_metrics("rcmr_model", &gauges, &counters, &histograms);
+        record_custom_metrics("rcmr_model", "1", &gauges, &counters, &histograms);
 
         let output = gather_metrics();
         assert!(output.contains("lite_server_rcmr_gauge"), "gauge missing: {}", output);
@@ -622,7 +635,7 @@ mod tests {
             counters: vec![],
             histograms: vec![],
         };
-        record_worker_metrics("rwmc_model", Some(&metrics));
+        record_worker_metrics("rwmc_model", "1", Some(&metrics));
 
         let output = gather_metrics();
         assert!(output.contains("lite_server_rwmc_gauge"), "custom gauge missing: {}", output);

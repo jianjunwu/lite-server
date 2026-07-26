@@ -250,7 +250,7 @@ pub async fn execute_ensemble(
                     let result = execute_step(state, &step, &ctx, &request_id).await;
                     let latency = start.elapsed().as_secs_f64();
                     crate::metrics::prometheus::record_ensemble_step_latency(
-                        &ensemble_name, &step.name, &step.model, latency,
+                        &ensemble_name, &step.name, &step.model, &step.version, latency,
                     );
                     (step.name, result)
                 }));

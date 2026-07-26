@@ -25,6 +25,7 @@ pub fn create_routes(state: AppState) -> Router {
         // Timeline & Alerts
         .route("/metrics/timeline", get(timeline_handler))
         .route("/metrics/timeline/:model_name", get(timeline_model_handler))
+        .route("/metrics/timeline/:model_name/versions/:version", get(timeline_model_version_handler))
         .route("/metrics/alerts", get(alerts_handler))
         // Version compare
         .route("/v2/models/:model_name/compare", get(compare_versions_handler))
@@ -34,16 +35,21 @@ pub fn create_routes(state: AppState) -> Router {
         .route("/v2/models/:model_name/versions", get(list_versions_handler))
         // Admin: model ready check
         .route("/v2/models/:model_name/ready", get(model_ready_handler))
+        .route("/v2/models/:model_name/versions/:version/ready", get(model_ready_version_handler))
         // Admin: model health (per-worker status)
         .route("/v2/models/:model_name/health", get(model_health_handler))
+        .route("/v2/models/:model_name/versions/:version/health", get(model_health_version_handler))
         // Admin: repository index
         .route("/v2/repository/index", post(repository_index_handler))
-        // Admin: load
-        .route("/v2/repository/models/:model_name/load", post(load_model_handler))
-        // Admin: unload
+        // Admin: load (versioned-only since §4.4 — the bare endpoint
+        // silently defaulted to version "1")
+        .route("/v2/repository/models/:model_name/versions/:version/load", post(load_model_handler))
+        // Admin: unload (bare = active version; versioned = explicit)
         .route("/v2/repository/models/:model_name/unload", post(unload_model_handler))
-        // Admin: reload
+        .route("/v2/repository/models/:model_name/versions/:version/unload", post(unload_version_handler))
+        // Admin: reload (bare = active version; versioned = explicit)
         .route("/v2/models/:model_name/reload", post(reload_model_handler))
+        .route("/v2/models/:model_name/versions/:version/reload", post(reload_version_handler))
         // Admin: upload/download/list files
         .route("/v2/repository/models/:model_name/versions/:version/upload", post(upload_model_handler))
         .route("/v2/repository/models/:model_name/versions/:version/download", get(download_model_handler))

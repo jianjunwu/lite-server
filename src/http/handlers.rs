@@ -88,11 +88,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn, Instrument};
 use uuid::Uuid;
 
-#[derive(Deserialize)]
-pub struct VersionQuery {
-    version: Option<String>,
-}
-
 // ===== Health =====
 
 /// Liveness: the process is up — deliberately checks nothing else (no
@@ -145,21 +140,31 @@ pub async fn startupz_handler(State(state): State<Arc<AppState>>) -> Response {
 /// loaded_at. `status` mirrors the readyz predicate.
 pub async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let status = state.registry.server_status();
-    let models: Vec<Value> = status
-        .entries
-        .iter()
-        .map(|e| {
-            json!({
-                "name": e.name,
-                "version": e.version,
-                "status": e.status,
-                "workers": e.workers,
-                "loaded_at": e.loaded_at
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs()),
-            })
-        })
-        .collect();
+    // §4.5: group per-version entries under their model, carrying the
+    // active_version pointer. Entries are sorted by (name, version), so a
+    // model's versions are contiguous.
+    let mut models: Vec<Value> = Vec::new();
+    for e in &status.entries {
+        let version_json = json!({
+            "version": e.version,
+            "status": e.status,
+            "workers": e.workers,
+            "loaded_at": e.loaded_at
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs()),
+        });
+        if let Some(last) = models.last_mut() {
+            if last["name"] == e.name {
+                last["versions"].as_array_mut().unwrap().push(version_json);
+                continue;
+            }
+        }
+        models.push(json!({
+            "name": e.name,
+            "active_version": state.registry.get_active_version(&e.name),
+            "versions": [version_json],
+        }));
+    }
     Json(json!({
         "status": if status.has_serving() { "ready" } else { "not_ready" },
         "models": models,
@@ -179,7 +184,13 @@ pub async fn inference_options_handler(
     let Some(model_name) = params.get("model_name") else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match state.registry.active_cors_headers(model_name) {
+    // §4.4: versioned routes answer with the hit version's CORS policy;
+    // bare routes use the active version's.
+    let cors = match params.get("version") {
+        Some(v) => state.registry.cors_headers_for(model_name, v),
+        None => state.registry.active_cors_headers(model_name),
+    };
+    match cors {
         Some(headers) => {
             (StatusCode::NO_CONTENT, (*headers).clone()).into_response()
         }
@@ -230,65 +241,100 @@ pub async fn list_models_handler(State(state): State<Arc<AppState>>) -> impl Int
 
 // ===== List Versions =====
 
+/// Multi-version overview (§4.5): per-version status / active / weight /
+/// worker counts / loaded_at.
 pub async fn list_versions_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     let versions = state.registry.list_versions(&model_name);
+    if versions.is_empty() {
+        return Err(AppError::ModelNotFound(model_name));
+    }
     let active = state.registry.get_active_version(&model_name);
+    let versions_json: Vec<Value> = versions
+        .iter()
+        .map(|mv| {
+            let ready_workers = mv
+                .workers
+                .iter()
+                .filter(|w| w.status == crate::registry::types::WorkerStatus::Ready)
+                .count();
+            json!({
+                "version": mv.version,
+                "status": mv.status,
+                "active": active.as_deref() == Some(mv.version.as_str()),
+                "weight": mv.weight,
+                "workers": {
+                    "ready": ready_workers,
+                    "total": mv.workers.len(),
+                },
+                "loaded_at": mv.loaded_at
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs()),
+            })
+        })
+        .collect();
     Ok(Json(json!({
         "name": model_name,
         "active_version": active,
-        "versions": versions,
+        "versions": versions_json,
     })))
 }
 
 // ===== Model Ready =====
 
+fn model_ready_json(state: &AppState, model_name: &str, version: &str) -> Json<Value> {
+    let ready = state.registry.is_ready(model_name, Some(version));
+    let active_version = state.registry.get_active_version(model_name);
+    Json(json!({
+        "name": model_name,
+        "version": version,
+        "ready": ready,
+        "active_version": active_version,
+    }))
+}
+
+/// Bare readiness = the active version (§4.4). Always 200: a readiness
+/// probe answers the boolean question even when nothing is active
+/// (`ready: false`), instead of conflating "not ready" with "not found".
 pub async fn model_ready_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
-    ApiQuery(query): ApiQuery<VersionQuery>,
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
-    if let Some(ref v) = query.version {
-        crate::validation::validate_version(v)?;
-    }
-    let ready = state.registry.is_ready(&model_name, query.version.as_deref());
     let active_version = state.registry.get_active_version(&model_name);
+    let ready = active_version
+        .as_deref()
+        .is_some_and(|v| state.registry.is_ready(&model_name, Some(v)));
     Ok(Json(json!({
         "name": model_name,
-        "version": query.version.or(active_version.clone()),
+        "version": active_version.clone(),
         "ready": ready,
         "active_version": active_version,
     })))
 }
 
-// ===== Model Health =====
-
-pub async fn model_health_handler(
+/// Versioned readiness = the explicit version (§4.4).
+pub async fn model_ready_version_handler(
     State(state): State<Arc<AppState>>,
-    Path(model_name): Path<String>,
-    ApiQuery(query): ApiQuery<VersionQuery>,
+    Path((model_name, version)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
-    if let Some(ref v) = query.version {
-        crate::validation::validate_version(v)?;
-    }
+    crate::validation::validate_version(&version)?;
+    Ok(model_ready_json(&state, &model_name, &version))
+}
 
-    let resolved_version = match &query.version {
-        Some(v) => v.clone(),
-        None => state.registry.get_active_version(&model_name)
-            .ok_or_else(|| AppError::ModelNotFound(format!("{} has no active version", model_name)))?,
-    };
+// ===== Model Health =====
 
-    let mv = state.registry.get(&model_name, Some(&resolved_version))
+fn model_health_json(state: &AppState, model_name: &str, resolved_version: &str) -> Result<Json<Value>, AppError> {
+    let mv = state.registry.get(model_name, Some(resolved_version))
         .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", model_name, resolved_version)))?;
 
     let total_workers = mv.workers.len();
 
-    if let Some(outlier) = state.inference_queue.get_outlier_state(&model_name, &resolved_version) {
+    if let Some(outlier) = state.inference_queue.get_outlier_state(model_name, resolved_version) {
         let mut workers_json = Vec::with_capacity(total_workers);
         let mut healthy_count = 0usize;
         for i in 0..total_workers {
@@ -322,6 +368,27 @@ pub async fn model_health_handler(
             "workers": workers_json,
         })))
     }
+}
+
+/// Bare model health = the version the router would serve (§4.3/§4.5).
+pub async fn model_health_handler(
+    State(state): State<Arc<AppState>>,
+    Path(model_name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
+    let resolved_version = resolve_version(&state, &model_name, None, &headers).await?;
+    model_health_json(&state, &model_name, &resolved_version)
+}
+
+/// Versioned model health = the explicit version (§4.4).
+pub async fn model_health_version_handler(
+    State(state): State<Arc<AppState>>,
+    Path((model_name, version)): Path<(String, String)>,
+) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
+    crate::validation::validate_version(&version)?;
+    model_health_json(&state, &model_name, &version)
 }
 
 // ===== Repository Index =====
@@ -401,12 +468,12 @@ async fn scan_repository(repo_path: &std::path::Path) -> Vec<Value> {
 
 // ===== Load Model =====
 
+/// Load is versioned-only (§4.4): the old bare endpoint silently defaulted
+/// to version "1".
 pub async fn load_model_handler(
     State(state): State<Arc<AppState>>,
-    Path(model_name): Path<String>,
-    ApiQuery(query): ApiQuery<VersionQuery>,
+    Path((model_name, version)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
-    let version = query.version.unwrap_or_else(|| "1".to_string());
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
 
@@ -436,19 +503,18 @@ pub async fn load_model_handler(
 
 // ===== Unload Model =====
 
-pub async fn unload_model_handler(
-    State(state): State<Arc<AppState>>,
-    Path(model_name): Path<String>,
-    ApiQuery(query): ApiQuery<VersionQuery>,
+async fn unload_model_impl(
+    state: &AppState,
+    model_name: &str,
+    version: &str,
 ) -> Result<Json<Value>, AppError> {
-    crate::validation::validate_identifier(&model_name)?;
-    if let Some(ref v) = query.version {
-        crate::validation::validate_version(v)?;
-    }
-    info!(model = %model_name, version = ?query.version, "unload model requested");
-    let success = state.worker_manager.unload_model(&model_name, query.version.as_deref()).await?;
+    info!(model = %model_name, version = %version, "unload model requested");
+    let success = state.worker_manager.unload_model(model_name, Some(version)).await?;
     if !success {
-        return Err(AppError::ModelNotFound(format!("{} not loaded", model_name)));
+        return Err(AppError::ModelNotFound(format!(
+            "{} version {} not loaded",
+            model_name, version
+        )));
     }
 
     // Re-check if any loaded models still have hot_reload enabled
@@ -457,29 +523,73 @@ pub async fn unload_model_handler(
 
     Ok(Json(json!({
         "success": true,
-        "message": format!("Model {} unloaded", model_name),
+        "message": format!("Model {} version {} unloaded", model_name, version),
     })))
+}
+
+/// Bare unload targets the **active** version (§4.4): admin ops never follow
+/// the weighted routing pick.
+pub async fn unload_model_handler(
+    State(state): State<Arc<AppState>>,
+    Path(model_name): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
+    let active = state.registry.get_active_version(&model_name).ok_or_else(|| {
+        AppError::ModelNotFound(format!("{} has no active version", model_name))
+    })?;
+    unload_model_impl(&state, &model_name, &active).await
+}
+
+/// Versioned unload targets the explicit version (§4.4).
+pub async fn unload_version_handler(
+    State(state): State<Arc<AppState>>,
+    Path((model_name, version)): Path<(String, String)>,
+) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
+    crate::validation::validate_version(&version)?;
+    unload_model_impl(&state, &model_name, &version).await
 }
 
 // ===== Reload Model =====
 
+/// Bare reload targets the **active** version (§4.4).
 pub async fn reload_model_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
-    ApiQuery(query): ApiQuery<VersionQuery>,
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
-    if let Some(ref v) = query.version {
-        crate::validation::validate_version(v)?;
-    }
-    info!(model = %model_name, version = ?query.version, "reload model requested");
-    let success = state.worker_manager.reload_model(&model_name, query.version.as_deref()).await?;
+    let active = state.registry.get_active_version(&model_name).ok_or_else(|| {
+        AppError::ModelNotFound(format!("{} has no active version", model_name))
+    })?;
+    reload_model_impl(&state, &model_name, &active).await
+}
+
+/// Versioned reload targets the explicit version (§4.4).
+pub async fn reload_version_handler(
+    State(state): State<Arc<AppState>>,
+    Path((model_name, version)): Path<(String, String)>,
+) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
+    crate::validation::validate_version(&version)?;
+    reload_model_impl(&state, &model_name, &version).await
+}
+
+async fn reload_model_impl(
+    state: &AppState,
+    model_name: &str,
+    version: &str,
+) -> Result<Json<Value>, AppError> {
+    info!(model = %model_name, version = %version, "reload model requested");
+    let success = state.worker_manager.reload_model(model_name, Some(version)).await?;
     if !success {
-        return Err(AppError::ModelNotFound(format!("{} not loaded", model_name)));
+        return Err(AppError::ModelNotFound(format!(
+            "{} version {} not loaded",
+            model_name, version
+        )));
     }
     Ok(Json(json!({
         "success": true,
-        "message": format!("Model {} reloaded", model_name),
+        "message": format!("Model {} version {} reloaded", model_name, version),
     })))
 }
 
@@ -863,7 +973,7 @@ async fn do_infer(
     };
 
     let duration = start.elapsed().as_secs_f64();
-    prometheus::record_worker_metrics(&model_name, response.metrics.as_ref());
+    prometheus::record_worker_metrics(&model_name, &resolved_version, response.metrics.as_ref());
 
     // Parse protobuf response
     match response.payload {
@@ -1540,7 +1650,7 @@ async fn sse_infer_impl(
                     Event::default().data(event_data)
                 }
                 Some(pb::stream_response::Payload::Done(done)) => {
-                    prometheus::record_worker_metrics(&model_name, done.metrics.as_ref());
+                    prometheus::record_worker_metrics(&model_name, &resolved_version, done.metrics.as_ref());
                     Event::default().data("[DONE]")
                 }
                 _ => continue,
@@ -1736,7 +1846,7 @@ async fn handle_ws_stream(
                     Message::Text(event_data)
                 }
                 Some(pb::stream_response::Payload::Done(done)) => {
-                    prometheus::record_worker_metrics(&model_name, done.metrics.as_ref());
+                    prometheus::record_worker_metrics(&model_name, &resolved_version, done.metrics.as_ref());
                     Message::Text(json!({"done": true}).to_string())
                 }
                 _ => continue,
@@ -2074,24 +2184,35 @@ pub async fn timeline_handler() -> impl IntoResponse {
     Json(json!({ "snapshots": snapshots }))
 }
 
-#[derive(Deserialize)]
-pub struct TimelineQuery {
-    version: Option<String>,
-}
-
-pub async fn timeline_model_handler(
-    Path(model_name): Path<String>,
-    ApiQuery(query): ApiQuery<TimelineQuery>,
-) -> Result<Json<Value>, AppError> {
-    let version = query.version.unwrap_or_else(|| "1".to_string());
-    crate::validation::validate_identifier(&model_name)?;
-    crate::validation::validate_version(&version)?;
-    let entries = crate::metrics::aggregator::TIMELINE.get_timeline(&model_name, &version).await;
-    Ok(Json(json!({
+async fn timeline_json(model_name: &str, version: &str) -> Json<Value> {
+    let entries = crate::metrics::aggregator::TIMELINE.get_timeline(model_name, version).await;
+    Json(json!({
         "model": model_name,
         "version": version,
         "entries": entries,
-    })))
+    }))
+}
+
+/// Bare timeline = the active version (§4.4; the old default was the literal
+/// string "1" regardless of what is actually active).
+pub async fn timeline_model_handler(
+    State(state): State<Arc<AppState>>,
+    Path(model_name): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
+    let version = state.registry.get_active_version(&model_name).ok_or_else(|| {
+        AppError::ModelNotFound(format!("{} has no active version", model_name))
+    })?;
+    Ok(timeline_json(&model_name, &version).await)
+}
+
+/// Versioned timeline = the explicit version (§4.4).
+pub async fn timeline_model_version_handler(
+    Path((model_name, version)): Path<(String, String)>,
+) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
+    crate::validation::validate_version(&version)?;
+    Ok(timeline_json(&model_name, &version).await)
 }
 
 // ===== Alerts =====
@@ -2861,5 +2982,256 @@ mod version_routing_tests {
         assert_eq!(state.registry.get_active_version("m").as_deref(), Some("2"));
         assert_eq!(state.registry.get("m", Some("1")).unwrap().weight, 0);
         assert_eq!(state.registry.get("m", Some("2")).unwrap().weight, 100);
+    }
+
+    // ===== §4.4: bare vs versioned resolution =====
+
+    #[tokio::test]
+    async fn bare_unload_targets_active_not_weighted_pick() {
+        // Admin ops on the bare path always target the active version (§4.4
+        // decision) — never the routing pick, even at 100% weight.
+        let state = test_state();
+        register_ready(&state, "m", &["1", "2"]);
+        state
+            .registry
+            .set_weights("m", &HashMap::from([("2".into(), 100u32)]))
+            .unwrap();
+        state.registry.activate_version("m", "1").unwrap();
+
+        let app = Router::new()
+            .route(
+                "/v2/repository/models/:model_name/unload",
+                axum::routing::post(unload_model_handler),
+            )
+            .with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/repository/models/m/unload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(state.registry.get("m", Some("1")).is_none(), "active v1 must be unloaded");
+        assert!(state.registry.get("m", Some("2")).is_some(), "weighted v2 must be untouched");
+    }
+
+    #[tokio::test]
+    async fn versioned_unload_targets_explicit_version() {
+        let state = test_state();
+        register_ready(&state, "m", &["1", "2"]);
+        state.registry.activate_version("m", "1").unwrap();
+
+        let app = Router::new()
+            .route(
+                "/v2/repository/models/:model_name/versions/:version/unload",
+                axum::routing::post(unload_version_handler),
+            )
+            .with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/repository/models/m/versions/2/unload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(state.registry.get("m", Some("1")).is_some(), "active v1 untouched");
+        assert!(state.registry.get("m", Some("2")).is_none(), "explicit v2 unloaded");
+    }
+
+    #[tokio::test]
+    async fn bare_health_uses_routing_pick() {
+        // Traffic-facing bare endpoints resolve via routing (§4.3) — unlike
+        // admin ops.
+        let state = test_state();
+        register_ready(&state, "m", &["1", "2"]);
+        state
+            .registry
+            .set_weights("m", &HashMap::from([("2".into(), 100u32)]))
+            .unwrap();
+        state.registry.activate_version("m", "1").unwrap();
+
+        let app = Router::new()
+            .route("/v2/models/:model_name/health", axum::routing::get(model_health_handler))
+            .with_state(state.clone());
+        let resp = app
+            .oneshot(Request::builder().uri("/v2/models/m/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["version"], "2", "bare health must follow the routing pick");
+    }
+
+    #[tokio::test]
+    async fn versioned_ready_reports_explicit_version() {
+        let state = test_state();
+        register_ready(&state, "m", &["1", "2"]);
+        state.registry.activate_version("m", "2").unwrap();
+
+        let app = Router::new()
+            .route(
+                "/v2/models/:model_name/versions/:version/ready",
+                axum::routing::get(model_ready_version_handler),
+            )
+            .with_state(state.clone());
+        let resp = app
+            .oneshot(Request::builder().uri("/v2/models/m/versions/1/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["version"], "1");
+        assert_eq!(json["ready"], true);
+        assert_eq!(json["active_version"], "2");
+    }
+
+    #[tokio::test]
+    async fn bare_timeline_defaults_to_active_not_1() {
+        // The old default was the literal string "1" regardless of what is
+        // actually active (§4.0 bug list).
+        let state = test_state();
+        register_ready(&state, "m", &["2"]);
+        state.registry.activate_version("m", "2").unwrap();
+
+        let app = Router::new()
+            .route("/metrics/timeline/:model_name", axum::routing::get(timeline_model_handler))
+            .with_state(state.clone());
+        let resp = app
+            .oneshot(Request::builder().uri("/metrics/timeline/m").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["version"], "2", "bare timeline must default to the active version");
+    }
+
+    // ===== §4.5: multi-version health =====
+
+    #[tokio::test]
+    async fn versions_endpoint_returns_multi_version_overview() {
+        let state = test_state();
+        register_ready(&state, "m", &["1", "2"]);
+        state.registry.activate_version("m", "1").unwrap();
+        state
+            .registry
+            .set_weights("m", &HashMap::from([("1".into(), 90u32), ("2".into(), 10)]))
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/v2/models/:model_name/versions",
+                axum::routing::get(list_versions_handler),
+            )
+            .with_state(state.clone());
+        let resp = app
+            .oneshot(Request::builder().uri("/v2/models/m/versions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["name"], "m");
+        assert_eq!(json["active_version"], "1");
+        let versions = json["versions"].as_array().unwrap();
+        assert_eq!(versions.len(), 2);
+
+        let v1 = versions.iter().find(|v| v["version"] == "1").unwrap();
+        assert_eq!(v1["active"], true);
+        assert_eq!(v1["status"], "ready");
+        assert_eq!(v1["weight"], 90);
+        assert_eq!(v1["workers"]["total"], 0);
+        assert_eq!(v1["workers"]["ready"], 0);
+        assert!(v1["loaded_at"].as_u64().is_some(), "loaded_at must be epoch secs");
+
+        let v2 = versions.iter().find(|v| v["version"] == "2").unwrap();
+        assert_eq!(v2["active"], false);
+        assert_eq!(v2["weight"], 10);
+    }
+
+    #[tokio::test]
+    async fn server_health_groups_versions_by_model() {
+        // §4.5: /health nests per-version entries under their model with the
+        // active_version pointer.
+        let state = test_state();
+        register_ready(&state, "m", &["1", "2"]);
+        state.registry.activate_version("m", "2").unwrap();
+
+        let app = Router::new()
+            .route("/health", axum::routing::get(health_handler))
+            .with_state(state.clone());
+        let resp = app
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["status"], "ready");
+        let models = json["models"].as_array().unwrap();
+        assert_eq!(models.len(), 1, "one model groups both versions");
+        let m = &models[0];
+        assert_eq!(m["name"], "m");
+        assert_eq!(m["active_version"], "2");
+        let versions = m["versions"].as_array().unwrap();
+        assert_eq!(versions.len(), 2);
+        assert!(versions.iter().all(|v| v["status"] == "ready"));
+        assert!(versions.iter().all(|v| v["loaded_at"].as_u64().is_some()));
+        assert!(m.get("version").is_none(), "flat per-version fields must be gone");
+    }
+
+    #[tokio::test]
+    async fn versioned_options_uses_hit_version_cors_policy() {
+        // §4.4: a versioned route's OPTIONS preflight must answer with that
+        // version's CORS policy, not the active version's.
+        use crate::worker::protocol::{CorsPolicy, ModelPolicies};
+        let state = test_state();
+        register_ready(&state, "m", &["1", "2"]);
+        state.registry.activate_version("m", "1").unwrap();
+        let policies = |origin: &str| ModelPolicies {
+            cors: Some(CorsPolicy {
+                allow_origins: vec![origin.to_string()],
+                allow_methods: vec!["POST".to_string()],
+                allow_headers: vec!["content-type".to_string()],
+            }),
+            ..Default::default()
+        };
+        state.registry.set_policies("m", "1", Some(policies("https://v1.example")));
+        state.registry.set_policies("m", "2", Some(policies("https://v2.example")));
+
+        let app = Router::new()
+            .route(
+                "/v2/models/:model_name/versions/:version/infer",
+                axum::routing::post(infer_version_handler).options(inference_options_handler),
+            )
+            .with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/v2/models/m/versions/2/infer")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").unwrap(),
+            "https://v2.example",
+            "versioned OPTIONS must use the hit version's policy"
+        );
     }
 }

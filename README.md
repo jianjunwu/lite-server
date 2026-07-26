@@ -237,20 +237,25 @@ See [examples/README.md](examples/README.md) for learning path and usage details
 | GET | `/v2/models/{name}/stream` | WebSocket streaming |
 | GET | `/v2/models/{name}/versions/{v}/stream` | WebSocket streaming (specific version) |
 | GET | `/v2/models` | List loaded models |
-| GET | `/v2/models/{name}/versions` | List versions |
-| GET | `/v2/models/{name}/ready` | Readiness check |
-| GET | `/v2/models/{name}/health` | Per-worker health status |
+| GET | `/v2/models/{name}/versions` | Multi-version overview (status / active / weight / workers / loaded_at) |
+| GET | `/v2/models/{name}/ready` | Readiness check (active version) |
+| GET | `/v2/models/{name}/versions/{v}/ready` | Readiness check (specific version) |
+| GET | `/v2/models/{name}/health` | Per-worker health status (routed version) |
+| GET | `/v2/models/{name}/versions/{v}/health` | Per-worker health status (specific version) |
 | GET | `/v2/models/{name}/compare` | Compare model versions |
 | DELETE | `/v2/models/{name}/versions/{v}` | Delete model version |
-| POST | `/v2/repository/models/{name}/load` | Load model |
-| POST | `/v2/repository/models/{name}/unload` | Unload model |
+| POST | `/v2/repository/models/{name}/versions/{v}/load` | Load model version |
+| POST | `/v2/repository/models/{name}/unload` | Unload active version |
+| POST | `/v2/repository/models/{name}/versions/{v}/unload` | Unload specific version |
 | POST | `/v2/repository/index` | Index model repository |
 | POST | `/v2/repository/models/{name}/versions/{v}/upload` | Upload model files (.lma or raw) |
 | GET | `/v2/repository/models/{name}/versions/{v}/download` | Download model files |
 | GET | `/v2/repository/models/{name}/versions/{v}/files` | List version directory contents |
-| POST | `/v2/models/{name}/reload` | Hot reload |
-| POST | `/v2/models/{name}/versions/{v}/activate` | Activate version |
-| GET | `/health` | Health summary (JSON: per-version status, workers, loaded_at) |
+| POST | `/v2/models/{name}/reload` | Hot reload (active version) |
+| POST | `/v2/models/{name}/versions/{v}/reload` | Hot reload (specific version) |
+| POST | `/v2/models/{name}/versions/{v}/activate` | Activate version (hard cutover) |
+| PUT | `/v2/models/{name}/routing` | Set traffic weights atomically (`{"weights":{"v1":90,"v2":10}}`) |
+| GET | `/health` | Health summary (JSON: per-version status grouped by model) |
 | GET | `/livez` | Liveness probe (always 200) |
 | GET | `/readyz` | Readiness probe (503 until a model can serve) |
 | GET | `/startupz` | Startup probe (503 while models load) |

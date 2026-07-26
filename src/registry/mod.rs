@@ -400,6 +400,18 @@ impl ModelRegistry {
         mv.cors_headers.clone()
     }
 
+    /// CORS headers for a specific version (§4.4): versioned routes answer
+    /// OPTIONS with the hit version's policy, not the active one's.
+    pub fn cors_headers_for(
+        &self,
+        model_name: &str,
+        version: &str,
+    ) -> Option<Arc<axum::http::HeaderMap>> {
+        let model = self.models.get(model_name)?;
+        let mv = model.versions.get(version)?;
+        mv.cors_headers.clone()
+    }
+
     pub fn set_strategy(
         &self,
         model_name: &str,

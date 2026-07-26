@@ -371,7 +371,7 @@ async fn wait_model_ready(base: &str, model: &str, timeout_secs: u64) -> bool {
 async fn load_model(base: &str, model: &str, version: &str) {
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("{}/v2/repository/models/{}/load?version={}", base, model, version))
+        .post(format!("{}/v2/repository/models/{}/versions/{}/load", base, model, version))
         .send()
         .await
         .expect("load request failed");
@@ -387,7 +387,7 @@ async fn load_model(base: &str, model: &str, version: &str) {
 async fn unload_model(base: &str, model: &str, version: &str) {
     let client = reqwest::Client::new();
     let _ = client
-        .post(format!("{}/v2/repository/models/{}/unload?version={}", base, model, version))
+        .post(format!("{}/v2/repository/models/{}/versions/{}/unload", base, model, version))
         .send()
         .await;
 }
@@ -529,13 +529,16 @@ async fn test_health_probes() {
         .iter().filter_map(|m| m.as_str()).collect();
     assert!(models.contains(&MODEL), "readyz models: {:?}", models);
 
-    // /health: per-version status (snake_case serde) + loaded_at epoch secs
+    // /health: per-version status (snake_case serde) + loaded_at epoch secs,
+    // grouped under the model since §4.5.
     let resp = client.get(format!("{}/health", base)).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["status"], "ready");
     let entry = body["models"].as_array().unwrap().iter()
-        .find(|m| m["name"] == MODEL && m["version"] == "1")
+        .find(|m| m["name"] == MODEL)
+        .and_then(|m| m["versions"].as_array().unwrap().iter()
+            .find(|e| e["version"] == "1"))
         .expect("test_model/1 must appear in /health");
     assert_eq!(entry["status"], "ready");
     assert!(entry["loaded_at"].as_u64().is_some(),
@@ -1728,9 +1731,12 @@ class ReloadAPI(LitAPI):
     let base = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
 
+    // /health (§4.5): per-version entries nested under their model.
     let health_entry = |body: &Value, v: &str| {
         body["models"].as_array().unwrap().iter()
-            .find(|m| m["name"] == "reload_model" && m["version"] == v)
+            .find(|m| m["name"] == "reload_model")
+            .and_then(|m| m["versions"].as_array().unwrap().iter()
+                .find(|e| e["version"] == v))
             .cloned()
     };
     let get_health = || async {
@@ -1876,7 +1882,9 @@ class LruAPI(LitAPI):
     let health_versions = |body: &Value| -> Vec<String> {
         body["models"].as_array().unwrap().iter()
             .filter(|m| m["name"] == "lru_model")
-            .map(|m| m["version"].as_str().unwrap().to_string())
+            .flat_map(|m| m["versions"].as_array().unwrap().iter()
+                .map(|e| e["version"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>())
             .collect()
     };
 
@@ -2167,6 +2175,12 @@ async fn test_grpc_health_service() {
         .await.unwrap().into_inner();
     assert_eq!(resp.status(), ServingStatus::Serving);
 
+    // Per-version service "{model}/{version}" (§4.5).
+    let resp = client
+        .check(HealthCheckRequest { service: format!("{}/1", MODEL) })
+        .await.unwrap().into_inner();
+    assert_eq!(resp.status(), ServingStatus::Serving);
+
     // Unknown service → NotFound per the health-check spec.
     let err = client
         .check(HealthCheckRequest { service: "no_such_model".to_string() })
@@ -2179,6 +2193,11 @@ async fn test_grpc_health_service() {
     // service flips back to NOT_SERVING.
     let err = client
         .check(HealthCheckRequest { service: MODEL.to_string() })
+        .await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound);
+    // The per-version service is cleared too.
+    let err = client
+        .check(HealthCheckRequest { service: format!("{}/1", MODEL) })
         .await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::NotFound);
     let resp = client

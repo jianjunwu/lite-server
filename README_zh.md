@@ -235,20 +235,25 @@ lite-server init my_project           # 脚手架创建项目
 | GET | `/v2/models/{name}/stream` | WebSocket 流式 |
 | GET | `/v2/models/{name}/versions/{v}/stream` | WebSocket 流式（指定版本） |
 | GET | `/v2/models` | 列出已加载模型 |
-| GET | `/v2/models/{name}/versions` | 列出版本 |
-| GET | `/v2/models/{name}/ready` | 就绪检查 |
-| GET | `/v2/models/{name}/health` | 各 worker 健康状态 |
+| GET | `/v2/models/{name}/versions` | 多版本总览（状态 / 活跃 / 权重 / worker / loaded_at） |
+| GET | `/v2/models/{name}/ready` | 就绪检查（活跃版本） |
+| GET | `/v2/models/{name}/versions/{v}/ready` | 就绪检查（指定版本） |
+| GET | `/v2/models/{name}/health` | 各 worker 健康状态（路由选中版本） |
+| GET | `/v2/models/{name}/versions/{v}/health` | 各 worker 健康状态（指定版本） |
 | GET | `/v2/models/{name}/compare` | 比较模型版本 |
 | DELETE | `/v2/models/{name}/versions/{v}` | 删除模型版本 |
-| POST | `/v2/repository/models/{name}/load` | 加载模型 |
-| POST | `/v2/repository/models/{name}/unload` | 卸载模型 |
+| POST | `/v2/repository/models/{name}/versions/{v}/load` | 加载模型版本 |
+| POST | `/v2/repository/models/{name}/unload` | 卸载活跃版本 |
+| POST | `/v2/repository/models/{name}/versions/{v}/unload` | 卸载指定版本 |
 | POST | `/v2/repository/index` | 索引模型仓库 |
 | POST | `/v2/repository/models/{name}/versions/{v}/upload` | 上传模型文件（.lma 或原始文件） |
 | GET | `/v2/repository/models/{name}/versions/{v}/download` | 下载模型文件 |
 | GET | `/v2/repository/models/{name}/versions/{v}/files` | 列出版本目录文件 |
-| POST | `/v2/models/{name}/reload` | 热重载 |
-| POST | `/v2/models/{name}/versions/{v}/activate` | 激活版本 |
-| GET | `/health` | 健康检查 |
+| POST | `/v2/models/{name}/reload` | 热重载（活跃版本） |
+| POST | `/v2/models/{name}/versions/{v}/reload` | 热重载（指定版本） |
+| POST | `/v2/models/{name}/versions/{v}/activate` | 激活版本（硬切换） |
+| PUT | `/v2/models/{name}/routing` | 原子设置流量权重（`{"weights":{"v1":90,"v2":10}}`） |
+| GET | `/health` | 健康检查（按模型分组的 JSON） |
 | GET | `/info` | 服务器信息 |
 | GET | `/metrics` | Prometheus 指标 |
 | GET | `/metrics/timeline` | 历史指标时间线 |

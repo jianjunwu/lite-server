@@ -128,24 +128,26 @@ impl OutlierState {
         }
     }
 
-    /// Record an error — increment count and potentially eject.
-    pub fn record_error(&self, worker_idx: usize) {
+    /// Record an error — increment the consecutive error count, ejecting the
+    /// worker at the threshold. Returns `true` only when this call newly
+    /// ejects the worker, so callers can record the per-(model, version)
+    /// ejection metric exactly once (§4.6).
+    pub fn record_error(&self, worker_idx: usize) -> bool {
         let w = match self.workers.get(worker_idx) {
             Some(w) => w,
-            None => return,
+            None => return false,
         };
         let count = w.consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
-        if count >= self.consecutive_threshold {
-            self.maybe_eject(worker_idx);
-        }
+        count >= self.consecutive_threshold && self.maybe_eject(worker_idx)
     }
 
     /// Eject a worker if not already ejected and below max ejection percent.
-    fn maybe_eject(&self, worker_idx: usize) {
+    /// Returns `true` when this call performed the ejection.
+    fn maybe_eject(&self, worker_idx: usize) -> bool {
         let w = &self.workers[worker_idx];
         let mut guard = w.ejected.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_some() {
-            return; // already ejected
+            return false; // already ejected
         }
         // Count currently ejected workers (non-blocking, approximate is fine)
         let mut ejected_count = 0;
@@ -167,9 +169,10 @@ impl OutlierState {
             *guard = Some(EjectedWorker {
                 ejected_at: Instant::now(),
             });
-            prometheus::inc_worker_ejection();
             info!("Worker {} ejected after {} consecutive errors", worker_idx, self.consecutive_threshold);
+            return true;
         }
+        false
     }
 
     /// Check if a worker is currently ejected, recovering if ejection time has passed.
@@ -516,6 +519,7 @@ async fn do_send_batch(
     );
     inflight[worker_idx].fetch_add(1, Ordering::Relaxed);
     let zmq_client = &zmq_clients[worker_idx];
+    prometheus::observe_batch_size(model_name, version, batch_size);
 
     // Build protobuf request (Single if batch.len() == 1, else Batch)
     let request = if batch.len() == 1 {
@@ -542,10 +546,12 @@ async fn do_send_batch(
         }
     };
 
+    let send_start = Instant::now();
     let result = if request_timeout > Duration::ZERO {
         match tokio::time::timeout(request_timeout, zmq_client.send(request)).await {
             Ok(r) => r,
             Err(_) => {
+                prometheus::observe_inference_duration(model_name, version, send_start.elapsed().as_secs_f64());
                 error!("Request timeout ({:?}) for {} {}", request_timeout, model_name, version);
                 for queue_item in batch.drain(..) {
                     let _ = queue_item.response_tx.send(pb::Response {
@@ -564,17 +570,20 @@ async fn do_send_batch(
                     });
                 }
                 inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
-                outlier.record_error(worker_idx);
+                if outlier.record_error(worker_idx) {
+                    prometheus::inc_worker_ejection(model_name, version);
+                }
                 return Err(());
             }
         }
     } else {
         zmq_client.send(request).await
     };
+    prometheus::observe_inference_duration(model_name, version, send_start.elapsed().as_secs_f64());
 
     match result {
         Ok(resp) => {
-            crate::metrics::prometheus::record_worker_metrics(model_name, resp.metrics.as_ref());
+            crate::metrics::prometheus::record_worker_metrics(model_name, version, resp.metrics.as_ref());
             match resp.payload {
                 Some(pb::response::Payload::Batch(batch_resp)) => {
                     let resp_map: std::collections::HashMap<String, pb::BatchItemResponse> =
@@ -609,7 +618,9 @@ async fn do_send_batch(
                         debug!(model = %model_name, version = %version, worker_idx = worker_idx, "batch ok");
                         Ok(())
                     } else {
-                        outlier.record_error(worker_idx);
+                        if outlier.record_error(worker_idx) {
+                    prometheus::inc_worker_ejection(model_name, version);
+                }
                         Err(())
                     }
                 }
@@ -624,7 +635,9 @@ async fn do_send_batch(
                     }
                     inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
                     if is_error {
-                        outlier.record_error(worker_idx);
+                        if outlier.record_error(worker_idx) {
+                    prometheus::inc_worker_ejection(model_name, version);
+                }
                         Err(())
                     } else {
                         outlier.record_success(worker_idx);
@@ -651,7 +664,9 @@ async fn do_send_batch(
                         });
                     }
                     inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
-                    outlier.record_error(worker_idx);
+                    if outlier.record_error(worker_idx) {
+                    prometheus::inc_worker_ejection(model_name, version);
+                }
                     Err(())
                 }
             }
@@ -678,7 +693,9 @@ async fn do_send_batch(
                 });
             }
             inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
-            outlier.record_error(worker_idx);
+            if outlier.record_error(worker_idx) {
+                prometheus::inc_worker_ejection(model_name, version);
+            }
             Err(())
         }
     }
@@ -971,7 +988,9 @@ async fn health_checker(
                             _ => None,
                         }).map(|s| s.code.as_str()) == Some("Error");
                         if is_error {
-                            outlier.record_error(idx);
+                            if outlier.record_error(idx) {
+                                prometheus::inc_worker_ejection(&model_name, &version);
+                            }
                             prometheus::inc_health_check(&model_name, &version, "error");
                         } else {
                             outlier.record_success(idx);
@@ -985,7 +1004,9 @@ async fn health_checker(
                         }
                     }
                     Ok(Err(_)) | Err(_) => {
-                        outlier.record_error(idx);
+                        if outlier.record_error(idx) {
+                            prometheus::inc_worker_ejection(&model_name, &version);
+                        }
                         prometheus::inc_health_check(&model_name, &version, "error");
                         if !was_ejected && outlier.is_ejected(idx) {
                             warn!(model = %model_name, version = %version, worker_idx = idx, "worker ejected");
@@ -1602,6 +1623,17 @@ mod tests {
         // At threshold — ejected
         outlier.record_error(0);
         assert!(outlier.is_ejected(0));
+    }
+
+    #[tokio::test]
+    async fn test_record_error_returns_true_only_on_new_ejection() {
+        // Callers use the return value to record the per-(model, version)
+        // ejection metric exactly once per ejection (§4.6).
+        let outlier = OutlierState::new(1);
+        assert!(!outlier.record_error(0), "below threshold");
+        assert!(!outlier.record_error(0), "below threshold");
+        assert!(outlier.record_error(0), "third consecutive error ejects");
+        assert!(!outlier.record_error(0), "already ejected — not a new ejection");
     }
 
     #[tokio::test]

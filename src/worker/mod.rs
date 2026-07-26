@@ -1706,26 +1706,42 @@ async fn sync_grpc_health(registry: &ModelRegistry, handle: &GrpcHealthHandle) {
     state.reporter.set_service_status("", overall).await;
 
     let mut current: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for name in status.entries.iter().map(|e| e.name.clone()) {
-        if !current.insert(name.clone()) {
+    let mut seen_models: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in &status.entries {
+        // Per-version service "{model}/{version}" (§4.5).
+        let version_svc = format!("{}/{}", e.name, e.version);
+        let version_status = if matches!(e.status, VersionStatus::Ready | VersionStatus::Degraded) {
+            ServingStatus::Serving
+        } else {
+            ServingStatus::NotServing
+        };
+        state
+            .reporter
+            .set_service_status(version_svc.clone(), version_status)
+            .await;
+        current.insert(version_svc);
+
+        // Per-model service "{model}": follows the active version.
+        if !seen_models.insert(e.name.clone()) {
             continue; // already pushed this model
         }
         let serving = registry
-            .get_active_version(&name)
+            .get_active_version(&e.name)
             .and_then(|v| {
                 status
                     .entries
                     .iter()
-                    .find(|e| e.name == name && e.version == v)
+                    .find(|e2| e2.name == e.name && e2.version == v)
             })
-            .map(|e| matches!(e.status, VersionStatus::Ready | VersionStatus::Degraded))
+            .map(|e2| matches!(e2.status, VersionStatus::Ready | VersionStatus::Degraded))
             .unwrap_or(false);
         let svc_status = if serving {
             ServingStatus::Serving
         } else {
             ServingStatus::NotServing
         };
-        state.reporter.set_service_status(name, svc_status).await;
+        state.reporter.set_service_status(e.name.clone(), svc_status).await;
+        current.insert(e.name.clone());
     }
 
     let stale: Vec<String> = state
