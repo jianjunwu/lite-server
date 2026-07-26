@@ -422,58 +422,64 @@ async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.
     pending_tasks: dict[str, asyncio.Task] = {}
     active_streams: dict[str, asyncio.Task] = {}
 
-    while True:
-        try:
-            req_bytes = await socket.recv()
-        except zmq.ZMQError as e:
-            if e.errno == zmq.ETERM:
-                break
-            continue
-
-        try:
-            request = Request()
-            request.ParseFromString(req_bytes)
-        except Exception as e:
-            await socket.send(_make_error_response("", f"Protobuf parse: {e}").SerializeToString())
-            continue
-
-        if request.HasField("stream"):
-            stream_id = request.stream.stream_id
-            action = request.stream.WhichOneof("action")
-            # All stream actions are handled inline: bidi chunk/close
-            # ordering is protocol-significant (each chunk expects its ack
-            # in order), and open must register the session before the next
-            # message arrives.  Uni-directional consumption still runs in
-            # its own task, created by the open handler.
+    cancelled = False
+    try:
+        while True:
             try:
-                await _handle_stream_async(lit_api, request, socket, active_streams, log)
-            except Exception as e:
-                log.error("stream %s action %s failed: %s", stream_id, action, _format_exc_brief(e))
-            if action == "open":
-                # Track the consume task for exception retrieval / shutdown
-                entry = active_streams.get(stream_id)
-                if isinstance(entry, asyncio.Task):
-                    pending_tasks[f"stream-consume-{stream_id}"] = entry
-        else:
-            task = asyncio.create_task(
-                _handle_request_async(lit_api, request, socket, log)
-            )
-            pending_tasks[request.uid] = task
-
-        # Clean up completed tasks and retrieve exceptions to avoid warnings
-        done = [uid for uid, t in pending_tasks.items() if t.done()]
-        for uid in done:
-            t = pending_tasks.pop(uid)
-            # Also clean up active_streams if this was a stream task
-            for sid, stream_task in list(active_streams.items()):
-                if stream_task is t:
-                    active_streams.pop(sid, None)
+                req_bytes = await socket.recv()
+            except zmq.ZMQError as e:
+                if e.errno == zmq.ETERM:
                     break
-            if t.cancelled():
-                continue  # t.exception() raises CancelledError on cancelled tasks
-            exc = t.exception()
-            if exc is not None:
-                log.error("async task %s failed: %s", uid, exc)
+                continue
+
+            try:
+                request = Request()
+                request.ParseFromString(req_bytes)
+            except Exception as e:
+                await socket.send(_make_error_response("", f"Protobuf parse: {e}").SerializeToString())
+                continue
+
+            if request.HasField("stream"):
+                stream_id = request.stream.stream_id
+                action = request.stream.WhichOneof("action")
+                # All stream actions are handled inline: bidi chunk/close
+                # ordering is protocol-significant (each chunk expects its ack
+                # in order), and open must register the session before the next
+                # message arrives.  Uni-directional consumption still runs in
+                # its own task, created by the open handler.
+                try:
+                    await _handle_stream_async(lit_api, request, socket, active_streams, log)
+                except Exception as e:
+                    log.error("stream %s action %s failed: %s", stream_id, action, _format_exc_brief(e))
+                if action == "open":
+                    # Track the consume task for exception retrieval / shutdown
+                    entry = active_streams.get(stream_id)
+                    if isinstance(entry, asyncio.Task):
+                        pending_tasks[f"stream-consume-{stream_id}"] = entry
+            else:
+                task = asyncio.create_task(
+                    _handle_request_async(lit_api, request, socket, log)
+                )
+                pending_tasks[request.uid] = task
+
+            # Clean up completed tasks and retrieve exceptions to avoid warnings
+            done = [uid for uid, t in pending_tasks.items() if t.done()]
+            for uid in done:
+                t = pending_tasks.pop(uid)
+                # Also clean up active_streams if this was a stream task
+                for sid, stream_task in list(active_streams.items()):
+                    if stream_task is t:
+                        active_streams.pop(sid, None)
+                        break
+                if t.cancelled():
+                    continue  # t.exception() raises CancelledError on cancelled tasks
+                exc = t.exception()
+                if exc is not None:
+                    log.error("async task %s failed: %s", uid, exc)
+    except asyncio.CancelledError:
+        # Task cancelled (e.g. asyncio.run SIGINT shutdown): fall through to
+        # the shutdown cleanup below instead of skipping it, then re-raise.
+        cancelled = True
 
     # Cancel any pending tasks on shutdown
     for uid, t in list(pending_tasks.items()):
@@ -490,6 +496,9 @@ async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.
         if isinstance(entry, _BidiSession):
             await _close_bidi_quietly(entry.on_close, entry.ctx, sid, log)
             active_streams.pop(sid, None)
+
+    if cancelled:
+        raise asyncio.CancelledError()
 
 
 async def _handle_route_call(

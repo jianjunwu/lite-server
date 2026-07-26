@@ -82,11 +82,22 @@ class SyncMockSocket:
         self._incoming.append(data)
 
 
-def drive_loop(model, socket, delay=0.05):
-    """Run run_async_loop briefly: start → settle → cancel."""
+def drive_loop(model, socket, delay=0.05, timeout=5.0):
+    """Run run_async_loop briefly: start → drain injected messages → cancel.
+
+    Waits until the socket's injected queue is consumed (deadline-bounded)
+    before the final settle delay, instead of relying on a fixed wall-clock
+    sleep alone — a bare fixed delay races under xdist CPU contention and
+    flakes (loop cancelled before all messages were processed).
+    """
 
     async def runner():
         task = asyncio.create_task(inference.run_async_loop(model, socket, "test", log))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while socket._incoming and loop.time() < deadline:
+            await asyncio.sleep(0.001)
+        # Settle: let in-flight handler tasks (created per request) finish.
         await asyncio.sleep(delay)
         task.cancel()
         try:
@@ -2600,6 +2611,58 @@ class TestBidiStreamingAsyncLoop:
 
         assert handler is not None
         assert handler.closed is True
+
+    def test_bidi_session_closed_on_loop_cancellation(self):
+        """A bidi session still open when the loop task is cancelled must
+        receive on_close — shutdown cleanup runs on CancelledError too,
+        not only on the ETERM break path (asyncio.run's SIGINT shutdown
+        cancels the main task)."""
+
+        class TrackHandler(BidiStreamHandler):
+            def __init__(self):
+                self.closed = False
+
+            def on_open(self, initial_data):
+                return None
+
+            def on_close(self):
+                self.closed = True
+
+        class TrackModel(LitAPI):
+            async def predict(self, x):
+                return x
+
+            def bidi_stream(self):
+                return TrackHandler()
+
+        socket = AsyncMockSocket()
+        model = TrackModel()
+        handler = None
+
+        original_bidi_stream = model.bidi_stream
+
+        def capture_bidi_stream():
+            nonlocal handler
+            handler = original_bidi_stream()
+            return handler
+
+        model.bidi_stream = capture_bidi_stream
+        model._pipeline = Pipeline.build(model, [])
+
+        # Only an open — the session is still active when drive_loop
+        # cancels the loop task.
+        socket.inject(Request(
+            uid="cl1",
+            stream=StreamRequest(stream_id="cls1", open=StreamOpen(data=b"{}")),
+        ).SerializeToString())
+        drive_loop(model, socket)
+
+        assert handler is not None
+        assert handler.closed is True, (
+            "on_close must run when the loop task is cancelled with an "
+            "active bidi session (shutdown cleanup was unreachable on "
+            "CancelledError)"
+        )
 
     def test_bidi_error_in_on_open(self):
         class BadOpenHandler(BidiStreamHandler):
