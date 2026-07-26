@@ -145,7 +145,7 @@ Rust 内核处理所有 I/O（HTTP、gRPC、IPC、指标、文件监听），Pyt
 - **装饰器路由** — 在 `LitAPI` 方法上用 `@route.get("/status")` 声明，挂在 `/v2/models/<model>/<tail>` 下
 - **与推理同通道** — 路由 handler 运行在模型 worker 内，无独立进程
 - **服务器上下文访问** — handler 中可使用 `ctx.server.registry` 和跨模型 `ctx.server.inference.infer()`
-- **回调链** — 模型级回调（认证、限流、CORS、日志）同时覆盖推理和自定义路由
+- **回调链** — 模型级回调（认证、限流、CORS、日志）同时覆盖推理和自定义路由（Rust 侧限流/CORS 中间件暂未覆盖自定义路由）
 
 ### Worker 韧性
 
