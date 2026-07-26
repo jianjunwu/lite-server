@@ -8,6 +8,14 @@ from pathlib import Path
 from typing import Any
 
 
+def _num(value: Any, default: float = 0.0) -> float:
+    """Coerce value to float, falling back to default for None/non-numeric."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class ReportGenerator:
     """Generate human-readable reports from analysis results."""
 
@@ -57,13 +65,13 @@ class ReportGenerator:
                 lines.append(f"- **Total requests:** {benchmark.get('total_requests', 0)}\n")
                 lines.append(f"- **Successful:** {benchmark.get('successful', 0)}\n")
                 lines.append(f"- **Failed:** {benchmark.get('failed', 0)}\n")
-                lines.append(f"- **Throughput:** {benchmark.get('throughput', 0):.2f} req/s\n")
+                lines.append(f"- **Throughput:** {_num(benchmark.get('throughput')):.2f} req/s\n")
                 lat = benchmark.get("latency_ms", {})
                 if lat:
-                    lines.append(f"- **Latency (ms):** mean={lat.get('mean', 0):.2f}, "
-                                 f"p50={lat.get('p50', 0):.2f}, "
-                                 f"p90={lat.get('p90', 0):.2f}, "
-                                 f"p99={lat.get('p99', 0):.2f}\n")
+                    lines.append(f"- **Latency (ms):** mean={_num(lat.get('mean')):.2f}, "
+                                 f"p50={_num(lat.get('p50')):.2f}, "
+                                 f"p90={_num(lat.get('p90')):.2f}, "
+                                 f"p99={_num(lat.get('p99')):.2f}\n")
 
         # Recommendations
         recommendations = report.get("recommendations", [])
@@ -98,7 +106,7 @@ class ReportGenerator:
         benchmark = report.get("benchmark")
         if benchmark and isinstance(benchmark, dict):
             lines.append(f"  Benchmark: {benchmark.get('total_requests', 0)} requests, "
-                         f"{benchmark.get('throughput', 0):.1f} req/s")
+                         f"{_num(benchmark.get('throughput')):.1f} req/s")
 
         recommendations = report.get("recommendations", [])
         if recommendations:
@@ -114,7 +122,8 @@ class ReportGenerator:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         model = report.get("model", "unknown")
-        base = output_dir / f"{model}_analysis"
+        safe_model = str(model).replace("/", "-").replace("\\", "-")
+        base = output_dir / f"{safe_model}_analysis"
 
         json_path = base.with_suffix(".json")
         json_path.write_text(ReportGenerator.to_json(report), encoding="utf-8")

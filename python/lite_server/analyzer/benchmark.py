@@ -71,7 +71,7 @@ class BenchmarkResult:
                 "min": round(self.min_latency, 2),
                 "max": round(self.max_latency, 2),
             },
-            "errors": self.errors[:5],  # cap error list
+            "errors": self.errors,
         }
 
 
@@ -101,6 +101,8 @@ class BenchmarkEngine:
         """
         if duration is None and total_requests is None:
             raise ValueError("Either duration or total_requests must be provided")
+        if concurrency < 1:
+            raise ValueError(f"concurrency must be >= 1, got {concurrency}")
 
         result = BenchmarkResult()
 
@@ -148,8 +150,7 @@ class BenchmarkEngine:
                     result.successful += 1
                 except Exception as e:
                     result.failed += 1
-                    if len(result.errors) < 5:
-                        result.errors.append(str(e))
+                    result.errors.append(str(e))
                 result.total_requests += 1
 
         tasks = []
@@ -190,8 +191,7 @@ class BenchmarkEngine:
                     result.successful += 1
                 except Exception as e:
                     result.failed += 1
-                    if len(result.errors) < 5:
-                        result.errors.append(str(e))
+                    result.errors.append(str(e))
                 result.total_requests += 1
 
         tasks = [asyncio.create_task(_send()) for _ in range(total_requests)]

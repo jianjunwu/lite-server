@@ -20,6 +20,8 @@ class StaticAnalyzer:
 
     def analyze_model(self, model_name: str) -> dict[str, Any]:
         """Return a dict with static analysis results for a model."""
+        if "/" in model_name or "\\" in model_name or model_name in (".", ".."):
+            raise ValueError(f"Invalid model name: {model_name!r}")
         model_dir = self.repo_path / model_name
         result: dict[str, Any] = {
             "model_name": model_name,
@@ -62,7 +64,11 @@ class StaticAnalyzer:
             result["has_config"] = True
             try:
                 with open(config_path, "r", encoding="utf-8") as f:
-                    result["config"] = yaml.safe_load(f) or {}
+                    config = yaml.safe_load(f)
+                if not isinstance(config, dict):
+                    result["warnings"].append("config.yaml is not a mapping, ignoring")
+                    config = {}
+                result["config"] = config
             except Exception as e:
                 result["warnings"].append(f"config.yaml parse error: {e}")
 
@@ -149,9 +155,7 @@ class StaticAnalyzer:
 
     def list_models(self) -> list[str]:
         """Return list of model names in the repository."""
-        if not (self.repo_path / "model_repo").exists():
-            return []
         return sorted([
-            d.name for d in (self.repo_path / "model_repo").iterdir()
-            if d.is_dir()
+            d.name for d in self.repo_path.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
         ])
