@@ -223,7 +223,7 @@ pub fn record_request_start(_model: &str, _version: &str) {
     // Kept for backward compat during transition
 }
 
-pub async fn record_request_end(model: &str, version: &str, status: &str, duration_secs: f64) {
+pub fn record_request_end(model: &str, version: &str, status: &str, duration_secs: f64) {
     REQUESTS_TOTAL.with_label_values(&[model, version, status]).inc();
     REQUEST_DURATION.with_label_values(&[model, version]).observe(duration_secs);
     super::aggregator::TIMELINE.record_latency(model, version, duration_secs);
@@ -330,7 +330,7 @@ pub fn observe_batch_size(model: &str, version: &str, size: usize) {
 pub fn record_worker_metrics(model: &str, version: &str, metrics: Option<&crate::proto::liteserver::Metrics>) {
     if let Some(m) = metrics {
         if m.prefill_ms > 0.0 {
-            let mut guard = CUSTOM_GAUGES.lock().unwrap();
+            let mut guard = CUSTOM_GAUGES.lock().unwrap_or_else(|e| e.into_inner());
             let gauge = guard.entry("prefill_ms".to_string()).or_insert_with(|| {
                 let g = GaugeVec::new(
                     prometheus::Opts::new("lite_server_prefill_ms", "Prefill latency in ms"),
@@ -342,7 +342,7 @@ pub fn record_worker_metrics(model: &str, version: &str, metrics: Option<&crate:
             gauge.with_label_values(&[model, version]).set(m.prefill_ms as f64);
         }
         if m.decode_ms > 0.0 {
-            let mut guard = CUSTOM_GAUGES.lock().unwrap();
+            let mut guard = CUSTOM_GAUGES.lock().unwrap_or_else(|e| e.into_inner());
             let gauge = guard.entry("decode_ms".to_string()).or_insert_with(|| {
                 let g = GaugeVec::new(
                     prometheus::Opts::new("lite_server_decode_ms", "Decode latency in ms"),
@@ -354,7 +354,7 @@ pub fn record_worker_metrics(model: &str, version: &str, metrics: Option<&crate:
             gauge.with_label_values(&[model, version]).set(m.decode_ms as f64);
         }
         if m.tokens_generated > 0 {
-            let mut guard = CUSTOM_COUNTERS.lock().unwrap();
+            let mut guard = CUSTOM_COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
             let counter = guard.entry("tokens_generated".to_string()).or_insert_with(|| {
                 let c = CounterVec::new(
                     prometheus::Opts::new("lite_server_tokens_generated_total", "Total tokens generated"),
@@ -443,7 +443,7 @@ pub fn record_custom_metrics(
     histograms: &[crate::proto::liteserver::MetricValue],
 ) {
     if !gauges.is_empty() {
-        let guard = CUSTOM_GAUGE_OBJECTS.lock().unwrap();
+        let guard = CUSTOM_GAUGE_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
         for mv in gauges {
             if let Some(g) = guard.get(mv.id as usize) {
                 g.with_label_values(&[model, version]).set(mv.value as f64);
@@ -451,7 +451,7 @@ pub fn record_custom_metrics(
         }
     }
     if !counters.is_empty() {
-        let guard = CUSTOM_COUNTER_OBJECTS.lock().unwrap();
+        let guard = CUSTOM_COUNTER_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
         for mv in counters {
             if let Some(c) = guard.get(mv.id as usize) {
                 c.with_label_values(&[model, version]).inc_by(mv.value as f64);
@@ -459,7 +459,7 @@ pub fn record_custom_metrics(
         }
     }
     if !histograms.is_empty() {
-        let guard = CUSTOM_HISTOGRAM_OBJECTS.lock().unwrap();
+        let guard = CUSTOM_HISTOGRAM_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
         for mv in histograms {
             if let Some(h) = guard.get(mv.id as usize) {
                 h.with_label_values(&[model, version]).observe(mv.value as f64);
@@ -691,5 +691,118 @@ mod tests {
         dec_queue_depth(model, version); // -1 (extra dec, e.g. from retry)
         let value = QUEUE_DEPTH.with_label_values(&[model, version]).get();
         assert!(value < 0.0, "extra dec should produce negative value, got {}", value);
+    }
+
+    // ===== Audit: B3 — mutex poisoning in record_worker_metrics =====
+
+    /// `record_worker_metrics` recovers from a poisoned `CUSTOM_GAUGES` mutex
+    /// via `unwrap_or_else(|e| e.into_inner())`, consistent with other
+    /// subsystems (OutlierState, SizeRotatingAppender).
+    ///
+    /// Marked `#[ignore]` because poisoning global `lazy_static!` mutexes
+    /// permanently corrupts the static and breaks subsequent tests.
+    #[test]
+    #[ignore = "run explicitly: poisons global static, breaks subsequent tests"]
+    fn test_record_worker_metrics_survives_mutex_poison() {
+        use crate::proto::liteserver::Metrics;
+
+        // Poison the CUSTOM_GAUGES mutex
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = CUSTOM_GAUGES.lock().unwrap();
+            panic!("intentional poison");
+        }));
+
+        let metrics = Metrics {
+            prefill_ms: 10.0,
+            decode_ms: 0.0,
+            tokens_generated: 0,
+            gauges: vec![],
+            counters: vec![],
+            histograms: vec![],
+        };
+
+        // Must NOT panic — the poisoned lock is recovered via into_inner().
+        record_worker_metrics("poison_m", "1", Some(&metrics));
+    }
+
+    // ===== Audit: B1 — worker metrics recorded exactly once per request =====
+
+    /// Regression test for the double-recording defect: `record_worker_metrics`
+    /// used to be called from **two** call sites for every non-streaming
+    /// inference request (`inference_queue::do_send_batch` and
+    /// `http::handlers::infer_handler`), counting `tokens_generated` and all
+    /// custom metrics 2×.  The `do_send_batch` call site has been removed;
+    /// the HTTP handler is now the sole recording point.
+    ///
+    /// This test pins the single-call semantics: one call records 1× the value.
+    #[test]
+    fn test_record_worker_metrics_single_call_counts_once() {
+        use crate::proto::liteserver::Metrics;
+
+        let metrics = Metrics {
+            prefill_ms: 0.0,
+            decode_ms: 0.0,
+            tokens_generated: 50,
+            gauges: vec![],
+            counters: vec![],
+            histograms: vec![],
+        };
+
+        let model = "b1_single_m";
+        let version = "1";
+        let before = CUSTOM_COUNTERS.lock().unwrap_or_else(|e| e.into_inner())
+            .get("tokens_generated")
+            .map(|c| c.with_label_values(&[model, version]).get())
+            .unwrap_or(0.0);
+
+        record_worker_metrics(model, version, Some(&metrics));
+
+        let after = CUSTOM_COUNTERS.lock().unwrap_or_else(|e| e.into_inner())
+            .get("tokens_generated")
+            .map(|c| c.with_label_values(&[model, version]).get())
+            .unwrap_or(0.0);
+
+        let delta = after - before;
+        assert_eq!(delta, 50.0,
+            "single call should record 1x tokens_generated, got {}", delta);
+    }
+
+    // ===== Audit: B4 — record_request_end is a plain synchronous fn =====
+
+    /// `record_request_end` performs only synchronous operations
+    /// (`REQUESTS_TOTAL.inc()`, `REQUEST_DURATION.observe()`, and
+    /// `TIMELINE.record_latency()`), so it is a plain `fn` — no async
+    /// runtime required.
+    #[test]
+    fn test_record_request_end_is_sync_not_async() {
+        // Direct call from a sync test context: this only compiles and runs
+        // because record_request_end is not async.
+        record_request_end("b4_model", "1", "2xx", 0.05);
+        assert!(REQUESTS_TOTAL.with_label_values(&["b4_model", "1", "2xx"]).get() >= 1.0);
+    }
+
+    /// `record_custom_metrics` recovers from poisoned `CUSTOM_*_OBJECTS`
+    /// mutexes the same way as `record_worker_metrics`.
+    /// Marked `#[ignore]` for the same reason as above.
+    #[test]
+    #[ignore = "run explicitly: poisons global static, breaks subsequent tests"]
+    fn test_record_custom_metrics_survives_mutex_poison() {
+        use crate::proto::liteserver::MetricValue;
+
+        // Register so the vec is non-empty, forcing the locked path
+        register_custom_metrics(&[("poison_cm", "gauge")]);
+        let index = CUSTOM_METRIC_INDEX.lock().unwrap();
+        let gauge_id = index.get("poison_cm:gauge").unwrap().1;
+        drop(index);
+
+        // Poison the CUSTOM_GAUGE_OBJECTS mutex
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = CUSTOM_GAUGE_OBJECTS.lock().unwrap();
+            panic!("intentional poison");
+        }));
+
+        let gauges = vec![MetricValue { id: gauge_id as i32, value: 42.0 }];
+        // Must NOT panic — the poisoned lock is recovered via into_inner().
+        record_custom_metrics("poison_cm_m", "1", &gauges, &[], &[]);
     }
 }

@@ -583,7 +583,9 @@ async fn do_send_batch(
 
     match result {
         Ok(resp) => {
-            crate::metrics::prometheus::record_worker_metrics(model_name, version, resp.metrics.as_ref());
+            // Worker metrics are recorded once per logical request by the HTTP
+            // handler (handlers.rs infer_handler / stream Done frames) — do NOT
+            // record here, or every metric would be double-counted.
             match resp.payload {
                 Some(pb::response::Payload::Batch(batch_resp)) => {
                     let resp_map: std::collections::HashMap<String, pb::BatchItemResponse> =

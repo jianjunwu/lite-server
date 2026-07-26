@@ -156,8 +156,12 @@ impl TimelineAggregator {
     }
 
     async fn compute_qps(&self, key: &str, model: &str, version: &str, now: f64) -> f64 {
-        // Sum all success + error request counts
+        // Sum request counts across all status families — status_family()
+        // (handlers.rs) labels 2xx/3xx/4xx/5xx, and 3xx/4xx requests are real
+        // throughput that must count toward QPS.
         let current_count = read_counter(&super::prometheus::REQUESTS_TOTAL, &[model, version, "2xx"])
+            + read_counter(&super::prometheus::REQUESTS_TOTAL, &[model, version, "3xx"])
+            + read_counter(&super::prometheus::REQUESTS_TOTAL, &[model, version, "4xx"])
             + read_counter(&super::prometheus::REQUESTS_TOTAL, &[model, version, "5xx"]);
 
         let mut last_counts = self.last_counts.lock().await;
@@ -512,5 +516,37 @@ mod tests {
         let snapshots = agg.all_snapshots().await;
         // Data map is empty because sample() hasn't been called — only latency_samples has data
         assert!(snapshots.is_empty());
+    }
+
+    // ===== Audit: B2 — QPS counts all status families =====
+
+    /// `compute_qps` must sum `REQUESTS_TOTAL` across all four status
+    /// families produced by `status_family` (handlers.rs): 2xx/3xx/4xx/5xx.
+    /// Regression test for the defect where only 2xx + 5xx were counted,
+    /// undercounting throughput by the 3xx/4xx rate.
+    #[tokio::test]
+    async fn test_qps_counts_all_status_families() {
+        use crate::metrics::prometheus;
+
+        // Ensure counters are registered
+        let _ = prometheus::register_metrics();
+
+        let agg = TimelineAggregator::new();
+        let model = "b2_qps_all";
+        let version = "1";
+        let key = "b2_qps_all_1";
+
+        // Seed last_counts / last_check at t=100.0 (delta is zero)
+        let qps0 = agg.compute_qps(key, model, version, 100.0).await;
+        assert_eq!(qps0, 0.0);
+
+        prometheus::REQUESTS_TOTAL.with_label_values(&[model, version, "2xx"]).inc_by(100.0);
+        prometheus::REQUESTS_TOTAL.with_label_values(&[model, version, "3xx"]).inc_by(5.0);
+        prometheus::REQUESTS_TOTAL.with_label_values(&[model, version, "4xx"]).inc_by(20.0);
+        prometheus::REQUESTS_TOTAL.with_label_values(&[model, version, "5xx"]).inc_by(10.0);
+
+        // 135 requests over 1 second — 3xx/4xx included
+        let qps = agg.compute_qps(key, model, version, 101.0).await;
+        assert_eq!(qps, 135.0, "QPS must count 3xx/4xx requests, got {}", qps);
     }
 }

@@ -962,12 +962,12 @@ async fn do_infer(
         Ok(Ok(resp)) => resp,
         Ok(Err(_)) => {
             error!(timeout_secs = %timeout_duration.as_secs(), "Response channel closed");
-            prometheus::record_request_end(&model_name, &resolved_version, "5xx", start.elapsed().as_secs_f64()).await;
+            prometheus::record_request_end(&model_name, &resolved_version, "5xx", start.elapsed().as_secs_f64());
             return Err(AppError::InferenceTimeout("response channel closed".to_string()));
         }
         Err(_) => {
             error!(timeout_secs = %timeout_duration.as_secs(), elapsed_ms = %start.elapsed().as_millis(), "Inference request timed out");
-            prometheus::record_request_end(&model_name, &resolved_version, "5xx", start.elapsed().as_secs_f64()).await;
+            prometheus::record_request_end(&model_name, &resolved_version, "5xx", start.elapsed().as_secs_f64());
             return Err(AppError::InferenceTimeout("request timeout".to_string()));
         }
     };
@@ -986,7 +986,7 @@ async fn do_infer(
             let code = single.status.as_ref().map(|s| s.code.as_str()).unwrap_or("Ok");
             match code {
                 "Ok" => {
-                    prometheus::record_request_end(&model_name, &resolved_version, status_family(single.status_code), duration).await;
+                    prometheus::record_request_end(&model_name, &resolved_version, status_family(single.status_code), duration);
                     // Fire InferenceResponse callback
                     let resp_ctx = crate::callback::InferenceContext {
                         elapsed_us: Some((duration * 1_000_000.0) as u64),
@@ -1046,7 +1046,7 @@ async fn do_infer(
                             4 => "4xx",
                             _ => "5xx",
                         };
-                        prometheus::record_request_end(&model_name, &resolved_version, status_family, duration).await;
+                        prometheus::record_request_end(&model_name, &resolved_version, status_family, duration);
                         return Err(AppError::ModelError(Box::new(
                             crate::error::ModelErrorData {
                                 status_code: http_status,
@@ -1065,11 +1065,11 @@ async fn do_infer(
 
                     // Not a numeric status code — internal worker error, sanitize.
                     error!(worker_error = %msg, duration_ms = %(duration * 1000.0) as u64, "Worker returned error");
-                    prometheus::record_request_end(&model_name, &resolved_version, "5xx", duration).await;
+                    prometheus::record_request_end(&model_name, &resolved_version, "5xx", duration);
                     Err(AppError::WorkerCrashed(msg))
                 }
                 _ => {
-                    prometheus::record_request_end(&model_name, &resolved_version, status_family(single.status_code), duration).await;
+                    prometheus::record_request_end(&model_name, &resolved_version, status_family(single.status_code), duration);
                     let json_body = serde_json::to_string(&data).unwrap_or_default();
                     let content_type = if single.media_type.is_empty() {
                         "application/json; charset=utf-8"
@@ -1092,7 +1092,7 @@ async fn do_infer(
             }
         }
         _ => {
-            prometheus::record_request_end(&model_name, &resolved_version, "5xx", duration).await;
+            prometheus::record_request_end(&model_name, &resolved_version, "5xx", duration);
             Err(AppError::WorkerCrashed("unexpected response type".to_string()))
         }
     }
