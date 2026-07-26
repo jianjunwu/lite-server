@@ -1,7 +1,7 @@
 """Audit tests for benchmarks/scripts — defects found during /audit review.
 
-Each test demonstrates a confirmed defect by FAILING against the current code.
-These tests do NOT modify any implementation code.
+B1 (fallback api_path mismatch) is now fixed — the test passes and serves
+as regression coverage.
 """
 
 import importlib.util
@@ -24,27 +24,28 @@ def run_litserve():
 
 
 # ---------------------------------------------------------------------------
-# B1 — LitServe fallback serves at wrong api_path for models not in
-#      _BUILTIN_SLEEP_MAP, so wait_for_server never sees a healthy server
+# B1 — LitServe fallback must serve at the api_path compare.py benchmarks
+#      against: /v2/models/{args.model}/infer
 # ---------------------------------------------------------------------------
 
 class TestAuditB1_FallbackApiPathMismatch:
-    """B1 (P1): unknown model names fall back to a hardcoded api_path that
-    does not match the URL compare.py benchmarks against."""
+    """B1 (P1, fixed): the fallback built-in must serve at the requested
+    model's api_path, so wait_for_server sees a healthy server."""
 
-    def test_scope_fallback_api_path_mismatches_requested_model(self, run_litserve):
-        """compare.py POSTs to /v2/models/{args.model}/infer.  When the repo
-        contains a lite_server-only model whose name is NOT in
-        _BUILTIN_SLEEP_MAP (e.g. any custom model), the fallback built-in
-        still serves at /v2/models/sleep_1ms_model/infer — wait_for_server
-        polls the requested URL, gets 404 for 60s, and LitServe is reported
-        as 'failed to start' for every (workers, concurrency) row."""
+    def test_fallback_api_path_matches_requested_model(self, run_litserve):
+        """compare.py POSTs to /v2/models/{args.model}/infer.  main()'s
+        fallback constructs _BuiltinSleepAPI with model_name=args.model, so
+        even a model NOT in _BUILTIN_SLEEP_MAP serves at the requested URL."""
         requested = "my_custom_model"
         sleep_ms = run_litserve._BUILTIN_SLEEP_MAP.get(requested, 1)
-        api = run_litserve._BuiltinSleepAPI(sleep_ms=sleep_ms)
+        api = run_litserve._BuiltinSleepAPI(sleep_ms=sleep_ms, model_name=requested)
 
-        expected_path = f"/v2/models/{requested}/infer"
-        assert api.api_path == expected_path, (
-            f"fallback for unknown model {requested!r} serves at {api.api_path!r} "
-            f"but compare.py benchmarks {expected_path!r} — all requests 404"
-        )
+        assert api.api_path == f"/v2/models/{requested}/infer"
+
+    def test_builtin_default_paths_unchanged(self, run_litserve):
+        """Without an explicit model_name, api_path still derives from
+        sleep_ms (default behaviour preserved)."""
+        assert run_litserve._BuiltinSleepAPI(sleep_ms=1).api_path == \
+            "/v2/models/sleep_1ms_model/infer"
+        assert run_litserve._BuiltinSleepAPI(sleep_ms=10).api_path == \
+            "/v2/models/sleep_model/infer"

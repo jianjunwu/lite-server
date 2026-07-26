@@ -239,20 +239,19 @@ class TestAuditB7_ErrorTruncation:
 # ---------------------------------------------------------------------------
 
 class TestAuditB9_EmptyModelName:
-    """B9 (P2): analyze_model("") treats repo_path itself as the model dir."""
+    """B9 (P2, fixed): analyze_model("") must report found=False.
+
+    ``Path(repo) / "" == repo``, which exists — an empty model name used to
+    report found=True and scan the repository root for version dirs.  It now
+    short-circuits to not-found with a warning."""
 
     def test_data_empty_model_name_returns_not_found(self, tmp_path):
-        """Path(repo) / "" == repo, which exists — so an empty model name
-        reports found=True and scans the repository root for version dirs."""
         (tmp_path / "real_model" / "1").mkdir(parents=True)
         analyzer = StaticAnalyzer(tmp_path)
 
         result = analyzer.analyze_model("")
 
-        assert result["found"] is False, (
-            f"empty model_name should not find a model, got found=True "
-            f"(analyzed repo root {tmp_path})"
-        )
+        assert result["found"] is False
 
 
 # ---------------------------------------------------------------------------

@@ -36,6 +36,11 @@ class StaticAnalyzer:
             "warnings": [],
         }
 
+        if not model_name:
+            # repo_path / "" resolves to the repo root itself — not a model dir.
+            result["warnings"].append("Empty model name")
+            return result
+
         if not model_dir.exists():
             result["warnings"].append(f"Model directory not found: {model_dir}")
             return result

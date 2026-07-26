@@ -93,11 +93,11 @@ _BUILTIN_SLEEP_MAP = {
 class _BuiltinSleepAPI(ls.LitAPI):
     """CPU-bound mock model with configurable sleep duration."""
 
-    def __init__(self, sleep_ms: float = 1):
+    def __init__(self, sleep_ms: float = 1, model_name: str | None = None):
         self._sleep_sec = sleep_ms / 1000.0
-        super().__init__(
-            api_path=f"/v2/models/{'sleep_1ms_model' if sleep_ms == 1 else 'sleep_model'}/infer"
-        )
+        if model_name is None:
+            model_name = "sleep_1ms_model" if sleep_ms == 1 else "sleep_model"
+        super().__init__(api_path=f"/v2/models/{model_name}/infer")
 
     def setup(self, device):
         self.device = device
@@ -146,7 +146,7 @@ def main() -> int:
             # Model is likely a lite_server model (inherits from lite_server.LitAPI,
             # not litserve.LitAPI).  Use built-in with equivalent workload.
             sleep_ms = _BUILTIN_SLEEP_MAP.get(args.model, 1)
-            api = _BuiltinSleepAPI(sleep_ms=sleep_ms)
+            api = _BuiltinSleepAPI(sleep_ms=sleep_ms, model_name=args.model)
             model_name = args.model
             print(
                 f"No litserve-compatible LitAPI found; "
