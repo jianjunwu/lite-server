@@ -235,6 +235,27 @@ class TestAuditB7_ErrorTruncation:
 
 
 # ---------------------------------------------------------------------------
+# B9 — empty model_name slips past the sanitizer and analyzes the repo root
+# ---------------------------------------------------------------------------
+
+class TestAuditB9_EmptyModelName:
+    """B9 (P2): analyze_model("") treats repo_path itself as the model dir."""
+
+    def test_data_empty_model_name_returns_not_found(self, tmp_path):
+        """Path(repo) / "" == repo, which exists — so an empty model name
+        reports found=True and scans the repository root for version dirs."""
+        (tmp_path / "real_model" / "1").mkdir(parents=True)
+        analyzer = StaticAnalyzer(tmp_path)
+
+        result = analyzer.analyze_model("")
+
+        assert result["found"] is False, (
+            f"empty model_name should not find a model, got found=True "
+            f"(analyzed repo root {tmp_path})"
+        )
+
+
+# ---------------------------------------------------------------------------
 # B8 — save() creates subdirectories when model name contains "/"
 # ---------------------------------------------------------------------------
 
