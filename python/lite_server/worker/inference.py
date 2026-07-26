@@ -255,7 +255,8 @@ def load_litapi(model_py_path: str, config: dict, device: str = "cpu"):
     # model's global callback chain; per-route callbacks are out of scope —
     # constraint #3, gateway concern).
     _discover_routes(instance)
-    instance._route_pipeline = Pipeline.for_route(callbacks)
+    if instance._route_handlers:
+        instance._route_pipeline = Pipeline.for_route(callbacks)
 
     return instance
 

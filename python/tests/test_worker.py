@@ -287,6 +287,85 @@ class TestLoadLitAPI:
             if saved is not None:
                 sys.modules["callbacks"] = saved
 
+    def test_on_output_callback_ok_when_no_route_handlers(self, tmp_path):
+        """A model with on_output callbacks but NO @route handlers should load:
+        on_output is valid for the model pipeline (decode→predict→encode).
+        Regression test for Pipeline.for_route rejecting valid model callbacks."""
+        saved = sys.modules.pop("callbacks", None)
+        try:
+            callbacks_py = tmp_path / "callbacks.py"
+            callbacks_py.write_text(textwrap.dedent('''
+                from lite_server.callbacks import Callback
+
+                class AuditLogger(Callback):
+                    def on_request(self, ctx):
+                        pass
+
+                    def on_output(self, ctx):
+                        pass
+            '''))
+            model_py = tmp_path / "model.py"
+            model_py.write_text(textwrap.dedent('''
+                from lite_server import LitAPI
+
+                class MyModel(LitAPI):
+                    def decode_request(self, request, ctx=None):
+                        return request.get("input")
+
+                    def predict(self, x):
+                        return x
+
+                    def encode_response(self, output, ctx=None):
+                        return {"output": output}
+            '''))
+            config = {"callbacks": ["callbacks.AuditLogger"]}
+            api = inference.load_litapi(str(model_py), config)
+            assert hasattr(api, "_pipeline")
+            # on_output should be registered on the model pipeline
+            assert len(api._pipeline._chains.get("on_output", [])) == 1
+            # No @route handlers → _route_pipeline must NOT be built
+            assert not hasattr(api, "_route_pipeline")
+        finally:
+            sys.modules.pop("callbacks", None)
+            if saved is not None:
+                sys.modules["callbacks"] = saved
+
+    def test_on_output_callback_rejected_when_route_handlers_present(self, tmp_path):
+        """When a model has @route handlers AND on_output callbacks, it must
+        still be rejected — routes have no encode stage."""
+        saved = sys.modules.pop("callbacks", None)
+        try:
+            callbacks_py = tmp_path / "callbacks.py"
+            callbacks_py.write_text(textwrap.dedent('''
+                from lite_server.callbacks import Callback
+
+                class AuditLogger(Callback):
+                    def on_request(self, ctx):
+                        pass
+
+                    def on_output(self, ctx):
+                        pass
+            '''))
+            model_py = tmp_path / "model.py"
+            model_py.write_text(textwrap.dedent('''
+                from lite_server import LitAPI, route
+
+                class MyModel(LitAPI):
+                    def predict(self, x):
+                        return x
+
+                    @route.get("/custom")
+                    async def my_route(self, ctx):
+                        return {"ok": True}
+            '''))
+            config = {"callbacks": ["callbacks.AuditLogger"]}
+            with pytest.raises(RuntimeError, match="on_output"):
+                inference.load_litapi(str(model_py), config)
+        finally:
+            sys.modules.pop("callbacks", None)
+            if saved is not None:
+                sys.modules["callbacks"] = saved
+
     def test_old_signature_callback_fails_loudly(self, tmp_path):
         """Pre-0.7 (value, meta) callbacks are rejected at load time."""
         saved = sys.modules.pop("callbacks", None)
