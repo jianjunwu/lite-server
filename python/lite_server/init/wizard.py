@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-from typing import Any
 
 from lite_server.init.generator import ProjectGenerator
 
@@ -42,19 +41,8 @@ def run_wizard(output_dir: str = ".") -> None:
         print("Project name is required.", file=sys.stderr)
         sys.exit(1)
 
-    # Template (only one available since 0.7.0)
-    template = "empty"
-
     # Model name
     model_name = _ask("Model name", "my_model")
-
-    print("\n--- Service Configuration ---")
-    grpc = _ask_yn("Enable gRPC?", default=True)
-    metrics = _ask_yn("Enable Prometheus metrics?", default=True)
-
-    print("\n--- Inference Features ---")
-    batch = _ask_yn("Enable dynamic batching?", default=False)
-    stream = _ask_yn("Enable streaming responses?", default=False)
 
     # --- Summary & confirmation ---
     print("\n" + "=" * 50)
@@ -62,31 +50,18 @@ def run_wizard(output_dir: str = ".") -> None:
     print("=" * 50)
     print(f"  Project:    {project_name}")
     print(f"  Model:      {model_name}")
-    print(f"  gRPC:       {'yes' if grpc else 'no'}")
-    print(f"  Metrics:    {'yes' if metrics else 'no'}")
-    print(f"  Streaming:  {'yes' if stream else 'no'}")
-    print(f"  Batching:   {'yes' if batch else 'no'}")
     print("=" * 50)
     confirmed = _ask_yn("Create project?", default=True)
     if not confirmed:
         print("Aborted.", file=sys.stderr)
         sys.exit(0)
 
-    options: dict[str, Any] = {
-        "grpc": grpc,
-        "metrics": metrics,
-        "batch": batch,
-        "stream": stream,
-    }
-
-    print(f"\nGenerating project '{project_name}' with template '{template}'...")
+    print(f"\nGenerating project '{project_name}'...")
 
     generator = ProjectGenerator(
         project_name=project_name,
-        template=template,
         output_dir=output_dir,
         model_name=model_name,
-        options=options,
     )
     try:
         root = generator.generate()

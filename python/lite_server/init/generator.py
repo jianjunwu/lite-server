@@ -5,8 +5,6 @@ from __future__ import annotations
 import importlib.resources
 import textwrap
 from pathlib import Path
-from typing import Any
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -25,12 +23,7 @@ def _load_template(name: str) -> str:
         return (base / name).read_text(encoding="utf-8")
 
 
-def _render_config_yaml(
-    batch: bool = False,
-    stream: bool = False,
-    continuous_batching: bool = False,
-    accelerator: str | None = None,
-) -> str:
+def _render_config_yaml() -> str:
     """Render concise active config for config.yaml."""
     lines = [
         "# Model version configuration",
@@ -45,26 +38,6 @@ def _render_config_yaml(
         "",
         "# ===== Inference Behavior =====",
     ]
-
-    if batch:
-        lines.extend([
-            "max_batch_size: 8",
-            "batch_timeout: 0.01",
-        ])
-    if stream:
-        lines.append("stream: true")
-    if continuous_batching:
-        lines.extend([
-            "continuous_batching: true",
-            "max_sequence_length: 2048",
-        ])
-
-    if accelerator:
-        lines.extend([
-            "",
-            "# ===== Resource Allocation =====",
-            f"accelerator: {accelerator}",
-        ])
 
     lines.extend([
         "",
@@ -163,18 +136,6 @@ CONFIG_YAML_EXAMPLE = textwrap.dedent("""\
     # my_model_path: /opt/models/weights.pt
     # my_threshold: 0.5
 """)
-
-
-# ---------------------------------------------------------------------------
-# Templates
-# ---------------------------------------------------------------------------
-
-TEMPLATES = {
-    "empty": {
-        "model_py": _load_template("empty_model.py"),
-        "config_yaml": _render_config_yaml(batch=False, stream=False),
-    },
-}
 
 
 # ---------------------------------------------------------------------------
@@ -581,26 +542,17 @@ CI_YML = textwrap.dedent("""\
 
 
 class ProjectGenerator:
-    """Generate a new lite-server project from a template."""
+    """Generate a new lite-server project."""
 
     def __init__(
         self,
         project_name: str,
-        template: str,
         output_dir: Path | str = ".",
         model_name: str | None = None,
-        options: dict[str, Any] | None = None,
     ):
-        if template not in TEMPLATES:
-            avail = ", ".join(TEMPLATES)
-            raise ValueError(
-                f"Unknown template '{template}'. Available: {avail}"
-            )
         self.project_name = project_name
-        self.template = template
         self.output_dir = Path(output_dir)
         self.model_name = model_name or "my_model"
-        self.options = options or {}
 
     def generate(self) -> Path:
         """Create project files and return the project root path."""
@@ -610,21 +562,14 @@ class ProjectGenerator:
 
         root.mkdir(parents=True)
 
-        tmpl = TEMPLATES[self.template]
         model_dir = root / "model_repo" / self.model_name / "1"
         model_dir.mkdir(parents=True)
 
-        # Resolve config from wizard overrides (empty template defaults)
-        batch = self.options.get("batch", False)
-        stream = self.options.get("stream", False)
-
-        config_yaml = _render_config_yaml(
-            batch=batch,
-            stream=stream,
-        )
+        model_py = _load_template("empty_model.py")
+        config_yaml = _render_config_yaml()
 
         # Model files
-        (model_dir / "model.py").write_text(tmpl["model_py"])
+        (model_dir / "model.py").write_text(model_py)
         (model_dir / "config.yaml").write_text(config_yaml)
         (model_dir / "config.yaml.example").write_text(CONFIG_YAML_EXAMPLE)
 
@@ -632,11 +577,9 @@ class ProjectGenerator:
         (model_dir / "callbacks.py").write_text(CALLBACKS_PY)
 
         # Server config
-        grpc = str(self.options.get("grpc", True)).lower()
-        metrics = str(self.options.get("metrics", True)).lower()
         (root / "server.yaml").write_text(
             SERVER_YAML.format(
-                grpc=grpc, metrics=metrics, model_name=self.model_name
+                grpc="true", metrics="true", model_name=self.model_name
             )
         )
 

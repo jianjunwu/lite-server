@@ -79,7 +79,6 @@ def main(argv=None):
     # init
     init_parser = subparsers.add_parser("init", help="Initialize project")
     init_parser.add_argument("project_name", nargs="?")
-    init_parser.add_argument("--template", "-t", default="empty")
     init_parser.add_argument("--wizard", "-w", action="store_true", help="Interactive wizard mode")
 
     args = parser.parse_args(argv)
@@ -446,7 +445,7 @@ def _cmd_unpack(args):
 
 
 def _cmd_init(args):
-    """Initialize a new lite-server project from a template."""
+    """Initialize a new lite-server project."""
     if getattr(args, "wizard", False):
         from lite_server.init.wizard import run_wizard
         try:
@@ -458,12 +457,10 @@ def _cmd_init(args):
     from lite_server.init import ProjectGenerator
 
     project_name = args.project_name or "my_project"
-    template = args.template
 
     try:
         gen = ProjectGenerator(
             project_name=project_name,
-            template=template,
             output_dir=Path("."),
         )
         root = gen.generate()
@@ -473,9 +470,6 @@ def _cmd_init(args):
         print(f"  lite-server serve --config server.yaml")
         return 0
     except FileExistsError as e:
-        _logger.error("%s", e)
-        return 1
-    except ValueError as e:
         _logger.error("%s", e)
         return 1
 

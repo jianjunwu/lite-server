@@ -382,7 +382,6 @@ class TestInit:
         monkeypatch.chdir(tmp_path)
         args = type("Args", (), {
             "project_name": "empty_proj",
-            "template": "empty",
             "wizard": False,
         })()
         assert cli._cmd_init(args) == 0
@@ -410,7 +409,6 @@ class TestInit:
         (tmp_path / "exists").mkdir()
         args = type("Args", (), {
             "project_name": "exists",
-            "template": "empty",
             "wizard": False,
         })()
         assert cli._cmd_init(args) == 1
@@ -420,7 +418,6 @@ class TestInit:
         monkeypatch.chdir(tmp_path)
         args = type("Args", (), {
             "project_name": None,
-            "template": "empty",
             "wizard": False,
         })()
         assert cli._cmd_init(args) == 0
@@ -428,11 +425,10 @@ class TestInit:
 
     def test_init_wizard_mode(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        inputs = iter(["wiz_proj", "", "", "", "", "", "", ""])
+        inputs = iter(["wiz_proj", "", ""])
         monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
         args = type("Args", (), {
             "project_name": None,
-            "template": "empty",
             "wizard": True,
         })()
         assert cli._cmd_init(args) == 0

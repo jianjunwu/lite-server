@@ -13,9 +13,8 @@ class TestRunWizard:
     """Interactive wizard with mocked input."""
 
     def test_generates_project_with_defaults(self, tmp_path, monkeypatch):
-        # project_name, model_name(default=my_model),
-        # grpc(y), metrics(y), batch(n), stream(n), confirm(y)
-        inputs = iter(["myproj", "", "", "", "", "", ""])
+        # project_name, model_name(default=my_model), confirm(y)
+        inputs = iter(["myproj", "", ""])
         monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
 
         run_wizard(output_dir=str(tmp_path))
@@ -25,7 +24,7 @@ class TestRunWizard:
         assert (root / "server.yaml").exists()
 
     def test_uses_empty_template_by_default(self, tmp_path, monkeypatch):
-        inputs = iter(["myproj", "", "", "", "", "", ""])
+        inputs = iter(["myproj", "", ""])
         monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
 
         run_wizard(output_dir=str(tmp_path))
@@ -37,34 +36,13 @@ class TestRunWizard:
         assert "class MyAPI" in text or "class MyModel" in text
 
     def test_custom_model_name(self, tmp_path, monkeypatch):
-        inputs = iter(["myproj", "classifier", "", "", "", "", ""])
+        inputs = iter(["myproj", "classifier", ""])
         monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
 
         run_wizard(output_dir=str(tmp_path))
 
         root = tmp_path / "myproj"
         assert (root / "model_repo" / "classifier").exists()
-
-    def test_enables_features_when_yes(self, tmp_path, monkeypatch):
-        inputs = iter(["myproj", "", "y", "y", "y", "y", ""])
-        monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
-
-        run_wizard(output_dir=str(tmp_path))
-
-        root = tmp_path / "myproj"
-        cfg = (root / "server.yaml").read_text()
-        assert "enabled: true" in cfg
-
-    def test_skips_features_when_no(self, tmp_path, monkeypatch):
-        inputs = iter(["myproj", "", "n", "n", "n", "n", ""])
-        monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
-
-        run_wizard(output_dir=str(tmp_path))
-
-        root = tmp_path / "myproj"
-        cfg = (root / "server.yaml").read_text()
-        # At least some features should be disabled
-        assert "enabled: false" in cfg or "enabled: true" not in cfg
 
     def test_empty_project_name_aborts(self, tmp_path, monkeypatch):
         inputs = iter([""])
@@ -83,46 +61,10 @@ class TestRunWizard:
             run_wizard(output_dir=str(tmp_path))
 
     def test_confirm_no_aborts_without_generating(self, tmp_path, monkeypatch):
-        # all defaults, then decline the summary confirmation
-        inputs = iter(["myproj", "", "", "", "", "", "n"])
+        # project_name, model_name(default), confirm(n)
+        inputs = iter(["myproj", "", "n"])
         monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
 
         with pytest.raises(SystemExit):
             run_wizard(output_dir=str(tmp_path))
         assert not (tmp_path / "myproj").exists()
-
-
-class TestWizardOptionsPropagation:
-    """Wizard batch/stream options must affect model config.yaml."""
-
-    def test_batch_yes_sets_max_batch_size(self, tmp_path, monkeypatch):
-        # proj, model_name(my_model), grpc(y), metrics(y), batch(y), stream(n), confirm(y)
-        inputs = iter(["myproj", "", "", "", "y", "", ""])
-        monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
-
-        run_wizard(output_dir=str(tmp_path))
-
-        root = tmp_path / "myproj"
-        cfg = (root / "model_repo" / "my_model" / "1" / "config.yaml").read_text()
-        assert "max_batch_size:" in cfg
-        # Should be an active (uncommented) config line
-        for line in cfg.splitlines():
-            if "max_batch_size:" in line and not line.strip().startswith("#"):
-                return
-        pytest.fail("max_batch_size should be uncommented when batch=yes")
-
-    def test_stream_yes_sets_stream_true(self, tmp_path, monkeypatch):
-        # proj, model_name(my_model), grpc(y), metrics(y), batch(n), stream(y), confirm(y)
-        inputs = iter(["myproj", "", "", "", "", "y", ""])
-        monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
-
-        run_wizard(output_dir=str(tmp_path))
-
-        root = tmp_path / "myproj"
-        cfg = (root / "model_repo" / "my_model" / "1" / "config.yaml").read_text()
-        assert "stream:" in cfg
-        for line in cfg.splitlines():
-            if "stream:" in line and not line.strip().startswith("#"):
-                assert "true" in line
-                return
-        pytest.fail("stream should be uncommented and true when stream=yes")
