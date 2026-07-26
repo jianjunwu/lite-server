@@ -7,7 +7,13 @@ use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
-const ZMQ_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Backstop response timeout applied by [`WorkerZmqClient::send`] when the
+/// caller has no timeout of its own (e.g. request_timeout disabled). Must be
+/// large enough to never silently cap a user-configured request_timeout —
+/// callers with a configured timeout use [`WorkerZmqClient::send_with_timeout`]
+/// instead. Health checks / heartbeats wrap `send` with their own shorter
+/// outer timeouts and are unaffected by this value.
+pub(crate) const ZMQ_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 const STREAM_CHANNEL_SIZE: usize = 64;
 
 enum ZmqCommand {
@@ -244,6 +250,16 @@ impl WorkerZmqClient {
     }
 
     pub async fn send(&self, request: pb::Request) -> Result<pb::Response, AppError> {
+        self.send_with_timeout(request, ZMQ_RESPONSE_TIMEOUT).await
+    }
+
+    /// Like [`send`], but the response wait is bounded by `timeout` instead of
+    /// the [`ZMQ_RESPONSE_TIMEOUT`] backstop.
+    pub async fn send_with_timeout(
+        &self,
+        request: pb::Request,
+        timeout: Duration,
+    ) -> Result<pb::Response, AppError> {
         let (response_tx, response_rx) = oneshot::channel();
         let cmd = ZmqCommand::Unary {
             request,
@@ -255,7 +271,7 @@ impl WorkerZmqClient {
             .await
             .map_err(|_| AppError::Transport("ZMQ command channel closed".to_string()))?;
 
-        tokio::time::timeout(ZMQ_RESPONSE_TIMEOUT, response_rx)
+        tokio::time::timeout(timeout, response_rx)
             .await
             .map_err(|_| AppError::InferenceTimeout("ZMQ response timeout".to_string()))?
             .map_err(|_| AppError::Transport("ZMQ response channel closed".to_string()))

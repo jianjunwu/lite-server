@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use crate::config::ModelConfig;
+use crate::error::AppError;
 use crate::metrics::prometheus;
 use crate::proto::liteserver as pb;
 use crate::registry::types::WorkerInfo;
@@ -429,30 +430,44 @@ impl InferenceQueue {
 }
 
 /// Pick the worker with the lowest inflight count (least-loaded), skipping ejected workers.
-fn pick_worker_least_loaded(inflight: &[Arc<AtomicUsize>], outlier: &OutlierState) -> usize {
+fn pick_worker_least_loaded(
+    inflight: &[Arc<AtomicUsize>],
+    outlier: &OutlierState,
+    exclude: &[usize],
+) -> usize {
     if inflight.len() == 1 {
         return 0;
     }
 
     let mut best_active: Option<(usize, usize)> = None;
     let mut best_ejected: Option<(usize, usize)> = None;
+    let mut best_excluded: Option<(usize, usize)> = None;
 
     for (i, counter) in inflight.iter().enumerate() {
         let load = counter.load(Ordering::Relaxed);
-        if outlier.is_ejected(i) {
-            if best_ejected.is_none() || load < best_ejected.unwrap().1 {
-                best_ejected = Some((i, load));
-            }
+        // `exclude` holds workers that already failed this retry cycle —
+        // soft-avoid them so a retry lands on a different worker, but keep
+        // them as last-resort fallback when every worker was tried.
+        let slot = if exclude.contains(&i) {
+            &mut best_excluded
+        } else if outlier.is_ejected(i) {
+            &mut best_ejected
         } else {
-            if best_active.is_none() || load < best_active.unwrap().1 {
-                best_active = Some((i, load));
-            }
+            &mut best_active
+        };
+        let replace = match *slot {
+            None => true,
+            Some((_, best_load)) => load < best_load,
+        };
+        if replace {
+            *slot = Some((i, load));
         }
     }
 
-    // Prefer active worker; if all ejected, fall back to least-loaded ejected
+    // Prefer active worker; then ejected; finally an excluded (just-failed) one
     best_active
         .or(best_ejected)
+        .or(best_excluded)
         .map(|(idx, _)| idx)
         .unwrap_or(0)
 }
@@ -492,9 +507,53 @@ fn batch_item_to_single_response(
     }
 }
 
+/// Failure of one dispatch attempt against a specific worker. The failed
+/// items are left in the batch so the caller can retry them elsewhere.
+struct BatchError {
+    worker_idx: usize,
+    code: String,
+    message: String,
+    /// The worker's original error response, forwarded verbatim when retries
+    /// are exhausted so status_code / headers / metrics survive to the caller.
+    /// Present only for Single-response worker errors.
+    single: Option<(pb::SingleResponse, Option<pb::Metrics>)>,
+}
+
+/// Send an error response to every remaining item in `batch` and drain it.
+fn fail_batch_items(batch: &mut Vec<QueueItem>, err: &BatchError) {
+    for queue_item in batch.drain(..) {
+        let (single, metrics) = match &err.single {
+            Some((s, m)) => (s.clone(), m.clone()),
+            None => (
+                pb::SingleResponse {
+                    data: Default::default(),
+                    headers: Default::default(),
+                    status: Some(pb::Status {
+                        code: err.code.clone(),
+                        message: err.message.clone(),
+                    }),
+                    ..Default::default()
+                },
+                None,
+            ),
+        };
+        let _ = queue_item.response_tx.send(pb::Response {
+            uid: queue_item.uid,
+            payload: Some(pb::response::Payload::Single(single)),
+            metrics,
+        });
+    }
+}
+
 /// Send a batch to a single worker. Returns Err on transport/worker failure.
 /// On success, all items are drained and responses sent to callers.
-/// On error, the batch is drained with error responses and Err is returned.
+/// On worker-level failure (timeout, transport error, 5xx/no-status Error,
+/// malformed response), the items are LEFT in the batch for the caller to
+/// retry; the returned [`BatchError`] carries what to report if retries are
+/// exhausted. Errors that retrying cannot fix are NOT retried: a Single Error
+/// with a 4xx status_code (request-level) is forwarded verbatim, and a Batch
+/// response with per-item errors delivers each item's own response — both
+/// drain the batch.
 async fn do_send_batch(
     batch: &mut Vec<QueueItem>,
     zmq_clients: &[Arc<WorkerZmqClient>],
@@ -503,13 +562,14 @@ async fn do_send_batch(
     model_name: &str,
     version: &str,
     request_timeout: Duration,
-) -> Result<(), ()> {
+    exclude: &[usize],
+) -> Result<(), BatchError> {
     if batch.is_empty() {
         return Ok(());
     }
 
     let batch_size = batch.len();
-    let worker_idx = pick_worker_least_loaded(inflight, outlier);
+    let worker_idx = pick_worker_least_loaded(inflight, outlier, exclude);
     debug!(
         model = %model_name,
         version = %version,
@@ -547,35 +607,11 @@ async fn do_send_batch(
     };
 
     let send_start = Instant::now();
+    // Single timeout layer: the configured request_timeout is passed down to
+    // the ZMQ wait itself, so it is the real effective bound (previously the
+    // outer wrapper raced a hardcoded inner timeout and the shorter one won).
     let result = if request_timeout > Duration::ZERO {
-        match tokio::time::timeout(request_timeout, zmq_client.send(request)).await {
-            Ok(r) => r,
-            Err(_) => {
-                prometheus::observe_inference_duration(model_name, version, send_start.elapsed().as_secs_f64());
-                error!("Request timeout ({:?}) for {} {}", request_timeout, model_name, version);
-                for queue_item in batch.drain(..) {
-                    let _ = queue_item.response_tx.send(pb::Response {
-                        uid: queue_item.uid,
-                        payload: Some(pb::response::Payload::Single(pb::SingleResponse {
-                            data: Default::default(),
-                            headers: Default::default(),
-                            status: Some(pb::Status {
-                                code: "Timeout".to_string(),
-                                message: "request timeout".to_string(),
-                            }),
-                        
-                            ..Default::default()
-                        })),
-                        metrics: None,
-                    });
-                }
-                inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
-                if outlier.record_error(worker_idx) {
-                    prometheus::inc_worker_ejection(model_name, version);
-                }
-                return Err(());
-            }
-        }
+        zmq_client.send_with_timeout(request, request_timeout).await
     } else {
         zmq_client.send(request).await
     };
@@ -623,25 +659,63 @@ async fn do_send_batch(
                         if outlier.record_error(worker_idx) {
                     prometheus::inc_worker_ejection(model_name, version);
                 }
-                        Err(())
+                        // Per-item responses (real errors included) were
+                        // already delivered above — nothing left to retry.
+                        Err(BatchError {
+                            worker_idx,
+                            code: "Error".to_string(),
+                            message: "one or more batch items failed".to_string(),
+                            single: None,
+                        })
                     }
                 }
                 Some(pb::response::Payload::Single(single_resp)) => {
                     let is_error = single_resp.status.as_ref().map(|s| s.code.as_str()) == Some("Error");
-                    if let Some(queue_item) = batch.pop() {
-                        let _ = queue_item.response_tx.send(pb::Response {
-                            uid: queue_item.uid,
-                            payload: Some(pb::response::Payload::Single(single_resp)),
-                            metrics: resp.metrics,
-                        });
-                    }
-                    inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
-                    if is_error {
+                    if is_error && (400..500).contains(&single_resp.status_code) {
+                        // Request-level error (e.g. BadRequestError) — deterministic,
+                        // retrying on another worker can't help. Forward the
+                        // worker's response verbatim (status_code/headers intact).
+                        if let Some(queue_item) = batch.pop() {
+                            let _ = queue_item.response_tx.send(pb::Response {
+                                uid: queue_item.uid,
+                                payload: Some(pb::response::Payload::Single(single_resp)),
+                                metrics: resp.metrics,
+                            });
+                        }
+                        inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
                         if outlier.record_error(worker_idx) {
                     prometheus::inc_worker_ejection(model_name, version);
                 }
-                        Err(())
+                        Err(BatchError {
+                            worker_idx,
+                            code: "Error".to_string(),
+                            message: "request-level error".to_string(),
+                            single: None,
+                        })
+                    } else if is_error {
+                        // Worker-level failure: keep the item for retry on
+                        // another worker, carrying the worker's real response
+                        // for verbatim delivery if retries are exhausted.
+                        let st = single_resp.status.clone().unwrap_or_default();
+                        inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
+                        if outlier.record_error(worker_idx) {
+                    prometheus::inc_worker_ejection(model_name, version);
+                }
+                        Err(BatchError {
+                            worker_idx,
+                            code: st.code,
+                            message: st.message,
+                            single: Some((single_resp, resp.metrics)),
+                        })
                     } else {
+                        if let Some(queue_item) = batch.pop() {
+                            let _ = queue_item.response_tx.send(pb::Response {
+                                uid: queue_item.uid,
+                                payload: Some(pb::response::Payload::Single(single_resp)),
+                                metrics: resp.metrics,
+                            });
+                        }
+                        inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
                         outlier.record_success(worker_idx);
                         debug!(model = %model_name, version = %version, worker_idx = worker_idx, "batch ok");
                         Ok(())
@@ -649,27 +723,16 @@ async fn do_send_batch(
                 }
                 _ => {
                     warn!("Unexpected response type from worker for {} {}", model_name, version);
-                    for queue_item in batch.drain(..) {
-                        let _ = queue_item.response_tx.send(pb::Response {
-                            uid: queue_item.uid,
-                            payload: Some(pb::response::Payload::Single(pb::SingleResponse {
-                                data: Default::default(),
-                                headers: Default::default(),
-                                status: Some(pb::Status {
-                                    code: "Error".to_string(),
-                                    message: "unexpected response type".to_string(),
-                                }),
-                            
-                                ..Default::default()
-                            })),
-                            metrics: None,
-                        });
-                    }
                     inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
                     if outlier.record_error(worker_idx) {
                     prometheus::inc_worker_ejection(model_name, version);
                 }
-                    Err(())
+                    Err(BatchError {
+                        worker_idx,
+                        code: "Error".to_string(),
+                        message: "unexpected response type".to_string(),
+                        single: None,
+                    })
                 }
             }
         }
@@ -678,27 +741,21 @@ async fn do_send_batch(
                 "Batch request failed for {} {}: {}",
                 model_name, version, e
             );
-            for queue_item in batch.drain(..) {
-                let _ = queue_item.response_tx.send(pb::Response {
-                    uid: queue_item.uid,
-                    payload: Some(pb::response::Payload::Single(pb::SingleResponse {
-                        data: Default::default(),
-                        headers: Default::default(),
-                        status: Some(pb::Status {
-                            code: "Error".to_string(),
-                            message: e.to_string(),
-                        }),
-                    
-                        ..Default::default()
-                    })),
-                    metrics: None,
-                });
-            }
+            let (code, message) = if matches!(e, AppError::InferenceTimeout(_)) {
+                ("Timeout".to_string(), "request timeout".to_string())
+            } else {
+                ("Error".to_string(), e.to_string())
+            };
             inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
             if outlier.record_error(worker_idx) {
                 prometheus::inc_worker_ejection(model_name, version);
             }
-            Err(())
+            Err(BatchError {
+                worker_idx,
+                code,
+                message,
+                single: None,
+            })
         }
     }
 }
@@ -729,37 +786,45 @@ async fn send_batch_with_retry(
 
     // Fast path: single worker, no retry possible
     if zmq_clients.len() <= 1 {
-        let result = do_send_batch(&mut batch, zmq_clients, inflight, outlier, model_name, version, request_timeout).await;
-        if result.is_ok() {
-            check_max_requests(request_count, batch_size, max_requests, model_name, version, reload_tx).await;
+        let result = do_send_batch(&mut batch, zmq_clients, inflight, outlier, model_name, version, request_timeout, &[]).await;
+        match result {
+            Ok(()) => check_max_requests(request_count, batch_size, max_requests, model_name, version, reload_tx).await,
+            Err(e) => fail_batch_items(&mut batch, &e),
         }
         return;
     }
 
+    let mut excluded: Vec<usize> = Vec::new();
+    let mut last_err: Option<BatchError> = None;
     for attempt in 0..MAX_RETRIES {
         if attempt > 0 {
             prometheus::inc_retry(model_name, version);
         }
-        match do_send_batch(&mut batch, zmq_clients, inflight, outlier, model_name, version, request_timeout).await {
+        match do_send_batch(&mut batch, zmq_clients, inflight, outlier, model_name, version, request_timeout, &excluded).await {
             Ok(()) => {
                 check_max_requests(request_count, batch_size, max_requests, model_name, version, reload_tx).await;
                 return;
             }
-            Err(()) => {
+            Err(e) => {
                 if batch.is_empty() {
-                    return; // all items already got error responses
+                    return; // per-item responses already delivered — nothing to retry
                 }
                 warn!(
                     model = %model_name,
                     version = %version,
                     attempt = attempt + 1,
-                    "batch failed, retrying"
+                    worker_idx = e.worker_idx,
+                    "batch failed, retrying on another worker"
                 );
-                // items remain — retry on next worker
+                excluded.push(e.worker_idx);
+                last_err = Some(e);
             }
         }
     }
-    // All retries exhausted; remaining items already have error responses from last attempt
+    // All retries exhausted — report the last failure to remaining items.
+    if let Some(e) = last_err {
+        fail_batch_items(&mut batch, &e);
+    }
 }
 
 /// Check if worker hit max_requests and signal reload.
@@ -1722,7 +1787,7 @@ mod tests {
         }
 
         // Should skip ejected worker 0, pick 1 or 2 (both load 0)
-        let picked = pick_worker_least_loaded(&inflight, &outlier);
+        let picked = pick_worker_least_loaded(&inflight, &outlier, &[]);
         assert!(picked == 1 || picked == 2, "should skip ejected worker, got {}", picked);
     }
 
@@ -1741,7 +1806,7 @@ mod tests {
         }
 
         // Should pick worker 2 (lowest load among active)
-        let picked = pick_worker_least_loaded(&inflight, &outlier);
+        let picked = pick_worker_least_loaded(&inflight, &outlier, &[]);
         assert_eq!(picked, 2, "should pick lowest-load active worker");
     }
 
@@ -1762,7 +1827,7 @@ mod tests {
         // Both ejected, but max_ejection_percent=50 means only 1 can be ejected
         // Actually with 2 workers, max_ejected = max(2*50/100, 1) = 1
         // So only worker 0 should be ejected, worker 1 should still be active
-        let picked = pick_worker_least_loaded(&inflight, &outlier);
+        let picked = pick_worker_least_loaded(&inflight, &outlier, &[]);
         assert_eq!(picked, 1, "second worker should still be active");
     }
 
@@ -1775,7 +1840,7 @@ mod tests {
         for _ in 0..3 {
             outlier.record_error(0);
         }
-        let picked = pick_worker_least_loaded(&inflight, &outlier);
+        let picked = pick_worker_least_loaded(&inflight, &outlier, &[]);
         assert_eq!(picked, 0, "single worker should always return 0");
     }
 
@@ -1962,6 +2027,197 @@ mod tests {
             let result = compute_jittered_max_requests(1, 5);
             assert!(result >= 1, "jittered value must be >= 1, got {}", result);
         }
+    }
+
+    // ===== B1: Retry mechanism dead code =====
+
+    /// Spawn a PAIR-socket worker that answers every request with an Error
+    /// status. Used by the retry-dead-code test to simulate a failing worker.
+    fn spawn_error_worker(endpoint: String) -> std::thread::JoinHandle<()> {
+        use prost::Message;
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("error worker socket");
+            s.connect(&endpoint).expect("error worker connect");
+            let _ = s.set_rcvtimeo(5000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let resp = pb::Response {
+                    uid: req.uid,
+                    payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+                        data: Bytes::new(),
+                        status: Some(pb::Status {
+                            code: "Error".to_string(),
+                            message: "worker always fails".to_string(),
+                        }),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                if s.send(resp.encode_to_vec(), 0).is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// B1 (P0): The retry mechanism in send_batch_with_retry is dead code.
+    ///
+    /// do_send_batch drains all batch items (sends error responses to every
+    /// caller) in every one of its Err(()) return paths.  When
+    /// send_batch_with_retry receives Err(()), `batch.is_empty()` is always
+    /// true, so the retry loop exits immediately — the for loop body for
+    /// attempt > 0 is unreachable.
+    ///
+    /// This test sets up two workers: worker 0 always returns Error, worker 1
+    /// returns Ok.  With the retry mechanism working, the failing request to
+    /// worker 0 would be retried on worker 1 and the caller would receive Ok.
+    /// Because the retry is dead, the caller receives Error from worker 0
+    /// and worker 1 is never contacted.
+    #[tokio::test]
+    async fn test_b1_retry_mechanism_dead_code() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ep0 = drain_test_endpoint("b1-err-0");
+        let ep1 = drain_test_endpoint("b1-ok-1");
+
+        // Worker 0: always returns Error
+        let _w0 = spawn_error_worker(ep0.clone());
+
+        // Worker 1: returns Ok, tracks whether it was ever contacted
+        let w1_contacted = Arc::new(AtomicBool::new(false));
+        let w1_contacted_clone = w1_contacted.clone();
+        let ep1_clone = ep1.clone();
+        let _w1 = std::thread::spawn(move || {
+            use prost::Message;
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("ok worker socket");
+            s.connect(&ep1_clone).expect("ok worker connect");
+            let _ = s.set_rcvtimeo(5000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                w1_contacted_clone.store(true, Ordering::SeqCst);
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let resp = pb::Response {
+                    uid: req.uid,
+                    payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+                        data: Bytes::from_static(b"{\"ok\":true}"),
+                        status: Some(pb::Status {
+                            code: "Ok".to_string(),
+                            message: String::new(),
+                        }),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                if s.send(resp.encode_to_vec(), 0).is_err() {
+                    return;
+                }
+            }
+        });
+
+        let queue = InferenceQueue::new();
+        let config = ModelConfig {
+            max_queue_size: 10,
+            max_batch_size: 1,
+            batch_timeout: 0.0,
+            adaptive_batching: false,
+            min_batch_timeout: 0.0,
+            adaptive_queue_threshold: 0,
+            health_check_interval: 0.0,
+            request_timeout: 5.0,
+            ..Default::default()
+        };
+        let (reload_tx, _reload_rx) = mpsc::channel(8);
+        let outlier = Arc::new(OutlierState::new(2));
+        let client0 = Arc::new(WorkerZmqClient::new(ep0));
+        let client1 = Arc::new(WorkerZmqClient::new(ep1));
+        queue.register_model(
+            "m", "1", &config, vec![],
+            vec![client0, client1],
+            reload_tx, outlier,
+        );
+        // Let both PAIR connections establish.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        queue
+            .try_submit("m", "1", QueueItem {
+                uid: "b1-test".to_string(),
+                data: Bytes::from_static(b"{}"),
+                meta: None,
+                response_tx: resp_tx,
+                inflight_guard: None,
+            })
+            .unwrap();
+
+        let resp = tokio::time::timeout(Duration::from_secs(10), resp_rx)
+            .await
+            .expect("response must arrive promptly")
+            .expect("response channel must not be dropped");
+
+        // BUG: The response is Error from worker 0, proving the retry never
+        // handed the request to the healthy worker 1.
+        let code = match resp.payload {
+            Some(pb::response::Payload::Single(ref s)) => {
+                s.status.as_ref().map(|st| st.code.as_str()).unwrap_or("")
+            }
+            _ => "",
+        };
+        assert_eq!(
+            code, "Ok",
+            "B1 REGRESSION: expected Ok (retry would forward to healthy worker 1), \
+             got {code}. Retry mechanism is still dead code — do_send_batch \
+             drains the batch before send_batch_with_retry can retry."
+        );
+        // Confirm worker 1 was never contacted — retry never fired.
+        assert!(
+            w1_contacted.load(Ordering::SeqCst),
+            "B1 REGRESSION: healthy worker 1 was never contacted — \
+             send_batch_with_retry never retried after worker 0 failed"
+        );
+    }
+
+    /// B2 (P1): request_timeout must not be silently capped by the ZMQ-level
+    /// backstop timeout.
+    ///
+    /// Regression: `zmq_client.send()` used to apply a hardcoded inner timeout
+    /// of 60 s (`ZMQ_RESPONSE_TIMEOUT`) while the outer request_timeout wrapped
+    /// it, so the effective timeout was min(request_timeout, 60s). A user
+    /// configuring request_timeout=120 got a 60s timeout with a misleading
+    /// "ZMQ response timeout" error message.
+    ///
+    /// Fixed by (a) raising the backstop constant well above any realistic
+    /// configured timeout and (b) passing the caller's request_timeout down to
+    /// the ZMQ wait via `send_with_timeout`, making it the single real bound.
+    /// This test guards the invariant that the backstop never caps a
+    /// configured request_timeout.
+    #[test]
+    fn test_b2_request_timeout_capped_at_zmq_response_timeout() {
+        // The ZMQ-level backstop timeout, referenced from its definition so
+        // this test tracks the real constant.
+        let zmq_timeout = crate::transport::zmq::ZMQ_RESPONSE_TIMEOUT;
+
+        // Simulate: a user configures request_timeout = 120 s.
+        let configured: f64 = 120.0;
+        let request_timeout = Duration::from_secs_f64(configured);
+
+        // The effective timeout must be the user-configured value: the ZMQ
+        // backstop may only fire when no request_timeout is configured.
+        let expected = request_timeout; // what the user expects
+        let actual_effective = std::cmp::min(request_timeout, zmq_timeout);
+        assert_eq!(
+            actual_effective, expected,
+            "B2 REGRESSION: effective timeout ({:?}) != configured request_timeout ({:?}). \
+             The ZMQ_RESPONSE_TIMEOUT backstop ({:?}) silently caps request_timeout — \
+             it must stay above the maximum realistic request_timeout.",
+            actual_effective, expected, zmq_timeout
+        );
     }
 
     #[test]
