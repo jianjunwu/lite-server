@@ -907,10 +907,19 @@ Framework-level errors are standardized as well: unknown routes return 404 (`cod
 Models can be tested independently without starting the server:
 
 ```python
+import json, asyncio
+from lite_server.pipeline import Pipeline
+from lite_server.context import RequestMeta, Headers
+
 api = MyModel(max_batch_size=1)
 api.setup("cpu")
-result = api.encode_response(api.predict(api.decode_request({"input": 42})))
-assert result == {"result": 84}
+
+pipe = Pipeline.build(api)
+data = json.dumps({"input": 42}).encode()
+meta = RequestMeta(route="/predict", headers=Headers(), client_ip="",
+                   request_id="", timestamp_ns=0)
+resp_bytes, status, _, _ = asyncio.run(pipe.run_single(data, meta))
+assert json.loads(resp_bytes) == {"result": 84}
 ```
 
 ## Example: Complete Model
