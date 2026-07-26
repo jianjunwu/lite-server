@@ -266,7 +266,7 @@ See [examples/README.md](examples/README.md) for learning path and usage details
 | GET | `/metrics/timeline/{name}/versions/{v}` | Per-model-version metric timeline |
 | GET | `/metrics/alerts` | Alert rules and status |
 
-**Custom routes** declared with `@route` on `LitAPI` methods are served under `/v2/models/{name}/<tail>`. System tails (`infer`, `events`, `stream`, `ready`, `health`, `reload`, `versions`, `compare`, `livez`, `readyz`, `startupz`) are reserved and cannot be overridden.
+**Custom routes** declared with `@route` on `LitAPI` methods are served under `/v2/models/{name}/<tail>`. System tails (`infer`, `events`, `stream`, `ready`, `health`, `reload`, `versions`, `compare`) are reserved and cannot be overridden. `livez`, `readyz`, `startupz` are root-level probes outside the model namespace, so they do not conflict with custom routes.
 
 ## Configuration
 

@@ -264,7 +264,7 @@ lite-server init my_project           # 脚手架创建项目
 | GET | `/metrics/timeline/{name}/versions/{v}` | 单模型单版本指标时间线 |
 | GET | `/metrics/alerts` | 告警规则与状态 |
 
-**自定义路由**通过 `LitAPI` 方法上的 `@route` 装饰器声明，挂在 `/v2/models/{name}/<tail>` 下。系统保留字（`infer`、`events`、`stream`、`ready`、`health`、`reload`、`versions`、`compare`、`livez`、`readyz`、`startupz`）不可覆盖。
+**自定义路由**通过 `LitAPI` 方法上的 `@route` 装饰器声明，挂在 `/v2/models/{name}/<tail>` 下。系统保留字（`infer`、`events`、`stream`、`ready`、`health`、`reload`、`versions`、`compare`）不可覆盖。`livez`、`readyz`、`startupz` 是根路径探针，不在模型命名空间下，因此不与自定义路由冲突。
 
 ## 配置
 
