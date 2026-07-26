@@ -555,8 +555,10 @@ async def _send_route_stream(socket, stream_id: str, resp, ctx: RequestContext,
     from lite_server.exceptions import HTTPException
     from lite_server.proto.liteserver_pb2 import StreamStart
 
-    headers = dict(resp.headers)
-    headers.update(ctx.response_headers or {})
+    # Merge ctx.response_headers (e.g. from Cors): explicit headers win,
+    # same priority as Pipeline.finalize().
+    headers = dict(ctx.response_headers or {})
+    headers.update(resp.headers)
     start = StreamStart(status_code=resp.status_code,
                         media_type=resp.media_type or "text/event-stream")
     for k, v in headers.items():
@@ -617,7 +619,11 @@ def _build_route_response(uid: str, ctx: RequestContext) -> Response:
         media_type = "application/json"
         headers = {}
         content = ctx.response
-    headers.update(ctx.response_headers or {})
+    # Merge ctx.response_headers (e.g. from Cors): explicit headers win,
+    # same priority as Pipeline.finalize().
+    merged = dict(ctx.response_headers or {})
+    merged.update(headers)
+    headers = merged
 
     if isinstance(content, (bytes, bytearray)):
         data = bytes(content)
@@ -1116,6 +1122,10 @@ async def _handle_stream_chunk_async(
         return
     if ctx.early is not None:
         await _send_stream_early(socket, stream_id, ctx.early, lit_api)
+        # Symmetric with the on_open early path: release the session now.
+        # Pop first so a later client close/cancel can't double-fire on_close.
+        active_streams.pop(stream_id, None)
+        await _close_bidi_quietly(session.on_close, ctx, stream_id, log)
         return
     body, _ = unwrap_response(ctx.response)
     await socket.send(_make_stream_chunk(stream_id, json.dumps(body).encode(), is_final=False).SerializeToString())
