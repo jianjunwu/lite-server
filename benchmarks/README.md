@@ -54,7 +54,7 @@ model_repo/
 The `model.py` must define a `LitAPI` subclass. Example:
 
 ```python
-from litserve import LitAPI
+from lite_server import LitAPI
 
 class MyAPI(LitAPI):
     def setup(self, device):

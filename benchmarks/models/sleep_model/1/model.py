@@ -6,7 +6,7 @@ Both lite-server and LitServe load this model via the LitAPI interface.
 
 import time
 
-from litserve import LitAPI
+from lite_server import LitAPI
 
 
 class SleepAPI(LitAPI):

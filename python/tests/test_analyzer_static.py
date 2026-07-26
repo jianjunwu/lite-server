@@ -131,3 +131,53 @@ class TestAnalyzeModel:
         analyzer = StaticAnalyzer(repo.parent)
         result = analyzer.analyze_model("test_model")
         assert any("syntax" in w.lower() or "load" in w.lower() for w in result["warnings"])
+
+    def test_benchmark_model_loads_with_lite_server_import(self, repo):
+        """B1 (fixed): benchmark models must import from lite_server, not litserve.
+
+        Since 0.7.0, litserve is no longer a project dependency.  The benchmark
+        model files under benchmarks/models/ use ``from lite_server import LitAPI``
+        and must load cleanly through the StaticAnalyzer without import warnings.
+        """
+        vdir = repo / "sleep_1ms_model" / "1"
+        vdir.mkdir(parents=True)
+        (vdir / "config.yaml").write_text("max_batch_size: 1\n")
+        (vdir / "model.py").write_text(
+            '"""Sleep model (1ms): CPU-bound mock for benchmarking IPC overhead.\n'
+            '\n'
+            'Simulates 1ms compute latency using time.sleep().\n'
+            'Both lite-server and LitServe load this model via the LitAPI interface.\n'
+            '"""\n'
+            '\n'
+            'import time\n'
+            '\n'
+            'from lite_server import LitAPI\n'
+            '\n'
+            '\n'
+            'class Sleep1msAPI(LitAPI):\n'
+            '    """A model that sleeps for 1ms per request."""\n'
+            '\n'
+            '    SLEEP_TIME = 0.001  # 1ms per request\n'
+            '\n'
+            '    def setup(self, device):\n'
+            '        self.device = device\n'
+            '\n'
+            '    def decode_request(self, request):\n'
+            '        return request.get("input", "")\n'
+            '\n'
+            '    def predict(self, inputs):\n'
+            '        time.sleep(self.SLEEP_TIME)\n'
+            '        if isinstance(inputs, list):\n'
+            '            return [{"output": i, "sleep_ms": self.SLEEP_TIME * 1000} for i in inputs]\n'
+            '        return {"output": inputs, "sleep_ms": self.SLEEP_TIME * 1000}\n'
+            '\n'
+            '    def encode_response(self, output):\n'
+            '        return output\n'
+        )
+        analyzer = StaticAnalyzer(repo)
+        result = analyzer.analyze_model("sleep_1ms_model")
+        # No import warnings — the model loads cleanly with lite_server.LitAPI
+        import_warnings = [w for w in result["warnings"] if "import check" in w]
+        assert not import_warnings, (
+            f"Unexpected import warning: {import_warnings}"
+        )
