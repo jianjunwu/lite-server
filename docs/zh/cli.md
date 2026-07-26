@@ -224,5 +224,4 @@ lite-server init --wizard
 
 | 变量 | 说明 |
 |------|------|
-| `LITE_SERVER_LOG_LEVEL` | 覆盖日志级别（等同于 `--log-level`） |
 | `RUST_LOG` | Rust tracing 过滤器（高级用法） |

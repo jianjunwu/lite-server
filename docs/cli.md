@@ -224,5 +224,4 @@ For model config:
 
 | Variable | Description |
 |----------|-------------|
-| `LITE_SERVER_LOG_LEVEL` | Override log level (same as `--log-level`) |
 | `RUST_LOG` | Rust tracing filter (advanced) |
