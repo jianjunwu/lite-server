@@ -166,22 +166,46 @@ fn create_writer(
     match rotation {
         "daily" => {
             cleanup_old_logs(parent, &file_name, backup_count);
+            spawn_log_cleanup(
+                parent.to_path_buf(),
+                file_name.clone(),
+                backup_count,
+                std::time::Duration::from_secs(24 * 3600),
+            );
             let appender = tracing_appender::rolling::daily(parent, &file_name);
             let (writer, guard) = tracing_appender::non_blocking(appender);
             Ok((writer, guard))
         }
         "hourly" => {
             cleanup_old_logs(parent, &file_name, backup_count);
+            spawn_log_cleanup(
+                parent.to_path_buf(),
+                file_name.clone(),
+                backup_count,
+                std::time::Duration::from_secs(3600),
+            );
             let appender = tracing_appender::rolling::hourly(parent, &file_name);
             let (writer, guard) = tracing_appender::non_blocking(appender);
             Ok((writer, guard))
         }
         "size" => {
-            let appender = SizeRotatingAppender::new(final_path, max_size * 1024 * 1024, backup_count)?;
+            let max_bytes = max_size.checked_mul(1024 * 1024).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("max_size {} MB overflows byte conversion", max_size),
+                )
+            })?;
+            let appender = SizeRotatingAppender::new(final_path, max_bytes, backup_count)?;
             let (writer, guard) = tracing_appender::non_blocking(appender);
             Ok((writer, guard))
         }
         _ => {
+            if rotation != "none" {
+                eprintln!(
+                    "unknown log rotation '{}', falling back to 'none'",
+                    rotation
+                );
+            }
             let file = OpenOptions::new().append(true).create(true).open(&final_path)?;
             let (writer, guard) = tracing_appender::non_blocking(file);
             Ok((writer, guard))
@@ -216,6 +240,27 @@ fn cleanup_old_logs(parent: &std::path::Path, file_name: &str, backup_count: usi
     }
 }
 
+/// Spawn a detached thread that periodically removes rotated log files
+/// exceeding backup_count. A plain std thread is used because logging is
+/// initialized before the tokio runtime exists; the thread is detached and
+/// exits with the process.
+fn spawn_log_cleanup(
+    dir: PathBuf,
+    file_name: String,
+    backup_count: usize,
+    interval: std::time::Duration,
+) {
+    let result = std::thread::Builder::new()
+        .name("log-cleanup".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(interval);
+            cleanup_old_logs(&dir, &file_name, backup_count);
+        });
+    if let Err(e) = result {
+        eprintln!("failed to spawn log cleanup thread: {}", e);
+    }
+}
+
 // ===== SizeRotatingAppender =====
 
 #[derive(Clone)]
@@ -232,6 +277,18 @@ struct SizeRotatingAppenderInner {
 
 impl SizeRotatingAppender {
     fn new(path: PathBuf, max_size: usize, backup_count: usize) -> std::io::Result<Self> {
+        if max_size == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "max_size must be > 0 (0 would rotate on every write)",
+            ));
+        }
+        if backup_count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "backup_count must be > 0 (0 would delete the log on every rotation)",
+            ));
+        }
         let file = OpenOptions::new().append(true).create(true).open(&path)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(SizeRotatingAppenderInner {
@@ -374,6 +431,105 @@ mod tests {
             sanitize_hostname("node_01.example-2"),
             "node_01.example-2"
         );
+    }
+
+    // ===== defect reproduction tests =====
+    //
+    // Each test asserts CORRECT behaviour that the current code violates.
+    // When the underlying defect is fixed, the test turns green.
+
+    /// B1: `max_size=0` causes every `write()` to trigger a rotation (because
+    /// `current_size + buf.len() > 0` is always true).  A zero-sized limit is
+    /// a misconfiguration — it should be rejected at construction time.
+    #[test]
+    fn test_data_max_size_zero_should_be_rejected() {
+        let dir = std::env::temp_dir()
+            .join(format!("lite-server-maxsize-zero-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.log");
+
+        let result = SizeRotatingAppender::new(path, 0, 3);
+        assert!(
+            result.is_err(),
+            "max_size=0 is a misconfiguration and must be rejected at construction"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B2: `backup_count=0` combined with rotation renames the current log to
+    /// `<stem>.1.<ext>`, then the cleanup loop (starting at `backup_count+1`)
+    /// immediately deletes it — all previous log content is lost.  Zero backups
+    /// is a misconfiguration and should be rejected at construction time.
+    #[test]
+    fn test_data_backup_count_zero_should_be_rejected() {
+        let dir = std::env::temp_dir()
+            .join(format!("lite-server-backup-zero-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.log");
+
+        let result = SizeRotatingAppender::new(path, 10, 0);
+        assert!(
+            result.is_err(),
+            "backup_count=0 is a misconfiguration and must be rejected at construction"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Overflow: `max_size` is multiplied by 1024*1024 in create_writer — a
+    /// huge value must be rejected with Err, not panic (debug) or wrap
+    /// (release).
+    #[test]
+    fn test_data_max_size_overflow_should_be_rejected() {
+        let dir = std::env::temp_dir()
+            .join(format!("lite-server-maxsize-overflow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.log");
+
+        let result = create_writer(path.to_str().unwrap(), "size", usize::MAX, 3, false);
+        assert!(
+            result.is_err(),
+            "max_size that overflows MB->bytes conversion must be rejected"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_old_logs_removes_oldest_beyond_backup_count() {
+        let dir = std::env::temp_dir()
+            .join(format!("lite-server-cleanup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for day in 1..=5 {
+            std::fs::write(dir.join(format!("app.log.2024-01-0{}", day)), b"x").unwrap();
+        }
+
+        cleanup_old_logs(&dir, "app.log", 2);
+
+        assert!(!dir.join("app.log.2024-01-01").exists());
+        assert!(!dir.join("app.log.2024-01-02").exists());
+        assert!(!dir.join("app.log.2024-01-03").exists());
+        assert!(dir.join("app.log.2024-01-04").exists());
+        assert!(dir.join("app.log.2024-01-05").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_old_logs_keeps_all_when_within_backup_count() {
+        let dir = std::env::temp_dir()
+            .join(format!("lite-server-cleanup-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for day in 1..=3 {
+            std::fs::write(dir.join(format!("app.log.2024-01-0{}", day)), b"x").unwrap();
+        }
+
+        cleanup_old_logs(&dir, "app.log", 7);
+
+        assert!(dir.join("app.log.2024-01-01").exists());
+        assert!(dir.join("app.log.2024-01-02").exists());
+        assert!(dir.join("app.log.2024-01-03").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
