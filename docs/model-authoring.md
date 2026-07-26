@@ -35,12 +35,16 @@ Save as `model_repo/{model_name}/{version}/model.py`.
 model_repo/
   {model_name}/
     {version}/
-      model.py          # Required: LitAPI subclass
-      config.yaml        # Optional: model configuration
+      model.py          # Required: LitAPI subclass (except for ensemble models)
+      config.yaml        # Optional: model configuration (defines ensemble models)
 ```
 
-- `model_name`: alphanumeric, underscores, hyphens (e.g., `my_model`, `resnet-v2`)
-- `version`: numeric or string (e.g., `1`, `v2`, `latest`)
+- `model_name`: alphanumeric, underscores, hyphens, max 64 characters (e.g., `my_model`, `resnet-v2`). Dots `.` are not allowed.
+- `version`: alphanumeric, dots, underscores, hyphens, max 64 characters. Must start with an alphanumeric character, must not start/end with a dot, and must not contain `..` (e.g., `1`, `v2`, `latest`, `1.0.0`)
+
+For **ensemble models**, `model.py` can be omitted — define a top-level `ensemble` key in `config.yaml` instead. The model is then entirely configuration-driven.
+
+The model root directory (`{model_name}/`) may also contain `requirements.txt` (Python dependencies) and `README.md`, which are automatically included when packaging as `.lma`.
 
 ## LitAPI Interface
 
