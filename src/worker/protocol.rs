@@ -145,9 +145,6 @@ pub struct RouteDecl {
 /// `create_routes`.
 pub const SYSTEM_ROUTE_LEAVES: &[&str] = &[
     "compare", "versions", "ready", "health", "reload", "infer", "events", "stream",
-    // Server-level health probes (phase 3) — not model-namespace collisions,
-    // but reserved so custom routes can't masquerade as probe endpoints.
-    "livez", "readyz", "startupz",
 ];
 
 /// True if a declared route tail (e.g. "/status", "/infer", "/pets/{id}")
@@ -412,9 +409,10 @@ mod tests {
             assert!(is_reserved_route(&format!("/{leaf}")), "{leaf} should be reserved");
             assert!(is_reserved_route(leaf), "{leaf} (no slash) should be reserved");
         }
-        // server-level health probes are also reserved (phase 3)
+        // server-level health probes live at root, not under the model
+        // namespace, so they are NOT reserved here (B3)
         for leaf in ["livez", "readyz", "startupz"] {
-            assert!(is_reserved_route(&format!("/{leaf}")), "{leaf} should be reserved");
+            assert!(!is_reserved_route(&format!("/{leaf}")), "{leaf} should not be reserved");
         }
         // a reserved first segment with deeper tail is still reserved
         assert!(is_reserved_route("/versions/v2/status"));
@@ -466,5 +464,37 @@ mod tests {
         let decl: RouteDecl = serde_json::from_str(json).unwrap();
         assert_eq!(decl.route, "/x");
         assert_eq!(decl.methods, vec!["GET".to_string()]);
+    }
+
+    // ===== B3: SYSTEM_ROUTE_LEAVES must not over-guard root-level probes =====
+
+    /// Regression for B3: `livez`, `readyz`, `startupz` are root-level HTTP
+    /// probes (`/livez`, ...). A `@route.get("/livez")` declaration creates
+    /// a route at `/v2/models/:m/livez` — a different path that does not
+    /// shadow the root probe, so it must be allowed.
+    ///
+    /// `infer` / `events` / `stream` ARE exact routes under
+    /// `/v2/models/:m/`, so they stay reserved.
+    #[test]
+    fn root_probes_are_not_reserved_in_model_namespace() {
+        for probe in &["livez", "readyz", "startupz"] {
+            assert!(
+                !SYSTEM_ROUTE_LEAVES.contains(probe),
+                "{probe} lives at root /{probe}, not under /v2/models/:m/{probe}"
+            );
+            assert!(
+                !is_reserved_route(probe),
+                "@route.get(\"/{probe}\") must be allowed at /v2/models/:m/{probe}"
+            );
+        }
+
+        // SANITY: "infer" / "events" / "stream" ARE model-namespace leaves
+        // and MUST stay reserved.
+        for leaf in &["infer", "events", "stream"] {
+            assert!(
+                SYSTEM_ROUTE_LEAVES.contains(leaf),
+                "{leaf} must be reserved (it is a model-namespace leaf)"
+            );
+        }
     }
 }

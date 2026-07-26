@@ -1117,6 +1117,9 @@ async fn resolve_version(
                 .and_then(|v| v.to_str().ok())
                 .filter(|s| !s.is_empty())
             {
+                // Same guard as versioned URL paths — an invalid pin is
+                // rejected (400), not silently honored or fallen back.
+                crate::validation::validate_version(pin)?;
                 pin.to_string()
             } else if let Some(picked) = state.registry.routing_pick(model_name) {
                 picked
@@ -1744,7 +1747,7 @@ async fn handle_ws_stream(
         }
     };
 
-    if !state.registry.is_ready(&model_name, None) {
+    if !state.registry.is_ready(&model_name, Some(&resolved_version)) {
         let _ = socket.close().await;
         return;
     }
@@ -2898,6 +2901,36 @@ mod version_routing_tests {
         assert!(matches!(err, AppError::ModelNotFound(_)), "got {err:?}");
     }
 
+    // ===== B4: x-lite-version header must pass validate_version =====
+
+    /// Regression for B4: the header pin used to reach downstream lookups
+    /// unvalidated, while versioned URL paths are guarded by
+    /// `validate_version`. Invalid header values are rejected (400), same
+    /// as invalid path versions. (Values with control chars can't appear
+    /// in a HeaderValue at all, so only representable cases are tested.)
+    #[tokio::test]
+    async fn invalid_header_pin_is_rejected() {
+        let state = test_state();
+        register_ready(&state, "m", &["1", "2"]);
+        state.registry.activate_version("m", "1").unwrap();
+
+        for bad in ["a/b", "a b", "a..b", ".hidden", "trailing.", &"x".repeat(65)] {
+            let err = resolve_version(&state, "m", None, &pinned_header(bad))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, AppError::Validation(_)),
+                "header pin {bad:?} must be rejected, got {err:?}"
+            );
+        }
+
+        // Sanity: a valid pin still resolves.
+        let v = resolve_version(&state, "m", None, &pinned_header("2"))
+            .await
+            .unwrap();
+        assert_eq!(v, "2");
+    }
+
     // ===== PUT /v2/models/:m/routing (§4.3) =====
 
     fn routing_router(state: Arc<AppState>) -> Router {
@@ -3232,6 +3265,60 @@ mod version_routing_tests {
             resp.headers().get("access-control-allow-origin").unwrap(),
             "https://v2.example",
             "versioned OPTIONS must use the hit version's policy"
+        );
+    }
+
+    // ===== B1: WS readiness must check the resolved version =====
+
+    /// Regression for B1: `handle_ws_stream` used to gate on the ACTIVE
+    /// version's readiness (`is_ready(model, None)`), so a WS pinned via
+    /// `x-lite-version` to a Ready non-active version was closed whenever
+    /// the active version was not Ready.
+    #[tokio::test]
+    async fn ws_stream_readiness_uses_resolved_version_not_active() {
+        use futures::StreamExt;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let state = test_state();
+        // v1 = active but Failed; v2 = Ready (the pin target).
+        state
+            .registry
+            .register("m", "1", Default::default(), ModelType::LitAPI, std::path::PathBuf::new())
+            .unwrap();
+        state
+            .registry
+            .set_status("m", "1", crate::registry::types::VersionStatus::Failed)
+            .unwrap();
+        state.registry.activate_version("m", "1").unwrap();
+        register_ready(&state, "m", &["2"]);
+
+        let app = Router::new()
+            .route(
+                "/v2/models/:model_name/stream",
+                axum::routing::get(ws_stream_handler),
+            )
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("ws://{addr}/v2/models/m/stream");
+        let mut req = url.into_client_request().unwrap();
+        req.headers_mut().insert("x-lite-version", "2".parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("WS connect failed");
+
+        // The pinned v2 is Ready, so the handler must be waiting for the
+        // first client message — NOT closing. Receiving a close frame here
+        // means the readiness gate still checks the active (Failed) version.
+        let first = tokio::time::timeout(std::time::Duration::from_millis(500), ws.next()).await;
+        assert!(
+            first.is_err(),
+            "server closed a WS pinned to a Ready version — readiness gate used the active version, got {first:?}"
         );
     }
 }

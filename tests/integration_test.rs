@@ -239,7 +239,7 @@ class RouteAPI(LitAPI):
     def shadow(self, ctx):
         return {"shadowed": True}
 
-    @route.get("/livez")  # reserved probe leaf (phase 3) → skipped at ingest
+    @route.get("/livez")  # root probe lives at /livez — no model-namespace collision (B3)
     def livez(self, ctx):
         return {"alive": True}
 
@@ -612,11 +612,12 @@ async fn test_model_health_fields() {
     unload_model(&base, MODEL, "1").await;
 }
 
-/// route_model declares @route.get("/livez") — a reserved probe leaf. It is
-/// skipped at ingest, so the path falls through to the standardized 404.
+/// route_model declares @route.get("/livez"). The root probe lives at /livez,
+/// so a model-namespace route with the same leaf does not shadow it and must
+/// be served (B3: probes removed from SYSTEM_ROUTE_LEAVES).
 #[tokio::test]
 #[serial]
-async fn test_custom_route_probe_leaf_skipped() {
+async fn test_custom_route_probe_leaf_served() {
     let base = shared_base().await;
     let client = reqwest::Client::new();
 
@@ -625,7 +626,9 @@ async fn test_custom_route_probe_leaf_skipped() {
     let resp = client
         .get(format!("{}/v2/models/{}/livez", base, ROUTE_MODEL))
         .send().await.unwrap();
-    assert_eq!(resp.status(), 404, "reserved probe leaf must be skipped at ingest");
+    assert_eq!(resp.status(), 200, "probe leaf is not reserved in the model namespace");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["alive"], true);
 
     unload_model(&base, ROUTE_MODEL, "1").await;
 }

@@ -336,17 +336,10 @@ impl WorkerManager {
             }
         }
 
-        // Remove old ZMQ client and create new one
+        // The old ZMQ client is dropped when the new one replaces it in
+        // place below — never remove() from the list, that would shift
+        // later workers' clients out of their worker_id slots.
         let endpoint = worker_endpoint(model_name, version, worker_id as usize);
-        {
-            let mut clients = self.zmq_clients.write().await;
-            if let Some(list) = clients.get_mut(&key) {
-                // Remove the old client at this worker_id index
-                if (worker_id as usize) < list.len() {
-                    list.remove(worker_id as usize);
-                }
-            }
-        }
 
         // Remove stale socket (Unix only)
         #[cfg(unix)]
@@ -528,12 +521,7 @@ impl WorkerManager {
         {
             let mut clients = self.zmq_clients.write().await;
             if let Some(list) = clients.get_mut(&key) {
-                let idx = worker_id as usize;
-                if idx < list.len() {
-                    list[idx] = zmq_client.clone();
-                } else {
-                    list.push(zmq_client.clone());
-                }
+                upsert_zmq_client(list, worker_id as usize, zmq_client.clone());
             }
         }
 
@@ -815,6 +803,16 @@ impl WorkerManager {
         } else {
             ModelType::LitAPI
         };
+
+        // Reject duplicates before any eviction below: a doomed load must
+        // never evict a healthy version. Same error `registry.register`
+        // would return, but raised before `enforce_max_loaded_versions`.
+        if self.registry.get(model_name, Some(version)).is_some() {
+            return Err(AppError::VersionAlreadyLoaded(
+                model_name.to_string(),
+                version.to_string(),
+            ));
+        }
 
         // Evict LRU non-active versions if the model is at its
         // max_loaded_versions limit (§4.2). Placed after the on-disk checks
@@ -1623,6 +1621,23 @@ fn new_worker_command(python_module_dir: &str) -> Command {
     cmd.env("LITE_POLICY_MANAGED", "1");
     cmd.kill_on_drop(true);
     cmd
+}
+
+/// Replace the ZMQ client for `worker_id` in place.
+///
+/// Request routing indexes `clients[worker_id]` positionally, so a respawn
+/// must never shrink the list or shift slots. Appends only when `idx` is
+/// the next slot (first registration).
+fn upsert_zmq_client(
+    list: &mut Vec<Arc<WorkerZmqClient>>,
+    idx: usize,
+    client: Arc<WorkerZmqClient>,
+) {
+    if idx < list.len() {
+        list[idx] = client;
+    } else {
+        list.push(client);
+    }
 }
 
 /// Build a platform-appropriate ZMQ endpoint for a worker.
@@ -2665,5 +2680,112 @@ class TestAPI(LitAPI):
         // clear on unload removes them
         wm.clear_routes("m", "1").await;
         assert!(wm.get_routes("m", "1").await.is_empty());
+    }
+
+    // ===== B5: respawn_worker ZMQ client vector index corruption =====
+
+    /// Regression for B5: respawn must replace the client at `worker_id`
+    /// in place. Callers index `clients[worker_id]` positionally, so the
+    /// list must stay aligned with worker ids — same length, other slots
+    /// untouched.
+    #[tokio::test]
+    async fn upsert_zmq_client_replaces_in_place_preserving_worker_alignment() {
+        let c = || {
+            Arc::new(WorkerZmqClient::new(
+                "ipc:///tmp/lite-b5-test.sock".to_string(),
+            ))
+        };
+        let mut list = vec![c(), c(), c()];
+        let keep1 = list[1].clone();
+        let keep2 = list[2].clone();
+
+        let new0 = c();
+        upsert_zmq_client(&mut list, 0, new0.clone());
+
+        assert_eq!(list.len(), 3, "list must not shrink on respawn");
+        assert!(Arc::ptr_eq(&list[0], &new0), "slot 0 holds the new client");
+        assert!(
+            Arc::ptr_eq(&list[1], &keep1),
+            "worker 1's client must survive respawn of worker 0"
+        );
+        assert!(Arc::ptr_eq(&list[2], &keep2), "worker 2's client untouched");
+    }
+
+    /// Appending is only for the next-slot case (e.g. first registration);
+    /// it must not create gaps.
+    #[tokio::test]
+    async fn upsert_zmq_client_appends_at_next_slot() {
+        let c = || {
+            Arc::new(WorkerZmqClient::new(
+                "ipc:///tmp/lite-b5-test.sock".to_string(),
+            ))
+        };
+        let mut list = vec![c()];
+        let new1 = c();
+        upsert_zmq_client(&mut list, 1, new1.clone());
+
+        assert_eq!(list.len(), 2);
+        assert!(Arc::ptr_eq(&list[1], &new1));
+    }
+
+    /// Regression for B2: `load_model` used to run `enforce_max_loaded_versions`
+    /// (which may evict a healthy version) before the duplicate check in
+    /// `registry.register`. Re-loading an already-loaded version must fail
+    /// with `VersionAlreadyLoaded` WITHOUT evicting anything.
+    ///
+    /// Scenario: max_loaded=2, v1 (active) + v2 loaded. Re-load v1 → must
+    /// reject, and v2 must still be loaded.
+    #[tokio::test]
+    async fn test_load_model_duplicate_rejects_before_lru_eviction() {
+        // On-disk fixture so load_model passes the model.py checks and
+        // reaches the duplicate guard.
+        let repo = std::env::temp_dir()
+            .join(format!("lite-server-b2-dup-test-{}", std::process::id()));
+        for v in ["1", "2"] {
+            let dir = repo.join("m").join(v);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("model.py"), "# test fixture\n").unwrap();
+        }
+
+        let registry = Arc::new(ModelRegistry::new());
+        registry
+            .set_strategy("m", &lru_strategy(Some(2)))
+            .unwrap();
+        for v in ["1", "2"] {
+            registry
+                .register(
+                    "m", v,
+                    ModelConfig::default(),
+                    ModelType::LitAPI,
+                    repo.join("m").join(v),
+                )
+                .unwrap();
+            registry.mark_ready("m", v).unwrap();
+        }
+        registry.activate_version("m", "1").unwrap();
+
+        let wm = WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            Arc::new(InferenceQueue::new()),
+            "warn".to_string(),
+            Arc::new(CallbackRunner::new()),
+        );
+
+        let err = wm
+            .load_model("m", "1", &ModelConfig::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::VersionAlreadyLoaded(ref m, ref v) if m == "m" && v == "1"),
+            "duplicate load must reject, got {err:?}"
+        );
+        assert!(
+            registry.get("m", Some("2")).is_some(),
+            "v2 must NOT be evicted by a doomed duplicate load"
+        );
+        assert_eq!(registry.list_versions("m").len(), 2);
+
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }
