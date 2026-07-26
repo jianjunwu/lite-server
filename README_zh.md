@@ -219,7 +219,6 @@ lite-server init my_project           # 脚手架创建项目
 | 12 | [continuous_batching](examples/12_continuous_batching/) | LLM 连续批处理（prefill/step/has_finished） |
 | 13 | [bidi_streaming](examples/13_bidi_streaming/) | 双向流式通信（ASR） |
 | 14 | [lifecycle_hooks](examples/14_lifecycle_hooks/) | Worker 生命周期钩子（shell + HTTP） |
-| 15 | [middleware](examples/15_middleware/) | 端点中间件（认证、限流、CORS） |
 | 16 | [grpc](examples/16_grpc/) | gRPC 推理端点 |
 
 详见 [examples/README.md](examples/README.md) 获取学习路径和使用说明。

@@ -117,19 +117,6 @@ impl ModelEntry {
             weights: HashMap::new(),
         }
     }
-
-    pub fn ready_versions(&self) -> Vec<&ModelVersion> {
-        self.versions
-            .values()
-            .filter(|v| v.status == VersionStatus::Ready)
-            .collect()
-    }
-
-    pub fn latest_version(&self) -> Option<&ModelVersion> {
-        self.ready_versions()
-            .into_iter()
-            .max_by_key(|v| &v.version)
-    }
 }
 
 /// One model version's health summary (server-wide status rollup, phase 3).

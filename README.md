@@ -221,7 +221,6 @@ See [examples/](examples/) for runnable model repositories:
 | 12 | [continuous_batching](examples/12_continuous_batching/) | LLM continuous batching (prefill/step/has_finished) |
 | 13 | [bidi_streaming](examples/13_bidi_streaming/) | Bidirectional streaming for ASR |
 | 14 | [lifecycle_hooks](examples/14_lifecycle_hooks/) | Worker lifecycle hooks (shell + HTTP) |
-| 15 | [middleware](examples/15_middleware/) | Endpoint middleware (auth, rate limit, CORS) |
 | 16 | [grpc](examples/16_grpc/) | gRPC inference endpoints |
 
 See [examples/README.md](examples/README.md) for learning path and usage details.

@@ -289,22 +289,6 @@ def check_14():
     return ok, f"HTTP {st} -> {r}"
 
 
-def check_15():
-    # Model-level callback chain guards every route of the model — inference
-    # and custom @route handlers alike. No key → 401; valid key → 200.
-    key = {"X-API-Key": "secret-api-key-123"}
-    st1, _ = http_json("POST", "/v2/models/protected/infer", {"input": "hello"})
-    st2, r2 = http_json("POST", "/v2/models/protected/infer", {"input": "hello"}, headers=key)
-    st3, _ = http_json("GET", "/v2/models/protected/status")
-    st4, r4 = http_json("GET", "/v2/models/protected/status", headers=key)
-    ok = (st1 == 401
-          and st2 == 200 and isinstance(r2, dict) and r2.get("output") == "protected: hello"
-          and st3 == 401
-          and st4 == 200 and isinstance(r4, dict))
-    return ok, (f"infer no-key HTTP {st1} | infer key HTTP {st2} | "
-                f"status no-key HTTP {st3} | status key HTTP {st4}")
-
-
 def check_16():
     st, r = http_json("POST", "/v2/models/grpc_echo/infer", {"input": "hello"})
     return st == 200 and r.get("output") == "grpc_echo: hello", f"HTTP {st} -> {r}"
@@ -324,7 +308,6 @@ SPECS = {
     "12_continuous_batching": ("cb_llm", check_12),
     "13_bidi_streaming": ("asr", check_13),
     "14_lifecycle_hooks": ("hooked_model", check_14),
-    "15_middleware": ("protected", check_15),
     "16_grpc": ("grpc_echo", check_16),
 }
 
