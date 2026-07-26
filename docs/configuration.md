@@ -4,7 +4,7 @@
 
 lite-server uses three layers of configuration: **server config** (YAML file or CLI), **model config** (per-model `config.yaml`), and **orchestration config** (`orchestration` section in `server.yaml`). CLI flags override YAML values.
 
-## Server Configuration
+## Server Configuration (`server.yaml`)
 
 Path: `server.yaml` (passed via `--config` or `-c`)
 
@@ -35,6 +35,11 @@ grpc:
 
 metrics:
   enabled: true                # Enable Prometheus metrics endpoint
+
+rate_limit:
+  max_buckets: 65536           # Max distinct rate-limit buckets (per IP/route key).
+                               # Bounds memory under spoofed-source floods.
+                               # 0 = unlimited.
 
 model_repository:
   path: ./model_repo           # Path to the model repository directory
@@ -119,6 +124,11 @@ hot_reload: false              # Enable file watching for hot reload
 hot_reload_patterns:           # Glob patterns to watch
   - "*.py"
 hot_reload_interval: 1.0       # Polling interval in seconds
+
+# Middleware / Callbacks
+callbacks:                     # Callback class paths loaded at worker startup
+  - my_package.callbacks.AuditLogger
+  - lite_server.callback.RequireApiKey
 ```
 
 ## Orchestration Configuration
@@ -141,6 +151,9 @@ models:                        # Per-model version strategies
       - "2"
     default_version: "2"       # Version to activate by default
     max_loaded_versions: null  # Max versions to keep loaded (null = unlimited)
+    weights:                   # Canary traffic weights per version (versions not listed get weight 0)
+      "1": 80
+      "2": 20
 ```
 
 ### Load Policies
@@ -156,7 +169,7 @@ models:                        # Per-model version strategies
 All server config fields can be overridden via CLI flags:
 
 ```bash
-python -m lite_server serve [flags]
+lite-server serve [flags]
 ```
 
 | Flag | Description | Overrides |
@@ -176,6 +189,8 @@ python -m lite_server serve [flags]
 | `--max-requests-jitter` | Jitter for max_requests | `model_defaults.max_requests_jitter` |
 | `--request-timeout` | Per-request timeout | `model_defaults.request_timeout` |
 | `--health-check-interval` | Health check interval | `model_defaults.health_check_interval` |
+| `--threads` | Tokio worker threads | `server.threads` |
+| `--metrics-port` | Metrics port | `server.metrics_port` |
 | `--graceful-timeout` | Graceful shutdown timeout | `server.graceful_timeout` |
 | `--keepalive-timeout` | HTTP keep-alive timeout | `server.keepalive_timeout` |
 
@@ -198,7 +213,7 @@ For model config, the precedence is:
 ### Development (single model, no config file)
 
 ```bash
-python -m lite_server serve --model-repo ./my_models
+lite-server serve --model-repo ./my_models
 ```
 
 ### Production (multiple workers, custom ports)

@@ -4,7 +4,7 @@
 
 lite-server 采用三层配置：**服务器配置**（YAML 文件或 CLI）、**模型配置**（每模型 `config.yaml`）和**编排配置**（`server.yaml` 中的 `orchestration` 段落）。CLI 参数覆盖 YAML 值。
 
-## 服务器配置
+## 服务器配置（`server.yaml`）
 
 路径：`server.yaml`（通过 `--config` 或 `-c` 传入）
 
@@ -35,6 +35,11 @@ grpc:
 
 metrics:
   enabled: true                # 启用 Prometheus 指标端点
+
+rate_limit:
+  max_buckets: 65536           # 限流桶数量上限（按 IP/路由 key），
+                               # 防 IP 伪造洪泛导致内存无限增长。
+                               # 0 = 无限制。
 
 model_repository:
   path: ./model_repo           # 模型仓库目录
@@ -119,6 +124,11 @@ hot_reload: false              # 启用文件监听热重载
 hot_reload_patterns:           # 监听的 glob 模式
   - "*.py"
 hot_reload_interval: 1.0       # 轮询间隔（秒）
+
+# 中间件 / Callback
+callbacks:                     # Worker 启动时加载的 callback 类路径列表
+  - my_package.callbacks.AuditLogger
+  - lite_server.callback.RequireApiKey
 ```
 
 ## 编排配置
@@ -141,6 +151,9 @@ models:                        # 每个模型的版本策略
       - "2"
     default_version: "2"       # 默认激活的版本
     max_loaded_versions: null  # 最多保留的已加载版本数（null = 无限制）
+    weights:                   # 金丝雀/加权流量分配（未列出的版本权重为 0）
+      "1": 80
+      "2": 20
 ```
 
 ### 加载策略
@@ -176,6 +189,8 @@ lite-server serve [参数]
 | `--max-requests-jitter` | max_requests 抖动 | `model_defaults.max_requests_jitter` |
 | `--request-timeout` | 单请求超时 | `model_defaults.request_timeout` |
 | `--health-check-interval` | 健康检查间隔 | `model_defaults.health_check_interval` |
+| `--threads` | Tokio 工作线程数 | `server.threads` |
+| `--metrics-port` | 指标端口 | `server.metrics_port` |
 | `--graceful-timeout` | 优雅关闭超时 | `server.graceful_timeout` |
 | `--keepalive-timeout` | HTTP keep-alive 超时 | `server.keepalive_timeout` |
 
