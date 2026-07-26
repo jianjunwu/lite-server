@@ -72,6 +72,14 @@ def decode_request(self, request):
     }
 ```
 
+如需访问每请求上下文，可声明第二个参数 ``ctx``（worker 加载时自动检测）：
+
+```python
+def decode_request(self, request, ctx):
+    ctx.state["user_id"] = request.get("user_id")
+    return {"prompt": request["prompt"]}
+```
+
 #### `predict(self, x)`
 
 运行推理。接收 `decode_request()` 的输出。
@@ -80,6 +88,15 @@ def decode_request(self, request):
 def predict(self, x):
     tokens = self.tokenizer(x["text"], max_length=x["max_length"])
     return self.model(**tokens)
+```
+
+在单请求模式下，也可声明第二个参数 ``ctx`` 获取每请求上下文（注入单个
+:class:`RequestContext`）：
+
+```python
+def predict(self, x, ctx):
+    self.logger.info("processing request %s", ctx.meta.request_id)
+    return self.model(x)
 ```
 
 启用批处理时（`max_batch_size > 1`），`x` 是解码输入的**列表**：
@@ -119,6 +136,13 @@ def encode_response(self, output):
     return {"prediction": output.tolist(), "confidence": float(output.max())}
 ```
 
+如需访问每请求上下文，可声明第二个参数 ``ctx``：
+
+```python
+def encode_response(self, output, ctx):
+    return {"prediction": output, "request_id": ctx.meta.request_id}
+```
+
 ### 可选方法
 
 #### `stream_predict(self, request)`
@@ -131,6 +155,15 @@ def stream_predict(self, request):
     for token in self.model.generate(prompt):
         yield {"token": token}
         time.sleep(0.02)  # 模拟生成延迟
+```
+
+如需访问流级上下文，可声明第二个参数 ``ctx``（注入单个 :class:`RequestContext`）：
+
+```python
+def stream_predict(self, request, ctx):
+    self.logger.info("streaming for request %s", ctx.meta.request_id)
+    for token in self.model.generate(request.get("prompt", "")):
+        yield {"token": token}
 ```
 
 在 `config.yaml` 中启用流式：
@@ -146,14 +179,16 @@ stream: true
 在 `decode_request()` 之前对原始请求调用。用于鉴权、日志或请求修改。接收单个 :class:`RequestContext` 参数（与 Callback 钩子契约一致）。
 
 ```python
+from lite_server.exceptions import UnauthorizedError
+
 def on_request(self, ctx):
     self.logger.info(f"Request from {ctx.meta.client_ip}: {ctx.meta.request_id}")
     if not self._check_auth(ctx.meta.headers):
-        raise PermissionError("Unauthorized")
+        raise UnauthorizedError("invalid or missing token")
     return ctx.request
 ```
 
-``ctx.meta`` 是 `RequestMeta` 对象，包含：`route`、`headers`、`client_ip`、`request_id`、`timestamp_ns`。
+``ctx.meta`` 是 `RequestMeta` 对象，包含：`route`、`method`、`headers`、`query`、`client_ip`、`request_id`、`timestamp_ns`。其中 `method` 和 `query` 主要用于自定义路由处理器。
 
 #### `on_response(self, ctx)`
 
@@ -217,13 +252,19 @@ class MyCallback(Callback):
     def on_output(self, ctx):
         """在 predict 之后、encode_response 之前调用。"""
         ctx.output["_latency_ns"] = time.time_ns() - ctx.meta.timestamp_ns
+
+    def on_error(self, ctx, exc):
+        """请求失败（任意钩子或阶段抛出异常）时调用。"""
+        self.logger.error("request %s failed: %s", ctx.meta.request_id, exc)
 ```
 
-**钩子点**（管线顺序）：
+**管线阶段**（正常路径）：
 
 ```
 on_request → decode_request → on_input → predict → on_output → encode_response → on_response
 ```
+
+任意阶段或钩子抛出异常时，管线短路到 ``on_error``，之后返回错误响应给客户端。
 
 | 钩子 | 触发时机 | 读写字段 |
 |------|---------|---------|
@@ -231,6 +272,7 @@ on_request → decode_request → on_input → predict → on_output → encode_
 | `on_input` | `decode_request` 之后，`predict` 之前 | `ctx.input` |
 | `on_output` | `predict` 之后，`encode_response` 之前（流式时每个 chunk） | `ctx.output` |
 | `on_response` | `encode_response` 之后，发送前（流式时每个 chunk） | `ctx.response` |
+| `on_error` | 任意钩子或阶段抛出异常时 | `ctx` + `exc`（异常对象） |
 | `on_before_setup` | `LitAPI.setup()` 之前 | `(config, device)` |
 | `on_after_setup` | `LitAPI.setup()` 完成后 | `(lit_api)` |
 | `on_teardown` | 模型卸载 / worker 关闭时 | `(lit_api)` |
@@ -250,7 +292,7 @@ on_request → decode_request → on_input → predict → on_output → encode_
 
 - **Early return**（如缓存命中）：在任意钩子中调用 `ctx.respond(body, status_code=..., headers=...)` 或返回一个 `Response`。后续阶段和剩余钩子被跳过。
 - **参数校验 / 拒绝**：在任意钩子中抛出 `HTTPException`（`BadRequestError`、`UnauthorizedError` 等）。客户端收到对应状态码的结构化错误 — 数据钩子的异常**不会**被吞掉。
-- 生命周期钩子（`on_before_setup` / `on_after_setup` / `on_teardown`）保持异常隔离：失败只记日志，不传播。
+- 生命周期钩子（`on_before_setup` / `on_after_setup` / `on_teardown`）和 `on_error` 保持异常隔离：失败只记日志，不传播（`on_error` 自身的异常也不会掩盖原始错误）。
 
 ```python
 from lite_server import Callback, BadRequestError
@@ -266,19 +308,6 @@ class Cache(Callback):
         if hit is not None:
             ctx.respond(hit, headers={"X-Cache-Hit": "1"})
 ```
-
-### 声明式加载
-
-在 `config.yaml` 中通过 `callbacks` 字段声明 callback 类路径，服务启动时自动加载并注册：
-
-```yaml
-# config.yaml
-callbacks:
-  - my_package.callbacks.AuditLogger
-  - my_package.callbacks.MetricsCollector
-```
-
-每个类必须是无参构造的 `Callback` 子类。导入失败或 0.7 之前的旧钩子签名会在加载时响亮报错 — 被静默跳过的 callback 可能意味着鉴权/校验逻辑从未执行。
 
 ### 完整示例：审计日志
 
@@ -297,8 +326,86 @@ class AuditLogger(Callback):
         print(f"[AUDIT] request_id={ctx.meta.request_id} latency={elapsed_ms:.2f}ms")
 
     def on_teardown(self, lit_api):
-        print(f"[AUDIT] model torn down, total handled: {lit_api.call_count}")
+        print(f"[AUDIT] model torn down, class: {type(lit_api).__name__}")
 ```
+
+### 内置 Callback
+
+lite-server 提供了几个开箱即用的 Callback，可直接在 ``callbacks`` 列表中使用：
+
+**``RequireApiKey``** — API Key 鉴权：
+
+```python
+from lite_server import RequireApiKey
+
+# 在 callbacks 列表中声明
+callbacks:
+  - lite_server.callback.RequireApiKey
+```
+
+默认从 `X-API-Key` 请求头读取 key。支持自定义 header 和白名单：
+
+```python
+RequireApiKey(header="Authorization", keys=["sk-xxx", "sk-yyy"])
+# keys 为空列表时，任意非空值即通过
+```
+
+**``Cors``** — 跨域策略声明（由 Rust HTTP 层执行）：
+
+```python
+from lite_server import Cors
+
+Cors(
+    allow_origins=["https://example.com"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "Authorization"],
+)
+```
+
+**``RateLimit``** — 速率限制声明（由 Rust HTTP 层执行）：
+
+```python
+from lite_server import RateLimit
+
+RateLimit(requests_per_minute=60, key="ip", burst=100)
+# key="route" 按路由限流，key="ip" 按客户端 IP 限流
+```
+
+**``LogRequests``** — 请求日志（方法、路由、状态码、耗时）：
+
+```python
+from lite_server import LogRequests
+
+LogRequests(logger_name="lite_server.requests")
+```
+
+> 当进程运行在 Rust 管理的 worker 之外（如单元测试）时，`RateLimit` 和 `Cors`
+> 会自动回退到进程内的本地实现——因此策略可测试，但不适合生产级限流。
+
+### Callback 声明方式
+
+Callback 可通过两种方式声明，两者可组合使用（类属性优先）：
+
+**方式一：`LitAPI.callbacks` 类属性**（支持构造参数）：
+
+```python
+class MyModel(LitAPI):
+    callbacks = (
+        RequireApiKey(header="X-API-Key", keys=["sk-xxx"]),
+        LogRequests(),
+    )
+```
+
+**方式二：`config.yaml`**（无参构造）：
+
+```yaml
+callbacks:
+  - my_package.callbacks.AuditLogger
+  - lite_server.callback.LogRequests
+```
+
+> 导入失败或 0.7 之前的旧钩子签名会在加载时响亮报错 —— 被静默跳过的
+> callback 可能意味着鉴权/校验逻辑从未执行。
 
 ### Callback vs LitAPI 内联 Hook
 
@@ -440,6 +547,7 @@ class AsyncModel(LitAPI):
 - **全同步模型**在事件循环内联执行 — 零适配开销，行为与 0.7 之前的 standard loop 一致。
 - **只要存在异步方法**（任意模型方法或 callback 钩子），同步模型阶段就在单线程 executor 上执行：同步代码绝不并发运行（保持线程安全假设），也绝不阻塞事件循环。
 - 批处理、流式、双向流式、连续批处理都同时支持同步和异步方法。
+- ``enable_async`` 构造参数自 0.7.0 起接受但**忽略**——所有模型统一运行在 async event loop 上，不再需要显式开启。
 
 参见 [examples/10_async](../examples/10_async/) 获取可运行的示例。
 
@@ -466,7 +574,7 @@ class LLMModel(LitAPI):
         """为所有活跃序列运行一步生成。"""
         new_tokens = []
         for seq in active_sequences:
-            token = self.model.generate_step(seq["uid"])
+            token = self.model.generate_step(seq.uid)
             new_tokens.append(token)
         return new_tokens
 
@@ -475,7 +583,30 @@ class LLMModel(LitAPI):
         return token == self.eos_token or len(generated_sequence) >= self.max_length
 ```
 
-`active_sequences` 中每个元素包含键：`uid`、`input`、`output`（到目前为止的 token 列表）。
+``active_sequences`` 中每个元素是 :class:`CBSequence` 对象，包含以下属性：
+
+| 属性 | 说明 |
+|------|------|
+| `seq.uid` | 唯一请求标识符 |
+| `seq.input` | ``decode_request`` 的输出 |
+| `seq.output` | 到目前为止生成的 token 列表 |
+| `seq.state` | 每序列用户数据（与 ``ctx.state`` 相同字典） |
+| `seq.meta` | 不可变请求元数据（``RequestMeta``） |
+| `seq.ctx` | 完整的 ``RequestContext`` |
+
+``prefill`` 和 ``has_finished`` 可声明可选的 ``ctx`` 参数以访问每请求上下文：
+
+```python
+def prefill(self, uid, decoded_input, ctx):
+    ctx.state["max_tokens"] = decoded_input.get("max_tokens", 100)
+    self.kv_cache.add(uid, self.tokenizer.encode(decoded_input["prompt"]))
+
+def has_finished(self, uid, token, generated_sequence, ctx):
+    return len(generated_sequence) >= ctx.state.get("max_tokens", 100)
+```
+
+> **注意：** ``step()`` 操作跨序列，**不支持** ``ctx`` 参数（声明会导致加载时报错）。
+> 通过 ``seq.state`` 或 ``seq.ctx`` 访问每序列数据。
 
 ## 批处理
 
@@ -511,7 +642,7 @@ def predict(self, x):
 decode_request → batch → predict → unbatch → encode_response
 ```
 
-当只有一个请求排队时，`batch()` 和 `unbatch()` 都会被跳过 — `predict()` 直接接收解码后的请求。
+当只有一个请求排队**且用户覆盖了** `batch()` / `unbatch()` 时，它们会被跳过 — `predict()` 直接接收解码后的请求。使用默认 `batch()` / `unbatch()` 时，`predict()` 始终接收 `batch()` 的输出。
 
 ```python
 class CustomBatchModel(LitAPI):
@@ -549,21 +680,42 @@ class CustomBatchModel(LitAPI):
 
 ## 双向流式
 
-用于实时双向通信（如 ASR）：
+用于实时双向通信（如 ASR）。重写 `bidi_stream()` 返回一个
+:class:`BidiStreamHandler` 子类的实例，实现 `on_open`、`on_chunk` 和
+`on_close` 三个钩子：
 
 ```python
-class ASRModel(LitAPI):
-    def bidi_stream(self):
-        class Handler:
-            def on_chunk(self, chunk):
-                # 处理传入的音频 chunk，返回部分结果
-                return self.model.process_audio(chunk)
+from lite_server import LitAPI, BidiStreamHandler
 
-            def on_close(self):
-                # 完成并返回最终结果
-                return self.model.finalize()
-        return Handler()
+class ASRHandler(BidiStreamHandler):
+    def on_open(self, initial_data, ctx=None):
+        """流打开时调用。返回初始响应，或 None。"""
+        ctx.state["buffer"] = []
+        return {"status": "ready", "sample_rate": 16000}
+
+    def on_chunk(self, chunk, ctx=None):
+        """处理每个传入的 chunk。返回结果 chunk，或 None。"""
+        text = chunk.get("text", "")
+        if text:
+            ctx.state["buffer"].append(text)
+            return {"partial": " ".join(ctx.state["buffer"]), "is_final": False}
+        return None
+
+    def on_close(self, ctx=None):
+        """流关闭时调用。返回最终结果。"""
+        result = " ".join(ctx.state.get("buffer", []))
+        return {"final": result, "is_final": True}
+
+class ASRModel(LitAPI):
+    def bidi_stream(self, ctx=None):
+        return ASRHandler()
 ```
+
+- 所有钩子均可声明可选的 ``ctx`` 参数——``ctx.state`` 在同一会话的
+  ``on_open`` / ``on_chunk`` / ``on_close`` 之间共享，并发安全。
+- ``bidi_stream()`` 本身也可声明 ``ctx`` 参数以访问会话元数据。
+- ``on_open`` 成功完成后，必定有恰好一次 ``on_close``（正常关闭、取消或
+  worker 关闭时）。``on_open`` 失败则不创建会话，也不会触发 ``on_close``。
 
 在配置中启用：
 
@@ -571,9 +723,9 @@ class ASRModel(LitAPI):
 bidirectional: true
 ```
 
-> **注意：** 在双向（bidi）会话期间，钩子中的 ``ctx.request`` 和 ``ctx.input``
-> 始终指向初始的 open 负载——它们不会随 chunk 到达而变化。每个 chunk 的数据
-> 通过 handler 的 ``on_chunk(chunk)`` 参数获取。
+> **注意：** 在双向（bidi）会话期间，回调钩子中的 ``ctx.request`` 和
+> ``ctx.input`` 始终指向初始的 open 负载——它们不会随 chunk 到达而变化。
+> 每个 chunk 的数据通过 handler 的 ``on_chunk(chunk)`` 参数获取。
 
 ## 自定义指标
 
@@ -660,19 +812,22 @@ lite_server_my_inference_ms_bucket{model="mymodel",le="0.5"} 1400
 
 ### 流式支持
 
-指标在所有模式下均可使用 — 标准、批处理、流式和连续批处理。流式模式下，指标在生成器完成后收集并附加到 `StreamDone` 消息。
+指标在所有模式下均可使用 — 标准、批处理、流式和连续批处理。流式模式下，指标默认在生成器完成后收集并附加到 `StreamDone` 消息。如需按 chunk 收集指标（不等流结束），可在 yield 之间调用 `flush_metrics()`：
 
 ```python
 def stream_predict(self, request):
-    for token in self.model.generate(request["prompt"]):
+    for i, token in enumerate(self.model.generate(request["prompt"])):
+        self.report_metric(self.c_tokens, 1.0)
         yield {"token": token}
-    # 生成期间上报的指标会自动收集
-    self.report_metric(self.c_predictions, 1.0)
+        if i % 100 == 0:
+            self.flush_metrics()  # 立即收集并发送，不等到流结束
+    # 流结束时框架也会自动收集一次
 ```
 
 ### 注意事项
 
 - 指标名不得与内置 Prometheus 指标冲突（如 `liteserver_requests_total`）
+- **Counter 指标不要以 `_total` 结尾** —— Prometheus 会自动追加 `_total` 后缀。如注册名为 `my_predictions_total` 的 counter，实际暴露为 `my_predictions_total_total`
 - ID 按 LitAPI 实例隔离 — 不同模型可注册相同指标名（值通过 `model` 标签区分）
 - 默认 Histogram 桶：`[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]`
 
@@ -823,7 +978,7 @@ from lite_server.exceptions import (
 class MyModel(LitAPI):
     def predict(self, x):
         if x.get("value") < 0:
-            raise BadRequestError("input must be non-negative", "INVALID_INPUT")
+            raise BadRequestError("input must be non-negative", code="invalid_input", param="value")
         if self.model is None:
             raise ServiceUnavailableError("model not loaded yet")
         return self.model(x)
@@ -843,10 +998,11 @@ class MyModel(LitAPI):
 | `InternalServerError` | 500 | `server_error` |
 | `ServiceUnavailableError` | 503 | `service_unavailable` |
 
-所有异常类都接受自定义 `error_type` 作为第二个参数，以及可选的 `code` 和 `param` 关键字参数用于程序化错误处理（OpenAI 惯例）：
+所有异常类都接受 ``error_type`` 作为第二个参数设置错误类型，以及可选的 ``code``、``param`` 和 ``headers`` 关键字参数用于程序化错误处理（OpenAI 惯例）：
 
 ```python
 raise BadRequestError("input must be non-negative", code="invalid_input", param="value")
+raise ServiceUnavailableError("overloaded", headers={"Retry-After": "30"})
 ```
 
 客户端始终收到四字段结构化响应：
