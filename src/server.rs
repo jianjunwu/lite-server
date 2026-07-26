@@ -656,7 +656,13 @@ async fn scan_repo_models(repo_path: &Path) -> Vec<RepoModel> {
                 let mut is_ensemble = false;
                 if config_yaml.exists() {
                     if let Ok(content) = tokio::fs::read_to_string(&config_yaml).await {
-                        is_ensemble = content.contains("ensemble:");
+                        // Structural check: parse YAML and look for a top-level
+                        // `ensemble` key. String-contains would false-positive on
+                        // comments or description strings mentioning "ensemble:".
+                        is_ensemble = serde_yaml::from_str::<serde_yaml::Value>(&content)
+                            .ok()
+                            .and_then(|v| v.get("ensemble").map(|_| ()))
+                            .is_some();
                     }
                 }
 
@@ -1167,5 +1173,95 @@ mod tests {
         assert_eq!(resolved.load_models, vec!["from_file"]);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ===== B1: ensemble detection via string contains is fragile =====
+
+    /// B1 (P2): `scan_repo_models` detects ensemble models via
+    /// `content.contains("ensemble:")`. This matches comments,
+    /// documentation strings, and other non-structural occurrences,
+    /// causing false positives.
+    #[tokio::test]
+    async fn test_scan_repo_models_ensemble_detection_false_positive_on_comment() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-ensemble-fp-{}",
+            std::process::id()
+        ));
+        let model_dir = tmp.join("test_model").join("1");
+        tokio::fs::create_dir_all(&model_dir).await.unwrap();
+
+        // A config.yaml where "ensemble:" only appears in a comment / description.
+        // A real model.py also exists, so the directory would be picked up as a
+        // standard model — but the string-contains check marks it as ensemble.
+        let config = r#"# This model is NOT an ensemble; the line below is a comment.
+# ensemble: would be here if it were one
+max_batch_size: 4
+batch_timeout: 0.05
+"#;
+        tokio::fs::write(model_dir.join("config.yaml"), config)
+            .await
+            .unwrap();
+        tokio::fs::write(model_dir.join("model.py"), "class MyAPI(LitAPI): pass")
+            .await
+            .unwrap();
+
+        let result = scan_repo_models(&tmp).await;
+
+        // BUG: the comment mentioning "ensemble:" triggers the string-contains
+        // check. The directory contains model.py so it would be discovered
+        // anyway, but the ensemble flag on the returned model is wrong.
+        // We can't observe the ensemble flag directly (it's not in RepoModel),
+        // but we can verify the model IS discovered (it should be, since
+        // model.py exists). The real defect — that a comment could cause
+        // incorrect ensemble classification — is demonstrated by the fact
+        // that removing model.py would still cause discovery if the
+        // string-contains check fires, but with model.py present it masks
+        // the issue. See the next test for the pure false-positive case.
+        assert_eq!(result.len(), 1, "model with model.py must be discovered");
+        assert_eq!(result[0].name, "test_model");
+        assert_eq!(result[0].version, "1");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// B1b: pure false positive — no model.py, only config.yaml with
+    /// "ensemble:" in a comment. The string-contains check incorrectly
+    /// treats this as an ensemble model and discovers it.
+    #[tokio::test]
+    async fn test_scan_repo_models_ensemble_detection_pure_false_positive() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-ensemble-fp2-{}",
+            std::process::id()
+        ));
+        let model_dir = tmp.join("no_py_model").join("1");
+        tokio::fs::create_dir_all(&model_dir).await.unwrap();
+
+        // config.yaml where "ensemble:" only appears in a YAML comment.
+        // No model.py — a genuine ensemble would have `ensemble:` as a YAML
+        // key, but this has it as a comment/description string.
+        let config = r#"description: "This is not an ensemble model"
+# ensemble:
+#   steps: ...
+max_batch_size: 4
+"#;
+        tokio::fs::write(model_dir.join("config.yaml"), config)
+            .await
+            .unwrap();
+
+        let result = scan_repo_models(&tmp).await;
+
+        // BUG: `content.contains("ensemble:")` matches the comment
+        // "# ensemble:", so this directory is incorrectly discovered as
+        // an ensemble model even though it has no model.py and the
+        // ensemble key is commented out.
+        assert!(
+            result.is_empty(),
+            "B1b REGRESSION: directory with ensemble: in a comment must NOT be \
+             discovered as a model. scan_repo_models uses string-contains \
+             which matches commented-out ensemble keys. Got {} model(s).",
+            result.len()
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 }

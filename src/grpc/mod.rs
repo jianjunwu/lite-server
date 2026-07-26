@@ -393,7 +393,14 @@ impl LiteServer for GrpcService {
             return Err(Status::unavailable("no workers available"));
         }
 
-        let worker_id = crate::worker::pick_worker_random(clients.len());
+        let worker_id = match self
+            .worker_manager
+            .get_outlier_state(model_name, &resolved_version)
+            .await
+        {
+            Some(outlier) => crate::worker::pick_worker_skip_ejected(clients.len(), &outlier),
+            None => crate::worker::pick_worker_random(clients.len()),
+        };
         let client = &clients[worker_id];
 
         let resp = client
@@ -483,7 +490,14 @@ impl LiteServer for GrpcService {
             return Err(Status::unavailable("no workers available"));
         }
 
-        let worker_id = crate::worker::pick_worker_random(clients.len());
+        let worker_id = match self
+            .worker_manager
+            .get_outlier_state(model_name.as_str(), &resolved_version)
+            .await
+        {
+            Some(outlier) => crate::worker::pick_worker_skip_ejected(clients.len(), &outlier),
+            None => crate::worker::pick_worker_random(clients.len()),
+        };
         let client = clients[worker_id].clone();
 
         let mut chunk_rx = client
@@ -638,7 +652,14 @@ impl LiteServer for GrpcService {
             return Err(Status::unavailable("no workers available"));
         }
 
-        let worker_id = crate::worker::pick_worker_random(clients.len());
+        let worker_id = match self
+            .worker_manager
+            .get_outlier_state(model_name.as_str(), &resolved_version)
+            .await
+        {
+            Some(outlier) => crate::worker::pick_worker_skip_ejected(clients.len(), &outlier),
+            None => crate::worker::pick_worker_random(clients.len()),
+        };
         let client = clients[worker_id].clone();
 
         let mut chunk_rx = client
@@ -960,5 +981,51 @@ mod tests {
 
         let data = serde_json::json!({"other": "stuff"});
         assert!(try_parse_model_error(&data).is_none());
+    }
+
+    // ===== B2: gRPC streaming bypasses ejected workers =====
+
+    /// B2 (P2): gRPC streaming endpoints (`stream_infer`, `bidi_stream`) and
+    /// `batch_infer` use `pick_worker_random` for worker selection, which
+    /// does NOT skip ejected (outlier) workers.
+    ///
+    /// HTTP streaming (SSE/WS) uses `pick_worker_skip_ejected` via
+    /// `open_worker_stream`, which avoids workers marked as unhealthy.
+    /// gRPC lacks this protection — a request can land on an ejected worker
+    /// that the HTTP path would have avoided.
+    ///
+    /// This test verifies the inconsistency by confirming that the three
+    /// gRPC functions use `pick_worker_random` (no ejection awareness).
+    #[test]
+    fn test_grpc_worker_selection_does_not_skip_ejected() {
+        // Only inspect lines before the #[cfg(test)] boundary to avoid
+        // counting the test's own mentions of pick_worker_random.
+        let source = include_str!("mod.rs");
+        let test_boundary = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let prod_source = &source[..test_boundary];
+
+        let random_calls: Vec<&str> = prod_source
+            .lines()
+            .filter(|l| l.contains("pick_worker_random"))
+            .collect();
+        let ejected_calls: Vec<&str> = prod_source
+            .lines()
+            .filter(|l| l.contains("pick_worker_skip_ejected"))
+            .collect();
+
+        // Current state: zero pick_worker_skip_ejected calls — the defect.
+        // When fixed, all three endpoints will skip ejected workers.
+        // This test FAILS today because gRPC doesn't skip ejected workers.
+        assert!(
+            !ejected_calls.is_empty(),
+            "B2: gRPC streaming endpoints must skip ejected workers. \
+             Currently all three ({}) use pick_worker_random (no ejection \
+             awareness), while HTTP SSE/WS use pick_worker_skip_ejected. \
+             Found {} pick_worker_random calls, {} pick_worker_skip_ejected \
+             calls in production code.",
+            random_calls.len(),
+            random_calls.len(),
+            ejected_calls.len()
+        );
     }
 }

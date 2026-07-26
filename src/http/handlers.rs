@@ -1305,6 +1305,24 @@ pub async fn dispatch_custom_route(
     }
     let client = clients[worker_id].clone();
 
+    // Fire InferenceRequest callback — model-level callbacks cover custom
+    // routes too, same as the inference paths (do_infer & co.).
+    let start = Instant::now();
+    let req_ctx = crate::callback::InferenceContext {
+        model_name: model_name.to_string(),
+        version: resolved_version.clone(),
+        route: route_pattern.clone(),
+        protocol: crate::callback::Protocol::Http,
+        request_id: request_id.clone(),
+        client_ip: extract_client_ip(headers),
+        elapsed_us: None,
+    };
+    let cb_runner = state.callback_runner.clone();
+    let req_ctx_clone = req_ctx.clone();
+    tokio::spawn(async move {
+        cb_runner.on_inference_request(&req_ctx_clone).await;
+    });
+
     // Build the request: route_call reuses the SingleRequest body type; the
     // route tag discriminates dispatch in the worker. method/query/path_params
     // ride on RequestMeta (route_pattern == meta.route).
@@ -1349,7 +1367,7 @@ pub async fn dispatch_custom_route(
     .await
     .map_err(|_| AppError::InferenceTimeout("route response timeout".to_string()))?;
 
-    match first {
+    let result = match first {
         RouteReply::Unary(Some(response)) => match response.payload {
             // Decode the SingleResponse (routes reuse the inference response shape).
             Some(pb::response::Payload::Single(single)) => build_route_http_response(single),
@@ -1366,7 +1384,19 @@ pub async fn dispatch_custom_route(
                 "route stream missing start frame".to_string(),
             )),
         },
+    };
+
+    // Fire InferenceResponse callback on success, mirroring do_infer.
+    if result.is_ok() {
+        let resp_ctx = crate::callback::InferenceContext {
+            elapsed_us: Some(start.elapsed().as_micros() as u64),
+            ..req_ctx
+        };
+        let cb_runner = state.callback_runner.clone();
+        tokio::spawn(async move { cb_runner.on_inference_response(&resp_ctx).await; });
     }
+
+    result
 }
 
 /// Bound on waiting for a route call's first reply frame (unary or stream
@@ -3319,6 +3349,117 @@ mod version_routing_tests {
         assert!(
             first.is_err(),
             "server closed a WS pinned to a Ready version — readiness gate used the active version, got {first:?}"
+        );
+    }
+}
+
+// ===== B3: custom-route callback gap =====
+
+#[cfg(test)]
+mod custom_route_callback_tests {
+    /// B3 (P1): `dispatch_custom_route` does not fire `on_inference_request`
+    /// or `on_inference_response` callbacks, unlike the inference paths
+    /// (`do_infer`, `sse_infer_impl`, `handle_ws_stream`).
+    ///
+    /// The spec states model-level callbacks should cover both inference and
+    /// custom routes. Inference paths fire `on_inference_request` before
+    /// queueing and `on_inference_response` after; `dispatch_custom_route`
+    /// does neither — the callback runner is entirely silent for routes.
+    ///
+    /// This structural test verifies the source-level gap: the callback
+    /// invocations exist in `do_infer` but not in `dispatch_custom_route`.
+    #[test]
+    fn test_dispatch_custom_route_does_not_fire_inference_callbacks() {
+        let source = include_str!("handlers.rs");
+
+        // Find the dispatch_custom_route function boundaries.
+        let lines: Vec<&str> = source.lines().collect();
+        let fn_start = lines
+            .iter()
+            .position(|l| l.contains("pub async fn dispatch_custom_route("))
+            .expect("dispatch_custom_route must exist");
+
+        // Find the matching closing brace (heuristic: next line starting
+        // with `^}` at the same indent as `pub async fn`).
+        let mut fn_end = fn_start;
+        let mut depth = 0i32;
+        let mut started = false;
+        for (i, line) in lines.iter().enumerate().skip(fn_start) {
+            if line.contains('{') {
+                depth += line.matches('{').count() as i32;
+                started = true;
+            }
+            if line.contains('}') {
+                depth -= line.matches('}').count() as i32;
+            }
+            if started && depth == 0 {
+                fn_end = i;
+                break;
+            }
+        }
+
+        let fn_body: Vec<&&str> = lines[fn_start..=fn_end].iter().collect();
+
+        // The inference path calls on_inference_request (in do_infer).
+        let has_inference_request = source.contains("on_inference_request");
+        assert!(
+            has_inference_request,
+            "sanity: handlers.rs must reference on_inference_request somewhere"
+        );
+
+        let fn_has_req_cb = fn_body
+            .iter()
+            .any(|l| l.contains("on_inference_request"));
+        let fn_has_resp_cb = fn_body
+            .iter()
+            .any(|l| l.contains("on_inference_response"));
+
+        // B3: The defect — dispatch_custom_route does NOT fire inference
+        // callbacks (the spec says model-level callbacks cover both inference
+        // and custom routes). These assertions FAIL against current code.
+        // When fixed, they will pass.
+        assert!(
+            fn_has_req_cb,
+            "B3: dispatch_custom_route must fire on_inference_request \
+             callback. Currently it does not — only do_infer fires it."
+        );
+
+        assert!(
+            fn_has_resp_cb,
+            "B3: dispatch_custom_route must fire on_inference_response \
+             callback. Currently it does not — only do_infer fires it."
+        );
+
+        // Counter-check: do_infer DOES call both (verify test methodology).
+        let do_infer_start = lines
+            .iter()
+            .position(|l| l.contains("async fn do_infer("))
+            .expect("do_infer must exist");
+        let mut do_infer_end = do_infer_start;
+        let mut depth = 0i32;
+        let mut started = false;
+        for (i, line) in lines.iter().enumerate().skip(do_infer_start) {
+            if line.contains('{') {
+                depth += line.matches('{').count() as i32;
+                started = true;
+            }
+            if line.contains('}') {
+                depth -= line.matches('}').count() as i32;
+            }
+            if started && depth == 0 {
+                do_infer_end = i;
+                break;
+            }
+        }
+        let do_infer_body: Vec<&&str> =
+            lines[do_infer_start..=do_infer_end].iter().collect();
+        assert!(
+            do_infer_body.iter().any(|l| l.contains("on_inference_request")),
+            "do_infer must fire on_inference_request (sanity check)"
+        );
+        assert!(
+            do_infer_body.iter().any(|l| l.contains("on_inference_response")),
+            "do_infer must fire on_inference_response (sanity check)"
         );
     }
 }
