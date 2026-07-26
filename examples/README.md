@@ -266,27 +266,6 @@ curl -X POST http://localhost:8000/v2/models/hooked_model/infer \
 # Console shows hook commands executing (echo statements)
 ```
 
-### 15 Callbacks
-
-```bash
-# Inference — requires API key
-curl -X POST http://localhost:8000/v2/models/protected/infer \
-  -H 'Content-Type: application/json' -d '{"input": "hello"}'
-# => {"error": {"type": "authentication_error", "message": "missing API key", ...}}  (401)
-
-curl -X POST http://localhost:8000/v2/models/protected/infer \
-  -H 'Content-Type: application/json' -H "X-API-Key: secret-api-key-123" \
-  -d '{"input": "hello"}'
-# => {"output": "protected: hello"}
-
-# Custom route — guarded by the same model-level chain
-curl http://localhost:8000/v2/models/protected/status
-# => 401
-
-curl -H "X-API-Key: secret-api-key-123" http://localhost:8000/v2/models/protected/status
-# => {"server": "lite-server", "loaded_models": [{"name": "protected", ...}], ...}
-```
-
 ### 16 gRPC
 
 ```bash

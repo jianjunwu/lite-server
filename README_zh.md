@@ -65,7 +65,7 @@ curl -X POST http://localhost:8000/v2/models/my_model/infer \
 # => {"output": 42}
 ```
 
-可用模板：`empty`、`llm`、`cv-classify`、`cv-detect`、`nlp`。使用 `--wizard` 进入交互式选择。
+目前仅提供 `empty` 模板。使用 `--wizard` 进入交互式项目设置。
 
 ## 架构
 
@@ -96,15 +96,15 @@ Rust 内核处理所有 I/O（HTTP、gRPC、IPC、指标、文件监听），Pyt
 | 维度 | lite-server | Triton | TorchServe | BentoML | Ray Serve |
 |------|------------|--------|------------|---------|-----------|
 | 语言 | Rust + Python | C++ | Java + Python | Python | Python |
-| 安装 | `pip install` | Docker | Java + Conda | `pip install` | `pip install` |
-| 热重载 | 文件监听自动重载 | 不支持 | 有限支持 | 不支持 | 不支持 |
+| 安装 | `pip install` | Docker | `pip install` / Docker | `pip install` | `pip install` |
+| 热重载 | 文件监听自动重载 | API 模型切换（不支持代码热重载） | 有限支持 | 不支持 | 不支持 |
 | 多版本 | 支持（激活/停用切换） | 支持 | 支持 | 手动管理 | 手动管理 |
 | Ensemble | DAG 并行分层执行 | 支持 | 不支持 | Pipeline | Deployment graph |
 | 异常检测 | Envoy 风格自动剔除 | 不支持 | 不支持 | 不支持 | 不支持 |
-| 心跳 + 自动重启 | ZMQ 探测，自动重启卡死 worker | 不支持 | 不支持 | 不支持 | 不支持 |
-| 生命周期钩子 | Shell + HTTP 回调 | 不支持 | 不支持 | 不支持 | 不支持 |
-| 流式输出 | SSE + WebSocket + gRPC | 支持 | 不支持 | 支持 | 支持 |
-| 最小开销 | ~15MB | ~500MB | ~200MB | ~50MB | ~100MB |
+| 心跳 + 自动重启 | ZMQ 探测，自动重启卡死 worker | 不支持 | 不支持 | 不支持 | 支持（Replica 健康检查 + 自动重启） |
+| 生命周期钩子 | Shell + HTTP 回调 | 不支持 | 不支持 | 支持（`on_startup`/`on_shutdown`） | 支持（`__init__`/`reconfigure`/`on_shutdown`） |
+| 流式输出 | SSE + WebSocket + gRPC | 支持（gRPC streaming） | 支持（HTTP streaming） | 支持 | 支持 |
+| 最小开销 | ~15MB | ~2GB+ | ~1.5GB+ | ~500MB+ | ~100MB+ |
 
 详见 [docs/zh/comparison.md](docs/zh/comparison.md)。
 
@@ -212,6 +212,7 @@ lite-server init my_project           # 脚手架创建项目
 | 03 | [streaming](examples/03_streaming/) | 逐 token 流式输出（SSE/WebSocket） |
 | 04 | [multi_version](examples/04_multi_version/) | 双版本切换演示 |
 | 05 | [ensemble](examples/05_ensemble/) | DAG 多模型流水线 |
+| 06 | [custom_route](examples/06_custom_route/) | 自定义 HTTP 路由（`@route` 装饰器） |
 | 07 | [custom_params](examples/07_custom_params/) | 配置驱动的模型行为 |
 | 09 | [custom_metrics](examples/09_custom_metrics/) | 自定义 Prometheus 指标（Gauge/Counter/Histogram） |
 | 10 | [async](examples/10_async/) | 异步推理（统一异步管线） |
@@ -253,13 +254,17 @@ lite-server init my_project           # 脚手架创建项目
 | POST | `/v2/models/{name}/versions/{v}/activate` | 激活版本（硬切换） |
 | PUT | `/v2/models/{name}/routing` | 原子设置流量权重（`{"weights":{"v1":90,"v2":10}}`） |
 | GET | `/health` | 健康检查（按模型分组的 JSON） |
+| GET | `/livez` | 存活探针（始终 200） |
+| GET | `/readyz` | 就绪探针（有模型可服务前返回 503） |
+| GET | `/startupz` | 启动探针（模型加载中返回 503） |
 | GET | `/info` | 服务器信息 |
 | GET | `/metrics` | Prometheus 指标 |
 | GET | `/metrics/timeline` | 历史指标时间线 |
 | GET | `/metrics/timeline/{name}` | 单模型指标时间线 |
+| GET | `/metrics/timeline/{name}/versions/{v}` | 单模型单版本指标时间线 |
 | GET | `/metrics/alerts` | 告警规则与状态 |
 
-**自定义路由**通过 `LitAPI` 方法上的 `@route` 装饰器声明，挂在 `/v2/models/{name}/<tail>` 下。系统保留字（`infer`、`events`、`stream`、`ready`、`health`、`reload`、`versions`、`compare`）不可覆盖。
+**自定义路由**通过 `LitAPI` 方法上的 `@route` 装饰器声明，挂在 `/v2/models/{name}/<tail>` 下。系统保留字（`infer`、`events`、`stream`、`ready`、`health`、`reload`、`versions`、`compare`、`livez`、`readyz`、`startupz`）不可覆盖。
 
 ## 配置
 
@@ -347,8 +352,8 @@ cd python && python -m pytest tests/
 
 ```
 .
-├── src/              # Rust 核心（HTTP、推理队列、Worker 管理）
-├── python/           # Python 包（CLI、Worker 进程、LitAPI）
+├── src/              # Rust 核心（HTTP、推理队列、Worker 管理、ensemble、gRPC）
+├── python/           # Python 包（CLI、Worker 进程、LitAPI、artifact packer）
 ├── tests/            # Rust 集成测试
 ├── examples/         # 示例模型仓库
 ├── benchmarks/       # 性能基准测试

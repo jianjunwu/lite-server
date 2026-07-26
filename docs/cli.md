@@ -193,12 +193,12 @@ lite-server init [PROJECT_NAME] [OPTIONS]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `project_name` | string | (positional) | Project directory name |
-| `--template`, `-t` | string | empty | Template: `empty`, `llm`, `cv-classify`, `cv-detect`, `nlp` |
+| `--template`, `-t` | string | empty | Project template (currently only `empty`) |
 | `--wizard`, `-w` | flag | false | Interactive wizard mode |
 
 ```bash
-# Create a new LLM serving project
-lite-server init my-llm-server --template llm
+# Create a new project
+lite-server init my-server --template empty
 
 # Interactive wizard
 lite-server init --wizard

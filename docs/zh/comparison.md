@@ -25,10 +25,10 @@
 
 | 维度 | lite-server | Triton | TorchServe | BentoML | Ray Serve |
 |------|------------|--------|------------|---------|-----------|
-| 安装命令 | `pip install` | 仅 Docker | Java + pip | `pip install` | `pip install` |
+| 安装命令 | `pip install` | 仅 Docker | `pip install` / Docker | `pip install` | `pip install` |
 | 最低依赖 | Python 3.10+ | CUDA, Docker | Java 11+, Python | Python 3.8+ | Python 3.8+ |
 | 需要容器 | 否 | 强烈推荐 | 否 | 否 | 否 |
-| 二进制大小 | ~15MB | ~1GB | ~500MB | ~50MB | ~200MB |
+| 二进制大小 | ~15MB | ~2GB+ | ~1.5GB+ | ~500MB+ | ~100MB+ |
 
 ### 模型管理
 
@@ -36,7 +36,7 @@
 |------|------------|--------|------------|---------|-----------|
 | 模型格式 | Python 类 (LitAPI) | 框架特定格式 | MAR 归档 | Python 类 | Python 类 |
 | 版本控制 | 多版本，支持激活/停用切换 | 多版本 | 多版本 | 手动管理 | 手动管理 |
-| 热重载 | 文件监听 + 防抖 | 不支持（需重启） | 有限（模型控制 API） | 不支持 | 不支持 |
+| 热重载 | 文件监听 + 防抖 | API 模型切换（不支持代码热重载） | 有限（模型控制 API） | 不支持 | 不支持 |
 | 加载策略 | explicit、latest、all | explicit、polling | explicit | N/A | N/A |
 | Ensemble/DAG | DAG 并行分层执行 | 支持（模型集成） | 不支持 | Pipeline | Deployment graph |
 | 模型打包 | .lma 格式，SHA256+HMAC 签名 | 不支持 | MAR 格式 | Bento | 不支持 |
@@ -49,7 +49,7 @@
 | Continuous batching | 支持（LLM 钩子） | 支持 | 不支持 | 不支持 | 不支持 |
 | Worker 调度 | 最小负载 + 异常感知 | 轮询 | 轮询 | 可配置 | Actor 调度 |
 | 零拷贝数据路径 | Bytes + Arc | 共享内存 | 无 | 无 | 无 |
-| 流式输出 | SSE + WebSocket + gRPC | gRPC 流式 | 不支持 | SSE | Streaming |
+| 流式输出 | SSE + WebSocket + gRPC | gRPC 流式 | HTTP streaming | SSE | Streaming |
 
 ### 韧性
 
@@ -58,8 +58,8 @@
 | 异常检测 | Envoy 风格自动剔除 | 不支持 | 不支持 | 不支持 | 不支持 |
 | 请求重试 | 最多 3 次，换 worker 重试 | 不支持 | 不支持 | 不支持 | 可配置 |
 | Worker 回收 | max_requests 自动重启 + 抖动防惊群 | 不支持 | 不支持 | 不支持 | 不支持 |
-| 心跳检测 | ZMQ 探测 + 自动 respawn | 不支持 | 不支持 | 不支持 | 不支持 |
-| 生命周期钩子 | Shell + HTTP 回调（就绪/退出/异常） | 不支持 | 不支持 | 不支持 | 不支持 |
+| 心跳检测 | ZMQ 探测 + 自动 respawn | 不支持 | 不支持 | 不支持 | Replica 健康检查 + 自动重启 |
+| 生命周期钩子 | Shell + HTTP 回调（就绪/退出/异常） | 不支持 | 不支持 | on_startup / on_shutdown | __init__ / reconfigure / on_shutdown |
 | 单请求超时 | 支持（可配置） | 支持 | 支持 | 支持 | 支持 |
 | 健康检查 | 深度检查（worker + 模型状态） | 基础 | 基础 | 基础 | 基础 |
 

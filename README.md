@@ -66,7 +66,7 @@ curl -X POST http://localhost:8000/v2/models/my_model/infer \
 # => {"output": 42}
 ```
 
-Available templates: `empty`, `llm`, `cv-classify`, `cv-detect`, `nlp`. Use `--wizard` for interactive selection.
+Currently only the `empty` template is available. Use `--wizard` for interactive project setup.
 
 ## Architecture
 
@@ -98,15 +98,15 @@ See [docs/architecture.md](docs/architecture.md) for details.
 | Aspect | lite-server | Triton | TorchServe | BentoML | Ray Serve |
 |--------|------------|--------|------------|---------|-----------|
 | Language | Rust + Python | C++ | Java + Python | Python | Python |
-| Install | `pip install` | Docker | Java + Conda | `pip install` | `pip install` |
-| Hot Reload | File watcher | No | Limited | No | No |
+| Install | `pip install` | Docker | `pip install` / Docker | `pip install` | `pip install` |
+| Hot Reload | File watcher auto-reload | Model-swap via API (no code hot-reload) | Limited | No | No |
 | Multi-Version | Yes (activate/deactivate) | Yes | Yes | Manual | Manual |
 | Ensemble | DAG with parallel layers | Yes | No | Pipeline | Deployment graph |
 | Outlier Detection | Envoy-style auto-eject | No | No | No | No |
-| Heartbeat + Respawn | ZMQ probe, auto-restart hung workers | No | No | No | No |
-| Lifecycle Hooks | Shell + HTTP callbacks | No | No | No | No |
-| Streaming | SSE + WebSocket + gRPC | Yes | No | Yes | Yes |
-| Min. Overhead | ~15MB | ~500MB | ~200MB | ~50MB | ~100MB |
+| Heartbeat + Respawn | ZMQ probe, auto-restart hung workers | No | No | No | Yes (replica health check + auto-restart) |
+| Lifecycle Hooks | Shell + HTTP callbacks | No | No | Yes (`on_startup`/`on_shutdown`) | Yes (`__init__`/`reconfigure`/`on_shutdown`) |
+| Streaming | SSE + WebSocket + gRPC | Yes (gRPC streaming) | Yes (HTTP streaming) | Yes | Yes |
+| Min. Overhead | ~15MB | ~2GB+ | ~1.5GB+ | ~500MB+ | ~100MB+ |
 
 See [docs/comparison.md](docs/comparison.md) for detailed analysis.
 
@@ -214,6 +214,7 @@ See [examples/](examples/) for runnable model repositories:
 | 03 | [streaming](examples/03_streaming/) | Token-by-token streaming via SSE/WebSocket |
 | 04 | [multi_version](examples/04_multi_version/) | Two versions with activation switching |
 | 05 | [ensemble](examples/05_ensemble/) | DAG-based multi-model pipeline |
+| 06 | [custom_route](examples/06_custom_route/) | Custom HTTP routes with `@route` decorator |
 | 07 | [custom_params](examples/07_custom_params/) | Config-driven model behavior |
 | 09 | [custom_metrics](examples/09_custom_metrics/) | Custom Prometheus metrics (gauge/counter/histogram) |
 | 10 | [async](examples/10_async/) | Asynchronous inference (unified async pipeline) |
@@ -262,6 +263,7 @@ See [examples/README.md](examples/README.md) for learning path and usage details
 | GET | `/metrics` | Prometheus metrics |
 | GET | `/metrics/timeline` | Historical metric timeline |
 | GET | `/metrics/timeline/{name}` | Per-model metric timeline |
+| GET | `/metrics/timeline/{name}/versions/{v}` | Per-model-version metric timeline |
 | GET | `/metrics/alerts` | Alert rules and status |
 
 **Custom routes** declared with `@route` on `LitAPI` methods are served under `/v2/models/{name}/<tail>`. System tails (`infer`, `events`, `stream`, `ready`, `health`, `reload`, `versions`, `compare`, `livez`, `readyz`, `startupz`) are reserved and cannot be overridden.
@@ -352,8 +354,8 @@ cd python && python -m pytest tests/
 
 ```
 .
-├── src/              # Rust core (HTTP, inference queue, worker management)
-├── python/           # Python package (CLI, worker process, LitAPI)
+├── src/              # Rust core (HTTP, inference queue, worker management, ensemble, gRPC)
+├── python/           # Python package (CLI, worker process, LitAPI, artifact packer)
 ├── tests/            # Rust integration tests
 ├── examples/         # Example model repositories
 ├── benchmarks/       # Performance benchmarks

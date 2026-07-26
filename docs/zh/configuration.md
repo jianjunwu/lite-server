@@ -230,7 +230,7 @@ logging:
 ### LLM 推理（流式 + continuous batching）
 
 ```yaml
-# model_repo/llm/1/config.yaml
+# model_repo/my_model/1/config.yaml
 stream: true
 continuous_batching: true
 max_sequence_length: 4096

@@ -193,12 +193,12 @@ lite-server init [项目名] [选项]
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `project_name` | string | （位置参数） | 项目目录名 |
-| `--template`, `-t` | string | empty | 模板：`empty`、`llm`、`cv-classify`、`cv-detect`、`nlp` |
+| `--template`, `-t` | string | empty | 项目模板（目前仅有 `empty`） |
 | `--wizard`, `-w` | flag | false | 交互式向导模式 |
 
 ```bash
-# 创建 LLM 推理项目
-lite-server init my-llm-server --template llm
+# 创建新项目
+lite-server init my-server --template empty
 
 # 交互式向导
 lite-server init --wizard

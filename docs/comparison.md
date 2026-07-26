@@ -25,10 +25,10 @@
 
 | Aspect | lite-server | Triton | TorchServe | BentoML | Ray Serve |
 |--------|------------|--------|------------|---------|-----------|
-| Install command | `pip install` | Docker only | Java + pip | `pip install` | `pip install` |
+| Install command | `pip install` | Docker only | `pip install` / Docker | `pip install` | `pip install` |
 | Min. dependencies | Python 3.10+ | CUDA, Docker | Java 11+, Python | Python 3.8+ | Python 3.8+ |
 | Container required | No | Yes (strongly recommended) | No | No | No |
-| Binary size | ~15MB | ~1GB | ~500MB | ~50MB | ~200MB |
+| Binary size | ~15MB | ~2GB+ | ~1.5GB+ | ~500MB+ | ~100MB+ |
 
 ### Model Management
 
@@ -36,7 +36,7 @@
 |--------|------------|--------|------------|---------|-----------|
 | Model format | Python class (LitAPI) | Framework-specific | MAR archive | Python class | Python class |
 | Version control | Multi-version with activate/deactivate | Multi-version | Multi-version | Manual | Manual |
-| Hot reload | File watcher with debounce | No (requires restart) | Limited (model control API) | No | No |
+| Hot reload | File watcher with debounce | API model-swap (no code hot-reload) | Limited (model control API) | No | No |
 | Load policies | explicit, latest, all | explicit, polling | explicit | N/A | N/A |
 | Ensemble/DAG | DAG with parallel layers | Yes (model ensemble) | No | Pipeline | Deployment graph |
 | Model packing | .lma with SHA256+HMAC | No | MAR format | Bento | No |
@@ -49,7 +49,7 @@
 | Continuous batching | Yes (LLM hooks) | Yes | No | No | No |
 | Worker scheduling | Least-loaded + outlier-aware | Round-robin | Round-robin | Configurable | Actor-based |
 | Zero-copy data path | Bytes + Arc | Shared memory | No | No | No |
-| Streaming | SSE + WebSocket + gRPC | gRPC streaming | No | SSE | Streaming |
+| Streaming | SSE + WebSocket + gRPC | gRPC streaming | HTTP streaming | SSE | Streaming |
 
 ### Resilience
 
@@ -58,8 +58,8 @@
 | Outlier detection | Envoy-style auto-eject | No | No | No | No |
 | Request retry | Up to 3 retries on different workers | No | No | No | Configurable |
 | Worker recycling | max_requests auto-restart with jitter | No | No | No | No |
-| Heartbeat detection | ZMQ probe + auto respawn | No | No | No | No |
-| Lifecycle hooks | Shell + HTTP callbacks (ready/exit/error) | No | No | No | No |
+| Heartbeat detection | ZMQ probe + auto respawn | No | No | No | Replica health check + auto-restart |
+| Lifecycle hooks | Shell + HTTP callbacks (ready/exit/error) | No | No | on_startup / on_shutdown | __init__ / reconfigure / on_shutdown |
 | Per-request timeout | Yes (configurable) | Yes | Yes | Yes | Yes |
 | Health checks | Deep (worker + model status) | Basic | Basic | Basic | Basic |
 
