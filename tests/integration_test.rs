@@ -1809,6 +1809,13 @@ class ReloadAPI(LitAPI):
     }
     assert!(v1_back, "v1 did not return to ready after recycle");
 
+    // The recycled standby version must not steal the active pointer (§4.3).
+    let resp = client
+        .get(format!("{}/v2/models/reload_model/versions", base))
+        .send().await.unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["active_version"], "2", "active must stay v2 after v1 recycle");
+
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 }
 
@@ -1897,6 +1904,126 @@ class LruAPI(LitAPI):
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["output"], 42);
+
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+}
+
+// ---------------------------------------------------------------------------
+// §4.3: weighted / canary routing
+// ---------------------------------------------------------------------------
+
+/// Weights drive bare-request distribution; x-lite-version pins explicitly;
+/// activate is a hard cutover. v1 computes x*2, v2 computes x*3 so responses
+/// identify the serving version.
+#[tokio::test]
+async fn test_weighted_routing_canary() {
+    let model_py = |factor: i32| format!(r#"from lite_server import LitAPI
+
+
+class CanaryAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {{"output": x * {}}}
+
+    def encode_response(self, output):
+        return output
+"#, factor);
+
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-canary-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let cfg = "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n";
+    for (v, factor) in [("1", 2), ("2", 3)] {
+        let dir = tmp_dir.join("canary_model").join(v);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.py"), model_py(factor)).unwrap();
+        std::fs::write(dir.join("config.yaml"), cfg).unwrap();
+    }
+
+    let port = 18092;
+    kill_stale_on_port(port);
+    let _server = ServerGuard::start(&[
+        "--port", &port.to_string(),
+        "--model-repo", &tmp_dir.to_string_lossy(),
+        "--no-metrics",
+        "--no-grpc",
+        "--log-level", "warn",
+    ]);
+    wait_for_server(port, 30).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+
+    load_model(&base, "canary_model", "1").await;
+    load_model(&base, "canary_model", "2").await;
+
+    let infer_output = |headers: &[(&str, &str)]| {
+        let base = base.clone();
+        let client = client.clone();
+        let headers: Vec<(String, String)> =
+            headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        async move {
+            let mut req = client
+                .post(format!("{}/v2/models/canary_model/infer", base))
+                .json(&json!({"input": 1}));
+            for (k, v) in headers {
+                req = req.header(k, v);
+            }
+            let resp = req.send().await.unwrap();
+            assert_eq!(resp.status(), 200);
+            resp.json::<Value>().await.unwrap()["output"].as_i64().unwrap()
+        }
+    };
+    let put_weights = |body: &str| {
+        let base = base.clone();
+        let client = client.clone();
+        let body = body.to_string();
+        async move {
+            let resp = client
+                .put(format!("{}/v2/models/canary_model/routing", base))
+                .header("content-type", "application/json")
+                .body(body)
+                .send().await.unwrap();
+            assert_eq!(resp.status(), 200);
+        }
+    };
+
+    // 100/0: all traffic to v1.
+    put_weights(r#"{"weights":{"1":100,"2":0}}"#).await;
+    for _ in 0..20 {
+        assert_eq!(infer_output(&[]).await, 2, "100/0 must serve only v1");
+    }
+
+    // 90/10: roughly proportional split (n=100, expect ~10 v2, wide bounds).
+    put_weights(r#"{"weights":{"1":90,"2":10}}"#).await;
+    let mut v2_count = 0;
+    for _ in 0..100 {
+        if infer_output(&[]).await == 3 {
+            v2_count += 1;
+        }
+    }
+    assert!((2..=25).contains(&v2_count), "v2 served {} / 100, expected ~10", v2_count);
+
+    // Header pin beats weights: 0/100 with x-lite-version: 1 → v1.
+    put_weights(r#"{"weights":{"2":100}}"#).await;
+    assert_eq!(infer_output(&[]).await, 3, "100% v2 after zeroing v1");
+    assert_eq!(
+        infer_output(&[("x-lite-version", "1")]).await,
+        2,
+        "x-lite-version header must pin to v1"
+    );
+
+    // activate(v1) is a hard cutover: weights become 100/0.
+    let resp = client
+        .post(format!("{}/v2/models/canary_model/versions/1/activate", base))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    for _ in 0..20 {
+        assert_eq!(infer_output(&[]).await, 2, "activate must hard-switch to v1");
+    }
 
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 }

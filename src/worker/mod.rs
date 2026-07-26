@@ -1258,6 +1258,7 @@ impl WorkerManager {
 
         crate::metrics::prometheus::record_model_unload(model_name, version);
         crate::metrics::prometheus::set_active_workers(model_name, version, 0.0);
+        crate::metrics::prometheus::remove_version_weight(model_name, version);
 
         info!("Model {} version {} unloaded", model_name, version);
         Ok(())
@@ -1281,6 +1282,8 @@ impl WorkerManager {
             None => return Ok(false),
         };
 
+        let was_active = self.registry.get_active_version(model_name).as_deref() == Some(v.as_str());
+
         info!("Reloading {} version {}", model_name, v);
         self.unload_version(model_name, &v).await?;
 
@@ -1288,7 +1291,12 @@ impl WorkerManager {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         self.load_model(model_name, &v, &config).await?;
-        self.registry.activate_version(model_name, &v)?;
+        // Restore the active pointer only if this version was active before
+        // the reload — auto-recycling a standby version must not steal the
+        // pointer from the serving version (§4.3).
+        if was_active {
+            self.registry.activate_version(model_name, &v)?;
+        }
 
         // Fire ModelReload callback
         self.callback_runner.on_model_reload(&ModelLifecycleContext {
@@ -2174,6 +2182,7 @@ mod tests {
             versions_to_load: vec![],
             default_version: None,
             max_loaded_versions: max,
+            weights: None,
         }
     }
 

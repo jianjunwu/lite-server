@@ -58,6 +58,14 @@ lazy_static! {
         &["model", "version"]
     ).unwrap();
 
+    pub static ref VERSION_WEIGHT: GaugeVec = GaugeVec::new(
+        prometheus::Opts::new(
+            "liteserver_version_weight",
+            "Traffic weight per model version (§4.3 weighted routing)"
+        ),
+        &["model", "version"]
+    ).unwrap();
+
     // Ensemble metrics
     pub static ref ENSEMBLE_STEP_LATENCY: HistogramVec = HistogramVec::new(
         HistogramOpts::new(
@@ -179,6 +187,7 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(MODEL_LOAD_TOTAL.clone()))?;
     REGISTRY.register(Box::new(VERSION_SWITCHES_TOTAL.clone()))?;
     REGISTRY.register(Box::new(ACTIVE_WORKERS.clone()))?;
+    REGISTRY.register(Box::new(VERSION_WEIGHT.clone()))?;
     REGISTRY.register(Box::new(ENSEMBLE_STEP_LATENCY.clone()))?;
     REGISTRY.register(Box::new(WORKER_EJECTIONS_TOTAL.clone()))?;
     REGISTRY.register(Box::new(RETRIES_TOTAL.clone()))?;
@@ -250,6 +259,14 @@ pub fn record_model_unload(model: &str, version: &str) {
 
 pub fn set_active_workers(model: &str, version: &str, count: f64) {
     ACTIVE_WORKERS.with_label_values(&[model, version]).set(count);
+}
+
+pub fn set_version_weight(model: &str, version: &str, weight: f64) {
+    VERSION_WEIGHT.with_label_values(&[model, version]).set(weight);
+}
+
+pub fn remove_version_weight(model: &str, version: &str) {
+    let _ = VERSION_WEIGHT.remove_label_values(&[model, version]);
 }
 
 pub fn record_version_switch(model: &str, from: &str, to: &str) {

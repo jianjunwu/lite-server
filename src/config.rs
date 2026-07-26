@@ -214,6 +214,9 @@ pub struct ModelStrategyConfig {
     pub versions_to_load: Vec<String>,
     pub default_version: Option<String>,
     pub max_loaded_versions: Option<usize>,
+    /// Initial traffic weights per version (§4.3 canary). Applied to
+    /// `ModelEntry.weights`; versions not listed get weight 0.
+    pub weights: Option<std::collections::HashMap<String, u32>>,
 }
 
 impl Default for ModelStrategyConfig {
@@ -224,6 +227,7 @@ impl Default for ModelStrategyConfig {
             versions_to_load: vec![],
             default_version: None,
             max_loaded_versions: None,
+            weights: None,
         }
     }
 }

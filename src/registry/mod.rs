@@ -5,6 +5,7 @@ use crate::registry::types::LoadPolicy;
 use crate::error::AppError;
 use crate::registry::types::*;
 use dashmap::DashMap;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -166,11 +167,69 @@ impl ModelRegistry {
             workers: vec![],
             loaded_at: None,
             last_used_at: None,
+            weight: entry.weights.get(version).copied().unwrap_or(0),
             policies: Default::default(),
             cors_headers: None,
         };
         entry.versions.insert(version.to_string(), mv);
         Ok(())
+    }
+
+    /// Atomically replace the model's traffic weights (§4.3). Versions not
+    /// listed in the map get weight 0. Unknown versions are rejected before
+    /// anything is mutated.
+    pub fn set_weights(
+        &self,
+        model_name: &str,
+        weights: &HashMap<String, u32>,
+    ) -> Result<(), AppError> {
+        let mut entry = self
+            .models
+            .get_mut(model_name)
+            .ok_or_else(|| AppError::ModelNotFound(model_name.to_string()))?;
+        for v in weights.keys() {
+            if !entry.versions.contains_key(v) {
+                return Err(AppError::Validation(format!(
+                    "unknown version {} for model {}",
+                    v, model_name
+                )));
+            }
+        }
+        entry.weights = weights.clone();
+        for (v, mv) in entry.versions.iter_mut() {
+            mv.weight = weights.get(v).copied().unwrap_or(0);
+        }
+        Ok(())
+    }
+
+    /// Weighted random pick among serving (`Ready`/`Degraded`) versions with
+    /// weight > 0 (§4.3). Hot path: one shared read + a tiny candidate Vec.
+    /// Returns `None` when no candidate exists — callers fall back to the
+    /// active version.
+    pub fn routing_pick(&self, model_name: &str) -> Option<String> {
+        let entry = self.models.get(model_name)?;
+        let candidates: Vec<(&String, u32)> = entry
+            .versions
+            .iter()
+            .filter(|(_, mv)| {
+                mv.weight > 0
+                    && matches!(mv.status, VersionStatus::Ready | VersionStatus::Degraded)
+            })
+            .map(|(v, mv)| (v, mv.weight))
+            .collect();
+        let total: u32 = candidates.iter().map(|(_, w)| w).sum();
+        if total == 0 {
+            return None;
+        }
+        use rand::Rng;
+        let mut roll = rand::thread_rng().gen_range(0..total);
+        for (v, w) in candidates {
+            if roll < w {
+                return Some(v.clone());
+            }
+            roll -= w;
+        }
+        None // unreachable: roll < total guarantees a hit
     }
 
     pub fn set_status(
@@ -357,6 +416,9 @@ impl ModelRegistry {
             _ => LoadPolicy::Explicit,
         };
         entry.max_loaded_versions = strategy.max_loaded_versions;
+        if let Some(weights) = &strategy.weights {
+            entry.weights = weights.clone();
+        }
         Ok(())
     }
 
@@ -372,6 +434,7 @@ impl ModelRegistry {
             versions_to_load: entry.versions.keys().cloned().collect(),
             default_version: self.get_active_version(model_name),
             max_loaded_versions: entry.max_loaded_versions,
+            weights: Some(entry.weights.clone()),
         })
     }
 }
@@ -563,6 +626,160 @@ mod tests {
         reg.mark_ready("m1", "1").unwrap();
         reg.activate_version("m1", "1").unwrap();
         assert_eq!(reg.lru_eviction_candidate("m1"), None);
+    }
+
+    // --- Weighted routing (§4.3) ---
+
+    #[test]
+    fn test_set_weights_atomic_and_unlisted_zeroed() {
+        let reg = ModelRegistry::new();
+        for v in ["1", "2"] {
+            reg.register("m1", v, test_config(), ModelType::LitAPI, tmp_dir())
+                .unwrap();
+        }
+
+        reg.set_weights("m1", &HashMap::from([("1".into(), 90u32), ("2".into(), 10)]))
+            .unwrap();
+        assert_eq!(reg.get("m1", Some("1")).unwrap().weight, 90);
+        assert_eq!(reg.get("m1", Some("2")).unwrap().weight, 10);
+
+        // Atomic full-set: versions not listed in the new map are zeroed.
+        reg.set_weights("m1", &HashMap::from([("2".into(), 50u32)]))
+            .unwrap();
+        assert_eq!(reg.get("m1", Some("1")).unwrap().weight, 0);
+        assert_eq!(reg.get("m1", Some("2")).unwrap().weight, 50);
+    }
+
+    #[test]
+    fn test_set_weights_unknown_version_rejected() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        let err = reg
+            .set_weights("m1", &HashMap::from([("nope".into(), 100u32)]))
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        // Rejected wholesale: the valid version's weight is untouched.
+        assert_eq!(reg.get("m1", Some("1")).unwrap().weight, 0);
+
+        assert!(reg.set_weights("nope", &HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn test_register_inherits_strategy_weights() {
+        let reg = ModelRegistry::new();
+        let strategy = ModelStrategyConfig {
+            name: "m1".to_string(),
+            weights: Some(HashMap::from([("1".to_string(), 80u32)])),
+            ..Default::default()
+        };
+        reg.set_strategy("m1", &strategy).unwrap();
+
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.register("m1", "2", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        assert_eq!(reg.get("m1", Some("1")).unwrap().weight, 80);
+        assert_eq!(reg.get("m1", Some("2")).unwrap().weight, 0);
+    }
+
+    #[test]
+    fn test_routing_pick_deterministic_single_candidate() {
+        let reg = ModelRegistry::new();
+        for v in ["1", "2"] {
+            reg.register("m1", v, test_config(), ModelType::LitAPI, tmp_dir())
+                .unwrap();
+            reg.mark_ready("m1", v).unwrap();
+        }
+        reg.set_weights("m1", &HashMap::from([("1".into(), 100u32), ("2".into(), 0)]))
+            .unwrap();
+        for _ in 0..20 {
+            assert_eq!(reg.routing_pick("m1"), Some("1".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_routing_pick_excludes_not_serving_and_zero_weight() {
+        let reg = ModelRegistry::new();
+        for v in ["1", "2", "3"] {
+            reg.register("m1", v, test_config(), ModelType::LitAPI, tmp_dir())
+                .unwrap();
+            reg.mark_ready("m1", v).unwrap();
+        }
+        reg.set_weights(
+            "m1",
+            &HashMap::from([("1".into(), 100u32), ("2".into(), 1u32), ("3".into(), 100u32)]),
+        )
+        .unwrap();
+        // "1" Failed and "3" still Loading (reset below) → only "2" is eligible.
+        reg.set_status("m1", "1", VersionStatus::Failed).unwrap();
+        reg.set_status("m1", "3", VersionStatus::Loading).unwrap();
+        for _ in 0..20 {
+            assert_eq!(reg.routing_pick("m1"), Some("2".to_string()));
+        }
+
+        // Degraded still counts as serving.
+        reg.set_status("m1", "2", VersionStatus::Degraded).unwrap();
+        assert_eq!(reg.routing_pick("m1"), Some("2".to_string()));
+    }
+
+    #[test]
+    fn test_routing_pick_none_when_no_candidate() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        // All weights zero (default) → None (caller falls back to active).
+        assert_eq!(reg.routing_pick("m1"), None);
+        // Weight > 0 but not serving → None.
+        reg.set_weights("m1", &HashMap::from([("1".into(), 100u32)]))
+            .unwrap();
+        assert_eq!(reg.routing_pick("m1"), None, "Pending is not serving");
+        // Unknown model → None.
+        assert_eq!(reg.routing_pick("nope"), None);
+    }
+
+    #[test]
+    fn test_activate_version_does_not_touch_weights() {
+        // Registry-level activate moves the pointer only (§4.3): the weight
+        // hard-switch lives in the HTTP handler, so internal re-activations
+        // (e.g. auto-recycle reload) never clobber a canary split.
+        let reg = ModelRegistry::new();
+        for v in ["1", "2"] {
+            reg.register("m1", v, test_config(), ModelType::LitAPI, tmp_dir())
+                .unwrap();
+            reg.mark_ready("m1", v).unwrap();
+        }
+        reg.set_weights("m1", &HashMap::from([("1".into(), 90u32), ("2".into(), 10)]))
+            .unwrap();
+
+        reg.activate_version("m1", "2").unwrap();
+        assert_eq!(reg.get("m1", Some("1")).unwrap().weight, 90);
+        assert_eq!(reg.get("m1", Some("2")).unwrap().weight, 10);
+    }
+
+    #[test]
+    fn test_routing_pick_distribution_roughly_proportional() {
+        let reg = ModelRegistry::new();
+        for v in ["1", "2"] {
+            reg.register("m1", v, test_config(), ModelType::LitAPI, tmp_dir())
+                .unwrap();
+            reg.mark_ready("m1", v).unwrap();
+        }
+        reg.set_weights("m1", &HashMap::from([("1".into(), 90u32), ("2".into(), 10)]))
+            .unwrap();
+
+        let mut v2 = 0usize;
+        let n = 10_000;
+        for _ in 0..n {
+            if reg.routing_pick("m1").as_deref() == Some("2") {
+                v2 += 1;
+            }
+        }
+        // Expected 1000 ± wide tolerance (best-effort weights, no flake).
+        assert!(
+            (500..=1500).contains(&v2),
+            "v2 picked {v2}/{n} times, expected ~10%"
+        );
     }
 
     // --- Server-wide status rollup ---

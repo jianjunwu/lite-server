@@ -512,6 +512,34 @@ pub async fn delete_version_handler(
 
 // ===== Activate Version =====
 
+/// Request body for `PUT /v2/models/:m/routing` (§4.3): atomically sets all
+/// traffic weights; versions not listed get weight 0.
+#[derive(Debug, serde::Deserialize)]
+pub struct SetRoutingRequest {
+    pub weights: HashMap<String, u32>,
+}
+
+pub async fn set_routing_handler(
+    State(state): State<Arc<AppState>>,
+    Path(model_name): Path<String>,
+    ApiJson(body): ApiJson<SetRoutingRequest>,
+) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
+    for v in body.weights.keys() {
+        crate::validation::validate_version(v)?;
+    }
+    info!(model = %model_name, weights = ?body.weights, "set routing weights requested");
+    state.registry.set_weights(&model_name, &body.weights)?;
+    // The gauge mirrors every loaded version; unlisted ones were zeroed.
+    for mv in state.registry.list_versions(&model_name) {
+        prometheus::set_version_weight(&model_name, &mv.version, mv.weight as f64);
+    }
+    Ok(Json(json!({
+        "success": true,
+        "weights": body.weights,
+    })))
+}
+
 pub async fn activate_version_handler(
     State(state): State<Arc<AppState>>,
     Path((model_name, version)): Path<(String, String)>,
@@ -527,6 +555,15 @@ pub async fn activate_version_handler(
             "Model {} version {} is not ready",
             model_name, version
         )));
+    }
+    // Explicit activate is a hard cutover (§4.3): the target version gets all
+    // weighted traffic. Registry-level activate stays pointer-only so
+    // internal re-activations (auto-recycle reload) never clobber a canary.
+    state
+        .registry
+        .set_weights(&model_name, &HashMap::from([(version.clone(), 100u32)]))?;
+    for mv in state.registry.list_versions(&model_name) {
+        prometheus::set_version_weight(&model_name, &mv.version, mv.weight as f64);
     }
     // A switch is counted only when a different version was active before —
     // first activation and re-activation of the same version are not switches.
@@ -713,7 +750,7 @@ async fn do_infer(
         request_id = %request_id,
     );
     async move {
-    let resolved_version = resolve_version(&state, &model_name, version).await?;
+    let resolved_version = resolve_version(&state, &model_name, version, &headers).await?;
 
     // Check ready
     if !state.registry.is_ready(&model_name, Some(&resolved_version)) {
@@ -958,12 +995,27 @@ async fn resolve_version(
     state: &AppState,
     model_name: &str,
     version: Option<String>,
+    headers: &HeaderMap,
 ) -> Result<String, AppError> {
+    // Precedence (§4.3): explicit version > x-lite-version header pin >
+    // weighted routing pick > active version.
     let resolved = match version {
         Some(v) => v,
-        None => state.registry.get_active_version(model_name).ok_or_else(|| {
-            AppError::ModelNotFound(format!("{} has no active version", model_name))
-        })?,
+        None => {
+            if let Some(pin) = headers
+                .get("x-lite-version")
+                .and_then(|v| v.to_str().ok())
+                .filter(|s| !s.is_empty())
+            {
+                pin.to_string()
+            } else if let Some(picked) = state.registry.routing_pick(model_name) {
+                picked
+            } else {
+                state.registry.get_active_version(model_name).ok_or_else(|| {
+                    AppError::ModelNotFound(format!("{} has no active version", model_name))
+                })?
+            }
+        }
     };
     // LRU touch (§4.2): coarse, no-op for unknown versions.
     state.registry.touch_last_used(model_name, &resolved);
@@ -1096,7 +1148,7 @@ pub async fn dispatch_custom_route(
     if let Some(ref v) = version {
         crate::validation::validate_version(v)?;
     }
-    let resolved_version = resolve_version(state, model_name, version).await?;
+    let resolved_version = resolve_version(state, model_name, version, headers).await?;
 
     if !state.registry.is_ready(model_name, Some(&resolved_version)) {
         return Err(AppError::ModelNotReady(format!(
@@ -1413,7 +1465,7 @@ async fn sse_infer_entry(
     if let Some(ref v) = version {
         crate::validation::validate_version(v)?;
     }
-    let resolved_version = resolve_version(state, model_name, version).await?;
+    let resolved_version = resolve_version(state, model_name, version, &headers).await?;
     if !state.registry.is_ready(model_name, Some(&resolved_version)) {
         return Err(AppError::ModelNotReady(format!(
             "{} version {} is not ready",
@@ -1540,13 +1592,14 @@ async fn open_worker_stream_cancel(
 pub async fn ws_stream_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
+    headers: HeaderMap,
     ws: axum::extract::WebSocketUpgrade,
     RequestId(request_id): RequestId,
 ) -> Response {
     if let Err(e) = crate::validation::validate_identifier(&model_name) {
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, socket, request_id))
+    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, headers, socket, request_id))
 }
 
 pub async fn ws_stream_version_handler(
@@ -1561,17 +1614,19 @@ pub async fn ws_stream_version_handler(
     if let Err(e) = crate::validation::validate_version(&version) {
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), socket, request_id))
+    // Explicit version wins — the header map is irrelevant here.
+    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), HeaderMap::new(), socket, request_id))
 }
 
 async fn handle_ws_stream(
     state: Arc<AppState>,
     model_name: String,
     version: Option<String>,
+    headers: HeaderMap,
     mut socket: WebSocket,
     request_id: String,
 ) {
-    let resolved_version = match resolve_version(&state, &model_name, version).await {
+    let resolved_version = match resolve_version(&state, &model_name, version, &headers).await {
         Ok(v) => v,
         Err(_) => {
             let _ = socket.close().await;
@@ -2601,5 +2656,210 @@ mod route_match_tests {
             }
             other => panic!("expected Hit, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod version_routing_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::inference_queue::InferenceQueue;
+    use crate::registry::ModelRegistry;
+    use crate::registry::types::ModelType;
+    use crate::worker::WorkerManager;
+    use axum::body::Body;
+    use axum::http::{HeaderName, HeaderValue, Request, StatusCode};
+    use axum::Router;
+    use tower::ServiceExt;
+
+    fn test_state() -> Arc<AppState> {
+        let registry = Arc::new(ModelRegistry::new());
+        let inference_queue = Arc::new(InferenceQueue::new());
+        let callback_runner = Arc::new(crate::callback::CallbackRunner::new());
+        let worker_manager = Arc::new(WorkerManager::new(
+            registry.clone(),
+            std::path::PathBuf::new(),
+            inference_queue.clone(),
+            "warn".to_string(),
+            callback_runner.clone(),
+        ));
+        Arc::new(AppState::new(
+            registry,
+            worker_manager,
+            inference_queue,
+            Config::default(),
+            std::path::PathBuf::new(),
+            callback_runner,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+        ))
+    }
+
+    fn register_ready(state: &AppState, model: &str, versions: &[&str]) {
+        for v in versions {
+            state
+                .registry
+                .register(model, v, Default::default(), ModelType::LitAPI, std::path::PathBuf::new())
+                .unwrap();
+            state.registry.mark_ready(model, v).unwrap();
+        }
+    }
+
+    fn pinned_header(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            HeaderName::from_static("x-lite-version"),
+            HeaderValue::from_str(value).unwrap(),
+        );
+        h
+    }
+
+    #[tokio::test]
+    async fn explicit_version_wins_over_header_and_weights() {
+        let state = test_state();
+        register_ready(&state, "m", &["1", "2"]);
+        state
+            .registry
+            .set_weights("m", &HashMap::from([("2".into(), 100u32)]))
+            .unwrap();
+        let v = resolve_version(&state, "m", Some("1".into()), &pinned_header("2"))
+            .await
+            .unwrap();
+        assert_eq!(v, "1");
+    }
+
+    #[tokio::test]
+    async fn header_pin_wins_over_weights() {
+        let state = test_state();
+        register_ready(&state, "m", &["1", "2"]);
+        state
+            .registry
+            .set_weights("m", &HashMap::from([("2".into(), 100u32)]))
+            .unwrap();
+        let v = resolve_version(&state, "m", None, &pinned_header("1"))
+            .await
+            .unwrap();
+        assert_eq!(v, "1");
+    }
+
+    #[tokio::test]
+    async fn weights_pick_when_no_explicit_or_header() {
+        let state = test_state();
+        register_ready(&state, "m", &["1", "2"]);
+        state
+            .registry
+            .set_weights("m", &HashMap::from([("2".into(), 100u32)]))
+            .unwrap();
+        let v = resolve_version(&state, "m", None, &HeaderMap::new())
+            .await
+            .unwrap();
+        assert_eq!(v, "2");
+    }
+
+    #[tokio::test]
+    async fn active_fallback_when_no_weights() {
+        let state = test_state();
+        register_ready(&state, "m", &["1", "2"]);
+        state.registry.activate_version("m", "1").unwrap();
+        let v = resolve_version(&state, "m", None, &HeaderMap::new())
+            .await
+            .unwrap();
+        assert_eq!(v, "1");
+    }
+
+    #[tokio::test]
+    async fn no_active_no_weights_is_not_found() {
+        let state = test_state();
+        register_ready(&state, "m", &["1"]);
+        let err = resolve_version(&state, "m", None, &HeaderMap::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::ModelNotFound(_)), "got {err:?}");
+    }
+
+    // ===== PUT /v2/models/:m/routing (§4.3) =====
+
+    fn routing_router(state: Arc<AppState>) -> Router {
+        Router::new()
+            .route("/v2/models/:model_name/routing", axum::routing::put(set_routing_handler))
+            .with_state(state)
+    }
+
+    async fn put_routing(app: Router, model: &str, body: &str) -> axum::response::Response {
+        app.oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/v2/models/{}/routing", model))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn put_routing_sets_weights_atomically() {
+        let state = test_state();
+        register_ready(&state, "m", &["1", "2"]);
+
+        let resp = put_routing(routing_router(state.clone()), "m", r#"{"weights":{"1":90,"2":10}}"#).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(state.registry.get("m", Some("1")).unwrap().weight, 90);
+        assert_eq!(state.registry.get("m", Some("2")).unwrap().weight, 10);
+
+        // Atomic full-set: unlisted versions are zeroed.
+        let resp = put_routing(routing_router(state.clone()), "m", r#"{"weights":{"2":50}}"#).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(state.registry.get("m", Some("1")).unwrap().weight, 0);
+        assert_eq!(state.registry.get("m", Some("2")).unwrap().weight, 50);
+    }
+
+    #[tokio::test]
+    async fn put_routing_unknown_version_is_400_and_untouched() {
+        let state = test_state();
+        register_ready(&state, "m", &["1"]);
+
+        let resp = put_routing(routing_router(state.clone()), "m", r#"{"weights":{"nope":100}}"#).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(state.registry.get("m", Some("1")).unwrap().weight, 0);
+
+        // Unknown model → 404.
+        let resp = put_routing(routing_router(state.clone()), "nope", r#"{"weights":{}}"#).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn activate_hard_switches_weights() {
+        // Explicit activate = hard cutover (§4.3): target gets weight 100,
+        // every other version 0.
+        let state = test_state();
+        register_ready(&state, "m", &["1", "2"]);
+        state
+            .registry
+            .set_weights("m", &HashMap::from([("1".into(), 90u32), ("2".into(), 10)]))
+            .unwrap();
+        state.registry.activate_version("m", "1").unwrap();
+
+        let app = Router::new()
+            .route(
+                "/v2/models/:model_name/versions/:version/activate",
+                axum::routing::post(activate_version_handler),
+            )
+            .with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/models/m/versions/2/activate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(state.registry.get_active_version("m").as_deref(), Some("2"));
+        assert_eq!(state.registry.get("m", Some("1")).unwrap().weight, 0);
+        assert_eq!(state.registry.get("m", Some("2")).unwrap().weight, 100);
     }
 }

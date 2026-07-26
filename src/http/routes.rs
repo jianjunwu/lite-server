@@ -1,7 +1,7 @@
 use crate::http::handlers::*;
 use crate::http::state::AppState;
 use axum::{
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use std::sync::Arc;
@@ -52,6 +52,8 @@ pub fn create_routes(state: AppState) -> Router {
         .route("/v2/models/:model_name/versions/:version", delete(delete_version_handler))
         // Admin: activate version
         .route("/v2/models/:model_name/versions/:version/activate", post(activate_version_handler))
+        // Admin: weighted/canary routing weights (§4.3)
+        .route("/v2/models/:model_name/routing", put(set_routing_handler))
         // Inference
         .route("/v2/models/:model_name/infer", post(infer_handler).options(inference_options_handler))
         .route("/v2/models/:model_name/versions/:version/infer", post(infer_version_handler).options(inference_options_handler))

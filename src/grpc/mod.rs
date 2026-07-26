@@ -168,11 +168,13 @@ impl LiteServer for GrpcService {
             return Err(Status::invalid_argument(e.to_string()));
         }
 
+        // version="" → weighted routing pick (§4.3), falling back to active.
         let resolved_version = match version {
             Some(v) => v.to_string(),
             None => self
                 .registry
-                .get_active_version(model_name)
+                .routing_pick(model_name)
+                .or_else(|| self.registry.get_active_version(model_name))
                 .ok_or_else(|| Status::not_found(format!("{} has no active version", model_name)))?,
         };
         self.registry.touch_last_used(model_name, &resolved_version);
@@ -333,11 +335,13 @@ impl LiteServer for GrpcService {
             return Err(Status::invalid_argument(e.to_string()));
         }
 
+        // version="" → weighted routing pick (§4.3), falling back to active.
         let resolved_version = match version {
             Some(v) => v.to_string(),
             None => self
                 .registry
-                .get_active_version(model_name)
+                .routing_pick(model_name)
+                .or_else(|| self.registry.get_active_version(model_name))
                 .ok_or_else(|| Status::not_found(format!("{} has no active version", model_name)))?,
         };
         self.registry.touch_last_used(model_name, &resolved_version);
@@ -434,11 +438,13 @@ impl LiteServer for GrpcService {
             return Err(Status::invalid_argument(e.to_string()));
         }
 
+        // version="" → weighted routing pick (§4.3), falling back to active.
         let resolved_version = match version {
             Some(v) => v.to_string(),
             None => self
                 .registry
-                .get_active_version(model_name)
+                .routing_pick(model_name)
+                .or_else(|| self.registry.get_active_version(model_name))
                 .ok_or_else(|| Status::not_found(format!("{} has no active version", model_name)))?,
         };
         self.registry.touch_last_used(model_name, &resolved_version);

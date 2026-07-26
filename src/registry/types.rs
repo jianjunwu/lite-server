@@ -45,6 +45,10 @@ pub struct ModelEntry {
     pub versions: HashMap<String, ModelVersion>,
     pub load_policy: LoadPolicy,
     pub max_loaded_versions: Option<usize>,
+    /// Desired traffic weights per version (§4.3). Survives version reload:
+    /// `register` initializes `ModelVersion.weight` from this map.
+    #[serde(default)]
+    pub weights: HashMap<String, u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +77,10 @@ pub struct ModelVersion {
     /// see [`super::ModelRegistry::touch_last_used`]). Drives LRU eviction.
     #[serde(default)]
     pub last_used_at: Option<SystemTime>,
+    /// Traffic weight for weighted/canary routing (§4.3). 0 = no weighted
+    /// traffic (bare requests then fall back to the active version).
+    #[serde(default)]
+    pub weight: u32,
     #[serde(default)]
     pub policies: crate::worker::protocol::ModelPolicies,
     /// Pre-built CORS header map, cached at policy ingest (B9) so responses
@@ -106,6 +114,7 @@ impl ModelEntry {
             versions: HashMap::new(),
             load_policy: LoadPolicy::default(),
             max_loaded_versions: None,
+            weights: HashMap::new(),
         }
     }
 
