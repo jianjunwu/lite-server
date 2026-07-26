@@ -61,7 +61,7 @@ def setup(self, device):
     self.model.eval()
 ```
 
-- `device` is a string like `"cpu"` or `"cuda:0"`
+- `device` has the format `{accelerator}:{index}` (e.g., `"cpu:0"`, `"cuda:0"`, `"cuda:1"`, `"rocm:0"`, `"mps:0"`). It is controlled by the `accelerator` (default `"cpu"`), `devices`, and `workers_per_device` fields in `config.yaml`. The framework does **not** auto-detect hardware — `device` is an opaque label forwarded from config; your `setup()` is responsible for interpreting it.
 - Resources stored on `self` persist for the worker's lifetime
 
 #### `decode_request(self, request)`

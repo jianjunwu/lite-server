@@ -61,7 +61,7 @@ def setup(self, device):
     self.model.eval()
 ```
 
-- `device` 是字符串，如 `"cpu"` 或 `"cuda:0"`
+- `device` 格式为 `{accelerator}:{index}`（如 `"cpu:0"`、`"cuda:0"`、`"cuda:1"`、`"rocm:0"`、`"mps:0"`）。由 `config.yaml` 中的 `accelerator`（默认 `"cpu"`）、`devices` 和 `workers_per_device` 字段控制。框架不自动检测硬件——`device` 是一个透传标签，由模型的 `setup()` 负责解释。
 - 存储在 `self` 上的资源在 worker 生命周期内持续存在
 
 #### `decode_request(self, request)`
