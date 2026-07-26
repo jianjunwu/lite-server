@@ -11,7 +11,7 @@ import threading
 import pytest
 
 from lite_server.api import LitAPI
-from lite_server.callback import (
+from lite_server.callbacks import (
     Callback,
     Cors,
     LogRequests,

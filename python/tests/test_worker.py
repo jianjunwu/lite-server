@@ -19,7 +19,7 @@ import time
 import pytest
 
 from lite_server.api import BidiStreamHandler, LitAPI
-from lite_server.callback import Callback
+from lite_server.callbacks import Callback
 from lite_server.context import Headers, RequestContext, RequestMeta
 from lite_server.pipeline import Pipeline
 from lite_server.response import Response as LiteResponse
@@ -260,7 +260,7 @@ class TestLoadLitAPI:
         try:
             callbacks_py = tmp_path / "callbacks.py"
             callbacks_py.write_text(textwrap.dedent('''
-                from lite_server.callback import Callback
+                from lite_server.callbacks import Callback
 
                 class Tracker(Callback):
                     def on_request(self, ctx):
@@ -293,7 +293,7 @@ class TestLoadLitAPI:
         try:
             callbacks_py = tmp_path / "callbacks.py"
             callbacks_py.write_text(textwrap.dedent('''
-                from lite_server.callback import Callback
+                from lite_server.callbacks import Callback
 
                 class Old(Callback):
                     def on_before_decode(self, request, meta):

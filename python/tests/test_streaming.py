@@ -11,7 +11,7 @@ import logging
 import pytest
 
 from lite_server.api import BidiStreamHandler, LitAPI
-from lite_server.callback import Callback
+from lite_server.callbacks import Callback
 from lite_server.context import Headers, RequestContext, RequestMeta
 from lite_server.pipeline import Pipeline
 from lite_server.proto import (

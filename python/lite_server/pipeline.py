@@ -32,7 +32,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Awaitable, Callable
 
 from lite_server.api import LitAPI
-from lite_server.callback import (
+from lite_server.callbacks._base import (
     _DATA_HOOKS,
     _ERROR_HOOKS,
     _LIFECYCLE_HOOKS,
@@ -413,7 +413,7 @@ class Pipeline:
         stages, so on_input/on_output hooks would silently never run.
         """
         for cb in callbacks:
-            from lite_server.callback import validate_callback as _vc
+            from lite_server.callbacks._base import validate_callback as _vc
             _vc(cb)
             cls_type = type(cb)
             if _overrides(cls_type, "on_input", Callback):

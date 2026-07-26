@@ -24,7 +24,7 @@ import yaml
 import zmq
 
 from lite_server.api import LitAPI
-from lite_server.callback import extract_policies, load_callbacks
+from lite_server.callbacks import extract_policies, load_callbacks
 from lite_server.context import CBSequence, Headers, RequestContext, RequestMeta
 from lite_server.exceptions import HTTPException
 from lite_server.pipeline import (

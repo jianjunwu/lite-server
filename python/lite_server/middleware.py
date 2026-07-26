@@ -20,7 +20,7 @@ built-in Callback classes instead:
 Migration guide: https://lite-server.dev/migration-0.7
 Full discussion: .claude/design-callback-middleware-unification.md
 
-TokenBucket is now an internal implementation detail (lite_server.callback._TokenBucket).
+TokenBucket is now an internal implementation detail (lite_server.callbacks.rate_limit._TokenBucket).
 """
 
 raise ImportError(__doc__)

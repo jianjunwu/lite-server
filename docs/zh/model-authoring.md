@@ -340,7 +340,7 @@ from lite_server import RequireApiKey
 
 # 在 callbacks 列表中声明
 callbacks:
-  - lite_server.callback.RequireApiKey
+  - lite_server.callbacks.RequireApiKey
 ```
 
 默认从 `X-API-Key` 请求头读取 key。支持自定义 header 和白名单：
@@ -401,7 +401,7 @@ class MyModel(LitAPI):
 ```yaml
 callbacks:
   - my_package.callbacks.AuditLogger
-  - lite_server.callback.LogRequests
+  - lite_server.callbacks.LogRequests
 ```
 
 > 导入失败或 0.7 之前的旧钩子签名会在加载时响亮报错 —— 被静默跳过的

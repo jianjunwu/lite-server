@@ -11,7 +11,7 @@ import json
 import pytest
 
 from lite_server.api import LitAPI
-from lite_server.callback import Callback
+from lite_server.callbacks import Callback
 from lite_server.context import Headers, RequestMeta
 from lite_server.pipeline import Pipeline
 from lite_server.response import Response

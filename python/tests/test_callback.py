@@ -6,19 +6,18 @@ import time
 
 import pytest
 
-from lite_server.context import Headers, RequestMeta
-from lite_server.callback import (
+from lite_server.context import Headers, RequestContext, RequestMeta
+from lite_server.callbacks import (
     Callback,
     Cors,
     LogRequests,
     RateLimit,
     RequireApiKey,
-    RequestContext,
-    _TokenBucket,
     extract_policies,
     load_callbacks,
     validate_callback,
 )
+from lite_server.callbacks.rate_limit import _TokenBucket
 from lite_server.exceptions import HTTPException, UnauthorizedError
 
 

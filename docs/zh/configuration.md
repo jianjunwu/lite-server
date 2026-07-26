@@ -128,7 +128,7 @@ hot_reload_interval: 1.0       # 轮询间隔（秒）
 # 中间件 / Callback
 callbacks:                     # Worker 启动时加载的 callback 类路径列表
   - my_package.callbacks.AuditLogger
-  - lite_server.callback.RequireApiKey
+  - lite_server.callbacks.RequireApiKey
 ```
 
 ## 编排配置

@@ -8,7 +8,7 @@ import pytest
 
 from lite_server.context import Headers, RequestContext, RequestMeta
 from lite_server.exceptions import HTTPException, UnauthorizedError
-from lite_server.callback import (
+from lite_server.callbacks import (
     Callback,
     Cors,
     LogRequests,

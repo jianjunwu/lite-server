@@ -15,7 +15,7 @@ except ImportError:
     validate_model_config = None
 
 from lite_server.api import BidiStreamHandler, LitAPI
-from lite_server.callback import (
+from lite_server.callbacks import (
     Callback,
     Cors,
     LogRequests,

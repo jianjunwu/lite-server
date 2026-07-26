@@ -128,7 +128,7 @@ hot_reload_interval: 1.0       # Polling interval in seconds
 # Middleware / Callbacks
 callbacks:                     # Callback class paths loaded at worker startup
   - my_package.callbacks.AuditLogger
-  - lite_server.callback.RequireApiKey
+  - lite_server.callbacks.RequireApiKey
 ```
 
 ## Orchestration Configuration
