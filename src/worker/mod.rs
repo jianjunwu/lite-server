@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::timeout;
@@ -40,16 +40,8 @@ fn replace_hook_vars(template: &str, vars: &[(String, String)]) -> String {
 
 /// Execute a worker lifecycle hook (shell command + optional HTTP callback).
 /// Both are fire-and-forget: spawned as background tasks, never block the caller.
-/// Process-wide HTTP client for worker lifecycle hooks. Cloning a
-/// reqwest::Client is cheap (it is Arc internally) and reuses the underlying
-/// connection pool, so build it once instead of on every hook firing (#4).
-static HTTP_HOOK_CLIENT: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync::Lazy::new(|| {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap_or_default()
-});
-
+/// The HTTP client is built per firing so its timeout can come from
+/// `WorkerHooksConfig::hook_http_timeout` (§3) instead of a process-wide constant.
 pub fn execute_hook(
     hook_type: &str,
     hooks: &crate::config::WorkerHooksConfig,
@@ -105,8 +97,14 @@ pub fn execute_hook(
         let method = http.method.clone();
         let body = http.body_template.as_deref().map(|t| replace_hook_vars(t, &vars));
         let hook_name = hook_type.to_string();
+        let hook_timeout = Duration::from_secs_f32(hooks.hook_http_timeout);
         tokio::spawn(async move {
-            let client = HTTP_HOOK_CLIENT.clone();
+            // Per-call client so the timeout is configurable (§3). reqwest::Client
+            // is Arc internally, so building it per firing is cheap.
+            let client = reqwest::Client::builder()
+                .timeout(hook_timeout)
+                .build()
+                .unwrap_or_default();
             let result = match method.to_uppercase().as_str() {
                 "GET" => client.get(&url).send().await,
                 _ => {
@@ -181,11 +179,75 @@ struct WorkerProcess {
     /// Resolves once the worker process has been reaped. unload/shutdown must
     /// await this so no orphaned worker survives to steal the re-bound socket.
     done_rx: Option<oneshot::Receiver<()>>,
+    /// Max seconds to wait for the OS to reap this killed worker (§3).
+    kill_timeout: Duration,
 }
 
-/// Max time to wait for a single worker to die after signaling shutdown.
-/// kill() is SIGKILL/TerminateProcess, so this only trips on a stuck OS call.
-const WORKER_KILL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Max bytes of a dying worker's stderr to retain for crash diagnostics.
+/// Bounded so a chatty/frozen worker cannot stall model load unbounded.
+const WORKER_STDERR_CAPTURE: usize = 64 * 1024;
+/// How long to wait for a worker that exited before "ready" to flush its
+/// stderr — its traceback lives there. Bounded so a stuck pipe can't hang load.
+const WORKER_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Trailing stderr lines folded into the crash message. Python tracebacks put
+/// the actionable error on the last line.
+const WORKER_STDERR_TAIL_LINES: usize = 5;
+
+/// Return the last `n` lines of `text`, in order. `n == 0` or empty input
+/// yields an empty string.
+fn tail_lines(text: &str, n: usize) -> String {
+    if n == 0 {
+        return String::new();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
+/// Read up to [`WORKER_STDERR_CAPTURE`] bytes from `stderr` (or until EOF),
+/// bounded by `deadline`, and return the last [`WORKER_STDERR_TAIL_LINES`]
+/// lines. Surfaces a crashed worker's real traceback in the error message
+/// instead of a bare "worker exited before ready". Generic over the reader so
+/// it is unit-testable without spawning a real process.
+async fn drain_worker_stderr_bounded<R>(stderr: R, deadline: Duration) -> String
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = stderr;
+    let mut cap: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut buf = [0u8; 4096];
+
+    let read_loop = async {
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(k) => {
+                    let remaining = WORKER_STDERR_CAPTURE.saturating_sub(cap.len());
+                    if remaining == 0 {
+                        break;
+                    }
+                    let take = k.min(remaining);
+                    cap.extend_from_slice(&buf[..take]);
+                    if cap.len() >= WORKER_STDERR_CAPTURE {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    };
+
+    let _ = timeout(deadline, read_loop).await;
+    tail_lines(&String::from_utf8_lossy(&cap), WORKER_STDERR_TAIL_LINES)
+}
+
+/// Production wrapper: drains worker stderr with the standard 5s deadline.
+async fn drain_worker_stderr<R>(stderr: R) -> String
+where
+    R: AsyncRead + Unpin,
+{
+    drain_worker_stderr_bounded(stderr, WORKER_STDERR_DRAIN_TIMEOUT).await
+}
 
 impl WorkerManager {
     pub fn new(
@@ -426,14 +488,20 @@ impl WorkerManager {
         // Wait for "ready" signal
         let mut reader = BufReader::new(stdout);
         let mut ready_line = String::new();
-        let n = timeout(Duration::from_secs(60), reader.read_line(&mut ready_line))
+        let n = timeout(Duration::from_secs_f32(model_config.startup_timeout), reader.read_line(&mut ready_line))
             .await
             .map_err(|_| AppError::InferenceTimeout("worker startup timeout".to_string()))
             .and_then(|r| r.map_err(AppError::Io))
             .inspect_err(|_| self.mark_degraded(model_name, version))?;
         if n == 0 {
             self.mark_degraded(model_name, version);
-            return Err(AppError::WorkerCrashed("worker exited before ready".to_string()));
+            let stderr_tail = drain_worker_stderr(stderr).await;
+            let msg = if stderr_tail.trim().is_empty() {
+                "worker exited before ready".to_string()
+            } else {
+                format!("worker exited before ready: {stderr_tail}")
+            };
+            return Err(AppError::WorkerCrashed(msg));
         }
         let stdout = reader.into_inner();
 
@@ -569,6 +637,7 @@ impl WorkerManager {
                     endpoint,
                     shutdown_tx: Some(shutdown_tx),
                     done_rx: Some(done_rx),
+                    kill_timeout: Duration::from_secs_f32(model_config.worker_kill_timeout),
                 });
             }
         }
@@ -927,14 +996,20 @@ impl WorkerManager {
             // Wait for "ready" signal
             let mut reader = BufReader::new(stdout);
             let mut ready_line = String::new();
-            let n = timeout(Duration::from_secs(60), reader.read_line(&mut ready_line))
+            let n = timeout(Duration::from_secs_f32(model_config.startup_timeout), reader.read_line(&mut ready_line))
                 .await
                 .map_err(|_| AppError::InferenceTimeout("worker startup timeout".to_string()))
                 .and_then(|r| r.map_err(AppError::Io))
                 .inspect_err(|_| self.mark_load_failed(model_name, version))?;
             if n == 0 {
                 self.mark_load_failed(model_name, version);
-                return Err(AppError::WorkerCrashed("worker exited before ready".to_string()));
+                let stderr_tail = drain_worker_stderr(stderr).await;
+                let msg = if stderr_tail.trim().is_empty() {
+                    "worker exited before ready".to_string()
+                } else {
+                    format!("worker exited before ready: {stderr_tail}")
+                };
+                return Err(AppError::WorkerCrashed(msg));
             }
             let stdout = reader.into_inner();
 
@@ -1064,6 +1139,7 @@ impl WorkerManager {
                 endpoint,
                 shutdown_tx: Some(shutdown_tx),
                 done_rx: Some(done_rx),
+                kill_timeout: Duration::from_secs_f32(model_config.worker_kill_timeout),
             });
         }
 
@@ -1072,8 +1148,14 @@ impl WorkerManager {
         self.registry
             .mark_ready(model_name, version)?;
 
-        // Create shared OutlierState — single instance for batch_collector, health_checker, and streaming
-        let outlier = Arc::new(OutlierState::new(total_workers));
+        // Create shared OutlierState — single instance for batch_collector, health_checker, and streaming.
+        // Ejection thresholds come from ModelConfig (§3); error_threshold == 0 disables ejection.
+        let ejection = crate::inference_queue::EjectionConfig {
+            error_threshold: model_config.ejection_error_threshold,
+            timeout: Duration::from_secs_f32(model_config.ejection_timeout),
+            max_percent: model_config.ejection_max_percent,
+        };
+        let outlier = Arc::new(OutlierState::with_config(total_workers, &ejection));
 
         // Register inference queue for batching
         self.inference_queue
@@ -1235,7 +1317,7 @@ impl WorkerManager {
             }
             for proc in procs {
                 if let Some(done_rx) = proc.done_rx {
-                    if timeout(WORKER_KILL_TIMEOUT, done_rx).await.is_err() {
+                    if timeout(proc.kill_timeout, done_rx).await.is_err() {
                         error!(
                             model = %model_name, version = %version, worker_id = proc.worker_id,
                             "Timed out waiting for worker process to die; cleaning up anyway"
@@ -2330,6 +2412,7 @@ mod tests {
             }),
             on_exit_http: None,
             on_error_http: None,
+            ..Default::default()
         };
         let yaml = serde_yaml::to_string(&hooks).unwrap();
         let parsed: crate::config::WorkerHooksConfig = serde_yaml::from_str(&yaml).unwrap();
@@ -2893,5 +2976,87 @@ class TestAPI(LitAPI):
         let _ = wm.unload_model("test_model", Some("1")).await;
 
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // ===== P0: worker startup stderr drain (diagnostics on early exit) =====
+    // When a worker exits before sending "ready" (n==0 on the stdout handshake),
+    // its stderr — holding the real Python traceback — used to be dropped.
+    // These cover the pure `tail_lines` and async `drain_worker_stderr` helpers
+    // that surface the last few stderr lines in the crash message.
+
+    #[test]
+    fn tail_lines_returns_last_n_lines() {
+        let text = "line0\nline1\nline2\nline3\nline4\nline5\nline6";
+        assert_eq!(tail_lines(text, 3), "line4\nline5\nline6");
+    }
+
+    #[test]
+    fn tail_lines_returns_all_when_fewer_than_n() {
+        assert_eq!(tail_lines("only\none", 5), "only\none");
+    }
+
+    #[test]
+    fn tail_lines_empty_input_returns_empty() {
+        assert_eq!(tail_lines("", 5), "");
+    }
+
+    #[test]
+    fn tail_lines_zero_n_returns_empty() {
+        assert_eq!(tail_lines("a\nb\nc", 0), "");
+    }
+
+    #[test]
+    fn tail_lines_keeps_real_traceback_error_line() {
+        // A realistic traceback: the actionable line (ModuleNotFoundError) is
+        // the LAST line — it must survive the tail truncation.
+        let tb = "Traceback (most recent call last):\n\
+  File \"model.py\", line 10, in <module>\n    import torch\n\
+ModuleNotFoundError: No module named 'torch'";
+        let tail = tail_lines(tb, 5);
+        assert!(tail.contains("ModuleNotFoundError: No module named 'torch'"));
+    }
+
+    #[tokio::test]
+    async fn drain_worker_stderr_captures_until_eof_then_tails() {
+        // 7 lines; drain reads all (EOF) and returns the last 5.
+        let stderr: &[u8] = b"l0\nl1\nl2\nl3\nl4\nl5\nl6\n";
+        let got = drain_worker_stderr(stderr).await;
+        assert_eq!(got, "l2\nl3\nl4\nl5\nl6");
+    }
+
+    #[tokio::test]
+    async fn drain_worker_stderr_empty_returns_empty() {
+        let got = drain_worker_stderr(&b""[..]).await;
+        assert_eq!(got, "");
+    }
+
+    #[tokio::test]
+    async fn drain_worker_stderr_caps_at_64kb_before_eof() {
+        // 64KB of filler followed by a marker line that only exists past the
+        // cap. If the drain respects the 64KB cap it stops reading BEFORE the
+        // marker; if it ignores the cap and reads to EOF, the marker leaks in.
+        let mut bytes: Vec<u8> = Vec::with_capacity(64 * 1024 + 32);
+        while bytes.len() < 64 * 1024 {
+            bytes.extend_from_slice(b"x\n");
+        }
+        bytes.extend_from_slice(b"AFTER_CAP_MARKER\n");
+        assert!(bytes.len() > 64 * 1024);
+
+        let got = drain_worker_stderr(&bytes[..]).await;
+        assert!(
+            !got.contains("AFTER_CAP_MARKER"),
+            "drain read past the 64KB cap: {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_worker_stderr_does_not_hang_on_open_pipe() {
+        // A pipe that never writes and never closes: the drain must give up at
+        // the deadline and return whatever it captured (empty), not hang.
+        let (_tx, rx) = tokio::io::duplex(64);
+        // keep _tx alive so the pipe never sees EOF
+        let got = drain_worker_stderr_bounded(rx, Duration::from_millis(50)).await;
+        assert_eq!(got, "");
+        let _ = _tx;
     }
 }

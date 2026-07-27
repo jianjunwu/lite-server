@@ -98,6 +98,28 @@ struct WorkerOutlier {
     ejected: Mutex<Option<EjectedWorker>>,
 }
 
+/// Configurable outlier-ejection parameters (§3). `Default` preserves the prior
+/// hardcoded behavior, so existing `OutlierState::new` callers are unaffected.
+#[derive(Clone)]
+pub struct EjectionConfig {
+    /// Consecutive errors before a worker is ejected. 0 = never eject.
+    pub error_threshold: usize,
+    /// How long a worker stays ejected before auto-recovery.
+    pub timeout: Duration,
+    /// Max % of workers ejectable at once (1-100).
+    pub max_percent: usize,
+}
+
+impl Default for EjectionConfig {
+    fn default() -> Self {
+        Self {
+            error_threshold: 3,
+            timeout: Duration::from_secs(30),
+            max_percent: 50,
+        }
+    }
+}
+
 /// Shared outlier detection state for a model version's workers.
 pub struct OutlierState {
     workers: Vec<WorkerOutlier>,
@@ -108,7 +130,13 @@ pub struct OutlierState {
 }
 
 impl OutlierState {
+    /// Default ejection parameters (threshold 3, 30s, 50%) — prior behavior.
     pub fn new(num_workers: usize) -> Self {
+        Self::with_config(num_workers, &EjectionConfig::default())
+    }
+
+    /// Configurable ejection parameters (§3). `error_threshold == 0` disables ejection.
+    pub fn with_config(num_workers: usize, config: &EjectionConfig) -> Self {
         Self {
             workers: (0..num_workers)
                 .map(|_| WorkerOutlier {
@@ -116,9 +144,9 @@ impl OutlierState {
                     ejected: Mutex::new(None),
                 })
                 .collect(),
-            consecutive_threshold: 3,
-            base_ejection_time: Duration::from_secs(30),
-            max_ejection_percent: 50,
+            consecutive_threshold: config.error_threshold,
+            base_ejection_time: config.timeout,
+            max_ejection_percent: config.max_percent,
         }
     }
 
@@ -139,7 +167,10 @@ impl OutlierState {
             None => return false,
         };
         let count = w.consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
-        count >= self.consecutive_threshold && self.maybe_eject(worker_idx)
+        // threshold == 0 ⇒ outlier ejection disabled (§3).
+        self.consecutive_threshold > 0
+            && count >= self.consecutive_threshold
+            && self.maybe_eject(worker_idx)
     }
 
     /// Eject a worker if not already ejected and below max ejection percent.
@@ -209,10 +240,6 @@ impl OutlierState {
         count
     }
 }
-
-// ===== Retry configuration =====
-
-const MAX_RETRIES: usize = 3;
 
 /// Signal to trigger a model version reload (worker auto-recycle).
 #[derive(Debug)]
@@ -314,7 +341,9 @@ impl InferenceQueue {
         let request_timeout = Duration::from_secs_f64(config.request_timeout as f64);
         let max_requests = config.max_requests;
         let max_requests_jitter = config.max_requests_jitter;
+        let max_retries = config.max_retries;
         let health_interval = Duration::from_secs_f64(config.health_check_interval as f64);
+        let health_probe_timeout = Duration::from_secs_f64(config.health_check_timeout as f64);
 
         let worker_count = workers.len();
         let handle = tokio::spawn(batch_collector(
@@ -331,6 +360,7 @@ impl InferenceQueue {
             max_requests,
             max_requests_jitter,
             reload_tx,
+            max_retries,
             outlier.clone(),
         ));
 
@@ -338,6 +368,7 @@ impl InferenceQueue {
         let health_handle = if health_interval > Duration::ZERO {
             Some(std::sync::Arc::new(tokio::spawn(health_checker(
                 health_interval,
+                health_probe_timeout,
                 zmq_clients,
                 outlier.clone(),
                 model_name.to_string(),
@@ -772,6 +803,7 @@ async fn send_batch_with_retry(
     request_count: &AtomicUsize,
     max_requests: usize,
     reload_tx: &mpsc::Sender<ReloadSignal>,
+    max_retries: usize,
 ) {
     if batch.is_empty() {
         return;
@@ -784,8 +816,8 @@ async fn send_batch_with_retry(
 
     let batch_size = batch.len();
 
-    // Fast path: single worker, no retry possible
-    if zmq_clients.len() <= 1 {
+    // Fast path: single worker, or retries disabled (max_retries == 0)
+    if zmq_clients.len() <= 1 || max_retries == 0 {
         let result = do_send_batch(&mut batch, zmq_clients, inflight, outlier, model_name, version, request_timeout, &[]).await;
         match result {
             Ok(()) => check_max_requests(request_count, batch_size, max_requests, model_name, version, reload_tx).await,
@@ -796,7 +828,7 @@ async fn send_batch_with_retry(
 
     let mut excluded: Vec<usize> = Vec::new();
     let mut last_err: Option<BatchError> = None;
-    for attempt in 0..MAX_RETRIES {
+    for attempt in 0..max_retries {
         if attempt > 0 {
             prometheus::inc_retry(model_name, version);
         }
@@ -907,6 +939,7 @@ async fn batch_collector(
     max_requests: usize,
     max_requests_jitter: usize,
     reload_tx: mpsc::Sender<ReloadSignal>,
+    max_retries: usize,
     outlier: Arc<OutlierState>,
 ) {
     let worker_inflight: Vec<Arc<AtomicUsize>> = (0..zmq_clients.len())
@@ -930,7 +963,7 @@ async fn batch_collector(
             let request_count = request_count.clone();
             let reload_tx = reload_tx.clone();
             tokio::spawn(async move {
-                send_batch_with_retry(batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx).await;
+                send_batch_with_retry(batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx, max_retries).await;
             });
         }
         return;
@@ -955,7 +988,7 @@ async fn batch_collector(
                     let request_count = request_count.clone();
                     let reload_tx = reload_tx.clone();
                     tokio::spawn(async move {
-                        send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx).await;
+                        send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx, max_retries).await;
                     });
                     deadline = None;
                 } else if deadline.is_none() {
@@ -993,7 +1026,7 @@ async fn batch_collector(
                     let request_count = request_count.clone();
                     let reload_tx = reload_tx.clone();
                     tokio::spawn(async move {
-                        send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx).await;
+                        send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx, max_retries).await;
                     });
                 }
                 deadline = None;
@@ -1013,7 +1046,7 @@ async fn batch_collector(
         let request_count = request_count.clone();
         let reload_tx = reload_tx.clone();
         tokio::spawn(async move {
-            send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx).await;
+            send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx, max_retries).await;
         });
     }
 }
@@ -1022,12 +1055,12 @@ async fn batch_collector(
 /// Probes ALL workers concurrently (including ejected ones) for early recovery.
 async fn health_checker(
     interval: Duration,
+    probe_timeout: Duration,
     zmq_clients: Vec<Arc<WorkerZmqClient>>,
     outlier: Arc<OutlierState>,
     model_name: String,
     version: String,
 ) {
-    let probe_timeout = Duration::from_secs(5);
     let uid_prefix = format!("health-{}-{}", model_name, version);
     loop {
         tokio::time::sleep(interval).await;
@@ -1689,6 +1722,35 @@ mod tests {
 
         // At threshold — ejected
         outlier.record_error(0);
+        assert!(outlier.is_ejected(0));
+    }
+
+    #[test]
+    fn test_outlier_never_ejects_when_threshold_zero() {
+        // §3: ejection_error_threshold == 0 disables outlier ejection entirely.
+        let cfg = EjectionConfig {
+            error_threshold: 0,
+            timeout: Duration::from_secs(30),
+            max_percent: 50,
+        };
+        let outlier = OutlierState::with_config(2, &cfg);
+        for _ in 0..10 {
+            assert!(!outlier.record_error(0), "threshold 0 must never eject");
+        }
+        assert!(!outlier.is_ejected(0));
+    }
+
+    #[test]
+    fn test_outlier_ejects_at_configured_threshold() {
+        // §3: the threshold is configurable (here 2, not the default 3).
+        let cfg = EjectionConfig {
+            error_threshold: 2,
+            timeout: Duration::from_secs(30),
+            max_percent: 50,
+        };
+        let outlier = OutlierState::with_config(1, &cfg);
+        assert!(!outlier.record_error(0)); // 1st error, below threshold 2
+        assert!(outlier.record_error(0)); // 2nd error → eject
         assert!(outlier.is_ejected(0));
     }
 

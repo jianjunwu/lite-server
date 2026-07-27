@@ -555,6 +555,14 @@ class TestServeArgs:
             "keepalive_timeout": 10.0,
             "metrics_port": 9090,
             "health_check_interval": 20.0,
+            "ejection_error_threshold": 5,
+            "ejection_timeout": 45.0,
+            "ejection_max_percent": 40,
+            "max_retries": 2,
+            "startup_timeout": 90.0,
+            "health_check_timeout": 8.0,
+            "worker_kill_timeout": 15.0,
+            "hook_http_timeout": 7.0,
         })()
         assert cli._cmd_serve(args) == 0
 
@@ -562,4 +570,9 @@ class TestServeArgs:
         assert called_with["host"] == "127.0.0.1"
         assert called_with["metrics_port"] == 9090
         assert called_with["health_check_interval"] == 20.0
+        # Worker resilience (§3) must be forwarded.
+        assert called_with["max_retries"] == 2
+        assert called_with["startup_timeout"] == 90.0
+        assert called_with["ejection_error_threshold"] == 5
+        assert called_with["hook_http_timeout"] == 7.0
         assert "transport" not in called_with

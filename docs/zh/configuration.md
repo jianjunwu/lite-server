@@ -104,6 +104,16 @@ heartbeat_interval: 0.0        # 心跳探测间隔（秒），0 = 禁用
 heartbeat_timeout: 5.0         # 等待探测响应的最大秒数
 heartbeat_max_failures: 3      # 连续失败次数达到此值后杀死 worker
 
+# Worker 韧性（Resilience）
+max_retries: 3                 # 失败的 batch 换其它 worker 重试次数（0 = 禁用）
+ejection_error_threshold: 3    # 连续错误达到此次数后剔除 worker（0 = 禁用剔除）
+ejection_timeout: 30.0         # 被剔除 worker 自动恢复前的等待秒数
+ejection_max_percent: 50       # 同时最多剔除的 worker 比例（1-100）
+startup_timeout: 60.0          # 等待 worker "ready" 握手的最大秒数
+health_check_timeout: 5.0      # 单次健康探测超时秒数
+worker_kill_timeout: 10.0      # 杀死 worker 后等待 OS 回收的秒数
+hook_http_timeout: 5.0         # 生命周期 HTTP 钩子请求的超时秒数（配置在 `hooks:` 下）
+
 # Worker 生命周期钩子
 hooks:
   on_ready: null               # worker 就绪时执行的 shell 命令
@@ -193,6 +203,14 @@ lite-server serve [参数]
 | `--metrics-port` | 指标端口 | `server.metrics_port` |
 | `--graceful-timeout` | 优雅关闭超时 | `server.graceful_timeout` |
 | `--keepalive-timeout` | HTTP keep-alive 超时 | `server.keepalive_timeout` |
+| `--ejection-error-threshold` | 剔除 worker 的错误次数（0=禁用） | `model_defaults.ejection_error_threshold` |
+| `--ejection-timeout` | 被剔除 worker 自动恢复（秒） | `model_defaults.ejection_timeout` |
+| `--ejection-max-percent` | 最多剔除的 worker 比例 | `model_defaults.ejection_max_percent` |
+| `--max-retries` | 失败 batch 换 worker 重试 | `model_defaults.max_retries` |
+| `--startup-timeout` | worker ready 握手超时（秒） | `model_defaults.startup_timeout` |
+| `--health-check-timeout` | 健康探测超时（秒） | `model_defaults.health_check_timeout` |
+| `--worker-kill-timeout` | 杀死后等待 OS 回收（秒） | `model_defaults.worker_kill_timeout` |
+| `--hook-http-timeout` | 生命周期 HTTP 钩子超时（秒） | `model_defaults.hook_http_timeout` |
 
 ## 优先级
 

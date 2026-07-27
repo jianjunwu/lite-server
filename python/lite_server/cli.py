@@ -44,6 +44,15 @@ def main(argv=None):
     serve_parser.add_argument("--graceful-timeout", type=float, help="Graceful shutdown timeout in seconds")
     serve_parser.add_argument("--threads", type=int, help="Number of Tokio worker threads (default: auto = CPU cores)")
     serve_parser.add_argument("--keepalive-timeout", type=float, help="HTTP keep-alive timeout in seconds (0=disabled)")
+    # Worker resilience (§3)
+    serve_parser.add_argument("--ejection-error-threshold", type=int, help="Consecutive errors before a worker is ejected (0=disable)")
+    serve_parser.add_argument("--ejection-timeout", type=float, help="Seconds a worker stays ejected before auto-recovery")
+    serve_parser.add_argument("--ejection-max-percent", type=int, help="Max %% of workers ejectable at once (1-100)")
+    serve_parser.add_argument("--max-retries", type=int, help="Retry a failed batch on a different worker up to N times (0=disable)")
+    serve_parser.add_argument("--startup-timeout", type=float, help="Max seconds to wait for a worker ready handshake")
+    serve_parser.add_argument("--health-check-timeout", type=float, help="Seconds per health-check probe before timeout")
+    serve_parser.add_argument("--worker-kill-timeout", type=float, help="Seconds to wait for the OS to reap a killed worker")
+    serve_parser.add_argument("--hook-http-timeout", type=float, help="Seconds for a worker lifecycle HTTP hook request")
 
     # config-check
     check_parser = subparsers.add_parser("config-check", help="Validate configuration")
@@ -134,6 +143,14 @@ def _cmd_serve(args):
             health_check_interval=args.health_check_interval,
             graceful_timeout=args.graceful_timeout,
             keepalive_timeout=args.keepalive_timeout,
+            ejection_error_threshold=args.ejection_error_threshold,
+            ejection_timeout=args.ejection_timeout,
+            ejection_max_percent=args.ejection_max_percent,
+            max_retries=args.max_retries,
+            startup_timeout=args.startup_timeout,
+            health_check_timeout=args.health_check_timeout,
+            worker_kill_timeout=args.worker_kill_timeout,
+            hook_http_timeout=args.hook_http_timeout,
         )
     except KeyboardInterrupt:
         print("\nShutting down...")

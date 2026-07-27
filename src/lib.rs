@@ -47,6 +47,14 @@ pub struct ServerOptions {
     pub health_check_interval: Option<f32>,
     pub graceful_timeout: Option<f32>,
     pub keepalive_timeout: Option<f32>,
+    pub ejection_error_threshold: Option<usize>,
+    pub ejection_timeout: Option<f32>,
+    pub ejection_max_percent: Option<usize>,
+    pub max_retries: Option<usize>,
+    pub startup_timeout: Option<f32>,
+    pub health_check_timeout: Option<f32>,
+    pub worker_kill_timeout: Option<f32>,
+    pub hook_http_timeout: Option<f32>,
 }
 
 pub fn run_server(
@@ -75,6 +83,14 @@ pub fn run_server(
         health_check_interval,
         graceful_timeout,
         keepalive_timeout,
+        ejection_error_threshold,
+        ejection_timeout,
+        ejection_max_percent,
+        max_retries,
+        startup_timeout,
+        health_check_timeout,
+        worker_kill_timeout,
+        hook_http_timeout,
     } = opts;
     let mut cfg = if let Some(config_path) = config {
         config::load_config(&config_path)?
@@ -104,6 +120,14 @@ pub fn run_server(
         health_check_interval,
         graceful_timeout,
         keepalive_timeout,
+        ejection_error_threshold,
+        ejection_timeout,
+        ejection_max_percent,
+        max_retries,
+        startup_timeout,
+        health_check_timeout,
+        worker_kill_timeout,
+        hook_http_timeout,
     });
 
     let _log_guard = logging::init(
@@ -175,6 +199,14 @@ fn build_runtime(threads: Option<usize>) -> tokio::runtime::Runtime {
     health_check_interval=None,
     graceful_timeout=None,
     keepalive_timeout=None,
+    ejection_error_threshold=None,
+    ejection_timeout=None,
+    ejection_max_percent=None,
+    max_retries=None,
+    startup_timeout=None,
+    health_check_timeout=None,
+    worker_kill_timeout=None,
+    hook_http_timeout=None,
 ))]
 fn serve(
     config: Option<String>,
@@ -199,6 +231,14 @@ fn serve(
     health_check_interval: Option<f32>,
     graceful_timeout: Option<f32>,
     keepalive_timeout: Option<f32>,
+    ejection_error_threshold: Option<usize>,
+    ejection_timeout: Option<f32>,
+    ejection_max_percent: Option<usize>,
+    max_retries: Option<usize>,
+    startup_timeout: Option<f32>,
+    health_check_timeout: Option<f32>,
+    worker_kill_timeout: Option<f32>,
+    hook_http_timeout: Option<f32>,
 ) -> PyResult<()> {
     pyo3::Python::with_gil(|py| {
         py.allow_threads(|| {
@@ -208,6 +248,9 @@ fn serve(
                 metrics_port, no_metrics, grpc_port, no_grpc, no_streaming_metrics,
                 max_queue_size, max_requests, max_requests_jitter, request_timeout,
                 health_check_interval, graceful_timeout, keepalive_timeout,
+                ejection_error_threshold, ejection_timeout, ejection_max_percent,
+                max_retries, startup_timeout, health_check_timeout,
+                worker_kill_timeout, hook_http_timeout,
             })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })

@@ -204,6 +204,15 @@ pub struct ModelDefaults {
     pub max_requests_jitter: Option<usize>,
     pub request_timeout: Option<f32>,
     pub health_check_interval: Option<f32>,
+    // Worker resilience (§3).
+    pub ejection_error_threshold: Option<usize>,
+    pub ejection_timeout: Option<f32>,
+    pub ejection_max_percent: Option<usize>,
+    pub max_retries: Option<usize>,
+    pub startup_timeout: Option<f32>,
+    pub health_check_timeout: Option<f32>,
+    pub worker_kill_timeout: Option<f32>,
+    pub hook_http_timeout: Option<f32>,
 }
 
 impl ModelDefaults {
@@ -223,6 +232,30 @@ impl ModelDefaults {
         }
         if let Some(v) = self.health_check_interval {
             model.health_check_interval = v;
+        }
+        if let Some(v) = self.ejection_error_threshold {
+            model.ejection_error_threshold = v;
+        }
+        if let Some(v) = self.ejection_timeout {
+            model.ejection_timeout = v;
+        }
+        if let Some(v) = self.ejection_max_percent {
+            model.ejection_max_percent = v;
+        }
+        if let Some(v) = self.max_retries {
+            model.max_retries = v;
+        }
+        if let Some(v) = self.startup_timeout {
+            model.startup_timeout = v;
+        }
+        if let Some(v) = self.health_check_timeout {
+            model.health_check_timeout = v;
+        }
+        if let Some(v) = self.worker_kill_timeout {
+            model.worker_kill_timeout = v;
+        }
+        if let Some(v) = self.hook_http_timeout {
+            model.hooks.hook_http_timeout = v;
         }
     }
 }
@@ -268,7 +301,7 @@ fn default_http_method() -> String {
 
 /// Worker lifecycle hook configuration.
 /// Shell commands and HTTP hooks are both fire-and-forget, non-blocking.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorkerHooksConfig {
     pub on_ready: Option<String>,
@@ -277,6 +310,22 @@ pub struct WorkerHooksConfig {
     pub on_ready_http: Option<HttpHookConfig>,
     pub on_exit_http: Option<HttpHookConfig>,
     pub on_error_http: Option<HttpHookConfig>,
+    /// Seconds before a lifecycle HTTP hook request times out (§3).
+    pub hook_http_timeout: f32,
+}
+
+impl Default for WorkerHooksConfig {
+    fn default() -> Self {
+        Self {
+            on_ready: None,
+            on_exit: None,
+            on_error: None,
+            on_ready_http: None,
+            on_exit_http: None,
+            on_error_http: None,
+            hook_http_timeout: 5.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -316,6 +365,21 @@ pub struct ModelConfig {
     pub heartbeat_timeout: f32,
     /// Consecutive heartbeat failures before killing the worker.
     pub heartbeat_max_failures: usize,
+    // ===== Worker resilience (§3 — configurable, defaults preserve prior behavior) =====
+    /// Consecutive errors before a worker is ejected. 0 = never eject.
+    pub ejection_error_threshold: usize,
+    /// Seconds a worker stays ejected before auto-recovery.
+    pub ejection_timeout: f32,
+    /// Max % of workers that may be ejected at once (1-100).
+    pub ejection_max_percent: usize,
+    /// Max retry attempts on a different worker for a failed batch. 0 = no retry.
+    pub max_retries: usize,
+    /// Max seconds to wait for a worker's "ready" handshake.
+    pub startup_timeout: f32,
+    /// Seconds per health-check probe before timing out.
+    pub health_check_timeout: f32,
+    /// Seconds to wait for the OS to reap a killed worker process.
+    pub worker_kill_timeout: f32,
 }
 
 impl Default for ModelConfig {
@@ -347,6 +411,13 @@ impl Default for ModelConfig {
             heartbeat_interval: 0.0,
             heartbeat_timeout: 5.0,
             heartbeat_max_failures: 3,
+            ejection_error_threshold: 3,
+            ejection_timeout: 30.0,
+            ejection_max_percent: 50,
+            max_retries: 3,
+            startup_timeout: 60.0,
+            health_check_timeout: 5.0,
+            worker_kill_timeout: 10.0,
         }
     }
 }
@@ -414,6 +485,15 @@ pub struct CliOverrides {
     pub health_check_interval: Option<f32>,
     pub graceful_timeout: Option<f32>,
     pub keepalive_timeout: Option<f32>,
+    // Worker resilience overrides (§3).
+    pub ejection_error_threshold: Option<usize>,
+    pub ejection_timeout: Option<f32>,
+    pub ejection_max_percent: Option<usize>,
+    pub max_retries: Option<usize>,
+    pub startup_timeout: Option<f32>,
+    pub health_check_timeout: Option<f32>,
+    pub worker_kill_timeout: Option<f32>,
+    pub hook_http_timeout: Option<f32>,
 }
 
 impl Config {
@@ -475,6 +555,31 @@ impl Config {
         }
         if let Some(v) = cli.health_check_interval {
             self.model_defaults.health_check_interval = Some(v);
+        }
+        // Worker resilience (§3).
+        if let Some(v) = cli.ejection_error_threshold {
+            self.model_defaults.ejection_error_threshold = Some(v);
+        }
+        if let Some(v) = cli.ejection_timeout {
+            self.model_defaults.ejection_timeout = Some(v);
+        }
+        if let Some(v) = cli.ejection_max_percent {
+            self.model_defaults.ejection_max_percent = Some(v);
+        }
+        if let Some(v) = cli.max_retries {
+            self.model_defaults.max_retries = Some(v);
+        }
+        if let Some(v) = cli.startup_timeout {
+            self.model_defaults.startup_timeout = Some(v);
+        }
+        if let Some(v) = cli.health_check_timeout {
+            self.model_defaults.health_check_timeout = Some(v);
+        }
+        if let Some(v) = cli.worker_kill_timeout {
+            self.model_defaults.worker_kill_timeout = Some(v);
+        }
+        if let Some(v) = cli.hook_http_timeout {
+            self.model_defaults.hook_http_timeout = Some(v);
         }
         if let Some(t) = cli.graceful_timeout {
             self.server.graceful_timeout = t;
@@ -1009,6 +1114,7 @@ mod tests {
                 }),
                 on_exit_http: None,
                 on_error_http: None,
+                ..Default::default()
             },
             ..Default::default()
         };

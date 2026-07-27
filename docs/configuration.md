@@ -104,6 +104,16 @@ heartbeat_interval: 0.0        # Heartbeat probe interval in seconds (0 = disabl
 heartbeat_timeout: 5.0         # Max seconds to wait for a probe response
 heartbeat_max_failures: 3      # Consecutive failures before killing the worker
 
+# Worker Resilience
+max_retries: 3                 # Retry a failed batch on another worker (0 = disable)
+ejection_error_threshold: 3    # Consecutive errors before ejecting a worker (0 = disable)
+ejection_timeout: 30.0         # Seconds an ejected worker stays out before auto-recovery
+ejection_max_percent: 50       # Max % of workers ejectable at once (1-100)
+startup_timeout: 60.0          # Max seconds to wait for a worker "ready" handshake
+health_check_timeout: 5.0      # Seconds per health-check probe before timing out
+worker_kill_timeout: 10.0      # Seconds to wait for the OS to reap a killed worker
+hook_http_timeout: 5.0         # Seconds for a lifecycle HTTP hook request (set under `hooks:`)
+
 # Worker Lifecycle Hooks
 hooks:
   on_ready: null               # Shell command on worker ready
@@ -193,6 +203,14 @@ lite-server serve [flags]
 | `--metrics-port` | Metrics port | `server.metrics_port` |
 | `--graceful-timeout` | Graceful shutdown timeout | `server.graceful_timeout` |
 | `--keepalive-timeout` | HTTP keep-alive timeout | `server.keepalive_timeout` |
+| `--ejection-error-threshold` | Errors to eject a worker (0=disable) | `model_defaults.ejection_error_threshold` |
+| `--ejection-timeout` | Ejected worker auto-recovery (s) | `model_defaults.ejection_timeout` |
+| `--ejection-max-percent` | Max % workers ejectable | `model_defaults.ejection_max_percent` |
+| `--max-retries` | Retry a failed batch on another worker | `model_defaults.max_retries` |
+| `--startup-timeout` | Worker ready-handshake timeout (s) | `model_defaults.startup_timeout` |
+| `--health-check-timeout` | Health probe timeout (s) | `model_defaults.health_check_timeout` |
+| `--worker-kill-timeout` | OS reap wait after kill (s) | `model_defaults.worker_kill_timeout` |
+| `--hook-http-timeout` | Lifecycle HTTP hook timeout (s) | `model_defaults.hook_http_timeout` |
 
 ## Precedence
 
