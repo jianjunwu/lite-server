@@ -175,6 +175,7 @@ fn main() {
                 health_check_interval,
                 graceful_timeout,
                 keepalive_timeout,
+                ..Default::default()
             });
 
             // Initialize logging (level from config, overridable via --log-level CLI)
