@@ -704,7 +704,8 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
         # A multi-line traceback would be split into many events by the Rust
         # stderr forwarder (it splits on newlines), so we log only the locator.
         log.error("async request %s failed: %s", uid, _format_exc_brief(e))
-        response = _make_error_response(uid, f"{type(e).__name__}: {e}")
+        hdrs = dict(getattr(e, "_response_headers", None) or {})
+        response = _make_error_response(uid, f"{type(e).__name__}: {e}", headers=hdrs or None)
 
     await socket.send(response.SerializeToString())
 

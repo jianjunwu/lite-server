@@ -1187,6 +1187,30 @@ class TestRunRoute:
             await pipe.run_route(ctx, handler)
 
     @pytest.mark.asyncio
+    async def test_on_error_threads_response_headers(self):
+        """run_route threads ctx.response_headers → e._response_headers after
+        on_error, so worker-layer handlers can merge them into the error
+        response (parity with run_single)."""
+        class HeadersCB(Callback):
+            def on_error(self, ctx, exc):
+                ctx.response_headers["X-On-Error"] = "caught"
+                ctx.response_headers["X-Exc-Type"] = type(exc).__name__
+
+        pipe = Pipeline.for_route([HeadersCB()])
+        ctx = RequestContext(meta=_make_route_meta())
+
+        async def handler(ctx_arg):
+            raise RuntimeError("route boom")
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await pipe.run_route(ctx, handler)
+
+        hdrs = getattr(exc_info.value, "_response_headers", None)
+        assert hdrs is not None, "run_route must thread _response_headers"
+        assert hdrs["X-On-Error"] == "caught"
+        assert hdrs["X-Exc-Type"] == "RuntimeError"
+
+    @pytest.mark.asyncio
     async def test_sync_handler_in_async_pipeline(self):
         """Sync handler runs on executor when any callback is async."""
         class AsyncCB(Callback):
@@ -1273,6 +1297,31 @@ class TestRunSingleOnError:
         with pytest.raises(RuntimeError):
             await pipe.run_single(b'{"x": 1}', meta)
         assert len(errors) == 1
+
+    @pytest.mark.asyncio
+    async def test_on_error_threads_response_headers_for_plain_exception(self):
+        """run_single threads ctx.response_headers → e._response_headers for
+        plain exceptions (ZeroDivisionError etc.), not just HTTPException."""
+        class HeadersCB(Callback):
+            def on_error(self, ctx, exc):
+                ctx.response_headers["X-On-Error"] = "caught"
+                ctx.response_headers["X-Exc-Type"] = type(exc).__name__
+
+        class FailingAPI(LitAPI):
+            def predict(self, x):
+                raise RuntimeError("predict crash")
+
+        api = FailingAPI()
+        pipe = Pipeline.build(api, [HeadersCB()])
+        meta = _make_route_meta()
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await pipe.run_single(b'{"x": 1}', meta)
+
+        hdrs = getattr(exc_info.value, "_response_headers", None)
+        assert hdrs is not None, "run_single must thread _response_headers"
+        assert hdrs["X-On-Error"] == "caught"
+        assert hdrs["X-Exc-Type"] == "RuntimeError"
 
 
 # ---------------------------------------------------------------------------

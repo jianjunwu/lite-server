@@ -912,6 +912,33 @@ class TestAsyncLoop:
         assert resp.single.status.code == "Error"
         assert resp.single.headers["x-uni"] == "1"
 
+    def test_unary_plain_exception_carries_on_error_headers(self):
+        """Plain exceptions (RuntimeError etc.) carry headers set by on_error
+        callback via ctx.response_headers — not just HTTPException."""
+        class OnErrorHeaderCB(Callback):
+            def on_error(self, ctx, exc):
+                ctx.response_headers["X-On-Error"] = "caught"
+                ctx.response_headers["X-Exc-Type"] = type(exc).__name__
+
+        class CrashModel(LitAPI):
+            async def predict(self, x):
+                return 1 / 0  # ZeroDivisionError, not HTTPException
+
+        model = CrashModel()
+        model._pipeline = Pipeline.build(model, [OnErrorHeaderCB()])
+        socket = AsyncMockSocket()
+        socket.inject(Request(
+            uid="u", single=SingleRequest(data=json.dumps({"input": 1}).encode()),
+        ).SerializeToString())
+        drive_loop(model, socket)
+
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.single.status.code == "Error"
+        assert resp.single.status.message == "500"
+        assert resp.single.headers["X-On-Error"] == "caught"
+        assert resp.single.headers["X-Exc-Type"] == "ZeroDivisionError"
+
     def test_unary_invalid_json_returns_400_and_drives_on_error(self):
         """P3: invalid JSON on the unary path yields a 400 (not 500) and
         drives on_error instead of escaping before the pipeline try."""

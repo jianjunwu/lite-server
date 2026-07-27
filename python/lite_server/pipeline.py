@@ -487,6 +487,11 @@ class Pipeline:
                 await self._run_chain("on_response", ctx)
         except Exception as e:
             await self.run_on_error(ctx, e)
+            # Thread accumulated response headers onto the exception so the
+            # unary handler can merge them into the error response (parity
+            # with run_single).
+            if ctx.response_headers:
+                e._response_headers = dict(ctx.response_headers)  # type: ignore[attr-defined]
             raise
 
     async def run_on_error(self, ctx: RequestContext, exc: Exception) -> None:
