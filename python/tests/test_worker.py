@@ -939,6 +939,43 @@ class TestAsyncLoop:
         assert resp.single.headers["X-On-Error"] == "caught"
         assert resp.single.headers["X-Exc-Type"] == "ZeroDivisionError"
 
+    def test_route_plain_exception_carries_on_error_headers(self):
+        """Route path end-to-end: run_route threads ctx.response_headers onto
+        the exception and the worker's generic except merges them into the
+        error response — parity with the unary single path."""
+        from lite_server import route
+
+        class OnErrorHeaderCB(Callback):
+            def on_error(self, ctx, exc):
+                ctx.response_headers["X-On-Error"] = "caught"
+                ctx.response_headers["X-Exc-Type"] = type(exc).__name__
+
+        class RouteModel(LitAPI):
+            async def predict(self, x):
+                return x
+
+            @route.get("/boom")
+            def boom(self, ctx):
+                raise ValueError("route crash")
+
+        model = RouteModel()
+        inference._discover_routes(model)
+        model._route_pipeline = Pipeline.for_route([OnErrorHeaderCB()])
+        socket = AsyncMockSocket()
+        req = Request(uid="u")
+        req.meta.route = "/boom"
+        req.meta.method = "GET"
+        req.route_call.data = b"{}"
+        socket.inject(req.SerializeToString())
+        drive_loop(model, socket)
+
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.single.status.code == "Error"
+        assert resp.single.status.message == "500"
+        assert resp.single.headers["X-On-Error"] == "caught"
+        assert resp.single.headers["X-Exc-Type"] == "ValueError"
+
     def test_unary_invalid_json_returns_400_and_drives_on_error(self):
         """P3: invalid JSON on the unary path yields a 400 (not 500) and
         drives on_error instead of escaping before the pipeline try."""
