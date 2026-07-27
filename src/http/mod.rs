@@ -188,6 +188,12 @@ pub async fn start_http_server(
 
     let app = create_routes(state);
 
+    // Peer-IP fallback (innermost): inject the TCP peer IP as a fallback
+    // x-real-ip for direct (non-proxied) connections so client_ip is never
+    // empty (0.7.x regression). No-op on the unix-socket path (no ConnectInfo)
+    // and when a proxy header is already present.
+    let app = app.layer(axum::middleware::from_fn(crate::http::handlers::peer_ip_fallback));
+
     // Keepalive middleware (inner)
     let app = if config.server.keepalive_timeout <= 0.0 {
         app.layer(axum::middleware::from_fn(disable_keepalive_middleware))
@@ -231,7 +237,10 @@ pub async fn start_http_server(
             .map_err(AppError::Io)?;
 
         info!("Starting HTTP server on {}", addr);
-        axum::serve(listener, app)
+        // into_make_service_with_connect_info makes ConnectInfo<SocketAddr>
+        // available to extractors/middleware — peer_ip_fallback uses it to
+        // populate client_ip for direct connections.
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
             .with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
             })

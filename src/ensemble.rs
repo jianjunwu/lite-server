@@ -217,6 +217,7 @@ pub async fn execute_ensemble(
     version: &str,
     payload: Value,
     request_id: &str,
+    client_ip: &str,
 ) -> Result<Value, AppError> {
     let model_dir = crate::validation::resolve_model_dir(
         &state.repo_path, model_name, version,
@@ -245,9 +246,10 @@ pub async fn execute_ensemble(
                 let step = step.clone();
                 let ensemble_name = model_name.to_string();
                 let request_id = request_id.to_string();
+                let client_ip = client_ip.to_string();
                 futures.push(tokio::spawn(async move {
                     let start = Instant::now();
-                    let result = execute_step(state, &step, &ctx, &request_id).await;
+                    let result = execute_step(state, &step, &ctx, &request_id, &client_ip).await;
                     let latency = start.elapsed().as_secs_f64();
                     crate::metrics::prometheus::record_ensemble_step_latency(
                         &ensemble_name, &step.name, &step.model, &step.version, latency,
@@ -294,6 +296,7 @@ async fn execute_step(
     step: &EnsembleStep,
     context: &HashMap<String, Value>,
     request_id: &str,
+    client_ip: &str,
 ) -> Result<Value, AppError> {
     // Resolve inputs
     let mut payload = serde_json::Map::new();
@@ -355,7 +358,7 @@ async fn execute_step(
     let meta = pb::RequestMeta {
         route: "/predict".to_string(),
         headers: HashMap::new(),
-        client_ip: "".to_string(),
+        client_ip: client_ip.to_string(),
         // Correlate sub-step requests with the client-facing request ID;
         // the step-name suffix keeps each step uniquely identifiable.
         request_id: format!("{}:{}", request_id, step.name),

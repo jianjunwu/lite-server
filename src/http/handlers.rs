@@ -734,9 +734,51 @@ fn extract_client_ip(headers: &HeaderMap) -> String {
     headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
-        .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .filter(|s| !s.is_empty())
+        })
         .unwrap_or("")
         .to_string()
+}
+
+/// Pure decision for the peer-IP fallback layer: return the IP string to inject
+/// as `x-real-ip`, or `None`. Injection is skipped when a proxy header is
+/// already present (never overwrite a client/proxy-supplied value) or when
+/// there is no peer (the unix-socket path carries no `ConnectInfo`).
+pub(crate) fn peer_ip_fallback_target(
+    headers: &HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+) -> Option<String> {
+    let has_proxy = headers.contains_key("x-forwarded-for")
+        || headers.contains_key("x-real-ip");
+    if has_proxy {
+        return None;
+    }
+    peer.map(|p| p.ip().to_string())
+}
+
+/// Middleware: inject the TCP peer IP as a fallback `x-real-ip` for direct
+/// (non-proxied) connections so `extract_client_ip` is never empty for them
+/// (the 0.7.x regression). A no-op when `ConnectInfo` is unavailable (unix
+/// socket) or when a proxy header is already present.
+pub(crate) async fn peer_ip_fallback(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0);
+    if let Some(ip) = peer_ip_fallback_target(req.headers(), peer) {
+        if let Ok(val) = axum::http::HeaderValue::from_str(&ip) {
+            req.headers_mut().insert("x-real-ip", val);
+        }
+    }
+    next.run(req).await
 }
 
 /// Acquire a rate-limit token for a model. Shared by unary infer, SSE, and WS.
@@ -758,6 +800,15 @@ async fn enforce_rate_limit(
         "ip" => extract_client_ip(headers),
         _ => "/predict".to_string(),
     };
+    // Empty IP scope (unix-socket path with no peer, or a proxy that sent no
+    // client headers) collapses every request into one shared bucket — surface
+    // it once so per-IP limiting silently degrading to a global cap is visible.
+    if rl.key == "ip" && scope.is_empty() {
+        warn!(
+            model = %model_name,
+            "rate-limit key=ip resolved to empty scope; all requests share one bucket"
+        );
+    }
     let burst = rl.burst.unwrap_or(rl.requests_per_minute * 1.5);
     let key = format!("{}:{}", model_name, scope);
     match state
@@ -882,7 +933,7 @@ async fn do_infer(
 
     // Handle ensemble
     if mv.model_type == ModelType::Ensemble {
-        let result = crate::ensemble::execute_ensemble(state, &model_name, &resolved_version, payload, &request_id).await?;
+        let result = crate::ensemble::execute_ensemble(state, &model_name, &resolved_version, payload, &request_id, &extract_client_ip(&headers)).await?;
         return Ok(Json(result).into_response());
     }
 
@@ -1751,6 +1802,7 @@ pub async fn ws_stream_handler(
 pub async fn ws_stream_version_handler(
     State(state): State<Arc<AppState>>,
     Path((model_name, version)): Path<(String, String)>,
+    headers: HeaderMap,
     ws: axum::extract::WebSocketUpgrade,
     RequestId(request_id): RequestId,
 ) -> Response {
@@ -1760,8 +1812,7 @@ pub async fn ws_stream_version_handler(
     if let Err(e) = crate::validation::validate_version(&version) {
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
     }
-    // Explicit version wins — the header map is irrelevant here.
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), HeaderMap::new(), socket, request_id))
+    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), headers, socket, request_id))
 }
 
 async fn handle_ws_stream(
@@ -1785,16 +1836,15 @@ async fn handle_ws_stream(
         return;
     }
 
-    // Rate limit (same logic as HTTP infer). The upgraded WebSocket has no
-    // HTTP headers, so key="ip" collapses every connection to one shared
-    // bucket per model — a known limitation; front WS with a reverse proxy
-    // for per-client limiting. Rejection closes the socket with an error frame.
+    // Rate limit (same logic as HTTP infer). The original upgrade request's
+    // headers are preserved (including the peer_ip_fallback-injected x-real-ip
+    // for direct connections), so key="ip" limits per real client.
     if let Some(mv) = state.registry.get(&model_name, Some(&resolved_version)) {
         if enforce_rate_limit(
             &state,
             mv.policies.rate_limit.as_ref(),
             &model_name,
-            &HeaderMap::new(),
+            &headers,
         )
         .await
         .is_err()
@@ -1828,7 +1878,8 @@ async fn handle_ws_stream(
         }
     };
 
-    let headers = HeaderMap::new();
+    // The original upgrade-request headers (with the peer-IP fallback applied
+    // by the middleware) flow into meta so WS client_ip/rate-limit are correct.
     let meta = build_request_meta(&headers, &payload, "/predict", request_id);
     let payload_bytes = meta.payload.clone();
 
@@ -2813,6 +2864,86 @@ mod route_match_tests {
             }
             other => panic!("expected Hit, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod client_ip_tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    fn addr(ip: &str) -> Option<SocketAddr> {
+        Some(format!("{ip}:1234").parse().unwrap())
+    }
+
+    // --- extract_client_ip: header-based resolution (peer fallback is the
+    //     peer_ip_fallback layer's job, tested below) ---
+
+    #[test]
+    fn prefers_x_forwarded_for() {
+        let h = headers(&[("x-forwarded-for", "10.0.0.1"), ("x-real-ip", "10.0.0.2")]);
+        assert_eq!(extract_client_ip(&h), "10.0.0.1");
+    }
+
+    #[test]
+    fn uses_x_real_ip_when_no_xff() {
+        let h = headers(&[("x-real-ip", "10.0.0.2")]);
+        assert_eq!(extract_client_ip(&h), "10.0.0.2");
+    }
+
+    #[test]
+    fn empty_when_no_headers() {
+        assert_eq!(extract_client_ip(&headers(&[])), "");
+    }
+
+    #[test]
+    fn skips_empty_xff_and_uses_real_ip() {
+        // An empty x-forwarded-for must fall through (parity with gRPC),
+        // so the layer-injected x-real-ip can engage for direct connections.
+        let h = headers(&[("x-forwarded-for", ""), ("x-real-ip", "10.0.0.2")]);
+        assert_eq!(extract_client_ip(&h), "10.0.0.2");
+    }
+
+    // --- peer_ip_fallback_target: should the layer inject the peer IP? ---
+
+    #[test]
+    fn fallback_injects_peer_when_no_proxy_header() {
+        // Direct connection (no reverse proxy): the TCP peer IS the client.
+        // This is the 0.7.x regression — client_ip was empty for direct HTTP.
+        assert_eq!(
+            peer_ip_fallback_target(&headers(&[]), addr("203.0.113.7")),
+            Some("203.0.113.7".to_string())
+        );
+    }
+
+    #[test]
+    fn fallback_skips_when_xff_present() {
+        // A (spoofable) proxy header wins; never overwrite it with the peer IP.
+        let h = headers(&[("x-forwarded-for", "10.0.0.99")]);
+        assert_eq!(peer_ip_fallback_target(&h, addr("203.0.113.7")), None);
+    }
+
+    #[test]
+    fn fallback_skips_when_real_ip_present() {
+        let h = headers(&[("x-real-ip", "10.0.0.2")]);
+        assert_eq!(peer_ip_fallback_target(&h, addr("203.0.113.7")), None);
+    }
+
+    #[test]
+    fn fallback_skips_when_no_peer() {
+        // Unix-socket path: no ConnectInfo → nothing to inject.
+        assert_eq!(peer_ip_fallback_target(&headers(&[]), None), None);
     }
 }
 
