@@ -623,55 +623,51 @@ class TestRunAsyncLoopStream:
 
 
 # ---------------------------------------------------------------------------
-# F2: Stream executor isolation — sync generator must use pipe._executor
+# F2: Stream thread isolation — sync generator consumption stays off the loop
 # ---------------------------------------------------------------------------
 
 
 class TestStreamExecutorIsolation:
-    """F2: sync generator ``__next__`` / ``close`` must dispatch to the
-    pipeline's single-thread executor, NOT ``asyncio.to_thread``'s default
-    pool.  Otherwise sync code from stream consumption and sync code from
-    other requests (predict, encode) can run concurrently, violating the
-    core invariant that sync code never runs concurrently."""
+    """Sync stages run inline on the event loop (0.6.x semantics); the one
+    exception is sync generator ``__next__`` / ``close``, which runs on the
+    pipeline's dedicated ``lite-gen`` thread so a blocking generator can
+    never freeze the loop — and concurrent requests' inline sync stages are
+    not queued behind it."""
 
     @pytest.mark.asyncio
-    async def test_sync_generator_and_predict_never_overlap(self):
-        """Deterministic concurrency test: a blocking sync generator holds the
-        executor while a concurrent single request's sync predict is
-        dispatched.  Before the fix (generator __next__ on default pool),
-        predict runs on pipe._executor in parallel → overlap.  After the fix
-        (both on pipe._executor), predict is queued behind the generator."""
+    async def test_sync_predict_not_blocked_by_stream_generator(self):
+        """A blocking sync generator holds the lite-gen thread while a
+        concurrent single request's sync predict runs inline on the loop.
+        The predict must complete WITHOUT waiting for the generator (no
+        head-of-line blocking), and must run on the loop thread."""
         import asyncio
         import threading
-        import time
 
         in_generator = threading.Event()
         release_generator = threading.Event()
-        overlap_detected = False
+        predict_ident = None
 
         class StreamAPI(LitAPI):
             def setup(self, device):
                 pass
 
             async def decode_request(self, request):
-                # async method → forces executor mode (any_async = True)
+                # async method → mixed mode
                 return request
 
             def predict(self, x):
-                if in_generator.is_set():
-                    nonlocal overlap_detected
-                    overlap_detected = True
+                nonlocal predict_ident
+                predict_ident = threading.get_ident()
                 return x
 
             def stream_predict(self, x):
                 in_generator.set()
-                release_generator.wait()  # block the executor thread
+                release_generator.wait()  # block the lite-gen thread
                 in_generator.clear()
                 yield {"done": True}
 
         api = StreamAPI()
         pipe = Pipeline.build(api, [])
-        assert pipe._executor is not None, "mixed mode must create executor"
 
         # Preprocess to get a decoded input
         meta1 = RequestMeta(
@@ -691,36 +687,30 @@ class TestStreamExecutorIsolation:
         # Wait until the generator body has been entered and is blocking
         await asyncio.to_thread(in_generator.wait)
 
-        # Issue a concurrent single request — its sync predict will be
-        # dispatched to pipe._executor.  Before fix: runs on a different
-        # thread pool → overlap_detected = True.  After fix: queued on the
-        # same single-thread executor → overlap_detected stays False.
+        # Issue a concurrent single request — its sync predict runs inline
+        # on the loop, so it completes even though the generator still
+        # holds the lite-gen thread.
         meta2 = RequestMeta(
             route="/", headers=Headers(), client_ip="", request_id="r2",
             timestamp_ns=0,
         )
-        single_task = asyncio.create_task(pipe.run_single(b"{}", meta2))
+        loop_ident = threading.get_ident()
+        await asyncio.wait_for(pipe.run_single(b"{}", meta2), timeout=5.0)
 
-        # Give the single request time to queue up on the executor
-        await asyncio.sleep(0.1)
-
-        # Release the generator
-        release_generator.set()
-
-        # Both tasks should complete
-        await asyncio.wait_for(consume_task, timeout=5.0)
-        await asyncio.wait_for(single_task, timeout=5.0)
-
-        assert not overlap_detected, (
-            "sync generator __next__ ran on a different executor than sync predict — "
-            "generator is bypassing the pipeline's single-thread executor"
+        assert predict_ident == loop_ident, (
+            "sync predict should run inline on the loop thread, "
+            "not queued behind the blocking stream generator"
         )
+
+        # Release the generator; consumption completes
+        release_generator.set()
+        await asyncio.wait_for(consume_task, timeout=5.0)
         pipe.close()
 
     @pytest.mark.asyncio
-    async def test_generator_close_uses_pipeline_executor(self):
-        """Cancelling a stream must call ``generator.close()`` through the
-        pipeline executor, not the default thread pool."""
+    async def test_generator_close_uses_dedicated_thread(self):
+        """Cancelling a stream must call ``generator.close()`` on the
+        dedicated lite-gen thread, never inline on the event loop."""
         import asyncio
         import threading
 
@@ -759,7 +749,6 @@ class TestStreamExecutorIsolation:
 
         api = StreamAPI()
         pipe = Pipeline.build(api, [])
-        assert pipe._executor is not None
 
         ctx = RequestContext(
             meta=RequestMeta(
@@ -788,9 +777,9 @@ class TestStreamExecutorIsolation:
             await consume_task
 
         assert close_thread_name is not None, "generator.close() was never called"
-        assert "lite-sync" in close_thread_name, (
-            f"generator.close() ran on {close_thread_name}, expected lite-sync thread — "
-            "close is using the wrong executor"
+        assert "lite-gen" in close_thread_name, (
+            f"generator.close() ran on {close_thread_name}, expected lite-gen thread — "
+            "close must stay off the event loop"
         )
         pipe.close()
 

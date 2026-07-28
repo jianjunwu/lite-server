@@ -362,7 +362,7 @@ class TestSyncAsyncAdaptation:
     async def test_fully_sync_model_uses_no_executor(self):
         pipe = Pipeline.build(EchoAPI(), [])
         assert pipe.any_async is False
-        assert pipe._executor is None
+        assert pipe._gen_executor is None
         resp_bytes, *_ = await pipe.run_single(b'{"x": 1}', _make_route_meta())
         assert _body(resp_bytes) == {"echo": {"x": 1}}
 
@@ -378,29 +378,69 @@ class TestSyncAsyncAdaptation:
         assert _body(resp_bytes) == {"async": {"x": 1}}
 
     @pytest.mark.asyncio
-    async def test_sync_stage_runs_on_single_thread_executor_in_mixed_mode(self):
-        threads = []
+    async def test_sync_stage_runs_inline_on_loop_in_mixed_mode(self):
+        idents = []
 
         class Mixed(EchoAPI):
             async def decode_request(self, request):
                 return request
 
             def predict(self, x):
-                threads.append(threading.current_thread().name)
+                idents.append(threading.get_ident())
                 return x
 
             def encode_response(self, output):
-                threads.append(threading.current_thread().name)
+                idents.append(threading.get_ident())
                 return output
 
         pipe = Pipeline.build(Mixed(), [])
         assert pipe.any_async is True
+        loop_ident = threading.get_ident()
         resp_bytes, *_ = await pipe.run_single(b'{"x": 1}', _make_route_meta())
         assert _body(resp_bytes) == {"x": 1}
-        # Both sync stages ran on the SAME executor thread, not the loop thread
-        assert len(threads) == 2
-        assert threads[0] == threads[1]
-        assert "lite-sync" in threads[0]
+        # Sync stages run inline on the event loop thread (0.6.x semantics),
+        # not on a dispatched executor thread.
+        assert idents == [loop_ident, loop_ident]
+        pipe.close()
+
+    @pytest.mark.asyncio
+    async def test_run_blocking_uses_dedicated_thread_in_mixed_mode(self):
+        """Sync-generator consumption must stay off the loop thread even
+        though sync stages now run inline."""
+
+        class Mixed(EchoAPI):
+            async def decode_request(self, request):
+                return request
+
+        pipe = Pipeline.build(Mixed(), [])
+        loop_ident = threading.get_ident()
+        seen = []
+
+        def work():
+            seen.append(threading.get_ident())
+            return 42
+
+        result = await pipe.run_blocking(work)
+        assert result == 42
+        assert seen[0] != loop_ident
+        pipe.close()
+
+    @pytest.mark.asyncio
+    async def test_run_blocking_uses_thread_even_in_all_sync_mode(self):
+        """All-sync pipelines have no stage executor; generator consumption
+        must still run on a dedicated thread (never inline on the loop)."""
+        pipe = Pipeline.build(EchoAPI(), [])
+        assert pipe.any_async is False
+        loop_ident = threading.get_ident()
+        seen = []
+
+        def work():
+            seen.append(threading.get_ident())
+            return 42
+
+        result = await pipe.run_blocking(work)
+        assert result == 42
+        assert seen[0] != loop_ident
         pipe.close()
 
     @pytest.mark.asyncio
@@ -428,7 +468,6 @@ class TestSyncAsyncAdaptation:
 
         pipe = Pipeline.build(EchoAPI(), [AsyncErrCB()])
         assert pipe.any_async is True
-        assert pipe._executor is not None
         pipe.close()
 
     @pytest.mark.asyncio
@@ -1106,6 +1145,28 @@ class TestRunRoute:
         assert called[0] is ctx
 
     @pytest.mark.asyncio
+    async def test_sync_handler_runs_inline_on_loop(self):
+        """Sync route handlers run inline on the loop thread (no executor),
+        even when an async callback makes the pipeline mixed-mode."""
+
+        class AsyncCB(Callback):
+            async def on_request(self, ctx):
+                pass
+
+        pipe = Pipeline.for_route([AsyncCB()])
+        assert pipe.any_async is True
+        ctx = RequestContext(meta=_make_route_meta())
+        loop_ident = threading.get_ident()
+        seen = []
+
+        def handler(ctx_arg):
+            seen.append(threading.get_ident())
+            return {"ok": True}
+
+        await pipe.run_route(ctx, handler)
+        assert seen == [loop_ident]
+
+    @pytest.mark.asyncio
     async def test_on_request_early_return_skips_handler(self):
         class EarlyCB(Callback):
             def on_request(self, ctx):
@@ -1239,7 +1300,7 @@ class TestRunRoute:
                 pass
 
         pipe = Pipeline.for_route([AsyncCB()])
-        assert pipe._executor is not None  # mixed mode -> run_blocking path
+        assert pipe.any_async is True
         ctx = RequestContext(meta=_make_route_meta())
 
         class CallableObj:

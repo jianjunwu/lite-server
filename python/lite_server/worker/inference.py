@@ -1245,9 +1245,9 @@ def run_cb_loop(lit_api: LitAPI, socket: zmq.Socket, model_name: str, log: loggi
     def _drive(coro):
         return cb_loop.run_until_complete(coro)
 
-    prefill = _wrap_ctx_method(lit_api.prefill, "prefill", None)
-    step_fn = _adapt(lit_api.step, None)  # step prohibits ctx (validated at load)
-    has_finished = _wrap_ctx_method(lit_api.has_finished, "has_finished", None)
+    prefill = _wrap_ctx_method(lit_api.prefill, "prefill")
+    step_fn = _adapt(lit_api.step)  # step prohibits ctx (validated at load)
+    has_finished = _wrap_ctx_method(lit_api.has_finished, "has_finished")
 
     def _send_ctx_response(uid: str, ctx: RequestContext):
         resp_bytes, status, metrics, resp_headers = pipe.finalize(ctx)

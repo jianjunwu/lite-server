@@ -12,10 +12,12 @@ Design rules:
 - **Load-time adaptation.**  All ``iscoroutinefunction`` / override detection
   happens once in :meth:`Pipeline.build`; the hot path is a plain iteration
   of pre-wrapped async callables.
-- **Unified async.**  Fully-sync models run inline on the event loop (zero
-  overhead, identical to the old standard loop).  When any method or hook is
-  async, sync model stages are dispatched to a single-thread executor so
-  sync code never runs concurrently and never blocks the loop.
+- **Unified async.**  Sync stages always run inline on the event loop
+  (0.6.x semantics — CPU-bound sync work is serialized by the GIL anyway,
+  so an executor only adds handoff cost).  Async methods/hooks are awaited
+  natively.  The single exception is sync *generator* consumption in the
+  stream paths, which runs on a dedicated thread via
+  :meth:`Pipeline.run_blocking` so it can never freeze the loop.
 - **Engine-level control flow.**  Early return (``ctx.respond(...)`` or a
   hook/stage returning a ``Response``) and error mapping live here exactly
   once — not at every call site.
@@ -24,7 +26,6 @@ Design rules:
 from __future__ import annotations
 
 import asyncio
-import functools
 import inspect
 import json
 import logging
@@ -74,44 +75,31 @@ def _parse_request_json(data: bytes | None) -> dict:
         ) from e
 
 
-def _adapt(fn: Callable, executor: ThreadPoolExecutor | None) -> Callable[..., Awaitable]:
+def _adapt(fn: Callable) -> Callable[..., Awaitable]:
     """Wrap *fn* (sync or async) into an async callable.
 
-    With *executor* None, sync functions run inline (all-sync fast path).
-    Otherwise they run on the single-thread executor so sync user code is
-    never executed concurrently and never blocks the event loop.
+    Sync functions run inline on the event loop (0.6.x semantics). The one
+    exception — sync generator consumption in stream paths — goes through
+    :meth:`Pipeline.run_blocking`, not through here.
     """
     if inspect.iscoroutinefunction(fn):
         return fn
-    if executor is None:
 
-        async def call_inline(*args, **kwargs):
-            result = fn(*args, **kwargs)
-            # Runtime check — not redundant with the iscoroutinefunction
-            # guard above.  A sync function may return a coroutine object
-            # (e.g. a sync wrapper that delegates to an async inner), and
-            # a callable object with async __call__ is invisible to
-            # iscoroutinefunction.
-            if asyncio.iscoroutine(result):
-                return await result
-            return result
-
-        return call_inline
-
-    async def call_in_executor(*args, **kwargs):
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            executor, functools.partial(fn, *args, **kwargs)
-        )
-        # Same runtime guard — see call_inline comment.
+    async def call_inline(*args, **kwargs):
+        result = fn(*args, **kwargs)
+        # Runtime check — not redundant with the iscoroutinefunction
+        # guard above.  A sync function may return a coroutine object
+        # (e.g. a sync wrapper that delegates to an async inner), and
+        # a callable object with async __call__ is invisible to
+        # iscoroutinefunction.
         if asyncio.iscoroutine(result):
             return await result
         return result
 
-    return call_in_executor
+    return call_inline
 
 
-def _adapt_producer(fn: Callable, executor: ThreadPoolExecutor | None) -> Callable[..., Awaitable]:
+def _adapt_producer(fn: Callable) -> Callable[..., Awaitable]:
     """Wrap ``stream_predict`` — may be a sync/async generator function or a
     coroutine function returning a generator.  Returns an async callable that
     yields the (sync or async) generator itself."""
@@ -121,7 +109,7 @@ def _adapt_producer(fn: Callable, executor: ThreadPoolExecutor | None) -> Callab
             return fn(*args, **kwargs)
 
         return call
-    inner = _adapt(fn, executor)
+    inner = _adapt(fn)
 
     async def call(*args, **kwargs):
         return await inner(*args, **kwargs)
@@ -172,7 +160,7 @@ def _validate_ctx_injection(lit_api: LitAPI) -> None:
             )
 
 
-def _wrap_ctx_method(fn: Callable, name: str, executor) -> Callable:
+def _wrap_ctx_method(fn: Callable, name: str) -> Callable:
     """Adapt *fn* into an async callable with optional ctx injection.
 
     *fn* receives its declared arguments by default; declaring a parameter
@@ -181,7 +169,7 @@ def _wrap_ctx_method(fn: Callable, name: str, executor) -> Callable:
     hot path.  The returned callable always accepts a ``ctx=`` keyword
     (ignored when *fn* didn't declare it).
     """
-    call = _adapt(fn, executor)
+    call = _adapt(fn)
     p = _ctx_param(fn)
     if p is None:
 
@@ -201,9 +189,9 @@ def _wrap_ctx_method(fn: Callable, name: str, executor) -> Callable:
     return wrapped
 
 
-def _wrap_ctx_producer(fn: Callable, executor) -> Callable:
+def _wrap_ctx_producer(fn: Callable) -> Callable:
     """Same as _wrap_ctx_method but for ``stream_predict`` (generator)."""
-    inner = _adapt_producer(fn, executor)
+    inner = _adapt_producer(fn)
     if _ctx_param(fn) is None:
 
         async def wrapped(*args, ctx=None):
@@ -323,15 +311,14 @@ class Pipeline:
         if _overrides(api_cls, "on_response", LitAPI):
             candidate_fns.append(lit_api.on_response)
 
-        # All-sync fast path: everything runs inline on the event loop
-        # (no await points → natural serialization, zero executor overhead).
-        # Otherwise sync stages go to a single-thread executor.
+        # Sync stages always run inline on the event loop (0.6.x semantics):
+        # CPU-bound sync work is serialized by the GIL anyway, so an executor
+        # only adds handoff cost. Sync *generator* consumption (stream paths)
+        # is the one exception — see run_blocking.
         self.any_async = any(_is_asyncish(f) for f in candidate_fns)
-        self._executor = (
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="lite-sync")
-            if self.any_async
-            else None
-        )
+        # Lazily-created dedicated thread for run_blocking (sync generator
+        # next/close) so blocking generator consumption never freezes the loop.
+        self._gen_executor: ThreadPoolExecutor | None = None
 
         # --- Ctx injection validation (load-time) -------------------------
         _validate_ctx_injection(lit_api)
@@ -340,20 +327,20 @@ class Pipeline:
         # with the batch (see batch_predict). No load-time guard needed.
 
         # --- Model stages (adapted once) ----------------------------------
-        self._decode = _wrap_ctx_method(lit_api.decode_request, "decode_request", self._executor)
-        self._predict = _wrap_ctx_method(lit_api.predict, "predict", self._executor)
-        self._encode = _wrap_ctx_method(lit_api.encode_response, "encode_response", self._executor)
+        self._decode = _wrap_ctx_method(lit_api.decode_request, "decode_request")
+        self._predict = _wrap_ctx_method(lit_api.predict, "predict")
+        self._encode = _wrap_ctx_method(lit_api.encode_response, "encode_response")
         # batch / unbatch use the same ctx-injecting wrapper: in batch mode
         # the caller passes a list[RequestContext] aligned with the inputs.
-        self._batch_fn = _wrap_ctx_method(lit_api.batch, "batch", self._executor)
-        self._unbatch_fn = _wrap_ctx_method(lit_api.unbatch, "unbatch", self._executor)
+        self._batch_fn = _wrap_ctx_method(lit_api.batch, "batch")
+        self._unbatch_fn = _wrap_ctx_method(lit_api.unbatch, "unbatch")
         self._stream_producer = (
-            _wrap_ctx_producer(lit_api.stream_predict, self._executor)
+            _wrap_ctx_producer(lit_api.stream_predict)
             if self.has_stream_predict
             else None
         )
         self._bidi_factory = (
-            _wrap_ctx_method(lit_api.bidi_stream, "bidi_stream", self._executor)
+            _wrap_ctx_method(lit_api.bidi_stream, "bidi_stream")
             if self.has_bidi_stream
             else None
         )
@@ -397,7 +384,7 @@ class Pipeline:
         for cb in self.callbacks:
             for name in _ERROR_HOOKS:
                 if _overrides(type(cb), name, Callback):
-                    self._error_hooks.append(_adapt(getattr(cb, name), self._executor))
+                    self._error_hooks.append(_adapt(getattr(cb, name)))
 
     # ---- Construction ----------------------------------------------------
 
@@ -444,11 +431,9 @@ class Pipeline:
                 candidate_fns.append(getattr(cb, name))
 
         pipe.any_async = any(_is_asyncish(f) for f in candidate_fns)
-        pipe._executor = (
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="ep-sync")
-            if pipe.any_async
-            else None
-        )
+        # Same rule as the inference pipeline: sync handlers/hooks run
+        # inline on the loop; no stage executor.
+        pipe._gen_executor = None
 
         # Hook chains: on_request → handler → on_response
         pipe._chains = {name: [] for name in _DATA_HOOKS}
@@ -462,7 +447,7 @@ class Pipeline:
         for cb in callbacks:
             for name in _ERROR_HOOKS:
                 if _overrides(type(cb), name, Callback):
-                    pipe._error_hooks.append(_adapt(getattr(cb, name), pipe._executor))
+                    pipe._error_hooks.append(_adapt(getattr(cb, name)))
         pipe._lifecycle = {name: [] for name in _LIFECYCLE_HOOKS}
         return pipe
 
@@ -472,12 +457,9 @@ class Pipeline:
             await self._run_chain("on_request", ctx)
             if ctx.early is not None:
                 return
-            if self._executor is not None and not inspect.iscoroutinefunction(handler):
-                result = await self.run_blocking(handler, ctx)
-            else:
-                result = handler(ctx)
-                if asyncio.iscoroutine(result):
-                    result = await result
+            result = handler(ctx)
+            if asyncio.iscoroutine(result):
+                result = await result
             from lite_server.response import Response as LiteResponse
             if isinstance(result, LiteResponse):
                 ctx.early = result
@@ -534,7 +516,7 @@ class Pipeline:
 
     def _wrap_hook(self, hook: Callable, name: str) -> Callable:
         field = _HOOK_FIELD[name]
-        call = _adapt(hook, self._executor)
+        call = _adapt(hook)
 
         async def wrapped(ctx: RequestContext) -> None:
             self._assign(ctx, field, await call(ctx))
@@ -665,9 +647,9 @@ class Pipeline:
     def adapt_handler(self, handler: Any) -> tuple[Callable, Callable, Callable]:
         """Adapt a BidiStreamHandler's hooks; each may optionally declare ctx."""
         return (
-            _wrap_ctx_method(handler.on_open, "on_open", self._executor),
-            _wrap_ctx_method(handler.on_chunk, "on_chunk", self._executor),
-            _wrap_ctx_method(handler.on_close, "on_close", self._executor),
+            _wrap_ctx_method(handler.on_open, "on_open"),
+            _wrap_ctx_method(handler.on_chunk, "on_chunk"),
+            _wrap_ctx_method(handler.on_close, "on_close"),
         )
 
     async def bidi_stream(self, ctx: RequestContext) -> Any:
@@ -709,17 +691,19 @@ class Pipeline:
             asyncio.run(_drain())
 
     async def run_blocking(self, fn: Callable, *args: Any) -> Any:
-        """Run a sync callable under the stage rules.
+        """Run a potentially-blocking sync callable on a dedicated thread.
 
-        When a single-thread executor is present, *fn* is dispatched there
-        so sync code never runs concurrently and never blocks the event loop.
-        Otherwise (all-sync fast path) *fn* runs inline on the loop thread.
+        Used for sync-generator ``next()``/``close()`` in the stream paths:
+        unlike sync *stages* (which run inline on the loop), generator
+        consumption may block arbitrarily long and must never freeze the
+        event loop. The thread is created lazily on first use.
         """
-        if self._executor is not None:
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(self._executor, fn, *args)
-        else:
-            result = fn(*args)
+        if self._gen_executor is None:
+            self._gen_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="lite-gen"
+            )
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(self._gen_executor, fn, *args)
         # Sync callable may still return a coroutine (e.g. an object with
         # async __call__) — same runtime guard as _adapt.
         if asyncio.iscoroutine(result):
@@ -727,6 +711,7 @@ class Pipeline:
         return result
 
     def close(self) -> None:
-        """Shut down the sync-stage executor (worker teardown)."""
-        if self._executor is not None:
-            self._executor.shutdown(wait=False, cancel_futures=True)
+        """Shut down the generator-consumption thread (worker teardown)."""
+        if self._gen_executor is not None:
+            self._gen_executor.shutdown(wait=False, cancel_futures=True)
+            self._gen_executor = None
