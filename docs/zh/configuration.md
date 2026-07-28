@@ -82,27 +82,19 @@ adaptive_queue_threshold: 10   # 自适应 batching 的队列深度阈值
 
 # 流式输出
 stream: false                  # 启用流式输出（需要 model.py 中实现 stream_predict）
-bidirectional: false           # 启用双向流式
 
 # Continuous Batching（LLM）
 continuous_batching: false     # 启用 continuous batching 模式
-max_sequence_length: 2048      # 最大序列长度
 
 # Worker 管理
 accelerator: null              # 加速器类型：cpu, cuda, auto（null = cpu）
 devices: null                  # 设备分配（null = 自动，或整数如 1）
 workers_per_device: null       # 每设备 worker 数（null = 1）
 max_queue_size: 1000           # 每个 worker 的最大待处理请求数
-queue_mode: per_worker         # 队列模式：per_worker 或 shared
 request_timeout: 0.0           # 单请求硬超时（秒），0 = 禁用
 max_requests: 0                # worker 处理 N 个请求后自动重启（0 = 禁用）
 max_requests_jitter: 0         # max_requests 的随机抖动，防止惊群效应
 health_check_interval: 15.0    # 主动健康检查间隔（秒），0 = 禁用
-
-# 心跳检测（Worker 存活检测）
-heartbeat_interval: 0.0        # 心跳探测间隔（秒），0 = 禁用
-heartbeat_timeout: 5.0         # 等待探测响应的最大秒数
-heartbeat_max_failures: 3      # 连续失败次数达到此值后杀死 worker
 
 # Worker 韧性（Resilience）
 max_retries: 3                 # 失败的 batch 换其它 worker 重试次数（0 = 禁用）
@@ -111,6 +103,7 @@ ejection_timeout: 30.0         # 被剔除 worker 自动恢复前的等待秒数
 ejection_max_percent: 50       # 同时最多剔除的 worker 比例（1-100）
 startup_timeout: 60.0          # 等待 worker "ready" 握手的最大秒数
 health_check_timeout: 5.0      # 单次健康探测超时秒数
+health_check_kill_threshold: 0 # 连续探测失败达到此次数后杀死并重启 worker（0 = 从不）
 worker_kill_timeout: 10.0      # 杀死 worker 后等待 OS 回收的秒数
 hook_http_timeout: 5.0         # 生命周期 HTTP 钩子请求的超时秒数（配置在 `hooks:` 下）
 
@@ -133,12 +126,20 @@ hooks:
 hot_reload: false              # 启用文件监听热重载
 hot_reload_patterns:           # 监听的 glob 模式
   - "*.py"
-hot_reload_interval: 1.0       # 轮询间隔（秒）
 
-# 中间件 / Callback
+# 策略（由 Rust 服务端按模型版本执行）
+policies:
+  auth: { header: "X-API-Key", keys: ["${API_KEYS}"] }  # ${VAR} = 环境变量；keys 为空 = 任意非空值通过
+  rate_limit: { requests_per_minute: 60, key: ip, burst: 100 }  # key: "route" | "ip"
+  cors:
+    allow_origins: ["https://example.com"]
+    allow_methods: ["GET", "POST"]
+    allow_headers: ["Content-Type", "Authorization"]
+  request_log: {}                # 访问日志：方法、路径、状态码、耗时
+
+# Callback（推理管线数据钩子）
 callbacks:                     # Worker 启动时加载的 callback 类路径列表
   - my_package.callbacks.AuditLogger
-  - lite_server.callbacks.RequireApiKey
 ```
 
 ## 编排配置
@@ -282,23 +283,23 @@ logging:
 # model_repo/my_model/1/config.yaml
 stream: true
 continuous_batching: true
-max_sequence_length: 4096
 max_batch_size: 4
 batch_timeout: 0.05
 workers_per_device: 1
 request_timeout: 120.0
 ```
 
-### 生产环境 + 心跳检测 + 生命周期钩子
+### 生产环境 + 健康检查杀进程 + 生命周期钩子
 
 ```yaml
 # model_repo/my_model/1/config.yaml
 max_requests: 500
 max_requests_jitter: 50
 
-heartbeat_interval: 10.0
-heartbeat_timeout: 5.0
-heartbeat_max_failures: 3
+# 每 10s 探测一次；连续 3 次探测失败的 worker 将被杀死并重启
+health_check_interval: 10.0
+health_check_timeout: 5.0
+health_check_kill_threshold: 3
 
 hooks:
   on_ready: 'echo "Worker $WORKER_ID ready for $MODEL"'

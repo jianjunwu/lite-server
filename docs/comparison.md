@@ -58,7 +58,7 @@
 | Outlier detection | Envoy-style auto-eject | No | No | No | No |
 | Request retry | Up to 3 retries on different workers | No | No | No | Configurable |
 | Worker recycling | max_requests auto-restart with jitter | No | No | No | No |
-| Heartbeat detection | ZMQ probe + auto respawn | No | No | No | Replica health check + auto-restart |
+| Hung-worker detection | ZMQ health probe + auto respawn | No | No | No | Replica health check + auto-restart |
 | Lifecycle hooks | Shell + HTTP callbacks (ready/exit/error) | No | No | on_startup / on_shutdown | __init__ / reconfigure / on_shutdown |
 | Per-request timeout | Yes (configurable) | Yes | Yes | Yes | Yes |
 | Health checks | Deep (worker + model status) | Basic | Basic | Basic | Basic |
@@ -89,7 +89,7 @@
 - Your team writes Python but wants Rust-level HTTP throughput
 - You need hot reload for rapid iteration during development
 - You want built-in outlier detection and self-healing workers
-- You need heartbeat detection with automatic worker respawn for hung processes
+- You need automatic detection and respawn of hung workers
 - You want lifecycle hooks for observability and alerting (Slack, PagerDuty, etc.)
 - You're deploying multiple model versions with A/B testing
 - You need ensemble pipelines (preprocessing -> model -> postprocessing)

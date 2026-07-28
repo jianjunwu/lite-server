@@ -82,27 +82,19 @@ adaptive_queue_threshold: 10   # Queue depth threshold for adaptive batching
 
 # Streaming
 stream: false                  # Enable streaming output (requires stream_predict in model.py)
-bidirectional: false           # Enable bidirectional streaming
 
 # Continuous Batching (LLM)
 continuous_batching: false     # Enable continuous batching mode
-max_sequence_length: 2048      # Max sequence length for continuous batching
 
 # Worker Management
 accelerator: null              # Accelerator type: "cpu", "cuda", "auto" (null = cpu)
 devices: null                  # Device assignment (null = auto, or integer like 1)
 workers_per_device: null       # Workers per device (null = 1)
 max_queue_size: 1000           # Max pending requests per worker
-queue_mode: per_worker         # Queue mode: "per_worker" or "shared"
 request_timeout: 0.0           # Per-request hard timeout in seconds (0 = disabled)
 max_requests: 0                # Auto-restart worker after N requests (0 = disabled)
 max_requests_jitter: 0         # Random jitter for max_requests (prevents thundering herd)
 health_check_interval: 15.0    # Active health check interval in seconds (0 = disabled)
-
-# Heartbeat (Worker Liveness Detection)
-heartbeat_interval: 0.0        # Heartbeat probe interval in seconds (0 = disabled)
-heartbeat_timeout: 5.0         # Max seconds to wait for a probe response
-heartbeat_max_failures: 3      # Consecutive failures before killing the worker
 
 # Worker Resilience
 max_retries: 3                 # Retry a failed batch on another worker (0 = disable)
@@ -111,6 +103,7 @@ ejection_timeout: 30.0         # Seconds an ejected worker stays out before auto
 ejection_max_percent: 50       # Max % of workers ejectable at once (1-100)
 startup_timeout: 60.0          # Max seconds to wait for a worker "ready" handshake
 health_check_timeout: 5.0      # Seconds per health-check probe before timing out
+health_check_kill_threshold: 0 # Consecutive probe failures before kill + respawn (0 = never)
 worker_kill_timeout: 10.0      # Seconds to wait for the OS to reap a killed worker
 hook_http_timeout: 5.0         # Seconds for a lifecycle HTTP hook request (set under `hooks:`)
 
@@ -133,12 +126,20 @@ hooks:
 hot_reload: false              # Enable file watching for hot reload
 hot_reload_patterns:           # Glob patterns to watch
   - "*.py"
-hot_reload_interval: 1.0       # Polling interval in seconds
 
-# Middleware / Callbacks
+# Policies (enforced by the Rust server, per model version)
+policies:
+  auth: { header: "X-API-Key", keys: ["${API_KEYS}"] }  # ${VAR} = env var; empty keys = any non-empty value
+  rate_limit: { requests_per_minute: 60, key: ip, burst: 100 }  # key: "route" | "ip"
+  cors:
+    allow_origins: ["https://example.com"]
+    allow_methods: ["GET", "POST"]
+    allow_headers: ["Content-Type", "Authorization"]
+  request_log: {}                # Access log: method, path, status, elapsed
+
+# Callbacks (data hooks around the inference pipeline)
 callbacks:                     # Callback class paths loaded at worker startup
   - my_package.callbacks.AuditLogger
-  - lite_server.callbacks.RequireApiKey
 ```
 
 ## Orchestration Configuration
@@ -285,23 +286,23 @@ logging:
 # model_repo/my_model/1/config.yaml
 stream: true
 continuous_batching: true
-max_sequence_length: 4096
 max_batch_size: 4
 batch_timeout: 0.05
 workers_per_device: 1
 request_timeout: 120.0
 ```
 
-### Production with Heartbeat and Hooks
+### Production with Health-Check Kill and Hooks
 
 ```yaml
 # model_repo/my_model/1/config.yaml
 max_requests: 500
 max_requests_jitter: 50
 
-heartbeat_interval: 10.0
-heartbeat_timeout: 5.0
-heartbeat_max_failures: 3
+# Probe every 10s; a worker that fails 3 consecutive probes is killed and respawned
+health_check_interval: 10.0
+health_check_timeout: 5.0
+health_check_kill_threshold: 3
 
 hooks:
   on_ready: 'echo "Worker $WORKER_ID ready for $MODEL"'

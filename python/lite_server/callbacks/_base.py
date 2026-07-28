@@ -248,6 +248,27 @@ def _field_for(hook_name: str) -> str:
     }[hook_name]
 
 
+# Policy callbacks retired in 0.7.6 — they are now declarative per-model
+# policies in config.yaml, enforced by the Rust server. Loading one via the
+# ``callbacks:`` list is a loud error, never a silent skip.
+_REMOVED_POLICY_CLASSES = frozenset({
+    "RequireApiKey",
+    "Cors",
+    "RateLimit",
+    "LogRequests",
+})
+
+_REMOVED_POLICY_HINT = (
+    "policy callbacks were removed in 0.7.6. Declare the policy in the "
+    "model's config.yaml instead:\n"
+    "    policies:\n"
+    "      auth: { header: \"X-API-Key\", keys: [\"${API_KEYS}\"] }\n"
+    "      rate_limit: { requests_per_minute: 60, key: ip }\n"
+    "      cors: { allow_origins: [\"*\"], allow_methods: [\"POST\"], allow_headers: [] }\n"
+    "      request_log: {}"
+)
+
+
 def load_callbacks(
     config: dict[str, Any], lit_api: "LitAPI | None" = None
 ) -> list[Callback]:
@@ -273,8 +294,10 @@ def load_callbacks(
 
     # config.yaml (append)
     for path in config.get("callbacks", []) or []:
+        module_path, _, class_name = path.rpartition(".")
+        if class_name in _REMOVED_POLICY_CLASSES:
+            raise RuntimeError(f"Callback '{path}' was removed: {_REMOVED_POLICY_HINT}")
         try:
-            module_path, class_name = path.rsplit(".", 1)
             mod = importlib.import_module(module_path)
             cls = getattr(mod, class_name)
         except Exception as e:

@@ -150,6 +150,45 @@ fn inject_grpc_metadata(
     }
 }
 
+/// API-key enforcement mirroring the HTTP layer's `enforce_auth`: transport
+/// metadata first (idiomatic gRPC), then the protobuf `headers` map
+/// (REST→gRPC bridges). An empty `keys` list accepts any non-empty value.
+fn enforce_auth_grpc(
+    auth: Option<&crate::config::AuthPolicy>,
+    metadata: &MetadataMap,
+    headers: &HashMap<String, String>,
+) -> Result<(), Status> {
+    let Some(auth) = auth else {
+        return Ok(());
+    };
+    let value = metadata
+        .get(&auth.header)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            // Proto headers map is a plain HashMap — match case-insensitively
+            // per HTTP header semantics.
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&auth.header))
+                .map(|(_, v)| v.clone())
+        })
+        .unwrap_or_default();
+    if value.is_empty() {
+        return Err(Status::unauthenticated(format!(
+            "missing API key (header: {})",
+            auth.header
+        )));
+    }
+    if !auth.keys.is_empty() && !auth.keys.iter().any(|k| k == &value) {
+        return Err(Status::unauthenticated(format!(
+            "invalid API key (header: {})",
+            auth.header
+        )));
+    }
+    Ok(())
+}
+
 /// Extract the client request ID: gRPC metadata (transport-level, idiomatic
 /// for gRPC) takes priority over the protobuf `headers` map (application-level,
 /// e.g. a REST→gRPC bridge); falls back to a fresh UUID v4. Values must pass
@@ -232,6 +271,10 @@ impl LiteServer for GrpcService {
                 "{} version {} is not ready",
                 model_name, resolved_version
             )));
+        }
+
+        if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
+            enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
         }
 
         let header_map: HashMap<String, String> = req.headers.clone();
@@ -404,6 +447,10 @@ impl LiteServer for GrpcService {
             )));
         }
 
+        if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
+            enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
+        }
+
         let header_map: HashMap<String, String> = req.headers.clone();
         let meta = pb::RequestMeta {
             route: "/predict".to_string(),
@@ -515,6 +562,10 @@ impl LiteServer for GrpcService {
                 "{} version {} is not ready",
                 model_name, resolved_version
             )));
+        }
+
+        if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
+            enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
         }
 
         let header_map: HashMap<String, String> = req.headers.clone();
@@ -676,6 +727,12 @@ impl LiteServer for GrpcService {
                             "{} version {} is not ready",
                             model_name, resolved_version
                         )));
+                    }
+
+                    // BidiOpen has no headers map — transport metadata is the
+                    // only credential carrier on this path.
+                    if let Some(mv) = self.registry.get(&model_name, Some(&resolved_version)) {
+                        enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &HashMap::new())?;
                     }
 
                     let sid = format!("grpc-bidi-{}", Uuid::new_v4());
@@ -1186,5 +1243,55 @@ mod tests {
             random_calls.len(),
             ejected_calls.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod auth_policy_tests {
+    use super::*;
+    use crate::config::AuthPolicy;
+
+    fn policy(keys: &[&str]) -> AuthPolicy {
+        AuthPolicy {
+            header: "x-api-key".to_string(),
+            keys: keys.iter().map(|k| k.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_metadata_key_passes() {
+        let mut md = MetadataMap::new();
+        md.insert("x-api-key", "sk-a".parse().unwrap());
+        assert!(enforce_auth_grpc(Some(&policy(&["sk-a"])), &md, &HashMap::new()).is_ok());
+    }
+
+    #[test]
+    fn test_proto_headers_fallback_passes() {
+        let headers = HashMap::from([("X-API-Key".to_string(), "sk-a".to_string())]);
+        assert!(
+            enforce_auth_grpc(Some(&policy(&["sk-a"])), &MetadataMap::new(), &headers).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_missing_key_unauthenticated() {
+        let err = enforce_auth_grpc(Some(&policy(&["sk-a"])), &MetadataMap::new(), &HashMap::new())
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn test_wrong_key_unauthenticated() {
+        let mut md = MetadataMap::new();
+        md.insert("x-api-key", "nope".parse().unwrap());
+        let err = enforce_auth_grpc(Some(&policy(&["sk-a"])), &md, &HashMap::new()).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn test_empty_keys_accepts_any_nonempty() {
+        let mut md = MetadataMap::new();
+        md.insert("x-api-key", "anything".parse().unwrap());
+        assert!(enforce_auth_grpc(Some(&policy(&[])), &md, &HashMap::new()).is_ok());
     }
 }

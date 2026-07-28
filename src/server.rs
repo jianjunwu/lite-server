@@ -152,7 +152,7 @@ impl LiteServer {
         // Start reload listener for max_requests auto-recycle
         self.worker_manager.start_reload_listener().await;
 
-        // Start respawn listener for heartbeat-triggered worker restarts
+        // Start respawn listener for health-check-kill-triggered worker restarts
         self.worker_manager.start_respawn_listener().await;
 
         // Load initial models
@@ -449,7 +449,7 @@ async fn reconcile_models(
     orch: &OrchestrationConfig,
     worker_manager: &WorkerManager,
     registry: &ModelRegistry,
-    model_defaults: &crate::config::ModelDefaults,
+    model_defaults: &crate::config::ModelTunables,
     seen_lma: &mut HashSet<(PathBuf, std::time::SystemTime)>,
 ) {
     auto_unpack_lma_files(repo_path, seen_lma).await;
@@ -789,7 +789,7 @@ async fn process_watch_events(
     worker_manager: Arc<WorkerManager>,
     registry: Arc<ModelRegistry>,
     last_reload: &mut std::collections::HashMap<(String, String), Instant>,
-    model_defaults: &crate::config::ModelDefaults,
+    model_defaults: &crate::config::ModelTunables,
     has_hot_reload: &AtomicBool,
 ) -> Result<(), AppError> {
     use std::collections::HashSet;
@@ -954,7 +954,7 @@ async fn start_model_poller(
     orch: OrchestrationConfig,
     worker_manager: Arc<WorkerManager>,
     registry: Arc<ModelRegistry>,
-    model_defaults: crate::config::ModelDefaults,
+    model_defaults: crate::config::ModelTunables,
 ) {
     let poll_secs = orch.poll_interval.max(1);
     info!(

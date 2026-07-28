@@ -164,22 +164,16 @@ class BatchAPI(LitAPI):
     )
     .unwrap();
 
-    // policy_model: declares RateLimit + Cors callbacks so the Rust HTTP
-    // layer executes rate limiting and attaches CORS headers / answers
-    // preflight (LITE_POLICY_MANAGED=1 makes the Python side a declaration).
+    // policy_model: declares rate_limit + cors policies in config.yaml;
+    // the Rust HTTP layer enforces them per model version.
     let policy_dir = tmp.join("policy_model/1");
     std::fs::create_dir_all(&policy_dir).unwrap();
     std::fs::write(
         policy_dir.join("model.py"),
-        r#"from lite_server import LitAPI, RateLimit, Cors
+        r#"from lite_server import LitAPI
 
 
 class PolicyAPI(LitAPI):
-    callbacks = (
-        RateLimit(requests_per_minute=3, burst=3),
-        Cors(allow_origins=["https://app.example.com"]),
-    )
-
     def setup(self, device):
         pass
 
@@ -196,7 +190,7 @@ class PolicyAPI(LitAPI):
     .unwrap();
     std::fs::write(
         policy_dir.join("config.yaml"),
-        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\npolicies:\n  rate_limit: { requests_per_minute: 3, burst: 3 }\n  cors:\n    allow_origins: [\"https://app.example.com\"]\n",
     )
     .unwrap();
 

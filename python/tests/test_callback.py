@@ -9,15 +9,9 @@ import pytest
 from lite_server.context import Headers, RequestContext, RequestMeta
 from lite_server.callbacks import (
     Callback,
-    Cors,
-    LogRequests,
-    RateLimit,
-    RequireApiKey,
-    extract_policies,
     load_callbacks,
     validate_callback,
 )
-from lite_server.callbacks.rate_limit import _TokenBucket
 from lite_server.exceptions import HTTPException, UnauthorizedError
 
 
@@ -166,390 +160,15 @@ class TestLoadCallbacks:
 # ---------------------------------------------------------------------------
 # _TokenBucket
 # ---------------------------------------------------------------------------
-
-
-class TestTokenBucket:
-    def test_acquire_succeeds_when_tokens_available(self):
-        tb = _TokenBucket(rate=10.0, capacity=10.0)
-        allowed, wait = tb.acquire()
-        assert allowed is True
-        assert wait == 0.0
-
-    def test_acquire_fails_when_exhausted_zero_rate(self):
-        tb = _TokenBucket(rate=0.0, capacity=1.0)
-        assert tb.acquire()[0] is True
-        allowed, wait = tb.acquire()
-        assert allowed is False
-        assert wait == 0.0  # zero rate → no finite refill wait
-
-    def test_acquire_fails_reports_refill_wait(self):
-        """C2: on rejection, acquire returns the wait for the next token
-        (computed under the lock) instead of just a bool."""
-        tb = _TokenBucket(rate=10.0, capacity=1.0)  # 10 tokens/s
-        assert tb.acquire()[0] is True  # exhaust the 1-token burst
-        allowed, wait = tb.acquire()
-        assert allowed is False
-        assert 0.0 < wait <= 0.1  # ~1 token at 10/s
-
-    def test_refill_over_time(self):
-        tb = _TokenBucket(rate=100.0, capacity=5.0)
-        # Consume all tokens
-        for _ in range(5):
-            assert tb.acquire()[0] is True
-        assert tb.acquire()[0] is False
-        # Wait for refill
-        time.sleep(0.02)  # 100 tokens/s → 2 tokens in 0.02s
-        assert tb.acquire()[0] is True
-
-    def test_burst_capacity_upper_bound(self):
-        tb = _TokenBucket(rate=1000.0, capacity=5.0)
-        time.sleep(0.1)  # would be 100 tokens without cap
-        for _ in range(5):
-            assert tb.acquire()[0] is True
-        assert tb.acquire()[0] is False
-
-
-# ---------------------------------------------------------------------------
-# RequireApiKey
-# ---------------------------------------------------------------------------
-
-
-class TestRequireApiKey:
-    def _ctx(self, headers=None):
-        return RequestContext(
-            meta=RequestMeta(
-                route="/predict",
-                headers=Headers(headers or {}),
-                client_ip="127.0.0.1",
-                request_id="r1",
-                timestamp_ns=1,
-            )
-        )
-
-    def test_missing_header_raises_unauthorized(self):
-        cb = RequireApiKey(header="X-API-Key", keys=["sk-123"])
-        with pytest.raises(UnauthorizedError, match="missing API key"):
-            cb.on_request(self._ctx())
-
-    def test_wrong_key_raises_unauthorized(self):
-        cb = RequireApiKey(header="X-API-Key", keys=["sk-123"])
-        with pytest.raises(UnauthorizedError, match="invalid API key"):
-            cb.on_request(self._ctx({"X-API-Key": "wrong"}))
-
-    def test_correct_key_passes(self):
-        cb = RequireApiKey(header="X-API-Key", keys=["sk-123"])
-        cb.on_request(self._ctx({"X-API-Key": "sk-123"}))  # no raise
-
-    def test_empty_keys_allows_any_nonempty_value(self):
-        cb = RequireApiKey(header="Authorization")
-        cb.on_request(self._ctx({"Authorization": "Bearer xxx"}))  # no raise
-
-    def test_empty_keys_rejects_empty_value(self):
-        cb = RequireApiKey(header="Authorization")
-        with pytest.raises(UnauthorizedError):
-            cb.on_request(self._ctx({"Authorization": ""}))
-
-    def test_header_case_insensitive(self):
-        """Headers wrapper is case-insensitive — 'x-api-key' matches 'X-API-Key'."""
-        cb = RequireApiKey(header="X-API-Key", keys=["secret"])
-        # lower-case in headers dict should still match
-        cb.on_request(self._ctx({"x-api-key": "secret"}))  # no raise
-
-
-# ---------------------------------------------------------------------------
-# RateLimit
-# ---------------------------------------------------------------------------
-
-
-class TestRateLimit:
-    def _ctx(self, route="/predict", client_ip="127.0.0.1"):
-        return RequestContext(
-            meta=RequestMeta(
-                route=route,
-                headers=Headers({}),
-                client_ip=client_ip,
-                request_id="r1",
-                timestamp_ns=1,
-            )
-        )
-
-    def test_declaration_fields(self):
-        cb = RateLimit(requests_per_minute=120, key="ip", burst=10.0)
-        assert cb.requests_per_minute == 120
-        assert cb.key == "ip"
-        assert cb.burst == 10.0
-
-    def test_burst_defaults_to_1_5x_rpm(self):
-        cb = RateLimit(requests_per_minute=60)
-        assert cb.burst == 90.0
-
-    def test_invalid_key_raises(self):
-        with pytest.raises(ValueError, match="key"):
-            RateLimit(key="host")
-
-    def test_zero_or_negative_rpm_raises(self):
-        """C1: a non-positive rate silently rejects every request — reject
-        the misconfiguration at construction instead."""
-        with pytest.raises(ValueError, match="requests_per_minute"):
-            RateLimit(requests_per_minute=0)
-        with pytest.raises(ValueError, match="requests_per_minute"):
-            RateLimit(requests_per_minute=-5)
-
-    def test_zero_or_negative_burst_raises(self):
-        """C1: an explicit non-positive burst is a misconfiguration."""
-        with pytest.raises(ValueError, match="burst"):
-            RateLimit(requests_per_minute=60, burst=0)
-        with pytest.raises(ValueError, match="burst"):
-            RateLimit(requests_per_minute=60, burst=-1.5)
-
-    def test_fallback_allows_under_limit(self):
-        cb = RateLimit(requests_per_minute=6000)  # 100/s
-        for _ in range(10):
-            cb.on_request(self._ctx())  # no raise
-
-    def test_fallback_rejects_over_limit(self):
-        cb = RateLimit(requests_per_minute=6, burst=1.0)  # 0.1/s, 1 burst
-        cb.on_request(self._ctx())  # consume burst token
-        with pytest.raises(HTTPException) as exc_info:
-            cb.on_request(self._ctx())
-        assert exc_info.value.status_code == 429
-        assert exc_info.value.headers is not None
-        assert "Retry-After" in exc_info.value.headers
-
-    def test_rejected_request_retry_after_is_positive_integer(self):
-        """C2: Retry-After is a positive integer derived from the bucket's
-        refill wait (snapshots under the lock), not a stale out-of-lock read."""
-        cb = RateLimit(requests_per_minute=6, burst=1.0)  # 0.1 tokens/s
-        cb.on_request(self._ctx())  # consume the burst token
-        with pytest.raises(HTTPException) as exc_info:
-            cb.on_request(self._ctx())
-        retry = int(exc_info.value.headers["Retry-After"])
-        assert retry >= 1
-
-    def test_fallback_buckets_by_route(self):
-        cb = RateLimit(requests_per_minute=6, key="route", burst=1.0)
-        cb.on_request(self._ctx(route="/a"))
-        # /a exhausted, /b should still work
-        cb.on_request(self._ctx(route="/b"))  # no raise
-
-    def test_fallback_buckets_by_ip(self):
-        cb = RateLimit(requests_per_minute=6, key="ip", burst=1.0)
-        cb.on_request(self._ctx(client_ip="10.0.0.1"))
-        with pytest.raises(HTTPException):
-            cb.on_request(self._ctx(client_ip="10.0.0.1"))
-        cb.on_request(self._ctx(client_ip="10.0.0.2"))  # different IP, no raise
-
-    def test_managed_mode_noop(self, monkeypatch):
-        monkeypatch.setenv("LITE_POLICY_MANAGED", "1")
-        # burst < 1 token ⇒ unmanaged, the very first request would be rejected.
-        cb = RateLimit(requests_per_minute=1, burst=0.5)
-        cb.on_request(self._ctx())  # no raise — Rust handles it
-        cb.on_request(self._ctx())  # still no raise
-
-
-# ---------------------------------------------------------------------------
-# LogRequests
-# ---------------------------------------------------------------------------
-
-
-class TestLogRequests:
-    def _ctx(self, route="/predict", method="POST"):
-        return RequestContext(
-            meta=RequestMeta(
-                route=route,
-                headers=Headers({}),
-                client_ip="127.0.0.1",
-                request_id="r1",
-                timestamp_ns=1,
-                method=method,
-            )
-        )
-
-    def test_on_request_stores_start_time(self):
-        cb = LogRequests()
-        ctx = self._ctx()
-        cb.on_request(ctx)
-        key = f"_logreq_start_{id(cb)}"
-        assert key in ctx.state
-        assert isinstance(ctx.state[key], float)
-
-    def test_on_response_logs_info(self, caplog):
-        import logging
-        caplog.set_level(logging.INFO)
-        logging.getLogger("lite_server.requests").setLevel(logging.INFO)
-        cb = LogRequests()
-        ctx = self._ctx()
-        cb.on_request(ctx)
-        cb.on_response(ctx)
-        log_records = [r for r in caplog.records if r.name == "lite_server.requests"]
-        assert len(log_records) == 1, f"records: {[(r.name, r.getMessage()) for r in caplog.records]}"
-        assert "POST" in log_records[0].getMessage()
-        assert "/predict" in log_records[0].getMessage()
-        assert "200" in log_records[0].getMessage()
-
-    def test_on_error_logs_401(self, caplog):
-        import logging
-        caplog.set_level(logging.INFO)
-        logging.getLogger("lite_server.requests").setLevel(logging.INFO)
-        from lite_server.exceptions import UnauthorizedError
-        cb = LogRequests()
-        ctx = self._ctx()
-        cb.on_request(ctx)
-        cb.on_error(ctx, UnauthorizedError("bad"))
-        log_records = [r for r in caplog.records if r.name == "lite_server.requests"]
-        assert len(log_records) == 1
-        assert "401" in log_records[0].getMessage()
-
-    def test_on_error_logs_500_for_unknown_exception(self, caplog):
-        import logging
-        caplog.set_level(logging.INFO)
-        logging.getLogger("lite_server.requests").setLevel(logging.INFO)
-        cb = LogRequests()
-        ctx = self._ctx()
-        cb.on_request(ctx)
-        cb.on_error(ctx, RuntimeError("boom"))
-        log_records = [r for r in caplog.records if r.name == "lite_server.requests"]
-        assert len(log_records) == 1
-        assert "500" in log_records[0].getMessage()
-
-    def test_two_instances_no_state_collision(self):
-        cb1 = LogRequests()
-        cb2 = LogRequests()
-        ctx = self._ctx()
-        cb1.on_request(ctx)
-        k1 = f"_logreq_start_{id(cb1)}"
-        k2 = f"_logreq_start_{id(cb2)}"
-        assert k1 in ctx.state
-        assert k2 not in ctx.state
-
-
-# ---------------------------------------------------------------------------
-# Cors
-# ---------------------------------------------------------------------------
-
-
-class TestCors:
-    def _ctx(self, method="POST"):
-        return RequestContext(
-            meta=RequestMeta(
-                route="/predict",
-                headers=Headers({}),
-                client_ip="127.0.0.1",
-                request_id="r1",
-                timestamp_ns=1,
-                method=method,
-            )
-        )
-
-    def test_fallback_stashes_response_headers(self):
-        cb = Cors(allow_origins=["https://app.example.com"])
-        ctx = self._ctx()
-        cb.on_request(ctx)
-        assert ctx.early is None  # NOT an early return
-        assert "Access-Control-Allow-Origin" in ctx.response_headers
-        assert ctx.response_headers["Access-Control-Allow-Origin"] == "https://app.example.com"
-
-    def test_fallback_options_returns_204_with_headers(self):
-        cb = Cors()
-        ctx = self._ctx(method="OPTIONS")
-        cb.on_request(ctx)
-        assert ctx.early is not None
-        assert ctx.early.status_code == 204
-        assert "Access-Control-Allow-Origin" in ctx.early.headers
-
-    def test_fallback_post_does_not_early_return(self):
-        cb = Cors()
-        ctx = self._ctx(method="POST")
-        cb.on_request(ctx)
-        assert ctx.early is None
-
-    def test_managed_mode_noop(self, monkeypatch):
-        monkeypatch.setenv("LITE_POLICY_MANAGED", "1")
-        cb = Cors()
-        ctx = self._ctx(method="OPTIONS")
-        cb.on_request(ctx)
-        assert ctx.early is None
-        assert ctx.response_headers == {}
-
-    def test_default_values(self):
-        cb = Cors()
-        assert cb.allow_origins == ["*"]
-        assert "GET" in cb.allow_methods
-        assert "POST" in cb.allow_methods
-
-
-# ---------------------------------------------------------------------------
-# on_error hook validation
-# ---------------------------------------------------------------------------
-
-
-class TestOnErrorHook:
-    def test_valid_on_error_passes_validation(self):
-        class WithError(Callback):
-            def on_error(self, ctx, exc):
-                pass
-
-        validate_callback(WithError())  # must not raise
-
-    def test_on_error_bad_arity_raises(self):
-        class BadError(Callback):
-            def on_error(self, ctx):
-                pass
-
-        with pytest.raises(RuntimeError, match="on_error"):
-            validate_callback(BadError())
-
-
-# ---------------------------------------------------------------------------
-# extract_policies
-# ---------------------------------------------------------------------------
-
-
-class TestExtractPolicies:
-    def test_empty_list_returns_empty(self):
-        assert extract_policies([]) == {}
-
-    def test_extracts_rate_limit(self):
-        cb = RateLimit(requests_per_minute=120, key="ip", burst=200.0)
-        policies = extract_policies([cb])
-        assert policies["rate_limit"] == {
-            "requests_per_minute": 120,
-            "key": "ip",
-            "burst": 200.0,
-        }
-
-    def test_extracts_cors(self):
-        cb = Cors(allow_origins=["https://a.com"], allow_methods=["GET"])
-        policies = extract_policies([cb])
-        assert policies["cors"]["allow_origins"] == ["https://a.com"]
-        assert policies["cors"]["allow_methods"] == ["GET"]
-
-    def test_both_policies_extracted(self):
-        policies = extract_policies([
-            RateLimit(requests_per_minute=60),
-            Cors(allow_origins=["*"]),
-        ])
-        assert "rate_limit" in policies
-        assert "cors" in policies
-
-    def test_last_declaration_wins(self):
-        policies = extract_policies([
-            RateLimit(requests_per_minute=60),
-            RateLimit(requests_per_minute=120),
-        ])
-        assert policies["rate_limit"]["requests_per_minute"] == 120
-
-    def test_ignores_other_callbacks(self):
-        policies = extract_policies([
-            RequireApiKey(keys=["x"]),
-            LogRequests(),
-        ])
-        assert policies == {}
-
-
-# ---------------------------------------------------------------------------
 # load_callbacks with LitAPI class attribute
 # ---------------------------------------------------------------------------
+
+
+class _TagCB(Callback):
+    """Data-hook callback with constructor args (class-attribute loading)."""
+
+    def __init__(self, tag="default"):
+        self.tag = tag
 
 
 class TestLoadCallbacksWithLitAPI:
@@ -558,12 +177,12 @@ class TestLoadCallbacksWithLitAPI:
         from lite_server.api import LitAPI
 
         class MyAPI(LitAPI):
-            callbacks = (RequireApiKey(keys=["sk-123"]),)
+            callbacks = (_TagCB(tag="sk-123"),)
 
         api = MyAPI()
         cbs = load_callbacks({}, api)
         assert len(cbs) == 1
-        assert isinstance(cbs[0], RequireApiKey)
+        assert isinstance(cbs[0], _TagCB)
 
     def test_class_attr_and_yaml_merged(self, tmp_path, monkeypatch):
         from lite_server.api import LitAPI
@@ -576,12 +195,12 @@ class TestLoadCallbacksWithLitAPI:
         monkeypatch.syspath_prepend(str(tmp_path))
 
         class MyAPI(LitAPI):
-            callbacks = (RequireApiKey(keys=["sk-123"]),)
+            callbacks = (_TagCB(tag="sk-123"),)
 
         api = MyAPI()
         cbs = load_callbacks({"callbacks": ["my_cb.LoggerCB"]}, api)
         assert len(cbs) == 2
-        assert isinstance(cbs[0], RequireApiKey)
+        assert isinstance(cbs[0], _TagCB)
 
     def test_class_attr_validated(self):
         """Old-style hooks on class-attribute callbacks are loud errors."""
@@ -597,3 +216,19 @@ class TestLoadCallbacksWithLitAPI:
         api = MyAPI()
         with pytest.raises(RuntimeError, match="on_before_decode"):
             load_callbacks({}, api)
+
+
+class TestRemovedPolicyCallbacks:
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "lite_server.callbacks.RequireApiKey",
+            "lite_server.callbacks.Cors",
+            "lite_server.callbacks.RateLimit",
+            "lite_server.callbacks.LogRequests",
+            "my_package.auth.RequireApiKey",
+        ],
+    )
+    def test_removed_policy_callback_is_loud_with_migration_hint(self, path):
+        with pytest.raises(RuntimeError, match="removed in 0.7.6"):
+            load_callbacks({"callbacks": [path]})

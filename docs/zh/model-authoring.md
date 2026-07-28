@@ -333,58 +333,35 @@ class AuditLogger(Callback):
         print(f"[AUDIT] model torn down, class: {type(lit_api).__name__}")
 ```
 
-### 内置 Callback
+### 策略（Policies）
 
-lite-server 提供了几个开箱即用的 Callback，可直接在 ``callbacks`` 列表中使用：
+鉴权、限流、跨域、访问日志属于 HTTP 层关注点，在模型 config.yaml 中声明，
+由 Rust 服务端按模型（精确到版本）执行：
 
-**``RequireApiKey``** — API Key 鉴权：
+```yaml
+# model_repo/my_model/1/config.yaml
+policies:
+  # API Key 鉴权：默认从 X-API-Key 头读取；keys 为空 = 任意非空值即通过。
+  # ${VAR} 形式从环境变量读取密钥，变量未设置时加载失败（fail-closed）。
+  auth: { header: "X-API-Key", keys: ["${API_KEYS}"] }
 
-```python
-from lite_server import RequireApiKey
+  # 速率限制：key="route" 按路由共享配额，key="ip" 按客户端 IP
+  rate_limit: { requests_per_minute: 60, key: ip, burst: 100 }
 
-# 在 callbacks 列表中声明
-callbacks:
-  - lite_server.callbacks.RequireApiKey
+  # 跨域
+  cors:
+    allow_origins: ["https://example.com"]
+    allow_methods: ["GET", "POST"]
+    allow_headers: ["Content-Type", "Authorization"]
+
+  # 访问日志（方法、路径、状态码、耗时，含被拒绝的请求）
+  request_log: {}
 ```
 
-默认从 `X-API-Key` 请求头读取 key。支持自定义 header 和白名单：
-
-```python
-RequireApiKey(header="Authorization", keys=["sk-xxx", "sk-yyy"])
-# keys 为空列表时，任意非空值即通过
-```
-
-**``Cors``** — 跨域策略声明（由 Rust HTTP 层执行）：
-
-```python
-from lite_server import Cors
-
-Cors(
-    allow_origins=["https://example.com"],
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "Authorization"],
-)
-```
-
-**``RateLimit``** — 速率限制声明（由 Rust HTTP 层执行）：
-
-```python
-from lite_server import RateLimit
-
-RateLimit(requests_per_minute=60, key="ip", burst=100)
-# key="route" 按路由限流，key="ip" 按客户端 IP 限流
-```
-
-**``LogRequests``** — 请求日志（方法、路由、状态码、耗时）：
-
-```python
-from lite_server import LogRequests
-
-LogRequests(logger_name="lite_server.requests")
-```
-
-> 当进程运行在 Rust 管理的 worker 之外（如单元测试）时，`RateLimit` 和 `Cors`
-> 会自动回退到进程内的本地实现——因此策略可测试，但不适合生产级限流。
+> 0.7.6 起，`RequireApiKey` / `Cors` / `RateLimit` / `LogRequests` 四个
+> Python policy callback 已移除——它们与 Rust 侧执行是双实现，且按 worker
+> 声明存在一致性隐患（"最后声明者胜"）。在 ``callbacks:`` 列表中引用这些
+> 类会在加载时报错并给出迁移指引。
 
 ### Callback 声明方式
 
@@ -395,8 +372,7 @@ Callback 可通过两种方式声明，两者可组合使用（类属性优先�
 ```python
 class MyModel(LitAPI):
     callbacks = (
-        RequireApiKey(header="X-API-Key", keys=["sk-xxx"]),
-        LogRequests(),
+        AuditLogger(prefix="[prod]"),
     )
 ```
 
@@ -405,7 +381,6 @@ class MyModel(LitAPI):
 ```yaml
 callbacks:
   - my_package.callbacks.AuditLogger
-  - lite_server.callbacks.LogRequests
 ```
 
 > 导入失败或 0.7 之前的旧钩子签名会在加载时响亮报错 —— 被静默跳过的
@@ -562,7 +537,6 @@ class AsyncModel(LitAPI):
 ```yaml
 # config.yaml
 continuous_batching: true
-max_sequence_length: 4096
 ```
 
 实现三个钩子：
@@ -721,11 +695,8 @@ class ASRModel(LitAPI):
 - ``on_open`` 成功完成后，必定有恰好一次 ``on_close``（正常关闭、取消或
   worker 关闭时）。``on_open`` 失败则不创建会话，也不会触发 ``on_close``。
 
-在配置中启用：
-
-```yaml
-bidirectional: true
-```
+只需实现 ``bidi_stream()`` 即可——会话由该方法自动检测并通过 gRPC 提供服务，
+无需任何配置项。
 
 > **注意：** 在双向（bidi）会话期间，回调钩子中的 ``ctx.request`` 和
 > ``ctx.input`` 始终指向初始的 open 负载——它们不会随 chunk 到达而变化。

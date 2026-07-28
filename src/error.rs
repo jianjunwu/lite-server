@@ -77,6 +77,12 @@ pub enum AppError {
     #[error("rate limit exceeded")]
     RateLimitExceeded { retry_after_secs: u64 },
 
+    /// Missing or invalid API key — HTTP 401. The detail names the header
+    /// that was checked; it is client-facing (mirrors the old Python-side
+    /// RequireApiKey messages).
+    #[error("{0}")]
+    Unauthorized(String),
+
     /// Model-initiated error with explicit HTTP status and client-facing message.
     /// Unlike WorkerCrashed, the message is NOT sanitized — the model author
     /// intentionally exposes it. Boxed so `AppError` stays small (this payload
@@ -132,6 +138,7 @@ impl AppError {
             AppError::InvalidRequestBody(_) => "invalid request body",
             AppError::InvalidQueryParam(_) => "invalid query parameter",
             AppError::RateLimitExceeded { .. } => "rate limit exceeded",
+            AppError::Unauthorized(_) => "unauthorized",
             // ModelError is handled specially in IntoResponse
             // and never reaches this point, but provide a fallback.
             AppError::ModelError(_) => "model error",
@@ -145,6 +152,7 @@ impl AppError {
         match self {
             AppError::InvalidRequestBody(detail) => detail.clone(),
             AppError::InvalidQueryParam(detail) => detail.clone(),
+            AppError::Unauthorized(detail) => detail.clone(),
             _ => self.pub_error_message().to_string(),
         }
     }
@@ -173,6 +181,7 @@ impl AppError {
             AppError::InvalidRequestBody(_) => "invalid_request_body",
             AppError::InvalidQueryParam(_) => "invalid_query_param",
             AppError::RateLimitExceeded { .. } => "rate_limit_exceeded",
+            AppError::Unauthorized(_) => "unauthorized",
             // ModelError code comes from the Python worker; fallback to its error_type
             AppError::ModelError(d) => d.code.as_deref().unwrap_or(d.error_type.as_str()),
         }
@@ -239,6 +248,7 @@ impl IntoResponse for AppError {
             AppError::InvalidRequestBody(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
             AppError::InvalidQueryParam(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
             AppError::RateLimitExceeded { .. } => (StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded"),
+            AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "authentication_error"),
             // Handled above via early return; should never reach here.
             AppError::ModelError(_) => unreachable!(),
         };

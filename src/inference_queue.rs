@@ -157,6 +157,33 @@ impl OutlierState {
         }
     }
 
+    /// Current consecutive error count for a worker (0 for unknown index).
+    pub fn consecutive_errors(&self, worker_idx: usize) -> usize {
+        self.workers
+            .get(worker_idx)
+            .map(|w| w.consecutive_errors.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Zero the consecutive error count without touching ejection state.
+    /// Used after escalating to kill+respawn so the kill signal is not
+    /// re-sent every probe interval while the replacement starts.
+    pub fn reset_error_count(&self, worker_idx: usize) {
+        if let Some(w) = self.workers.get(worker_idx) {
+            w.consecutive_errors.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Clear error count AND ejection state — used when the worker's process
+    /// has been replaced (respawn), so the new process starts clean.
+    pub fn reset(&self, worker_idx: usize) {
+        if let Some(w) = self.workers.get(worker_idx) {
+            w.consecutive_errors.store(0, Ordering::Relaxed);
+            let mut guard = w.ejected.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = None;
+        }
+    }
+
     /// Record an error — increment the consecutive error count, ejecting the
     /// worker at the threshold. Returns `true` only when this call newly
     /// ejects the worker, so callers can record the per-(model, version)
@@ -250,6 +277,16 @@ pub struct ReloadSignal {
     pub version: String,
 }
 
+/// Signal to kill + respawn a single worker (health-check kill escalation).
+#[derive(Debug)]
+pub struct RespawnSignal {
+    pub model_name: String,
+    pub version: String,
+    pub worker_id: u32,
+    /// Metric/log label identifying the trigger (e.g. "health_check").
+    pub reason: &'static str,
+}
+
 /// Per-(model, version) queue state held in [`InferenceQueue::queues`].
 /// Factored out of an anonymous tuple so the field types are self-documenting.
 struct VersionQueue {
@@ -319,6 +356,7 @@ impl InferenceQueue {
         zmq_clients: Vec<Arc<WorkerZmqClient>>,
         reload_tx: mpsc::Sender<ReloadSignal>,
         outlier: Arc<OutlierState>,
+        respawn_tx: Option<mpsc::Sender<RespawnSignal>>,
     ) {
         let key = model_version_key(model_name, version);
 
@@ -344,6 +382,13 @@ impl InferenceQueue {
         let max_retries = config.max_retries;
         let health_interval = Duration::from_secs_f64(config.health_check_interval as f64);
         let health_probe_timeout = Duration::from_secs_f64(config.health_check_timeout as f64);
+        let health_kill_threshold = config.health_check_kill_threshold;
+        if health_kill_threshold > 0 && health_interval <= Duration::ZERO {
+            warn!(
+                model = %model_name, version = %version,
+                "health_check_kill_threshold is set but health_check_interval is 0 — kill escalation will never run"
+            );
+        }
 
         let worker_count = workers.len();
         let handle = tokio::spawn(batch_collector(
@@ -373,6 +418,8 @@ impl InferenceQueue {
                 outlier.clone(),
                 model_name.to_string(),
                 version.to_string(),
+                health_kill_threshold,
+                respawn_tx,
             ))))
         } else {
             None
@@ -1053,6 +1100,11 @@ async fn batch_collector(
 
 /// Background task that periodically probes workers for health.
 /// Probes ALL workers concurrently (including ejected ones) for early recovery.
+///
+/// Failure handling is a two-level escalation on the shared consecutive-error
+/// count: reaching the ejection threshold stops routing to the worker
+/// ([`OutlierState`]); reaching `kill_threshold` (0 = never) kills + respawns
+/// the process via `respawn_tx`.
 async fn health_checker(
     interval: Duration,
     probe_timeout: Duration,
@@ -1060,6 +1112,8 @@ async fn health_checker(
     outlier: Arc<OutlierState>,
     model_name: String,
     version: String,
+    kill_threshold: usize,
+    respawn_tx: Option<mpsc::Sender<RespawnSignal>>,
 ) {
     let uid_prefix = format!("health-{}-{}", model_name, version);
     loop {
@@ -1070,6 +1124,7 @@ async fn health_checker(
             let outlier = outlier.clone();
             let model_name = model_name.clone();
             let version = version.clone();
+            let respawn_tx = respawn_tx.clone();
             let uid = format!("{}-{}", uid_prefix, idx);
             async move {
                 let was_ejected = outlier.is_ejected(idx);
@@ -1092,6 +1147,7 @@ async fn health_checker(
                                 prometheus::inc_worker_ejection(&model_name, &version);
                             }
                             prometheus::inc_health_check(&model_name, &version, "error");
+                            escalate_to_kill(&outlier, idx, kill_threshold, &respawn_tx, &model_name, &version).await;
                         } else {
                             outlier.record_success(idx);
                             prometheus::inc_health_check(&model_name, &version, "ok");
@@ -1108,6 +1164,7 @@ async fn health_checker(
                             prometheus::inc_worker_ejection(&model_name, &version);
                         }
                         prometheus::inc_health_check(&model_name, &version, "error");
+                        escalate_to_kill(&outlier, idx, kill_threshold, &respawn_tx, &model_name, &version).await;
                         if !was_ejected && outlier.is_ejected(idx) {
                             warn!(model = %model_name, version = %version, worker_idx = idx, "worker ejected");
                         }
@@ -1123,6 +1180,41 @@ async fn health_checker(
         }).collect();
         futures::future::join_all(futs).await;
     }
+}
+
+/// Kill escalation after a failed probe: once the shared consecutive-error
+/// count reaches `kill_threshold`, ask the worker manager to kill + respawn
+/// the process. `kill_threshold == 0` disables killing (ejection-only).
+async fn escalate_to_kill(
+    outlier: &OutlierState,
+    idx: usize,
+    kill_threshold: usize,
+    respawn_tx: &Option<mpsc::Sender<RespawnSignal>>,
+    model_name: &str,
+    version: &str,
+) {
+    if kill_threshold == 0 || outlier.consecutive_errors(idx) < kill_threshold {
+        return;
+    }
+    let Some(tx) = respawn_tx.as_ref() else {
+        return;
+    };
+    error!(
+        model = %model_name, version = %version, worker_idx = idx,
+        consecutive_failures = outlier.consecutive_errors(idx),
+        kill_threshold,
+        "Health probe failures reached kill threshold, respawning worker"
+    );
+    let _ = tx.send(RespawnSignal {
+        model_name: model_name.to_string(),
+        version: version.to_string(),
+        worker_id: idx as u32,
+        reason: "health_check",
+    }).await;
+    // Throttle re-sends while the respawn is in flight: the replacement must
+    // accumulate kill_threshold fresh failures before the next escalation.
+    // Ejection state is left intact so traffic keeps avoiding the dead slot.
+    outlier.reset_error_count(idx);
 }
 
 #[cfg(test)]
@@ -1179,7 +1271,7 @@ mod tests {
         };
         let (reload_tx, _reload_rx) = mpsc::channel(8);
         let outlier = Arc::new(OutlierState::new(0));
-        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx, outlier);
+        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx, outlier, None);
 
         // has_queue should find it using the same key
         assert!(queue.has_queue("test_model", "1"));
@@ -1271,13 +1363,13 @@ mod tests {
         let (reload_tx, _reload_rx) = mpsc::channel(8);
 
         let outlier = Arc::new(OutlierState::new(0));
-        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx.clone(), outlier);
+        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx.clone(), outlier, None);
         let first_handle = queue.queues.get(&model_version_key("test_model", "1")).unwrap().collector.clone();
         assert!(!first_handle.is_finished());
 
         // Re-register should abort the first collector
         let outlier = Arc::new(OutlierState::new(0));
-        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx, outlier);
+        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx, outlier, None);
         let second_handle = queue.queues.get(&model_version_key("test_model", "1")).unwrap().collector.clone();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1352,7 +1444,7 @@ mod tests {
         let (reload_tx, _reload_rx) = mpsc::channel(8);
         let outlier = Arc::new(OutlierState::new(1));
         let client = Arc::new(WorkerZmqClient::new(endpoint));
-        queue.register_model("m", "1", &config, vec![], vec![client], reload_tx, outlier);
+        queue.register_model("m", "1", &config, vec![], vec![client], reload_tx, outlier, None);
         // Let the PAIR connect establish.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -1409,7 +1501,7 @@ mod tests {
         };
         let (reload_tx, _reload_rx) = mpsc::channel(8);
         let outlier = Arc::new(OutlierState::new(0));
-        queue.register_model("m", "1", &config, vec![], vec![], reload_tx, outlier);
+        queue.register_model("m", "1", &config, vec![], vec![], reload_tx, outlier, None);
 
         let drain = queue.begin_drain("m", "1").expect("queue must exist");
         tokio::time::timeout(Duration::from_millis(500), drain.wait_idle())
@@ -1437,7 +1529,7 @@ mod tests {
         let (reload_tx, _reload_rx) = mpsc::channel(8);
 
         let outlier = Arc::new(OutlierState::new(0));
-        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx, outlier);
+        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx, outlier, None);
         let handle = queue.queues.get(&model_version_key("test_model", "1")).unwrap().collector.clone();
         assert!(!handle.is_finished());
 
@@ -1754,6 +1846,131 @@ mod tests {
         assert!(outlier.is_ejected(0));
     }
 
+    #[test]
+    fn test_outlier_consecutive_errors_accessor() {
+        let outlier = OutlierState::new(2);
+        assert_eq!(outlier.consecutive_errors(0), 0);
+        outlier.record_error(0);
+        outlier.record_error(0);
+        assert_eq!(outlier.consecutive_errors(0), 2);
+        outlier.record_success(0);
+        assert_eq!(outlier.consecutive_errors(0), 0);
+        // Unknown index reads as 0 rather than panicking.
+        assert_eq!(outlier.consecutive_errors(99), 0);
+    }
+
+    #[test]
+    fn test_outlier_reset_clears_count_and_ejection() {
+        // Used when a worker's process is replaced: the new process must
+        // start with neither an error history nor an ejection.
+        let outlier = OutlierState::new(1);
+        outlier.record_error(0);
+        outlier.record_error(0);
+        outlier.record_error(0);
+        assert!(outlier.is_ejected(0));
+        outlier.reset(0);
+        assert!(!outlier.is_ejected(0));
+        assert_eq!(outlier.consecutive_errors(0), 0);
+        // Unknown index is a no-op.
+        outlier.reset(99);
+    }
+
+    #[test]
+    fn test_outlier_reset_error_count_keeps_ejection() {
+        // After a kill signal is sent, the count is throttled but the dead
+        // slot must stay ejected until the replacement proves healthy.
+        let outlier = OutlierState::new(1);
+        outlier.record_error(0);
+        outlier.record_error(0);
+        outlier.record_error(0);
+        assert!(outlier.is_ejected(0));
+        outlier.reset_error_count(0);
+        assert_eq!(outlier.consecutive_errors(0), 0);
+        assert!(outlier.is_ejected(0), "ejection must survive error-count reset");
+    }
+
+    // ===== Health-check kill escalation =====
+
+    /// Endpoint with a bound client but no worker ever connecting — every
+    /// probe times out. Models a hung worker.
+    fn unreachable_endpoint(name: &str) -> String {
+        #[cfg(unix)]
+        {
+            format!(
+                "ipc://{}",
+                std::env::temp_dir()
+                    .join(format!("lite-server-hc-{}-{}.sock", name, std::process::id()))
+                    .display()
+            )
+        }
+        #[cfg(windows)]
+        {
+            format!("tcp://127.0.0.1:{}", 35000 + std::process::id() % 1000)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_health_checker_escalates_to_kill() {
+        // kill_threshold=2, ejection threshold=1: the first failed probe
+        // ejects, the second triggers a kill+respawn signal.
+        let queue = InferenceQueue::new();
+        let config = ModelConfig {
+            max_queue_size: 10,
+            health_check_interval: 0.05,
+            health_check_timeout: 0.05,
+            health_check_kill_threshold: 2,
+            ..Default::default()
+        };
+        let (reload_tx, _reload_rx) = mpsc::channel(8);
+        let (respawn_tx, mut respawn_rx) = mpsc::channel(8);
+        let ejection_cfg = EjectionConfig {
+            error_threshold: 1,
+            timeout: Duration::from_secs(60),
+            max_percent: 100,
+        };
+        let outlier = Arc::new(OutlierState::with_config(1, &ejection_cfg));
+        let outlier_probe = outlier.clone();
+        let client = Arc::new(WorkerZmqClient::new(unreachable_endpoint("kill")));
+        queue.register_model(
+            "m", "1", &config, vec![], vec![client], reload_tx, outlier,
+            Some(respawn_tx),
+        );
+
+        let sig = tokio::time::timeout(Duration::from_secs(10), respawn_rx.recv())
+            .await
+            .expect("kill escalation must signal respawn")
+            .expect("respawn channel must stay open");
+        assert_eq!(sig.model_name, "m");
+        assert_eq!(sig.version, "1");
+        assert_eq!(sig.worker_id, 0);
+        assert_eq!(sig.reason, "health_check");
+        assert!(outlier_probe.is_ejected(0), "first failure must have ejected the worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_health_checker_no_kill_when_threshold_zero() {
+        // kill_threshold=0 (default) — failures eject but never respawn.
+        let queue = InferenceQueue::new();
+        let config = ModelConfig {
+            max_queue_size: 10,
+            health_check_interval: 0.05,
+            health_check_timeout: 0.05,
+            health_check_kill_threshold: 0,
+            ..Default::default()
+        };
+        let (reload_tx, _reload_rx) = mpsc::channel(8);
+        let (respawn_tx, mut respawn_rx) = mpsc::channel(8);
+        let outlier = Arc::new(OutlierState::new(1));
+        let client = Arc::new(WorkerZmqClient::new(unreachable_endpoint("nokill")));
+        queue.register_model(
+            "m", "1", &config, vec![], vec![client], reload_tx, outlier,
+            Some(respawn_tx),
+        );
+
+        let result = tokio::time::timeout(Duration::from_millis(500), respawn_rx.recv()).await;
+        assert!(result.is_err(), "kill_threshold=0 must never signal respawn");
+    }
+
     #[tokio::test]
     async fn test_record_error_returns_true_only_on_new_ejection() {
         // Callers use the return value to record the per-(model, version)
@@ -2015,7 +2232,7 @@ mod tests {
         let (reload_tx, _reload_rx) = mpsc::channel(8);
         let outlier = Arc::new(OutlierState::new(2));
 
-        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx, outlier.clone());
+        queue.register_model("test_model", "1", &config, vec![], vec![], reload_tx, outlier.clone(), None);
 
         let retrieved = queue.get_outlier_state("test_model", "1").unwrap();
         // Must be the same Arc
@@ -2052,7 +2269,7 @@ mod tests {
         };
         let (reload_tx, _reload_rx) = mpsc::channel(8);
         let outlier = Arc::new(OutlierState::new(1));
-        queue.register_model("m", "1", &config, vec![], vec![], reload_tx, outlier);
+        queue.register_model("m", "1", &config, vec![], vec![], reload_tx, outlier, None);
         assert!(queue.has_queue("m", "1"));
     }
 
@@ -2202,7 +2419,7 @@ mod tests {
         queue.register_model(
             "m", "1", &config, vec![],
             vec![client0, client1],
-            reload_tx, outlier,
+            reload_tx, outlier, None,
         );
         // Let both PAIR connections establish.
         tokio::time::sleep(Duration::from_millis(300)).await;

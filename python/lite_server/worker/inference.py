@@ -24,7 +24,7 @@ import yaml
 import zmq
 
 from lite_server.api import LitAPI
-from lite_server.callbacks import extract_policies, load_callbacks
+from lite_server.callbacks import load_callbacks
 from lite_server.context import CBSequence, Headers, RequestContext, RequestMeta
 from lite_server.exceptions import HTTPException
 from lite_server.pipeline import (
@@ -107,7 +107,7 @@ def setup_logging(worker_id: int, level_str: str = "info"):
     Configures the root logger so that all child loggers (including the
     user's model logger via ``LitAPI.logger``) inherit the handler and level.
     Also ensures the ``lite_server`` namespace logger has a handler so builtin
-    callbacks (e.g. LogRequests) are never silently lost.
+    callback logs are never silently lost.
     """
     level = getattr(logging, level_str.upper(), logging.INFO)
     root = logging.getLogger()
@@ -1481,7 +1481,6 @@ def worker_main():
         "status": "ready",
         "worker_id": args.worker_id,
         "metric_specs": specs,
-        "policies": extract_policies(pipeline.callbacks) if pipeline is not None else {},
         "custom_routes": custom_routes,
     }), flush=True)
 

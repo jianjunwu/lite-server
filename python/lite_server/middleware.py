@@ -1,26 +1,19 @@
 """DEPRECATED since 0.7.0 — import lite_server.middleware is no longer supported.
 
-The middleware API has been unified with the Callback system.  Use the
-built-in Callback classes instead:
+Route middleware became the unified Callback system in 0.7.0; the built-in
+policy callbacks (require_api_key / rate_limit / log_requests / cors) were
+then retired in 0.7.6 in favor of declarative per-model policies in
+config.yaml — enforced by the Rust server:
 
-    Old                                    New
-    ─────────────────────────────────────────────────────────────
-    from lite_server.middleware import     from lite_server import
-      require_api_key                        RequireApiKey
-      rate_limit                             RateLimit
-      log_requests                           LogRequests
-      cors                                   Cors
+    policies:
+      auth: { header: "X-API-Key", keys: ["${API_KEYS}"] }
+      rate_limit: { requests_per_minute: 60, key: ip, burst: 100 }
+      cors: { allow_origins: ["*"], allow_methods: ["POST"], allow_headers: ["content-type"] }
+      request_log: {}
 
-    @route.get("/p",                     @route.get("/p",
-      middleware=[...])                       callbacks=[...])
-
-    async def handler(request, server):     def handler(ctx):
-        ...                                    ...
+Custom route logic: use lite_server.Callback subclasses instead of middleware.
 
 Migration guide: https://lite-server.dev/migration-0.7
-Full discussion: .claude/design-callback-middleware-unification.md
-
-TokenBucket is now an internal implementation detail (lite_server.callbacks.rate_limit._TokenBucket).
 """
 
 raise ImportError(__doc__)

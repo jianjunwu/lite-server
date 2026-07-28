@@ -168,13 +168,16 @@ fn main() {
                 no_grpc,
                 no_metrics,
                 no_streaming_metrics,
-                max_queue_size,
-                max_requests,
-                max_requests_jitter,
-                request_timeout,
-                health_check_interval,
                 graceful_timeout,
                 keepalive_timeout,
+                tunables: lite_server::config::ModelTunables {
+                    max_queue_size,
+                    max_requests,
+                    max_requests_jitter,
+                    request_timeout,
+                    health_check_interval,
+                    ..Default::default()
+                },
                 ..Default::default()
             });
 

@@ -783,13 +783,41 @@ pub(crate) async fn peer_ip_fallback(
 
 /// Acquire a rate-limit token for a model. Shared by unary infer, SSE, and WS.
 ///
+/// API-key check for models declaring `policies.auth`. An empty `keys` list
+/// accepts any non-empty value (mirrors the retired Python RequireApiKey).
+fn enforce_auth(
+    auth: Option<&crate::config::AuthPolicy>,
+    headers: &HeaderMap,
+) -> Result<(), AppError> {
+    let Some(auth) = auth else {
+        return Ok(());
+    };
+    let value = headers
+        .get(&auth.header)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if value.is_empty() {
+        return Err(AppError::Unauthorized(format!(
+            "missing API key (header: {})",
+            auth.header
+        )));
+    }
+    if !auth.keys.is_empty() && !auth.keys.iter().any(|k| k == value) {
+        return Err(AppError::Unauthorized(format!(
+            "invalid API key (header: {})",
+            auth.header
+        )));
+    }
+    Ok(())
+}
+
 /// `scope` derives from the policy key: `"ip"` → client IP from headers,
 /// otherwise the constant `"/predict"` route scope so all inference paths for
 /// a model share one bucket. Returns `RateLimitExceeded` (429 + Retry-After)
 /// when the bucket is empty.
 async fn enforce_rate_limit(
     state: &Arc<AppState>,
-    rl: Option<&crate::worker::protocol::RateLimitPolicy>,
+    rl: Option<&crate::config::RateLimitPolicy>,
     model_name: &str,
     headers: &HeaderMap,
 ) -> Result<(), AppError> {
@@ -928,7 +956,8 @@ async fn do_infer(
     let mv = state.registry.get(&model_name, Some(&resolved_version))
         .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", model_name, resolved_version)))?;
 
-    // Rate limit check (before ensemble, after mv resolution)
+    // Policy checks (before ensemble, after mv resolution): auth first, then rate limit
+    enforce_auth(mv.policies.auth.as_ref(), &headers)?;
     enforce_rate_limit(&state, mv.policies.rate_limit.as_ref(), &model_name, &headers).await?;
 
     // Handle ensemble
@@ -1669,8 +1698,9 @@ async fn sse_infer_entry(
             model_name, resolved_version
         )));
     }
-    // Rate limit (shares the /predict bucket with unary infer).
+    // Auth + rate limit (rate limit shares the /predict bucket with unary infer).
     if let Some(mv) = state.registry.get(model_name, Some(&resolved_version)) {
+        enforce_auth(mv.policies.auth.as_ref(), &headers)?;
         enforce_rate_limit(state, mv.policies.rate_limit.as_ref(), model_name, &headers).await?;
     }
     let sse = sse_infer_impl(
@@ -1840,14 +1870,15 @@ async fn handle_ws_stream(
     // headers are preserved (including the peer_ip_fallback-injected x-real-ip
     // for direct connections), so key="ip" limits per real client.
     if let Some(mv) = state.registry.get(&model_name, Some(&resolved_version)) {
-        if enforce_rate_limit(
-            &state,
-            mv.policies.rate_limit.as_ref(),
-            &model_name,
-            &headers,
-        )
-        .await
-        .is_err()
+        if enforce_auth(mv.policies.auth.as_ref(), &headers).is_err()
+            || enforce_rate_limit(
+                &state,
+                mv.policies.rate_limit.as_ref(),
+                &model_name,
+                &headers,
+            )
+            .await
+            .is_err()
         {
             let _ = socket
                 .send(Message::Text(
@@ -3393,7 +3424,7 @@ mod version_routing_tests {
     async fn versioned_options_uses_hit_version_cors_policy() {
         // §4.4: a versioned route's OPTIONS preflight must answer with that
         // version's CORS policy, not the active version's.
-        use crate::worker::protocol::{CorsPolicy, ModelPolicies};
+        use crate::config::{CorsPolicy, ModelPolicies};
         let state = test_state();
         register_ready(&state, "m", &["1", "2"]);
         state.registry.activate_version("m", "1").unwrap();
@@ -3694,5 +3725,69 @@ mod scan_repository_ensemble_tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+}
+
+#[cfg(test)]
+mod auth_policy_tests {
+    use super::*;
+    use crate::config::AuthPolicy;
+
+    fn policy(keys: &[&str]) -> AuthPolicy {
+        AuthPolicy {
+            header: "X-API-Key".to_string(),
+            keys: keys.iter().map(|k| k.to_string()).collect(),
+        }
+    }
+
+    fn headers_with(key: &str, value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::HeaderName::from_bytes(key.as_bytes()).unwrap(),
+            axum::http::HeaderValue::from_str(value).unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn test_no_policy_passes() {
+        assert!(enforce_auth(None, &HeaderMap::new()).is_ok());
+    }
+
+    #[test]
+    fn test_missing_header_rejected() {
+        let err = enforce_auth(Some(&policy(&["sk-a"])), &HeaderMap::new()).unwrap_err();
+        assert!(matches!(err, AppError::Unauthorized(_)));
+        assert!(err.to_string().contains("missing API key"));
+    }
+
+    #[test]
+    fn test_wrong_key_rejected() {
+        let h = headers_with("x-api-key", "sk-wrong");
+        let err = enforce_auth(Some(&policy(&["sk-a"])), &h).unwrap_err();
+        assert!(err.to_string().contains("invalid API key"));
+    }
+
+    #[test]
+    fn test_correct_key_passes() {
+        let h = headers_with("X-API-Key", "sk-a");
+        assert!(enforce_auth(Some(&policy(&["sk-a", "sk-b"])), &h).is_ok());
+    }
+
+    #[test]
+    fn test_empty_keys_accepts_any_nonempty() {
+        let h = headers_with("x-api-key", "anything");
+        assert!(enforce_auth(Some(&policy(&[])), &h).is_ok());
+        assert!(enforce_auth(Some(&policy(&[])), &HeaderMap::new()).is_err());
+    }
+
+    #[test]
+    fn test_custom_header_name_case_insensitive() {
+        let p = AuthPolicy {
+            header: "Authorization".to_string(),
+            keys: vec!["tok".to_string()],
+        };
+        let h = headers_with("authorization", "tok");
+        assert!(enforce_auth(Some(&p), &h).is_ok());
     }
 }

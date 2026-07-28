@@ -13,10 +13,6 @@ import pytest
 from lite_server.api import LitAPI
 from lite_server.callbacks import (
     Callback,
-    Cors,
-    LogRequests,
-    RateLimit,
-    RequireApiKey,
 )
 from lite_server.context import RequestContext, RequestMeta, Headers
 from lite_server.exceptions import BadRequestError, HTTPException
@@ -1110,14 +1106,9 @@ class TestForRoute:
         assert pipe.lit_api is None
         assert len(pipe.callbacks) == 1
 
-    def test_accepts_builtin_callbacks(self):
-        pipe = Pipeline.for_route([
-            RequireApiKey(keys=["sk-123"]),
-            RateLimit(requests_per_minute=60),
-            LogRequests(),
-            Cors(),
-        ])
-        assert len(pipe.callbacks) == 4
+    def test_accepts_multiple_callbacks(self):
+        pipe = Pipeline.for_route([Callback(), Callback()])
+        assert len(pipe.callbacks) == 2
 
 
 # ---------------------------------------------------------------------------

@@ -120,8 +120,6 @@ pub struct WorkerStartup {
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metric_specs: Option<Vec<MetricSpec>>,
-    #[serde(default)]
-    pub policies: Option<ModelPolicies>,
     /// Custom `@route` declarations emitted by the Python worker at handshake
     /// (phase 2). Empty list when the model declares no routes.
     #[serde(default)]
@@ -174,64 +172,6 @@ pub fn convert_path_params(route: &str) -> String {
         }
     }
     result
-}
-
-// ===== Policy structures (Python → Rust handshake) =====
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RateLimitPolicy {
-    pub requests_per_minute: f64,
-    #[serde(default = "default_rl_key")]
-    pub key: String, // "route" | "ip"
-    #[serde(default)]
-    pub burst: Option<f64>, // None → 1.5× rpm
-}
-
-fn default_rl_key() -> String {
-    "route".into()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CorsPolicy {
-    pub allow_origins: Vec<String>,
-    pub allow_methods: Vec<String>,
-    pub allow_headers: Vec<String>,
-}
-
-impl CorsPolicy {
-    /// Pre-built header map for attaching to responses. Built once at policy
-    /// ingest (B9) and Arc-shared per request, avoiding a per-response
-    /// `String::join` + `HeaderValue::from_str` round on the hot path.
-    /// C12: invalid header values are skipped with a warning instead of
-    /// silently dropped.
-    pub fn header_map(&self) -> axum::http::HeaderMap {
-        use axum::http::{HeaderMap, HeaderName, HeaderValue};
-        let mut headers = HeaderMap::new();
-        for (name, values) in [
-            ("access-control-allow-origin", &self.allow_origins),
-            ("access-control-allow-methods", &self.allow_methods),
-            ("access-control-allow-headers", &self.allow_headers),
-        ] {
-            match HeaderValue::from_str(&values.join(", ")) {
-                Ok(v) => {
-                    headers.insert(HeaderName::from_static(name), v);
-                }
-                Err(_) => tracing::warn!(
-                    header = name,
-                    "invalid CORS header value — skipped"
-                ),
-            }
-        }
-        headers
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ModelPolicies {
-    #[serde(default)]
-    pub rate_limit: Option<RateLimitPolicy>,
-    #[serde(default)]
-    pub cors: Option<CorsPolicy>,
 }
 
 #[cfg(test)]
@@ -346,47 +286,6 @@ mod tests {
         assert_eq!(startup.status, "ready");
         assert_eq!(startup.worker_id, 1);
         assert!(startup.metric_specs.is_none());
-    }
-
-    // ===== CorsPolicy::header_map (B9 / C12) =====
-
-    #[test]
-    fn test_cors_policy_header_map_builds_three_headers() {
-        let policy = CorsPolicy {
-            allow_origins: vec!["https://a.com".into(), "https://b.com".into()],
-            allow_methods: vec!["GET".into(), "POST".into()],
-            allow_headers: vec!["content-type".into(), "authorization".into()],
-        };
-        let hm = policy.header_map();
-        assert_eq!(
-            hm.get("access-control-allow-origin").unwrap(),
-            "https://a.com, https://b.com"
-        );
-        assert_eq!(
-            hm.get("access-control-allow-methods").unwrap(),
-            "GET, POST"
-        );
-        assert_eq!(
-            hm.get("access-control-allow-headers").unwrap(),
-            "content-type, authorization"
-        );
-    }
-
-    #[test]
-    fn test_cors_policy_header_map_skips_invalid_value() {
-        // C12: an invalid header value is skipped (and warned); the others survive.
-        let policy = CorsPolicy {
-            allow_origins: vec!["\0bad".into()], // NUL → invalid HeaderValue
-            allow_methods: vec!["GET".into()],
-            allow_headers: vec!["x-trace".into()],
-        };
-        let hm = policy.header_map();
-        assert!(
-            hm.get("access-control-allow-origin").is_none(),
-            "invalid origin must be skipped"
-        );
-        assert_eq!(hm.get("access-control-allow-methods").unwrap(), "GET");
-        assert_eq!(hm.get("access-control-allow-headers").unwrap(), "x-trace");
     }
 
     // ===== convert_path_params (C10) =====

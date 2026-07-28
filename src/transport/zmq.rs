@@ -11,7 +11,7 @@ use tracing::{error, info, warn};
 /// caller has no timeout of its own (e.g. request_timeout disabled). Must be
 /// large enough to never silently cap a user-configured request_timeout —
 /// callers with a configured timeout use [`WorkerZmqClient::send_with_timeout`]
-/// instead. Health checks / heartbeats wrap `send` with their own shorter
+/// instead. Health checks wrap `send` with their own shorter
 /// outer timeouts and are unaffected by this value.
 pub(crate) const ZMQ_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 const STREAM_CHANNEL_SIZE: usize = 64;

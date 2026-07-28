@@ -43,7 +43,6 @@ def _render_config_yaml() -> str:
         "",
         "# ===== Queue & Timeout =====",
         "# max_queue_size: 1000       # Max pending requests per worker",
-        "# queue_mode: per_worker     # per_worker | shared",
         "request_timeout: 30.0        # 0 = no limit (not recommended for production)",
         "",
         "# ===== Lifecycle =====",
@@ -86,11 +85,9 @@ CONFIG_YAML_EXAMPLE = textwrap.dedent("""\
 
     # ===== Streaming =====
     # stream: false                # Enable streaming output (requires stream_predict in model.py)
-    # bidirectional: false         # Enable bidirectional streaming (WebSocket)
 
     # ===== Continuous Batching (LLM) =====
     # continuous_batching: false   # Enable continuous batching mode
-    # max_sequence_length: 2048    # Max sequence length for continuous batching
 
     # ===== Resource Allocation =====
     # accelerator: null            # Accelerator type: cpu, cuda, mps, tpu, auto (null = cpu)
@@ -99,7 +96,6 @@ CONFIG_YAML_EXAMPLE = textwrap.dedent("""\
 
     # ===== Queue & Timeout =====
     # max_queue_size: 1000         # Max pending requests per worker
-    # queue_mode: per_worker       # Queue mode: per_worker or shared
     # request_timeout: 0.0         # Per-request hard timeout in seconds (0 = disabled)
     # max_requests: 0              # Auto-restart worker after N requests (0 = disabled)
     # max_requests_jitter: 0       # Random jitter for max_requests (prevents thundering herd)
@@ -112,13 +108,9 @@ CONFIG_YAML_EXAMPLE = textwrap.dedent("""\
     # ejection_max_percent: 50      # Max % of workers that may be ejected at once (1-100)
     # startup_timeout: 60.0         # Max seconds to wait for a worker "ready" handshake
     # health_check_timeout: 5.0     # Seconds per health-check probe before timing out
+    # health_check_kill_threshold: 0 # Consecutive probe failures before kill + respawn (0 = never)
     # worker_kill_timeout: 10.0     # Seconds to wait for the OS to reap a killed worker
     # hook_http_timeout: 5.0        # Seconds for a worker lifecycle HTTP hook request
-
-    # ===== Heartbeat (Worker Liveness) =====
-    # heartbeat_interval: 0.0     # Heartbeat probe interval in seconds (0 = disabled)
-    # heartbeat_timeout: 5.0      # Max seconds to wait for a probe response
-    # heartbeat_max_failures: 3   # Consecutive failures before killing the worker
 
     # ===== Worker Lifecycle Hooks =====
     # hooks:
@@ -140,7 +132,13 @@ CONFIG_YAML_EXAMPLE = textwrap.dedent("""\
     # hot_reload: false            # Enable file watching for hot reload
     # hot_reload_patterns:         # Glob patterns to watch (e.g., *.py, model_*.yaml)
     #   - "*.py"
-    # hot_reload_interval: 1.0     # Polling interval in seconds
+
+    # ===== Policies (enforced by the Rust server) =====
+    # policies:
+    #   auth: { header: "X-API-Key", keys: ["${API_KEYS}"] }  # ${VAR} = env var
+    #   rate_limit: { requests_per_minute: 60, key: ip, burst: 100 }
+    #   cors: { allow_origins: ["*"], allow_methods: ["POST"], allow_headers: ["content-type"] }
+    #   request_log: {}
 
     # ===== Callbacks (Inference Pipeline) =====
     # List of fully-qualified Callback subclass paths.  Each class must be
@@ -250,10 +248,11 @@ CALLBACKS_PY = textwrap.dedent('''\
 
     You can also declare callbacks directly on your LitAPI class::
 
-        from lite_server import LitAPI, RequireApiKey
+        from lite_server import LitAPI
+        from callbacks import AuditLogger
 
         class MyAPI(LitAPI):
-            callbacks = (RequireApiKey(keys=["sk-xxx"]),)
+            callbacks = (AuditLogger(),)
     """
     import time
 

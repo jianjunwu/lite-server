@@ -309,6 +309,39 @@ class AuditLogger(Callback):
         print(f"[AUDIT] model torn down, total handled: {lit_api.call_count}")
 ```
 
+### Policies
+
+Auth, rate limiting, CORS, and access logging are HTTP-layer concerns. They
+are declared per model in `config.yaml` and enforced by the Rust server
+(scoped to each model version):
+
+```yaml
+# model_repo/my_model/1/config.yaml
+policies:
+  # API-key auth: reads the X-API-Key header by default; empty keys = any
+  # non-empty value passes. ${VAR} entries are read from the environment —
+  # an unset variable fails the config load (fail-closed).
+  auth: { header: "X-API-Key", keys: ["${API_KEYS}"] }
+
+  # Rate limit: key="route" shares one bucket per route, key="ip" limits per client IP
+  rate_limit: { requests_per_minute: 60, key: ip, burst: 100 }
+
+  # CORS
+  cors:
+    allow_origins: ["https://example.com"]
+    allow_methods: ["GET", "POST"]
+    allow_headers: ["Content-Type", "Authorization"]
+
+  # Access log (method, path, status, elapsed — including rejections)
+  request_log: {}
+```
+
+> Since 0.7.6, the four Python policy callbacks (`RequireApiKey`, `Cors`,
+> `RateLimit`, `LogRequests`) are removed — they duplicated the Rust-side
+> enforcement, and per-worker declaration had a last-declaration-wins
+> consistency hazard. Referencing them in a `callbacks:` list is a load-time
+> error with migration instructions.
+
 ### Callback vs LitAPI Inline Hooks
 
 | Aspect | `Callback` | `LitAPI.on_request` / `on_response` |
@@ -462,7 +495,6 @@ For LLM workloads, enable continuous batching to process multiple sequences simu
 ```yaml
 # config.yaml
 continuous_batching: true
-max_sequence_length: 4096
 ```
 
 Implement three hooks:
@@ -577,11 +609,8 @@ class ASRModel(LitAPI):
         return Handler()
 ```
 
-Enable in config:
-
-```yaml
-bidirectional: true
-```
+Implementing ``bidi_stream()`` is all that's needed — sessions are detected
+from the method itself and served over gRPC; no config flag is required.
 
 > **Note:** During a bidi session, ``ctx.request`` and ``ctx.input`` in hooks
 > always hold the original open payload — they do not change as individual

@@ -1,12 +1,80 @@
 use crate::http::handlers::*;
 use crate::http::state::AppState;
 use axum::{
-    routing::{delete, get, post, put},
     Router,
+    extract::{Request, State},
+    middleware::Next,
+    response::Response,
+    routing::{delete, get, post, put},
 };
 use std::sync::Arc;
+use std::time::Instant;
+use tracing::info;
+
+/// Resolve the (model, version) an inference-path request targets, or None
+/// for non-model paths and model-scoped admin leaves (ready/health/routing/
+/// activate/compare/versions CRUD). Custom @route tails resolve to the active
+/// version — the fallback handler does the real matching.
+fn access_log_target(path: &str) -> Option<(&str, Option<&str>)> {
+    let rest = path.strip_prefix("/v2/models/")?;
+    let mut segs = rest.split('/');
+    let model = segs.next()?;
+    if model.is_empty() {
+        return None;
+    }
+    let segs: Vec<&str> = segs.collect();
+    match segs.as_slice() {
+        [] => None,
+        ["infer" | "events" | "stream"] => Some((model, None)),
+        ["versions", v, "infer" | "events" | "stream"] if !v.is_empty() => Some((model, Some(v))),
+        ["versions", ..] => None,
+        ["ready" | "health" | "routing" | "activate" | "compare"] => None,
+        // Anything else under /v2/models/{m}/ is a custom @route tail.
+        _ => Some((model, None)),
+    }
+}
+
+/// Per-model access log (policies.request_log): logs method, path, status and
+/// elapsed time for inference-path requests — including rejections, mirroring
+/// the retired Python LogRequests callback.
+async fn access_log_middleware(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some((model, version)) = access_log_target(request.uri().path()) else {
+        return next.run(request).await;
+    };
+    let resolved = match version {
+        Some(v) => Some(v.to_string()),
+        None => state.registry.get_active_version(model),
+    };
+    let enabled = resolved
+        .as_deref()
+        .and_then(|v| state.registry.get(model, Some(v)))
+        .map(|mv| mv.policies.request_log.is_some())
+        .unwrap_or(false);
+    if !enabled {
+        return next.run(request).await;
+    }
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let model = model.to_string();
+    let start = Instant::now();
+    let response = next.run(request).await;
+    info!(
+        model = %model,
+        method = %method,
+        path = %path,
+        status = response.status().as_u16(),
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "access"
+    );
+    response
+}
 
 pub fn create_routes(state: AppState) -> Router {
+    let shared = Arc::new(state);
     let mut router = Router::new();
 
     // Built-in health probes (phase 3) — fixed HTTP-layer endpoints, not
@@ -82,5 +150,50 @@ pub fn create_routes(state: AppState) -> Router {
         .fallback(crate::http::route_fallback)
         .method_not_allowed_fallback(crate::http::method_not_allowed_fallback);
 
-    router.with_state(Arc::new(state))
+    router
+        .layer(axum::middleware::from_fn_with_state(
+            shared.clone(),
+            access_log_middleware,
+        ))
+        .with_state(shared)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::access_log_target;
+
+    #[test]
+    fn test_access_log_target_inference_endpoints() {
+        assert_eq!(access_log_target("/v2/models/m/infer"), Some(("m", None)));
+        assert_eq!(access_log_target("/v2/models/m/events"), Some(("m", None)));
+        assert_eq!(access_log_target("/v2/models/m/stream"), Some(("m", None)));
+        assert_eq!(
+            access_log_target("/v2/models/m/versions/2/infer"),
+            Some(("m", Some("2")))
+        );
+        assert_eq!(
+            access_log_target("/v2/models/m/versions/2/events"),
+            Some(("m", Some("2")))
+        );
+    }
+
+    #[test]
+    fn test_access_log_target_skips_admin_and_non_model_paths() {
+        assert_eq!(access_log_target("/v2/models/m/ready"), None);
+        assert_eq!(access_log_target("/v2/models/m/health"), None);
+        assert_eq!(access_log_target("/v2/models/m/routing"), None);
+        assert_eq!(access_log_target("/v2/models/m/versions"), None);
+        assert_eq!(access_log_target("/v2/models/m/versions/2/ready"), None);
+        assert_eq!(access_log_target("/v2/repository/index"), None);
+        assert_eq!(access_log_target("/health"), None);
+        assert_eq!(access_log_target("/v2/models/"), None);
+    }
+
+    #[test]
+    fn test_access_log_target_custom_route_tails() {
+        // Custom @route declarations fall through to the fallback handler;
+        // they belong to the model pipeline and are logged (active version).
+        assert_eq!(access_log_target("/v2/models/m/summarize"), Some(("m", None)));
+        assert_eq!(access_log_target("/v2/models/m/a/b"), Some(("m", None)));
+    }
 }

@@ -82,7 +82,7 @@ pub struct ModelVersion {
     #[serde(default)]
     pub weight: u32,
     #[serde(default)]
-    pub policies: crate::worker::protocol::ModelPolicies,
+    pub policies: crate::config::ModelPolicies,
     /// Pre-built CORS header map, cached at policy ingest (B9) so responses
     /// avoid a per-request `String::join` + `HeaderValue::from_str` round.
     /// `#[serde(skip)]`: a Rust-side cache, never serialized over the wire.

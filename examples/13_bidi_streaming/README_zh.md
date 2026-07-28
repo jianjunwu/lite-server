@@ -41,4 +41,4 @@ close : {"final": "hello world test", "is_final": true, "buffer": ["hello", "wor
 
 - 如何实现 `BidiStreamHandler` 的 `on_open`、`on_chunk`、`on_close`
 - 如何在 `bidi_stream()` 中返回 handler 实例
-- 配置模式：在 config.yaml 中设置 `bidirectional: true` 和 `stream: true`
+- bidi 会话由 `bidi_stream()` 方法自动检测，无需配置项

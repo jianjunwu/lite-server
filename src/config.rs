@@ -13,7 +13,7 @@ pub struct Config {
     pub features: FeaturesConfig,
     pub orchestration: OrchestrationConfig,
     /// CLI-provided defaults that override per-model config when set.
-    pub model_defaults: ModelDefaults,
+    pub model_defaults: ModelTunables,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,11 +193,13 @@ impl Default for OrchestrationConfig {
     }
 }
 
-/// CLI-level defaults for model parameters.  When set (Some), these override
-/// the per-model config.yaml values for every loaded model.
+/// Per-model tunables as optional overrides — the single definition shared by
+/// `Config::model_defaults` (config.yaml) and `CliOverrides::tunables` (CLI).
+/// Adding a tunable touches: one field here, one line in apply_to, one line
+/// in merge_from, plus the resolved field in ModelConfig.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
-pub struct ModelDefaults {
+pub struct ModelTunables {
     pub max_queue_size: Option<usize>,
     pub max_requests: Option<usize>,
     /// Jitter range for max_requests to prevent thundering herd on worker recycle.
@@ -211,11 +213,13 @@ pub struct ModelDefaults {
     pub max_retries: Option<usize>,
     pub startup_timeout: Option<f32>,
     pub health_check_timeout: Option<f32>,
+    /// Consecutive health-probe failures before killing + respawning the worker.
+    pub health_check_kill_threshold: Option<usize>,
     pub worker_kill_timeout: Option<f32>,
     pub hook_http_timeout: Option<f32>,
 }
 
-impl ModelDefaults {
+impl ModelTunables {
     /// Apply these defaults to a ModelConfig (per-model at load time).
     pub fn apply_to(&self, model: &mut ModelConfig) {
         if let Some(v) = self.max_queue_size {
@@ -251,12 +255,34 @@ impl ModelDefaults {
         if let Some(v) = self.health_check_timeout {
             model.health_check_timeout = v;
         }
+        if let Some(v) = self.health_check_kill_threshold {
+            model.health_check_kill_threshold = v;
+        }
         if let Some(v) = self.worker_kill_timeout {
             model.worker_kill_timeout = v;
         }
         if let Some(v) = self.hook_http_timeout {
             model.hooks.hook_http_timeout = v;
         }
+    }
+
+    /// Overlay fields set in `other` on top of `self` (CLI overrides win over
+    /// config.yaml model_defaults).
+    pub fn merge_from(&mut self, other: &ModelTunables) {
+        if other.max_queue_size.is_some() { self.max_queue_size = other.max_queue_size; }
+        if other.max_requests.is_some() { self.max_requests = other.max_requests; }
+        if other.max_requests_jitter.is_some() { self.max_requests_jitter = other.max_requests_jitter; }
+        if other.request_timeout.is_some() { self.request_timeout = other.request_timeout; }
+        if other.health_check_interval.is_some() { self.health_check_interval = other.health_check_interval; }
+        if other.ejection_error_threshold.is_some() { self.ejection_error_threshold = other.ejection_error_threshold; }
+        if other.ejection_timeout.is_some() { self.ejection_timeout = other.ejection_timeout; }
+        if other.ejection_max_percent.is_some() { self.ejection_max_percent = other.ejection_max_percent; }
+        if other.max_retries.is_some() { self.max_retries = other.max_retries; }
+        if other.startup_timeout.is_some() { self.startup_timeout = other.startup_timeout; }
+        if other.health_check_timeout.is_some() { self.health_check_timeout = other.health_check_timeout; }
+        if other.health_check_kill_threshold.is_some() { self.health_check_kill_threshold = other.health_check_kill_threshold; }
+        if other.worker_kill_timeout.is_some() { self.worker_kill_timeout = other.worker_kill_timeout; }
+        if other.hook_http_timeout.is_some() { self.hook_http_timeout = other.hook_http_timeout; }
     }
 }
 
@@ -328,6 +354,97 @@ impl Default for WorkerHooksConfig {
     }
 }
 
+// ===== Per-model policies (declared in model config.yaml, enforced by Rust) =====
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitPolicy {
+    pub requests_per_minute: f64,
+    #[serde(default = "default_rl_key")]
+    pub key: String, // "route" | "ip"
+    #[serde(default)]
+    pub burst: Option<f64>, // None → 1.5× rpm
+}
+
+fn default_rl_key() -> String {
+    "route".into()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CorsPolicy {
+    pub allow_origins: Vec<String>,
+    pub allow_methods: Vec<String>,
+    pub allow_headers: Vec<String>,
+}
+
+impl CorsPolicy {
+    /// Pre-built header map for attaching to responses. Built once at policy
+    /// ingest (B9) and Arc-shared per request, avoiding a per-response
+    /// `String::join` + `HeaderValue::from_str` round on the hot path.
+    /// C12: invalid header values are skipped with a warning instead of
+    /// silently dropped.
+    pub fn header_map(&self) -> axum::http::HeaderMap {
+        use axum::http::{HeaderMap, HeaderName, HeaderValue};
+        let mut headers = HeaderMap::new();
+        for (name, values) in [
+            ("access-control-allow-origin", &self.allow_origins),
+            ("access-control-allow-methods", &self.allow_methods),
+            ("access-control-allow-headers", &self.allow_headers),
+        ] {
+            match HeaderValue::from_str(&values.join(", ")) {
+                Ok(v) => {
+                    headers.insert(HeaderName::from_static(name), v);
+                }
+                Err(_) => tracing::warn!(
+                    header = name,
+                    "invalid CORS header value — skipped"
+                ),
+            }
+        }
+        headers
+    }
+}
+
+fn default_auth_header() -> String {
+    "X-API-Key".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthPolicy {
+    /// Header carrying the API key.
+    #[serde(default = "default_auth_header")]
+    pub header: String,
+    /// Allowed keys. Empty = any non-empty value passes. Entries of the form
+    /// `${VAR}` are expanded from the environment at config load; an unset
+    /// variable fails the load (fail-closed).
+    #[serde(default)]
+    pub keys: Vec<String>,
+}
+
+/// Presence enables per-request access logging for the model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestLogPolicy {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelPolicies {
+    pub rate_limit: Option<RateLimitPolicy>,
+    pub cors: Option<CorsPolicy>,
+    pub auth: Option<AuthPolicy>,
+    pub request_log: Option<RequestLogPolicy>,
+}
+
+impl ModelPolicies {
+    /// True when no policy is configured at all.
+    pub fn is_empty(&self) -> bool {
+        self.rate_limit.is_none()
+            && self.cors.is_none()
+            && self.auth.is_none()
+            && self.request_log.is_none()
+    }
+}
+
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelConfig {
@@ -335,17 +452,13 @@ pub struct ModelConfig {
     pub max_batch_size: usize,
     pub batch_timeout: f32,
     pub stream: bool,
-    pub bidirectional: bool,
     pub continuous_batching: bool,
-    pub max_sequence_length: usize,
     pub accelerator: Option<String>,
     pub devices: Option<serde_json::Value>,
     pub workers_per_device: Option<usize>,
     pub max_queue_size: usize,
-    pub queue_mode: String,
     pub hot_reload: bool,
     pub hot_reload_patterns: Vec<String>,
-    pub hot_reload_interval: f32,
     pub adaptive_batching: bool,
     pub min_batch_timeout: f32,
     pub adaptive_queue_threshold: usize,
@@ -359,12 +472,9 @@ pub struct ModelConfig {
     pub health_check_interval: f32,
     /// Worker lifecycle hooks (shell commands and HTTP callbacks).
     pub hooks: WorkerHooksConfig,
-    /// Heartbeat probe interval in seconds. 0 = disabled.
-    pub heartbeat_interval: f32,
-    /// Heartbeat timeout in seconds — max time to wait for a probe response.
-    pub heartbeat_timeout: f32,
-    /// Consecutive heartbeat failures before killing the worker.
-    pub heartbeat_max_failures: usize,
+    /// Per-model policies (rate limit / CORS / auth / request log), enforced
+    /// by the Rust HTTP/gRPC layer.
+    pub policies: ModelPolicies,
     // ===== Worker resilience (§3 — configurable, defaults preserve prior behavior) =====
     /// Consecutive errors before a worker is ejected. 0 = never eject.
     pub ejection_error_threshold: usize,
@@ -378,6 +488,9 @@ pub struct ModelConfig {
     pub startup_timeout: f32,
     /// Seconds per health-check probe before timing out.
     pub health_check_timeout: f32,
+    /// Consecutive health-probe failures before killing + respawning the
+    /// worker. 0 = never kill (ejection-only). Requires health_check_interval > 0.
+    pub health_check_kill_threshold: usize,
     /// Seconds to wait for the OS to reap a killed worker process.
     pub worker_kill_timeout: f32,
 }
@@ -389,17 +502,13 @@ impl Default for ModelConfig {
             max_batch_size: 1,
             batch_timeout: 0.0,
             stream: false,
-            bidirectional: false,
             continuous_batching: false,
-            max_sequence_length: 2048,
             accelerator: None,
             devices: None,
             workers_per_device: None,
             max_queue_size: 1000,
-            queue_mode: "per_worker".to_string(),
             hot_reload: false,
             hot_reload_patterns: vec!["*.py".to_string()],
-            hot_reload_interval: 1.0,
             adaptive_batching: false,
             min_batch_timeout: 0.001,
             adaptive_queue_threshold: 10,
@@ -408,15 +517,14 @@ impl Default for ModelConfig {
             max_requests_jitter: 0,
             health_check_interval: 15.0,
             hooks: WorkerHooksConfig::default(),
-            heartbeat_interval: 0.0,
-            heartbeat_timeout: 5.0,
-            heartbeat_max_failures: 3,
+            policies: ModelPolicies::default(),
             ejection_error_threshold: 3,
             ejection_timeout: 30.0,
             ejection_max_percent: 50,
             max_retries: 3,
             startup_timeout: 60.0,
             health_check_timeout: 5.0,
+            health_check_kill_threshold: 0,
             worker_kill_timeout: 10.0,
         }
     }
@@ -438,8 +546,27 @@ pub fn load_model_config(path: &Path) -> anyhow::Result<ModelConfig> {
         return Ok(ModelConfig::default());
     }
     let content = std::fs::read_to_string(path)?;
-    let config: ModelConfig = serde_yaml::from_str(&content)?;
+    let mut config: ModelConfig = serde_yaml::from_str(&content)?;
+    expand_policy_env_vars(&mut config)?;
     Ok(config)
+}
+
+/// Expand `${VAR}` entries in `policies.auth.keys` from the environment.
+/// Fail-closed: an unset variable is a load error, never an empty key.
+fn expand_policy_env_vars(config: &mut ModelConfig) -> anyhow::Result<()> {
+    let Some(auth) = config.policies.auth.as_mut() else {
+        return Ok(());
+    };
+    for key in auth.keys.iter_mut() {
+        if let Some(var) = key.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
+            *key = std::env::var(var).map_err(|_| {
+                anyhow::anyhow!(
+                    "policies.auth.keys references ${{{var}}} but the variable is not set"
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Structural ensemble detection: true only when the config.yaml content has a
@@ -469,22 +596,10 @@ pub struct CliOverrides {
     pub no_grpc: bool,
     pub no_metrics: bool,
     pub no_streaming_metrics: bool,
-    pub max_queue_size: Option<usize>,
-    pub max_requests: Option<usize>,
-    pub max_requests_jitter: Option<usize>,
-    pub request_timeout: Option<f32>,
-    pub health_check_interval: Option<f32>,
     pub graceful_timeout: Option<f32>,
     pub keepalive_timeout: Option<f32>,
-    // Worker resilience overrides (§3).
-    pub ejection_error_threshold: Option<usize>,
-    pub ejection_timeout: Option<f32>,
-    pub ejection_max_percent: Option<usize>,
-    pub max_retries: Option<usize>,
-    pub startup_timeout: Option<f32>,
-    pub health_check_timeout: Option<f32>,
-    pub worker_kill_timeout: Option<f32>,
-    pub hook_http_timeout: Option<f32>,
+    /// Per-model tunables overridden via CLI flags.
+    pub tunables: ModelTunables,
 }
 
 impl Config {
@@ -532,46 +647,7 @@ impl Config {
         if cli.no_streaming_metrics {
             self.features.streaming_metrics = false;
         }
-        if let Some(v) = cli.max_queue_size {
-            self.model_defaults.max_queue_size = Some(v);
-        }
-        if let Some(v) = cli.max_requests {
-            self.model_defaults.max_requests = Some(v);
-        }
-        if let Some(v) = cli.max_requests_jitter {
-            self.model_defaults.max_requests_jitter = Some(v);
-        }
-        if let Some(v) = cli.request_timeout {
-            self.model_defaults.request_timeout = Some(v);
-        }
-        if let Some(v) = cli.health_check_interval {
-            self.model_defaults.health_check_interval = Some(v);
-        }
-        // Worker resilience (§3).
-        if let Some(v) = cli.ejection_error_threshold {
-            self.model_defaults.ejection_error_threshold = Some(v);
-        }
-        if let Some(v) = cli.ejection_timeout {
-            self.model_defaults.ejection_timeout = Some(v);
-        }
-        if let Some(v) = cli.ejection_max_percent {
-            self.model_defaults.ejection_max_percent = Some(v);
-        }
-        if let Some(v) = cli.max_retries {
-            self.model_defaults.max_retries = Some(v);
-        }
-        if let Some(v) = cli.startup_timeout {
-            self.model_defaults.startup_timeout = Some(v);
-        }
-        if let Some(v) = cli.health_check_timeout {
-            self.model_defaults.health_check_timeout = Some(v);
-        }
-        if let Some(v) = cli.worker_kill_timeout {
-            self.model_defaults.worker_kill_timeout = Some(v);
-        }
-        if let Some(v) = cli.hook_http_timeout {
-            self.model_defaults.hook_http_timeout = Some(v);
-        }
+        self.model_defaults.merge_from(&cli.tunables);
         if let Some(t) = cli.graceful_timeout {
             self.server.graceful_timeout = t;
         }
@@ -844,9 +920,12 @@ mod tests {
     fn test_apply_overrides_model_defaults() {
         let mut cfg = Config::default();
         let overrides = CliOverrides {
-            max_queue_size: Some(500),
-            max_requests: Some(10000),
-            request_timeout: Some(60.0),
+            tunables: ModelTunables {
+                max_queue_size: Some(500),
+                max_requests: Some(10000),
+                request_timeout: Some(60.0),
+                ..Default::default()
+            },
             ..Default::default()
         };
         cfg.apply_overrides(&overrides);
@@ -859,7 +938,7 @@ mod tests {
     #[test]
     fn test_apply_model_defaults_overrides_model_config() {
         let cfg = Config {
-            model_defaults: ModelDefaults {
+            model_defaults: ModelTunables {
                 max_queue_size: Some(200),
                 max_requests: Some(5000),
                 request_timeout: Some(45.0),
@@ -899,7 +978,7 @@ mod tests {
     #[test]
     fn test_model_defaults_yaml_roundtrip() {
         let cfg = Config {
-            model_defaults: ModelDefaults {
+            model_defaults: ModelTunables {
                 max_queue_size: Some(300),
                 max_requests: Some(8000),
                 request_timeout: Some(120.0),
@@ -935,7 +1014,10 @@ mod tests {
     fn test_apply_overrides_health_check_interval() {
         let mut cfg = Config::default();
         let overrides = CliOverrides {
-            health_check_interval: Some(30.0),
+            tunables: ModelTunables {
+                health_check_interval: Some(30.0),
+                ..Default::default()
+            },
             ..Default::default()
         };
         cfg.apply_overrides(&overrides);
@@ -943,9 +1025,49 @@ mod tests {
     }
 
     #[test]
+    fn test_model_tunables_merge_from_cli_wins() {
+        let mut yaml_defaults = ModelTunables {
+            max_queue_size: Some(100),
+            request_timeout: Some(30.0),
+            ..Default::default()
+        };
+        let cli = ModelTunables {
+            max_queue_size: Some(500),
+            ..Default::default()
+        };
+        yaml_defaults.merge_from(&cli);
+        assert_eq!(yaml_defaults.max_queue_size, Some(500), "CLI field wins");
+        assert_eq!(yaml_defaults.request_timeout, Some(30.0), "unset CLI field preserves YAML value");
+    }
+
+    #[test]
+    fn test_apply_overrides_merges_into_existing_model_defaults() {
+        // config.yaml model_defaults + CLI flags: CLI wins per-field, other
+        // YAML defaults survive.
+        let mut cfg = Config {
+            model_defaults: ModelTunables {
+                max_queue_size: Some(100),
+                max_retries: Some(5),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let overrides = CliOverrides {
+            tunables: ModelTunables {
+                max_queue_size: Some(500),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cfg.apply_overrides(&overrides);
+        assert_eq!(cfg.model_defaults.max_queue_size, Some(500));
+        assert_eq!(cfg.model_defaults.max_retries, Some(5));
+    }
+
+    #[test]
     fn test_apply_model_defaults_health_check_interval() {
         let cfg = Config {
-            model_defaults: ModelDefaults {
+            model_defaults: ModelTunables {
                 health_check_interval: Some(10.0),
                 ..Default::default()
             },
@@ -966,6 +1088,148 @@ mod tests {
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         let parsed: ModelConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.health_check_interval, 20.0);
+    }
+
+    // --- health_check_kill_threshold ---
+
+    #[test]
+    fn test_health_check_kill_threshold_default() {
+        let cfg = ModelConfig::default();
+        assert_eq!(cfg.health_check_kill_threshold, 0, "kill should be disabled by default");
+    }
+
+    #[test]
+    fn test_health_check_kill_threshold_yaml_roundtrip() {
+        let yaml = "health_check_kill_threshold: 5\n";
+        let cfg: ModelConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.health_check_kill_threshold, 5);
+    }
+
+    #[test]
+    fn test_apply_model_defaults_health_check_kill_threshold() {
+        let cfg = Config {
+            model_defaults: ModelTunables {
+                health_check_kill_threshold: Some(4),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut model = ModelConfig::default();
+        cfg.apply_model_defaults(&mut model);
+        assert_eq!(model.health_check_kill_threshold, 4);
+    }
+
+    // --- per-model policies ---
+
+    // ===== CorsPolicy::header_map (B9 / C12) =====
+
+    #[test]
+    fn test_cors_policy_header_map_builds_three_headers() {
+        let policy = CorsPolicy {
+            allow_origins: vec!["https://a.com".into(), "https://b.com".into()],
+            allow_methods: vec!["GET".into(), "POST".into()],
+            allow_headers: vec!["content-type".into(), "authorization".into()],
+        };
+        let hm = policy.header_map();
+        assert_eq!(
+            hm.get("access-control-allow-origin").unwrap(),
+            "https://a.com, https://b.com"
+        );
+        assert_eq!(
+            hm.get("access-control-allow-methods").unwrap(),
+            "GET, POST"
+        );
+        assert_eq!(
+            hm.get("access-control-allow-headers").unwrap(),
+            "content-type, authorization"
+        );
+    }
+
+    #[test]
+    fn test_cors_policy_header_map_skips_invalid_value() {
+        // C12: an invalid header value is skipped (and warned); the others survive.
+        let policy = CorsPolicy {
+            allow_origins: vec!["\0bad".into()], // NUL → invalid HeaderValue
+            allow_methods: vec!["GET".into()],
+            allow_headers: vec!["x-trace".into()],
+        };
+        let hm = policy.header_map();
+        assert!(
+            hm.get("access-control-allow-origin").is_none(),
+            "invalid origin must be skipped"
+        );
+        assert_eq!(hm.get("access-control-allow-methods").unwrap(), "GET");
+        assert_eq!(hm.get("access-control-allow-headers").unwrap(), "x-trace");
+    }
+
+
+    #[test]
+    fn test_policies_default_empty() {
+        let cfg = ModelConfig::default();
+        assert!(cfg.policies.is_empty());
+    }
+
+    #[test]
+    fn test_policies_yaml_roundtrip() {
+        let yaml = r#"
+name: m
+policies:
+  rate_limit: { requests_per_minute: 100, key: ip, burst: 20 }
+  cors:
+    allow_origins: ["https://app.example"]
+    allow_methods: ["POST"]
+    allow_headers: ["content-type"]
+  auth: { header: "Authorization", keys: ["sk-a", "sk-b"] }
+  request_log: {}
+"#;
+        let cfg: ModelConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!cfg.policies.is_empty());
+        let rl = cfg.policies.rate_limit.unwrap();
+        assert_eq!(rl.requests_per_minute, 100.0);
+        assert_eq!(rl.key, "ip");
+        assert_eq!(rl.burst, Some(20.0));
+        let cors = cfg.policies.cors.unwrap();
+        assert_eq!(cors.allow_origins, vec!["https://app.example"]);
+        let auth = cfg.policies.auth.unwrap();
+        assert_eq!(auth.header, "Authorization");
+        assert_eq!(auth.keys, vec!["sk-a", "sk-b"]);
+        assert!(cfg.policies.request_log.is_some());
+    }
+
+    #[test]
+    fn test_auth_policy_defaults() {
+        let yaml = "policies:\n  auth: {}\n";
+        let cfg: ModelConfig = serde_yaml::from_str(yaml).unwrap();
+        let auth = cfg.policies.auth.unwrap();
+        assert_eq!(auth.header, "X-API-Key");
+        assert!(auth.keys.is_empty(), "empty keys = any non-empty value passes");
+    }
+
+    #[test]
+    fn test_auth_keys_env_expansion() {
+        std::env::set_var("LITE_TEST_POLICY_KEY", "sk-from-env");
+        let dir = std::env::temp_dir().join("lite-server-policy-env-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, "policies:\n  auth:\n    keys: [\"${LITE_TEST_POLICY_KEY}\", \"sk-static\"]\n").unwrap();
+        let cfg = load_model_config(&path).unwrap();
+        let auth = cfg.policies.auth.unwrap();
+        assert_eq!(auth.keys, vec!["sk-from-env", "sk-static"]);
+        std::env::remove_var("LITE_TEST_POLICY_KEY");
+    }
+
+    #[test]
+    fn test_auth_keys_env_expansion_fail_closed() {
+        std::env::remove_var("LITE_TEST_POLICY_MISSING");
+        let dir = std::env::temp_dir().join("lite-server-policy-env-fail-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, "policies:\n  auth:\n    keys: [\"${LITE_TEST_POLICY_MISSING}\"]\n").unwrap();
+        let err = load_model_config(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("LITE_TEST_POLICY_MISSING"),
+            "error must name the missing variable: {err}"
+        );
     }
 
     // --- Unix socket path detection ---
@@ -1109,28 +1373,6 @@ mod tests {
         let yaml = r#"url: "http://localhost/hook""#;
         let parsed: HttpHookConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(parsed.method, "POST");
-    }
-
-    #[test]
-    fn test_heartbeat_config_defaults() {
-        let cfg = ModelConfig::default();
-        assert_eq!(cfg.heartbeat_interval, 0.0);
-        assert_eq!(cfg.heartbeat_timeout, 5.0);
-        assert_eq!(cfg.heartbeat_max_failures, 3);
-    }
-
-    #[test]
-    fn test_heartbeat_config_yaml_roundtrip() {
-        let yaml = r#"
-name: test
-heartbeat_interval: 10.0
-heartbeat_timeout: 3.0
-heartbeat_max_failures: 5
-"#;
-        let cfg: ModelConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(cfg.heartbeat_interval, 10.0);
-        assert_eq!(cfg.heartbeat_timeout, 3.0);
-        assert_eq!(cfg.heartbeat_max_failures, 5);
     }
 
     // --- rate_limit config (#7) ---

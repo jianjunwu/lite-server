@@ -43,4 +43,4 @@ close : {"final": "hello world test", "is_final": true, "buffer": ["hello", "wor
 
 - How to implement `BidiStreamHandler` with `on_open`, `on_chunk`, `on_close`
 - How to return `BidiStreamHandler` from `bidi_stream()`
-- Config pattern: `bidirectional: true` and `stream: true` in config.yaml
+- Bidi sessions are detected from `bidi_stream()` itself — no config flag needed

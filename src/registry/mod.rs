@@ -376,7 +376,7 @@ impl ModelRegistry {
         &self,
         model_name: &str,
         version: &str,
-        policies: Option<crate::worker::protocol::ModelPolicies>,
+        policies: Option<crate::config::ModelPolicies>,
     ) {
         if let Some(p) = policies {
             if let Some(mut entry) = self.models.get_mut(model_name) {
