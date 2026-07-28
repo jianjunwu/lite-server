@@ -129,9 +129,17 @@ CONFIG_YAML_EXAMPLE = textwrap.dedent("""\
     #     method: POST
 
     # ===== Hot Reload =====
+    # Watches files of ALREADY-LOADED versions. On a matching change the
+    # workers restart — or refresh in-process without a restart when
+    # model.py defines on_file_changed (see the example in model.py).
     # hot_reload: false            # Enable file watching for hot reload
     # hot_reload_patterns:         # Glob patterns to watch (e.g., *.py, model_*.yaml)
     #   - "*.py"
+    # Scope note: with control_mode=auto (server.yaml), adding/removing
+    # version directories is handled by the server's reconcile task, not by
+    # hot_reload. Auto-LOADING new version directories under hot_reload with
+    # a non-auto control_mode is deprecated — load via the Admin API or use
+    # control_mode=auto.
 
     # ===== Policies (enforced by the Rust server) =====
     # policies:

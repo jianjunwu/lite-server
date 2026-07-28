@@ -56,3 +56,19 @@ class MyAPI(LitAPI):
             )
         """
         return {"result": output}
+
+    # ----- Optional: hot-reload hook (needs hot_reload: true in config.yaml)
+    # Uncomment to refresh artifacts IN-PROCESS when watched files change,
+    # instead of paying a full worker restart (weights stay loaded).
+    #
+    # Return any non-None value to mark the change handled; returning None
+    # (or raising) makes the server restart the worker as before.  The hook
+    # runs synchronously on the worker event loop — heavy refreshes block
+    # inference, and refreshing state while requests are in flight is your
+    # responsibility.
+    #
+    # def on_file_changed(self, changed_files: list[str]):
+    #     for path in changed_files:
+    #         if path.endswith("weights.pt"):
+    #             self.model = load_weights(path)
+    #     return "handled"

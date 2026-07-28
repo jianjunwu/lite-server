@@ -343,3 +343,27 @@ class TestCallbacksPy:
         text = (root / "model_repo" / "my_model" / "1" / "callbacks.py").read_text()
         compile(text, "callbacks.py", "exec")
         assert "Callback" in text
+
+
+class TestHotReloadTemplateContent:
+    """Generated templates reflect the reconcile + FILE_CHANGED semantics:
+    hot_reload restarts/refreshes already-loaded versions (on_file_changed
+    hook for in-process refresh); version-dir lifecycle belongs to the
+    reconciler; manual-mode auto-load is deprecated."""
+
+    def _example(self, tmp_path):
+        gen = ProjectGenerator("myproj", tmp_path)
+        root = gen.generate()
+        return (root / "model_repo" / "my_model" / "1" / "config.yaml.example").read_text()
+
+    def test_config_example_mentions_on_file_changed_hook(self, tmp_path):
+        assert "on_file_changed" in self._example(tmp_path)
+
+    def test_config_example_notes_deprecated_manual_autoload(self, tmp_path):
+        assert "deprecated" in self._example(tmp_path).lower()
+
+    def test_model_py_shows_on_file_changed_example(self, tmp_path):
+        gen = ProjectGenerator("myproj", tmp_path)
+        root = gen.generate()
+        model_py = (root / "model_repo" / "my_model" / "1" / "model.py").read_text()
+        assert "on_file_changed" in model_py
