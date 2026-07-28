@@ -155,8 +155,10 @@ impl LiteServer {
         // Start respawn listener for health-check-kill-triggered worker restarts
         self.worker_manager.start_respawn_listener().await;
 
-        // Load initial models
-        self.load_initial_models().await?;
+        // Load initial models; the returned seen_lma set is handed to the
+        // reconcile task so .lma artifacts unpacked at startup are not
+        // re-unpacked (i.e. overwritten) on the first reconcile tick.
+        let seen_lma = self.load_initial_models().await?;
 
         // Fire ServerStart callbacks
         self.callback_runner.on_server_start(&ServerContext {
@@ -239,7 +241,10 @@ impl LiteServer {
             }
         });
 
-        // P2: Start hot reload watcher with on-demand flag
+        // P2: Start hot reload watcher. In auto mode events are always
+        // forwarded — directory-level events feed the reconcile task even
+        // when no loaded model has hot_reload enabled.
+        let auto_mode = self.config.orchestration.control_mode == "auto";
         let (watch_tx, mut watch_rx) = mpsc::channel::<Vec<PathBuf>>(32);
         let has_hot_reload_for_watcher = has_hot_reload.clone();
         let watcher_handle = tokio::spawn(start_file_watcher(
@@ -247,21 +252,28 @@ impl LiteServer {
             self.worker_manager.clone(),
             watch_tx,
             has_hot_reload_for_watcher,
+            auto_mode,
         ));
 
-        // Start model poller for control_mode = "auto": periodically
-        // reconciles the registry with the repo (new versions discovered,
-        // removed versions unloaded).
-        let poller_handle = if self.config.orchestration.control_mode == "auto" {
-            Some(tokio::spawn(start_model_poller(
-                repo_path.clone(),
-                self.config.orchestration.clone(),
-                self.worker_manager.clone(),
-                self.registry.clone(),
-                self.config.model_defaults.clone(),
-            )))
+        // Start the reconcile task for control_mode = "auto": directory
+        // events trigger a reconcile (near-real-time), the poll interval is
+        // the resync backstop (watch events can be lost on network FS).
+        let (reconcile_tx, poller_handle) = if auto_mode {
+            let (tx, rx) = mpsc::channel::<()>(8);
+            (
+                Some(tx),
+                Some(tokio::spawn(start_reconcile_task(
+                    repo_path.clone(),
+                    self.config.orchestration.clone(),
+                    self.worker_manager.clone(),
+                    self.registry.clone(),
+                    self.config.model_defaults.clone(),
+                    rx,
+                    seen_lma,
+                ))),
+            )
         } else {
-            None
+            (None, None)
         };
 
         // Process reload events
@@ -280,6 +292,7 @@ impl LiteServer {
                     &mut last_reload,
                     &model_defaults,
                     &has_hot_reload_for_reload,
+                    &reconcile_tx,
                 ).await {
                     warn!("Hot reload processing error: {}", e);
                 }
@@ -411,7 +424,7 @@ impl LiteServer {
         self.registry.list_loaded().iter().any(|(_, _, mv)| mv.config.hot_reload)
     }
 
-    async fn load_initial_models(&self) -> Result<(), AppError> {
+    async fn load_initial_models(&self) -> Result<HashSet<(PathBuf, std::time::SystemTime)>, AppError> {
         let repo_path = PathBuf::from(&self.config.model_repository.path);
         let orch = &self.config.orchestration;
 
@@ -431,7 +444,7 @@ impl LiteServer {
         )
         .await;
 
-        Ok(())
+        Ok(seen_lma)
     }
 }
 
@@ -783,6 +796,20 @@ fn matches_patterns(filename: &str, patterns: &[String]) -> bool {
     })
 }
 
+/// Process a debounced batch of file events.
+///
+/// Classification is registry-based, not directory-shape-based:
+/// - events on a **live** version (loaded AND its dir still exists) are
+///   file-level: the hot-reload path (gate + patterns + cooldown) restarts
+///   the worker;
+/// - everything else (unknown version, or the version dir is gone) is a
+///   lifecycle event. In auto mode (`reconcile_trigger` = Some) these only
+///   trigger a reconcile — the reconciler is the single authority on version
+///   load/unload, applying load_policy and max_loaded_versions. In manual
+///   mode the legacy behavior remains: auto-load hot_reload-enabled new
+///   versions, and directly unload versions whose dir disappeared (that
+///   invariant holds in every mode — the files are gone, the worker cannot
+///   serve).
 async fn process_watch_events(
     paths: Vec<PathBuf>,
     repo_path: PathBuf,
@@ -791,6 +818,7 @@ async fn process_watch_events(
     last_reload: &mut std::collections::HashMap<(String, String), Instant>,
     model_defaults: &crate::config::ModelTunables,
     has_hot_reload: &AtomicBool,
+    reconcile_trigger: &Option<mpsc::Sender<()>>,
 ) -> Result<(), AppError> {
     use std::collections::HashSet;
 
@@ -798,8 +826,7 @@ async fn process_watch_events(
     let mut models_to_reload: HashSet<(String, String)> = HashSet::new();
     let mut trigger_files: std::collections::HashMap<(String, String), Vec<PathBuf>> =
         std::collections::HashMap::new();
-    let mut models_to_check_new: Vec<PathBuf> = Vec::new();
-    let mut models_to_check_removed: Vec<(String, String)> = Vec::new();
+    let mut lifecycle_candidates: HashSet<(String, String)> = HashSet::new();
 
     for path in paths {
         // Skip endpoint files and Python cache
@@ -828,30 +855,26 @@ async fn process_watch_events(
                         _ => None,
                     }),
                 ) {
+                    if crate::validation::validate_identifier(model_name).is_err()
+                        || crate::validation::validate_identifier(version).is_err()
+                    {
+                        continue;
+                    }
+                    let key = (model_name.to_string(), version.to_string());
+                    let version_dir = repo_path.join(model_name).join(version);
+                    let is_live = registry.get(model_name, Some(version)).is_some()
+                        && version_dir.exists();
                     if path.is_dir() {
-                        // Directory change: could be new model or version
-                        if path.join("model.py").exists() || path.join("config.yaml").exists() {
-                            models_to_check_new.push(path);
+                        // Dir events on a live version (e.g. mtime changes
+                        // when files are written inside) carry no signal.
+                        if !is_live {
+                            lifecycle_candidates.insert(key);
                         }
-                    } else if path.exists() {
-                        // File change: trigger reload of the containing model
-                        if crate::validation::validate_identifier(model_name).is_ok()
-                            && crate::validation::validate_identifier(version).is_ok()
-                        {
-                            let key = (model_name.to_string(), version.to_string());
-                            models_to_reload.insert(key.clone());
-                            trigger_files.entry(key).or_default().push(path.clone());
-                        }
+                    } else if is_live {
+                        models_to_reload.insert(key.clone());
+                        trigger_files.entry(key).or_default().push(path.clone());
                     } else {
-                        // File was deleted
-                        if crate::validation::validate_identifier(model_name).is_ok()
-                            && crate::validation::validate_identifier(version).is_ok()
-                        {
-                            let key = (model_name.to_string(), version.to_string());
-                            models_to_reload.insert(key.clone());
-                            trigger_files.entry(key).or_default().push(path.clone());
-                            models_to_check_removed.push((model_name.to_string(), version.to_string()));
-                        }
+                        lifecycle_candidates.insert(key);
                     }
                 }
             }
@@ -869,7 +892,9 @@ async fn process_watch_events(
             }
         }
 
-        // P0: Check if hot_reload is enabled for this model version
+        // P0: Check if hot_reload is enabled for this model version.
+        // Classification guarantees the version is loaded; a concurrent
+        // unload between classification and here is impossible on this task.
         if let Some(mv) = registry.get(&name, Some(&version)) {
             if !mv.config.hot_reload {
                 debug!("Hot reload: skipping {} version {} (hot_reload=false)", name, version);
@@ -895,49 +920,74 @@ async fn process_watch_events(
             if let Err(e) = worker_manager.reload_model(&name, Some(&version)).await {
                 warn!("Hot reload failed for {} version {}: {}", name, version, e);
             }
-        } else {
-            // Model not loaded yet, try to load it
-            // For new models, check config.yaml for hot_reload setting
-            let config_path = repo_path.join(&name).join(&version).join("config.yaml");
-            if config_path.exists() {
-                let mut config = crate::config::load_model_config(&config_path).unwrap_or_default();
-                model_defaults.apply_to(&mut config);
+        }
+    }
 
-                // P0: Only auto-load if hot_reload is enabled
-                if !config.hot_reload {
-                    debug!("Hot reload: skipping new model {} version {} (hot_reload=false)", name, version);
-                    continue;
-                }
+    if lifecycle_candidates.is_empty() {
+        return Ok(());
+    }
 
-                last_reload.insert(key, Instant::now());
-                info!("Hot reload: auto-loading new model {} version {}", name, version);
-                if let Err(e) = worker_manager.load_model(&name, &version, &config).await {
-                    warn!("Hot load failed for {} version {}: {}", name, version, e);
+    match reconcile_trigger {
+        // Auto mode: the reconciler is the single authority on version
+        // lifecycle. try_send coalesces naturally — a full channel means a
+        // trigger is already pending.
+        Some(tx) => {
+            debug!(
+                count = lifecycle_candidates.len(),
+                "Lifecycle events detected, triggering reconcile"
+            );
+            let _ = tx.try_send(());
+        }
+        // Manual mode: legacy behavior (P4 will deprecate the auto-load half).
+        None => {
+            let mut had_unloads = false;
+            for (name, version) in lifecycle_candidates {
+                let key = (name.clone(), version.clone());
+                let version_dir = repo_path.join(&name).join(&version);
+                if version_dir.exists() {
+                    // New version dir: auto-load only if its config opts in.
+                    if let Some(last) = last_reload.get(&key) {
+                        if Instant::now().duration_since(*last) < cooldown {
+                            continue;
+                        }
+                    }
+                    let config_path = version_dir.join("config.yaml");
+                    if config_path.exists() {
+                        let mut config = crate::config::load_model_config(&config_path).unwrap_or_default();
+                        model_defaults.apply_to(&mut config);
+
+                        // P0: Only auto-load if hot_reload is enabled
+                        if !config.hot_reload {
+                            debug!("Hot reload: skipping new model {} version {} (hot_reload=false)", name, version);
+                            continue;
+                        }
+
+                        last_reload.insert(key, Instant::now());
+                        info!("Hot reload: auto-loading new model {} version {}", name, version);
+                        if let Err(e) = worker_manager.load_model(&name, &version, &config).await {
+                            warn!("Hot load failed for {} version {}: {}", name, version, e);
+                        } else {
+                            // P2: Update flag when new hot_reload model is loaded
+                            has_hot_reload.store(true, Ordering::Relaxed);
+                        }
+                    }
                 } else {
-                    // P2: Update flag when new hot_reload model is loaded
-                    has_hot_reload.store(true, Ordering::Relaxed);
+                    // Dir gone → unload. This invariant holds in every mode:
+                    // the files no longer exist, the worker cannot serve.
+                    had_unloads = true;
+                    info!("Hot reload: auto-unloading removed model {} version {}", name, version);
+                    let _ = worker_manager.unload_model(&name, Some(&version)).await;
                 }
             }
-        }
-    }
 
-    // Check for removed models
-    // After unloading, re-check if any hot_reload models remain
-    let had_unloads = !models_to_check_removed.is_empty();
-    for (name, version) in models_to_check_removed {
-        let version_dir = repo_path.join(&name).join(&version);
-        if !version_dir.exists() {
-            info!("Hot reload: auto-unloading removed model {} version {}", name, version);
-            let _ = worker_manager.unload_model(&name, Some(&version)).await;
-        }
-    }
-
-    // P2: Re-check hot_reload flag after potential unloads
-    if had_unloads {
-        let any_hot_reload = registry.list_loaded().iter().any(|(_, _, mv)| mv.config.hot_reload);
-        has_hot_reload.store(any_hot_reload, Ordering::Relaxed);
-        if !any_hot_reload {
-            info!("Hot reload: no more enabled models, watcher will skip events");
+            // P2: Re-check hot_reload flag after potential unloads
+            if had_unloads {
+                let any_hot_reload = registry.list_loaded().iter().any(|(_, _, mv)| mv.config.hot_reload);
+                has_hot_reload.store(any_hot_reload, Ordering::Relaxed);
+                if !any_hot_reload {
+                    info!("Hot reload: no more enabled models, watcher will skip events");
+                }
+            }
         }
     }
 
@@ -946,46 +996,105 @@ async fn process_watch_events(
 
 // ===== Hot Reload File Watcher =====
 
-/// Poll the model repository on an interval and reconcile registry state
-/// with the orchestration config. Spawned only when control_mode = "auto";
-/// orchestration is static (server.yaml section), so no config is re-read.
-async fn start_model_poller(
+/// Run the reconcile loop for control_mode = "auto": directory events
+/// trigger a reconcile (near-real-time), the poll interval is the resync
+/// backstop (watch events can be lost, e.g. on network filesystems).
+/// `seen_lma` comes from the startup load so artifacts unpacked there are
+/// not re-unpacked on the first tick.
+async fn start_reconcile_task(
     repo_path: PathBuf,
     orch: OrchestrationConfig,
     worker_manager: Arc<WorkerManager>,
     registry: Arc<ModelRegistry>,
     model_defaults: crate::config::ModelTunables,
+    trigger_rx: mpsc::Receiver<()>,
+    seen_lma: HashSet<(PathBuf, std::time::SystemTime)>,
 ) {
     let poll_secs = orch.poll_interval.max(1);
     info!(
-        "Model poller started (control_mode=auto, interval={}s)",
+        "Reconcile task started (control_mode=auto, resync interval={}s)",
         poll_secs
     );
-    let mut tick = interval(Duration::from_secs(poll_secs));
-    let mut seen_lma: HashSet<(PathBuf, std::time::SystemTime)> = HashSet::new();
+    let seen_lma = Arc::new(tokio::sync::Mutex::new(seen_lma));
+    reconcile_loop(Duration::from_secs(poll_secs), trigger_rx, move || {
+        let repo_path = repo_path.clone();
+        let orch = orch.clone();
+        let worker_manager = worker_manager.clone();
+        let registry = registry.clone();
+        let model_defaults = model_defaults.clone();
+        let seen_lma = seen_lma.clone();
+        async move {
+            let mut seen_lma = seen_lma.lock().await;
+            reconcile_models(
+                &repo_path,
+                &orch,
+                &worker_manager,
+                &registry,
+                &model_defaults,
+                &mut seen_lma,
+            )
+            .instrument(tracing::info_span!("reconcile"))
+            .await;
+        }
+    })
+    .await;
+}
+
+/// Generic reconcile driver: run `reconcile` on every resync tick, and
+/// near-real-time on trigger events (coalesced over a 2s window so a burst
+/// of filesystem events — e.g. unpacking a version dir — produces one run).
+async fn reconcile_loop<F, Fut>(
+    poll_interval: Duration,
+    trigger_rx: mpsc::Receiver<()>,
+    mut reconcile: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    const COALESCE: Duration = Duration::from_secs(2);
+    let mut tick = interval(poll_interval);
+    // The first interval tick fires immediately; skip it — the startup
+    // reconcile just ran, a second one would be a redundant repo scan.
+    tick.tick().await;
+    let mut trigger_rx = Some(trigger_rx);
     loop {
-        tick.tick().await;
-        reconcile_models(
-            &repo_path,
-            &orch,
-            &worker_manager,
-            &registry,
-            &model_defaults,
-            &mut seen_lma,
-        )
-        .instrument(tracing::info_span!("model_poller_tick"))
-        .await;
+        tokio::select! {
+            _ = tick.tick() => {
+                reconcile().await;
+            }
+            msg = async {
+                match trigger_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => futures::future::pending().await,
+                }
+            } => {
+                match msg {
+                    Some(()) => {
+                        tokio::time::sleep(COALESCE).await;
+                        if let Some(rx) = trigger_rx.as_mut() {
+                            while rx.try_recv().is_ok() {}
+                        }
+                        reconcile().await;
+                    }
+                    // Sender dropped (reload task gone): tick-only resync.
+                    None => trigger_rx = None,
+                }
+            }
+        }
     }
 }
 
 /// Start a file watcher on the model repository directory.
 /// The `has_hot_reload` flag controls whether events are actually sent for processing.
-/// When no models have hot_reload enabled, events are collected but not forwarded.
+/// When no models have hot_reload enabled, events are collected but not forwarded —
+/// unless `always_forward` (control_mode = "auto"), where directory-level
+/// lifecycle events feed the reconcile task regardless of hot_reload.
 async fn start_file_watcher(
     repo_path: PathBuf,
     _worker_manager: Arc<WorkerManager>,
     tx: mpsc::Sender<Vec<PathBuf>>,
     has_hot_reload: Arc<AtomicBool>,
+    always_forward: bool,
 ) {
     use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -1022,7 +1131,9 @@ async fn start_file_watcher(
                 match res {
                     Ok(event) => {
                         // P2: Skip collecting events if no hot_reload models
-                        if !has_hot_reload.load(Ordering::Relaxed) {
+                        // (auto mode always forwards — lifecycle events feed
+                        // the reconcile task).
+                        if !always_forward && !has_hot_reload.load(Ordering::Relaxed) {
                             continue;
                         }
 
@@ -1121,7 +1232,7 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel::<Vec<PathBuf>>(32);
         let has_hot_reload = Arc::new(AtomicBool::new(true));
-        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload));
+        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload, false));
 
         // Give watcher time to start
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -1158,7 +1269,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel::<Vec<PathBuf>>(32);
         let has_hot_reload = Arc::new(AtomicBool::new(true));
-        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload));
+        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload, false));
 
         // Give watcher time to start
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -1365,5 +1476,284 @@ max_batch_size: 4
         );
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // ===== P1/P2: watcher lifecycle events → reconcile trigger (control_mode = "auto") =====
+
+    use crate::config::ModelConfig;
+    use crate::registry::types::ModelType;
+
+    fn build_test_worker_manager(
+        repo: PathBuf,
+        registry: Arc<ModelRegistry>,
+    ) -> Arc<WorkerManager> {
+        let inference_queue = Arc::new(InferenceQueue::new());
+        let callback_runner = Arc::new(CallbackRunner::new());
+        Arc::new(WorkerManager::new(
+            registry,
+            repo,
+            inference_queue,
+            "warn".to_string(),
+            callback_runner,
+        ))
+    }
+
+    fn test_repo_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("lite-server-p12-{}-{}", tag, std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn auto_mode_new_version_triggers_reconcile_instead_of_loading() {
+        let tmp = test_repo_dir("new");
+        let version_dir = tmp.join("m").join("1");
+        tokio::fs::create_dir_all(&version_dir).await.unwrap();
+        tokio::fs::write(version_dir.join("config.yaml"), "hot_reload: true\n").await.unwrap();
+        tokio::fs::write(version_dir.join("model.py"), "class M: pass").await.unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let wm = build_test_worker_manager(tmp.clone(), registry.clone());
+        let (tx, mut rx) = mpsc::channel::<()>(8);
+        let trigger = Some(tx);
+        let mut last_reload = std::collections::HashMap::new();
+        let flag = AtomicBool::new(true);
+
+        process_watch_events(
+            vec![version_dir.join("config.yaml")],
+            tmp.clone(),
+            wm,
+            registry.clone(),
+            &mut last_reload,
+            &crate::config::ModelTunables::default(),
+            &flag,
+            &trigger,
+        ).await.unwrap();
+
+        assert!(
+            registry.get("m", Some("1")).is_none(),
+            "auto mode: watcher must not load versions directly — reconcile decides"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "auto mode: lifecycle event must trigger reconcile"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn auto_mode_removed_version_triggers_reconcile_instead_of_unloading() {
+        let tmp = test_repo_dir("removed");
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+        // Version dir does NOT exist (already deleted); registry still lists it.
+        let registry = Arc::new(ModelRegistry::new());
+        registry
+            .register("m", "1", ModelConfig::default(), ModelType::LitAPI, tmp.join("m").join("1"))
+            .unwrap();
+        let wm = build_test_worker_manager(tmp.clone(), registry.clone());
+        let (tx, mut rx) = mpsc::channel::<()>(8);
+        let trigger = Some(tx);
+        let mut last_reload = std::collections::HashMap::new();
+        let flag = AtomicBool::new(true);
+
+        process_watch_events(
+            vec![tmp.join("m").join("1").join("model.py")],
+            tmp.clone(),
+            wm,
+            registry.clone(),
+            &mut last_reload,
+            &crate::config::ModelTunables::default(),
+            &flag,
+            &trigger,
+        ).await.unwrap();
+
+        assert!(
+            registry.get("m", Some("1")).is_some(),
+            "auto mode: watcher must not unload versions directly — reconcile decides"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "auto mode: removal must trigger reconcile"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn auto_mode_live_version_file_change_is_file_level_not_lifecycle() {
+        let tmp = test_repo_dir("live");
+        let version_dir = tmp.join("m").join("1");
+        tokio::fs::create_dir_all(&version_dir).await.unwrap();
+        let model_py = version_dir.join("model.py");
+        tokio::fs::write(&model_py, "class M: pass").await.unwrap();
+
+        // hot_reload=false: the file-level reload path is a no-op, so no
+        // workers are spawned; the assertion targets the trigger channel.
+        let registry = Arc::new(ModelRegistry::new());
+        registry
+            .register("m", "1", ModelConfig::default(), ModelType::LitAPI, version_dir.clone())
+            .unwrap();
+        let wm = build_test_worker_manager(tmp.clone(), registry.clone());
+        let (tx, mut rx) = mpsc::channel::<()>(8);
+        let trigger = Some(tx);
+        let mut last_reload = std::collections::HashMap::new();
+        let flag = AtomicBool::new(true);
+
+        process_watch_events(
+            vec![model_py],
+            tmp.clone(),
+            wm,
+            registry.clone(),
+            &mut last_reload,
+            &crate::config::ModelTunables::default(),
+            &flag,
+            &trigger,
+        ).await.unwrap();
+
+        assert!(
+            rx.try_recv().is_err(),
+            "file change on a live version must go down the hot-reload path, not trigger reconcile"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn manual_mode_removed_version_unloads_directly() {
+        // Regression: manual (non-auto) mode keeps the legacy direct-unload
+        // behavior — the "dir gone → unload" invariant does not wait for a
+        // reconciler that only runs at startup.
+        let tmp = test_repo_dir("manual");
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+        let registry = Arc::new(ModelRegistry::new());
+        registry
+            .register("m", "1", ModelConfig::default(), ModelType::LitAPI, tmp.join("m").join("1"))
+            .unwrap();
+        let wm = build_test_worker_manager(tmp.clone(), registry.clone());
+        let trigger: Option<mpsc::Sender<()>> = None;
+        let mut last_reload = std::collections::HashMap::new();
+        let flag = AtomicBool::new(true);
+
+        process_watch_events(
+            vec![tmp.join("m").join("1").join("model.py")],
+            tmp.clone(),
+            wm,
+            registry.clone(),
+            &mut last_reload,
+            &crate::config::ModelTunables::default(),
+            &flag,
+            &trigger,
+        ).await.unwrap();
+
+        assert!(
+            registry.get("m", Some("1")).is_none(),
+            "manual mode: removed version dir must be unloaded directly"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // ===== P2: reconcile loop (tick resync + event trigger) =====
+
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_loop_trigger_runs_despite_long_poll_interval() {
+        let (tx, rx) = mpsc::channel::<()>(8);
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        let handle = tokio::spawn(reconcile_loop(Duration::from_secs(3600), rx, move || {
+            let c = c.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        tx.send(()).await.unwrap();
+        // Auto-advances past the coalesce window; the 3600s tick never fires.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "event trigger must run reconcile even with a 3600s poll interval"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_loop_coalesces_trigger_burst_into_one_run() {
+        let (tx, rx) = mpsc::channel::<()>(8);
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        let handle = tokio::spawn(reconcile_loop(Duration::from_secs(3600), rx, move || {
+            let c = c.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        for _ in 0..5 {
+            tx.send(()).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "a burst of triggers within the coalesce window must produce one reconcile run"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_loop_ticks_without_triggers() {
+        let (_tx, rx) = mpsc::channel::<()>(8);
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        let handle = tokio::spawn(reconcile_loop(Duration::from_secs(1), rx, move || {
+            let c = c.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "resync ticks must keep firing without triggers"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn file_watcher_forwards_events_when_always_forward_without_hot_reload() {
+        // control_mode=auto: lifecycle events must reach the reconciler even
+        // when no loaded model has hot_reload enabled.
+        let tmp_dir_raw = std::env::temp_dir().join(format!("lite-server-fw-auto-{}", std::process::id()));
+        tokio::fs::create_dir_all(&tmp_dir_raw).await.unwrap();
+        let tmp_dir = tmp_dir_raw.canonicalize().unwrap();
+        let sub_dir = tmp_dir.join("model").join("1");
+        tokio::fs::create_dir_all(&sub_dir).await.unwrap();
+        let model_py = sub_dir.join("model.py");
+        tokio::fs::write(&model_py, "original").await.unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let worker_manager = build_test_worker_manager(tmp_dir.clone(), registry);
+
+        let (tx, mut rx) = mpsc::channel::<Vec<PathBuf>>(32);
+        let has_hot_reload = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload, true));
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::fs::write(&model_py, "modified").await.unwrap();
+
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(10),
+            rx.recv()
+        ).await;
+        assert!(
+            result.is_ok(),
+            "auto mode: watcher must forward events even with no hot_reload models"
+        );
+
+        handle.abort();
+        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
     }
 }

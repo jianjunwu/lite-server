@@ -149,8 +149,8 @@ callbacks:                     # Worker 启动时加载的 callback 类路径列
 控制启动时加载哪些模型和版本。
 
 ```yaml
-control_mode: explicit         # explicit（手动）或 auto（轮询变更）
-poll_interval: 5               # 轮询间隔（秒），control_mode=auto 时生效
+control_mode: explicit         # explicit（手动）或 auto（对齐仓库变更）
+poll_interval: 30              # 兜底重同步间隔（秒），control_mode=auto 时生效
 load_models:                   # 启动时加载的模型列表
   - my_model
   - another_model
@@ -175,21 +175,27 @@ models:                        # 每个模型的版本策略
 | `latest` | 仅加载最新版本（最大版本号） |
 | `all` | 加载所有可用版本 |
 
-### auto 模式（轮询）
+### auto 模式（reconcile）
 
-`control_mode: auto` 时，后台轮询任务每隔 `poll_interval` 秒（最小 1）
-将注册表与模型仓库对齐：
+`control_mode: auto` 时，后台 reconcile 任务保持注册表与模型仓库一致。
+磁盘上版本目录的出现/消失会通过文件监听器近实时触发 reconcile（2 秒
+合并窗口）；每隔 `poll_interval` 秒（最小 1，默认 30）做一次全量重同步
+作为兜底（watch 事件在网络文件系统上可能丢失）：
 
 - **托管集合**：`load_models` 中列出的模型。磁盘上新出现的版本目录会按
   各模型的 `load_policy` 自动加载；从磁盘删除的版本会自动卸载。
 - **声明式语义**：orchestration 配置是托管模型的唯一事实源。通过 Admin
-  API 对托管模型手动 load/unload 会在下一个轮询周期被回正。不在
+  API 对托管模型手动 load/unload 会在下一次 reconcile 被回正。不在
   `load_models` 中的模型不受影响。
+- **单一决策者**：auto 模式下文件监听器不再直接加载/卸载版本——它只对
+  已加载版本做 worker 重启（`hot_reload`），生命周期事件全部交给
+  reconcile 任务。所有策略决策（`load_policy`、`max_loaded_versions`）
+  只有这一个执行点。
 - **静态配置**：orchestration 位于 `server.yaml`，启动时读取一次，修改
   后需重启生效。
 - **容量保护**：超出模型 `max_loaded_versions` 的版本会跳过并告警（不会
   出现驱逐/重载循环）。
-- 大仓库（>1000 模型）建议调大 `poll_interval` 以降低扫描开销。
+- 大仓库（>1000 模型）建议调大 `poll_interval` 以降低重同步开销。
 
 ## CLI 参数
 

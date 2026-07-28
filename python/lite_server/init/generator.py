@@ -199,10 +199,11 @@ SERVER_YAML = textwrap.dedent("""\
       path: ./model_repo
 
     orchestration:
-      control_mode: explicit        # explicit | poll | all
+      control_mode: explicit        # explicit | auto
       load_models:
         - {model_name}
-      # poll_interval: 5            # Seconds between repo scans (control_mode=poll)
+      # poll_interval: 30           # Resync backstop in seconds (control_mode=auto);
+                                    # directory events trigger near-real-time reconciles
       # models:                     # Per-model strategy overrides (advanced)
       #   - name: my_model
       #     load_policy: explicit   # explicit | all | latest

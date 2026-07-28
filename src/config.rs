@@ -186,7 +186,9 @@ impl Default for OrchestrationConfig {
     fn default() -> Self {
         Self {
             control_mode: "explicit".to_string(),
-            poll_interval: 5,
+            // Resync backstop for the reconcile task; directory events
+            // trigger near-real-time reconciles in between (§P2).
+            poll_interval: 30,
             load_models: vec![],
             models: vec![],
         }
@@ -691,6 +693,7 @@ mod tests {
         assert!(cfg.features.websocket_streaming);
         assert!(cfg.features.streaming_metrics);
         assert_eq!(cfg.orchestration.control_mode, "explicit");
+        assert_eq!(cfg.orchestration.poll_interval, 30);
     }
 
     #[test]
