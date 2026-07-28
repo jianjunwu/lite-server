@@ -174,6 +174,25 @@ models:                        # Per-model version strategies
 | `latest` | Load only the latest version (highest version number) |
 | `all` | Load all available versions |
 
+### Auto Mode (Polling)
+
+With `control_mode: auto`, a background poller reconciles the registry with
+the model repository every `poll_interval` seconds (minimum 1):
+
+- **Managed set**: the models listed in `load_models`. New version
+  directories appearing on disk are loaded automatically (per each model's
+  `load_policy`); versions removed from disk are unloaded.
+- **Declarative semantics**: the orchestration config is the source of truth
+  for managed models. Manual `load`/`unload` calls via the Admin API on a
+  managed model are reverted on the next poll tick. Models not in
+  `load_models` are left untouched.
+- **Static config**: orchestration lives in `server.yaml` and is read once
+  at startup; changing it requires a restart.
+- **Capacity**: versions beyond a model's `max_loaded_versions` are skipped
+  with a warning (no evict/reload thrash).
+- For large repositories (>1000 models) increase `poll_interval` to reduce
+  scan overhead.
+
 ## CLI Flags
 
 All server config fields can be overridden via CLI flags:

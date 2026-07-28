@@ -433,15 +433,6 @@ pub fn load_config(path: &str) -> anyhow::Result<Config> {
     Ok(config)
 }
 
-pub fn load_orchestration(path: &Path) -> anyhow::Result<OrchestrationConfig> {
-    if !path.exists() {
-        return Ok(OrchestrationConfig::default());
-    }
-    let content = std::fs::read_to_string(path)?;
-    let orch: OrchestrationConfig = serde_yaml::from_str(&content)?;
-    Ok(orch)
-}
-
 pub fn load_model_config(path: &Path) -> anyhow::Result<ModelConfig> {
     if !path.exists() {
         return Ok(ModelConfig::default());
@@ -723,30 +714,16 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // --- load_orchestration ---
-
-    #[test]
-    fn test_load_orchestration_valid() {
-        let dir = std::env::temp_dir().join("lite-server-orch-valid");
-        let _ = fs::create_dir_all(&dir);
-        let path = dir.join("orchestration.yaml");
-        fs::write(&path, "control_mode: auto\npoll_interval: 10\n").unwrap();
-
-        let orch = load_orchestration(&path).unwrap();
-        assert_eq!(orch.control_mode, "auto");
-        assert_eq!(orch.poll_interval, 10);
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_load_orchestration_missing_file_returns_default() {
-        let path = Path::new("/tmp/nonexistent-lite-server-orch.yaml");
-        let orch = load_orchestration(path).unwrap();
-        assert_eq!(orch.control_mode, "explicit");
-    }
-
     // --- Serialization roundtrip ---
+
+    #[test]
+    fn test_orchestration_section_parses_poll_interval() {
+        let yaml = "orchestration:\n  control_mode: auto\n  poll_interval: 10\n  load_models:\n    - m1\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.orchestration.control_mode, "auto");
+        assert_eq!(cfg.orchestration.poll_interval, 10);
+        assert_eq!(cfg.orchestration.load_models, vec!["m1".to_string()]);
+    }
 
     #[test]
     fn test_config_yaml_roundtrip() {

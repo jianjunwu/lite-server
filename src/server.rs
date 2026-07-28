@@ -6,14 +6,14 @@ use crate::inference_queue::InferenceQueue;
 use crate::metrics::prometheus;
 use crate::registry::ModelRegistry;
 use crate::worker::WorkerManager;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::signal;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration, Instant};
-use tracing::{debug, info, error, warn};
+use tracing::{debug, info, error, warn, Instrument};
 
 /// Tracks in-flight requests during graceful shutdown.
 #[derive(Clone)]
@@ -249,6 +249,21 @@ impl LiteServer {
             has_hot_reload_for_watcher,
         ));
 
+        // Start model poller for control_mode = "auto": periodically
+        // reconciles the registry with the repo (new versions discovered,
+        // removed versions unloaded).
+        let poller_handle = if self.config.orchestration.control_mode == "auto" {
+            Some(tokio::spawn(start_model_poller(
+                repo_path.clone(),
+                self.config.orchestration.clone(),
+                self.worker_manager.clone(),
+                self.registry.clone(),
+                self.config.model_defaults.clone(),
+            )))
+        } else {
+            None
+        };
+
         // Process reload events
         let reload_worker = self.worker_manager.clone();
         let reload_registry = self.registry.clone();
@@ -323,6 +338,9 @@ impl LiteServer {
         watcher_handle.abort();
         timeline_handle.abort();
         reload_handle.abort();
+        if let Some(h) = poller_handle {
+            h.abort();
+        }
 
         // Notify HTTP server to start graceful shutdown
         let _ = http_shutdown_tx.send(());
@@ -395,97 +413,136 @@ impl LiteServer {
 
     async fn load_initial_models(&self) -> Result<(), AppError> {
         let repo_path = PathBuf::from(&self.config.model_repository.path);
-        let orch = resolve_orchestration(&repo_path, &self.config.orchestration);
+        let orch = &self.config.orchestration;
 
         // Apply strategies to registry
         for strategy in &orch.models {
             self.registry.set_strategy(&strategy.name, strategy)?;
         }
 
-        // Auto-unpack any .lma artifacts placed in the model repo
-        auto_unpack_lma_files(&repo_path).await;
+        let mut seen_lma = HashSet::new();
+        reconcile_models(
+            &repo_path,
+            orch,
+            &self.worker_manager,
+            &self.registry,
+            &self.config.model_defaults,
+            &mut seen_lma,
+        )
+        .await;
 
-        let available = scan_repo_models(&repo_path).await;
-        let by_model = group_by_model(available);
+        Ok(())
+    }
+}
 
-        let names_to_load: Vec<String> = match orch.control_mode.as_str() {
-            "all" => by_model.keys().cloned().collect(),
-            "explicit" | "poll" => orch.load_models.clone(),
-            _ => orch.load_models.clone(),
-        };
+/// Reconcile registry state with the model repository: load versions that
+/// should be present per the orchestration config, unload managed versions
+/// that should no longer be present (declarative semantics — the config is
+/// the source of truth for models in scope). Runs once at startup (initial
+/// load) and on every poll tick when control_mode = "auto".
+///
+/// `seen_lma` tracks (path, mtime) of .lma artifacts already unpacked so the
+/// poller doesn't re-unpack — and thereby overwrite — the same file every
+/// tick. A replaced artifact has a new mtime and is unpacked again.
+async fn reconcile_models(
+    repo_path: &Path,
+    orch: &OrchestrationConfig,
+    worker_manager: &WorkerManager,
+    registry: &ModelRegistry,
+    model_defaults: &crate::config::ModelDefaults,
+    seen_lma: &mut HashSet<(PathBuf, std::time::SystemTime)>,
+) {
+    auto_unpack_lma_files(repo_path, seen_lma).await;
 
-        let strategy_map: HashMap<String, &ModelStrategyConfig> = orch
-            .models
-            .iter()
-            .map(|s| (s.name.clone(), s))
+    let available = scan_repo_models(repo_path).await;
+    let by_model = group_by_model(available);
+
+    let names: Vec<String> = match orch.control_mode.as_str() {
+        "all" => by_model.keys().cloned().collect(),
+        _ => orch.load_models.clone(),
+    };
+
+    let strategy_map: HashMap<String, &ModelStrategyConfig> = orch
+        .models
+        .iter()
+        .map(|s| (s.name.clone(), s))
+        .collect();
+
+    for name in &names {
+        let strategy = strategy_map.get(name).copied();
+        let models = by_model.get(name).cloned().unwrap_or_default();
+        let target = compute_target_versions(&models, strategy);
+
+        let loaded: HashSet<String> = registry
+            .list_versions(name)
+            .into_iter()
+            .map(|v| v.version)
             .collect();
+        let target_set: HashSet<String> = target.iter().cloned().collect();
 
-        for name in names_to_load {
-            let strategy = strategy_map.get(&name);
-            let load_policy = strategy
-                .map(|s| s.load_policy.as_str())
-                .unwrap_or("explicit");
-            let versions_to_load = strategy.map(|s| &s.versions_to_load);
-            let default_version = strategy.and_then(|s| s.default_version.clone());
-
-            let models = by_model.get(&name).cloned().unwrap_or_default();
-            let mut versions_loaded = Vec::new();
-            let max_version = pick_latest_version(
-                &models.iter().map(|m| m.version.clone()).collect::<Vec<_>>(),
-            );
-
-            for m in &models {
-                let version = m.version.clone();
-                let should_load = match load_policy {
-                    "all" => true,
-                    "latest" => Some(&version) == max_version.as_ref(),
-                    _ => versions_to_load
-                        .map(|v| v.contains(&version))
-                        .unwrap_or(true),
-                };
-
-                if should_load {
-                    if let Err(e) = crate::validation::validate_identifier(&name) {
-                        error!("Skipping model with invalid name '{}': {}", name, e);
-                        continue;
-                    }
-                    if let Err(e) = crate::validation::validate_identifier(&version) {
-                        error!("Skipping {} version with invalid version '{}': {}", name, version, e);
-                        continue;
-                    }
-                    let config_path = repo_path.join(&name).join(&version).join("config.yaml");
-                    let mut config = crate::config::load_model_config(&config_path).unwrap_or_default();
-                    self.config.apply_model_defaults(&mut config);
-
-                    if let Err(e) = self.worker_manager.load_model(&name, &version, &config).await {
-                        error!("Failed to load {} version {}: {}", name, version, e);
-                    } else {
-                        versions_loaded.push(version);
-                    }
-                }
-            }
-
-            // Activate default version
-            if let Some(ref dv) = default_version {
-                if versions_loaded.contains(dv) {
-                    match self.registry.activate_version(&name, dv) {
-                        Ok(true) => info!("Activated default version {} for {}", dv, name),
-                        Ok(false) => warn!("Failed to activate default version {} for {} (not ready)", dv, name),
-                        Err(e) => error!("Error activating default version {} for {}: {}", dv, name, e),
-                    }
-                }
-            } else if !versions_loaded.is_empty() && self.registry.get_active_version(&name).is_none() {
-                match self.registry.activate_version(&name, &versions_loaded[0]) {
-                    Ok(true) => info!("Activated version {} for {}", versions_loaded[0], name),
-                    Ok(false) => warn!("Failed to activate version {} for {} (not ready)", versions_loaded[0], name),
-                    Err(e) => error!("Error activating version {} for {}: {}", versions_loaded[0], name, e),
-                }
-            } else {
-                info!("Skipping activation for {}: versions_loaded={:?}, active={:?}", name, versions_loaded, self.registry.get_active_version(&name));
+        // Unload managed versions that should no longer be present.
+        for version in loaded.difference(&target_set) {
+            info!("Unloading {} version {} (no longer in target set)", name, version);
+            if let Err(e) = worker_manager.unload_model(name, Some(version)).await {
+                warn!("Failed to unload {} version {}: {}", name, version, e);
             }
         }
 
-        Ok(())
+        // Load missing versions.
+        let mut versions_loaded = Vec::new();
+        for version in &target {
+            if loaded.contains(version) {
+                continue;
+            }
+            if let Err(e) = crate::validation::validate_identifier(name) {
+                error!("Skipping model with invalid name '{}': {}", name, e);
+                break;
+            }
+            if let Err(e) = crate::validation::validate_identifier(version) {
+                error!("Skipping {} version with invalid version '{}': {}", name, version, e);
+                continue;
+            }
+            // Respect max_loaded_versions: loading beyond the cap would
+            // trigger LRU eviction, which the next reconcile would see as
+            // "missing" and reload — an evict/reload thrash loop.
+            if let Some(max) = strategy.and_then(|s| s.max_loaded_versions) {
+                let current = registry.list_versions(name).len();
+                if current >= max {
+                    warn!(
+                        "Skipping load of {} version {}: max_loaded_versions={} already reached",
+                        name, version, max
+                    );
+                    continue;
+                }
+            }
+            let config_path = repo_path.join(name).join(version).join("config.yaml");
+            let mut config = crate::config::load_model_config(&config_path).unwrap_or_default();
+            model_defaults.apply_to(&mut config);
+
+            if let Err(e) = worker_manager.load_model(name, version, &config).await {
+                error!("Failed to load {} version {}: {}", name, version, e);
+            } else {
+                versions_loaded.push(version.clone());
+            }
+        }
+
+        // Activate default version
+        let default_version = strategy.and_then(|s| s.default_version.clone());
+        if let Some(ref dv) = default_version {
+            if versions_loaded.contains(dv) {
+                match registry.activate_version(name, dv) {
+                    Ok(true) => info!("Activated default version {} for {}", dv, name),
+                    Ok(false) => warn!("Failed to activate default version {} for {} (not ready)", dv, name),
+                    Err(e) => error!("Error activating default version {} for {}: {}", dv, name, e),
+                }
+            }
+        } else if !versions_loaded.is_empty() && registry.get_active_version(name).is_none() {
+            match registry.activate_version(name, &versions_loaded[0]) {
+                Ok(true) => info!("Activated version {} for {}", versions_loaded[0], name),
+                Ok(false) => warn!("Failed to activate version {} for {} (not ready)", versions_loaded[0], name),
+                Err(e) => error!("Error activating version {} for {}: {}", versions_loaded[0], name, e),
+            }
+        }
     }
 }
 
@@ -546,38 +603,52 @@ async fn shutdown_signal() {
     info!("signal received, starting graceful shutdown");
 }
 
-fn find_orchestration(repo_path: &Path) -> Option<PathBuf> {
-    let path = repo_path.join("orchestration.yaml");
-    if path.exists() {
-        Some(path)
-    } else {
-        None
-    }
-}
-
-/// Resolve orchestration config: prefer standalone file for backward compat,
-/// fall back to server.yaml orchestration section.
-fn resolve_orchestration(
-    repo_path: &Path,
-    config_orch: &OrchestrationConfig,
-) -> OrchestrationConfig {
-    if let Some(orch_path) = find_orchestration(repo_path) {
-        crate::config::load_orchestration(&orch_path).unwrap_or_default()
-    } else {
-        config_orch.clone()
-    }
-}
-
 #[derive(Clone)]
 struct RepoModel {
     name: String,
     version: String,
 }
 
+/// Versions of a model that should be loaded per the strategy's load_policy:
+/// "all" → every version found on disk; "latest" → the highest semver;
+/// otherwise ("explicit") → versions_to_load ∩ disk versions. No strategy
+/// (None) loads every disk version — the legacy default for load_models
+/// entries without a strategy.
+fn compute_target_versions(
+    models: &[RepoModel],
+    strategy: Option<&ModelStrategyConfig>,
+) -> Vec<String> {
+    let all: Vec<String> = models.iter().map(|m| m.version.clone()).collect();
+    let load_policy = strategy
+        .map(|s| s.load_policy.as_str())
+        .unwrap_or("explicit");
+    match load_policy {
+        "all" => all,
+        "latest" => pick_latest_version(&all).into_iter().collect(),
+        _ => match strategy {
+            Some(s) => models
+                .iter()
+                .filter(|m| s.versions_to_load.contains(&m.version))
+                .map(|m| m.version.clone())
+                .collect(),
+            None => all,
+        },
+    }
+}
+
 /// Auto-unpack .lma artifact files found in the model repository root.
 /// Shells out to `python -m lite_server unpack` to extract each .lma into
 /// the standard repo/model_name/version/ directory layout.
-async fn auto_unpack_lma_files(repo_path: &Path) {
+///
+/// `seen` tracks (path, mtime) of artifacts already unpacked: the unpacker
+/// does not delete the .lma after extraction, so without this the model
+/// poller would re-unpack — and overwrite the extracted directory — every
+/// tick. Each artifact is attempted once per mtime; a failed unpack is not
+/// retried unless the file is replaced (new mtime).
+async fn auto_unpack_lma_files(
+    repo_path: &Path,
+    seen: &mut HashSet<(PathBuf, std::time::SystemTime)>,
+) {
     let mut entries = match tokio::fs::read_dir(repo_path).await {
         Ok(e) => e,
         Err(_) => return,
@@ -588,41 +659,50 @@ async fn auto_unpack_lma_files(repo_path: &Path) {
         if !path.is_file() {
             continue;
         }
-        if path.extension().map(|e| e == "lma").unwrap_or(false) {
-            let output = tokio::process::Command::new("python")
-                .args([
-                    "-m",
-                    "lite_server",
-                    "unpack",
-                    path.to_str().unwrap_or(""),
-                    "--to",
-                    repo_path.to_str().unwrap_or(""),
-                ])
-                .output()
-                .await;
+        if !path.extension().map(|e| e == "lma").unwrap_or(false) {
+            continue;
+        }
+        let mtime = match tokio::fs::metadata(&path).await.and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if !seen.insert((path.clone(), mtime)) {
+            continue;
+        }
 
-            match output {
-                Ok(out) if out.status.success() => {
-                    info!(
-                        "Auto-unpacked .lma artifact: {}",
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    );
-                }
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    warn!(
-                        "Failed to unpack .lma artifact {}: {}",
-                        path.display(),
-                        stderr.trim()
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to run unpack for .lma artifact {}: {}",
-                        path.display(),
-                        e
-                    );
-                }
+        let output = tokio::process::Command::new("python")
+            .args([
+                "-m",
+                "lite_server",
+                "unpack",
+                path.to_str().unwrap_or(""),
+                "--to",
+                repo_path.to_str().unwrap_or(""),
+            ])
+            .output()
+            .await;
+
+        match output {
+            Ok(out) if out.status.success() => {
+                info!(
+                    "Auto-unpacked .lma artifact: {}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                );
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                warn!(
+                    "Failed to unpack .lma artifact {}: {}",
+                    path.display(),
+                    stderr.trim()
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to run unpack for .lma artifact {}: {}",
+                    path.display(),
+                    e
+                );
             }
         }
     }
@@ -722,11 +802,6 @@ async fn process_watch_events(
     let mut models_to_check_removed: Vec<(String, String)> = Vec::new();
 
     for path in paths {
-        // Skip orchestration.yaml - handled separately if needed
-        if path.file_name().map(|n| n == "orchestration.yaml").unwrap_or(false) {
-            continue;
-        }
-
         // Skip endpoint files and Python cache
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
             if name.ends_with("_endpoint.py") || name == "__pycache__" || name.ends_with(".pyc") || name.ends_with(".pyo") {
@@ -870,6 +945,38 @@ async fn process_watch_events(
 }
 
 // ===== Hot Reload File Watcher =====
+
+/// Poll the model repository on an interval and reconcile registry state
+/// with the orchestration config. Spawned only when control_mode = "auto";
+/// orchestration is static (server.yaml section), so no config is re-read.
+async fn start_model_poller(
+    repo_path: PathBuf,
+    orch: OrchestrationConfig,
+    worker_manager: Arc<WorkerManager>,
+    registry: Arc<ModelRegistry>,
+    model_defaults: crate::config::ModelDefaults,
+) {
+    let poll_secs = orch.poll_interval.max(1);
+    info!(
+        "Model poller started (control_mode=auto, interval={}s)",
+        poll_secs
+    );
+    let mut tick = interval(Duration::from_secs(poll_secs));
+    let mut seen_lma: HashSet<(PathBuf, std::time::SystemTime)> = HashSet::new();
+    loop {
+        tick.tick().await;
+        reconcile_models(
+            &repo_path,
+            &orch,
+            &worker_manager,
+            &registry,
+            &model_defaults,
+            &mut seen_lma,
+        )
+        .instrument(tracing::info_span!("model_poller_tick"))
+        .await;
+    }
+}
 
 /// Start a file watcher on the model repository directory.
 /// The `has_hot_reload` flag controls whether events are actually sent for processing.
@@ -1094,76 +1201,80 @@ mod tests {
         assert!(!matches_patterns("data.json", &patterns));
     }
 
-    // --- resolve_orchestration ---
+    // --- compute_target_versions ---
 
-    #[test]
-    fn test_resolve_orchestration_from_file() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-orch-file-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let orch_path = tmp.join("orchestration.yaml");
-        std::fs::write(
-            &orch_path,
-            "control_mode: poll\nload_models:\n  - from_file\n",
-        )
-        .unwrap();
-
-        let config_orch = OrchestrationConfig::default();
-        let resolved = resolve_orchestration(&tmp, &config_orch);
-        assert_eq!(resolved.control_mode, "poll");
-        assert_eq!(resolved.load_models, vec!["from_file"]);
-
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn rm(name: &str, version: &str) -> RepoModel {
+        RepoModel {
+            name: name.to_string(),
+            version: version.to_string(),
+        }
     }
 
     #[test]
-    fn test_resolve_orchestration_fallback_to_config() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-orch-config-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
-        // No orchestration.yaml written
-
-        let config_orch = OrchestrationConfig {
-            control_mode: "explicit".to_string(),
-            load_models: vec!["from_config".to_string()],
+    fn test_compute_target_versions_all() {
+        let models = vec![rm("m", "1"), rm("m", "2"), rm("m", "3")];
+        let strategy = ModelStrategyConfig {
+            name: "m".to_string(),
+            load_policy: "all".to_string(),
             ..Default::default()
         };
-        let resolved = resolve_orchestration(&tmp, &config_orch);
-        assert_eq!(resolved.control_mode, "explicit");
-        assert_eq!(resolved.load_models, vec!["from_config"]);
-
-        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(
+            compute_target_versions(&models, Some(&strategy)),
+            vec!["1".to_string(), "2".to_string(), "3".to_string()]
+        );
     }
 
     #[test]
-    fn test_resolve_orchestration_file_takes_precedence() {
-        let tmp = std::env::temp_dir().join(format!(
-            "lite-server-orch-prec-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let orch_path = tmp.join("orchestration.yaml");
-        std::fs::write(
-            &orch_path,
-            "control_mode: all\nload_models:\n  - from_file\n",
-        )
-        .unwrap();
-
-        let config_orch = OrchestrationConfig {
-            control_mode: "explicit".to_string(),
-            load_models: vec!["from_config".to_string()],
+    fn test_compute_target_versions_latest() {
+        let models = vec![rm("m", "v2"), rm("m", "v10"), rm("m", "v1")];
+        let strategy = ModelStrategyConfig {
+            name: "m".to_string(),
+            load_policy: "latest".to_string(),
             ..Default::default()
         };
-        let resolved = resolve_orchestration(&tmp, &config_orch);
-        // File takes precedence for backward compat
-        assert_eq!(resolved.control_mode, "all");
-        assert_eq!(resolved.load_models, vec!["from_file"]);
+        assert_eq!(
+            compute_target_versions(&models, Some(&strategy)),
+            vec!["v10".to_string()]
+        );
+    }
 
-        let _ = std::fs::remove_dir_all(&tmp);
+    #[test]
+    fn test_compute_target_versions_explicit_intersection() {
+        let models = vec![rm("m", "1"), rm("m", "2")];
+        let strategy = ModelStrategyConfig {
+            name: "m".to_string(),
+            load_policy: "explicit".to_string(),
+            versions_to_load: vec!["2".to_string(), "3".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            compute_target_versions(&models, Some(&strategy)),
+            vec!["2".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_compute_target_versions_no_strategy_loads_all_disk_versions() {
+        // A model in load_models without a strategy entry loads every
+        // version found on disk (legacy default).
+        let models = vec![rm("m", "1"), rm("m", "2")];
+        assert_eq!(
+            compute_target_versions(&models, None),
+            vec!["1".to_string(), "2".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_compute_target_versions_explicit_empty_versions_to_load() {
+        // Strategy present with explicit policy but no versions_to_load:
+        // nothing loads (empty intersection), unlike the no-strategy case.
+        let models = vec![rm("m", "1"), rm("m", "2")];
+        let strategy = ModelStrategyConfig {
+            name: "m".to_string(),
+            load_policy: "explicit".to_string(),
+            ..Default::default()
+        };
+        assert!(compute_target_versions(&models, Some(&strategy)).is_empty());
     }
 
     // ===== B1: ensemble detection via string contains is fragile =====

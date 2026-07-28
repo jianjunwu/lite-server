@@ -174,6 +174,22 @@ models:                        # 每个模型的版本策略
 | `latest` | 仅加载最新版本（最大版本号） |
 | `all` | 加载所有可用版本 |
 
+### auto 模式（轮询）
+
+`control_mode: auto` 时，后台轮询任务每隔 `poll_interval` 秒（最小 1）
+将注册表与模型仓库对齐：
+
+- **托管集合**：`load_models` 中列出的模型。磁盘上新出现的版本目录会按
+  各模型的 `load_policy` 自动加载；从磁盘删除的版本会自动卸载。
+- **声明式语义**：orchestration 配置是托管模型的唯一事实源。通过 Admin
+  API 对托管模型手动 load/unload 会在下一个轮询周期被回正。不在
+  `load_models` 中的模型不受影响。
+- **静态配置**：orchestration 位于 `server.yaml`，启动时读取一次，修改
+  后需重启生效。
+- **容量保护**：超出模型 `max_loaded_versions` 的版本会跳过并告警（不会
+  出现驱逐/重载循环）。
+- 大仓库（>1000 模型）建议调大 `poll_interval` 以降低扫描开销。
+
 ## CLI 参数
 
 所有服务器配置字段均可通过 CLI 参数覆盖，详见 [CLI 参考手册](cli.md)。

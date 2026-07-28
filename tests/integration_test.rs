@@ -1863,21 +1863,20 @@ class LruAPI(LitAPI):
         std::fs::write(dir.join("model.py"), model_py).unwrap();
         std::fs::write(dir.join("config.yaml"), cfg).unwrap();
     }
+    let port = 18091;
+    let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(
-        tmp_dir.join("orchestration.yaml"),
-        "control_mode: explicit\nmodels:\n  - name: lru_model\n    load_policy: explicit\n    max_loaded_versions: 2\n",
+        &server_yaml,
+        format!(
+            "server:\n  host: 0.0.0.0\n  http_port: {}\n  grpc_port: 18991\n  metrics_port: 18992\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: false\nmodel_repository:\n  path: {}\norchestration:\n  control_mode: explicit\n  models:\n    - name: lru_model\n      load_policy: explicit\n      max_loaded_versions: 2\n",
+            port,
+            tmp_dir.to_string_lossy()
+        ),
     )
     .unwrap();
 
-    let port = 18091;
     kill_stale_on_port(port);
-    let _server = ServerGuard::start(&[
-        "--port", &port.to_string(),
-        "--model-repo", &tmp_dir.to_string_lossy(),
-        "--no-metrics",
-        "--no-grpc",
-        "--log-level", "warn",
-    ]);
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
     wait_for_server(port, 30).await;
     let base = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
@@ -1915,6 +1914,157 @@ class LruAPI(LitAPI):
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["output"], 42);
+
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+}
+
+// ---------------------------------------------------------------------------
+// control_mode: auto — model poller
+// ---------------------------------------------------------------------------
+
+const POLL_MODEL_PY: &str = r#"from lite_server import LitAPI
+
+
+class PollAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x * 2}
+
+    def encode_response(self, output):
+        return output
+"#;
+
+const POLL_MODEL_CFG: &str =
+    "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n";
+
+fn write_poll_model_version(repo: &std::path::Path, version: &str) {
+    let dir = repo.join("poll_model").join(version);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("model.py"), POLL_MODEL_PY).unwrap();
+    std::fs::write(dir.join("config.yaml"), POLL_MODEL_CFG).unwrap();
+}
+
+fn write_auto_poll_server_yaml(tmp_dir: &std::path::Path, port: u16, grpc_port: u16, metrics_port: u16) -> std::path::PathBuf {
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 0.0.0.0\n  http_port: {}\n  grpc_port: {}\n  metrics_port: {}\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: false\nmodel_repository:\n  path: {}\norchestration:\n  control_mode: auto\n  poll_interval: 1\n  load_models:\n    - poll_model\n",
+            port,
+            grpc_port,
+            metrics_port,
+            tmp_dir.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    server_yaml
+}
+
+/// Versions of poll_model listed in a /health response body.
+fn poll_model_versions(body: &Value) -> Vec<String> {
+    body["models"].as_array().unwrap().iter()
+        .filter(|m| m["name"] == "poll_model")
+        .flat_map(|m| m["versions"].as_array().unwrap().iter()
+            .map(|e| e["version"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>())
+        .collect()
+}
+
+/// control_mode=auto: a version directory created after startup is
+/// discovered by the poller and loaded without any API call.
+#[tokio::test]
+async fn test_auto_poll_discovers_new_version() {
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-autopoll-disc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    write_poll_model_version(&tmp_dir, "1");
+
+    let port = 18101;
+    let server_yaml = write_auto_poll_server_yaml(&tmp_dir, port, 18111, 18112);
+    kill_stale_on_port(port);
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(port, 30).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+
+    // v1 is loaded at startup (initial reconcile).
+    assert!(
+        wait_model_ready(&base, "poll_model", 30).await,
+        "v1 did not become ready at startup"
+    );
+
+    // Create v2 after startup; the poller must discover and load it.
+    write_poll_model_version(&tmp_dir, "2");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut found = false;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(resp) = client.get(format!("{}/health", base)).send().await {
+            let body: Value = resp.json().await.unwrap();
+            if poll_model_versions(&body).iter().any(|v| v == "2") {
+                found = true;
+                break;
+            }
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    assert!(found, "poller did not discover and load v2 within 30s");
+
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+}
+
+/// control_mode=auto: a version directory removed from disk is unloaded by
+/// the poller (declarative semantics — disk state is the source of truth).
+#[tokio::test]
+async fn test_auto_poll_unloads_removed_version() {
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-autopoll-unload-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    write_poll_model_version(&tmp_dir, "1");
+    write_poll_model_version(&tmp_dir, "2");
+
+    let port = 18102;
+    let server_yaml = write_auto_poll_server_yaml(&tmp_dir, port, 18113, 18114);
+    kill_stale_on_port(port);
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(port, 30).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+
+    // Both versions load at startup (no strategy → all disk versions).
+    assert!(
+        wait_model_ready(&base, "poll_model", 30).await,
+        "startup versions did not become ready"
+    );
+    let resp = client.get(format!("{}/health", base)).send().await.unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        poll_model_versions(&body).len(),
+        2,
+        "both versions should be loaded at startup: {:?}",
+        body["models"]
+    );
+
+    // Remove v2 from disk; the poller must unload it.
+    std::fs::remove_dir_all(tmp_dir.join("poll_model").join("2")).unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut removed = false;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(resp) = client.get(format!("{}/health", base)).send().await {
+            let body: Value = resp.json().await.unwrap();
+            let versions = poll_model_versions(&body);
+            if versions.len() == 1 && versions[0] == "1" {
+                removed = true;
+                break;
+            }
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    assert!(removed, "poller did not unload removed v2 within 30s");
 
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 }

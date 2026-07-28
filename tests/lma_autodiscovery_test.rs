@@ -164,14 +164,7 @@ class TestAPI(LitAPI):
     std::fs::create_dir_all(&repo_dir).unwrap();
     std::fs::copy(&lma_file, repo_dir.join("my_model_v1.lma")).unwrap();
 
-    // 4. Write orchestration.yaml to auto-load all models
-    std::fs::write(
-        repo_dir.join("orchestration.yaml"),
-        "control_mode: all\n",
-    )
-    .unwrap();
-
-    // 5. Write server.yaml
+    // 4. Write server.yaml (orchestration section auto-loads all models)
     let server_yaml_content = format!(
         r#"
 server:
