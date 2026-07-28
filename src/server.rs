@@ -976,6 +976,16 @@ async fn process_watch_events(
                             continue;
                         }
 
+                        // P4: version lifecycle belongs to the reconciler;
+                        // this legacy path is scheduled for removal.
+                        warn!(
+                            "DEPRECATED: hot_reload auto-loading new version {} {} under \
+                             control_mode != \"auto\" will be removed in the next minor \
+                             release — load explicitly via the Admin API or switch to \
+                             control_mode: \"auto\"",
+                            name, version
+                        );
+
                         last_reload.insert(key, Instant::now());
                         info!("Hot reload: auto-loading new model {} version {}", name, version);
                         if let Err(e) = worker_manager.load_model(&name, &version, &config).await {
@@ -1737,8 +1747,7 @@ max_batch_size: 4
     }
 
     #[tokio::test]
-    async fn file_watcher_forwards_events_when_always_forward_without_hot_reload() {
-        // control_mode=auto: lifecycle events must reach the reconciler even
+    async fn file_watcher_forwards_events_when_always_forward_without_hot_reload() {        // control_mode=auto: lifecycle events must reach the reconciler even
         // when no loaded model has hot_reload enabled.
         let tmp_dir_raw = std::env::temp_dir().join(format!("lite-server-fw-auto-{}", std::process::id()));
         tokio::fs::create_dir_all(&tmp_dir_raw).await.unwrap();
@@ -1769,5 +1778,98 @@ max_batch_size: 4
 
         handle.abort();
         let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+    }
+
+    // ===== P4: manual-mode auto-load deprecation warning =====
+
+    /// Capture the messages of all tracing events emitted while `f` runs on
+    /// a fresh current-thread runtime (the subscriber is installed as the
+    /// thread-local default, so no global-subscriber conflicts).
+    fn run_capturing_logs<F, Fut>(f: F) -> Vec<String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use tracing_subscriber::prelude::*;
+
+        struct MessageVisitor<'a>(&'a mut String);
+        impl tracing::field::Visit for MessageVisitor<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    *self.0 = format!("{:?}", value);
+                }
+            }
+        }
+
+        #[derive(Clone, Default)]
+        struct Messages(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        struct CaptureLayer(Messages);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut msg = String::new();
+                event.record(&mut MessageVisitor(&mut msg));
+                self.0 .0.lock().unwrap().push(msg);
+            }
+        }
+
+        let messages = Messages::default();
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer(messages.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(f());
+        });
+        let out = messages.0.lock().unwrap().clone();
+        out
+    }
+
+    #[test]
+    fn manual_mode_autoload_logs_deprecation_warning() {
+        let tmp = test_repo_dir("deprecate");
+        let version_dir = tmp.join("m").join("1");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        // hot_reload=true opts into auto-load; model.py exits immediately so
+        // the load attempt fails fast on any machine (with or without a
+        // working Python env) — the warning fires before the attempt.
+        std::fs::write(
+            version_dir.join("config.yaml"),
+            "hot_reload: true\nstartup_timeout: 5\n",
+        ).unwrap();
+        std::fs::write(version_dir.join("model.py"), "raise SystemExit(1)\n").unwrap();
+
+        let messages = run_capturing_logs(|| {
+            let tmp = tmp.clone();
+            async move {
+                let registry = Arc::new(ModelRegistry::new());
+                let wm = build_test_worker_manager(tmp.clone(), registry);
+                let trigger: Option<mpsc::Sender<()>> = None;
+                let mut last_reload = std::collections::HashMap::new();
+                let flag = AtomicBool::new(true);
+                let _ = process_watch_events(
+                    vec![tmp.join("m").join("1").join("config.yaml")],
+                    tmp.clone(),
+                    wm,
+                    Arc::new(ModelRegistry::new()),
+                    &mut last_reload,
+                    &crate::config::ModelTunables::default(),
+                    &flag,
+                    &trigger,
+                ).await;
+            }
+        });
+
+        assert!(
+            messages.iter().any(|m| m.contains("DEPRECATED") && m.contains("auto")),
+            "manual-mode auto-load must log a DEPRECATED warning; got: {:?}",
+            messages
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

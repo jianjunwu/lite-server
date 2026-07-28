@@ -142,6 +142,16 @@ callbacks:                     # Callback class paths loaded at worker startup
   - my_package.callbacks.AuditLogger
 ```
 
+> **Note on `hot_reload` scope:** it restarts (or, with an
+> `on_file_changed` hook, refreshes in-process) workers of
+> **already-loaded** versions when their files change. With
+> `control_mode: "auto"`, adding/removing version directories is handled
+> exclusively by the reconcile task. The legacy behavior of auto-**loading**
+> brand-new versions under `hot_reload: true` with a non-auto
+> `control_mode` is **deprecated** and will be removed in the next minor
+> release — load explicitly via the Admin API or switch to
+> `control_mode: "auto"`.
+
 ## Orchestration Configuration
 
 Path: `server.yaml` (`orchestration` section)
