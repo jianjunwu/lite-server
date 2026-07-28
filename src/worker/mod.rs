@@ -682,6 +682,70 @@ impl WorkerManager {
         guard.get(&key).cloned()
     }
 
+    /// Hot reload without restart (P3): send FILE_CHANGED to every worker of
+    /// a model version so each worker's `on_file_changed` hook can refresh
+    /// weights/configs in-process. Returns true only if at least one worker
+    /// exists and ALL workers replied {"handled": true}; any send error,
+    /// timeout, or handled=false/malformed reply (including pre-FILE_CHANGED
+    /// workers replying "Unsupported payload type") means false — the caller
+    /// then falls back to a full restart of the version.
+    pub async fn notify_file_changed(
+        &self,
+        model_name: &str,
+        version: &str,
+        paths: &[String],
+    ) -> bool {
+        /// Hook invocations may reload large weights; bounded well under the
+        /// 300s unary backstop so a hung hook can't stall the watch-event
+        /// task for minutes.
+        const FILE_CHANGED_TIMEOUT: Duration = Duration::from_secs(60);
+
+        let clients = self.get_zmq_clients(model_name, version).await.unwrap_or_default();
+        if clients.is_empty() {
+            return false;
+        }
+        for client in clients {
+            let request = crate::proto::liteserver::Request {
+                uid: format!(
+                    "file_changed_{}_{}-{}",
+                    model_name,
+                    version,
+                    uuid::Uuid::new_v4()
+                ),
+                meta: None,
+                payload: Some(crate::proto::liteserver::request::Payload::FileChanged(
+                    crate::proto::liteserver::FileChangedRequest {
+                        paths: paths.to_vec(),
+                    },
+                )),
+            };
+            let handled = match client.send_with_timeout(request, FILE_CHANGED_TIMEOUT).await {
+                Ok(resp) => resp
+                    .payload
+                    .and_then(|p| match p {
+                        crate::proto::liteserver::response::Payload::Single(s) => Some(s.data),
+                        _ => None,
+                    })
+                    .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
+                    .and_then(|v| v.get("handled")?.as_bool())
+                    .unwrap_or(false),
+                Err(e) => {
+                    warn!(
+                        "FILE_CHANGED to {} version {} failed: {}",
+                        model_name, version, e
+                    );
+                    false
+                }
+            };
+            if !handled {
+                // One worker can't refresh in-process → the whole version
+                // gets restarted anyway; no point notifying the rest.
+                return false;
+            }
+        }
+        true
+    }
+
     /// Get outlier detection state for a model version (used for streaming worker selection).
     pub async fn get_outlier_state(
         &self,
@@ -2883,5 +2947,129 @@ ModuleNotFoundError: No module named 'torch'";
         let got = drain_worker_stderr_bounded(rx, Duration::from_millis(50)).await;
         assert_eq!(got, "");
         let _ = _tx;
+    }
+
+    // ===== notify_file_changed (P3: hot reload without restart) =====
+
+    fn fc_test_manager() -> Arc<WorkerManager> {
+        let registry = Arc::new(ModelRegistry::new());
+        let inference_queue = Arc::new(InferenceQueue::new());
+        let callback_runner = Arc::new(CallbackRunner::new());
+        Arc::new(WorkerManager::new(
+            registry,
+            std::env::temp_dir(),
+            inference_queue,
+            "warn".to_string(),
+            callback_runner,
+        ))
+    }
+
+    #[cfg(unix)]
+    fn fc_ipc_endpoint(tag: &str) -> String {
+        let sock = std::env::temp_dir().join(format!(
+            "lite-server-fc-{}-{}.sock",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&sock);
+        format!("ipc://{}", sock.display())
+    }
+
+    /// A fake worker on a ZMQ PAIR socket: expects one FILE_CHANGED request,
+    /// asserts its paths, replies with the given SingleResponse data payload.
+    #[cfg(unix)]
+    fn spawn_fake_worker(
+        endpoint: String,
+        expect_paths: Vec<String>,
+        reply_data: &'static [u8],
+    ) -> std::thread::JoinHandle<()> {
+        use prost::Message as _;
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let socket = ctx.socket(zmq::PAIR).unwrap();
+            socket.set_rcvtimeo(5000).unwrap();
+            socket.set_linger(0).unwrap();
+            socket.connect(&endpoint).unwrap();
+            let bytes = socket.recv_bytes(0).expect("fake worker: no request received");
+            let req = crate::proto::liteserver::Request::decode(bytes.as_slice()).unwrap();
+            match req.payload {
+                Some(crate::proto::liteserver::request::Payload::FileChanged(fc)) => {
+                    assert_eq!(fc.paths, expect_paths);
+                }
+                _ => panic!("fake worker: expected FileChanged payload"),
+            }
+            let resp = crate::proto::liteserver::Response {
+                uid: req.uid,
+                metrics: None,
+                payload: Some(crate::proto::liteserver::response::Payload::Single(
+                    crate::proto::liteserver::SingleResponse {
+                        data: bytes::Bytes::from_static(reply_data),
+                        status: Some(crate::proto::liteserver::Status {
+                            code: "Ok".to_string(),
+                            message: String::new(),
+                        }),
+                        ..Default::default()
+                    },
+                )),
+            };
+            socket.send(resp.encode_to_vec(), 0).unwrap();
+            // Keep the socket alive briefly so the reply actually flushes.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        })
+    }
+
+    #[cfg(unix)]
+    async fn fc_manager_with_worker(tag: &str) -> (Arc<WorkerManager>, String) {
+        let wm = fc_test_manager();
+        let endpoint = fc_ipc_endpoint(tag);
+        let client = Arc::new(WorkerZmqClient::new(endpoint.clone()));
+        wm.zmq_clients
+            .write()
+            .await
+            .insert(model_version_key("m", "1"), vec![client]);
+        // Give the blocking bind a moment to come up before the peer connects.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        (wm, endpoint)
+    }
+
+    #[tokio::test]
+    async fn notify_file_changed_no_workers_returns_false() {
+        let wm = fc_test_manager();
+        assert!(
+            !wm.notify_file_changed("m", "1", &["/x.py".to_string()]).await,
+            "no workers → nothing handled → caller must fall back to restart"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn notify_file_changed_handled_returns_true() {
+        let (wm, endpoint) = fc_manager_with_worker("handled").await;
+        let fake = spawn_fake_worker(endpoint, vec!["/a.py".to_string(), "/b.yaml".to_string()], b"{\"handled\":true}");
+        assert!(wm
+            .notify_file_changed("m", "1", &["/a.py".to_string(), "/b.yaml".to_string()])
+            .await);
+        fake.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn notify_file_changed_unhandled_returns_false() {
+        let (wm, endpoint) = fc_manager_with_worker("unhandled").await;
+        let fake = spawn_fake_worker(endpoint, vec!["/a.py".to_string()], b"{\"handled\":false}");
+        assert!(!wm.notify_file_changed("m", "1", &["/a.py".to_string()]).await);
+        fake.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn notify_file_changed_malformed_reply_returns_false() {
+        // Old workers predating FILE_CHANGED reply "Unsupported payload type"
+        // (an error SingleResponse); any non-{"handled":true} body means the
+        // caller must fall back to restart.
+        let (wm, endpoint) = fc_manager_with_worker("malformed").await;
+        let fake = spawn_fake_worker(endpoint, vec!["/a.py".to_string()], b"Unsupported payload type");
+        assert!(!wm.notify_file_changed("m", "1", &["/a.py".to_string()]).await);
+        fake.join().unwrap();
     }
 }

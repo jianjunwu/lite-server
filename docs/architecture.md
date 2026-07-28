@@ -335,15 +335,21 @@ Timeline ◄── Historical sampling (optional)
    → unmatched file changes are ignored
         │
         ▼
-5. If model implements on_file_changed():
-   → call on_file_changed(changed_files)
-   → model handles its own reload logic (e.g. hot-swap weights)
+5. FILE_CHANGED is sent to every worker of the version:
+   → each worker calls its on_file_changed(changed_files) hook
+   → a hook returning non-None = handled (e.g. hot-swap weights, no restart)
         │
         ▼
-6. Else: default behavior
+6. If ALL workers report handled: done — no restart
+   Else (no hook / returns None / raises / old worker): default behavior
    → restart all workers for that model version
    → workers re-run setup() with new code
 ```
+
+`on_file_changed` runs synchronously on the worker event loop (same as a
+sync `predict`): heavy refresh work blocks inference for its duration, and
+refreshing state while requests are in flight is the model author's
+responsibility.
 
 ## Rate Limiting
 

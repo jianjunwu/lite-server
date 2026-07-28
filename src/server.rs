@@ -915,10 +915,24 @@ async fn process_watch_events(
                 }
             }
 
-            last_reload.insert(key, Instant::now());
-            info!("Hot reload: reloading {} version {}", name, version);
-            if let Err(e) = worker_manager.reload_model(&name, Some(&version)).await {
-                warn!("Hot reload failed for {} version {}: {}", name, version, e);
+            last_reload.insert(key.clone(), Instant::now());
+            // P3: give live workers a chance to refresh in-process via their
+            // on_file_changed hook; fall back to a full worker restart
+            // unless every worker of the version reports handled.
+            let changed: Vec<String> = trigger_files
+                .get(&key)
+                .map(|fs| fs.iter().map(|f| f.to_string_lossy().into_owned()).collect())
+                .unwrap_or_default();
+            if worker_manager.notify_file_changed(&name, &version, &changed).await {
+                info!(
+                    "Hot reload: {} version {} refreshed in-process via on_file_changed (no restart)",
+                    name, version
+                );
+            } else {
+                info!("Hot reload: reloading {} version {}", name, version);
+                if let Err(e) = worker_manager.reload_model(&name, Some(&version)).await {
+                    warn!("Hot reload failed for {} version {}: {}", name, version, e);
+                }
             }
         }
     }

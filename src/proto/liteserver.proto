@@ -29,6 +29,13 @@ message Request {
     // run_single). Route pattern / method / query / path_params live on
     // RequestMeta; HTTP headers ride the outer meta as for inference.
     SingleRequest route_call = 12;
+    // Hot reload: notify a live worker that files in its model version
+    // directory changed. The worker dispatches to the model's
+    // LitAPI.on_file_changed hook and replies with a SingleResponse whose
+    // data is {"handled": bool}. handled=false — or any error/timeout,
+    // including a pre-FILE_CHANGED worker replying "Unsupported payload
+    // type" — makes the server fall back to a full worker restart.
+    FileChangedRequest file_changed = 13;
     CBAddRequest cb_add = 20;
     CBRemoveRequest cb_remove = 21;
     StreamRequest stream = 30;
@@ -46,6 +53,12 @@ message BatchRequest {
 message BatchItem {
   string uid = 1;
   bytes data = 2;
+}
+
+// Hot reload notification: absolute paths of changed files inside one model
+// version directory. See Request.file_changed for the handling contract.
+message FileChangedRequest {
+  repeated string paths = 1;
 }
 
 // Continuous Batching

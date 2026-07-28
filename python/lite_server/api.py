@@ -414,13 +414,21 @@ class LitAPI:
         """Called when files in the model directory change (hot reload).
 
         Override to implement custom reload logic for weights, configs,
-        vocab files, or any other model artifacts.
+        vocab files, or any other model artifacts — refreshing them
+        in-process instead of paying a full worker restart.
+
+        The hook runs synchronously on the worker event loop (same as sync
+        ``predict``): heavy refresh work blocks inference for its duration,
+        and refreshing state while requests are in flight is the model
+        author's responsibility.
 
         Args:
             changed_files: Absolute paths to files that have changed.
 
         Returns:
-            Any non-None value suppresses the default fallback behavior.
+            Any non-None value marks the change as handled and suppresses
+            the default fallback (a full worker restart). Returning None —
+            or raising — lets the server restart the worker instead.
         """
         return None
 

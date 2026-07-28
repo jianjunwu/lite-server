@@ -39,8 +39,6 @@ pub enum RequestPayload {
     StreamClose { stream_id: String },
     #[serde(rename = "STREAM_CANCEL")]
     StreamCancel { stream_id: String },
-    #[serde(rename = "FILE_CHANGED")]
-    FileChanged { paths: Vec<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

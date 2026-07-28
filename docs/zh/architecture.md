@@ -334,15 +334,20 @@ Prometheus ◄── /metrics 端点
    → 不匹配的文件变更被忽略
         │
         ▼
-5. 如果模型实现了 on_file_changed()：
-   → 调用 on_file_changed(changed_files)
-   → 模型自行处理重载逻辑（如热更新权重）
+5. 向该版本的每个 worker 发送 FILE_CHANGED：
+   → 各 worker 调用自己的 on_file_changed(changed_files) 钩子
+   → 钩子返回非 None = 已处理（如热更新权重，不重启）
         │
         ▼
-6. 否则：默认行为
+6. 所有 worker 都报告已处理：完成，不重启
+   否则（无钩子 / 返回 None / 抛异常 / 旧版 worker)：默认行为
    → 重启该模型版本的所有 worker
    → worker 重新执行 setup() 加载新代码
 ```
+
+`on_file_changed` 在 worker 事件循环上同步执行（与同步 `predict` 相同）：
+重量级刷新会阻塞推理，在飞行请求期间刷新状态的并发安全由模型作者
+负责。
 
 ## 限流
 

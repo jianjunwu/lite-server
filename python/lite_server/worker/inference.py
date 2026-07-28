@@ -684,6 +684,9 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
         elif request.HasField("batch"):
             response = await _handle_batch(pipe, uid, request.batch, meta, lit_api, log)
 
+        elif request.HasField("file_changed"):
+            response = _handle_file_changed(lit_api, uid, request.file_changed, log)
+
         else:
             response = _make_error_response(uid, "Unsupported payload type")
 
@@ -708,6 +711,33 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
         response = _make_error_response(uid, f"{type(e).__name__}: {e}", headers=hdrs or None)
 
     await socket.send(response.SerializeToString())
+
+
+def _handle_file_changed(lit_api: LitAPI, uid: str, fc, log: logging.Logger) -> Response:
+    """Dispatch a FILE_CHANGED notification to the model's on_file_changed hook.
+
+    Reply contract: data = {"handled": bool}; the server falls back to a
+    full worker restart unless every worker of the version replies
+    handled=true. A hook exception is logged and reported as handled=false —
+    never an error status: the restart fallback IS the error handling.
+
+    The hook runs synchronously on the worker event loop (same as sync
+    predict stages): heavy refresh work blocks inference for its duration,
+    and refreshing weights while requests are in flight is the model
+    author's responsibility.
+    """
+    try:
+        handled = lit_api.on_file_changed(list(fc.paths)) is not None
+    except Exception as e:
+        log.error("on_file_changed failed: %s", _format_exc_brief(e))
+        handled = False
+    return Response(
+        uid=uid,
+        single=SingleResponse(
+            data=json.dumps({"handled": handled}).encode(),
+            status=_make_status(True),
+        ),
+    )
 
 
 async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,

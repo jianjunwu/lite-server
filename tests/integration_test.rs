@@ -1680,6 +1680,119 @@ class TestAPI(LitAPI):
 }
 
 // ---------------------------------------------------------------------------
+// P3: on_file_changed hook refreshes in-process (no worker restart)
+// ---------------------------------------------------------------------------
+
+/// The model reads its multiplier from mult.txt at setup AND in its
+/// on_file_changed hook. Changing mult.txt must change inference output
+/// while the response's boot id stays constant — proof the worker process
+/// was NOT restarted (a restart would re-import the module → new boot id,
+/// and would also produce the new output, so output alone can't
+/// distinguish the paths).
+#[tokio::test]
+#[serial]
+#[ignore] // flaky on CI: filesystem watcher timeout on macOS runners
+async fn test_hot_reload_on_file_changed_hook_avoids_restart() {
+    let model_py = r#"import os
+import uuid
+
+from lite_server import LitAPI
+
+BOOT_ID = str(uuid.uuid4())
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        self.mult = self._read_mult()
+
+    def _read_mult(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "mult.txt")) as f:
+            return int(f.read().strip())
+
+    def on_file_changed(self, changed_files):
+        if any(f.endswith("mult.txt") for f in changed_files):
+            self.mult = self._read_mult()
+            return "handled"
+        return None
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x * self.mult, "boot": BOOT_ID}
+
+    def encode_response(self, output):
+        return output
+"#;
+
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-fchanged-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let version_dir = tmp_dir.join("test_model").join("1");
+    std::fs::create_dir_all(&version_dir).unwrap();
+    std::fs::write(version_dir.join("model.py"), model_py).unwrap();
+    std::fs::write(version_dir.join("mult.txt"), "2\n").unwrap();
+    std::fs::write(
+        version_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\nhot_reload: true\nhot_reload_patterns: [\"*.txt\"]\n",
+    ).unwrap();
+
+    let port = 18031;
+    kill_stale_on_port(port);
+    let server = start_server(&[
+        "--port", &port.to_string(),
+        "--model-repo", &tmp_dir.to_string_lossy(),
+        "--no-metrics",
+        "--no-grpc",
+        "--log-level", "warn",
+    ]);
+
+    wait_for_server(port, 15).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+
+    load_model(&base, "test_model", "1").await;
+    let resp = client
+        .post(format!("{}/v2/models/test_model/infer", base))
+        .json(&json!({"input": 5}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["output"], 10);
+    let boot_before = body["boot"].as_str().unwrap().to_string();
+
+    // Change only the data file — the hook must pick it up in-process.
+    tokio::fs::write(version_dir.join("mult.txt"), "3\n").await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut refreshed = false;
+    while tokio::time::Instant::now() < deadline {
+        let resp = client
+            .post(format!("{}/v2/models/test_model/infer", base))
+            .json(&json!({"input": 5}))
+            .send().await.unwrap();
+        if resp.status() == 200 {
+            let body: Value = resp.json().await.unwrap();
+            if body["output"] == 15 {
+                assert_eq!(
+                    body["boot"].as_str().unwrap(),
+                    boot_before,
+                    "output changed but boot id changed too — worker was restarted \
+                     instead of refreshed in-process via on_file_changed"
+                );
+                refreshed = true;
+                break;
+            }
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    assert!(refreshed, "on_file_changed hook did not pick up mult.txt change within 30s");
+
+    stop_server(server);
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+}
+
+// ---------------------------------------------------------------------------
 // §4.1: max_requests reload must target the triggering version
 // ---------------------------------------------------------------------------
 

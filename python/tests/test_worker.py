@@ -26,6 +26,7 @@ from lite_server.response import Response as LiteResponse
 from lite_server.proto import (
     BatchItem,
     BatchRequest,
+    FileChangedRequest,
     Request,
     Response,
     SingleRequest,
@@ -3100,3 +3101,63 @@ class TestSetupLogging:
 
     def test_inference_setup_logging_handles_existing_handler(self):
         self._run(lambda: inference.setup_logging(0, "info"))
+
+
+class TestFileChangedDispatch:
+    """FILE_CHANGED requests dispatch to LitAPI.on_file_changed.
+
+    Reply contract: SingleResponse data = {"handled": bool}; the server
+    falls back to a full worker restart unless every worker replies
+    handled=true. A hook exception is logged and reported as handled=false
+    (never an error status — the fallback path is the error handling).
+    """
+
+    def _drive(self, api, paths=("/repo/m/1/model.py",)):
+        async def go():
+            sock = AsyncMockSocket()
+            req = Request(uid="fc-1", file_changed=FileChangedRequest(paths=paths))
+            await inference._handle_request_async(api, req, sock, log)
+            assert len(sock._msgs) == 1
+            resp = Response()
+            resp.ParseFromString(sock._msgs[0])
+            return resp
+        return asyncio.run(go())
+
+    def test_handled_true_when_hook_returns_non_none(self):
+        seen = []
+
+        class HookAPI(LitAPI):
+            def predict(self, x):
+                return x
+
+            def on_file_changed(self, changed_files):
+                seen.extend(changed_files)
+                return "handled"
+
+        resp = self._drive(HookAPI(), paths=("/a.py", "/b.yaml"))
+        assert seen == ["/a.py", "/b.yaml"]
+        assert resp.uid == "fc-1"
+        assert resp.single.status.code == "Ok"
+        assert json.loads(resp.single.data) == {"handled": True}
+
+    def test_handled_false_when_hook_returns_none(self):
+        class DefaultHookAPI(LitAPI):
+            def predict(self, x):
+                return x
+
+        resp = self._drive(DefaultHookAPI())
+        assert resp.single.status.code == "Ok"
+        assert json.loads(resp.single.data) == {"handled": False}
+
+    def test_handled_false_when_hook_raises(self):
+        class RaisingAPI(LitAPI):
+            def predict(self, x):
+                return x
+
+            def on_file_changed(self, changed_files):
+                raise RuntimeError("weights corrupted")
+
+        resp = self._drive(RaisingAPI())
+        # Not an error status: handled=false tells the server to restart.
+        assert resp.single.status.code == "Ok"
+        assert json.loads(resp.single.data) == {"handled": False}
