@@ -105,7 +105,7 @@ stream: false                  # Enable streaming output (requires stream_predic
 continuous_batching: false     # Enable continuous batching mode
 
 # Worker Management
-accelerator: null              # Accelerator type: "cpu", "cuda", "auto" (null = cpu)
+accelerator: null              # Device type label, passed through to device string (e.g. "cuda:0"); null = cpu
 devices: null                  # Device assignment (null = auto, or integer like 1)
 workers_per_device: null       # Workers per device (null = 1)
 max_queue_size: 1000           # Max pending requests per worker
@@ -123,7 +123,6 @@ startup_timeout: 60.0          # Max seconds to wait for a worker "ready" handsh
 health_check_timeout: 5.0      # Seconds per health-check probe before timing out
 health_check_kill_threshold: 0 # Consecutive probe failures before kill + respawn (0 = never)
 worker_kill_timeout: 10.0      # Seconds to wait for the OS to reap a killed worker
-hook_http_timeout: 5.0         # Seconds for a lifecycle HTTP hook request (set under `hooks:`)
 
 # Worker Lifecycle Hooks
 hooks:
@@ -133,6 +132,7 @@ hooks:
   on_ready_http: null          # HTTP callback on worker ready
   on_exit_http: null           # HTTP callback on worker exit
   on_error_http: null          # HTTP callback on worker error
+  hook_http_timeout: 5.0       # Seconds for a lifecycle HTTP hook request
   # HTTP hook format:
   # on_ready_http:
   #   url: "http://notify.internal/worker-ready"
@@ -177,7 +177,7 @@ Path: `server.yaml` (`orchestration` section)
 Controls which models and versions to load at startup.
 
 ```yaml
-control_mode: explicit         # "explicit" (manual) or "auto" (reconcile repo changes)
+control_mode: explicit         # "explicit", "auto" (reconcile repo changes), or "all" (load all models in repo)
 poll_interval: 30              # Resync interval in seconds (when control_mode=auto)
 load_models:                   # List of model names to load
   - my_model
@@ -247,6 +247,9 @@ lite-server serve [flags]
 | `--model-repo` | Model repository path | `model_repository.path` |
 | `--timeout` | Global request timeout | `server.timeout` |
 | `--log-level` | Log level | `logging.level` |
+| `--log-info-output` | Info log output file | `logging.info_output` |
+| `--log-error-output` | Error log output file | `logging.error_output` |
+| `--log-rotation` | Log rotation strategy (none/size/daily/hourly) | `logging.rotation` |
 | `--no-metrics` | Disable metrics | `metrics.enabled` |
 | `--grpc-port` | gRPC port | `server.grpc_port` |
 | `--no-grpc` | Disable gRPC | `grpc.enabled` |

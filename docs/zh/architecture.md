@@ -63,8 +63,8 @@ lite-server 是 Rust + Python 混合架构的推理服务器。Rust 内核处理
 5. Worker 通过 ZMQ 获取请求
         │
         ▼
-6. Python worker 执行：
-   decode_request() → predict() → encode_response()
+6. Python worker 执行 callback 管线：
+   on_request() → decode_request() → on_input() → predict() → on_output() → encode_response() → on_response()
         │
         ▼
 7. 响应通过 ZMQ 返回
@@ -188,14 +188,11 @@ lite-server 是 Rust + Python 混合架构的推理服务器。Rust 内核处理
 |------|------|------|
 | CLI | `cli.py` | 命令行接口（serve、benchmark、init 等） |
 | LitAPI | `api.py` | 模型开发基类，支持 predict / batch / stream / bidi_stream 等钩子 |
-| Async LitAPI | `api_async.py` | 原生 async 版 LitAPI 基类 |
-| Callback | `callback.py` | Python 侧生命周期回调 |
-| Context | `context.py` | 请求上下文（RequestContext），含 request_id、client_ip 等 |
-| Middleware | `middleware.py` | 请求/响应中间件管道 |
+| Callbacks | `callbacks/` | 推理管线回调（on_request / on_input / on_output / on_response）+ 生命周期钩子（on_before_setup / on_after_setup / on_teardown） |
+| Context | `context.py` | 请求上下文（RequestContext、RequestMeta），含 request_id、client_ip 等 |
 | Pipeline | `pipeline.py` | 数据预处理/后处理流水线 |
 | Route | `route.py` | `@route` 装饰器，声明自定义 HTTP 路由 |
 | Server Proxy | `server_proxy.py` | Worker 内 loopback HTTP 代理（回连 Rust 内核） |
-| Request | `request.py` | 推理请求数据模型 |
 | Response | `response.py` | 推理响应数据模型 |
 | Exceptions | `exceptions.py` | Python 侧异常定义 |
 | Worker | `worker/inference.py` | 加载和运行模型的 Worker 进程 |
@@ -221,7 +218,8 @@ lite-server-core（主进程）
   ├── 指标服务器
   ├── 限流器（令牌桶）
   ├── 模型注册表
-  │     ├── 文件监听器（热重载）
+  │     ├── reconcile 任务（auto 模式下管理版本生命周期）
+  │     ├── 文件监听器（目录事件近实时触发 reconcile）
   │     └── 推理队列（每模型版本一个）
   └── Worker 进程（子进程）
         ├── Worker 1 → Python 解释器 → model.py
@@ -236,6 +234,7 @@ lite-server-core（主进程）
 - 异常检测剔除不健康 worker（Envoy 风格的连续错误计数）
 - 心跳探测检测卡死 worker 并自动重启
 - Worker 生命周期钩子（shell 命令 + HTTP 回调）：`on_ready`、`on_exit`、`on_error`
+- Python Callback 生命周期钩子：`on_before_setup` / `on_after_setup` / `on_teardown`（异常隔离，失败不传播）
 - 加权路由支持金丝雀发布（多版本按权重分流）
 - 自适应批处理根据队列深度动态调整 batch_timeout
 
@@ -262,7 +261,7 @@ InferenceQueue：Arc<RequestMeta>（无数据拷贝）
 ZMQ：protobuf 序列化 → 发送给 worker
     │
     ▼
-Python：protobuf 反序列化 → decode_request() → [batch()] → predict() → [unbatch()] → encode_response()
+Python：protobuf 反序列化 → on_request() → decode_request() → on_input() → [batch()] → predict() → [unbatch()] → on_output() → encode_response() → on_response()
     │
     ▼
 ZMQ：protobuf 序列化 → 发回
@@ -317,37 +316,66 @@ Prometheus ◄── /metrics 端点
 
 ## 热重载流程
 
+lite-server 通过 `orchestration.control_mode` 控制模型版本的生命周期管理：
+
+| control_mode | 行为 |
+|---|---|
+| `"explicit"`（默认） | 仅加载 `load_models` 中列出的模型版本，不监听目录变化 |
+| `"auto"` | 后台 reconcile 任务周期扫描模型仓库 + 目录事件近实时触发 reconcile，自动加载/卸载版本 |
+
+### auto 模式下的 reconcile
+
+`"auto"` 模式下，reconcile 任务是版本生命周期的唯一属主：
+
 ```
-1. 文件监听器检测到模型目录文件变更
+1. 目录事件（新版本目录 / 版本目录消失）触发 reconcile
         │
         ▼
-2. 防抖（默认 1 秒）
+2. 合并窗口（reconcile_coalesce_secs，默认 2 秒）内的事件合并为一次 reconcile
         │
         ▼
-3. 检查模型配置：
+3. reconcile_models()：
+   ├── 自动解包 .lma 制品（增量，按 mtime）
+   ├── 扫描模型仓库中的可用版本
+   ├── 根据 load_policy 计算目标版本集（"all" / "latest" / "explicit"）
+   ├── 卸载不在目标集中的版本
+   ├── 加载缺失的目标版本
+   └── 激活默认版本（如配置）
+```
+
+### 已加载版本的热刷新
+
+对已加载且 `hot_reload: true` 的版本，文件变更走 FILE_CHANGED 路径：
+
+```
+1. 文件监听器检测到已加载版本目录内的文件变更
+        │
+        ▼
+2. 检查模型配置：
    ├── hot_reload = false → 跳过
    └── hot_reload = true → 继续
         │
         ▼
-4. 如果配置了 hot_reload_patterns：
-   → 只对匹配模式的文件触发重载
-   → 不匹配的文件变更被忽略
+3. 如果配置了 hot_reload_patterns（默认 ["*.py"]）：
+   → 只对匹配模式的文件触发刷新，不匹配的被忽略
+        │
+        ▼
+4. 冷却检查（hot_reload_cooldown_secs，默认 3 秒）：
+   → 同一版本在冷却窗口内的重复事件被忽略
         │
         ▼
 5. 向该版本的每个 worker 发送 FILE_CHANGED：
-   → 各 worker 调用自己的 on_file_changed(changed_files) 钩子
+   → 各 worker 调用 on_file_changed(changed_files) 钩子
    → 钩子返回非 None = 已处理（如热更新权重，不重启）
         │
         ▼
 6. 所有 worker 都报告已处理：完成，不重启
-   否则（无钩子 / 返回 None / 抛异常 / 旧版 worker)：默认行为
+   否则（无钩子 / 返回 None / 抛异常 / 旧版 worker）：默认行为
    → 重启该模型版本的所有 worker
    → worker 重新执行 setup() 加载新代码
 ```
 
-`on_file_changed` 在 worker 事件循环上同步执行（与同步 `predict` 相同）：
-重量级刷新会阻塞推理，在飞行请求期间刷新状态的并发安全由模型作者
-负责。
+> **已废弃**：`control_mode != "auto"` 时，新版本目录自动加载的行为已在当前版本标记为 DEPRECATED，将在下个小版本移除。请改用 `control_mode: "auto"` 或通过 Admin API 显式加载。
 
 ## 限流
 
@@ -359,6 +387,21 @@ Prometheus ◄── /metrics 端点
 
 配置示例见 [configuration.md](./configuration.md)。
 
-## 中间件
+## Callbacks
 
-Python 侧支持请求/响应中间件管道（`middleware.py`），在 `decode_request()` 之前和 `encode_response()` 之后执行。典型用途：请求日志、认证鉴权、请求/响应改写。
+Python 侧 Callback 系统（`callbacks/`）在推理管线的关键节点注入自定义逻辑：
+
+```
+on_request → [decode_request] → on_input → [predict] → on_output → [encode_response] → on_response
+```
+
+**数据钩子**（`on_request` / `on_input` / `on_output` / `on_response`）：
+接收 `RequestContext`，可修改数据、提前返回 `Response`、或抛出 `HTTPException` 拒绝请求。支持 sync / async，流式模式下每个 chunk 各触发一次 `on_output` + `on_response`。
+
+**生命周期钩子**（`on_before_setup` / `on_after_setup` / `on_teardown`）：
+在请求路径之外运行，异常隔离（失败仅日志，不传播）。
+
+**错误钩子**（`on_error`）：
+请求失败时驱动，异常隔离，不掩盖原始错误。
+
+> `middleware.py` 自 0.7.0 起已废弃，被 Callback 系统取代。内置策略回调（RequireApiKey / RateLimit / Cors / LogRequests）自 0.7.6 起改为 `config.yaml` 中的声明式 `policies` 配置，由 Rust 内核执行。

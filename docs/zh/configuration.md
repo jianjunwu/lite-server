@@ -105,7 +105,7 @@ stream: false                  # 启用流式输出（需要 model.py 中实现 
 continuous_batching: false     # 启用 continuous batching 模式
 
 # Worker 管理
-accelerator: null              # 加速器类型：cpu, cuda, auto（null = cpu）
+accelerator: null              # 设备类型标签，透传到 device 字符串（如 "cuda:0"）；null = cpu
 devices: null                  # 设备分配（null = 自动，或整数如 1）
 workers_per_device: null       # 每设备 worker 数（null = 1）
 max_queue_size: 1000           # 每个 worker 的最大待处理请求数
@@ -123,7 +123,6 @@ startup_timeout: 60.0          # 等待 worker "ready" 握手的最大秒数
 health_check_timeout: 5.0      # 单次健康探测超时秒数
 health_check_kill_threshold: 0 # 连续探测失败达到此次数后杀死并重启 worker（0 = 从不）
 worker_kill_timeout: 10.0      # 杀死 worker 后等待 OS 回收的秒数
-hook_http_timeout: 5.0         # 生命周期 HTTP 钩子请求的超时秒数（配置在 `hooks:` 下）
 
 # Worker 生命周期钩子
 hooks:
@@ -133,6 +132,7 @@ hooks:
   on_ready_http: null          # worker 就绪时的 HTTP 回调
   on_exit_http: null           # worker 退出时的 HTTP 回调
   on_error_http: null          # worker 异常退出时的 HTTP 回调
+  hook_http_timeout: 5.0       # 生命周期 HTTP 钩子请求的超时秒数
   # HTTP 钩子格式：
   # on_ready_http:
   #   url: "http://notify.internal/worker-ready"
@@ -174,7 +174,7 @@ callbacks:                     # Worker 启动时加载的 callback 类路径列
 控制启动时加载哪些模型和版本。
 
 ```yaml
-control_mode: explicit         # explicit（手动）或 auto（对齐仓库变更）
+control_mode: explicit         # explicit（显式）、auto（对齐仓库变更）或 all（加载仓库中所有模型）
 poll_interval: 30              # 兜底重同步间隔（秒），control_mode=auto 时生效
 load_models:                   # 启动时加载的模型列表
   - my_model
@@ -238,6 +238,9 @@ lite-server serve [参数]
 | `--model-repo` | 模型仓库路径 | `model_repository.path` |
 | `--timeout` | 全局请求超时 | `server.timeout` |
 | `--log-level` | 日志级别 | `logging.level` |
+| `--log-info-output` | info 日志输出文件 | `logging.info_output` |
+| `--log-error-output` | error 日志输出文件 | `logging.error_output` |
+| `--log-rotation` | 日志轮转策略（none/size/daily/hourly） | `logging.rotation` |
 | `--no-metrics` | 禁用指标 | `metrics.enabled` |
 | `--grpc-port` | gRPC 端口 | `server.grpc_port` |
 | `--no-grpc` | 禁用 gRPC | `grpc.enabled` |

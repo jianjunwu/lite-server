@@ -64,8 +64,8 @@ A single inference request follows this path:
 5. Worker picks up request via ZMQ
         │
         ▼
-6. Python worker executes:
-   decode_request() → predict() → encode_response()
+6. Python worker executes callback pipeline:
+   on_request() → decode_request() → on_input() → predict() → on_output() → encode_response() → on_response()
         │
         ▼
 7. Response sent back via ZMQ
@@ -189,14 +189,11 @@ Models can override `add_sequence()` / `remove_sequence()` to implement continuo
 |-----------|---------|------|
 | CLI | `cli.py` | Command-line interface (serve, benchmark, init, etc.) |
 | LitAPI | `api.py` | Model authoring base class with predict / batch / stream / bidi_stream hooks |
-| Async LitAPI | `api_async.py` | Native async variant of LitAPI base class |
-| Callback | `callback.py` | Python-side lifecycle callbacks |
-| Context | `context.py` | Request context (RequestContext) with request_id, client_ip, etc. |
-| Middleware | `middleware.py` | Request/response middleware pipeline |
+| Callbacks | `callbacks/` | Inference pipeline callbacks (on_request / on_input / on_output / on_response) + lifecycle hooks (on_before_setup / on_after_setup / on_teardown) |
+| Context | `context.py` | Request context (RequestContext, RequestMeta) with request_id, client_ip, etc. |
 | Pipeline | `pipeline.py` | Data pre/post-processing pipeline |
 | Route | `route.py` | `@route` decorator for declaring custom HTTP routes |
 | Server Proxy | `server_proxy.py` | Loopback HTTP proxy within worker (reach back into Rust core) |
-| Request | `request.py` | Inference request data model |
 | Response | `response.py` | Inference response data model |
 | Exceptions | `exceptions.py` | Python-side exception definitions |
 | Worker | `worker/inference.py` | Worker process that loads and runs models |
@@ -222,7 +219,8 @@ lite-server-core (main process)
   ├── Metrics server
   ├── Rate limiter (token bucket)
   ├── Model Registry
-  │     ├── File watcher (hot reload)
+  │     ├── Reconcile task (manages version lifecycle in auto mode)
+  │     ├── File watcher (directory events trigger near-real-time reconcile)
   │     └── Inference Queue (per model version)
   └── Worker processes (subprocesses)
         ├── Worker 1 → Python interpreter → model.py
@@ -237,6 +235,7 @@ lite-server-core (main process)
 - Outlier detection ejects unhealthy workers (Envoy-style consecutive error counting)
 - Heartbeat probing detects stuck workers and auto-restarts them
 - Worker lifecycle hooks (shell commands + HTTP callbacks): `on_ready`, `on_exit`, `on_error`
+- Python Callback lifecycle hooks: `on_before_setup` / `on_after_setup` / `on_teardown` (exception-isolated, failures never propagated)
 - Weighted routing enables canary deployments (multi-version traffic splitting)
 - Adaptive batching adjusts batch_timeout dynamically based on queue depth
 
@@ -263,7 +262,7 @@ InferenceQueue: Arc<RequestMeta> (no data copy)
 ZMQ: protobuf serialize → send to worker
     │
     ▼
-Python: protobuf deserialize → decode_request() → [batch()] → predict() → [unbatch()] → encode_response()
+Python: protobuf deserialize → on_request() → decode_request() → on_input() → [batch()] → predict() → [unbatch()] → on_output() → encode_response() → on_response()
     │
     ▼
 ZMQ: protobuf serialize → send back
@@ -318,21 +317,52 @@ Timeline ◄── Historical sampling (optional)
 
 ## Hot Reload Flow
 
+lite-server controls model version lifecycle through `orchestration.control_mode`:
+
+| control_mode | Behavior |
+|---|---|
+| `"explicit"` (default) | Only loads models listed in `load_models`; does not watch for directory changes |
+| `"auto"` | A background reconcile task periodically scans the model repo + directory events trigger near-real-time reconciles to auto-load/unload versions |
+
+### Reconcile in auto mode
+
+In `"auto"` mode, the reconcile task is the single authority on version lifecycle:
+
 ```
-1. File watcher detects file change in model directory
+1. Directory events (new version dir / version dir removed) trigger a reconcile
         │
         ▼
-2. Debounce (1 second default)
+2. A coalesce window (reconcile_coalesce_secs, default 2s) merges bursts into one reconcile run
         │
         ▼
-3. Check model configuration:
+3. reconcile_models():
+   ├── Auto-unpack .lma artifacts (incremental, by mtime)
+   ├── Scan the model repo for available versions
+   ├── Compute target version set per load_policy ("all" / "latest" / "explicit")
+   ├── Unload versions no longer in the target set
+   ├── Load missing target versions
+   └── Activate the default version (if configured)
+```
+
+### In-Process Hot Refresh for Loaded Versions
+
+For loaded versions with `hot_reload: true`, file changes go through the FILE_CHANGED path:
+
+```
+1. File watcher detects file change inside a loaded version's directory
+        │
+        ▼
+2. Check model configuration:
    ├── hot_reload = false → skip
    └── hot_reload = true → continue
         │
         ▼
-4. If hot_reload_patterns is configured:
-   → only changes matching the pattern trigger reload
-   → unmatched file changes are ignored
+3. If hot_reload_patterns is configured (default ["*.py"]):
+   → only changes matching the pattern trigger a refresh; unmatched files are ignored
+        │
+        ▼
+4. Cooldown check (hot_reload_cooldown_secs, default 3s):
+   → repeat events within the cooldown window for the same version are ignored
         │
         ▼
 5. FILE_CHANGED is sent to every worker of the version:
@@ -346,10 +376,7 @@ Timeline ◄── Historical sampling (optional)
    → workers re-run setup() with new code
 ```
 
-`on_file_changed` runs synchronously on the worker event loop (same as a
-sync `predict`): heavy refresh work blocks inference for its duration, and
-refreshing state while requests are in flight is the model author's
-responsibility.
+> **Deprecated**: When `control_mode != "auto"`, the automatic loading of new version directories is DEPRECATED and will be removed in the next minor release. Switch to `control_mode: "auto"` or load explicitly via the Admin API.
 
 ## Rate Limiting
 
@@ -361,6 +388,21 @@ Token-bucket-based rate limiting (`rate_limit.rs`), supporting:
 
 See [configuration.md](./configuration.md) for configuration examples.
 
-## Middleware
+## Callbacks
 
-Python-side request/response middleware pipeline (`middleware.py`), executed before `decode_request()` and after `encode_response()`. Typical use cases: request logging, authentication/authorization, request/response transformation.
+The Python-side Callback system (`callbacks/`) injects custom logic at key points in the inference pipeline:
+
+```
+on_request → [decode_request] → on_input → [predict] → on_output → [encode_response] → on_response
+```
+
+**Data hooks** (`on_request` / `on_input` / `on_output` / `on_response`):
+Receive a `RequestContext`; can mutate data, return a `Response` for early exit, or raise `HTTPException` to reject the request. Sync and async are both supported. In streaming mode, `on_output` + `on_response` fire once per chunk.
+
+**Lifecycle hooks** (`on_before_setup` / `on_after_setup` / `on_teardown`):
+Run outside the request path, exception-isolated (failures are logged, never propagated).
+
+**Error hook** (`on_error`):
+Driven when a request fails; exception-isolated, never masks the original error.
+
+> `middleware.py` has been deprecated since 0.7.0, replaced by the Callback system. Built-in policy callbacks (RequireApiKey / RateLimit / Cors / LogRequests) were retired in 0.7.6 in favor of declarative `policies` in `config.yaml`, enforced by the Rust core.
