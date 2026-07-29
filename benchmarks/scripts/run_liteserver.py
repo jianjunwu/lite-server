@@ -37,22 +37,24 @@ def _set_workers_in_config(model_repo: Path, model_name: str, workers: int) -> N
                 yaml.safe_dump(cfg, f, sort_keys=False)
 
 
-def _write_orchestration(model_repo: Path, model_name: str) -> Path:
-    """Write orchestration.yaml to model_repo root for auto-load."""
-    orch_path = model_repo / "orchestration.yaml"
-    orch = {
-        "control_mode": "explicit",
-        "load_models": [model_name],
-        "models": [
-            {
-                "name": model_name,
-                "load_policy": "all",
-            }
-        ],
+def _write_server_config(model_repo: Path, model_name: str) -> Path:
+    """Write a server config YAML with explicit orchestration for auto-load."""
+    cfg_path = model_repo / "server.yaml"
+    cfg = {
+        "orchestration": {
+            "control_mode": "explicit",
+            "load_models": [model_name],
+            "models": [
+                {
+                    "name": model_name,
+                    "load_policy": "all",
+                }
+            ],
+        },
     }
-    with open(orch_path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(orch, f, sort_keys=False)
-    return orch_path
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+    return cfg_path
 
 
 def wait_for_health(url: str, timeout: float = 30.0) -> bool:
@@ -149,8 +151,8 @@ def main() -> int:
     # Update workers_per_device in the temporary config
     _set_workers_in_config(temp_repo, args.model, args.workers)
 
-    # Write orchestration.yaml for auto-load in the temporary repo
-    orch_path = _write_orchestration(temp_repo, args.model)
+    # Write server config for auto-load in the temporary repo
+    config_path = _write_server_config(temp_repo, args.model)
 
     if args.core:
         # Look for lite-server-core binary
@@ -182,6 +184,7 @@ def main() -> int:
     cmd = [
         lite_server,
         subcmd,
+        "--config", str(config_path),
         "--port", str(args.port),
         "--host", "127.0.0.1",
         "--model-repo", str(temp_repo),

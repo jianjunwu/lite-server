@@ -91,11 +91,14 @@ def run_wrk(
     concurrency: int,
     duration: float,
     lua_script: Path,
+    threads: int = 4,
 ) -> dict[str, float]:
     """Run wrk and parse its output."""
+    # wrk requires connections >= threads
+    threads = min(threads, concurrency)
     cmd = [
         wrk_path,
-        "-t4",
+        f"-t{threads}",
         f"-c{concurrency}",
         f"-d{int(duration)}s",
         "--latency",
