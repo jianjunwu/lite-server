@@ -935,6 +935,13 @@ impl WorkerManager {
         version: &str,
         config: &ModelConfig,
     ) -> Result<(), AppError> {
+        // Fail fast on bad float tunables (negative/NaN) before they reach
+        // Duration::from_secs_f* and panic. Catches every load path: YAML,
+        // CLI model_defaults, Admin API, ensemble.
+        config
+            .validate()
+            .map_err(|e| AppError::Config(e.to_string()))?;
+
         info!("Loading model {} version {}", model_name, version);
 
         let model_dir = crate::validation::resolve_model_dir(

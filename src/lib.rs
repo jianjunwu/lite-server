@@ -133,6 +133,10 @@ pub fn run_server(
         },
     });
 
+    // Validate after overrides so a bad float tunable fails fast here instead
+    // of panicking at Duration::from_secs_f* during model load.
+    cfg.validate()?;
+
     let _log_guard = logging::init(
         &cfg.logging.level,
         cfg.logging.info_output.as_deref(),

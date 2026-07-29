@@ -235,6 +235,13 @@ fn main() {
                 ..Default::default()
             });
 
+            // Validate after CLI overrides so a negative --<tunable> fails fast
+            // with a clear message instead of panicking at model load.
+            if let Err(e) = cfg.validate() {
+                eprintln!("Invalid configuration: {}", e);
+                std::process::exit(1);
+            }
+
             // Initialize logging (level from config, overridable via --log-level CLI)
             let _log_guard = lite_server::logging::init(
                 &cfg.logging.level,

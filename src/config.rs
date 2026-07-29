@@ -569,6 +569,35 @@ impl Default for ModelConfig {
     }
 }
 
+/// Reject float values that would later panic at `Duration::from_secs_f*`.
+/// A duration-like config field must be finite and non-negative (0 = disabled).
+fn check_duration_secs(name: &str, v: f32) -> anyhow::Result<()> {
+    if !v.is_finite() {
+        anyhow::bail!("config field `{name}` must be a finite number of seconds, got {v}");
+    }
+    if v < 0.0 {
+        anyhow::bail!("config field `{name}` must be >= 0 seconds, got {v}");
+    }
+    Ok(())
+}
+
+impl ModelConfig {
+    /// Validate duration-like float fields so a YAML typo or negative CLI
+    /// override fails fast here instead of panicking later at
+    /// `Duration::from_secs_f*` when the inference queue / worker is built.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        check_duration_secs("batch_timeout", self.batch_timeout)?;
+        check_duration_secs("min_batch_timeout", self.min_batch_timeout)?;
+        check_duration_secs("request_timeout", self.request_timeout)?;
+        check_duration_secs("health_check_interval", self.health_check_interval)?;
+        check_duration_secs("ejection_timeout", self.ejection_timeout)?;
+        check_duration_secs("startup_timeout", self.startup_timeout)?;
+        check_duration_secs("health_check_timeout", self.health_check_timeout)?;
+        check_duration_secs("worker_kill_timeout", self.worker_kill_timeout)?;
+        Ok(())
+    }
+}
+
 /// Returns the Unix socket path if `host` starts with `unix:`, otherwise `None`.
 pub fn unix_socket_path(host: &str) -> Option<&str> {
     host.strip_prefix("unix:")
@@ -577,6 +606,7 @@ pub fn unix_socket_path(host: &str) -> Option<&str> {
 pub fn load_config(path: &str) -> anyhow::Result<Config> {
     let content = std::fs::read_to_string(path)?;
     let config: Config = serde_yaml::from_str(&content)?;
+    config.validate()?;
     Ok(config)
 }
 
@@ -698,6 +728,23 @@ impl Config {
     /// Apply CLI model defaults to a ModelConfig (called per-model at load time).
     pub fn apply_model_defaults(&self, model: &mut ModelConfig) {
         self.model_defaults.apply_to(model);
+    }
+
+    /// Validate server-level duration-like fields (ServerConfig + ServerTunables).
+    /// Per-model fields are validated on `ModelConfig::validate` at load time;
+    /// `model_defaults` reach a `ModelConfig` only through `apply_to`, so they are
+    /// checked there rather than enumerated here.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        check_duration_secs("server.timeout", self.server.timeout)?;
+        check_duration_secs("server.graceful_timeout", self.server.graceful_timeout)?;
+        check_duration_secs("server.keepalive_timeout", self.server.keepalive_timeout)?;
+        check_duration_secs("tunables.reconcile_coalesce_secs", self.tunables.reconcile_coalesce_secs)?;
+        check_duration_secs("tunables.hot_reload_cooldown_secs", self.tunables.hot_reload_cooldown_secs)?;
+        check_duration_secs("tunables.watcher_debounce_secs", self.tunables.watcher_debounce_secs)?;
+        check_duration_secs("tunables.file_changed_timeout_secs", self.tunables.file_changed_timeout_secs)?;
+        check_duration_secs("tunables.worker_stderr_drain_secs", self.tunables.worker_stderr_drain_secs)?;
+        check_duration_secs("tunables.unpack_timeout_secs", self.tunables.unpack_timeout_secs)?;
+        Ok(())
     }
 }
 
@@ -1457,5 +1504,40 @@ policies:
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         let parsed: Config = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.rate_limit.max_buckets, 4096);
+    }
+
+    #[test]
+    fn test_negative_float_tunable_is_rejected_at_config_boundary() {
+        // B1: a negative or non-finite float tunable must be rejected at the
+        // config boundary (load_config / apply_overrides / load_model) so it
+        // never reaches Duration::from_secs_f* and panics the server.
+        //
+        // serde accepts the value unchanged (ModelConfig is #[serde(default)]),
+        // so without validation a YAML typo or `--health-check-interval -1`
+        // would crash at model load.
+        let cfg: ModelConfig =
+            serde_yaml::from_str("health_check_interval: -1.0\n").expect("parses");
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("health_check_interval"),
+            "validation should name the offending field; got: {err}"
+        );
+
+        // Non-finite values are rejected too (NaN/Inf also panic Duration):
+        let mut cfg = ModelConfig::default();
+        cfg.request_timeout = f32::NAN;
+        assert!(cfg.validate().is_err());
+
+        // Valid defaults pass:
+        assert!(ModelConfig::default().validate().is_ok());
+
+        // Server-level + tunables fields are validated on Config too:
+        let mut cfg = Config::default();
+        cfg.server.timeout = -1.0;
+        assert!(cfg.validate().is_err());
+        cfg.server.timeout = 30.0;
+        cfg.tunables.watcher_debounce_secs = f32::INFINITY;
+        assert!(cfg.validate().is_err());
+        assert!(Config::default().validate().is_ok());
     }
 }
