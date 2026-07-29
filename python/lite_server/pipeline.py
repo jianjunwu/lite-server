@@ -613,7 +613,14 @@ class Pipeline:
         merged = dict(ctx.response_headers)
         if headers:
             merged.update(headers)
-        resp_bytes = _json.dumps(body)
+        # bytes/str bodies go out verbatim — JSON is only for structured
+        # data. Matches _build_route_response / _serialize_route_chunk.
+        if isinstance(body, (bytes, bytearray)):
+            resp_bytes = bytes(body)
+        elif isinstance(body, str):
+            resp_bytes = body.encode()
+        else:
+            resp_bytes = _json.dumps(body)
         return (
             resp_bytes,
             Status(code="Ok"),

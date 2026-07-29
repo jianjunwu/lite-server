@@ -665,7 +665,8 @@ class TestFinalize:
         assert sc == 201
         assert mt == "text/plain"
         assert clean is None
-        assert resp_bytes == b'"plain"'
+        # P3: str 直发(配合 media_type=text/plain),不再 JSON 加引号
+        assert resp_bytes == b"plain"
 
     def test_unwrap_plain_value(self):
         assert unwrap_response({"a": 1}) == ({"a": 1}, None)
@@ -1426,3 +1427,39 @@ class TestFinalizeResponseHeaders:
         assert headers is not None
         assert headers["X-Ctx"] == "ctx_val"
         assert headers["X-Early"] == "early_val"
+
+
+# ---------------------------------------------------------------------------
+# finalize bytes/str passthrough (P3)
+# ---------------------------------------------------------------------------
+
+
+class TestFinalizeBytesPassthrough:
+    """encode_response 返回 bytes/str 时不经 JSON 序列化(P3):bytes 直发、
+    str 直接 utf-8 encode,结构化数据才走 _json.dumps。"""
+
+    def test_bytes_returned_verbatim(self):
+        ctx = RequestContext(meta=_make_route_meta(), response=b"\x00\x01\x02")
+        pipe = Pipeline.build(DummyLitAPI(), [])
+        resp_bytes, _, _, _ = pipe.finalize(ctx)
+        assert resp_bytes == b"\x00\x01\x02"
+
+    def test_bytearray_returned_as_bytes(self):
+        ctx = RequestContext(meta=_make_route_meta(), response=bytearray(b"abc"))
+        pipe = Pipeline.build(DummyLitAPI(), [])
+        resp_bytes, _, _, _ = pipe.finalize(ctx)
+        assert resp_bytes == b"abc"
+        assert isinstance(resp_bytes, bytes)
+
+    def test_str_encoded_without_json_quoting(self):
+        # 模型返回已序列化的 JSON 字符串时不被二次编码。
+        ctx = RequestContext(meta=_make_route_meta(), response='{"a":1}')
+        pipe = Pipeline.build(DummyLitAPI(), [])
+        resp_bytes, _, _, _ = pipe.finalize(ctx)
+        assert resp_bytes == b'{"a":1}'
+
+    def test_dict_still_json_serialized(self):
+        ctx = RequestContext(meta=_make_route_meta(), response={"a": 1})
+        pipe = Pipeline.build(DummyLitAPI(), [])
+        resp_bytes, _, _, _ = pipe.finalize(ctx)
+        assert resp_bytes == b'{"a":1}'

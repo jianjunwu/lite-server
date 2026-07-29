@@ -213,7 +213,7 @@ class TestEarlyReturnPoints:
         api.predict = lambda x: Response(content="<h1>hi</h1>", media_type="text/html")
 
         resp_bytes, status, metrics, headers = await _run(api)
-        assert resp_bytes == b'"<h1>hi</h1>"'
+        assert resp_bytes == b"<h1>hi</h1>"  # P3: str 直发,配合 media_type=text/html
         assert headers == {"_mt": "text/html"}
 
     # ---- ctx.respond ----
@@ -283,7 +283,7 @@ class TestEarlyReturnFlow:
         api._metric_values = [(0, 3.14)]
 
         resp_bytes, status, metrics, headers = await _run(api, [MetricCB()])
-        assert resp_bytes == b'"done"'
+        assert resp_bytes == b"done"  # P3: str 直发
         assert metrics is not None
         assert len(metrics.gauges) == 1
         # protobuf float (f32) has limited precision for 3.14
