@@ -29,7 +29,7 @@ from lite_server.proto import (
     SingleResponse,
     Status,
 )
-from lite_server.worker.inference import (
+from lite_server.worker.common import (
     _build_single_response,
     _format_exc_brief,
     _get_pipeline,

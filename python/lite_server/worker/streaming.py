@@ -16,7 +16,7 @@ from lite_server.context import Headers, RequestContext, RequestMeta
 from lite_server.exceptions import HTTPException
 from lite_server.pipeline import Pipeline, collect_metrics, unwrap_response
 from lite_server.proto import Request, Response, StreamDone, StreamRequest, StreamResponse
-from lite_server.worker.inference import (
+from lite_server.worker.common import (
     _format_exc_brief,
     _get_pipeline,
     _make_stream_chunk,
