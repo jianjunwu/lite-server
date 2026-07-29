@@ -2096,7 +2096,8 @@ pub async fn upload_model_handler(
     let auto_load = query.load.unwrap_or(true);
     if auto_load {
         let config_path = target_dir.join("config.yaml");
-        let config = crate::config::load_model_config(&config_path).unwrap_or_default();
+        let mut config = crate::config::load_model_config(&config_path).unwrap_or_default();
+        state.config.apply_model_defaults(&mut config);
         if let Err(e) = state.worker_manager.load_model(&model_name, &version, &config).await {
             warn!("Auto-load after upload failed: {}", e);
         }

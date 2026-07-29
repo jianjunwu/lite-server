@@ -311,9 +311,10 @@ async fn execute_step(
         let sub_model_dir = crate::validation::resolve_model_dir(
             &state.repo_path, &step.model, &step.version,
         )?;
-        let config = crate::config::load_model_config(
+        let mut config = crate::config::load_model_config(
             &sub_model_dir.join("config.yaml")
         ).unwrap_or_default();
+        state.config.apply_model_defaults(&mut config);
         if let Err(e) = state.worker_manager.load_model(&step.model, &step.version, &config).await {
             warn!("Failed to auto-load sub-model {} v{}: {}", step.model, step.version, e);
             return Err(AppError::ModelNotReady(format!(

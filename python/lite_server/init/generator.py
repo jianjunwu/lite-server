@@ -227,6 +227,25 @@ SERVER_YAML = textwrap.dedent("""\
       # max_requests: null            # Override per-model max requests before recycle
       # max_requests_jitter: null     # Override per-model recycle jitter
       # health_check_interval: null   # Override per-model health check interval
+      # max_retries: null             # Override per-model batch retry count
+      # ejection_error_threshold: null  # Override per-model ejection threshold
+      # ejection_timeout: null        # Override per-model ejection recovery seconds
+      # ejection_max_percent: null    # Override per-model max ejectable worker %
+      # startup_timeout: null         # Override per-model worker ready handshake timeout
+      # health_check_timeout: null    # Override per-model per-probe timeout
+      # health_check_kill_threshold: null  # Override per-model probe failures before kill+respawn
+      # worker_kill_timeout: null     # Override per-model OS reap wait after kill
+      # hook_http_timeout: null       # Override per-model lifecycle HTTP hook timeout
+
+    # Server-level knobs (defaults shown; uncomment to tune).
+    # tunables:
+    #   reconcile_coalesce_secs: 2.0    # Coalesce window: burst of fs events -> one reconcile
+    #   hot_reload_cooldown_secs: 3.0   # Per-model/version cooldown between hot reloads
+    #   watcher_debounce_secs: 2.5      # File watcher debounce window
+    #   file_changed_timeout_secs: 60.0 # Timeout for one worker's FILE_CHANGED round-trip
+    #   worker_stderr_tail_bytes: 65536 # Max stderr bytes retained for crash diagnostics
+    #   worker_stderr_drain_secs: 5.0   # Wait for an exited worker to flush stderr
+    #   unpack_timeout_secs: 120.0      # Upper bound for one .lma unpack invocation
 
     # Admin UI and API feature toggles.
     features:

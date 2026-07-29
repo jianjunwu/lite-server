@@ -76,6 +76,15 @@ These flags set global defaults that override per-model `config.yaml` values.
 | `--max-requests-jitter` | int | 0 | Random jitter range for `max_requests` to prevent thundering herd |
 | `--request-timeout` | float | 0.0 | Per-request hard timeout in seconds (0 = disabled) |
 | `--health-check-interval` | float | 15.0 | Active health check interval in seconds (0 = disabled) |
+| `--ejection-error-threshold` | int | 3 | Consecutive errors before a worker is ejected (0 = disabled) |
+| `--ejection-timeout` | float | 30.0 | Seconds an ejected worker stays out before auto-recovery |
+| `--ejection-max-percent` | int | 50 | Max % of workers ejectable at once (1-100) |
+| `--max-retries` | int | 3 | Retry a failed batch on another worker up to N times (0 = disabled) |
+| `--startup-timeout` | float | 60.0 | Max seconds to wait for a worker ready handshake |
+| `--health-check-timeout` | float | 5.0 | Seconds per health-check probe before timeout |
+| `--health-check-kill-threshold` | int | 0 | Consecutive probe failures before kill + respawn (0 = disabled) |
+| `--worker-kill-timeout` | float | 10.0 | Seconds to wait for the OS to reap a killed worker |
+| `--hook-http-timeout` | float | 5.0 | Seconds for a worker lifecycle HTTP hook request |
 
 #### Examples
 

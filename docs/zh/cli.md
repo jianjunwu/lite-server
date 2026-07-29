@@ -76,6 +76,15 @@ lite-server serve [选项]
 | `--max-requests-jitter` | int | 0 | `max_requests` 的随机抖动范围，防止惊群效应 |
 | `--request-timeout` | float | 0.0 | 单请求硬超时（秒），0 = 禁用 |
 | `--health-check-interval` | float | 15.0 | 主动健康检查间隔（秒），0 = 禁用 |
+| `--ejection-error-threshold` | int | 3 | 连续错误 N 次后剔除 worker（0 = 禁用） |
+| `--ejection-timeout` | float | 30.0 | 被剔除 worker 自动恢复前的秒数 |
+| `--ejection-max-percent` | int | 50 | 同一时刻最多可剔除的 worker 比例（1-100） |
+| `--max-retries` | int | 3 | 失败 batch 换 worker 重试次数（0 = 禁用） |
+| `--startup-timeout` | float | 60.0 | 等待 worker ready 握手的最大秒数 |
+| `--health-check-timeout` | float | 5.0 | 单次健康探测超时（秒） |
+| `--health-check-kill-threshold` | int | 0 | 连续探测失败 N 次后杀死并重启 worker（0 = 禁用） |
+| `--worker-kill-timeout` | float | 10.0 | 杀死 worker 后等待 OS 回收的秒数 |
+| `--hook-http-timeout` | float | 5.0 | 生命周期 HTTP 钩子请求超时（秒） |
 
 #### 示例
 

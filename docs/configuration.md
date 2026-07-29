@@ -64,6 +64,24 @@ model_defaults:                # CLI-level defaults applied to all models
   max_requests_jitter: null    # Override max_requests_jitter for all models
   request_timeout: null        # Override request_timeout for all models
   health_check_interval: null  # Override health_check_interval for all models
+  max_retries: null            # Override max_retries for all models
+  ejection_error_threshold: null   # Override ejection_error_threshold for all models
+  ejection_timeout: null       # Override ejection_timeout for all models
+  ejection_max_percent: null   # Override ejection_max_percent for all models
+  startup_timeout: null        # Override startup_timeout for all models
+  health_check_timeout: null   # Override health_check_timeout for all models
+  health_check_kill_threshold: null  # Override health_check_kill_threshold for all models
+  worker_kill_timeout: null    # Override worker_kill_timeout for all models
+  hook_http_timeout: null      # Override hook_http_timeout for all models
+
+tunables:                      # Server-level knobs (defaults shown; rarely need tuning)
+  reconcile_coalesce_secs: 2.0     # Coalesce window: a burst of fs events -> one reconcile
+  hot_reload_cooldown_secs: 3.0    # Cooldown between hot reloads per model/version
+  watcher_debounce_secs: 2.5       # File watcher debounce window
+  file_changed_timeout_secs: 60.0  # Timeout for one worker's FILE_CHANGED round-trip
+  worker_stderr_tail_bytes: 65536  # Max stderr bytes retained for crash diagnostics
+  worker_stderr_drain_secs: 5.0    # Wait for an exited worker to flush stderr
+  unpack_timeout_secs: 120.0       # Upper bound for one .lma unpack invocation
 ```
 
 ## Model Configuration
@@ -248,6 +266,7 @@ lite-server serve [flags]
 | `--max-retries` | Retry a failed batch on another worker | `model_defaults.max_retries` |
 | `--startup-timeout` | Worker ready-handshake timeout (s) | `model_defaults.startup_timeout` |
 | `--health-check-timeout` | Health probe timeout (s) | `model_defaults.health_check_timeout` |
+| `--health-check-kill-threshold` | Probe failures before kill + respawn (0=disable) | `model_defaults.health_check_kill_threshold` |
 | `--worker-kill-timeout` | OS reap wait after kill (s) | `model_defaults.worker_kill_timeout` |
 | `--hook-http-timeout` | Lifecycle HTTP hook timeout (s) | `model_defaults.hook_http_timeout` |
 

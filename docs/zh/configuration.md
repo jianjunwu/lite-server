@@ -64,6 +64,24 @@ model_defaults:                # CLI 级别默认值，应用于所有模型
   max_requests_jitter: null    # 覆盖所有模型的 max_requests_jitter
   request_timeout: null        # 覆盖所有模型的 request_timeout
   health_check_interval: null  # 覆盖所有模型的 health_check_interval
+  max_retries: null            # 覆盖所有模型的 max_retries
+  ejection_error_threshold: null   # 覆盖所有模型的 ejection_error_threshold
+  ejection_timeout: null       # 覆盖所有模型的 ejection_timeout
+  ejection_max_percent: null   # 覆盖所有模型的 ejection_max_percent
+  startup_timeout: null        # 覆盖所有模型的 startup_timeout
+  health_check_timeout: null   # 覆盖所有模型的 health_check_timeout
+  health_check_kill_threshold: null  # 覆盖所有模型的 health_check_kill_threshold
+  worker_kill_timeout: null    # 覆盖所有模型的 worker_kill_timeout
+  hook_http_timeout: null      # 覆盖所有模型的 hook_http_timeout
+
+tunables:                      # 服务器级旋钮（默认值即下列值，一般无需调整）
+  reconcile_coalesce_secs: 2.0     # 文件事件合并窗口：一批事件合并为一次 reconcile
+  hot_reload_cooldown_secs: 3.0    # 同一模型/版本两次热重载之间的冷却期
+  watcher_debounce_secs: 2.5       # 文件监听器防抖窗口
+  file_changed_timeout_secs: 60.0  # 单个 worker FILE_CHANGED 往返的超时
+  worker_stderr_tail_bytes: 65536  # worker 崩溃诊断保留的最大 stderr 字节数
+  worker_stderr_drain_secs: 5.0    # 等待已退出 worker 冲刷 stderr 的时限
+  unpack_timeout_secs: 120.0       # 单次 .lma unpack 命令的上限（防挂起阻塞 reconcile）
 ```
 
 ## 模型配置
@@ -239,6 +257,7 @@ lite-server serve [参数]
 | `--max-retries` | 失败 batch 换 worker 重试 | `model_defaults.max_retries` |
 | `--startup-timeout` | worker ready 握手超时（秒） | `model_defaults.startup_timeout` |
 | `--health-check-timeout` | 健康探测超时（秒） | `model_defaults.health_check_timeout` |
+| `--health-check-kill-threshold` | 连续探测失败 N 次后杀死并重启 worker（0=禁用） | `model_defaults.health_check_kill_threshold` |
 | `--worker-kill-timeout` | 杀死后等待 OS 回收（秒） | `model_defaults.worker_kill_timeout` |
 | `--hook-http-timeout` | 生命周期 HTTP 钩子超时（秒） | `model_defaults.hook_http_timeout` |
 

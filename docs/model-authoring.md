@@ -197,6 +197,15 @@ def on_file_changed(self, changed_files):
 
 If not overridden, the default behavior restarts the worker (re-runs `setup()`).
 
+Notes:
+
+- A single `FILE_CHANGED` round-trip times out after 60 seconds by default
+  (tunable via `tunables.file_changed_timeout_secs` in server.yaml). If any
+  worker times out, errors, or does not reply `{"handled": true}`, the server
+  falls back to restarting the whole version.
+- Hot reloads of the same model/version are rate-limited by a 3-second
+  cooldown (`tunables.hot_reload_cooldown_secs`).
+
 #### `teardown(self)`
 
 Called when the model is unloaded. Release resources here.

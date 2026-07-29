@@ -117,7 +117,8 @@ impl LiteServer {
             config.logging.level.clone(),
             callback_runner.clone(),
         ).with_server_http(Self::loopback_http_base(&config))
-         .with_unload_grace(Duration::from_secs_f32(config.server.timeout)));
+         .with_unload_grace(Duration::from_secs_f32(config.server.timeout))
+         .with_server_tunables(config.tunables.clone()));
 
         Self {
             config,
@@ -253,6 +254,7 @@ impl LiteServer {
             watch_tx,
             has_hot_reload_for_watcher,
             auto_mode,
+            Duration::from_secs_f32(self.config.tunables.watcher_debounce_secs),
         ));
 
         // Start the reconcile task for control_mode = "auto": directory
@@ -268,6 +270,7 @@ impl LiteServer {
                     self.worker_manager.clone(),
                     self.registry.clone(),
                     self.config.model_defaults.clone(),
+                    self.config.tunables.clone(),
                     rx,
                     seen_lma,
                 ))),
@@ -280,6 +283,7 @@ impl LiteServer {
         let reload_worker = self.worker_manager.clone();
         let reload_registry = self.registry.clone();
         let model_defaults = self.config.model_defaults.clone();
+        let server_tunables = self.config.tunables.clone();
         let has_hot_reload_for_reload = has_hot_reload.clone();
         let reload_handle = tokio::spawn(async move {
             let mut last_reload: std::collections::HashMap<(String, String), Instant> = std::collections::HashMap::new();
@@ -291,6 +295,7 @@ impl LiteServer {
                     reload_registry.clone(),
                     &mut last_reload,
                     &model_defaults,
+                    &server_tunables,
                     &has_hot_reload_for_reload,
                     &reconcile_tx,
                 ).await {
@@ -440,6 +445,7 @@ impl LiteServer {
             &self.worker_manager,
             &self.registry,
             &self.config.model_defaults,
+            &self.config.tunables,
             &mut seen_lma,
         )
         .await;
@@ -463,9 +469,15 @@ async fn reconcile_models(
     worker_manager: &WorkerManager,
     registry: &ModelRegistry,
     model_defaults: &crate::config::ModelTunables,
+    server_tunables: &crate::config::ServerTunables,
     seen_lma: &mut HashSet<(PathBuf, std::time::SystemTime)>,
 ) {
-    auto_unpack_lma_files(repo_path, seen_lma).await;
+    auto_unpack_lma_files(
+        repo_path,
+        seen_lma,
+        Duration::from_secs_f32(server_tunables.unpack_timeout_secs),
+    )
+    .await;
 
     let available = scan_repo_models(repo_path).await;
     let by_model = group_by_model(available);
@@ -661,6 +673,7 @@ fn compute_target_versions(
 async fn auto_unpack_lma_files(
     repo_path: &Path,
     seen: &mut HashSet<(PathBuf, std::time::SystemTime)>,
+    unpack_timeout: Duration,
 ) {
     let mut entries = match tokio::fs::read_dir(repo_path).await {
         Ok(e) => e,
@@ -683,17 +696,34 @@ async fn auto_unpack_lma_files(
             continue;
         }
 
-        let output = tokio::process::Command::new("python")
-            .args([
-                "-m",
-                "lite_server",
-                "unpack",
-                path.to_str().unwrap_or(""),
-                "--to",
-                repo_path.to_str().unwrap_or(""),
-            ])
-            .output()
-            .await;
+        // H7/L1: bound the unpack subprocess — a hung `unpack` would
+        // otherwise block the whole reconcile loop forever.
+        let output = tokio::time::timeout(
+            unpack_timeout,
+            tokio::process::Command::new("python")
+                .args([
+                    "-m",
+                    "lite_server",
+                    "unpack",
+                    path.to_str().unwrap_or(""),
+                    "--to",
+                    repo_path.to_str().unwrap_or(""),
+                ])
+                .output(),
+        )
+        .await;
+
+        let output = match output {
+            Ok(o) => o,
+            Err(_) => {
+                warn!(
+                    "Unpack of .lma artifact {} timed out after {:?}; skipping",
+                    path.display(),
+                    unpack_timeout
+                );
+                continue;
+            }
+        };
 
         match output {
             Ok(out) if out.status.success() => {
@@ -817,6 +847,7 @@ async fn process_watch_events(
     registry: Arc<ModelRegistry>,
     last_reload: &mut std::collections::HashMap<(String, String), Instant>,
     model_defaults: &crate::config::ModelTunables,
+    server_tunables: &crate::config::ServerTunables,
     has_hot_reload: &AtomicBool,
     reconcile_trigger: &Option<mpsc::Sender<()>>,
 ) -> Result<(), AppError> {
@@ -881,8 +912,8 @@ async fn process_watch_events(
         }
     }
 
-    // Reload changed models (with 3s cooldown per model/version)
-    let cooldown = Duration::from_secs(3);
+    // Reload changed models (with per-model/version cooldown)
+    let cooldown = Duration::from_secs_f32(server_tunables.hot_reload_cooldown_secs);
     for (name, version) in models_to_reload {
         let key = (name.clone(), version.clone());
         if let Some(last) = last_reload.get(&key) {
@@ -1031,6 +1062,7 @@ async fn start_reconcile_task(
     worker_manager: Arc<WorkerManager>,
     registry: Arc<ModelRegistry>,
     model_defaults: crate::config::ModelTunables,
+    server_tunables: crate::config::ServerTunables,
     trigger_rx: mpsc::Receiver<()>,
     seen_lma: HashSet<(PathBuf, std::time::SystemTime)>,
 ) {
@@ -1040,12 +1072,14 @@ async fn start_reconcile_task(
         poll_secs
     );
     let seen_lma = Arc::new(tokio::sync::Mutex::new(seen_lma));
-    reconcile_loop(Duration::from_secs(poll_secs), trigger_rx, move || {
+    let coalesce = Duration::from_secs_f32(server_tunables.reconcile_coalesce_secs);
+    reconcile_loop(Duration::from_secs(poll_secs), trigger_rx, coalesce, move || {
         let repo_path = repo_path.clone();
         let orch = orch.clone();
         let worker_manager = worker_manager.clone();
         let registry = registry.clone();
         let model_defaults = model_defaults.clone();
+        let server_tunables = server_tunables.clone();
         let seen_lma = seen_lma.clone();
         async move {
             let mut seen_lma = seen_lma.lock().await;
@@ -1055,6 +1089,7 @@ async fn start_reconcile_task(
                 &worker_manager,
                 &registry,
                 &model_defaults,
+                &server_tunables,
                 &mut seen_lma,
             )
             .instrument(tracing::info_span!("reconcile"))
@@ -1065,17 +1100,17 @@ async fn start_reconcile_task(
 }
 
 /// Generic reconcile driver: run `reconcile` on every resync tick, and
-/// near-real-time on trigger events (coalesced over a 2s window so a burst
+/// near-real-time on trigger events (coalesced over `coalesce` so a burst
 /// of filesystem events — e.g. unpacking a version dir — produces one run).
 async fn reconcile_loop<F, Fut>(
     poll_interval: Duration,
     trigger_rx: mpsc::Receiver<()>,
+    coalesce: Duration,
     mut reconcile: F,
 ) where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    const COALESCE: Duration = Duration::from_secs(2);
     let mut tick = interval(poll_interval);
     // The first interval tick fires immediately; skip it — the startup
     // reconcile just ran, a second one would be a redundant repo scan.
@@ -1094,7 +1129,7 @@ async fn reconcile_loop<F, Fut>(
             } => {
                 match msg {
                     Some(()) => {
-                        tokio::time::sleep(COALESCE).await;
+                        tokio::time::sleep(coalesce).await;
                         if let Some(rx) = trigger_rx.as_mut() {
                             while rx.try_recv().is_ok() {}
                         }
@@ -1119,6 +1154,7 @@ async fn start_file_watcher(
     tx: mpsc::Sender<Vec<PathBuf>>,
     has_hot_reload: Arc<AtomicBool>,
     always_forward: bool,
+    debounce: Duration,
 ) {
     use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -1182,7 +1218,7 @@ async fn start_file_watcher(
                             }
                             pending_paths.push(path);
                         }
-                        debounce_deadline = Some(Instant::now() + Duration::from_millis(2500));
+                        debounce_deadline = Some(Instant::now() + debounce);
                     }
                     Err(e) => {
                         warn!("Watch error: {}", e);
@@ -1256,7 +1292,7 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel::<Vec<PathBuf>>(32);
         let has_hot_reload = Arc::new(AtomicBool::new(true));
-        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload, false));
+        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload, false, Duration::from_millis(2500)));
 
         // Give watcher time to start
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -1293,7 +1329,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel::<Vec<PathBuf>>(32);
         let has_hot_reload = Arc::new(AtomicBool::new(true));
-        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload, false));
+        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload, false, Duration::from_millis(2500)));
 
         // Give watcher time to start
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -1548,6 +1584,7 @@ max_batch_size: 4
             registry.clone(),
             &mut last_reload,
             &crate::config::ModelTunables::default(),
+            &crate::config::ServerTunables::default(),
             &flag,
             &trigger,
         ).await.unwrap();
@@ -1586,6 +1623,7 @@ max_batch_size: 4
             registry.clone(),
             &mut last_reload,
             &crate::config::ModelTunables::default(),
+            &crate::config::ServerTunables::default(),
             &flag,
             &trigger,
         ).await.unwrap();
@@ -1629,6 +1667,7 @@ max_batch_size: 4
             registry.clone(),
             &mut last_reload,
             &crate::config::ModelTunables::default(),
+            &crate::config::ServerTunables::default(),
             &flag,
             &trigger,
         ).await.unwrap();
@@ -1664,6 +1703,7 @@ max_batch_size: 4
             registry.clone(),
             &mut last_reload,
             &crate::config::ModelTunables::default(),
+            &crate::config::ServerTunables::default(),
             &flag,
             &trigger,
         ).await.unwrap();
@@ -1683,7 +1723,7 @@ max_batch_size: 4
         let (tx, rx) = mpsc::channel::<()>(8);
         let count = Arc::new(AtomicUsize::new(0));
         let c = count.clone();
-        let handle = tokio::spawn(reconcile_loop(Duration::from_secs(3600), rx, move || {
+        let handle = tokio::spawn(reconcile_loop(Duration::from_secs(3600), rx, Duration::from_secs(2), move || {
             let c = c.clone();
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
@@ -1706,7 +1746,7 @@ max_batch_size: 4
         let (tx, rx) = mpsc::channel::<()>(8);
         let count = Arc::new(AtomicUsize::new(0));
         let c = count.clone();
-        let handle = tokio::spawn(reconcile_loop(Duration::from_secs(3600), rx, move || {
+        let handle = tokio::spawn(reconcile_loop(Duration::from_secs(3600), rx, Duration::from_secs(2), move || {
             let c = c.clone();
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
@@ -1730,7 +1770,7 @@ max_batch_size: 4
         let (_tx, rx) = mpsc::channel::<()>(8);
         let count = Arc::new(AtomicUsize::new(0));
         let c = count.clone();
-        let handle = tokio::spawn(reconcile_loop(Duration::from_secs(1), rx, move || {
+        let handle = tokio::spawn(reconcile_loop(Duration::from_secs(1), rx, Duration::from_secs(2), move || {
             let c = c.clone();
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
@@ -1762,7 +1802,7 @@ max_batch_size: 4
 
         let (tx, mut rx) = mpsc::channel::<Vec<PathBuf>>(32);
         let has_hot_reload = Arc::new(AtomicBool::new(false));
-        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload, true));
+        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload, true, Duration::from_millis(2500)));
 
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         tokio::fs::write(&model_py, "modified").await.unwrap();
@@ -1858,6 +1898,7 @@ max_batch_size: 4
                     Arc::new(ModelRegistry::new()),
                     &mut last_reload,
                     &crate::config::ModelTunables::default(),
+                    &crate::config::ServerTunables::default(),
                     &flag,
                     &trigger,
                 ).await;

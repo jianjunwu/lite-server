@@ -227,6 +227,13 @@ def on_file_changed(self, changed_files):
 
 如果未覆盖，默认行为是重启 worker（重新运行 `setup()`）。
 
+注意：
+
+- 单次 `FILE_CHANGED` 往返的超时默认 60 秒（可经 server.yaml 的
+  `tunables.file_changed_timeout_secs` 调整）。任一 worker 超时、出错或未返回
+  `{"handled": true}` 时，服务端回退为整版本重启。
+- 同一模型/版本两次热重载之间有 3 秒冷却期（`tunables.hot_reload_cooldown_secs`）。
+
 #### `teardown(self)`
 
 模型卸载时调用。在此释放资源。

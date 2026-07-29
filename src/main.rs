@@ -96,6 +96,42 @@ enum Commands {
         #[arg(long)]
         health_check_interval: Option<f32>,
 
+        /// Consecutive errors before a worker is ejected (0 = disable, overrides model config)
+        #[arg(long)]
+        ejection_error_threshold: Option<usize>,
+
+        /// Seconds a worker stays ejected before auto-recovery (overrides model config)
+        #[arg(long)]
+        ejection_timeout: Option<f32>,
+
+        /// Max % of workers ejectable at once (1-100, overrides model config)
+        #[arg(long)]
+        ejection_max_percent: Option<usize>,
+
+        /// Retry a failed batch on a different worker up to N times (0 = disable, overrides model config)
+        #[arg(long)]
+        max_retries: Option<usize>,
+
+        /// Max seconds to wait for a worker ready handshake (overrides model config)
+        #[arg(long)]
+        startup_timeout: Option<f32>,
+
+        /// Seconds per health-check probe before timeout (overrides model config)
+        #[arg(long)]
+        health_check_timeout: Option<f32>,
+
+        /// Consecutive health-probe failures before killing + respawning the worker (overrides model config)
+        #[arg(long)]
+        health_check_kill_threshold: Option<usize>,
+
+        /// Seconds to wait for the OS to reap a killed worker (overrides model config)
+        #[arg(long)]
+        worker_kill_timeout: Option<f32>,
+
+        /// Seconds for a worker lifecycle HTTP hook request (overrides model config)
+        #[arg(long)]
+        hook_http_timeout: Option<f32>,
+
         /// Graceful shutdown timeout in seconds (max time to wait for in-flight requests)
         #[arg(long)]
         graceful_timeout: Option<f32>,
@@ -137,6 +173,15 @@ fn main() {
             max_requests_jitter,
             request_timeout,
             health_check_interval,
+            ejection_error_threshold,
+            ejection_timeout,
+            ejection_max_percent,
+            max_retries,
+            startup_timeout,
+            health_check_timeout,
+            health_check_kill_threshold,
+            worker_kill_timeout,
+            hook_http_timeout,
             graceful_timeout,
             keepalive_timeout,
         } => {
@@ -176,6 +221,15 @@ fn main() {
                     max_requests_jitter,
                     request_timeout,
                     health_check_interval,
+                    ejection_error_threshold,
+                    ejection_timeout,
+                    ejection_max_percent,
+                    max_retries,
+                    startup_timeout,
+                    health_check_timeout,
+                    health_check_kill_threshold,
+                    worker_kill_timeout,
+                    hook_http_timeout,
                     ..Default::default()
                 },
                 ..Default::default()

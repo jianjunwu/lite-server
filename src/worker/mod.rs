@@ -32,12 +32,15 @@ fn replace_hook_vars(template: &str, vars: &[(String, String)]) -> String {
 
 /// Execute a worker lifecycle hook (shell command + optional HTTP callback).
 /// Both are fire-and-forget: spawned as background tasks, never block the caller.
+/// Tasks are tracked in `hook_tasks` so WorkerManager::shutdown can abort them
+/// instead of leaving them dangling (L2).
 /// The HTTP client is built per firing so its timeout can come from
 /// `WorkerHooksConfig::hook_http_timeout` (§3) instead of a process-wide constant.
 pub fn execute_hook(
     hook_type: &str,
     hooks: &crate::config::WorkerHooksConfig,
     vars: Vec<(String, String)>,
+    hook_tasks: &HookTasks,
 ) {
     // Determine which shell command and HTTP hook to use based on hook_type
     let shell_cmd = match hook_type {
@@ -62,25 +65,28 @@ pub fn execute_hook(
     if let Some(cmd) = shell_cmd {
         let resolved = replace_hook_vars(cmd, &vars);
         let hook_name = hook_type.to_string();
-        tokio::spawn(async move {
-            match tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(&resolved)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await
-            {
-                Ok(status) => {
-                    if !status.success() {
-                        warn!("Hook '{}' command exited with {}", hook_name, status);
+        hook_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spawn(async move {
+                match tokio::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&resolved)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .await
+                {
+                    Ok(status) => {
+                        if !status.success() {
+                            warn!("Hook '{}' command exited with {}", hook_name, status);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Hook '{}' command failed to execute: {}", hook_name, e);
                     }
                 }
-                Err(e) => {
-                    warn!("Hook '{}' command failed to execute: {}", hook_name, e);
-                }
-            }
-        });
+            });
     }
 
     // HTTP hook: fire-and-forget
@@ -90,7 +96,10 @@ pub fn execute_hook(
         let body = http.body_template.as_deref().map(|t| replace_hook_vars(t, &vars));
         let hook_name = hook_type.to_string();
         let hook_timeout = Duration::from_secs_f32(hooks.hook_http_timeout);
-        tokio::spawn(async move {
+        hook_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spawn(async move {
             // Per-call client so the timeout is configurable (§3). reqwest::Client
             // is Arc internally, so building it per firing is cheap.
             let client = reqwest::Client::builder()
@@ -120,6 +129,11 @@ pub fn execute_hook(
 
 /// Global pending response map: uid -> oneshot sender
 pub type PendingMap = Arc<DashMap<String, oneshot::Sender<InferenceResponse>>>;
+
+/// Tracks fire-and-forget lifecycle hook tasks (execute_hook) so
+/// WorkerManager::shutdown can abort them instead of leaving them dangling
+/// past server teardown (L2). std Mutex: execute_hook is sync.
+pub type HookTasks = Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>;
 
 pub struct WorkerManager {
     registry: Arc<ModelRegistry>,
@@ -162,6 +176,11 @@ pub struct WorkerManager {
     // Defaults to the server.timeout default; overridden via
     // `set_unload_grace` at startup.
     unload_grace: Duration,
+    // Server-level tunables from server.yaml `tunables:` (worker stderr
+    // diagnostics bounds, FILE_CHANGED hook timeout).
+    server_tunables: crate::config::ServerTunables,
+    // Fire-and-forget lifecycle hook tasks, aborted on shutdown (L2).
+    hook_tasks: HookTasks,
 }
 
 struct WorkerProcess {
@@ -175,12 +194,6 @@ struct WorkerProcess {
     kill_timeout: Duration,
 }
 
-/// Max bytes of a dying worker's stderr to retain for crash diagnostics.
-/// Bounded so a chatty/frozen worker cannot stall model load unbounded.
-const WORKER_STDERR_CAPTURE: usize = 64 * 1024;
-/// How long to wait for a worker that exited before "ready" to flush its
-/// stderr — its traceback lives there. Bounded so a stuck pipe can't hang load.
-const WORKER_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Trailing stderr lines folded into the crash message. Python tracebacks put
 /// the actionable error on the last line.
 const WORKER_STDERR_TAIL_LINES: usize = 5;
@@ -196,12 +209,12 @@ fn tail_lines(text: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
-/// Read up to [`WORKER_STDERR_CAPTURE`] bytes from `stderr` (or until EOF),
-/// bounded by `deadline`, and return the last [`WORKER_STDERR_TAIL_LINES`]
+/// Read up to `cap_bytes` bytes from `stderr` (or until EOF), bounded by
+/// `deadline`, and return the last [`WORKER_STDERR_TAIL_LINES`]
 /// lines. Surfaces a crashed worker's real traceback in the error message
 /// instead of a bare "worker exited before ready". Generic over the reader so
 /// it is unit-testable without spawning a real process.
-async fn drain_worker_stderr_bounded<R>(stderr: R, deadline: Duration) -> String
+async fn drain_worker_stderr_bounded<R>(stderr: R, deadline: Duration, cap_bytes: usize) -> String
 where
     R: AsyncRead + Unpin,
 {
@@ -214,13 +227,13 @@ where
             match reader.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(k) => {
-                    let remaining = WORKER_STDERR_CAPTURE.saturating_sub(cap.len());
+                    let remaining = cap_bytes.saturating_sub(cap.len());
                     if remaining == 0 {
                         break;
                     }
                     let take = k.min(remaining);
                     cap.extend_from_slice(&buf[..take]);
-                    if cap.len() >= WORKER_STDERR_CAPTURE {
+                    if cap.len() >= cap_bytes {
                         break;
                     }
                 }
@@ -233,12 +246,18 @@ where
     tail_lines(&String::from_utf8_lossy(&cap), WORKER_STDERR_TAIL_LINES)
 }
 
-/// Production wrapper: drains worker stderr with the standard 5s deadline.
-async fn drain_worker_stderr<R>(stderr: R) -> String
+/// Production wrapper: drains worker stderr with the configured deadline and
+/// capture bound (`tunables:` in server.yaml).
+async fn drain_worker_stderr<R>(stderr: R, tunables: &crate::config::ServerTunables) -> String
 where
     R: AsyncRead + Unpin,
 {
-    drain_worker_stderr_bounded(stderr, WORKER_STDERR_DRAIN_TIMEOUT).await
+    drain_worker_stderr_bounded(
+        stderr,
+        Duration::from_secs_f32(tunables.worker_stderr_drain_secs),
+        tunables.worker_stderr_tail_bytes,
+    )
+    .await
 }
 
 impl WorkerManager {
@@ -270,6 +289,8 @@ impl WorkerManager {
             grpc_health: Arc::new(RwLock::new(None)),
             server_http: None,
             unload_grace: Duration::from_secs(30),
+            server_tunables: crate::config::ServerTunables::default(),
+            hook_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
         }
     }
 
@@ -284,6 +305,13 @@ impl WorkerManager {
     /// Set the unload drain grace period (§4.2), from `server.timeout`.
     pub fn with_unload_grace(mut self, grace: Duration) -> Self {
         self.unload_grace = grace;
+        self
+    }
+
+    /// Set server-level tunables (worker stderr diagnostics, FILE_CHANGED
+    /// timeout). Builder-style, from `tunables:` in server.yaml.
+    pub fn with_server_tunables(mut self, tunables: crate::config::ServerTunables) -> Self {
+        self.server_tunables = tunables;
         self
     }
 
@@ -506,7 +534,7 @@ impl WorkerManager {
             .inspect_err(|_| self.mark_degraded(model_name, version))?;
         if n == 0 {
             self.mark_degraded(model_name, version);
-            let stderr_tail = drain_worker_stderr(stderr).await;
+            let stderr_tail = drain_worker_stderr(stderr, &self.server_tunables).await;
             let msg = if stderr_tail.trim().is_empty() {
                 "worker exited before ready".to_string()
             } else {
@@ -550,7 +578,7 @@ impl WorkerManager {
             ("$MODEL".to_string(), model_name.to_string()),
             ("$VERSION".to_string(), version.to_string()),
             ("$WORKER_ID".to_string(), worker_id.to_string()),
-        ]);
+        ], &self.hook_tasks);
 
         // Drain stdout
         tokio::spawn(async move {
@@ -620,6 +648,7 @@ impl WorkerManager {
                 }
             },
             Some(hooks_arc),
+            self.hook_tasks.clone(),
         );
 
         // Update registry worker info
@@ -695,10 +724,11 @@ impl WorkerManager {
         version: &str,
         paths: &[String],
     ) -> bool {
-        /// Hook invocations may reload large weights; bounded well under the
-        /// 300s unary backstop so a hung hook can't stall the watch-event
-        /// task for minutes.
-        const FILE_CHANGED_TIMEOUT: Duration = Duration::from_secs(60);
+        // Hook invocations may reload large weights; bounded well under the
+        // 300s unary backstop so a hung hook can't stall the watch-event
+        // task for minutes. Configurable via tunables.file_changed_timeout_secs.
+        let file_changed_timeout =
+            Duration::from_secs_f32(self.server_tunables.file_changed_timeout_secs);
 
         let clients = self.get_zmq_clients(model_name, version).await.unwrap_or_default();
         if clients.is_empty() {
@@ -719,7 +749,7 @@ impl WorkerManager {
                     },
                 )),
             };
-            let handled = match client.send_with_timeout(request, FILE_CHANGED_TIMEOUT).await {
+            let handled = match client.send_with_timeout(request, file_changed_timeout).await {
                 Ok(resp) => resp
                     .payload
                     .and_then(|p| match p {
@@ -938,12 +968,11 @@ impl WorkerManager {
             )));
         }
 
-        // Register in registry
-        let model_config = if config_yaml.exists() {
-            crate::config::load_model_config(&config_yaml).unwrap_or_else(|_| config.clone())
-        } else {
-            config.clone()
-        };
+        // Register in registry. The caller owns config construction
+        // (YAML load + model_defaults application) — re-reading the YAML
+        // here would silently drop the caller's model_defaults overrides
+        // for fields the per-model YAML doesn't set (B4).
+        let model_config = config.clone();
 
         let model_type = if is_ensemble {
             ModelType::Ensemble
@@ -1080,7 +1109,7 @@ impl WorkerManager {
                 .inspect_err(|_| self.mark_load_failed(model_name, version))?;
             if n == 0 {
                 self.mark_load_failed(model_name, version);
-                let stderr_tail = drain_worker_stderr(stderr).await;
+                let stderr_tail = drain_worker_stderr(stderr, &self.server_tunables).await;
                 let msg = if stderr_tail.trim().is_empty() {
                     "worker exited before ready".to_string()
                 } else {
@@ -1124,7 +1153,7 @@ impl WorkerManager {
                 ("$MODEL".to_string(), model_name.to_string()),
                 ("$VERSION".to_string(), version.to_string()),
                 ("$WORKER_ID".to_string(), worker_id.to_string()),
-            ]);
+            ], &self.hook_tasks);
 
             // Drain stdout so the worker does not get SIGPIPE/BrokenPipeError
             // if anything writes to stdout after the ready signal.
@@ -1193,6 +1222,7 @@ impl WorkerManager {
                     }
                 },
                 Some(hooks_arc),
+                self.hook_tasks.clone(),
             );
 
             let info = WorkerInfo {
@@ -1472,6 +1502,25 @@ impl WorkerManager {
                 let _ = self.unload_version(model_name, version).await;
             }
         }
+
+        // L2: abort fire-and-forget hook tasks so they don't dangle past
+        // server teardown; bounded reap so a task mid-abort doesn't stall us.
+        {
+            let mut set = self.hook_tasks.lock().unwrap_or_else(|e| e.into_inner());
+            set.abort_all();
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let drained = {
+                let mut set = self.hook_tasks.lock().unwrap_or_else(|e| e.into_inner());
+                while set.try_join_next().is_some() {}
+                set.is_empty()
+            };
+            if drained || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }
 
@@ -1543,6 +1592,7 @@ fn spawn_worker_monitor(
     mut shutdown_rx: oneshot::Receiver<()>,
     on_exit: impl FnOnce() + Send + 'static,
     hooks: Option<Arc<crate::config::WorkerHooksConfig>>,
+    hook_tasks: HookTasks,
 ) -> oneshot::Receiver<()> {
     let (done_tx, done_rx) = oneshot::channel::<()>();
     let model = model_name.to_string();
@@ -1563,7 +1613,7 @@ fn spawn_worker_monitor(
                                 "Worker process exited cleanly"
                             );
                             if let Some(ref h) = hooks {
-                                execute_hook("exit", h, hook_vars.clone());
+                                execute_hook("exit", h, hook_vars.clone(), &hook_tasks);
                             }
                         } else {
                             let exit_code = status.code().unwrap_or(-1);
@@ -1576,7 +1626,7 @@ fn spawn_worker_monitor(
                                 let mut vars = hook_vars.clone();
                                 vars.push(("$EXIT_CODE".to_string(), exit_code.to_string()));
                                 vars.push(("$REASON".to_string(), "crash".to_string()));
-                                execute_hook("error", h, vars);
+                                execute_hook("error", h, vars, &hook_tasks);
                             }
                         }
                     }
@@ -1960,6 +2010,7 @@ mod tests {
             child, "test_model", "1", 0, shutdown_rx,
             move || { cleaned_up_clone.store(true, Ordering::SeqCst); },
             None,
+            Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
         );
 
         // Wait for the monitor to detect the exit and run cleanup
@@ -2310,7 +2361,15 @@ mod tests {
     fn test_execute_hook_no_hooks_configured() {
         // Should not panic when no hooks are configured
         let hooks = crate::config::WorkerHooksConfig::default();
-        execute_hook("ready", &hooks, vec![("$MODEL".to_string(), "test".to_string())]);
+        // Bound to a variable: dropping the last Arc aborts the JoinSet's
+        // tasks (unlike tokio::spawn, which detaches).
+        let hook_tasks: HookTasks = Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new()));
+        execute_hook(
+            "ready",
+            &hooks,
+            vec![("$MODEL".to_string(), "test".to_string())],
+            &hook_tasks,
+        );
     }
 
     #[test]
@@ -2355,7 +2414,15 @@ mod tests {
             on_ready: Some(format!("touch {}", tmp_str)),
             ..Default::default()
         };
-        execute_hook("ready", &hooks, vec![("$MODEL".to_string(), "test".to_string())]);
+        // Bound to a variable: dropping the last Arc aborts the JoinSet's
+        // tasks (unlike tokio::spawn, which detaches).
+        let hook_tasks: HookTasks = Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new()));
+        execute_hook(
+            "ready",
+            &hooks,
+            vec![("$MODEL".to_string(), "test".to_string())],
+            &hook_tasks,
+        );
 
         // Wait for the background task to complete
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -2393,6 +2460,7 @@ mod tests {
             child, "test", "1", 0, shutdown_rx,
             move || { done_c.store(true, Ordering::SeqCst); },
             None,
+            Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
         );
 
         // Send shutdown
@@ -2419,6 +2487,7 @@ mod tests {
             child, "test", "1", 0, shutdown_rx,
             || {},
             None,
+            Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
         );
 
         shutdown_tx.send(()).unwrap();
@@ -2460,6 +2529,7 @@ mod tests {
             child, "test", "1", 0, shutdown_rx,
             || {},
             None,
+            Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
         );
 
         timeout(Duration::from_secs(5), done_rx)
@@ -2909,13 +2979,13 @@ ModuleNotFoundError: No module named 'torch'";
     async fn drain_worker_stderr_captures_until_eof_then_tails() {
         // 7 lines; drain reads all (EOF) and returns the last 5.
         let stderr: &[u8] = b"l0\nl1\nl2\nl3\nl4\nl5\nl6\n";
-        let got = drain_worker_stderr(stderr).await;
+        let got = drain_worker_stderr(stderr, &Default::default()).await;
         assert_eq!(got, "l2\nl3\nl4\nl5\nl6");
     }
 
     #[tokio::test]
     async fn drain_worker_stderr_empty_returns_empty() {
-        let got = drain_worker_stderr(&b""[..]).await;
+        let got = drain_worker_stderr(&b""[..], &Default::default()).await;
         assert_eq!(got, "");
     }
 
@@ -2931,7 +3001,7 @@ ModuleNotFoundError: No module named 'torch'";
         bytes.extend_from_slice(b"AFTER_CAP_MARKER\n");
         assert!(bytes.len() > 64 * 1024);
 
-        let got = drain_worker_stderr(&bytes[..]).await;
+        let got = drain_worker_stderr(&bytes[..], &Default::default()).await;
         assert!(
             !got.contains("AFTER_CAP_MARKER"),
             "drain read past the 64KB cap: {got:?}"
@@ -2944,7 +3014,8 @@ ModuleNotFoundError: No module named 'torch'";
         // the deadline and return whatever it captured (empty), not hang.
         let (_tx, rx) = tokio::io::duplex(64);
         // keep _tx alive so the pipe never sees EOF
-        let got = drain_worker_stderr_bounded(rx, Duration::from_millis(50)).await;
+        let got =
+            drain_worker_stderr_bounded(rx, Duration::from_millis(50), 64 * 1024).await;
         assert_eq!(got, "");
         let _ = _tx;
     }
@@ -3071,5 +3142,157 @@ ModuleNotFoundError: No module named 'torch'";
         let fake = spawn_fake_worker(endpoint, vec!["/a.py".to_string()], b"Unsupported payload type");
         assert!(!wm.notify_file_changed("m", "1", &["/a.py".to_string()]).await);
         fake.join().unwrap();
+    }
+
+    // ===== B4: load_model silently drops model_defaults =====
+
+    /// B4 (P1): `load_model` re-reads `config.yaml` and replaces the caller's
+    /// `config` argument — which the caller (e.g. `reconcile_models`, CLI
+    /// `serve`) has already applied `model_defaults` to.  The YAML-on-disk
+    /// parse starts from serde defaults, so any field NOT explicitly in the
+    /// per-model `config.yaml` reverts to the hardcoded serde default,
+    /// silently ignoring the `model_defaults` override.
+    ///
+    /// Real example: `model_defaults: { max_queue_size: 500 }` has no effect
+    /// on models with a `config.yaml` on disk — the per-model parse resets
+    /// `max_queue_size` to 1000 (the serde default).  Only CLI overrides
+    /// survived the drop before this test was written.
+    #[tokio::test]
+    async fn test_load_model_drops_model_defaults_when_config_yaml_exists() {
+        let repo = std::env::temp_dir()
+            .join(format!("lite-server-b4-def-{}", std::process::id()));
+        let model_dir = repo.join("m").join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+
+        // Valid LitAPI model so the worker spawn path doesn't fail.
+        std::fs::write(
+            model_dir.join("model.py"),
+            r#"from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+"#,
+        )
+        .unwrap();
+
+        // config.yaml WITHOUT max_queue_size — the caller applied a default
+        // override (500) that should survive into the registry.
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+        )
+        .unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let wm = WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            Arc::new(InferenceQueue::new()),
+            "warn".to_string(),
+            Arc::new(CallbackRunner::new()),
+        );
+
+        // Simulate what reconcile_models (and the startup path) does:
+        // apply model_defaults, then hand the config to load_model.
+        let mut config = ModelConfig::default();
+        let defaults = crate::config::ModelTunables {
+            max_queue_size: Some(500),
+            ..Default::default()
+        };
+        defaults.apply_to(&mut config);
+        assert_eq!(config.max_queue_size, 500, "defaults applied before load_model");
+
+        wm.load_model("m", "1", &config).await.unwrap();
+
+        let mv = registry.get("m", Some("1")).unwrap();
+        assert_eq!(
+            mv.config.max_queue_size, 500,
+            "B4 REGRESSION: model_defaults max_queue_size=500 was silently \
+             dropped by load_model re-reading config.yaml from disk. The \
+             YAML file doesn't set max_queue_size, so the serde default \
+             (1000) wins instead of the caller's override (500). Expected \
+             500, got {}.",
+            mv.config.max_queue_size
+        );
+
+        let _ = wm.unload_model("m", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// B4 companion: `reload_model` re-enters `load_model` with the registry's
+    /// config (which had model_defaults applied at the original load).  The
+    /// reload must not lose those defaults.
+    #[tokio::test]
+    async fn test_reload_model_preserves_model_defaults() {
+        let repo = std::env::temp_dir()
+            .join(format!("lite-server-b4-reload-{}", std::process::id()));
+        let model_dir = repo.join("m").join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+
+        std::fs::write(
+            model_dir.join("model.py"),
+            r#"from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+        )
+        .unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let wm = WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            Arc::new(InferenceQueue::new()),
+            "warn".to_string(),
+            Arc::new(CallbackRunner::new()),
+        );
+
+        let mut config = ModelConfig::default();
+        let defaults = crate::config::ModelTunables {
+            max_queue_size: Some(500),
+            ..Default::default()
+        };
+        defaults.apply_to(&mut config);
+        wm.load_model("m", "1", &config).await.unwrap();
+
+        assert!(wm.reload_model("m", Some("1")).await.unwrap());
+
+        let mv = registry.get("m", Some("1")).unwrap();
+        assert_eq!(
+            mv.config.max_queue_size, 500,
+            "reload_model must preserve model_defaults (got {})",
+            mv.config.max_queue_size
+        );
+
+        let _ = wm.unload_model("m", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }

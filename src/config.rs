@@ -14,6 +14,43 @@ pub struct Config {
     pub orchestration: OrchestrationConfig,
     /// CLI-provided defaults that override per-model config when set.
     pub model_defaults: ModelTunables,
+    /// Server-level knobs (reconcile loop, file watcher, worker diagnostics).
+    pub tunables: ServerTunables,
+}
+
+/// Server-level tunables (server.yaml `tunables:` section). Defaults preserve
+/// the values that were hardcoded before these became configurable (H1-H7).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerTunables {
+    /// Window to coalesce a burst of filesystem events into one reconcile run.
+    pub reconcile_coalesce_secs: f32,
+    /// Per-model/version cooldown between hot reloads.
+    pub hot_reload_cooldown_secs: f32,
+    /// File watcher debounce window.
+    pub watcher_debounce_secs: f32,
+    /// Timeout for one worker's FILE_CHANGED hook round-trip.
+    pub file_changed_timeout_secs: f32,
+    /// Max bytes of a dying worker's stderr retained for crash diagnostics.
+    pub worker_stderr_tail_bytes: usize,
+    /// How long to wait for an exited worker to flush its stderr.
+    pub worker_stderr_drain_secs: f32,
+    /// Upper bound for one `python -m lite_server unpack` invocation.
+    pub unpack_timeout_secs: f32,
+}
+
+impl Default for ServerTunables {
+    fn default() -> Self {
+        Self {
+            reconcile_coalesce_secs: 2.0,
+            hot_reload_cooldown_secs: 3.0,
+            watcher_debounce_secs: 2.5,
+            file_changed_timeout_secs: 60.0,
+            worker_stderr_tail_bytes: 64 * 1024,
+            worker_stderr_drain_secs: 5.0,
+            unpack_timeout_secs: 120.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -994,6 +1031,31 @@ mod tests {
         assert_eq!(parsed.model_defaults.max_queue_size, Some(300));
         assert_eq!(parsed.model_defaults.max_requests, Some(8000));
         assert_eq!(parsed.model_defaults.request_timeout, Some(120.0));
+    }
+
+    // --- ServerTunables (tunables: section, H1-H7) ---
+
+    #[test]
+    fn test_server_tunables_defaults_match_former_hardcoded_values() {
+        let t = ServerTunables::default();
+        assert_eq!(t.reconcile_coalesce_secs, 2.0);
+        assert_eq!(t.hot_reload_cooldown_secs, 3.0);
+        assert_eq!(t.watcher_debounce_secs, 2.5);
+        assert_eq!(t.file_changed_timeout_secs, 60.0);
+        assert_eq!(t.worker_stderr_tail_bytes, 64 * 1024);
+        assert_eq!(t.worker_stderr_drain_secs, 5.0);
+        assert_eq!(t.unpack_timeout_secs, 120.0);
+    }
+
+    #[test]
+    fn test_server_tunables_yaml_roundtrip() {
+        let yaml = "tunables:\n  reconcile_coalesce_secs: 1.5\n  unpack_timeout_secs: 60.0\n";
+        let parsed: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(parsed.tunables.reconcile_coalesce_secs, 1.5);
+        assert_eq!(parsed.tunables.unpack_timeout_secs, 60.0);
+        // Unset fields fall back to the former hardcoded values.
+        assert_eq!(parsed.tunables.hot_reload_cooldown_secs, 3.0);
+        assert_eq!(parsed.tunables.watcher_debounce_secs, 2.5);
     }
 
     // --- health_check_interval ---
