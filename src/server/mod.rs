@@ -37,10 +37,13 @@ impl ShutdownState {
     }
 
     pub fn mark_start(&self) {
+        // 有意的 Mutex poison recovery:即使持锁线程 panic,也要继续记录关停时间,
+        // 不属于规范禁止的 unwrap 路径(不会 panic)
         *self.start_time.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
     }
 
     pub fn elapsed(&self) -> Option<Duration> {
+        // 同上:poison recovery,非 panic 路径
         self.start_time
             .lock()
             .unwrap_or_else(|e| e.into_inner())

@@ -110,7 +110,11 @@ pub(super) async fn scan_repo_models(repo_path: &Path) -> Vec<RepoModel> {
         if !model_dir.is_dir() {
             continue;
         }
-        let model_name = model_dir.file_name().unwrap().to_string_lossy().to_string();
+        // 无文件名的目录条目不可作为模型目录,跳过(read_dir 返回的路径实际必有文件名)
+        let Some(model_name) = model_dir.file_name().map(|n| n.to_string_lossy().to_string())
+        else {
+            continue;
+        };
 
         let mut versions = Vec::new();
         if let Ok(mut version_entries) = tokio::fs::read_dir(&model_dir).await {
@@ -119,7 +123,10 @@ pub(super) async fn scan_repo_models(repo_path: &Path) -> Vec<RepoModel> {
                 if !version_dir.is_dir() {
                     continue;
                 }
-                let version = version_dir.file_name().unwrap().to_string_lossy().to_string();
+                let Some(version) = version_dir.file_name().map(|n| n.to_string_lossy().to_string())
+                else {
+                    continue;
+                };
                 let model_py = version_dir.join("model.py");
                 let config_yaml = version_dir.join("config.yaml");
 
