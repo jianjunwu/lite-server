@@ -211,7 +211,7 @@ class TestRouteStreaming:
 
         chunks = [f.stream.chunk.data for f in self._decode(socket)
                   if f.stream.WhichOneof("payload") == "chunk"]
-        assert chunks == [b"\x00\x01", b"hello", b"[1, 2]"]
+        assert chunks == [b"\x00\x01", b"hello", b"[1,2]"]
 
     @pytest.mark.asyncio
     async def test_start_frame_carries_status_headers_and_ctx_headers(self):

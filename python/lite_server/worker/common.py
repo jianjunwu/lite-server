@@ -13,6 +13,11 @@ from lite_server.api import LitAPI
 from lite_server.context import Headers, RequestContext, RequestMeta
 from lite_server.exceptions import HTTPException
 from lite_server.pipeline import Pipeline, extract_response_meta
+
+# Single implementation lives in pipeline (P1 merge); re-exported under the
+# historical worker-side name so dispatch/streaming/inference imports are
+# unchanged.
+from lite_server.pipeline import _parse_request_json as _parse_json_payload  # noqa: F401
 from lite_server.proto import (
     Response,
     SingleResponse,
@@ -82,21 +87,6 @@ def _merge_err_headers(ctx: RequestContext, e: Exception) -> dict[str, str] | No
     if extra:
         hdrs.update(extra)
     return hdrs or None
-
-
-def _parse_json_payload(data: bytes | None) -> dict:
-    """Parse request JSON, raising HTTPException(400) on invalid JSON so the
-    failure flows through normal error handling (on_error + error frame)
-    instead of escaping the pipeline try (P3). Empty/absent body → {}."""
-    if not data:
-        return {}
-    try:
-        return json.loads(data)
-    except json.JSONDecodeError as e:
-        raise HTTPException(
-            400, f"invalid JSON in request body: {e}",
-            error_type="invalid_request_error", code="invalid_json",
-        ) from e
 
 
 def _format_exc_brief(exc: BaseException) -> str:

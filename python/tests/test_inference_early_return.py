@@ -82,7 +82,7 @@ class TestEarlyReturnPoints:
         )
 
         resp_bytes, status, metrics, headers = await _run(api)
-        assert resp_bytes == b'{"early": true}'
+        assert resp_bytes == b'{"early":true}'
         assert headers == {"X-Stage": "on_request"}
         assert "decode_request" not in api.calls
         assert "predict" not in api.calls
@@ -96,7 +96,7 @@ class TestEarlyReturnPoints:
 
         api = _TrackerAPI()
         resp_bytes, status, metrics, headers = await _run(api, [EarlyCB()])
-        assert resp_bytes == b'{"from_cb": 1}'
+        assert resp_bytes == b'{"from_cb":1}'
         assert headers == {"X-Cb": "on_request"}
         assert "decode_request" not in api.calls
         assert "predict" not in api.calls
@@ -109,7 +109,7 @@ class TestEarlyReturnPoints:
         )
 
         resp_bytes, status, metrics, headers = await _run(api)
-        assert resp_bytes == b'{"decoded": true}'
+        assert resp_bytes == b'{"decoded":true}'
         assert headers == {"X-Stage": "decode_request"}
         assert "predict" not in api.calls
         assert "encode_response" not in api.calls
@@ -122,7 +122,7 @@ class TestEarlyReturnPoints:
 
         api = _TrackerAPI()
         resp_bytes, status, metrics, headers = await _run(api, [EarlyCB()])
-        assert resp_bytes == b'{"from_cb": 2}'
+        assert resp_bytes == b'{"from_cb":2}'
         assert headers == {"X-Cb": "on_input"}
         assert "predict" not in api.calls
 
@@ -134,7 +134,7 @@ class TestEarlyReturnPoints:
         )
 
         resp_bytes, status, metrics, headers = await _run(api)
-        assert resp_bytes == b'{"predicted": true}'
+        assert resp_bytes == b'{"predicted":true}'
         assert headers == {"X-Stage": "predict"}
         assert "encode_response" not in api.calls
 
@@ -146,7 +146,7 @@ class TestEarlyReturnPoints:
 
         api = _TrackerAPI()
         resp_bytes, status, metrics, headers = await _run(api, [EarlyCB()])
-        assert resp_bytes == b'{"from_cb": 4}'
+        assert resp_bytes == b'{"from_cb":4}'
         assert headers == {"X-Cb": "on_output"}
         assert "encode_response" not in api.calls
 
@@ -158,7 +158,7 @@ class TestEarlyReturnPoints:
         )
 
         resp_bytes, status, metrics, headers = await _run(api)
-        assert resp_bytes == b'{"encoded": true}'
+        assert resp_bytes == b'{"encoded":true}'
         assert headers == {"X-Stage": "encode_response"}
 
     @pytest.mark.asyncio
@@ -169,7 +169,7 @@ class TestEarlyReturnPoints:
 
         api = _TrackerAPI()
         resp_bytes, status, metrics, headers = await _run(api, [EarlyCB()])
-        assert resp_bytes == b'{"from_cb": 6}'
+        assert resp_bytes == b'{"from_cb":6}'
         assert headers == {"X-Cb": "on_response"}
 
     @pytest.mark.asyncio
@@ -180,7 +180,7 @@ class TestEarlyReturnPoints:
         )
 
         resp_bytes, status, metrics, headers = await _run(api)
-        assert resp_bytes == b'{"final": true}'
+        assert resp_bytes == b'{"final":true}'
         assert headers == {"X-Stage": "on_response"}
 
     # ---- plain Response (status code / media type embedded) ----
@@ -193,7 +193,7 @@ class TestEarlyReturnPoints:
         )
 
         resp_bytes, status, metrics, headers = await _run(api)
-        assert resp_bytes == b'{"error": "bad input"}'
+        assert resp_bytes == b'{"error":"bad input"}'
         assert headers == {"_sc": "400"}
         assert "predict" not in api.calls
 
@@ -203,7 +203,7 @@ class TestEarlyReturnPoints:
         api.predict = lambda x: Response(content={"rejected": True}, status_code=422)
 
         resp_bytes, status, metrics, headers = await _run(api)
-        assert resp_bytes == b'{"rejected": true}'
+        assert resp_bytes == b'{"rejected":true}'
         assert headers == {"_sc": "422"}
         assert "encode_response" not in api.calls
 
@@ -226,7 +226,7 @@ class TestEarlyReturnPoints:
 
         api = _TrackerAPI()
         resp_bytes, status, metrics, headers = await _run(api, [CacheCB()])
-        assert resp_bytes == b'{"cached": true}'
+        assert resp_bytes == b'{"cached":true}'
         assert headers == {"X-Cache": "1"}
         assert "predict" not in api.calls
 
@@ -240,7 +240,7 @@ class TestEarlyReturnFlow:
     async def test_normal_flow_still_works(self):
         api = _TrackerAPI()
         resp_bytes, status, metrics, headers = await _run(api)
-        assert resp_bytes == b'{"input": "hello"}'
+        assert resp_bytes == b'{"input":"hello"}'
         assert headers is None
         for name in ("on_request", "decode_request", "predict", "encode_response", "on_response"):
             assert name in api.calls
@@ -265,7 +265,7 @@ class TestEarlyReturnFlow:
 
         api = _TrackerAPI()
         resp_bytes, status, metrics, headers = await _run(api, [CallbackA(), CallbackB()])
-        assert resp_bytes == b'{"early": true}'
+        assert resp_bytes == b'{"early":true}'
         assert headers == {"X-Cb": "A"}
         assert calls == ["A_on_request"]
         assert "predict" not in api.calls
@@ -312,7 +312,7 @@ class TestEarlyReturnFlow:
 
         api = AsyncTracker()
         resp_bytes, status, metrics, headers = await _run(api)
-        assert resp_bytes == b'{"pred": true}'
+        assert resp_bytes == b'{"pred":true}'
         assert headers == {"X-S": "p"}
         assert "encode_response" not in api.calls
 
@@ -324,6 +324,6 @@ class TestEarlyReturnFlow:
 
         api = _TrackerAPI()
         resp_bytes, status, metrics, headers = await _run(api, [AsyncEarlyCB()])
-        assert resp_bytes == b'{"cb": 2}'
+        assert resp_bytes == b'{"cb":2}'
         assert headers == {"X-Cb": "async"}
         assert "predict" not in api.calls

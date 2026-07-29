@@ -29,6 +29,8 @@ import asyncio
 import inspect
 import json
 import logging
+
+from lite_server import _json
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Awaitable, Callable
 
@@ -67,7 +69,7 @@ def _parse_request_json(data: bytes | None) -> dict:
     if not data:
         return {}
     try:
-        return json.loads(data)
+        return _json.loads(data)
     except json.JSONDecodeError as e:
         raise HTTPException(
             400, f"invalid JSON in request body: {e}",
@@ -611,7 +613,7 @@ class Pipeline:
         merged = dict(ctx.response_headers)
         if headers:
             merged.update(headers)
-        resp_bytes = json.dumps(body).encode()
+        resp_bytes = _json.dumps(body)
         return (
             resp_bytes,
             Status(code="Ok"),

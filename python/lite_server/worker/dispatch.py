@@ -11,6 +11,7 @@ import logging
 import traceback
 from typing import Any
 
+from lite_server import _json
 from lite_server.api import LitAPI
 from lite_server.context import Headers, RequestContext, RequestMeta
 from lite_server.exceptions import HTTPException
@@ -69,7 +70,7 @@ async def _handle_route_call(
             uid, f"No route handler for {meta.route!r}", status_code=404
         )
     handler, _methods = entry
-    body = json.loads(rc.data) if rc.data else {}
+    body = _json.loads(rc.data) if rc.data else {}
     ctx = RequestContext(meta=meta, request=body)
     ctx.state["path_params"] = (
         dict(request.meta.path_params) if request.HasField("meta") else {}
@@ -113,7 +114,7 @@ def _build_route_response(uid: str, ctx: RequestContext) -> Response:
     elif isinstance(content, str):
         data = content.encode()
     else:
-        data = json.dumps(content).encode()
+        data = _json.dumps(content)
 
     # Status.code reflects pipeline execution ("Ok" = no exception), separate
     # from the HTTP status_code the handler chose (may be 4xx/5xx).
@@ -231,7 +232,7 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
 
     def _store_result(item_uid: str, body: Any, headers: dict[str, str] | None) -> None:
         sc, mt, clean = extract_response_meta(headers)
-        final_map[item_uid] = (json.dumps(body).encode(), sc, mt, clean)
+        final_map[item_uid] = (_json.dumps(body), sc, mt, clean)
 
     # Phase 1: per-item on_request → decode → on_input
     for item in batch.items:
