@@ -962,7 +962,8 @@ async fn test_custom_route_streaming() {
     let body = resp.text().await.unwrap();
     assert_eq!(
         body,
-        "data: {\"n\": 1}\n\ndata: {\"n\": 2}\n\ndata: {\"n\": 3}\n\n"
+        // P1: orjson 紧凑输出(无空格)
+        "data: {\"n\":1}\n\ndata: {\"n\":2}\n\ndata: {\"n\":3}\n\n"
     );
 
     let resp = client
