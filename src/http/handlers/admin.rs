@@ -491,17 +491,17 @@ pub async fn activate_version_handler(
     })))
 }
 
-// ===== B2: ensemble detection via string-contains in scan_repository =====
+// ===== B2 regression guard: ensemble detection in scan_repository =====
 
 #[cfg(test)]
 mod scan_repository_ensemble_tests {
     use super::*;
 
-    /// B2 (P1): `scan_repository` detects ensemble models via
-    /// `content.contains("ensemble:")` rather than structural YAML parsing.
-    /// A config.yaml with "ensemble:" appearing ONLY in a YAML comment or
-    /// description string is incorrectly classified as `type: "ensemble"`,
-    /// breaking the repository index API.
+    /// Regression guard (fixed in e5e45f4): `scan_repository` used to detect
+    /// ensemble models via `content.contains("ensemble:")` rather than
+    /// structural YAML parsing. A config.yaml with "ensemble:" appearing
+    /// ONLY in a YAML comment or description string was misclassified as
+    /// `type: "ensemble"`, breaking the repository index API.
     #[tokio::test]
     async fn test_scan_repository_ensemble_detection_false_positive_on_comment() {
         let repo = std::env::temp_dir().join(format!(
@@ -534,23 +534,23 @@ mod scan_repository_ensemble_tests {
         assert_eq!(entry["name"], "test_model");
         assert_eq!(entry["version"], "1");
 
-        // BUG: the comment "ensemble:" triggers the string-contains check,
-        // so the type is incorrectly reported as "ensemble".
+        // Regression guard (fixed in e5e45f4): the string-contains check
+        // would have matched the "ensemble:" comment and reported the type
+        // as "ensemble"; structural detection reports "litapi".
         assert_eq!(
             entry["type"].as_str().unwrap(),
             "litapi",
-            "B2 REGRESSION: model with model.py and 'ensemble:' in a comment \
-             must be classified as 'litapi', not '{}'. The string-contains \
-             check at handlers.rs:429 matched a YAML comment.",
+            "model with model.py and 'ensemble:' only in a comment must be \
+             classified as 'litapi', not '{}'.",
             entry["type"].as_str().unwrap_or("")
         );
 
         let _ = tokio::fs::remove_dir_all(&repo).await;
     }
 
-    /// B2b (P1): pure false positive — no model.py, only config.yaml with
-    /// "ensemble:" in a comment. scan_repository incorrectly treats this as
-    /// an ensemble model.
+    /// B2b regression guard: no model.py, only config.yaml with "ensemble:"
+    /// in a comment — structural detection must not treat this as an
+    /// ensemble model (the pre-e5e45f4 string-contains check did).
     #[tokio::test]
     async fn test_scan_repository_ensemble_detection_pure_false_positive() {
         let repo = std::env::temp_dir().join(format!(
@@ -572,16 +572,14 @@ mod scan_repository_ensemble_tests {
 
         let result = scan_repository(&repo).await;
 
-        // BUG: `content.contains("ensemble:")` matches the comment
-        // "# ensemble:", so this directory is incorrectly discovered as
-        // an ensemble model even though it has no model.py and the
-        // ensemble key is commented out.
+        // Regression guard (fixed in e5e45f4): the string-contains check
+        // matched the "# ensemble:" comment and discovered this directory as
+        // an ensemble model even though it has no model.py and the ensemble
+        // key is commented out. Structural detection must skip it.
         assert!(
             result.is_empty(),
-            "B2b REGRESSION: directory with 'ensemble:' in a comment and no \
-             model.py must NOT be discovered as a model. scan_repository uses \
-             string-contains which matches commented-out ensemble keys. \
-             Got {} entry(s): {:?}",
+            "directory with 'ensemble:' only in a comment and no model.py \
+             must NOT be discovered as a model. Got {} entry(s): {:?}",
             result.len(),
             result.iter().map(|e| format!("{}:{}", e["name"], e["version"])).collect::<Vec<_>>()
         );

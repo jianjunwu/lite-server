@@ -204,12 +204,13 @@ mod tests {
         assert!(!matches_patterns("data.json", &patterns));
     }
 
-    // ===== B1: ensemble detection via string contains is fragile =====
+    // ===== B1 regression guard: ensemble detection in scan_repo_models =====
 
-    /// B1 (P2): `scan_repo_models` detects ensemble models via
-    /// `content.contains("ensemble:")`. This matches comments,
-    /// documentation strings, and other non-structural occurrences,
-    /// causing false positives.
+    /// Regression guard (fixed in e5e45f4): `scan_repo_models` used to detect
+    /// ensemble models via `content.contains("ensemble:")`, which matched
+    /// comments, documentation strings, and other non-structural
+    /// occurrences, causing false positives. Detection is now structural
+    /// (`config_content_is_ensemble`).
     #[tokio::test]
     async fn test_scan_repo_models_ensemble_detection_false_positive_on_comment() {
         let tmp = std::env::temp_dir().join(format!(
@@ -219,9 +220,10 @@ mod tests {
         let model_dir = tmp.join("test_model").join("1");
         tokio::fs::create_dir_all(&model_dir).await.unwrap();
 
-        // A config.yaml where "ensemble:" only appears in a comment / description.
-        // A real model.py also exists, so the directory would be picked up as a
-        // standard model — but the string-contains check marks it as ensemble.
+        // A config.yaml where "ensemble:" only appears in a comment.
+        // model.py also exists, so the directory must be discovered as a
+        // standard model; the pre-e5e45f4 string-contains check would
+        // additionally have misclassified it as ensemble.
         let config = r#"# This model is NOT an ensemble; the line below is a comment.
 # ensemble: would be here if it were one
 max_batch_size: 4
@@ -236,16 +238,10 @@ batch_timeout: 0.05
 
         let result = scan_repo_models(&tmp).await;
 
-        // BUG: the comment mentioning "ensemble:" triggers the string-contains
-        // check. The directory contains model.py so it would be discovered
-        // anyway, but the ensemble flag on the returned model is wrong.
-        // We can't observe the ensemble flag directly (it's not in RepoModel),
-        // but we can verify the model IS discovered (it should be, since
-        // model.py exists). The real defect — that a comment could cause
-        // incorrect ensemble classification — is demonstrated by the fact
-        // that removing model.py would still cause discovery if the
-        // string-contains check fires, but with model.py present it masks
-        // the issue. See the next test for the pure false-positive case.
+        // The ensemble flag is not observable on RepoModel; what we can
+        // assert here is that a model with model.py is discovered. The pure
+        // false-positive case (comment-only "ensemble:", no model.py) is
+        // covered by the next test.
         assert_eq!(result.len(), 1, "model with model.py must be discovered");
         assert_eq!(result[0].name, "test_model");
         assert_eq!(result[0].version, "1");
@@ -253,9 +249,10 @@ batch_timeout: 0.05
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 
-    /// B1b: pure false positive — no model.py, only config.yaml with
-    /// "ensemble:" in a comment. The string-contains check incorrectly
-    /// treats this as an ensemble model and discovers it.
+    /// B1b regression guard: pure false positive — no model.py, only
+    /// config.yaml with "ensemble:" in a comment. The pre-e5e45f4
+    /// string-contains check incorrectly discovered this as an ensemble
+    /// model; structural detection must skip it.
     #[tokio::test]
     async fn test_scan_repo_models_ensemble_detection_pure_false_positive() {
         let tmp = std::env::temp_dir().join(format!(
@@ -279,15 +276,10 @@ max_batch_size: 4
 
         let result = scan_repo_models(&tmp).await;
 
-        // BUG: `content.contains("ensemble:")` matches the comment
-        // "# ensemble:", so this directory is incorrectly discovered as
-        // an ensemble model even though it has no model.py and the
-        // ensemble key is commented out.
         assert!(
             result.is_empty(),
-            "B1b REGRESSION: directory with ensemble: in a comment must NOT be \
-             discovered as a model. scan_repo_models uses string-contains \
-             which matches commented-out ensemble keys. Got {} model(s).",
+            "directory with 'ensemble:' only in a comment must NOT be \
+             discovered as a model. Got {} model(s).",
             result.len()
         );
 

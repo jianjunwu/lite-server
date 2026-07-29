@@ -2839,13 +2839,15 @@ class TestAPI(LitAPI):
         let _ = std::fs::remove_dir_all(&repo);
     }
 
-    // ===== B1: ensemble detection via string-contains in load_model =====
+    // ===== B1 regression guard: ensemble detection in load_model =====
 
-    /// B1 (P1): `load_model` detects ensemble models via `content.contains("ensemble:")`
-    /// rather than structural YAML parsing (as `scan_repo_models` was already fixed to do).
-    /// A config.yaml with "ensemble:" appearing ONLY in a YAML comment or description
-    /// string is incorrectly classified as `ModelType::Ensemble`, which means no workers
-    /// are spawned and the model is silently marked Ready with nothing to serve.
+    /// Regression guard (fixed in e5e45f4): `load_model` used to detect
+    /// ensemble models via `content.contains("ensemble:")` rather than
+    /// structural YAML parsing. A config.yaml with "ensemble:" appearing
+    /// ONLY in a YAML comment or description string was misclassified as
+    /// `ModelType::Ensemble` — no workers spawned, yet the model was
+    /// silently marked Ready with nothing to serve. Detection is now
+    /// structural; this test locks that in.
     #[tokio::test]
     async fn test_load_model_ensemble_detection_false_positive_on_comment() {
         let repo = std::env::temp_dir().join(format!(
@@ -2880,8 +2882,9 @@ class TestAPI(LitAPI):
         .unwrap();
 
         // config.yaml where "ensemble:" appears only in a YAML comment.
-        // A properly-structured check (serde_yaml get("ensemble")) would
-        // classify this as LitAPI; string-contains classifies it as Ensemble.
+        // Structural detection (serde_yaml top-level key) classifies this
+        // as LitAPI; the pre-e5e45f4 string-contains check misclassified it
+        // as Ensemble.
         std::fs::write(
             model_dir.join("config.yaml"),
             "# ensemble: this is just a comment, not a real ensemble config\nmax_batch_size: 4\n",
@@ -2901,29 +2904,26 @@ class TestAPI(LitAPI):
 
         let config = ModelConfig::default();
 
-        // The model.py EXISTS and the string-contains check finds "ensemble:"
-        // in a comment, so load_model takes the ensemble fast path: register
+        // model.py EXISTS and "ensemble:" is only a comment, so load_model
+        // must take the normal LitAPI path (spawn workers). Pre-e5e45f4 the
+        // string-contains check took the ensemble fast path instead: register
         // as Ensemble, mark ready, return Ok — zero workers spawned.
         let result = wm.load_model("test_model", "1", &config).await;
 
-        // BUG: load succeeds WITHOUT spawning workers, because the model
-        // was wrongly classified as Ensemble.
         assert!(
             result.is_ok(),
-            "B1 REGRESSION: load_model should succeed — string-contains \
-             'ensemble:' in a comment triggers the ensemble fast-path, so no \
-             worker spawn is attempted. Got: {:?}",
+            "load_model must succeed for a LitAPI model whose config only \
+             mentions 'ensemble:' in a comment. Got: {:?}",
             result.err()
         );
 
-        // The model is registered as Ensemble instead of LitAPI.
+        // The model must be registered as LitAPI, not Ensemble.
         let mv = registry.get("test_model", Some("1")).unwrap();
         assert_eq!(
             mv.model_type,
             ModelType::LitAPI,
-            "B1 REGRESSION: model with model.py and 'ensemble:' in a comment \
-             must be classified as LitAPI, not {:?}. The string-contains \
-             check at load_model:781 matched a YAML comment.",
+            "model with model.py and 'ensemble:' only in a comment must be \
+             classified as LitAPI, not {:?}.",
             mv.model_type
         );
         assert_eq!(
