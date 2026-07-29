@@ -376,7 +376,7 @@ For loaded versions with `hot_reload: true`, file changes go through the FILE_CH
    → workers re-run setup() with new code
 ```
 
-> **Deprecated**: When `control_mode != "auto"`, the automatic loading of new version directories is DEPRECATED and will be removed in the next minor release. Switch to `control_mode: "auto"` or load explicitly via the Admin API.
+> **Removed in 0.7.7**: When `control_mode != "auto"`, new version directories are no longer auto-loaded — they are only logged. Switch to `control_mode: "auto"` or load explicitly via the Admin API.
 
 ## Rate Limiting
 

@@ -375,7 +375,7 @@ lite-server 通过 `orchestration.control_mode` 控制模型版本的生命周�
    → worker 重新执行 setup() 加载新代码
 ```
 
-> **已废弃**：`control_mode != "auto"` 时，新版本目录自动加载的行为已在当前版本标记为 DEPRECATED，将在下个小版本移除。请改用 `control_mode: "auto"` 或通过 Admin API 显式加载。
+> **已于 0.7.7 移除**：`control_mode != "auto"` 时，新版本目录不再自动加载，仅记录日志提示。请改用 `control_mode: "auto"` 或通过 Admin API 显式加载。
 
 ## 限流
 

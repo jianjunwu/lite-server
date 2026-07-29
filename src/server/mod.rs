@@ -291,7 +291,6 @@ impl LiteServer {
         // Process reload events
         let reload_worker = self.worker_manager.clone();
         let reload_registry = self.registry.clone();
-        let model_defaults = self.config.model_defaults.clone();
         let server_tunables = self.config.tunables.clone();
         let has_hot_reload_for_reload = has_hot_reload.clone();
         let reload_handle = tokio::spawn(async move {
@@ -303,7 +302,6 @@ impl LiteServer {
                     reload_worker.clone(),
                     reload_registry.clone(),
                     &mut last_reload,
-                    &model_defaults,
                     &server_tunables,
                     &has_hot_reload_for_reload,
                     &reconcile_tx,

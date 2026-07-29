@@ -19,17 +19,16 @@ use tracing::{debug, error, info, warn};
 ///   lifecycle event. In auto mode (`reconcile_trigger` = Some) these only
 ///   trigger a reconcile — the reconciler is the single authority on version
 ///   load/unload, applying load_policy and max_loaded_versions. In manual
-///   mode the legacy behavior remains: auto-load hot_reload-enabled new
-///   versions, and directly unload versions whose dir disappeared (that
-///   invariant holds in every mode — the files are gone, the worker cannot
-///   serve).
+///   mode the user is the lifecycle owner: new version dirs are only
+///   reported (warn log), never auto-loaded. A version dir that disappeared
+///   is unloaded directly in every mode — the files are gone, the worker
+///   cannot serve.
 pub(super) async fn process_watch_events(
     paths: Vec<PathBuf>,
     repo_path: PathBuf,
     worker_manager: Arc<WorkerManager>,
     registry: Arc<ModelRegistry>,
     last_reload: &mut std::collections::HashMap<(String, String), Instant>,
-    model_defaults: &crate::config::ModelTunables,
     server_tunables: &crate::config::ServerTunables,
     has_hot_reload: &AtomicBool,
     reconcile_trigger: &Option<mpsc::Sender<()>>,
@@ -166,49 +165,20 @@ pub(super) async fn process_watch_events(
             );
             let _ = tx.try_send(());
         }
-        // Manual mode: legacy behavior (P4 will deprecate the auto-load half).
+        // Manual mode: the user is the lifecycle owner. New version dirs
+        // are only reported — never auto-loaded (the legacy hot_reload
+        // auto-load was removed in 0.7.7 after being deprecated in 0.7.6).
         None => {
             let mut had_unloads = false;
             for (name, version) in lifecycle_candidates {
-                let key = (name.clone(), version.clone());
                 let version_dir = repo_path.join(&name).join(&version);
                 if version_dir.exists() {
-                    // New version dir: auto-load only if its config opts in.
-                    if let Some(last) = last_reload.get(&key) {
-                        if Instant::now().duration_since(*last) < cooldown {
-                            continue;
-                        }
-                    }
-                    let config_path = version_dir.join("config.yaml");
-                    if config_path.exists() {
-                        let mut config = crate::config::load_model_config(&config_path).unwrap_or_default();
-                        model_defaults.apply_to(&mut config);
-
-                        // P0: Only auto-load if hot_reload is enabled
-                        if !config.hot_reload {
-                            debug!("Hot reload: skipping new model {} version {} (hot_reload=false)", name, version);
-                            continue;
-                        }
-
-                        // P4: version lifecycle belongs to the reconciler;
-                        // this legacy path is scheduled for removal.
-                        warn!(
-                            "DEPRECATED: hot_reload auto-loading new version {} {} under \
-                             control_mode != \"auto\" will be removed in the next minor \
-                             release — load explicitly via the Admin API or switch to \
-                             control_mode: \"auto\"",
-                            name, version
-                        );
-
-                        last_reload.insert(key, Instant::now());
-                        info!("Hot reload: auto-loading new model {} version {}", name, version);
-                        if let Err(e) = worker_manager.load_model(&name, &version, &config).await {
-                            warn!("Hot load failed for {} version {}: {}", name, version, e);
-                        } else {
-                            // P2: Update flag when new hot_reload model is loaded
-                            has_hot_reload.store(true, Ordering::Relaxed);
-                        }
-                    }
+                    warn!(
+                        "New version {} {} detected under manual control_mode — \
+                         not loading; load explicitly via the Admin API or \
+                         switch to control_mode: \"auto\"",
+                        name, version
+                    );
                 } else {
                     // Dir gone → unload. This invariant holds in every mode:
                     // the files no longer exist, the worker cannot serve.
@@ -460,7 +430,6 @@ mod tests {
             wm,
             registry.clone(),
             &mut last_reload,
-            &crate::config::ModelTunables::default(),
             &crate::config::ServerTunables::default(),
             &flag,
             &trigger,
@@ -499,7 +468,6 @@ mod tests {
             wm,
             registry.clone(),
             &mut last_reload,
-            &crate::config::ModelTunables::default(),
             &crate::config::ServerTunables::default(),
             &flag,
             &trigger,
@@ -543,7 +511,6 @@ mod tests {
             wm,
             registry.clone(),
             &mut last_reload,
-            &crate::config::ModelTunables::default(),
             &crate::config::ServerTunables::default(),
             &flag,
             &trigger,
@@ -579,7 +546,6 @@ mod tests {
             wm,
             registry.clone(),
             &mut last_reload,
-            &crate::config::ModelTunables::default(),
             &crate::config::ServerTunables::default(),
             &flag,
             &trigger,
@@ -629,7 +595,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
     }
 
-    // ===== P4: manual-mode auto-load deprecation warning =====
+    // ===== Manual mode: new version dirs are NOT auto-loaded =====
 
     /// Capture the messages of all tracing events emitted while `f` runs on
     /// a fresh current-thread runtime (the subscriber is installed as the
@@ -679,13 +645,11 @@ mod tests {
     }
 
     #[test]
-    fn manual_mode_autoload_logs_deprecation_warning() {
-        let tmp = test_repo_dir("deprecate");
+    fn manual_mode_new_version_warns_and_does_not_load() {
+        let tmp = test_repo_dir("no-autoload");
         let version_dir = tmp.join("m").join("1");
         std::fs::create_dir_all(&version_dir).unwrap();
-        // hot_reload=true opts into auto-load; model.py exits immediately so
-        // the load attempt fails fast on any machine (with or without a
-        // working Python env) — the warning fires before the attempt.
+        // hot_reload=true would have opted into the removed auto-load path.
         std::fs::write(
             version_dir.join("config.yaml"),
             "hot_reload: true\nstartup_timeout: 5\n",
@@ -696,7 +660,7 @@ mod tests {
             let tmp = tmp.clone();
             async move {
                 let registry = Arc::new(ModelRegistry::new());
-                let wm = build_test_worker_manager(tmp.clone(), registry);
+                let wm = build_test_worker_manager(tmp.clone(), registry.clone());
                 let trigger: Option<mpsc::Sender<()>> = None;
                 let mut last_reload = std::collections::HashMap::new();
                 let flag = AtomicBool::new(true);
@@ -704,19 +668,28 @@ mod tests {
                     vec![tmp.join("m").join("1").join("config.yaml")],
                     tmp.clone(),
                     wm,
-                    Arc::new(ModelRegistry::new()),
+                    registry.clone(),
                     &mut last_reload,
-                    &crate::config::ModelTunables::default(),
                     &crate::config::ServerTunables::default(),
                     &flag,
                     &trigger,
                 ).await;
+                assert!(
+                    registry.get("m", Some("1")).is_none(),
+                    "manual mode: new version dir must NOT be auto-loaded — \
+                     the user is the lifecycle owner"
+                );
             }
         });
 
         assert!(
-            messages.iter().any(|m| m.contains("DEPRECATED") && m.contains("auto")),
-            "manual-mode auto-load must log a DEPRECATED warning; got: {:?}",
+            messages.iter().any(|m| m.contains("manual") && m.contains("Admin API")),
+            "manual mode: a new version dir must log guidance to load explicitly; got: {:?}",
+            messages
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("auto-loading") || m.contains("Hot load failed")),
+            "manual mode: no load attempt may happen; got: {:?}",
             messages
         );
 
