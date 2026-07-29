@@ -1,4 +1,5 @@
 use super::*;
+use super::inference::resolve_version;
 use crate::error::AppError;
 use crate::http::state::AppState;
 use crate::metrics::prometheus;
