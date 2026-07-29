@@ -121,7 +121,11 @@ declaring `ctx` behaves exactly as before (the list is ignored).
 
 #### `encode_response(self, output)`
 
-Format the prediction output into an HTTP response body (must be JSON-serializable).
+Format the prediction output into an HTTP response body:
+
+- `dict` / `list` / other JSON-serializable values are serialized as JSON (compact form; NaN/Infinity become `null`).
+- `str` is sent verbatim as UTF-8 — **not** JSON-quoted. Pair with a matching `media_type` (e.g. `Response(content=html, media_type="text/html")`) for non-JSON payloads.
+- `bytes` / `bytearray` are sent verbatim (e.g. images, protobuf payloads).
 
 ```python
 def encode_response(self, output):

@@ -344,3 +344,25 @@ hooks:
     method: POST
     body_template: '{"model":"$MODEL","version":"$VERSION","worker":$WORKER_ID}'
 ```
+
+## 构建期性能选项
+
+### CPU target(`target-cpu`)
+
+Rust release 构建默认面向基线指令集(x86-64 / 通用 aarch64)。调整
+`target-cpu` 可让编译器生成更新的指令(AVX2 等),但为新 CPU 构建的
+二进制**在老 CPU 上会 SIGILL 崩溃** —— 必须按部署目标选择,绝不能按
+"在我机器上最快"选择。
+
+三层策略:
+
+1. **本地开发** —— 在机器本地的 `.cargo/config.toml`(**不要提交**)设置
+   `target-cpu=native`,获得本机最佳性能。
+2. **CI / 面向已知机群的发布构建** —— 按机群中最老的 CPU 代际选择:
+   `x86-64-v2`(SSE4.2/POPCNT,约 2009+ 年)或 `x86-64-v3`(AVX2,约
+   2013+ 年),如 `RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release`。
+3. **发布的安装包(pip wheel)** —— 不设置(保持基线)。wheel 安装在未知
+   硬件上,基线是唯一安全选择。
+
+Apple Silicon / aarch64:`target-cpu` 可设 `apple-m1` 等已知目标;机群
+规则同上。

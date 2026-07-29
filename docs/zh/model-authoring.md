@@ -133,7 +133,11 @@ def unbatch(self, output, ctx):
 
 #### `encode_response(self, output)`
 
-将预测输出格式化为 HTTP 响应体（必须可 JSON 序列化）。
+将预测输出格式化为 HTTP 响应体:
+
+- `dict` / `list` 等可 JSON 序列化的值按 JSON 输出(紧凑格式;NaN/Infinity 序列化为 `null`)。
+- `str` 按 UTF-8 原文发送 —— **不**加 JSON 引号。非 JSON 负载请搭配 `media_type`(如 `Response(content=html, media_type="text/html")`)。
+- `bytes` / `bytearray` 原文发送(如图片、protobuf 负载)。
 
 ```python
 def encode_response(self, output):

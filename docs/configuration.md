@@ -353,3 +353,26 @@ hooks:
     method: POST
     body_template: '{"model":"$MODEL","version":"$VERSION","worker":$WORKER_ID}'
 ```
+
+## Build-Time Performance Options
+
+### CPU target (`target-cpu`)
+
+Rust release builds default to the baseline instruction set (x86-64 / generic
+aarch64). Tuning `target-cpu` lets the compiler emit newer instructions
+(AVX2, …), but a binary built for a newer CPU **crashes with SIGILL on older
+CPUs** — choose per deployment target, never by "fastest on my machine".
+
+Three-tier strategy:
+
+1. **Local development** — set `target-cpu=native` in a machine-local
+   `.cargo/config.toml` (do **not** commit it) for maximum dev-machine
+   performance.
+2. **CI / release builds for a known fleet** — pick the oldest CPU generation
+   in the fleet: `x86-64-v2` (SSE4.2/POPCNT, ~2009+) or `x86-64-v3` (AVX2,
+   ~2013+), e.g. `RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release`.
+3. **Published artifacts (pip wheels)** — leave unset (baseline). Wheels are
+   installed on unknown hardware; baseline is the only safe choice.
+
+Apple Silicon / aarch64: `target-cpu` accepts e.g. `apple-m1` for known
+targets; the same fleet rule applies.
