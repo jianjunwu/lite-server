@@ -180,3 +180,33 @@ class TestCBSequence:
         # CBSequence is NOT a dict — attribute access only
         with pytest.raises(TypeError):
             _ = seq["uid"]  # type: ignore
+
+
+class TestSlots:
+    """P4: 热路径数据类使用 __slots__,禁动态挂属性换内存与属性访问速度。"""
+
+    def test_request_meta_has_no_dict(self):
+        meta = _make_meta()
+        assert not hasattr(meta, "__dict__")
+        # frozen+slots 在部分 Python 版本上 __setattr__ 抛 TypeError 而非
+        # FrozenInstanceError(CPython 已知 quirk),两者都表明 mutation 被禁止。
+        with pytest.raises((AttributeError, TypeError)):
+            meta.custom = 1  # frozen + slots
+
+    def test_request_context_has_no_dict(self):
+        ctx = RequestContext(meta=_make_meta())
+        assert not hasattr(ctx, "__dict__")
+        with pytest.raises(AttributeError):
+            ctx.custom = 1
+
+    def test_response_has_no_dict(self):
+        resp = Response(content={})
+        assert not hasattr(resp, "__dict__")
+        with pytest.raises(AttributeError):
+            resp.custom = 1
+
+    def test_headers_has_no_dict(self):
+        h = Headers({"a": "b"})
+        assert not hasattr(h, "__dict__")
+        with pytest.raises(AttributeError):
+            h.custom = 1

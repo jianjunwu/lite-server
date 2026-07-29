@@ -26,6 +26,8 @@ class Headers:
     Read-only: no public mutation API, safe to share across batch items.
     """
 
+    __slots__ = ("_data",)
+
     def __init__(self, raw: dict[str, str] | None = None) -> None:
         self._data: dict[str, list[str]] = {}
         if raw:
@@ -61,7 +63,7 @@ class Headers:
         return f"Headers({dict(self.items())!r})"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RequestMeta:
     """Immutable HTTP request metadata from the wire.
 
@@ -83,7 +85,7 @@ class RequestMeta:
     query: dict[str, str] = field(default_factory=dict)  # URL query parameters (endpoints only)
 
 
-@dataclass
+@dataclass(slots=True)
 class RequestContext:
     """Per-request state flowing through the inference pipeline.
 

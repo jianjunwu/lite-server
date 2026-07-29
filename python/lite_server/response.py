@@ -89,7 +89,7 @@ def _delete_cookie_header(
 # Response
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(slots=True)
 class Response:
     """HTTP response with full control over status, headers, and media type.
 
