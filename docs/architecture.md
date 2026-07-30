@@ -317,6 +317,29 @@ Timeline ◄── Historical sampling (optional)
 
 ## Hot Reload Flow
 
+Version/file hot-reload is handled by three independent mechanisms:
+
+| Mechanism | Config Location | Responsibility |
+|-----------|----------------|----------------|
+| `control_mode` | `server.yaml` `orchestration` | **Version** lifecycle — which versions are loaded/unloaded |
+| `hot_reload` | `config.yaml` (per-model) | Whether to react to **file** changes |
+| `on_file_changed` | `model.py` (model code) | **How** to handle file changes |
+
+They form a pipeline, not alternatives:
+
+```
+control_mode                 hot_reload                on_file_changed
+    │                            │                          │
+    └─→ version enters registry   └─→ file matches pattern    └─→ returns non-None
+        (version "ingress")           → sends FILE_CHANGED        → in-process refresh
+                                      (file-change "gate")
+                                                              returns None / not implemented
+                                                               → fallback: restart workers
+```
+
+`control_mode` operates at version granularity; `hot_reload` operates at file granularity.
+`hot_reload=true` works regardless of `control_mode` — it only cares about files inside already-loaded versions.
+
 lite-server controls model version lifecycle through `orchestration.control_mode`:
 
 | control_mode | Behavior |

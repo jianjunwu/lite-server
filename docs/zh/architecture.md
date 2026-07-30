@@ -316,6 +316,29 @@ Prometheus ◄── /metrics 端点
 
 ## 热重载流程
 
+lite-server 的版本/文件热更新由三个独立机制协作完成：
+
+| 机制 | 配置位置 | 管什么 |
+|------|---------|--------|
+| `control_mode` | `server.yaml` `orchestration` | **版本**生命周期——哪些版本加载/卸载 |
+| `hot_reload` | `config.yaml`（模型级） | **文件**变更要不要响应 |
+| `on_file_changed` | `model.py`（模型代码） | 文件变了**怎么**处理 |
+
+三者是上下游接力关系：
+
+```
+control_mode                 hot_reload                on_file_changed
+    │                            │                          │
+    └─→ 版本进入注册表             └─→ 文件变更匹配 pattern     └─→ 返回非 None
+        （版本的"入口"）               → 发 FILE_CHANGED           → 进程内刷新，不重启
+                                      （文件变更的"开关"）
+                                                             返回 None / 未实现
+                                                               → 回退：重启 worker
+```
+
+`control_mode` 控制版本粒度，`hot_reload` 控制文件粒度，两者互不覆盖。
+即使 `control_mode=explicit`，`hot_reload=true` 仍然生效——它只关心已加载版本内的文件变化。
+
 lite-server 通过 `orchestration.control_mode` 控制模型版本的生命周期管理：
 
 | control_mode | 行为 |
