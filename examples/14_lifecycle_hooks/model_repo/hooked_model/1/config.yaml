@@ -15,10 +15,3 @@ hooks:
   on_error_http:
     url: "http://localhost:8000/health"
     method: "GET"
-
-# Inference lifecycle callbacks (Python Callback classes)
-# Each class must be a no-arg constructible Callback subclass.
-# Callbacks chain in order with automatic exception isolation.
-callbacks:
-  - callbacks.AuditLogger
-  - callbacks.ResponseEnricher

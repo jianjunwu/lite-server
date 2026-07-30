@@ -1,0 +1,95 @@
+# 15 Callbacks
+
+详细演示 Python `Callback` 系统：全部钩子点、两种注册方式、请求拒绝、短路早返和每请求状态。
+
+[English](README.md)
+
+## 核心概念
+
+Callback 在模型三个阶段的上下游提供四个数据钩子点，可观察并改写推理管线：
+
+```
+on_request → decode_request → on_input → predict
+→ on_output → encode_response → on_response
+```
+
+此外还有 `on_error`（请求失败时）和三个生命周期钩子（`on_before_setup` / `on_after_setup` / `on_teardown`）。
+
+本示例注册了六个 callback —— 见 `model_repo/callbacks_demo/1/callbacks.py`：
+
+| Callback | 钩子 | 演示点 |
+|----------|------|--------|
+| `ApiKeyAuth` | `on_request` | 拒绝请求：抛 `UnauthorizedError` → 401 |
+| `RequestTimer` | `on_request`、`on_response` | 用 `ctx.state` 存每请求状态（并发安全） |
+| `SimpleCache` | `on_request`、`on_output` | `ctx.respond(...)` 短路早返、自定义响应头 |
+| `InputValidator` | `on_input` | `async` 钩子、抛 `BadRequestError` → 400 |
+| `ErrorMetrics` | `on_error` | 异常隔离的错误钩子 |
+| `LifecycleTracer` | setup/teardown | `on_before_setup` / `on_after_setup` / `on_teardown` |
+
+### 两种注册方式
+
+- **`LitAPI.callbacks` 类属性**（在 `model.py` 中）：优先级更高，支持构造参数 —— callback 需要配置时用它。先于 config.yaml 中的 callback 执行。
+- **config.yaml 的 `callbacks:`**：全限定类路径，必须无参可构造，追加在类属性之后。
+
+本例中 `ApiKeyAuth` 通过类属性注册（接受合法 key 列表作为构造参数，保证鉴权先于缓存执行），其余通过 config.yaml 注册。
+
+### 需要了解的语义
+
+- 数据钩子接收单个 `ctx`（`RequestContext`）参数，同步异步均可。可原地修改 `ctx.request` / `ctx.input` / `ctx.output` / `ctx.response`，或返回替换值。
+- 每请求的临时数据放在 `ctx.state` —— 不要放在 `self` 属性上（在并发请求间共享）。
+- 数据钩子的异常**不会**被吞掉：抛 `HTTPException`（或 `BadRequestError` / `UnauthorizedError` 等子类）即以对应状态码拒绝请求，返回机器可读的错误体。
+- `ctx.respond(body, status_code=..., headers=...)` 短路管线 —— 后续阶段和钩子全部跳过。
+- `on_error` 和生命周期钩子是异常隔离的：失败只记日志，不传播。
+- 流式模式下，`on_output` / `on_response` 对每个 chunk 各调一次，`on_error` 对每个失败的 chunk 调一次。
+- 日志用 `logging` 模块，不要 `print()` —— stdout 承载 worker 启动握手协议，往里写（比如在 `on_before_setup` 中）会导致 worker 启动失败。
+- 生产环境的鉴权/限流/CORS 应使用 config.yaml 中声明式的 `policies:` 配置 —— 这里的 `ApiKeyAuth` 仅用于教学演示钩子机制。
+
+## 运行
+
+```bash
+cd examples/15_callbacks
+python -m lite_server serve --config server.yaml
+```
+
+启动时可以看到 worker 加载模型打印 `[LifecycleTracer] before setup` / `setup done`。
+
+## 测试
+
+```bash
+# 无 API key -> ApiKeyAuth.on_request 返回 401
+curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
+  -H 'Content-Type: application/json' \
+  -d '{"input": "hello"}'
+# => HTTP 401 {"error": {"type": "authentication_error", "message": "missing or invalid X-API-Key header"}}
+
+# 非法输入（空字符串）-> InputValidator.on_input 返回 400
+curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
+  -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
+  -d '{"input": ""}'
+# => HTTP 400 {"error": {"type": "invalid_request_error", "message": "input must be a non-empty string"}}
+
+# 正常请求 -> 200；[RequestTimer] 每请求打印耗时
+curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
+  -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
+  -d '{"input": "hello"}'
+# => HTTP 200 {"output": "hello"}
+
+# 相同请求再来一次 -> 缓存命中：X-Cache 响应头 + "cached": true，
+# predict() 不会执行
+curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
+  -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
+  -d '{"input": "hello"}'
+# => HTTP 200, X-Cache: hit, {"output": "hello", "cached": true}
+```
+
+合法 key 默认为 `demo-key`，可用 `DEMO_API_KEYS=key1,key2` 覆盖。
+
+关闭服务（Ctrl+C）时可以看到 `[LifecycleTracer] model unloading, teardown`。
+
+## 学习要点
+
+- 全部 callback 钩子点及顺序：`on_request` → decode → `on_input` → predict → `on_output` → encode → `on_response`，外加 `on_error` 和生命周期钩子
+- 两种注册方式及适用场景（带构造参数的 `LitAPI.callbacks` vs config.yaml 的 `callbacks:`）
+- 在数据钩子中抛 `HTTPException` 子类拒绝请求（401/400）
+- 用 `ctx.respond(...)` 短路管线并附加自定义响应头
+- 用 `ctx.state` 携带每请求数据；同步与 `async` 钩子

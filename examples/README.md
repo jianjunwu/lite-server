@@ -64,6 +64,7 @@ Start from example 01 and work your way up. Each example builds on concepts from
 | 12 | [continuous_batching](12_continuous_batching/) | LLM continuous batching | `prefill()` / `step()` / `has_finished()` hooks |
 | 13 | [bidi_streaming](13_bidi_streaming/) | Bidirectional streaming (ASR) | `BidiStreamHandler`, `on_open` / `on_chunk` / `on_close` |
 | 14 | [lifecycle_hooks](14_lifecycle_hooks/) | Worker lifecycle hooks | `on_ready` / `on_error` / `on_exit` shell + HTTP callbacks |
+| 15 | [callbacks](15_callbacks/) | Python Callback pipeline hooks | `on_request`/`on_input`/`on_output`/`on_response`, `ctx.respond()`, `HTTPException` rejection, both registration paths |
 | 16 | [grpc](16_grpc/) | gRPC inference endpoints | `grpc_port`, auto-generated gRPC from LitAPI |
 
 ## Running Any Example
@@ -264,6 +265,22 @@ curl -X POST http://localhost:8000/v2/models/hooked_model/infer \
   -d '{"input": "hello"}'
 # => {"output": "hello", "count": 1}
 # Console shows hook commands executing (echo statements)
+```
+
+### 15 Callbacks
+
+```bash
+# No API key -> 401; empty input -> 400; valid -> 200
+curl -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
+  -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
+  -d '{"input": "hello"}'
+# => {"output": "hello"}
+
+# Same request again -> cache hit short-circuit
+curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
+  -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
+  -d '{"input": "hello"}'
+# => X-Cache: hit, {"output": "hello", "cached": true}
 ```
 
 ### 16 gRPC

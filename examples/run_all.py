@@ -294,6 +294,27 @@ def check_16():
     return st == 200 and r.get("output") == "grpc_echo: hello", f"HTTP {st} -> {r}"
 
 
+def check_15():
+    path = "/v2/models/callbacks_demo/infer"
+    key = {"X-API-Key": "demo-key"}
+    # No API key -> 401 from ApiKeyAuth.on_request
+    st, r = http_json("POST", path, {"input": "hello"})
+    if st != 401:
+        return False, f"expected 401 without key, got HTTP {st} -> {r}"
+    # Empty input -> 400 from InputValidator.on_input
+    st, r = http_json("POST", path, {"input": ""}, headers=key)
+    if st != 400:
+        return False, f"expected 400 for empty input, got HTTP {st} -> {r}"
+    # Valid request -> 200
+    st, r = http_json("POST", path, {"input": "hello"}, headers=key)
+    if not (st == 200 and isinstance(r, dict) and r.get("output") == "hello"):
+        return False, f"valid request failed: HTTP {st} -> {r}"
+    # Same request again -> SimpleCache short-circuits with cached body
+    st, r = http_json("POST", path, {"input": "hello"}, headers=key)
+    ok = st == 200 and isinstance(r, dict) and r.get("cached") is True
+    return ok, f"cache hit: HTTP {st} -> {r}"
+
+
 # example dir -> (primary model for readiness, check fn)
 SPECS = {
     "01_basic": ("echo", check_01),
@@ -308,6 +329,7 @@ SPECS = {
     "12_continuous_batching": ("cb_llm", check_12),
     "13_bidi_streaming": ("asr", check_13),
     "14_lifecycle_hooks": ("hooked_model", check_14),
+    "15_callbacks": ("callbacks_demo", check_15),
     "16_grpc": ("grpc_echo", check_16),
 }
 

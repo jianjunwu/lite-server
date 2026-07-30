@@ -1,0 +1,15 @@
+max_batch_size: 1
+stream: false
+accelerator: cpu
+devices: 1
+workers_per_device: 1
+
+# Inference pipeline callbacks (Python Callback subclasses).
+# Classes here must be no-arg constructible; they chain in order and run
+# AFTER LitAPI.callbacks (the class attribute in model.py).
+callbacks:
+  - callbacks.RequestTimer
+  - callbacks.SimpleCache
+  - callbacks.InputValidator
+  - callbacks.ErrorMetrics
+  - callbacks.LifecycleTracer
