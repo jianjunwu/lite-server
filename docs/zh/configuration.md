@@ -16,7 +16,7 @@ server:
   host: 0.0.0.0                # 绑定地址（支持 unix:/path/to/sock 使用 UDS）
   timeout: 30.0                # 全局请求超时（秒）
   threads: null                # Tokio 工作线程数（null = 自动 = CPU 核数）
-  cache_registry: false        # 缓存模型注册表到磁盘
+  cache_registry: false        # 缓存模型注册表到磁盘（预留 — 尚未实现）
   graceful_timeout: 30.0       # 优雅关闭时等待进行中请求的最大秒数
   keepalive_timeout: 5.0       # HTTP keep-alive 超时（秒），0 = 禁用
 
@@ -31,7 +31,7 @@ logging:
 
 grpc:
   enabled: true                # 启用 gRPC 服务
-  max_workers: 10              # gRPC 最大工作线程数
+  max_workers: 10              # gRPC 最大工作线程数（预留 — 尚未实现）
 
 metrics:
   enabled: true                # 启用 Prometheus 指标端点

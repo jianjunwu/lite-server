@@ -82,7 +82,6 @@ These flags set global defaults that override per-model `config.yaml` values.
 | `--max-retries` | int | 3 | Retry a failed batch on another worker up to N times (0 = disabled) |
 | `--startup-timeout` | float | 60.0 | Max seconds to wait for a worker ready handshake |
 | `--health-check-timeout` | float | 5.0 | Seconds per health-check probe before timeout |
-| `--health-check-kill-threshold` | int | 0 | Consecutive probe failures before kill + respawn (0 = disabled) |
 | `--worker-kill-timeout` | float | 10.0 | Seconds to wait for the OS to reap a killed worker |
 | `--hook-http-timeout` | float | 5.0 | Seconds for a worker lifecycle HTTP hook request |
 
@@ -202,12 +201,11 @@ lite-server init [PROJECT_NAME] [OPTIONS]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `project_name` | string | (positional) | Project directory name |
-| `--template`, `-t` | string | empty | Project template (currently only `empty`) |
 | `--wizard`, `-w` | flag | false | Interactive wizard mode |
 
 ```bash
 # Create a new project
-lite-server init my-server --template empty
+lite-server init my-server
 
 # Interactive wizard
 lite-server init --wizard

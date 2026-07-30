@@ -82,7 +82,6 @@ lite-server serve [选项]
 | `--max-retries` | int | 3 | 失败 batch 换 worker 重试次数（0 = 禁用） |
 | `--startup-timeout` | float | 60.0 | 等待 worker ready 握手的最大秒数 |
 | `--health-check-timeout` | float | 5.0 | 单次健康探测超时（秒） |
-| `--health-check-kill-threshold` | int | 0 | 连续探测失败 N 次后杀死并重启 worker（0 = 禁用） |
 | `--worker-kill-timeout` | float | 10.0 | 杀死 worker 后等待 OS 回收的秒数 |
 | `--hook-http-timeout` | float | 5.0 | 生命周期 HTTP 钩子请求超时（秒） |
 
@@ -202,12 +201,11 @@ lite-server init [项目名] [选项]
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `project_name` | string | （位置参数） | 项目目录名 |
-| `--template`, `-t` | string | empty | 项目模板（目前仅有 `empty`） |
 | `--wizard`, `-w` | flag | false | 交互式向导模式 |
 
 ```bash
 # 创建新项目
-lite-server init my-server --template empty
+lite-server init my-server
 
 # 交互式向导
 lite-server init --wizard

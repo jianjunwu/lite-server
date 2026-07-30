@@ -155,7 +155,7 @@ lite-server 是 Rust + Python 混合架构的推理服务器。Rust 内核处理
 
 ### 持续批处理
 
-模型可以覆写 `add_sequence()` / `remove_sequence()` 实现持续批处理（continuous batching）：序列动态加入/离开正在进行的推理，而非等待 batch 收集完成。适用于 LLM 等可变长度生成场景。
+模型可以实现 `prefill()` / `step()` / `has_finished()` 钩子实现持续批处理（continuous batching）：序列动态加入/离开正在进行的推理，而非等待 batch 收集完成。适用于 LLM 等可变长度生成场景。
 
 ## 核心组件
 

@@ -247,12 +247,15 @@ class MyCallback(Callback):
 on_request → decode_request → on_input → predict → on_output → encode_response → on_response
 ```
 
+When any stage or hook raises, the pipeline short-circuits to ``on_error``, then an error response is returned to the client.
+
 | Hook | When | Reads / writes |
 |------|------|----------------|
 | `on_request` | Raw request, before `decode_request` | `ctx.request` |
 | `on_input` | After `decode_request`, before `predict` | `ctx.input` |
 | `on_output` | After `predict`, before `encode_response` (per chunk when streaming) | `ctx.output` |
 | `on_response` | After `encode_response`, before sending (per chunk when streaming) | `ctx.response` |
+| `on_error` | Any hook or stage raises an exception | `ctx` + `exc` (the exception) |
 | `on_before_setup` | Before `LitAPI.setup()` | `(config, device)` |
 | `on_after_setup` | After `LitAPI.setup()` succeeds | `(lit_api)` |
 | `on_teardown` | Model unload / worker shutdown | `(lit_api)` |
@@ -272,7 +275,7 @@ A data hook may mutate `ctx` in place or return a replacement value (`None` = pa
 
 - **Early return** (e.g. cache hit): call `ctx.respond(body, status_code=..., headers=...)` or return a `Response` from any hook. Later stages and remaining hooks are skipped.
 - **Validation / rejection**: raise `HTTPException` (`BadRequestError`, `UnauthorizedError`, ...) from any hook. The client receives the structured error with the exception's status code — data-hook exceptions are **not** swallowed.
-- Lifecycle hooks (`on_before_setup` / `on_after_setup` / `on_teardown`) stay exception-isolated: failures are logged, never propagated.
+- Lifecycle hooks (`on_before_setup` / `on_after_setup` / `on_teardown`) and `on_error` are exception-isolated: failures are logged, never propagated (a failing `on_error` also never masks the original error).
 
 ```python
 from lite_server import Callback, BadRequestError
@@ -670,7 +673,7 @@ class MyModel(LitAPI):
         self.model = load_model()
         # Pre-register metrics — one-time cost
         self.g_batch_size = self.register_metric("my_batch_size", "gauge")
-        self.c_predictions = self.register_metric("my_predictions_total", "counter")
+        self.c_predictions = self.register_metric("my_predictions", "counter")
         self.h_latency = self.register_metric("my_inference_ms", "histogram")
 
     def predict(self, x):
@@ -695,7 +698,7 @@ After sending requests, check `/metrics`:
 lite_server_my_batch_size{model="mymodel"} 32
 
 # Counter
-lite_server_my_predictions_total_total{model="mymodel"} 1542
+lite_server_my_predictions_total{model="mymodel"} 1542
 
 # Histogram
 lite_server_my_inference_ms_count{model="mymodel"} 1542
@@ -727,6 +730,7 @@ def stream_predict(self, request):
 
 ### Notes
 
+- **Counter metrics must NOT end with `_total`** — Prometheus automatically appends `_total` to counter names. Naming a counter `my_predictions_total` produces `my_predictions_total_total` in `/metrics` output. Use `my_predictions` instead.
 - Metric names must not conflict with built-in Prometheus metrics (e.g. `liteserver_requests_total`)
 - IDs are per-LitAPI-instance — different models can register the same metric name (values are separated by the `model` label)
 - Default histogram buckets: `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]`

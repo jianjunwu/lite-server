@@ -156,7 +156,7 @@ the system slides between `batch_timeout` (upper bound under high load) and `min
 
 ### Continuous Batching
 
-Models can override `add_sequence()` / `remove_sequence()` to implement continuous batching: sequences dynamically join/leave an ongoing inference, rather than waiting for a batch to be collected. This is suited to LLMs and other variable-length generation scenarios.
+Models can implement `prefill()` / `step()` / `has_finished()` hooks to implement continuous batching: sequences dynamically join/leave an ongoing inference, rather than waiting for a batch to be collected. This is suited to LLMs and other variable-length generation scenarios.
 
 ## Key Components
 

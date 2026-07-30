@@ -16,7 +16,7 @@ server:
   host: 0.0.0.0                # Bind address (supports unix:/path/to/sock for UDS)
   timeout: 30.0                # Global request timeout (seconds)
   threads: null                # Tokio worker threads (null = auto = CPU cores)
-  cache_registry: false        # Cache model registry to disk
+  cache_registry: false        # Cache model registry to disk (reserved — not yet implemented)
   graceful_timeout: 30.0       # Max seconds to wait for in-flight requests during shutdown
   keepalive_timeout: 5.0       # HTTP keep-alive timeout (seconds), 0 = disable
 
@@ -31,7 +31,7 @@ logging:
 
 grpc:
   enabled: true                # Enable gRPC server
-  max_workers: 10              # Max gRPC worker threads
+  max_workers: 10              # Max gRPC worker threads (reserved — not yet implemented)
 
 metrics:
   enabled: true                # Enable Prometheus metrics endpoint
