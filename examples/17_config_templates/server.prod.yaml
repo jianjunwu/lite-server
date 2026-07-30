@@ -1,0 +1,20 @@
+# Prod config — production port, warn-level logging, gRPC enabled, keep-alive.
+server:
+  http_port: 8080
+  grpc_port: 9001       # gRPC for service-to-service calls
+  host: "0.0.0.0"       # bind all interfaces in prod
+  keepalive_timeout: 30
+
+logging:
+  level: warn
+
+grpc:
+  enabled: true
+
+model_repository:
+  path: ./model_repo
+
+orchestration:
+  control_mode: explicit
+  load_models:
+    - env_demo

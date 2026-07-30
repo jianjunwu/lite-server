@@ -1,0 +1,15 @@
+max_batch_size: 1
+stream: false
+accelerator: cpu
+devices: 1
+workers_per_device: 1
+# Custom YAML fields — read via self.config in setup()
+greeting: "hello"
+version_label: "dev"
+# policies.auth.keys supports ${VAR} substitution — the variable MUST be set
+# at config load time, or the model fails to load (fail-closed).
+policies:
+  auth:
+    header: X-API-Key
+    keys:
+      - ${DEMO_API_KEY}

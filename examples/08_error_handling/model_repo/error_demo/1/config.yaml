@@ -1,0 +1,14 @@
+max_batch_size: 1
+stream: false
+accelerator: cpu
+devices: 1
+workers_per_device: 1
+# Per-request hard timeout in seconds. The "slow" mode sleeps for 5s, so this
+# 2s timeout will trigger and the request will fail with a timeout error.
+request_timeout: 2.0
+# After 2 consecutive errors the worker is ejected for 30s, then auto-recovers.
+ejection_error_threshold: 2
+ejection_timeout: 30.0
+# Callbacks registered via config.yaml (no-arg constructible).
+callbacks:
+  - callbacks.ErrorMetrics

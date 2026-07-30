@@ -53,6 +53,7 @@ Start from example 01 and work your way up. Each example builds on concepts from
 | 05 | [ensemble](05_ensemble/) | Multi-model DAG pipeline | Ensemble config, parallel step execution, `$request`/`$step` refs |
 | 06 | [custom_route](06_custom_route/) | Custom HTTP routes on a model | `@route` decorator, path params, `ctx.server` registry queries |
 | 07 | [custom_params](07_custom_params/) | Config-driven behavior | `self.config`, custom YAML fields |
+| 08 | [error_handling](08_error_handling/) | Error handling & robustness | Exception-to-HTTP mapping, `request_timeout`, `on_error`, worker ejection |
 | 09 | [custom_metrics](09_custom_metrics/) | Custom Prometheus metrics | `register_metric()`, `report_metric()`, gauge/counter/histogram |
 | 10 | [async](10_async/) | Asynchronous inference | `async def predict()`, unified async pipeline, mixed sync/async |
 | 11 | [logging](11_logging/) | Structured logging at every stage | `self.logger`, per-request tracing, `--log-level` |
@@ -66,6 +67,7 @@ Start from example 01 and work your way up. Each example builds on concepts from
 | 14 | [lifecycle_hooks](14_lifecycle_hooks/) | Worker lifecycle hooks | `on_ready` / `on_error` / `on_exit` shell + HTTP callbacks |
 | 15 | [callbacks](15_callbacks/) | Python Callback pipeline hooks | `on_request`/`on_input`/`on_output`/`on_response`, `ctx.respond()`, `HTTPException` rejection, both registration paths |
 | 16 | [grpc](16_grpc/) | gRPC inference endpoints | `grpc_port`, auto-generated gRPC from LitAPI |
+| 17 | [config_templates](17_config_templates/) | Config templates & env vars | `os.environ`, `${VAR}` auth keys, multi-env server.yaml |
 
 ## Running Any Example
 
@@ -298,6 +300,63 @@ grpcurl -plaintext \
   localhost:8001 \
   liteserver.LiteServer/Infer
 # => {"output": "grpc_echo: hello"}
+```
+
+### 08 Error Handling
+
+```bash
+# Normal → 200
+curl -s -X POST http://localhost:8000/v2/models/error_demo/infer \
+  -H 'Content-Type: application/json' \
+  -d '{"input": "hello", "mode": "normal"}'
+# => {"output": "ok: hello", "timeout": "request_timeout=2.0s"}
+
+# Bad request → 400
+curl -s -X POST http://localhost:8000/v2/models/error_demo/infer \
+  -H 'Content-Type: application/json' \
+  -d '{"input": "", "mode": "bad_request"}'
+# => 400 {"error": {"type": "invalid_request_error", ...}}
+
+# Not found → 404
+curl -s -X POST http://localhost:8000/v2/models/error_demo/infer \
+  -H 'Content-Type: application/json' \
+  -d '{"input": "x", "mode": "not_found"}'
+# => 404 {"error": {"type": "not_found_error", ...}}
+
+# Server error → 500
+curl -s -X POST http://localhost:8000/v2/models/error_demo/infer \
+  -H 'Content-Type: application/json' \
+  -d '{"input": "boom", "mode": "server_error"}'
+# => 500 {"error": {"type": "server_error", "message": "RuntimeError: simulated crash..."}}
+
+# Slow → times out after request_timeout (2s)
+curl -s -w "\nHTTP %{http_code}\n" -X POST http://localhost:8000/v2/models/error_demo/infer \
+  -H 'Content-Type: application/json' \
+  -d '{"input": "", "mode": "slow"}'
+# => timeout error
+```
+
+### 17 Config Templates
+
+```bash
+# Start with the required API key env var
+DEMO_API_KEY=dev-secret python -m lite_server serve --config server.yaml
+
+# Valid request → 200, echoes active config
+curl -s -X POST http://127.0.0.1:8000/v2/models/env_demo/infer \
+  -H 'Content-Type: application/json' -H 'X-API-Key: dev-secret' \
+  -d '{"input": "world"}'
+# => {"output": "hello, world", "backend": "cpu", "version": "dev"}
+
+# No auth → 401
+curl -s -X POST http://127.0.0.1:8000/v2/models/env_demo/infer \
+  -H 'Content-Type: application/json' \
+  -d '{"input": "world"}'
+# => 401 {"error": {"type": "authentication_error", ...}}
+
+# Prod config (port 8080 + gRPC):
+DEMO_API_KEY=prod-secret DEMO_BACKEND=gpu \
+  python -m lite_server serve --config server.prod.yaml
 ```
 
 ## More Documentation

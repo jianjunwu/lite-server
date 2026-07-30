@@ -35,6 +35,19 @@ BASE = "http://localhost:8000"
 HOST, PORT = "localhost", 8000
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
+USAGE = """Usage: python run_all.py [OPTIONS] [example_dir ...]
+
+Options:
+  -v, --verbose      Print detailed intermediate results for each check.
+  -t, --timeout N    Readiness wait timeout in seconds (default: 45).
+  -h, --help         Show this help message and exit.
+
+Examples:
+  python run_all.py                          # run every example
+  python run_all.py 01_basic 03_streaming    # run a subset
+  python run_all.py -v -t 60 13_bidi_streaming  # verbose, 60s timeout
+"""
+
 
 # ---------------------------------------------------------------------------
 # HTTP helpers
@@ -109,13 +122,28 @@ def read_sse(path, body, want_lines=4, deadline_s=8.0):
 # Server lifecycle
 # ---------------------------------------------------------------------------
 
-def start_server(example):
+def start_server(example, env=None):
+    # Check for port conflicts before launching.
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    in_use = s.connect_ex(("localhost", PORT)) == 0
+    s.close()
+    if in_use:
+        raise RuntimeError(
+            f"Port {PORT} is already in use — a previous server may still be "
+            f"running. Kill it first:  pkill -f 'lite_server serve'"
+        )
     log_path = os.path.join("/tmp", f"run_all_{example}.log")
     log = open(log_path, "wb")
+    # Merge extra env vars into the current environment.
+    proc_env = os.environ.copy()
+    if env:
+        proc_env.update(env)
     proc = subprocess.Popen(
         [sys.executable, "-m", "lite_server", "serve", "--config", "server.yaml"],
         cwd=os.path.join(ROOT, example),
         stdout=log, stderr=subprocess.STDOUT,
+        env=proc_env,
         start_new_session=True,  # own process group → clean group kill
     )
     return proc, log_path, log
@@ -194,6 +222,57 @@ def check_04():
 def check_05():
     st, r = http_json("POST", "/v2/models/pipeline/infer", {"input": "hello"})
     return st == 200 and r.get("output") == "preprocessed(hello) -> done", f"HTTP {st} -> {r}"
+
+
+def check_06():
+    """Custom routes: GET /status, GET /pets/{id} (hit + 404), POST /pets, infer."""
+    # 1) GET /status — basic route with ctx.meta
+    st, r = http_json("GET", "/v2/models/pets/status")
+    if not (st == 200 and isinstance(r, dict) and r.get("model_loaded") is True):
+        return False, f"/status: HTTP {st} -> {r}"
+    # 2) GET /pets/1 — path param hit
+    st, r = http_json("GET", "/v2/models/pets/pets/1")
+    if not (st == 200 and isinstance(r, dict) and r.get("name") == "Fido"):
+        return False, f"/pets/1: HTTP {st} -> {r}"
+    # 3) GET /pets/99 — 404
+    st, r = http_json("GET", "/v2/models/pets/pets/99")
+    if st != 404:
+        return False, f"/pets/99: expected 404, got HTTP {st}"
+    # 4) POST /pets — create, returns 201
+    st, r = http_json("POST", "/v2/models/pets/pets", {"name": "Buddy"})
+    if not (st == 201 and isinstance(r, dict) and r.get("name") == "Buddy"):
+        return False, f"POST /pets: HTTP {st} -> {r}"
+    # 5) Standard inference still works
+    st, r = http_json("POST", "/v2/models/pets/infer", {"input": 5})
+    if not (st == 200 and isinstance(r, dict) and r.get("output") == 10):
+        return False, f"infer: HTTP {st} -> {r}"
+    return True, "status + path params + 404 + POST 201 + infer all OK"
+
+
+def check_08():
+    """Error handling: exercises exception-to-HTTP mapping."""
+    path = "/v2/models/error_demo/infer"
+    # 1) normal → 200
+    st, r = http_json("POST", path, {"input": "hello", "mode": "normal"})
+    if not (st == 200 and isinstance(r, dict) and r.get("output") == "ok: hello"):
+        return False, f"normal: HTTP {st} -> {r}"
+    # 2) bad_request → 400
+    st, r = http_json("POST", path, {"input": "", "mode": "bad_request"})
+    if st != 400:
+        return False, f"bad_request: expected 400, got HTTP {st}"
+    # 3) not_found → 404
+    st, r = http_json("POST", path, {"input": "x", "mode": "not_found"})
+    if st != 404:
+        return False, f"not_found: expected 404, got HTTP {st}"
+    # 4) server_error → 500
+    st, r = http_json("POST", path, {"input": "x", "mode": "server_error"})
+    if st != 500:
+        return False, f"server_error: expected 500, got HTTP {st}"
+    # 5) invalid mode → 400 (caught in decode_request)
+    st, r = http_json("POST", path, {"input": "x", "mode": "unknown"})
+    if st != 400:
+        return False, f"invalid_mode: expected 400, got HTTP {st}"
+    return True, "200 + 400 + 404 + 500 + invalid_mode_400 all OK"
 
 
 def check_07():
@@ -294,6 +373,24 @@ def check_16():
     return st == 200 and r.get("output") == "grpc_echo: hello", f"HTTP {st} -> {r}"
 
 
+def check_17():
+    """Config templates: env-var auth + env-driven model output."""
+    path = "/v2/models/env_demo/infer"
+    key = {"X-API-Key": "test-key-17"}
+    # Valid request with auth → 200, response echoes env-driven config
+    st, r1 = http_json("POST", path, {"input": "world"}, headers=key)
+    if not (st == 200 and isinstance(r1, dict) and r1.get("output") == "hello, world"):
+        return False, f"valid: HTTP {st} -> {r1}"
+    backend = r1.get("backend", "?")
+    if backend != "cpu":
+        return False, f"expected backend=cpu, got {backend}"
+    # No auth header → 401
+    st, r2 = http_json("POST", path, {"input": "world"})
+    if st != 401:
+        return False, f"no-auth: expected 401, got HTTP {st} -> {r2}"
+    return True, f"auth OK + backend={backend} + 401 without key"
+
+
 def check_15():
     path = "/v2/models/callbacks_demo/infer"
     key = {"X-API-Key": "demo-key"}
@@ -322,7 +419,9 @@ SPECS = {
     "03_streaming": ("streaming", check_03),
     "04_multi_version": ("multi_version", check_04),
     "05_ensemble": ("pipeline", check_05),
+    "06_custom_route": ("pets", check_06),
     "07_custom_params": ("threshold", check_07),
+    "08_error_handling": ("error_demo", check_08),
     "09_custom_metrics": ("metrics_demo", check_09),
     "10_async": ("async_echo", check_10),
     "11_logging": ("logged_model", check_11),
@@ -331,6 +430,7 @@ SPECS = {
     "14_lifecycle_hooks": ("hooked_model", check_14),
     "15_callbacks": ("callbacks_demo", check_15),
     "16_grpc": ("grpc_echo", check_16),
+    "17_config_templates": ("env_demo", check_17, {"DEMO_API_KEY": "test-key-17"}),
 }
 
 
@@ -338,15 +438,21 @@ SPECS = {
 # Driver
 # ---------------------------------------------------------------------------
 
-def run_one(example):
-    primary, check = SPECS[example]
-    proc, log_path, log = start_server(example)
+def run_one(example, timeout=45, verbose=False):
+    spec = SPECS[example]
+    primary, check = spec[0], spec[1]
+    env = spec[2] if len(spec) > 2 else None
+    proc, log_path, log = start_server(example, env=env)
     result = {"example": example, "ready": False, "ok": False, "detail": "", "log": log_path}
     try:
-        result["ready"] = wait_ready(primary, timeout=45)
+        if verbose:
+            print(f"  [startup] waiting up to {timeout}s for model '{primary}' ...", flush=True)
+        result["ready"] = wait_ready(primary, timeout=timeout)
         if not result["ready"]:
-            result["detail"] = f"NOT READY within 45s (primary model={primary})"
+            result["detail"] = f"NOT READY within {timeout}s (primary model={primary})"
         else:
+            if verbose:
+                print(f"  [startup] model ready, running check ...", flush=True)
             ok, detail = check()
             result["ok"] = bool(ok)
             result["detail"] = detail
@@ -371,7 +477,37 @@ def main():
               "       Install it (pip install -e .) so `python -m lite_server` works.")
         sys.exit(2)
 
-    only = sys.argv[1:] or list(SPECS.keys())
+    # Parse CLI flags and positional example names.
+    args = sys.argv[1:]
+    verbose = False
+    timeout = 45
+    only = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-h", "--help"):
+            print(USAGE)
+            sys.exit(0)
+        elif a in ("-v", "--verbose"):
+            verbose = True
+        elif a in ("-t", "--timeout"):
+            i += 1
+            if i >= len(args):
+                print("ERROR: --timeout requires a value", file=sys.stderr)
+                sys.exit(2)
+            try:
+                timeout = int(args[i])
+            except ValueError:
+                print(f"ERROR: invalid timeout value: {args[i]}", file=sys.stderr)
+                sys.exit(2)
+            if timeout < 1:
+                print("ERROR: timeout must be >= 1", file=sys.stderr)
+                sys.exit(2)
+        else:
+            only.append(a)
+        i += 1
+
+    only = only or list(SPECS.keys())
     unknown = [e for e in only if e not in SPECS]
     if unknown:
         print(f"ERROR: unknown example(s): {unknown}\n"
@@ -381,7 +517,7 @@ def main():
     results = []
     for ex in only:
         print(f"\n===== {ex} =====", flush=True)
-        r = run_one(ex)
+        r = run_one(ex, timeout=timeout, verbose=verbose)
         results.append(r)
         status = ("PASS" if r["ready"] and r["ok"]
                   else "READY-FAIL" if not r["ready"] else "CHECK-FAIL")
