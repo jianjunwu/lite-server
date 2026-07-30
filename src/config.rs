@@ -594,6 +594,7 @@ impl ModelConfig {
         check_duration_secs("startup_timeout", self.startup_timeout)?;
         check_duration_secs("health_check_timeout", self.health_check_timeout)?;
         check_duration_secs("worker_kill_timeout", self.worker_kill_timeout)?;
+        check_duration_secs("hook_http_timeout", self.hooks.hook_http_timeout)?;
         Ok(())
     }
 }
@@ -1527,6 +1528,17 @@ policies:
         let mut cfg = ModelConfig::default();
         cfg.request_timeout = f32::NAN;
         assert!(cfg.validate().is_err());
+
+        // B1 regression: hook_http_timeout is NOT validated — negative/NaN
+        // values panic at Duration::from_secs_f32 in worker/mod.rs:98 when an
+        // HTTP lifecycle hook fires. All 8 other duration fields are checked.
+        let cfg: ModelConfig =
+            serde_yaml::from_str("hooks:\n  hook_http_timeout: -1.0\n").expect("parses");
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("hook_http_timeout"),
+            "B1: hook_http_timeout must be validated; got: {err}"
+        );
 
         // Valid defaults pass:
         assert!(ModelConfig::default().validate().is_ok());
