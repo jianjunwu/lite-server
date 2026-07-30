@@ -195,31 +195,12 @@ pub async fn dispatch_custom_route(
         ..Default::default()
     };
 
-    let (mut resp_rx, mut chunk_rx) = client.send_route_or_stream(request).await?;
+    let (resp_rx, mut chunk_rx) = client.send_route_or_stream(request).await?;
 
-    // The handler picks the reply shape: a plain/Response result answers with
-    // one SingleResponse; a StreamingResponse result answers with a
-    // start→chunks→done frame sequence. Race the first arrival, bounded like
-    // a unary send so a dead worker can't hang the request.
-    enum RouteReply {
-        Unary(Option<pb::Response>),
-        Stream(pb::StreamResponse),
-    }
-    let first = tokio::time::timeout(ROUTE_FIRST_FRAME_TIMEOUT, async {
-        tokio::select! {
-            unary = &mut resp_rx => RouteReply::Unary(unary.ok()),
-            frame = chunk_rx.recv() => match frame {
-                Some(f) => RouteReply::Stream(f),
-                // Chunk sender dropped with no frames sent: the unary reply
-                // arrived first (its delivery frees the unused stream route,
-                // which is what closed this channel). Wait for the unary
-                // reply instead of treating the close as a stream failure —
-                // select! would otherwise pick between two ready arms at
-                // random.
-                None => RouteReply::Unary(resp_rx.await.ok()),
-            },
-        }
-    })
+    let first = tokio::time::timeout(
+        ROUTE_FIRST_FRAME_TIMEOUT,
+        first_route_reply(resp_rx, &mut chunk_rx),
+    )
     .await
     .map_err(|_| AppError::InferenceTimeout("route response timeout".to_string()))?;
 
@@ -258,6 +239,40 @@ pub async fn dispatch_custom_route(
 /// Bound on waiting for a route call's first reply frame (unary or stream
 /// start). Mirrors the transport's unary response timeout.
 const ROUTE_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The handler picks the reply shape: a plain/Response result answers with
+/// one SingleResponse; a StreamingResponse result answers with a
+/// start→chunks→done frame sequence. Await the first arrival, bounded by
+/// the caller like a unary send so a dead worker can't hang the request.
+enum RouteReply {
+    Unary(Option<pb::Response>),
+    Stream(pb::StreamResponse),
+}
+
+/// Race the first arrival of the unary reply vs. the first stream frame.
+///
+/// `biased` polls the chunk channel FIRST: when the whole frame sequence
+/// (start→…→done) lands before this task is scheduled, the actor has
+/// already dropped the unary sender (freed on stream done), making both
+/// arms ready — an unbiased select! would flip a coin and return
+/// Unary(None) → spurious WorkerCrashed 500. With biased, buffered frames
+/// always win; the unary arm only fires when no frame ever arrived (the
+/// unary reply path, where delivering it frees the unused stream route and
+/// closes the chunk channel with nothing sent).
+async fn first_route_reply(
+    resp_rx: tokio::sync::oneshot::Receiver<pb::Response>,
+    chunk_rx: &mut mpsc::Receiver<pb::StreamResponse>,
+) -> RouteReply {
+    let mut resp_rx = resp_rx;
+    tokio::select! {
+        biased;
+        frame = chunk_rx.recv() => match frame {
+            Some(f) => RouteReply::Stream(f),
+            None => RouteReply::Unary((&mut resp_rx).await.ok()),
+        },
+        unary = &mut resp_rx => RouteReply::Unary(unary.ok()),
+    }
+}
 
 /// Build the HTTP response for a streaming route reply. The `start` frame
 /// carries the handler-chosen status/headers/media_type; subsequent `chunk`
@@ -381,6 +396,54 @@ fn build_route_http_response(single: pb::SingleResponse) -> Result<Response, App
 #[cfg(test)]
 mod route_match_tests {
     use super::*;
+
+    fn stream_start_frame(sid: &str) -> pb::StreamResponse {
+        pb::StreamResponse {
+            stream_id: sid.to_string(),
+            payload: Some(pb::stream_response::Payload::Start(pb::StreamStart {
+                status_code: 200,
+                media_type: "text/event-stream".to_string(),
+                headers: HashMap::new(),
+            })),
+        }
+    }
+
+    /// Race regression: the whole start→chunks→done sequence lands before
+    /// the HTTP task is scheduled. The actor freed the unary slot on stream
+    /// done (sender dropped) AND frames are buffered — both select arms are
+    /// ready. Buffered frames must always win; Unary(None) here becomes a
+    /// spurious WorkerCrashed 500 (seen on ubuntu CI, 0.7.7 tag run).
+    #[tokio::test]
+    async fn first_route_reply_prefers_buffered_frames_over_closed_unary() {
+        for _ in 0..20 {
+            let (unary_tx, unary_rx) = tokio::sync::oneshot::channel::<pb::Response>();
+            let (chunk_tx, mut chunk_rx) = mpsc::channel(4);
+            chunk_tx.send(stream_start_frame("s")).await.unwrap();
+            drop(chunk_tx); // whole sequence delivered, channel closed
+            drop(unary_tx); // actor freed the unary slot on stream done
+            match first_route_reply(unary_rx, &mut chunk_rx).await {
+                RouteReply::Stream(_) => {}
+                RouteReply::Unary(_) => {
+                    panic!("buffered stream frames must win over the closed unary slot")
+                }
+            }
+        }
+    }
+
+    /// Unary reply path: delivering it frees the unused stream route,
+    /// closing the chunk channel with no frames sent. The unary reply must
+    /// be returned, not treated as a stream failure.
+    #[tokio::test]
+    async fn first_route_reply_falls_back_to_unary_when_no_frames() {
+        let (unary_tx, unary_rx) = tokio::sync::oneshot::channel::<pb::Response>();
+        let (chunk_tx, mut chunk_rx) = mpsc::channel::<pb::StreamResponse>(1);
+        drop(chunk_tx);
+        unary_tx.send(pb::Response::default()).unwrap();
+        match first_route_reply(unary_rx, &mut chunk_rx).await {
+            RouteReply::Unary(Some(_)) => {}
+            _ => panic!("expected the unary reply"),
+        }
+    }
 
     #[test]
     fn test_param_name() {

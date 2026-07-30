@@ -953,13 +953,15 @@ async fn test_custom_route_streaming() {
     let resp = client
         .get(format!("{}/v2/models/{}/ticks", base, ROUTE_MODEL))
         .send().await.unwrap();
-    assert_eq!(resp.status(), 200);
+    let ticks_status = resp.status();
+    let ticks_headers = resp.headers().clone();
+    let body = resp.text().await.unwrap();
+    assert_eq!(ticks_status, 200, "GET /ticks failed: {body}");
     assert_eq!(
-        resp.headers().get("content-type").unwrap(),
+        ticks_headers.get("content-type").unwrap(),
         "text/event-stream"
     );
-    assert_eq!(resp.headers().get("x-route").unwrap(), "ticks");
-    let body = resp.text().await.unwrap();
+    assert_eq!(ticks_headers.get("x-route").unwrap(), "ticks");
     assert_eq!(
         body,
         // P1: orjson 紧凑输出(无空格)
