@@ -56,6 +56,12 @@ impl ModelRegistry {
             .unwrap_or_default()
     }
 
+    /// True when no model is registered. O(1); used by the file watcher
+    /// gate to skip events only when nothing can need reload or unload.
+    pub fn is_empty(&self) -> bool {
+        self.models.is_empty()
+    }
+
     pub fn get(&self, model_name: &str, version: Option<&str>) -> Option<ModelVersion> {
         let entry = self.models.get(model_name)?;
 

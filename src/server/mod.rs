@@ -264,6 +264,7 @@ impl LiteServer {
             has_hot_reload_for_watcher,
             auto_mode,
             Duration::from_secs_f32(self.config.tunables.watcher_debounce_secs),
+            self.registry.clone(),
         ));
 
         // Start the reconcile task for control_mode = "auto": directory

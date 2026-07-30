@@ -206,6 +206,10 @@ pub(super) async fn process_watch_events(
 /// When no models have hot_reload enabled, events are collected but not forwarded —
 /// unless `always_forward` (control_mode = "auto"), where directory-level
 /// lifecycle events feed the reconcile task regardless of hot_reload.
+/// In manual mode events are also forwarded while the registry is non-empty:
+/// a loaded model's version dir can disappear at any time and the
+/// "dir gone → unload" invariant holds in every mode. Only an empty
+/// registry (nothing to reload, nothing to unload) skips events.
 pub(super) async fn start_file_watcher(
     repo_path: PathBuf,
     _worker_manager: Arc<WorkerManager>,
@@ -213,6 +217,7 @@ pub(super) async fn start_file_watcher(
     has_hot_reload: Arc<AtomicBool>,
     always_forward: bool,
     debounce: Duration,
+    registry: Arc<ModelRegistry>,
 ) {
     use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -250,8 +255,14 @@ pub(super) async fn start_file_watcher(
                     Ok(event) => {
                         // P2: Skip collecting events if no hot_reload models
                         // (auto mode always forwards — lifecycle events feed
-                        // the reconcile task).
-                        if !always_forward && !has_hot_reload.load(Ordering::Relaxed) {
+                        // the reconcile task). Manual mode must still forward
+                        // while any model is loaded: a removed version dir is
+                        // unloaded directly, in every mode. An empty registry
+                        // means nothing can need reload or unload — skip.
+                        if !always_forward
+                            && !has_hot_reload.load(Ordering::Relaxed)
+                            && registry.is_empty()
+                        {
                             continue;
                         }
 
@@ -316,7 +327,7 @@ mod tests {
         let inference_queue = Arc::new(InferenceQueue::new());
         let callback_runner = Arc::new(CallbackRunner::new());
         let worker_manager = Arc::new(WorkerManager::new(
-            registry,
+            registry.clone(),
             tmp_dir.clone(),
             inference_queue,
             "warn".to_string(),
@@ -325,7 +336,7 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel::<Vec<PathBuf>>(32);
         let has_hot_reload = Arc::new(AtomicBool::new(true));
-        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload, false, Duration::from_millis(2500)));
+        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload, false, Duration::from_millis(2500), registry));
 
         // Give watcher time to start
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -353,7 +364,7 @@ mod tests {
         let inference_queue = Arc::new(InferenceQueue::new());
         let callback_runner = Arc::new(CallbackRunner::new());
         let worker_manager = Arc::new(WorkerManager::new(
-            registry,
+            registry.clone(),
             tmp_dir.clone(),
             inference_queue,
             "warn".to_string(),
@@ -362,7 +373,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel::<Vec<PathBuf>>(32);
         let has_hot_reload = Arc::new(AtomicBool::new(true));
-        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload, false, Duration::from_millis(2500)));
+        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload, false, Duration::from_millis(2500), registry));
 
         // Give watcher time to start
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -573,11 +584,11 @@ mod tests {
         tokio::fs::write(&model_py, "original").await.unwrap();
 
         let registry = Arc::new(ModelRegistry::new());
-        let worker_manager = build_test_worker_manager(tmp_dir.clone(), registry);
+        let worker_manager = build_test_worker_manager(tmp_dir.clone(), registry.clone());
 
         let (tx, mut rx) = mpsc::channel::<Vec<PathBuf>>(32);
         let has_hot_reload = Arc::new(AtomicBool::new(false));
-        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload, true, Duration::from_millis(2500)));
+        let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload, true, Duration::from_millis(2500), registry));
 
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         tokio::fs::write(&model_py, "modified").await.unwrap();
@@ -589,6 +600,103 @@ mod tests {
         assert!(
             result.is_ok(),
             "auto mode: watcher must forward events even with no hot_reload models"
+        );
+
+        handle.abort();
+        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+    }
+
+    /// B2 regression: manual mode (always_forward=false) with a loaded model
+    /// whose hot_reload=false drops ALL file events at the watcher gate.
+    /// This breaks the "dir gone → unload" invariant — if the user deletes a
+    /// version directory, the watcher never forwards the event, so the model
+    /// stays registered serving deleted files. The gate must forward whenever
+    /// the registry is non-empty (something may need unloading); hot_reload
+    /// gating stays per-model downstream.
+    #[tokio::test]
+    async fn manual_mode_watcher_forwards_events_when_models_loaded() {
+        let tmp_dir_raw = std::env::temp_dir().join(format!(
+            "lite-server-fw-manual-loaded-{}",
+            std::process::id()
+        ));
+        tokio::fs::create_dir_all(&tmp_dir_raw).await.unwrap();
+        let tmp_dir = tmp_dir_raw.canonicalize().unwrap();
+        let sub_dir = tmp_dir.join("model").join("1");
+        tokio::fs::create_dir_all(&sub_dir).await.unwrap();
+        let model_py = sub_dir.join("model.py");
+        tokio::fs::write(&model_py, "original").await.unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        // Loaded model WITHOUT hot_reload — the gate must still forward so a
+        // later dir removal can unload it.
+        registry
+            .register("model", "1", ModelConfig::default(), ModelType::LitAPI, sub_dir.clone())
+            .unwrap();
+        let worker_manager = build_test_worker_manager(tmp_dir.clone(), registry.clone());
+
+        let (tx, mut rx) = mpsc::channel::<Vec<PathBuf>>(32);
+        let has_hot_reload = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn(start_file_watcher(
+            tmp_dir.clone(), worker_manager, tx, has_hot_reload,
+            false, // always_forward = false (manual mode)
+            Duration::from_millis(300),
+            registry.clone(),
+        ));
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::fs::write(&model_py, "modified").await.unwrap();
+
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            rx.recv(),
+        ).await;
+        assert!(
+            result.is_ok(),
+            "manual mode with loaded models: watcher must forward events; \
+             the 'dir gone → unload' invariant depends on this"
+        );
+
+        handle.abort();
+        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+    }
+
+    /// P2 counterpart: manual mode with an EMPTY registry keeps skipping
+    /// events — nothing is loaded, so no model can need reload or unload.
+    #[tokio::test]
+    async fn manual_mode_watcher_skips_events_when_registry_empty() {
+        let tmp_dir_raw = std::env::temp_dir().join(format!(
+            "lite-server-fw-manual-empty-{}",
+            std::process::id()
+        ));
+        tokio::fs::create_dir_all(&tmp_dir_raw).await.unwrap();
+        let tmp_dir = tmp_dir_raw.canonicalize().unwrap();
+        let sub_dir = tmp_dir.join("model").join("1");
+        tokio::fs::create_dir_all(&sub_dir).await.unwrap();
+        let model_py = sub_dir.join("model.py");
+        tokio::fs::write(&model_py, "original").await.unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let worker_manager = build_test_worker_manager(tmp_dir.clone(), registry.clone());
+
+        let (tx, mut rx) = mpsc::channel::<Vec<PathBuf>>(32);
+        let has_hot_reload = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn(start_file_watcher(
+            tmp_dir.clone(), worker_manager, tx, has_hot_reload,
+            false, // always_forward = false (manual mode)
+            Duration::from_millis(300),
+            registry.clone(),
+        ));
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::fs::write(&model_py, "modified").await.unwrap();
+
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            rx.recv(),
+        ).await;
+        assert!(
+            result.is_err(),
+            "manual mode with empty registry: watcher must skip events (P2)"
         );
 
         handle.abort();
