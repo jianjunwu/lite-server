@@ -174,7 +174,7 @@ callbacks:                     # Worker 启动时加载的 callback 类路径列
 控制启动时加载哪些模型和版本。
 
 ```yaml
-control_mode: explicit         # explicit（显式）、auto（对齐仓库变更）或 all（加载仓库中所有模型）
+control_mode: explicit         # explicit（显式）、auto（自动同步仓库）或 all（加载仓库中所有模型）
 poll_interval: 30              # 兜底重同步间隔（秒），control_mode=auto 时生效
 load_models:                   # 启动时加载的模型列表
   - my_model
