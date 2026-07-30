@@ -356,9 +356,14 @@ impl WorkerZmqClient {
 
 impl Drop for WorkerZmqClient {
     fn drop(&mut self) {
-        // Wake the actor so it can observe the closed command channel and
-        // shut down promptly; if the wake races ahead of the channel close,
-        // the backstop tick bounds the delay.
+        // Close the command channel BEFORE waking the actor. The actor
+        // shuts down when its drain observes Disconnected; waking while the
+        // channel is still open (field-drop order) races — an actor that
+        // drains in that window re-enters poll and only notices the close
+        // at the next 200ms backstop tick.
+        let (dummy_tx, dummy_rx) = mpsc::channel::<ZmqCommand>(1);
+        drop(dummy_rx);
+        drop(std::mem::replace(&mut self.cmd_tx, dummy_tx));
         self.wake_actor();
     }
 }
@@ -488,6 +493,47 @@ mod tests {
         let removed = sweep_dead_pending(&mut pending);
         assert_eq!(removed, 0);
         assert_eq!(pending.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn drop_client_releases_endpoint_before_backstop_tick() {
+        // Regression: Drop used to wake the actor BEFORE the command
+        // channel closed (field-drop order), so the actor drained nothing,
+        // re-entered its 200ms poll, and only noticed the close at the next
+        // backstop tick — holding the bound endpoint ~200ms after drop.
+        // Drop must close the channel first, then wake: the endpoint is
+        // released within a few milliseconds.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let endpoint = format!("tcp://127.0.0.1:{port}");
+
+        let client = WorkerZmqClient::new(endpoint.clone());
+        // Let the actor reach its blocking poll.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(client);
+
+        let start = std::time::Instant::now();
+        loop {
+            let probe_ctx = zmq::Context::new();
+            let probe = probe_ctx.socket(zmq::PAIR).unwrap();
+            if probe.bind(&endpoint).is_ok() {
+                drop(probe);
+                break;
+            }
+            drop(probe);
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "actor never released {endpoint}"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "endpoint released in {:?}; drop must shut the actor down promptly, \
+             not at the 200ms backstop tick",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]
