@@ -1566,6 +1566,35 @@ class TestBatchPredict:
         assert len(seen) == 1
         assert isinstance(seen[0], HTTPException)
 
+    def test_batch_str_and_bytes_bodies_pass_through_verbatim(self):
+        """P3 parity: batch items serialize like Pipeline.finalize — str/bytes
+        bodies go out verbatim; JSON quoting is only for structured data."""
+        class RawModel(LitAPI):
+            def predict(self, x):
+                if x.get("as_bytes"):
+                    return b"\x00\x01raw bytes"
+                return "hello world"
+
+        pipe = Pipeline.build(RawModel(), [])
+        batch = BatchRequest(items=[
+            BatchItem(uid="i1", data=json.dumps({"as_bytes": False}).encode()),
+            BatchItem(uid="i2", data=json.dumps({"as_bytes": True}).encode()),
+        ])
+        meta = RequestMeta(
+            route="/predict", headers=Headers(), client_ip="",
+            request_id="bp", timestamp_ns=0,
+        )
+        resp = asyncio.run(
+            inference._handle_batch(pipe, "bp", batch, meta, RawModel(), log)
+        )
+        data_by_uid = {item.uid: item.data for item in resp.batch.items}
+        assert data_by_uid["i1"] == b"hello world", (
+            "str body must pass through verbatim, not JSON-quoted"
+        )
+        assert data_by_uid["i2"] == b"\x00\x01raw bytes", (
+            "bytes body must pass through verbatim"
+        )
+
     def test_async_batch_predict_full_path(self):
         class AsyncBatchModel(LitAPI):
             async def batch(self, inputs):
@@ -1678,12 +1707,13 @@ class TestBatchPredict:
         assert json.loads(i1.data) == {"error": "bad"}
         assert dict(i1.headers) == {"X-Item": "1"}
 
-        # Item 2 (uid=i2): text/html media type
+        # Item 2 (uid=i2): text/html media type — str body verbatim (P3
+        # parity with Pipeline.finalize; was JSON-quoted before 0.7.8)
         i2 = resp.batch.items[1]
         assert i2.uid == "i2"
         assert i2.status_code == 0  # not set → default
         assert i2.media_type == "text/html"
-        assert i2.data == b'"<p>ok</p>"'
+        assert i2.data == b'<p>ok</p>'
 
         # Item 3 (uid=i3): custom headers via Response
         i3 = resp.batch.items[2]

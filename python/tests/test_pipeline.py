@@ -1463,3 +1463,47 @@ class TestFinalizeBytesPassthrough:
         pipe = Pipeline.build(DummyLitAPI(), [])
         resp_bytes, _, _, _ = pipe.finalize(ctx)
         assert resp_bytes == b'{"a":1}'
+
+    def test_json_dumps_quotes_str_unlike_finalize_passthrough(self):
+        """Bx: _json.dumps wraps str in JSON quotes; Pipeline.finalize passes
+        through verbatim (P3).  The batch handler (_store_result) and all five
+        streaming paths call _json.dumps() without the bytes/str check, so a
+        model whose encode_response returns str gets different wire formats in
+        single mode (raw) vs batch/streaming modes (JSON-quoted)."""
+        from lite_server import _json
+
+        body_str = "hello world"
+        body_bytes = b"raw bytes"
+
+        # Pipeline.finalize passthrough (correct after P3):
+        ctx = RequestContext(meta=_make_route_meta(), response=body_str)
+        pipe = Pipeline.build(DummyLitAPI(), [])
+        resp_bytes, _, _, _ = pipe.finalize(ctx)
+        assert resp_bytes == b"hello world", "str must pass through verbatim"
+
+        ctx2 = RequestContext(meta=_make_route_meta(), response=body_bytes)
+        resp_bytes2, _, _, _ = pipe.finalize(ctx2)
+        assert resp_bytes2 == b"raw bytes", "bytes must pass through verbatim"
+
+        # _json.dumps (used by batch _store_result + streaming paths):
+        # wraps str in JSON quotes
+        assert _json.dumps(body_str) == b'"hello world"', (
+            "_json.dumps wraps str in quotes; batch/streaming paths using "
+            "_json.dumps without passthrough would emit JSON-quoted str"
+        )
+        # bytes → TypeError (orjson) or base64 (stdlib fallback); in either
+        # case NOT raw passthrough — inconsistent with Pipeline.finalize
+        throws = False
+        try:
+            result = _json.dumps(body_bytes)
+            # stdlib fallback: base64-encodes bytes, so result != raw bytes
+            assert result != body_bytes, (
+                f"_json.dumps returned {result!r} for bytes; "
+                f"batch/streaming paths would emit this, not raw bytes"
+            )
+        except TypeError:
+            throws = True
+        assert throws or result != body_bytes, (
+            "_json.dumps(bytes) must not return raw bytes; "
+            "batch/streaming paths diverge from Pipeline.finalize passthrough"
+        )

@@ -19,6 +19,7 @@ from lite_server.pipeline import (
     Pipeline,
     collect_metrics,
     extract_response_meta,
+    serialize_body,
     unwrap_response,
 )
 from lite_server.proto import (
@@ -109,13 +110,7 @@ def _build_route_response(uid: str, ctx: RequestContext) -> Response:
     merged.update(headers)
     headers = merged
 
-    if isinstance(content, (bytes, bytearray)):
-        data = bytes(content)
-    elif isinstance(content, str):
-        data = content.encode()
-    else:
-        data = _json.dumps(content)
-
+    data = serialize_body(content)
     # Status.code reflects pipeline execution ("Ok" = no exception), separate
     # from the HTTP status_code the handler chose (may be 4xx/5xx).
     single = SingleResponse(
@@ -232,7 +227,7 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
 
     def _store_result(item_uid: str, body: Any, headers: dict[str, str] | None) -> None:
         sc, mt, clean = extract_response_meta(headers)
-        final_map[item_uid] = (_json.dumps(body), sc, mt, clean)
+        final_map[item_uid] = (serialize_body(body), sc, mt, clean)
 
     # Phase 1: per-item on_request → decode → on_input
     for item in batch.items:

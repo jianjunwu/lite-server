@@ -231,6 +231,20 @@ def unwrap_response(encoded: Any) -> tuple[Any, dict[str, str] | None]:
     return encoded, None
 
 
+def serialize_body(body: Any) -> bytes:
+    """One response body → wire bytes.
+
+    bytes/str go out verbatim — JSON is only for structured data. This is
+    THE serialization rule for every response path (single, batch,
+    streaming, routes); call this instead of ``_json.dumps`` on bodies.
+    """
+    if isinstance(body, (bytes, bytearray)):
+        return bytes(body)
+    if isinstance(body, str):
+        return body.encode()
+    return _json.dumps(body)
+
+
 def extract_response_meta(headers: dict[str, str] | None) -> tuple[int, str, dict[str, str] | None]:
     """Extract ``(status_code, media_type, clean_headers)`` from headers
     embedded by :func:`unwrap_response`."""
@@ -615,12 +629,7 @@ class Pipeline:
             merged.update(headers)
         # bytes/str bodies go out verbatim — JSON is only for structured
         # data. Matches _build_route_response / _serialize_route_chunk.
-        if isinstance(body, (bytes, bytearray)):
-            resp_bytes = bytes(body)
-        elif isinstance(body, str):
-            resp_bytes = body.encode()
-        else:
-            resp_bytes = _json.dumps(body)
+        resp_bytes = serialize_body(body)
         return (
             resp_bytes,
             Status(code="Ok"),

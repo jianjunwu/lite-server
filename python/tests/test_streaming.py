@@ -156,6 +156,30 @@ class TestStreamOpenFallback:
         assert len(err) == 1
         assert "predict failed" in err[0].stream.error.message
 
+    @pytest.mark.asyncio
+    async def test_early_return_str_body_passes_through_verbatim(self):
+        """P3 parity: an early-return str body streams verbatim like
+        Pipeline.finalize — not JSON-quoted (_send_stream_early path)."""
+        from lite_server.response import Response as LiteResponse
+
+        class EarlyCB(Callback):
+            def on_request(self, ctx):
+                return LiteResponse(content="early text")
+
+        class StreamAPI(EchoAPI):
+            def stream_predict(self, x):
+                yield {"never": "reached"}
+
+        api = StreamAPI()
+        api._pipeline = Pipeline.build(api, [EarlyCB()])
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            api, _stream_req("s-early", b'{"x": 1}'), sock, {}, log
+        )
+        responses = sock.stream_responses("s-early")
+        assert len(responses) == 2  # chunk + done
+        assert responses[0].stream.chunk.data == b"early text"
+
 
 # ---------------------------------------------------------------------------
 # Normal streaming (stream_predict)
@@ -180,6 +204,26 @@ class TestStreamOpen:
         for i in range(3):
             assert json.loads(responses[i].stream.chunk.data)["chunk"] == i
         assert responses[3].stream.HasField("done")
+
+    @pytest.mark.asyncio
+    async def test_stream_str_and_bytes_chunks_pass_through_verbatim(self):
+        """P3 parity: str/bytes chunks stream verbatim like
+        Pipeline.finalize; JSON is only for structured data."""
+        class RawStreamAPI(EchoAPI):
+            def stream_predict(self, x):
+                yield "chunk-one"
+                yield b"chunk-two-bytes"
+
+        sock = AsyncSocket()
+        active = {}
+        await inference._handle_stream_open_async(
+            RawStreamAPI(), _stream_req("s-raw", b'{"prompt": "go"}'), sock, active, log
+        )
+        await sock.wait_for(lambda r: _is_done(r, "s-raw"))
+        responses = sock.stream_responses("s-raw")
+        assert len(responses) == 3  # 2 chunks + done
+        assert responses[0].stream.chunk.data == b"chunk-one"
+        assert responses[1].stream.chunk.data == b"chunk-two-bytes"
 
     @pytest.mark.asyncio
     async def test_stream_task_registered_in_active_streams(self):
@@ -604,9 +648,10 @@ class TestRunAsyncLoopStream:
         async def cancel_after_first_chunk():
             # Deliver the cancel only once the first chunk is on the wire —
             # deterministic: open has completed, consume task is registered.
+            # (str chunks are verbatim since P3, not JSON-quoted.)
             while not any(
                 r.HasField("stream") and r.stream.HasField("chunk")
-                and r.stream.chunk.data == b'"first"'
+                and r.stream.chunk.data == b'first'
                 for r in sock.sent
             ):
                 await asyncio.sleep(0.005)

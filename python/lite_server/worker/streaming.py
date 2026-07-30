@@ -10,11 +10,10 @@ import inspect
 import logging
 from typing import Any
 
-from lite_server import _json
 from lite_server.api import LitAPI
 from lite_server.context import Headers, RequestContext, RequestMeta
 from lite_server.exceptions import HTTPException
-from lite_server.pipeline import Pipeline, collect_metrics, unwrap_response
+from lite_server.pipeline import Pipeline, collect_metrics, serialize_body, unwrap_response
 from lite_server.proto import Request, Response, StreamDone, StreamRequest, StreamResponse
 from lite_server.worker.common import (
     _format_exc_brief,
@@ -28,11 +27,7 @@ from lite_server.worker.common import (
 
 def _serialize_route_chunk(item) -> bytes:
     """One streamed item → wire bytes: bytes verbatim, str utf-8, else JSON."""
-    if isinstance(item, (bytes, bytearray)):
-        return bytes(item)
-    if isinstance(item, str):
-        return item.encode()
-    return _json.dumps(item)
+    return serialize_body(item)
 
 
 async def _send_route_stream(socket, stream_id: str, resp, ctx: RequestContext,
@@ -143,14 +138,14 @@ async def _send_bidi_final_chunk(
         return
     body, _headers = unwrap_response(ctx.response)
     await socket.send(
-        _make_stream_chunk(stream_id, _json.dumps(body), is_final=False).SerializeToString()
+        _make_stream_chunk(stream_id, serialize_body(body), is_final=False).SerializeToString()
     )
 
 
 async def _send_stream_early(socket, stream_id: str, early_response, lit_api: LitAPI) -> None:
     """Send an early-return response as a stream chunk + StreamDone."""
     body, _headers = unwrap_response(early_response)
-    resp_bytes = _json.dumps(body)
+    resp_bytes = serialize_body(body)
     await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
     metrics = collect_metrics(lit_api)
     await socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
@@ -286,7 +281,7 @@ async def _handle_stream_open_async(
             # Register only after the open fully succeeded — a failed open
             # must not leave a half-open session behind.
             active_streams[stream_id] = _BidiSession(handler, on_chunk, on_close, ctx)
-            await socket.send(_make_stream_chunk(stream_id, _json.dumps(body), is_final=False).SerializeToString())
+            await socket.send(_make_stream_chunk(stream_id, serialize_body(body), is_final=False).SerializeToString())
             return
         active_streams[stream_id] = _BidiSession(handler, on_chunk, on_close, ctx)
         return
@@ -400,7 +395,7 @@ async def _handle_stream_chunk_async(
         await _close_bidi_quietly(session.on_close, ctx, stream_id, log)
         return
     body, _ = unwrap_response(ctx.response)
-    await socket.send(_make_stream_chunk(stream_id, _json.dumps(body), is_final=False).SerializeToString())
+    await socket.send(_make_stream_chunk(stream_id, serialize_body(body), is_final=False).SerializeToString())
 
 
 _SENTINEL = object()
@@ -437,7 +432,7 @@ async def _process_stream_chunk(
         await _send_stream_early(socket, stream_id, ctx.early, lit_api)
         return False
     body, _ = unwrap_response(ctx.response)
-    await socket.send(_make_stream_chunk(stream_id, _json.dumps(body), is_final=False).SerializeToString())
+    await socket.send(_make_stream_chunk(stream_id, serialize_body(body), is_final=False).SerializeToString())
     return True
 
 
