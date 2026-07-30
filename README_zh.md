@@ -214,13 +214,16 @@ lite-server init my_project           # 脚手架创建项目
 | 05 | [ensemble](examples/05_ensemble/) | DAG 多模型流水线 |
 | 06 | [custom_route](examples/06_custom_route/) | 自定义 HTTP 路由（`@route` 装饰器） |
 | 07 | [custom_params](examples/07_custom_params/) | 配置驱动的模型行为 |
+| 08 | [error_handling](examples/08_error_handling/) | 异常→HTTP 映射、请求超时、Worker 驱逐 |
 | 09 | [custom_metrics](examples/09_custom_metrics/) | 自定义 Prometheus 指标（Gauge/Counter/Histogram） |
 | 10 | [async](examples/10_async/) | 异步推理（统一异步管线） |
 | 11 | [logging](examples/11_logging/) | 各阶段结构化日志 |
 | 12 | [continuous_batching](examples/12_continuous_batching/) | LLM 连续批处理（prefill/step/has_finished） |
 | 13 | [bidi_streaming](examples/13_bidi_streaming/) | 双向流式通信（ASR） |
-| 14 | [lifecycle_hooks](examples/14_lifecycle_hooks/) | Worker 生命周期钩子（shell + HTTP） |
+| 14 | [lifecycle_hooks](examples/14_lifecycle_hooks/) | Worker 生命周期钩子（Shell + HTTP 回调） |
+| 15 | [callbacks](examples/15_callbacks/) | Python 回调管线（鉴权、缓存、校验、错误指标） |
 | 16 | [grpc](examples/16_grpc/) | gRPC 推理端点 |
+| 17 | [config_templates](examples/17_config_templates/) | 配置模板、环境变量、多环境 server.yaml |
 
 详见 [examples/README.md](examples/README.md) 获取学习路径和使用说明。
 
