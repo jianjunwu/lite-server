@@ -3694,3 +3694,242 @@ ensemble:
 
     let _ = std::fs::remove_dir_all(&repo);
 }
+
+// ---------------------------------------------------------------------------
+// P-ENSEMBLE-GRPC: gRPC unary infer dispatches ensemble models through the DAG
+// executor (mirrors HTTP do_infer), instead of falling through to the worker
+// queue (ensemble models have no workers).
+// ---------------------------------------------------------------------------
+
+/// Write a fast sub-model whose `predict` returns immediately. `predict_body`
+/// is the indented body of `def predict(self, x):` (must return a dict with an
+/// `out` key so the ensemble DAG can chain `$<step>.out`).
+fn write_submodel(repo: &std::path::Path, name: &str, predict_body: &str) {
+    let dir = repo.join(format!("{}/1", name));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("model.py"),
+        format!(
+            r#"from lite_server import LitAPI
+
+
+class SubAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request
+
+    def predict(self, x):
+{body}
+
+    def encode_response(self, output):
+        return output
+"#,
+            body = predict_body,
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+}
+
+/// gRPC Infer on an ensemble model walks the DAG: a parallel recall layer
+/// (`recall_a` ∥ `recall_b`, both echoing request.x) feeds a serial `merge`
+/// step (sums the two outputs). request {x:5} → {out:10}. Exercises both the
+/// parallel layer and serial dependency edges over gRPC, matching HTTP.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_grpc_ensemble_infer_walks_dag() {
+    use std::collections::HashMap;
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+
+    let http_port = 18350u16;
+    let grpc_port = 18351u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-grpc-ensemble-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    // echo sub-model: echoes request.x as {"out": x}.
+    write_submodel(
+        &repo,
+        "echo",
+        r#"        return {"out": x.get("x", 0) if isinstance(x, dict) else x}"#,
+    );
+    // summer sub-model: sums two inputs as {"out": a + b}.
+    write_submodel(
+        &repo,
+        "summer",
+        "        a = x.get(\"a\", 0)\n        b = x.get(\"b\", 0)\n        return {\"out\": a + b}",
+    );
+    // Ensemble DAG: recall_a ∥ recall_b (parallel layer) → merge (serial).
+    let ens_dir = repo.join("ensemble_model/1");
+    std::fs::create_dir_all(&ens_dir).unwrap();
+    std::fs::write(
+        ens_dir.join("config.yaml"),
+        r#"
+ensemble:
+  steps:
+    - name: recall_a
+      model: echo
+      version: "1"
+      inputs:
+        x: "$request.x"
+    - name: recall_b
+      model: echo
+      version: "1"
+      inputs:
+        x: "$request.x"
+    - name: merge
+      model: summer
+      version: "1"
+      inputs:
+        a: "$recall_a.out"
+        b: "$recall_b.out"
+"#,
+    )
+    .unwrap();
+
+    let tmp_dir = std::env::temp_dir()
+        .join(format!("lite-server-grpc-ensemble-yaml-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18352\n  timeout: 30.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let _guard = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 30).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "echo", "1").await;
+    load_model(&base, "summer", "1").await;
+    load_model(&base, "ensemble_model", "1").await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+    let resp = client
+        .infer(InferRequest {
+            model_name: "ensemble_model".to_string(),
+            version: "1".to_string(),
+            data: bytes::Bytes::from(serde_json::to_vec(&json!({"x": 5})).unwrap()),
+            headers: HashMap::new(),
+        })
+        .await
+        .expect("ensemble gRPC Infer must walk the DAG, not error")
+        .into_inner();
+
+    let got: Value =
+        serde_json::from_slice(&resp.data).expect("ensemble response must be JSON");
+    assert_eq!(
+        got["out"].as_i64(),
+        Some(10),
+        "parallel recall (5,5) → merge sum = 10; got: {}",
+        got
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// A malformed ensemble DAG (cycle) surfaces as a gRPC error Status, not OK and
+/// not a panic — the cycle is detected when `execute_ensemble` parses the config
+/// (load succeeds; the error fires at infer time) and maps through D4.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_grpc_ensemble_dag_error_maps_to_status() {
+    use std::collections::HashMap;
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+
+    let http_port = 18360u16;
+    let grpc_port = 18361u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-grpc-ensemble-cycle-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    write_submodel(
+        &repo,
+        "echo",
+        r#"        return {"out": x.get("x", 0) if isinstance(x, dict) else x}"#,
+    );
+    // Cyclic DAG: a → b → a. validate_dag rejects it at infer time.
+    let ens_dir = repo.join("ensemble_cycle/1");
+    std::fs::create_dir_all(&ens_dir).unwrap();
+    std::fs::write(
+        ens_dir.join("config.yaml"),
+        r#"
+ensemble:
+  steps:
+    - name: a
+      model: echo
+      version: "1"
+      inputs:
+        x: "$b.out"
+    - name: b
+      model: echo
+      version: "1"
+      inputs:
+        x: "$a.out"
+"#,
+    )
+    .unwrap();
+
+    let tmp_dir = std::env::temp_dir()
+        .join(format!("lite-server-grpc-ensemble-cycle-yaml-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18362\n  timeout: 30.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let _guard = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 30).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    // Load succeeds — the cycle is only detected when the config is parsed at
+    // infer time, so the model registers and becomes ready.
+    load_model(&base, "ensemble_cycle", "1").await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+    let result = client
+        .infer(InferRequest {
+            model_name: "ensemble_cycle".to_string(),
+            version: "1".to_string(),
+            data: bytes::Bytes::from(serde_json::to_vec(&json!({"x": 1})).unwrap()),
+            headers: HashMap::new(),
+        })
+        .await;
+
+    assert!(
+        result.is_err(),
+        "cyclic ensemble DAG must surface as a gRPC error, not OK; got: {:?}",
+        result.map(|r| String::from_utf8_lossy(&r.into_inner().data).to_string())
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}

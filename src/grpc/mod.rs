@@ -1,11 +1,14 @@
 use crate::callback::CallbackRunner;
 use crate::error::AppError;
+use crate::http::state::AppState;
 use crate::proto::liteserver as pb;
+use crate::registry::types::ModelType;
 use crate::registry::ModelRegistry;
 use crate::request_context::RequestContext;
 use crate::streaming;
 use crate::worker::WorkerManager;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -63,6 +66,13 @@ pub struct GrpcService {
     /// 共用同一实例 + 60s cleanup task）。进程内 DashMap → per-instance（多副本
     /// 实际限额 = N×配置值；全局限流属上游网关职责，§4.1 P3-1 评审 2.2）。
     rate_limiter: Arc<crate::rate_limit::RateLimiter>,
+    /// P-ENSEMBLE-GRPC (蓝图 §4.1, D23): full AppState to dispatch ensemble
+    /// models through `execute_ensemble`. Ensemble models have no workers, so
+    /// unary infer must route to the DAG executor instead of the worker queue
+    /// — mirroring HTTP `do_infer`. Built once in `start_grpc_server` from the
+    /// same shared pieces (registry/worker_manager/queue/config/repo_path/…),
+    /// overriding `shutdown_state` to the real in-flight tracker.
+    app_state: Arc<AppState>,
 }
 
 impl GrpcService {
@@ -75,6 +85,7 @@ impl GrpcService {
         shutdown_state: Arc<crate::server::ShutdownState>,
         server_timeout: Duration,
         rate_limiter: Arc<crate::rate_limit::RateLimiter>,
+        app_state: Arc<AppState>,
     ) -> Self {
         Self {
             registry,
@@ -85,6 +96,7 @@ impl GrpcService {
             shutdown_state,
             server_timeout,
             rate_limiter,
+            app_state,
         }
     }
 
@@ -148,6 +160,34 @@ impl GrpcService {
         if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
             enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
             enforce_grpc_rate_limit(&self.rate_limiter, mv.policies.rate_limit.as_ref(), model_name, &client_ip)?;
+        }
+
+        // P-ENSEMBLE-GRPC (蓝图 §4.1, D23): ensemble models have no workers —
+        // dispatch through the DAG executor instead of the worker queue,
+        // mirroring HTTP `do_infer` (inference.rs). Thin translation layer:
+        // proto request → execute_ensemble args; orchestration is not duplicated.
+        // Only unary `infer` (batch/stream/bidi intentionally excluded, matching
+        // HTTP which also only ensembles in do_infer).
+        if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
+            if mv.model_type == ModelType::Ensemble {
+                let payload = serde_json::from_slice(&req.data).unwrap_or(serde_json::Value::Null);
+                let result = crate::ensemble::execute_ensemble(
+                    self.app_state.clone(),
+                    model_name,
+                    &resolved_version,
+                    payload,
+                    &request_id,
+                    &client_ip,
+                )
+                .await
+                .map_err(|e| err(app_error_to_grpc_status(&e)))?;
+                let data = bytes::Bytes::from(serde_json::to_vec(&result).unwrap_or_default());
+                return Ok(Response::new(pb::InferResponse {
+                    data,
+                    status: None,
+                    metrics: None,
+                }));
+            }
         }
 
         let header_map: HashMap<String, String> = req.headers.clone();
@@ -1493,6 +1533,25 @@ pub async fn start_grpc_server(
     has_hot_reload: Arc<std::sync::atomic::AtomicBool>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), AppError> {
+    // P-ENSEMBLE-GRPC (蓝图 §4.1): build an AppState so the unary infer handler
+    // can dispatch ensemble models through execute_ensemble (ensemble models have
+    // no workers). Built from the same shared pieces as HTTP's AppState; the
+    // shutdown_state is overridden to the real in-flight tracker so ensemble
+    // sub-step queue submits and the handler's InflightGuard share one tally.
+    let repo_path = PathBuf::from(&config.model_repository.path);
+    let mut app_state = AppState::new(
+        registry.clone(),
+        worker_manager.clone(),
+        worker_manager.inference_queue().clone(),
+        config.clone(),
+        repo_path,
+        callback_runner.clone(),
+        has_hot_reload.clone(),
+        rate_limiter.clone(),
+    );
+    app_state.shutdown_state = shutdown_state.clone();
+    let app_state = Arc::new(app_state);
+
     let service = GrpcService::new(
         registry.clone(),
         worker_manager.clone(),
@@ -1502,6 +1561,7 @@ pub async fn start_grpc_server(
         shutdown_state,
         server_timeout,
         rate_limiter,
+        app_state,
     );
     let server = LiteServerServer::new(service);
     // P1-3: gzip response compression is opt-in and applies to the
@@ -2336,6 +2396,19 @@ mod request_metrics_tests {
             "error".to_string(),
             Arc::new(CallbackRunner::new()),
         ));
+        // P-ENSEMBLE-GRPC: GrpcService now carries an AppState for ensemble
+        // dispatch. These unit tests exercise LitAPI models, so the AppState is
+        // never used for ensemble — a minimal default-built one suffices.
+        let app_state = Arc::new(AppState::new(
+            registry.clone(),
+            wm.clone(),
+            wm.inference_queue().clone(),
+            crate::config::Config::default(),
+            std::env::temp_dir(),
+            Arc::new(CallbackRunner::new()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+        ));
         GrpcService::new(
             registry,
             wm,
@@ -2345,6 +2418,7 @@ mod request_metrics_tests {
             Arc::new(crate::server::ShutdownState::new()),
             Duration::from_secs(5),
             Arc::new(crate::rate_limit::RateLimiter::default()),
+            app_state,
         )
     }
 
