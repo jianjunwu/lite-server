@@ -2567,6 +2567,104 @@ async fn test_grpc_infer_records_request_metrics() {
 }
 
 // ---------------------------------------------------------------------------
+// P2-2: gRPC x-request-id + x-processing-time-ms 回显
+// ---------------------------------------------------------------------------
+
+/// gRPC 客户端传 `x-client-request-id` metadata → 响应 metadata 回显
+/// `x-request-id`（同值）+ `x-processing-time-ms`（蓝图 §4.1 P2-2）。
+/// 错误路径（模型不存在）同样回显——覆盖 interceptor→RequestContext→handler
+/// 出口注入的全链路（unit test 直调 handler 不经 interceptor）。
+#[tokio::test]
+#[serial]
+async fn test_grpc_infer_echoes_request_id() {
+    use bytes::Bytes;
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+    use std::collections::HashMap;
+    use tonic::Request;
+
+    let http_port = 18079u16;
+    let grpc_port = 18080u16;
+    let metrics_port = 18081u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    kill_stale_on_port(metrics_port);
+    let repo = test_model_repo();
+    let _server = ServerGuard::start(&[
+        "--port",
+        &http_port.to_string(),
+        "--grpc-port",
+        &grpc_port.to_string(),
+        "--metrics-port",
+        &metrics_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--log-level",
+        "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, MODEL, "1").await;
+
+    let mut client = LiteServerClient::connect(format!("http://127.0.0.1:{}", grpc_port))
+        .await
+        .expect("gRPC client must connect");
+
+    // 成功路径回显
+    let mut req = Request::new(InferRequest {
+        model_name: MODEL.to_string(),
+        version: "1".to_string(),
+        data: Bytes::from(serde_json::to_vec(&json!({"input": 1})).unwrap()),
+        headers: HashMap::new(),
+    });
+    req.metadata_mut()
+        .insert("x-client-request-id", "p22-foo".parse().unwrap());
+    let resp = client
+        .infer(req)
+        .await
+        .expect("gRPC infer must succeed");
+    let md = resp.metadata();
+    assert_eq!(
+        md.get("x-request-id").and_then(|v| v.to_str().ok()),
+        Some("p22-foo"),
+        "x-request-id must echo the client id: {:?}",
+        md
+    );
+    assert!(
+        md.get("x-processing-time-ms").is_some(),
+        "x-processing-time-ms must be present"
+    );
+
+    // 错误路径（模型不存在）同样回显
+    let mut err_req = Request::new(InferRequest {
+        model_name: "no_such_model".to_string(),
+        version: String::new(),
+        data: Bytes::from_static(b"{}"),
+        headers: HashMap::new(),
+    });
+    err_req
+        .metadata_mut()
+        .insert("x-client-request-id", "p22-bar".parse().unwrap());
+    let err = client
+        .infer(err_req)
+        .await
+        .expect_err("unknown model must fail");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+    assert_eq!(
+        err.metadata().get("x-request-id").and_then(|v| v.to_str().ok()),
+        Some("p22-bar"),
+        "x-request-id must echo on the error path too: {:?}",
+        err.metadata()
+    );
+    assert!(
+        err.metadata().get("x-processing-time-ms").is_some(),
+        "x-processing-time-ms must be present on the error path"
+    );
+
+    unload_model(&base, MODEL, "1").await;
+}
+
+// ---------------------------------------------------------------------------
 // gRPC health checking (grpc.health.v1, phase 3)
 // ---------------------------------------------------------------------------
 

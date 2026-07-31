@@ -53,6 +53,7 @@ impl GrpcService {
         &self,
         request: Request<pb::InferRequest>,
         version_label: &mut String,
+        request_id_out: &mut String,
     ) -> Result<Response<pb::InferResponse>, Status> {
         let remote_addr = request.remote_addr();
         let (grpc_metadata, extensions, req) = request.into_parts();
@@ -63,6 +64,7 @@ impl GrpcService {
             remote_addr,
         );
         let request_id = cx.request_id.clone();
+        *request_id_out = request_id.clone();
         let client_ip = cx.client_ip.clone();
         let model_name = &req.model_name;
         let version = if req.version.is_empty() {
@@ -238,6 +240,7 @@ impl GrpcService {
         &self,
         request: Request<pb::BatchInferRequest>,
         version_label: &mut String,
+        request_id_out: &mut String,
     ) -> Result<Response<pb::BatchInferResponse>, Status> {
         let remote_addr = request.remote_addr();
         let (grpc_metadata, extensions, req) = request.into_parts();
@@ -248,6 +251,7 @@ impl GrpcService {
             remote_addr,
         );
         let request_id = cx.request_id;
+        *request_id_out = request_id.clone();
         let client_ip = cx.client_ip;
         let model_name = &req.model_name;
         let version = if req.version.is_empty() {
@@ -361,6 +365,7 @@ impl GrpcService {
         &self,
         request: Request<pb::StreamInferRequest>,
         version_label: &mut String,
+        request_id_out: &mut String,
         start: Instant,
     ) -> Result<Response<ReceiverStream<Result<pb::StreamChunk, Status>>>, Status> {
         let remote_addr = request.remote_addr();
@@ -372,6 +377,7 @@ impl GrpcService {
             remote_addr,
         );
         let request_id = cx.request_id;
+        *request_id_out = request_id.clone();
         let client_ip = cx.client_ip;
         let model_name = &req.model_name;
         let version = if req.version.is_empty() {
@@ -532,6 +538,7 @@ impl GrpcService {
         request: Request<Streaming<pb::BidiChunk>>,
         model_label: &mut String,
         version_label: &mut String,
+        request_id_out: &mut String,
         start: Instant,
     ) -> Result<Response<ReceiverStream<Result<pb::BidiChunk, Status>>>, Status> {
         let remote_addr = request.remote_addr();
@@ -545,6 +552,7 @@ impl GrpcService {
             remote_addr,
         );
         let request_id = cx.request_id;
+        *request_id_out = request_id.clone();
         let client_ip = cx.client_ip;
 
         // Wait for first message (must be BidiOpen)
@@ -881,6 +889,39 @@ fn grpc_code_to_status_family(code: tonic::Code) -> &'static str {
     }
 }
 
+/// P2-2：将 `x-request-id` + `x-processing-time-ms` 注入响应/错误 metadata
+///（对齐 HTTP observability_middleware 错误路径回显）。interceptor 是 pre-call
+/// 无法改响应（评审 1.12），故回显在 handler 出口统一完成。
+fn echo_grpc_response_headers<T>(
+    result: Result<Response<T>, Status>,
+    request_id: &str,
+    start: Instant,
+) -> Result<Response<T>, Status> {
+    let elapsed = start.elapsed();
+    match result {
+        Ok(mut response) => {
+            inject_echo_headers(response.metadata_mut(), request_id, elapsed);
+            Ok(response)
+        }
+        Err(mut status) => {
+            inject_echo_headers(status.metadata_mut(), request_id, elapsed);
+            Err(status)
+        }
+    }
+}
+
+/// 注入回显 header（request_id 缺省/非法则跳过该项；processing-time 恒定注入）。
+fn inject_echo_headers(metadata: &mut MetadataMap, request_id: &str, elapsed: Duration) {
+    if !request_id.is_empty() {
+        if let Ok(v) = MetadataValue::try_from(request_id) {
+            metadata.insert("x-request-id", v);
+        }
+    }
+    if let Ok(v) = MetadataValue::try_from(elapsed.as_millis().to_string().as_str()) {
+        metadata.insert("x-processing-time-ms", v);
+    }
+}
+
 /// P2-1：unary 请求指标统一记录点（成功 "2xx"；错误按 `grpc_code_to_status_family`）。
 fn record_grpc_request_end<T>(
     model: &str,
@@ -1019,25 +1060,33 @@ impl LiteServer for GrpcService {
     ) -> Result<Response<pb::InferResponse>, Status> {
         // P2-1 请求指标：成功/失败统一在此记一次（version label 取解析后版本，
         // 解析失败保持请求原值；D5 无 protocol label，与 HTTP 共享计数）。
+        // P2-2 回显：request_id/processing-time 注入响应或错误 metadata（对齐
+        // HTTP observability_middleware 错误路径回显）。
         let start = Instant::now();
         let model_label = request.get_ref().model_name.clone();
         let mut version_label = request.get_ref().version.clone();
-        let result = self.infer_impl(request, &mut version_label).await;
+        let mut request_id = String::new();
+        let result = self
+            .infer_impl(request, &mut version_label, &mut request_id)
+            .await;
         record_grpc_request_end(&model_label, &version_label, start, &result);
-        result
+        echo_grpc_response_headers(result, &request_id, start)
     }
 
     async fn batch_infer(
         &self,
         request: Request<pb::BatchInferRequest>,
     ) -> Result<Response<pb::BatchInferResponse>, Status> {
-        // P2-1 请求指标（同 infer 包装）。
+        // P2-1 请求指标 + P2-2 回显（同 infer 包装）。
         let start = Instant::now();
         let model_label = request.get_ref().model_name.clone();
         let mut version_label = request.get_ref().version.clone();
-        let result = self.batch_infer_impl(request, &mut version_label).await;
+        let mut request_id = String::new();
+        let result = self
+            .batch_infer_impl(request, &mut version_label, &mut request_id)
+            .await;
         record_grpc_request_end(&model_label, &version_label, start, &result);
-        result
+        echo_grpc_response_headers(result, &request_id, start)
     }
 
     type StreamInferStream = ReceiverStream<Result<pb::StreamChunk, Status>>;
@@ -1048,34 +1097,14 @@ impl LiteServer for GrpcService {
     ) -> Result<Response<Self::StreamInferStream>, Status> {
         // P2-1 请求指标：open 失败在此记一次；open 成功后由转发 task 在流
         // 关闭处记一次整体 duration（蓝图 §4.3 P2-1 stream/bidi 语义）。
+        // P2-2 回显：注入 stream open 的 initial metadata（processing-time 为
+        // 开流耗时，蓝图 §4.0.4）。
         let start = Instant::now();
         let model_label = request.get_ref().model_name.clone();
         let mut version_label = request.get_ref().version.clone();
-        let result = self.stream_infer_impl(request, &mut version_label, start).await;
-        if let Err(s) = &result {
-            crate::metrics::prometheus::record_request_end(
-                &model_label,
-                &version_label,
-                grpc_code_to_status_family(s.code()),
-                start.elapsed().as_secs_f64(),
-            );
-        }
-        result
-    }
-
-    type BidiStreamStream = ReceiverStream<Result<pb::BidiChunk, Status>>;
-
-    async fn bidi_stream(
-        &self,
-        request: Request<Streaming<pb::BidiChunk>>,
-    ) -> Result<Response<Self::BidiStreamStream>, Status> {
-        // P2-1 请求指标（同 stream_infer；model 在 BidiOpen 前未知，早期
-        // 失败以空 label 记录）。
-        let start = Instant::now();
-        let mut model_label = String::new();
-        let mut version_label = String::new();
+        let mut request_id = String::new();
         let result = self
-            .bidi_stream_impl(request, &mut model_label, &mut version_label, start)
+            .stream_infer_impl(request, &mut version_label, &mut request_id, start)
             .await;
         if let Err(s) = &result {
             crate::metrics::prometheus::record_request_end(
@@ -1085,7 +1114,39 @@ impl LiteServer for GrpcService {
                 start.elapsed().as_secs_f64(),
             );
         }
-        result
+        echo_grpc_response_headers(result, &request_id, start)
+    }
+
+    type BidiStreamStream = ReceiverStream<Result<pb::BidiChunk, Status>>;
+
+    async fn bidi_stream(
+        &self,
+        request: Request<Streaming<pb::BidiChunk>>,
+    ) -> Result<Response<Self::BidiStreamStream>, Status> {
+        // P2-1 请求指标 + P2-2 回显（同 stream_infer；model 在 BidiOpen 前未知，
+        // 早期失败以空 label 记录；request_id 来自 transport metadata）。
+        let start = Instant::now();
+        let mut model_label = String::new();
+        let mut version_label = String::new();
+        let mut request_id = String::new();
+        let result = self
+            .bidi_stream_impl(
+                request,
+                &mut model_label,
+                &mut version_label,
+                &mut request_id,
+                start,
+            )
+            .await;
+        if let Err(s) = &result {
+            crate::metrics::prometheus::record_request_end(
+                &model_label,
+                &version_label,
+                grpc_code_to_status_family(s.code()),
+                start.elapsed().as_secs_f64(),
+            );
+        }
+        echo_grpc_response_headers(result, &request_id, start)
     }
 }
 
@@ -1872,5 +1933,57 @@ mod request_metrics_tests {
         }
         assert_eq!(counter.get(), before + 1.0,
             "stream close must record exactly one 2xx request (overall duration)");
+    }
+
+    // ===== P2-2: x-request-id / x-processing-time-ms 回显 =====
+
+    /// 带 `x-client-request-id` metadata 的请求 → 响应 metadata 回显
+    /// `x-request-id`（同值）+ `x-processing-time-ms`（蓝图 §4.1 P2-2）。
+    #[tokio::test]
+    async fn should_echo_request_id_and_processing_time_on_success() {
+        let model = "echo_ok";
+        let endpoint = metric_test_endpoint(model);
+        let _worker = spawn_ok_worker(endpoint.clone());
+        let service = ready_service_with_worker(model, endpoint).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut req = infer_request(model, "1");
+        req.metadata_mut()
+            .insert("x-client-request-id", "echo-foo".parse().unwrap());
+
+        let resp = service.infer(req).await.expect("infer must succeed");
+        let md = resp.metadata();
+        assert_eq!(
+            md.get("x-request-id").and_then(|v| v.to_str().ok()),
+            Some("echo-foo"),
+            "x-request-id must echo the client-supplied id"
+        );
+        assert!(
+            md.get("x-processing-time-ms").is_some(),
+            "x-processing-time-ms must be present on success"
+        );
+    }
+
+    /// 错误路径同样回显（对齐 HTTP observability 错误路径）。
+    #[tokio::test]
+    async fn should_echo_request_id_on_error_path() {
+        let service = build_service(Arc::new(ModelRegistry::new()), Arc::new(InferenceQueue::new()));
+
+        let mut req = infer_request("echo_404", "");
+        req.metadata_mut()
+            .insert("x-client-request-id", "echo-bar".parse().unwrap());
+
+        let err = service.infer(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        let md = err.metadata();
+        assert_eq!(
+            md.get("x-request-id").and_then(|v| v.to_str().ok()),
+            Some("echo-bar"),
+            "x-request-id must echo on the error path too"
+        );
+        assert!(
+            md.get("x-processing-time-ms").is_some(),
+            "x-processing-time-ms must be present on the error path"
+        );
     }
 }
