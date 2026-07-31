@@ -1733,17 +1733,28 @@ fn upsert_zmq_client(
 /// Build a platform-appropriate ZMQ endpoint for a worker.
 /// - Unix: IPC socket in the system temp directory
 /// - Windows: TCP on localhost (IPC not supported)
+/// Per-process-unique worker endpoint: `{model}_{version}_{worker_id}_{pid}`.
+/// The pid component lets parallel server processes (integration tests, or
+/// stale `.sock` files left by killed runs/orphan workers) never collide on
+/// the same IPC path — a collided `bind` returns EEXIST, which the zmq crate
+/// escalates to a panic (unknown errno), killing the client actor.
 fn worker_endpoint(model_name: &str, version: &str, worker_id: usize) -> String {
     #[cfg(unix)]
     {
         let sock_path = std::env::temp_dir()
             .join("lite-server")
-            .join(format!("{}_{}_{}.sock", model_name, version, worker_id));
+            .join(format!(
+                "{}_{}_{}_{}.sock",
+                model_name,
+                version,
+                worker_id,
+                std::process::id()
+            ));
         format!("ipc://{}", sock_path.display())
     }
     #[cfg(windows)]
     {
-        let key = format!("{}_{}_{}", model_name, version, worker_id);
+        let key = format!("{}_{}_{}_{}", model_name, version, worker_id, std::process::id());
         let port = crate::transport::derive_port_from_path(&key);
         format!("tcp://127.0.0.1:{}", port)
     }
@@ -1956,6 +1967,20 @@ fn emit_stderr_line(level: tracing::Level, msg: &str, worker_id: usize, model: &
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Parallel server processes must never collide on worker IPC paths: the
+    /// endpoint embeds the pid, and stays stable within one process (worker
+    /// restarts rebind the same path after cleanup).
+    #[test]
+    fn worker_endpoint_is_pid_scoped_and_stable() {
+        let ep = worker_endpoint("m", "1", 0);
+        assert!(
+            ep.contains(&std::process::id().to_string()),
+            "endpoint {ep} must embed the pid for cross-process uniqueness"
+        );
+        assert_eq!(ep, worker_endpoint("m", "1", 0), "same process → stable path");
+        assert_ne!(ep, worker_endpoint("m", "1", 1), "worker_id still distinguishes");
+    }
 
     /// PendingMap must be Arc<DashMap> for lock-free per-uid insert/remove.
     /// This verifies the type alias — reverting to Arc<RwLock<HashMap>> won't compile.

@@ -2825,7 +2825,6 @@ class CanaryAPI(LitAPI):
 /// (requires `features.canary_override: true`, P5-2); activate is a hard
 /// cutover.
 #[tokio::test]
-#[serial]
 async fn test_weighted_routing_canary() {
     let tmp_dir = std::env::temp_dir().join(format!("lite-server-canary-{}", std::process::id()));
     write_canary_model_repo(&tmp_dir);
@@ -2923,7 +2922,6 @@ async fn test_weighted_routing_canary() {
 /// P5-2 (蓝图 §4.4): gRPC x-lite-version pin parity——metadata 优先、fallback
 /// proto headers map；非法 pin → InvalidArgument；pin 版本不存在 → NotFound。
 #[tokio::test]
-#[serial]
 async fn test_grpc_canary_pin_parity() {
     use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
     use lite_server::proto::liteserver::InferRequest;
@@ -3015,7 +3013,6 @@ async fn test_grpc_canary_pin_parity() {
 /// P5-2 (蓝图 §4.4, D16): 默认配置（features 段缺省 → canary_override=false）
 /// 下 x-lite-version 被整体忽略——pin 不影响权重路由，非法/不存在的 pin 也不报错。
 #[tokio::test]
-#[serial]
 async fn test_canary_override_default_off_ignores_pin() {
     let port = 18117u16;
     kill_stale_on_port(port);
