@@ -233,6 +233,7 @@ impl LiteServer {
                 self.config.features.streaming_metrics,
                 self.callback_runner.clone(),
                 Duration::from_secs_f64(self.config.server.timeout as f64),
+                self.config.grpc.clone(),
             )))
         } else {
             None

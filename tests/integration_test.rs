@@ -1054,6 +1054,99 @@ async fn test_batch_aggregation_per_item_status_and_headers() {
 }
 
 // ---------------------------------------------------------------------------
+// HTTP response compression (P1-4)
+// ---------------------------------------------------------------------------
+
+/// With `server.compression: true`: JSON responses are gzipped when the
+/// client advertises `accept-encoding: gzip`; SSE streams are excluded
+/// (compression would break per-event flush); WS upgrade is unaffected.
+#[tokio::test]
+#[serial]
+async fn test_http_response_compression() {
+    use futures::{SinkExt, StreamExt};
+
+    let http_port = 18090u16;
+    let grpc_port = 18091u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = test_model_repo();
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-http-gzip-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 0.0.0.0\n  http_port: {}\n  grpc_port: {}\n  metrics_port: 18092\n  log_level: warn\n  compression: true\nmetrics:\n  enabled: false\ngrpc:\n  enabled: false\nmodel_repository:\n  path: {}\n",
+            http_port,
+            grpc_port,
+            repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, MODEL, "1").await;
+
+    // no_gzip: reqwest must not transparently decompress — we inspect the raw
+    // response headers/body.
+    let client = reqwest::Client::builder().no_gzip().build().unwrap();
+
+    // 1. JSON response is gzip-compressed when the client accepts it.
+    let resp = client
+        .get(format!("{}/health", base))
+        .header("accept-encoding", "gzip")
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("content-encoding").and_then(|v| v.to_str().ok()),
+        Some("gzip"),
+        "JSON response must be gzip-compressed"
+    );
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(&body[..2], &[0x1f, 0x8b], "body must be gzip-framed");
+
+    // 2. SSE stream is excluded from compression and still delivers frames.
+    let mut resp = client
+        .post(format!("{}/v2/models/{}/events", base, MODEL))
+        .header("accept-encoding", "gzip")
+        .json(&json!({"input": 3}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap().to_string();
+    assert!(content_type.contains("text/event-stream"), "expected SSE content-type, got: {}", content_type);
+    assert!(
+        resp.headers().get("content-encoding").is_none(),
+        "SSE responses must not be compressed"
+    );
+    // The SSE stream outlives the test (server-side idle timeout ~300s), so
+    // read only until the first data frame arrives, then drop the response.
+    let mut body = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !body.contains("data:") && tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), resp.chunk()).await {
+            Ok(Ok(Some(bytes))) => body.push_str(&String::from_utf8_lossy(&bytes)),
+            _ => break,
+        }
+    }
+    assert!(body.contains("data:"), "SSE response should contain data frames: {}", body);
+
+    // 3. WS handshake and streaming are unaffected.
+    let ws_url = format!("ws://127.0.0.1:{}/v2/models/{}/stream", http_port, MODEL);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect failed");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&json!({"input": 4})).unwrap(),
+    )).await.unwrap();
+    let msg = ws.next().await.expect("WS must yield a message").unwrap();
+    assert!(msg.is_text() || msg.is_binary(), "WS must deliver a data frame");
+    let _ = ws.close(None).await;
+
+    unload_model(&base, MODEL, "1").await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// ---------------------------------------------------------------------------
 // SSE streaming
 // ---------------------------------------------------------------------------
 
@@ -2467,6 +2560,71 @@ async fn test_grpc_health_service() {
         .check(HealthCheckRequest { service: String::new() })
         .await.unwrap().into_inner();
     assert_eq!(resp.status(), ServingStatus::NotServing);
+}
+
+// ---------------------------------------------------------------------------
+// gRPC response compression (P1-3)
+// ---------------------------------------------------------------------------
+
+/// With `grpc.response_compression: true` and a gzip-capable client, unary
+/// Infer responses must be gzip-compressed (`grpc-encoding: gzip`).
+#[tokio::test]
+#[serial]
+async fn test_grpc_response_compression_gzip() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+    use std::collections::HashMap;
+    use tonic::codec::CompressionEncoding;
+
+    let http_port = 18080u16;
+    let grpc_port = 18081u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = test_model_repo();
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-grpc-gzip-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 0.0.0.0\n  http_port: {}\n  grpc_port: {}\n  metrics_port: 18082\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\n  response_compression: true\nmodel_repository:\n  path: {}\n",
+            http_port,
+            grpc_port,
+            repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, MODEL, "1").await;
+
+    let channel = tonic::transport::Endpoint::new(format!("http://127.0.0.1:{}", grpc_port))
+        .expect("valid gRPC address")
+        .connect()
+        .await
+        .expect("gRPC channel must connect");
+    let mut client = LiteServerClient::new(channel).accept_compressed(CompressionEncoding::Gzip);
+
+    let resp = client
+        .infer(InferRequest {
+            model_name: MODEL.to_string(),
+            version: "1".to_string(),
+            data: bytes::Bytes::from(serde_json::to_vec(&json!({"input": 1})).unwrap()),
+            headers: HashMap::new(),
+        })
+        .await
+        .expect("infer must succeed");
+
+    assert_eq!(
+        resp.metadata().get("grpc-encoding").and_then(|v| v.to_str().ok()),
+        Some("gzip"),
+        "response must be gzip-compressed when enabled and the client accepts it"
+    );
+
+    unload_model(&base, MODEL, "1").await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
 // ---------------------------------------------------------------------------

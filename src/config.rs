@@ -67,6 +67,9 @@ pub struct ServerConfig {
     pub graceful_timeout: f32,
     /// HTTP keep-alive timeout in seconds. 0 = disable keep-alive.
     pub keepalive_timeout: f32,
+    /// gzip response compression (P1-4). Default false. SSE responses are
+    /// excluded (per-event flush semantics); WS upgrades are unaffected.
+    pub compression: bool,
 }
 
 impl Default for ServerConfig {
@@ -81,6 +84,7 @@ impl Default for ServerConfig {
             cache_registry: false,
             graceful_timeout: 30.0,
             keepalive_timeout: 5.0,
+            compression: false,
         }
     }
 }
@@ -90,6 +94,21 @@ impl Default for ServerConfig {
 pub struct GrpcConfig {
     pub enabled: bool,
     pub max_workers: usize,
+    /// HTTP/2 keepalive ping interval in seconds (P1-2). None = disabled.
+    pub http2_keepalive_interval_secs: Option<u64>,
+    /// HTTP/2 keepalive ping-ack timeout in seconds (P1-2). Effective default
+    /// is 20s when the interval is set; configuring it without an interval
+    /// never takes effect (startup warns).
+    pub http2_keepalive_timeout_secs: Option<u64>,
+    /// HTTP/2 adaptive flow-control window (P1-2): grows the window with BDP.
+    /// Default false (tonic/hyper fixed 64KB connection window).
+    pub http2_adaptive_window: bool,
+    /// HTTP/2 max frame size in bytes (P1-2). None = tonic default (16KB);
+    /// 256KB–1MB avoids frame-splitting overhead for large/streaming payloads.
+    pub http2_max_frame_size: Option<u32>,
+    /// gzip response compression on the LiteServer service (P1-3).
+    /// Default false; Admin/health services are never compressed.
+    pub response_compression: bool,
 }
 
 impl Default for GrpcConfig {
@@ -97,6 +116,11 @@ impl Default for GrpcConfig {
         Self {
             enabled: true,
             max_workers: 10,
+            http2_keepalive_interval_secs: None,
+            http2_keepalive_timeout_secs: None,
+            http2_adaptive_window: false,
+            http2_max_frame_size: None,
+            response_compression: false,
         }
     }
 }
@@ -897,6 +921,44 @@ mod tests {
         assert_eq!(parsed.server.http_port, cfg.server.http_port);
         assert_eq!(parsed.server.host, cfg.server.host);
         assert_eq!(parsed.grpc.enabled, cfg.grpc.enabled);
+    }
+
+    #[test]
+    fn test_grpc_http2_config_parses() {
+        let yaml = "grpc:\n  http2_keepalive_interval_secs: 30\n  http2_keepalive_timeout_secs: 5\n  http2_adaptive_window: true\n  http2_max_frame_size: 1048576\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.grpc.http2_keepalive_interval_secs, Some(30));
+        assert_eq!(cfg.grpc.http2_keepalive_timeout_secs, Some(5));
+        assert!(cfg.grpc.http2_adaptive_window);
+        assert_eq!(cfg.grpc.http2_max_frame_size, Some(1048576));
+    }
+
+    #[test]
+    fn test_grpc_http2_config_defaults_off() {
+        // P1-2: everything off by default — no keepalive, tonic-default window/frame.
+        let cfg = Config::default();
+        assert_eq!(cfg.grpc.http2_keepalive_interval_secs, None);
+        assert_eq!(cfg.grpc.http2_keepalive_timeout_secs, None);
+        assert!(!cfg.grpc.http2_adaptive_window);
+        assert_eq!(cfg.grpc.http2_max_frame_size, None);
+    }
+
+    #[test]
+    fn test_grpc_response_compression_config() {
+        // P1-3: off by default; opt-in via grpc.response_compression.
+        assert!(!Config::default().grpc.response_compression);
+        let yaml = "grpc:\n  response_compression: true\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.grpc.response_compression);
+    }
+
+    #[test]
+    fn test_server_compression_config() {
+        // P1-4: off by default; opt-in via server.compression.
+        assert!(!Config::default().server.compression);
+        let yaml = "server:\n  compression: true\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.server.compression);
     }
 
     #[test]

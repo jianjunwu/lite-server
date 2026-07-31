@@ -115,6 +115,66 @@ fn model_error_status(code: tonic::Code, parsed: &ParsedModelError) -> Status {
     )
 }
 
+/// Resolve the serving version for `bidi_stream` (P0-2 parity with
+/// unary/batch/stream): version="" → weighted routing pick (§4.3), falling
+/// back to the active version; explicit version passes through. Stamps
+/// `last_used_at` for LRU eviction on the resolved version.
+///
+/// The protocol layer only passes parameters — the actual routing decision
+/// is delegated to the registry (`routing_pick` / `get_active_version`).
+fn resolve_bidi_version(
+    registry: &ModelRegistry,
+    model_name: &str,
+    version: Option<&str>,
+) -> Result<String, Status> {
+    let resolved = match version {
+        Some(v) => v.to_string(),
+        None => registry
+            .routing_pick(model_name)
+            .or_else(|| registry.get_active_version(model_name))
+            .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
+    };
+    registry.touch_last_used(model_name, &resolved);
+    Ok(resolved)
+}
+
+/// Whether a gRPC status code is a client-class error (P1-1). Mirrors the
+/// HTTP 4xx/5xx split in error.rs: client-class codes log at info, server
+/// faults at error. ResourceExhausted (429) is client-class so a saturated
+/// rate limiter doesn't flood error logs; Cancelled is client-initiated.
+fn is_client_class(code: tonic::Code) -> bool {
+    use tonic::Code::*;
+    matches!(
+        code,
+        InvalidArgument
+            | NotFound
+            | OutOfRange
+            | Unauthenticated
+            | PermissionDenied
+            | ResourceExhausted
+            | Cancelled
+    )
+}
+
+/// Log a gRPC error status with graded severity, then return it (P1-1 parity
+/// with HTTP error.rs:256-270 — gRPC handlers previously logged nothing).
+fn err(status: Status) -> Status {
+    if is_client_class(status.code()) {
+        tracing::info!(
+            code = ?status.code(),
+            message = %status.message(),
+            "grpc request error"
+        );
+    } else {
+        tracing::error!(
+            code = ?status.code(),
+            message = %status.message(),
+            "grpc request error"
+        );
+    }
+    status
+}
+
 /// Headers that must not be set by user code (RFC 7230 §6.1 hop-by-hop headers
 /// and other transport headers managed by the server).
 const BLOCKED_RESPONSE_HEADERS: &[&str] = &[
@@ -175,18 +235,41 @@ fn enforce_auth_grpc(
         })
         .unwrap_or_default();
     if value.is_empty() {
-        return Err(Status::unauthenticated(format!(
+        return Err(err(Status::unauthenticated(format!(
             "missing API key (header: {})",
             auth.header
-        )));
+        ))));
     }
     if !auth.keys.is_empty() && !auth.keys.iter().any(|k| k == &value) {
-        return Err(Status::unauthenticated(format!(
+        return Err(err(Status::unauthenticated(format!(
             "invalid API key (header: {})",
             auth.header
-        )));
+        ))));
     }
     Ok(())
+}
+
+/// Effective HTTP/2 keepalive parameters (P1-2): `(interval, timeout)`.
+/// `None` when keepalive is disabled (interval unset). The timeout defaults
+/// to 20s when only the interval is configured; a timeout configured without
+/// an interval can never fire, so warn at startup.
+fn http2_keepalive_params(cfg: &crate::config::GrpcConfig) -> Option<(Duration, Duration)> {
+    match cfg.http2_keepalive_interval_secs {
+        Some(interval) => Some((
+            Duration::from_secs(interval),
+            Duration::from_secs(cfg.http2_keepalive_timeout_secs.unwrap_or(20)),
+        )),
+        None => {
+            if cfg.http2_keepalive_timeout_secs.is_some() {
+                warn!(
+                    "grpc.http2_keepalive_timeout_secs is set but \
+                     http2_keepalive_interval_secs is not — the timeout never \
+                     takes effect without a ping interval"
+                );
+            }
+            None
+        }
+    }
 }
 
 /// Extract the client request ID: gRPC metadata (transport-level, idiomatic
@@ -252,7 +335,7 @@ impl LiteServer for GrpcService {
         };
 
         if let Err(e) = crate::validation::validate_identifier(model_name) {
-            return Err(Status::invalid_argument(e.to_string()));
+            return Err(err(Status::invalid_argument(e.to_string())));
         }
 
         // version="" → weighted routing pick (§4.3), falling back to active.
@@ -262,15 +345,15 @@ impl LiteServer for GrpcService {
                 .registry
                 .routing_pick(model_name)
                 .or_else(|| self.registry.get_active_version(model_name))
-                .ok_or_else(|| Status::not_found(format!("{} has no active version", model_name)))?,
+                .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
         };
         self.registry.touch_last_used(model_name, &resolved_version);
 
         if !self.registry.is_ready(model_name, version) {
-            return Err(Status::unavailable(format!(
+            return Err(err(Status::unavailable(format!(
                 "{} version {} is not ready",
                 model_name, resolved_version
-            )));
+            ))));
         }
 
         if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
@@ -331,25 +414,25 @@ impl LiteServer for GrpcService {
         {
             Ok(()) => match tokio::time::timeout(self.server_timeout, response_rx).await {
                 Ok(Ok(resp)) => resp,
-                Ok(Err(_)) => return Err(Status::internal("response channel closed")),
+                Ok(Err(_)) => return Err(err(Status::internal("response channel closed"))),
                 Err(_) => {
-                    return Err(Status::deadline_exceeded(format!(
+                    return Err(err(Status::deadline_exceeded(format!(
                         "inference timed out after {:.1}s",
                         self.server_timeout.as_secs_f64()
-                    )));
+                    ))));
                 }
             },
             Err(crate::inference_queue::QueueError::Full) => {
-                return Err(Status::resource_exhausted(format!(
+                return Err(err(Status::resource_exhausted(format!(
                     "queue full for {} {}",
                     model_name, resolved_version
-                )));
+                ))));
             }
             Err(_) => {
-                return Err(Status::unavailable(format!(
+                return Err(err(Status::unavailable(format!(
                     "queue not available for {} {}",
                     model_name, resolved_version
-                )));
+                ))));
             }
         };
 
@@ -373,16 +456,16 @@ impl LiteServer for GrpcService {
                                 serde_json::from_slice(&single.data).unwrap_or(serde_json::json!({}));
                             let parsed = try_parse_model_error(&data);
                             return Err(match parsed {
-                                Some(p) => model_error_status(
-                                    http_status_to_grpc_code(http_status), &p),
-                                None => Status::new(
+                                Some(p) => err(model_error_status(
+                                    http_status_to_grpc_code(http_status), &p)),
+                                None => err(Status::new(
                                     http_status_to_grpc_code(http_status),
                                     format!("[model_error] {}", msg),
-                                ),
+                                )),
                             });
                         }
                         // Not a numeric status code — internal worker error.
-                        return Err(Status::internal(msg));
+                        return Err(err(Status::internal(msg)));
                     }
                     _ => {
                         let headers = single.headers.clone();
@@ -406,7 +489,7 @@ impl LiteServer for GrpcService {
                     }
                 }
             }
-            _ => Err(Status::internal("unexpected response type")),
+            _ => Err(err(Status::internal("unexpected response type"))),
         }
     }
 
@@ -426,7 +509,7 @@ impl LiteServer for GrpcService {
         };
 
         if let Err(e) = crate::validation::validate_identifier(model_name) {
-            return Err(Status::invalid_argument(e.to_string()));
+            return Err(err(Status::invalid_argument(e.to_string())));
         }
 
         // version="" → weighted routing pick (§4.3), falling back to active.
@@ -436,15 +519,15 @@ impl LiteServer for GrpcService {
                 .registry
                 .routing_pick(model_name)
                 .or_else(|| self.registry.get_active_version(model_name))
-                .ok_or_else(|| Status::not_found(format!("{} has no active version", model_name)))?,
+                .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
         };
         self.registry.touch_last_used(model_name, &resolved_version);
 
         if !self.registry.is_ready(model_name, version) {
-            return Err(Status::unavailable(format!(
+            return Err(err(Status::unavailable(format!(
                 "{} version {} is not ready",
                 model_name, resolved_version
-            )));
+            ))));
         }
 
         if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
@@ -485,10 +568,10 @@ impl LiteServer for GrpcService {
             .worker_manager
             .get_zmq_clients(model_name, &resolved_version)
             .await
-            .ok_or_else(|| Status::unavailable("no workers available"))?;
+            .ok_or_else(|| err(Status::unavailable("no workers available")))?;
 
         if clients.is_empty() {
-            return Err(Status::unavailable("no workers available"));
+            return Err(err(Status::unavailable("no workers available")));
         }
 
         let worker_id = match self
@@ -504,7 +587,7 @@ impl LiteServer for GrpcService {
         let resp = client
             .send(internal_req)
             .await
-            .map_err(|e| Status::internal(format!("worker error: {}", e)))?;
+            .map_err(|e| err(Status::internal(format!("worker error: {}", e))))?;
 
         match resp.payload {
             Some(pb::response::Payload::Batch(batch_resp)) => {
@@ -521,7 +604,7 @@ impl LiteServer for GrpcService {
                 inject_grpc_metadata(response.metadata_mut(), &batch_resp.headers);
                 Ok(response)
             }
-            _ => Err(Status::internal("unexpected response type")),
+            _ => Err(err(Status::internal("unexpected response type"))),
         }
     }
 
@@ -543,7 +626,7 @@ impl LiteServer for GrpcService {
         };
 
         if let Err(e) = crate::validation::validate_identifier(model_name) {
-            return Err(Status::invalid_argument(e.to_string()));
+            return Err(err(Status::invalid_argument(e.to_string())));
         }
 
         // version="" → weighted routing pick (§4.3), falling back to active.
@@ -553,15 +636,15 @@ impl LiteServer for GrpcService {
                 .registry
                 .routing_pick(model_name)
                 .or_else(|| self.registry.get_active_version(model_name))
-                .ok_or_else(|| Status::not_found(format!("{} has no active version", model_name)))?,
+                .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
         };
         self.registry.touch_last_used(model_name, &resolved_version);
 
         if !self.registry.is_ready(model_name, version) {
-            return Err(Status::unavailable(format!(
+            return Err(err(Status::unavailable(format!(
                 "{} version {} is not ready",
                 model_name, resolved_version
-            )));
+            ))));
         }
 
         if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
@@ -589,10 +672,10 @@ impl LiteServer for GrpcService {
             .worker_manager
             .get_zmq_clients(model_name, &resolved_version)
             .await
-            .ok_or_else(|| Status::unavailable("no workers available"))?;
+            .ok_or_else(|| err(Status::unavailable("no workers available")))?;
 
         if clients.is_empty() {
-            return Err(Status::unavailable("no workers available"));
+            return Err(err(Status::unavailable("no workers available")));
         }
 
         let worker_id = match self
@@ -608,7 +691,7 @@ impl LiteServer for GrpcService {
         let mut chunk_rx = client
             .send_stream(open_req, stream_id.clone())
             .await
-            .map_err(|e| Status::internal(format!("worker stream error: {}", e)))?;
+            .map_err(|e| err(Status::internal(format!("worker stream error: {}", e))))?;
 
         let (tx, rx) = mpsc::channel(64);
         let cancel_client = client.clone();
@@ -654,10 +737,10 @@ impl LiteServer for GrpcService {
                                         &parsed,
                                     )
                                 } else {
-                                    Status::internal(e.message.clone())
+                                    err(Status::internal(e.message.clone()))
                                 }
                             }
-                            Err(_) => Status::internal(e.message.clone()),
+                            Err(_) => err(Status::internal(e.message.clone())),
                         };
                         let _ = tx.send(Err(grpc_err)).await;
                         break;
@@ -696,7 +779,7 @@ impl LiteServer for GrpcService {
         let first = stream
             .message()
             .await
-            .map_err(|e| Status::internal(format!("stream error: {}", e)))?;
+            .map_err(|e| err(Status::internal(format!("stream error: {}", e))))?;
 
         let (model_name, resolved_version, stream_id, initial_data) = match first {
             Some(chunk) => match chunk.payload {
@@ -709,24 +792,19 @@ impl LiteServer for GrpcService {
                     };
 
                     if let Err(e) = crate::validation::validate_identifier(&model_name) {
-                        return Err(Status::invalid_argument(e.to_string()));
+                        return Err(err(Status::invalid_argument(e.to_string())));
                     }
 
-                    let resolved_version = match &version {
-                        Some(v) => v.clone(),
-                        None => self
-                            .registry
-                            .get_active_version(&model_name)
-                            .ok_or_else(|| {
-                                Status::not_found(format!("{} has no active version", model_name))
-                            })?,
-                    };
+                    // version="" → weighted routing pick (§4.3), falling back
+                    // to active; stamps last_used_at (P0-2 bidi parity).
+                    let resolved_version =
+                        resolve_bidi_version(&self.registry, &model_name, version.as_deref())?;
 
                     if !self.registry.is_ready(&model_name, version.as_deref()) {
-                        return Err(Status::unavailable(format!(
+                        return Err(err(Status::unavailable(format!(
                             "{} version {} is not ready",
                             model_name, resolved_version
-                        )));
+                        ))));
                     }
 
                     // BidiOpen has no headers map — transport metadata is the
@@ -738,9 +816,9 @@ impl LiteServer for GrpcService {
                     let sid = format!("grpc-bidi-{}", Uuid::new_v4());
                     (model_name, resolved_version, sid, open.initial_data)
                 }
-                _ => return Err(Status::invalid_argument("first message must be BidiOpen")),
+                _ => return Err(err(Status::invalid_argument("first message must be BidiOpen"))),
             },
-            None => return Err(Status::invalid_argument("empty stream")),
+            None => return Err(err(Status::invalid_argument("empty stream"))),
         };
 
         let meta = pb::RequestMeta {
@@ -762,10 +840,10 @@ impl LiteServer for GrpcService {
             .worker_manager
             .get_zmq_clients(&model_name, &resolved_version)
             .await
-            .ok_or_else(|| Status::unavailable("no workers available"))?;
+            .ok_or_else(|| err(Status::unavailable("no workers available")))?;
 
         if clients.is_empty() {
-            return Err(Status::unavailable("no workers available"));
+            return Err(err(Status::unavailable("no workers available")));
         }
 
         let worker_id = match self
@@ -781,7 +859,7 @@ impl LiteServer for GrpcService {
         let mut chunk_rx = client
             .send_stream(open_req, stream_id.clone())
             .await
-            .map_err(|e| Status::internal(format!("worker stream error: {}", e)))?;
+            .map_err(|e| err(Status::internal(format!("worker stream error: {}", e))))?;
 
         let (tx, rx) = mpsc::channel(64);
         let worker_client = client.clone();
@@ -863,10 +941,10 @@ impl LiteServer for GrpcService {
                                         &parsed,
                                     )
                                 } else {
-                                    Status::internal(e.message.clone())
+                                    err(Status::internal(e.message.clone()))
                                 }
                             }
-                            Err(_) => Status::internal(e.message.clone()),
+                            Err(_) => err(Status::internal(e.message.clone())),
                         };
                         let _ = tx.send(Err(grpc_err)).await;
                         let _ = tx.send(Ok(bidi_chunk)).await;
@@ -906,6 +984,7 @@ pub async fn start_grpc_server(
     streaming_metrics: bool,
     callback_runner: Arc<CallbackRunner>,
     server_timeout: Duration,
+    grpc_config: crate::config::GrpcConfig,
 ) -> Result<(), AppError> {
     let addr: std::net::SocketAddr = format!("{}:{}", host, port)
         .parse()
@@ -919,6 +998,15 @@ pub async fn start_grpc_server(
         server_timeout,
     );
     let server = LiteServerServer::new(service);
+    // P1-3: gzip response compression is opt-in and applies to the
+    // LiteServer inference service only (Admin/health stay uncompressed).
+    let server = if grpc_config.response_compression {
+        server
+            .send_compressed(tonic::codec::CompressionEncoding::Gzip)
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+    } else {
+        server
+    };
 
     // Standard gRPC health checking (grpc.health.v1): the reporter lives in
     // the WorkerManager, which syncs "" and per-model services on every
@@ -929,7 +1017,21 @@ pub async fn start_grpc_server(
 
     tracing::info!("Starting gRPC server on {}", addr);
 
-    tonic::transport::Server::builder()
+    let mut builder = tonic::transport::Server::builder();
+    // P1-2: HTTP/2 keepalive + flow-control window / frame size tuning.
+    if let Some((interval, timeout)) = http2_keepalive_params(&grpc_config) {
+        builder = builder
+            .http2_keepalive_interval(Some(interval))
+            .http2_keepalive_timeout(Some(timeout));
+    }
+    if grpc_config.http2_adaptive_window {
+        builder = builder.http2_adaptive_window(Some(true));
+    }
+    if let Some(max_frame_size) = grpc_config.http2_max_frame_size {
+        builder = builder.max_frame_size(Some(max_frame_size));
+    }
+
+    builder
         .add_service(server)
         .add_service(health_service)
         .serve(addr)
@@ -981,6 +1083,153 @@ mod tests {
         let task = tokio::spawn(async {});
         let panicked = observe_or_abort(task).await;
         assert!(!panicked);
+    }
+
+    // --- P1-2: HTTP/2 keepalive params ---
+
+    #[test]
+    fn test_http2_keepalive_params_none_by_default() {
+        let cfg = crate::config::GrpcConfig::default();
+        assert_eq!(http2_keepalive_params(&cfg), None);
+    }
+
+    #[test]
+    fn test_http2_keepalive_params_timeout_without_interval_never_applies() {
+        // Timeout alone can never fire (no ping is ever sent) → params stay
+        // disabled and startup warns.
+        let cfg = crate::config::GrpcConfig {
+            http2_keepalive_timeout_secs: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(http2_keepalive_params(&cfg), None);
+    }
+
+    #[test]
+    fn test_http2_keepalive_params_default_timeout_20s() {
+        let cfg = crate::config::GrpcConfig {
+            http2_keepalive_interval_secs: Some(30),
+            ..Default::default()
+        };
+        assert_eq!(
+            http2_keepalive_params(&cfg),
+            Some((Duration::from_secs(30), Duration::from_secs(20)))
+        );
+    }
+
+    #[test]
+    fn test_http2_keepalive_params_custom_timeout() {
+        let cfg = crate::config::GrpcConfig {
+            http2_keepalive_interval_secs: Some(30),
+            http2_keepalive_timeout_secs: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(
+            http2_keepalive_params(&cfg),
+            Some((Duration::from_secs(30), Duration::from_secs(5)))
+        );
+    }
+
+    // --- P1-1: graded error logging (client-class → info, server faults → error) ---
+
+    #[test]
+    fn test_is_client_class_codes_log_at_info() {
+        use tonic::Code;
+        // Client-class codes (HTTP 4xx analogues) — including ResourceExhausted
+        // (429): a saturated rate limiter must not flood error logs.
+        for code in [
+            Code::InvalidArgument,
+            Code::NotFound,
+            Code::OutOfRange,
+            Code::Unauthenticated,
+            Code::PermissionDenied,
+            Code::ResourceExhausted,
+            Code::Cancelled,
+        ] {
+            assert!(is_client_class(code), "{code:?} should be client-class");
+        }
+    }
+
+    #[test]
+    fn test_server_fault_codes_log_at_error() {
+        use tonic::Code;
+        for code in [
+            Code::Internal,
+            Code::Unavailable,
+            Code::DeadlineExceeded,
+            Code::Unknown,
+            Code::DataLoss,
+            Code::Unimplemented,
+        ] {
+            assert!(!is_client_class(code), "{code:?} should be a server fault");
+        }
+    }
+
+    // --- P0-2: bidi version resolution parity (routing_pick + touch_last_used) ---
+
+    fn bidi_test_registry() -> ModelRegistry {
+        use crate::config::ModelConfig;
+        use crate::registry::types::ModelType;
+
+        let reg = ModelRegistry::new();
+        let dir = std::env::temp_dir().join(format!("lite-server-grpc-test-{}", std::process::id()));
+        for v in ["1", "2"] {
+            reg.register(
+                "m1",
+                v,
+                ModelConfig { max_batch_size: 1, ..Default::default() },
+                ModelType::LitAPI,
+                dir.clone(),
+            )
+            .unwrap();
+            reg.mark_ready("m1", v).unwrap();
+        }
+        reg
+    }
+
+    #[test]
+    fn test_bidi_resolve_version_uses_weighted_routing() {
+        let reg = bidi_test_registry();
+        reg.activate_version("m1", "1").unwrap();
+        // Weight 100/0 → deterministic pick of the weighted version, even
+        // though "1" is the active version.
+        reg.set_weights("m1", &HashMap::from([("1".into(), 0u32), ("2".into(), 100)]))
+            .unwrap();
+
+        let resolved = resolve_bidi_version(&reg, "m1", None).unwrap();
+        assert_eq!(resolved, "2");
+    }
+
+    #[test]
+    fn test_bidi_resolve_version_falls_back_to_active_without_routing() {
+        let reg = bidi_test_registry();
+        reg.activate_version("m1", "1").unwrap();
+
+        let resolved = resolve_bidi_version(&reg, "m1", None).unwrap();
+        assert_eq!(resolved, "1");
+    }
+
+    #[test]
+    fn test_bidi_resolve_version_touches_last_used() {
+        let reg = bidi_test_registry();
+        reg.activate_version("m1", "1").unwrap();
+        assert!(reg.get("m1", Some("1")).unwrap().last_used_at.is_none());
+
+        let resolved = resolve_bidi_version(&reg, "m1", None).unwrap();
+        assert_eq!(
+            reg.get("m1", Some(&resolved)).unwrap().last_used_at.is_some(),
+            true,
+            "bidi version resolution must stamp last_used_at like unary/batch/stream"
+        );
+    }
+
+    #[test]
+    fn test_bidi_resolve_version_explicit_passthrough() {
+        let reg = bidi_test_registry();
+        reg.activate_version("m1", "1").unwrap();
+
+        // Explicit version bypasses routing/active resolution entirely.
+        let resolved = resolve_bidi_version(&reg, "m1", Some("2")).unwrap();
+        assert_eq!(resolved, "2");
     }
 
     #[test]
@@ -1201,19 +1450,15 @@ mod tests {
 
     // ===== B2: gRPC streaming bypasses ejected workers =====
 
-    /// B2 (P2): gRPC streaming endpoints (`stream_infer`, `bidi_stream`) and
-    /// `batch_infer` use `pick_worker_random` for worker selection, which
-    /// does NOT skip ejected (outlier) workers.
+    /// B2 回归守卫: gRPC streaming endpoints (`stream_infer`, `bidi_stream`)
+    /// and `batch_infer` use `pick_worker_skip_ejected` for worker selection,
+    /// which skips ejected (outlier) workers — 与 HTTP SSE/WS
+    /// (`open_worker_stream`) 行为一致。
     ///
-    /// HTTP streaming (SSE/WS) uses `pick_worker_skip_ejected` via
-    /// `open_worker_stream`, which avoids workers marked as unhealthy.
-    /// gRPC lacks this protection — a request can land on an ejected worker
-    /// that the HTTP path would have avoided.
-    ///
-    /// This test verifies the inconsistency by confirming that the three
-    /// gRPC functions use `pick_worker_random` (no ejection awareness).
+    /// This test guards against regression by confirming that
+    /// `pick_worker_skip_ejected` is used in production code.
     #[test]
-    fn test_grpc_worker_selection_does_not_skip_ejected() {
+    fn test_grpc_worker_selection_skips_ejected() {
         // Only inspect lines before the #[cfg(test)] boundary to avoid
         // counting the test's own mentions of pick_worker_random.
         let source = include_str!("mod.rs");
@@ -1229,17 +1474,15 @@ mod tests {
             .filter(|l| l.contains("pick_worker_skip_ejected"))
             .collect();
 
-        // Current state: zero pick_worker_skip_ejected calls — the defect.
-        // When fixed, all three endpoints will skip ejected workers.
-        // This test FAILS today because gRPC doesn't skip ejected workers.
+        // 生产代码必须调用 pick_worker_skip_ejected —— gRPC 三个直连 RPC
+        // (stream_infer / bidi_stream / batch_infer) 均需跳过被驱逐的 worker,
+        // 与 HTTP SSE/WS 一致。
         assert!(
             !ejected_calls.is_empty(),
-            "B2: gRPC streaming endpoints must skip ejected workers. \
-             Currently all three ({}) use pick_worker_random (no ejection \
-             awareness), while HTTP SSE/WS use pick_worker_skip_ejected. \
+            "B2: gRPC streaming endpoints must skip ejected workers via \
+             pick_worker_skip_ejected (parity with HTTP SSE/WS). \
              Found {} pick_worker_random calls, {} pick_worker_skip_ejected \
              calls in production code.",
-            random_calls.len(),
             random_calls.len(),
             ejected_calls.len()
         );
