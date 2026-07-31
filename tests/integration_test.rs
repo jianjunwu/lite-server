@@ -2791,11 +2791,9 @@ async fn test_auto_poll_unloads_removed_version() {
 // §4.3: weighted / canary routing
 // ---------------------------------------------------------------------------
 
-/// Weights drive bare-request distribution; x-lite-version pins explicitly;
-/// activate is a hard cutover. v1 computes x*2, v2 computes x*3 so responses
-/// identify the serving version.
-#[tokio::test]
-async fn test_weighted_routing_canary() {
+/// Two versions of canary_model — v1 computes x*2, v2 computes x*3, so
+/// responses identify the serving version (§4.3 weights / §4.4 canary pin).
+fn write_canary_model_repo(tmp_dir: &std::path::Path) {
     let model_py = |factor: i32| format!(r#"from lite_server import LitAPI
 
 
@@ -2813,8 +2811,7 @@ class CanaryAPI(LitAPI):
         return output
 "#, factor);
 
-    let tmp_dir = std::env::temp_dir().join(format!("lite-server-canary-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let _ = std::fs::remove_dir_all(tmp_dir);
     let cfg = "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n";
     for (v, factor) in [("1", 2), ("2", 3)] {
         let dir = tmp_dir.join("canary_model").join(v);
@@ -2822,16 +2819,32 @@ class CanaryAPI(LitAPI):
         std::fs::write(dir.join("model.py"), model_py(factor)).unwrap();
         std::fs::write(dir.join("config.yaml"), cfg).unwrap();
     }
+}
+
+/// Weights drive bare-request distribution; x-lite-version pins explicitly
+/// (requires `features.canary_override: true`, P5-2); activate is a hard
+/// cutover.
+#[tokio::test]
+#[serial]
+async fn test_weighted_routing_canary() {
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-canary-{}", std::process::id()));
+    write_canary_model_repo(&tmp_dir);
 
     let port = 18092;
     kill_stale_on_port(port);
-    let _server = ServerGuard::start(&[
-        "--port", &port.to_string(),
-        "--model-repo", &tmp_dir.to_string_lossy(),
-        "--no-metrics",
-        "--no-grpc",
-        "--log-level", "warn",
-    ]);
+    let cfg_dir = std::env::temp_dir().join(format!("lite-server-canary-cfg-{}", std::process::id()));
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    let server_yaml = cfg_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {}\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: false\nmodel_repository:\n  path: {}\nfeatures:\n  canary_override: true\n",
+            port,
+            tmp_dir.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
     wait_for_server(port, 30).await;
     let base = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
@@ -2903,6 +2916,157 @@ class CanaryAPI(LitAPI):
     for _ in 0..20 {
         assert_eq!(infer_output(&[]).await, 2, "activate must hard-switch to v1");
     }
+
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+}
+
+/// P5-2 (蓝图 §4.4): gRPC x-lite-version pin parity——metadata 优先、fallback
+/// proto headers map；非法 pin → InvalidArgument；pin 版本不存在 → NotFound。
+#[tokio::test]
+#[serial]
+async fn test_grpc_canary_pin_parity() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+    use std::collections::HashMap;
+
+    async fn grpc_infer(
+        infer: &mut LiteServerClient<tonic::transport::Channel>,
+        pin_metadata: Option<&'static str>,
+        pin_proto_header: Option<&'static str>,
+    ) -> Result<i64, tonic::Status> {
+        let mut req = tonic::Request::new(InferRequest {
+            model_name: "canary_model".to_string(),
+            version: String::new(),
+            data: br#"{"input":1}"#.to_vec().into(),
+            headers: pin_proto_header
+                .map(|p| HashMap::from([("x-lite-version".to_string(), p.to_string())]))
+                .unwrap_or_default(),
+        });
+        if let Some(p) = pin_metadata {
+            req.metadata_mut().insert("x-lite-version", p.parse().unwrap());
+        }
+        let resp = infer.infer(req).await?.into_inner();
+        let body: Value = serde_json::from_slice(&resp.data).unwrap();
+        Ok(body["output"].as_i64().unwrap())
+    }
+
+    let http_port = 18115u16;
+    let grpc_port = 18116u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-grpc-canary-{}", std::process::id()));
+    write_canary_model_repo(&tmp_dir);
+    let cfg_dir = std::env::temp_dir().join(format!("lite-server-grpc-canary-cfg-{}", std::process::id()));
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    let server_yaml = cfg_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {}\n  grpc_port: {}\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {}\nfeatures:\n  canary_override: true\n",
+            http_port,
+            grpc_port,
+            tmp_dir.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 30).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "canary_model", "1").await;
+    load_model(&base, "canary_model", "2").await;
+
+    // Weights 0/100: bare infer goes to v2 — only a pin can land on v1.
+    let resp = reqwest::Client::new()
+        .put(format!("{}/v2/models/canary_model/routing", base))
+        .header("content-type", "application/json")
+        .body(r#"{"weights":{"2":100}}"#)
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{}", grpc_port))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut infer = LiteServerClient::new(channel);
+
+    // metadata pin → v1 despite 0/100 weights.
+    assert_eq!(grpc_infer(&mut infer, Some("1"), None).await.unwrap(), 2,
+        "metadata pin must route to v1");
+    // proto headers map fallback → v1.
+    assert_eq!(grpc_infer(&mut infer, None, Some("1")).await.unwrap(), 2,
+        "proto headers map pin must route to v1");
+    // metadata beats proto headers when both are present.
+    assert_eq!(grpc_infer(&mut infer, Some("1"), Some("2")).await.unwrap(), 2,
+        "metadata pin must win over proto headers pin");
+    // no pin → weighted routing (v2).
+    assert_eq!(grpc_infer(&mut infer, None, None).await.unwrap(), 3,
+        "no pin → weights route to v2");
+    // pin to an unregistered version → NotFound.
+    let err = grpc_infer(&mut infer, Some("9"), None).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound, "unknown pin version → NotFound");
+    // invalid pin → InvalidArgument.
+    let err = grpc_infer(&mut infer, Some("a b"), None).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "invalid pin → InvalidArgument");
+
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+}
+
+/// P5-2 (蓝图 §4.4, D16): 默认配置（features 段缺省 → canary_override=false）
+/// 下 x-lite-version 被整体忽略——pin 不影响权重路由，非法/不存在的 pin 也不报错。
+#[tokio::test]
+#[serial]
+async fn test_canary_override_default_off_ignores_pin() {
+    let port = 18117u16;
+    kill_stale_on_port(port);
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-canary-off-{}", std::process::id()));
+    write_canary_model_repo(&tmp_dir);
+    let cfg_dir = std::env::temp_dir().join(format!("lite-server-canary-off-cfg-{}", std::process::id()));
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    let server_yaml = cfg_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {}\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: false\nmodel_repository:\n  path: {}\n",
+            port,
+            tmp_dir.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(port, 30).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+    load_model(&base, "canary_model", "1").await;
+    load_model(&base, "canary_model", "2").await;
+
+    let resp = client
+        .put(format!("{}/v2/models/canary_model/routing", base))
+        .header("content-type", "application/json")
+        .body(r#"{"weights":{"2":100}}"#)
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let infer_output = |pin: Option<&str>| {
+        let base = base.clone();
+        let client = client.clone();
+        let pin = pin.map(str::to_string);
+        async move {
+            let mut req = client
+                .post(format!("{}/v2/models/canary_model/infer", base))
+                .json(&json!({"input": 1}));
+            if let Some(p) = pin {
+                req = req.header("x-lite-version", p);
+            }
+            let resp = req.send().await.unwrap();
+            assert_eq!(resp.status(), 200, "pin must not affect status when switch is off");
+            resp.json::<Value>().await.unwrap()["output"].as_i64().unwrap()
+        }
+    };
+
+    assert_eq!(infer_output(Some("1")).await, 3, "switch off → pin ignored, weights (v2) serve");
+    assert_eq!(infer_output(Some("9")).await, 3, "switch off → unknown pin ignored, no 404");
+    assert_eq!(infer_output(None).await, 3);
 
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 }

@@ -66,6 +66,8 @@ async fn do_infer(
         model = %model_name,
         version = version.as_deref().unwrap_or("auto"),
         request_id = %request_id,
+        // P5-2: canary pin 命中时由 resolve_version record（蓝图 §4.4）。
+        pinned_version = tracing::field::Empty,
     );
     async move {
     let resolved_version = resolve_version(&state, &model_name, version, &headers).await?;
@@ -317,19 +319,40 @@ pub(super) async fn resolve_version(
     version: Option<String>,
     headers: &HeaderMap,
 ) -> Result<String, AppError> {
-    // Precedence (§4.3): explicit version > x-lite-version header pin >
-    // weighted routing pick > active version.
+    // Precedence (§4.3/§4.4): explicit version > x-lite-version header pin
+    // (features.canary_override=on, P5-2) > weighted routing pick > active version.
+    let pin = headers
+        .get("x-lite-version")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty());
+    // P5-2 (蓝图 §4.4, D16): 开关关 → pin 完全不参与解析（debug 日志，
+    // 连非法值也不校验），与 gRPC canary_pin 行为一致。
+    let pin = match pin {
+        Some(p) if !state.config.features.canary_override => {
+            tracing::debug!(
+                model = %model_name,
+                pinned_version = %p,
+                "x-lite-version pin ignored (features.canary_override=false)"
+            );
+            None
+        }
+        other => other,
+    };
     let resolved = match version {
         Some(v) => v,
         None => {
-            if let Some(pin) = headers
-                .get("x-lite-version")
-                .and_then(|v| v.to_str().ok())
-                .filter(|s| !s.is_empty())
-            {
+            if let Some(pin) = pin {
                 // Same guard as versioned URL paths — an invalid pin is
                 // rejected (400), not silently honored or fallen back.
                 crate::validation::validate_version(pin)?;
+                // P5-2 (蓝图 §4.4): pin 版本不存在 → 404（区别于未就绪的 503）。
+                if state.registry.get(model_name, Some(pin)).is_none() {
+                    return Err(AppError::ModelNotFound(format!(
+                        "{} version {} not found",
+                        model_name, pin
+                    )));
+                }
+                tracing::Span::current().record("pinned_version", pin);
                 pin.to_string()
             } else if let Some(picked) = state.registry.routing_pick(model_name) {
                 picked

@@ -293,6 +293,7 @@ impl LiteServer {
                 self.registry.clone(),
                 self.worker_manager.clone(),
                 self.config.features.streaming_metrics,
+                self.config.features.canary_override,
                 self.callback_runner.clone(),
                 shutdown_state.clone(),
                 Duration::from_secs_f64(self.config.server.timeout as f64),
