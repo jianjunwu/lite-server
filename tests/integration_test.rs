@@ -2476,6 +2476,97 @@ async fn test_grpc_infer_aggregates_into_batch() {
 }
 
 // ---------------------------------------------------------------------------
+// P2-1: gRPC 请求指标 + GIE 指标语义
+// ---------------------------------------------------------------------------
+
+/// gRPC Infer 完成（成功 + 失败）记请求指标：/metrics 暴露
+/// liteserver_requests_total（D5: 无 protocol label，与 HTTP 共享计数），
+/// 并暴露 GIE 语义 gauge（默认 namespace `liteserver`）。
+#[tokio::test]
+#[serial]
+async fn test_grpc_infer_records_request_metrics() {
+    use bytes::Bytes;
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+    use std::collections::HashMap;
+
+    let http_port = 18076u16;
+    let grpc_port = 18077u16;
+    let metrics_port = 18078u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    kill_stale_on_port(metrics_port);
+    let repo = test_model_repo();
+    let _server = ServerGuard::start(&[
+        "--port",
+        &http_port.to_string(),
+        "--grpc-port",
+        &grpc_port.to_string(),
+        "--metrics-port",
+        &metrics_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--log-level",
+        "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, MODEL, "1").await;
+
+    let mut client = LiteServerClient::connect(format!("http://127.0.0.1:{}", grpc_port))
+        .await
+        .expect("gRPC client must connect");
+
+    // 成功 → 2xx
+    let ok = client
+        .infer(InferRequest {
+            model_name: MODEL.to_string(),
+            version: "1".to_string(),
+            data: Bytes::from(serde_json::to_vec(&json!({"input": 1})).unwrap()),
+            headers: HashMap::new(),
+        })
+        .await;
+    assert!(ok.is_ok(), "gRPC infer must succeed: {:?}", ok.err());
+
+    // 模型不存在 → NotFound (4xx)
+    let err = client
+        .infer(InferRequest {
+            model_name: "no_such_model".to_string(),
+            version: String::new(),
+            data: Bytes::from_static(b"{}"),
+            headers: HashMap::new(),
+        })
+        .await
+        .expect_err("unknown model must fail");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    let body = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{}/metrics", metrics_port))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("liteserver_requests_total{model=\"test_model\",status=\"2xx\",version=\"1\"}"),
+        "2xx series missing: {}", body
+    );
+    assert!(
+        body.contains("liteserver_requests_total{model=\"no_such_model\",status=\"4xx\",version=\"\"}"),
+        "4xx series missing: {}", body
+    );
+    // GIE/EPP 语义 gauge（默认 namespace `liteserver`）：TotalQueuedRequests
+    // 映射既有 queue depth；KVCacheUtilization 无 KV 概念上报 N/A (NaN)。
+    assert!(body.contains("liteserver:total_queued_requests"),
+        "GIE TotalQueuedRequests gauge missing: {}", body);
+    assert!(body.contains("liteserver:kv_cache_utilization NaN"),
+        "GIE KVCacheUtilization must be NaN (N/A): {}", body);
+
+    unload_model(&base, MODEL, "1").await;
+}
+
+// ---------------------------------------------------------------------------
 // gRPC health checking (grpc.health.v1, phase 3)
 // ---------------------------------------------------------------------------
 

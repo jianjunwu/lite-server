@@ -56,14 +56,22 @@ pub struct QueueItem {
     /// after its response is sent, or when the item is discarded — so no
     /// completion path can leak the count (§4.2 graceful drain).
     pub inflight_guard: Option<InflightGuard>,
+    /// 入队时刻（P2-1 扩缩指标）：首次派发时采样 queue_wait_seconds。
+    pub enqueued_at: Instant,
 }
 
-/// Decrements the per-version in-flight counter on drop (§4.2).
-pub struct InflightGuard(Arc<AtomicUsize>);
+/// Decrements the per-version in-flight counter and the
+/// `liteserver_in_flight_requests` gauge on drop (§4.2 + P2-1 扩缩指标).
+pub struct InflightGuard {
+    counter: Arc<AtomicUsize>,
+    model: String,
+    version: String,
+}
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+        prometheus::dec_in_flight(&self.model, &self.version);
     }
 }
 
@@ -479,7 +487,12 @@ impl InferenceQueue {
         // Count from acceptance (not dispatch) so a drain starting right after
         // try_submit returns still observes this request.
         counter.fetch_add(1, Ordering::Relaxed);
-        item.inflight_guard = Some(InflightGuard(counter));
+        prometheus::inc_in_flight(model_name, version);
+        item.inflight_guard = Some(InflightGuard {
+            counter,
+            model: model_name.to_string(),
+            version: version.to_string(),
+        });
         sender
             .try_send(item)
             .map_err(|e| match e {
@@ -632,6 +645,18 @@ fn fail_batch_items(batch: &mut Vec<QueueItem>, err: &BatchError) {
 /// with a 4xx status_code (request-level) is forwarded verbatim, and a Batch
 /// response with per-item errors delivers each item's own response — both
 /// drain the batch.
+/// P2-1 扩缩指标：worker 饱和度 = 最热 worker 的并发 in-flight batch 数
+/// （label 白名单不含 worker_id，故以聚合 gauge 呈现，§6.5 约束 10）。
+/// 在 inflight 计数每次增/减后调用。
+fn update_worker_saturation(model_name: &str, version: &str, inflight: &[Arc<AtomicUsize>]) {
+    let max = inflight
+        .iter()
+        .map(|c| c.load(Ordering::Relaxed))
+        .max()
+        .unwrap_or(0);
+    prometheus::set_worker_saturation(model_name, version, max as f64);
+}
+
 async fn do_send_batch(
     batch: &mut Vec<QueueItem>,
     zmq_clients: &[Arc<WorkerZmqClient>],
@@ -656,6 +681,7 @@ async fn do_send_batch(
         "sending batch"
     );
     inflight[worker_idx].fetch_add(1, Ordering::Relaxed);
+    update_worker_saturation(model_name, version, inflight);
     let zmq_client = &zmq_clients[worker_idx];
     prometheus::observe_batch_size(model_name, version, batch_size);
 
@@ -729,6 +755,7 @@ async fn do_send_batch(
                     }
 
                     inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
+                    update_worker_saturation(model_name, version, inflight);
                     if all_ok {
                         outlier.record_success(worker_idx);
                         debug!(model = %model_name, version = %version, worker_idx = worker_idx, "batch ok");
@@ -761,6 +788,7 @@ async fn do_send_batch(
                             });
                         }
                         inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
+                        update_worker_saturation(model_name, version, inflight);
                         if outlier.record_error(worker_idx) {
                     prometheus::inc_worker_ejection(model_name, version);
                 }
@@ -776,6 +804,7 @@ async fn do_send_batch(
                         // for verbatim delivery if retries are exhausted.
                         let st = single_resp.status.clone().unwrap_or_default();
                         inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
+                        update_worker_saturation(model_name, version, inflight);
                         if outlier.record_error(worker_idx) {
                     prometheus::inc_worker_ejection(model_name, version);
                 }
@@ -794,6 +823,7 @@ async fn do_send_batch(
                             });
                         }
                         inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
+                        update_worker_saturation(model_name, version, inflight);
                         outlier.record_success(worker_idx);
                         debug!(model = %model_name, version = %version, worker_idx = worker_idx, "batch ok");
                         Ok(())
@@ -802,6 +832,7 @@ async fn do_send_batch(
                 _ => {
                     warn!("Unexpected response type from worker for {} {}", model_name, version);
                     inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
+                    update_worker_saturation(model_name, version, inflight);
                     if outlier.record_error(worker_idx) {
                     prometheus::inc_worker_ejection(model_name, version);
                 }
@@ -825,6 +856,7 @@ async fn do_send_batch(
                 ("Error".to_string(), e.to_string())
             };
             inflight[worker_idx].fetch_sub(1, Ordering::Relaxed);
+            update_worker_saturation(model_name, version, inflight);
             if outlier.record_error(worker_idx) {
                 prometheus::inc_worker_ejection(model_name, version);
             }
@@ -859,6 +891,10 @@ async fn send_batch_with_retry(
     // Decrement queue depth once per item — retries must not decrement again
     for _ in 0..batch.len() {
         prometheus::dec_queue_depth(model_name, version);
+    }
+    // P2-1 扩缩指标：提交 → 首次派发（含攒批等待）采样一次；重试不重复采样。
+    for item in &batch {
+        prometheus::observe_queue_wait(model_name, version, item.enqueued_at.elapsed().as_secs_f64());
     }
 
     let batch_size = batch.len();
@@ -1457,6 +1493,7 @@ mod tests {
                 meta: None,
                 response_tx: resp_tx,
                 inflight_guard: None,
+                enqueued_at: Instant::now(),
             })
             .unwrap();
 
@@ -1470,6 +1507,7 @@ mod tests {
                 meta: None,
                 response_tx: late_tx,
                 inflight_guard: None,
+                enqueued_at: Instant::now(),
             })
             .unwrap_err();
         assert!(matches!(err, QueueError::NotFound));
@@ -1553,6 +1591,7 @@ mod tests {
             meta: None,
             response_tx: tx,
                   inflight_guard: None,
+                enqueued_at: Instant::now(),
         };
         // Bytes::clone shares the same underlying buffer
         let cloned_data = item.data.clone();
@@ -1613,6 +1652,7 @@ mod tests {
             meta: Some(meta),
             response_tx: tx,
                   inflight_guard: None,
+                enqueued_at: Instant::now(),
         };
 
         // Cloning the item's data is zero-copy
@@ -1655,6 +1695,7 @@ mod tests {
             meta: None,
             response_tx: resp_tx,
                   inflight_guard: None,
+                enqueued_at: Instant::now(),
         };
         tx.try_send(item).unwrap();
 
@@ -1758,6 +1799,7 @@ mod tests {
             meta: Some(Arc::new(meta)),
             response_tx: tx,
                   inflight_guard: None,
+                enqueued_at: Instant::now(),
         };
         // Cloning meta should be a refcount bump, not a deep copy
         let meta_clone = item.meta.clone();
@@ -2432,6 +2474,7 @@ mod tests {
                 meta: None,
                 response_tx: resp_tx,
                 inflight_guard: None,
+                enqueued_at: Instant::now(),
             })
             .unwrap();
 
@@ -2507,5 +2550,95 @@ mod tests {
             seen.insert(compute_jittered_max_requests(100, 20));
         }
         assert!(seen.len() > 1, "jitter should produce varied values, got {:?}", seen);
+    }
+
+    // ===== P2-1 扩展: 扩缩一等指标 =====
+
+    /// Register a single-worker model backed by a slow echo worker (delay per
+    /// request), returning the queue. Caller submits and awaits the response.
+    fn scaling_metric_queue(model: &str, endpoint_name: &str, delay: Duration) -> InferenceQueue {
+        let endpoint = drain_test_endpoint(endpoint_name);
+        let _worker = spawn_echo_worker(endpoint.clone(), delay);
+        let queue = InferenceQueue::new();
+        let config = ModelConfig {
+            max_queue_size: 10,
+            max_batch_size: 1,
+            batch_timeout: 0.0,
+            adaptive_batching: false,
+            min_batch_timeout: 0.0,
+            adaptive_queue_threshold: 0,
+            health_check_interval: 0.0,
+            ..Default::default()
+        };
+        let (reload_tx, _reload_rx) = mpsc::channel(8);
+        let outlier = Arc::new(OutlierState::new(1));
+        let client = Arc::new(WorkerZmqClient::new(endpoint));
+        queue.register_model(model, "1", &config, vec![], vec![client], reload_tx, outlier, None);
+        queue
+    }
+
+    fn submit_one(queue: &InferenceQueue, model: &str, uid: &str) -> oneshot::Receiver<pb::Response> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        queue
+            .try_submit(model, "1", QueueItem {
+                uid: uid.to_string(),
+                data: Bytes::new(),
+                meta: None,
+                response_tx: resp_tx,
+                inflight_guard: None,
+                enqueued_at: Instant::now(),
+            })
+            .unwrap();
+        resp_rx
+    }
+
+    #[tokio::test]
+    async fn should_track_in_flight_requests_gauge() {
+        let queue = scaling_metric_queue("ifm", "ifm", Duration::from_millis(300));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let gauge = prometheus::IN_FLIGHT_REQUESTS.with_label_values(&["ifm", "1"]);
+        let base = gauge.get();
+
+        let resp_rx = submit_one(&queue, "ifm", "ifm-1");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(gauge.get() >= base + 1.0, "accepted request must count in-flight, got {}", gauge.get());
+
+        let _resp = tokio::time::timeout(Duration::from_secs(5), resp_rx)
+            .await.expect("response must arrive").expect("channel open");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(gauge.get(), base, "completed request must leave the gauge");
+    }
+
+    #[tokio::test]
+    async fn should_observe_queue_wait_seconds_on_dispatch() {
+        let queue = scaling_metric_queue("qwm", "qwm", Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let before = prometheus::QUEUE_WAIT_SECONDS
+            .with_label_values(&["qwm", "1"]).get_sample_count();
+        let resp_rx = submit_one(&queue, "qwm", "qwm-1");
+        let _resp = tokio::time::timeout(Duration::from_secs(5), resp_rx)
+            .await.expect("response must arrive").expect("channel open");
+
+        let after = prometheus::QUEUE_WAIT_SECONDS
+            .with_label_values(&["qwm", "1"]).get_sample_count();
+        assert_eq!(after, before + 1, "each dispatched item must observe one queue-wait sample");
+    }
+
+    #[tokio::test]
+    async fn should_report_worker_saturation_while_batch_in_flight() {
+        let queue = scaling_metric_queue("swm", "swm", Duration::from_millis(300));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let gauge = prometheus::WORKER_SATURATION.with_label_values(&["swm", "1"]);
+        let resp_rx = submit_one(&queue, "swm", "swm-1");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(gauge.get() >= 1.0, "hottest worker must report saturation >= 1 while in flight, got {}", gauge.get());
+
+        let _resp = tokio::time::timeout(Duration::from_secs(5), resp_rx)
+            .await.expect("response must arrive").expect("channel open");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(gauge.get(), 0.0, "saturation must return to 0 after completion");
     }
 }

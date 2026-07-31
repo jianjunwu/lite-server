@@ -158,6 +158,10 @@ impl LiteServer {
         if let Err(e) = prometheus::register_metrics() {
             error!("Failed to register metrics: {}", e);
         }
+        // P2-1 扩展（D32）：GIE/EPP 语义 gauge，命名经 metrics.metric_namespace
+        // 可配置；非法 namespace 启动快速失败。
+        prometheus::register_gie_metrics(&self.config.metrics.metric_namespace)
+            .map_err(|e| AppError::Config(format!("invalid metrics.metric_namespace: {}", e)))?;
 
         // Start reload listener for max_requests auto-recycle
         self.worker_manager.start_reload_listener().await;

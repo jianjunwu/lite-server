@@ -711,6 +711,19 @@ impl WorkerManager {
         guard.get(&key).cloned()
     }
 
+    /// Test-only hook: populate the zmq client map without spawning workers
+    /// (unit tests that drive streaming handlers against a mock worker).
+    #[cfg(test)]
+    pub(crate) async fn insert_zmq_clients_for_test(
+        &self,
+        model_name: &str,
+        version: &str,
+        clients: Vec<Arc<WorkerZmqClient>>,
+    ) {
+        let key = model_version_key(model_name, version);
+        self.zmq_clients.write().await.insert(key, clients);
+    }
+
     /// Hot reload without restart (P3): send FILE_CHANGED to every worker of
     /// a model version so each worker's `on_file_changed` hook can refresh
     /// weights/configs in-process. Returns true only if at least one worker

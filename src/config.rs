@@ -129,11 +129,18 @@ impl Default for GrpcConfig {
 #[serde(default)]
 pub struct MetricsConfig {
     pub enabled: bool,
+    /// GIE/EPP 指标命名 namespace（P2-1 扩展，D32）：`{namespace}:total_queued_requests`
+    /// / `{namespace}:kv_cache_utilization` 暴露到 /metrics，兼容 `vllm` 模式。
+    /// 非法 namespace 在启动时快速失败（register_gie_metrics 校验）。
+    pub metric_namespace: String,
 }
 
 impl Default for MetricsConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            metric_namespace: "liteserver".to_string(),
+        }
     }
 }
 
@@ -931,6 +938,20 @@ mod tests {
         assert_eq!(cfg.grpc.http2_keepalive_timeout_secs, Some(5));
         assert!(cfg.grpc.http2_adaptive_window);
         assert_eq!(cfg.grpc.http2_max_frame_size, Some(1048576));
+    }
+
+    #[test]
+    fn should_default_metric_namespace_to_liteserver() {
+        let cfg = MetricsConfig::default();
+        assert_eq!(cfg.metric_namespace, "liteserver");
+    }
+
+    #[test]
+    fn should_parse_custom_metric_namespace() {
+        let yaml = "metrics:\n  metric_namespace: vllm\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.metrics.metric_namespace, "vllm");
+        assert!(cfg.metrics.enabled, "enabled keeps its default when unset");
     }
 
     #[test]

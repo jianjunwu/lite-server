@@ -48,6 +48,715 @@ impl GrpcService {
             server_timeout,
         }
     }
+
+    async fn infer_impl(
+        &self,
+        request: Request<pb::InferRequest>,
+        version_label: &mut String,
+    ) -> Result<Response<pb::InferResponse>, Status> {
+        let remote_addr = request.remote_addr();
+        let (grpc_metadata, extensions, req) = request.into_parts();
+        let cx = interceptor::finalize_context(
+            extensions.get::<RequestContext>().cloned(),
+            &grpc_metadata,
+            &req.headers,
+            remote_addr,
+        );
+        let request_id = cx.request_id.clone();
+        let client_ip = cx.client_ip.clone();
+        let model_name = &req.model_name;
+        let version = if req.version.is_empty() {
+            None
+        } else {
+            Some(req.version.as_str())
+        };
+
+        if let Err(e) = crate::validation::validate_identifier(model_name) {
+            return Err(err(Status::invalid_argument(e.to_string())));
+        }
+
+        // version="" → weighted routing pick (§4.3), falling back to active.
+        let resolved_version = match version {
+            Some(v) => v.to_string(),
+            None => self
+                .registry
+                .routing_pick(model_name)
+                .or_else(|| self.registry.get_active_version(model_name))
+                .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
+        };
+        self.registry.touch_last_used(model_name, &resolved_version);
+        *version_label = resolved_version.clone();
+
+        if !self.registry.is_ready(model_name, version) {
+            return Err(err(Status::unavailable(format!(
+                "{} version {} is not ready",
+                model_name, resolved_version
+            ))));
+        }
+
+        if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
+            enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
+        }
+
+        let header_map: HashMap<String, String> = req.headers.clone();
+        let meta = pb::RequestMeta {
+            route: "/predict".to_string(),
+            headers: header_map,
+            client_ip: client_ip.clone(),
+            request_id: request_id.clone(),
+            timestamp_ns: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i64,
+            payload: req.data.clone(),
+            ..Default::default()
+        };
+
+        let uid = format!("grpc-{}-{}", model_name, Uuid::new_v4());
+
+        // Fire InferenceRequest callback
+        let req_ctx = crate::callback::InferenceContext {
+            model_name: model_name.to_string(),
+            version: resolved_version.clone(),
+            route: "/predict".to_string(),
+            protocol: crate::callback::Protocol::Grpc,
+            request_id,
+            client_ip,
+            elapsed_us: None,
+        };
+        let cb_runner = self.callback_runner.clone();
+        let req_ctx_clone = req_ctx.clone();
+        tokio::spawn(async move {
+            cb_runner.on_inference_request(&req_ctx_clone).await;
+        });
+
+        // #1: route unary infer through the unified InferenceQueue — the same
+        // path as REST — so gRPC inherits batch aggregation, least-loaded
+        // worker selection, outlier ejection, retry, and max_requests
+        // recycling, all of which the previous direct client.send() bypassed.
+        // (batch_infer and streaming keep their direct path; REST streaming
+        // bypasses the queue too, so behavior stays consistent.)
+        let start = Instant::now();
+        let (response_tx, response_rx) = oneshot::channel();
+        let item = crate::inference_queue::QueueItem {
+            uid,
+            data: meta.payload.clone(),
+            meta: Some(std::sync::Arc::new(meta)),
+            response_tx,
+            inflight_guard: None,
+            enqueued_at: Instant::now(),
+        };
+        let resp = match self
+            .worker_manager
+            .inference_queue()
+            .try_submit(model_name, &resolved_version, item)
+        {
+            Ok(()) => match tokio::time::timeout(self.server_timeout, response_rx).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(_)) => return Err(err(Status::internal("response channel closed"))),
+                Err(_) => {
+                    return Err(err(Status::deadline_exceeded(format!(
+                        "inference timed out after {:.1}s",
+                        self.server_timeout.as_secs_f64()
+                    ))));
+                }
+            },
+            Err(crate::inference_queue::QueueError::Full) => {
+                // §4.0.9: queue-full/过载 → Unavailable（落 5xx）；
+                // ResourceExhausted 专给限流（P3-1）。
+                return Err(err(Status::unavailable(format!(
+                    "queue full for {} {}",
+                    model_name, resolved_version
+                ))));
+            }
+            Err(_) => {
+                return Err(err(Status::unavailable(format!(
+                    "queue not available for {} {}",
+                    model_name, resolved_version
+                ))));
+            }
+        };
+
+        match resp.payload {
+            Some(pb::response::Payload::Single(single)) => {
+                let grpc_status = single.status.as_ref().map(|s| pb::Status {
+                    code: s.code.clone(),
+                    message: s.message.clone(),
+                });
+                let code = single.status.as_ref().map(|s| s.code.as_str()).unwrap_or("Ok");
+                match code {
+                    "Error" => {
+                        let msg = grpc_status
+                            .as_ref()
+                            .map(|s| s.message.clone())
+                            .unwrap_or_default();
+                        // If Status.message parses as u16, the worker signalled
+                        // a model-level HTTPException with structured error in data.
+                        if let Ok(http_status) = msg.parse::<u16>() {
+                            let data: serde_json::Value =
+                                serde_json::from_slice(&single.data).unwrap_or(serde_json::json!({}));
+                            let parsed = try_parse_model_error(&data);
+                            return Err(match parsed {
+                                Some(p) => err(model_error_status(
+                                    http_status_to_grpc_code(http_status), &p)),
+                                None => err(Status::new(
+                                    http_status_to_grpc_code(http_status),
+                                    format!("[model_error] {}", msg),
+                                )),
+                            });
+                        }
+                        // Not a numeric status code — internal worker error.
+                        return Err(err(Status::internal(msg)));
+                    }
+                    _ => {
+                        let headers = single.headers.clone();
+                        let mut response = Response::new(pb::InferResponse {
+                            data: single.data,
+                            status: grpc_status,
+                            metrics: resp.metrics,
+                        });
+                        inject_grpc_metadata(response.metadata_mut(), &headers);
+
+                        // Fire InferenceResponse callback
+                        let duration = start.elapsed().as_secs_f64();
+                        let resp_ctx = crate::callback::InferenceContext {
+                            elapsed_us: Some((duration * 1_000_000.0) as u64),
+                            ..req_ctx.clone()
+                        };
+                        let cb_runner = self.callback_runner.clone();
+                        tokio::spawn(async move { cb_runner.on_inference_response(&resp_ctx).await; });
+
+                        Ok(response)
+                    }
+                }
+            }
+            _ => Err(err(Status::internal("unexpected response type"))),
+        }
+    }
+
+    async fn batch_infer_impl(
+        &self,
+        request: Request<pb::BatchInferRequest>,
+        version_label: &mut String,
+    ) -> Result<Response<pb::BatchInferResponse>, Status> {
+        let remote_addr = request.remote_addr();
+        let (grpc_metadata, extensions, req) = request.into_parts();
+        let cx = interceptor::finalize_context(
+            extensions.get::<RequestContext>().cloned(),
+            &grpc_metadata,
+            &req.headers,
+            remote_addr,
+        );
+        let request_id = cx.request_id;
+        let client_ip = cx.client_ip;
+        let model_name = &req.model_name;
+        let version = if req.version.is_empty() {
+            None
+        } else {
+            Some(req.version.as_str())
+        };
+
+        if let Err(e) = crate::validation::validate_identifier(model_name) {
+            return Err(err(Status::invalid_argument(e.to_string())));
+        }
+
+        // version="" → weighted routing pick (§4.3), falling back to active.
+        let resolved_version = match version {
+            Some(v) => v.to_string(),
+            None => self
+                .registry
+                .routing_pick(model_name)
+                .or_else(|| self.registry.get_active_version(model_name))
+                .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
+        };
+        self.registry.touch_last_used(model_name, &resolved_version);
+        *version_label = resolved_version.clone();
+
+        if !self.registry.is_ready(model_name, version) {
+            return Err(err(Status::unavailable(format!(
+                "{} version {} is not ready",
+                model_name, resolved_version
+            ))));
+        }
+
+        if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
+            enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
+        }
+
+        let header_map: HashMap<String, String> = req.headers.clone();
+        let meta = pb::RequestMeta {
+            route: "/predict".to_string(),
+            headers: header_map,
+            client_ip,
+            request_id,
+            timestamp_ns: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i64,
+            payload: Default::default(),
+            ..Default::default()
+        };
+
+        let items: Vec<pb::BatchItem> = req
+            .items
+            .into_iter()
+            .enumerate()
+            .map(|(i, data)| pb::BatchItem {
+                uid: format!("grpc-batch-{}-{}", i, Uuid::new_v4()),
+                data,
+            })
+            .collect();
+
+        let internal_req = pb::Request {
+            uid: format!("grpc-batch-{}", Uuid::new_v4()),
+            meta: Some(meta),
+            payload: Some(pb::request::Payload::Batch(pb::BatchRequest { items })),
+        };
+
+        let clients = self
+            .worker_manager
+            .get_zmq_clients(model_name, &resolved_version)
+            .await
+            .ok_or_else(|| err(Status::unavailable("no workers available")))?;
+
+        if clients.is_empty() {
+            return Err(err(Status::unavailable("no workers available")));
+        }
+
+        let worker_id = match self
+            .worker_manager
+            .get_outlier_state(model_name, &resolved_version)
+            .await
+        {
+            Some(outlier) => crate::worker::pick_worker_skip_ejected(clients.len(), &outlier),
+            None => crate::worker::pick_worker_random(clients.len()),
+        };
+        let client = &clients[worker_id];
+
+        let resp = client
+            .send(internal_req)
+            .await
+            .map_err(|e| err(Status::internal(format!("worker error: {}", e))))?;
+
+        match resp.payload {
+            Some(pb::response::Payload::Batch(batch_resp)) => {
+                let items: Vec<pb::InferResponse> = batch_resp
+                    .items
+                    .into_iter()
+                    .map(|item| pb::InferResponse {
+                        data: item.data,
+                        status: item.status,
+                        metrics: None,
+                    })
+                    .collect();
+                let mut response = Response::new(pb::BatchInferResponse { items });
+                inject_grpc_metadata(response.metadata_mut(), &batch_resp.headers);
+                Ok(response)
+            }
+            _ => Err(err(Status::internal("unexpected response type"))),
+        }
+    }
+
+    async fn stream_infer_impl(
+        &self,
+        request: Request<pb::StreamInferRequest>,
+        version_label: &mut String,
+        start: Instant,
+    ) -> Result<Response<ReceiverStream<Result<pb::StreamChunk, Status>>>, Status> {
+        let remote_addr = request.remote_addr();
+        let (grpc_metadata, extensions, req) = request.into_parts();
+        let cx = interceptor::finalize_context(
+            extensions.get::<RequestContext>().cloned(),
+            &grpc_metadata,
+            &req.headers,
+            remote_addr,
+        );
+        let request_id = cx.request_id;
+        let client_ip = cx.client_ip;
+        let model_name = &req.model_name;
+        let version = if req.version.is_empty() {
+            None
+        } else {
+            Some(req.version.as_str())
+        };
+
+        if let Err(e) = crate::validation::validate_identifier(model_name) {
+            return Err(err(Status::invalid_argument(e.to_string())));
+        }
+
+        // version="" → weighted routing pick (§4.3), falling back to active.
+        let resolved_version = match version {
+            Some(v) => v.to_string(),
+            None => self
+                .registry
+                .routing_pick(model_name)
+                .or_else(|| self.registry.get_active_version(model_name))
+                .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
+        };
+        self.registry.touch_last_used(model_name, &resolved_version);
+        *version_label = resolved_version.clone();
+
+        if !self.registry.is_ready(model_name, version) {
+            return Err(err(Status::unavailable(format!(
+                "{} version {} is not ready",
+                model_name, resolved_version
+            ))));
+        }
+
+        if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
+            enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
+        }
+
+        let header_map: HashMap<String, String> = req.headers.clone();
+        let meta = pb::RequestMeta {
+            route: "/predict".to_string(),
+            headers: header_map,
+            client_ip,
+            request_id,
+            timestamp_ns: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i64,
+            payload: req.data.clone(),
+            ..Default::default()
+        };
+
+        let stream_id = format!("grpc-stream-{}", Uuid::new_v4());
+        let open_req = streaming::build_stream_open(stream_id.clone(), req.data, Some(meta));
+
+        let clients = self
+            .worker_manager
+            .get_zmq_clients(model_name, &resolved_version)
+            .await
+            .ok_or_else(|| err(Status::unavailable("no workers available")))?;
+
+        if clients.is_empty() {
+            return Err(err(Status::unavailable("no workers available")));
+        }
+
+        let worker_id = match self
+            .worker_manager
+            .get_outlier_state(model_name.as_str(), &resolved_version)
+            .await
+        {
+            Some(outlier) => crate::worker::pick_worker_skip_ejected(clients.len(), &outlier),
+            None => crate::worker::pick_worker_random(clients.len()),
+        };
+        let client = clients[worker_id].clone();
+
+        let mut chunk_rx = client
+            .send_stream(open_req, stream_id.clone())
+            .await
+            .map_err(|e| err(Status::internal(format!("worker stream error: {}", e))))?;
+
+        let (tx, rx) = mpsc::channel(64);
+        let cancel_client = client.clone();
+
+        let stream_metrics = self.streaming_metrics;
+        let metrics_model = model_name.to_string();
+        let metrics_version = resolved_version.clone();
+        if stream_metrics {
+            crate::metrics::prometheus::record_stream_open(&metrics_model, &metrics_version, "grpc");
+        }
+
+        tokio::spawn(async move {
+            let open_time = std::time::Instant::now();
+            let mut first_chunk = true;
+            let mut last_chunk_time = open_time;
+            // P2-1：流关闭时记一次整体 duration；中途 worker 错误按其状态族记。
+            let mut stream_family = "2xx";
+
+            while let Some(chunk) = chunk_rx.recv().await {
+                match chunk.payload {
+                    Some(pb::stream_response::Payload::Chunk(ref c)) => {
+                        if stream_metrics {
+                            if first_chunk {
+                                crate::metrics::prometheus::record_stream_ttft(&metrics_model, &metrics_version, "grpc", open_time.elapsed().as_secs_f64());
+                                first_chunk = false;
+                            } else {
+                                crate::metrics::prometheus::record_stream_tbt(&metrics_model, &metrics_version, "grpc", last_chunk_time.elapsed().as_secs_f64());
+                            }
+                            last_chunk_time = std::time::Instant::now();
+                            crate::metrics::prometheus::record_stream_chunk(&metrics_model, &metrics_version, "grpc");
+                        }
+                        let grpc_chunk = pb::StreamChunk {
+                            data: c.data.clone(),
+                        };
+                        if tx.send(Ok(grpc_chunk)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(pb::stream_response::Payload::Error(ref e)) => {
+                        let grpc_err = match serde_json::from_str::<serde_json::Value>(&e.message) {
+                            Ok(val) => {
+                                if let Some(parsed) = try_parse_model_error(&val) {
+                                    model_error_status(
+                                        error_type_to_grpc_code(&parsed.error_type),
+                                        &parsed,
+                                    )
+                                } else {
+                                    err(Status::internal(e.message.clone()))
+                                }
+                            }
+                            Err(_) => err(Status::internal(e.message.clone())),
+                        };
+                        stream_family = grpc_code_to_status_family(grpc_err.code());
+                        let _ = tx.send(Err(grpc_err)).await;
+                        break;
+                    }
+                    Some(pb::stream_response::Payload::Done(_)) => {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if stream_metrics {
+                crate::metrics::prometheus::record_stream_close(&metrics_model, &metrics_version, "grpc");
+            }
+            crate::metrics::prometheus::record_request_end(
+                &metrics_model,
+                &metrics_version,
+                stream_family,
+                start.elapsed().as_secs_f64(),
+            );
+            // Cleanup: send cancel to worker
+            let cancel_req = streaming::build_stream_cancel(stream_id);
+            let _ = cancel_client.send(cancel_req).await;
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn bidi_stream_impl(
+        &self,
+        request: Request<Streaming<pb::BidiChunk>>,
+        model_label: &mut String,
+        version_label: &mut String,
+        start: Instant,
+    ) -> Result<Response<ReceiverStream<Result<pb::BidiChunk, Status>>>, Status> {
+        let remote_addr = request.remote_addr();
+        let (grpc_metadata, extensions, mut stream) = request.into_parts();
+        // BidiOpen carries no headers map — metadata and the transport peer
+        // address are the only client-identity sources on this path.
+        let cx = interceptor::finalize_context(
+            extensions.get::<RequestContext>().cloned(),
+            &grpc_metadata,
+            &HashMap::new(),
+            remote_addr,
+        );
+        let request_id = cx.request_id;
+        let client_ip = cx.client_ip;
+
+        // Wait for first message (must be BidiOpen)
+        let first = stream
+            .message()
+            .await
+            .map_err(|e| err(Status::internal(format!("stream error: {}", e))))?;
+
+        let (model_name, resolved_version, stream_id, initial_data) = match first {
+            Some(chunk) => match chunk.payload {
+                Some(pb::bidi_chunk::Payload::Open(open)) => {
+                    let model_name = open.model_name;
+                    let version = if open.version.is_empty() {
+                        None
+                    } else {
+                        Some(open.version)
+                    };
+
+                    if let Err(e) = crate::validation::validate_identifier(&model_name) {
+                        return Err(err(Status::invalid_argument(e.to_string())));
+                    }
+
+                    // version="" → weighted routing pick (§4.3), falling back
+                    // to active; stamps last_used_at (P0-2 bidi parity).
+                    let resolved_version =
+                        resolve_bidi_version(&self.registry, &model_name, version.as_deref())?;
+
+                    if !self.registry.is_ready(&model_name, version.as_deref()) {
+                        return Err(err(Status::unavailable(format!(
+                            "{} version {} is not ready",
+                            model_name, resolved_version
+                        ))));
+                    }
+
+                    // BidiOpen has no headers map — transport metadata is the
+                    // only credential carrier on this path.
+                    if let Some(mv) = self.registry.get(&model_name, Some(&resolved_version)) {
+                        enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &HashMap::new())?;
+                    }
+
+                    let sid = format!("grpc-bidi-{}", Uuid::new_v4());
+                    (model_name, resolved_version, sid, open.initial_data)
+                }
+                _ => return Err(err(Status::invalid_argument("first message must be BidiOpen"))),
+            },
+            None => return Err(err(Status::invalid_argument("empty stream"))),
+        };
+
+        *model_label = model_name.clone();
+        *version_label = resolved_version.clone();
+
+        let meta = pb::RequestMeta {
+            route: "/predict".to_string(),
+            headers: HashMap::new(),
+            client_ip,
+            request_id,
+            timestamp_ns: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i64,
+            payload: initial_data.clone(),
+            ..Default::default()
+        };
+
+        let open_req = streaming::build_stream_open(stream_id.clone(), initial_data, Some(meta));
+
+        let clients = self
+            .worker_manager
+            .get_zmq_clients(&model_name, &resolved_version)
+            .await
+            .ok_or_else(|| err(Status::unavailable("no workers available")))?;
+
+        if clients.is_empty() {
+            return Err(err(Status::unavailable("no workers available")));
+        }
+
+        let worker_id = match self
+            .worker_manager
+            .get_outlier_state(model_name.as_str(), &resolved_version)
+            .await
+        {
+            Some(outlier) => crate::worker::pick_worker_skip_ejected(clients.len(), &outlier),
+            None => crate::worker::pick_worker_random(clients.len()),
+        };
+        let client = clients[worker_id].clone();
+
+        let mut chunk_rx = client
+            .send_stream(open_req, stream_id.clone())
+            .await
+            .map_err(|e| err(Status::internal(format!("worker stream error: {}", e))))?;
+
+        let (tx, rx) = mpsc::channel(64);
+        let worker_client = client.clone();
+
+        let stream_metrics = self.streaming_metrics;
+        let metrics_model = model_name.clone();
+        let metrics_version = resolved_version.clone();
+        if stream_metrics {
+            crate::metrics::prometheus::record_stream_open(&metrics_model, &metrics_version, "grpc");
+        }
+
+        // Spawn forwarder: worker chunks -> gRPC stream
+        let stream_id_for_incoming = stream_id.clone();
+        tokio::spawn(async move {
+            // Forward incoming bidi chunks to worker as StreamRequest::Chunk.
+            // These are fire-and-forget: the worker's response to each chunk
+            // comes back as a StreamResponse routed through the stream's
+            // channel (registered at open), so we must NOT use send() — that
+            // would await a unary reply that never matches and stall for
+            // ZMQ_RESPONSE_TIMEOUT between chunks.
+            let incoming_task = tokio::spawn(async move {
+                while let Some(Ok(chunk)) = stream.message().await.transpose() {
+                    match chunk.payload {
+                        Some(pb::bidi_chunk::Payload::Data(data)) => {
+                            let chunk_req = streaming::build_stream_chunk(
+                                stream_id_for_incoming.clone(),
+                                data.data,
+                            );
+                            let _ = worker_client.send_raw(chunk_req).await;
+                        }
+                        Some(pb::bidi_chunk::Payload::Close(_)) => {
+                            let close_req = streaming::build_stream_close(stream_id_for_incoming.clone());
+                            let _ = worker_client.send_raw(close_req).await;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+
+            // Forward worker chunks -> gRPC
+            let open_time = std::time::Instant::now();
+            let mut first_chunk = true;
+            let mut last_chunk_time = open_time;
+            // P2-1：流关闭时记一次整体 duration；中途 worker 错误按其状态族记。
+            let mut stream_family = "2xx";
+
+            while let Some(chunk) = chunk_rx.recv().await {
+                match chunk.payload {
+                    Some(pb::stream_response::Payload::Chunk(ref c)) => {
+                        if stream_metrics {
+                            if first_chunk {
+                                crate::metrics::prometheus::record_stream_ttft(&metrics_model, &metrics_version, "grpc", open_time.elapsed().as_secs_f64());
+                                first_chunk = false;
+                            } else {
+                                crate::metrics::prometheus::record_stream_tbt(&metrics_model, &metrics_version, "grpc", last_chunk_time.elapsed().as_secs_f64());
+                            }
+                            last_chunk_time = std::time::Instant::now();
+                            crate::metrics::prometheus::record_stream_chunk(&metrics_model, &metrics_version, "grpc");
+                        }
+                        let bidi_chunk = pb::BidiChunk {
+                            stream_id: stream_id.clone(),
+                            payload: Some(pb::bidi_chunk::Payload::Data(pb::BidiData {
+                                data: c.data.clone(),
+                            })),
+                        };
+                        if tx.send(Ok(bidi_chunk)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(pb::stream_response::Payload::Error(ref e)) => {
+                        let bidi_chunk = pb::BidiChunk {
+                            stream_id: stream_id.clone(),
+                            payload: Some(pb::bidi_chunk::Payload::Close(pb::BidiClose {})),
+                        };
+                        let grpc_err = match serde_json::from_str::<serde_json::Value>(&e.message) {
+                            Ok(val) => {
+                                if let Some(parsed) = try_parse_model_error(&val) {
+                                    model_error_status(
+                                        error_type_to_grpc_code(&parsed.error_type),
+                                        &parsed,
+                                    )
+                                } else {
+                                    err(Status::internal(e.message.clone()))
+                                }
+                            }
+                            Err(_) => err(Status::internal(e.message.clone())),
+                        };
+                        stream_family = grpc_code_to_status_family(grpc_err.code());
+                        let _ = tx.send(Err(grpc_err)).await;
+                        let _ = tx.send(Ok(bidi_chunk)).await;
+                        break;
+                    }
+                    Some(pb::stream_response::Payload::Done(_)) => {
+                        let bidi_chunk = pb::BidiChunk {
+                            stream_id: stream_id.clone(),
+                            payload: Some(pb::bidi_chunk::Payload::Close(pb::BidiClose {})),
+                        };
+                        let _ = tx.send(Ok(bidi_chunk)).await;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            if stream_metrics {
+                crate::metrics::prometheus::record_stream_close(&metrics_model, &metrics_version, "grpc");
+            }
+            crate::metrics::prometheus::record_request_end(
+                &metrics_model,
+                &metrics_version,
+                stream_family,
+                start.elapsed().as_secs_f64(),
+            );
+
+            // #8: observe the incoming task so a panic is logged, not silently
+            // dropped by a bare abort().
+            observe_or_abort(incoming_task).await;
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -157,6 +866,33 @@ fn is_client_class(code: tonic::Code) -> bool {
             | ResourceExhausted
             | Cancelled
     )
+}
+
+/// gRPC 状态码 → 请求指标 status 族（P2-1，蓝图 §4.3 P2-1）：成功 → "2xx"；
+/// 客户端类（与 `is_client_class` 同集——InvalidArgument/NotFound/OutOfRange/
+/// Unauthenticated/PermissionDenied/ResourceExhausted(限流)/Cancelled）→ "4xx"；
+/// 其余服务端故障（Internal/Unavailable/DeadlineExceeded 等）→ "5xx"。
+/// queue-full/过载返 Unavailable 天然落 "5xx"（§4.0.9 收口，D5：无 protocol label）。
+fn grpc_code_to_status_family(code: tonic::Code) -> &'static str {
+    match code {
+        tonic::Code::Ok => "2xx",
+        c if is_client_class(c) => "4xx",
+        _ => "5xx",
+    }
+}
+
+/// P2-1：unary 请求指标统一记录点（成功 "2xx"；错误按 `grpc_code_to_status_family`）。
+fn record_grpc_request_end<T>(
+    model: &str,
+    version: &str,
+    start: Instant,
+    result: &Result<T, Status>,
+) {
+    let family = match result {
+        Ok(_) => "2xx",
+        Err(s) => grpc_code_to_status_family(s.code()),
+    };
+    crate::metrics::prometheus::record_request_end(model, version, family, start.elapsed().as_secs_f64());
 }
 
 /// Log a gRPC error status with graded severity, then return it (P1-1 parity
@@ -281,301 +1017,27 @@ impl LiteServer for GrpcService {
         &self,
         request: Request<pb::InferRequest>,
     ) -> Result<Response<pb::InferResponse>, Status> {
-        let remote_addr = request.remote_addr();
-        let (grpc_metadata, extensions, req) = request.into_parts();
-        let cx = interceptor::finalize_context(
-            extensions.get::<RequestContext>().cloned(),
-            &grpc_metadata,
-            &req.headers,
-            remote_addr,
-        );
-        let request_id = cx.request_id.clone();
-        let client_ip = cx.client_ip.clone();
-        let model_name = &req.model_name;
-        let version = if req.version.is_empty() {
-            None
-        } else {
-            Some(req.version.as_str())
-        };
-
-        if let Err(e) = crate::validation::validate_identifier(model_name) {
-            return Err(err(Status::invalid_argument(e.to_string())));
-        }
-
-        // version="" → weighted routing pick (§4.3), falling back to active.
-        let resolved_version = match version {
-            Some(v) => v.to_string(),
-            None => self
-                .registry
-                .routing_pick(model_name)
-                .or_else(|| self.registry.get_active_version(model_name))
-                .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
-        };
-        self.registry.touch_last_used(model_name, &resolved_version);
-
-        if !self.registry.is_ready(model_name, version) {
-            return Err(err(Status::unavailable(format!(
-                "{} version {} is not ready",
-                model_name, resolved_version
-            ))));
-        }
-
-        if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
-            enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
-        }
-
-        let header_map: HashMap<String, String> = req.headers.clone();
-        let meta = pb::RequestMeta {
-            route: "/predict".to_string(),
-            headers: header_map,
-            client_ip: client_ip.clone(),
-            request_id: request_id.clone(),
-            timestamp_ns: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as i64,
-            payload: req.data.clone(),
-            ..Default::default()
-        };
-
-        let uid = format!("grpc-{}-{}", model_name, Uuid::new_v4());
-
-        // Fire InferenceRequest callback
-        let req_ctx = crate::callback::InferenceContext {
-            model_name: model_name.to_string(),
-            version: resolved_version.clone(),
-            route: "/predict".to_string(),
-            protocol: crate::callback::Protocol::Grpc,
-            request_id,
-            client_ip,
-            elapsed_us: None,
-        };
-        let cb_runner = self.callback_runner.clone();
-        let req_ctx_clone = req_ctx.clone();
-        tokio::spawn(async move {
-            cb_runner.on_inference_request(&req_ctx_clone).await;
-        });
-
-        // #1: route unary infer through the unified InferenceQueue — the same
-        // path as REST — so gRPC inherits batch aggregation, least-loaded
-        // worker selection, outlier ejection, retry, and max_requests
-        // recycling, all of which the previous direct client.send() bypassed.
-        // (batch_infer and streaming keep their direct path; REST streaming
-        // bypasses the queue too, so behavior stays consistent.)
+        // P2-1 请求指标：成功/失败统一在此记一次（version label 取解析后版本，
+        // 解析失败保持请求原值；D5 无 protocol label，与 HTTP 共享计数）。
         let start = Instant::now();
-        let (response_tx, response_rx) = oneshot::channel();
-        let item = crate::inference_queue::QueueItem {
-            uid,
-            data: meta.payload.clone(),
-            meta: Some(std::sync::Arc::new(meta)),
-            response_tx,
-            inflight_guard: None,
-        };
-        let resp = match self
-            .worker_manager
-            .inference_queue()
-            .try_submit(model_name, &resolved_version, item)
-        {
-            Ok(()) => match tokio::time::timeout(self.server_timeout, response_rx).await {
-                Ok(Ok(resp)) => resp,
-                Ok(Err(_)) => return Err(err(Status::internal("response channel closed"))),
-                Err(_) => {
-                    return Err(err(Status::deadline_exceeded(format!(
-                        "inference timed out after {:.1}s",
-                        self.server_timeout.as_secs_f64()
-                    ))));
-                }
-            },
-            Err(crate::inference_queue::QueueError::Full) => {
-                return Err(err(Status::resource_exhausted(format!(
-                    "queue full for {} {}",
-                    model_name, resolved_version
-                ))));
-            }
-            Err(_) => {
-                return Err(err(Status::unavailable(format!(
-                    "queue not available for {} {}",
-                    model_name, resolved_version
-                ))));
-            }
-        };
-
-        match resp.payload {
-            Some(pb::response::Payload::Single(single)) => {
-                let grpc_status = single.status.as_ref().map(|s| pb::Status {
-                    code: s.code.clone(),
-                    message: s.message.clone(),
-                });
-                let code = single.status.as_ref().map(|s| s.code.as_str()).unwrap_or("Ok");
-                match code {
-                    "Error" => {
-                        let msg = grpc_status
-                            .as_ref()
-                            .map(|s| s.message.clone())
-                            .unwrap_or_default();
-                        // If Status.message parses as u16, the worker signalled
-                        // a model-level HTTPException with structured error in data.
-                        if let Ok(http_status) = msg.parse::<u16>() {
-                            let data: serde_json::Value =
-                                serde_json::from_slice(&single.data).unwrap_or(serde_json::json!({}));
-                            let parsed = try_parse_model_error(&data);
-                            return Err(match parsed {
-                                Some(p) => err(model_error_status(
-                                    http_status_to_grpc_code(http_status), &p)),
-                                None => err(Status::new(
-                                    http_status_to_grpc_code(http_status),
-                                    format!("[model_error] {}", msg),
-                                )),
-                            });
-                        }
-                        // Not a numeric status code — internal worker error.
-                        return Err(err(Status::internal(msg)));
-                    }
-                    _ => {
-                        let headers = single.headers.clone();
-                        let mut response = Response::new(pb::InferResponse {
-                            data: single.data,
-                            status: grpc_status,
-                            metrics: resp.metrics,
-                        });
-                        inject_grpc_metadata(response.metadata_mut(), &headers);
-
-                        // Fire InferenceResponse callback
-                        let duration = start.elapsed().as_secs_f64();
-                        let resp_ctx = crate::callback::InferenceContext {
-                            elapsed_us: Some((duration * 1_000_000.0) as u64),
-                            ..req_ctx.clone()
-                        };
-                        let cb_runner = self.callback_runner.clone();
-                        tokio::spawn(async move { cb_runner.on_inference_response(&resp_ctx).await; });
-
-                        Ok(response)
-                    }
-                }
-            }
-            _ => Err(err(Status::internal("unexpected response type"))),
-        }
+        let model_label = request.get_ref().model_name.clone();
+        let mut version_label = request.get_ref().version.clone();
+        let result = self.infer_impl(request, &mut version_label).await;
+        record_grpc_request_end(&model_label, &version_label, start, &result);
+        result
     }
 
     async fn batch_infer(
         &self,
         request: Request<pb::BatchInferRequest>,
     ) -> Result<Response<pb::BatchInferResponse>, Status> {
-        let remote_addr = request.remote_addr();
-        let (grpc_metadata, extensions, req) = request.into_parts();
-        let cx = interceptor::finalize_context(
-            extensions.get::<RequestContext>().cloned(),
-            &grpc_metadata,
-            &req.headers,
-            remote_addr,
-        );
-        let request_id = cx.request_id;
-        let client_ip = cx.client_ip;
-        let model_name = &req.model_name;
-        let version = if req.version.is_empty() {
-            None
-        } else {
-            Some(req.version.as_str())
-        };
-
-        if let Err(e) = crate::validation::validate_identifier(model_name) {
-            return Err(err(Status::invalid_argument(e.to_string())));
-        }
-
-        // version="" → weighted routing pick (§4.3), falling back to active.
-        let resolved_version = match version {
-            Some(v) => v.to_string(),
-            None => self
-                .registry
-                .routing_pick(model_name)
-                .or_else(|| self.registry.get_active_version(model_name))
-                .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
-        };
-        self.registry.touch_last_used(model_name, &resolved_version);
-
-        if !self.registry.is_ready(model_name, version) {
-            return Err(err(Status::unavailable(format!(
-                "{} version {} is not ready",
-                model_name, resolved_version
-            ))));
-        }
-
-        if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
-            enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
-        }
-
-        let header_map: HashMap<String, String> = req.headers.clone();
-        let meta = pb::RequestMeta {
-            route: "/predict".to_string(),
-            headers: header_map,
-            client_ip,
-            request_id,
-            timestamp_ns: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as i64,
-            payload: Default::default(),
-            ..Default::default()
-        };
-
-        let items: Vec<pb::BatchItem> = req
-            .items
-            .into_iter()
-            .enumerate()
-            .map(|(i, data)| pb::BatchItem {
-                uid: format!("grpc-batch-{}-{}", i, Uuid::new_v4()),
-                data,
-            })
-            .collect();
-
-        let internal_req = pb::Request {
-            uid: format!("grpc-batch-{}", Uuid::new_v4()),
-            meta: Some(meta),
-            payload: Some(pb::request::Payload::Batch(pb::BatchRequest { items })),
-        };
-
-        let clients = self
-            .worker_manager
-            .get_zmq_clients(model_name, &resolved_version)
-            .await
-            .ok_or_else(|| err(Status::unavailable("no workers available")))?;
-
-        if clients.is_empty() {
-            return Err(err(Status::unavailable("no workers available")));
-        }
-
-        let worker_id = match self
-            .worker_manager
-            .get_outlier_state(model_name, &resolved_version)
-            .await
-        {
-            Some(outlier) => crate::worker::pick_worker_skip_ejected(clients.len(), &outlier),
-            None => crate::worker::pick_worker_random(clients.len()),
-        };
-        let client = &clients[worker_id];
-
-        let resp = client
-            .send(internal_req)
-            .await
-            .map_err(|e| err(Status::internal(format!("worker error: {}", e))))?;
-
-        match resp.payload {
-            Some(pb::response::Payload::Batch(batch_resp)) => {
-                let items: Vec<pb::InferResponse> = batch_resp
-                    .items
-                    .into_iter()
-                    .map(|item| pb::InferResponse {
-                        data: item.data,
-                        status: item.status,
-                        metrics: None,
-                    })
-                    .collect();
-                let mut response = Response::new(pb::BatchInferResponse { items });
-                inject_grpc_metadata(response.metadata_mut(), &batch_resp.headers);
-                Ok(response)
-            }
-            _ => Err(err(Status::internal("unexpected response type"))),
-        }
+        // P2-1 请求指标（同 infer 包装）。
+        let start = Instant::now();
+        let model_label = request.get_ref().model_name.clone();
+        let mut version_label = request.get_ref().version.clone();
+        let result = self.batch_infer_impl(request, &mut version_label).await;
+        record_grpc_request_end(&model_label, &version_label, start, &result);
+        result
     }
 
     type StreamInferStream = ReceiverStream<Result<pb::StreamChunk, Status>>;
@@ -584,158 +1046,21 @@ impl LiteServer for GrpcService {
         &self,
         request: Request<pb::StreamInferRequest>,
     ) -> Result<Response<Self::StreamInferStream>, Status> {
-        let remote_addr = request.remote_addr();
-        let (grpc_metadata, extensions, req) = request.into_parts();
-        let cx = interceptor::finalize_context(
-            extensions.get::<RequestContext>().cloned(),
-            &grpc_metadata,
-            &req.headers,
-            remote_addr,
-        );
-        let request_id = cx.request_id;
-        let client_ip = cx.client_ip;
-        let model_name = &req.model_name;
-        let version = if req.version.is_empty() {
-            None
-        } else {
-            Some(req.version.as_str())
-        };
-
-        if let Err(e) = crate::validation::validate_identifier(model_name) {
-            return Err(err(Status::invalid_argument(e.to_string())));
+        // P2-1 请求指标：open 失败在此记一次；open 成功后由转发 task 在流
+        // 关闭处记一次整体 duration（蓝图 §4.3 P2-1 stream/bidi 语义）。
+        let start = Instant::now();
+        let model_label = request.get_ref().model_name.clone();
+        let mut version_label = request.get_ref().version.clone();
+        let result = self.stream_infer_impl(request, &mut version_label, start).await;
+        if let Err(s) = &result {
+            crate::metrics::prometheus::record_request_end(
+                &model_label,
+                &version_label,
+                grpc_code_to_status_family(s.code()),
+                start.elapsed().as_secs_f64(),
+            );
         }
-
-        // version="" → weighted routing pick (§4.3), falling back to active.
-        let resolved_version = match version {
-            Some(v) => v.to_string(),
-            None => self
-                .registry
-                .routing_pick(model_name)
-                .or_else(|| self.registry.get_active_version(model_name))
-                .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
-        };
-        self.registry.touch_last_used(model_name, &resolved_version);
-
-        if !self.registry.is_ready(model_name, version) {
-            return Err(err(Status::unavailable(format!(
-                "{} version {} is not ready",
-                model_name, resolved_version
-            ))));
-        }
-
-        if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
-            enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
-        }
-
-        let header_map: HashMap<String, String> = req.headers.clone();
-        let meta = pb::RequestMeta {
-            route: "/predict".to_string(),
-            headers: header_map,
-            client_ip,
-            request_id,
-            timestamp_ns: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as i64,
-            payload: req.data.clone(),
-            ..Default::default()
-        };
-
-        let stream_id = format!("grpc-stream-{}", Uuid::new_v4());
-        let open_req = streaming::build_stream_open(stream_id.clone(), req.data, Some(meta));
-
-        let clients = self
-            .worker_manager
-            .get_zmq_clients(model_name, &resolved_version)
-            .await
-            .ok_or_else(|| err(Status::unavailable("no workers available")))?;
-
-        if clients.is_empty() {
-            return Err(err(Status::unavailable("no workers available")));
-        }
-
-        let worker_id = match self
-            .worker_manager
-            .get_outlier_state(model_name.as_str(), &resolved_version)
-            .await
-        {
-            Some(outlier) => crate::worker::pick_worker_skip_ejected(clients.len(), &outlier),
-            None => crate::worker::pick_worker_random(clients.len()),
-        };
-        let client = clients[worker_id].clone();
-
-        let mut chunk_rx = client
-            .send_stream(open_req, stream_id.clone())
-            .await
-            .map_err(|e| err(Status::internal(format!("worker stream error: {}", e))))?;
-
-        let (tx, rx) = mpsc::channel(64);
-        let cancel_client = client.clone();
-
-        let stream_metrics = self.streaming_metrics;
-        let metrics_model = model_name.to_string();
-        let metrics_version = resolved_version.clone();
-        if stream_metrics {
-            crate::metrics::prometheus::record_stream_open(&metrics_model, &metrics_version, "grpc");
-        }
-
-        tokio::spawn(async move {
-            let open_time = std::time::Instant::now();
-            let mut first_chunk = true;
-            let mut last_chunk_time = open_time;
-
-            while let Some(chunk) = chunk_rx.recv().await {
-                match chunk.payload {
-                    Some(pb::stream_response::Payload::Chunk(ref c)) => {
-                        if stream_metrics {
-                            if first_chunk {
-                                crate::metrics::prometheus::record_stream_ttft(&metrics_model, &metrics_version, "grpc", open_time.elapsed().as_secs_f64());
-                                first_chunk = false;
-                            } else {
-                                crate::metrics::prometheus::record_stream_tbt(&metrics_model, &metrics_version, "grpc", last_chunk_time.elapsed().as_secs_f64());
-                            }
-                            last_chunk_time = std::time::Instant::now();
-                            crate::metrics::prometheus::record_stream_chunk(&metrics_model, &metrics_version, "grpc");
-                        }
-                        let grpc_chunk = pb::StreamChunk {
-                            data: c.data.clone(),
-                        };
-                        if tx.send(Ok(grpc_chunk)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(pb::stream_response::Payload::Error(ref e)) => {
-                        let grpc_err = match serde_json::from_str::<serde_json::Value>(&e.message) {
-                            Ok(val) => {
-                                if let Some(parsed) = try_parse_model_error(&val) {
-                                    model_error_status(
-                                        error_type_to_grpc_code(&parsed.error_type),
-                                        &parsed,
-                                    )
-                                } else {
-                                    err(Status::internal(e.message.clone()))
-                                }
-                            }
-                            Err(_) => err(Status::internal(e.message.clone())),
-                        };
-                        let _ = tx.send(Err(grpc_err)).await;
-                        break;
-                    }
-                    Some(pb::stream_response::Payload::Done(_)) => {
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            if stream_metrics {
-                crate::metrics::prometheus::record_stream_close(&metrics_model, &metrics_version, "grpc");
-            }
-            // Cleanup: send cancel to worker
-            let cancel_req = streaming::build_stream_cancel(stream_id);
-            let _ = cancel_client.send(cancel_req).await;
-        });
-
-        Ok(Response::new(ReceiverStream::new(rx)))
+        result
     }
 
     type BidiStreamStream = ReceiverStream<Result<pb::BidiChunk, Status>>;
@@ -744,216 +1069,23 @@ impl LiteServer for GrpcService {
         &self,
         request: Request<Streaming<pb::BidiChunk>>,
     ) -> Result<Response<Self::BidiStreamStream>, Status> {
-        let remote_addr = request.remote_addr();
-        let (grpc_metadata, extensions, mut stream) = request.into_parts();
-        // BidiOpen carries no headers map — metadata and the transport peer
-        // address are the only client-identity sources on this path.
-        let cx = interceptor::finalize_context(
-            extensions.get::<RequestContext>().cloned(),
-            &grpc_metadata,
-            &HashMap::new(),
-            remote_addr,
-        );
-        let request_id = cx.request_id;
-        let client_ip = cx.client_ip;
-
-        // Wait for first message (must be BidiOpen)
-        let first = stream
-            .message()
-            .await
-            .map_err(|e| err(Status::internal(format!("stream error: {}", e))))?;
-
-        let (model_name, resolved_version, stream_id, initial_data) = match first {
-            Some(chunk) => match chunk.payload {
-                Some(pb::bidi_chunk::Payload::Open(open)) => {
-                    let model_name = open.model_name;
-                    let version = if open.version.is_empty() {
-                        None
-                    } else {
-                        Some(open.version)
-                    };
-
-                    if let Err(e) = crate::validation::validate_identifier(&model_name) {
-                        return Err(err(Status::invalid_argument(e.to_string())));
-                    }
-
-                    // version="" → weighted routing pick (§4.3), falling back
-                    // to active; stamps last_used_at (P0-2 bidi parity).
-                    let resolved_version =
-                        resolve_bidi_version(&self.registry, &model_name, version.as_deref())?;
-
-                    if !self.registry.is_ready(&model_name, version.as_deref()) {
-                        return Err(err(Status::unavailable(format!(
-                            "{} version {} is not ready",
-                            model_name, resolved_version
-                        ))));
-                    }
-
-                    // BidiOpen has no headers map — transport metadata is the
-                    // only credential carrier on this path.
-                    if let Some(mv) = self.registry.get(&model_name, Some(&resolved_version)) {
-                        enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &HashMap::new())?;
-                    }
-
-                    let sid = format!("grpc-bidi-{}", Uuid::new_v4());
-                    (model_name, resolved_version, sid, open.initial_data)
-                }
-                _ => return Err(err(Status::invalid_argument("first message must be BidiOpen"))),
-            },
-            None => return Err(err(Status::invalid_argument("empty stream"))),
-        };
-
-        let meta = pb::RequestMeta {
-            route: "/predict".to_string(),
-            headers: HashMap::new(),
-            client_ip,
-            request_id,
-            timestamp_ns: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as i64,
-            payload: initial_data.clone(),
-            ..Default::default()
-        };
-
-        let open_req = streaming::build_stream_open(stream_id.clone(), initial_data, Some(meta));
-
-        let clients = self
-            .worker_manager
-            .get_zmq_clients(&model_name, &resolved_version)
-            .await
-            .ok_or_else(|| err(Status::unavailable("no workers available")))?;
-
-        if clients.is_empty() {
-            return Err(err(Status::unavailable("no workers available")));
+        // P2-1 请求指标（同 stream_infer；model 在 BidiOpen 前未知，早期
+        // 失败以空 label 记录）。
+        let start = Instant::now();
+        let mut model_label = String::new();
+        let mut version_label = String::new();
+        let result = self
+            .bidi_stream_impl(request, &mut model_label, &mut version_label, start)
+            .await;
+        if let Err(s) = &result {
+            crate::metrics::prometheus::record_request_end(
+                &model_label,
+                &version_label,
+                grpc_code_to_status_family(s.code()),
+                start.elapsed().as_secs_f64(),
+            );
         }
-
-        let worker_id = match self
-            .worker_manager
-            .get_outlier_state(model_name.as_str(), &resolved_version)
-            .await
-        {
-            Some(outlier) => crate::worker::pick_worker_skip_ejected(clients.len(), &outlier),
-            None => crate::worker::pick_worker_random(clients.len()),
-        };
-        let client = clients[worker_id].clone();
-
-        let mut chunk_rx = client
-            .send_stream(open_req, stream_id.clone())
-            .await
-            .map_err(|e| err(Status::internal(format!("worker stream error: {}", e))))?;
-
-        let (tx, rx) = mpsc::channel(64);
-        let worker_client = client.clone();
-
-        let stream_metrics = self.streaming_metrics;
-        let metrics_model = model_name.clone();
-        let metrics_version = resolved_version.clone();
-        if stream_metrics {
-            crate::metrics::prometheus::record_stream_open(&metrics_model, &metrics_version, "grpc");
-        }
-
-        // Spawn forwarder: worker chunks -> gRPC stream
-        let stream_id_for_incoming = stream_id.clone();
-        tokio::spawn(async move {
-            // Forward incoming bidi chunks to worker as StreamRequest::Chunk.
-            // These are fire-and-forget: the worker's response to each chunk
-            // comes back as a StreamResponse routed through the stream's
-            // channel (registered at open), so we must NOT use send() — that
-            // would await a unary reply that never matches and stall for
-            // ZMQ_RESPONSE_TIMEOUT between chunks.
-            let incoming_task = tokio::spawn(async move {
-                while let Some(Ok(chunk)) = stream.message().await.transpose() {
-                    match chunk.payload {
-                        Some(pb::bidi_chunk::Payload::Data(data)) => {
-                            let chunk_req = streaming::build_stream_chunk(
-                                stream_id_for_incoming.clone(),
-                                data.data,
-                            );
-                            let _ = worker_client.send_raw(chunk_req).await;
-                        }
-                        Some(pb::bidi_chunk::Payload::Close(_)) => {
-                            let close_req = streaming::build_stream_close(stream_id_for_incoming.clone());
-                            let _ = worker_client.send_raw(close_req).await;
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            });
-
-            // Forward worker chunks -> gRPC
-            let open_time = std::time::Instant::now();
-            let mut first_chunk = true;
-            let mut last_chunk_time = open_time;
-
-            while let Some(chunk) = chunk_rx.recv().await {
-                match chunk.payload {
-                    Some(pb::stream_response::Payload::Chunk(ref c)) => {
-                        if stream_metrics {
-                            if first_chunk {
-                                crate::metrics::prometheus::record_stream_ttft(&metrics_model, &metrics_version, "grpc", open_time.elapsed().as_secs_f64());
-                                first_chunk = false;
-                            } else {
-                                crate::metrics::prometheus::record_stream_tbt(&metrics_model, &metrics_version, "grpc", last_chunk_time.elapsed().as_secs_f64());
-                            }
-                            last_chunk_time = std::time::Instant::now();
-                            crate::metrics::prometheus::record_stream_chunk(&metrics_model, &metrics_version, "grpc");
-                        }
-                        let bidi_chunk = pb::BidiChunk {
-                            stream_id: stream_id.clone(),
-                            payload: Some(pb::bidi_chunk::Payload::Data(pb::BidiData {
-                                data: c.data.clone(),
-                            })),
-                        };
-                        if tx.send(Ok(bidi_chunk)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(pb::stream_response::Payload::Error(ref e)) => {
-                        let bidi_chunk = pb::BidiChunk {
-                            stream_id: stream_id.clone(),
-                            payload: Some(pb::bidi_chunk::Payload::Close(pb::BidiClose {})),
-                        };
-                        let grpc_err = match serde_json::from_str::<serde_json::Value>(&e.message) {
-                            Ok(val) => {
-                                if let Some(parsed) = try_parse_model_error(&val) {
-                                    model_error_status(
-                                        error_type_to_grpc_code(&parsed.error_type),
-                                        &parsed,
-                                    )
-                                } else {
-                                    err(Status::internal(e.message.clone()))
-                                }
-                            }
-                            Err(_) => err(Status::internal(e.message.clone())),
-                        };
-                        let _ = tx.send(Err(grpc_err)).await;
-                        let _ = tx.send(Ok(bidi_chunk)).await;
-                        break;
-                    }
-                    Some(pb::stream_response::Payload::Done(_)) => {
-                        let bidi_chunk = pb::BidiChunk {
-                            stream_id: stream_id.clone(),
-                            payload: Some(pb::bidi_chunk::Payload::Close(pb::BidiClose {})),
-                        };
-                        let _ = tx.send(Ok(bidi_chunk)).await;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-
-            if stream_metrics {
-                crate::metrics::prometheus::record_stream_close(&metrics_model, &metrics_version, "grpc");
-            }
-
-            // #8: observe the incoming task so a panic is logged, not silently
-            // dropped by a bare abort().
-            observe_or_abort(incoming_task).await;
-        });
-
-        Ok(Response::new(ReceiverStream::new(rx)))
+        result
     }
 }
 
@@ -1431,5 +1563,314 @@ mod auth_policy_tests {
         let mut md = MetadataMap::new();
         md.insert("x-api-key", "anything".parse().unwrap());
         assert!(enforce_auth_grpc(Some(&policy(&[])), &md, &HashMap::new()).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod request_metrics_tests {
+    //! P2-1: gRPC 4 RPC 记请求指标（与 HTTP 共享 REQUESTS_TOTAL，无 protocol
+    //! label，D5）+ §4.0.9 收口（queue-full → Unavailable 落 5xx）。
+    use super::*;
+    use crate::callback::CallbackRunner;
+    use crate::config::ModelConfig;
+    use crate::inference_queue::{InferenceQueue, OutlierState};
+    use crate::metrics::prometheus::REQUESTS_TOTAL;
+    use crate::registry::types::ModelType;
+    use crate::transport::zmq::WorkerZmqClient;
+    use bytes::Bytes;
+    use prost::Message;
+
+    // --- grpc_code_to_status_family ---
+
+    #[test]
+    fn should_map_success_to_2xx() {
+        assert_eq!(grpc_code_to_status_family(tonic::Code::Ok), "2xx");
+    }
+
+    #[test]
+    fn should_map_client_error_codes_to_4xx() {
+        // 蓝图映射: InvalidArgument/NotFound/OutOfRange/Unauthenticated/
+        // PermissionDenied/ResourceExhausted → "4xx"（ResourceExhausted
+        // 专给限流，§4.0.9）。Cancelled 是客户端主动断开，同类。
+        for code in [
+            tonic::Code::InvalidArgument,
+            tonic::Code::NotFound,
+            tonic::Code::OutOfRange,
+            tonic::Code::Unauthenticated,
+            tonic::Code::PermissionDenied,
+            tonic::Code::ResourceExhausted,
+            tonic::Code::Cancelled,
+        ] {
+            assert_eq!(grpc_code_to_status_family(code), "4xx", "{code:?}");
+        }
+    }
+
+    #[test]
+    fn should_map_server_fault_codes_to_5xx() {
+        // 蓝图映射: Internal/Unavailable/DeadlineExceeded → "5xx"；
+        // queue-full/过载返 Unavailable 天然落此族（§4.0.9）。
+        for code in [
+            tonic::Code::Internal,
+            tonic::Code::Unavailable,
+            tonic::Code::DeadlineExceeded,
+        ] {
+            assert_eq!(grpc_code_to_status_family(code), "5xx", "{code:?}");
+        }
+    }
+
+    // --- handler 级指标记录 ---
+
+    fn metric_test_endpoint(name: &str) -> String {
+        #[cfg(unix)]
+        {
+            format!(
+                "ipc://{}",
+                std::env::temp_dir()
+                    .join(format!("lite-server-grpc-met-{}-{}.sock", name, std::process::id()))
+                    .display()
+            )
+        }
+        #[cfg(windows)]
+        {
+            format!("tcp://127.0.0.1:{}", 36000 + std::process::id() % 1000)
+        }
+    }
+
+    /// PAIR worker answering every unary request with an Ok Single.
+    fn spawn_ok_worker(endpoint: String) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(5000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let resp = pb::Response {
+                    uid: req.uid,
+                    payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+                        data: Bytes::from_static(b"{\"ok\":true}"),
+                        status: Some(pb::Status { code: "Ok".to_string(), message: String::new() }),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                if s.send(resp.encode_to_vec(), 0).is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// PAIR worker answering a stream Open with one Chunk + Done; other
+    /// requests (e.g. the trailing Cancel) get a bare ack so the client's
+    /// request/response exchange completes instead of hanging to timeout.
+    fn spawn_stream_worker(endpoint: String) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(5000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let is_open = matches!(
+                    req.payload,
+                    Some(pb::request::Payload::Stream(pb::StreamRequest {
+                        action: Some(pb::stream_request::Action::Open(_)),
+                        ..
+                    }))
+                );
+                if !is_open {
+                    // Ack (Cancel etc.) so the awaiting send() completes.
+                    let ack = pb::Response {
+                        uid: req.uid,
+                        ..Default::default()
+                    };
+                    let _ = s.send(ack.encode_to_vec(), 0);
+                    continue;
+                }
+                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                let mk = |payload| pb::Response {
+                    payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                        stream_id: st.stream_id.clone(),
+                        payload: Some(payload),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                let _ = s.send(mk(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
+                    data: Bytes::from_static(b"{}"),
+                    is_final: false,
+                })).encode_to_vec(), 0);
+                let _ = s.send(mk(pb::stream_response::Payload::Done(pb::StreamDone::default()))
+                    .encode_to_vec(), 0);
+            }
+        })
+    }
+
+    fn test_config(max_batch_size: usize, batch_timeout: f32, max_queue_size: usize) -> ModelConfig {
+        ModelConfig {
+            max_batch_size,
+            batch_timeout,
+            max_queue_size,
+            health_check_interval: 0.0,
+            ..Default::default()
+        }
+    }
+
+    fn build_service(registry: Arc<ModelRegistry>, queue: Arc<InferenceQueue>) -> GrpcService {
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            std::env::temp_dir(),
+            queue,
+            "error".to_string(),
+            Arc::new(CallbackRunner::new()),
+        ));
+        GrpcService::new(
+            registry,
+            wm,
+            false,
+            Arc::new(CallbackRunner::new()),
+            Duration::from_secs(5),
+        )
+    }
+
+    /// Registry (registered + ready) and queue (one worker client) for `model`.
+    async fn ready_service_with_worker(model: &str, endpoint: String) -> GrpcService {
+        let registry = Arc::new(ModelRegistry::new());
+        registry
+            .register(model, "1", test_config(1, 0.0, 10), ModelType::LitAPI, std::env::temp_dir())
+            .unwrap();
+        registry.mark_ready(model, "1").unwrap();
+        let queue = Arc::new(InferenceQueue::new());
+        let client = Arc::new(WorkerZmqClient::new(endpoint));
+        let (reload_tx, _rx) = mpsc::channel(8);
+        queue.register_model(
+            model, "1", &test_config(1, 0.0, 10), vec![],
+            vec![client.clone()],
+            reload_tx, Arc::new(OutlierState::new(1)), None,
+        );
+        let service = build_service(registry, queue);
+        // stream/bidi 走 worker_manager.get_zmq_clients（不经 queue）——
+        // 测试不经 spawn_workers，用 test hook 直接填充。
+        service
+            .worker_manager
+            .insert_zmq_clients_for_test(model, "1", vec![client])
+            .await;
+        service
+    }
+
+    fn infer_request(model: &str, version: &str) -> Request<pb::InferRequest> {
+        Request::new(pb::InferRequest {
+            model_name: model.to_string(),
+            version: version.to_string(),
+            data: Bytes::from_static(b"{}"),
+            headers: HashMap::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn should_record_2xx_after_successful_infer() {
+        let model = "met_ok";
+        let endpoint = metric_test_endpoint(model);
+        let _worker = spawn_ok_worker(endpoint.clone());
+        let service = ready_service_with_worker(model, endpoint).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let counter = REQUESTS_TOTAL.with_label_values(&[model, "1", "2xx"]);
+        let before = counter.get();
+
+        let resp = service.infer(infer_request(model, "1")).await;
+        assert!(resp.is_ok(), "infer must succeed: {:?}", resp.err());
+        assert_eq!(counter.get(), before + 1.0, "successful infer must record one 2xx request");
+    }
+
+    #[tokio::test]
+    async fn should_record_4xx_when_model_not_found() {
+        let service = build_service(Arc::new(ModelRegistry::new()), Arc::new(InferenceQueue::new()));
+
+        let counter = REQUESTS_TOTAL.with_label_values(&["met_404", "", "4xx"]);
+        let before = counter.get();
+
+        let err = service.infer(infer_request("met_404", "")).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        assert_eq!(counter.get(), before + 1.0, "model-not-found must record one 4xx request");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn should_return_unavailable_and_record_5xx_when_queue_full() {
+        let model = "met_full";
+        let registry = Arc::new(ModelRegistry::new());
+        registry
+            .register(model, "1", test_config(2, 3600.0, 1), ModelType::LitAPI, std::env::temp_dir())
+            .unwrap();
+        registry.mark_ready(model, "1").unwrap();
+        let queue = Arc::new(InferenceQueue::new());
+        let (reload_tx, _rx) = mpsc::channel(8);
+        queue.register_model(
+            model, "1", &test_config(2, 3600.0, 1), vec![], vec![],
+            reload_tx, Arc::new(OutlierState::new(0)), None,
+        );
+        let service = build_service(registry, queue.clone());
+
+        // Pre-fill the queue (capacity 1). current_thread runtime with no
+        // intervening yield: the collector task never runs, so the channel
+        // stays full and the next submit deterministically gets Full.
+        let (filler_tx, _filler_rx) = oneshot::channel();
+        queue
+            .try_submit(model, "1", crate::inference_queue::QueueItem {
+                uid: "filler".to_string(),
+                data: Bytes::new(),
+                meta: None,
+                response_tx: filler_tx,
+                inflight_guard: None,
+                enqueued_at: Instant::now(),
+            })
+            .unwrap();
+
+        let counter = REQUESTS_TOTAL.with_label_values(&[model, "1", "5xx"]);
+        let before = counter.get();
+
+        let err = service.infer(infer_request(model, "1")).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable,
+            "§4.0.9: queue-full must be Unavailable (ResourceExhausted 专给限流)");
+        assert_eq!(counter.get(), before + 1.0, "queue-full must record one 5xx request");
+    }
+
+    #[tokio::test]
+    async fn should_record_2xx_once_when_stream_closes() {
+        let model = "met_stream";
+        let endpoint = metric_test_endpoint(model);
+        let _worker = spawn_stream_worker(endpoint.clone());
+        let service = ready_service_with_worker(model, endpoint).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let counter = REQUESTS_TOTAL.with_label_values(&[model, "1", "2xx"]);
+        let before = counter.get();
+
+        let resp = service
+            .stream_infer(Request::new(pb::StreamInferRequest {
+                model_name: model.to_string(),
+                version: "1".to_string(),
+                data: Bytes::from_static(b"{}"),
+                headers: HashMap::new(),
+            }))
+            .await
+            .expect("stream must open");
+
+        // Drain the stream: the worker sends one chunk + Done, so the stream
+        // closes and the forwarder records the overall duration exactly once.
+        use tokio_stream::StreamExt;
+        let mut stream = resp.into_inner();
+        while let Some(chunk) = stream.next().await {
+            chunk.expect("chunk must be Ok");
+        }
+        assert_eq!(counter.get(), before + 1.0,
+            "stream close must record exactly one 2xx request (overall duration)");
     }
 }
