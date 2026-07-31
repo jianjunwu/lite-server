@@ -53,7 +53,7 @@ impl RequestContext {
             client_ip,
             trace_cx: Context::new(), // P-TRACE 前为空 Context 占位
             protocol: Protocol::Grpc,
-            principal: None, // P5-1 mTLS 预留
+            principal: None, // P5-1: context_interceptor 随后按 TlsConnectInfo 填充
         }
     }
 }
@@ -63,9 +63,24 @@ impl RequestContext {
 /// 对 unary / server-streaming / bidi 语义透明（每次 RPC 调用前执行一次，
 /// 不触碰消息流）。
 pub fn context_interceptor(mut request: Request<()>) -> Result<Request<()>, Status> {
-    let cx = RequestContext::from_grpc_metadata(request.metadata(), request.remote_addr());
+    let mut cx = RequestContext::from_grpc_metadata(request.metadata(), request.remote_addr());
+    // P5-1: TLS 连接经 tonic 的 TlsConnectInfo 携带 mTLS 客户端证书 → T1
+    // principal（明文 TCP/UDS 恒为 None）。
+    cx.principal = tls_principal(request.extensions());
     request.extensions_mut().insert(cx);
     Ok(request)
+}
+
+/// 从 transport extensions 提取 mTLS 客户端 principal：自定义 TLS incoming
+/// （`tls::tls_incoming`）产出 `TlsStream<TcpStream>`，tonic 的 blanket
+/// `Connected` impl 据此把 `TlsConnectInfo<TcpConnectInfo>`（含 peer certs）
+/// 放进 extensions。
+fn tls_principal(extensions: &tonic::Extensions) -> Option<String> {
+    let info = extensions.get::<tonic::transport::server::TlsConnectInfo<
+        tonic::transport::server::TcpConnectInfo,
+    >>()?;
+    let certs = info.peer_certs()?;
+    certs.first().map(crate::tls::principal_from_cert)
 }
 
 /// post-decode finalize：proto `headers` map 的 fallback 只有 decode 后可见。

@@ -19,6 +19,11 @@ server:
   cache_registry: false        # 缓存模型注册表到磁盘（预留 — 尚未实现）
   graceful_timeout: 30.0       # 优雅关闭时等待进行中请求的最大秒数
   keepalive_timeout: 5.0       # HTTP keep-alive 超时（秒），0 = 禁用
+  # TLS/mTLS（见下文「TLS / mTLS」一节）——均可选，默认关闭
+  tls_cert_path: null          # 服务器证书链 PEM；须与 tls_key_path 同设
+  tls_key_path: null           # 服务器私钥 PEM；须与 tls_cert_path 同设
+  mtls_ca_path: null           # 客户端 CA  bundle PEM；设置后强制客户端证书（mTLS）
+  tls_min_version: null        # "1.2"（默认）或 "1.3"
 
 logging:
   level: info                  # 日志级别：trace, debug, info, warn, error
@@ -32,6 +37,11 @@ logging:
 grpc:
   enabled: true                # 启用 gRPC 服务
   max_workers: 10              # gRPC 最大工作线程数（预留 — 尚未实现）
+  # TLS/mTLS——与 server.* 的 TLS 键语义相同，作用于 gRPC 监听器
+  tls_cert_path: null          # 服务器证书链 PEM；须与 tls_key_path 同设
+  tls_key_path: null           # 服务器私钥 PEM；须与 tls_cert_path 同设
+  mtls_ca_path: null           # 客户端 CA bundle PEM；设置后强制客户端证书（mTLS）
+  tls_min_version: null        # "1.2"（默认）或 "1.3"
 
 metrics:
   enabled: true                # 启用 Prometheus 指标端点
@@ -83,6 +93,41 @@ tunables:                      # 服务器级旋钮（默认值即下列值，�
   worker_stderr_drain_secs: 5.0    # 等待已退出 worker 冲刷 stderr 的时限
   unpack_timeout_secs: 120.0       # 单次 .lma unpack 命令的上限（防挂起阻塞 reconcile）
 ```
+
+## TLS / mTLS
+
+两个监听器（HTTP `server.*` 与 gRPC `grpc.*`）均支持基于 rustls（纯 Rust，ring provider）的 TLS 与双向 TLS。TLS 按监听器独立启用：同设 `tls_cert_path` + `tls_key_path` 即开启。
+
+```yaml
+server:
+  tls_cert_path: /etc/lite/tls/server.crt   # PEM 证书链（叶子在前）
+  tls_key_path: /etc/lite/tls/server.key    # PEM 私钥（建议 chmod 600）
+  mtls_ca_path: /etc/lite/tls/clients-ca.crt # 可选：强制客户端证书（mTLS）
+  tls_min_version: "1.3"                     # 可选；默认 "1.2"
+grpc:
+  tls_cert_path: /etc/lite/tls/server.crt   # 与 HTTP 监听器相互独立
+  tls_key_path: /etc/lite/tls/server.key
+```
+
+启动时强制校验的规则：
+
+- `tls_cert_path` / `tls_key_path` 必须**成对设置**——只设一个为启动错误。
+- `mtls_ca_path` 依赖该证书对（没有服务器证书的 mTLS 无意义）。
+- TLS 与 **UDS（`unix:` 主机）互斥**——Unix socket 本身已有对等凭证。
+- `tls_min_version` 仅接受 `"1.2"`（默认）或 `"1.3"`，建议 TLS 1.3。
+- PEM 非法、私钥与证书不匹配、CA bundle 为空均为启动错误。
+
+**证书热轮换（免重启）。** 服务器监视 PEM 文件（10 秒内容轮询 + Unix 下 `SIGHUP` 即时触发）：文件变更后——如 cert-manager/Let's Encrypt 续期或 k8s secret 卷符号链接交换——新连接立即使用新证书，已建立连接不受影响。轮换失败（文件损坏、轮换中途 cert/key 不匹配）保留旧证书继续服务并记录错误，下一轮轮询自动重试。mTLS CA bundle 同样支持热轮换。
+
+**ALPN。** gRPC 监听器仅通告 `h2`；HTTP 监听器通告 `h2` 与 `http/1.1`，探活与简单 HTTPS 客户端不受影响。
+
+**mTLS 客户端身份。** 已通过验证的客户端证书 principal（URI SAN → DNS SAN → Subject DN → SHA-256 指纹）写入请求上下文，供访问日志/审计使用。访问控制本期尚不消费该身份——按模型的 API key 鉴权（`policies.auth`）独立配置。
+
+**既定策略说明：**
+
+- **不做 CRL/OCSP 吊销检查**——吊销检查超出范围；剔除被入侵客户端请轮换 CA bundle。
+- `metrics_port` 监听器保持**明文且无鉴权**——请绑定内网或 loopback。启用 TLS 后，主端口的 Prometheus 抓取/探活/内部客户端须走 HTTPS（ALPN 含 `http/1.1`，简单客户端可用）。
+- 私钥文件为组/全员可读时启动仅告警（建议 `chmod 600`），不阻断基于用户组的部署。
 
 ## 模型配置
 

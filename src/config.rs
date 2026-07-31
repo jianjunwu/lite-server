@@ -70,6 +70,17 @@ pub struct ServerConfig {
     /// gzip response compression (P1-4). Default false. SSE responses are
     /// excluded (per-event flush semantics); WS upgrades are unaffected.
     pub compression: bool,
+    /// TLS server certificate chain PEM path (P5-1). Must be set together with
+    /// `tls_key_path`; setting only one is a startup error. Mutually exclusive
+    /// with a UDS `server.host`.
+    pub tls_cert_path: Option<String>,
+    /// TLS private key PEM path (P5-1). See `tls_cert_path`.
+    pub tls_key_path: Option<String>,
+    /// Client CA bundle PEM path (P5-1): when set, client certificates are
+    /// REQUIRED (mTLS). Requires cert+key (setting it alone is an error).
+    pub mtls_ca_path: Option<String>,
+    /// Minimum TLS version (P5-1): "1.2" (default) or "1.3".
+    pub tls_min_version: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -85,6 +96,10 @@ impl Default for ServerConfig {
             graceful_timeout: 30.0,
             keepalive_timeout: 5.0,
             compression: false,
+            tls_cert_path: None,
+            tls_key_path: None,
+            mtls_ca_path: None,
+            tls_min_version: None,
         }
     }
 }
@@ -118,6 +133,17 @@ pub struct GrpcConfig {
     /// gzip response compression on the LiteServer service (P1-3).
     /// Default false; Admin/health services are never compressed.
     pub response_compression: bool,
+    /// TLS server certificate chain PEM path (P5-1). Must be set together with
+    /// `tls_key_path`; setting only one is a startup error. Mutually exclusive
+    /// with a UDS `grpc.host`.
+    pub tls_cert_path: Option<String>,
+    /// TLS private key PEM path (P5-1). See `tls_cert_path`.
+    pub tls_key_path: Option<String>,
+    /// Client CA bundle PEM path (P5-1): when set, client certificates are
+    /// REQUIRED (mTLS). Requires cert+key (setting it alone is an error).
+    pub mtls_ca_path: Option<String>,
+    /// Minimum TLS version (P5-1): "1.2" (default) or "1.3".
+    pub tls_min_version: Option<String>,
 }
 
 impl Default for GrpcConfig {
@@ -132,8 +158,103 @@ impl Default for GrpcConfig {
             http2_adaptive_window: false,
             http2_max_frame_size: None,
             response_compression: false,
+            tls_cert_path: None,
+            tls_key_path: None,
+            mtls_ca_path: None,
+            tls_min_version: None,
         }
     }
+}
+
+/// Resolved TLS file group for one side (HTTP or gRPC), P5-1. Produced by
+/// `tls_settings()` only when cert+key are both set (pair consistency is
+/// enforced by `Config::validate`, which runs before this is consulted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsSettings {
+    pub cert_path: String,
+    pub key_path: String,
+    pub mtls_ca_path: Option<String>,
+    /// "1.2" (default) or "1.3" — validated values only.
+    pub min_version: String,
+}
+
+impl ServerConfig {
+    /// TLS is enabled iff cert+key are both set.
+    pub fn tls_settings(&self) -> Option<TlsSettings> {
+        tls_settings_from(
+            self.tls_cert_path.as_deref(),
+            self.tls_key_path.as_deref(),
+            self.mtls_ca_path.as_deref(),
+            self.tls_min_version.as_deref(),
+        )
+    }
+}
+
+impl GrpcConfig {
+    /// TLS is enabled iff cert+key are both set.
+    pub fn tls_settings(&self) -> Option<TlsSettings> {
+        tls_settings_from(
+            self.tls_cert_path.as_deref(),
+            self.tls_key_path.as_deref(),
+            self.mtls_ca_path.as_deref(),
+            self.tls_min_version.as_deref(),
+        )
+    }
+}
+
+fn tls_settings_from(
+    cert: Option<&str>,
+    key: Option<&str>,
+    ca: Option<&str>,
+    min_version: Option<&str>,
+) -> Option<TlsSettings> {
+    match (cert, key) {
+        (Some(c), Some(k)) => Some(TlsSettings {
+            cert_path: c.to_string(),
+            key_path: k.to_string(),
+            mtls_ca_path: ca.map(String::from),
+            min_version: min_version.unwrap_or("1.2").to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// Shared per-side TLS structural checks (P5-1). `side` is "server" or "grpc"
+/// for error messages that name the exact YAML path.
+fn validate_tls_side(
+    side: &str,
+    cert: Option<&str>,
+    key: Option<&str>,
+    ca: Option<&str>,
+    min_version: Option<&str>,
+    is_uds: bool,
+) -> anyhow::Result<()> {
+    match (cert, key) {
+        (Some(_), None) => anyhow::bail!(
+            "{side}.tls_cert_path is set but {side}.tls_key_path is not — TLS requires both"
+        ),
+        (None, Some(_)) => anyhow::bail!(
+            "{side}.tls_key_path is set but {side}.tls_cert_path is not — TLS requires both"
+        ),
+        _ => {}
+    }
+    let tls_enabled = cert.is_some() && key.is_some();
+    if ca.is_some() && !tls_enabled {
+        anyhow::bail!(
+            "{side}.mtls_ca_path requires {side}.tls_cert_path and {side}.tls_key_path (mTLS without a server certificate is meaningless)"
+        );
+    }
+    if tls_enabled && is_uds {
+        anyhow::bail!(
+            "{side} TLS is mutually exclusive with a UDS bind — a Unix socket is already peer-credentialed; remove the unix: host or the TLS settings"
+        );
+    }
+    if let Some(v) = min_version {
+        if v != "1.2" && v != "1.3" {
+            anyhow::bail!("{side}.tls_min_version must be \"1.2\" or \"1.3\", got \"{v}\"");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -787,6 +908,36 @@ impl Config {
         check_duration_secs("tunables.file_changed_timeout_secs", self.tunables.file_changed_timeout_secs)?;
         check_duration_secs("tunables.worker_stderr_drain_secs", self.tunables.worker_stderr_drain_secs)?;
         check_duration_secs("tunables.unpack_timeout_secs", self.tunables.unpack_timeout_secs)?;
+        self.validate_tls()?;
+        Ok(())
+    }
+
+    /// P5-1 TLS/mTLS structural validation (both sides, same rules):
+    /// cert/key must be set as a pair; `mtls_ca_path` requires the pair;
+    /// TLS is mutually exclusive with a UDS bind; `tls_min_version` is
+    /// "1.2" or "1.3" only. File contents are checked later at TLS store load.
+    fn validate_tls(&self) -> anyhow::Result<()> {
+        validate_tls_side(
+            "server",
+            self.server.tls_cert_path.as_deref(),
+            self.server.tls_key_path.as_deref(),
+            self.server.mtls_ca_path.as_deref(),
+            self.server.tls_min_version.as_deref(),
+            unix_socket_path(&self.server.host).is_some(),
+        )?;
+        let grpc_is_uds = unix_socket_path(&crate::grpc::resolve_grpc_host(
+            self.grpc.host.as_deref(),
+            &self.server.host,
+        ))
+        .is_some();
+        validate_tls_side(
+            "grpc",
+            self.grpc.tls_cert_path.as_deref(),
+            self.grpc.tls_key_path.as_deref(),
+            self.grpc.mtls_ca_path.as_deref(),
+            self.grpc.tls_min_version.as_deref(),
+            grpc_is_uds,
+        )?;
         Ok(())
     }
 }
@@ -1645,5 +1796,112 @@ policies:
         cfg.tunables.watcher_debounce_secs = f32::INFINITY;
         assert!(cfg.validate().is_err());
         assert!(Config::default().validate().is_ok());
+    }
+
+    // ===== P5-1: TLS/mTLS config validation =====
+
+    fn tls_err(cfg: &Config) -> String {
+        cfg.validate().unwrap_err().to_string()
+    }
+
+    #[test]
+    fn tls_disabled_by_default_is_valid() {
+        assert!(Config::default().validate().is_ok());
+        assert!(ServerConfig::default().tls_settings().is_none());
+        assert!(GrpcConfig::default().tls_settings().is_none());
+    }
+
+    #[test]
+    fn tls_cert_without_key_is_error_http_and_grpc() {
+        let mut cfg = Config::default();
+        cfg.server.tls_cert_path = Some("/c.pem".into());
+        assert!(tls_err(&cfg).contains("server.tls_cert_path"));
+
+        let mut cfg = Config::default();
+        cfg.grpc.tls_cert_path = Some("/c.pem".into());
+        assert!(tls_err(&cfg).contains("grpc.tls_cert_path"));
+    }
+
+    #[test]
+    fn tls_key_without_cert_is_error_http_and_grpc() {
+        let mut cfg = Config::default();
+        cfg.server.tls_key_path = Some("/k.pem".into());
+        assert!(tls_err(&cfg).contains("server.tls_key_path"));
+
+        let mut cfg = Config::default();
+        cfg.grpc.tls_key_path = Some("/k.pem".into());
+        assert!(tls_err(&cfg).contains("grpc.tls_key_path"));
+    }
+
+    #[test]
+    fn mtls_ca_alone_is_error_http_and_grpc() {
+        // 蓝图测试项：mtls_ca_path 单独配置报错（无 cert/key 的 mTLS 无意义）。
+        let mut cfg = Config::default();
+        cfg.server.mtls_ca_path = Some("/ca.pem".into());
+        assert!(tls_err(&cfg).contains("server.mtls_ca_path"));
+
+        let mut cfg = Config::default();
+        cfg.grpc.mtls_ca_path = Some("/ca.pem".into());
+        assert!(tls_err(&cfg).contains("grpc.mtls_ca_path"));
+    }
+
+    #[test]
+    fn tls_and_uds_are_mutually_exclusive() {
+        // HTTP: server.host 为 UDS + TLS → 报错。
+        let mut cfg = Config::default();
+        cfg.server.host = "unix:/tmp/x.sock".into();
+        cfg.server.tls_cert_path = Some("/c.pem".into());
+        cfg.server.tls_key_path = Some("/k.pem".into());
+        assert!(tls_err(&cfg).contains("UDS"));
+
+        // gRPC: 显式 grpc.host unix: + mtls_ca → 报错（蓝图测试项 UDS+mtls_ca）。
+        let mut cfg = Config::default();
+        cfg.grpc.host = Some("unix:/tmp/g.sock".into());
+        cfg.grpc.tls_cert_path = Some("/c.pem".into());
+        cfg.grpc.tls_key_path = Some("/k.pem".into());
+        cfg.grpc.mtls_ca_path = Some("/ca.pem".into());
+        assert!(tls_err(&cfg).contains("UDS"));
+
+        // server.host 为 UDS 时 gRPC 回退 TCP 127.0.0.1（P4-1）——gRPC TLS 合法。
+        let mut cfg = Config::default();
+        cfg.server.host = "unix:/tmp/x.sock".into();
+        cfg.grpc.tls_cert_path = Some("/c.pem".into());
+        cfg.grpc.tls_key_path = Some("/k.pem".into());
+        assert!(cfg.validate().is_ok(), "gRPC on TCP fallback may use TLS");
+    }
+
+    #[test]
+    fn tls_min_version_must_be_12_or_13() {
+        for bad in ["1.1", "1.0", "tls13", "v1.3"] {
+            let mut cfg = Config::default();
+            cfg.server.tls_min_version = Some(bad.into());
+            assert!(tls_err(&cfg).contains("tls_min_version"), "{bad}");
+
+            let mut cfg = Config::default();
+            cfg.grpc.tls_min_version = Some(bad.into());
+            assert!(tls_err(&cfg).contains("tls_min_version"), "{bad}");
+        }
+        for ok in ["1.2", "1.3"] {
+            let mut cfg = Config::default();
+            cfg.server.tls_cert_path = Some("/c.pem".into());
+            cfg.server.tls_key_path = Some("/k.pem".into());
+            cfg.server.tls_min_version = Some(ok.into());
+            assert!(cfg.validate().is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn tls_settings_resolve_defaults_and_fields() {
+        let cfg = ServerConfig {
+            tls_cert_path: Some("/c.pem".into()),
+            tls_key_path: Some("/k.pem".into()),
+            mtls_ca_path: Some("/ca.pem".into()),
+            ..Default::default()
+        };
+        let s = cfg.tls_settings().expect("cert+key set");
+        assert_eq!(s.cert_path, "/c.pem");
+        assert_eq!(s.key_path, "/k.pem");
+        assert_eq!(s.mtls_ca_path.as_deref(), Some("/ca.pem"));
+        assert_eq!(s.min_version, "1.2", "default min version");
     }
 }

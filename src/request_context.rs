@@ -41,7 +41,8 @@ pub struct RequestContext {
     pub trace_cx: Context,
     /// 入站协议（复用 callback.rs 的 `Protocol`）。
     pub protocol: Protocol,
-    /// mTLS 客户端身份（P5-1 预留；未启用 TLS 时恒为 None）。
+    /// mTLS 客户端身份（P5-1：TLS acceptor 经 extension 注入；未启用 TLS 或
+    /// 单向 TLS 时为 None）。本期仅供访问日志/审计，access_control 不消费。
     pub principal: Option<String>,
 }
 
@@ -92,12 +93,18 @@ impl RequestContext {
             .get::<OtelParentContext>()
             .map(|c| c.0.clone())
             .unwrap_or_default();
+        // P5-1: the TLS acceptor stamps the verified mTLS client principal
+        // (absent on plaintext and one-way TLS).
+        let principal = parts
+            .extensions
+            .get::<crate::tls::TlsClientPrincipal>()
+            .and_then(|p| p.0.clone());
         Self {
             request_id,
             client_ip,
             trace_cx,
             protocol: Protocol::Http,
-            principal: None,
+            principal,
         }
     }
 }
@@ -214,6 +221,41 @@ mod tests {
         assert_eq!(request_id.len(), 36, "no RequestId stash → UUID v4, got {request_id}");
         assert_eq!(parts.next(), Some("10.0.0.9"));
         assert_eq!(parts.next(), Some("http"));
+    }
+
+    // ===== P5-1: mTLS principal 传播 =====
+
+    #[tokio::test]
+    async fn context_middleware_propagates_tls_principal() {
+        async fn handler(cx: RequestContext) -> String {
+            cx.principal.unwrap_or_default()
+        }
+        let app = axum::Router::new()
+            .route("/t", axum::routing::get(handler))
+            .layer(axum::middleware::from_fn(context_middleware));
+
+        let mut request = Request::builder().uri("/t").body(Body::empty()).unwrap();
+        request
+            .extensions_mut()
+            .insert(crate::tls::TlsClientPrincipal(Some("spiffe://ns/svc".to_string())));
+        let response = app.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "spiffe://ns/svc");
+    }
+
+    #[tokio::test]
+    async fn context_middleware_principal_none_without_tls_extension() {
+        async fn handler(cx: RequestContext) -> String {
+            format!("{}", cx.principal.is_none())
+        }
+        let app = axum::Router::new()
+            .route("/t", axum::routing::get(handler))
+            .layer(axum::middleware::from_fn(context_middleware));
+
+        let request = Request::builder().uri("/t").body(Body::empty()).unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "true");
     }
 
     #[tokio::test]
