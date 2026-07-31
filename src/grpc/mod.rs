@@ -2,6 +2,7 @@ use crate::callback::CallbackRunner;
 use crate::error::AppError;
 use crate::proto::liteserver as pb;
 use crate::registry::ModelRegistry;
+use crate::request_context::RequestContext;
 use crate::streaming;
 use crate::worker::WorkerManager;
 use std::collections::HashMap;
@@ -14,6 +15,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 use uuid::Uuid;
+
+pub mod interceptor;
 
 pub use pb::lite_server_server::{LiteServer, LiteServerServer};
 
@@ -272,51 +275,6 @@ fn http2_keepalive_params(cfg: &crate::config::GrpcConfig) -> Option<(Duration, 
     }
 }
 
-/// Extract the client request ID: gRPC metadata (transport-level, idiomatic
-/// for gRPC) takes priority over the protobuf `headers` map (application-level,
-/// e.g. a REST→gRPC bridge); falls back to a fresh UUID v4. Values must pass
-/// the same validation as the HTTP path (`is_valid_request_id`).
-fn extract_request_id(metadata: &MetadataMap, headers: &HashMap<String, String>) -> String {
-    metadata
-        .get("x-client-request-id")
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| crate::validation::is_valid_request_id(s))
-        .map(String::from)
-        .or_else(|| {
-            headers
-                .get("x-client-request-id")
-                .filter(|s| crate::validation::is_valid_request_id(s))
-                .cloned()
-        })
-        .unwrap_or_else(|| Uuid::new_v4().to_string())
-}
-
-/// Extract the client IP with the same proxy-header semantics as the HTTP
-/// path (`x-forwarded-for` > `x-real-ip`), checked in gRPC metadata first
-/// then the protobuf `headers` map. Falls back to the transport peer address
-/// (populated by `Server::serve` on TCP), then "".
-fn extract_client_ip(
-    metadata: &MetadataMap,
-    headers: &HashMap<String, String>,
-    remote_addr: Option<std::net::SocketAddr>,
-) -> String {
-    for key in ["x-forwarded-for", "x-real-ip"] {
-        if let Some(v) = metadata
-            .get(key)
-            .and_then(|v| v.to_str().ok())
-            .filter(|s| !s.is_empty())
-        {
-            return v.to_string();
-        }
-        if let Some(v) = headers.get(key).filter(|s| !s.is_empty()) {
-            return v.clone();
-        }
-    }
-    remote_addr
-        .map(|a| a.ip().to_string())
-        .unwrap_or_default()
-}
-
 #[tonic::async_trait]
 impl LiteServer for GrpcService {
     async fn infer(
@@ -324,9 +282,15 @@ impl LiteServer for GrpcService {
         request: Request<pb::InferRequest>,
     ) -> Result<Response<pb::InferResponse>, Status> {
         let remote_addr = request.remote_addr();
-        let (grpc_metadata, _extensions, req) = request.into_parts();
-        let request_id = extract_request_id(&grpc_metadata, &req.headers);
-        let client_ip = extract_client_ip(&grpc_metadata, &req.headers, remote_addr);
+        let (grpc_metadata, extensions, req) = request.into_parts();
+        let cx = interceptor::finalize_context(
+            extensions.get::<RequestContext>().cloned(),
+            &grpc_metadata,
+            &req.headers,
+            remote_addr,
+        );
+        let request_id = cx.request_id.clone();
+        let client_ip = cx.client_ip.clone();
         let model_name = &req.model_name;
         let version = if req.version.is_empty() {
             None
@@ -498,9 +462,15 @@ impl LiteServer for GrpcService {
         request: Request<pb::BatchInferRequest>,
     ) -> Result<Response<pb::BatchInferResponse>, Status> {
         let remote_addr = request.remote_addr();
-        let (grpc_metadata, _extensions, req) = request.into_parts();
-        let request_id = extract_request_id(&grpc_metadata, &req.headers);
-        let client_ip = extract_client_ip(&grpc_metadata, &req.headers, remote_addr);
+        let (grpc_metadata, extensions, req) = request.into_parts();
+        let cx = interceptor::finalize_context(
+            extensions.get::<RequestContext>().cloned(),
+            &grpc_metadata,
+            &req.headers,
+            remote_addr,
+        );
+        let request_id = cx.request_id;
+        let client_ip = cx.client_ip;
         let model_name = &req.model_name;
         let version = if req.version.is_empty() {
             None
@@ -615,9 +585,15 @@ impl LiteServer for GrpcService {
         request: Request<pb::StreamInferRequest>,
     ) -> Result<Response<Self::StreamInferStream>, Status> {
         let remote_addr = request.remote_addr();
-        let (grpc_metadata, _extensions, req) = request.into_parts();
-        let request_id = extract_request_id(&grpc_metadata, &req.headers);
-        let client_ip = extract_client_ip(&grpc_metadata, &req.headers, remote_addr);
+        let (grpc_metadata, extensions, req) = request.into_parts();
+        let cx = interceptor::finalize_context(
+            extensions.get::<RequestContext>().cloned(),
+            &grpc_metadata,
+            &req.headers,
+            remote_addr,
+        );
+        let request_id = cx.request_id;
+        let client_ip = cx.client_ip;
         let model_name = &req.model_name;
         let version = if req.version.is_empty() {
             None
@@ -769,11 +745,17 @@ impl LiteServer for GrpcService {
         request: Request<Streaming<pb::BidiChunk>>,
     ) -> Result<Response<Self::BidiStreamStream>, Status> {
         let remote_addr = request.remote_addr();
-        let (grpc_metadata, _extensions, mut stream) = request.into_parts();
+        let (grpc_metadata, extensions, mut stream) = request.into_parts();
         // BidiOpen carries no headers map — metadata and the transport peer
         // address are the only client-identity sources on this path.
-        let request_id = extract_request_id(&grpc_metadata, &HashMap::new());
-        let client_ip = extract_client_ip(&grpc_metadata, &HashMap::new(), remote_addr);
+        let cx = interceptor::finalize_context(
+            extensions.get::<RequestContext>().cloned(),
+            &grpc_metadata,
+            &HashMap::new(),
+            remote_addr,
+        );
+        let request_id = cx.request_id;
+        let client_ip = cx.client_ip;
 
         // Wait for first message (must be BidiOpen)
         let first = stream
@@ -1007,6 +989,12 @@ pub async fn start_grpc_server(
     } else {
         server
     };
+    // P-MW (蓝图 §4.0.3, D20): pre-decode interceptor fills RequestContext
+    // into request extensions — mounted on LiteServer AND health (挂载矩阵).
+    // Pre-call semantics only: it cannot touch responses/Status, so echo
+    // (P2-2) and error logging (P1-1) stay in handlers. Transparent to
+    // unary/stream/bidi (runs once per RPC, never touches the message flow).
+    let server = tonic::codegen::InterceptedService::new(server, interceptor::context_interceptor);
 
     // Standard gRPC health checking (grpc.health.v1): the reporter lives in
     // the WorkerManager, which syncs "" and per-model services on every
@@ -1014,6 +1002,8 @@ pub async fn start_grpc_server(
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     worker_manager.set_grpc_health_reporter(health_reporter).await;
     worker_manager.sync_grpc_health().await;
+    let health_service =
+        tonic::codegen::InterceptedService::new(health_service, interceptor::context_interceptor);
 
     tracing::info!("Starting gRPC server on {}", addr);
 
@@ -1349,104 +1339,9 @@ mod tests {
     }
 
     // ===== request_id / client_ip extraction =====
-
-    fn md_with(pairs: &[(&str, &str)]) -> MetadataMap {
-        let mut md = MetadataMap::new();
-        for (k, v) in pairs {
-            md.insert(MetadataKey::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
-        }
-        md
-    }
-
-    fn headers_with(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
-
-    #[test]
-    fn extract_request_id_prefers_grpc_metadata() {
-        let md = md_with(&[("x-client-request-id", "from-metadata")]);
-        let headers = headers_with(&[("x-client-request-id", "from-headers")]);
-        assert_eq!(extract_request_id(&md, &headers), "from-metadata");
-    }
-
-    #[test]
-    fn extract_request_id_falls_back_to_proto_headers() {
-        let md = MetadataMap::new();
-        let headers = headers_with(&[("x-client-request-id", "from-headers")]);
-        assert_eq!(extract_request_id(&md, &headers), "from-headers");
-    }
-
-    #[test]
-    fn extract_request_id_skips_invalid_metadata_value() {
-        let md = md_with(&[("x-client-request-id", &"x".repeat(513))]);
-        let headers = headers_with(&[("x-client-request-id", "from-headers")]);
-        assert_eq!(extract_request_id(&md, &headers), "from-headers");
-    }
-
-    #[test]
-    fn extract_request_id_generates_uuid_when_absent() {
-        let id = extract_request_id(&MetadataMap::new(), &HashMap::new());
-        assert!(uuid::Uuid::parse_str(&id).is_ok(), "expected UUID, got {}", id);
-    }
-
-    #[test]
-    fn extract_client_ip_prefers_metadata_xff() {
-        let md = md_with(&[
-            ("x-forwarded-for", "10.0.0.1"),
-            ("x-real-ip", "10.0.0.2"),
-        ]);
-        let headers = headers_with(&[("x-forwarded-for", "10.0.0.3")]);
-        let addr: std::net::SocketAddr = "192.168.1.1:5000".parse().unwrap();
-        assert_eq!(extract_client_ip(&md, &headers, Some(addr)), "10.0.0.1");
-    }
-
-    #[test]
-    fn extract_client_ip_uses_metadata_real_ip_when_no_xff() {
-        let md = md_with(&[("x-real-ip", "10.0.0.2")]);
-        assert_eq!(
-            extract_client_ip(&md, &HashMap::new(), None),
-            "10.0.0.2"
-        );
-    }
-
-    #[test]
-    fn extract_client_ip_falls_back_to_proto_headers() {
-        let headers = headers_with(&[("x-forwarded-for", "10.0.0.3")]);
-        let addr: std::net::SocketAddr = "192.168.1.1:5000".parse().unwrap();
-        assert_eq!(
-            extract_client_ip(&MetadataMap::new(), &headers, Some(addr)),
-            "10.0.0.3"
-        );
-    }
-
-    #[test]
-    fn extract_client_ip_falls_back_to_remote_addr() {
-        let addr: std::net::SocketAddr = "192.168.1.1:5000".parse().unwrap();
-        assert_eq!(
-            extract_client_ip(&MetadataMap::new(), &HashMap::new(), Some(addr)),
-            "192.168.1.1"
-        );
-    }
-
-    #[test]
-    fn extract_client_ip_empty_when_no_source() {
-        assert_eq!(
-            extract_client_ip(&MetadataMap::new(), &HashMap::new(), None),
-            ""
-        );
-    }
-
-    #[test]
-    fn extract_client_ip_skips_empty_xff() {
-        let md = md_with(&[("x-forwarded-for", ""), ("x-real-ip", "10.0.0.2")]);
-        assert_eq!(
-            extract_client_ip(&md, &HashMap::new(), None),
-            "10.0.0.2"
-        );
-    }
+    // P-MW: the extract_* unit tests moved with the logic to
+    // `grpc::interceptor` (metadata side: `RequestContext::from_grpc_metadata`;
+    // post-decode fallback: `finalize_context`).
 
     // ===== B2: gRPC streaming bypasses ejected workers =====
 

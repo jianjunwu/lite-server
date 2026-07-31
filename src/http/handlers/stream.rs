@@ -2,9 +2,9 @@ use super::*;
 use super::inference::{build_request_meta, resolve_version};
 use crate::error::AppError;
 use crate::http::state::AppState;
-use crate::http::RequestId;
 use crate::metrics::prometheus;
 use crate::proto::liteserver as pb;
+use crate::request_context::RequestContext;
 use crate::streaming;
 use axum::{
     extract::{Path, State},
@@ -68,11 +68,11 @@ pub async fn sse_infer_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
     headers: HeaderMap,
-    RequestId(request_id): RequestId,
+    cx: RequestContext,
     ApiJson(payload): ApiJson<Value>,
 ) -> Response {
     let result =
-        sse_infer_entry(&state, &model_name, None, headers, payload, request_id).await;
+        sse_infer_entry(&state, &model_name, None, headers, payload, cx).await;
     attach_cors_headers(&state, &model_name, result)
 }
 
@@ -80,11 +80,11 @@ pub async fn sse_infer_version_handler(
     State(state): State<Arc<AppState>>,
     Path((model_name, version)): Path<(String, String)>,
     headers: HeaderMap,
-    RequestId(request_id): RequestId,
+    cx: RequestContext,
     ApiJson(payload): ApiJson<Value>,
 ) -> Response {
     let result = sse_infer_entry(
-        &state, &model_name, Some(version), headers, payload, request_id,
+        &state, &model_name, Some(version), headers, payload, cx,
     )
     .await;
     attach_cors_headers(&state, &model_name, result)
@@ -99,7 +99,7 @@ async fn sse_infer_entry(
     version: Option<String>,
     headers: HeaderMap,
     payload: Value,
-    request_id: String,
+    cx: RequestContext,
 ) -> Result<Response, AppError> {
     crate::validation::validate_identifier(model_name)?;
     if let Some(ref v) = version {
@@ -115,7 +115,7 @@ async fn sse_infer_entry(
     // Auth + rate limit (rate limit shares the /predict bucket with unary infer).
     if let Some(mv) = state.registry.get(model_name, Some(&resolved_version)) {
         enforce_auth(mv.policies.auth.as_ref(), &headers)?;
-        enforce_rate_limit(state, mv.policies.rate_limit.as_ref(), model_name, &headers).await?;
+        enforce_rate_limit(state, mv.policies.rate_limit.as_ref(), model_name, &cx.client_ip).await?;
     }
     let sse = sse_infer_impl(
         state.clone(),
@@ -123,7 +123,7 @@ async fn sse_infer_entry(
         resolved_version,
         headers,
         payload,
-        request_id,
+        cx,
     )
     .await?;
     Ok(sse.into_response())
@@ -135,10 +135,10 @@ async fn sse_infer_impl(
     resolved_version: String,
     headers: HeaderMap,
     payload: Value,
-    request_id: String,
+    cx: RequestContext,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, AppError> {
 
-    let meta = build_request_meta(&headers, &payload, "/predict", request_id);
+    let meta = build_request_meta(&headers, &payload, "/predict", &cx);
     let payload_bytes = meta.payload.clone();
     let (stream_id, mut chunk_rx) = open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await?;
 
@@ -235,12 +235,12 @@ pub async fn ws_stream_handler(
     Path(model_name): Path<String>,
     headers: HeaderMap,
     ws: axum::extract::WebSocketUpgrade,
-    RequestId(request_id): RequestId,
+    cx: RequestContext,
 ) -> Response {
     if let Err(e) = crate::validation::validate_identifier(&model_name) {
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, headers, socket, request_id))
+    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, headers, socket, cx))
 }
 
 pub async fn ws_stream_version_handler(
@@ -248,7 +248,7 @@ pub async fn ws_stream_version_handler(
     Path((model_name, version)): Path<(String, String)>,
     headers: HeaderMap,
     ws: axum::extract::WebSocketUpgrade,
-    RequestId(request_id): RequestId,
+    cx: RequestContext,
 ) -> Response {
     if let Err(e) = crate::validation::validate_identifier(&model_name) {
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
@@ -256,7 +256,7 @@ pub async fn ws_stream_version_handler(
     if let Err(e) = crate::validation::validate_version(&version) {
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), headers, socket, request_id))
+    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), headers, socket, cx))
 }
 
 async fn handle_ws_stream(
@@ -265,7 +265,7 @@ async fn handle_ws_stream(
     version: Option<String>,
     headers: HeaderMap,
     mut socket: WebSocket,
-    request_id: String,
+    cx: RequestContext,
 ) {
     let resolved_version = match resolve_version(&state, &model_name, version, &headers).await {
         Ok(v) => v,
@@ -280,16 +280,16 @@ async fn handle_ws_stream(
         return;
     }
 
-    // Rate limit (same logic as HTTP infer). The original upgrade request's
-    // headers are preserved (including the peer_ip_fallback-injected x-real-ip
-    // for direct connections), so key="ip" limits per real client.
+    // Rate limit (same logic as HTTP infer). client_ip comes from the
+    // RequestContext filled once by context_middleware (including the
+    // direct-connection peer fallback), so key="ip" limits per real client.
     if let Some(mv) = state.registry.get(&model_name, Some(&resolved_version)) {
         if enforce_auth(mv.policies.auth.as_ref(), &headers).is_err()
             || enforce_rate_limit(
                 &state,
                 mv.policies.rate_limit.as_ref(),
                 &model_name,
-                &headers,
+                &cx.client_ip,
             )
             .await
             .is_err()
@@ -323,9 +323,9 @@ async fn handle_ws_stream(
         }
     };
 
-    // The original upgrade-request headers (with the peer-IP fallback applied
-    // by the middleware) flow into meta so WS client_ip/rate-limit are correct.
-    let meta = build_request_meta(&headers, &payload, "/predict", request_id);
+    // The original upgrade-request headers flow into meta; client_ip /
+    // request_id come from the RequestContext (P-MW single fill).
+    let meta = build_request_meta(&headers, &payload, "/predict", &cx);
     let payload_bytes = meta.payload.clone();
 
     let (stream_id, mut chunk_rx) = match open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await {

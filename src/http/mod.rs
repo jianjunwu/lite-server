@@ -33,29 +33,15 @@ async fn disable_keepalive_middleware(request: Request, next: Next) -> Response 
     response
 }
 
-/// Newtype for request ID extraction from extensions.
+/// Newtype for the request ID stash in request extensions, written once by
+/// `observability_middleware` (outermost) and read by `context_middleware`
+/// when it builds the `RequestContext` (P-MW, D21 single-source).
 #[derive(Clone, Debug)]
 pub struct RequestId(pub String);
 
 impl std::fmt::Display for RequestId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
-    }
-}
-
-#[axum::async_trait]
-impl<S: Send + Sync> axum::extract::FromRequestParts<S> for RequestId {
-    type Rejection = std::convert::Infallible;
-
-    async fn from_request_parts(
-        parts: &mut axum::http::request::Parts,
-        _state: &S,
-    ) -> Result<Self, Self::Rejection> {
-        Ok(parts
-            .extensions
-            .get::<RequestId>()
-            .cloned()
-            .unwrap_or_else(|| RequestId(Uuid::new_v4().to_string())))
     }
 }
 
@@ -85,12 +71,13 @@ pub(crate) async fn route_fallback(
         .map(|q| q.0)
         .unwrap_or_default();
     let method = parts.method.clone();
-    let request_id = parts
+    // P-MW: read the RequestContext filled by context_middleware (the
+    // from_http_parts fallback only fires when the middleware is absent).
+    let cx = parts
         .extensions
-        .get::<RequestId>()
+        .get::<crate::request_context::RequestContext>()
         .cloned()
-        .map(|r| r.0)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+        .unwrap_or_else(|| crate::request_context::RequestContext::from_http_parts(&parts));
     let headers = parts.headers.clone();
     let body = match axum::body::to_bytes(body, ROUTE_BODY_LIMIT).await {
         Ok(b) => b,
@@ -100,7 +87,7 @@ pub(crate) async fn route_fallback(
     };
 
     match crate::http::handlers::dispatch_custom_route(
-        &state, &model, &tail, &method, query, &headers, body, request_id,
+        &state, &model, &tail, &method, query, &headers, body, &cx,
     )
     .await
     {
@@ -231,6 +218,14 @@ pub async fn start_http_server(
     } else {
         app
     };
+
+    // Context middleware (P-MW, 蓝图 §4.0.2): immediately inside
+    // observability, ahead of every RequestContext consumer (D21) — fills
+    // RequestContext once from the observability RequestId stash + headers
+    // + ConnectInfo; rate-limit / callbacks / RequestMeta all read it.
+    let app = app.layer(axum::middleware::from_fn(
+        crate::request_context::context_middleware,
+    ));
 
     // Observability middleware (outermost — applied last so it captures total
     // wall-clock duration and sets x-request-id + x-processing-time-ms on ALL
@@ -428,28 +423,6 @@ mod tests {
         assert_eq!(body["error"]["param"], serde_json::Value::Null);
     }
 
-    // ===== RequestId extractor tests =====
-
-    #[tokio::test]
-    async fn test_request_id_extractor_generates_uuid_without_middleware() {
-        // Handlers must work without the observability middleware —
-        // the extractor falls back to a fresh UUID instead of failing.
-        async fn id_handler(RequestId(id): RequestId) -> String {
-            id
-        }
-        let app = axum::Router::new().route("/test", axum::routing::get(id_handler));
-
-        let response = app
-            .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
-        let id = String::from_utf8(body_bytes.to_vec()).unwrap();
-        assert_eq!(id.len(), 36, "should fall back to UUID v4 (36 chars), got: {}", id);
-    }
-
     // ===== observability middleware tests =====
 
     #[tokio::test]
@@ -558,5 +531,50 @@ mod tests {
             "x-request-id must be on error responses too");
         assert!(response.headers().get("x-processing-time-ms").is_some(),
             "x-processing-time-ms must be on error responses too");
+    }
+
+    // ===== P-MW: production stack order (observability → context_middleware) =====
+
+    #[tokio::test]
+    async fn test_context_reads_single_request_id_fill_by_observability() {
+        // 蓝图 §4.0.5: one fill, many readers — the handler's RequestContext
+        // must carry the SAME request_id observability echoes on the response,
+        // and the client_ip from the request headers.
+        async fn cx_handler(cx: crate::request_context::RequestContext) -> String {
+            format!("{}|{}", cx.request_id, cx.client_ip)
+        }
+        // Same order as start_http_server: context_middleware applied first
+        // (inner), observability last (outermost).
+        let app = axum::Router::new()
+            .route("/test", axum::routing::get(cx_handler))
+            .layer(axum::middleware::from_fn(
+                crate::request_context::context_middleware,
+            ))
+            .layer(axum::middleware::from_fn(observability_middleware));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/test")
+                    .header("x-client-request-id", "trace-abc")
+                    .header("x-forwarded-for", "10.1.2.3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let echoed = response
+            .headers()
+            .get("x-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+        assert_eq!(body, format!("{}|10.1.2.3", echoed),
+            "handler context must read the same request_id observability echoes");
     }
 }

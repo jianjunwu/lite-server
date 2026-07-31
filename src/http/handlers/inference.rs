@@ -1,10 +1,10 @@
 use super::*;
 use crate::error::AppError;
 use crate::http::state::AppState;
-use crate::http::RequestId;
 use crate::metrics::prometheus;
 use crate::proto::liteserver as pb;
 use crate::registry::types::ModelType;
+use crate::request_context::RequestContext;
 use axum::{
     extract::{Path, State},
     http::HeaderMap,
@@ -25,13 +25,13 @@ pub async fn infer_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
     headers: HeaderMap,
-    RequestId(request_id): RequestId,
+    cx: RequestContext,
     ApiJson(payload): ApiJson<Value>,
 ) -> Result<Response, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     let result = do_infer(
         state.clone(), model_name.clone(), None,
-        "/predict".to_string(), headers, payload, request_id,
+        "/predict".to_string(), headers, payload, cx,
     ).await;
     Ok(attach_cors_headers(&state, &model_name, result))
 }
@@ -40,14 +40,14 @@ pub async fn infer_version_handler(
     State(state): State<Arc<AppState>>,
     Path((model_name, version)): Path<(String, String)>,
     headers: HeaderMap,
-    RequestId(request_id): RequestId,
+    cx: RequestContext,
     ApiJson(payload): ApiJson<Value>,
 ) -> Result<Response, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
     let result = do_infer(
         state.clone(), model_name.clone(), Some(version),
-        "/predict".to_string(), headers, payload, request_id,
+        "/predict".to_string(), headers, payload, cx,
     ).await;
     Ok(attach_cors_headers(&state, &model_name, result))
 }
@@ -58,8 +58,9 @@ async fn do_infer(
     route: String,
     headers: HeaderMap,
     payload: Value,
-    request_id: String,
+    cx: RequestContext,
 ) -> Result<Response, AppError> {
+    let request_id = cx.request_id.clone();
     let span = tracing::info_span!(
         "inference",
         model = %model_name,
@@ -83,11 +84,11 @@ async fn do_infer(
 
     // Policy checks (before ensemble, after mv resolution): auth first, then rate limit
     enforce_auth(mv.policies.auth.as_ref(), &headers)?;
-    enforce_rate_limit(&state, mv.policies.rate_limit.as_ref(), &model_name, &headers).await?;
+    enforce_rate_limit(&state, mv.policies.rate_limit.as_ref(), &model_name, &cx.client_ip).await?;
 
     // Handle ensemble
     if mv.model_type == ModelType::Ensemble {
-        let result = crate::ensemble::execute_ensemble(state, &model_name, &resolved_version, payload, &request_id, &extract_client_ip(&headers)).await?;
+        let result = crate::ensemble::execute_ensemble(state, &model_name, &resolved_version, payload, &request_id, &cx.client_ip).await?;
         return Ok(Json(result).into_response());
     }
 
@@ -107,7 +108,7 @@ async fn do_infer(
         .iter()
         .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), s.to_string())))
         .collect();
-    let client_ip = extract_client_ip(&headers);
+    let client_ip = cx.client_ip.clone();
     let timestamp_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -343,12 +344,11 @@ pub(super) async fn resolve_version(
     Ok(resolved)
 }
 
-pub(super) fn build_request_meta(headers: &HeaderMap, payload: &Value, route: &str, request_id: String) -> pb::RequestMeta {
+pub(super) fn build_request_meta(headers: &HeaderMap, payload: &Value, route: &str, cx: &RequestContext) -> pb::RequestMeta {
     let header_map: HashMap<String, String> = headers
         .iter()
         .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), s.to_string())))
         .collect();
-    let client_ip = extract_client_ip(headers);
     let timestamp_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -358,8 +358,8 @@ pub(super) fn build_request_meta(headers: &HeaderMap, payload: &Value, route: &s
     pb::RequestMeta {
         route: route.to_string(),
         headers: header_map,
-        client_ip,
-        request_id,
+        client_ip: cx.client_ip.clone(),
+        request_id: cx.request_id.clone(),
         timestamp_ns,
         payload: payload_bytes,
         ..Default::default()
@@ -370,6 +370,16 @@ mod streaming_tests {
     use super::*;
     use axum::http::HeaderMap;
 
+    fn test_cx(request_id: &str, client_ip: &str) -> RequestContext {
+        RequestContext {
+            request_id: request_id.to_string(),
+            client_ip: client_ip.to_string(),
+            trace_cx: opentelemetry::Context::new(),
+            protocol: crate::callback::Protocol::Http,
+            principal: None,
+        }
+    }
+
     #[test]
     fn test_build_request_meta_payload_matches_serialized() {
         // build_request_meta already serializes payload into meta.payload.
@@ -378,23 +388,25 @@ mod streaming_tests {
         let headers = HeaderMap::new();
         let payload = serde_json::json!({"prompt": "hello", "max_tokens": 100});
         let direct_bytes = bytes::Bytes::from(serde_json::to_vec(&payload).unwrap_or_default());
-        let request_id = "test-id-001".to_string();
+        let cx = test_cx("test-id-001", "");
 
-        let meta = build_request_meta(&headers, &payload, "/predict", request_id);
+        let meta = build_request_meta(&headers, &payload, "/predict", &cx);
 
         assert_eq!(meta.payload, direct_bytes,
             "meta.payload should equal direct serde_json::to_vec output");
     }
 
     #[test]
-    fn test_build_request_meta_returns_correct_route() {
+    fn test_build_request_meta_reads_context() {
+        // P-MW: request_id / client_ip come from the RequestContext filled
+        // once by context_middleware — never re-extracted from headers here.
         let headers = HeaderMap::new();
         let payload = serde_json::json!({"x": 1});
-        let request_id = "test-id-002".to_string();
-        let meta = build_request_meta(&headers, &payload, "/custom", request_id);
+        let cx = test_cx("test-id-002", "10.0.0.7");
+        let meta = build_request_meta(&headers, &payload, "/custom", &cx);
 
         assert_eq!(meta.route, "/custom");
-        assert_eq!(meta.client_ip, "");
+        assert_eq!(meta.client_ip, "10.0.0.7");
         assert_eq!(meta.request_id, "test-id-002");
     }
 }
