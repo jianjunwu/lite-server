@@ -137,7 +137,7 @@ impl GrpcService {
         self.registry.touch_last_used(model_name, &resolved_version);
         *version_label = resolved_version.clone();
 
-        if !self.registry.is_ready(model_name, version) {
+        if !self.registry.is_ready(model_name, Some(&resolved_version)) {
             return Err(err(Status::unavailable(format!(
                 "{} version {} is not ready",
                 model_name, resolved_version
@@ -335,7 +335,7 @@ impl GrpcService {
         self.registry.touch_last_used(model_name, &resolved_version);
         *version_label = resolved_version.clone();
 
-        if !self.registry.is_ready(model_name, version) {
+        if !self.registry.is_ready(model_name, Some(&resolved_version)) {
             return Err(err(Status::unavailable(format!(
                 "{} version {} is not ready",
                 model_name, resolved_version
@@ -472,7 +472,7 @@ impl GrpcService {
         self.registry.touch_last_used(model_name, &resolved_version);
         *version_label = resolved_version.clone();
 
-        if !self.registry.is_ready(model_name, version) {
+        if !self.registry.is_ready(model_name, Some(&resolved_version)) {
             return Err(err(Status::unavailable(format!(
                 "{} version {} is not ready",
                 model_name, resolved_version
@@ -661,7 +661,7 @@ impl GrpcService {
                     let resolved_version =
                         resolve_bidi_version(&self.registry, &model_name, version.as_deref(), pin.clone())?;
 
-                    if !self.registry.is_ready(&model_name, version.as_deref()) {
+                    if !self.registry.is_ready(&model_name, Some(&resolved_version)) {
                         return Err(err(Status::unavailable(format!(
                             "{} version {} is not ready",
                             model_name, resolved_version
@@ -1872,6 +1872,10 @@ mod tests {
         assert_eq!(resolved, "1", "显式 version 优先级高于 pin");
     }
 
+    // B1 readiness-gate tests live in `request_metrics_tests` (below), where
+    // the handler-level harness (`build_service_with_canary`, `infer_request`,
+    // `test_config`) exists.
+
     #[test]
     fn test_http_status_to_grpc_code() {
         assert_eq!(http_status_to_grpc_code(400), tonic::Code::InvalidArgument);
@@ -2414,6 +2418,107 @@ mod request_metrics_tests {
         req.metadata_mut().insert("x-lite-version", "9".parse().unwrap());
         let err = service.infer(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound, "pin 版本不存在 → NotFound（蓝图 §4.4）");
+    }
+
+    // --- B1: readiness gate must check the RESOLVED version, not the raw
+    //     request version (HTTP inference.rs:76 checks Some(&resolved)).
+    //     On the broken code the gate inspects the active Ready v1 and the
+    //     request falls through to a dispatch error ("queue not available" /
+    //     "no workers available") — Unavailable, but never the gate's
+    //     "not ready" message, which is what these tests assert. ---
+
+    /// v1 active+Ready (weight 0); v2 was Ready, now Degraded, holding all
+    /// weight — an empty-version request deterministically resolves to the
+    /// not-Ready v2. No queue/worker wiring: the gate fires before dispatch.
+    fn degraded_weighted_service(model: &str) -> GrpcService {
+        use crate::registry::types::VersionStatus;
+        let registry = Arc::new(ModelRegistry::new());
+        for v in ["1", "2"] {
+            registry
+                .register(model, v, test_config(1, 0.0, 10), ModelType::LitAPI, std::env::temp_dir())
+                .unwrap();
+            registry.mark_ready(model, v).unwrap();
+        }
+        registry.activate_version(model, "1").unwrap();
+        registry.set_status(model, "2", VersionStatus::Degraded).unwrap();
+        registry
+            .set_weights(model, &HashMap::from([("1".into(), 0u32), ("2".into(), 100)]))
+            .unwrap();
+        build_service_with_canary(registry, Arc::new(InferenceQueue::new()), false)
+    }
+
+    /// canary_override=true + pin "2" resolves an empty-version request to the
+    /// registered-but-not-Ready v2; the gate must reject it (HTTP parity).
+    #[tokio::test]
+    async fn grpc_readiness_gate_must_check_resolved_version_not_raw() {
+        let model = "gate_pin";
+        let registry = Arc::new(ModelRegistry::new());
+        registry
+            .register(model, "1", test_config(1, 0.0, 10), ModelType::LitAPI, std::env::temp_dir())
+            .unwrap();
+        registry.mark_ready(model, "1").unwrap();
+        registry.activate_version(model, "1").unwrap();
+        // v2 registered (exists for canary_pin) but deliberately NOT marked ready.
+        registry
+            .register(model, "2", test_config(1, 0.0, 10), ModelType::LitAPI, std::env::temp_dir())
+            .unwrap();
+        let service = build_service_with_canary(registry, Arc::new(InferenceQueue::new()), true);
+
+        let mut req = infer_request(model, "");
+        req.metadata_mut().insert("x-lite-version", "2".parse().unwrap());
+        let err = service.infer(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(err.message().contains("not ready"),
+            "resolved v2 is not Ready → gate must 503; got: {}", err.message());
+    }
+
+    /// Same root cause without any opt-in flag: a weighted rollout whose
+    /// non-active version degraded — routing_pick (Degraded is a candidate)
+    /// resolves empty-version requests to it; the gate must reject.
+    #[tokio::test]
+    async fn grpc_readiness_gate_bypasses_degraded_weighted_version() {
+        let service = degraded_weighted_service("gate_degraded");
+
+        let err = service.infer(infer_request("gate_degraded", "")).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(err.message().contains("not ready"),
+            "resolved Degraded v2 → gate must 503; got: {}", err.message());
+    }
+
+    #[tokio::test]
+    async fn batch_infer_readiness_gate_checks_resolved_version() {
+        let service = degraded_weighted_service("gate_batch");
+
+        let err = service
+            .batch_infer(Request::new(pb::BatchInferRequest {
+                model_name: "gate_batch".to_string(),
+                version: String::new(),
+                items: vec![Bytes::from_static(b"{}")],
+                headers: HashMap::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(err.message().contains("not ready"),
+            "resolved Degraded v2 → gate must 503; got: {}", err.message());
+    }
+
+    #[tokio::test]
+    async fn stream_infer_readiness_gate_checks_resolved_version() {
+        let service = degraded_weighted_service("gate_stream");
+
+        let err = service
+            .stream_infer(Request::new(pb::StreamInferRequest {
+                model_name: "gate_stream".to_string(),
+                version: String::new(),
+                data: Bytes::from_static(b"{}"),
+                headers: HashMap::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(err.message().contains("not ready"),
+            "resolved Degraded v2 → gate must 503; got: {}", err.message());
     }
 
     #[tokio::test(flavor = "current_thread")]
