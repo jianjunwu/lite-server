@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tracing::warn;
+use tracing::Instrument;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
@@ -604,6 +605,14 @@ impl GrpcService {
         *model_label = model_name.clone();
         *version_label = resolved_version.clone();
 
+        // P2-3 span：覆盖 bidi handler 全程（model/version 在 Open 解码后已知）。
+        let span = tracing::info_span!(
+            "inference",
+            model = %model_name,
+            version = %resolved_version,
+            request_id = %request_id,
+        );
+        async move {
         let meta = pb::RequestMeta {
             route: "/predict".to_string(),
             headers: HashMap::new(),
@@ -764,6 +773,7 @@ impl GrpcService {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+        }.instrument(span).await
     }
 }
 
@@ -887,6 +897,16 @@ fn grpc_code_to_status_family(code: tonic::Code) -> &'static str {
         c if is_client_class(c) => "4xx",
         _ => "5xx",
     }
+}
+
+/// P2-3：从入站 metadata 取 request_id（span 字段用；与 interceptor 同源）。
+fn metadata_request_id(metadata: &MetadataMap) -> String {
+    metadata
+        .get("x-client-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_default()
 }
 
 /// P2-2：将 `x-request-id` + `x-processing-time-ms` 注入响应/错误 metadata
@@ -1062,12 +1082,26 @@ impl LiteServer for GrpcService {
         // 解析失败保持请求原值；D5 无 protocol label，与 HTTP 共享计数）。
         // P2-2 回显：request_id/processing-time 注入响应或错误 metadata（对齐
         // HTTP observability_middleware 错误路径回显）。
+        // P2-3 span：覆盖 handler 全程（字段与 HTTP info_span! 一致）。
         let start = Instant::now();
         let model_label = request.get_ref().model_name.clone();
+        let span_version = if request.get_ref().version.is_empty() {
+            "auto".to_string()
+        } else {
+            request.get_ref().version.clone()
+        };
+        let span_rid = metadata_request_id(request.metadata());
+        let span = tracing::info_span!(
+            "inference",
+            model = %model_label,
+            version = %span_version,
+            request_id = %span_rid,
+        );
         let mut version_label = request.get_ref().version.clone();
         let mut request_id = String::new();
         let result = self
             .infer_impl(request, &mut version_label, &mut request_id)
+            .instrument(span)
             .await;
         record_grpc_request_end(&model_label, &version_label, start, &result);
         echo_grpc_response_headers(result, &request_id, start)
@@ -1077,13 +1111,26 @@ impl LiteServer for GrpcService {
         &self,
         request: Request<pb::BatchInferRequest>,
     ) -> Result<Response<pb::BatchInferResponse>, Status> {
-        // P2-1 请求指标 + P2-2 回显（同 infer 包装）。
+        // P2-1 请求指标 + P2-2 回显 + P2-3 span（同 infer 包装）。
         let start = Instant::now();
         let model_label = request.get_ref().model_name.clone();
+        let span_version = if request.get_ref().version.is_empty() {
+            "auto".to_string()
+        } else {
+            request.get_ref().version.clone()
+        };
+        let span_rid = metadata_request_id(request.metadata());
+        let span = tracing::info_span!(
+            "inference",
+            model = %model_label,
+            version = %span_version,
+            request_id = %span_rid,
+        );
         let mut version_label = request.get_ref().version.clone();
         let mut request_id = String::new();
         let result = self
             .batch_infer_impl(request, &mut version_label, &mut request_id)
+            .instrument(span)
             .await;
         record_grpc_request_end(&model_label, &version_label, start, &result);
         echo_grpc_response_headers(result, &request_id, start)
@@ -1098,13 +1145,26 @@ impl LiteServer for GrpcService {
         // P2-1 请求指标：open 失败在此记一次；open 成功后由转发 task 在流
         // 关闭处记一次整体 duration（蓝图 §4.3 P2-1 stream/bidi 语义）。
         // P2-2 回显：注入 stream open 的 initial metadata（processing-time 为
-        // 开流耗时，蓝图 §4.0.4）。
+        // 开流耗时，蓝图 §4.0.4）。P2-3 span 同 infer。
         let start = Instant::now();
         let model_label = request.get_ref().model_name.clone();
+        let span_version = if request.get_ref().version.is_empty() {
+            "auto".to_string()
+        } else {
+            request.get_ref().version.clone()
+        };
+        let span_rid = metadata_request_id(request.metadata());
+        let span = tracing::info_span!(
+            "inference",
+            model = %model_label,
+            version = %span_version,
+            request_id = %span_rid,
+        );
         let mut version_label = request.get_ref().version.clone();
         let mut request_id = String::new();
         let result = self
             .stream_infer_impl(request, &mut version_label, &mut request_id, start)
+            .instrument(span)
             .await;
         if let Err(s) = &result {
             crate::metrics::prometheus::record_request_end(
@@ -1985,5 +2045,61 @@ mod request_metrics_tests {
             md.get("x-processing-time-ms").is_some(),
             "x-processing-time-ms must be present on the error path"
         );
+    }
+
+    // ===== P2-3: handler tracing span =====
+
+    /// handler 创建 `inference` span，字段与 HTTP info_span! 一致（model/version/
+    /// request_id）。错误路径在 span 内打日志（err 助手），故 span 上下文可见。
+    /// handler 创建 `inference` span，字段与 HTTP info_span! 一致（model/version/
+    /// request_id）。用一个 in-memory capturing subscriber（thread-local
+    /// set_default）捕获 err() 在 span 内打的 info 事件——其输出含 span 名 +
+    /// 字段，证明 span 被创建并覆盖 handler。（蓝图建议 tracing-test，但其
+    /// 属性宏在本工具链未注入 `logs`，故用等价的手动 capturing subscriber。）
+    #[tokio::test]
+    async fn should_create_inference_span_with_fields() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::format::FmtSpan;
+        use tracing_subscriber::fmt::{MakeWriter};
+
+        #[derive(Clone)]
+        struct CaptureMaker(Arc<Mutex<Vec<u8>>>);
+        impl<'a> MakeWriter<'a> for CaptureMaker {
+            type Writer = CaptureWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                CaptureWriter(self.0.clone())
+            }
+        }
+        struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().write(b)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CaptureMaker(buf.clone()))
+            .with_target(false)
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_span_events(FmtSpan::ACTIVE)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let service = build_service(Arc::new(ModelRegistry::new()), Arc::new(InferenceQueue::new()));
+        let mut req = infer_request("span_404", "");
+        req.metadata_mut()
+            .insert("x-client-request-id", "span-rid".parse().unwrap());
+        let err = service.infer(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("inference"), "inference span must be created: {}", logs);
+        assert!(logs.contains("span_404"), "span must carry model field: {}", logs);
+        assert!(logs.contains("span-rid"), "span must carry request_id: {}", logs);
     }
 }
