@@ -2241,12 +2241,20 @@ mod request_metrics_tests {
     // ===== P2-3: handler tracing span =====
 
     /// handler 创建 `inference` span，字段与 HTTP info_span! 一致（model/version/
-    /// request_id）。错误路径在 span 内打日志（err 助手），故 span 上下文可见。
-    /// handler 创建 `inference` span，字段与 HTTP info_span! 一致（model/version/
     /// request_id）。在专用线程上 set_default 一个 span-recording Layer + 自有
-    /// current_thread runtime——线程局部 subscriber 覆盖全局，且 block_on 在持有
-    /// guard 的同一线程轮询，并行测试套件下确定性地捕获 span 创建。蓝图建议
-    /// tracing-test，但其属性宏在本工具链未注入 `logs`，故用等价方案。
+    /// current_thread runtime——block_on 在持有 guard 的同一线程轮询，span 创建
+    /// 必然走该线程的 scoped subscriber。蓝图建议 tracing-test，但其属性宏在
+    /// 本工具链未注入 `logs`，故用等价方案。
+    ///
+    /// 并行套件稳定性：tracing 的 callsite interest 是进程级全局缓存。全进程仅
+    /// 注册过 ≤1 个 dispatch 时走 `has_just_one` 快路径——首个执行本 callsite 的
+    /// 【无 subscriber】线程（如其他并行测试的 tokio worker）会用 NoSubscriber 把
+    /// interest 缓存成 NEVER，之后所有线程的 `info_span!` 宏直接短路返回
+    /// `Span::none()`，scoped subscriber 根本不会被询问（曾致本测试 ~50% 假阴性）。
+    /// 修复：常驻两个存活 dispatch（锚点 + 录制）使快路径永久失效——此后任何
+    /// interest 重建都带上本测试的 dispatch（默认 Layer 投 always，合并不同意见
+    /// 至少得 SOMETIMES），且 `Dispatch::new` 触发的全量重建会修复测试开始前已
+    /// 被毒化的缓存。锚点须存活到 join 之后（interest 只认存活的 dispatch）。
     #[test]
     fn should_create_inference_span_with_fields() {
         use std::sync::{Arc, Mutex};
@@ -2281,9 +2289,16 @@ mod request_metrics_tests {
 
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
         let recorded_thread = recorded.clone();
+        // 见上方 doc comment：两个 dispatch 都先注册好再执行 handler，保证
+        // `has_just_one` 为 false 且缓存已被本测试的 always 票重建过。
+        let _anchor = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(SpanLayer(Arc::new(Mutex::new(Vec::new())))),
+        );
+        let recording = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(SpanLayer(recorded_thread)),
+        );
         let handle = std::thread::spawn(move || {
-            let subscriber = tracing_subscriber::registry().with(SpanLayer(recorded_thread));
-            let _guard = tracing::subscriber::set_default(subscriber);
+            let _guard = tracing::dispatcher::set_default(&recording);
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
