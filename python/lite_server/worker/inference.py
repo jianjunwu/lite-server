@@ -409,12 +409,12 @@ def worker_main():
         {"route": path, "methods": methods}
         for path, (_handler, methods) in getattr(lit_api, "_route_handlers", {}).items()
     ]
-    print(json.dumps({
+    ready_payload = json.dumps({
         "status": "ready",
         "worker_id": args.worker_id,
         "metric_specs": specs,
         "custom_routes": custom_routes,
-    }), flush=True)
+    })
 
     if args.continuous_batching or config.get("continuous_batching", False):
         context = zmq.Context()
@@ -422,6 +422,11 @@ def worker_main():
         try:
             socket.connect(args.endpoint)
             socket.setsockopt(zmq.LINGER, 0)
+            # Signal ready only after connect() is issued: the server marks the
+            # version ready on this line and a request can arrive immediately —
+            # the handshake must already be in flight so the server's send
+            # doesn't out-wait its sndtimeo racing a not-yet-connected peer.
+            print(ready_payload, flush=True)
             log.info(f"Connected ZMQ PAIR to {args.endpoint}")
             run_cb_loop(lit_api, socket, args.model_name, log)
         except KeyboardInterrupt:
@@ -438,6 +443,8 @@ def worker_main():
         try:
             async_socket.connect(args.endpoint)
             async_socket.setsockopt(zmq.LINGER, 0)
+            # See above: ready follows connect, never precedes it.
+            print(ready_payload, flush=True)
             log.info(f"Connected async ZMQ PAIR to {args.endpoint}")
             asyncio.run(run_async_loop(lit_api, async_socket, args.model_name, log))
         except KeyboardInterrupt:
