@@ -31,6 +31,9 @@ semver = "1.0"
 # P7-1: constant-time API-key comparison (timing side-channel). Already in the
 # dependency graph via rustls; pinned here as a direct dependency.
 subtle = "2"
+# P7-2: getuid for admin UDS owner checks (cfg unix). Already in the graph via
+# tokio/mio; pinned as a direct dependency.
+libc = "0.2"
 
 # gRPC
 tonic = { version = "0.12", features = ["gzip", "tls"] }
@@ -122,7 +125,6 @@ tokio-test = "0.4"
 # rustls 版 HTTP 客户端（P5-1 e2e）：与服务端同一 TLS 栈 + ring provider
 # （蓝图评审 2.4 统一 ring）；native-tls 在 macOS 无法导入 EC PKCS#8 身份。
 reqwest = { version = "0.12", default-features = false, features = ["json", "http2", "rustls-tls-manual-roots"] }
-libc = "0.2"
 tokio-tungstenite = "0.24"
 serial_test = "3"
 tower = { version = "0.4", features = ["util"] }

@@ -171,6 +171,13 @@ pub struct GrpcConfig {
     /// unless this is explicitly set to `unix:/path` to bind a UDS. See
     /// `grpc::resolve_grpc_host`.
     pub host: Option<String>,
+    /// P7-2: separate admin bind target (`host:port` or `unix:/path`). When set,
+    /// a SECOND tonic server is spawned: Admin + health bind here, the main port
+    /// keeps LiteServer + health (Admin is removed from the main port). Gives
+    /// transport isolation on top of P7-1's logical (class) isolation. A `unix:`
+    /// admin_bind defaults to owner-only 0o600 (a world-writable admin socket
+    /// would let any local user bypass fail-closed — rejected at startup).
+    pub admin_bind: Option<String>,
     /// Unix socket file permission for the gRPC UDS (P4-1), as a decimal mode
     /// (e.g. 438 = 0o666). Default 0o666 for the inference socket — admin UDS
     /// uses a stricter 0o600 (P7-2). Applied via chmod on cfg(unix) only.
@@ -209,6 +216,7 @@ impl Default for GrpcConfig {
             enabled: true,
             max_workers: 10,
             host: None,
+            admin_bind: None,
             socket_mode: 0o666,
             http2_keepalive_interval_secs: None,
             http2_keepalive_timeout_secs: None,
@@ -1197,6 +1205,21 @@ mod tests {
         assert_eq!(cfg.grpc.http2_keepalive_timeout_secs, None);
         assert!(!cfg.grpc.http2_adaptive_window);
         assert_eq!(cfg.grpc.http2_max_frame_size, None);
+    }
+
+    #[test]
+    fn test_grpc_admin_bind_parse_and_default() {
+        // P7-2: admin_bind is unset by default (single server, all 3 services).
+        assert!(Config::default().grpc.admin_bind.is_none());
+        let yaml = "grpc:\n  admin_bind: unix:/var/run/lite-server-admin.sock\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            cfg.grpc.admin_bind.as_deref(),
+            Some("unix:/var/run/lite-server-admin.sock")
+        );
+        let yaml = "grpc:\n  admin_bind: 127.0.0.1:19090\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.grpc.admin_bind.as_deref(), Some("127.0.0.1:19090"));
     }
 
     #[test]

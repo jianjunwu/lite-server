@@ -1602,19 +1602,23 @@ pub async fn start_grpc_server(
         interceptor::service_interceptor(access_control.clone(), EndpointClass::Health),
     );
 
-    let mut builder = tonic::transport::Server::builder();
-    // P1-2: HTTP/2 keepalive + flow-control window / frame size tuning.
-    if let Some((interval, timeout)) = http2_keepalive_params(&grpc_config) {
-        builder = builder
-            .http2_keepalive_interval(Some(interval))
-            .http2_keepalive_timeout(Some(timeout));
-    }
-    if grpc_config.http2_adaptive_window {
-        builder = builder.http2_adaptive_window(Some(true));
-    }
-    if let Some(max_frame_size) = grpc_config.http2_max_frame_size {
-        builder = builder.max_frame_size(Some(max_frame_size));
-    }
+    // P1-2: HTTP/2 keepalive / window / frame tuning — applied to every tonic
+    // server below (main, and the admin server when grpc.admin_bind is set: P7-2).
+    let make_builder = || {
+        let mut builder = tonic::transport::Server::builder();
+        if let Some((interval, timeout)) = http2_keepalive_params(&grpc_config) {
+            builder = builder
+                .http2_keepalive_interval(Some(interval))
+                .http2_keepalive_timeout(Some(timeout));
+        }
+        if grpc_config.http2_adaptive_window {
+            builder = builder.http2_adaptive_window(Some(true));
+        }
+        if let Some(max_frame_size) = grpc_config.http2_max_frame_size {
+            builder = builder.max_frame_size(Some(max_frame_size));
+        }
+        builder
+    };
 
     // P6 Admin service (蓝图 §4.1): mirrors the HTTP admin REST handlers.
     // Built from the same injected state as the inference service.
@@ -1634,89 +1638,249 @@ pub async fn start_grpc_server(
         interceptor::service_interceptor(access_control.clone(), EndpointClass::Admin),
     );
 
-    let router = builder
+    // P7-2 admin_bind (蓝图 §4.2): when unset, a single server serves all three
+    // services (unchanged behavior). When set, Admin splits onto a second server
+    // (Admin + health) bound to admin_bind — the main port keeps LiteServer +
+    // health, so Admin RPCs are reachable ONLY via admin_bind (transport
+    // isolation layered on P7-1's class isolation). Both servers share state and
+    // observe the same shutdown signal. admin_server is conditionally consumed
+    // (into main when no admin_bind, into the admin server otherwise), so it is
+    // staged in an Option and taken.
+    let admin_bind = grpc_config.admin_bind.clone();
+    let mut admin_server_opt = Some(admin_server);
+    let main_router = make_builder()
         .add_service(server)
-        .add_service(health_service)
-        .add_service(admin_server);
+        .add_service(health_service.clone());
+    let main_router = if admin_bind.is_none() {
+        main_router.add_service(admin_server_opt.take().expect("admin_server staged"))
+    } else {
+        main_router
+    };
 
+    // P4-2: one shutdown signal shared by every server (main + admin). Shared so
+    // both observers fire on the single shutdown_rx; tls_incoming also takes a clone.
+    let shutdown = futures::FutureExt::shared(async move {
+        let _ = shutdown_rx.await;
+    });
+
+    let main_fut = serve_grpc_router(
+        main_router,
+        host,
+        port,
+        tls,
+        grpc_config.socket_mode,
+        false,
+        "gRPC",
+        shutdown.clone(),
+    );
+
+    if let Some(admin_bind) = admin_bind {
+        let (admin_host, admin_port, admin_mode) = resolve_admin_bind(&admin_bind)?;
+        // admin_bind never uses TLS (it is for local/loopback isolation; TLS is
+        // the main port's concern). Admin UDS is forced owner-only 0o600 so a
+        // world-writable admin socket cannot let any local user bypass fail-closed.
+        let admin_router = make_builder()
+            .add_service(admin_server_opt.take().expect("admin_server staged"))
+            .add_service(health_service);
+        let admin_fut = serve_grpc_router(
+            admin_router,
+            admin_host,
+            admin_port,
+            None,
+            admin_mode,
+            true,
+            "gRPC admin",
+            shutdown.clone(),
+        );
+        // Run both servers concurrently until shutdown; either erroring fails startup.
+        let (main_res, admin_res) = tokio::join!(main_fut, admin_fut);
+        main_res?;
+        admin_res?;
+    } else {
+        main_fut.await?;
+    }
+
+    Ok(())
+}
+
+/// Resolve a `grpc.admin_bind` target into (host, port, socket_mode) (P7-2). A
+/// `unix:/path` target carries owner-only 0o600 — a world-writable admin socket
+/// would let any local user reach admin and bypass P7-1's fail-closed (评审 1.4).
+/// A TCP `host:port` is split; socket_mode is unused on TCP (returned 0o600 for
+/// uniformity with the UDS branch).
+fn resolve_admin_bind(admin_bind: &str) -> Result<(String, u16, u32), AppError> {
+    if crate::config::unix_socket_path(admin_bind).is_some() {
+        return Ok((admin_bind.to_string(), 0, 0o600));
+    }
+    let (host, port_s) = admin_bind.rsplit_once(':').ok_or_else(|| {
+        AppError::Config(format!(
+            "grpc.admin_bind '{}' must be 'host:port' or 'unix:/path'",
+            admin_bind
+        ))
+    })?;
+    let port: u16 = port_s.parse().map_err(|_| {
+        AppError::Config(format!("grpc.admin_bind '{}' has an invalid port", admin_bind))
+    })?;
+    Ok((host.to_string(), port, 0o600))
+}
+
+/// Serve a tonic router on a bind target (P7-2 factored out of the single-server
+/// path so the main and admin servers share it). `host` is `unix:/path` (port
+/// ignored) or a TCP host. `owner_only` (admin UDS) additionally requires the
+/// bound socket be owned by the current process with no group/other permission
+/// bits, so a misconfigured admin socket cannot weaken fail-closed.
+async fn serve_grpc_router(
+    router: tonic::transport::server::Router,
+    host: String,
+    port: u16,
+    tls: Option<Arc<crate::tls::TlsConfigStore>>,
+    socket_mode: u32,
+    owner_only: bool,
+    label: &str,
+    shutdown: impl std::future::Future<Output = ()> + Send + Clone + 'static,
+) -> Result<(), AppError> {
     if let Some(path) = crate::config::unix_socket_path(&host) {
-        // P4-1: gRPC over a Unix domain socket.
         #[cfg(unix)]
         {
-            // Clear a stale socket left by an unclean prior shutdown, then bind.
+            // Defensive (symlink safety): only clear our OWN stale socket from an
+            // unclean exit; never remove one owned by another user.
+            if std::path::Path::new(path).exists() {
+                check_uds_owner(path, label)?;
+            }
             let _ = std::fs::remove_file(path);
             let listener = tokio::net::UnixListener::bind(path).map_err(|e| {
-                AppError::Config(format!("failed to bind gRPC UDS {}: {}", path, e))
+                AppError::Config(format!("failed to bind {} UDS {}: {}", label, path, e))
             })?;
-            // Apply the configured socket permission (default 0o666 inference
-            // socket; admin UDS uses 0o600 in P7-2). chmod, not umask, sets the
-            // mode exactly regardless of the process umask.
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(metadata) = std::fs::metadata(path) {
-                let mut permissions = metadata.permissions();
-                permissions.set_mode(grpc_config.socket_mode);
-                std::fs::set_permissions(path, permissions).map_err(|e| {
-                    AppError::Config(format!("failed to chmod gRPC UDS {}: {}", path, e))
-                })?;
+            chmod_uds(path, socket_mode, label)?;
+            if owner_only {
+                enforce_owner_only_uds(path, label)?;
             }
-            tracing::info!("Starting gRPC server on unix:{}", path);
+            tracing::info!("Starting {} on unix:{}", label, path);
             // UnixListenerStream yields bare AsyncRead+AsyncWrite streams — exactly
             // what serve_with_incoming wants (tonic provides `Connected` for UnixStream).
             let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
-            // P4-2: graceful shutdown — on the shutdown signal tonic stops
-            // accepting new streams (sends GOAWAY) and drains in-flight RPCs.
             router
-                .serve_with_incoming_shutdown(incoming, async {
-                    let _ = shutdown_rx.await;
-                })
+                .serve_with_incoming_shutdown(incoming, shutdown)
                 .await
-                .map_err(|e| AppError::Internal(format!("gRPC server error: {}", e)))?;
+                .map_err(|e| AppError::Internal(format!("{} server error: {}", label, e)))?;
         }
         #[cfg(not(unix))]
         {
             return Err(AppError::Config(format!(
-                "gRPC host '{}' requires Unix domain sockets, which are not supported on this \
-                 platform; set grpc.host to a TCP host instead",
-                host
+                "{} host '{}' requires Unix domain sockets, which are not supported on this \
+                 platform; set it to a TCP host:port instead",
+                label, host
             )));
         }
     } else if let Some(tls_store) = tls {
-        // P5-1: TLS/mTLS termination over TCP. Our own incoming (tls.rs)
-        // terminates TLS per connection from the rotating store, so the cert
-        // reloader's swap applies to the NEXT handshake; tonic's blanket
-        // `Connected for TlsStream<TcpStream>` keeps remote_addr() working and
-        // exposes mTLS peer certs via TlsConnectInfo (→ interceptor principal).
-        // UDS+TLS is rejected at config validation.
+        // P5-1: TLS/mTLS termination over TCP (main port only). Our own incoming
+        // (tls.rs) terminates TLS per connection from the rotating store, so the
+        // cert reloader's swap applies to the NEXT handshake; tonic's blanket
+        // `Connected for TlsStream<TcpStream>` keeps remote_addr() and peer certs.
         let addr: std::net::SocketAddr = format!("{}:{}", host, port)
             .parse()
-            .map_err(|e| AppError::Config(format!("invalid gRPC address: {}", e)))?;
+            .map_err(|e| AppError::Config(format!("invalid {} address: {}", label, e)))?;
         let listener = tokio::net::TcpListener::bind(addr).await.map_err(AppError::Io)?;
-        tracing::info!("Starting gRPC server on {} (TLS, {})", addr, tls_store.describe());
-        // One shutdown signal, two observers: tonic's drain and the accept loop.
-        let shutdown = futures::FutureExt::shared(async move {
-            let _ = shutdown_rx.await;
-        });
+        tracing::info!("Starting {} on {} (TLS, {})", label, addr, tls_store.describe());
         let incoming = crate::tls::tls_incoming(listener, tls_store, shutdown.clone());
         router
             .serve_with_incoming_shutdown(incoming, shutdown)
             .await
-            .map_err(|e| AppError::Internal(format!("gRPC server error: {}", e)))?;
+            .map_err(|e| AppError::Internal(format!("{} server error: {}", label, e)))?;
     } else {
         let addr: std::net::SocketAddr = format!("{}:{}", host, port)
             .parse()
-            .map_err(|e| AppError::Config(format!("invalid gRPC address: {}", e)))?;
-        tracing::info!("Starting gRPC server on {}", addr);
-        // P4-2: graceful shutdown — on the shutdown signal tonic stops accepting
-        // new connections (sends GOAWAY) and drains in-flight RPCs; bounded by
-        // the caller's graceful_timeout + abort backstop.
+            .map_err(|e| AppError::Config(format!("invalid {} address: {}", label, e)))?;
+        tracing::info!("Starting {} on {}", label, addr);
+        // P4-2: graceful shutdown — tonic stops accepting new connections (sends
+        // GOAWAY) and drains in-flight RPCs; bounded by the caller's
+        // graceful_timeout + abort backstop.
         router
-            .serve_with_shutdown(addr, async {
-                let _ = shutdown_rx.await;
-            })
+            .serve_with_shutdown(addr, shutdown)
             .await
-            .map_err(|e| AppError::Internal(format!("gRPC server error: {}", e)))?;
+            .map_err(|e| AppError::Internal(format!("{} server error: {}", label, e)))?;
     }
+    Ok(())
+}
 
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    // getuid never fails (returns the real user ID; no errno), so the FFI is safe.
+    unsafe { libc::getuid() }
+}
+
+/// chmod a bound UDS to `mode` exactly (independent of the process umask).
+#[cfg(unix)]
+fn chmod_uds(path: &str, mode: u32, label: &str) -> Result<(), AppError> {
+    let path = std::path::Path::new(path);
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(mode);
+        std::fs::set_permissions(path, permissions).map_err(|e| {
+            AppError::Config(format!(
+                "failed to chmod {} UDS {}: {}",
+                label,
+                path.display(),
+                e
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Refuse to remove a pre-existing UDS owned by another user (symlink safety).
+#[cfg(unix)]
+fn check_uds_owner(path: &str, label: &str) -> Result<(), AppError> {
+    let path = std::path::Path::new(path);
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let me = current_uid();
+        if metadata.uid() != me {
+            return Err(AppError::Config(format!(
+                "refusing to remove existing {} UDS {} owned by uid {} (current uid {}); \
+                 remove it manually or choose a different path",
+                label,
+                path.display(),
+                metadata.uid(),
+                me
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Admin UDS hardening (评审 1.4): after bind+chmod, the socket must be owned by
+/// the current process AND have NO group/other permission bits — otherwise any
+/// local user could connect and bypass admin fail-closed.
+#[cfg(unix)]
+fn enforce_owner_only_uds(path: &str, label: &str) -> Result<(), AppError> {
+    let path = std::path::Path::new(path);
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        AppError::Config(format!("failed to stat {} UDS {}: {}", label, path.display(), e))
+    })?;
+    let mode = metadata.permissions().mode();
+    let me = current_uid();
+    if metadata.uid() != me {
+        return Err(AppError::Config(format!(
+            "{} UDS {} must be owned by the current process (uid {}); got uid {}",
+            label,
+            path.display(),
+            me,
+            metadata.uid()
+        )));
+    }
+    if mode & 0o077 != 0 {
+        return Err(AppError::Config(format!(
+            "{} UDS {} must be owner-only (0o600); got mode 0o{:o} — group/other access would \
+             let any local user bypass admin fail-closed",
+            label,
+            path.display(),
+            mode
+        )));
+    }
     Ok(())
 }
 
@@ -1744,6 +1908,30 @@ async fn observe_or_abort(mut task: tokio::task::JoinHandle<()>) -> bool {
 mod tests {
     use super::*;
     use tonic_types::StatusExt;
+
+    // ===== P7-2 resolve_admin_bind =====
+
+    #[test]
+    fn resolve_admin_bind_unix_forces_owner_only_mode() {
+        let (host, port, mode) = resolve_admin_bind("unix:/tmp/admin.sock").unwrap();
+        assert_eq!(host, "unix:/tmp/admin.sock");
+        assert_eq!(port, 0, "port unused for a UDS target");
+        assert_eq!(mode, 0o600, "admin UDS must be owner-only 0o600");
+    }
+
+    #[test]
+    fn resolve_admin_bind_tcp_splits_host_port() {
+        let (host, port, mode) = resolve_admin_bind("127.0.0.1:19090").unwrap();
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 19090);
+        assert_eq!(mode, 0o600, "socket_mode unused on TCP but returned 0o600");
+    }
+
+    #[test]
+    fn resolve_admin_bind_rejects_missing_port_and_garbage() {
+        assert!(resolve_admin_bind("127.0.0.1").is_err(), "bare host without :port is invalid");
+        assert!(resolve_admin_bind("127.0.0.1:notaport").is_err(), "non-numeric port is invalid");
+    }
 
     #[tokio::test]
     async fn observe_or_abort_detects_panicked_task() {

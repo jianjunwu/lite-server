@@ -4025,3 +4025,84 @@ async fn test_access_control_admin_key_mode_both_protocols() {
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+// ---------------------------------------------------------------------------
+// P7-2: grpc.admin_bind splits Admin onto a second server. With admin_bind set
+// to a UDS, Admin RPCs are reachable ONLY via the UDS (and the socket is
+// owner-only 0o600); the main TCP port returns UNIMPLEMENTED for Admin (the
+// service is not registered there). health stays on both ports.
+// ---------------------------------------------------------------------------
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_admin_bind_splits_admin_onto_udf() {
+    use lite_server::proto::liteserver::admin_client::AdminClient;
+    use lite_server::proto::liteserver::GetInfoRequest;
+
+    let http_port = 18390u16;
+    let grpc_port = 18391u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let admin_sock = std::env::temp_dir()
+        .join(format!("lite-server-p72-admin-{}.sock", std::process::id()));
+    let admin_sock_str = admin_sock.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&admin_sock);
+
+    // Empty model repo — only Admin GetInfo / health are exercised.
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-p72-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    std::fs::create_dir_all(&repo).unwrap();
+
+    let tmp_dir = std::env::temp_dir()
+        .join(format!("lite-server-p72-yaml-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18392\n  timeout: 30.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\n  admin_bind: unix:{sock}\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            sock = admin_sock_str,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let _guard = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 30).await;
+
+    // Main TCP gRPC port: Admin RPC → UNIMPLEMENTED (Admin is NOT registered on
+    // the main port once admin_bind splits it off). health stays on the main port.
+    let main_channel = grpc_tcp_channel(grpc_port).await;
+    let mut main_admin = AdminClient::new(main_channel.clone());
+    let main_admin_res = main_admin.get_info(GetInfoRequest {}).await;
+    assert!(main_admin_res.is_err(), "Admin on main port must be rejected");
+    assert_eq!(
+        main_admin_res.err().unwrap().code(),
+        tonic::Code::Unimplemented,
+        "Admin RPC on main port → UNIMPLEMENTED (service not registered)"
+    );
+    let mut main_health =
+        tonic_health::pb::health_client::HealthClient::new(main_channel);
+    let health = main_health
+        .check(tonic_health::pb::HealthCheckRequest { service: String::new() })
+        .await;
+    assert!(health.is_ok(), "health must stay on the main port: {:?}", health.err());
+
+    // Admin UDS: Admin RPC → OK, and the socket is owner-only 0o600.
+    let admin_channel = uds_grpc_channel(&admin_sock_str).await;
+    let mut uds_admin = AdminClient::new(admin_channel);
+    let resp = uds_admin
+        .get_info(GetInfoRequest {})
+        .await
+        .expect("Admin RPC via admin_bind UDS must succeed")
+        .into_inner();
+    assert_eq!(resp.server, "lite-server");
+    assert_socket_mode(&admin_sock_str, 0o600);
+
+    let _ = std::fs::remove_file(&admin_sock);
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
