@@ -387,6 +387,92 @@ async fn unload_model(base: &str, model: &str, version: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// P4-2 graceful-shutdown helpers (unix)
+// ---------------------------------------------------------------------------
+
+/// A model whose `predict` sleeps `sleep_secs` — used to keep an RPC in-flight
+/// across a SIGTERM so drain / abort behavior is observable. `slow_model/1`
+/// doubles the input like `test_model`.
+#[cfg(unix)]
+fn create_slow_model_repo(sleep_secs: u64) -> std::path::PathBuf {
+    let tmp = std::env::temp_dir().join(format!(
+        "lite-server-slow-{}-{}",
+        std::process::id(),
+        sleep_secs
+    ));
+    let model_dir = tmp.join("slow_model/1");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    std::fs::write(
+        model_dir.join("model.py"),
+        format!(
+            r#"from lite_server import LitAPI
+import time
+
+
+class SlowAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        time.sleep({secs})
+        return {{"output": x * 2}}
+
+    def encode_response(self, output):
+        return output
+"#,
+            secs = sleep_secs
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        model_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+    tmp
+}
+
+/// SIGTERM the server's MAIN process only (not its process group) so the Python
+/// worker stays alive long enough for an in-flight RPC to complete during drain.
+#[cfg(unix)]
+fn send_sigterm(child: &std::process::Child) {
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+}
+
+/// Poll until the child exits, or `timeout_secs` elapse. Returns true if it
+/// exited on its own.
+#[cfg(unix)]
+async fn wait_for_exit(child: &mut std::process::Child, timeout_secs: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            _ => {
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+/// Connect a tonic channel to the server's TCP gRPC port.
+#[cfg(unix)]
+async fn grpc_tcp_channel(grpc_port: u16) -> tonic::transport::Channel {
+    tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{}", grpc_port))
+        .expect("grpc endpoint")
+        .connect()
+        .await
+        .expect("grpc connect")
+}
+
+// ---------------------------------------------------------------------------
 // Shared server fixture — one server for most tests
 // ---------------------------------------------------------------------------
 
@@ -1331,6 +1417,247 @@ async fn test_grpc_uds_custom_socket_mode() {
     assert_socket_mode(&sock, 0o660); // 432 decimal = 0o660
 
     let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// ---------------------------------------------------------------------------
+// gRPC graceful shutdown (P4-2)
+// ---------------------------------------------------------------------------
+
+/// An in-flight gRPC Infer started before SIGTERM must complete (tonic
+/// `serve_with_shutdown` drains in-flight RPCs), then the server self-exits.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_grpc_graceful_shutdown_drains_inflight() {
+    use std::collections::HashMap;
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+
+    let http_port = 18210u16;
+    let grpc_port = 18211u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = create_slow_model_repo(2);
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-p42-drain-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18212\n  graceful_timeout: 10.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let mut child = start_server(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "slow_model", "1").await;
+
+    // Fire a gRPC Infer (2s predict), then SIGTERM mid-flight. The server must
+    // drain the in-flight RPC so the client still gets 42.
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let infer_handle = tokio::spawn(async move {
+        let mut client = LiteServerClient::new(channel);
+        client
+            .infer(InferRequest {
+                model_name: "slow_model".to_string(),
+                version: "1".to_string(),
+                data: br#"{"input":21}"#.to_vec().into(),
+                headers: HashMap::new(),
+            })
+            .await
+    });
+    sleep(Duration::from_millis(400)).await; // let predict start
+    send_sigterm(&child);
+
+    let got = tokio::time::timeout(Duration::from_secs(20), infer_handle)
+        .await
+        .expect("infer task did not finish");
+    let resp = got
+        .expect("infer task panicked")
+        .expect("drained in-flight Infer must complete, not error")
+        .into_inner();
+    let body = String::from_utf8_lossy(&resp.data);
+    assert!(
+        body.contains("42"),
+        "drained in-flight Infer must complete (21 -> 42); got: {}",
+        body
+    );
+
+    let exited = wait_for_exit(&mut child, 20).await;
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(exited, "server must self-exit after draining in-flight gRPC");
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// Once SIGTERM starts graceful shutdown, the gRPC server stops accepting NEW
+/// RPCs (tonic `serve_with_shutdown` sends GOAWAY / stops the listener): an
+/// in-flight Infer still drains to completion, but a NEW Infer fired after the
+/// signal is rejected. (A request that outlives its own per-request deadline or
+/// the worker unload-grace is cut separately — not asserted here, where timing
+/// against those coupled timeouts is racy.)
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_grpc_shutdown_rejects_new_rpcs() {
+    use std::collections::HashMap;
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+
+    let http_port = 18220u16;
+    let grpc_port = 18221u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = create_slow_model_repo(5); // keeps the server in drain mode
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-p42-reject-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18222\n  timeout: 30.0\n  graceful_timeout: 12.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let mut child = start_server(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "slow_model", "1").await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    // In-flight Infer #1 (5s predict) keeps the server in drain mode.
+    let chan1 = channel.clone();
+    let infer1 = tokio::spawn(async move {
+        let mut client = LiteServerClient::new(chan1);
+        client
+            .infer(InferRequest {
+                model_name: "slow_model".to_string(),
+                version: "1".to_string(),
+                data: br#"{"input":21}"#.to_vec().into(),
+                headers: HashMap::new(),
+            })
+            .await
+    });
+    sleep(Duration::from_millis(400)).await; // let predict start
+    send_sigterm(&child);
+    sleep(Duration::from_millis(2500)).await; // drain mode + GOAWAY propagated
+
+    // NEW Infer #2 after the signal must be rejected (no new streams accepted).
+    let mut client2 = LiteServerClient::new(channel);
+    let infer2 = tokio::time::timeout(
+        Duration::from_secs(6),
+        client2.infer(InferRequest {
+            model_name: "slow_model".to_string(),
+            version: "1".to_string(),
+            data: br#"{"input":99}"#.to_vec().into(),
+            headers: HashMap::new(),
+        }),
+    )
+    .await;
+    match infer2 {
+        Ok(Ok(_)) => panic!("new gRPC RPC after SIGTERM must be rejected, got Ok"),
+        _ => {} // Err or timeout — both mean rejected / not served
+    }
+
+    // In-flight Infer #1 still drains to completion.
+    let resp = tokio::time::timeout(Duration::from_secs(20), infer1)
+        .await
+        .expect("infer1 did not finish")
+        .expect("infer1 panicked")
+        .expect("in-flight Infer must drain, not error")
+        .into_inner();
+    assert!(
+        String::from_utf8_lossy(&resp.data).contains("42"),
+        "drained in-flight Infer must complete (21 -> 42)"
+    );
+
+    let exited = wait_for_exit(&mut child, 20).await;
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(exited, "server must self-exit after drain");
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// C3 (P4-2): once SIGTERM arrives, /readyz stops returning 200 within a short
+/// window — either 503 (draining flag, on a keep-alive connection) or
+/// connection-refused (listener stopped) — so the LB摘流.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_shutdown_health_goes_unavailable() {
+    let http_port = 18230u16;
+    let grpc_port = 18231u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = test_model_repo();
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-p42-drainflag-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18232\n  graceful_timeout: 8.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let mut child = start_server(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, MODEL, "1").await;
+
+    let client = reqwest::Client::new();
+    assert_eq!(
+        client.get(format!("{}/readyz", base)).send().await.unwrap().status(),
+        200
+    );
+
+    send_sigterm(&child);
+
+    // readyz must stop returning 200 within the drain window — 503 (draining
+    // flag) or connection-refused (listener stopped) both count as摘流.
+    let mut unavailable = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+    while tokio::time::Instant::now() < deadline {
+        match client.get(format!("{}/readyz", base)).send().await {
+            Ok(r) if r.status() == 200 => {}
+            _ => {
+                unavailable = true;
+                break;
+            }
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(unavailable, "readyz must become unavailable after SIGTERM");
+
+    let exited = wait_for_exit(&mut child, 15).await;
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(exited, "server must self-exit after drain");
+
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 

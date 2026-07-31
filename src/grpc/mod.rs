@@ -23,11 +23,34 @@ pub use pb::lite_server_server::{LiteServer, LiteServerServer};
 
 /// Shared state for the gRPC service.
 #[derive(Clone)]
+/// RAII in-flight guard (P4-2): inc on creation, dec on drop. Mirrors the HTTP
+/// middleware so gRPC inference counts toward the graceful-shutdown `pending`
+/// tally. For unary RPCs the guard spans the whole handler; for streaming RPCs
+/// it is dropped when the handler returns the stream (the open phase) — the
+/// long-lived stream itself is drained by `serve_with_shutdown` + the
+/// `graceful_timeout` backstop, not by this observability counter.
+struct InflightGuard(Arc<crate::server::ShutdownState>);
+impl InflightGuard {
+    fn new(state: Arc<crate::server::ShutdownState>) -> Self {
+        state.inc_pending();
+        Self(state)
+    }
+}
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.dec_pending();
+    }
+}
+
 pub struct GrpcService {
     registry: Arc<ModelRegistry>,
     worker_manager: Arc<WorkerManager>,
     streaming_metrics: bool,
     callback_runner: Arc<CallbackRunner>,
+    /// Graceful-shutdown in-flight tracker (P4-2). Held by the service so every
+    /// inference handler can inc on entry / dec on exit — mirrors the HTTP
+    /// middleware; together they make the drain-time `pending` count accurate.
+    shutdown_state: Arc<crate::server::ShutdownState>,
     /// Per-request inference deadline. Mirrors the REST path's
     /// `config.server.timeout` so gRPC and HTTP share one request budget.
     server_timeout: Duration,
@@ -43,6 +66,7 @@ impl GrpcService {
         worker_manager: Arc<WorkerManager>,
         streaming_metrics: bool,
         callback_runner: Arc<CallbackRunner>,
+        shutdown_state: Arc<crate::server::ShutdownState>,
         server_timeout: Duration,
         rate_limiter: Arc<crate::rate_limit::RateLimiter>,
     ) -> Self {
@@ -51,6 +75,7 @@ impl GrpcService {
             worker_manager,
             streaming_metrics,
             callback_runner,
+            shutdown_state,
             server_timeout,
             rate_limiter,
         }
@@ -1132,6 +1157,7 @@ impl LiteServer for GrpcService {
         &self,
         request: Request<pb::InferRequest>,
     ) -> Result<Response<pb::InferResponse>, Status> {
+        let _guard = InflightGuard::new(self.shutdown_state.clone());
         // P2-1 请求指标：成功/失败统一在此记一次（version label 取解析后版本，
         // 解析失败保持请求原值；D5 无 protocol label，与 HTTP 共享计数）。
         // P2-2 回显：request_id/processing-time 注入响应或错误 metadata（对齐
@@ -1165,6 +1191,7 @@ impl LiteServer for GrpcService {
         &self,
         request: Request<pb::BatchInferRequest>,
     ) -> Result<Response<pb::BatchInferResponse>, Status> {
+        let _guard = InflightGuard::new(self.shutdown_state.clone());
         // P2-1 请求指标 + P2-2 回显 + P2-3 span（同 infer 包装）。
         let start = Instant::now();
         let model_label = request.get_ref().model_name.clone();
@@ -1196,6 +1223,7 @@ impl LiteServer for GrpcService {
         &self,
         request: Request<pb::StreamInferRequest>,
     ) -> Result<Response<Self::StreamInferStream>, Status> {
+        let _guard = InflightGuard::new(self.shutdown_state.clone());
         // P2-1 请求指标：open 失败在此记一次；open 成功后由转发 task 在流
         // 关闭处记一次整体 duration（蓝图 §4.3 P2-1 stream/bidi 语义）。
         // P2-2 回显：注入 stream open 的 initial metadata（processing-time 为
@@ -1237,6 +1265,7 @@ impl LiteServer for GrpcService {
         &self,
         request: Request<Streaming<pb::BidiChunk>>,
     ) -> Result<Response<Self::BidiStreamStream>, Status> {
+        let _guard = InflightGuard::new(self.shutdown_state.clone());
         // P2-1 请求指标 + P2-2 回显（同 stream_infer；model 在 BidiOpen 前未知，
         // 早期失败以空 label 记录；request_id 来自 transport metadata）。
         let start = Instant::now();
@@ -1288,15 +1317,18 @@ pub async fn start_grpc_server(
     worker_manager: Arc<WorkerManager>,
     streaming_metrics: bool,
     callback_runner: Arc<CallbackRunner>,
+    shutdown_state: Arc<crate::server::ShutdownState>,
     server_timeout: Duration,
     grpc_config: crate::config::GrpcConfig,
     rate_limiter: Arc<crate::rate_limit::RateLimiter>,
+    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), AppError> {
     let service = GrpcService::new(
         registry,
         worker_manager.clone(),
         streaming_metrics,
         callback_runner,
+        shutdown_state,
         server_timeout,
         rate_limiter,
     );
@@ -1366,8 +1398,12 @@ pub async fn start_grpc_server(
             // UnixListenerStream yields bare AsyncRead+AsyncWrite streams — exactly
             // what serve_with_incoming wants (tonic provides `Connected` for UnixStream).
             let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
+            // P4-2: graceful shutdown — on the shutdown signal tonic stops
+            // accepting new streams (sends GOAWAY) and drains in-flight RPCs.
             router
-                .serve_with_incoming(incoming)
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
                 .await
                 .map_err(|e| AppError::Internal(format!("gRPC server error: {}", e)))?;
         }
@@ -1384,8 +1420,13 @@ pub async fn start_grpc_server(
             .parse()
             .map_err(|e| AppError::Config(format!("invalid gRPC address: {}", e)))?;
         tracing::info!("Starting gRPC server on {}", addr);
+        // P4-2: graceful shutdown — on the shutdown signal tonic stops accepting
+        // new connections (sends GOAWAY) and drains in-flight RPCs; bounded by
+        // the caller's graceful_timeout + abort backstop.
         router
-            .serve(addr)
+            .serve_with_shutdown(addr, async {
+                let _ = shutdown_rx.await;
+            })
             .await
             .map_err(|e| AppError::Internal(format!("gRPC server error: {}", e)))?;
     }
@@ -2005,6 +2046,7 @@ mod request_metrics_tests {
             wm,
             false,
             Arc::new(CallbackRunner::new()),
+            Arc::new(crate::server::ShutdownState::new()),
             Duration::from_secs(5),
             Arc::new(crate::rate_limit::RateLimiter::default()),
         )

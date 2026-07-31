@@ -12,6 +12,7 @@ use crate::worker::WorkerManager;
 use axum::extract::{FromRequestParts, Query, Request, State};
 use axum::http::header::CONNECTION;
 use axum::http::HeaderValue;
+use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Router;
@@ -138,6 +139,44 @@ async fn observability_middleware(mut request: Request, next: Next) -> Response 
     response
 }
 
+/// P4-2: in-flight accounting for the graceful-shutdown `pending` count — inc on
+/// entry, dec when the response is produced. Placed outermost so it spans the
+/// full request. For SSE/WebSocket the response is produced when headers are
+/// sent, so an active long-lived stream stops counting; the actual stream drain
+/// is handled by axum's graceful shutdown + the graceful_timeout backstop, this
+/// counter is observability only (it was a no-op for HTTP before P4-2).
+async fn inflight_middleware(
+    state: State<Arc<crate::server::ShutdownState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    state.inc_pending();
+    let response = next.run(request).await;
+    state.dec_pending();
+    response
+}
+
+/// C3 (P4-2): once draining, reject new non-probe requests with 503 so
+/// keep-alive clients (and LBs that miss readyz) add no new work during the
+/// drain window. Health probes (/livez, /readyz, /startupz, /health) bypass the
+/// gate so they can report draining themselves. Placed inside observability so
+/// the 503 is logged with a request-id.
+async fn draining_gate(
+    state: State<Arc<AtomicBool>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    use std::sync::atomic::Ordering;
+    if state.load(Ordering::Relaxed) {
+        let path = request.uri().path();
+        let is_probe = matches!(path, "/livez" | "/readyz" | "/startupz" | "/health");
+        if !is_probe {
+            return (StatusCode::SERVICE_UNAVAILABLE, "server draining").into_response();
+        }
+    }
+    next.run(request).await
+}
+
 /// Compression predicate (P1-4): never compress SSE responses — buffering
 /// would break per-event flush semantics.
 #[derive(Clone, Copy)]
@@ -167,6 +206,7 @@ pub async fn start_http_server(
     inference_queue: Arc<InferenceQueue>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     shutdown_state: Arc<crate::server::ShutdownState>,
+    draining: Arc<AtomicBool>,
     callback_runner: Arc<crate::callback::CallbackRunner>,
     has_hot_reload: Arc<AtomicBool>,
     rate_limiter: Arc<crate::rate_limit::RateLimiter>,
@@ -174,7 +214,8 @@ pub async fn start_http_server(
     let repo_path = PathBuf::from(&config.model_repository.path);
     // P3-1：RateLimiter 构造上移到 server/mod.rs（HTTP/gRPC 共享 + 60s cleanup）。
     let mut state = AppState::new(registry, worker_manager, inference_queue, config.clone(), repo_path, callback_runner, has_hot_reload, rate_limiter);
-    state.shutdown_state = shutdown_state;
+    state.shutdown_state = shutdown_state.clone();
+    state.draining = draining.clone();
 
     let app = create_routes(state);
 
@@ -211,10 +252,24 @@ pub async fn start_http_server(
         crate::request_context::context_middleware,
     ));
 
-    // Observability middleware (outermost — applied last so it captures total
-    // wall-clock duration and sets x-request-id + x-processing-time-ms on ALL
-    // responses including errors and fallbacks)
+    // C3 (P4-2): draining gate — inside observability (so 503s carry a
+    // request-id) but outside context/compression so new work is rejected
+    // before any handler runs. Respects D21: it neither consumes RequestContext
+    // nor touches compression/observability semantics.
+    let app =
+        app.layer(axum::middleware::from_fn_with_state(draining.clone(), draining_gate));
+
+    // Observability middleware (captures total wall-clock duration and sets
+    // x-request-id + x-processing-time-ms on ALL responses including errors and
+    // fallbacks).
     let app = app.layer(axum::middleware::from_fn(observability_middleware));
+
+    // P4-2: in-flight accounting — outermost so it spans the whole request,
+    // including observability overhead and draining-gate 503s.
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        shutdown_state.clone(),
+        inflight_middleware,
+    ));
 
     if let Some(path) = unix_socket_path(&config.server.host) {
         #[cfg(unix)]

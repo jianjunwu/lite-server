@@ -879,7 +879,19 @@ impl WorkerManager {
         *self.grpc_health.write().await = Some(GrpcHealthState {
             reporter,
             known_models: std::collections::HashSet::new(),
+            draining: false,
         });
+    }
+
+    /// C3 (P4-2): mark the server as draining — subsequent gRPC Health syncs
+    /// report the overall "" service as NOT_SERVING (gRPC LB摘流), and an
+    /// immediate sync pushes it right away rather than waiting for the next
+    /// coordinator tick. No-op before the reporter is installed.
+    pub async fn mark_draining(&self) {
+        if let Some(state) = self.grpc_health.write().await.as_mut() {
+            state.draining = true;
+        }
+        self.sync_grpc_health().await;
     }
 
     /// Push the current registry health to the gRPC Health service. No-op
@@ -1770,6 +1782,9 @@ pub fn pick_worker_skip_ejected(num_workers: usize, outlier: &OutlierState) -> u
 struct GrpcHealthState {
     reporter: tonic_health::server::HealthReporter,
     known_models: std::collections::HashSet<String>,
+    /// C3 (P4-2): once true, the overall "" service is forced NOT_SERVING so the
+    /// gRPC LB health check摘流 during graceful shutdown.
+    draining: bool,
 }
 
 /// Shared handle to the optional gRPC Health state (None until the gRPC
@@ -1795,6 +1810,13 @@ async fn sync_grpc_health(registry: &ModelRegistry, handle: &GrpcHealthHandle) {
         ServingStatus::Serving
     } else {
         ServingStatus::NotServing
+    };
+    // C3 (P4-2): once draining, force the overall "" service to NOT_SERVING so
+    // the gRPC LB health check摘流; per-model statuses still reflect reality.
+    let overall = if state.draining {
+        ServingStatus::NotServing
+    } else {
+        overall
     };
     state.reporter.set_service_status("", overall).await;
 

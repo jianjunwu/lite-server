@@ -213,10 +213,16 @@ impl LiteServer {
 
         // Create shared shutdown state for pending request tracking
         let shutdown_state = Arc::new(ShutdownState::new());
+        // C3 (P4-2): shared draining flag — set true at the start of graceful
+        // shutdown so /livez, /readyz fail and new HTTP inference is rejected
+        // (503) while in-flight work drains. gRPC health fail-fast is driven
+        // separately via WorkerManager::mark_draining.
+        let draining = Arc::new(AtomicBool::new(false));
 
         // Start HTTP server as spawned task with graceful shutdown channel
         let (http_shutdown_tx, http_shutdown_rx) = tokio::sync::oneshot::channel();
         let has_hot_reload_for_http = has_hot_reload.clone();
+        let draining_for_http = draining.clone();
         let mut http_handle = tokio::spawn(http::start_http_server(
             self.config.clone(),
             self.registry.clone(),
@@ -224,6 +230,7 @@ impl LiteServer {
             self.inference_queue.clone(),
             http_shutdown_rx,
             shutdown_state.clone(),
+            draining_for_http,
             self.callback_runner.clone(),
             has_hot_reload_for_http,
             rate_limiter.clone(),
@@ -252,7 +259,9 @@ impl LiteServer {
             None
         };
 
-        // Start gRPC server if enabled
+        // Start gRPC server if enabled (P4-2: graceful-shutdown channel mirrors
+        // HTTP's; sent in parallel during drain).
+        let (grpc_shutdown_tx, grpc_shutdown_rx) = tokio::sync::oneshot::channel();
         let mut grpc_handle = if self.config.grpc.enabled {
             Some(tokio::spawn(crate::grpc::start_grpc_server(
                 grpc_host,
@@ -261,9 +270,11 @@ impl LiteServer {
                 self.worker_manager.clone(),
                 self.config.features.streaming_metrics,
                 self.callback_runner.clone(),
+                shutdown_state.clone(),
                 Duration::from_secs_f64(self.config.server.timeout as f64),
                 self.config.grpc.clone(),
                 rate_limiter.clone(),
+                grpc_shutdown_rx,
             )))
         } else {
             None
@@ -391,6 +402,13 @@ impl LiteServer {
         // Mark shutdown start for pending request tracking
         shutdown_state.mark_start();
 
+        // C3 (P4-2): fail health fast so the LB stops sending new traffic before
+        // the drain window — /livez, /readyz return 503 (HTTP draining flag) and
+        // the gRPC overall Health service goes NOT_SERVING (mark_draining pushes
+        // immediately rather than waiting for the next coordinator tick).
+        draining.store(true, Ordering::Relaxed);
+        self.worker_manager.mark_draining().await;
+
         // Abort background tasks
         watcher_handle.abort();
         timeline_handle.abort();
@@ -399,8 +417,13 @@ impl LiteServer {
             h.abort();
         }
 
-        // Notify HTTP server to start graceful shutdown
+        // Notify HTTP and gRPC servers to start graceful shutdown (drain in
+        // parallel). gRPC serve_with_shutdown stops accepting new streams and
+        // sends GOAWAY; HTTP stops accepting new connections. C3 (P4-2): the
+        // draining flag set above also fails readyz/livez + gRPC health so the
+        // LB stops sending new traffic during the drain window.
         let _ = http_shutdown_tx.send(());
+        let _ = grpc_shutdown_tx.send(());
 
         // Spawn periodic shutdown status logger
         let state_for_monitor = shutdown_state.clone();
@@ -432,28 +455,44 @@ impl LiteServer {
             }
         });
 
-        // Wait for HTTP server with graceful timeout
+        // Drain HTTP and gRPC in parallel, each bounded by graceful_timeout;
+        // anything still running after the grace window is force-aborted below.
         let graceful_timeout = Duration::from_secs_f32(self.config.server.graceful_timeout);
-        match tokio::time::timeout(graceful_timeout, http_handle).await {
-            Ok(Ok(Ok(()))) => info!("HTTP server shut down gracefully"),
-            Ok(Ok(Err(e))) => error!("HTTP server error during shutdown: {}", e),
-            Ok(Err(e)) => error!("HTTP task panicked during shutdown: {}", e),
-            Err(_) => {
-                let remaining = shutdown_state.pending();
-                warn!(
+        let http_fut = async {
+            match tokio::time::timeout(graceful_timeout, &mut http_handle).await {
+                Ok(Ok(Ok(()))) => info!("HTTP server shut down gracefully"),
+                Ok(Ok(Err(e))) => error!("HTTP server error during shutdown: {}", e),
+                Ok(Err(e)) => error!("HTTP task panicked during shutdown: {}", e),
+                Err(_) => warn!(
                     "HTTP server graceful shutdown timed out after {}s ({} requests still pending)",
                     self.config.server.graceful_timeout,
-                    remaining
-                );
+                    shutdown_state.pending()
+                ),
             }
-        }
+        };
+        let grpc_fut = async {
+            if let Some(h) = grpc_handle.as_mut() {
+                match tokio::time::timeout(graceful_timeout, h).await {
+                    Ok(Ok(Ok(()))) => info!("gRPC server shut down gracefully"),
+                    Ok(Ok(Err(e))) => error!("gRPC server error during shutdown: {}", e),
+                    Ok(Err(e)) => error!("gRPC task panicked during shutdown: {}", e),
+                    Err(_) => warn!(
+                        "gRPC server graceful shutdown timed out after {}s",
+                        self.config.server.graceful_timeout
+                    ),
+                }
+            }
+        };
+        tokio::join!(http_fut, grpc_fut);
 
         monitor_handle.abort();
 
-        // Abort metrics and gRPC if still running
+        // Abort metrics (no graceful protocol). Force-abort HTTP/gRPC if the
+        // grace window expired mid-drain.
         if let Some(h) = metrics_handle {
             h.abort();
         }
+        http_handle.abort();
         if let Some(h) = grpc_handle {
             h.abort();
         }

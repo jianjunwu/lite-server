@@ -13,14 +13,31 @@ use std::sync::Arc;
 // ===== Health =====
 
 /// Liveness: the process is up — deliberately checks nothing else (no
-/// models/ZMQ/DB) so a model failure never cascades into a pod restart.
-pub async fn livez_handler() -> impl IntoResponse {
-    Json(json!({"status": "alive"}))
+/// models/ZMQ/DB) so a model failure never cascades into a pod restart. C3
+/// (P4-2): once draining, returns 503 so a liveness-based LB stops sending
+/// traffic during the drain window (the process is still alive, just retiring).
+pub async fn livez_handler(State(state): State<Arc<AppState>>) -> Response {
+    if state.draining.load(std::sync::atomic::Ordering::Relaxed) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "draining"})),
+        )
+            .into_response();
+    }
+    Json(json!({"status": "alive"})).into_response()
 }
 
 /// Readiness: 200 while at least one version can serve (Ready or Degraded);
-/// 503 otherwise. A single failed model never takes readiness down.
+/// 503 otherwise. A single failed model never takes readiness down. C3 (P4-2):
+/// also 503 once draining — readiness is the primary LB摘流 signal.
 pub async fn readyz_handler(State(state): State<Arc<AppState>>) -> Response {
+    if state.draining.load(std::sync::atomic::Ordering::Relaxed) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "draining", "reason": "graceful shutdown in progress"})),
+        )
+            .into_response();
+    }
     let status = state.registry.server_status();
     if status.has_serving() {
         (
