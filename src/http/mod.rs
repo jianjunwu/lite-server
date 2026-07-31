@@ -210,6 +210,7 @@ pub async fn start_http_server(
     callback_runner: Arc<crate::callback::CallbackRunner>,
     has_hot_reload: Arc<AtomicBool>,
     rate_limiter: Arc<crate::rate_limit::RateLimiter>,
+    tls: Option<Arc<crate::tls::TlsConfigStore>>,
 ) -> Result<(), AppError> {
     let repo_path = PathBuf::from(&config.model_repository.path);
     // P3-1：RateLimiter 构造上移到 server/mod.rs（HTTP/gRPC 共享 + 60s cleanup）。
@@ -297,20 +298,45 @@ pub async fn start_http_server(
             .parse()
             .map_err(|e| AppError::Config(format!("invalid address: {}", e)))?;
 
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(AppError::Io)?;
+        if let Some(tls_store) = tls {
+            // P5-1: TLS/mTLS termination. axum-server drives the accept loop
+            // (per-connection handshake concurrency); RotatingTlsAcceptor
+            // snapshots the current rustls config per connection so the cert
+            // reloader's swap applies to the NEXT handshake. Graceful shutdown
+            // parity with the plaintext path: the outer graceful_timeout +
+            // task-abort backstop in server/mod.rs still bounds the drain.
+            let std_listener = std::net::TcpListener::bind(addr).map_err(AppError::Io)?;
+            std_listener.set_nonblocking(true).map_err(AppError::Io)?;
+            info!("Starting HTTPS server on {} ({})", addr, tls_store.describe());
+            let handle = axum_server::Handle::new();
+            tokio::spawn({
+                let handle = handle.clone();
+                async move {
+                    let _ = shutdown_rx.await;
+                    handle.graceful_shutdown(None);
+                }
+            });
+            axum_server::Server::from_tcp(std_listener)
+                .acceptor(crate::tls::RotatingTlsAcceptor::new(tls_store))
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .map_err(|e| AppError::Internal(format!("server error: {}", e)))?;
+        } else {
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .map_err(AppError::Io)?;
 
-        info!("Starting HTTP server on {}", addr);
-        // into_make_service_with_connect_info makes ConnectInfo<SocketAddr>
-        // available to extractors/middleware — peer_ip_fallback uses it to
-        // populate client_ip for direct connections.
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-            .with_graceful_shutdown(async {
-                let _ = shutdown_rx.await;
-            })
-            .await
-            .map_err(|e| AppError::Internal(format!("server error: {}", e)))?;
+            info!("Starting HTTP server on {}", addr);
+            // into_make_service_with_connect_info makes ConnectInfo<SocketAddr>
+            // available to extractors/middleware — peer_ip_fallback uses it to
+            // populate client_ip for direct connections.
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .map_err(|e| AppError::Internal(format!("server error: {}", e)))?;
+        }
     }
 
     Ok(())

@@ -15,6 +15,7 @@ pub mod server;
 pub mod streaming;
 #[cfg(feature = "python")]
 pub mod test_support;
+pub mod tls;
 pub mod transport;
 pub mod validation;
 pub mod worker;

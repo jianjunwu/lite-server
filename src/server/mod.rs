@@ -219,6 +219,29 @@ impl LiteServer {
         // separately via WorkerManager::mark_draining.
         let draining = Arc::new(AtomicBool::new(false));
 
+        // P5-1: build rotating TLS stores before binding anything — invalid
+        // PEM / key mismatch / empty CA bundle fail startup here (fail fast).
+        // Structural checks (pairing, UDS exclusivity) already ran in
+        // Config::validate; tls_settings() is None unless cert+key are set.
+        let http_tls = match self.config.server.tls_settings() {
+            Some(s) => Some(Arc::new(crate::tls::TlsConfigStore::load(
+                &s,
+                crate::tls::TlsProtocol::Http,
+            )?)),
+            None => None,
+        };
+        let grpc_tls = if self.config.grpc.enabled {
+            match self.config.grpc.tls_settings() {
+                Some(s) => Some(Arc::new(crate::tls::TlsConfigStore::load(
+                    &s,
+                    crate::tls::TlsProtocol::Grpc,
+                )?)),
+                None => None,
+            }
+        } else {
+            None
+        };
+
         // Start HTTP server as spawned task with graceful shutdown channel
         let (http_shutdown_tx, http_shutdown_rx) = tokio::sync::oneshot::channel();
         let has_hot_reload_for_http = has_hot_reload.clone();
@@ -234,6 +257,7 @@ impl LiteServer {
             self.callback_runner.clone(),
             has_hot_reload_for_http,
             rate_limiter.clone(),
+            http_tls.clone(),
         ));
 
         // metrics always needs a TCP host (UDS not supported); when HTTP uses a
@@ -274,11 +298,22 @@ impl LiteServer {
                 Duration::from_secs_f64(self.config.server.timeout as f64),
                 self.config.grpc.clone(),
                 rate_limiter.clone(),
+                grpc_tls.clone(),
                 grpc_shutdown_rx,
             )))
         } else {
             None
         };
+
+        // P5-1 证书热轮换（蓝图 D28）：SIGHUP 立即触发 + 10s 内容轮询兜底
+        // （覆盖 k8s secret symlink 交换）；任何一侧启用 TLS 才启动。
+        crate::tls::spawn_cert_reloader(
+            [http_tls.clone(), grpc_tls.clone()]
+                .into_iter()
+                .flatten()
+                .collect(),
+            std::time::Duration::from_secs(10),
+        );
 
         // Start timeline sampler (uses list_loaded_keys to avoid cloning ModelVersion)
         let registry_for_timeline = self.registry.clone();

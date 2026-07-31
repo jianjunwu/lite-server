@@ -29,12 +29,24 @@ prost-types = "0.13"
 semver = "1.0"
 
 # gRPC
-tonic = { version = "0.12", features = ["gzip"] }
+tonic = { version = "0.12", features = ["gzip", "tls"] }
 tonic-health = { version = "0.12", features = ["transport"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 
+# TLS/mTLS (P5-1, 蓝图 §4.3): 统一 ring provider（评审 2.4）——axum-server 的
+# tls-rustls feature 会拉 aws-lc-rs，故零 feature 引用、TLS 全部经自建
+# acceptor/incoming（支持热轮换；静态 RustlsConfig/ServerTlsConfig 无法重建）。
+axum-server = { version = "0.7", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls-pemfile = "2"
+x509-parser = { version = "0.16", default-features = false }
+sha2 = "0.10"
+
 # HTTP middleware (response compression, P1-4)
 tower-http = { version = "0.6", features = ["compression-gzip"] }
+# Service trait for the HTTP TLS acceptor's extension-injecting wrapper (P5-1)
+tower-service = "0.3"
 
 # OpenTelemetry core only (P-MW, 蓝图 §4.0.1 评审 1.10): RequestContext.trace_cx
 # 的类型载体。恒依赖、无 SDK/exporter（P-TRACE 才以 opt-in feature 引入）。
@@ -103,12 +115,15 @@ prost-build = "0.13"
 
 [dev-dependencies]
 tokio-test = "0.4"
-reqwest = { version = "0.12", features = ["json"] }
+# rustls 版 HTTP 客户端（P5-1 e2e）：与服务端同一 TLS 栈 + ring provider
+# （蓝图评审 2.4 统一 ring）；native-tls 在 macOS 无法导入 EC PKCS#8 身份。
+reqwest = { version = "0.12", default-features = false, features = ["json", "http2", "rustls-tls-manual-roots"] }
 libc = "0.2"
 tokio-tungstenite = "0.24"
 serial_test = "3"
 tower = { version = "0.4", features = ["util"] }
 bytes = "1.8"
+rcgen = "0.13"
 
 [lib]
 name = "lite_server"

@@ -1321,6 +1321,7 @@ pub async fn start_grpc_server(
     server_timeout: Duration,
     grpc_config: crate::config::GrpcConfig,
     rate_limiter: Arc<crate::rate_limit::RateLimiter>,
+    tls: Option<Arc<crate::tls::TlsConfigStore>>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), AppError> {
     let service = GrpcService::new(
@@ -1415,6 +1416,27 @@ pub async fn start_grpc_server(
                 host
             )));
         }
+    } else if let Some(tls_store) = tls {
+        // P5-1: TLS/mTLS termination over TCP. Our own incoming (tls.rs)
+        // terminates TLS per connection from the rotating store, so the cert
+        // reloader's swap applies to the NEXT handshake; tonic's blanket
+        // `Connected for TlsStream<TcpStream>` keeps remote_addr() working and
+        // exposes mTLS peer certs via TlsConnectInfo (→ interceptor principal).
+        // UDS+TLS is rejected at config validation.
+        let addr: std::net::SocketAddr = format!("{}:{}", host, port)
+            .parse()
+            .map_err(|e| AppError::Config(format!("invalid gRPC address: {}", e)))?;
+        let listener = tokio::net::TcpListener::bind(addr).await.map_err(AppError::Io)?;
+        tracing::info!("Starting gRPC server on {} (TLS, {})", addr, tls_store.describe());
+        // One shutdown signal, two observers: tonic's drain and the accept loop.
+        let shutdown = futures::FutureExt::shared(async move {
+            let _ = shutdown_rx.await;
+        });
+        let incoming = crate::tls::tls_incoming(listener, tls_store, shutdown.clone());
+        router
+            .serve_with_incoming_shutdown(incoming, shutdown)
+            .await
+            .map_err(|e| AppError::Internal(format!("gRPC server error: {}", e)))?;
     } else {
         let addr: std::net::SocketAddr = format!("{}:{}", host, port)
             .parse()

@@ -19,6 +19,11 @@ server:
   cache_registry: false        # Cache model registry to disk (reserved — not yet implemented)
   graceful_timeout: 30.0       # Max seconds to wait for in-flight requests during shutdown
   keepalive_timeout: 5.0       # HTTP keep-alive timeout (seconds), 0 = disable
+  # TLS/mTLS (see "TLS / mTLS" section below) — all optional, off by default
+  tls_cert_path: null          # Server certificate chain PEM; requires tls_key_path
+  tls_key_path: null           # Server private key PEM; requires tls_cert_path
+  mtls_ca_path: null           # Client CA bundle PEM; when set, client certs are REQUIRED (mTLS)
+  tls_min_version: null        # "1.2" (default) or "1.3"
 
 logging:
   level: info                  # Log level: trace, debug, info, warn, error
@@ -32,6 +37,11 @@ logging:
 grpc:
   enabled: true                # Enable gRPC server
   max_workers: 10              # Max gRPC worker threads (reserved — not yet implemented)
+  # TLS/mTLS — same semantics as the server.* TLS keys, applied to the gRPC listener
+  tls_cert_path: null          # Server certificate chain PEM; requires tls_key_path
+  tls_key_path: null           # Server private key PEM; requires tls_cert_path
+  mtls_ca_path: null           # Client CA bundle PEM; when set, client certs are REQUIRED (mTLS)
+  tls_min_version: null        # "1.2" (default) or "1.3"
 
 metrics:
   enabled: true                # Enable Prometheus metrics endpoint
@@ -83,6 +93,41 @@ tunables:                      # Server-level knobs (defaults shown; rarely need
   worker_stderr_drain_secs: 5.0    # Wait for an exited worker to flush stderr
   unpack_timeout_secs: 120.0       # Upper bound for one .lma unpack invocation
 ```
+
+## TLS / mTLS
+
+Both listeners (HTTP `server.*` and gRPC `grpc.*`) support TLS and mutual TLS with rustls (pure-Rust, ring provider). TLS is opt-in per listener: set `tls_cert_path` + `tls_key_path` together.
+
+```yaml
+server:
+  tls_cert_path: /etc/lite/tls/server.crt   # PEM chain (leaf first)
+  tls_key_path: /etc/lite/tls/server.key    # PEM private key (chmod 600 recommended)
+  mtls_ca_path: /etc/lite/tls/clients-ca.crt # optional: REQUIRE client certificates (mTLS)
+  tls_min_version: "1.3"                     # optional; default "1.2"
+grpc:
+  tls_cert_path: /etc/lite/tls/server.crt   # independent settings from the HTTP listener
+  tls_key_path: /etc/lite/tls/server.key
+```
+
+Rules enforced at startup:
+
+- `tls_cert_path` / `tls_key_path` must be set **as a pair** — one without the other is a startup error.
+- `mtls_ca_path` requires the pair (mTLS without a server certificate is meaningless).
+- TLS is **mutually exclusive with UDS** (`unix:` host) — a Unix socket is already peer-credentialed.
+- `tls_min_version` accepts `"1.2"` (default) or `"1.3"` only. TLS 1.3 is recommended.
+- Invalid PEM, a key that does not match the certificate, or an empty CA bundle fail startup.
+
+**Hot rotation (no restart).** The server watches the PEM files (10-second content poll, plus instant `SIGHUP` on Unix): when the files change — e.g. a cert-manager/Let's Encrypt renewal or a k8s secret-volume symlink swap — new connections use the new certificate, without dropping established connections. A failed reload (corrupt files, key/cert mismatch mid-rotation) keeps serving the previous certificate and logs an error; the next poll retries. The mTLS CA bundle rotates the same way.
+
+**ALPN.** The gRPC listener advertises `h2` only; the HTTP listener advertises `h2` and `http/1.1`, so health probes and simple HTTPS clients keep working.
+
+**mTLS client identity.** The verified client-certificate principal (URI SAN, else DNS SAN, else subject DN, else SHA-256 fingerprint) is recorded in the request context for access logs/audit. Access control does not consume it yet — API-key auth is configured separately per model (`policies.auth`).
+
+**Deliberate policy notes:**
+
+- **No CRL/OCSP revocation checking** — revocation is out of scope; rotate the CA bundle to exclude a compromised client.
+- The `metrics_port` listener stays **plaintext and unauthenticated** — bind it to an internal network or loopback. With TLS enabled, the main port's Prometheus/probe/internal clients must use HTTPS (ALPN includes `http/1.1` for simple clients).
+- The server warns at startup if the private key file is group/world-readable (`chmod 600` recommended); this is a warning, not a failure, to allow group-based deployments.
 
 ## Model Configuration
 
