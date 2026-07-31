@@ -1264,6 +1264,22 @@ impl LiteServer for GrpcService {
     }
 }
 
+/// Resolve the effective gRPC bind host (P4-1).
+///
+/// - `grpc.host` set → use it verbatim (`unix:/path` ⇒ UDS, else a TCP host).
+/// - `grpc.host` None + `server.host` is a UDS (`unix:/path`) → gRPC cannot
+///   share the HTTP socket, fall back to TCP `127.0.0.1`.
+/// - `grpc.host` None + `server.host` is TCP → follow `server.host`.
+pub(crate) fn resolve_grpc_host(grpc_host: Option<&str>, server_host: &str) -> String {
+    match grpc_host {
+        Some(h) => h.to_string(),
+        None => match crate::config::unix_socket_path(server_host) {
+            Some(_) => "127.0.0.1".to_string(),
+            None => server_host.to_string(),
+        },
+    }
+}
+
 /// Start the gRPC server.
 pub async fn start_grpc_server(
     host: String,
@@ -1276,10 +1292,6 @@ pub async fn start_grpc_server(
     grpc_config: crate::config::GrpcConfig,
     rate_limiter: Arc<crate::rate_limit::RateLimiter>,
 ) -> Result<(), AppError> {
-    let addr: std::net::SocketAddr = format!("{}:{}", host, port)
-        .parse()
-        .map_err(|e| AppError::Config(format!("invalid gRPC address: {}", e)))?;
-
     let service = GrpcService::new(
         registry,
         worker_manager.clone(),
@@ -1314,8 +1326,6 @@ pub async fn start_grpc_server(
     let health_service =
         tonic::codegen::InterceptedService::new(health_service, interceptor::context_interceptor);
 
-    tracing::info!("Starting gRPC server on {}", addr);
-
     let mut builder = tonic::transport::Server::builder();
     // P1-2: HTTP/2 keepalive + flow-control window / frame size tuning.
     if let Some((interval, timeout)) = http2_keepalive_params(&grpc_config) {
@@ -1330,12 +1340,55 @@ pub async fn start_grpc_server(
         builder = builder.max_frame_size(Some(max_frame_size));
     }
 
-    builder
-        .add_service(server)
-        .add_service(health_service)
-        .serve(addr)
-        .await
-        .map_err(|e| AppError::Internal(format!("gRPC server error: {}", e)))?;
+    let router = builder.add_service(server).add_service(health_service);
+
+    if let Some(path) = crate::config::unix_socket_path(&host) {
+        // P4-1: gRPC over a Unix domain socket.
+        #[cfg(unix)]
+        {
+            // Clear a stale socket left by an unclean prior shutdown, then bind.
+            let _ = std::fs::remove_file(path);
+            let listener = tokio::net::UnixListener::bind(path).map_err(|e| {
+                AppError::Config(format!("failed to bind gRPC UDS {}: {}", path, e))
+            })?;
+            // Apply the configured socket permission (default 0o666 inference
+            // socket; admin UDS uses 0o600 in P7-2). chmod, not umask, sets the
+            // mode exactly regardless of the process umask.
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = std::fs::metadata(path) {
+                let mut permissions = metadata.permissions();
+                permissions.set_mode(grpc_config.socket_mode);
+                std::fs::set_permissions(path, permissions).map_err(|e| {
+                    AppError::Config(format!("failed to chmod gRPC UDS {}: {}", path, e))
+                })?;
+            }
+            tracing::info!("Starting gRPC server on unix:{}", path);
+            // UnixListenerStream yields bare AsyncRead+AsyncWrite streams — exactly
+            // what serve_with_incoming wants (tonic provides `Connected` for UnixStream).
+            let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
+            router
+                .serve_with_incoming(incoming)
+                .await
+                .map_err(|e| AppError::Internal(format!("gRPC server error: {}", e)))?;
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(AppError::Config(format!(
+                "gRPC host '{}' requires Unix domain sockets, which are not supported on this \
+                 platform; set grpc.host to a TCP host instead",
+                host
+            )));
+        }
+    } else {
+        let addr: std::net::SocketAddr = format!("{}:{}", host, port)
+            .parse()
+            .map_err(|e| AppError::Config(format!("invalid gRPC address: {}", e)))?;
+        tracing::info!("Starting gRPC server on {}", addr);
+        router
+            .serve(addr)
+            .await
+            .map_err(|e| AppError::Internal(format!("gRPC server error: {}", e)))?;
+    }
 
     Ok(())
 }
@@ -1425,6 +1478,45 @@ mod tests {
         assert_eq!(
             http2_keepalive_params(&cfg),
             Some((Duration::from_secs(30), Duration::from_secs(5)))
+        );
+    }
+
+    // --- P4-1: gRPC host resolution (TCP follow / UDS fallback / explicit unix:) ---
+
+    #[test]
+    fn resolve_grpc_host_follows_server_host_when_unset() {
+        // grpc.host None + server.host TCP → follow server.host.
+        assert_eq!(
+            resolve_grpc_host(None, "0.0.0.0"),
+            "0.0.0.0".to_string()
+        );
+    }
+
+    #[test]
+    fn resolve_grpc_host_falls_back_to_loopback_when_server_is_uds() {
+        // grpc.host None + server.host is a UDS → gRPC cannot share the socket,
+        // fall back to loopback TCP (blueprint §4.1 P4-1).
+        assert_eq!(
+            resolve_grpc_host(None, "unix:/tmp/x.sock"),
+            "127.0.0.1".to_string()
+        );
+    }
+
+    #[test]
+    fn resolve_grpc_host_explicit_unix_takes_uds() {
+        // Explicit grpc.host = unix:/path → gRPC listens on that UDS.
+        assert_eq!(
+            resolve_grpc_host(Some("unix:/run/lite.sock"), "0.0.0.0"),
+            "unix:/run/lite.sock".to_string()
+        );
+    }
+
+    #[test]
+    fn resolve_grpc_host_explicit_tcp_takes_that_host() {
+        // Explicit grpc.host = a plain host overrides server.host.
+        assert_eq!(
+            resolve_grpc_host(Some("10.0.0.5"), "0.0.0.0"),
+            "10.0.0.5".to_string()
         );
     }
 

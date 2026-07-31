@@ -1147,6 +1147,194 @@ async fn test_http_response_compression() {
 }
 
 // ---------------------------------------------------------------------------
+// gRPC Unix domain socket (P4-1)
+// ---------------------------------------------------------------------------
+//
+// `grpc.host: unix:/path` makes the gRPC server bind a UDS instead of TCP.
+// Verified end-to-end: a tonic client connects over the socket, an Infer RPC
+// drives the worker, the grpc.health.v1 Health RPC answers, and the socket
+// file carries the configured permission bits.
+
+#[cfg(unix)]
+fn unique_uds_path(label: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "/tmp/lite-server-grpc-uds-{}-{}-{}.sock",
+        std::process::id(),
+        label,
+        n
+    )
+}
+
+/// Connect a tonic channel to a UDS path, retrying briefly until the server
+/// has bound the socket (the HTTP port being up is a hint, not a guarantee).
+#[cfg(unix)]
+async fn uds_grpc_channel(sock_path: &str) -> tonic::transport::Channel {
+    use hyper_util::rt::TokioIo;
+    use tower::service_fn;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let path = sock_path.to_string();
+        let endpoint = tonic::transport::Endpoint::try_from("http://localhost")
+            .expect("static placeholder URI is valid");
+        match endpoint
+            .connect_with_connector(service_fn(move |_: http::Uri| {
+                let path = path.clone();
+                async move {
+                    Ok::<_, std::io::Error>(TokioIo::new(
+                        tokio::net::UnixStream::connect(&path).await?,
+                    ))
+                }
+            }))
+            .await
+        {
+            Ok(channel) => return channel,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+            Err(e) => panic!("failed to connect gRPC over UDS {}: {}", sock_path, e),
+        }
+    }
+}
+
+/// Assert a socket file's permission bits (lower 9) match `mode`.
+#[cfg(unix)]
+fn assert_socket_mode(path: &str, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path).unwrap_or_else(|e| panic!("stat {}: {}", path, e));
+    assert_eq!(
+        meta.permissions().mode() & 0o777,
+        mode,
+        "socket {} perms mismatch",
+        path
+    );
+}
+
+/// gRPC `grpc.host: unix:/path` drives Infer + Health over the socket, and the
+/// default inference-socket permission is 0o666.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_grpc_uds_infer_health_default_mode() {
+    use std::collections::HashMap;
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+
+    let http_port = 18094u16;
+    let grpc_port = 18095u16; // parsed but unused for bind (UDS)
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = test_model_repo();
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-grpc-uds-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let sock = unique_uds_path("default");
+    let _ = std::fs::remove_file(&sock);
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {}\n  grpc_port: {}\n  metrics_port: 18096\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\n  host: unix:{}\nmodel_repository:\n  path: {}\n",
+            http_port, grpc_port, sock, repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, MODEL, "1").await;
+
+    let channel = uds_grpc_channel(&sock).await;
+
+    // Health: overall service "" → SERVING once the model is ready.
+    let mut health =
+        tonic_health::pb::health_client::HealthClient::new(channel.clone());
+    let hresp = health
+        .check(tonic_health::pb::HealthCheckRequest { service: String::new() })
+        .await
+        .expect("Health.check over UDS must succeed")
+        .into_inner();
+    assert_eq!(
+        hresp.status,
+        tonic_health::ServingStatus::Serving as i32,
+        "overall health should be SERVING once a model is loaded"
+    );
+
+    // Infer: test_model doubles the input (21 -> 42).
+    let mut infer = LiteServerClient::new(channel);
+    let resp = infer
+        .infer(InferRequest {
+            model_name: MODEL.to_string(),
+            version: "1".to_string(),
+            data: br#"{"input":21}"#.to_vec().into(),
+            headers: HashMap::new(),
+        })
+        .await
+        .expect("Infer over UDS must succeed")
+        .into_inner();
+    let body = String::from_utf8_lossy(&resp.data);
+    assert!(
+        body.contains("42"),
+        "test_model doubles the input (21 -> 42); got: {}",
+        body
+    );
+
+    // Default inference-socket permission.
+    assert_socket_mode(&sock, 0o666);
+
+    unload_model(&base, MODEL, "1").await;
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// A custom `grpc.socket_mode` is applied to the UDS (432 = 0o660).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_grpc_uds_custom_socket_mode() {
+    let http_port = 18097u16;
+    let grpc_port = 18098u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = test_model_repo();
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-grpc-uds-mode-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let sock = unique_uds_path("mode");
+    let _ = std::fs::remove_file(&sock);
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {}\n  grpc_port: {}\n  metrics_port: 18099\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\n  host: unix:{}\n  socket_mode: 432\nmodel_repository:\n  path: {}\n",
+            http_port, grpc_port, sock, repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 20).await;
+
+    // Connecting + a Health round-trip proves the socket is live; no model is
+    // loaded here, so the overall status is NOT_SERVING (we only require Ok).
+    let channel = uds_grpc_channel(&sock).await;
+    let mut health =
+        tonic_health::pb::health_client::HealthClient::new(channel);
+    health
+        .check(tonic_health::pb::HealthCheckRequest { service: String::new() })
+        .await
+        .expect("Health.check over UDS must succeed");
+
+    assert_socket_mode(&sock, 0o660); // 432 decimal = 0o660
+
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// ---------------------------------------------------------------------------
 // SSE streaming
 // ---------------------------------------------------------------------------
 

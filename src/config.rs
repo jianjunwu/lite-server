@@ -94,6 +94,15 @@ impl Default for ServerConfig {
 pub struct GrpcConfig {
     pub enabled: bool,
     pub max_workers: usize,
+    /// gRPC bind target (P4-1). None = follow `server.host`, falling back to
+    /// TCP `127.0.0.1` when `server.host` is a Unix socket — gRPC stays on TCP
+    /// unless this is explicitly set to `unix:/path` to bind a UDS. See
+    /// `grpc::resolve_grpc_host`.
+    pub host: Option<String>,
+    /// Unix socket file permission for the gRPC UDS (P4-1), as a decimal mode
+    /// (e.g. 438 = 0o666). Default 0o666 for the inference socket — admin UDS
+    /// uses a stricter 0o600 (P7-2). Applied via chmod on cfg(unix) only.
+    pub socket_mode: u32,
     /// HTTP/2 keepalive ping interval in seconds (P1-2). None = disabled.
     pub http2_keepalive_interval_secs: Option<u64>,
     /// HTTP/2 keepalive ping-ack timeout in seconds (P1-2). Effective default
@@ -116,6 +125,8 @@ impl Default for GrpcConfig {
         Self {
             enabled: true,
             max_workers: 10,
+            host: None,
+            socket_mode: 0o666,
             http2_keepalive_interval_secs: None,
             http2_keepalive_timeout_secs: None,
             http2_adaptive_window: false,

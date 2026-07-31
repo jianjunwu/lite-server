@@ -229,12 +229,18 @@ impl LiteServer {
             rate_limiter.clone(),
         ));
 
-        // When HTTP uses a Unix socket, gRPC/metrics still need a TCP host.
+        // metrics always needs a TCP host (UDS not supported); when HTTP uses a
+        // Unix socket, fall back to loopback. gRPC resolves its own bind target
+        // from grpc.host / server.host (P4-1, may itself be a `unix:/path`).
         let tcp_host = if crate::config::unix_socket_path(&self.config.server.host).is_some() {
             "127.0.0.1".to_string()
         } else {
             self.config.server.host.clone()
         };
+        let grpc_host = crate::grpc::resolve_grpc_host(
+            self.config.grpc.host.as_deref(),
+            &self.config.server.host,
+        );
 
         // Start metrics server if enabled
         let mut metrics_handle = if self.config.metrics.enabled {
@@ -249,7 +255,7 @@ impl LiteServer {
         // Start gRPC server if enabled
         let mut grpc_handle = if self.config.grpc.enabled {
             Some(tokio::spawn(crate::grpc::start_grpc_server(
-                tcp_host,
+                grpc_host,
                 self.config.server.grpc_port,
                 self.registry.clone(),
                 self.worker_manager.clone(),
