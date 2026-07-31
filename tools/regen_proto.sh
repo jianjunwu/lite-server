@@ -39,7 +39,7 @@ echo "[regen_proto] source : $PROTO"
 echo "[regen_proto] output : $OUT_DIR/liteserver_pb2.py"
 echo "[regen_proto] tool   : grpcio-tools==$GRPCIO_TOOLS_VERSION (protoc 25.x — no runtime_version guard)"
 
-uv run --no-project --with "grpcio-tools==$GRPCIO_TOOLS_VERSION" \
+uv run --no-project --python 3.12 --with "grpcio-tools==$GRPCIO_TOOLS_VERSION" \
   python -m grpc_tools.protoc \
     -I "$REPO_ROOT/src/proto" \
     --python_out="$OUT_DIR" \

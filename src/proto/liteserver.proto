@@ -260,3 +260,170 @@ message BidiData {
 
 message BidiClose {
 }
+
+// ===== Admin Service (P6, 蓝图 §4.1) =====
+//
+// 11 RPCs mirroring the HTTP admin REST surface. Additive ONLY: a new service
+// + new messages; no existing message/field is touched (proto 双用途 gRPC+ZMQ，
+// additive 对 ZMQ wire 向后安全). gRPC reflection (评审低#12) is an opt-in
+// follow-up, not included here.
+service Admin {
+  rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+  rpc ListVersions(ListVersionsRequest) returns (ListVersionsResponse);
+  rpc ModelReady(ModelReadyRequest) returns (ModelReadyResponse);
+  rpc ModelHealth(ModelHealthRequest) returns (ModelHealthResponse);
+  rpc LoadModel(LoadModelRequest) returns (LoadModelResponse);
+  rpc UnloadModel(UnloadModelRequest) returns (UnloadModelResponse);
+  rpc ReloadModel(ReloadModelRequest) returns (ReloadModelResponse);
+  rpc ActivateVersion(ActivateVersionRequest) returns (ActivateVersionResponse);
+  rpc SetRouting(SetRoutingRequest) returns (SetRoutingResponse);
+  rpc GetModelStats(GetModelStatsRequest) returns (GetModelStatsResponse);
+}
+
+// --- GetInfo (mirrors GET /info) ---
+message GetInfoRequest {}
+message GetInfoResponse {
+  string server = 1;                       // "lite-server"
+  string version = 2;                      // CARGO_PKG_VERSION
+  repeated string loaded_models = 3;       // "name/version" per loaded version
+}
+
+// --- ListModels (mirrors GET /v2/models) ---
+message ListModelsRequest {}
+message ListModelsResponse {
+  repeated ModelSummary models = 1;
+}
+message ModelSummary {
+  string name = 1;
+  string version = 2;
+  string status = 3;                       // VersionStatus snake_case (ready/degraded/...)
+  string model_type = 4;                   // {:?} Debug: "LitAPI" | "Ensemble"
+  uint32 workers = 5;                      // mv.workers.len()
+}
+
+// --- ListVersions (mirrors GET /v2/models/:m/versions) ---
+message ListVersionsRequest {
+  string model_name = 1;
+}
+message ListVersionsResponse {
+  string name = 1;
+  optional string active_version = 2;      // absent when no active version
+  repeated VersionSummary versions = 3;
+}
+message VersionSummary {
+  string version = 1;
+  string status = 2;                       // VersionStatus snake_case
+  bool active = 3;
+  uint32 weight = 4;
+  uint32 ready_workers = 5;
+  uint32 total_workers = 6;
+  optional uint64 loaded_at = 7;           // epoch seconds; absent when None
+}
+
+// --- ModelReady (mirrors GET /v2/models/:m[/versions/:v]/ready) ---
+message ModelReadyRequest {
+  string model_name = 1;
+  optional string version = 2;             // absent → active version
+}
+message ModelReadyResponse {
+  string name = 1;
+  optional string version = 2;             // the version queried (active when request omitted)
+  bool ready = 3;
+  optional string active_version = 4;
+}
+
+// --- ModelHealth (mirrors GET /v2/models/:m[/versions/:v]/health) ---
+message ModelHealthRequest {
+  string model_name = 1;
+  optional string version = 2;             // absent → router-resolved version
+}
+message ModelHealthResponse {
+  string name = 1;
+  string version = 2;
+  uint32 healthy_workers = 3;
+  uint32 total_workers = 4;
+  repeated WorkerHealth workers = 5;
+}
+message WorkerHealth {
+  uint32 worker_id = 1;
+  bool healthy = 2;
+  bool ejected = 3;
+}
+
+// --- Load / Unload / Reload (mirror POST /v2/repository/...) ---
+message LoadModelRequest {
+  string model_name = 1;
+  string version = 2;
+}
+message LoadModelResponse {
+  bool success = 1;
+  string message = 2;
+}
+message UnloadModelRequest {
+  string model_name = 1;
+  optional string version = 2;             // absent → active version
+}
+message UnloadModelResponse {
+  bool success = 1;
+  string message = 2;
+}
+message ReloadModelRequest {
+  string model_name = 1;
+  optional string version = 2;             // absent → active version
+}
+message ReloadModelResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// --- ActivateVersion (mirrors POST /v2/models/:m/versions/:v/activate) ---
+message ActivateVersionRequest {
+  string model_name = 1;
+  string version = 2;
+}
+message ActivateVersionResponse {
+  bool success = 1;
+  string message = 2;
+  string active_version = 3;
+}
+
+// --- SetRouting (mirrors PUT /v2/models/:m/routing + P5-2 canary 糖) ---
+message SetRoutingRequest {
+  string model_name = 1;
+  // Primary: explicit per-version weights (mirrors HTTP). Versions not listed
+  // get weight 0.
+  map<string, uint32> weights = 2;
+  // P5-2 canary 糖 (蓝图 §4.4, 随 P6 实施): declare a canary split; the server
+  // converts it into weights — canary_percent → canary_version, the remainder
+  // (100 - canary_percent) → the currently active version. Mutually exclusive
+  // with `weights` (setting both → INVALID_ARGUMENT).
+  optional string canary_version = 3;
+  optional uint32 canary_percent = 4;
+}
+message SetRoutingResponse {
+  bool success = 1;
+  map<string, uint32> weights = 2;         // effective weights applied
+}
+
+// --- GetModelStats (assembled from prometheus counters + queue depth; no HTTP twin) ---
+message GetModelStatsRequest {
+  string model_name = 1;
+  optional string version = 2;             // absent → all loaded versions of the model
+}
+message GetModelStatsResponse {
+  repeated ModelStats stats = 1;
+}
+message ModelStats {
+  string model = 1;
+  string version = 2;
+  uint64 inference_count = 3;              // Σ REQUESTS_TOTAL across status families
+  double avg_duration_ms = 4;              // REQUEST_DURATION sum/count (0 when no samples)
+  int64 queue_depth = 5;                   // QUEUE_DEPTH gauge
+  repeated WorkerStats workers = 6;
+}
+message WorkerStats {
+  uint32 worker_id = 1;
+  bool healthy = 2;                        // !OutlierState::is_ejected
+  uint64 inference_count = 3;              // WORKER_INFERENCE_TOTAL{...,worker_id}
+}
