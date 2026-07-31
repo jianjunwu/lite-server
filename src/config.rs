@@ -352,6 +352,10 @@ pub struct FeaturesConfig {
     pub sse: bool,
     pub websocket_streaming: bool,
     pub streaming_metrics: bool,
+    /// P5-2 (蓝图 §4.4, D16): 允许 `x-lite-version` pin 绕过权重路由（HTTP 与
+    /// gRPC 双侧门控一致）。默认 false（breaking）——生产上 pin 可绕过灰度
+    /// 权重，仅灰度/调试环境显式开启。
+    pub canary_override: bool,
 }
 
 impl Default for FeaturesConfig {
@@ -369,6 +373,7 @@ impl Default for FeaturesConfig {
             sse: true,
             websocket_streaming: true,
             streaming_metrics: true,
+            canary_override: false,
         }
     }
 }
@@ -970,8 +975,19 @@ mod tests {
         assert!(cfg.features.streaming);
         assert!(cfg.features.websocket_streaming);
         assert!(cfg.features.streaming_metrics);
+        // P5-2 (蓝图 §4.4, D16): x-lite-version pin 默认关闭（breaking）。
+        assert!(!cfg.features.canary_override);
         assert_eq!(cfg.orchestration.control_mode, "explicit");
         assert_eq!(cfg.orchestration.poll_interval, 30);
+    }
+
+    #[test]
+    fn test_canary_override_deserializes_from_yaml() {
+        let cfg: Config = serde_yaml::from_str("features:\n  canary_override: true\n").unwrap();
+        assert!(cfg.features.canary_override);
+        // Unset → default false (breaking 默认关).
+        let cfg: Config = serde_yaml::from_str("features:\n  streaming: true\n").unwrap();
+        assert!(!cfg.features.canary_override);
     }
 
     #[test]

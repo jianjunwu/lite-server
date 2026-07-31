@@ -20,6 +20,18 @@ mod version_routing_tests {
     use tower::ServiceExt;
 
     fn test_state() -> Arc<AppState> {
+        test_state_with(Config::default())
+    }
+
+    /// P5-2 (蓝图 §4.4): features.canary_override=true 的 state —— x-lite-version
+    /// pin 仅在开关开时生效。
+    fn test_state_canary() -> Arc<AppState> {
+        let mut config = Config::default();
+        config.features.canary_override = true;
+        test_state_with(config)
+    }
+
+    fn test_state_with(config: Config) -> Arc<AppState> {
         let registry = Arc::new(ModelRegistry::new());
         let inference_queue = Arc::new(InferenceQueue::new());
         let callback_runner = Arc::new(crate::callback::CallbackRunner::new());
@@ -34,7 +46,7 @@ mod version_routing_tests {
             registry,
             worker_manager,
             inference_queue,
-            Config::default(),
+            config,
             std::path::PathBuf::new(),
             callback_runner,
             Arc::new(AtomicBool::new(false)),
@@ -99,7 +111,7 @@ mod version_routing_tests {
 
     #[tokio::test]
     async fn explicit_version_wins_over_header_and_weights() {
-        let state = test_state();
+        let state = test_state_canary();
         register_ready(&state, "m", &["1", "2"]);
         state
             .registry
@@ -113,7 +125,7 @@ mod version_routing_tests {
 
     #[tokio::test]
     async fn header_pin_wins_over_weights() {
-        let state = test_state();
+        let state = test_state_canary();
         register_ready(&state, "m", &["1", "2"]);
         state
             .registry
@@ -123,6 +135,47 @@ mod version_routing_tests {
             .await
             .unwrap();
         assert_eq!(v, "1");
+    }
+
+    // ===== P5-2: features.canary_override 开关门控（蓝图 §4.4, D16）=====
+
+    #[tokio::test]
+    async fn switch_off_ignores_pin_and_uses_weights() {
+        // canary_override 默认 false：pin header 被忽略，权重路由决定版本。
+        let state = test_state();
+        register_ready(&state, "m", &["1", "2"]);
+        state
+            .registry
+            .set_weights("m", &HashMap::from([("2".into(), 100u32)]))
+            .unwrap();
+        let v = resolve_version(&state, "m", None, &pinned_header("1"))
+            .await
+            .unwrap();
+        assert_eq!(v, "2", "switch off → pin ignored, weights decide");
+    }
+
+    #[tokio::test]
+    async fn switch_off_ignores_invalid_pin_without_error() {
+        // 开关关时 pin 完全不参与解析——非法值也不校验、不报 400。
+        let state = test_state();
+        register_ready(&state, "m", &["1"]);
+        state.registry.activate_version("m", "1").unwrap();
+        let v = resolve_version(&state, "m", None, &pinned_header("a/b"))
+            .await
+            .unwrap();
+        assert_eq!(v, "1");
+    }
+
+    #[tokio::test]
+    async fn switch_on_pin_to_unknown_version_is_not_found() {
+        // 开关开 + pin 指向未注册版本 → 404（蓝图 §4.4：版本不存在→NotFound）。
+        let state = test_state_canary();
+        register_ready(&state, "m", &["1"]);
+        state.registry.activate_version("m", "1").unwrap();
+        let err = resolve_version(&state, "m", None, &pinned_header("2"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::ModelNotFound(_)), "got {err:?}");
     }
 
     #[tokio::test]
@@ -167,9 +220,10 @@ mod version_routing_tests {
     /// `validate_version`. Invalid header values are rejected (400), same
     /// as invalid path versions. (Values with control chars can't appear
     /// in a HeaderValue at all, so only representable cases are tested.)
+    /// P5-2: 校验仅在 features.canary_override=true 时进行（开关关→pin 整体忽略）。
     #[tokio::test]
     async fn invalid_header_pin_is_rejected() {
-        let state = test_state();
+        let state = test_state_canary();
         register_ready(&state, "m", &["1", "2"]);
         state.registry.activate_version("m", "1").unwrap();
 
@@ -533,12 +587,13 @@ mod version_routing_tests {
     /// version's readiness (`is_ready(model, None)`), so a WS pinned via
     /// `x-lite-version` to a Ready non-active version was closed whenever
     /// the active version was not Ready.
+    /// P5-2: pin 生效需 features.canary_override=true。
     #[tokio::test]
     async fn ws_stream_readiness_uses_resolved_version_not_active() {
         use futures::StreamExt;
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-        let state = test_state();
+        let state = test_state_canary();
         // v1 = active but Failed; v2 = Ready (the pin target).
         state
             .registry

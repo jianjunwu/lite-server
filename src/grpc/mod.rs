@@ -46,6 +46,10 @@ pub struct GrpcService {
     registry: Arc<ModelRegistry>,
     worker_manager: Arc<WorkerManager>,
     streaming_metrics: bool,
+    /// P5-2 (蓝图 §4.4, D16): features.canary_override——false（默认）时
+    /// `x-lite-version` pin 被忽略（debug 日志），true 时参与版本解析
+    /// （优先级：显式 version > pin > routing_pick > active，与 HTTP 一致）。
+    canary_override: bool,
     callback_runner: Arc<CallbackRunner>,
     /// Graceful-shutdown in-flight tracker (P4-2). Held by the service so every
     /// inference handler can inc on entry / dec on exit — mirrors the HTTP
@@ -65,6 +69,7 @@ impl GrpcService {
         registry: Arc<ModelRegistry>,
         worker_manager: Arc<WorkerManager>,
         streaming_metrics: bool,
+        canary_override: bool,
         callback_runner: Arc<CallbackRunner>,
         shutdown_state: Arc<crate::server::ShutdownState>,
         server_timeout: Duration,
@@ -74,6 +79,7 @@ impl GrpcService {
             registry,
             worker_manager,
             streaming_metrics,
+            canary_override,
             callback_runner,
             shutdown_state,
             server_timeout,
@@ -109,14 +115,24 @@ impl GrpcService {
             return Err(err(Status::invalid_argument(e.to_string())));
         }
 
-        // version="" → weighted routing pick (§4.3), falling back to active.
+        // version="" → canary pin (P5-2, 开关开) → weighted routing pick (§4.3),
+        // falling back to active. 优先级与 HTTP resolve_version 一致（蓝图 §4.4）。
         let resolved_version = match version {
             Some(v) => v.to_string(),
-            None => self
-                .registry
-                .routing_pick(model_name)
-                .or_else(|| self.registry.get_active_version(model_name))
-                .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
+            None => match canary_pin(
+                &self.registry,
+                self.canary_override,
+                model_name,
+                &grpc_metadata,
+                &req.headers,
+            )? {
+                Some(pin) => pin,
+                None => self
+                    .registry
+                    .routing_pick(model_name)
+                    .or_else(|| self.registry.get_active_version(model_name))
+                    .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
+            },
         };
         self.registry.touch_last_used(model_name, &resolved_version);
         *version_label = resolved_version.clone();
@@ -297,14 +313,24 @@ impl GrpcService {
             return Err(err(Status::invalid_argument(e.to_string())));
         }
 
-        // version="" → weighted routing pick (§4.3), falling back to active.
+        // version="" → canary pin (P5-2, 开关开) → weighted routing pick (§4.3),
+        // falling back to active. 优先级与 HTTP resolve_version 一致（蓝图 §4.4）。
         let resolved_version = match version {
             Some(v) => v.to_string(),
-            None => self
-                .registry
-                .routing_pick(model_name)
-                .or_else(|| self.registry.get_active_version(model_name))
-                .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
+            None => match canary_pin(
+                &self.registry,
+                self.canary_override,
+                model_name,
+                &grpc_metadata,
+                &req.headers,
+            )? {
+                Some(pin) => pin,
+                None => self
+                    .registry
+                    .routing_pick(model_name)
+                    .or_else(|| self.registry.get_active_version(model_name))
+                    .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
+            },
         };
         self.registry.touch_last_used(model_name, &resolved_version);
         *version_label = resolved_version.clone();
@@ -424,14 +450,24 @@ impl GrpcService {
             return Err(err(Status::invalid_argument(e.to_string())));
         }
 
-        // version="" → weighted routing pick (§4.3), falling back to active.
+        // version="" → canary pin (P5-2, 开关开) → weighted routing pick (§4.3),
+        // falling back to active. 优先级与 HTTP resolve_version 一致（蓝图 §4.4）。
         let resolved_version = match version {
             Some(v) => v.to_string(),
-            None => self
-                .registry
-                .routing_pick(model_name)
-                .or_else(|| self.registry.get_active_version(model_name))
-                .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
+            None => match canary_pin(
+                &self.registry,
+                self.canary_override,
+                model_name,
+                &grpc_metadata,
+                &req.headers,
+            )? {
+                Some(pin) => pin,
+                None => self
+                    .registry
+                    .routing_pick(model_name)
+                    .or_else(|| self.registry.get_active_version(model_name))
+                    .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
+            },
         };
         self.registry.touch_last_used(model_name, &resolved_version);
         *version_label = resolved_version.clone();
@@ -596,7 +632,7 @@ impl GrpcService {
             .await
             .map_err(|e| err(Status::internal(format!("stream error: {}", e))))?;
 
-        let (model_name, resolved_version, stream_id, initial_data) = match first {
+        let (model_name, resolved_version, stream_id, initial_data, pin) = match first {
             Some(chunk) => match chunk.payload {
                 Some(pb::bidi_chunk::Payload::Open(open)) => {
                     let model_name = open.model_name;
@@ -610,10 +646,20 @@ impl GrpcService {
                         return Err(err(Status::invalid_argument(e.to_string())));
                     }
 
-                    // version="" → weighted routing pick (§4.3), falling back
-                    // to active; stamps last_used_at (P0-2 bidi parity).
+                    // P5-2: bidi 仅 metadata 携带 pin（BidiOpen 无 headers map）。
+                    let pin = canary_pin(
+                        &self.registry,
+                        self.canary_override,
+                        &model_name,
+                        &grpc_metadata,
+                        &HashMap::new(),
+                    )?;
+
+                    // version="" → canary pin (P5-2, 开关开) → weighted routing
+                    // pick (§4.3), falling back to active; stamps last_used_at
+                    // (P0-2 bidi parity).
                     let resolved_version =
-                        resolve_bidi_version(&self.registry, &model_name, version.as_deref())?;
+                        resolve_bidi_version(&self.registry, &model_name, version.as_deref(), pin.clone())?;
 
                     if !self.registry.is_ready(&model_name, version.as_deref()) {
                         return Err(err(Status::unavailable(format!(
@@ -631,7 +677,7 @@ impl GrpcService {
                     }
 
                     let sid = format!("grpc-bidi-{}", Uuid::new_v4());
-                    (model_name, resolved_version, sid, open.initial_data)
+                    (model_name, resolved_version, sid, open.initial_data, pin)
                 }
                 _ => return Err(err(Status::invalid_argument("first message must be BidiOpen"))),
             },
@@ -642,12 +688,18 @@ impl GrpcService {
         *version_label = resolved_version.clone();
 
         // P2-3 span：覆盖 bidi handler 全程（model/version 在 Open 解码后已知）。
+        // P5-2：pin 命中记 pinned_version（bidi span 在解析后才创建，无法走
+        // canary_pin 内的 Span::current().record，在此补记）。
         let span = tracing::info_span!(
             "inference",
             model = %model_name,
             version = %resolved_version,
             request_id = %request_id,
+            pinned_version = tracing::field::Empty,
         );
+        if let Some(p) = &pin {
+            span.record("pinned_version", p.as_str());
+        }
         async move {
         let meta = pb::RequestMeta {
             route: "/predict".to_string(),
@@ -881,8 +933,58 @@ fn model_error_status(code: tonic::Code, parsed: &ParsedModelError) -> Status {
     )
 }
 
+/// P5-2 (蓝图 §4.4, D16): 提取并校验 `x-lite-version` canary pin——metadata 优先，
+/// fallback proto headers map（bidi 无 headers map，调用方传空 map → 仅 metadata）。
+///
+/// - `canary_override=false`（默认）→ `Ok(None)` + debug 日志：pin 完全不参与解析
+///   （连非法值也不校验，与 HTTP 侧开关关行为一致）。
+/// - 开关开：非法 pin → InvalidArgument（与 HTTP validate_version 同一守卫，B4
+///   parity）；pin 版本未注册 → NotFound。
+/// - pin 命中在当前 span 记 `pinned_version`（bidi 的 span 在解析后才创建，
+///   由调用方自行 record）。
+fn canary_pin(
+    registry: &ModelRegistry,
+    canary_override: bool,
+    model_name: &str,
+    metadata: &MetadataMap,
+    proto_headers: &HashMap<String, String>,
+) -> Result<Option<String>, Status> {
+    let pin = metadata
+        .get("x-lite-version")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            proto_headers
+                .get("x-lite-version")
+                .filter(|s| !s.is_empty())
+                .cloned()
+        });
+    let Some(pin) = pin else { return Ok(None) };
+    if !canary_override {
+        tracing::debug!(
+            model = %model_name,
+            pinned_version = %pin,
+            "x-lite-version pin ignored (features.canary_override=false)"
+        );
+        return Ok(None);
+    }
+    if let Err(e) = crate::validation::validate_version(&pin) {
+        return Err(err(Status::invalid_argument(e.to_string())));
+    }
+    if registry.get(model_name, Some(&pin)).is_none() {
+        return Err(err(Status::not_found(format!(
+            "{} version {} not found",
+            model_name, pin
+        ))));
+    }
+    tracing::Span::current().record("pinned_version", pin.as_str());
+    Ok(Some(pin))
+}
+
 /// Resolve the serving version for `bidi_stream` (P0-2 parity with
-/// unary/batch/stream): version="" → weighted routing pick (§4.3), falling
+/// unary/batch/stream): version="" → canary pin (P5-2, 开关开时由
+/// [`canary_pin`] 提供) → weighted routing pick (§4.3), falling
 /// back to the active version; explicit version passes through. Stamps
 /// `last_used_at` for LRU eviction on the resolved version.
 ///
@@ -892,13 +994,17 @@ fn resolve_bidi_version(
     registry: &ModelRegistry,
     model_name: &str,
     version: Option<&str>,
+    pin: Option<String>,
 ) -> Result<String, Status> {
     let resolved = match version {
         Some(v) => v.to_string(),
-        None => registry
-            .routing_pick(model_name)
-            .or_else(|| registry.get_active_version(model_name))
-            .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
+        None => match pin {
+            Some(p) => p,
+            None => registry
+                .routing_pick(model_name)
+                .or_else(|| registry.get_active_version(model_name))
+                .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
+        },
     };
     registry.touch_last_used(model_name, &resolved);
     Ok(resolved)
@@ -1176,6 +1282,8 @@ impl LiteServer for GrpcService {
             model = %model_label,
             version = %span_version,
             request_id = %span_rid,
+            // P5-2: canary pin 命中时由 canary_pin record（蓝图 §4.4）。
+            pinned_version = tracing::field::Empty,
         );
         let mut version_label = request.get_ref().version.clone();
         let mut request_id = String::new();
@@ -1206,6 +1314,8 @@ impl LiteServer for GrpcService {
             model = %model_label,
             version = %span_version,
             request_id = %span_rid,
+            // P5-2: canary pin 命中时由 canary_pin record（蓝图 §4.4）。
+            pinned_version = tracing::field::Empty,
         );
         let mut version_label = request.get_ref().version.clone();
         let mut request_id = String::new();
@@ -1241,6 +1351,8 @@ impl LiteServer for GrpcService {
             model = %model_label,
             version = %span_version,
             request_id = %span_rid,
+            // P5-2: canary pin 命中时由 canary_pin record（蓝图 §4.4）。
+            pinned_version = tracing::field::Empty,
         );
         let mut version_label = request.get_ref().version.clone();
         let mut request_id = String::new();
@@ -1316,6 +1428,7 @@ pub async fn start_grpc_server(
     registry: Arc<ModelRegistry>,
     worker_manager: Arc<WorkerManager>,
     streaming_metrics: bool,
+    canary_override: bool,
     callback_runner: Arc<CallbackRunner>,
     shutdown_state: Arc<crate::server::ShutdownState>,
     server_timeout: Duration,
@@ -1328,6 +1441,7 @@ pub async fn start_grpc_server(
         registry,
         worker_manager.clone(),
         streaming_metrics,
+        canary_override,
         callback_runner,
         shutdown_state,
         server_timeout,
@@ -1649,7 +1763,7 @@ mod tests {
         reg.set_weights("m1", &HashMap::from([("1".into(), 0u32), ("2".into(), 100)]))
             .unwrap();
 
-        let resolved = resolve_bidi_version(&reg, "m1", None).unwrap();
+        let resolved = resolve_bidi_version(&reg, "m1", None, None).unwrap();
         assert_eq!(resolved, "2");
     }
 
@@ -1658,7 +1772,7 @@ mod tests {
         let reg = bidi_test_registry();
         reg.activate_version("m1", "1").unwrap();
 
-        let resolved = resolve_bidi_version(&reg, "m1", None).unwrap();
+        let resolved = resolve_bidi_version(&reg, "m1", None, None).unwrap();
         assert_eq!(resolved, "1");
     }
 
@@ -1668,7 +1782,7 @@ mod tests {
         reg.activate_version("m1", "1").unwrap();
         assert!(reg.get("m1", Some("1")).unwrap().last_used_at.is_none());
 
-        let resolved = resolve_bidi_version(&reg, "m1", None).unwrap();
+        let resolved = resolve_bidi_version(&reg, "m1", None, None).unwrap();
         assert_eq!(
             reg.get("m1", Some(&resolved)).unwrap().last_used_at.is_some(),
             true,
@@ -1682,8 +1796,80 @@ mod tests {
         reg.activate_version("m1", "1").unwrap();
 
         // Explicit version bypasses routing/active resolution entirely.
-        let resolved = resolve_bidi_version(&reg, "m1", Some("2")).unwrap();
+        let resolved = resolve_bidi_version(&reg, "m1", Some("2"), None).unwrap();
         assert_eq!(resolved, "2");
+    }
+
+    // --- P5-2: canary_override 开关 + x-lite-version pin（蓝图 §4.4, D16）---
+
+    fn canary_metadata(pin: &str) -> MetadataMap {
+        let mut md = MetadataMap::new();
+        md.insert("x-lite-version", pin.parse().unwrap());
+        md
+    }
+
+    #[test]
+    fn test_canary_pin_absent_is_none() {
+        let reg = bidi_test_registry();
+        let pin = canary_pin(&reg, true, "m1", &MetadataMap::new(), &HashMap::new()).unwrap();
+        assert_eq!(pin, None);
+    }
+
+    #[test]
+    fn test_canary_pin_prefers_metadata_over_proto_headers() {
+        let reg = bidi_test_registry();
+        let headers = HashMap::from([("x-lite-version".to_string(), "2".to_string())]);
+        let pin = canary_pin(&reg, true, "m1", &canary_metadata("1"), &headers).unwrap();
+        assert_eq!(pin.as_deref(), Some("1"), "metadata 优先于 proto headers map");
+    }
+
+    #[test]
+    fn test_canary_pin_falls_back_to_proto_headers() {
+        let reg = bidi_test_registry();
+        let headers = HashMap::from([("x-lite-version".to_string(), "2".to_string())]);
+        let pin = canary_pin(&reg, true, "m1", &MetadataMap::new(), &headers).unwrap();
+        assert_eq!(pin.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn test_canary_pin_switch_off_ignores_pin() {
+        let reg = bidi_test_registry();
+        let pin = canary_pin(&reg, false, "m1", &canary_metadata("1"), &HashMap::new()).unwrap();
+        assert_eq!(pin, None, "canary_override=false → pin 被忽略");
+        // 非法 pin 在开关关时同样不校验、不报错。
+        let pin = canary_pin(&reg, false, "m1", &canary_metadata("a b"), &HashMap::new()).unwrap();
+        assert_eq!(pin, None);
+    }
+
+    #[test]
+    fn test_canary_pin_invalid_is_invalid_argument() {
+        let reg = bidi_test_registry();
+        let err = canary_pin(&reg, true, "m1", &canary_metadata("a b"), &HashMap::new()).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn test_canary_pin_unknown_version_is_not_found() {
+        let reg = bidi_test_registry();
+        let err = canary_pin(&reg, true, "m1", &canary_metadata("9"), &HashMap::new()).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[test]
+    fn test_bidi_resolve_version_pin_beats_weights() {
+        let reg = bidi_test_registry();
+        reg.activate_version("m1", "1").unwrap();
+        reg.set_weights("m1", &HashMap::from([("1".into(), 100u32)])).unwrap();
+
+        let resolved = resolve_bidi_version(&reg, "m1", None, Some("2".to_string())).unwrap();
+        assert_eq!(resolved, "2", "pin（开关开）优先级高于 routing_pick");
+    }
+
+    #[test]
+    fn test_bidi_resolve_version_explicit_beats_pin() {
+        let reg = bidi_test_registry();
+        let resolved = resolve_bidi_version(&reg, "m1", Some("1"), Some("2".to_string())).unwrap();
+        assert_eq!(resolved, "1", "显式 version 优先级高于 pin");
     }
 
     #[test]
@@ -2056,6 +2242,14 @@ mod request_metrics_tests {
     }
 
     fn build_service(registry: Arc<ModelRegistry>, queue: Arc<InferenceQueue>) -> GrpcService {
+        build_service_with_canary(registry, queue, false)
+    }
+
+    fn build_service_with_canary(
+        registry: Arc<ModelRegistry>,
+        queue: Arc<InferenceQueue>,
+        canary_override: bool,
+    ) -> GrpcService {
         let wm = Arc::new(WorkerManager::new(
             registry.clone(),
             std::env::temp_dir(),
@@ -2067,6 +2261,7 @@ mod request_metrics_tests {
             registry,
             wm,
             false,
+            canary_override,
             Arc::new(CallbackRunner::new()),
             Arc::new(crate::server::ShutdownState::new()),
             Duration::from_secs(5),
@@ -2134,6 +2329,91 @@ mod request_metrics_tests {
         let err = service.infer(infer_request("met_404", "")).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
         assert_eq!(counter.get(), before + 1.0, "model-not-found must record one 4xx request");
+    }
+
+    // --- P5-2: handler 级 canary pin（蓝图 §4.4：metadata 优先，fallback proto headers map）---
+
+    /// Two ready versions ("1","2") each backed by an ok-worker; v1 is active
+    /// with weights 100/0, so a served "2" can only come from the canary pin.
+    async fn two_version_canary_service(model: &str, canary_override: bool) -> GrpcService {
+        let registry = Arc::new(ModelRegistry::new());
+        let queue = Arc::new(InferenceQueue::new());
+        for v in ["1", "2"] {
+            registry
+                .register(model, v, test_config(1, 0.0, 10), ModelType::LitAPI, std::env::temp_dir())
+                .unwrap();
+            registry.mark_ready(model, v).unwrap();
+            let endpoint = metric_test_endpoint(&format!("{}-v{}", model, v));
+            spawn_ok_worker(endpoint.clone());
+            let client = Arc::new(WorkerZmqClient::new(endpoint));
+            let (reload_tx, _rx) = mpsc::channel(8);
+            queue.register_model(
+                model, v, &test_config(1, 0.0, 10), vec![],
+                vec![client], reload_tx, Arc::new(OutlierState::new(1)), None,
+            );
+        }
+        // activate = hard cutover（§4.3）：active=v1 且权重 100/0。
+        registry.activate_version(model, "1").unwrap();
+        build_service_with_canary(registry, queue, canary_override)
+    }
+
+    #[tokio::test]
+    async fn should_route_to_pinned_version_when_canary_override_on() {
+        let model = "canary_on";
+        let service = two_version_canary_service(model, true).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let pinned = REQUESTS_TOTAL.with_label_values(&[model, "2", "2xx"]);
+        let before = pinned.get();
+
+        let mut req = infer_request(model, "");
+        req.metadata_mut().insert("x-lite-version", "2".parse().unwrap());
+        let resp = service.infer(req).await;
+        assert!(resp.is_ok(), "pinned infer must succeed: {:?}", resp.err());
+        assert_eq!(pinned.get(), before + 1.0, "pin must route to v2 despite weights 100→v1");
+    }
+
+    #[tokio::test]
+    async fn should_ignore_pin_when_canary_override_off() {
+        let model = "canary_off";
+        let service = two_version_canary_service(model, false).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let weighted = REQUESTS_TOTAL.with_label_values(&[model, "1", "2xx"]);
+        let before = weighted.get();
+
+        let mut req = infer_request(model, "");
+        req.metadata_mut().insert("x-lite-version", "2".parse().unwrap());
+        let resp = service.infer(req).await;
+        assert!(resp.is_ok(), "infer must succeed: {:?}", resp.err());
+        assert_eq!(weighted.get(), before + 1.0, "switch off → weights (v1) serve, pin ignored");
+    }
+
+    #[tokio::test]
+    async fn should_route_to_pinned_version_via_proto_headers() {
+        let model = "canary_hdr";
+        let service = two_version_canary_service(model, true).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let pinned = REQUESTS_TOTAL.with_label_values(&[model, "2", "2xx"]);
+        let before = pinned.get();
+
+        let mut req = infer_request(model, "");
+        req.get_mut().headers.insert("x-lite-version".to_string(), "2".to_string());
+        let resp = service.infer(req).await;
+        assert!(resp.is_ok(), "pinned infer must succeed: {:?}", resp.err());
+        assert_eq!(pinned.get(), before + 1.0, "proto headers map pin must route to v2");
+    }
+
+    #[tokio::test]
+    async fn should_reject_unknown_pin_with_not_found() {
+        let model = "canary_nf";
+        let service = two_version_canary_service(model, true).await;
+
+        let mut req = infer_request(model, "");
+        req.metadata_mut().insert("x-lite-version", "9".parse().unwrap());
+        let err = service.infer(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound, "pin 版本不存在 → NotFound（蓝图 §4.4）");
     }
 
     #[tokio::test(flavor = "current_thread")]
