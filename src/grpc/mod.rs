@@ -1,3 +1,4 @@
+use crate::access_control::EndpointClass;
 use crate::callback::CallbackRunner;
 use crate::error::AppError;
 use crate::http::state::AppState;
@@ -1552,6 +1553,13 @@ pub async fn start_grpc_server(
     app_state.shutdown_state = shutdown_state.clone();
     let app_state = Arc::new(app_state);
 
+    // P7-1 (蓝图 §4.2): endpoint-class access control — value_env/value_file
+    // resolved here so a missing source fails fast at startup. Each service
+    // mounts the interceptor with its own class (挂载矩阵 §4.0.3).
+    let access_control = Arc::new(
+        crate::access_control::AccessControl::build(&config.access_control)?,
+    );
+
     let service = GrpcService::new(
         registry.clone(),
         worker_manager.clone(),
@@ -1573,12 +1581,15 @@ pub async fn start_grpc_server(
     } else {
         server
     };
-    // P-MW (蓝图 §4.0.3, D20): pre-decode interceptor fills RequestContext
-    // into request extensions — mounted on LiteServer AND health (挂载矩阵).
-    // Pre-call semantics only: it cannot touch responses/Status, so echo
-    // (P2-2) and error logging (P1-1) stay in handlers. Transparent to
-    // unary/stream/bidi (runs once per RPC, never touches the message flow).
-    let server = tonic::codegen::InterceptedService::new(server, interceptor::context_interceptor);
+    // P-MW (蓝图 §4.0.3, D20) + P7-1: pre-decode interceptor fills RequestContext
+    // into request extensions AND enforces endpoint-class access control. The
+    // LiteServer inference service carries the Inference class. Pre-call semantics
+    // only: it cannot touch responses/Status, so echo (P2-2) and error logging
+    // (P1-1) stay in handlers. Transparent to unary/stream/bidi.
+    let server = tonic::codegen::InterceptedService::new(
+        server,
+        interceptor::service_interceptor(access_control.clone(), EndpointClass::Inference),
+    );
 
     // Standard gRPC health checking (grpc.health.v1): the reporter lives in
     // the WorkerManager, which syncs "" and per-model services on every
@@ -1586,8 +1597,10 @@ pub async fn start_grpc_server(
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     worker_manager.set_grpc_health_reporter(health_reporter).await;
     worker_manager.sync_grpc_health().await;
-    let health_service =
-        tonic::codegen::InterceptedService::new(health_service, interceptor::context_interceptor);
+    let health_service = tonic::codegen::InterceptedService::new(
+        health_service,
+        interceptor::service_interceptor(access_control.clone(), EndpointClass::Health),
+    );
 
     let mut builder = tonic::transport::Server::builder();
     // P1-2: HTTP/2 keepalive + flow-control window / frame size tuning.
@@ -1613,11 +1626,13 @@ pub async fn start_grpc_server(
         has_hot_reload,
     );
     let admin_server = crate::grpc::admin::AdminServer::new(admin_service);
-    // P-MW 挂载矩阵 (§4.0.3): Admin service 挂 context_interceptor——
-    // request_id / mTLS principal 供审计日志（D27）；access_control fail-closed
-    // 随 P7-1 落地（届时在此追加 admin 类校验 interceptor）。
-    let admin_server =
-        tonic::codegen::InterceptedService::new(admin_server, interceptor::context_interceptor);
+    // P-MW 挂载矩阵 (§4.0.3) + P7-1: Admin service 挂 service_interceptor——
+    // request_id / mTLS principal 供审计日志（D27），admin 类 access_control
+    // fail-closed（未配置仅 loopback；D14）。
+    let admin_server = tonic::codegen::InterceptedService::new(
+        admin_server,
+        interceptor::service_interceptor(access_control.clone(), EndpointClass::Admin),
+    );
 
     let router = builder
         .add_service(server)

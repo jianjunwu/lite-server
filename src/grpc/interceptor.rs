@@ -10,11 +10,13 @@
 //! post-decode 经 `finalize_context` 一次完成（T1 extension 实例不被回写，
 //! handler 得到的是 finalize 后的副本）。
 
+use crate::access_control::{AccessControl, EndpointClass};
 use crate::callback::Protocol;
 use crate::request_context::RequestContext;
 use opentelemetry::Context;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Status};
 use uuid::Uuid;
@@ -55,6 +57,29 @@ impl RequestContext {
             protocol: Protocol::Grpc,
             principal: None, // P5-1: context_interceptor 随后按 TlsConnectInfo 填充
         }
+    }
+}
+
+/// P7-1 production interceptor for one tonic service: fills `RequestContext`
+/// (pre-call, same as `context_interceptor`) AND enforces endpoint-class access
+/// control for the service's class. Mounted per-service with the matching class
+/// (LiteServer=Inference, Admin=Admin, health=Health) — the class is known at
+/// mount time, so no per-RPC path parsing is needed. Denied → `Unauthenticated`.
+/// loopback comes from the transport peer (UDS has none → treated as loopback).
+pub fn service_interceptor(
+    access_control: Arc<AccessControl>,
+    class: EndpointClass,
+) -> impl FnMut(Request<()>) -> Result<Request<()>, Status> + Send + Sync + Clone + 'static {
+    move |mut request| {
+        let remote = request.remote_addr();
+        let mut cx = RequestContext::from_grpc_metadata(request.metadata(), remote);
+        cx.principal = tls_principal(request.extensions());
+        let is_loopback = remote.map(|a| a.ip().is_loopback()).unwrap_or(true);
+        if !access_control.check(class, Protocol::Grpc, request.metadata(), is_loopback) {
+            return Err(Status::unauthenticated("access denied"));
+        }
+        request.extensions_mut().insert(cx);
+        Ok(request)
     }
 }
 

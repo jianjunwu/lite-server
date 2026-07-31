@@ -16,6 +16,63 @@ pub struct Config {
     pub model_defaults: ModelTunables,
     /// Server-level knobs (reconcile loop, file watcher, worker diagnostics).
     pub tunables: ServerTunables,
+    /// P7-1 endpoint-class access control (admin/inference/health × http/grpc).
+    /// Default (unconfigured) = admin loopback fail-closed, inference/health
+    /// public. Per-model `policies.auth` (enforce_auth) is a separate, finer
+    /// gate that stacks on top of this coarse class gate.
+    pub access_control: AccessControlConfig,
+}
+
+/// P7-1 access-control config (蓝图 §4.2). Three endpoint classes; admin and
+/// inference carry per-protocol controls, health carries a single control that
+/// applies to both protocols (`health: { mode: public }`). An unset cell falls
+/// back to its class default (admin → loopback fail-closed; inference/health →
+/// public).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AccessControlConfig {
+    pub admin: ProtocolControl,
+    pub inference: ProtocolControl,
+    pub health: HealthControl,
+}
+
+/// Per-protocol controls for one class (admin/inference).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProtocolControl {
+    #[serde(default)]
+    pub http: Option<EndpointControl>,
+    #[serde(default)]
+    pub grpc: Option<EndpointControl>,
+}
+
+/// Health is a single control applied to both protocols (`{ mode: public }`).
+/// None = class default (health public).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, transparent)]
+pub struct HealthControl(pub Option<EndpointControl>);
+
+/// One endpoint-class × protocol cell. The explicit `mode` tag avoids serde's
+/// untagged-representation pitfalls (评审低#13).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "mode")]
+pub enum EndpointControl {
+    /// Explicitly open (admin escape hatch).
+    #[serde(rename = "public")]
+    Public,
+    /// Require an API key: `key` is the header name, the secret comes from
+    /// `value` / `value_env` / `value_file` (first present wins; resolved at
+    /// startup so a missing env/file fails fast).
+    #[serde(rename = "key")]
+    Key {
+        key: String,
+        #[serde(default)]
+        value: Option<String>,
+        #[serde(default)]
+        value_env: Option<String>,
+        #[serde(default)]
+        value_file: Option<String>,
+    },
 }
 
 /// Server-level tunables (server.yaml `tunables:` section). Defaults preserve

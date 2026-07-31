@@ -15,7 +15,7 @@ use tracing::info;
 /// for non-model paths and model-scoped admin leaves (ready/health/routing/
 /// activate/compare/versions CRUD). Custom @route tails resolve to the active
 /// version — the fallback handler does the real matching.
-fn access_log_target(path: &str) -> Option<(&str, Option<&str>)> {
+pub(crate) fn access_log_target(path: &str) -> Option<(&str, Option<&str>)> {
     let rest = path.strip_prefix("/v2/models/")?;
     let mut segs = rest.split('/');
     let model = segs.next()?;

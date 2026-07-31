@@ -177,6 +177,29 @@ async fn draining_gate(
     next.run(request).await
 }
 
+/// P7-1 (蓝图 §4.2): endpoint-class access control. Coarse gate inside
+/// observability (so a 401 still carries x-request-id) and outside the handler.
+/// loopback is taken from the transport peer (ConnectInfo), NEVER from XFF
+/// (client-forgable; aligned with P-XFF); UDS / missing ConnectInfo → loopback.
+/// Stacks in front of the per-model `policies.auth` gate, which still runs in
+/// the handler.
+async fn access_control_middleware(
+    State(ac): State<Arc<crate::access_control::AccessControl>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let class = crate::access_control::classify_http_path(request.uri().path());
+    let is_loopback = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip().is_loopback())
+        .unwrap_or(true);
+    if !ac.check(class, crate::callback::Protocol::Http, request.headers(), is_loopback) {
+        return AppError::Unauthorized("access denied".into()).into_response();
+    }
+    next.run(request).await
+}
+
 /// Compression predicate (P1-4): never compress SSE responses — buffering
 /// would break per-event flush semantics.
 #[derive(Clone, Copy)]
@@ -218,6 +241,12 @@ pub async fn start_http_server(
     state.shutdown_state = shutdown_state.clone();
     state.draining = draining.clone();
 
+    // P7-1: resolve endpoint-class access control (value_env/value_file read
+    // here so a missing source fails fast at startup). Shared shape with gRPC.
+    let access_control = std::sync::Arc::new(
+        crate::access_control::AccessControl::build(&config.access_control)?,
+    );
+
     let app = create_routes(state);
 
     // Peer-IP fallback (innermost): inject the TCP peer IP as a fallback
@@ -251,6 +280,14 @@ pub async fn start_http_server(
     // + ConnectInfo; rate-limit / callbacks / RequestMeta all read it.
     let app = app.layer(axum::middleware::from_fn(
         crate::request_context::context_middleware,
+    ));
+
+    // P7-1: endpoint-class access control — inside observability (401 carries
+    // x-request-id) and inside draining_gate (drain rejects before auth); does
+    // not need RequestContext (uses the transport peer for loopback).
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        access_control.clone(),
+        access_control_middleware,
     ));
 
     // C3 (P4-2): draining gate — inside observability (so 503s carry a

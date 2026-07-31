@@ -3933,3 +3933,95 @@ ensemble:
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+// ---------------------------------------------------------------------------
+// P7-1: endpoint-class access control. Admin class in key mode requires a key
+// on BOTH protocols; a missing/wrong key is rejected (401 / Unauthenticated).
+// Health stays public; inference stays public (default). No workers needed —
+// only GetInfo / list_models / health are exercised.
+// ---------------------------------------------------------------------------
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_access_control_admin_key_mode_both_protocols() {
+    use lite_server::proto::liteserver::admin_client::AdminClient;
+    use lite_server::proto::liteserver::GetInfoRequest;
+
+    let http_port = 18370u16;
+    let grpc_port = 18371u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+
+    // Empty model repo: GetInfo / list_models / health work without workers.
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-p71-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    std::fs::create_dir_all(&repo).unwrap();
+
+    let tmp_dir = std::env::temp_dir()
+        .join(format!("lite-server-p71-yaml-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18372\n  timeout: 30.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\naccess_control:\n  admin:\n    http:\n      mode: key\n      key: x-api-key\n      value: secret\n    grpc:\n      mode: key\n      key: x-token\n      value: secret\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let _guard = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 30).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+
+    // gRPC Admin (header "x-token"): no key → Unauthenticated, key → OK.
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut admin = AdminClient::new(channel);
+    let denied = admin.get_info(GetInfoRequest {}).await;
+    assert!(denied.is_err(), "gRPC Admin without key must be rejected");
+    assert_eq!(
+        denied.err().unwrap().code(),
+        tonic::Code::Unauthenticated,
+        "expected Unauthenticated"
+    );
+    let mut req = tonic::Request::new(GetInfoRequest {});
+    req.metadata_mut()
+        .insert("x-token", "secret".parse().unwrap());
+    let resp = admin
+        .get_info(req)
+        .await
+        .expect("gRPC Admin with correct key must succeed")
+        .into_inner();
+    assert_eq!(resp.server, "lite-server");
+
+    // HTTP admin (list_models, header "x-api-key"): no key → 401, key → 200.
+    let client = reqwest::Client::new();
+    let no_key = client.get(format!("{}/v2/models", base)).send().await.unwrap();
+    assert_eq!(no_key.status(), 401, "HTTP admin without key must be 401");
+    let with_key = client
+        .get(format!("{}/v2/models", base))
+        .header("x-api-key", "secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(with_key.status(), 200, "HTTP admin with key must be 200");
+
+    // A wrong key is rejected (constant-time compare still denies).
+    let wrong = client
+        .get(format!("{}/v2/models", base))
+        .header("x-api-key", "wrong")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 401, "HTTP admin with wrong key must be 401");
+
+    // Health stays public even with admin key configured.
+    let health = client.get(format!("{}/health", base)).send().await.unwrap();
+    assert_eq!(health.status(), 200, "health must remain public");
+
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
