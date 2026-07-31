@@ -684,6 +684,9 @@ async fn do_send_batch(
     update_worker_saturation(model_name, version, inflight);
     let zmq_client = &zmq_clients[worker_idx];
     prometheus::observe_batch_size(model_name, version, batch_size);
+    // P6 GetModelStats: count logical inferences per worker (batch size here;
+    // per-attempt like observe_inference_duration above, so retries count too).
+    prometheus::record_worker_inference(model_name, version, worker_idx, batch_size);
 
     // Build protobuf request (Single if batch.len() == 1, else Batch)
     let request = if batch.len() == 1 {

@@ -142,6 +142,17 @@ lazy_static! {
         &["model", "version", "worker_id"]
     ).unwrap();
 
+    // P6 GetModelStats.WorkerStats.inference_count — per-worker inference
+    // dispatches. The worker_id label is precedent (WORKER_HEALTH_STATUS) and
+    // was explicitly approved for this counter (蓝图 §6.5 约束 10 评审).
+    pub static ref WORKER_INFERENCE_TOTAL: CounterVec = CounterVec::new(
+        prometheus::Opts::new(
+            "liteserver_worker_inference_total",
+            "Inferences dispatched per worker (P6 Admin GetModelStats)"
+        ),
+        &["model", "version", "worker_id"]
+    ).unwrap();
+
     pub static ref WORKER_RESPAWNS_TOTAL: CounterVec = CounterVec::new(
         prometheus::Opts::new(
             "liteserver_worker_respawns_total",
@@ -234,6 +245,7 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(BATCH_SIZE.clone()))?;
     REGISTRY.register(Box::new(HEALTH_CHECK_TOTAL.clone()))?;
     REGISTRY.register(Box::new(WORKER_HEALTH_STATUS.clone()))?;
+    REGISTRY.register(Box::new(WORKER_INFERENCE_TOTAL.clone()))?;
     REGISTRY.register(Box::new(WORKER_RESPAWNS_TOTAL.clone()))?;
     REGISTRY.register(Box::new(SHUTDOWN_PENDING_REQUESTS.clone()))?;
     REGISTRY.register(Box::new(OPEN_CONNECTIONS.clone()))?;
@@ -619,6 +631,25 @@ pub fn inc_health_check(model: &str, version: &str, result: &str) {
 pub fn set_worker_health(model: &str, version: &str, worker_id: usize, healthy: bool) {
     let id_str = worker_id.to_string();
     WORKER_HEALTH_STATUS.with_label_values(&[model, version, &id_str]).set(if healthy { 1.0 } else { 0.0 });
+}
+
+/// Per-worker inference dispatch count (P6 GetModelStats). Incremented at every
+/// dispatch site: the queue's batch dispatch (unary infer) and the gRPC direct
+/// paths (batch/stream/bidi). `count` = logical inferences in the dispatch
+/// (batch size for batched sends, 1 for a stream/bidi open).
+pub fn record_worker_inference(model: &str, version: &str, worker_id: usize, count: usize) {
+    let id_str = worker_id.to_string();
+    WORKER_INFERENCE_TOTAL
+        .with_label_values(&[model, version, &id_str])
+        .inc_by(count as f64);
+}
+
+/// Read the per-worker inference count for GetModelStats (0 when unseen).
+pub fn worker_inference_count(model: &str, version: &str, worker_id: usize) -> u64 {
+    let id_str = worker_id.to_string();
+    WORKER_INFERENCE_TOTAL
+        .with_label_values(&[model, version, &id_str])
+        .get() as u64
 }
 
 #[cfg(test)]
@@ -1022,5 +1053,31 @@ mod tests {
         assert_eq!(WORKER_SATURATION.with_label_values(&[model, version]).get(), 2.0);
         set_worker_saturation(model, version, 0.0);
         assert_eq!(WORKER_SATURATION.with_label_values(&[model, version]).get(), 0.0);
+    }
+
+    // ===== P6: per-worker inference counter (GetModelStats source) =====
+
+    #[test]
+    fn should_record_worker_inference_total_per_worker() {
+        let model = "wim_model";
+        let version = "1";
+        let before0 = worker_inference_count(model, version, 0);
+        let before1 = worker_inference_count(model, version, 1);
+        // Dispatches accumulate per (model, version, worker_id).
+        record_worker_inference(model, version, 0, 3);
+        record_worker_inference(model, version, 0, 2);
+        record_worker_inference(model, version, 1, 5);
+        assert_eq!(
+            worker_inference_count(model, version, 0),
+            before0 + 5,
+            "worker 0 accumulates across dispatches"
+        );
+        assert_eq!(
+            worker_inference_count(model, version, 1),
+            before1 + 5,
+            "worker 1 is tracked separately from worker 0"
+        );
+        // Unseen worker/label reads as 0 (counter lazily instantiated).
+        assert_eq!(worker_inference_count(model, version, 99), 0);
     }
 }

@@ -300,6 +300,8 @@ impl LiteServer {
                 self.config.grpc.clone(),
                 rate_limiter.clone(),
                 grpc_tls.clone(),
+                self.config.clone(),
+                has_hot_reload.clone(),
                 grpc_shutdown_rx,
             )))
         } else {

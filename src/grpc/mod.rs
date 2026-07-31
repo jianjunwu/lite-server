@@ -17,6 +17,7 @@ use tonic::{Request, Response, Status, Streaming};
 use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 use uuid::Uuid;
 
+pub mod admin;
 pub mod interceptor;
 
 pub use pb::lite_server_server::{LiteServer, LiteServerServer};
@@ -361,6 +362,7 @@ impl GrpcService {
             ..Default::default()
         };
 
+        let batch_item_count = req.items.len();
         let items: Vec<pb::BatchItem> = req
             .items
             .into_iter()
@@ -396,6 +398,13 @@ impl GrpcService {
             None => crate::worker::pick_worker_random(clients.len()),
         };
         let client = &clients[worker_id];
+        // P6 GetModelStats: count one inference per batch item on this worker.
+        crate::metrics::prometheus::record_worker_inference(
+            model_name,
+            &resolved_version,
+            worker_id,
+            batch_item_count,
+        );
 
         let resp = client
             .send(internal_req)
@@ -520,6 +529,13 @@ impl GrpcService {
             None => crate::worker::pick_worker_random(clients.len()),
         };
         let client = clients[worker_id].clone();
+        // P6 GetModelStats: one streaming inference dispatched to this worker.
+        crate::metrics::prometheus::record_worker_inference(
+            model_name,
+            &resolved_version,
+            worker_id,
+            1,
+        );
 
         let mut chunk_rx = client
             .send_stream(open_req, stream_id.clone())
@@ -735,6 +751,13 @@ impl GrpcService {
             None => crate::worker::pick_worker_random(clients.len()),
         };
         let client = clients[worker_id].clone();
+        // P6 GetModelStats: one bidi inference dispatched to this worker.
+        crate::metrics::prometheus::record_worker_inference(
+            &model_name,
+            &resolved_version,
+            worker_id,
+            1,
+        );
 
         let mut chunk_rx = client
             .send_stream(open_req, stream_id.clone())
@@ -876,11 +899,42 @@ fn http_status_to_grpc_code(http_status: u16) -> tonic::Code {
         401 => tonic::Code::Unauthenticated,
         403 => tonic::Code::PermissionDenied,
         404 => tonic::Code::NotFound,
+        409 => tonic::Code::AlreadyExists,
         429 => tonic::Code::ResourceExhausted,
         503 => tonic::Code::Unavailable,
         504 => tonic::Code::DeadlineExceeded,
         _ => tonic::Code::Internal,
     }
+}
+
+/// Map an [`AppError`] to a gRPC [`Status`] for the Admin service (D4:
+/// centralized mapping — admin RPCs reuse this instead of inlining). Derives
+/// the gRPC code from the same HTTP status the REST path returns
+/// ([`AppError::IntoResponse`]) and carries only the sanitized public message
+/// (no internal detail / path leak, D4 details 白名单). Used by P6 Admin RPCs.
+pub(crate) fn app_error_to_grpc_status(e: &AppError) -> Status {
+    // ModelError carries its own status_code + model-author-facing detail.
+    if let AppError::ModelError(d) = e {
+        let code = http_status_to_grpc_code(d.status_code);
+        return Status::new(code, format!("[{}] {}", d.error_type, d.detail));
+    }
+    let http_status: u16 = match e {
+        AppError::ModelNotFound(_) | AppError::VersionNotFound(_, _) | AppError::RouteNotFound => 404,
+        AppError::ModelNotReady(_) | AppError::QueueFull(_) => 503,
+        AppError::VersionAlreadyLoaded(_, _) => 409,
+        AppError::InferenceTimeout(_) => 504,
+        AppError::Validation(_)
+        | AppError::Config(_)
+        | AppError::Serialization(_)
+        | AppError::InvalidRequestBody(_)
+        | AppError::InvalidQueryParam(_) => 400,
+        AppError::FrameTooLarge => 413,
+        AppError::RateLimitExceeded { .. } => 429,
+        AppError::Unauthorized(_) => 401,
+        AppError::MethodNotAllowed => 405,
+        _ => 500,
+    };
+    Status::new(http_status_to_grpc_code(http_status), e.pub_error_message())
 }
 
 /// Map an error_type string (from a structured stream error) to a gRPC code.
@@ -1100,7 +1154,7 @@ fn record_grpc_request_end<T>(
 
 /// Log a gRPC error status with graded severity, then return it (P1-1 parity
 /// with HTTP error.rs:256-270 — gRPC handlers previously logged nothing).
-fn err(status: Status) -> Status {
+pub(crate) fn err(status: Status) -> Status {
     if is_client_class(status.code()) {
         tracing::info!(
             code = ?status.code(),
@@ -1435,14 +1489,16 @@ pub async fn start_grpc_server(
     grpc_config: crate::config::GrpcConfig,
     rate_limiter: Arc<crate::rate_limit::RateLimiter>,
     tls: Option<Arc<crate::tls::TlsConfigStore>>,
+    config: crate::config::Config,
+    has_hot_reload: Arc<std::sync::atomic::AtomicBool>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), AppError> {
     let service = GrpcService::new(
-        registry,
+        registry.clone(),
         worker_manager.clone(),
         streaming_metrics,
         canary_override,
-        callback_runner,
+        callback_runner.clone(),
         shutdown_state,
         server_timeout,
         rate_limiter,
@@ -1487,7 +1543,26 @@ pub async fn start_grpc_server(
         builder = builder.max_frame_size(Some(max_frame_size));
     }
 
-    let router = builder.add_service(server).add_service(health_service);
+    // P6 Admin service (蓝图 §4.1): mirrors the HTTP admin REST handlers.
+    // Built from the same injected state as the inference service.
+    let admin_service = crate::grpc::admin::GrpcAdminService::new(
+        registry.clone(),
+        worker_manager.clone(),
+        callback_runner.clone(),
+        Arc::new(config),
+        has_hot_reload,
+    );
+    let admin_server = crate::grpc::admin::AdminServer::new(admin_service);
+    // P-MW 挂载矩阵 (§4.0.3): Admin service 挂 context_interceptor——
+    // request_id / mTLS principal 供审计日志（D27）；access_control fail-closed
+    // 随 P7-1 落地（届时在此追加 admin 类校验 interceptor）。
+    let admin_server =
+        tonic::codegen::InterceptedService::new(admin_server, interceptor::context_interceptor);
+
+    let router = builder
+        .add_service(server)
+        .add_service(health_service)
+        .add_service(admin_server);
 
     if let Some(path) = crate::config::unix_socket_path(&host) {
         // P4-1: gRPC over a Unix domain socket.
