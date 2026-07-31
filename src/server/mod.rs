@@ -392,6 +392,20 @@ impl LiteServer {
             }
         });
 
+        // Self-terminate if our parent dies — robust to the parent being
+        // SIGKILLed (atexit/Drop can't catch SIGKILL). A surviving child polls
+        // its parent pid; once reparented, it falls through to the same
+        // graceful-shutdown path below (which reaps python workers). Gated by
+        // a test-only env flag; production never sets it, so the watchdog
+        // future is disabled (never polled) there.
+        let die_with_parent = std::env::var("LITESERVER_DIE_WITH_PARENT")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        #[cfg(unix)]
+        let parent_pid = unsafe { libc::getppid() };
+        #[cfg(not(unix))]
+        let parent_pid = 0i32;
+
         // Wait for any server to exit or shutdown signal
         let shutdown_reason = tokio::select! {
             result = &mut http_handle => {
@@ -426,6 +440,7 @@ impl LiteServer {
                 }
             }
             _ = shutdown_signal() => "shutdown_signal".to_string(),
+            _ = parent_died(parent_pid), if die_with_parent => "parent_died".to_string(),
         };
 
         info!("{} received, starting graceful shutdown", shutdown_reason);
@@ -627,6 +642,38 @@ async fn shutdown_signal() {
     }
 
     info!("signal received, starting graceful shutdown");
+}
+
+/// Resolve once this process is reparented — i.e. its original parent died.
+/// Polls `getppid` at 1Hz: one trivial syscall in a standalone task, never on
+/// the inference hot path. Used only when `LITESERVER_DIE_WITH_PARENT` is set
+/// (test-only), so production never polls this.
+async fn parent_died(parent_pid: i32) {
+    #[cfg(unix)]
+    {
+        // Race closure: if the parent died during our fork→exec→run startup
+        // (before we could capture its real pid), getppid() is already 1 and a
+        // naive "getppid() != parent_pid" watcher would never fire. Treat
+        // already-orphaned (captured ppid 1) as "parent dead" → exit now.
+        // (ppid 0 means we ourselves are init — no parent to watch; the loop's
+        // `getppid() != 0` is always false, correctly never firing.)
+        if parent_pid == 1 {
+            return;
+        }
+        loop {
+            if unsafe { libc::getppid() } != parent_pid {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // No portable parent-death signal on Windows; the flag is test-only
+        // (unix), so this branch is effectively unused. Never resolve.
+        let _ = parent_pid;
+        std::future::pending::<()>().await;
+    }
 }
 
 #[cfg(windows)]

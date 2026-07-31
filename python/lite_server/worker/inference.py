@@ -258,6 +258,27 @@ async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.
     pending_tasks: dict[str, asyncio.Task] = {}
     active_streams: dict[str, asyncio.Task] = {}
 
+    # Self-terminate if the server (our parent) dies — including SIGKILL, which
+    # the server's own watchdog can't catch. Gated by LITESERVER_DIE_WITH_PARENT
+    # (inherited from the server's env; test-only). os._exit is intentional: the
+    # ZMQ sockets are dead once the server is gone, so graceful teardown would
+    # just hang. One getppid() per second, off the inference path.
+    if os.environ.get("LITESERVER_DIE_WITH_PARENT") == "1":
+        _parent_pid = os.getppid()
+
+        async def _watch_parent():
+            while True:
+                await asyncio.sleep(1)
+                if os.getppid() != _parent_pid:
+                    log.warning(
+                        "parent (server) pid %s exited; worker self-terminating",
+                        _parent_pid,
+                    )
+                    os._exit(0)
+
+        # Keep a strong reference so the task isn't garbage-collected mid-run.
+        _parent_watcher = asyncio.create_task(_watch_parent())
+
     cancelled = False
     try:
         while True:

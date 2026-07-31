@@ -31,7 +31,13 @@ fn start_server(args: &[&str]) -> std::process::Child {
         // and block the server on write. null also keeps the orphaned-server
         // footprint minimal when cleanup never runs.
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::inherit())
+        // Self-terminate when the test binary (our parent) dies — including
+        // SIGKILL, which atexit/ServerGuard cannot catch. The server watches
+        // its parent pid and runs its normal graceful shutdown (reaping python
+        // workers) once reparented to init. Test-only flag; production never
+        // sets it, so the watchdog is not even spawned there.
+        .env("LITESERVER_DIE_WITH_PARENT", "1");
 
     for arg in args {
         cmd.arg(arg);
@@ -1682,7 +1688,14 @@ async fn test_sse_streaming() {
     let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap().to_string();
     assert!(content_type.contains("text/event-stream"), "expected SSE content-type, got: {}", content_type);
 
-    let body = resp.text().await.unwrap();
+    // Bound the drain: the SSE response must terminate (close the body) once
+    // the worker sends [DONE]. If the server keeps the stream open (cleanup
+    // blocking response closure), this fails the test fast instead of hanging
+    // the whole suite and orphaning the shared server.
+    let body = tokio::time::timeout(Duration::from_secs(15), resp.text())
+        .await
+        .expect("SSE response body did not close within 15s")
+        .unwrap();
     // SSE format: "data: {...}\n\n"
     assert!(body.contains("data:"), "SSE response should contain data frames: {}", body);
 
@@ -2052,8 +2065,12 @@ async fn test_sse_response_carries_cors_headers() {
             .unwrap(),
         "https://app.example.com"
     );
-    // Drain the SSE body
-    let _ = resp.text().await.unwrap();
+    // Drain the SSE body — must terminate after [DONE]; bounded so a regression
+    // (stream kept open) fails the test instead of hanging the suite.
+    let _ = tokio::time::timeout(Duration::from_secs(15), resp.text())
+        .await
+        .expect("SSE response body did not close within 15s")
+        .unwrap();
 
     unload_model(&base, POLICY_MODEL, "1").await;
 }
@@ -4105,4 +4122,149 @@ async fn test_admin_bind_splits_admin_onto_udf() {
     let _ = std::fs::remove_file(&admin_sock);
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Parent-death self-cleanup — robust to the test binary being SIGKILLed.
+// atexit/ServerGuard cannot catch SIGKILL, so the spawned server (and its
+// python workers) must self-terminate when reparented to init. Gated by
+// LITESERVER_DIE_WITH_PARENT, which start_server sets for every test server.
+// ---------------------------------------------------------------------------
+
+/// Find the pid of a server's python worker for `model`, polling until it
+/// appears or `timeout_secs` elapse. macOS/Linux `pgrep -P` lists children.
+#[cfg(unix)]
+async fn wait_for_worker_pid(server_pid: i32, model: &str, timeout_secs: u64) -> Option<i32> {
+    let pattern = format!("lite_server.worker.inference --model-name {}", model);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        let out = Command::new("pgrep")
+            .args(["-P", &server_pid.to_string(), "-f", &pattern])
+            .output()
+            .ok()?;
+        if let Some(pid) = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .and_then(|l| l.trim().parse::<i32>().ok())
+        {
+            return Some(pid);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Poll a pid until it no longer exists (kill(pid,0) != 0) or `timeout_secs`.
+#[cfg(unix)]
+async fn wait_for_pid_gone(pid: i32, timeout_secs: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A server whose parent is killed must self-terminate (SIGKILL can't be caught
+/// by atexit/Drop — only a surviving child watching its parent can clean up).
+#[cfg(unix)]
+#[tokio::test]
+async fn die_with_parent_self_terminates_when_parent_killed() {
+    use std::io::BufRead;
+    let port = 18350u16;
+    kill_stale_on_port(port);
+    let repo = test_model_repo().to_string_lossy().to_string();
+    // Spawn the server under a disposable `sh` wrapper so we can SIGKILL its
+    // PARENT. `exec sleep` keeps the wrapper alive under a stable pid; the
+    // server's own output is discarded so the wrapper's stdout carries only
+    // `echo $!` (the server pid).
+    let mut wrapper = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "{bin} serve --port {port} --model-repo {repo} --no-metrics --no-grpc --log-level warn >/dev/null 2>&1 & echo $!; exec sleep 60",
+            bin = lite_server_bin().display(),
+        ))
+        .env("LITESERVER_DIE_WITH_PARENT", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("wrapper spawn");
+    let wrapper_pid = wrapper.id() as i32;
+    let mut line = String::new();
+    {
+        let stdout = wrapper.stdout.take().expect("wrapper stdout");
+        let mut reader = std::io::BufReader::new(stdout);
+        reader.read_line(&mut line).expect("read server pid");
+    }
+    let server_pid: i32 = line.trim().parse().expect("server pid");
+    wait_for_server(port, 20).await;
+
+    // SIGKILL the wrapper = the server's parent.
+    unsafe {
+        libc::kill(wrapper_pid, libc::SIGKILL);
+    }
+    let _ = wrapper.wait();
+
+    let gone = wait_for_pid_gone(server_pid, 6).await;
+    if !gone {
+        unsafe {
+            libc::kill(server_pid, libc::SIGKILL);
+        }
+    }
+    assert!(
+        gone,
+        "server did not self-terminate within 6s after its parent was SIGKILLed"
+    );
+}
+
+/// A python worker whose server (parent) is SIGKILLed must self-terminate via
+/// its own parent-death watch — the server's watchdog can't run when the server
+/// itself is SIGKILLed.
+#[cfg(unix)]
+#[tokio::test]
+async fn worker_self_terminates_when_server_killed() {
+    let port = 18351u16;
+    kill_stale_on_port(port);
+    let repo = test_model_repo();
+    let mut server = start_server(&[
+        "--port",
+        &port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-metrics",
+        "--no-grpc",
+        "--log-level",
+        "warn",
+    ]);
+    let server_pid = server.id() as i32;
+    let base = format!("http://127.0.0.1:{}", port);
+    wait_for_server(port, 20).await;
+    load_model(&base, MODEL, "1").await;
+
+    let worker_pid = wait_for_worker_pid(server_pid, MODEL, 10)
+        .await
+        .expect("worker process not found");
+
+    // SIGKILL the server directly (not graceful) — its watchdog can't run.
+    unsafe {
+        libc::kill(server_pid, libc::SIGKILL);
+    }
+    let _ = server.wait();
+
+    let gone = wait_for_pid_gone(worker_pid, 6).await;
+    if !gone {
+        unsafe {
+            libc::kill(worker_pid, libc::SIGKILL);
+        }
+    }
+    assert!(
+        gone,
+        "worker did not self-terminate within 6s after its server was SIGKILLed"
+    );
 }

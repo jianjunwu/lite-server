@@ -219,7 +219,14 @@ async fn open_worker_stream_cancel(
     match clients {
         Some(list) => {
             for client in &list {
-                let _ = client.send(cancel_req.clone()).await;
+                // Fire-and-forget: a stream Cancel carries no unary reply — the
+                // worker just signals the generator to stop — so send_raw must
+                // be used. client.send would register a pending reply slot and
+                // block up to ZMQ_RESPONSE_TIMEOUT (300s) for a reply that
+                // never comes. Because this runs inline after [DONE] while the
+                // SSE/WS `event_tx`/socket is still held, that 300s wait would
+                // keep the response stream open and hang any client draining it.
+                let _ = client.send_raw(cancel_req.clone()).await;
             }
         }
         None => {
