@@ -87,21 +87,6 @@ pub use files::*;
 mod tests;
 
 
-fn extract_client_ip(headers: &HeaderMap) -> String {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            headers
-                .get("x-real-ip")
-                .and_then(|v| v.to_str().ok())
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or("")
-        .to_string()
-}
-
 /// Pure decision for the peer-IP fallback layer: return the IP string to inject
 /// as `x-real-ip`, or `None`. Injection is skipped when a proxy header is
 /// already present (never overwrite a client/proxy-supplied value) or when
@@ -119,9 +104,12 @@ pub(crate) fn peer_ip_fallback_target(
 }
 
 /// Middleware: inject the TCP peer IP as a fallback `x-real-ip` for direct
-/// (non-proxied) connections so `extract_client_ip` is never empty for them
+/// (non-proxied) connections so client_ip is never empty for them
 /// (the 0.7.x regression). A no-op when `ConnectInfo` is unavailable (unix
-/// socket) or when a proxy header is already present.
+/// socket) or when a proxy header is already present. P-MW: the read side
+/// converged on `RequestContext::client_ip` (`request_context::http_client_ip`,
+/// same header > peer precedence); this layer remains so the injected header
+/// also reaches `RequestMeta.headers` verbatim for workers.
 pub(crate) async fn peer_ip_fallback(
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -168,21 +156,22 @@ fn enforce_auth(
     Ok(())
 }
 
-/// `scope` derives from the policy key: `"ip"` → client IP from headers,
-/// otherwise the constant `"/predict"` route scope so all inference paths for
+/// `scope` derives from the policy key: `"ip"` → client IP from the
+/// `RequestContext` (filled once by `context_middleware`), otherwise the
+/// constant `"/predict"` route scope so all inference paths for
 /// a model share one bucket. Returns `RateLimitExceeded` (429 + Retry-After)
 /// when the bucket is empty.
 async fn enforce_rate_limit(
     state: &Arc<AppState>,
     rl: Option<&crate::config::RateLimitPolicy>,
     model_name: &str,
-    headers: &HeaderMap,
+    client_ip: &str,
 ) -> Result<(), AppError> {
     let Some(rl) = rl else {
         return Ok(());
     };
     let scope = match rl.key.as_str() {
-        "ip" => extract_client_ip(headers),
+        "ip" => client_ip.to_string(),
         _ => "/predict".to_string(),
     };
     // Empty IP scope (unix-socket path with no peer, or a proxy that sent no
@@ -403,33 +392,8 @@ mod client_ip_tests {
         Some(format!("{ip}:1234").parse().unwrap())
     }
 
-    // --- extract_client_ip: header-based resolution (peer fallback is the
-    //     peer_ip_fallback layer's job, tested below) ---
-
-    #[test]
-    fn prefers_x_forwarded_for() {
-        let h = headers(&[("x-forwarded-for", "10.0.0.1"), ("x-real-ip", "10.0.0.2")]);
-        assert_eq!(extract_client_ip(&h), "10.0.0.1");
-    }
-
-    #[test]
-    fn uses_x_real_ip_when_no_xff() {
-        let h = headers(&[("x-real-ip", "10.0.0.2")]);
-        assert_eq!(extract_client_ip(&h), "10.0.0.2");
-    }
-
-    #[test]
-    fn empty_when_no_headers() {
-        assert_eq!(extract_client_ip(&headers(&[])), "");
-    }
-
-    #[test]
-    fn skips_empty_xff_and_uses_real_ip() {
-        // An empty x-forwarded-for must fall through (parity with gRPC),
-        // so the layer-injected x-real-ip can engage for direct connections.
-        let h = headers(&[("x-forwarded-for", ""), ("x-real-ip", "10.0.0.2")]);
-        assert_eq!(extract_client_ip(&h), "10.0.0.2");
-    }
+    // --- extract_client_ip: header-based resolution moved to
+    //     `request_context::http_client_ip` (P-MW); its tests moved with it. ---
 
     // --- peer_ip_fallback_target: should the layer inject the peer IP? ---
 

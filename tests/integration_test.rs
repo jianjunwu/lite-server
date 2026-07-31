@@ -387,6 +387,92 @@ async fn unload_model(base: &str, model: &str, version: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// P4-2 graceful-shutdown helpers (unix)
+// ---------------------------------------------------------------------------
+
+/// A model whose `predict` sleeps `sleep_secs` — used to keep an RPC in-flight
+/// across a SIGTERM so drain / abort behavior is observable. `slow_model/1`
+/// doubles the input like `test_model`.
+#[cfg(unix)]
+fn create_slow_model_repo(sleep_secs: u64) -> std::path::PathBuf {
+    let tmp = std::env::temp_dir().join(format!(
+        "lite-server-slow-{}-{}",
+        std::process::id(),
+        sleep_secs
+    ));
+    let model_dir = tmp.join("slow_model/1");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    std::fs::write(
+        model_dir.join("model.py"),
+        format!(
+            r#"from lite_server import LitAPI
+import time
+
+
+class SlowAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        time.sleep({secs})
+        return {{"output": x * 2}}
+
+    def encode_response(self, output):
+        return output
+"#,
+            secs = sleep_secs
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        model_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+    tmp
+}
+
+/// SIGTERM the server's MAIN process only (not its process group) so the Python
+/// worker stays alive long enough for an in-flight RPC to complete during drain.
+#[cfg(unix)]
+fn send_sigterm(child: &std::process::Child) {
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+}
+
+/// Poll until the child exits, or `timeout_secs` elapse. Returns true if it
+/// exited on its own.
+#[cfg(unix)]
+async fn wait_for_exit(child: &mut std::process::Child, timeout_secs: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            _ => {
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+/// Connect a tonic channel to the server's TCP gRPC port.
+#[cfg(unix)]
+async fn grpc_tcp_channel(grpc_port: u16) -> tonic::transport::Channel {
+    tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{}", grpc_port))
+        .expect("grpc endpoint")
+        .connect()
+        .await
+        .expect("grpc connect")
+}
+
+// ---------------------------------------------------------------------------
 // Shared server fixture — one server for most tests
 // ---------------------------------------------------------------------------
 
@@ -1143,6 +1229,435 @@ async fn test_http_response_compression() {
     let _ = ws.close(None).await;
 
     unload_model(&base, MODEL, "1").await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// ---------------------------------------------------------------------------
+// gRPC Unix domain socket (P4-1)
+// ---------------------------------------------------------------------------
+//
+// `grpc.host: unix:/path` makes the gRPC server bind a UDS instead of TCP.
+// Verified end-to-end: a tonic client connects over the socket, an Infer RPC
+// drives the worker, the grpc.health.v1 Health RPC answers, and the socket
+// file carries the configured permission bits.
+
+#[cfg(unix)]
+fn unique_uds_path(label: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "/tmp/lite-server-grpc-uds-{}-{}-{}.sock",
+        std::process::id(),
+        label,
+        n
+    )
+}
+
+/// Connect a tonic channel to a UDS path, retrying briefly until the server
+/// has bound the socket (the HTTP port being up is a hint, not a guarantee).
+#[cfg(unix)]
+async fn uds_grpc_channel(sock_path: &str) -> tonic::transport::Channel {
+    use hyper_util::rt::TokioIo;
+    use tower::service_fn;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let path = sock_path.to_string();
+        let endpoint = tonic::transport::Endpoint::try_from("http://localhost")
+            .expect("static placeholder URI is valid");
+        match endpoint
+            .connect_with_connector(service_fn(move |_: http::Uri| {
+                let path = path.clone();
+                async move {
+                    Ok::<_, std::io::Error>(TokioIo::new(
+                        tokio::net::UnixStream::connect(&path).await?,
+                    ))
+                }
+            }))
+            .await
+        {
+            Ok(channel) => return channel,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+            Err(e) => panic!("failed to connect gRPC over UDS {}: {}", sock_path, e),
+        }
+    }
+}
+
+/// Assert a socket file's permission bits (lower 9) match `mode`.
+#[cfg(unix)]
+fn assert_socket_mode(path: &str, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path).unwrap_or_else(|e| panic!("stat {}: {}", path, e));
+    assert_eq!(
+        meta.permissions().mode() & 0o777,
+        mode,
+        "socket {} perms mismatch",
+        path
+    );
+}
+
+/// gRPC `grpc.host: unix:/path` drives Infer + Health over the socket, and the
+/// default inference-socket permission is 0o666.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_grpc_uds_infer_health_default_mode() {
+    use std::collections::HashMap;
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+
+    let http_port = 18094u16;
+    let grpc_port = 18095u16; // parsed but unused for bind (UDS)
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = test_model_repo();
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-grpc-uds-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let sock = unique_uds_path("default");
+    let _ = std::fs::remove_file(&sock);
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {}\n  grpc_port: {}\n  metrics_port: 18096\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\n  host: unix:{}\nmodel_repository:\n  path: {}\n",
+            http_port, grpc_port, sock, repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, MODEL, "1").await;
+
+    let channel = uds_grpc_channel(&sock).await;
+
+    // Health: overall service "" → SERVING once the model is ready.
+    let mut health =
+        tonic_health::pb::health_client::HealthClient::new(channel.clone());
+    let hresp = health
+        .check(tonic_health::pb::HealthCheckRequest { service: String::new() })
+        .await
+        .expect("Health.check over UDS must succeed")
+        .into_inner();
+    assert_eq!(
+        hresp.status,
+        tonic_health::ServingStatus::Serving as i32,
+        "overall health should be SERVING once a model is loaded"
+    );
+
+    // Infer: test_model doubles the input (21 -> 42).
+    let mut infer = LiteServerClient::new(channel);
+    let resp = infer
+        .infer(InferRequest {
+            model_name: MODEL.to_string(),
+            version: "1".to_string(),
+            data: br#"{"input":21}"#.to_vec().into(),
+            headers: HashMap::new(),
+        })
+        .await
+        .expect("Infer over UDS must succeed")
+        .into_inner();
+    let body = String::from_utf8_lossy(&resp.data);
+    assert!(
+        body.contains("42"),
+        "test_model doubles the input (21 -> 42); got: {}",
+        body
+    );
+
+    // Default inference-socket permission.
+    assert_socket_mode(&sock, 0o666);
+
+    unload_model(&base, MODEL, "1").await;
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// A custom `grpc.socket_mode` is applied to the UDS (432 = 0o660).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_grpc_uds_custom_socket_mode() {
+    let http_port = 18097u16;
+    let grpc_port = 18098u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = test_model_repo();
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-grpc-uds-mode-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let sock = unique_uds_path("mode");
+    let _ = std::fs::remove_file(&sock);
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {}\n  grpc_port: {}\n  metrics_port: 18099\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\n  host: unix:{}\n  socket_mode: 432\nmodel_repository:\n  path: {}\n",
+            http_port, grpc_port, sock, repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 20).await;
+
+    // Connecting + a Health round-trip proves the socket is live; no model is
+    // loaded here, so the overall status is NOT_SERVING (we only require Ok).
+    let channel = uds_grpc_channel(&sock).await;
+    let mut health =
+        tonic_health::pb::health_client::HealthClient::new(channel);
+    health
+        .check(tonic_health::pb::HealthCheckRequest { service: String::new() })
+        .await
+        .expect("Health.check over UDS must succeed");
+
+    assert_socket_mode(&sock, 0o660); // 432 decimal = 0o660
+
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// ---------------------------------------------------------------------------
+// gRPC graceful shutdown (P4-2)
+// ---------------------------------------------------------------------------
+
+/// An in-flight gRPC Infer started before SIGTERM must complete (tonic
+/// `serve_with_shutdown` drains in-flight RPCs), then the server self-exits.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_grpc_graceful_shutdown_drains_inflight() {
+    use std::collections::HashMap;
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+
+    let http_port = 18210u16;
+    let grpc_port = 18211u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = create_slow_model_repo(2);
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-p42-drain-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18212\n  graceful_timeout: 10.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let mut child = start_server(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "slow_model", "1").await;
+
+    // Fire a gRPC Infer (2s predict), then SIGTERM mid-flight. The server must
+    // drain the in-flight RPC so the client still gets 42.
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let infer_handle = tokio::spawn(async move {
+        let mut client = LiteServerClient::new(channel);
+        client
+            .infer(InferRequest {
+                model_name: "slow_model".to_string(),
+                version: "1".to_string(),
+                data: br#"{"input":21}"#.to_vec().into(),
+                headers: HashMap::new(),
+            })
+            .await
+    });
+    sleep(Duration::from_millis(400)).await; // let predict start
+    send_sigterm(&child);
+
+    let got = tokio::time::timeout(Duration::from_secs(20), infer_handle)
+        .await
+        .expect("infer task did not finish");
+    let resp = got
+        .expect("infer task panicked")
+        .expect("drained in-flight Infer must complete, not error")
+        .into_inner();
+    let body = String::from_utf8_lossy(&resp.data);
+    assert!(
+        body.contains("42"),
+        "drained in-flight Infer must complete (21 -> 42); got: {}",
+        body
+    );
+
+    let exited = wait_for_exit(&mut child, 20).await;
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(exited, "server must self-exit after draining in-flight gRPC");
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// Once SIGTERM starts graceful shutdown, the gRPC server stops accepting NEW
+/// RPCs (tonic `serve_with_shutdown` sends GOAWAY / stops the listener): an
+/// in-flight Infer still drains to completion, but a NEW Infer fired after the
+/// signal is rejected. (A request that outlives its own per-request deadline or
+/// the worker unload-grace is cut separately — not asserted here, where timing
+/// against those coupled timeouts is racy.)
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_grpc_shutdown_rejects_new_rpcs() {
+    use std::collections::HashMap;
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+
+    let http_port = 18220u16;
+    let grpc_port = 18221u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = create_slow_model_repo(5); // keeps the server in drain mode
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-p42-reject-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18222\n  timeout: 30.0\n  graceful_timeout: 12.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let mut child = start_server(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "slow_model", "1").await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    // In-flight Infer #1 (5s predict) keeps the server in drain mode.
+    let chan1 = channel.clone();
+    let infer1 = tokio::spawn(async move {
+        let mut client = LiteServerClient::new(chan1);
+        client
+            .infer(InferRequest {
+                model_name: "slow_model".to_string(),
+                version: "1".to_string(),
+                data: br#"{"input":21}"#.to_vec().into(),
+                headers: HashMap::new(),
+            })
+            .await
+    });
+    sleep(Duration::from_millis(400)).await; // let predict start
+    send_sigterm(&child);
+    sleep(Duration::from_millis(2500)).await; // drain mode + GOAWAY propagated
+
+    // NEW Infer #2 after the signal must be rejected (no new streams accepted).
+    let mut client2 = LiteServerClient::new(channel);
+    let infer2 = tokio::time::timeout(
+        Duration::from_secs(6),
+        client2.infer(InferRequest {
+            model_name: "slow_model".to_string(),
+            version: "1".to_string(),
+            data: br#"{"input":99}"#.to_vec().into(),
+            headers: HashMap::new(),
+        }),
+    )
+    .await;
+    match infer2 {
+        Ok(Ok(_)) => panic!("new gRPC RPC after SIGTERM must be rejected, got Ok"),
+        _ => {} // Err or timeout — both mean rejected / not served
+    }
+
+    // In-flight Infer #1 still drains to completion.
+    let resp = tokio::time::timeout(Duration::from_secs(20), infer1)
+        .await
+        .expect("infer1 did not finish")
+        .expect("infer1 panicked")
+        .expect("in-flight Infer must drain, not error")
+        .into_inner();
+    assert!(
+        String::from_utf8_lossy(&resp.data).contains("42"),
+        "drained in-flight Infer must complete (21 -> 42)"
+    );
+
+    let exited = wait_for_exit(&mut child, 20).await;
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(exited, "server must self-exit after drain");
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// C3 (P4-2): once SIGTERM arrives, /readyz stops returning 200 within a short
+/// window — either 503 (draining flag, on a keep-alive connection) or
+/// connection-refused (listener stopped) — so the LB摘流.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_shutdown_health_goes_unavailable() {
+    let http_port = 18230u16;
+    let grpc_port = 18231u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = test_model_repo();
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-p42-drainflag-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18232\n  graceful_timeout: 8.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let mut child = start_server(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, MODEL, "1").await;
+
+    let client = reqwest::Client::new();
+    assert_eq!(
+        client.get(format!("{}/readyz", base)).send().await.unwrap().status(),
+        200
+    );
+
+    send_sigterm(&child);
+
+    // readyz must stop returning 200 within the drain window — 503 (draining
+    // flag) or connection-refused (listener stopped) both count as摘流.
+    let mut unavailable = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+    while tokio::time::Instant::now() < deadline {
+        match client.get(format!("{}/readyz", base)).send().await {
+            Ok(r) if r.status() == 200 => {}
+            _ => {
+                unavailable = true;
+                break;
+            }
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(unavailable, "readyz must become unavailable after SIGTERM");
+
+    let exited = wait_for_exit(&mut child, 15).await;
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(exited, "server must self-exit after drain");
+
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
@@ -2473,6 +2988,272 @@ async fn test_grpc_infer_aggregates_into_batch() {
     assert_eq!(jb["batch_size"], 2, "gRPC infer B must be batched into size 2");
 
     unload_model(&base, BATCH_MODEL, "1").await;
+}
+
+// ---------------------------------------------------------------------------
+// P2-1: gRPC 请求指标 + GIE 指标语义
+// ---------------------------------------------------------------------------
+
+/// gRPC Infer 完成（成功 + 失败）记请求指标：/metrics 暴露
+/// liteserver_requests_total（D5: 无 protocol label，与 HTTP 共享计数），
+/// 并暴露 GIE 语义 gauge（默认 namespace `liteserver`）。
+#[tokio::test]
+#[serial]
+async fn test_grpc_infer_records_request_metrics() {
+    use bytes::Bytes;
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+    use std::collections::HashMap;
+
+    let http_port = 18076u16;
+    let grpc_port = 18077u16;
+    let metrics_port = 18078u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    kill_stale_on_port(metrics_port);
+    let repo = test_model_repo();
+    let _server = ServerGuard::start(&[
+        "--port",
+        &http_port.to_string(),
+        "--grpc-port",
+        &grpc_port.to_string(),
+        "--metrics-port",
+        &metrics_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--log-level",
+        "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, MODEL, "1").await;
+
+    let mut client = LiteServerClient::connect(format!("http://127.0.0.1:{}", grpc_port))
+        .await
+        .expect("gRPC client must connect");
+
+    // 成功 → 2xx
+    let ok = client
+        .infer(InferRequest {
+            model_name: MODEL.to_string(),
+            version: "1".to_string(),
+            data: Bytes::from(serde_json::to_vec(&json!({"input": 1})).unwrap()),
+            headers: HashMap::new(),
+        })
+        .await;
+    assert!(ok.is_ok(), "gRPC infer must succeed: {:?}", ok.err());
+
+    // 模型不存在 → NotFound (4xx)
+    let err = client
+        .infer(InferRequest {
+            model_name: "no_such_model".to_string(),
+            version: String::new(),
+            data: Bytes::from_static(b"{}"),
+            headers: HashMap::new(),
+        })
+        .await
+        .expect_err("unknown model must fail");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    let body = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{}/metrics", metrics_port))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("liteserver_requests_total{model=\"test_model\",status=\"2xx\",version=\"1\"}"),
+        "2xx series missing: {}", body
+    );
+    assert!(
+        body.contains("liteserver_requests_total{model=\"no_such_model\",status=\"4xx\",version=\"\"}"),
+        "4xx series missing: {}", body
+    );
+    // GIE/EPP 语义 gauge（默认 namespace `liteserver`）：TotalQueuedRequests
+    // 映射既有 queue depth；KVCacheUtilization 无 KV 概念上报 N/A (NaN)。
+    assert!(body.contains("liteserver:total_queued_requests"),
+        "GIE TotalQueuedRequests gauge missing: {}", body);
+    assert!(body.contains("liteserver:kv_cache_utilization NaN"),
+        "GIE KVCacheUtilization must be NaN (N/A): {}", body);
+
+    unload_model(&base, MODEL, "1").await;
+}
+
+// ---------------------------------------------------------------------------
+// P2-2: gRPC x-request-id + x-processing-time-ms 回显
+// ---------------------------------------------------------------------------
+
+/// gRPC 客户端传 `x-client-request-id` metadata → 响应 metadata 回显
+/// `x-request-id`（同值）+ `x-processing-time-ms`（蓝图 §4.1 P2-2）。
+/// 错误路径（模型不存在）同样回显——覆盖 interceptor→RequestContext→handler
+/// 出口注入的全链路（unit test 直调 handler 不经 interceptor）。
+#[tokio::test]
+#[serial]
+async fn test_grpc_infer_echoes_request_id() {
+    use bytes::Bytes;
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+    use std::collections::HashMap;
+    use tonic::Request;
+
+    let http_port = 18079u16;
+    let grpc_port = 18080u16;
+    let metrics_port = 18081u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    kill_stale_on_port(metrics_port);
+    let repo = test_model_repo();
+    let _server = ServerGuard::start(&[
+        "--port",
+        &http_port.to_string(),
+        "--grpc-port",
+        &grpc_port.to_string(),
+        "--metrics-port",
+        &metrics_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--log-level",
+        "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, MODEL, "1").await;
+
+    let mut client = LiteServerClient::connect(format!("http://127.0.0.1:{}", grpc_port))
+        .await
+        .expect("gRPC client must connect");
+
+    // 成功路径回显
+    let mut req = Request::new(InferRequest {
+        model_name: MODEL.to_string(),
+        version: "1".to_string(),
+        data: Bytes::from(serde_json::to_vec(&json!({"input": 1})).unwrap()),
+        headers: HashMap::new(),
+    });
+    req.metadata_mut()
+        .insert("x-client-request-id", "p22-foo".parse().unwrap());
+    let resp = client
+        .infer(req)
+        .await
+        .expect("gRPC infer must succeed");
+    let md = resp.metadata();
+    assert_eq!(
+        md.get("x-request-id").and_then(|v| v.to_str().ok()),
+        Some("p22-foo"),
+        "x-request-id must echo the client id: {:?}",
+        md
+    );
+    assert!(
+        md.get("x-processing-time-ms").is_some(),
+        "x-processing-time-ms must be present"
+    );
+
+    // 错误路径（模型不存在）同样回显
+    let mut err_req = Request::new(InferRequest {
+        model_name: "no_such_model".to_string(),
+        version: String::new(),
+        data: Bytes::from_static(b"{}"),
+        headers: HashMap::new(),
+    });
+    err_req
+        .metadata_mut()
+        .insert("x-client-request-id", "p22-bar".parse().unwrap());
+    let err = client
+        .infer(err_req)
+        .await
+        .expect_err("unknown model must fail");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+    assert_eq!(
+        err.metadata().get("x-request-id").and_then(|v| v.to_str().ok()),
+        Some("p22-bar"),
+        "x-request-id must echo on the error path too: {:?}",
+        err.metadata()
+    );
+    assert!(
+        err.metadata().get("x-processing-time-ms").is_some(),
+        "x-processing-time-ms must be present on the error path"
+    );
+
+    unload_model(&base, MODEL, "1").await;
+}
+
+// ---------------------------------------------------------------------------
+// P3-1: gRPC 限流（ResourceExhausted 专给限流，落 4xx）
+// ---------------------------------------------------------------------------
+
+/// policy_model 声明 rate_limit rpm=3 burst=3。gRPC 连续 4 次 infer：前 3 次
+/// 放行，第 4 次 ResourceExhausted + retry-after（蓝图 §4.1 P3-1 / §4.0.9）。
+#[tokio::test]
+#[serial]
+async fn test_grpc_infer_rate_limit_returns_resource_exhausted() {
+    use bytes::Bytes;
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+    use std::collections::HashMap;
+
+    let http_port = 18082u16;
+    let grpc_port = 18083u16;
+    let metrics_port = 18084u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    kill_stale_on_port(metrics_port);
+    let repo = test_model_repo();
+    let _server = ServerGuard::start(&[
+        "--port",
+        &http_port.to_string(),
+        "--grpc-port",
+        &grpc_port.to_string(),
+        "--metrics-port",
+        &metrics_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--log-level",
+        "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "policy_model", "1").await;
+    assert!(
+        wait_model_ready(&base, "policy_model", 20).await,
+        "policy_model must become ready"
+    );
+
+    let mut client = LiteServerClient::connect(format!("http://127.0.0.1:{}", grpc_port))
+        .await
+        .expect("gRPC client must connect");
+
+    let mk = || InferRequest {
+        model_name: "policy_model".to_string(),
+        version: "1".to_string(),
+        data: Bytes::from(serde_json::to_vec(&json!({"input": 1})).unwrap()),
+        headers: HashMap::new(),
+    };
+
+    // burst=3：前 3 次放行。
+    for i in 0..3 {
+        let r = client.infer(mk()).await;
+        assert!(r.is_ok(), "request {} must be allowed: {:?}", i + 1, r.err());
+    }
+    // 第 4 次 ResourceExhausted + retry-after。
+    let err = client
+        .infer(mk())
+        .await
+        .expect_err("4th request must be rate-limited");
+    assert_eq!(
+        err.code(),
+        tonic::Code::ResourceExhausted,
+        "over-limit must be ResourceExhausted (not Unavailable): {:?}",
+        err
+    );
+    assert!(
+        err.metadata().get("retry-after").is_some(),
+        "retry-after metadata must be present: {:?}",
+        err.metadata()
+    );
+
+    unload_model(&base, "policy_model", "1").await;
 }
 
 // ---------------------------------------------------------------------------

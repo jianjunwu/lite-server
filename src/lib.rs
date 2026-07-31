@@ -10,6 +10,7 @@ pub mod logging;
 pub mod metrics;
 pub mod proto;
 pub mod registry;
+pub mod request_context;
 pub mod server;
 pub mod streaming;
 #[cfg(feature = "python")]

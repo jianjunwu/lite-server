@@ -12,6 +12,7 @@ use crate::worker::WorkerManager;
 use axum::extract::{FromRequestParts, Query, Request, State};
 use axum::http::header::CONNECTION;
 use axum::http::HeaderValue;
+use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Router;
@@ -20,7 +21,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::info;
 use uuid::Uuid;
 
@@ -33,29 +34,15 @@ async fn disable_keepalive_middleware(request: Request, next: Next) -> Response 
     response
 }
 
-/// Newtype for request ID extraction from extensions.
+/// Newtype for the request ID stash in request extensions, written once by
+/// `observability_middleware` (outermost) and read by `context_middleware`
+/// when it builds the `RequestContext` (P-MW, D21 single-source).
 #[derive(Clone, Debug)]
 pub struct RequestId(pub String);
 
 impl std::fmt::Display for RequestId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
-    }
-}
-
-#[axum::async_trait]
-impl<S: Send + Sync> axum::extract::FromRequestParts<S> for RequestId {
-    type Rejection = std::convert::Infallible;
-
-    async fn from_request_parts(
-        parts: &mut axum::http::request::Parts,
-        _state: &S,
-    ) -> Result<Self, Self::Rejection> {
-        Ok(parts
-            .extensions
-            .get::<RequestId>()
-            .cloned()
-            .unwrap_or_else(|| RequestId(Uuid::new_v4().to_string())))
     }
 }
 
@@ -85,12 +72,13 @@ pub(crate) async fn route_fallback(
         .map(|q| q.0)
         .unwrap_or_default();
     let method = parts.method.clone();
-    let request_id = parts
+    // P-MW: read the RequestContext filled by context_middleware (the
+    // from_http_parts fallback only fires when the middleware is absent).
+    let cx = parts
         .extensions
-        .get::<RequestId>()
+        .get::<crate::request_context::RequestContext>()
         .cloned()
-        .map(|r| r.0)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+        .unwrap_or_else(|| crate::request_context::RequestContext::from_http_parts(&parts));
     let headers = parts.headers.clone();
     let body = match axum::body::to_bytes(body, ROUTE_BODY_LIMIT).await {
         Ok(b) => b,
@@ -100,7 +88,7 @@ pub(crate) async fn route_fallback(
     };
 
     match crate::http::handlers::dispatch_custom_route(
-        &state, &model, &tail, &method, query, &headers, body, request_id,
+        &state, &model, &tail, &method, query, &headers, body, &cx,
     )
     .await
     {
@@ -151,6 +139,44 @@ async fn observability_middleware(mut request: Request, next: Next) -> Response 
     response
 }
 
+/// P4-2: in-flight accounting for the graceful-shutdown `pending` count — inc on
+/// entry, dec when the response is produced. Placed outermost so it spans the
+/// full request. For SSE/WebSocket the response is produced when headers are
+/// sent, so an active long-lived stream stops counting; the actual stream drain
+/// is handled by axum's graceful shutdown + the graceful_timeout backstop, this
+/// counter is observability only (it was a no-op for HTTP before P4-2).
+async fn inflight_middleware(
+    state: State<Arc<crate::server::ShutdownState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    state.inc_pending();
+    let response = next.run(request).await;
+    state.dec_pending();
+    response
+}
+
+/// C3 (P4-2): once draining, reject new non-probe requests with 503 so
+/// keep-alive clients (and LBs that miss readyz) add no new work during the
+/// drain window. Health probes (/livez, /readyz, /startupz, /health) bypass the
+/// gate so they can report draining themselves. Placed inside observability so
+/// the 503 is logged with a request-id.
+async fn draining_gate(
+    state: State<Arc<AtomicBool>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    use std::sync::atomic::Ordering;
+    if state.load(Ordering::Relaxed) {
+        let path = request.uri().path();
+        let is_probe = matches!(path, "/livez" | "/readyz" | "/startupz" | "/health");
+        if !is_probe {
+            return (StatusCode::SERVICE_UNAVAILABLE, "server draining").into_response();
+        }
+    }
+    next.run(request).await
+}
+
 /// Compression predicate (P1-4): never compress SSE responses — buffering
 /// would break per-event flush semantics.
 #[derive(Clone, Copy)]
@@ -180,30 +206,16 @@ pub async fn start_http_server(
     inference_queue: Arc<InferenceQueue>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     shutdown_state: Arc<crate::server::ShutdownState>,
+    draining: Arc<AtomicBool>,
     callback_runner: Arc<crate::callback::CallbackRunner>,
     has_hot_reload: Arc<AtomicBool>,
+    rate_limiter: Arc<crate::rate_limit::RateLimiter>,
 ) -> Result<(), AppError> {
     let repo_path = PathBuf::from(&config.model_repository.path);
-    let rate_limiter = Arc::new(crate::rate_limit::RateLimiter::new(
-        config.rate_limit.max_buckets,
-    ));
-    let mut state = AppState::new(registry, worker_manager, inference_queue, config.clone(), repo_path, callback_runner, has_hot_reload, rate_limiter.clone());
-
-    // Background cleanup: evict stale rate-limit buckets every 60s
-    {
-        let limiter = rate_limiter.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(60));
-            loop {
-                tick.tick().await;
-                let removed = limiter.cleanup_stale(Duration::from_secs(600));
-                if removed > 0 {
-                    tracing::debug!(removed, "rate limiter: evicted stale buckets");
-                }
-            }
-        });
-    }
-    state.shutdown_state = shutdown_state;
+    // P3-1：RateLimiter 构造上移到 server/mod.rs（HTTP/gRPC 共享 + 60s cleanup）。
+    let mut state = AppState::new(registry, worker_manager, inference_queue, config.clone(), repo_path, callback_runner, has_hot_reload, rate_limiter);
+    state.shutdown_state = shutdown_state.clone();
+    state.draining = draining.clone();
 
     let app = create_routes(state);
 
@@ -232,10 +244,32 @@ pub async fn start_http_server(
         app
     };
 
-    // Observability middleware (outermost — applied last so it captures total
-    // wall-clock duration and sets x-request-id + x-processing-time-ms on ALL
-    // responses including errors and fallbacks)
+    // Context middleware (P-MW, 蓝图 §4.0.2): immediately inside
+    // observability, ahead of every RequestContext consumer (D21) — fills
+    // RequestContext once from the observability RequestId stash + headers
+    // + ConnectInfo; rate-limit / callbacks / RequestMeta all read it.
+    let app = app.layer(axum::middleware::from_fn(
+        crate::request_context::context_middleware,
+    ));
+
+    // C3 (P4-2): draining gate — inside observability (so 503s carry a
+    // request-id) but outside context/compression so new work is rejected
+    // before any handler runs. Respects D21: it neither consumes RequestContext
+    // nor touches compression/observability semantics.
+    let app =
+        app.layer(axum::middleware::from_fn_with_state(draining.clone(), draining_gate));
+
+    // Observability middleware (captures total wall-clock duration and sets
+    // x-request-id + x-processing-time-ms on ALL responses including errors and
+    // fallbacks).
     let app = app.layer(axum::middleware::from_fn(observability_middleware));
+
+    // P4-2: in-flight accounting — outermost so it spans the whole request,
+    // including observability overhead and draining-gate 503s.
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        shutdown_state.clone(),
+        inflight_middleware,
+    ));
 
     if let Some(path) = unix_socket_path(&config.server.host) {
         #[cfg(unix)]
@@ -428,28 +462,6 @@ mod tests {
         assert_eq!(body["error"]["param"], serde_json::Value::Null);
     }
 
-    // ===== RequestId extractor tests =====
-
-    #[tokio::test]
-    async fn test_request_id_extractor_generates_uuid_without_middleware() {
-        // Handlers must work without the observability middleware —
-        // the extractor falls back to a fresh UUID instead of failing.
-        async fn id_handler(RequestId(id): RequestId) -> String {
-            id
-        }
-        let app = axum::Router::new().route("/test", axum::routing::get(id_handler));
-
-        let response = app
-            .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
-        let id = String::from_utf8(body_bytes.to_vec()).unwrap();
-        assert_eq!(id.len(), 36, "should fall back to UUID v4 (36 chars), got: {}", id);
-    }
-
     // ===== observability middleware tests =====
 
     #[tokio::test]
@@ -558,5 +570,50 @@ mod tests {
             "x-request-id must be on error responses too");
         assert!(response.headers().get("x-processing-time-ms").is_some(),
             "x-processing-time-ms must be on error responses too");
+    }
+
+    // ===== P-MW: production stack order (observability → context_middleware) =====
+
+    #[tokio::test]
+    async fn test_context_reads_single_request_id_fill_by_observability() {
+        // 蓝图 §4.0.5: one fill, many readers — the handler's RequestContext
+        // must carry the SAME request_id observability echoes on the response,
+        // and the client_ip from the request headers.
+        async fn cx_handler(cx: crate::request_context::RequestContext) -> String {
+            format!("{}|{}", cx.request_id, cx.client_ip)
+        }
+        // Same order as start_http_server: context_middleware applied first
+        // (inner), observability last (outermost).
+        let app = axum::Router::new()
+            .route("/test", axum::routing::get(cx_handler))
+            .layer(axum::middleware::from_fn(
+                crate::request_context::context_middleware,
+            ))
+            .layer(axum::middleware::from_fn(observability_middleware));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/test")
+                    .header("x-client-request-id", "trace-abc")
+                    .header("x-forwarded-for", "10.1.2.3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let echoed = response
+            .headers()
+            .get("x-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+        assert_eq!(body, format!("{}|10.1.2.3", echoed),
+            "handler context must read the same request_id observability echoes");
     }
 }

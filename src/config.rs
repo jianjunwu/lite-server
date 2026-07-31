@@ -94,6 +94,15 @@ impl Default for ServerConfig {
 pub struct GrpcConfig {
     pub enabled: bool,
     pub max_workers: usize,
+    /// gRPC bind target (P4-1). None = follow `server.host`, falling back to
+    /// TCP `127.0.0.1` when `server.host` is a Unix socket — gRPC stays on TCP
+    /// unless this is explicitly set to `unix:/path` to bind a UDS. See
+    /// `grpc::resolve_grpc_host`.
+    pub host: Option<String>,
+    /// Unix socket file permission for the gRPC UDS (P4-1), as a decimal mode
+    /// (e.g. 438 = 0o666). Default 0o666 for the inference socket — admin UDS
+    /// uses a stricter 0o600 (P7-2). Applied via chmod on cfg(unix) only.
+    pub socket_mode: u32,
     /// HTTP/2 keepalive ping interval in seconds (P1-2). None = disabled.
     pub http2_keepalive_interval_secs: Option<u64>,
     /// HTTP/2 keepalive ping-ack timeout in seconds (P1-2). Effective default
@@ -116,6 +125,8 @@ impl Default for GrpcConfig {
         Self {
             enabled: true,
             max_workers: 10,
+            host: None,
+            socket_mode: 0o666,
             http2_keepalive_interval_secs: None,
             http2_keepalive_timeout_secs: None,
             http2_adaptive_window: false,
@@ -129,11 +140,18 @@ impl Default for GrpcConfig {
 #[serde(default)]
 pub struct MetricsConfig {
     pub enabled: bool,
+    /// GIE/EPP 指标命名 namespace（P2-1 扩展，D32）：`{namespace}:total_queued_requests`
+    /// / `{namespace}:kv_cache_utilization` 暴露到 /metrics，兼容 `vllm` 模式。
+    /// 非法 namespace 在启动时快速失败（register_gie_metrics 校验）。
+    pub metric_namespace: String,
 }
 
 impl Default for MetricsConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            metric_namespace: "liteserver".to_string(),
+        }
     }
 }
 
@@ -931,6 +949,20 @@ mod tests {
         assert_eq!(cfg.grpc.http2_keepalive_timeout_secs, Some(5));
         assert!(cfg.grpc.http2_adaptive_window);
         assert_eq!(cfg.grpc.http2_max_frame_size, Some(1048576));
+    }
+
+    #[test]
+    fn should_default_metric_namespace_to_liteserver() {
+        let cfg = MetricsConfig::default();
+        assert_eq!(cfg.metric_namespace, "liteserver");
+    }
+
+    #[test]
+    fn should_parse_custom_metric_namespace() {
+        let yaml = "metrics:\n  metric_namespace: vllm\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.metrics.metric_namespace, "vllm");
+        assert!(cfg.metrics.enabled, "enabled keeps its default when unset");
     }
 
     #[test]

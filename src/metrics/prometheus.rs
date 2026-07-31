@@ -164,6 +164,38 @@ lazy_static! {
         ),
         &["type"]
     ).unwrap();
+
+    // ===== P2-1 扩展: 扩缩一等指标（autoscaling 信号）=====
+    // label 仅封闭枚举 model/version（§6.5 约束 10）。
+
+    /// 已接受但未完成的请求数（per model/version），含排队中与处理中。
+    pub static ref IN_FLIGHT_REQUESTS: GaugeVec = GaugeVec::new(
+        prometheus::Opts::new(
+            "liteserver_in_flight_requests",
+            "Requests accepted but not yet completed (queued + processing)"
+        ),
+        &["model", "version"]
+    ).unwrap();
+
+    /// 排队等待时长（提交 → 首次派发，含攒批等待）。
+    pub static ref QUEUE_WAIT_SECONDS: HistogramVec = HistogramVec::new(
+        HistogramOpts::new(
+            "liteserver_queue_wait_seconds",
+            "Time a request waits in the queue before first dispatch"
+        ).buckets(vec![0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]),
+        &["model", "version"]
+    ).unwrap();
+
+    /// Worker 饱和度：各 worker 并发 in-flight batch 数的最大值（最热
+    /// worker）。label 白名单不含 worker_id，故以聚合 gauge 呈现；
+    /// autoscaler 结合 liteserver_active_workers 解读。
+    pub static ref WORKER_SATURATION: GaugeVec = GaugeVec::new(
+        prometheus::Opts::new(
+            "liteserver_worker_saturation",
+            "Max concurrent in-flight batches across workers (hottest worker)"
+        ),
+        &["model", "version"]
+    ).unwrap();
 }
 
 // Custom metrics reported by Python workers — std::sync::Mutex is sufficient
@@ -205,6 +237,72 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(WORKER_RESPAWNS_TOTAL.clone()))?;
     REGISTRY.register(Box::new(SHUTDOWN_PENDING_REQUESTS.clone()))?;
     REGISTRY.register(Box::new(OPEN_CONNECTIONS.clone()))?;
+    REGISTRY.register(Box::new(IN_FLIGHT_REQUESTS.clone()))?;
+    REGISTRY.register(Box::new(QUEUE_WAIT_SECONDS.clone()))?;
+    REGISTRY.register(Box::new(WORKER_SATURATION.clone()))?;
+    Ok(())
+}
+
+// ===== GIE/EPP 指标语义对齐（P2-1 扩展, D32）=====
+//
+// `/metrics` 暴露语义对齐的 TotalQueuedRequests 与 KVCacheUtilization gauge，
+// 命名经 `metrics.metric_namespace` 可配置兼容 `vllm:*` 模式（vLLM 指标名
+// 2025–2026 发生过重命名，兼容层不硬编码 vllm 名——后缀是本服务的稳定语义
+// 名，namespace 是部署侧适配 EPP 的杠杆）。
+//
+// TotalQueuedRequests 映射既有 liteserver_queue_depth：在 inc/dec_queue_depth
+// 内同步镜像（构造上即同步，无双写漂移）。KVCacheUtilization 无 KV 概念，
+// 上报 N/A (NaN)。
+lazy_static! {
+    /// 已注册的 GIE TotalQueuedRequests gauge（namespace → vec）。生产只有
+    /// 一个 namespace（启动注册一次）；测试可注册多个——镜像写入全部，
+    /// 避免测试间注册顺序竞争。
+    static ref GIE_TOTAL_QUEUED_REQUESTS: std::sync::RwLock<std::collections::HashMap<String, GaugeVec>> =
+        std::sync::RwLock::new(std::collections::HashMap::new());
+}
+
+/// Prometheus metric name 的合法 namespace 段（`[a-zA-Z_:][a-zA-Z0-9_:]*`）。
+fn is_valid_metric_namespace(ns: &str) -> bool {
+    let mut chars = ns.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == ':' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+}
+
+/// 注册 GIE/EPP 语义 gauge：`{namespace}:total_queued_requests{model,version}`
+/// 与 `{namespace}:kv_cache_utilization`（NaN）。server 启动时调用一次；
+/// 重复注册同 namespace 幂等。非法 namespace 报错（启动配置快速失败）。
+pub fn register_gie_metrics(namespace: &str) -> Result<(), prometheus::Error> {
+    if !is_valid_metric_namespace(namespace) {
+        return Err(prometheus::Error::Msg(format!(
+            "metrics.metric_namespace '{}' is not a valid Prometheus name segment \
+             ([a-zA-Z_:][a-zA-Z0-9_:]*)",
+            namespace
+        )));
+    }
+    let mut guard = GIE_TOTAL_QUEUED_REQUESTS
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    if guard.contains_key(namespace) {
+        return Ok(()); // 同 namespace 重复注册幂等
+    }
+    let queued = GaugeVec::new(
+        prometheus::Opts::new(
+            format!("{}:total_queued_requests", namespace),
+            "GIE/EPP TotalQueuedRequests: requests waiting in queue (mirrors liteserver_queue_depth)",
+        ),
+        &["model", "version"],
+    )?;
+    REGISTRY.register(Box::new(queued.clone()))?;
+    let kv = prometheus::Gauge::new(
+        format!("{}:kv_cache_utilization", namespace),
+        "GIE/EPP KVCacheUtilization: NaN — lite-server has no KV-cache concept (N/A)",
+    )?;
+    kv.set(f64::NAN);
+    REGISTRY.register(Box::new(kv))?;
+    guard.insert(namespace.to_string(), queued);
     Ok(())
 }
 
@@ -243,10 +341,44 @@ pub fn inc_retry(model: &str, version: &str) {
 
 pub fn inc_queue_depth(model: &str, version: &str) {
     QUEUE_DEPTH.with_label_values(&[model, version]).inc();
+    mirror_gie_queued(model, version, 1.0);
 }
 
 pub fn dec_queue_depth(model: &str, version: &str) {
     QUEUE_DEPTH.with_label_values(&[model, version]).dec();
+    mirror_gie_queued(model, version, -1.0);
+}
+
+/// GIE TotalQueuedRequests 镜像（构造上与 liteserver_queue_depth 同步，无双写
+/// 漂移）；register_gie_metrics 之前调用为 no-op。
+fn mirror_gie_queued(model: &str, version: &str, delta: f64) {
+    let guard = GIE_TOTAL_QUEUED_REQUESTS
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    for g in guard.values() {
+        g.with_label_values(&[model, version]).add(delta);
+    }
+}
+
+// ===== 扩缩一等指标（P2-1 扩展）=====
+
+/// 排队等待时长采样（提交 → 首次派发）。
+pub fn observe_queue_wait(model: &str, version: &str, secs: f64) {
+    QUEUE_WAIT_SECONDS.with_label_values(&[model, version]).observe(secs);
+}
+
+/// Worker 饱和度（最热 worker 的并发 in-flight batch 数）。
+pub fn set_worker_saturation(model: &str, version: &str, value: f64) {
+    WORKER_SATURATION.with_label_values(&[model, version]).set(value);
+}
+
+/// 已接受未完成请求数（in_flight_requests）增减。
+pub fn inc_in_flight(model: &str, version: &str) {
+    IN_FLIGHT_REQUESTS.with_label_values(&[model, version]).inc();
+}
+
+pub fn dec_in_flight(model: &str, version: &str) {
+    IN_FLIGHT_REQUESTS.with_label_values(&[model, version]).dec();
 }
 
 // ===== Model metrics =====
@@ -804,5 +936,91 @@ mod tests {
         let gauges = vec![MetricValue { id: gauge_id as i32, value: 42.0 }];
         // Must NOT panic — the poisoned lock is recovered via into_inner().
         record_custom_metrics("poison_cm_m", "1", &gauges, &[], &[]);
+    }
+
+    // ===== P2-1 扩展: GIE/EPP 指标语义对齐 =====
+
+    #[test]
+    fn should_expose_total_queued_requests_under_configured_namespace() {
+        register_gie_metrics("gie_p21a").unwrap();
+        let model = "gie_q_model";
+        let version = "1";
+        inc_queue_depth(model, version);
+        let output = gather_metrics();
+        assert!(
+            output.contains("gie_p21a:total_queued_requests{model=\"gie_q_model\",version=\"1\"} 1"),
+            "GIE TotalQueuedRequests gauge missing or wrong value: {}", output
+        );
+    }
+
+    #[test]
+    fn should_mirror_queue_depth_inc_and_dec_into_gie_gauge() {
+        register_gie_metrics("gie_p21b").unwrap();
+        let model = "gie_m_model";
+        let version = "1";
+        inc_queue_depth(model, version);
+        inc_queue_depth(model, version);
+        dec_queue_depth(model, version);
+        let guard = GIE_TOTAL_QUEUED_REQUESTS.read().unwrap_or_else(|e| e.into_inner());
+        let gauge = guard.get("gie_p21b").expect("gie_p21b gauge registered");
+        assert_eq!(gauge.with_label_values(&[model, version]).get(), 1.0);
+    }
+
+    #[test]
+    fn should_expose_kv_cache_utilization_as_nan() {
+        // lite-server 无 KV cache 概念——按 D32 上报 N/A (NaN)。
+        register_gie_metrics("gie_p21c").unwrap();
+        let output = gather_metrics();
+        assert!(
+            output.contains("gie_p21c:kv_cache_utilization NaN"),
+            "KVCacheUtilization must be exposed as NaN (N/A): {}", output
+        );
+    }
+
+    #[test]
+    fn should_reject_invalid_metric_namespace() {
+        assert!(register_gie_metrics("").is_err(), "empty namespace must be rejected");
+        assert!(register_gie_metrics("9bad").is_err(), "leading digit must be rejected");
+        assert!(register_gie_metrics("bad-name").is_err(), "dash must be rejected");
+    }
+
+    #[test]
+    fn should_accept_liteserver_and_vllm_namespaces() {
+        assert!(register_gie_metrics("liteserver_itself_ok").is_ok());
+        assert!(register_gie_metrics("vllm").is_ok());
+    }
+
+    // ===== P2-1 扩展: 扩缩一等指标 =====
+
+    #[test]
+    fn should_record_in_flight_requests_gauge() {
+        let model = "inflight_g_model";
+        let version = "1";
+        let gauge = IN_FLIGHT_REQUESTS.with_label_values(&[model, version]);
+        let before = gauge.get();
+        gauge.inc();
+        assert_eq!(gauge.get(), before + 1.0);
+        gauge.dec();
+        assert_eq!(gauge.get(), before);
+    }
+
+    #[test]
+    fn should_observe_queue_wait_seconds() {
+        let model = "qwait_model";
+        let version = "1";
+        let before = QUEUE_WAIT_SECONDS.with_label_values(&[model, version]).get_sample_count();
+        observe_queue_wait(model, version, 0.05);
+        let after = QUEUE_WAIT_SECONDS.with_label_values(&[model, version]).get_sample_count();
+        assert_eq!(after, before + 1);
+    }
+
+    #[test]
+    fn should_set_worker_saturation() {
+        let model = "sat_model";
+        let version = "1";
+        set_worker_saturation(model, version, 2.0);
+        assert_eq!(WORKER_SATURATION.with_label_values(&[model, version]).get(), 2.0);
+        set_worker_saturation(model, version, 0.0);
+        assert_eq!(WORKER_SATURATION.with_label_values(&[model, version]).get(), 0.0);
     }
 }

@@ -52,6 +52,42 @@ mod version_routing_tests {
         }
     }
 
+    /// C3 (P4-2): /readyz and /livez must flip to 503 the moment the draining
+    /// flag is set, so the LB摘流 at the start of graceful shutdown.
+    #[tokio::test]
+    async fn readyz_and_livez_go_503_when_draining() {
+        use std::sync::atomic::Ordering;
+        let state = test_state();
+        register_ready(&state, "m", &["1"]);
+        // Not draining → 200.
+        assert_eq!(
+            readyz_handler(axum::extract::State(state.clone()))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            livez_handler(axum::extract::State(state.clone()))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        // Draining → 503.
+        state.draining.store(true, Ordering::Relaxed);
+        assert_eq!(
+            readyz_handler(axum::extract::State(state.clone()))
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            livez_handler(axum::extract::State(state.clone()))
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
     fn pinned_header(value: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert(

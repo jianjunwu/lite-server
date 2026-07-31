@@ -19,6 +19,10 @@ pub struct AppState {
     pub repo_path: PathBuf,
     pub alert_engine: Arc<AlertEngine>,
     pub shutdown_state: Arc<ShutdownState>,
+    /// C3 (P4-2): set true at the start of graceful shutdown so /livez, /readyz
+    /// fail (LB摘流) and new inference is rejected with 503 while in-flight work
+    /// drains. Defaults false; overridden by start_http_server.
+    pub draining: Arc<AtomicBool>,
     pub callback_runner: Arc<CallbackRunner>,
     pub has_hot_reload: Arc<AtomicBool>,
     pub rate_limiter: Arc<RateLimiter>,
@@ -43,6 +47,7 @@ impl AppState {
             repo_path,
             alert_engine: Arc::new(AlertEngine::new(AlertThresholds::default())),
             shutdown_state: Arc::new(ShutdownState::new()),
+            draining: Arc::new(AtomicBool::new(false)),
             callback_runner,
             has_hot_reload,
             rate_limiter,

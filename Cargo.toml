@@ -31,10 +31,14 @@ semver = "1.0"
 # gRPC
 tonic = { version = "0.12", features = ["gzip"] }
 tonic-health = { version = "0.12", features = ["transport"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 
 # HTTP middleware (response compression, P1-4)
 tower-http = { version = "0.6", features = ["compression-gzip"] }
+
+# OpenTelemetry core only (P-MW, 蓝图 §4.0.1 评审 1.10): RequestContext.trace_cx
+# 的类型载体。恒依赖、无 SDK/exporter（P-TRACE 才以 opt-in feature 引入）。
+opentelemetry = { version = "0.30", default-features = false }
 
 # transport
 zmq = "0.10"

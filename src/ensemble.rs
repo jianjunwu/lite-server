@@ -378,6 +378,7 @@ async fn execute_step(
         meta: Some(std::sync::Arc::new(meta)),
         response_tx,
         inflight_guard: None,
+        enqueued_at: std::time::Instant::now(),
     };
 
     match state.inference_queue.try_submit(&step.model, &step.version, item) {

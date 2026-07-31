@@ -3,6 +3,7 @@ use super::inference::{build_request_meta, resolve_version};
 use crate::error::AppError;
 use crate::http::state::AppState;
 use crate::proto::liteserver as pb;
+use crate::request_context::RequestContext;
 use crate::worker::protocol::RouteDecl;
 use axum::http::HeaderMap;
 use axum::response::Response;
@@ -108,7 +109,7 @@ pub async fn dispatch_custom_route(
     query: HashMap<String, String>,
     headers: &HeaderMap,
     body: bytes::Bytes,
-    request_id: String,
+    cx: &RequestContext,
 ) -> Result<Response, AppError> {
     crate::validation::validate_identifier(model_name)?;
     let method_str = method.as_str();
@@ -169,8 +170,8 @@ pub async fn dispatch_custom_route(
         version: resolved_version.clone(),
         route: route_pattern.clone(),
         protocol: crate::callback::Protocol::Http,
-        request_id: request_id.clone(),
-        client_ip: extract_client_ip(headers),
+        request_id: cx.request_id.clone(),
+        client_ip: cx.client_ip.clone(),
         elapsed_us: None,
     };
     let cb_runner = state.callback_runner.clone();
@@ -182,7 +183,7 @@ pub async fn dispatch_custom_route(
     // Build the request: route_call reuses the SingleRequest body type; the
     // route tag discriminates dispatch in the worker. method/query/path_params
     // ride on RequestMeta (route_pattern == meta.route).
-    let mut meta = build_request_meta(headers, &serde_json::Value::Null, &route_pattern, request_id);
+    let mut meta = build_request_meta(headers, &serde_json::Value::Null, &route_pattern, cx);
     meta.method = method_str.to_string();
     meta.query = query;
     meta.path_params = path_params;
