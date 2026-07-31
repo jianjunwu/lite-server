@@ -2665,6 +2665,83 @@ async fn test_grpc_infer_echoes_request_id() {
 }
 
 // ---------------------------------------------------------------------------
+// P3-1: gRPC 限流（ResourceExhausted 专给限流，落 4xx）
+// ---------------------------------------------------------------------------
+
+/// policy_model 声明 rate_limit rpm=3 burst=3。gRPC 连续 4 次 infer：前 3 次
+/// 放行，第 4 次 ResourceExhausted + retry-after（蓝图 §4.1 P3-1 / §4.0.9）。
+#[tokio::test]
+#[serial]
+async fn test_grpc_infer_rate_limit_returns_resource_exhausted() {
+    use bytes::Bytes;
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+    use std::collections::HashMap;
+
+    let http_port = 18082u16;
+    let grpc_port = 18083u16;
+    let metrics_port = 18084u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    kill_stale_on_port(metrics_port);
+    let repo = test_model_repo();
+    let _server = ServerGuard::start(&[
+        "--port",
+        &http_port.to_string(),
+        "--grpc-port",
+        &grpc_port.to_string(),
+        "--metrics-port",
+        &metrics_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--log-level",
+        "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "policy_model", "1").await;
+    assert!(
+        wait_model_ready(&base, "policy_model", 20).await,
+        "policy_model must become ready"
+    );
+
+    let mut client = LiteServerClient::connect(format!("http://127.0.0.1:{}", grpc_port))
+        .await
+        .expect("gRPC client must connect");
+
+    let mk = || InferRequest {
+        model_name: "policy_model".to_string(),
+        version: "1".to_string(),
+        data: Bytes::from(serde_json::to_vec(&json!({"input": 1})).unwrap()),
+        headers: HashMap::new(),
+    };
+
+    // burst=3：前 3 次放行。
+    for i in 0..3 {
+        let r = client.infer(mk()).await;
+        assert!(r.is_ok(), "request {} must be allowed: {:?}", i + 1, r.err());
+    }
+    // 第 4 次 ResourceExhausted + retry-after。
+    let err = client
+        .infer(mk())
+        .await
+        .expect_err("4th request must be rate-limited");
+    assert_eq!(
+        err.code(),
+        tonic::Code::ResourceExhausted,
+        "over-limit must be ResourceExhausted (not Unavailable): {:?}",
+        err
+    );
+    assert!(
+        err.metadata().get("retry-after").is_some(),
+        "retry-after metadata must be present: {:?}",
+        err.metadata()
+    );
+
+    unload_model(&base, "policy_model", "1").await;
+}
+
+// ---------------------------------------------------------------------------
 // gRPC health checking (grpc.health.v1, phase 3)
 // ---------------------------------------------------------------------------
 

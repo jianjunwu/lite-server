@@ -163,6 +163,24 @@ impl LiteServer {
         prometheus::register_gie_metrics(&self.config.metrics.metric_namespace)
             .map_err(|e| AppError::Config(format!("invalid metrics.metric_namespace: {}", e)))?;
 
+        // P3-1：共享 RateLimiter 构造上移（HTTP/gRPC 同一实例 + 60s cleanup）。
+        let rate_limiter = std::sync::Arc::new(crate::rate_limit::RateLimiter::new(
+            self.config.rate_limit.max_buckets,
+        ));
+        {
+            let limiter = rate_limiter.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    tick.tick().await;
+                    let removed = limiter.cleanup_stale(std::time::Duration::from_secs(600));
+                    if removed > 0 {
+                        tracing::debug!(removed, "rate limiter: evicted stale buckets");
+                    }
+                }
+            });
+        }
+
         // Start reload listener for max_requests auto-recycle
         self.worker_manager.start_reload_listener().await;
 
@@ -208,6 +226,7 @@ impl LiteServer {
             shutdown_state.clone(),
             self.callback_runner.clone(),
             has_hot_reload_for_http,
+            rate_limiter.clone(),
         ));
 
         // When HTTP uses a Unix socket, gRPC/metrics still need a TCP host.
@@ -238,6 +257,7 @@ impl LiteServer {
                 self.callback_runner.clone(),
                 Duration::from_secs_f64(self.config.server.timeout as f64),
                 self.config.grpc.clone(),
+                rate_limiter.clone(),
             )))
         } else {
             None

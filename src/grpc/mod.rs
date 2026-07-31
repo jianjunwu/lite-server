@@ -31,6 +31,10 @@ pub struct GrpcService {
     /// Per-request inference deadline. Mirrors the REST path's
     /// `config.server.timeout` so gRPC and HTTP share one request budget.
     server_timeout: Duration,
+    /// Shared per-instance rate limiter（P3-1：构造上移 server/mod.rs，HTTP/gRPC
+    /// 共用同一实例 + 60s cleanup task）。进程内 DashMap → per-instance（多副本
+    /// 实际限额 = N×配置值；全局限流属上游网关职责，§4.1 P3-1 评审 2.2）。
+    rate_limiter: Arc<crate::rate_limit::RateLimiter>,
 }
 
 impl GrpcService {
@@ -40,6 +44,7 @@ impl GrpcService {
         streaming_metrics: bool,
         callback_runner: Arc<CallbackRunner>,
         server_timeout: Duration,
+        rate_limiter: Arc<crate::rate_limit::RateLimiter>,
     ) -> Self {
         Self {
             registry,
@@ -47,6 +52,7 @@ impl GrpcService {
             streaming_metrics,
             callback_runner,
             server_timeout,
+            rate_limiter,
         }
     }
 
@@ -99,6 +105,7 @@ impl GrpcService {
 
         if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
             enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
+            enforce_grpc_rate_limit(&self.rate_limiter, mv.policies.rate_limit.as_ref(), model_name, &client_ip)?;
         }
 
         let header_map: HashMap<String, String> = req.headers.clone();
@@ -286,6 +293,7 @@ impl GrpcService {
 
         if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
             enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
+            enforce_grpc_rate_limit(&self.rate_limiter, mv.policies.rate_limit.as_ref(), model_name, &client_ip)?;
         }
 
         let header_map: HashMap<String, String> = req.headers.clone();
@@ -412,6 +420,7 @@ impl GrpcService {
 
         if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
             enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
+            enforce_grpc_rate_limit(&self.rate_limiter, mv.policies.rate_limit.as_ref(), model_name, &client_ip)?;
         }
 
         let header_map: HashMap<String, String> = req.headers.clone();
@@ -592,6 +601,8 @@ impl GrpcService {
                     // only credential carrier on this path.
                     if let Some(mv) = self.registry.get(&model_name, Some(&resolved_version)) {
                         enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &HashMap::new())?;
+                        // bidi key="ip" 共享 bucket（注释注明：所有 bidi 请求归一）。
+                        enforce_grpc_rate_limit(&self.rate_limiter, mv.policies.rate_limit.as_ref(), &model_name, &client_ip)?;
                     }
 
                     let sid = format!("grpc-bidi-{}", Uuid::new_v4());
@@ -1049,6 +1060,49 @@ fn enforce_auth_grpc(
     Ok(())
 }
 
+/// gRPC 限流（P3-1，对齐 HTTP `enforce_rate_limit`）：policy 来自
+/// `ModelVersion.policies.rate_limit`；`key=="ip"` 用清洗后 client_ip，否则
+/// `/predict` 路由 scope（同模型所有推理共享一桶）。超限 → ResourceExhausted
+/// （**专给限流**，落 4xx）+ `retry-after` metadata（§4.0.9 收口；queue-full/
+/// 过载用 Unavailable）。无 policy 不限；`rpm<=0` fail-closed（RateLimiter 内置）。
+/// 限流放 handler：interceptor 在 decode 前取不到 model 名（D6）。
+fn enforce_grpc_rate_limit(
+    rate_limiter: &crate::rate_limit::RateLimiter,
+    rl: Option<&crate::config::RateLimitPolicy>,
+    model_name: &str,
+    client_ip: &str,
+) -> Result<(), Status> {
+    let Some(rl) = rl else {
+        return Ok(());
+    };
+    let scope = match rl.key.as_str() {
+        "ip" => client_ip.to_string(),
+        _ => "/predict".to_string(),
+    };
+    if rl.key == "ip" && scope.is_empty() {
+        warn!(
+            model = %model_name,
+            "rate-limit key=ip resolved to empty scope; all requests share one bucket"
+        );
+    }
+    let burst = rl.burst.unwrap_or(rl.requests_per_minute * 1.5);
+    let key = format!("{}:{}", model_name, scope);
+    match rate_limiter.acquire(&key, rl.requests_per_minute, burst) {
+        crate::rate_limit::AcquireResult::Allowed => Ok(()),
+        crate::rate_limit::AcquireResult::Rejected { retry_after_secs } => {
+            let mut status = Status::resource_exhausted(format!(
+                "rate limit exceeded for {} (retry in {}s)",
+                model_name, retry_after_secs
+            ));
+            // retry-after 经 metadata 回传（对齐 HTTP Retry-After header）。
+            if let Ok(v) = MetadataValue::try_from(retry_after_secs.to_string().as_str()) {
+                status.metadata_mut().insert("retry-after", v);
+            }
+            Err(err(status))
+        }
+    }
+}
+
 /// Effective HTTP/2 keepalive parameters (P1-2): `(interval, timeout)`.
 /// `None` when keepalive is disabled (interval unset). The timeout defaults
 /// to 20s when only the interval is configured; a timeout configured without
@@ -1220,6 +1274,7 @@ pub async fn start_grpc_server(
     callback_runner: Arc<CallbackRunner>,
     server_timeout: Duration,
     grpc_config: crate::config::GrpcConfig,
+    rate_limiter: Arc<crate::rate_limit::RateLimiter>,
 ) -> Result<(), AppError> {
     let addr: std::net::SocketAddr = format!("{}:{}", host, port)
         .parse()
@@ -1231,6 +1286,7 @@ pub async fn start_grpc_server(
         streaming_metrics,
         callback_runner,
         server_timeout,
+        rate_limiter,
     );
     let server = LiteServerServer::new(service);
     // P1-3: gzip response compression is opt-in and applies to the
@@ -1858,6 +1914,7 @@ mod request_metrics_tests {
             false,
             Arc::new(CallbackRunner::new()),
             Duration::from_secs(5),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
         )
     }
 
@@ -2052,54 +2109,134 @@ mod request_metrics_tests {
     /// handler 创建 `inference` span，字段与 HTTP info_span! 一致（model/version/
     /// request_id）。错误路径在 span 内打日志（err 助手），故 span 上下文可见。
     /// handler 创建 `inference` span，字段与 HTTP info_span! 一致（model/version/
-    /// request_id）。用一个 in-memory capturing subscriber（thread-local
-    /// set_default）捕获 err() 在 span 内打的 info 事件——其输出含 span 名 +
-    /// 字段，证明 span 被创建并覆盖 handler。（蓝图建议 tracing-test，但其
-    /// 属性宏在本工具链未注入 `logs`，故用等价的手动 capturing subscriber。）
-    #[tokio::test]
-    async fn should_create_inference_span_with_fields() {
+    /// request_id）。在专用线程上 set_default 一个 span-recording Layer + 自有
+    /// current_thread runtime——线程局部 subscriber 覆盖全局，且 block_on 在持有
+    /// guard 的同一线程轮询，并行测试套件下确定性地捕获 span 创建。蓝图建议
+    /// tracing-test，但其属性宏在本工具链未注入 `logs`，故用等价方案。
+    #[test]
+    fn should_create_inference_span_with_fields() {
         use std::sync::{Arc, Mutex};
-        use tracing_subscriber::fmt::format::FmtSpan;
-        use tracing_subscriber::fmt::{MakeWriter};
+        use tracing::field::Visit;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
-        #[derive(Clone)]
-        struct CaptureMaker(Arc<Mutex<Vec<u8>>>);
-        impl<'a> MakeWriter<'a> for CaptureMaker {
-            type Writer = CaptureWriter;
-            fn make_writer(&'a self) -> Self::Writer {
-                CaptureWriter(self.0.clone())
-            }
-        }
-        struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for CaptureWriter {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().write(b)
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
+        #[derive(Default)]
+        struct FieldCollector(Vec<(String, String)>);
+        impl Visit for FieldCollector {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push((field.name().to_string(), format!("{:?}", value)));
             }
         }
 
-        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(CaptureMaker(buf.clone()))
-            .with_target(false)
-            .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
-            .with_span_events(FmtSpan::ACTIVE)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        type Recorded = Arc<Mutex<Vec<(String, Vec<(String, String)>)>>>;
+        struct SpanLayer(Recorded);
+        impl<S: tracing::Subscriber> Layer<S> for SpanLayer {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _id: &tracing::span::Id,
+                _ctx: Context<'_, S>,
+            ) {
+                let mut collector = FieldCollector::default();
+                attrs.record(&mut collector);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((attrs.metadata().name().to_string(), collector.0));
+            }
+        }
 
-        let service = build_service(Arc::new(ModelRegistry::new()), Arc::new(InferenceQueue::new()));
-        let mut req = infer_request("span_404", "");
-        req.metadata_mut()
-            .insert("x-client-request-id", "span-rid".parse().unwrap());
-        let err = service.infer(req).await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::NotFound);
+        let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+        let recorded_thread = recorded.clone();
+        let handle = std::thread::spawn(move || {
+            let subscriber = tracing_subscriber::registry().with(SpanLayer(recorded_thread));
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let service = build_service(
+                    Arc::new(ModelRegistry::new()),
+                    Arc::new(InferenceQueue::new()),
+                );
+                let mut req = infer_request("span_404", "");
+                req.metadata_mut()
+                    .insert("x-client-request-id", "span-rid".parse().unwrap());
+                let _ = service.infer(req).await;
+            });
+        });
+        handle.join().expect("span test thread must not panic");
 
-        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        assert!(logs.contains("inference"), "inference span must be created: {}", logs);
-        assert!(logs.contains("span_404"), "span must carry model field: {}", logs);
-        assert!(logs.contains("span-rid"), "span must carry request_id: {}", logs);
+        let spans = recorded.lock().unwrap();
+        let inference = spans
+            .iter()
+            .find(|(name, _)| name == "inference")
+            .expect("inference span must be created");
+        let field = |key: &str| -> String {
+            inference
+                .1
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        assert!(field("model").contains("span_404"), "span model field: {:?}", inference.1);
+        assert!(field("request_id").contains("span-rid"), "span request_id field: {:?}", inference.1);
+    }
+
+    // ===== P3-1: gRPC 限流 =====
+
+    use crate::config::RateLimitPolicy;
+
+    fn rl(rpm: f64, key: &str, burst: Option<f64>) -> RateLimitPolicy {
+        RateLimitPolicy {
+            requests_per_minute: rpm,
+            key: key.to_string(),
+            burst,
+        }
+    }
+
+    /// 无 policy 不限（直通 Ok）。
+    #[test]
+    fn rate_limit_no_policy_is_unlimited() {
+        let limiter = crate::rate_limit::RateLimiter::default();
+        assert!(enforce_grpc_rate_limit(&limiter, None, "m", "1.2.3.4").is_ok());
+    }
+
+    /// 超限返 ResourceExhausted + retry-after metadata（§4.0.9：ResourceExhausted
+    /// 专给限流，落 4xx；queue-full/过载才是 Unavailable）。
+    #[test]
+    fn rate_limit_over_limit_returns_resource_exhausted_with_retry_after() {
+        let limiter = crate::rate_limit::RateLimiter::default();
+        let policy = rl(1.0, "ip", None); // 极低配额
+        // 首个请求耗尽配额，第二个被拒。
+        let _ = enforce_grpc_rate_limit(&limiter, Some(&policy), "rlm", "9.9.9.9");
+        let err = enforce_grpc_rate_limit(&limiter, Some(&policy), "rlm", "9.9.9.9")
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            err.metadata().get("retry-after").is_some(),
+            "retry-after metadata must be present: {:?}",
+            err.metadata()
+        );
+    }
+
+    /// key="ip"：不同 IP 各自独立桶（互不影响）。
+    #[test]
+    fn rate_limit_key_ip_separates_buckets_by_ip() {
+        let limiter = crate::rate_limit::RateLimiter::default();
+        let policy = rl(1.0, "ip", None);
+        let _ = enforce_grpc_rate_limit(&limiter, Some(&policy), "m", "10.0.0.1");
+        // 不同 IP 不受 10.0.0.1 的桶耗尽影响。
+        assert!(enforce_grpc_rate_limit(&limiter, Some(&policy), "m", "10.0.0.2").is_ok());
+    }
+
+    /// rpm<=0 fail-closed（RateLimiter 内置：rate=0 直接拒，retry_after 兜底）。
+    #[test]
+    fn rate_limit_zero_rpm_fails_closed() {
+        let limiter = crate::rate_limit::RateLimiter::default();
+        let policy = rl(0.0, "route", None);
+        let err = enforce_grpc_rate_limit(&limiter, Some(&policy), "m", "1.2.3.4").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
     }
 }
