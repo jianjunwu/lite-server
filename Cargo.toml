@@ -29,9 +29,12 @@ prost-types = "0.13"
 semver = "1.0"
 
 # gRPC
-tonic = "0.12"
+tonic = { version = "0.12", features = ["gzip"] }
 tonic-health = { version = "0.12", features = ["transport"] }
 tokio-stream = "0.1"
+
+# HTTP middleware (response compression, P1-4)
+tower-http = { version = "0.6", features = ["compression-gzip"] }
 
 # transport
 zmq = "0.10"

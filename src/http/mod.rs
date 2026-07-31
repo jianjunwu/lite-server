@@ -151,6 +151,25 @@ async fn observability_middleware(mut request: Request, next: Next) -> Response 
     response
 }
 
+/// Compression predicate (P1-4): never compress SSE responses — buffering
+/// would break per-event flush semantics.
+#[derive(Clone, Copy)]
+struct NotEventStream;
+
+impl tower_http::compression::predicate::Predicate for NotEventStream {
+    fn should_compress<B>(&self, response: &http::Response<B>) -> bool
+    where
+        B: axum::body::HttpBody,
+    {
+        response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|ct| !ct.starts_with("text/event-stream"))
+            .unwrap_or(true)
+    }
+}
+
 #[cfg(unix)]
 use tokio::net::UnixListener;
 
@@ -197,6 +216,18 @@ pub async fn start_http_server(
     // Keepalive middleware (inner)
     let app = if config.server.keepalive_timeout <= 0.0 {
         app.layer(axum::middleware::from_fn(disable_keepalive_middleware))
+    } else {
+        app
+    };
+
+    // Response compression (P1-4, inside observability so processing-time
+    // reflects handling, not the wire): gzip textual responses when the
+    // client accepts it. SSE is excluded — buffering would break per-event
+    // flush; WS upgrades carry no body and are unaffected.
+    let app = if config.server.compression {
+        use tower_http::compression::predicate::{DefaultPredicate, Predicate};
+        let predicate = DefaultPredicate::new().and(NotEventStream);
+        app.layer(tower_http::compression::CompressionLayer::new().compress_when(predicate))
     } else {
         app
     };
