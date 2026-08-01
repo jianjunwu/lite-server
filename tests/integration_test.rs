@@ -23,6 +23,30 @@ fn lite_server_bin() -> std::path::PathBuf {
         .join("lite-server-core")
 }
 
+/// Hand out a monotonically-unique TCP port for a dedicated-server test.
+///
+/// `kill_stale_on_port` pre-emptively `SIGKILL`s any `lite-server` holding the
+/// port. If two tests shared a fixed port and ran at once — and a `#[serial]`
+/// test is only excluded from *other serial* tests, not from non-serial ones —
+/// one test's `kill_stale_on_port` would murder the other's live server
+/// mid-flight. Under default-thread parallelism that surfaces as a server
+/// dying mid-test and, depending on timing, a hang the runner `SIGKILL`s with
+/// no FAILED line.
+///
+/// A per-process monotonic allocator guarantees no two concurrent tests ever
+/// share a port, so `kill_stale_on_port` can only ever find THIS test's own
+/// stale server (a previous crashed run reused the same reset counter value),
+/// never a sibling's. The counter resets each process; a stale server left by
+/// a crashed run is reclaimed by the next run's `kill_stale_on_port` on the
+/// same number.
+fn next_test_port() -> u16 {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    // Above every fixed port still baked into server_yaml literals (18020-18391)
+    // and below the macOS/Linux ephemeral ranges.
+    static NEXT: AtomicU16 = AtomicU16::new(19000);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 fn start_server(args: &[&str]) -> std::process::Child {
     let mut cmd = Command::new(lite_server_bin());
     cmd.arg("serve")
@@ -671,7 +695,7 @@ async fn test_health_probes() {
 /// /health reports not_ready with an empty model list.
 #[tokio::test]
 async fn test_readyz_503_when_no_models() {
-    let http_port = 18072u16;
+    let http_port = next_test_port();
     kill_stale_on_port(http_port);
     let repo = test_model_repo();
     let _server = ServerGuard::start(&[
@@ -1192,8 +1216,8 @@ async fn test_batch_aggregation_per_item_status_and_headers() {
 async fn test_http_response_compression() {
     use futures::{SinkExt, StreamExt};
 
-    let http_port = 18090u16;
-    let grpc_port = 18091u16;
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
     let repo = test_model_repo();
@@ -1351,8 +1375,8 @@ async fn test_grpc_uds_infer_health_default_mode() {
     use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
     use lite_server::proto::liteserver::InferRequest;
 
-    let http_port = 18094u16;
-    let grpc_port = 18095u16; // parsed but unused for bind (UDS)
+    let http_port = next_test_port();
+    let grpc_port = next_test_port(); // parsed but unused for bind (UDS)
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
     let repo = test_model_repo();
@@ -1425,8 +1449,8 @@ async fn test_grpc_uds_infer_health_default_mode() {
 #[tokio::test]
 #[serial]
 async fn test_grpc_uds_custom_socket_mode() {
-    let http_port = 18097u16;
-    let grpc_port = 18098u16;
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
     let repo = test_model_repo();
@@ -1477,8 +1501,8 @@ async fn test_grpc_graceful_shutdown_drains_inflight() {
     use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
     use lite_server::proto::liteserver::InferRequest;
 
-    let http_port = 18210u16;
-    let grpc_port = 18211u16;
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
     let repo = create_slow_model_repo(2);
@@ -1559,8 +1583,8 @@ async fn test_grpc_shutdown_rejects_new_rpcs() {
     use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
     use lite_server::proto::liteserver::InferRequest;
 
-    let http_port = 18220u16;
-    let grpc_port = 18221u16;
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
     let repo = create_slow_model_repo(5); // keeps the server in drain mode
@@ -1652,8 +1676,8 @@ async fn test_grpc_shutdown_rejects_new_rpcs() {
 #[tokio::test]
 #[serial]
 async fn test_shutdown_health_goes_unavailable() {
-    let http_port = 18230u16;
-    let grpc_port = 18231u16;
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
     let repo = test_model_repo();
@@ -1809,8 +1833,8 @@ async fn test_websocket_streaming() {
 #[tokio::test]
 #[serial]
 async fn test_metrics_endpoint() {
-    let port = 18020;
-    let metrics_port = 18021;
+    let port = next_test_port();
+    let metrics_port = next_test_port();
     kill_stale_on_port(port);
     kill_stale_on_port(metrics_port);
     let repo = test_model_repo();
@@ -2029,7 +2053,7 @@ async fn test_sse_rate_limit_returns_429() {
     // Dedicated server: the rate-limit bucket is shared across tests on the
     // shared server (key model:/predict, burst=3), so a fresh process gives a
     // deterministic starting bucket.
-    let port = 18040;
+    let port = next_test_port();
     kill_stale_on_port(port);
     let repo = test_model_repo();
     let _server = ServerGuard::start(&[
@@ -2187,7 +2211,7 @@ async fn test_inference_options_preflight_all_routes() {
 async fn test_infer_cors_success_and_rate_limit_error() {
     // Dedicated server: policy_model's rate-limit bucket (burst=3) is shared
     // across tests on the shared server, so a fresh process gives a clean bucket.
-    let port = 18042;
+    let port = next_test_port();
     kill_stale_on_port(port);
     let repo = test_model_repo();
     let _server = ServerGuard::start(&[
@@ -2299,7 +2323,7 @@ class TestAPI(LitAPI):
     let model_py = repo_dst.join("test_model/1/model.py");
     tokio::fs::write(&model_py, original).await.unwrap();
 
-    let port = 18030;
+    let port = next_test_port();
     kill_stale_on_port(port);
     let server = start_server(&[
         "--port", &port.to_string(),
@@ -2408,7 +2432,7 @@ class TestAPI(LitAPI):
         "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\nhot_reload: true\nhot_reload_patterns: [\"*.txt\"]\n",
     ).unwrap();
 
-    let port = 18031;
+    let port = next_test_port();
     kill_stale_on_port(port);
     let server = start_server(&[
         "--port", &port.to_string(),
@@ -2499,7 +2523,7 @@ class ReloadAPI(LitAPI):
         std::fs::write(dir.join("config.yaml"), cfg).unwrap();
     }
 
-    let port = 18090;
+    let port = next_test_port();
     kill_stale_on_port(port);
     let _server = ServerGuard::start(&[
         "--port", &port.to_string(),
@@ -2641,7 +2665,7 @@ class LruAPI(LitAPI):
         std::fs::write(dir.join("model.py"), model_py).unwrap();
         std::fs::write(dir.join("config.yaml"), cfg).unwrap();
     }
-    let port = 18091;
+    let port = next_test_port();
     let server_yaml = tmp_dir.join("server.yaml");
     std::fs::write(
         &server_yaml,
@@ -2761,7 +2785,7 @@ async fn test_auto_poll_discovers_new_version() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
     write_poll_model_version(&tmp_dir, "1");
 
-    let port = 18101;
+    let port = next_test_port();
     let server_yaml = write_auto_poll_server_yaml(&tmp_dir, port, 18111, 18112);
     kill_stale_on_port(port);
     let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
@@ -2804,7 +2828,7 @@ async fn test_auto_poll_unloads_removed_version() {
     write_poll_model_version(&tmp_dir, "1");
     write_poll_model_version(&tmp_dir, "2");
 
-    let port = 18102;
+    let port = next_test_port();
     let server_yaml = write_auto_poll_server_yaml(&tmp_dir, port, 18113, 18114);
     kill_stale_on_port(port);
     let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
@@ -2889,7 +2913,7 @@ async fn test_weighted_routing_canary() {
     let tmp_dir = std::env::temp_dir().join(format!("lite-server-canary-{}", std::process::id()));
     write_canary_model_repo(&tmp_dir);
 
-    let port = 18092;
+    let port = next_test_port();
     kill_stale_on_port(port);
     let cfg_dir = std::env::temp_dir().join(format!("lite-server-canary-cfg-{}", std::process::id()));
     std::fs::create_dir_all(&cfg_dir).unwrap();
@@ -3010,8 +3034,8 @@ async fn test_grpc_canary_pin_parity() {
         Ok(body["output"].as_i64().unwrap())
     }
 
-    let http_port = 18115u16;
-    let grpc_port = 18116u16;
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
     let tmp_dir = std::env::temp_dir().join(format!("lite-server-grpc-canary-{}", std::process::id()));
@@ -3076,7 +3100,7 @@ async fn test_grpc_canary_pin_parity() {
 /// 下 x-lite-version 被整体忽略——pin 不影响权重路由，非法/不存在的 pin 也不报错。
 #[tokio::test]
 async fn test_canary_override_default_off_ignores_pin() {
-    let port = 18117u16;
+    let port = next_test_port();
     kill_stale_on_port(port);
     let tmp_dir = std::env::temp_dir().join(format!("lite-server-canary-off-{}", std::process::id()));
     write_canary_model_repo(&tmp_dir);
@@ -3167,8 +3191,8 @@ async fn test_grpc_infer_aggregates_into_batch() {
     use std::collections::HashMap;
 
     // Dedicated server WITH gRPC enabled (the shared server runs --no-grpc).
-    let http_port = 18070u16;
-    let grpc_port = 18071u16;
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
     let repo = test_model_repo();
@@ -3230,8 +3254,8 @@ async fn test_grpc_decoupled_infer_pushes_chunks_then_final() {
     use std::collections::HashMap;
 
     // Dedicated server WITH gRPC (shared server runs --no-grpc).
-    let http_port = 18080u16;
-    let grpc_port = 18081u16;
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
     let repo = test_model_repo();
@@ -3299,8 +3323,8 @@ async fn test_grpc_decoupled_infer_not_implemented_is_failed_precondition() {
     use lite_server::proto::liteserver::DecoupledInferRequest;
     use std::collections::HashMap;
 
-    let http_port = 18082u16;
-    let grpc_port = 18083u16;
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
     let repo = test_model_repo();
@@ -3368,9 +3392,9 @@ async fn test_grpc_infer_records_request_metrics() {
     use lite_server::proto::liteserver::InferRequest;
     use std::collections::HashMap;
 
-    let http_port = 18076u16;
-    let grpc_port = 18077u16;
-    let metrics_port = 18078u16;
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    let metrics_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
     kill_stale_on_port(metrics_port);
@@ -3465,9 +3489,9 @@ async fn test_grpc_infer_echoes_request_id() {
     use std::collections::HashMap;
     use tonic::Request;
 
-    let http_port = 18079u16;
-    let grpc_port = 18080u16;
-    let metrics_port = 18081u16;
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    let metrics_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
     kill_stale_on_port(metrics_port);
@@ -3564,9 +3588,9 @@ async fn test_grpc_infer_rate_limit_returns_resource_exhausted() {
     use lite_server::proto::liteserver::InferRequest;
     use std::collections::HashMap;
 
-    let http_port = 18082u16;
-    let grpc_port = 18083u16;
-    let metrics_port = 18084u16;
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    let metrics_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
     kill_stale_on_port(metrics_port);
@@ -3640,8 +3664,8 @@ async fn test_grpc_health_service() {
     use tonic_health::pb::HealthCheckRequest;
 
     // Dedicated server WITH gRPC enabled (the shared server runs --no-grpc).
-    let http_port = 18074u16;
-    let grpc_port = 18075u16;
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
     let repo = test_model_repo();
@@ -3730,8 +3754,8 @@ async fn test_grpc_response_compression_gzip() {
     use std::collections::HashMap;
     use tonic::codec::CompressionEncoding;
 
-    let http_port = 18080u16;
-    let grpc_port = 18081u16;
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
     let repo = test_model_repo();
@@ -3861,7 +3885,7 @@ ensemble:
     )
     .unwrap();
 
-    let http_port = 18080u16;
+    let http_port = next_test_port();
     kill_stale_on_port(http_port);
     let _server = ServerGuard::start(&[
         "--port",
@@ -3963,8 +3987,8 @@ async fn test_grpc_ensemble_infer_walks_dag() {
     use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
     use lite_server::proto::liteserver::InferRequest;
 
-    let http_port = 18350u16;
-    let grpc_port = 18351u16;
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
 
@@ -4072,8 +4096,8 @@ async fn test_grpc_ensemble_dag_error_maps_to_status() {
     use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
     use lite_server::proto::liteserver::InferRequest;
 
-    let http_port = 18360u16;
-    let grpc_port = 18361u16;
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
 
@@ -4165,8 +4189,8 @@ async fn test_access_control_admin_key_mode_both_protocols() {
     use lite_server::proto::liteserver::admin_client::AdminClient;
     use lite_server::proto::liteserver::GetInfoRequest;
 
-    let http_port = 18370u16;
-    let grpc_port = 18371u16;
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
 
@@ -4257,8 +4281,8 @@ async fn test_admin_bind_splits_admin_onto_udf() {
     use lite_server::proto::liteserver::admin_client::AdminClient;
     use lite_server::proto::liteserver::GetInfoRequest;
 
-    let http_port = 18390u16;
-    let grpc_port = 18391u16;
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
     kill_stale_on_port(http_port);
     kill_stale_on_port(grpc_port);
     let admin_sock = std::env::temp_dir()
@@ -4378,7 +4402,7 @@ async fn wait_for_pid_gone(pid: i32, timeout_secs: u64) -> bool {
 #[tokio::test]
 async fn die_with_parent_self_terminates_when_parent_killed() {
     use std::io::BufRead;
-    let port = 18350u16;
+    let port = next_test_port();
     kill_stale_on_port(port);
     let repo = test_model_repo().to_string_lossy().to_string();
     // Spawn the server under a disposable `sh` wrapper so we can SIGKILL its
@@ -4430,7 +4454,7 @@ async fn die_with_parent_self_terminates_when_parent_killed() {
 #[cfg(unix)]
 #[tokio::test]
 async fn worker_self_terminates_when_server_killed() {
-    let port = 18351u16;
+    let port = next_test_port();
     kill_stale_on_port(port);
     let repo = test_model_repo();
     let mut server = start_server(&[
@@ -4501,9 +4525,9 @@ fn worker_inference_total(body: &str, model: &str, worker_id: u32) -> u64 {
 #[tokio::test]
 #[serial]
 async fn test_sequence_id_stickiness_pins_concurrent_requests_to_one_worker() {
-    let http_port = 18160u16;
-    let grpc_port = 18161u16;
-    let metrics_port = 18162u16;
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    let metrics_port = next_test_port();
     for p in [http_port, grpc_port, metrics_port] {
         kill_stale_on_port(p);
     }
@@ -4644,4 +4668,55 @@ class StickyAPI(LitAPI):
     unload_model(&base, "sticky_model", "1").await;
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_file(&cfg_path);
+}
+
+// ---------------------------------------------------------------------------
+// Port allocator — collision-free ports for dedicated-server tests
+// ---------------------------------------------------------------------------
+//
+// `kill_stale_on_port` does a blind `libc::kill(pid, SIGKILL)` on any
+// `lite-server` process holding the port. Two tests reusing a fixed port and
+// running concurrently (a `#[serial]` test is excluded only from OTHER serial
+// tests, not from non-serial ones) cross-SIGKILL each other's live server —
+// which under default-thread parallelism surfaces as a mid-test server death
+// and, depending on timing, a hang the runner SIGKILLs with no FAILED line.
+// These tests pin the invariant that prevents that: `next_test_port()` never
+// hands the same port to two callers, concurrent or not.
+
+#[test]
+fn next_test_port_is_unique_single_threaded() {
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..256 {
+        assert!(seen.insert(next_test_port()), "allocator reused a port");
+    }
+}
+
+#[test]
+fn next_test_port_is_unique_under_concurrency() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    let seen = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    let collisions = Arc::new(AtomicUsize::new(0));
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let (seen, collisions) = (seen.clone(), collisions.clone());
+            thread::spawn(move || {
+                for _ in 0..64 {
+                    if !seen.lock().unwrap().insert(next_test_port()) {
+                        collisions.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    assert_eq!(
+        collisions.load(Ordering::Relaxed),
+        0,
+        "concurrent port allocation collided — sibling tests could share a port"
+    );
 }
