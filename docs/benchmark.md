@@ -85,39 +85,69 @@ When a regression shows up, decompose it with:
 
 ## wrk comparison (lite-server vs LitServe)
 
-> **Note:** The benchmark data below is a preliminary placeholder with limited data points (2 worker configurations × 1 concurrency level). Comprehensive benchmarks covering more configurations, hardware platforms, and real model workloads are planned. Use as a rough reference only.
+> **Note:** Measured 2026-08-02 on a single workstation (Intel i9-9980HK) — see "Test Environment" below. A single machine × single model workload is not a verdict; use it as a directional reference, not a spec.
 
-Performance comparison of lite-server vs LitServe using `wrk` (preliminary data).
+Performance comparison of lite-server vs LitServe using `wrk`. Two workloads are
+reported: a **1ms sleep mock** (this section — measures worker-bound behavior,
+where framework overhead is drowned out) and a **zero-compute echo model**
+([below](#framework-overhead-comparison-zero-compute-echo-aligned) — measures
+pure framework overhead, where the real differences show).
 
 ## Test Environment
 
-- **Model**: 1ms `time.sleep()` CPU mock (measures IPC and HTTP overhead, not GPU compute)
-- **Tool**: `wrk` with POST requests (`{"input":"hello"}`)
-- **OS**: macOS (Apple Silicon)
+- **Model**: 1ms `time.sleep()` CPU mock for the matrix below; zero-compute echo for the framework-overhead section
+- **Tool**: `wrk` 4.2.0, POST requests (`{"input":"hello"}`), 30s per config, 4 threads
+- **OS**: macOS x86_64, Intel Core i9-9980HK (8P/16L), 32 GB
+- **Versions**: lite-server 0.7.8 (git `82b0535`) vs LitServe 0.2.17
+- **HTTP-layer threading** (alignment matters for the comparison): LitServe runs
+  a single uvicorn process with one asyncio event loop. lite-server /
+  lite-server-core run tokio with N worker threads (`--threads N`, default =
+  CPU cores). To compare like-for-like, the framework-overhead section pins
+  `--threads 1` — one event-loop thread on both sides.
 
-## Results
+## Results (1ms sleep model)
 
 ### Throughput (req/s)
 
 | Workers | Concurrency | lite-server | LitServe | lite-server-core | Speedup (ls/lit) |
 |---------|-------------|-------------|----------|------------------|-------------------|
-| 1 | 4 | 171 | 330 | 444 | 0.5x |
-| 2 | 4 | 1,583 | 531 | 1,364 | 3.0x |
+| 1 | 1 | 353 | 379 | 443 | 0.93x |
+| 1 | 4 | 634 | 656 | 612 | 0.97x |
+| 1 | 16 | 658 | 656 | 695 | 1.00x |
+| 1 | 64 | 666 | 658 | 694 | 1.01x |
+| 2 | 1 | 335 | 346 | 395 | 0.97x |
+| 2 | 4 | 1,203 | 1,333 | 1,218 | 0.90x |
+| 2 | 16 | 1,333 | 1,341 | 1,369 | 0.99x |
+| 2 | 64 | 1,357 | 1,335 | 1,394 | 1.02x |
+| 4 | 1 | 306 | 345 | 383 | 0.89x |
+| 4 | 4 | 1,464 | 1,495 | 1,526 | 0.98x |
+| 4 | 16 | 2,574 | 2,607 | 2,311 | 0.99x |
+| 4 | 64 | 2,617 | 2,601 | 2,425 | 1.01x |
 
 ### p99 Latency (ms)
 
 | Workers | Concurrency | lite-server | LitServe | lite-server-core |
 |---------|-------------|-------------|----------|------------------|
-| 1 | 4 | 72.1 | 139.6 | 139.2 |
-| 2 | 4 | 11.5 | 162.6 | 11.6 |
+| 1 | 1 | 4.08 | 5.47 | 2.80 |
+| 1 | 4 | 8.54 | 7.23 | 7.46 |
+| 1 | 16 | 29.59 | 28.04 | 31.98 |
+| 1 | 64 | 144.68 | 149.18 | 141.82 |
+| 2 | 1 | 4.07 | 3.59 | 4.59 |
+| 2 | 4 | 7.04 | 6.23 | 11.71 |
+| 2 | 16 | 21.18 | 25.99 | 21.32 |
+| 2 | 64 | 57.37 | 60.57 | 67.80 |
+| 4 | 1 | 4.41 | 3.86 | 3.20 |
+| 4 | 4 | 6.17 | 3.41 | 3.19 |
+| 4 | 16 | 8.17 | 27.35 | 9.01 |
+| 4 | 64 | 50.34 | 52.38 | 66.78 |
 
 ### Analysis
 
-**Single worker (w=1):** LitServe has higher raw throughput because lite-server's Rust HTTP layer adds overhead that isn't amortized at low concurrency. The Python wrapper path (`lite-server`) is slower than the direct Rust binary (`lite-server-core`) due to PyO3 bridging.
+**The three servers are within ~±10% of each other across the whole matrix** (0.89x–1.02x for `lite-server` vs LitServe, 0.89x–1.17x for `lite-server-core`). This is a different picture from earlier placeholder numbers (w=2/c=4: 1,583 vs 531 rps, "3.0x") — the main driver is LitServe itself: 0.2.17 does ~2.5x the throughput of the older release used for the placeholder data (531 → 1,333 rps at w=2/c=4), while lite-server is within a few percent of its earlier result.
 
-**Two workers (w=2):** lite-server's architecture shines. With multiple workers, the Rust core efficiently distributes requests across workers via ZMQ, while the adaptive batching and least-loaded scheduling keep workers busy. LitServe's throughput drops because its Python HTTP layer (uvicorn) becomes the bottleneck.
+**This parity is a measurement artifact, not a verdict.** The 1ms sleep is the bottleneck itself: one worker tops out at ~660 rps, four workers at ~2,600 rps, identical across all three servers once the sub-millisecond framework overhead is paid. The matrix says "three servers wait on the same 1ms", not "three servers perform equally". Framework differences are invisible under this load — they show up under a zero-compute echo model (next section): there lite-server delivers **2.5x LitServe's throughput** with the same workers and the same single-threaded HTTP layer.
 
-**Key takeaway:** lite-server's advantage grows with concurrency and worker count. For production workloads with multiple workers and concurrent requests, lite-server provides significantly higher throughput and lower latency.
+**Key takeaway:** do not benchmark serving frameworks with a sleep model. Use the echo workload below for framework-overhead comparisons; re-validate with real model workloads before making a call.
 
 ## Reproducing
 
@@ -152,6 +182,39 @@ Results are saved to `benchmarks/results/benchmark.csv`. With `--plot`, charts a
 **LitServe** = Lightning AI's inference server (FastAPI + uvicorn)
 
 The "speedup" column compares `lite-server` vs `LitServe`. The `lite-server-core` column shows the raw Rust binary performance without Python bridging overhead.
+
+## Framework-overhead comparison (zero-compute echo, aligned)
+
+The echo model returns immediately (`benchmarks/models/echo_model`) — no sleep,
+so every microsecond on the wire is framework cost. All servers run **2 workers**
+(`workers_per_device: 2`); the HTTP layer is aligned per the threading note in
+"Test Environment". 25-30s per config, same `wrk` load.
+
+### Default form (lite-server tokio threads = auto/16, LitServe 1 process)
+
+| Server | c=16 | c=64 |
+|---|---|---|
+| lite-server | 4,531 rps / p99 8.30 ms | 4,383 rps / p99 39.05 ms |
+| lite-server-core | 4,927 rps / p99 28.56 ms | 5,808 rps / p99 23.09 ms |
+| LitServe | 2,644 rps / p99 15.23 ms | 2,725 rps / p99 53.36 ms |
+
+### Aligned (single event-loop thread on both sides: `--threads 1`)
+
+| Server | c=16 | c=64 |
+|---|---|---|
+| lite-server | 6,606 rps / p99 4.94 ms | 6,574 rps / p99 36.65 ms |
+| lite-server-core | 4,920 rps / p99 29.21 ms | 6,376 rps / p99 27.34 ms |
+| LitServe | 2,568 rps / p99 31.03 ms | 2,679 rps / p99 70.78 ms |
+
+**lite-server is ~2.5x LitServe with identical HTTP-layer resources** (6,606 vs
+2,568 rps @ c=16) and keeps a tighter p99 tail at c=16 (4.94 vs 31.03 ms).
+`lite-server-core` is on par with the wrapper under this load (per-request
+fixed cost ~0.14 ms on both — the wrapper runs the tokio event loop on a
+dedicated OS thread, not CPython's main thread).
+
+**Key takeaway:** with HTTP-layer resources and workers aligned, lite-server
+outperforms LitServe ~2.5x on framework overhead, and the Python wrapper
+matches the raw binary.
 
 ## Notes
 

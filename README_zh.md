@@ -110,15 +110,15 @@ Rust 内核处理所有 I/O（HTTP、gRPC、IPC、指标、文件监听），Pyt
 
 ## 性能基准
 
-> **注意：** 以下数据为初步占位数据，数据点有限。详见 [docs/zh/benchmark.md](docs/zh/benchmark.md) 了解背景和复现步骤。
+> **注意：** 数据实测于 2026-08-02，单机（macOS x86_64，i9-9980HK），零计算 echo 模型，HTTP 层对齐为单事件循环线程（`--threads 1`），三方各 2 workers，每配置 30s。完整矩阵与方法见 [docs/zh/benchmark.md](docs/zh/benchmark.md)。
 
-2 worker、4 并发测试（1ms CPU mock 模型）：
+2 worker、64 并发测试（零计算 echo，lite-server 0.7.8 vs LitServe 0.2.17）：
 
 | 服务器 | 吞吐量 | p99 延迟 |
 |--------|--------|---------|
-| lite-server | 1,583 req/s | 11.5 ms |
-| LitServe | 531 req/s | 162.6 ms |
-| lite-server-core | 1,364 req/s | 11.6 ms |
+| lite-server | 6,574 req/s | 36.7 ms |
+| lite-server-core | 6,376 req/s | 27.3 ms |
+| LitServe | 2,679 req/s | 70.8 ms |
 
 详见 [docs/zh/benchmark.md](docs/zh/benchmark.md)。
 
@@ -177,7 +177,7 @@ pip install lite-server-<version>-py3-none-<platform>.whl
 
 ### 从源码编译
 
-需要 Rust >= 1.70 和 Python >= 3.10。
+需要较新的 stable Rust 工具链（CI 使用 `stable`）和 Python >= 3.10。
 
 ```bash
 pip install maturin
@@ -315,7 +315,7 @@ hooks:
 ## 常见问题
 
 **Q: lite-server 和 LitServe 有什么区别？**
-lite-server 用 Rust HTTP 内核（axum/tokio）替代了 Python 的 uvicorn，多 worker 并发场景下吞吐提升 3 倍。模型代码写法一样（兼容 LitAPI）。
+lite-server 用 Rust HTTP 内核（axum/tokio）替代了 Python 的 uvicorn，模型代码写法一样（兼容 LitAPI）。HTTP 层与 workers 对齐（双方单事件循环线程、各 2 worker）的框架开销实测中，lite-server 吞吐约为 LitServe 的 2.5 倍，p99 尾延迟更紧——见[性能基准](#性能基准)。
 
 **Q: 需要 Docker 吗？**
 不需要。`pip install` 后直接运行。支持 Linux、macOS、Windows。
@@ -366,15 +366,14 @@ cd python && python -m pytest tests/
 │   ├── cli.md              # CLI 参考
 │   ├── comparison.md
 │   ├── configuration.md
+│   ├── cors-security-checklist.md
+│   ├── graceful-shutdown.md
+│   ├── keda.md
+│   ├── migration.md
 │   ├── model-authoring.md
-│   └── zh/                 # 中文文档
-│       ├── architecture.md
-│       ├── benchmark.md
-│       ├── cli.md
-│       ├── comparison.md
-│       ├── configuration.md
-│       └── model-authoring.md
-├── Cargo.toml        # Rust 清单
+│   ├── otel-observability.md
+│   └── zh/                 # 中文文档（同套）
+└── Cargo.toml        # Rust 清单
 └── pyproject.toml    # Python 打包（maturin）
 ```
 

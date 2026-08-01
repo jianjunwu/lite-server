@@ -74,39 +74,65 @@ Python worker 往返（ZMQ IPC + 进程调度）且占大头——server 独占�
 
 ## wrk 对比（lite-server vs LitServe）
 
-> **注意：** 以下基准数据为初步占位数据，仅包含有限的数据点（2 种 worker 配置 × 1 种并发级别）。涵盖更多配置、硬件平台和真实模型负载的全面基准测试正在计划中。仅供参考。
+> **注意：** 数据实测于 2026-08-02，单机（Intel i9-9980HK）——单机型负载不足以作为定论，请视作方向性参考而非规格。
 
-lite-server 与 LitServe 的 `wrk` 性能对比（初步数据）。
+lite-server 与 LitServe 的 `wrk` 性能对比。报告两种负载：**1ms sleep mock**
+（本节——衡量 worker 侧行为，框架开销被淹没）和**零计算 echo 模型**（见
+[下方](#框架开销对比零计算-echo对齐)——衡量纯框架开销，真实差异在此显现）。
 
 ## 测试环境
 
-- **模型**：1ms `time.sleep()` CPU mock（衡量 IPC 和 HTTP 开销，非 GPU 计算）
-- **工具**：`wrk` + POST 请求（`{"input":"hello"}`）
-- **系统**：macOS（Apple Silicon）
+- **模型**：矩阵用 1ms `time.sleep()` CPU mock；框架开销节用零计算 echo
+- **工具**：`wrk` 4.2.0 + POST 请求（`{"input":"hello"}`），每配置 30s，4 线程
+- **系统**：macOS x86_64，Intel Core i9-9980HK（8P/16L），32 GB
+- **版本**：lite-server 0.7.8（git `82b0535`）vs LitServe 0.2.17
+- **HTTP 层线程模型**（对齐前提）：LitServe 是单 uvicorn 进程 + 单 asyncio
+  事件循环；lite-server / lite-server-core 是 tokio N 线程（`--threads N`，
+  默认 = CPU 核数）。框架开销节用 `--threads 1` 钉住单事件循环做同构对比。
 
-## 测试结果
+## 测试结果（1ms sleep 模型）
 
 ### 吞吐量（req/s）
 
 | Worker 数 | 并发数 | lite-server | LitServe | lite-server-core | 加速比（ls/lit） |
 |-----------|--------|-------------|----------|------------------|-----------------|
-| 1 | 4 | 171 | 330 | 444 | 0.5x |
-| 2 | 4 | 1,583 | 531 | 1,364 | 3.0x |
+| 1 | 1 | 353 | 379 | 443 | 0.93x |
+| 1 | 4 | 634 | 656 | 612 | 0.97x |
+| 1 | 16 | 658 | 656 | 695 | 1.00x |
+| 1 | 64 | 666 | 658 | 694 | 1.01x |
+| 2 | 1 | 335 | 346 | 395 | 0.97x |
+| 2 | 4 | 1,203 | 1,333 | 1,218 | 0.90x |
+| 2 | 16 | 1,333 | 1,341 | 1,369 | 0.99x |
+| 2 | 64 | 1,357 | 1,335 | 1,394 | 1.02x |
+| 4 | 1 | 306 | 345 | 383 | 0.89x |
+| 4 | 4 | 1,464 | 1,495 | 1,526 | 0.98x |
+| 4 | 16 | 2,574 | 2,607 | 2,311 | 0.99x |
+| 4 | 64 | 2,617 | 2,601 | 2,425 | 1.01x |
 
 ### p99 延迟（ms）
 
 | Worker 数 | 并发数 | lite-server | LitServe | lite-server-core |
 |-----------|--------|-------------|----------|------------------|
-| 1 | 4 | 72.1 | 139.6 | 139.2 |
-| 2 | 4 | 11.5 | 162.6 | 11.6 |
+| 1 | 1 | 4.08 | 5.47 | 2.80 |
+| 1 | 4 | 8.54 | 7.23 | 7.46 |
+| 1 | 16 | 29.59 | 28.04 | 31.98 |
+| 1 | 64 | 144.68 | 149.18 | 141.82 |
+| 2 | 1 | 4.07 | 3.59 | 4.59 |
+| 2 | 4 | 7.04 | 6.23 | 11.71 |
+| 2 | 16 | 21.18 | 25.99 | 21.32 |
+| 2 | 64 | 57.37 | 60.57 | 67.80 |
+| 4 | 1 | 4.41 | 3.86 | 3.20 |
+| 4 | 4 | 6.17 | 3.41 | 3.19 |
+| 4 | 16 | 8.17 | 27.35 | 9.01 |
+| 4 | 64 | 50.34 | 52.38 | 66.78 |
 
 ### 分析
 
-**单 worker（w=1）**：LitServe 原始吞吐更高，因为 lite-server 的 Rust HTTP 层在低并发下无法摊薄开销。Python 包装路径（`lite-server`）比直接运行 Rust 二进制（`lite-server-core`）慢，因为有 PyO3 桥接开销。
+**三个服务器在整个矩阵内互差约 ±10% 以内**（lite-server 对 LitServe 0.89x–1.02x，`lite-server-core` 0.89x–1.17x）。这与早期占位数据（w=2/c=4：1,583 vs 531 rps，"3.0x"）大不相同——主要原因是 LitServe 自身：0.2.17 相比占位数据所用的旧版本吞吐提升约 2.5×（w=2/c=4 从 531 → 1,333 rps），而 lite-server 与早前结果相差仅几个百分点。
 
-**双 worker（w=2）**：lite-server 的架构优势显现。多 worker 场景下，Rust 内核通过 ZMQ 高效分发请求，自适应 batching 和最小负载调度保持 worker 忙碌。LitServe 吞吐下降是因为其 Python HTTP 层（uvicorn）成为瓶颈。
+**这个持平是测量假象，不是结论。** 1ms sleep 本身就是瓶颈：1 worker 触顶 ~660 rps、4 worker ~2,600 rps，三个服务器完全一致——矩阵反映的是"三方都在等同一个 1ms"，不是"三方性能等价"。框架差异在这种负载下不可见，需要用零计算 echo 模型（下一节）才能暴露：**同 worker 数、同单线程 HTTP 层下，lite-server 是 LitServe 的 2.5×**。
 
-**关键结论**：lite-server 的优势随并发和 worker 数量增长而扩大。生产环境多 worker + 并发请求场景下，lite-server 提供显著更高的吞吐和更低的延迟。
+**关键结论**：不要用 sleep 模型给服务框架做基准。框架开销对比用下面的 echo 负载；真实模型负载拍板前另行验证。
 
 ## 复现步骤
 
@@ -141,6 +167,36 @@ python benchmarks/scripts/compare.py \
 - **LitServe** = Lightning AI 的推理服务器（FastAPI + uvicorn）
 
 "加速比"列对比 `lite-server` vs `LitServe`。`lite-server-core` 列展示无 Python 桥接开销的原始 Rust 二进制性能。
+
+## 框架开销对比（零计算 echo，对齐）
+
+echo 模型立即返回（`benchmarks/models/echo_model`）——无 sleep，线上的每一
+微秒都是框架成本。三个服务器均跑 **2 workers**（`workers_per_device: 2`），
+HTTP 层按"测试环境"的线程注记对齐。每配置 25-30s，同一 `wrk` 负载。
+
+### 默认形态（lite-server tokio 线程 = auto/16，LitServe 单进程）
+
+| Server | c=16 | c=64 |
+|---|---|---|
+| lite-server | 4,531 rps / p99 8.30 ms | 4,383 rps / p99 39.05 ms |
+| lite-server-core | 4,927 rps / p99 28.56 ms | 5,808 rps / p99 23.09 ms |
+| LitServe | 2,644 rps / p99 15.23 ms | 2,725 rps / p99 53.36 ms |
+
+### 对齐（双方单事件循环线程：`--threads 1`）
+
+| Server | c=16 | c=64 |
+|---|---|---|
+| lite-server | 6,606 rps / p99 4.94 ms | 6,574 rps / p99 36.65 ms |
+| lite-server-core | 4,920 rps / p99 29.21 ms | 6,376 rps / p99 27.34 ms |
+| LitServe | 2,568 rps / p99 31.03 ms | 2,679 rps / p99 70.78 ms |
+
+**lite-server 在 HTTP 层资源完全一致下是 LitServe 的 ~2.5×**（c=16：6,606 vs
+2,568 rps），c=16 的 p99 尾延迟更紧（4.94 vs 31.03 ms）。`lite-server-core`
+在此负载下与包装层相当（双方每请求固定开销均 ~0.14 ms——包装层的 tokio
+事件循环跑在独立 OS 线程上，不在 CPython 主线程）。
+
+**关键结论**：HTTP 层资源与 workers 对齐后，lite-server 的框架开销优于
+LitServe 约 2.5×，Python 包装层与原生二进制持平。
 
 ## 注意事项
 

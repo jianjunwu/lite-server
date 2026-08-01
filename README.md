@@ -112,15 +112,15 @@ See [docs/comparison.md](docs/comparison.md) for detailed analysis.
 
 ## Benchmarks
 
-> **Note:** The data below is a preliminary placeholder with limited data points. See [docs/benchmark.md](docs/benchmark.md) for context and reproduction steps.
+> **Note:** Measured 2026-08-02 on a single workstation (macOS x86_64, i9-9980HK), zero-compute echo model, HTTP layers aligned to a single event-loop thread (`--threads 1`), 2 workers each, 30s per config. See [docs/benchmark.md](docs/benchmark.md) for the full matrix and methodology.
 
-2-worker, 4-concurrency test (1ms CPU mock model):
+2-worker, 64-concurrency test (zero-compute echo, lite-server 0.7.8 vs LitServe 0.2.17):
 
 | Server | Throughput | p99 Latency |
 |--------|-----------|-------------|
-| lite-server | 1,583 req/s | 11.5 ms |
-| LitServe | 531 req/s | 162.6 ms |
-| lite-server-core | 1,364 req/s | 11.6 ms |
+| lite-server | 6,574 req/s | 36.7 ms |
+| lite-server-core | 6,376 req/s | 27.3 ms |
+| LitServe | 2,679 req/s | 70.8 ms |
 
 See [docs/benchmark.md](docs/benchmark.md) for full results and reproduction steps.
 
@@ -205,7 +205,7 @@ pip install lite-server-<version>-py3-none-<platform>.whl
 
 ### From Source
 
-Requires Rust >= 1.70 and Python >= 3.10.
+Requires a recent stable Rust toolchain (CI builds on `stable`) and Python >= 3.10.
 
 ```bash
 pip install maturin
@@ -366,7 +366,7 @@ See [docs/model-authoring.md](docs/model-authoring.md) for the complete model au
 ## FAQ
 
 **Q: How is lite-server different from LitServe?**
-lite-server uses a Rust HTTP core (axum/tokio) instead of Python's uvicorn, giving 3x higher throughput at multi-worker concurrency. Models are written the same way (LitAPI-compatible).
+lite-server uses a Rust HTTP core (axum/tokio) instead of Python's uvicorn, with the same LitAPI-compatible model code. With HTTP layers and workers aligned (single event-loop thread each, 2 workers), lite-server sustains ~2.5x LitServe's throughput on framework overhead with a tighter p99 tail — see [Benchmarks](#benchmarks).
 
 **Q: Do I need Docker?**
 No. `pip install` and run directly. Works on Linux, macOS, and Windows.
@@ -417,15 +417,14 @@ cd python && python -m pytest tests/
 │   ├── cli.md              # CLI reference
 │   ├── comparison.md
 │   ├── configuration.md
+│   ├── cors-security-checklist.md
+│   ├── graceful-shutdown.md
+│   ├── keda.md
+│   ├── migration.md
 │   ├── model-authoring.md
-│   └── zh/                 # Chinese docs
-│       ├── architecture.md
-│       ├── benchmark.md
-│       ├── cli.md
-│       ├── comparison.md
-│       ├── configuration.md
-│       └── model-authoring.md
-├── Cargo.toml        # Rust manifest
+│   ├── otel-observability.md
+│   └── zh/                 # Chinese docs (same set)
+└── Cargo.toml        # Rust manifest
 └── pyproject.toml    # Python packaging (maturin)
 ```
 
