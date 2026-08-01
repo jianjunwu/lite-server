@@ -14,6 +14,7 @@ pub mod logging;
 pub mod metrics;
 pub mod proto;
 pub mod preflight;
+pub mod python;
 pub mod registry;
 pub mod request_context;
 pub mod sequence;

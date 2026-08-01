@@ -197,10 +197,10 @@ See [docs/benchmark.md](docs/benchmark.md) for full results and reproduction ste
 
 ### From Wheel (Recommended)
 
-Pre-built wheels for Linux, macOS, Windows (x86_64 + aarch64), Python 3.10-3.14:
+Pre-built wheels for Linux (x86_64 + aarch64), macOS (Apple Silicon), and Windows (x86_64), Python 3.10-3.14:
 
 ```bash
-pip install lite-server-<version>-py3-none-<platform>.whl
+pip install lite-server-<version>-cp310-abi3-<platform>.whl
 ```
 
 ### From Source
@@ -385,14 +385,16 @@ The worker is automatically restarted. In-flight requests are retried on other w
 
 ## Multi-Platform
 
+Wheels are built by CI for the platforms below. macOS x86_64 (Intel) and
+Windows aarch64 are not currently published — build from source there
+(requires Rust + libzmq).
+
 | Platform | Architecture | Wheel Tag |
 |----------|-------------|-----------|
-| Linux | x86_64 | manylinux2014_x86_64 |
-| Linux | aarch64 | manylinux2014_aarch64 |
-| macOS | x86_64 | macosx_10_12_x86_64 |
+| Linux | x86_64 | manylinux_2_28_x86_64 |
+| Linux | aarch64 | manylinux_2_28_aarch64 |
 | macOS | aarch64 (Apple Silicon) | macosx_11_0_arm64 |
 | Windows | x86_64 | win_amd64 |
-| Windows | aarch64 | win_arm64 |
 
 ## Development
 

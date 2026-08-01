@@ -47,7 +47,7 @@ pub(super) async fn auto_unpack_lma_files(
         // otherwise block the whole reconcile loop forever.
         let output = tokio::time::timeout(
             unpack_timeout,
-            tokio::process::Command::new("python")
+            tokio::process::Command::new(crate::python::resolve_python_interpreter())
                 .args([
                     "-m",
                     "lite_server",

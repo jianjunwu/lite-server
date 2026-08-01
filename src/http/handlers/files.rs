@@ -60,7 +60,7 @@ pub async fn upload_model_handler(
                 .await
                 .map_err(AppError::Io)?;
 
-            let output = tokio::process::Command::new("python")
+            let output = tokio::process::Command::new(crate::python::resolve_python_interpreter())
                 .args([
                     "-m",
                     "lite_server",
@@ -203,7 +203,7 @@ pub async fn download_model_handler(
         .await
         .map_err(AppError::Io)?;
 
-    let output = tokio::process::Command::new("python")
+    let output = tokio::process::Command::new(crate::python::resolve_python_interpreter())
         .args([
             "-m",
             "lite_server",

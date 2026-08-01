@@ -224,7 +224,7 @@ pub(super) fn spawn_worker_monitor(
 /// is dropped instead of outliving the server and stealing the re-bound
 /// ZMQ socket.
 pub(super) fn new_worker_command(python_module_dir: &str) -> Command {
-    let mut cmd = Command::new("python");
+    let mut cmd = Command::new(crate::python::resolve_python_interpreter());
     if !python_module_dir.is_empty() {
         let current_pythonpath = std::env::var("PYTHONPATH").unwrap_or_default();
         let new_pythonpath = if current_pythonpath.is_empty() {

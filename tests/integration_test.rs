@@ -5342,3 +5342,234 @@ async fn test_p_flow_grpc_bidi_disconnect_propagates_cancel() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
     let _ = std::fs::remove_dir_all(&repo);
 }
+
+// ===========================================================================
+// Multi-platform / multi-version audit regression tests (2026-08-02)
+// ===========================================================================
+
+/// A gRPC port already taken at startup must fail fast with a startup error,
+/// NOT wedge the server. With a model already loaded, `run()` unwinds on the
+/// EADDRINUSE and the tokio Runtime drop deadlocks against the in-flight ZMQ
+/// blocking task (the worker handshake poll): the process then lives on
+/// forever with no error output and health never serving.
+///
+/// Reproduced manually: hog port 8001 + a loaded model → the server logs
+/// "Starting gRPC", then neither exits nor serves; `sample` shows
+/// lite-server-main stuck in `Runtime::drop → BlockingPool::shutdown` while a
+/// tokio-rt-worker sits in `WorkerZmqClient::new → zmq_poll`.
+#[tokio::test]
+#[serial]
+async fn test_grpc_port_conflict_fails_fast_not_wedge() {
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    let metrics_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    kill_stale_on_port(metrics_port);
+
+    // Occupy the gRPC port — what a second lite-server (or any other service)
+    // does at startup.
+    let hog = std::net::TcpListener::bind(("127.0.0.1", grpc_port)).unwrap();
+
+    let repo = test_model_repo();
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-grpc-conflict-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    // Orchestration auto-loads the model BEFORE the gRPC bind error unwinds
+    // run(), which is what leaves the blocking ZMQ handshake task in flight.
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: {metrics_port}\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\norchestration:\n  control_mode: explicit\n  load_models: [test_model]\n  models:\n    - name: test_model\n      load_policy: all\nmodel_repository:\n  path: {}\n",
+            repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let mut server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+
+    // The server must exit with a startup error inside the deadline. Today it
+    // wedges: the process stays alive forever, never exits, never serves.
+    let child = server.0.as_mut().unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(50);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(
+                !status.success(),
+                "server must exit non-zero on a gRPC port conflict; got {:?}",
+                status
+            );
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "server wedged on a gRPC port conflict: neither exited with an error \
+                 nor started serving — the Runtime drop deadlocked on the ZMQ \
+                 blocking task (port-conflict startup must fail fast)"
+            );
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+
+    drop(hog);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// Worker spawn must not depend on a `python` alias on PATH: Debian/Ubuntu
+/// installs and many container base images ship only `python3` (no
+/// `python-is-python3`). The worker command is hardcoded to `python`
+/// (worker/process.rs::new_worker_command), so models fail to load there.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_worker_spawn_works_with_python3_only_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let http_port = next_test_port();
+    let metrics_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(metrics_port);
+
+    // A PATH that has `python3` but no `python`. We expose the host's python3
+    // through a wrapper script rather than a symlink: CPython locates its venv
+    // `pyvenv.cfg` from argv[0]'s directory, so a symlink placed in this temp
+    // bin_dir would skip the venv (argv[0] = bin_dir/python3 → no pyvenv.cfg
+    // nearby) and the worker would import-fail on `google.protobuf` for reasons
+    // unrelated to the interpreter-name fallback under test. The wrapper execs
+    // the real venv interpreter, so argv[0] points at it and site-packages load.
+    let bin_dir =
+        std::env::temp_dir().join(format!("lite-server-py3bin-{}", std::process::id()));
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg("import sys; print(sys.executable)")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "python3 must exist for this test");
+    let real_python = String::from_utf8(out.stdout).unwrap();
+    let real_python = real_python.trim();
+    let wrapper = bin_dir.join("python3");
+    std::fs::write(&wrapper, format!("#!/bin/sh\nexec {} \"$@\"\n", real_python)).unwrap();
+    let mut perms = std::fs::metadata(&wrapper).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&wrapper, perms).unwrap();
+    assert!(
+        !bin_dir.join("python").exists(),
+        "test setup broken: PATH dir must not provide a `python` alias"
+    );
+
+    let repo = test_model_repo();
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-py3only-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: 18098\n  metrics_port: {metrics_port}\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: false\norchestration:\n  control_mode: explicit\n  load_models: [test_model]\n  models:\n    - name: test_model\n      load_policy: all\nmodel_repository:\n  path: {}\n",
+            repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let mut cmd = Command::new(lite_server_bin());
+    cmd.arg("serve")
+        .arg("--config")
+        .arg(&server_yaml)
+        .current_dir(project_root())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .env("LITESERVER_DIE_WITH_PARENT", "1")
+        .env("PATH", &bin_dir)
+        // Worker imports resolve via the crate's python dir, exactly like
+        // find_python_module_path sets PYTHONPATH in production.
+        .env("PYTHONPATH", project_root().join("python"));
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().expect("failed to spawn server");
+    let _guard = ServerGuard(Some(child));
+
+    let base = format!("http://127.0.0.1:{http_port}");
+    wait_for_server(http_port, 20).await;
+    assert!(
+        wait_model_ready(&base, MODEL, 20).await,
+        "model must become ready with only `python3` on PATH — the worker \
+         spawn must not hardcode the `python` alias (Debian/Ubuntu ship no \
+         python-is-python3)"
+    );
+
+    let _ = std::fs::remove_dir_all(&bin_dir);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// `--log-level warning` — the spelling the benchmark harness uses
+/// (benchmarks/scripts/run_liteserver.py) — must not break the server's own
+/// log filter. tracing's EnvFilter accepts `warn`, not `warning`: the
+/// lite_server directive is dropped with an "ignoring ... error parsing level
+/// filter" line and the server's WARN logs go silent.
+#[tokio::test]
+#[serial]
+async fn test_log_level_warning_is_accepted() {
+    let http_port = next_test_port();
+    let metrics_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(metrics_port);
+
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-loglvl-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: 18097\n  metrics_port: {metrics_port}\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: false\nmodel_repository:\n  path: {}\n",
+            tmp_dir.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let mut cmd = Command::new(lite_server_bin());
+    cmd.arg("serve")
+        .arg("--config")
+        .arg(&server_yaml)
+        .arg("--log-level")
+        .arg("warning")
+        .current_dir(project_root())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .env("LITESERVER_DIE_WITH_PARENT", "1");
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().expect("failed to spawn server");
+
+    // The filter parse happens at logging init, well inside this window.
+    sleep(Duration::from_secs(6)).await;
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        use std::io::Read;
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+
+    assert!(
+        !stderr.contains("error parsing level filter"),
+        "`--log-level warning` must be accepted by the server log filter; \
+         stderr contained: {}",
+        stderr.lines().next().unwrap_or("(empty)")
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}

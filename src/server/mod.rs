@@ -436,13 +436,29 @@ impl LiteServer {
         #[cfg(not(unix))]
         let parent_pid = 0i32;
 
-        // Wait for any server to exit or shutdown signal
+        // Wait for any server to exit or shutdown signal.
+        //
+        // B1: a startup error (e.g. a port-bind conflict) must NOT `return Err`
+        // directly — that skips the graceful teardown below and leaves the ZMQ
+        // worker actors (spawn_blocking loops that exit only when their command
+        // channel closes) live. On the Python CLI path the tokio Runtime then
+        // drops normally and BlockingPool::shutdown dead-locks waiting for those
+        // actors, wedging the process with no error and orphaned workers. The
+        // binary path dodges this only because main.rs exits via
+        // std::process::exit(1). Capture the error here and fall through to the
+        // same teardown a normal shutdown runs (it unloads workers, which clears
+        // the ZMQ client map in unload_version and lets the actors exit), then
+        // return Err at the end.
+        let mut startup_error: Option<AppError> = None;
         let shutdown_reason = tokio::select! {
             result = &mut http_handle => {
                 match result {
                     Ok(Ok(())) => "http_server_finished".to_string(),
-                    Ok(Err(e)) => return Err(e),
-                    Err(e) => return Err(AppError::Internal(format!("HTTP task panicked: {}", e))),
+                    Ok(Err(e)) => { startup_error = Some(e); "http_server_error".to_string() }
+                    Err(e) => {
+                        startup_error = Some(AppError::Internal(format!("HTTP task panicked: {}", e)));
+                        "http_server_panic".to_string()
+                    }
                 }
             }
             result = async {
@@ -453,8 +469,11 @@ impl LiteServer {
             } => {
                 match result {
                     Ok(Ok(())) => "metrics_server_finished".to_string(),
-                    Ok(Err(e)) => return Err(e),
-                    Err(e) => return Err(AppError::Internal(format!("Metrics task panicked: {}", e))),
+                    Ok(Err(e)) => { startup_error = Some(e); "metrics_server_error".to_string() }
+                    Err(e) => {
+                        startup_error = Some(AppError::Internal(format!("Metrics task panicked: {}", e)));
+                        "metrics_server_panic".to_string()
+                    }
                 }
             }
             result = async {
@@ -465,8 +484,11 @@ impl LiteServer {
             } => {
                 match result {
                     Ok(Ok(())) => "grpc_server_finished".to_string(),
-                    Ok(Err(e)) => return Err(e),
-                    Err(e) => return Err(AppError::Internal(format!("gRPC task panicked: {}", e))),
+                    Ok(Err(e)) => { startup_error = Some(e); "grpc_server_error".to_string() }
+                    Err(e) => {
+                        startup_error = Some(AppError::Internal(format!("gRPC task panicked: {}", e)));
+                        "grpc_server_panic".to_string()
+                    }
                 }
             }
             _ = shutdown_signal() => "shutdown_signal".to_string(),
@@ -566,7 +588,18 @@ impl LiteServer {
                 }
             }
         };
-        tokio::join!(http_fut, grpc_fut);
+        // B1: only drain on a graceful shutdown. On a startup error the failing
+        // server handle already completed and re-polling its JoinHandle panics
+        // ("JoinHandle polled after completion"); there is also nothing in-flight
+        // to drain since the server never served. Dropping the drain futures on
+        // the error path also releases the handle borrows before the abort()
+        // calls below.
+        if startup_error.is_none() {
+            tokio::join!(http_fut, grpc_fut);
+        } else {
+            drop(http_fut);
+            drop(grpc_fut);
+        }
 
         monitor_handle.abort();
 
@@ -589,6 +622,12 @@ impl LiteServer {
 
         self.worker_manager.shutdown().await;
 
+        // B1: surface a captured startup error now that the teardown above has
+        // released the worker/ZMQ resources (so the Runtime can drop cleanly on
+        // the Python CLI path instead of dead-locking on live ZMQ actors).
+        if let Some(e) = startup_error {
+            return Err(e);
+        }
         Ok(())
     }
 

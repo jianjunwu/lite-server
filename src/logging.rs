@@ -21,6 +21,21 @@ impl LogGuard {
     }
 }
 
+/// Normalize a CLI/config log level to the vocabulary tracing's EnvFilter accepts.
+///
+/// B3: the benchmark harness and Python users spell the level `warning` (the
+/// Python `logging` name); tracing only accepts `warn`, so an un-normalized
+/// `lite_server=warning` directive is dropped with an "error parsing level
+/// filter" line and the server's own WARN logs go silent. Map the alias; leave
+/// every other token untouched so we never rewrite a value we don't own.
+fn normalize_log_level(level: &str) -> String {
+    if level.eq_ignore_ascii_case("warning") {
+        "warn".to_string()
+    } else {
+        level.to_string()
+    }
+}
+
 pub fn init(
     level: &str,
     info_output: Option<&str>,
@@ -33,6 +48,8 @@ pub fn init(
     // same `.init()` so tracing spans bridge to OTel spans when telemetry is on.
     otel_layer: Option<crate::telemetry::BoxedLayer>,
 ) -> LogGuard {
+    // B3: normalize the level alias before building the filter (see helper).
+    let level = normalize_log_level(level);
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("lite_server={},tokio=warn,hyper=warn", level)));
 
