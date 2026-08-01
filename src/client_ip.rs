@@ -360,3 +360,139 @@ mod tests {
         assert_eq!(r, Some(ip("127.0.0.1")));
     }
 }
+
+/// §6.7 解析面 property 测试（proptest）：XFF/CIDR 清洗的安全不变式——
+/// 非受信 peer 恒胜、结果无捏造、非法段终止右移（不跳过）。
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    /// 任意 v4/v6 地址。
+    fn arb_ip() -> impl Strategy<Value = IpAddr> {
+        prop_oneof![
+            any::<u32>().prop_map(|b| IpAddr::from(Ipv4Addr::from(b))),
+            any::<u128>().prop_map(|b| IpAddr::from(Ipv6Addr::from(b))),
+        ]
+    }
+
+    /// 任意合法 CIDR。
+    fn arb_net() -> impl Strategy<Value = IpNet> {
+        prop_oneof![
+            (any::<u32>(), 0u8..=32)
+                .prop_map(|(a, p)| IpNet::V4(ipnet::Ipv4Net::new(Ipv4Addr::from(a), p).unwrap())),
+            (any::<u128>(), 0u8..=128)
+                .prop_map(|(a, p)| IpNet::V6(ipnet::Ipv6Net::new(Ipv6Addr::from(a), p).unwrap())),
+        ]
+    }
+
+    /// XFF 段：合法 IP / v4-ish / v6-ish / 纯垃圾混合，逼近真实畸形输入。
+    fn arb_segment() -> impl Strategy<Value = String> {
+        prop_oneof![
+            3 => arb_ip().prop_map(|ip| ip.to_string()),
+            1 => "[0-9.]{1,10}",
+            1 => "[0-9a-fA-F:]{1,16}",
+            1 => "[a-zA-Z]{1,8}",
+        ]
+    }
+
+    /// 受信 peer 场景：50% 概率把一个由 peer 派生的网段塞进 trusted，
+    /// 保证假设 `is_trusted(p)` 有足量通过样本。
+    fn arb_trusted_scenario()
+    -> impl Strategy<Value = (Vec<String>, Option<IpAddr>, IpAddr, Vec<IpNet>)> {
+        (
+            prop::collection::vec(arb_segment(), 0..8),
+            prop::option::of(arb_ip()),
+            arb_ip(),
+            prop::collection::vec(arb_net(), 0..2),
+            any::<bool>(),
+            0u8..=128,
+        )
+            .prop_map(|(segs, xri, p, mut nets, include_peer, prefix)| {
+                if include_peer {
+                    let max = if p.is_ipv4() { 32 } else { 128 };
+                    nets.push(IpNet::new(p, prefix.min(max)).unwrap());
+                }
+                (segs, xri, p, nets)
+            })
+    }
+
+    proptest! {
+        /// 核心 fail-safe 不变式：非受信 peer 一律胜出，header 再花哨也忽略。
+        #[test]
+        fn untrusted_peer_always_wins(
+            xff in prop::option::of(prop::collection::vec(arb_segment(), 0..6)
+                .prop_map(|v| v.join(", "))),
+            xri in prop::option::of("[a-zA-Z0-9.:]{1,20}"),
+            p in arb_ip(),
+            trusted in prop::collection::vec(arb_net(), 0..3),
+        ) {
+            prop_assume!(!is_trusted(p, &trusted));
+            let r = extract_client_ip(xff.as_deref(), xri.as_deref(), Some(p), &trusted);
+            prop_assert_eq!(r, Some(p));
+        }
+
+        /// 无捏造：返回 IP 必来自 peer / X-Real-IP / 某个合法 XFF 段。
+        /// 且若来自 XFF 段，其下标必在"最右非法段"右侧（非法段终止右移，不跳过）。
+        #[test]
+        fn result_never_fabricated_and_respects_termination(
+            (segs, xri, p, trusted) in arb_trusted_scenario(),
+        ) {
+            prop_assume!(is_trusted(p, &trusted)); // 走 header 路径
+            let xff = segs.join(", ");
+            let xri_s = xri.map(|i| i.to_string());
+            let r = extract_client_ip(Some(&xff), xri_s.as_deref(), Some(p), &trusted);
+            let Some(r) = r else { return Ok(()); };
+            if r == p || Some(r) == xri {
+                return Ok(());
+            }
+            // 与 walk_xff 同口径清洗段序列（split/trim/滤空）后比对
+            let cleaned: Vec<&str> =
+                xff.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+            prop_assert!(
+                cleaned.iter().any(|s| s.parse::<IpAddr>() == Ok(r)),
+                "result {} not from any XFF segment of {:?}", r, xff
+            );
+            let rightmost_invalid =
+                cleaned.iter().rposition(|s| s.parse::<IpAddr>().is_err());
+            if let Some(ri) = rightmost_invalid {
+                prop_assert!(
+                    cleaned.iter().enumerate()
+                        .any(|(i, s)| i > ri && s.parse::<IpAddr>() == Ok(r)),
+                    "segment left of invalid segment {} was trusted (xff={:?})", ri, xff
+                );
+            }
+        }
+
+        /// parse_network 与 std 解析严格等价：Some ⟺ trim 后按 IpNet 或 IpAddr 可解析；
+        /// 裸 IP 条目必含其自身（/32、/128 主机路由）。
+        #[test]
+        fn parse_network_iff_std_parses(s in ".*") {
+            let parsed = parse_network(&s);
+            let std_ok =
+                s.trim().parse::<IpNet>().is_ok() || s.trim().parse::<IpAddr>().is_ok();
+            prop_assert_eq!(parsed.is_some(), std_ok, "input: {:?}", s);
+            if let (Some(net), Ok(ip)) = (parsed, s.trim().parse::<IpAddr>()) {
+                prop_assert!(net.contains(&ip));
+            }
+        }
+
+        /// merge_xff：None ⟺ 全空白；Some 时 = 各非空段 trim 后按 ", " 连接（保序）。
+        #[test]
+        fn merge_xff_preserves_segments(
+            vals in prop::collection::vec("[a-zA-Z0-9.: ]{0,12}", 0..6),
+        ) {
+            let merged = merge_xff(&vals);
+            let nonblank: Vec<&str> =
+                vals.iter().map(|v| v.trim()).filter(|s| !s.is_empty()).collect();
+            if nonblank.is_empty() {
+                prop_assert!(merged.is_none());
+            } else {
+                let m = merged.unwrap();
+                let parts: Vec<&str> = m.split(", ").collect();
+                prop_assert_eq!(parts, nonblank);
+            }
+        }
+    }
+}

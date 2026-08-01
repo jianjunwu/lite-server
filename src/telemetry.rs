@@ -687,3 +687,103 @@ mod tests {
         );
     }
 }
+
+/// §6.7 解析面 property 测试（proptest）：入站 baggage 清洗的安全不变式——
+/// 白名单外零泄漏、条数/字节上限、值不篡改、幂等。不依赖 SDK（纯函数）。
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use opentelemetry::baggage::{Baggage, BaggageExt};
+    use proptest::prelude::*;
+    use std::collections::HashMap as StdMap;
+
+    /// 低基数 key（碰撞频繁，白名单命中/未命中都覆盖）+ 少量任意串。
+    fn arb_key() -> impl Strategy<Value = String> {
+        prop_oneof![
+            4 => "[a-c]{1,4}",
+            1 => "\\PC{0,8}",
+        ]
+    }
+
+    fn arb_entries() -> impl Strategy<Value = Vec<(String, String)>> {
+        prop::collection::vec((arb_key(), "\\PC{0,24}"), 0..12)
+    }
+
+    fn cx_of(entries: &[(String, String)]) -> Context {
+        let mut bag = Baggage::default();
+        for (k, v) in entries {
+            bag.insert(k.clone(), v.clone());
+        }
+        Context::current_with_baggage(bag)
+    }
+
+    fn map_of(cx: &Context) -> StdMap<String, String> {
+        cx.baggage().iter().map(|(k, (v, _))| (k.to_string(), v.as_str().to_string())).collect()
+    }
+
+    proptest! {
+        /// 清洗不变式全集：保留 key ⊆ 白名单；条数 ≤ max_entries；单条 ≤ max_entry_bytes；
+        /// 保留值 = 该 key 最终输入值（不篡改）；保留条数 = min(符合条件条数, max_entries)。
+        #[test]
+        fn scrub_invariants(
+            entries in arb_entries(),
+            allow_flags in prop::collection::vec(any::<bool>(), 0..12),
+            extra_allow in prop::collection::vec("[a-c]{1,4}", 0..3),
+            max_entries in 0usize..8,
+            max_entry_bytes in 0usize..48,
+        ) {
+            // 白名单 = 输入 key 的策略驱动子集 + 额外 key（覆盖命中与未命中）
+            let mut allowlist: Vec<String> = entries
+                .iter()
+                .zip(&allow_flags)
+                .filter(|(_, f)| **f)
+                .map(|((k, _), _)| k.clone())
+                .collect();
+            allowlist.extend(extra_allow);
+            let policy =
+                BaggagePolicy { allowlist: allowlist.clone(), max_entries, max_entry_bytes };
+            // Baggage 自身会拒收非法 key（如空 key）——以实际进入 Baggage 的内容为
+            // 输入基准，不变式刻画"清洗输出 vs 清洗输入"。
+            let cx = cx_of(&entries);
+            let input = map_of(&cx);
+            let kept = map_of(&scrub_baggage_with(cx, &policy));
+
+            for (k, v) in &kept {
+                prop_assert!(allowlist.contains(k), "key {:?} escaped the allowlist", k);
+                prop_assert!(k.len() + v.len() <= max_entry_bytes, "oversize entry kept");
+                prop_assert_eq!(Some(v), input.get(k), "value tampered");
+            }
+            let eligible = input
+                .iter()
+                .filter(|(k, v)| allowlist.contains(*k) && k.len() + v.len() <= max_entry_bytes)
+                .count();
+            prop_assert_eq!(kept.len(), eligible.min(max_entries));
+        }
+
+        /// 幂等：清洗输出再清洗内容不变（保留条目天然全过策略）。
+        #[test]
+        fn scrub_idempotent(
+            entries in arb_entries(),
+            max_entries in 0usize..8,
+            max_entry_bytes in 0usize..48,
+        ) {
+            let policy = BaggagePolicy {
+                allowlist: entries.iter().map(|(k, _)| k.clone()).collect(),
+                max_entries,
+                max_entry_bytes,
+            };
+            let once = scrub_baggage_with(cx_of(&entries), &policy);
+            let twice = scrub_baggage_with(once.clone(), &policy);
+            prop_assert_eq!(map_of(&once), map_of(&twice));
+        }
+
+        /// 默认策略（空白名单）对任意输入全拒——拓扑②默认不透传。
+        #[test]
+        fn default_policy_denies_everything(entries in arb_entries()) {
+            prop_assert!(
+                map_of(&scrub_baggage_with(cx_of(&entries), &BaggagePolicy::default()))
+                    .is_empty()
+            );
+        }
+    }
+}

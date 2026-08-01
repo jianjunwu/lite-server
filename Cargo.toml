@@ -151,6 +151,10 @@ serial_test = "3"
 tower = { version = "0.4", features = ["util"] }
 bytes = "1.8"
 rcgen = "0.13"
+# §6.7 解析面 property 测试（安全边界解析器：XFF/CIDR、CORS Origin、header 列表、
+# baggage 清洗）。选 proptest 而非 cargo-fuzz：stable 工具链、CI 友好，§6.7 原文
+# "cargo-fuzz 或 quickcheck" 二选一。
+proptest = "1"
 
 [lib]
 name = "lite_server"
