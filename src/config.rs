@@ -463,6 +463,13 @@ pub struct TelemetryConfig {
     pub metrics_enabled: bool,
     /// metrics exemplar filter 开关（`trace_based`）：仅采样 span 的观测点挂 exemplar。
     pub exemplars_enabled: bool,
+    /// 入站 baggage key 白名单（§4.0.7 评审 2.2；W3C 键为小写，精确匹配）。
+    /// 默认空 = 全拒（拓扑②默认不透传 baggage 到 worker）。
+    pub baggage_allowlist: Vec<String>,
+    /// 入站 baggage 最大保留条目数（白名单命中后按序截断）。
+    pub baggage_max_entries: usize,
+    /// 入站 baggage 单条目（key+value）字节上限，超限条目丢弃。
+    pub baggage_max_entry_bytes: usize,
 }
 
 impl Default for TelemetryConfig {
@@ -480,6 +487,9 @@ impl Default for TelemetryConfig {
             max_queue_size: 2048,
             metrics_enabled: false,
             exemplars_enabled: false,
+            baggage_allowlist: Vec::new(),
+            baggage_max_entries: 16,
+            baggage_max_entry_bytes: 128,
         }
     }
 }

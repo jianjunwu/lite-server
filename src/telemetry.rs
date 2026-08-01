@@ -13,6 +13,10 @@
 //! [`extract_grpc`]（interceptor）各一次提取 OTel parent context；HTTP 侧 stash
 //! 入 `OtelParentContext` extension 供 `context_middleware` 读 `trace_cx`，禁止二次 extract。
 //!
+//! **入站 baggage 清洗（§4.0.7 评审 2.2）**：入站 baggage 不受信——extract 出口
+//! 按 `telemetry.baggage_allowlist`（默认空 = 全拒，拓扑②默认不透传）+ 条目数/
+//! 单条目字节上限清洗，未过白名单的 baggage 不进 Context、不会注入 worker。
+//!
 //! **Rust→worker 注入**：[`inject`] 在每个 `RequestMeta` 构建点把当前 span 的
 //! trace context 写入 `headers` map（worker 以 server/step span 为 parent）。
 //!
@@ -81,13 +85,74 @@ impl<'a> opentelemetry::propagation::Injector for HeadersInjector<'a> {
 
 /// Extract the inbound OTel parent context from HTTP headers (D21 single-source).
 /// Returns an empty `Context` when no propagator is configured (telemetry off).
+/// Inbound baggage is scrubbed per the installed [`BaggagePolicy`] (§4.0.7).
 pub fn extract(headers: &axum::http::HeaderMap) -> Context {
-    opentelemetry::global::get_text_map_propagator(|p| p.extract(&HeaderExtractor(headers)))
+    let cx = opentelemetry::global::get_text_map_propagator(|p| p.extract(&HeaderExtractor(headers)));
+    scrub_baggage_with(cx, baggage_policy())
 }
 
 /// Extract the inbound OTel parent context from gRPC metadata.
+/// Inbound baggage is scrubbed per the installed [`BaggagePolicy`] (§4.0.7).
 pub fn extract_grpc(metadata: &tonic::metadata::MetadataMap) -> Context {
-    opentelemetry::global::get_text_map_propagator(|p| p.extract(&MetadataExtractor(metadata)))
+    let cx = opentelemetry::global::get_text_map_propagator(|p| p.extract(&MetadataExtractor(metadata)));
+    scrub_baggage_with(cx, baggage_policy())
+}
+
+// ===========================================================================
+// 入站 baggage 清洗（蓝图 §4.0.7 评审 2.2）：入站 baggage 不受信——key 白名单
+// + 单条目字节上限 + 总条目数上限。默认全拒（拓扑②默认不透传 baggage 到
+// worker）；策略由 `otel::init`（feature 开 且 enabled=true）按 `telemetry
+// .baggage_*` 安装，与 propagator 同生命周期。
+// ===========================================================================
+
+/// 入站 baggage 清洗策略（见上）。
+#[derive(Debug, Clone)]
+struct BaggagePolicy {
+    /// key 白名单（精确匹配）；空 = 全拒。
+    allowlist: Vec<String>,
+    /// 最大保留条目数（白名单命中后按序截断）。
+    max_entries: usize,
+    /// 单条目（key+value）字节上限，超限条目丢弃。
+    max_entry_bytes: usize,
+}
+
+impl Default for BaggagePolicy {
+    /// 未安装策略时的兜底：全拒（deny-all）。
+    fn default() -> Self {
+        Self { allowlist: Vec::new(), max_entries: 16, max_entry_bytes: 128 }
+    }
+}
+
+static BAGGAGE_POLICY: once_cell::sync::OnceCell<BaggagePolicy> =
+    once_cell::sync::OnceCell::new();
+
+/// 当前策略引用：init 已安装用安装的，否则默认全拒（feature 关/单测直调）。
+fn baggage_policy() -> &'static BaggagePolicy {
+    BAGGAGE_POLICY.get_or_init(BaggagePolicy::default)
+}
+
+/// 按策略清洗 Context 内 baggage（纯函数，无 SDK propagator 也可单测）。
+/// 只保留白名单条目，按序截断条目数、丢弃超限条目；空 baggage 快速返回。
+fn scrub_baggage_with(cx: Context, policy: &BaggagePolicy) -> Context {
+    use opentelemetry::baggage::BaggageExt;
+    let bag = cx.baggage();
+    if bag.is_empty() {
+        return cx;
+    }
+    let mut kept = opentelemetry::baggage::Baggage::default();
+    for (key, (value, _meta)) in bag.iter() {
+        if kept.len() >= policy.max_entries {
+            break;
+        }
+        if !policy.allowlist.iter().any(|k| k == key.as_str()) {
+            continue;
+        }
+        if key.as_str().len() + value.as_str().len() > policy.max_entry_bytes {
+            continue;
+        }
+        kept.insert(key.clone(), value.clone());
+    }
+    cx.with_baggage(kept)
 }
 
 /// Inject the **current** trace context into `RequestMeta.headers` so the Python
@@ -262,6 +327,14 @@ mod otel {
         ]);
         opentelemetry::global::set_text_map_propagator(propagator);
 
+        // 入站 baggage 清洗策略与 propagator 同生命周期安装（§4.0.7 评审 2.2）。
+        // set 失败（已初始化）不影响——策略幂等，单测进程内可能已 pin 默认值。
+        let _ = super::BAGGAGE_POLICY.set(super::BaggagePolicy {
+            allowlist: cfg.baggage_allowlist.clone(),
+            max_entries: cfg.baggage_max_entries,
+            max_entry_bytes: cfg.baggage_max_entry_bytes,
+        });
+
         let layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
         // ---- C4: OTel metrics SDK (overlay) — exemplar-ready plumbing ----
@@ -351,6 +424,58 @@ mod tests {
         assert_eq!(headers.get("x-keep"), Some(&"v".to_string()));
     }
 
+    // ===== 入站 baggage 清洗（§4.0.7 评审 2.2，scrub_baggage_with 纯函数）=====
+
+    fn cx_with_baggage(items: &[(&str, &str)]) -> Context {
+        use opentelemetry::baggage::{Baggage, BaggageExt};
+        let mut bag = Baggage::default();
+        for (k, v) in items {
+            bag.insert(k.to_string(), v.to_string());
+        }
+        Context::current_with_baggage(bag)
+    }
+
+    fn baggage_keys(cx: &Context) -> Vec<String> {
+        use opentelemetry::baggage::BaggageExt;
+        cx.baggage().iter().map(|(k, _)| k.to_string()).collect()
+    }
+
+    #[test]
+    fn scrub_default_policy_denies_all() {
+        // 默认策略（空白名单）全拒——拓扑②默认不透传。
+        let cx = cx_with_baggage(&[("tenant", "acme"), ("user_id", "u1")]);
+        assert!(baggage_keys(&scrub_baggage_with(cx, &BaggagePolicy::default())).is_empty());
+    }
+
+    #[test]
+    fn scrub_allowlist_keeps_only_listed_keys() {
+        let policy = BaggagePolicy { allowlist: vec!["tenant".to_string()], ..Default::default() };
+        let cx = cx_with_baggage(&[("tenant", "acme"), ("internal", "top-secret")]);
+        assert_eq!(baggage_keys(&scrub_baggage_with(cx, &policy)), ["tenant"]);
+    }
+
+    #[test]
+    fn scrub_caps_kept_entries() {
+        let policy = BaggagePolicy {
+            allowlist: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            max_entries: 2,
+            ..Default::default()
+        };
+        let cx = cx_with_baggage(&[("a", "1"), ("b", "2"), ("c", "3")]);
+        assert_eq!(baggage_keys(&scrub_baggage_with(cx, &policy)).len(), 2);
+    }
+
+    #[test]
+    fn scrub_drops_oversized_entries() {
+        let policy = BaggagePolicy {
+            allowlist: vec!["a".to_string(), "b".to_string()],
+            max_entry_bytes: 4, // key+value ≤ 4
+            ..Default::default()
+        };
+        let cx = cx_with_baggage(&[("a", "toolongvalue"), ("b", "xy")]);
+        assert_eq!(baggage_keys(&scrub_baggage_with(cx, &policy)), ["b"]);
+    }
+
     #[test]
     fn extract_returns_empty_context_without_propagator() {
         use opentelemetry::trace::TraceContextExt;
@@ -403,6 +528,31 @@ mod tests {
         assert!(
             extracted.span().span_context().is_valid(),
             "extracted context carries a valid span"
+        );
+    }
+
+    /// 蓝图 §4.0.7 评审 2.2：入站 baggage 不受信——经 BaggagePropagator 提取后
+    /// 必须过白名单清洗；默认策略（空白名单）全拒，任何条目不得进入 Context。
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn inbound_baggage_is_not_allowlisted() {
+        use opentelemetry::baggage::BaggageExt;
+        use opentelemetry::propagation::TextMapCompositePropagator;
+        use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
+        opentelemetry::global::set_text_map_propagator(TextMapCompositePropagator::new(vec![
+            Box::new(TraceContextPropagator::new()),
+            Box::new(BaggagePropagator::new()),
+        ]));
+
+        let mut inbound = axum::http::HeaderMap::new();
+        inbound
+            .insert("baggage", "tenant=acme;user_id=u1;internal=top-secret".parse().unwrap());
+        let cx = extract(&inbound);
+        let items: Vec<String> = cx.baggage().iter().map(|(k, _)| k.to_string()).collect();
+        assert!(
+            items.is_empty(),
+            "蓝图 §4.0.7: 未过 allowlist 的入站 baggage 必须被清洗（空 allowlist 下全拒），\
+             实际原样透传 {items:?}"
         );
     }
 

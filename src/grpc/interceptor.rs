@@ -397,4 +397,31 @@ mod tests {
             "P-MW: grpc/mod.rs handlers must read RequestContext (interceptor::finalize_context), not extract_client_ip inline"
         );
     }
+
+    /// P1-1 文本护栏（蓝图 §4.1）：gRPC 错误返回一律走 `err()` 分级日志助手
+    /// （客户端类→info!、其余→error!），流式路径与 unary（mod.rs:363）同式。
+    /// 本测试断言每一处 `model_error_status(` 调用都带 `err(` 包裹。
+    #[test]
+    fn streaming_model_errors_go_through_graded_logging() {
+        let src = include_str!("mod.rs");
+        let boundary = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..boundary];
+        let unguarded: Vec<String> = prod
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| {
+                // 调用点必须同行带 `err(model_error_status(`（unary 363 范本）；
+                // 定义行（fn model_error_status）与测试用例不计。
+                l.contains("model_error_status(")
+                    && !l.contains("err(model_error_status")
+                    && !l.trim_start().starts_with("fn model_error_status")
+            })
+            .map(|(i, l)| format!("{}: {}", i + 1, l.trim()))
+            .collect();
+        assert!(
+            unguarded.is_empty(),
+            "P1-1: 结构化 model error 必须经 err() 分级日志（unary 为范本），\
+             流式路径未包裹: {unguarded:?}"
+        );
+    }
 }

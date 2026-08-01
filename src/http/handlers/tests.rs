@@ -590,6 +590,112 @@ mod version_routing_tests {
     }
 
     #[tokio::test]
+    async fn preflight_with_disallowed_method_gets_no_cors_headers() {
+        // 蓝图 P-CORS ⑥：预检仅当 Origin 命中 **且 method/headers 全在清单内**
+        // 才附 CORS 头。本测试断言清单外 method（DELETE ∉ allow_methods）的预检
+        // 不得附 ACAO。
+        use crate::config::{CorsPolicy, ModelPolicies};
+        let state = test_state();
+        register_ready(&state, "m", &["1"]);
+        state.registry.activate_version("m", "1").unwrap();
+        state.registry.set_policies(
+            "m",
+            "1",
+            Some(ModelPolicies {
+                cors: Some(CorsPolicy {
+                    allow_origins: vec!["https://app.example.com".into()],
+                    allow_methods: vec!["POST".into()],
+                    allow_headers: vec!["content-type".into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        );
+        let app = Router::new()
+            .route(
+                "/v2/models/:model_name/infer",
+                axum::routing::post(infer_handler),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::http::cors::cors_middleware,
+            ))
+            .with_state(state.clone());
+        // DELETE 不在 allow_methods 清单内 → 蓝图 ⑥ 预检不得附 CORS 头。
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/v2/models/m/infer")
+                    .header("origin", "https://app.example.com")
+                    .header("access-control-request-method", "DELETE")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(
+            resp.headers().get("access-control-allow-origin").is_none(),
+            "蓝图 P-CORS ⑥: allow_methods 清单外的 method 预检不得附 ACAO"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_origin_request_still_carries_vary_origin() {
+        // 蓝图 P-CORS ④：`Vary: Origin` 必须始终附加——无 Origin 的响应也可能
+        // 被缓存再服务给带 Origin 的请求（缓存正确性）。本测试断言无 Origin
+        // 响应仍带 Vary: origin。
+        use crate::config::{CorsPolicy, ModelPolicies};
+        let state = test_state();
+        register_ready(&state, "m", &["1"]);
+        state.registry.activate_version("m", "1").unwrap();
+        state.registry.set_policies(
+            "m",
+            "1",
+            Some(ModelPolicies {
+                cors: Some(CorsPolicy {
+                    allow_origins: vec!["https://app.example.com".into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        );
+        let app = Router::new()
+            .route(
+                "/v2/models/:model_name/infer",
+                axum::routing::post(infer_handler),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::http::cors::cors_middleware,
+            ))
+            .with_state(state.clone());
+        // 同源/非浏览器请求不带 Origin → 蓝图 ④ Vary: Origin 仍须附加。
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/models/m/infer")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let vary = resp
+            .headers()
+            .get_all("vary")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            vary.iter().any(|v| v == "origin"),
+            "蓝图 P-CORS ④: Vary: Origin 必须始终附加（含无 Origin 请求），实际 vary={vary:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn cors_middleware_no_acao_for_disallowed_origin_on_actual_request() {
         // P-CORS security: an Origin not in the allowlist gets NO ACAO on the
         // actual response (browser blocks); Vary: Origin is still set.

@@ -235,11 +235,17 @@ pub async fn cors_middleware(
         .headers()
         .get("origin")
         .and_then(|v| v.to_str().ok());
+    // 蓝图 P-CORS ④：策略存在时 Vary: Origin 始终附加——无/非法 Origin 的
+    // 响应也可能被共享缓存再服务给带 Origin 的请求（缓存正确性）。
     let Some(origin_raw) = origin else {
-        return next.run(request).await; // 同源/非浏览器 → 不附 CORS
+        let mut response = next.run(request).await;
+        vary(response.headers_mut(), "origin"); // 同源/非浏览器 → 不附 CORS，仍附 Vary
+        return response;
     };
     let Some(norm) = normalize_origin(origin_raw) else {
-        return next.run(request).await; // 非法/null Origin → 不附
+        let mut response = next.run(request).await;
+        vary(response.headers_mut(), "origin"); // 非法/null Origin → 不附，仍附 Vary
+        return response;
     };
     let acao = resolve_acao(&norm, &policy.allow_origins);
 
@@ -247,7 +253,15 @@ pub async fn cors_middleware(
     let is_preflight = request.method() == Method::OPTIONS
         && request.headers().contains_key("access-control-request-method");
     if is_preflight {
-        return preflight_response(&policy, acao.as_ref());
+        let req_method = request
+            .headers()
+            .get("access-control-request-method")
+            .and_then(|v| v.to_str().ok());
+        let req_headers = request
+            .headers()
+            .get("access-control-request-headers")
+            .and_then(|v| v.to_str().ok());
+        return preflight_response(&policy, acao.as_ref(), req_method, req_headers);
     }
 
     // 实际请求：透传给下游，回程附 ACAO/ACAC/Vary/Expose。
@@ -269,18 +283,38 @@ pub async fn cors_middleware(
     response
 }
 
-/// 构造预检响应（评审 2.2）：始终 204；仅当 Origin 命中 且 method/headers 全在
-/// 清单内才附 ACAO/ACAM/ACAH/ACAC/Max-Age。
-fn preflight_response(policy: &CorsPolicy, acao: Option<&AcaoValue>) -> Response {
+/// 构造预检响应（评审 2.2）：始终 204；仅当 Origin 命中 且请求 method/headers
+/// 全在清单内才附 ACAO/ACAM/ACAH/ACAC/Max-Age（蓝图 P-CORS ⑥）。清单含 `*`
+/// 视为全放行；method/headers 比对大小写归一。
+fn preflight_response(
+    policy: &CorsPolicy,
+    acao: Option<&AcaoValue>,
+    req_method: Option<&str>,
+    req_headers: Option<&str>,
+) -> Response {
     let mut builder = Response::builder().status(StatusCode::NO_CONTENT);
     let headers = builder.headers_mut().unwrap();
     vary(headers, "origin");
     vary(headers, "access-control-request-method");
     vary(headers, "access-control-request-headers");
 
+    // 蓝图 ⑥：请求的 method 与 headers 全在清单内才附 CORS 头。
+    let method_ok = req_method.is_some_and(|m| {
+        let m = m.trim();
+        policy
+            .allow_methods
+            .iter()
+            .any(|am| am == "*" || am.eq_ignore_ascii_case(m))
+    });
+    let headers_ok = req_headers.map_or(true, |h| {
+        h.split(',')
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .all(|h| policy.allow_headers.iter().any(|ah| ah == "*" || ah.eq_ignore_ascii_case(h)))
+    });
+
     if let Some(acao) = acao {
-        // 预检仅在 method/headers 全在清单时附 CORS 头。
-        if apply_acao(headers, acao, policy.allow_credentials) {
+        if method_ok && headers_ok && apply_acao(headers, acao, policy.allow_credentials) {
             if let Ok(v) = HeaderValue::from_str(&policy.allow_methods.join(", ")) {
                 headers.insert(
                     HeaderName::from_static("access-control-allow-methods"),
@@ -444,7 +478,7 @@ mod tests {
             ..Default::default()
         };
         let acao = Some(AcaoValue::Origin("https://app.example.com".into()));
-        let resp = preflight_response(&policy, acao.as_ref());
+        let resp = preflight_response(&policy, acao.as_ref(), Some("POST"), Some("content-type"));
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         let h = resp.headers();
         assert_eq!(h.get("access-control-allow-origin").unwrap(), "https://app.example.com");
@@ -464,9 +498,29 @@ mod tests {
             allow_origins: vec!["https://app.example.com".into()],
             ..Default::default()
         };
-        let resp = preflight_response(&policy, None);
+        let resp = preflight_response(&policy, None, Some("POST"), None);
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         assert!(resp.headers().get("access-control-allow-origin").is_none());
         assert!(resp.headers().get("access-control-allow-methods").is_none());
+    }
+
+    #[test]
+    fn preflight_no_acao_when_request_headers_not_allowed() {
+        // 蓝图 ⑥：ACRH 含清单外 header → 不附 CORS 头（method 命中也不够）。
+        let policy = CorsPolicy {
+            allow_origins: vec!["https://app.example.com".into()],
+            allow_methods: vec!["POST".into()],
+            allow_headers: vec!["content-type".into()],
+            ..Default::default()
+        };
+        let acao = Some(AcaoValue::Origin("https://app.example.com".into()));
+        let resp = preflight_response(
+            &policy,
+            acao.as_ref(),
+            Some("POST"),
+            Some("content-type, x-internal"),
+        );
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(resp.headers().get("access-control-allow-origin").is_none());
     }
 }

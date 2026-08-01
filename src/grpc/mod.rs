@@ -755,10 +755,10 @@ impl GrpcService {
                         let grpc_err = match serde_json::from_str::<serde_json::Value>(&e.message) {
                             Ok(val) => {
                                 if let Some(parsed) = try_parse_model_error(&val) {
-                                    model_error_status(
+                                    err(model_error_status(
                                         error_type_to_grpc_code(&parsed.error_type),
                                         &parsed,
-                                    )
+                                    ))
                                 } else {
                                     err(Status::internal(e.message.clone()))
                                 }
@@ -998,10 +998,10 @@ impl GrpcService {
                         let grpc_err = match serde_json::from_str::<serde_json::Value>(&e.message) {
                             Ok(val) => {
                                 if let Some(parsed) = try_parse_model_error(&val) {
-                                    model_error_status(
+                                    err(model_error_status(
                                         error_type_to_grpc_code(&parsed.error_type),
                                         &parsed,
-                                    )
+                                    ))
                                 } else {
                                     err(Status::internal(e.message.clone()))
                                 }
@@ -1314,10 +1314,10 @@ impl GrpcService {
                         let grpc_err = match serde_json::from_str::<serde_json::Value>(&e.message) {
                             Ok(val) => {
                                 if let Some(parsed) = try_parse_model_error(&val) {
-                                    model_error_status(
+                                    err(model_error_status(
                                         error_type_to_grpc_code(&parsed.error_type),
                                         &parsed,
-                                    )
+                                    ))
                                 } else {
                                     err(Status::internal(e.message.clone()))
                                 }
