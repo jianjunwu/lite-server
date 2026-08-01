@@ -40,6 +40,10 @@ server:
                                # 不能挂）。0 = 无限。
   max_request_body_bytes: null # 单请求体上限（字节）。超限 → HTTP 413 / gRPC
                                # ResourceExhausted。null = 平台默认（axum 2MB / tonic 4MB）。
+  # P-XFF 受信代理 client-IP 清洗——默认 fail-safe。
+  trusted_proxies: []          # 前置代理的 CIDR/IP，其 X-Forwarded-For / X-Real-IP 才被信任。
+                               # 空（默认）= 一律用直连 TCP peer、忽略客户端代理头（防伪造 IP 绕过
+                               # key=ip 限流）。网关/代理需在此列出，其转发的客户端 IP 才能参与限流。
 
 logging:
   level: info                  # 日志级别：trace, debug, info, warn, error

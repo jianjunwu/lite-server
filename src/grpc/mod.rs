@@ -78,6 +78,11 @@ pub struct GrpcService {
     /// same shared pieces (registry/worker_manager/queue/config/repo_path/…),
     /// overriding `shutdown_state` to the real in-flight tracker.
     app_state: Arc<AppState>,
+    /// P-XFF: trusted-proxy CIDRs for client-IP cleansing (parsed once at
+    /// startup from `server.trusted_proxies`). Empty → fail-safe (gRPC TCP
+    /// peer used, client XFF/X-Real-IP ignored — prevents forged-IP
+    /// rate-limit bypass). Consumed by `finalize_context` in every handler.
+    trusted: Arc<crate::client_ip::TrustedNetworks>,
 }
 
 impl GrpcService {
@@ -92,6 +97,7 @@ impl GrpcService {
         rate_limiter: Arc<crate::rate_limit::RateLimiter>,
         decoupled_idle_timeout: Option<Duration>,
         app_state: Arc<AppState>,
+        trusted: Arc<crate::client_ip::TrustedNetworks>,
     ) -> Self {
         Self {
             registry,
@@ -104,6 +110,7 @@ impl GrpcService {
             rate_limiter,
             decoupled_idle_timeout,
             app_state,
+            trusted,
         }
     }
 
@@ -144,6 +151,7 @@ impl GrpcService {
             &grpc_metadata,
             &req.headers,
             remote_addr,
+            &self.trusted,
         );
         let request_id = cx.request_id.clone();
         *request_id_out = request_id.clone();
@@ -398,6 +406,7 @@ impl GrpcService {
             &grpc_metadata,
             &req.headers,
             remote_addr,
+            &self.trusted,
         );
         let request_id = cx.request_id;
         *request_id_out = request_id.clone();
@@ -548,6 +557,7 @@ impl GrpcService {
             &grpc_metadata,
             &req.headers,
             remote_addr,
+            &self.trusted,
         );
         let request_id = cx.request_id;
         *request_id_out = request_id.clone();
@@ -794,6 +804,7 @@ impl GrpcService {
             &grpc_metadata,
             &req.headers,
             remote_addr,
+            &self.trusted,
         );
         let request_id = cx.request_id;
         *request_id_out = request_id.clone();
@@ -1032,6 +1043,7 @@ impl GrpcService {
             &grpc_metadata,
             &HashMap::new(),
             remote_addr,
+            &self.trusted,
         );
         let request_id = cx.request_id;
         *request_id_out = request_id.clone();
@@ -2033,6 +2045,10 @@ pub async fn start_grpc_server(
         crate::access_control::AccessControl::build(&config.access_control)?,
     );
 
+    // P-XFF: parse trusted-proxy CIDRs once (fail-fast on a bad entry). Shared
+    // by the service interceptors and the handler-side `finalize_context`.
+    let trusted = Arc::new(config.server.trusted_networks()?);
+
     let service = GrpcService::new(
         registry.clone(),
         worker_manager.clone(),
@@ -2049,6 +2065,7 @@ pub async fn start_grpc_server(
             None
         },
         app_state,
+        trusted.clone(),
     );
     let max_request_body_bytes = config.server.max_request_body_bytes;
     let server = LiteServerServer::new(service);
@@ -2075,7 +2092,7 @@ pub async fn start_grpc_server(
     // (P1-1) stay in handlers. Transparent to unary/stream/bidi.
     let server = tonic::codegen::InterceptedService::new(
         server,
-        interceptor::service_interceptor(access_control.clone(), EndpointClass::Inference),
+        interceptor::service_interceptor(access_control.clone(), EndpointClass::Inference, trusted.clone()),
     );
 
     // Standard gRPC health checking (grpc.health.v1): the reporter lives in
@@ -2086,7 +2103,7 @@ pub async fn start_grpc_server(
     worker_manager.sync_grpc_health().await;
     let health_service = tonic::codegen::InterceptedService::new(
         health_service,
-        interceptor::service_interceptor(access_control.clone(), EndpointClass::Health),
+        interceptor::service_interceptor(access_control.clone(), EndpointClass::Health, trusted.clone()),
     );
 
     // P1-2: HTTP/2 keepalive / window / frame tuning — applied to every tonic
@@ -2128,7 +2145,7 @@ pub async fn start_grpc_server(
     // fail-closed（未配置仅 loopback；D14）。
     let admin_server = tonic::codegen::InterceptedService::new(
         admin_server,
-        interceptor::service_interceptor(access_control.clone(), EndpointClass::Admin),
+        interceptor::service_interceptor(access_control.clone(), EndpointClass::Admin, trusted.clone()),
     );
 
     // P7-2 admin_bind (蓝图 §4.2): when unset, a single server serves all three
@@ -3118,6 +3135,7 @@ mod request_metrics_tests {
             Arc::new(crate::rate_limit::RateLimiter::default()),
             None, // P9-1 decoupled idle timeout — unused in these unit tests.
             app_state,
+            Arc::new(Vec::new()), // P-XFF trusted — empty (fail-safe) in unit tests.
         )
     }
 
@@ -3454,6 +3472,7 @@ mod request_metrics_tests {
             Arc::new(crate::rate_limit::RateLimiter::default()),
             None,
             app_state,
+            Arc::new(Vec::new()), // P-XFF trusted — empty (fail-safe) in this test.
         );
 
         // Saturate the single admission slot.

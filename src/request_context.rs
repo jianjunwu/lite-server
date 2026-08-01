@@ -14,14 +14,16 @@
 //! propagator extract。P-TRACE 未落地前无写入方，`trace_cx` 为空 `Context`。
 
 use crate::callback::Protocol;
+use crate::client_ip::{extract_client_ip, merge_xff, TrustedNetworks};
 use crate::http::RequestId;
-use axum::extract::{ConnectInfo, FromRequestParts, Request};
+use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
 use axum::http::request::Parts;
 use axum::http::HeaderMap;
 use axum::middleware::Next;
 use axum::response::Response;
 use opentelemetry::Context;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// T1 请求级上下文：一次填充、处处消费。
@@ -52,21 +54,36 @@ pub struct RequestContext {
 #[derive(Clone, Debug)]
 pub(crate) struct OtelParentContext(pub Context);
 
-/// HTTP client_ip 提取的单一实现：x-forwarded-for > x-real-ip > TCP peer
-/// （`ConnectInfo`，直连连接的兜底，替代 0.7.x 回归的 peer_ip_fallback 读取
-/// 侧语义）> 空串。与 peer_ip_fallback 注入 x-real-ip 后 handler 读 header
-/// 的结果逐字节一致。
-pub(crate) fn http_client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
-    for key in ["x-forwarded-for", "x-real-ip"] {
-        if let Some(v) = headers
-            .get(key)
-            .and_then(|v| v.to_str().ok())
-            .filter(|s| !s.is_empty())
-        {
-            return v.to_string();
-        }
-    }
-    peer.map(|p| p.ip().to_string()).unwrap_or_default()
+/// HTTP client_ip 清洗（P-XFF）：把 header + TCP peer 经
+/// [`crate::client_ip::extract_client_ip`] 的 fail-safe 受信代理算法清洗成
+/// 单个 IP 字符串。`trusted` 由 `context_middleware` 的状态注入（生产栈）；
+/// 无锚点（UDS 无 `ConnectInfo`）时保留既有 header 优先语义。无任何来源 → 空串。
+///
+/// 重复 `X-Forwarded-For` 头按 RFC 出现序合并（`merge_xff`），再传入清洗。
+pub(crate) fn http_client_ip(
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+    trusted: &[ipnet::IpNet],
+) -> String {
+    let xff = header_all(headers, "x-forwarded-for");
+    let x_real_ip = header_first(headers, "x-real-ip");
+    extract_client_ip(xff.as_deref(), x_real_ip.as_deref(), peer.map(|p| p.ip()), trusted)
+        .map(|ip| ip.to_string())
+        .unwrap_or_default()
+}
+
+/// Collect every value of a header (RFC appearance order), comma-joined. Used
+/// for `X-Forwarded-For` where multiple hops/proxies each append a header.
+fn header_all(headers: &HeaderMap, name: &str) -> Option<String> {
+    merge_xff(headers.get_all(name).iter().filter_map(|v| v.to_str().ok()))
+}
+
+fn header_first(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 impl RequestContext {
@@ -74,10 +91,13 @@ impl RequestContext {
     /// 保证 handler 在无 middleware 的单测里也能拿到一致的 context）：
     /// - request_id：observability stash 的 `RequestId` extension 优先，否则
     ///   UUID v4（生产栈 observability 恒在最外，stash 恒存在）；
-    /// - client_ip：`http_client_ip`（header > ConnectInfo peer）；
+    /// - client_ip：`http_client_ip`（P-XFF 清洗：header + peer > 空串）；
     /// - trace_cx：observability stash 的 `OtelParentContext`，缺省为空
     ///   `Context`（P-TRACE 前恒为空）。
-    pub(crate) fn from_http_parts(parts: &Parts) -> Self {
+    ///
+    /// `trusted` 由 middleware 状态注入（生产）；extractor/兜底路径传 `&[]`
+    /// （fail-safe：直连 peer 优先，忽略客户端 header）。
+    pub(crate) fn from_http_parts(parts: &Parts, trusted: &[ipnet::IpNet]) -> Self {
         let request_id = parts
             .extensions
             .get::<RequestId>()
@@ -87,7 +107,7 @@ impl RequestContext {
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
             .map(|ci| ci.0);
-        let client_ip = http_client_ip(&parts.headers, peer);
+        let client_ip = http_client_ip(&parts.headers, peer, trusted);
         let trace_cx = parts
             .extensions
             .get::<OtelParentContext>()
@@ -110,10 +130,16 @@ impl RequestContext {
 }
 
 /// HTTP `context_middleware`（蓝图 §4.0.2）：紧随 observability、在各消费者
-/// 前（D21），一次填充 `RequestContext` 入 request extensions。
-pub async fn context_middleware(request: Request, next: Next) -> Response {
+/// 前（D21），一次填充 `RequestContext` 入 request extensions。状态携带 P-XFF
+/// 的受信代理 CIDR 列表（`server.trusted_proxies`）；未配 → 空 → fail-safe
+/// 用直连 peer、忽略客户端 XFF/X-Real-IP。
+pub async fn context_middleware(
+    State(trusted): State<Arc<TrustedNetworks>>,
+    request: Request,
+    next: Next,
+) -> Response {
     let (mut parts, body) = request.into_parts();
-    let cx = RequestContext::from_http_parts(&parts);
+    let cx = RequestContext::from_http_parts(&parts, &trusted);
     parts.extensions.insert(cx);
     next.run(Request::from_parts(parts, body)).await
 }
@@ -129,7 +155,7 @@ impl<S: Send + Sync> FromRequestParts<S> for RequestContext {
             .extensions
             .get::<RequestContext>()
             .cloned()
-            .unwrap_or_else(|| Self::from_http_parts(parts)))
+            .unwrap_or_else(|| Self::from_http_parts(parts, &[])))
     }
 }
 
@@ -253,39 +279,51 @@ mod tests {
 
     #[test]
     fn http_client_ip_prefers_x_forwarded_for() {
+        // 无 peer（UDS）+ 空 trusted：保留既有 header 优先语义。
         let h = headers_with(&[("x-forwarded-for", "10.0.0.1"), ("x-real-ip", "10.0.0.2")]);
-        assert_eq!(http_client_ip(&h, None), "10.0.0.1");
+        assert_eq!(http_client_ip(&h, None, &[]), "10.0.0.1");
     }
 
     #[test]
     fn http_client_ip_uses_x_real_ip_when_no_xff() {
         let h = headers_with(&[("x-real-ip", "10.0.0.2")]);
-        assert_eq!(http_client_ip(&h, None), "10.0.0.2");
+        assert_eq!(http_client_ip(&h, None, &[]), "10.0.0.2");
     }
 
     #[test]
     fn http_client_ip_empty_xff_falls_through() {
         let h = headers_with(&[("x-forwarded-for", ""), ("x-real-ip", "10.0.0.2")]);
-        assert_eq!(http_client_ip(&h, None), "10.0.0.2");
+        assert_eq!(http_client_ip(&h, None, &[]), "10.0.0.2");
     }
 
     #[test]
     fn http_client_ip_falls_back_to_peer_for_direct_connections() {
-        // 直连（无代理头）：TCP peer 即客户端（0.7.x 回归的兜底语义）。
+        // 直连（无代理头）：TCP peer 即客户端。
         let peer: SocketAddr = "203.0.113.7:5000".parse().unwrap();
-        assert_eq!(http_client_ip(&HeaderMap::new(), Some(peer)), "203.0.113.7");
+        assert_eq!(http_client_ip(&HeaderMap::new(), Some(peer), &[]), "203.0.113.7");
     }
 
     #[test]
-    fn http_client_ip_proxy_header_beats_peer() {
+    fn http_client_ip_untrusted_peer_ignores_forged_xff() {
+        // P-XFF fail-safe：非受信 peer 携带 XFF → 忽略 XFF，用 peer
+        // （修复前会信 XFF，可伪造绕过 key=ip 限流）。
         let h = headers_with(&[("x-forwarded-for", "10.0.0.99")]);
         let peer: SocketAddr = "203.0.113.7:5000".parse().unwrap();
-        assert_eq!(http_client_ip(&h, Some(peer)), "10.0.0.99");
+        assert_eq!(http_client_ip(&h, Some(peer), &[]), "203.0.113.7");
+    }
+
+    #[test]
+    fn http_client_ip_trusted_proxy_honors_forwarded_client() {
+        // 受信代理（10.0.0.0/8）转发的 XFF → 清洗出真实客户端。
+        let h = headers_with(&[("x-forwarded-for", "203.0.113.55")]);
+        let peer: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let trusted = vec!["10.0.0.0/8".parse().unwrap()];
+        assert_eq!(http_client_ip(&h, Some(peer), &trusted), "203.0.113.55");
     }
 
     #[test]
     fn http_client_ip_empty_when_no_source() {
-        assert_eq!(http_client_ip(&HeaderMap::new(), None), "");
+        assert_eq!(http_client_ip(&HeaderMap::new(), None, &[]), "");
     }
 
     // ===== context_middleware：一次填充 =====
@@ -297,7 +335,10 @@ mod tests {
         }
         let app = axum::Router::new()
             .route("/t", axum::routing::get(handler))
-            .layer(axum::middleware::from_fn(context_middleware));
+            .layer(axum::middleware::from_fn_with_state(
+                std::sync::Arc::new(crate::client_ip::TrustedNetworks::new()),
+                context_middleware,
+            ));
 
         let response = app
             .oneshot(
@@ -329,7 +370,10 @@ mod tests {
         }
         let app = axum::Router::new()
             .route("/t", axum::routing::get(handler))
-            .layer(axum::middleware::from_fn(context_middleware));
+            .layer(axum::middleware::from_fn_with_state(
+                std::sync::Arc::new(crate::client_ip::TrustedNetworks::new()),
+                context_middleware,
+            ));
 
         let mut request = Request::builder().uri("/t").body(Body::empty()).unwrap();
         request
@@ -347,7 +391,10 @@ mod tests {
         }
         let app = axum::Router::new()
             .route("/t", axum::routing::get(handler))
-            .layer(axum::middleware::from_fn(context_middleware));
+            .layer(axum::middleware::from_fn_with_state(
+                std::sync::Arc::new(crate::client_ip::TrustedNetworks::new()),
+                context_middleware,
+            ));
 
         let request = Request::builder().uri("/t").body(Body::empty()).unwrap();
         let response = app.oneshot(request).await.unwrap();
@@ -370,7 +417,10 @@ mod tests {
         // stash 在外（后挂），context_middleware 在内（先挂）——与生产栈同序。
         let app = axum::Router::new()
             .route("/t", axum::routing::get(handler))
-            .layer(axum::middleware::from_fn(context_middleware))
+            .layer(axum::middleware::from_fn_with_state(
+                std::sync::Arc::new(crate::client_ip::TrustedNetworks::new()),
+                context_middleware,
+            ))
             .layer(axum::middleware::from_fn(stash_middleware));
 
         let response = app
@@ -397,7 +447,10 @@ mod tests {
         }
         let app = axum::Router::new()
             .route("/t", axum::routing::get(handler))
-            .layer(axum::middleware::from_fn(context_middleware))
+            .layer(axum::middleware::from_fn_with_state(
+                std::sync::Arc::new(crate::client_ip::TrustedNetworks::new()),
+                context_middleware,
+            ))
             .layer(axum::middleware::from_fn(otel_stash_middleware));
 
         let response = app
@@ -416,7 +469,10 @@ mod tests {
         }
         let app = axum::Router::new()
             .route("/t", axum::routing::get(handler))
-            .layer(axum::middleware::from_fn(context_middleware));
+            .layer(axum::middleware::from_fn_with_state(
+                std::sync::Arc::new(crate::client_ip::TrustedNetworks::new()),
+                context_middleware,
+            ));
 
         let response = app
             .oneshot(Request::builder().uri("/t").body(Body::empty()).unwrap())

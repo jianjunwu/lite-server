@@ -78,7 +78,7 @@ pub(crate) async fn route_fallback(
         .extensions
         .get::<crate::request_context::RequestContext>()
         .cloned()
-        .unwrap_or_else(|| crate::request_context::RequestContext::from_http_parts(&parts));
+        .unwrap_or_else(|| crate::request_context::RequestContext::from_http_parts(&parts, &[]));
     let headers = parts.headers.clone();
     let body = match axum::body::to_bytes(body, ROUTE_BODY_LIMIT).await {
         Ok(b) => b,
@@ -288,6 +288,10 @@ pub async fn start_http_server(
         crate::access_control::AccessControl::build(&config.access_control)?,
     );
 
+    // P-XFF: parse trusted-proxy CIDRs once (fail-fast on a bad entry). Empty
+    // → fail-safe (direct peer used, client proxy headers ignored).
+    let trusted = std::sync::Arc::new(config.server.trusted_networks()?);
+
     let app = create_routes(state);
 
     // P-FLOW (§4.0.9): per-request body cap. Oversized bodies → 413. None =
@@ -327,7 +331,9 @@ pub async fn start_http_server(
     // observability, ahead of every RequestContext consumer (D21) — fills
     // RequestContext once from the observability RequestId stash + headers
     // + ConnectInfo; rate-limit / callbacks / RequestMeta all read it.
-    let app = app.layer(axum::middleware::from_fn(
+    // P-XFF: carries trusted_proxies so client-IP cleansing is fail-safe.
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        trusted.clone(),
         crate::request_context::context_middleware,
     ));
 
@@ -815,7 +821,8 @@ mod tests {
         // (inner), observability last (outermost).
         let app = axum::Router::new()
             .route("/test", axum::routing::get(cx_handler))
-            .layer(axum::middleware::from_fn(
+            .layer(axum::middleware::from_fn_with_state(
+                std::sync::Arc::new(crate::client_ip::TrustedNetworks::new()),
                 crate::request_context::context_middleware,
             ))
             .layer(axum::middleware::from_fn(observability_middleware));

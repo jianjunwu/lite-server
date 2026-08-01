@@ -12,6 +12,7 @@
 
 use crate::access_control::{AccessControl, EndpointClass};
 use crate::callback::Protocol;
+use crate::client_ip::{extract_client_ip, merge_xff, TrustedNetworks};
 use crate::request_context::RequestContext;
 use opentelemetry::Context;
 use std::collections::HashMap;
@@ -27,12 +28,12 @@ impl RequestContext {
     /// `finalize_context` 应用 proto `headers` map fallback / peer 兜底 /
     /// UUID 生成——interceptor 看不到 proto body，不能提前定案。
     ///
-    /// client_ip 在 metadata 内按 x-forwarded-for > x-real-ip 取首个非空值；
-    /// metadata 整体优先于 proto headers map（与 request_id 的既有
-    /// metadata-优先语义一致）。
+    /// client_ip 经 P-XFF fail-safe 清洗（`extract_client_ip`）：peer 锚定，
+    /// 受信代理才信任 metadata XFF/X-Real-IP。重复 XFF 头按出现序合并。
     pub(crate) fn from_grpc_metadata(
         metadata: &MetadataMap,
         _remote_addr: Option<SocketAddr>,
+        trusted: &[ipnet::IpNet],
     ) -> Self {
         let request_id = metadata
             .get("x-client-request-id")
@@ -40,16 +41,16 @@ impl RequestContext {
             .filter(|s| crate::validation::is_valid_request_id(s))
             .map(String::from)
             .unwrap_or_default();
-        let client_ip = ["x-forwarded-for", "x-real-ip"]
-            .iter()
-            .find_map(|k| {
-                metadata
-                    .get(*k)
-                    .and_then(|v| v.to_str().ok())
-                    .filter(|s| !s.is_empty())
-            })
-            .map(String::from)
-            .unwrap_or_default();
+        let xff = metadata_xff(metadata, "x-forwarded-for");
+        let x_real_ip = metadata_first(metadata, "x-real-ip");
+        let client_ip = extract_client_ip(
+            xff.as_deref(),
+            x_real_ip.as_deref(),
+            _remote_addr.map(|a| a.ip()),
+            trusted,
+        )
+        .map(|ip| ip.to_string())
+        .unwrap_or_default();
         Self {
             request_id,
             client_ip,
@@ -58,6 +59,19 @@ impl RequestContext {
             principal: None, // P5-1: context_interceptor 随后按 TlsConnectInfo 填充
         }
     }
+}
+
+/// Merge every `x-forwarded-for` metadata value (RFC appearance order).
+fn metadata_xff(metadata: &MetadataMap, key: &str) -> Option<String> {
+    merge_xff(metadata.get_all(key).iter().filter_map(|v| v.to_str().ok()))
+}
+
+fn metadata_first(metadata: &MetadataMap, key: &str) -> Option<String> {
+    metadata
+        .get(key)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// P7-1 production interceptor for one tonic service: fills `RequestContext`
@@ -69,10 +83,11 @@ impl RequestContext {
 pub fn service_interceptor(
     access_control: Arc<AccessControl>,
     class: EndpointClass,
+    trusted: Arc<TrustedNetworks>,
 ) -> impl FnMut(Request<()>) -> Result<Request<()>, Status> + Send + Sync + Clone + 'static {
     move |mut request| {
         let remote = request.remote_addr();
-        let mut cx = RequestContext::from_grpc_metadata(request.metadata(), remote);
+        let mut cx = RequestContext::from_grpc_metadata(request.metadata(), remote, &trusted);
         cx.principal = tls_principal(request.extensions());
         let is_loopback = remote.map(|a| a.ip().is_loopback()).unwrap_or(true);
         if !access_control.check(class, Protocol::Grpc, request.metadata(), is_loopback) {
@@ -86,9 +101,11 @@ pub fn service_interceptor(
 /// tonic `.interceptor()` 入口（挂载矩阵 §4.0.3：LiteServer 与 health 服务
 /// 都挂）：pre-call 提取 + 填充 `RequestContext` 入 request extensions。
 /// 对 unary / server-streaming / bidi 语义透明（每次 RPC 调用前执行一次，
-/// 不触碰消息流）。
+/// 不触碰消息流）。P-XFF：trusted 取空（fail-safe）——生产栈用
+/// `service_interceptor` 注入真实 trusted。
 pub fn context_interceptor(mut request: Request<()>) -> Result<Request<()>, Status> {
-    let mut cx = RequestContext::from_grpc_metadata(request.metadata(), request.remote_addr());
+    let mut cx =
+        RequestContext::from_grpc_metadata(request.metadata(), request.remote_addr(), &[]);
     // P5-1: TLS 连接经 tonic 的 TlsConnectInfo 携带 mTLS 客户端证书 → T1
     // principal（明文 TCP/UDS 恒为 None）。
     cx.principal = tls_principal(request.extensions());
@@ -113,15 +130,17 @@ fn tls_principal(extensions: &tonic::Extensions) -> Option<String> {
 ///   interceptor 同一规则从 metadata 合成；
 /// - request_id：metadata 已定案则保留，否则 proto headers 有效值，再否则
 ///   UUID v4；
-/// - client_ip：metadata 已定案则保留，否则 proto headers
-///   （xff > x-real-ip），再否则 transport peer 地址，最后空串。
+/// - client_ip：metadata 已定案则保留，否则 proto headers 经 P-XFF 清洗
+///   （`extract_client_ip`），再否则 transport peer 地址，最后空串。
 pub(crate) fn finalize_context(
     cx: Option<RequestContext>,
     metadata: &MetadataMap,
     proto_headers: &HashMap<String, String>,
     remote_addr: Option<SocketAddr>,
+    trusted: &[ipnet::IpNet],
 ) -> RequestContext {
-    let mut cx = cx.unwrap_or_else(|| RequestContext::from_grpc_metadata(metadata, remote_addr));
+    let mut cx =
+        cx.unwrap_or_else(|| RequestContext::from_grpc_metadata(metadata, remote_addr, trusted));
     if cx.request_id.is_empty() {
         cx.request_id = proto_headers
             .get("x-client-request-id")
@@ -130,10 +149,10 @@ pub(crate) fn finalize_context(
             .unwrap_or_else(|| Uuid::new_v4().to_string());
     }
     if cx.client_ip.is_empty() {
-        cx.client_ip = ["x-forwarded-for", "x-real-ip"]
-            .iter()
-            .find_map(|k| proto_headers.get(*k).filter(|s| !s.is_empty()).cloned())
-            .or_else(|| remote_addr.map(|a| a.ip().to_string()))
+        let xff = proto_headers.get("x-forwarded-for").map(String::as_str);
+        let x_real_ip = proto_headers.get("x-real-ip").map(String::as_str);
+        cx.client_ip = extract_client_ip(xff, x_real_ip, remote_addr.map(|a| a.ip()), trusted)
+            .map(|ip| ip.to_string())
             .unwrap_or_default();
     }
     cx
@@ -216,25 +235,51 @@ mod tests {
     #[test]
     fn metadata_request_id_valid_value() {
         let md = md_with(&[("x-client-request-id", "from-metadata")]);
-        assert_eq!(RequestContext::from_grpc_metadata(&md, None).request_id, "from-metadata");
+        assert_eq!(
+            RequestContext::from_grpc_metadata(&md, None, &[]).request_id,
+            "from-metadata"
+        );
     }
 
     #[test]
     fn metadata_request_id_skips_invalid_value() {
         let md = md_with(&[("x-client-request-id", &"x".repeat(513))]);
-        assert_eq!(RequestContext::from_grpc_metadata(&md, None).request_id, "");
+        assert_eq!(RequestContext::from_grpc_metadata(&md, None, &[]).request_id, "");
     }
 
     #[test]
     fn metadata_client_ip_prefers_xff_over_real_ip() {
+        // 无 peer（UDS）+ 空 trusted：保留 header 优先语义。
         let md = md_with(&[("x-forwarded-for", "10.0.0.1"), ("x-real-ip", "10.0.0.2")]);
-        assert_eq!(RequestContext::from_grpc_metadata(&md, None).client_ip, "10.0.0.1");
+        assert_eq!(RequestContext::from_grpc_metadata(&md, None, &[]).client_ip, "10.0.0.1");
     }
 
     #[test]
     fn metadata_client_ip_skips_empty_xff() {
         let md = md_with(&[("x-forwarded-for", ""), ("x-real-ip", "10.0.0.2")]);
-        assert_eq!(RequestContext::from_grpc_metadata(&md, None).client_ip, "10.0.0.2");
+        assert_eq!(RequestContext::from_grpc_metadata(&md, None, &[]).client_ip, "10.0.0.2");
+    }
+
+    // ===== P-XFF（gRPC 侧）：peer 锚定 fail-safe =====
+
+    #[test]
+    fn metadata_client_ip_untrusted_peer_ignores_forged_xff() {
+        // 非受信 TCP peer 携带 XFF → 忽略 XFF，用 peer（防伪造）。
+        let md = md_with(&[("x-forwarded-for", "10.0.0.99")]);
+        assert_eq!(
+            RequestContext::from_grpc_metadata(&md, addr("203.0.113.7"), &[]).client_ip,
+            "203.0.113.7"
+        );
+    }
+
+    #[test]
+    fn metadata_client_ip_trusted_proxy_honors_forwarded_client() {
+        let md = md_with(&[("x-forwarded-for", "203.0.113.55")]);
+        let trusted = vec!["10.0.0.0/8".parse().unwrap()];
+        assert_eq!(
+            RequestContext::from_grpc_metadata(&md, addr("10.0.0.1"), &trusted).client_ip,
+            "203.0.113.55"
+        );
     }
 
     // ===== finalize_context：post-decode fallback（原 extract_* 的 proto
@@ -244,14 +289,14 @@ mod tests {
     fn finalize_keeps_metadata_request_id_over_proto_headers() {
         let md = md_with(&[("x-client-request-id", "from-metadata")]);
         let proto = headers_with(&[("x-client-request-id", "from-headers")]);
-        let cx = finalize_context(None, &md, &proto, None);
+        let cx = finalize_context(None, &md, &proto, None, &[]);
         assert_eq!(cx.request_id, "from-metadata");
     }
 
     #[test]
     fn finalize_falls_back_to_proto_headers_request_id() {
         let proto = headers_with(&[("x-client-request-id", "from-headers")]);
-        let cx = finalize_context(None, &MetadataMap::new(), &proto, None);
+        let cx = finalize_context(None, &MetadataMap::new(), &proto, None, &[]);
         assert_eq!(cx.request_id, "from-headers");
     }
 
@@ -259,53 +304,67 @@ mod tests {
     fn finalize_skips_invalid_metadata_value_then_uses_proto() {
         let md = md_with(&[("x-client-request-id", &"x".repeat(513))]);
         let proto = headers_with(&[("x-client-request-id", "from-headers")]);
-        let cx = finalize_context(None, &md, &proto, None);
+        let cx = finalize_context(None, &md, &proto, None, &[]);
         assert_eq!(cx.request_id, "from-headers");
     }
 
     #[test]
     fn finalize_generates_uuid_when_request_id_absent() {
-        let cx = finalize_context(None, &MetadataMap::new(), &HashMap::new(), None);
+        let cx = finalize_context(None, &MetadataMap::new(), &HashMap::new(), None, &[]);
         assert!(Uuid::parse_str(&cx.request_id).is_ok(), "expected UUID, got {}", cx.request_id);
     }
 
     #[test]
     fn finalize_keeps_metadata_client_ip_over_proto_headers() {
+        // 无 peer（UDS）→ metadata XFF 生效（fail-safe 不触发）；metadata 命中
+        // 后 finalize 不覆盖。proto XFF 10.0.0.3 被忽略（cx 已非空）。
         let md = md_with(&[("x-forwarded-for", "10.0.0.1")]);
         let proto = headers_with(&[("x-forwarded-for", "10.0.0.3")]);
-        let cx = finalize_context(None, &md, &proto, addr("192.168.1.1"));
+        let cx = finalize_context(None, &md, &proto, None, &[]);
         assert_eq!(cx.client_ip, "10.0.0.1");
     }
 
     #[test]
     fn finalize_uses_metadata_real_ip_when_no_xff() {
         let md = md_with(&[("x-real-ip", "10.0.0.2")]);
-        let cx = finalize_context(None, &md, &HashMap::new(), None);
+        let cx = finalize_context(None, &md, &HashMap::new(), None, &[]);
         assert_eq!(cx.client_ip, "10.0.0.2");
     }
 
     #[test]
     fn finalize_falls_back_to_proto_headers_client_ip() {
+        // 无 peer（UDS）+ metadata 缺 → proto headers XFF 生效。
         let proto = headers_with(&[("x-forwarded-for", "10.0.0.3")]);
-        let cx = finalize_context(None, &MetadataMap::new(), &proto, addr("192.168.1.1"));
+        let cx = finalize_context(None, &MetadataMap::new(), &proto, None, &[]);
         assert_eq!(cx.client_ip, "10.0.0.3");
     }
 
     #[test]
     fn finalize_falls_back_to_remote_addr() {
-        let cx = finalize_context(None, &MetadataMap::new(), &HashMap::new(), addr("192.168.1.1"));
+        // 无 header → peer（非受信直连 peer 即客户端）。
+        let cx = finalize_context(None, &MetadataMap::new(), &HashMap::new(), addr("192.168.1.1"), &[]);
         assert_eq!(cx.client_ip, "192.168.1.1");
     }
 
     #[test]
     fn finalize_client_ip_empty_when_no_source() {
-        let cx = finalize_context(None, &MetadataMap::new(), &HashMap::new(), None);
+        let cx = finalize_context(None, &MetadataMap::new(), &HashMap::new(), None, &[]);
         assert_eq!(cx.client_ip, "");
     }
 
     #[test]
+    fn finalize_untrusted_peer_ignores_proto_xff() {
+        // P-XFF: 非受信 peer + proto headers XFF → 忽略 XFF，用 peer。
+        let proto = headers_with(&[("x-forwarded-for", "10.0.0.99")]);
+        let cx = finalize_context(None, &MetadataMap::new(), &proto, addr("192.168.1.1"), &[]);
+        assert_eq!(cx.client_ip, "192.168.1.1");
+    }
+
+    #[test]
     fn finalize_respects_interceptor_filled_context() {
-        // interceptor 已填充（生产路径）：finalize 不覆盖已定案字段。
+        // interceptor 已填充（生产路径）：finalize 不覆盖已定案字段。request
+        // 无 remote_addr（UDS）→ metadata 缺 XFF 时 client_ip 留空，finalize
+        // 用 proto headers XFF（无 peer → header 优先）。
         let md = md_with(&[("x-client-request-id", "from-metadata")]);
         let request = context_interceptor({
             let mut r = Request::new(());
@@ -314,8 +373,11 @@ mod tests {
         })
         .unwrap();
         let prefilled = request.extensions().get::<RequestContext>().cloned();
-        let proto = headers_with(&[("x-client-request-id", "from-headers"), ("x-forwarded-for", "10.0.0.3")]);
-        let cx = finalize_context(prefilled, &md, &proto, addr("192.168.1.1"));
+        let proto = headers_with(&[
+            ("x-client-request-id", "from-headers"),
+            ("x-forwarded-for", "10.0.0.3"),
+        ]);
+        let cx = finalize_context(prefilled, &md, &proto, None, &[]);
         assert_eq!(cx.request_id, "from-metadata");
         assert_eq!(cx.client_ip, "10.0.0.3", "metadata 未给 client_ip 时 proto headers 生效");
     }

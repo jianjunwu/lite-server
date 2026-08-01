@@ -28,6 +28,10 @@ prost-types = "0.13"
 # version ordering for load_policy = "latest"
 semver = "1.0"
 
+# P-XFF: trusted-proxy CIDR matching for client-IP cleansing (pure Rust,
+# cross-platform; hand-rolling IPv6 prefix checks is error-prone).
+ipnet = "2"
+
 # P7-1: constant-time API-key comparison (timing side-channel). Already in the
 # dependency graph via rustls; pinned here as a direct dependency.
 subtle = "2"

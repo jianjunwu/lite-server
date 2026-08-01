@@ -1468,6 +1468,7 @@ dependencies = [
  "gethostname",
  "http",
  "hyper-util",
+ "ipnet",
  "lazy_static",
  "libc",
  "notify",

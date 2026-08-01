@@ -60,6 +60,19 @@ async fn access_log_middleware(
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     let model = model.to_string();
+    // P-XFF (评审 1.2): log the cleansed client_ip (the rate-limit key source)
+    // alongside the raw XFF (truncated) so a mis-attributed limit / forged-XFF
+    // attempt is traceable back to its origin hop.
+    let client_ip = request
+        .extensions()
+        .get::<crate::request_context::RequestContext>()
+        .map(|cx| cx.client_ip.clone())
+        .unwrap_or_default();
+    let raw_xff = request
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().chars().take(64).collect::<String>());
     let start = Instant::now();
     let response = next.run(request).await;
     info!(
@@ -67,6 +80,8 @@ async fn access_log_middleware(
         method = %method,
         path = %path,
         status = response.status().as_u16(),
+        client_ip = %client_ip,
+        xff = ?raw_xff,
         elapsed_ms = start.elapsed().as_millis() as u64,
         "access"
     );

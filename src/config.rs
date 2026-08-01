@@ -169,6 +169,14 @@ pub struct ServerConfig {
     /// ResourceExhausted. None = platform default (axum 2MB / tonic 4MB,
     /// verified at implementation); behavior unchanged.
     pub max_request_body_bytes: Option<usize>,
+    /// P-XFF: trusted-proxy CIDRs (or bare IPs) whose `X-Forwarded-For` /
+    /// `X-Real-IP` headers are honored for client-IP cleansing. Empty
+    /// (default) = fail-safe: the direct TCP peer is always used and client
+    /// proxy headers are ignored (prevents forged-IP rate-limit bypass). A
+    /// fronting gateway/proxy must be listed here for its forwarded client
+    /// IPs to reach rate-limiting. Invalid entries fail at startup.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -195,6 +203,7 @@ impl Default for ServerConfig {
             decoupled_idle_timeout_secs: 300.0,
             max_inflight: 0,
             max_request_body_bytes: None,
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -290,6 +299,22 @@ impl ServerConfig {
             self.mtls_ca_path.as_deref(),
             self.tls_min_version.as_deref(),
         )
+    }
+
+    /// P-XFF: parse `trusted_proxies` into CIDR networks, fail-fast on any
+    /// unparseable entry (names the offending value in the error). Empty →
+    /// empty vec (fail-safe: client proxy headers ignored, peer used).
+    pub fn trusted_networks(&self) -> anyhow::Result<Vec<ipnet::IpNet>> {
+        self.trusted_proxies
+            .iter()
+            .map(|entry| {
+                crate::client_ip::parse_network(entry).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "server.trusted_proxies entry \"{entry}\" is not a valid CIDR or IP address"
+                    )
+                })
+            })
+            .collect()
     }
 }
 
@@ -1307,6 +1332,40 @@ mod tests {
         let yaml = "server:\n  compression: true\n";
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(cfg.server.compression);
+    }
+
+    // ===== P-XFF: trusted_proxies =====
+
+    #[test]
+    fn trusted_proxies_defaults_empty() {
+        // fail-safe default: empty → client proxy headers ignored, peer used.
+        assert!(Config::default().server.trusted_proxies.is_empty());
+        assert!(ServerConfig::default().trusted_networks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn trusted_proxies_parses_cidr_and_bare_ip() {
+        let cfg: Config = serde_yaml::from_str(
+            "server:\n  trusted_proxies: [\"10.0.0.0/8\", \"192.168.0.1\"]\n",
+        )
+        .unwrap();
+        let nets = cfg.server.trusted_networks().unwrap();
+        assert_eq!(nets.len(), 2);
+        use std::net::IpAddr;
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        assert!(nets[0].contains(&ip("10.1.2.3")));
+        assert!(nets[1].contains(&ip("192.168.0.1")));
+    }
+
+    #[test]
+    fn trusted_proxies_invalid_entry_fails_fast() {
+        let cfg: Config =
+            serde_yaml::from_str("server:\n  trusted_proxies: [\"not-a-network\"]\n").unwrap();
+        let err = cfg.server.trusted_networks().unwrap_err();
+        assert!(
+            err.to_string().contains("not-a-network"),
+            "error must name the offending entry: {err}"
+        );
     }
 
     #[test]

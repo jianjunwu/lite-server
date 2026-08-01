@@ -454,6 +454,16 @@ Token-bucket-based rate limiting (`rate_limit.rs`), supporting:
 - Configurable RPM (requests per minute) and burst capacity
 - Automatic stale-bucket cleanup
 
+> **Client IP & trusted proxies (P-XFF).** The `client_ip` feeding `key: ip`
+> buckets is cleansed fail-safe in `client_ip.rs`, anchored to the direct TCP
+> peer: an **untrusted** peer's `X-Forwarded-For` / `X-Real-IP` headers are
+> ignored (a client cannot forge an IP to bypass per-IP limiting). Only the
+> CIDRs in `server.trusted_proxies` (empty by default) are treated as proxies
+> whose forwarded chain is walked right-to-left to the first non-trusted hop.
+> The same cleansing runs on the gRPC path. The access log records both the
+> cleansed `client_ip` and the raw (truncated) `X-Forwarded-For` for
+> attribution.
+
 See [configuration.md](./configuration.md) for configuration examples.
 
 ## Overload Protection & Cancellation (P-FLOW)

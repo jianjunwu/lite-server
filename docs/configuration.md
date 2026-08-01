@@ -40,6 +40,12 @@ server:
                                # endpoints are exempt (probes stay reachable). 0 = unlimited.
   max_request_body_bytes: null # Per-request body cap (bytes). Oversized → HTTP 413 / gRPC
                                # ResourceExhausted. null = platform default (axum 2MB / tonic 4MB).
+  # P-XFF trusted-proxy client-IP cleansing — fail-safe by default.
+  trusted_proxies: []          # CIDRs/IPs of fronting proxies whose X-Forwarded-For /
+                               # X-Real-IP are honored. Empty (default) = the direct TCP peer is
+                               # always used and client proxy headers are IGNORED (prevents forged-
+                               # IP rate-limit bypass). List your gateway/proxy here for its
+                               # forwarded client IPs to reach key=ip rate-limiting.
 
 logging:
   level: info                  # Log level: trace, debug, info, warn, error

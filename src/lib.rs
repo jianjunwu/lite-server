@@ -1,4 +1,5 @@
 pub mod callback;
+pub mod client_ip;
 pub mod config;
 pub mod deadline;
 pub mod access_control;

@@ -450,6 +450,13 @@ lite-server 通过 `orchestration.control_mode` 控制模型版本的生命周�
 - 可配置 RPM（每分钟请求数）和 burst（突发容量）
 - 自动清理过期桶
 
+> **客户端 IP 与受信代理（P-XFF）。** 喂给 `key: ip` 桶的 `client_ip` 经
+> `client_ip.rs` 以直连 TCP peer 为锚做 fail-safe 清洗：**非受信** peer 的
+> `X-Forwarded-For` / `X-Real-IP` 一律忽略（客户端无法伪造 IP 绕过按 IP 限流）。
+> 仅 `server.trusted_proxies`（默认空）中的 CIDR 被视为代理，其转发链从右向左
+> 走到首个非受信 hop。gRPC 路径同款清洗。访问日志并列记录清洗后的 `client_ip`
+> 与原始（截断）`X-Forwarded-For`，便于回溯归因。
+
 配置示例见 [configuration.md](./configuration.md)。
 
 ## 过载保护与取消（P-FLOW）
