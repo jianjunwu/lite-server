@@ -83,11 +83,12 @@ pub struct ModelVersion {
     pub weight: u32,
     #[serde(default)]
     pub policies: crate::config::ModelPolicies,
-    /// Pre-built CORS header map, cached at policy ingest (B9) so responses
-    /// avoid a per-request `String::join` + `HeaderValue::from_str` round.
-    /// `#[serde(skip)]`: a Rust-side cache, never serialized over the wire.
+    /// P-CORS: cached per-version CORS policy (Arc for cheap hot-path clone).
+    /// ACAO depends on the request Origin so it cannot be pre-built into a
+    /// HeaderMap; the `cors_middleware` reads this and reflects the matched
+    /// origin. `#[serde(skip)]`: a Rust-side cache, never serialized.
     #[serde(skip)]
-    pub cors_headers: Option<std::sync::Arc<axum::http::HeaderMap>>,
+    pub cors: Option<std::sync::Arc<crate::config::CorsPolicy>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

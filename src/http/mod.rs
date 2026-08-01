@@ -1,3 +1,4 @@
+pub mod cors;
 pub mod handlers;
 pub mod routes;
 pub mod state;
@@ -292,7 +293,11 @@ pub async fn start_http_server(
     // → fail-safe (direct peer used, client proxy headers ignored).
     let trusted = std::sync::Arc::new(config.server.trusted_networks()?);
 
-    let app = create_routes(state);
+    // P-CORS / WS Origin check read global cors + per-model policy off the
+    // shared AppState; wrap once so the CORS middleware (mounted below) and
+    // create_routes share one Arc.
+    let shared = std::sync::Arc::new(state);
+    let app = create_routes(shared.clone());
 
     // P-FLOW (§4.0.9): per-request body cap. Oversized bodies → 413. None =
     // axum default (2MB), behaviour unchanged.
@@ -343,6 +348,15 @@ pub async fn start_http_server(
     let app = app.layer(axum::middleware::from_fn_with_state(
         access_control.clone(),
         access_control_middleware,
+    ));
+
+    // P-CORS (蓝图 §4.3): hybrid CORS middleware — per-model > global policy,
+    // exact Origin match, preflight short-circuit. Mounted OUTSIDE access_control
+    // (preflight must not trigger auth; D21) and inside observability (204
+    // carries x-request-id). Admin endpoints are skipped (not browser-facing).
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        shared.clone(),
+        crate::http::cors::cors_middleware,
     ));
 
     // C3 (P4-2): draining gate — inside observability (so 503s carry a

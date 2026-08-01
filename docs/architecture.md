@@ -466,6 +466,33 @@ Token-bucket-based rate limiting (`rate_limit.rs`), supporting:
 
 See [configuration.md](./configuration.md) for configuration examples.
 
+## CORS (P-CORS)
+
+A self-written `cors_middleware` (`src/http/cors.rs`) handles CORS — not
+`tower-http::cors`, because a per-model policy override must be resolved from the
+request path at runtime, which a statically-mounted `CorsLayer` cannot do.
+
+- **Effective policy**: per-model `policies.cors` wins over the global
+  `server.cors`; both absent → pass-through (no headers). Admin endpoints are
+  skipped (not browser-facing).
+- **Origin matching** is exact (after normalization: lowercase scheme/host,
+  default port stripped), with opt-in subdomain wildcards (`*.example.com`).
+  No reflection, no `null`, no suffix confusion — see the
+  [security checklist](./cors-security-checklist.md).
+- **Preflight** (`OPTIONS` + `Access-Control-Request-Method`) short-circuits with
+  `204` + CORS headers only when the Origin is allowed. The middleware is mounted
+  **outside** `access_control` (D21), so a preflight never triggers
+  authentication (preflight carries no credentials), and inside `observability`
+  so the `204` carries `x-request-id`.
+- **Actual requests** get `Access-Control-Allow-Origin` (the matched origin, or
+  `*`), `Access-Control-Allow-Credentials` when configured, `Vary: Origin`, and
+  `Access-Control-Expose-Headers`. `credentials: true` + `*` is rejected.
+- **WebSocket**: browsers send no preflight and do not enforce ACAO on a WS
+  handshake, so the middleware cannot stop cross-site WS hijacking. The WS
+  upgrade handler independently checks `Origin` against the same engine
+  (`ws_origin_allowed`); with no CORS policy configured, WS security relies on
+  `access_control` (P7-1) key auth.
+
 ## Overload Protection & Cancellation (P-FLOW)
 
 Production services need explicit overload and cancellation semantics, or they

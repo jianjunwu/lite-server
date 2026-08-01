@@ -82,9 +82,10 @@ pub async fn sse_infer_handler(
     cx: RequestContext,
     ApiJson(payload): ApiJson<Value>,
 ) -> Response {
-    let result =
-        sse_infer_entry(&state, &model_name, None, headers, payload, cx).await;
-    attach_cors_headers(&state, &model_name, result)
+    // P-CORS: CORS headers are attached by `cors_middleware` (no longer per-handler).
+    sse_infer_entry(&state, &model_name, None, headers, payload, cx)
+        .await
+        .into_response()
 }
 
 pub async fn sse_infer_version_handler(
@@ -94,11 +95,11 @@ pub async fn sse_infer_version_handler(
     cx: RequestContext,
     ApiJson(payload): ApiJson<Value>,
 ) -> Response {
-    let result = sse_infer_entry(
+    sse_infer_entry(
         &state, &model_name, Some(version), headers, payload, cx,
     )
-    .await;
-    attach_cors_headers(&state, &model_name, result)
+    .await
+    .into_response()
 }
 
 /// Shared entry for SSE inference: validation, ready check, rate limiting,
@@ -282,6 +283,11 @@ pub async fn ws_stream_handler(
     if let Err(e) = crate::validation::validate_identifier(&model_name) {
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
     }
+    // P-CORS (评审 1.3): browsers send no preflight for WS, so the CORS
+    // middleware can't stop cross-site WS hijacking — check Origin at upgrade.
+    if !crate::http::cors::ws_origin_allowed(&state, &model_name, None, &headers) {
+        return (axum::http::StatusCode::FORBIDDEN, "WebSocket Origin not allowed").into_response();
+    }
     ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, headers, socket, cx))
 }
 
@@ -297,6 +303,9 @@ pub async fn ws_stream_version_handler(
     }
     if let Err(e) = crate::validation::validate_version(&version) {
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+    }
+    if !crate::http::cors::ws_origin_allowed(&state, &model_name, Some(&version), &headers) {
+        return (axum::http::StatusCode::FORBIDDEN, "WebSocket Origin not allowed").into_response();
     }
     ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), headers, socket, cx))
 }

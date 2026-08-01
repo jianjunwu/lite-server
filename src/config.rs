@@ -177,6 +177,11 @@ pub struct ServerConfig {
     /// IPs to reach rate-limiting. Invalid entries fail at startup.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// P-CORS: global CORS policy (applied when no per-model `policies.cors`
+    /// override matches, and to non-model routes). None (default) = CORS
+    /// pass-through (no headers attached). See `CorsPolicy`.
+    #[serde(default)]
+    pub cors: Option<CorsPolicy>,
 }
 
 impl Default for ServerConfig {
@@ -204,6 +209,7 @@ impl Default for ServerConfig {
             max_inflight: 0,
             max_request_body_bytes: None,
             trusted_proxies: Vec::new(),
+            cors: None,
         }
     }
 }
@@ -704,39 +710,35 @@ fn default_rl_key() -> String {
     "route".into()
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CorsPolicy {
     pub allow_origins: Vec<String>,
     pub allow_methods: Vec<String>,
     pub allow_headers: Vec<String>,
+    /// P-CORS: response headers exposed to the browser (e.g. x-request-id,
+    /// x-processing-time-ms). Empty = none exposed.
+    pub expose_headers: Vec<String>,
+    /// P-CORS: send `Access-Control-Allow-Credentials: true`. Default false.
+    /// When true, `allow_origins` must NOT include `*` (a wildcard is inert
+    /// under exact Origin matching, but a real browser never sends Origin `*`
+    /// — configure explicit origins instead).
+    pub allow_credentials: bool,
+    /// P-CORS: preflight cache duration in seconds. Default 7200 (Chrome's
+    /// cap; values above it are clamped by the browser).
+    pub max_age_secs: u32,
 }
 
-impl CorsPolicy {
-    /// Pre-built header map for attaching to responses. Built once at policy
-    /// ingest (B9) and Arc-shared per request, avoiding a per-response
-    /// `String::join` + `HeaderValue::from_str` round on the hot path.
-    /// C12: invalid header values are skipped with a warning instead of
-    /// silently dropped.
-    pub fn header_map(&self) -> axum::http::HeaderMap {
-        use axum::http::{HeaderMap, HeaderName, HeaderValue};
-        let mut headers = HeaderMap::new();
-        for (name, values) in [
-            ("access-control-allow-origin", &self.allow_origins),
-            ("access-control-allow-methods", &self.allow_methods),
-            ("access-control-allow-headers", &self.allow_headers),
-        ] {
-            match HeaderValue::from_str(&values.join(", ")) {
-                Ok(v) => {
-                    headers.insert(HeaderName::from_static(name), v);
-                }
-                Err(_) => tracing::warn!(
-                    header = name,
-                    "invalid CORS header value — skipped"
-                ),
-            }
+impl Default for CorsPolicy {
+    fn default() -> Self {
+        Self {
+            allow_origins: Vec::new(),
+            allow_methods: Vec::new(),
+            allow_headers: Vec::new(),
+            expose_headers: Vec::new(),
+            allow_credentials: false,
+            max_age_secs: 7200,
         }
-        headers
     }
 }
 
@@ -1703,45 +1705,31 @@ mod tests {
 
     // --- per-model policies ---
 
-    // ===== CorsPolicy::header_map (B9 / C12) =====
+    // ===== P-CORS: CorsPolicy extended fields + server.cors =====
 
     #[test]
-    fn test_cors_policy_header_map_builds_three_headers() {
-        let policy = CorsPolicy {
-            allow_origins: vec!["https://a.com".into(), "https://b.com".into()],
-            allow_methods: vec!["GET".into(), "POST".into()],
-            allow_headers: vec!["content-type".into(), "authorization".into()],
-        };
-        let hm = policy.header_map();
-        assert_eq!(
-            hm.get("access-control-allow-origin").unwrap(),
-            "https://a.com, https://b.com"
-        );
-        assert_eq!(
-            hm.get("access-control-allow-methods").unwrap(),
-            "GET, POST"
-        );
-        assert_eq!(
-            hm.get("access-control-allow-headers").unwrap(),
-            "content-type, authorization"
-        );
+    fn cors_policy_defaults_credentials_off_max_age_7200() {
+        let p = CorsPolicy::default();
+        assert!(!p.allow_credentials);
+        assert_eq!(p.max_age_secs, 7200);
+        assert!(p.expose_headers.is_empty());
     }
 
     #[test]
-    fn test_cors_policy_header_map_skips_invalid_value() {
-        // C12: an invalid header value is skipped (and warned); the others survive.
-        let policy = CorsPolicy {
-            allow_origins: vec!["\0bad".into()], // NUL → invalid HeaderValue
-            allow_methods: vec!["GET".into()],
-            allow_headers: vec!["x-trace".into()],
-        };
-        let hm = policy.header_map();
-        assert!(
-            hm.get("access-control-allow-origin").is_none(),
-            "invalid origin must be skipped"
-        );
-        assert_eq!(hm.get("access-control-allow-methods").unwrap(), "GET");
-        assert_eq!(hm.get("access-control-allow-headers").unwrap(), "x-trace");
+    fn server_cors_defaults_none() {
+        assert!(Config::default().server.cors.is_none());
+    }
+
+    #[test]
+    fn server_cors_parses_from_yaml() {
+        let yaml = "server:\n  cors:\n    allow_origins: [\"https://app.example.com\"]\n    allow_methods: [\"GET\", \"POST\"]\n    allow_headers: [\"content-type\"]\n    expose_headers: [\"x-request-id\"]\n    allow_credentials: true\n    max_age_secs: 3600\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let cors = cfg.server.cors.expect("server.cors parsed");
+        assert_eq!(cors.allow_origins, vec!["https://app.example.com"]);
+        assert_eq!(cors.allow_methods, vec!["GET", "POST"]);
+        assert_eq!(cors.expose_headers, vec!["x-request-id"]);
+        assert!(cors.allow_credentials);
+        assert_eq!(cors.max_age_secs, 3600);
     }
 
 

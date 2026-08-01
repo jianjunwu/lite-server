@@ -33,7 +33,8 @@ pub async fn infer_handler(
         state.clone(), model_name.clone(), None,
         "/predict".to_string(), headers, payload, cx,
     ).await;
-    Ok(attach_cors_headers(&state, &model_name, result))
+    // P-CORS: CORS headers are attached by `cors_middleware` (no longer per-handler).
+    result
 }
 
 pub async fn infer_version_handler(
@@ -49,7 +50,7 @@ pub async fn infer_version_handler(
         state.clone(), model_name.clone(), Some(version),
         "/predict".to_string(), headers, payload, cx,
     ).await;
-    Ok(attach_cors_headers(&state, &model_name, result))
+    result
 }
 async fn do_infer(
     state: Arc<AppState>,

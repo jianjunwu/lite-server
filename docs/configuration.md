@@ -46,6 +46,11 @@ server:
                                # always used and client proxy headers are IGNORED (prevents forged-
                                # IP rate-limit bypass). List your gateway/proxy here for its
                                # forwarded client IPs to reach key=ip rate-limiting.
+  # P-CORS global CORS policy (applied when no per-model policies.cors matches, and
+  # to non-model routes). null (default) = CORS pass-through (no headers attached).
+  # Same shape as the per-model policies.cors (allow_origins/methods/headers,
+  # expose_headers, allow_credentials, max_age_secs).
+  cors: null
 
 logging:
   level: info                  # Log level: trace, debug, info, warn, error
@@ -222,10 +227,13 @@ hot_reload_patterns:           # Glob patterns to watch
 policies:
   auth: { header: "X-API-Key", keys: ["${API_KEYS}"] }  # ${VAR} = env var; empty keys = any non-empty value
   rate_limit: { requests_per_minute: 60, key: ip, burst: 100 }  # key: "route" | "ip"
-  cors:
-    allow_origins: ["https://example.com"]
+  cors:                          # P-CORS per-model policy (overrides server.cors). Omit = fall back to global.
+    allow_origins: ["https://example.com"]  # exact match; "*" = any; "*.example.com" = subdomain wildcard
     allow_methods: ["GET", "POST"]
     allow_headers: ["Content-Type", "Authorization"]
+    expose_headers: ["x-request-id", "x-processing-time-ms"]  # response headers visible to JS
+    allow_credentials: false     # true → ACAC: true; forbidden with "*"
+    max_age_secs: 7200           # preflight cache (s); Chrome caps at 7200
   request_log: {}                # Access log: method, path, status, elapsed
 
 # Callbacks (data hooks around the inference pipeline)

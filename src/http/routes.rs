@@ -88,8 +88,7 @@ async fn access_log_middleware(
     response
 }
 
-pub fn create_routes(state: AppState) -> Router {
-    let shared = Arc::new(state);
+pub fn create_routes(shared: Arc<AppState>) -> Router {
     let mut router = Router::new();
 
     // Built-in health probes (phase 3) — fixed HTTP-layer endpoints, not
@@ -143,12 +142,12 @@ pub fn create_routes(state: AppState) -> Router {
         .route("/v2/models/:model_name/versions/:version/activate", post(activate_version_handler))
         // Admin: weighted/canary routing weights (§4.3)
         .route("/v2/models/:model_name/routing", put(set_routing_handler))
-        // Inference
-        .route("/v2/models/:model_name/infer", post(infer_handler).options(inference_options_handler))
-        .route("/v2/models/:model_name/versions/:version/infer", post(infer_version_handler).options(inference_options_handler))
+        // Inference (P-CORS: preflight handled by cors_middleware, no per-route .options())
+        .route("/v2/models/:model_name/infer", post(infer_handler))
+        .route("/v2/models/:model_name/versions/:version/infer", post(infer_version_handler))
         // SSE streaming
-        .route("/v2/models/:model_name/events", post(sse_infer_handler).options(inference_options_handler))
-        .route("/v2/models/:model_name/versions/:version/events", post(sse_infer_version_handler).options(inference_options_handler))
+        .route("/v2/models/:model_name/events", post(sse_infer_handler))
+        .route("/v2/models/:model_name/versions/:version/events", post(sse_infer_version_handler))
         // WebSocket streaming
         .route("/v2/models/:model_name/stream", get(ws_stream_handler))
         .route("/v2/models/:model_name/versions/:version/stream", get(ws_stream_version_handler));

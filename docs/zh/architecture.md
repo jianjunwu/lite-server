@@ -459,6 +459,26 @@ lite-server 通过 `orchestration.control_mode` 控制模型版本的生命周�
 
 配置示例见 [configuration.md](./configuration.md)。
 
+## CORS（P-CORS）
+
+自写 `cors_middleware`（`src/http/cors.rs`）处理 CORS——不用 `tower-http::cors`，
+因为 per-model 策略覆盖需在请求时按路径解析 model，静态挂载的 CorsLayer 做不到。
+
+- **生效策略**：per-model `policies.cors` 优先于全局 `server.cors`；皆无 → 直通（不附
+  头）。admin 端点跳过（不面向浏览器）。
+- **Origin 匹配**为精确匹配（规范化后：scheme/host 小写、去默认端口），子域通配
+  （`*.example.com`）为显式 opt-in。禁反射、禁 `null`、禁后缀混淆——见
+  [安全清单](./cors-security-checklist.md)。
+- **预检**（`OPTIONS` + `Access-Control-Request-Method`）仅当 Origin 命中时短路返回
+  `204` + CORS 头。中间件挂在 **access_control 外**（D21），故预检不触发鉴权（预检不带
+  凭证），且在 observability 内，故 `204` 带 `x-request-id`。
+- **实际请求**附 `Access-Control-Allow-Origin`（命中的 origin 或 `*`）、按配置的
+  `Access-Control-Allow-Credentials`、`Vary: Origin`、`Access-Control-Expose-Headers`。
+  `credentials: true` + `*` 拒绝。
+- **WebSocket**：浏览器对 WS 握手不发预检、不强制 ACAO，故中间件无法防跨站 WS 劫持。
+  WS upgrade handler 独立用同一 Origin 引擎校验（`ws_origin_allowed`）；未配置 CORS 时
+  WS 安全完全依赖 `access_control`（P7-1）密钥鉴权。
+
 ## 过载保护与取消（P-FLOW）
 
 生产服务须有显式过载与取消语义，否则高压下雪崩（§4.0.9）。P-FLOW 落地：

@@ -44,6 +44,9 @@ server:
   trusted_proxies: []          # 前置代理的 CIDR/IP，其 X-Forwarded-For / X-Real-IP 才被信任。
                                # 空（默认）= 一律用直连 TCP peer、忽略客户端代理头（防伪造 IP 绕过
                                # key=ip 限流）。网关/代理需在此列出，其转发的客户端 IP 才能参与限流。
+  # P-CORS 全局 CORS 策略（无 per-model policies.cors 覆盖时生效，且覆盖非模型路由）。
+  # null（默认）= CORS 直通（不附任何头）。字段同 per-model policies.cors。
+  cors: null
 
 logging:
   level: info                  # 日志级别：trace, debug, info, warn, error
@@ -220,10 +223,13 @@ hot_reload_patterns:           # 监听的 glob 模式
 policies:
   auth: { header: "X-API-Key", keys: ["${API_KEYS}"] }  # ${VAR} = 环境变量；keys 为空 = 任意非空值通过
   rate_limit: { requests_per_minute: 60, key: ip, burst: 100 }  # key: "route" | "ip"
-  cors:
-    allow_origins: ["https://example.com"]
+  cors:                          # P-CORS per-model 策略（覆盖 server.cors）。省略 = 回退全局。
+    allow_origins: ["https://example.com"]  # 精确匹配；"*" = 任意；"*.example.com" = 子域通配
     allow_methods: ["GET", "POST"]
     allow_headers: ["Content-Type", "Authorization"]
+    expose_headers: ["x-request-id", "x-processing-time-ms"]  # 暴露给 JS 的响应头
+    allow_credentials: false     # true → ACAC: true；与 "*" 互斥
+    max_age_secs: 7200           # 预检缓存（秒）；Chrome 上限 7200
   request_log: {}                # 访问日志：方法、路径、状态码、耗时
 
 # Callback（推理管线数据钩子）

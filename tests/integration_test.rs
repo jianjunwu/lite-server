@@ -220,7 +220,7 @@ class PolicyAPI(LitAPI):
     .unwrap();
     std::fs::write(
         policy_dir.join("config.yaml"),
-        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\npolicies:\n  rate_limit: { requests_per_minute: 3, burst: 3 }\n  cors:\n    allow_origins: [\"https://app.example.com\"]\n",
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\npolicies:\n  rate_limit: { requests_per_minute: 3, burst: 3 }\n  cors:\n    allow_origins: [\"https://app.example.com\"]\n    allow_methods: [\"POST\"]\n    allow_headers: [\"content-type\"]\n",
     )
     .unwrap();
 
@@ -2115,10 +2115,11 @@ async fn test_sse_response_carries_cors_headers() {
 
     load_model(&base, POLICY_MODEL, "1").await;
 
-    // SSE success path must carry CORS headers (attach_cors_headers wraps the
-    // whole entry, including the stream-start response).
+    // SSE success path must carry CORS headers (cors_middleware attaches ACAO
+    // when the request Origin is allowed, including the stream-start response).
     let resp = client
         .post(format!("{}/v2/models/{}/events", base, POLICY_MODEL))
+        .header("origin", "https://app.example.com")
         .json(&json!({"input": 3}))
         .send()
         .await
@@ -2158,8 +2159,8 @@ async fn test_inference_options_preflight_all_routes() {
     load_model(&base, POLICY_MODEL, "1").await;
 
     // All four inference routes (incl. the two versioned ones) must answer
-    // OPTIONS preflight with 204 + ACAO. The versioned routes used to 500
-    // because inference_options_handler took Path<String> on a 2-param route.
+    // a CORS preflight (OPTIONS + Origin + ACRM) with 204 + ACAO. P-CORS moved
+    // preflight into cors_middleware (short-circuits before routing).
     let routes = [
         format!("/v2/models/{}/infer", POLICY_MODEL),
         format!("/v2/models/{}/versions/1/infer", POLICY_MODEL),
@@ -2169,20 +2170,22 @@ async fn test_inference_options_preflight_all_routes() {
     for path in &routes {
         let resp = client
             .request(reqwest::Method::OPTIONS, format!("{}{}", base, path))
+            .header("origin", "https://app.example.com")
+            .header("access-control-request-method", "POST")
             .send()
             .await
             .unwrap();
         assert_eq!(
             resp.status(),
             204,
-            "OPTIONS {} should be 204, got {}",
+            "preflight {} should be 204, got {}",
             path,
             resp.status()
         );
         let acao = resp
             .headers()
             .get("access-control-allow-origin")
-            .unwrap_or_else(|| panic!("ACAO missing on OPTIONS {}", path));
+            .unwrap_or_else(|| panic!("ACAO missing on preflight {}", path));
         assert_eq!(acao.to_str().unwrap(), "https://app.example.com");
     }
 
@@ -2229,9 +2232,11 @@ async fn test_infer_cors_success_and_rate_limit_error() {
     let client = reqwest::Client::new();
     load_model(&base, POLICY_MODEL, "1").await;
 
-    // Success: 200 + ACAO (attach_cors_headers wraps unary infer too).
+    // Success: 200 + ACAO (cors_middleware attaches ACAO for an allowed Origin
+    // on unary infer too).
     let resp = client
         .post(format!("{}/v2/models/{}/infer", base, POLICY_MODEL))
+        .header("origin", "https://app.example.com")
         .json(&json!({"input": 5}))
         .send()
         .await
@@ -2259,10 +2264,12 @@ async fn test_infer_cors_success_and_rate_limit_error() {
     }
 
     // 4th: rate-limited → 429 + Retry-After. The error response must still
-    // carry ACAO (attach_cors_headers wraps the Err path), and Retry-After
-    // must be a sane 1..=60 seconds (C1 Rust defense against rpm<=0 → u64::MAX).
+    // carry ACAO (cors_middleware attaches it on the response regardless of
+    // downstream status), and Retry-After must be a sane 1..=60 seconds
+    // (C1 Rust defense against rpm<=0 → u64::MAX).
     let resp = client
         .post(format!("{}/v2/models/{}/infer", base, POLICY_MODEL))
+        .header("origin", "https://app.example.com")
         .json(&json!({"input": 1}))
         .send()
         .await

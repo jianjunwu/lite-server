@@ -539,9 +539,10 @@ mod version_routing_tests {
     }
 
     #[tokio::test]
-    async fn versioned_options_uses_hit_version_cors_policy() {
-        // §4.4: a versioned route's OPTIONS preflight must answer with that
-        // version's CORS policy, not the active version's.
+    async fn versioned_preflight_uses_hit_version_cors_policy() {
+        // P-CORS: a versioned route's preflight must answer with that version's
+        // CORS policy, not the active version's. CORS is now a middleware
+        // (preflight short-circuits before routing), not a per-route .options().
         use crate::config::{CorsPolicy, ModelPolicies};
         let state = test_state();
         register_ready(&state, "m", &["1", "2"]);
@@ -551,6 +552,7 @@ mod version_routing_tests {
                 allow_origins: vec![origin.to_string()],
                 allow_methods: vec!["POST".to_string()],
                 allow_headers: vec!["content-type".to_string()],
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -560,14 +562,20 @@ mod version_routing_tests {
         let app = Router::new()
             .route(
                 "/v2/models/:model_name/versions/:version/infer",
-                axum::routing::post(infer_version_handler).options(inference_options_handler),
+                axum::routing::post(infer_version_handler),
             )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::http::cors::cors_middleware,
+            ))
             .with_state(state.clone());
         let resp = app
             .oneshot(
                 Request::builder()
                     .method("OPTIONS")
                     .uri("/v2/models/m/versions/2/infer")
+                    .header("origin", "https://v2.example")
+                    .header("access-control-request-method", "POST")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -577,8 +585,65 @@ mod version_routing_tests {
         assert_eq!(
             resp.headers().get("access-control-allow-origin").unwrap(),
             "https://v2.example",
-            "versioned OPTIONS must use the hit version's policy"
+            "versioned preflight must use the hit version's policy"
         );
+    }
+
+    #[tokio::test]
+    async fn cors_middleware_no_acao_for_disallowed_origin_on_actual_request() {
+        // P-CORS security: an Origin not in the allowlist gets NO ACAO on the
+        // actual response (browser blocks); Vary: Origin is still set.
+        use crate::config::{CorsPolicy, ModelPolicies};
+        let state = test_state();
+        register_ready(&state, "m", &["1"]);
+        state.registry.activate_version("m", "1").unwrap();
+        state.registry.set_policies(
+            "m",
+            "1",
+            Some(ModelPolicies {
+                cors: Some(CorsPolicy {
+                    allow_origins: vec!["https://app.example.com".into()],
+                    allow_methods: vec!["POST".into()],
+                    allow_headers: vec!["content-type".into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        );
+        let app = Router::new()
+            .route(
+                "/v2/models/:model_name/infer",
+                axum::routing::post(infer_handler),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::http::cors::cors_middleware,
+            ))
+            .with_state(state.clone());
+        // Attacker origin — must NOT receive ACAO.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/models/m/infer")
+                    .header("origin", "https://evil.example.com")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.headers().get("access-control-allow-origin").is_none(),
+            "disallowed Origin must not receive ACAO"
+        );
+        let vary = resp
+            .headers()
+            .get_all("vary")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(vary.contains(&"origin"), "Vary: Origin must still be set");
     }
 
     // ===== B1: WS readiness must check the resolved version =====

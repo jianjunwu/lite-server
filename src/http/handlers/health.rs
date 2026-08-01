@@ -7,7 +7,6 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 // ===== Health =====
@@ -108,33 +107,6 @@ pub async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
         "status": if status.has_serving() { "ready" } else { "not_ready" },
         "models": models,
     }))
-}
-
-// ===== OPTIONS preflight for inference routes =====
-
-pub async fn inference_options_handler(
-    State(state): State<Arc<AppState>>,
-    Path(params): Path<HashMap<String, String>>,
-) -> Response {
-    // The handler is registered on both 1-param (`/v2/models/:model_name/infer`)
-    // and 2-param (`/v2/models/:model_name/versions/:version/infer`) routes.
-    // Path<String> only accepts exactly one captured param, so the versioned
-    // routes returned 500. HashMap captures all params regardless of count.
-    let Some(model_name) = params.get("model_name") else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    // §4.4: versioned routes answer with the hit version's CORS policy;
-    // bare routes use the active version's.
-    let cors = match params.get("version") {
-        Some(v) => state.registry.cors_headers_for(model_name, v),
-        None => state.registry.active_cors_headers(model_name),
-    };
-    match cors {
-        Some(headers) => {
-            (StatusCode::NO_CONTENT, (*headers).clone()).into_response()
-        }
-        None => StatusCode::METHOD_NOT_ALLOWED.into_response(),
-    }
 }
 
 // ===== Info =====

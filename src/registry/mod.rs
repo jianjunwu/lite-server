@@ -175,7 +175,7 @@ impl ModelRegistry {
             last_used_at: None,
             weight: entry.weights.get(version).copied().unwrap_or(0),
             policies: Default::default(),
-            cors_headers: None,
+            cors: None,
         };
         entry.versions.insert(version.to_string(), mv);
         Ok(())
@@ -387,35 +387,36 @@ impl ModelRegistry {
         if let Some(p) = policies {
             if let Some(mut entry) = self.models.get_mut(model_name) {
                 if let Some(mv) = entry.versions.get_mut(version) {
-                    // Pre-build the CORS HeaderMap once (B9) so the hot response
-                    // path only Arc-clones instead of re-joining/parsing strings.
-                    mv.cors_headers = p.cors.as_ref().map(|c| Arc::new(c.header_map()));
+                    // P-CORS: cache the resolved CorsPolicy (Arc for cheap clone).
+                    // ACAO depends on the request Origin, so no pre-built HeaderMap.
+                    mv.cors = p.cors.clone().map(Arc::new);
                     mv.policies = p;
                 }
             }
         }
     }
 
-    pub fn active_cors_headers(
+    /// P-CORS: active version's CORS policy (Arc-cloned, cheap on the hot path).
+    pub fn active_cors_policy(
         &self,
         model_name: &str,
-    ) -> Option<Arc<axum::http::HeaderMap>> {
+    ) -> Option<Arc<crate::config::CorsPolicy>> {
         let active_version = self.active_versions.get(model_name)?;
         let model = self.models.get(model_name)?;
         let mv = model.versions.get(active_version.value())?;
-        mv.cors_headers.clone()
+        mv.cors.clone()
     }
 
-    /// CORS headers for a specific version (§4.4): versioned routes answer
-    /// OPTIONS with the hit version's policy, not the active one's.
-    pub fn cors_headers_for(
+    /// P-CORS: a specific version's CORS policy (versioned routes use the hit
+    /// version's policy, not the active one's).
+    pub fn cors_policy_for(
         &self,
         model_name: &str,
         version: &str,
-    ) -> Option<Arc<axum::http::HeaderMap>> {
+    ) -> Option<Arc<crate::config::CorsPolicy>> {
         let model = self.models.get(model_name)?;
         let mv = model.versions.get(version)?;
-        mv.cors_headers.clone()
+        mv.cors.clone()
     }
 
     pub fn set_strategy(

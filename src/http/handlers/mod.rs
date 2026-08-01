@@ -1,12 +1,11 @@
 use crate::error::AppError;
 use crate::http::state::AppState;
-use axum::{
-    extract::Query,
-    response::{IntoResponse, Json, Response},
-};
+use axum::{extract::Query, response::Json};
 use axum::http::header::HeaderMap;
 #[cfg(test)]
 use serde_json::Value;
+#[cfg(test)]
+use axum::response::Response;
 use std::sync::Arc;
 use tracing::warn;
 
@@ -211,31 +210,6 @@ const BLOCKED_RESPONSE_HEADERS: &[&str] = &[
     "trailer",
     "upgrade",
 ];
-
-/// Attach CORS headers to an inference response (success or error).
-fn attach_cors_headers(
-    state: &AppState,
-    model: &str,
-    result: Result<Response, AppError>,
-) -> Response {
-    let mut resp = match result {
-        Ok(r) => r,
-        Err(e) => e.into_response(),
-    };
-    if let Some(cors) = state.registry.active_cors_headers(model) {
-        extend_cors_headers(resp.headers_mut(), &cors);
-    }
-    resp
-}
-
-/// Copy pre-built CORS headers (Arc-shared, cached at policy ingest — B9) into
-/// a response in place. Entries are cloned since the source is shared behind an
-/// `Arc<HeaderMap>`.
-fn extend_cors_headers(target: &mut HeaderMap, src: &axum::http::HeaderMap) {
-    for (name, value) in src {
-        target.append(name.clone(), value.clone());
-    }
-}
 
 fn inject_response_headers(
     builder: axum::http::response::Builder,
