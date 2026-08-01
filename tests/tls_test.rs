@@ -327,6 +327,7 @@ async fn assert_grpc_infer_and_health(channel: tonic::transport::Channel) {
             version: "1".to_string(),
             data: br#"{"input":21}"#.to_vec().into(),
             headers: HashMap::new(),
+            sequence_id: None,
         })
         .await
         .expect("Infer over TLS must succeed")

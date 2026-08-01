@@ -1364,7 +1364,9 @@ async fn test_grpc_uds_infer_health_default_mode() {
             version: "1".to_string(),
             data: br#"{"input":21}"#.to_vec().into(),
             headers: HashMap::new(),
-        })
+
+        ..Default::default()
+})
         .await
         .expect("Infer over UDS must succeed")
         .into_inner();
@@ -1475,7 +1477,9 @@ async fn test_grpc_graceful_shutdown_drains_inflight() {
                 version: "1".to_string(),
                 data: br#"{"input":21}"#.to_vec().into(),
                 headers: HashMap::new(),
-            })
+
+            ..Default::default()
+})
             .await
     });
     sleep(Duration::from_millis(400)).await; // let predict start
@@ -1555,7 +1559,9 @@ async fn test_grpc_shutdown_rejects_new_rpcs() {
                 version: "1".to_string(),
                 data: br#"{"input":21}"#.to_vec().into(),
                 headers: HashMap::new(),
-            })
+
+            ..Default::default()
+})
             .await
     });
     sleep(Duration::from_millis(400)).await; // let predict start
@@ -1571,7 +1577,9 @@ async fn test_grpc_shutdown_rejects_new_rpcs() {
             version: "1".to_string(),
             data: br#"{"input":99}"#.to_vec().into(),
             headers: HashMap::new(),
-        }),
+
+        ..Default::default()
+}),
     )
     .await;
     match infer2 {
@@ -2956,7 +2964,9 @@ async fn test_grpc_canary_pin_parity() {
             headers: pin_proto_header
                 .map(|p| HashMap::from([("x-lite-version".to_string(), p.to_string())]))
                 .unwrap_or_default(),
-        });
+
+        ..Default::default()
+});
         if let Some(p) = pin_metadata {
             req.metadata_mut().insert("x-lite-version", p.parse().unwrap());
         }
@@ -3152,7 +3162,9 @@ async fn test_grpc_infer_aggregates_into_batch() {
         version: "1".to_string(),
         data: payload.clone(),
         headers: HashMap::new(),
-    };
+
+    ..Default::default()
+};
     // infer() takes &mut self, so clone the client for concurrent calls.
     let mut c1 = client.clone();
     let mut c2 = client.clone();
@@ -3217,7 +3229,9 @@ async fn test_grpc_infer_records_request_metrics() {
             version: "1".to_string(),
             data: Bytes::from(serde_json::to_vec(&json!({"input": 1})).unwrap()),
             headers: HashMap::new(),
-        })
+
+        ..Default::default()
+})
         .await;
     assert!(ok.is_ok(), "gRPC infer must succeed: {:?}", ok.err());
 
@@ -3228,7 +3242,9 @@ async fn test_grpc_infer_records_request_metrics() {
             version: String::new(),
             data: Bytes::from_static(b"{}"),
             headers: HashMap::new(),
-        })
+
+        ..Default::default()
+})
         .await
         .expect_err("unknown model must fail");
     assert_eq!(err.code(), tonic::Code::NotFound);
@@ -3309,7 +3325,9 @@ async fn test_grpc_infer_echoes_request_id() {
         version: "1".to_string(),
         data: Bytes::from(serde_json::to_vec(&json!({"input": 1})).unwrap()),
         headers: HashMap::new(),
-    });
+
+    ..Default::default()
+});
     req.metadata_mut()
         .insert("x-client-request-id", "p22-foo".parse().unwrap());
     let resp = client
@@ -3334,7 +3352,9 @@ async fn test_grpc_infer_echoes_request_id() {
         version: String::new(),
         data: Bytes::from_static(b"{}"),
         headers: HashMap::new(),
-    });
+
+    ..Default::default()
+});
     err_req
         .metadata_mut()
         .insert("x-client-request-id", "p22-bar".parse().unwrap());
@@ -3407,7 +3427,9 @@ async fn test_grpc_infer_rate_limit_returns_resource_exhausted() {
         version: "1".to_string(),
         data: Bytes::from(serde_json::to_vec(&json!({"input": 1})).unwrap()),
         headers: HashMap::new(),
-    };
+
+    ..Default::default()
+};
 
     // burst=3：前 3 次放行。
     for i in 0..3 {
@@ -3572,7 +3594,9 @@ async fn test_grpc_response_compression_gzip() {
             version: "1".to_string(),
             data: bytes::Bytes::from(serde_json::to_vec(&json!({"input": 1})).unwrap()),
             headers: HashMap::new(),
-        })
+
+        ..Default::default()
+})
         .await
         .expect("infer must succeed");
 
@@ -3844,7 +3868,9 @@ ensemble:
             version: "1".to_string(),
             data: bytes::Bytes::from(serde_json::to_vec(&json!({"x": 5})).unwrap()),
             headers: HashMap::new(),
-        })
+
+        ..Default::default()
+})
         .await
         .expect("ensemble gRPC Infer must walk the DAG, not error")
         .into_inner();
@@ -3938,7 +3964,9 @@ ensemble:
             version: "1".to_string(),
             data: bytes::Bytes::from(serde_json::to_vec(&json!({"x": 1})).unwrap()),
             headers: HashMap::new(),
-        })
+
+        ..Default::default()
+})
         .await;
 
     assert!(
@@ -4267,4 +4295,180 @@ async fn worker_self_terminates_when_server_killed() {
         gone,
         "worker did not self-terminate within 6s after its server was SIGKILLed"
     );
+}
+
+// ---------------------------------------------------------------------------
+// P8-1: sequence_id cross-request worker affinity (sticky routing)
+// ---------------------------------------------------------------------------
+
+/// Parse `liteserver_worker_inference_total{...,worker_id="N"} <value>` for one
+/// worker out of a /metrics scrape. Returns 0 when the series is absent.
+fn worker_inference_total(body: &str, model: &str, worker_id: u32) -> u64 {
+    let needle_model = format!("model=\"{model}\"");
+    let needle_worker = format!("worker_id=\"{worker_id}\"");
+    for line in body.lines() {
+        if line.starts_with("liteserver_worker_inference_total{")
+            && line.contains(&needle_model)
+            && line.contains(&needle_worker)
+        {
+            return line
+                .rsplit_once(' ')
+                .map(|(_, v)| v.trim().parse().unwrap_or(0))
+                .unwrap_or(0);
+        }
+    }
+    0
+}
+
+/// P8-1: many CONCURRENT requests carrying the SAME `sequence_id` all land on
+/// ONE worker (rendezvous hashing is deterministic even before the registry
+/// records), while concurrent requests WITHOUT a sequence_id balance across
+/// both workers via least-loaded. B2 load-threshold fallback is disabled via
+/// config so pure stickiness is observable.
+#[tokio::test]
+#[serial]
+async fn test_sequence_id_stickiness_pins_concurrent_requests_to_one_worker() {
+    let http_port = 18160u16;
+    let grpc_port = 18161u16;
+    let metrics_port = 18162u16;
+    for p in [http_port, grpc_port, metrics_port] {
+        kill_stale_on_port(p);
+    }
+
+    // 2-worker model so stickiness has somewhere to pin to.
+    let repo = std::env::temp_dir().join(format!("lite-server-p81-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    let model_dir = repo.join("sticky_model/1");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    std::fs::write(
+        model_dir.join("model.py"),
+        r#"from lite_server import LitAPI
+
+
+class StickyAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x * 2}
+
+    def encode_response(self, output):
+        return output
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        model_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 2\n",
+    )
+    .unwrap();
+
+    // Disable B2 load-threshold fallback so a pinned worker that gets 2+ ahead
+    // does not trigger power-of-two — pure stickiness is what we assert here.
+    let cfg_path =
+        std::env::temp_dir().join(format!("lite-server-p81-cfg-{}.yaml", std::process::id()));
+    std::fs::write(
+        &cfg_path,
+        "server:\n  balance_abs_threshold: 0\n  balance_rel_threshold: 0.0\n",
+    )
+    .unwrap();
+
+    let _server = ServerGuard::start(&[
+        "--port",
+        &http_port.to_string(),
+        "--grpc-port",
+        &grpc_port.to_string(),
+        "--metrics-port",
+        &metrics_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--config",
+        &cfg_path.to_string_lossy(),
+        "--log-level",
+        "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "sticky_model", "1").await;
+
+    let client = reqwest::Client::new();
+    let infer_url = format!("{base}/v2/models/sticky_model/infer");
+
+    // 8 CONCURRENT requests with the SAME sequence_id → all on one worker.
+    let sticky: Vec<_> = (0..8)
+        .map(|i| {
+            let c = client.clone();
+            let url = infer_url.clone();
+            tokio::spawn(async move {
+                c.post(&url)
+                    .header("x-sequence-id", "seq-A")
+                    .json(&json!({"input": i}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+            })
+        })
+        .collect();
+    for h in sticky {
+        assert_eq!(h.await.unwrap(), 200, "sticky infer must succeed");
+    }
+
+    let body = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{}/metrics", metrics_port))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let w0 = worker_inference_total(&body, "sticky_model", 0);
+    let w1 = worker_inference_total(&body, "sticky_model", 1);
+    assert_eq!(w0 + w1, 8, "all 8 sticky requests must be counted");
+    assert!(
+        (w0 == 8 && w1 == 0) || (w0 == 0 && w1 == 8),
+        "same sequence_id must pin to a single worker, got w0={w0} w1={w1}"
+    );
+
+    // 8 CONCURRENT requests WITHOUT sequence_id → least-loaded balances across
+    // both workers (each gains some). Proves non-affinity routing is untouched.
+    let plain: Vec<_> = (0..8)
+        .map(|i| {
+            let c = client.clone();
+            let url = infer_url.clone();
+            tokio::spawn(async move {
+                c.post(&url)
+                    .json(&json!({"input": i}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+            })
+        })
+        .collect();
+    for h in plain {
+        assert_eq!(h.await.unwrap(), 200, "plain infer must succeed");
+    }
+    let body2 = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{}/metrics", metrics_port))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let added0 = worker_inference_total(&body2, "sticky_model", 0) - w0;
+    let added1 = worker_inference_total(&body2, "sticky_model", 1) - w1;
+    assert_eq!(added0 + added1, 8, "all 8 plain requests must be counted");
+    assert!(
+        added0 > 0 && added1 > 0,
+        "non-affinity must balance across workers, got +{added0}/+{added1}"
+    );
+
+    unload_model(&base, "sticky_model", "1").await;
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_file(&cfg_path);
 }

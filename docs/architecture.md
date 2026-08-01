@@ -239,6 +239,18 @@ lite-server-core (main process)
 - Weighted routing enables canary deployments (multi-version traffic splitting)
 - Adaptive batching adjusts batch_timeout dynamically based on queue depth
 
+### Worker Selection & Sticky Routing (sequence_id)
+
+By default requests are routed statelessly: unary `Infer` through the per-(model,version) queue to the **least-loaded** worker (skipping ejected ones); streaming/batch connect **directly** to a random non-ejected worker. A request may opt into **cross-request worker affinity** by carrying a `sequence_id` (HTTP header `x-sequence-id`, gRPC `InferRequest`/`StreamInferRequest`/`BidiOpen.sequence_id`):
+
+- The server keeps a per-process `SequenceRegistry` mapping `sequence_id → (model, version, worker_id)`. A hit biases the next same-`sequence_id` request onto that worker when it is still registered and not ejected; a miss/ejection falls back to normal selection. Availability always wins over stickiness — fallback never rejects.
+- For the queue path, affinity is resolved at dispatch with live load/health, so an overloaded sticky worker (load beyond `server.balance_abs_threshold` / `balance_rel_threshold`) falls back to power-of-two selection, and a worker going offline redistributes its sequences via rendezvous hashing (smooth rehash — bounded movement, no hotspot). Streaming uses core stickiness only (it has no per-worker load signal).
+- Requests **without** a `sequence_id` route exactly as before — the feature is strictly opt-in.
+
+> **Security & isolation.** `sequence_id` is an **unauthenticated scheduling hint, not an isolation boundary**. A client can influence where its own requests land (by guessing/reusing a sequence id) but cannot cross model or tenant boundaries — those stay enforced by access control + worker model scope. Error responses never echo internal `worker_id`/registry structure.
+>
+> **Multi-instance.** The `SequenceRegistry` is **per-process**: under multiple replicas the same `sequence_id` may land on different workers in different instances. Global stickiness requires upstream session affinity (e.g. a gateway sticky cookie); this server provides in-instance affinity only.
+
 ## IPC Protocol
 
 Workers communicate with the Rust core using ZeroMQ PAIR sockets with protobuf serialization. On Unix, the transport uses `ipc://` (Unix domain sockets); on Windows, it falls back to `tcp://127.0.0.1:<port>`.

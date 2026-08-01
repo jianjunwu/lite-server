@@ -138,6 +138,21 @@ pub struct ServerConfig {
     pub mtls_ca_path: Option<String>,
     /// Minimum TLS version (P5-1): "1.2" (default) or "1.3".
     pub tls_min_version: Option<String>,
+    /// P8-1: how long a `sequence_id → worker` affinity mapping is kept after
+    /// its last use before the 60s cleanup sweep evicts it.
+    pub sequence_ttl_secs: f32,
+    /// P8-1: upper bound on tracked `sequence_id` entries (approximate LRU once
+    /// exceeded). Bounds memory for unauthenticated sequence hints.
+    pub max_sequences: usize,
+    /// P8-1 (B2): when an affinity worker's in-flight count exceeds the
+    /// least-loaded worker's by more than this absolute amount, fall back to
+    /// power-of-two selection (SGLang `--balance-abs-threshold` semantics).
+    /// 0 disables the absolute check.
+    pub balance_abs_threshold: u32,
+    /// P8-1 (B2): relative load-threshold complement to `balance_abs_threshold`
+    /// (SGLang `--balance-rel-threshold`, as a multiplier, e.g. 1.5 = +50%).
+    /// 0.0 disables the relative check.
+    pub balance_rel_threshold: f32,
 }
 
 impl Default for ServerConfig {
@@ -157,6 +172,10 @@ impl Default for ServerConfig {
             tls_key_path: None,
             mtls_ca_path: None,
             tls_min_version: None,
+            sequence_ttl_secs: 3600.0,
+            max_sequences: 65536,
+            balance_abs_threshold: 2,
+            balance_rel_threshold: 1.5,
         }
     }
 }
@@ -972,6 +991,13 @@ impl Config {
         check_duration_secs("server.timeout", self.server.timeout)?;
         check_duration_secs("server.graceful_timeout", self.server.graceful_timeout)?;
         check_duration_secs("server.keepalive_timeout", self.server.keepalive_timeout)?;
+        check_duration_secs("server.sequence_ttl_secs", self.server.sequence_ttl_secs)?;
+        if self.server.balance_rel_threshold < 0.0 || !self.server.balance_rel_threshold.is_finite() {
+            anyhow::bail!(
+                "config field `server.balance_rel_threshold` must be a finite non-negative multiplier, got {}",
+                self.server.balance_rel_threshold
+            );
+        }
         check_duration_secs("tunables.reconcile_coalesce_secs", self.tunables.reconcile_coalesce_secs)?;
         check_duration_secs("tunables.hot_reload_cooldown_secs", self.tunables.hot_reload_cooldown_secs)?;
         check_duration_secs("tunables.watcher_debounce_secs", self.tunables.watcher_debounce_secs)?;

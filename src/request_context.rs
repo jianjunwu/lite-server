@@ -133,12 +133,109 @@ impl<S: Send + Sync> FromRequestParts<S> for RequestContext {
     }
 }
 
+/// P8-1 (B3): request envelope hints — additive scheduling hints an upstream
+/// gateway/orchestrator MAY attach. **Define-only this period**: parsed and
+/// surfaced (debug log) but NOT yet consumed by routing. `sequence_id` (P8-1
+/// core) is the consumed special case of `affinity_key`.
+///
+/// All fields are unauthenticated hints, not an isolation boundary — a client
+/// can influence its own routing/landing but cannot cross model or tenant
+/// boundaries (those stay enforced by `access_control` + worker model scope).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RequestHints {
+    /// Scheduling priority (lower = higher priority). Reserved for the multi-
+    /// level priority queue (B1); not consumed this period.
+    pub priority: Option<i32>,
+    /// Generic content-affinity key. `sequence_id` is its special case; when
+    /// both are present the explicit `sequence_id` wins. Not consumed this period.
+    pub affinity_key: Option<String>,
+    /// Caller's expected request cost (relative weight). Reserved for
+    /// state-aware load scoring; not consumed this period.
+    pub expected_cost: Option<f64>,
+    /// Direct-mode: caller names a specific `worker_id`. Reserved ("gateway
+    /// citizen" extension — the server does not take over the decision); parsed
+    /// and validated-healthy in a follow-up, logged+ignored this period.
+    pub direct_worker_id: Option<u32>,
+}
+
+impl RequestHints {
+    /// Parse envelope hints off inbound HTTP headers. Unknown / malformed
+    /// values are silently dropped (a hint is best-effort).
+    pub fn from_http(headers: &HeaderMap) -> Self {
+        Self {
+            priority: header_str(headers, "x-lite-priority").and_then(|s| s.parse().ok()),
+            affinity_key: header_str(headers, "x-lite-affinity-key").map(|s| s.to_string()),
+            expected_cost: header_str(headers, "x-lite-expected-cost").and_then(|s| s.parse().ok()),
+            direct_worker_id: header_str(headers, "x-lite-worker-id").and_then(|s| s.parse().ok()),
+        }
+    }
+
+    /// Parse envelope hints off a gRPC `headers` map (lower-cased keys).
+    pub fn from_grpc(headers: &std::collections::HashMap<String, String>) -> Self {
+        let get = |k: &str| headers.get(k).map(|s| s.as_str());
+        Self {
+            priority: get("x-lite-priority").and_then(|s| s.parse().ok()),
+            affinity_key: get("x-lite-affinity-key").filter(|s| !s.is_empty()).map(|s| s.to_string()),
+            expected_cost: get("x-lite-expected-cost").and_then(|s| s.parse().ok()),
+            direct_worker_id: get("x-lite-worker-id").and_then(|s| s.parse().ok()),
+        }
+    }
+
+    /// `true` when no hint was supplied (the common case) — lets callers skip
+    /// the debug log and any future consumption work cheaply.
+    pub fn is_empty(&self) -> bool {
+        self.priority.is_none()
+            && self.affinity_key.is_none()
+            && self.expected_cost.is_none()
+            && self.direct_worker_id.is_none()
+    }
+}
+
+fn header_str<'a>(headers: &'a HeaderMap, key: &str) -> Option<&'a str> {
+    headers.get(key).and_then(|v| v.to_str().ok()).filter(|s| !s.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::StatusCode;
     use tower::ServiceExt;
+
+    // ===== P8-1 (B3) RequestHints parsing (define-only) =====
+
+    #[test]
+    fn request_hints_parse_from_http_headers() {
+        let h = headers_with(&[
+            ("x-lite-priority", "5"),
+            ("x-lite-affinity-key", "sess-42"),
+            ("x-lite-expected-cost", "1.25"),
+            ("x-lite-worker-id", "3"),
+        ]);
+        let hints = RequestHints::from_http(&h);
+        assert_eq!(hints.priority, Some(5));
+        assert_eq!(hints.affinity_key.as_deref(), Some("sess-42"));
+        assert_eq!(hints.expected_cost, Some(1.25));
+        assert_eq!(hints.direct_worker_id, Some(3));
+        assert!(!hints.is_empty());
+    }
+
+    #[test]
+    fn request_hints_empty_when_absent_or_malformed() {
+        let h = headers_with(&[("x-lite-priority", "not-a-number"), ("x-lite-affinity-key", "")]);
+        let hints = RequestHints::from_http(&h);
+        assert!(hints.is_empty(), "malformed/empty values drop to None");
+    }
+
+    #[test]
+    fn request_hints_parse_from_grpc_map() {
+        let mut m = std::collections::HashMap::new();
+        m.insert("x-lite-priority".to_string(), "2".to_string());
+        m.insert("x-lite-worker-id".to_string(), "1".to_string());
+        let hints = RequestHints::from_grpc(&m);
+        assert_eq!(hints.priority, Some(2));
+        assert_eq!(hints.direct_worker_id, Some(1));
+    }
 
     fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();

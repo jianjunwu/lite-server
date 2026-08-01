@@ -24,6 +24,13 @@ server:
   tls_key_path: null           # Server private key PEM; requires tls_cert_path
   mtls_ca_path: null           # Client CA bundle PEM; when set, client certs are REQUIRED (mTLS)
   tls_min_version: null        # "1.2" (default) or "1.3"
+  # sequence_id sticky routing (P8-1) — opt-in per request via x-sequence-id /
+  # the gRPC sequence_id field; absence leaves routing exactly as before.
+  sequence_ttl_secs: 3600.0    # Seconds a sequence_id→worker mapping is kept after last use
+  max_sequences: 65536         # Upper bound on tracked sequence_id entries (approx LRU)
+  balance_abs_threshold: 2     # B2: abandon a sticky worker once its in-flight exceeds the
+                               # least-loaded by this many (SGLang --balance-abs-threshold; 0 = off)
+  balance_rel_threshold: 1.5   # B2: relative complement (...* multiplier; 0.0 = off)
 
 logging:
   level: info                  # Log level: trace, debug, info, warn, error

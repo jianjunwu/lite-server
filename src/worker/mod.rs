@@ -658,6 +658,7 @@ impl WorkerManager {
             endpoint: endpoint.clone(),
             pid,
             status: WorkerStatus::Ready,
+            capacity: None,
         };
         self.registry.replace_worker(model_name, version, worker_id, new_info)?;
 
@@ -1263,6 +1264,7 @@ impl WorkerManager {
                 endpoint: endpoint.clone(),
                 pid,
                 status: WorkerStatus::Ready,
+                capacity: None,
             };
             worker_infos.push(info);
 
@@ -2111,6 +2113,7 @@ mod tests {
                     endpoint: format!("ipc:///tmp/reconcile-test-{}.sock", i),
                     pid: None,
                     status: WorkerStatus::Ready,
+                    capacity: None,
                 })
                 .collect(),
         )

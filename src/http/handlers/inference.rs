@@ -117,6 +117,18 @@ async fn do_infer(
         .as_nanos() as i64;
     let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
 
+    // P8-1: cross-request sequence_id affinity hint (optional, unauthenticated).
+    let sequence_id = headers
+        .get("x-sequence-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    // P8-1 (B3): envelope hints — parsed and surfaced, NOT yet consumed (define-only).
+    let hints = crate::request_context::RequestHints::from_http(&headers);
+    if !hints.is_empty() {
+        tracing::debug!(?hints, "envelope hints received (define-only, not consumed)");
+    }
+
     // Fire InferenceRequest callback (before values are moved into meta)
     let req_ctx = crate::callback::InferenceContext {
         model_name: model_name.clone(),
@@ -140,6 +152,7 @@ async fn do_infer(
         request_id,
         timestamp_ns,
         payload: bytes::Bytes::from(payload_bytes),
+        sequence_id,
         ..Default::default()
     };
 
@@ -378,6 +391,12 @@ pub(super) fn build_request_meta(headers: &HeaderMap, payload: &Value, route: &s
         .unwrap_or_default()
         .as_nanos() as i64;
     let payload_bytes = bytes::Bytes::from(serde_json::to_vec(payload).unwrap_or_default());
+    // P8-1: sequence_id affinity hint.
+    let sequence_id = headers
+        .get("x-sequence-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
 
     pb::RequestMeta {
         route: route.to_string(),
@@ -386,6 +405,7 @@ pub(super) fn build_request_meta(headers: &HeaderMap, payload: &Value, route: &s
         request_id: cx.request_id.clone(),
         timestamp_ns,
         payload: payload_bytes,
+        sequence_id,
         ..Default::default()
     }
 }

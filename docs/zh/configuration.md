@@ -24,6 +24,13 @@ server:
   tls_key_path: null           # 服务器私钥 PEM；须与 tls_cert_path 同设
   mtls_ca_path: null           # 客户端 CA  bundle PEM；设置后强制客户端证书（mTLS）
   tls_min_version: null        # "1.2"（默认）或 "1.3"
+  # sequence_id 粘性路由（P8-1）——按请求经 x-sequence-id / gRPC sequence_id 字段
+  # 显式开启；缺省时调度与现状完全一致。
+  sequence_ttl_secs: 3600.0    # sequence_id→worker 映射在末次使用后保留的秒数
+  max_sequences: 65536         # 追踪的 sequence_id 条目上限（近似 LRU）
+  balance_abs_threshold: 2     # B2：粘性 worker 在途数超过最少负载 worker 多少即回退
+                               # （SGLang --balance-abs-threshold 语义；0 = 关闭）
+  balance_rel_threshold: 1.5   # B2：相对阈值（…× 倍数；0.0 = 关闭）
 
 logging:
   level: info                  # 日志级别：trace, debug, info, warn, error

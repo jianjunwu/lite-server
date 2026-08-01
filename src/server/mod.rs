@@ -117,7 +117,21 @@ impl LiteServer {
     pub fn new(config: Config) -> Self {
         let repo_path = PathBuf::from(&config.model_repository.path);
         let registry = Arc::new(ModelRegistry::new());
-        let inference_queue = Arc::new(InferenceQueue::new());
+        // P8-1: one shared sequence→worker affinity map for the queue path and
+        // the streaming direct path (the latter reaches it via
+        // `inference_queue.sequence_registry()`). Built from server config.
+        let sequence_registry = Arc::new(crate::sequence::SequenceRegistry::new(
+            std::time::Duration::from_secs_f64(config.server.sequence_ttl_secs as f64),
+            config.server.max_sequences,
+        ));
+        let balance = crate::inference_queue::BalanceConfig {
+            abs_threshold: config.server.balance_abs_threshold,
+            rel_threshold: config.server.balance_rel_threshold,
+        };
+        let inference_queue = Arc::new(InferenceQueue::with_sequence(
+            sequence_registry.clone(),
+            balance,
+        ));
         let callback_runner = Arc::new(CallbackRunner::new());
         let worker_manager = Arc::new(WorkerManager::new(
             registry.clone(),
@@ -176,6 +190,22 @@ impl LiteServer {
                     let removed = limiter.cleanup_stale(std::time::Duration::from_secs(600));
                     if removed > 0 {
                         tracing::debug!(removed, "rate limiter: evicted stale buckets");
+                    }
+                }
+            });
+        }
+
+        // P8-1: reap expired / over-cap sequence→worker affinity entries every
+        // 60s so unauthenticated sequence hints cannot grow the map unbounded.
+        {
+            let seq_reg = self.inference_queue.sequence_registry().clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    tick.tick().await;
+                    let removed = seq_reg.cleanup();
+                    if removed > 0 {
+                        tracing::debug!(removed, "sequence registry: reaped stale affinity entries");
                     }
                 }
             });

@@ -192,6 +192,11 @@ impl GrpcService {
         }
 
         let header_map: HashMap<String, String> = req.headers.clone();
+        // P8-1 (B3): envelope hints — parsed and surfaced, NOT yet consumed (define-only).
+        let hints = crate::request_context::RequestHints::from_grpc(&req.headers);
+        if !hints.is_empty() {
+            tracing::debug!(?hints, "envelope hints received (define-only, not consumed)");
+        }
         let meta = pb::RequestMeta {
             route: "/predict".to_string(),
             headers: header_map,
@@ -202,6 +207,7 @@ impl GrpcService {
                 .unwrap_or_default()
                 .as_nanos() as i64,
             payload: req.data.clone(),
+            sequence_id: req.sequence_id.clone(),
             ..Default::default()
         };
 
@@ -545,8 +551,11 @@ impl GrpcService {
                 .unwrap_or_default()
                 .as_nanos() as i64,
             payload: req.data.clone(),
+            sequence_id: req.sequence_id.clone(),
             ..Default::default()
         };
+        // Capture before `meta` moves into `open_req` (used by the affinity pick below).
+        let sequence_id = meta.sequence_id.clone();
 
         let stream_id = format!("grpc-stream-{}", Uuid::new_v4());
         let open_req = streaming::build_stream_open(stream_id.clone(), req.data, Some(meta));
@@ -561,14 +570,27 @@ impl GrpcService {
             return Err(err(Status::unavailable("no workers available")));
         }
 
-        let worker_id = match self
+        // P8-1: connect directly to the worker that last served this
+        // sequence_id when it is still registered and not ejected; else the
+        // normal skip-ejected/random pick, then record the chosen worker.
+        let outlier = self
             .worker_manager
             .get_outlier_state(model_name.as_str(), &resolved_version)
-            .await
-        {
-            Some(outlier) => crate::worker::pick_worker_skip_ejected(clients.len(), &outlier),
-            None => crate::worker::pick_worker_random(clients.len()),
-        };
+            .await;
+        let seq_registry = self.app_state.inference_queue.sequence_registry();
+        let num_workers = clients.len();
+        let preferred = sequence_id.as_deref().and_then(|seq| {
+            let w = seq_registry.lookup(seq, model_name, &resolved_version)?;
+            let ejected = outlier.as_ref().map(|o| o.is_ejected(w)).unwrap_or(false);
+            (w < num_workers && !ejected).then_some(w)
+        });
+        let worker_id = preferred.unwrap_or_else(|| match &outlier {
+            Some(o) => crate::worker::pick_worker_skip_ejected(num_workers, o),
+            None => crate::worker::pick_worker_random(num_workers),
+        });
+        if let Some(seq) = sequence_id.as_deref() {
+            seq_registry.record(seq, model_name, &resolved_version, worker_id);
+        }
         let client = clients[worker_id].clone();
         // P6 GetModelStats: one streaming inference dispatched to this worker.
         crate::metrics::prometheus::record_worker_inference(
@@ -689,7 +711,7 @@ impl GrpcService {
             .await
             .map_err(|e| err(Status::internal(format!("stream error: {}", e))))?;
 
-        let (model_name, resolved_version, stream_id, initial_data, pin) = match first {
+        let (model_name, resolved_version, stream_id, initial_data, sequence_id, pin) = match first {
             Some(chunk) => match chunk.payload {
                 Some(pb::bidi_chunk::Payload::Open(open)) => {
                     let model_name = open.model_name;
@@ -734,7 +756,7 @@ impl GrpcService {
                     }
 
                     let sid = format!("grpc-bidi-{}", Uuid::new_v4());
-                    (model_name, resolved_version, sid, open.initial_data, pin)
+                    (model_name, resolved_version, sid, open.initial_data, open.sequence_id, pin)
                 }
                 _ => return Err(err(Status::invalid_argument("first message must be BidiOpen"))),
             },
@@ -768,6 +790,7 @@ impl GrpcService {
                 .unwrap_or_default()
                 .as_nanos() as i64,
             payload: initial_data.clone(),
+            sequence_id: sequence_id.clone(),
             ..Default::default()
         };
 
@@ -783,14 +806,27 @@ impl GrpcService {
             return Err(err(Status::unavailable("no workers available")));
         }
 
-        let worker_id = match self
+        // P8-1: connect directly to the worker that last served this
+        // sequence_id when it is still registered and not ejected; else the
+        // normal pick, then record the chosen worker.
+        let outlier = self
             .worker_manager
             .get_outlier_state(model_name.as_str(), &resolved_version)
-            .await
-        {
-            Some(outlier) => crate::worker::pick_worker_skip_ejected(clients.len(), &outlier),
-            None => crate::worker::pick_worker_random(clients.len()),
-        };
+            .await;
+        let seq_registry = self.app_state.inference_queue.sequence_registry();
+        let num_workers = clients.len();
+        let preferred = sequence_id.as_deref().and_then(|seq| {
+            let w = seq_registry.lookup(seq, &model_name, &resolved_version)?;
+            let ejected = outlier.as_ref().map(|o| o.is_ejected(w)).unwrap_or(false);
+            (w < num_workers && !ejected).then_some(w)
+        });
+        let worker_id = preferred.unwrap_or_else(|| match &outlier {
+            Some(o) => crate::worker::pick_worker_skip_ejected(num_workers, o),
+            None => crate::worker::pick_worker_random(num_workers),
+        });
+        if let Some(seq) = sequence_id.as_deref() {
+            seq_registry.record(seq, &model_name, &resolved_version, worker_id);
+        }
         let client = clients[worker_id].clone();
         // P6 GetModelStats: one bidi inference dispatched to this worker.
         crate::metrics::prometheus::record_worker_inference(
@@ -2656,6 +2692,7 @@ mod request_metrics_tests {
             version: version.to_string(),
             data: Bytes::from_static(b"{}"),
             headers: HashMap::new(),
+            sequence_id: None,
         })
     }
 
@@ -2865,6 +2902,7 @@ mod request_metrics_tests {
                 version: String::new(),
                 data: Bytes::from_static(b"{}"),
                 headers: HashMap::new(),
+                sequence_id: None,
             }))
             .await
             .unwrap_err();
@@ -2930,6 +2968,7 @@ mod request_metrics_tests {
                 version: "1".to_string(),
                 data: Bytes::from_static(b"{}"),
                 headers: HashMap::new(),
+                sequence_id: None,
             }))
             .await
             .expect("stream must open");

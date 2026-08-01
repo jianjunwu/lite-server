@@ -4,6 +4,7 @@ use crate::error::AppError;
 use crate::metrics::prometheus;
 use crate::proto::liteserver as pb;
 use crate::registry::types::WorkerInfo;
+use crate::sequence::SequenceRegistry;
 use crate::transport::zmq::WorkerZmqClient;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -339,6 +340,12 @@ impl DrainHandle {
 /// Per-model-version inference queue with batch aggregation.
 pub struct InferenceQueue {
     queues: DashMap<String, VersionQueue>,
+    /// P8-1: shared sequence→worker affinity map. The batch collector records
+    /// and consults it here; the streaming direct path shares the same `Arc`
+    /// (threaded out via [`Self::sequence_registry`]).
+    sequence_registry: Arc<SequenceRegistry>,
+    /// P8-1 (B2): affinity load-balance thresholds.
+    balance: BalanceConfig,
 }
 
 impl Default for InferenceQueue {
@@ -349,9 +356,29 @@ impl Default for InferenceQueue {
 
 impl InferenceQueue {
     pub fn new() -> Self {
+        Self::with_sequence(
+            Arc::new(SequenceRegistry::new(Duration::from_secs(3600), 65536)),
+            BalanceConfig::default(),
+        )
+    }
+
+    /// Construct with an explicit shared [`SequenceRegistry`] and balance
+    /// thresholds so the queue path and the streaming direct path share one
+    /// affinity map. [`Self::new`] delegates here with defaults.
+    pub(crate) fn with_sequence(
+        sequence_registry: Arc<SequenceRegistry>,
+        balance: BalanceConfig,
+    ) -> Self {
         Self {
             queues: DashMap::new(),
+            sequence_registry,
+            balance,
         }
+    }
+
+    /// Borrow the shared sequence registry (used by the streaming direct path).
+    pub fn sequence_registry(&self) -> &Arc<SequenceRegistry> {
+        &self.sequence_registry
     }
 
     /// Register a model version and start its batch collector task.
@@ -415,6 +442,8 @@ impl InferenceQueue {
             reload_tx,
             max_retries,
             outlier.clone(),
+            self.sequence_registry.clone(),
+            self.balance,
         ));
 
         // Spawn health checker if interval > 0
@@ -563,6 +592,197 @@ fn pick_worker_least_loaded(
         .unwrap_or(0)
 }
 
+/// P8-1 (B2) load-balance thresholds for affinity fallback, mirroring SGLang
+/// `--balance-abs/rel-threshold`: an affinity worker is abandoned for
+/// power-of-two selection when its in-flight count exceeds the least-loaded
+/// worker's by more than the absolute or relative threshold. `0` disables that
+/// axis. `Copy` so it threads through the collector cheaply.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BalanceConfig {
+    pub abs_threshold: u32,
+    pub rel_threshold: f32,
+}
+
+impl Default for BalanceConfig {
+    fn default() -> Self {
+        Self {
+            abs_threshold: 2,
+            rel_threshold: 1.5,
+        }
+    }
+}
+
+/// Resolved affinity hint for one dispatch, derived from the batch's sequenced
+/// items. `preferred` is `Some(w)` only when every sequenced item that has a
+/// live registry hit agrees on the same worker. Owns `seq` so it does not
+/// borrow `batch` (the batch is mutated later in dispatch).
+struct Affinity {
+    seq: String,
+    preferred: Option<usize>,
+}
+
+/// Compute the batch's affinity hint from the `sequence_id` each item carries
+/// on its `RequestMeta`. Returns `None` when no item carries a sequence_id —
+/// non-affinity dispatch, which the picker then routes exactly as before.
+fn batch_affinity(
+    batch: &[QueueItem],
+    reg: &SequenceRegistry,
+    model: &str,
+    version: &str,
+) -> Option<Affinity> {
+    let mut first_seq: Option<String> = None;
+    let mut agreed: Option<usize> = None;
+    let mut disagree = false;
+    for item in batch {
+        let Some(seq) = item.meta.as_ref().and_then(|m| m.sequence_id.as_deref()) else {
+            continue;
+        };
+        if first_seq.is_none() {
+            first_seq = Some(seq.to_string());
+        }
+        if let Some(w) = reg.lookup(seq, model, version) {
+            match agreed {
+                None => agreed = Some(w),
+                Some(cur) if cur != w => disagree = true,
+                _ => {}
+            }
+        }
+    }
+    Some(Affinity {
+        seq: first_seq?,
+        preferred: if disagree { None } else { agreed },
+    })
+}
+
+/// P8-1 worker selection. Non-affinity (`affinity == None`) is **identical** to
+/// [`pick_worker_least_loaded`] (acceptance: requests without `sequence_id`
+/// route exactly as before). Affinity dispatch honors the preferred worker when
+/// it is healthy and within the load thresholds; otherwise it falls back to
+/// power-of-two selection (overload, B2) or rendezvous hashing (preferred gone
+/// or ejected — smooth rehash, B2) over the live workers.
+fn pick_worker(
+    inflight: &[Arc<AtomicUsize>],
+    outlier: &OutlierState,
+    exclude: &[usize],
+    affinity: Option<Affinity>,
+    balance: BalanceConfig,
+) -> usize {
+    let (seq, preferred) = match affinity {
+        None => return pick_worker_least_loaded(inflight, outlier, exclude),
+        Some(a) => (a.seq, a.preferred),
+    };
+    if inflight.len() <= 1 {
+        return 0;
+    }
+    match preferred {
+        Some(w) if w < inflight.len() && !outlier.is_ejected(w) && !exclude.contains(&w) => {
+            if affinity_overloaded(inflight, outlier, exclude, w, balance) {
+                power_of_two_pick(inflight, outlier, exclude)
+            } else {
+                w
+            }
+        }
+        _ => rendezvous_pick(&seq, inflight, outlier, exclude)
+            .unwrap_or_else(|| pick_worker_least_loaded(inflight, outlier, exclude)),
+    }
+}
+
+/// Is affinity worker `w` loaded enough beyond the least-loaded live worker to
+/// justify abandoning stickiness? (B2 absolute + relative thresholds.)
+fn affinity_overloaded(
+    inflight: &[Arc<AtomicUsize>],
+    outlier: &OutlierState,
+    exclude: &[usize],
+    w: usize,
+    balance: BalanceConfig,
+) -> bool {
+    let mut min = usize::MAX;
+    for (i, c) in inflight.iter().enumerate() {
+        if i == w || outlier.is_ejected(i) || exclude.contains(&i) {
+            continue;
+        }
+        let l = c.load(Ordering::Relaxed);
+        if l < min {
+            min = l;
+        }
+    }
+    if min == usize::MAX {
+        return false; // no alternative live worker
+    }
+    let wload = inflight[w].load(Ordering::Relaxed);
+    if balance.abs_threshold > 0
+        && wload > min.saturating_add(balance.abs_threshold as usize)
+    {
+        return true;
+    }
+    if balance.rel_threshold > 0.0 && min > 0 {
+        let limit = (min as f64) * (balance.rel_threshold as f64);
+        if (wload as f64) > limit {
+            return true;
+        }
+    }
+    false
+}
+
+/// Power-of-two selection (B2): sample two distinct live workers, keep the
+/// less-loaded. Falls back to least-loaded if fewer than two are live.
+fn power_of_two_pick(
+    inflight: &[Arc<AtomicUsize>],
+    outlier: &OutlierState,
+    exclude: &[usize],
+) -> usize {
+    let live: Vec<usize> = (0..inflight.len())
+        .filter(|&i| !outlier.is_ejected(i) && !exclude.contains(&i))
+        .collect();
+    if live.len() < 2 {
+        return pick_worker_least_loaded(inflight, outlier, exclude);
+    }
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let a = live[rng.gen_range(0..live.len())];
+    let b = loop {
+        let c = live[rng.gen_range(0..live.len())];
+        if c != a {
+            break c;
+        }
+    };
+    if inflight[a].load(Ordering::Relaxed) <= inflight[b].load(Ordering::Relaxed) {
+        a
+    } else {
+        b
+    }
+}
+
+/// Rendezvous hashing (HRW) over live workers — consistent hashing's bounded
+/// redistribution with no ring data structure: only the sequences whose
+/// preferred worker died move, and they spread deterministically across the
+/// survivors. Returns `None` if no worker is live.
+fn rendezvous_pick(
+    seq: &str,
+    inflight: &[Arc<AtomicUsize>],
+    outlier: &OutlierState,
+    exclude: &[usize],
+) -> Option<usize> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut best: Option<(u64, usize)> = None;
+    for i in 0..inflight.len() {
+        if outlier.is_ejected(i) || exclude.contains(&i) {
+            continue;
+        }
+        let mut h = DefaultHasher::new();
+        seq.hash(&mut h);
+        i.hash(&mut h);
+        let hv = h.finish();
+        match best {
+            None => best = Some((hv, i)),
+            Some((bh, _)) if hv > bh => best = Some((hv, i)),
+            _ => {}
+        }
+    }
+    best.map(|(_, i)| i)
+}
+
 /// Map one item of a worker BatchResponse to the pb::Response delivered to
 /// its caller.  `resp_item` of None means the worker omitted this uid.
 /// Per-item status / status_code / media_type / headers propagate so each
@@ -666,13 +886,19 @@ async fn do_send_batch(
     version: &str,
     request_timeout: Duration,
     exclude: &[usize],
+    sequence_registry: &SequenceRegistry,
+    balance: BalanceConfig,
 ) -> Result<(), BatchError> {
     if batch.is_empty() {
         return Ok(());
     }
 
     let batch_size = batch.len();
-    let worker_idx = pick_worker_least_loaded(inflight, outlier, exclude);
+    // P8-1: bias worker selection toward the affinity worker when the batch
+    // carries sequence_ids, falling back to least-loaded (no sequence_id ⇒
+    // `batch_affinity` returns None ⇒ `pick_worker` behaves exactly as before).
+    let affinity = batch_affinity(batch.as_slice(), sequence_registry, model_name, version);
+    let worker_idx = pick_worker(inflight, outlier, exclude, affinity, balance);
     debug!(
         model = %model_name,
         version = %version,
@@ -687,6 +913,14 @@ async fn do_send_batch(
     // P6 GetModelStats: count logical inferences per worker (batch size here;
     // per-attempt like observe_inference_duration above, so retries count too).
     prometheus::record_worker_inference(model_name, version, worker_idx, batch_size);
+    // P8-1: record sequence_id → chosen worker for every sequenced item so the
+    // next same-sequence request biases here (last-writer-wins; a retry to a
+    // different worker updates the mapping to the actual handler).
+    for item in batch.iter() {
+        if let Some(seq) = item.meta.as_ref().and_then(|m| m.sequence_id.as_deref()) {
+            sequence_registry.record(seq, model_name, version, worker_idx);
+        }
+    }
 
     // Build protobuf request (Single if batch.len() == 1, else Batch)
     let request = if batch.len() == 1 {
@@ -886,6 +1120,8 @@ async fn send_batch_with_retry(
     max_requests: usize,
     reload_tx: &mpsc::Sender<ReloadSignal>,
     max_retries: usize,
+    sequence_registry: &SequenceRegistry,
+    balance: BalanceConfig,
 ) {
     if batch.is_empty() {
         return;
@@ -904,7 +1140,7 @@ async fn send_batch_with_retry(
 
     // Fast path: single worker, or retries disabled (max_retries == 0)
     if zmq_clients.len() <= 1 || max_retries == 0 {
-        let result = do_send_batch(&mut batch, zmq_clients, inflight, outlier, model_name, version, request_timeout, &[]).await;
+        let result = do_send_batch(&mut batch, zmq_clients, inflight, outlier, model_name, version, request_timeout, &[], sequence_registry, balance).await;
         match result {
             Ok(()) => check_max_requests(request_count, batch_size, max_requests, model_name, version, reload_tx).await,
             Err(e) => fail_batch_items(&mut batch, &e),
@@ -918,7 +1154,7 @@ async fn send_batch_with_retry(
         if attempt > 0 {
             prometheus::inc_retry(model_name, version);
         }
-        match do_send_batch(&mut batch, zmq_clients, inflight, outlier, model_name, version, request_timeout, &excluded).await {
+        match do_send_batch(&mut batch, zmq_clients, inflight, outlier, model_name, version, request_timeout, &excluded, sequence_registry, balance).await {
             Ok(()) => {
                 check_max_requests(request_count, batch_size, max_requests, model_name, version, reload_tx).await;
                 return;
@@ -1027,6 +1263,8 @@ async fn batch_collector(
     reload_tx: mpsc::Sender<ReloadSignal>,
     max_retries: usize,
     outlier: Arc<OutlierState>,
+    sequence_registry: Arc<SequenceRegistry>,
+    balance: BalanceConfig,
 ) {
     let worker_inflight: Vec<Arc<AtomicUsize>> = (0..zmq_clients.len())
         .map(|_| Arc::new(AtomicUsize::new(0)))
@@ -1044,12 +1282,13 @@ async fn batch_collector(
             let zmq_clients = zmq_clients.clone();
             let worker_inflight = worker_inflight.clone();
             let outlier = outlier.clone();
+            let sequence_registry = sequence_registry.clone();
             let model_name = model_name.clone();
             let version = version.clone();
             let request_count = request_count.clone();
             let reload_tx = reload_tx.clone();
             tokio::spawn(async move {
-                send_batch_with_retry(batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx, max_retries).await;
+                send_batch_with_retry(batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx, max_retries, &sequence_registry, balance).await;
             });
         }
         return;
@@ -1069,12 +1308,13 @@ async fn batch_collector(
                     let zmq_clients = zmq_clients.clone();
                     let worker_inflight = worker_inflight.clone();
                     let outlier = outlier.clone();
+                    let sequence_registry = sequence_registry.clone();
                     let model_name = model_name.clone();
                     let version = version.clone();
                     let request_count = request_count.clone();
                     let reload_tx = reload_tx.clone();
                     tokio::spawn(async move {
-                        send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx, max_retries).await;
+                        send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx, max_retries, &sequence_registry, balance).await;
                     });
                     deadline = None;
                 } else if deadline.is_none() {
@@ -1107,12 +1347,13 @@ async fn batch_collector(
                     let zmq_clients = zmq_clients.clone();
                     let worker_inflight = worker_inflight.clone();
                     let outlier = outlier.clone();
+                    let sequence_registry = sequence_registry.clone();
                     let model_name = model_name.clone();
                     let version = version.clone();
                     let request_count = request_count.clone();
                     let reload_tx = reload_tx.clone();
                     tokio::spawn(async move {
-                        send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx, max_retries).await;
+                        send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx, max_retries, &sequence_registry, balance).await;
                     });
                 }
                 deadline = None;
@@ -1127,12 +1368,13 @@ async fn batch_collector(
         let zmq_clients = zmq_clients.clone();
         let worker_inflight = worker_inflight.clone();
         let outlier = outlier.clone();
+        let sequence_registry = sequence_registry.clone();
         let model_name = model_name.clone();
         let version = version.clone();
         let request_count = request_count.clone();
         let reload_tx = reload_tx.clone();
         tokio::spawn(async move {
-            send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx, max_retries).await;
+            send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx, max_retries, &sequence_registry, balance).await;
         });
     }
 }
@@ -1260,6 +1502,112 @@ async fn escalate_to_kill(
 mod tests {
     use super::*;
     use bytes::Bytes;
+
+    // ===== P8-1 picker tests =====
+
+    fn mk_inflight(loads: &[usize]) -> Vec<Arc<AtomicUsize>> {
+        loads
+            .iter()
+            .map(|&l| Arc::new(AtomicUsize::new(l)))
+            .collect()
+    }
+
+    fn eject(outlier: &OutlierState, idx: usize) {
+        for _ in 0..EjectionConfig::default().error_threshold {
+            outlier.record_error(idx);
+        }
+        assert!(outlier.is_ejected(idx), "test setup: worker {idx} should be ejected");
+    }
+
+    /// Acceptance #1: with no `sequence_id`, `pick_worker` is byte-identical to
+    /// the pre-existing `pick_worker_least_loaded` across load / exclude / eject
+    /// states — stickiness never pertains the non-affinity path.
+    #[test]
+    fn pick_worker_non_affinity_matches_least_loaded() {
+        let bal = BalanceConfig::default();
+        let outlier = OutlierState::new(4);
+        let inflight = mk_inflight(&[3, 1, 2, 0]);
+        for exclude in [vec![], vec![3usize], vec![1usize, 2]] {
+            let got = pick_worker(&inflight, &outlier, &exclude, None, bal);
+            let want = pick_worker_least_loaded(&inflight, &outlier, &exclude);
+            assert_eq!(got, want, "non-affinity must match least-loaded (exclude={exclude:?})");
+        }
+        // with one ejected worker too
+        let outlier2 = OutlierState::new(4);
+        eject(&outlier2, 0);
+        let inflight2 = mk_inflight(&[0, 5, 5, 5]);
+        let got = pick_worker(&inflight2, &outlier2, &[], None, bal);
+        let want = pick_worker_least_loaded(&inflight2, &outlier2, &[]);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn pick_worker_affinity_honors_healthy_preferred() {
+        let bal = BalanceConfig::default();
+        let outlier = OutlierState::new(3);
+        let inflight = mk_inflight(&[0, 0, 0]); // balanced → preferred not overloaded
+        let aff = Some(Affinity {
+            seq: "s1".to_string(),
+            preferred: Some(2),
+        });
+        assert_eq!(pick_worker(&inflight, &outlier, &[], aff, bal), 2);
+    }
+
+    #[test]
+    fn pick_worker_affinity_falls_back_when_preferred_ejected() {
+        let bal = BalanceConfig::default();
+        let outlier = OutlierState::new(3);
+        eject(&outlier, 1); // preferred worker ejected
+        let inflight = mk_inflight(&[0, 0, 0]);
+        let chosen = pick_worker(
+            &inflight,
+            &outlier,
+            &[],
+            Some(Affinity { seq: "s1".to_string(), preferred: Some(1) }),
+            bal,
+        );
+        assert_ne!(chosen, 1, "must not route to an ejected preferred worker");
+        // HRW fallback is deterministic for the same sequence
+        let chosen2 = pick_worker(
+            &inflight,
+            &outlier,
+            &[],
+            Some(Affinity { seq: "s1".to_string(), preferred: Some(1) }),
+            bal,
+        );
+        assert_eq!(chosen, chosen2);
+    }
+
+    #[test]
+    fn pick_worker_affinity_power_of_two_when_overloaded() {
+        // preferred=0 at load 10, others idle → far beyond abs threshold (2)
+        let bal = BalanceConfig {
+            abs_threshold: 2,
+            rel_threshold: 1.5,
+        };
+        let outlier = OutlierState::new(3);
+        let inflight = mk_inflight(&[10, 0, 0]);
+        let chosen = pick_worker(
+            &inflight,
+            &outlier,
+            &[],
+            Some(Affinity { seq: "s1".to_string(), preferred: Some(0) }),
+            bal,
+        );
+        assert_ne!(chosen, 0, "an overloaded preferred worker must be abandoned");
+        assert!(chosen == 1 || chosen == 2);
+    }
+
+    #[test]
+    fn rendezvous_is_deterministic_and_skips_ejected() {
+        let outlier = OutlierState::new(4);
+        eject(&outlier, 0);
+        let inflight = mk_inflight(&[0; 4]);
+        let a = rendezvous_pick("seq-a", &inflight, &outlier, &[]).unwrap();
+        let b = rendezvous_pick("seq-a", &inflight, &outlier, &[]).unwrap();
+        assert_eq!(a, b, "same sequence → same worker (deterministic)");
+        assert_ne!(a, 0, "an ejected worker is never chosen");
+    }
 
     // ===== Key pre-computation tests =====
 

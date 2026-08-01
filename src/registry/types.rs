@@ -97,6 +97,22 @@ pub struct WorkerInfo {
     pub endpoint: String,
     pub pid: Option<u32>,
     pub status: WorkerStatus,
+    /// P8-1 (B5): reserved worker capacity report (cost units / available
+    /// slots) for state-aware load scoring. Server-side only — the Python
+    /// worker never sends it; populated from `ModelConfig` when present, else
+    /// `None`. Not consumed this period (define-only).
+    #[serde(default)]
+    pub capacity: Option<WorkerCapacity>,
+}
+
+/// P8-1 (B5): reserved capacity fields a worker/reporter MAY supply for
+/// state-aware routing. Define-only this period — parsed/recorded nowhere yet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkerCapacity {
+    /// Relative cost weight of one inference on this worker.
+    pub cost_units: Option<u32>,
+    /// Free scheduling slots currently advertised (e.g. KV-cache free slots).
+    pub available_slots: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

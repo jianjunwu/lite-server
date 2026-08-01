@@ -238,6 +238,18 @@ lite-server-core（主进程）
 - 加权路由支持金丝雀发布（多版本按权重分流）
 - 自适应批处理根据队列深度动态调整 batch_timeout
 
+### Worker 选择与 sequence_id 粘性路由
+
+默认调度是无状态的：unary `Infer` 经 per-(model,version) 队列投递到**最少负载**的 worker（跳过被驱逐者）；流式/batch **直连**一个随机未被驱逐的 worker。请求可经 `sequence_id`（HTTP header `x-sequence-id`，gRPC `InferRequest`/`StreamInferRequest`/`BidiOpen.sequence_id`）开启**跨请求 worker 粘性**：
+
+- 服务端维护 per-process 的 `SequenceRegistry`（`sequence_id → (model, version, worker_id)`）。命中且该 worker 仍注册、未被驱逐→粘到该 worker；未命中/被驱逐→回退正常调度。**可用性优先于粘性**——回退从不拒绝请求。
+- 队列路径在派发时结合实时负载与健康解析亲和：粘性 worker 过载（负载超过 `server.balance_abs_threshold` / `balance_rel_threshold`）→回退 power-of-two 选择；worker 下线→其 sequence 经 rendezvous hashing 重分布（平滑重哈希，迁移有界、无热点）。流式仅用核心粘性（无 per-worker 负载信号）。
+- **不带** `sequence_id` 的请求调度与现状**完全一致**——该特性纯可选。
+
+> **安全与隔离**：`sequence_id` 是**未认证的调度 hint，不构成隔离边界**。客户端只能影响自身请求的落点（猜/复用 sequence id），不能借此跨模型/跨租户访问——隔离仍由 access_control + worker 模型边界保证。错误响应不回显内部 `worker_id`/registry 结构。
+>
+> **多实例**：`SequenceRegistry` 为**per-process**——多副本下同一 `sequence_id` 在不同实例可能落不同 worker。全局粘性需上游会话亲和（如网关 sticky cookie）；本服务仅提供实例内粘性。
+
 ## IPC 协议
 
 Worker 使用 ZeroMQ PAIR 套接字与 Rust 内核通信，序列化协议为 protobuf。Unix 上传输层使用 `ipc://`（Unix 域套接字），Windows 上回退到 `tcp://127.0.0.1:<port>`。

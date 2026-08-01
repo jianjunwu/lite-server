@@ -1051,6 +1051,7 @@ mod tests {
             endpoint: "ipc:///tmp/w0.sock".to_string(),
             pid: Some(1234),
             status: WorkerStatus::Ready,
+            capacity: None,
         }];
         reg.set_workers("m1", "1", workers).unwrap();
 
