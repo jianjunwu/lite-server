@@ -148,7 +148,7 @@ prost-build = "0.13"
 tokio-test = "0.4"
 # rustls 版 HTTP 客户端（P5-1 e2e）：与服务端同一 TLS 栈 + ring provider
 # （蓝图评审 2.4 统一 ring）；native-tls 在 macOS 无法导入 EC PKCS#8 身份。
-reqwest = { version = "0.12", default-features = false, features = ["json", "http2", "rustls-tls-manual-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "http2", "rustls-tls-manual-roots", "stream"] }
 tokio-tungstenite = "0.24"
 serial_test = "3"
 tower = { version = "0.4", features = ["util"] }
@@ -158,6 +158,13 @@ rcgen = "0.13"
 # baggage 清洗）。选 proptest 而非 cargo-fuzz：stable 工具链、CI 友好，§6.7 原文
 # "cargo-fuzz 或 quickcheck" 二选一。
 proptest = "1"
+
+# P-PERF-a（蓝图 §4.0.8）：perf-smoke 自含测量（reqwest+tonic 客户端，零外部
+# 工具依赖）。`cargo run --release --example perf_smoke`，报告写
+# target/perf-smoke.json；CI informational（不 fail）。
+[[example]]
+name = "perf_smoke"
+path = "benchmarks/perf_smoke.rs"
 
 [lib]
 name = "lite_server"

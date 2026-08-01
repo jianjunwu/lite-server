@@ -37,6 +37,18 @@ python benchmarks/scripts/compare.py --workers 1 2 4 --concurrency 1 4 16 64 --p
 python benchmarks/scripts/compare.py --model sleep_model --workers 1 2 4 --concurrency 1 4 16 64 --plot
 ```
 
+## perf-smoke (P-PERF-a, self-contained)
+
+Zero-external-tool smoke of the key paths (HTTP/gRPC unary + SSE) — this is
+the §4.0.8 regression baseline harness (informational; CI uploads the report):
+
+```bash
+cargo build --release
+cargo run --release --example perf_smoke   # → stdout + target/perf-smoke.json
+```
+
+Methodology + first baseline: [docs/benchmark.md](../docs/benchmark.md).
+
 ## Custom Model Repository
 
 Both `run_liteserver.py` and `run_litserve.py` support `--model-repo` to point to a custom model directory.
