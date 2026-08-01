@@ -100,11 +100,17 @@ impl std::fmt::Display for QueueError {
 /// Per-worker ejection state.
 struct EjectedWorker {
     ejected_at: Instant,
+    /// false = Open（熔断中，不可选）；true = HalfOpen（退避期满，试探放行——
+    /// 一次失败立即以更久退避重熔断，一次成功即闭合并清零退避级数）。
+    half_open: bool,
 }
 
 /// Per-worker outlier detection tracking.
 struct WorkerOutlier {
     consecutive_errors: AtomicUsize,
+    /// 连续熔断级数：无成功闭合的累计熔断次数。退避时长 =
+    /// `min(base × 2^(series−1), max_timeout)`（sgl-router 清单：指数退避）。
+    ejection_series: AtomicUsize,
     ejected: Mutex<Option<EjectedWorker>>,
 }
 
@@ -114,10 +120,14 @@ struct WorkerOutlier {
 pub struct EjectionConfig {
     /// Consecutive errors before a worker is ejected. 0 = never eject.
     pub error_threshold: usize,
-    /// How long a worker stays ejected before auto-recovery.
+    /// Base ejection duration before the first half-open probe. Subsequent
+    /// ejections without a successful close back off exponentially:
+    /// `min(timeout × 2^(series−1), max_timeout)`.
     pub timeout: Duration,
     /// Max % of workers ejectable at once (1-100).
     pub max_percent: usize,
+    /// Cap for the exponential ejection backoff (per-worker 熔断器, B1).
+    pub max_timeout: Duration,
 }
 
 impl Default for EjectionConfig {
@@ -126,6 +136,7 @@ impl Default for EjectionConfig {
             error_threshold: 3,
             timeout: Duration::from_secs(30),
             max_percent: 50,
+            max_timeout: Duration::from_secs(300),
         }
     }
 }
@@ -137,6 +148,7 @@ pub struct OutlierState {
     consecutive_threshold: usize,
     base_ejection_time: Duration,
     max_ejection_percent: usize,
+    max_ejection_time: Duration,
 }
 
 impl OutlierState {
@@ -151,19 +163,37 @@ impl OutlierState {
             workers: (0..num_workers)
                 .map(|_| WorkerOutlier {
                     consecutive_errors: AtomicUsize::new(0),
+                    ejection_series: AtomicUsize::new(0),
                     ejected: Mutex::new(None),
                 })
                 .collect(),
             consecutive_threshold: config.error_threshold,
             base_ejection_time: config.timeout,
             max_ejection_percent: config.max_percent,
+            // 防御：上限不得小于 base（配置失误时退化为固定退避）。
+            max_ejection_time: config.max_timeout.max(config.timeout),
         }
     }
 
-    /// Record a successful request — reset consecutive error count.
+    /// 第 `series` 次连续熔断的退避时长：`base × 2^(series−1)`，封顶 max。
+    /// 指数封顶 2^20——再高也被 max 截断，且避免 Duration::mul_f64 溢出 panic。
+    fn backoff(&self, series: usize) -> Duration {
+        let shift = series.saturating_sub(1).min(20) as i32;
+        self.base_ejection_time.mul_f64(2f64.powi(shift)).min(self.max_ejection_time)
+    }
+
+    /// Record a successful request — reset consecutive error count. A success
+    /// while half-open closes the circuit: ejection cleared AND the backoff
+    /// series reset, so the next ejection starts from the base timeout again.
     pub fn record_success(&self, worker_idx: usize) {
         if let Some(w) = self.workers.get(worker_idx) {
             w.consecutive_errors.store(0, Ordering::Relaxed);
+            let mut guard = w.ejected.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(*guard, Some(ref e) if e.half_open) {
+                *guard = None;
+                w.ejection_series.store(0, Ordering::Relaxed);
+                info!("Worker {worker_idx} circuit closed after a successful half-open probe");
+            }
         }
     }
 
@@ -189,6 +219,7 @@ impl OutlierState {
     pub fn reset(&self, worker_idx: usize) {
         if let Some(w) = self.workers.get(worker_idx) {
             w.consecutive_errors.store(0, Ordering::Relaxed);
+            w.ejection_series.store(0, Ordering::Relaxed);
             let mut guard = w.ejected.lock().unwrap_or_else(|e| e.into_inner());
             *guard = None;
         }
@@ -198,11 +229,34 @@ impl OutlierState {
     /// worker at the threshold. Returns `true` only when this call newly
     /// ejects the worker, so callers can record the per-(model, version)
     /// ejection metric exactly once (§4.6).
+    ///
+    /// 半开特例（熔断器）：半开态的试探请求失败 → 立即重熔断（不等阈值），
+    /// 退避级数 +1（指数退避拉长），同样返回 `true`（新熔断事件）。
     pub fn record_error(&self, worker_idx: usize) -> bool {
         let w = match self.workers.get(worker_idx) {
             Some(w) => w,
             None => return false,
         };
+        {
+            let mut guard = w.ejected.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(*guard, Some(ref e) if e.half_open) {
+                let series = w.ejection_series.fetch_add(1, Ordering::Relaxed) + 1;
+                *guard = Some(EjectedWorker { ejected_at: Instant::now(), half_open: false });
+                w.consecutive_errors.store(0, Ordering::Relaxed);
+                info!(
+                    "Worker {worker_idx} circuit re-opened after a failed half-open probe \
+                     (series {series}, backoff {:?})",
+                    self.backoff(series)
+                );
+                return true;
+            }
+            // Open 中的 worker 不经正常挑选（仅 all-ejected 兜底路径可达）——
+            // 失败只计数，不改变既有熔断。
+            if guard.is_some() {
+                w.consecutive_errors.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        }
         let count = w.consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
         // threshold == 0 ⇒ outlier ejection disabled (§3).
         self.consecutive_threshold > 0
@@ -235,33 +289,42 @@ impl OutlierState {
         }
         let max_ejected = (self.workers.len() * self.max_ejection_percent / 100).max(1);
         if ejected_count < max_ejected {
-            *guard = Some(EjectedWorker {
-                ejected_at: Instant::now(),
-            });
-            info!("Worker {} ejected after {} consecutive errors", worker_idx, self.consecutive_threshold);
+            let series = w.ejection_series.fetch_add(1, Ordering::Relaxed) + 1;
+            *guard = Some(EjectedWorker { ejected_at: Instant::now(), half_open: false });
+            info!(
+                "Worker {worker_idx} ejected after {} consecutive errors (series {series}, backoff {:?})",
+                self.consecutive_threshold,
+                self.backoff(series)
+            );
             return true;
         }
         false
     }
 
     /// Check if a worker is currently ejected, recovering if ejection time has passed.
+    ///
+    /// 熔断语义：Open 退避期满 → 转 HalfOpen（返回 false = 可试探，错误计数清零
+    /// 让试探独立计）；HalfOpen 返回 false（试探放行中）；Open 未期满 → true。
+    /// 注意 HalfOpen 不等于恢复——试探结果由 record_success/record_error 收口。
     pub fn is_ejected(&self, worker_idx: usize) -> bool {
         let w = match self.workers.get(worker_idx) {
             Some(w) => w,
             None => return false,
         };
         let mut guard = w.ejected.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(ref ejected) = *guard {
-            if ejected.ejected_at.elapsed() >= self.base_ejection_time {
-                // Recovery: clear ejection state and reset errors
-                *guard = None;
-                w.consecutive_errors.store(0, Ordering::Relaxed);
-                false
-            } else {
-                true
+        match *guard {
+            None => false,
+            Some(ref e) if e.half_open => false,
+            Some(ref e) => {
+                let series = w.ejection_series.load(Ordering::Relaxed);
+                if e.ejected_at.elapsed() >= self.backoff(series) {
+                    *guard = Some(EjectedWorker { ejected_at: e.ejected_at, half_open: true });
+                    w.consecutive_errors.store(0, Ordering::Relaxed);
+                    false
+                } else {
+                    true
+                }
             }
-        } else {
-            false
         }
     }
 
@@ -2419,6 +2482,7 @@ mod tests {
             error_threshold: 0,
             timeout: Duration::from_secs(30),
             max_percent: 50,
+            max_timeout: Duration::from_secs(300),
         };
         let outlier = OutlierState::with_config(2, &cfg);
         for _ in 0..10 {
@@ -2434,6 +2498,7 @@ mod tests {
             error_threshold: 2,
             timeout: Duration::from_secs(30),
             max_percent: 50,
+            max_timeout: Duration::from_secs(300),
         };
         let outlier = OutlierState::with_config(1, &cfg);
         assert!(!outlier.record_error(0)); // 1st error, below threshold 2
@@ -2484,6 +2549,88 @@ mod tests {
         assert!(outlier.is_ejected(0), "ejection must survive error-count reset");
     }
 
+    // ===== 熔断器：指数退避 + 半开试探（B1 sgl-router 清单兑现）=====
+
+    /// 短超时熔断配置：threshold=1 即熔断，base 60ms，上限 500ms。
+    fn breaker_cfg() -> EjectionConfig {
+        EjectionConfig {
+            error_threshold: 1,
+            timeout: Duration::from_millis(60),
+            max_percent: 50,
+            max_timeout: Duration::from_millis(500),
+        }
+    }
+
+    #[test]
+    fn half_open_probe_failure_reopens_with_longer_backoff() {
+        let outlier = OutlierState::with_config(1, &breaker_cfg());
+        outlier.record_error(0); // threshold 1 → 熔断（series=1，退避 60ms）
+        assert!(outlier.is_ejected(0));
+
+        std::thread::sleep(Duration::from_millis(80)); // > 60ms
+        assert!(!outlier.is_ejected(0), "退避期满 → 半开（可试探）");
+
+        // 半开试探失败 → 立即重熔断（不等 threshold），退避升为 2×base=120ms；
+        // 返回 true = 新熔断事件（指标记一次）。
+        assert!(outlier.record_error(0), "half-open probe failure is a new ejection event");
+        assert!(outlier.is_ejected(0));
+        std::thread::sleep(Duration::from_millis(80)); // > 60ms 但 < 120ms
+        assert!(outlier.is_ejected(0), "第二次熔断退避应为 2×base（指数退避）");
+        std::thread::sleep(Duration::from_millis(60)); // 累计 ~140ms > 120ms
+        assert!(!outlier.is_ejected(0), "2×base 期满 → 再次半开");
+    }
+
+    #[test]
+    fn half_open_probe_success_closes_and_resets_backoff_series() {
+        let outlier = OutlierState::with_config(1, &breaker_cfg());
+        outlier.record_error(0);
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(!outlier.is_ejected(0)); // 半开
+
+        outlier.record_success(0); // 试探成功 → 闭合 + 退避级数清零
+        assert!(!outlier.is_ejected(0));
+        assert_eq!(outlier.consecutive_errors(0), 0);
+
+        // 级数已清零：再次熔断回到 base 退避（60ms 后开），而非 2×base。
+        outlier.record_error(0);
+        assert!(outlier.is_ejected(0));
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(!outlier.is_ejected(0), "series 清零后再次熔断应回到 base 退避");
+    }
+
+    #[test]
+    fn backoff_capped_at_max_timeout() {
+        let cfg = EjectionConfig {
+            error_threshold: 1,
+            timeout: Duration::from_millis(50),
+            max_percent: 50,
+            max_timeout: Duration::from_millis(120),
+        };
+        let outlier = OutlierState::with_config(1, &cfg);
+        // series: 1→50ms, 2→100ms, 3→min(200,120)=120ms, 4→cap 120ms
+        for (round, expected_ms) in [50u64, 100, 120, 120].iter().enumerate() {
+            outlier.record_error(0);
+            assert!(outlier.is_ejected(0), "round {round}: must be ejected");
+            std::thread::sleep(Duration::from_millis(expected_ms + 30));
+            assert!(
+                !outlier.is_ejected(0),
+                "round {round}: after {expected_ms}ms+margin must be half-open (cap=120ms)"
+            );
+        }
+    }
+
+    #[test]
+    fn closed_worker_success_clears_errors_without_touching_series() {
+        // 闭合态普通成功：清零连续错误（既有语义），不影响退避级数。
+        let outlier = OutlierState::with_config(1, &breaker_cfg());
+        outlier.record_error(0);
+        assert!(outlier.is_ejected(0));
+        outlier.reset(0); // 模拟进程替换：全清
+        outlier.record_success(0);
+        assert!(!outlier.is_ejected(0));
+        assert_eq!(outlier.consecutive_errors(0), 0);
+    }
+
     // ===== Health-check kill escalation =====
 
     /// Endpoint with a bound client but no worker ever connecting — every
@@ -2522,6 +2669,7 @@ mod tests {
             error_threshold: 1,
             timeout: Duration::from_secs(60),
             max_percent: 100,
+            max_timeout: Duration::from_secs(300),
         };
         let outlier = Arc::new(OutlierState::with_config(1, &ejection_cfg));
         let outlier_probe = outlier.clone();

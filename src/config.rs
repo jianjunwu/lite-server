@@ -651,6 +651,7 @@ pub struct ModelTunables {
     pub ejection_error_threshold: Option<usize>,
     pub ejection_timeout: Option<f32>,
     pub ejection_max_percent: Option<usize>,
+    pub ejection_max_timeout: Option<f32>,
     pub max_retries: Option<usize>,
     pub startup_timeout: Option<f32>,
     pub health_check_timeout: Option<f32>,
@@ -687,6 +688,9 @@ impl ModelTunables {
         if let Some(v) = self.ejection_max_percent {
             model.ejection_max_percent = v;
         }
+        if let Some(v) = self.ejection_max_timeout {
+            model.ejection_max_timeout = v;
+        }
         if let Some(v) = self.max_retries {
             model.max_retries = v;
         }
@@ -718,6 +722,7 @@ impl ModelTunables {
         if other.ejection_error_threshold.is_some() { self.ejection_error_threshold = other.ejection_error_threshold; }
         if other.ejection_timeout.is_some() { self.ejection_timeout = other.ejection_timeout; }
         if other.ejection_max_percent.is_some() { self.ejection_max_percent = other.ejection_max_percent; }
+        if other.ejection_max_timeout.is_some() { self.ejection_max_timeout = other.ejection_max_timeout; }
         if other.max_retries.is_some() { self.max_retries = other.max_retries; }
         if other.startup_timeout.is_some() { self.startup_timeout = other.startup_timeout; }
         if other.health_check_timeout.is_some() { self.health_check_timeout = other.health_check_timeout; }
@@ -994,6 +999,11 @@ pub struct ModelConfig {
     pub ejection_timeout: f32,
     /// Max % of workers that may be ejected at once (1-100).
     pub ejection_max_percent: usize,
+    /// Cap (seconds) for the per-worker circuit-breaker backoff (B1): ejection
+    /// duration = min(ejection_timeout × 2^(series−1), ejection_max_timeout);
+    /// after it elapses the worker is half-open — one probe success closes
+    /// (series reset), one probe failure re-opens with a longer backoff.
+    pub ejection_max_timeout: f32,
     /// Max retry attempts on a different worker for a failed batch. 0 = no retry.
     pub max_retries: usize,
     /// Max seconds to wait for a worker's "ready" handshake.
@@ -1038,6 +1048,7 @@ impl Default for ModelConfig {
             ejection_error_threshold: 3,
             ejection_timeout: 30.0,
             ejection_max_percent: 50,
+            ejection_max_timeout: 300.0,
             max_retries: 3,
             startup_timeout: 60.0,
             health_check_timeout: 5.0,

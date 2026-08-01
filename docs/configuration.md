@@ -130,6 +130,7 @@ model_defaults:                # CLI-level defaults applied to all models
   ejection_error_threshold: null   # Override ejection_error_threshold for all models
   ejection_timeout: null       # Override ejection_timeout for all models
   ejection_max_percent: null   # Override ejection_max_percent for all models
+  ejection_max_timeout: null   # Override ejection_max_timeout for all models
   startup_timeout: null        # Override startup_timeout for all models
   health_check_timeout: null   # Override health_check_timeout for all models
   health_check_kill_threshold: null  # Override health_check_kill_threshold for all models
@@ -270,7 +271,10 @@ health_check_interval: 15.0    # Active health check interval in seconds (0 = di
 # Worker Resilience
 max_retries: 3                 # Retry a failed batch on another worker (0 = disable)
 ejection_error_threshold: 3    # Consecutive errors before ejecting a worker (0 = disable)
-ejection_timeout: 30.0         # Seconds an ejected worker stays out before auto-recovery
+ejection_timeout: 30.0         # Base seconds an ejected worker stays out; backoff grows
+                               # ×2 per consecutive ejection (half-open probe after each
+                               # backoff: one success closes, one failure re-opens longer)
+ejection_max_timeout: 300.0    # Cap for the per-worker circuit-breaker backoff (B1)
 ejection_max_percent: 50       # Max % of workers ejectable at once (1-100)
 startup_timeout: 60.0          # Max seconds to wait for a worker "ready" handshake
 health_check_timeout: 5.0      # Seconds per health-check probe before timing out
@@ -425,7 +429,8 @@ lite-server serve [flags]
 | `--graceful-timeout` | Graceful shutdown timeout | `server.graceful_timeout` |
 | `--keepalive-timeout` | HTTP keep-alive timeout | `server.keepalive_timeout` |
 | `--ejection-error-threshold` | Errors to eject a worker (0=disable) | `model_defaults.ejection_error_threshold` |
-| `--ejection-timeout` | Ejected worker auto-recovery (s) | `model_defaults.ejection_timeout` |
+| `--ejection-timeout` | Ejected worker base backoff (s) | `model_defaults.ejection_timeout` |
+| `--ejection-max-timeout` | Circuit-breaker backoff cap (s) | `model_defaults.ejection_max_timeout` |
 | `--ejection-max-percent` | Max % workers ejectable | `model_defaults.ejection_max_percent` |
 | `--max-retries` | Retry a failed batch on another worker | `model_defaults.max_retries` |
 | `--startup-timeout` | Worker ready-handshake timeout (s) | `model_defaults.startup_timeout` |

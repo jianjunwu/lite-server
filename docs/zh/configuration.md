@@ -123,6 +123,7 @@ model_defaults:                # CLI 级别默认值，应用于所有模型
   ejection_error_threshold: null   # 覆盖所有模型的 ejection_error_threshold
   ejection_timeout: null       # 覆盖所有模型的 ejection_timeout
   ejection_max_percent: null   # 覆盖所有模型的 ejection_max_percent
+  ejection_max_timeout: null   # 覆盖所有模型的 ejection_max_timeout
   startup_timeout: null        # 覆盖所有模型的 startup_timeout
   health_check_timeout: null   # 覆盖所有模型的 health_check_timeout
   health_check_kill_threshold: null  # 覆盖所有模型的 health_check_kill_threshold
@@ -263,7 +264,9 @@ health_check_interval: 15.0    # 主动健康检查间隔（秒），0 = 禁用
 # Worker 韧性（Resilience）
 max_retries: 3                 # 失败的 batch 换其它 worker 重试次数（0 = 禁用）
 ejection_error_threshold: 3    # 连续错误达到此次数后剔除 worker（0 = 禁用剔除）
-ejection_timeout: 30.0         # 被剔除 worker 自动恢复前的等待秒数
+ejection_timeout: 30.0         # 熔断基础退避秒数；连续熔断按 ×2 指数增长
+                               #（每次退避期满进入半开：一次成功即闭合，一次失败即更久重熔断）
+ejection_max_timeout: 300.0    # per-worker 熔断器退避上限（B1）
 ejection_max_percent: 50       # 同时最多剔除的 worker 比例（1-100）
 startup_timeout: 60.0          # 等待 worker "ready" 握手的最大秒数
 health_check_timeout: 5.0      # 单次健康探测超时秒数
@@ -409,7 +412,8 @@ lite-server serve [参数]
 | `--graceful-timeout` | 优雅关闭超时 | `server.graceful_timeout` |
 | `--keepalive-timeout` | HTTP keep-alive 超时 | `server.keepalive_timeout` |
 | `--ejection-error-threshold` | 剔除 worker 的错误次数（0=禁用） | `model_defaults.ejection_error_threshold` |
-| `--ejection-timeout` | 被剔除 worker 自动恢复（秒） | `model_defaults.ejection_timeout` |
+| `--ejection-timeout` | 熔断基础退避（秒） | `model_defaults.ejection_timeout` |
+| `--ejection-max-timeout` | 熔断器退避上限（秒） | `model_defaults.ejection_max_timeout` |
 | `--ejection-max-percent` | 最多剔除的 worker 比例 | `model_defaults.ejection_max_percent` |
 | `--max-retries` | 失败 batch 换 worker 重试 | `model_defaults.max_retries` |
 | `--startup-timeout` | worker ready 握手超时（秒） | `model_defaults.startup_timeout` |

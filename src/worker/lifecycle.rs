@@ -468,6 +468,7 @@ impl WorkerManager {
             error_threshold: model_config.ejection_error_threshold,
             timeout: Duration::from_secs_f32(model_config.ejection_timeout),
             max_percent: model_config.ejection_max_percent,
+            max_timeout: Duration::from_secs_f32(model_config.ejection_max_timeout),
         };
         let outlier = Arc::new(OutlierState::with_config(total_workers, &ejection));
 

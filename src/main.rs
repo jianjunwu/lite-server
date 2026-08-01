@@ -108,6 +108,10 @@ enum Commands {
         #[arg(long)]
         ejection_max_percent: Option<usize>,
 
+        /// Circuit-breaker backoff cap in seconds (overrides model config)
+        #[arg(long)]
+        ejection_max_timeout: Option<f32>,
+
         /// Retry a failed batch on a different worker up to N times (0 = disable, overrides model config)
         #[arg(long)]
         max_retries: Option<usize>,
@@ -176,6 +180,7 @@ fn main() {
             ejection_error_threshold,
             ejection_timeout,
             ejection_max_percent,
+            ejection_max_timeout,
             max_retries,
             startup_timeout,
             health_check_timeout,
@@ -224,6 +229,7 @@ fn main() {
                     ejection_error_threshold,
                     ejection_timeout,
                     ejection_max_percent,
+                    ejection_max_timeout,
                     max_retries,
                     startup_timeout,
                     health_check_timeout,
