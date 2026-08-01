@@ -465,6 +465,11 @@ lite-server 通过 `orchestration.control_mode` 控制模型版本的生命周�
   （HTTP header / gRPC metadata）。`ResourceExhausted` 专给限流（P3-1）——过载落 5xx 族。
 - **请求大小上限**（`server.max_request_body_bytes`）：超限 → `413`（HTTP）/
   `ResourceExhausted`（gRPC，tonic 固定映射）。`null` = 平台默认（axum 2MB / tonic 4MB）。
+- **多级优先级队列**（B1）：每个 per-version 队列是按请求 `x-lite-priority` header
+  （越大越先派发，同优先级 FIFO）排序的优先级堆。无 header（默认 0）时退化为普通 FIFO，
+  行为不变。**排队超时 REJECT**（`queue_timeout_secs` + `queue_timeout_action: reject`）
+  对等待超 deadline 的请求返回 `503` / gRPC `Unavailable`；`delay`（默认）交给
+  `request_timeout` 兜底。
 - **取消传播**：任一流上客户端断连 → fire-and-forget `Cancel`（`send_raw`）通知
   worker 停止并释放资源。ensemble 子 step 共享一个取消：每层 `JoinSet` 意味着 parent
   取消（客户端断连、总预算超时、或同层兄弟 step 出错）**abort 所有在途子 step**，

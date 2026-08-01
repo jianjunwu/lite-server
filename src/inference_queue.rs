@@ -7,11 +7,12 @@ use crate::registry::types::WorkerInfo;
 use crate::sequence::SequenceRegistry;
 use crate::transport::zmq::WorkerZmqClient;
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::sync::Mutex;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tracing::{debug, error, info, warn};
 
 /// Pre-sized key for model_version lookups — single allocation, no reallocation.
@@ -296,10 +297,199 @@ pub struct RespawnSignal {
     pub reason: &'static str,
 }
 
+// ===== P-FLOW B1 (§4.0.9): priority-aware bounded channel =====
+//
+// A multi-producer, single-consumer channel that dispatches the HIGHEST-priority
+// pending item first (ties broken FIFO by insertion sequence). It is a faithful
+// drop-in for the previous `mpsc::channel<QueueItem>`: same `try_send`/`recv`/
+// `len`/close surface, so the batch collector is unchanged except for the
+// `rx.recv()`/`rx.len()` call sites. With all items at the default priority 0
+// (no `x-lite-priority` header) the heap degenerates to plain FIFO, so existing
+// behaviour is preserved.
+
+/// A queue item tagged with its scheduling priority and insertion sequence.
+struct OrdItem {
+    /// Higher value = dispatched first (Triton `priority_levels` semantics;
+    /// parsed from the `x-lite-priority` request header, default 0).
+    priority: i32,
+    /// Monotonic insertion counter — FIFO tiebreak within a priority.
+    seq: u64,
+    item: QueueItem,
+}
+
+impl Ord for OrdItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Higher priority first; equal priority → lower seq (older) first.
+        self.priority
+            .cmp(&other.priority)
+            .then_with(|| other.seq.cmp(&self.seq))
+    }
+}
+impl PartialOrd for OrdItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for OrdItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority && self.seq == other.seq
+    }
+}
+impl Eq for OrdItem {}
+
+struct PriorityInner {
+    heap: Mutex<BinaryHeap<OrdItem>>,
+    cap: usize,
+    seq: AtomicU64,
+    /// Live sender count; reaching 0 signals close (recv returns `None` once
+    /// drained), mirroring `mpsc` so the batch collector self-exits on drain.
+    senders: AtomicUsize,
+    notify: Notify,
+}
+
+/// Producer handle (cloned per `try_submit`, like `mpsc::Sender`).
+pub(crate) struct PrioritySender {
+    inner: Arc<PriorityInner>,
+}
+
+/// Consumer handle held by the batch-collector task.
+pub(crate) struct PriorityReceiver {
+    inner: Arc<PriorityInner>,
+}
+
+/// Create a bounded priority channel with the given capacity (min 1).
+pub(crate) fn priority_channel(cap: usize) -> (PrioritySender, PriorityReceiver) {
+    let inner = Arc::new(PriorityInner {
+        heap: Mutex::new(BinaryHeap::new()),
+        cap: cap.max(1),
+        seq: AtomicU64::new(0),
+        senders: AtomicUsize::new(1),
+        notify: Notify::new(),
+    });
+    (
+        PrioritySender {
+            inner: inner.clone(),
+        },
+        PriorityReceiver { inner },
+    )
+}
+
+impl PrioritySender {
+    /// Push `item` at `priority`. Returns `Full` at capacity, mirroring
+    /// `mpsc::Sender::try_send`.
+    fn try_send(&self, item: QueueItem, priority: i32) -> Result<(), QueueError> {
+        let mut heap = self.inner.heap.lock().unwrap();
+        if heap.len() >= self.inner.cap {
+            return Err(QueueError::Full);
+        }
+        let seq = self.inner.seq.fetch_add(1, Ordering::Relaxed);
+        heap.push(OrdItem {
+            priority,
+            seq,
+            item,
+        });
+        drop(heap);
+        self.inner.notify.notify_one();
+        Ok(())
+    }
+}
+
+impl Clone for PrioritySender {
+    fn clone(&self) -> Self {
+        self.inner.senders.fetch_add(1, Ordering::Relaxed);
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl Drop for PrioritySender {
+    fn drop(&mut self) {
+        if self.inner.senders.fetch_sub(1, Ordering::Relaxed) == 1 {
+            // Last sender gone → wake a parked consumer so it observes close.
+            self.inner.notify.notify_one();
+        }
+    }
+}
+
+impl PriorityReceiver {
+    /// Pop the highest-priority pending item, or `None` once all senders have
+    /// dropped and the queue is drained.
+    async fn recv(&self) -> Option<QueueItem> {
+        loop {
+            // Register interest BEFORE checking state so a push or close that
+            // happens between the heap check and the await is not lost.
+            let notified = self.inner.notify.notified();
+            if let Some(ord) = self.inner.heap.lock().unwrap().pop() {
+                return Some(ord.item);
+            }
+            if self.inner.senders.load(Ordering::Relaxed) == 0 {
+                return None;
+            }
+            notified.await;
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.inner.heap.lock().unwrap().len()
+    }
+}
+
+/// Parse the request's scheduling priority from its `x-lite-priority` header
+/// (default 0). Consumed here in B1; P8-1 only defined the field.
+fn item_priority(item: &QueueItem) -> i32 {
+    item.meta
+        .as_ref()
+        .and_then(|m| m.headers.get("x-lite-priority"))
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(0)
+}
+
+/// P-FLOW B1 (§4.0.9): reject a request that waited past `queue_timeout` by
+/// replying 503 (numeric `status.message` maps to HTTP 503 / gRPC Unavailable
+/// in both handlers) and dropping it. The item's `InflightGuard` decrements the
+/// in-flight counter on drop.
+fn reject_queue_timeout(item: QueueItem) {
+    debug!(
+        uid = %item.uid,
+        waited_secs = item.enqueued_at.elapsed().as_secs_f64(),
+        "queue timeout REJECT"
+    );
+    let _ = item.response_tx.send(pb::Response {
+        uid: item.uid.clone(),
+        payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+            status: Some(pb::Status {
+                code: "Error".to_string(),
+                message: "503".to_string(),
+            }),
+            ..Default::default()
+        })),
+        metrics: None,
+    });
+}
+
+/// If queue-timeout REJECT is armed and `item` has waited past the deadline,
+/// reject it and return `None`; otherwise return `Some(item)`.
+fn check_queue_timeout(
+    item: QueueItem,
+    queue_timeout: Duration,
+    action: crate::config::QueueTimeoutAction,
+) -> Option<QueueItem> {
+    if queue_timeout > Duration::ZERO
+        && action == crate::config::QueueTimeoutAction::Reject
+        && item.enqueued_at.elapsed() > queue_timeout
+    {
+        reject_queue_timeout(item);
+        None
+    } else {
+        Some(item)
+    }
+}
+
 /// Per-(model, version) queue state held in [`InferenceQueue::queues`].
 /// Factored out of an anonymous tuple so the field types are self-documenting.
 struct VersionQueue {
-    tx: mpsc::Sender<QueueItem>,
+    tx: PrioritySender,
     collector: std::sync::Arc<tokio::task::JoinHandle<()>>,
     outlier: Arc<OutlierState>,
     /// Health-checker task handle (abortable); `None` if health checks disabled.
@@ -404,7 +594,7 @@ impl InferenceQueue {
         }
 
         let max_queue_size = config.max_queue_size.max(1);
-        let (tx, rx) = mpsc::channel(max_queue_size);
+        let (tx, rx) = priority_channel(max_queue_size);
 
         let max_batch = config.max_batch_size;
         let batch_timeout = Duration::from_secs_f64(config.batch_timeout as f64);
@@ -415,6 +605,8 @@ impl InferenceQueue {
         let max_requests = config.max_requests;
         let max_requests_jitter = config.max_requests_jitter;
         let max_retries = config.max_retries;
+        let queue_timeout = Duration::from_secs_f64(config.queue_timeout_secs.max(0.0) as f64);
+        let queue_timeout_action = config.queue_timeout_action;
         let health_interval = Duration::from_secs_f64(config.health_check_interval as f64);
         let health_probe_timeout = Duration::from_secs_f64(config.health_check_timeout as f64);
         let health_kill_threshold = config.health_check_kill_threshold;
@@ -441,6 +633,8 @@ impl InferenceQueue {
             max_requests_jitter,
             reload_tx,
             max_retries,
+            queue_timeout,
+            queue_timeout_action,
             outlier.clone(),
             self.sequence_registry.clone(),
             self.balance,
@@ -522,18 +716,17 @@ impl InferenceQueue {
             model: model_name.to_string(),
             version: version.to_string(),
         });
-        sender
-            .try_send(item)
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => {
-                    debug!(model = %model_name, version = %version, "queue full");
-                    QueueError::Full
-                }
-                mpsc::error::TrySendError::Closed(_) => {
-                    debug!(model = %model_name, version = %version, "queue closed");
-                    QueueError::Closed
-                }
-            })
+        let priority = item_priority(&item);
+        match sender.try_send(item, priority) {
+            Ok(()) => Ok(()),
+            Err(QueueError::Full) => {
+                debug!(model = %model_name, version = %version, "queue full");
+                Err(QueueError::Full)
+            }
+            // PrioritySender never returns Closed (it has no receiver-drop signal);
+            // kept for exhaustiveness with the shared error type.
+            Err(other) => Err(other),
+        }
     }
 
     /// Check if a queue exists for the model version.
@@ -1248,7 +1441,7 @@ pub fn compute_adaptive_timeout(
 
 /// Background task that collects requests into batches and dispatches them.
 async fn batch_collector(
-    mut rx: mpsc::Receiver<QueueItem>,
+    rx: PriorityReceiver,
     max_batch_size: usize,
     base_timeout: Duration,
     adaptive: bool,
@@ -1262,6 +1455,8 @@ async fn batch_collector(
     max_requests_jitter: usize,
     reload_tx: mpsc::Sender<ReloadSignal>,
     max_retries: usize,
+    queue_timeout: Duration,
+    queue_timeout_action: crate::config::QueueTimeoutAction,
     outlier: Arc<OutlierState>,
     sequence_registry: Arc<SequenceRegistry>,
     balance: BalanceConfig,
@@ -1278,6 +1473,9 @@ async fn batch_collector(
         // Fast path: no batching, send immediately and concurrently
         while let Some(item) = rx.recv().await {
             prometheus::inc_queue_depth(&model_name, &version);
+            let Some(item) = check_queue_timeout(item, queue_timeout, queue_timeout_action) else {
+                continue;
+            };
             let batch = vec![item];
             let zmq_clients = zmq_clients.clone();
             let worker_inflight = worker_inflight.clone();
@@ -1302,6 +1500,9 @@ async fn batch_collector(
             biased;
             Some(item) = rx.recv() => {
                 prometheus::inc_queue_depth(&model_name, &version);
+                let Some(item) = check_queue_timeout(item, queue_timeout, queue_timeout_action) else {
+                    continue;
+                };
                 batch.push(item);
                 if batch.len() >= max_batch_size {
                     let current_batch = std::mem::take(&mut batch);
@@ -2034,9 +2235,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_send_with_bytes_data() {
-        // Full integration: QueueItem with Bytes flows through channel and send_batch
-        // builds correct protobuf request without data corruption
-        let (tx, mut rx) = mpsc::channel::<QueueItem>(10);
+        // Full integration: QueueItem with Bytes flows through the priority
+        // channel and send_batch builds correct protobuf request without data
+        // corruption.
+        let (tx, rx) = priority_channel(10);
 
         let payload = Bytes::from(r#"{"input":"hello"}"#.as_bytes().to_vec());
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -2048,7 +2250,7 @@ mod tests {
                   inflight_guard: None,
                 enqueued_at: Instant::now(),
         };
-        tx.try_send(item).unwrap();
+        tx.try_send(item, 0).unwrap();
 
         // Receive and verify data integrity
         let received = rx.recv().await.unwrap();
@@ -2991,5 +3193,151 @@ mod tests {
             .await.expect("response must arrive").expect("channel open");
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(gauge.get(), 0.0, "saturation must return to 0 after completion");
+    }
+
+    // ===== P-FLOW B1 (§4.0.9): priority queue + queue-timeout REJECT =====
+
+    fn b1_item(uid: &str, priority_header: Option<i32>) -> QueueItem {
+        let (response_tx, _response_rx) = oneshot::channel();
+        let mut headers = std::collections::HashMap::<String, String>::new();
+        if let Some(p) = priority_header {
+            headers.insert("x-lite-priority".to_string(), p.to_string());
+        }
+        QueueItem {
+            uid: uid.to_string(),
+            data: Bytes::new(),
+            meta: Some(Arc::new(pb::RequestMeta {
+                headers,
+                ..Default::default()
+            })),
+            response_tx,
+            inflight_guard: None,
+            enqueued_at: Instant::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn b1_priority_channel_dispatches_highest_priority_first() {
+        let (tx, rx) = priority_channel(8);
+        // Push in mixed order; high must come out first.
+        tx.try_send(b1_item("low", Some(0)), 0).unwrap();
+        tx.try_send(b1_item("high", Some(9)), 9).unwrap();
+        tx.try_send(b1_item("mid", Some(5)), 5).unwrap();
+        assert_eq!(rx.recv().await.unwrap().uid, "high");
+        assert_eq!(rx.recv().await.unwrap().uid, "mid");
+        assert_eq!(rx.recv().await.unwrap().uid, "low");
+    }
+
+    #[tokio::test]
+    async fn b1_priority_channel_fifo_tiebreak_within_same_priority() {
+        let (tx, rx) = priority_channel(8);
+        tx.try_send(b1_item("a", Some(1)), 1).unwrap();
+        tx.try_send(b1_item("b", Some(1)), 1).unwrap();
+        tx.try_send(b1_item("c", Some(1)), 1).unwrap();
+        assert_eq!(rx.recv().await.unwrap().uid, "a");
+        assert_eq!(rx.recv().await.unwrap().uid, "b");
+        assert_eq!(rx.recv().await.unwrap().uid, "c");
+    }
+
+    #[tokio::test]
+    async fn b1_priority_channel_cap_returns_full() {
+        let (tx, rx) = priority_channel(1);
+        tx.try_send(b1_item("x", None), 0).unwrap();
+        assert_eq!(rx.len(), 1);
+        assert!(matches!(
+            tx.try_send(b1_item("y", None), 0),
+            Err(QueueError::Full)
+        ));
+    }
+
+    #[tokio::test]
+    async fn b1_priority_channel_close_returns_none_after_drain() {
+        let (tx, rx) = priority_channel(8);
+        tx.try_send(b1_item("x", None), 0).unwrap();
+        drop(tx); // last sender gone → close
+        assert!(rx.recv().await.is_some(), "drain remaining item");
+        assert!(
+            rx.recv().await.is_none(),
+            "closed channel must return None once drained"
+        );
+    }
+
+    #[test]
+    fn b1_item_priority_reads_header_default_zero() {
+        assert_eq!(item_priority(&b1_item("x", Some(7))), 7);
+        assert_eq!(item_priority(&b1_item("x", None)), 0);
+    }
+
+    fn enqueued_ago(uid: &str, ago: Duration) -> QueueItem {
+        let (response_tx, response_rx) = oneshot::channel();
+        std::mem::forget(response_rx); // caller may or may not observe the reply
+        QueueItem {
+            uid: uid.to_string(),
+            data: Bytes::new(),
+            meta: None,
+            response_tx,
+            inflight_guard: None,
+            enqueued_at: Instant::now()
+                .checked_sub(ago)
+                .unwrap_or_else(Instant::now),
+        }
+    }
+
+    #[tokio::test]
+    async fn b1_check_queue_timeout_rejects_expired_when_reject() {
+        let (response_tx, response_rx) = oneshot::channel();
+        let item = QueueItem {
+            uid: "late".into(),
+            data: Bytes::new(),
+            meta: None,
+            response_tx,
+            inflight_guard: None,
+            enqueued_at: Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .unwrap(),
+        };
+        let opt = check_queue_timeout(
+            item,
+            Duration::from_millis(100),
+            crate::config::QueueTimeoutAction::Reject,
+        );
+        assert!(opt.is_none(), "expired item must be rejected");
+        let resp = response_rx.await.unwrap();
+        match resp.payload {
+            Some(pb::response::Payload::Single(s)) => {
+                assert_eq!(s.status.unwrap().message, "503", "reject maps to 503");
+            }
+            _ => panic!("expected single response payload"),
+        }
+    }
+
+    #[tokio::test]
+    async fn b1_check_queue_timeout_passes_within_deadline() {
+        let opt = check_queue_timeout(
+            enqueued_ago("ok", Duration::ZERO),
+            Duration::from_secs(10),
+            crate::config::QueueTimeoutAction::Reject,
+        );
+        assert!(opt.is_some(), "fresh item must not be rejected");
+    }
+
+    #[tokio::test]
+    async fn b1_check_queue_timeout_delay_does_not_reject() {
+        let opt = check_queue_timeout(
+            enqueued_ago("late", Duration::from_secs(5)),
+            Duration::from_millis(100),
+            crate::config::QueueTimeoutAction::Delay,
+        );
+        assert!(opt.is_some(), "Delay action must not reject even when expired");
+    }
+
+    #[tokio::test]
+    async fn b1_check_queue_timeout_disabled_when_zero() {
+        let opt = check_queue_timeout(
+            enqueued_ago("late", Duration::from_secs(5)),
+            Duration::ZERO,
+            crate::config::QueueTimeoutAction::Reject,
+        );
+        assert!(opt.is_some(), "queue_timeout=0 must not reject");
     }
 }

@@ -754,6 +754,23 @@ impl ModelPolicies {
     }
 }
 
+/// P-FLOW B1 (§4.0.9): action when a request waits longer than
+/// `queue_timeout_secs` (Triton `QueuePolicy.timeout_action`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueueTimeoutAction {
+    /// Let `request_timeout` govern (no proactive rejection) — the default.
+    Delay,
+    /// Return 503 / gRPC Unavailable once the queue delay elapses.
+    Reject,
+}
+
+impl Default for QueueTimeoutAction {
+    fn default() -> Self {
+        QueueTimeoutAction::Delay
+    }
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -803,6 +820,11 @@ pub struct ModelConfig {
     pub health_check_kill_threshold: usize,
     /// Seconds to wait for the OS to reap a killed worker process.
     pub worker_kill_timeout: f32,
+    /// P-FLOW B1 (§4.0.9): max seconds a request may wait in the queue before
+    /// `queue_timeout_action` applies. 0 = disabled (default).
+    pub queue_timeout_secs: f32,
+    /// P-FLOW B1: action when `queue_timeout_secs` elapses (default `delay`).
+    pub queue_timeout_action: QueueTimeoutAction,
 }
 
 impl Default for ModelConfig {
@@ -836,6 +858,8 @@ impl Default for ModelConfig {
             health_check_timeout: 5.0,
             health_check_kill_threshold: 0,
             worker_kill_timeout: 10.0,
+            queue_timeout_secs: 0.0,
+            queue_timeout_action: QueueTimeoutAction::default(),
         }
     }
 }

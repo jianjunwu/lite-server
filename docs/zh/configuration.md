@@ -171,6 +171,12 @@ devices: null                  # 设备分配（null = 自动，或整数如 1�
 workers_per_device: null       # 每设备 worker 数（null = 1）
 max_queue_size: 1000           # 每个 worker 的最大待处理请求数
 request_timeout: 0.0           # 单请求硬超时（秒），0 = 禁用
+# P-FLOW B1（§4.0.9）——过载队列控制。每请求用 `x-lite-priority` header
+# （整数；越大越先派发，默认 0）指定优先级。
+queue_timeout_secs: 0.0        # 请求在队列中最长等待秒数，超过则按 queue_timeout_action
+                               # 处理（0 = 禁用，默认）。
+queue_timeout_action: delay    # delay（默认；交给 request_timeout 兜底）| reject
+                               # （超过 queue_timeout_secs 返回 503 / gRPC Unavailable）
 max_requests: 0                # worker 处理 N 个请求后自动重启（0 = 禁用）
 max_requests_jitter: 0         # max_requests 的随机抖动，防止惊群效应
 health_check_interval: 15.0    # 主动健康检查间隔（秒），0 = 禁用

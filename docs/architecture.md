@@ -475,6 +475,13 @@ cascade-fail under pressure (§4.0.9). P-FLOW lands these:
 - **Request size cap** (`server.max_request_body_bytes`): oversized bodies return
   `413` (HTTP) / `ResourceExhausted` (gRPC, tonic's fixed mapping). `null` =
   platform default (axum 2MB / tonic 4MB).
+- **Multi-level priority queue** (B1): each per-version queue is a priority heap
+  keyed by the request's `x-lite-priority` header (higher = dispatched first,
+  ties FIFO). With the header absent (default 0) the queue is plain FIFO, so
+  behaviour is unchanged. **Queue timeout REJECT** (`queue_timeout_secs` +
+  `queue_timeout_action: reject`) returns `503` / gRPC `Unavailable` for a
+  request that waits past the deadline; `delay` (default) leaves it to
+  `request_timeout`.
 - **Cancel propagation**: client disconnect on any stream → a fire-and-forget
   `Cancel` (`send_raw`) tells the worker to stop and release resources. Ensemble
   sub-steps share one cancel: a per-layer `JoinSet` means a parent cancel (client

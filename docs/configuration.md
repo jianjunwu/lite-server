@@ -171,6 +171,12 @@ devices: null                  # Device assignment (null = auto, or integer like
 workers_per_device: null       # Workers per device (null = 1)
 max_queue_size: 1000           # Max pending requests per worker
 request_timeout: 0.0           # Per-request hard timeout in seconds (0 = disabled)
+# P-FLOW B1 (§4.0.9) — overload queue control. Per request, set the
+# `x-lite-priority` header (integer; higher = dispatched first, default 0).
+queue_timeout_secs: 0.0        # Max seconds a request may wait in the queue before
+                               # queue_timeout_action applies (0 = disabled, default).
+queue_timeout_action: delay    # delay (default; let request_timeout govern) | reject
+                               # (return 503 / gRPC Unavailable once queue_timeout_secs elapses)
 max_requests: 0                # Auto-restart worker after N requests (0 = disabled)
 max_requests_jitter: 0         # Random jitter for max_requests (prevents thundering herd)
 health_check_interval: 15.0    # Active health check interval in seconds (0 = disabled)
