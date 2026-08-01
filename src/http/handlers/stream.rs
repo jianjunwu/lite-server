@@ -149,8 +149,18 @@ async fn sse_infer_impl(
     cx: RequestContext,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, AppError> {
 
-    let meta = build_request_meta(&headers, &payload, "/predict", &cx);
+    let deadline = crate::deadline::resolve_from_http(&headers, state.config.server.timeout);
+    let meta = build_request_meta(&headers, &payload, "/predict", &cx, deadline.unix_ns);
     let payload_bytes = meta.payload.clone();
+    // P-DEADLINE streaming bound (client-specified only).
+    let (stream_deadline, stream_idle) = if deadline.client_specified {
+        (
+            crate::deadline::to_instant(deadline.unix_ns),
+            crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs),
+        )
+    } else {
+        (None, None)
+    };
     let (stream_id, mut chunk_rx) = open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await?;
 
     let stream_metrics = state.config.features.streaming_metrics;
@@ -165,7 +175,21 @@ async fn sse_infer_impl(
         let mut first_chunk = true;
         let mut last_chunk_time = open_time;
 
-        while let Some(chunk) = chunk_rx.recv().await {
+        loop {
+            let chunk = match streaming::recv_chunk(&mut chunk_rx, stream_deadline, stream_idle)
+                .await
+            {
+                Ok(Some(c)) => c,
+                Ok(None) => break, // worker closed the stream
+                Err(elapsed) => {
+                    // P-DEADLINE (§4.0.4): overall deadline or chunk-idle fired.
+                    tracing::warn!(
+                        ?elapsed, stream_id = %stream_id,
+                        "sse stream closed: deadline/idle elapsed"
+                    );
+                    break;
+                }
+            };
             let event = match &chunk.payload {
                 Some(pb::stream_response::Payload::Chunk(c)) => {
                     if stream_metrics {
@@ -343,8 +367,18 @@ async fn handle_ws_stream(
 
     // The original upgrade-request headers flow into meta; client_ip /
     // request_id come from the RequestContext (P-MW single fill).
-    let meta = build_request_meta(&headers, &payload, "/predict", &cx);
+    let deadline = crate::deadline::resolve_from_http(&headers, state.config.server.timeout);
+    let meta = build_request_meta(&headers, &payload, "/predict", &cx, deadline.unix_ns);
     let payload_bytes = meta.payload.clone();
+    // P-DEADLINE streaming bound (client-specified only).
+    let (stream_deadline, stream_idle) = if deadline.client_specified {
+        (
+            crate::deadline::to_instant(deadline.unix_ns),
+            crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs),
+        )
+    } else {
+        (None, None)
+    };
 
     let (stream_id, mut chunk_rx) = match open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await {
         Ok(r) => r,
@@ -370,7 +404,21 @@ async fn handle_ws_stream(
         let mut first_chunk = true;
         let mut last_chunk_time = open_time;
 
-        while let Some(chunk) = chunk_rx.recv().await {
+        loop {
+            let chunk = match streaming::recv_chunk(&mut chunk_rx, stream_deadline, stream_idle)
+                .await
+            {
+                Ok(Some(c)) => c,
+                Ok(None) => break, // worker closed the stream
+                Err(elapsed) => {
+                    // P-DEADLINE (§4.0.4): overall deadline or chunk-idle fired.
+                    tracing::warn!(
+                        ?elapsed, stream_id = %stream_id,
+                        "websocket stream closed: deadline/idle elapsed"
+                    );
+                    break;
+                }
+            };
             let msg = match &chunk.payload {
                 Some(pb::stream_response::Payload::Chunk(c)) => {
                     if stream_metrics {

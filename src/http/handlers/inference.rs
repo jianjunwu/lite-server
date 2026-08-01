@@ -13,7 +13,7 @@ use axum::{
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::oneshot;
 use tracing::error;
 use tracing::Instrument;
@@ -71,6 +71,9 @@ async fn do_infer(
     );
     async move {
     let resolved_version = resolve_version(&state, &model_name, version, &headers).await?;
+    // P-DEADLINE (§4.0.10): resolved once — shared by the ensemble cascade and
+    // the unary worker wait. Client `x-lite-timeout` else server.timeout.
+    let deadline = crate::deadline::resolve_from_http(&headers, state.config.server.timeout);
 
     // Check ready
     if !state.registry.is_ready(&model_name, Some(&resolved_version)) {
@@ -90,7 +93,7 @@ async fn do_infer(
 
     // Handle ensemble
     if mv.model_type == ModelType::Ensemble {
-        let result = crate::ensemble::execute_ensemble(state, &model_name, &resolved_version, payload, &request_id, &cx.client_ip).await?;
+        let result = crate::ensemble::execute_ensemble(state, &model_name, &resolved_version, payload, &request_id, &cx.client_ip, deadline.unix_ns).await?;
         return Ok(Json(result).into_response());
     }
 
@@ -153,6 +156,7 @@ async fn do_infer(
         timestamp_ns,
         payload: bytes::Bytes::from(payload_bytes),
         sequence_id,
+        deadline_unix_ns: deadline.unix_ns,
         ..Default::default()
     };
 
@@ -182,19 +186,30 @@ async fn do_infer(
         }
     }
 
-    let timeout_duration = Duration::from_secs_f64(state.config.server.timeout as f64);
-    let response = match tokio::time::timeout(timeout_duration, response_rx).await {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(_)) => {
-            error!(timeout_secs = %timeout_duration.as_secs(), "Response channel closed");
-            prometheus::record_request_end(&model_name, &resolved_version, "5xx", start.elapsed().as_secs_f64());
-            return Err(AppError::InferenceTimeout("response channel closed".to_string()));
-        }
-        Err(_) => {
-            error!(timeout_secs = %timeout_duration.as_secs(), elapsed_ms = %start.elapsed().as_millis(), "Inference request timed out");
-            prometheus::record_request_end(&model_name, &resolved_version, "5xx", start.elapsed().as_secs_f64());
-            return Err(AppError::InferenceTimeout("request timeout".to_string()));
-        }
+    // P-DEADLINE (§4.0.10): bound the worker wait by the resolved deadline;
+    // no deadline (no client spec AND server.timeout<=0) → unbounded.
+    let response = match crate::deadline::remaining(deadline.unix_ns) {
+        Some(timeout_duration) => match tokio::time::timeout(timeout_duration, response_rx).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(_)) => {
+                error!(timeout_secs = %timeout_duration.as_secs(), "Response channel closed");
+                prometheus::record_request_end(&model_name, &resolved_version, "5xx", start.elapsed().as_secs_f64());
+                return Err(AppError::InferenceTimeout("response channel closed".to_string()));
+            }
+            Err(_) => {
+                error!(timeout_secs = %timeout_duration.as_secs(), elapsed_ms = %start.elapsed().as_millis(), "Inference request timed out");
+                prometheus::record_request_end(&model_name, &resolved_version, "5xx", start.elapsed().as_secs_f64());
+                return Err(AppError::InferenceTimeout("request timeout".to_string()));
+            }
+        },
+        None => match response_rx.await {
+            Ok(resp) => resp,
+            Err(_) => {
+                error!("Response channel closed");
+                prometheus::record_request_end(&model_name, &resolved_version, "5xx", start.elapsed().as_secs_f64());
+                return Err(AppError::InferenceTimeout("response channel closed".to_string()));
+            }
+        },
     };
 
     let duration = start.elapsed().as_secs_f64();
@@ -381,7 +396,7 @@ pub(super) async fn resolve_version(
     Ok(resolved)
 }
 
-pub(super) fn build_request_meta(headers: &HeaderMap, payload: &Value, route: &str, cx: &RequestContext) -> pb::RequestMeta {
+pub(super) fn build_request_meta(headers: &HeaderMap, payload: &Value, route: &str, cx: &RequestContext, deadline_unix_ns: Option<i64>) -> pb::RequestMeta {
     let header_map: HashMap<String, String> = headers
         .iter()
         .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), s.to_string())))
@@ -406,6 +421,7 @@ pub(super) fn build_request_meta(headers: &HeaderMap, payload: &Value, route: &s
         timestamp_ns,
         payload: payload_bytes,
         sequence_id,
+        deadline_unix_ns,
         ..Default::default()
     }
 }
@@ -434,7 +450,7 @@ mod streaming_tests {
         let direct_bytes = bytes::Bytes::from(serde_json::to_vec(&payload).unwrap_or_default());
         let cx = test_cx("test-id-001", "");
 
-        let meta = build_request_meta(&headers, &payload, "/predict", &cx);
+        let meta = build_request_meta(&headers, &payload, "/predict", &cx, None);
 
         assert_eq!(meta.payload, direct_bytes,
             "meta.payload should equal direct serde_json::to_vec output");
@@ -447,7 +463,7 @@ mod streaming_tests {
         let headers = HeaderMap::new();
         let payload = serde_json::json!({"x": 1});
         let cx = test_cx("test-id-002", "10.0.0.7");
-        let meta = build_request_meta(&headers, &payload, "/custom", &cx);
+        let meta = build_request_meta(&headers, &payload, "/custom", &cx, None);
 
         assert_eq!(meta.route, "/custom");
         assert_eq!(meta.client_ip, "10.0.0.7");

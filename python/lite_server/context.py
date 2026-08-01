@@ -14,7 +14,7 @@ contract since 0.7.0.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 from lite_server.response import Response
 
@@ -83,6 +83,12 @@ class RequestMeta:
     timestamp_ns: int
     method: str = "POST"                  # HTTP method; POST for inference, from wire for endpoints
     query: dict[str, str] = field(default_factory=dict)  # URL query parameters (endpoints only)
+    # P-DEADLINE (蓝图 §4.0.10): absolute per-request deadline as UNIX ns, or
+    # None when there is no deadline. Carried from the Rust server (client
+    # x-lite-timeout / grpc-timeout, else server.timeout fallback). Models may
+    # check it cooperatively to stop at the deadline; the framework also checks
+    # it in the streaming consume loop. None = unbounded (behavior unchanged).
+    deadline_unix_ns: Optional[int] = None
 
 
 @dataclass(slots=True)

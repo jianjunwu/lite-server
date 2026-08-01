@@ -715,6 +715,25 @@ class TestMetaFromProto:
         assert meta.route == "/"
         assert meta.request_id == ""
 
+    def test_reads_deadline_when_present(self):
+        """P-DEADLINE: deadline_unix_ns is carried from the proto when set."""
+        from lite_server.proto import RequestMeta as ProtoMeta
+
+        meta_pb = ProtoMeta(
+            route="/predict", headers={}, client_ip="", request_id="r", timestamp_ns=0,
+            deadline_unix_ns=1_700_000_000_000_000_000,
+        )
+        meta = inference._meta_from_proto(meta_pb)
+        assert meta.deadline_unix_ns == 1_700_000_000_000_000_000
+
+    def test_deadline_none_when_absent(self):
+        """P-DEADLINE: an unset deadline deserializes to None (unbounded)."""
+        from lite_server.proto import RequestMeta as ProtoMeta
+
+        meta_pb = ProtoMeta(route="/predict", headers={}, client_ip="", request_id="r", timestamp_ns=0)
+        meta = inference._meta_from_proto(meta_pb)
+        assert meta.deadline_unix_ns is None
+
 
 class TestStdoutProtection:
     """C-level writes to fd 1 during model loading must not pollute the handshake."""

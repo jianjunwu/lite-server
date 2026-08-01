@@ -202,6 +202,12 @@ impl GrpcService {
         if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
             if mv.model_type == ModelType::Ensemble {
                 let payload = serde_json::from_slice(&req.data).unwrap_or(serde_json::Value::Null);
+                // P-DEADLINE: resolve here (grpc_metadata still in scope) and
+                // pass to the ensemble cascade.
+                let ensemble_deadline = crate::deadline::resolve_from_grpc(
+                    &grpc_metadata,
+                    self.server_timeout.as_secs_f32(),
+                );
                 let result = crate::ensemble::execute_ensemble(
                     self.app_state.clone(),
                     model_name,
@@ -209,6 +215,7 @@ impl GrpcService {
                     payload,
                     &request_id,
                     &client_ip,
+                    ensemble_deadline.unix_ns,
                 )
                 .await
                 .map_err(|e| err(app_error_to_grpc_status(&e)))?;
@@ -227,6 +234,10 @@ impl GrpcService {
         if !hints.is_empty() {
             tracing::debug!(?hints, "envelope hints received (define-only, not consumed)");
         }
+        // P-DEADLINE (§4.0.10): resolve the per-request deadline from the
+        // client's `grpc-timeout` metadata, falling back to `server.timeout`.
+        let deadline =
+            crate::deadline::resolve_from_grpc(&grpc_metadata, self.server_timeout.as_secs_f32());
         let meta = pb::RequestMeta {
             route: "/predict".to_string(),
             headers: header_map,
@@ -238,6 +249,7 @@ impl GrpcService {
                 .as_nanos() as i64,
             payload: req.data.clone(),
             sequence_id: req.sequence_id.clone(),
+            deadline_unix_ns: deadline.unix_ns,
             ..Default::default()
         };
 
@@ -280,15 +292,22 @@ impl GrpcService {
             .inference_queue()
             .try_submit(model_name, &resolved_version, item)
         {
-            Ok(()) => match tokio::time::timeout(self.server_timeout, response_rx).await {
-                Ok(Ok(resp)) => resp,
-                Ok(Err(_)) => return Err(err(Status::internal("response channel closed"))),
-                Err(_) => {
-                    return Err(err(Status::deadline_exceeded(format!(
-                        "inference timed out after {:.1}s",
-                        self.server_timeout.as_secs_f64()
-                    ))));
-                }
+            Ok(()) => match crate::deadline::remaining(deadline.unix_ns) {
+                Some(t) => match tokio::time::timeout(t, response_rx).await {
+                    Ok(Ok(resp)) => resp,
+                    Ok(Err(_)) => return Err(err(Status::internal("response channel closed"))),
+                    Err(_) => {
+                        return Err(err(Status::deadline_exceeded(format!(
+                            "inference timed out after {:.1}s",
+                            t.as_secs_f64()
+                        ))));
+                    }
+                },
+                // No deadline (no client spec AND server.timeout<=0): unbounded.
+                None => match response_rx.await {
+                    Ok(resp) => resp,
+                    Err(_) => return Err(err(Status::internal("response channel closed"))),
+                },
             },
             Err(crate::inference_queue::QueueError::Full) => {
                 // §4.0.9: queue-full/过载 → Unavailable（落 5xx）+
@@ -429,6 +448,10 @@ impl GrpcService {
         }
 
         let header_map: HashMap<String, String> = req.headers.clone();
+        // P-DEADLINE (§4.0.10): carried to the worker so it can stop; batch
+        // keeps its existing ZMQ send path (no server-side wrap change).
+        let deadline =
+            crate::deadline::resolve_from_grpc(&grpc_metadata, self.server_timeout.as_secs_f32());
         let meta = pb::RequestMeta {
             route: "/predict".to_string(),
             headers: header_map,
@@ -439,6 +462,7 @@ impl GrpcService {
                 .unwrap_or_default()
                 .as_nanos() as i64,
             payload: Default::default(),
+            deadline_unix_ns: deadline.unix_ns,
             ..Default::default()
         };
 
@@ -574,6 +598,11 @@ impl GrpcService {
         }
 
         let header_map: HashMap<String, String> = req.headers.clone();
+        // P-DEADLINE (§4.0.10): resolve + carry to worker; the streaming two-
+        // stage bound below activates only when the CLIENT specified a deadline
+        // (so the default config leaves streaming behavior unchanged).
+        let deadline =
+            crate::deadline::resolve_from_grpc(&grpc_metadata, self.server_timeout.as_secs_f32());
         let meta = pb::RequestMeta {
             route: "/predict".to_string(),
             headers: header_map,
@@ -585,10 +614,20 @@ impl GrpcService {
                 .as_nanos() as i64,
             payload: req.data.clone(),
             sequence_id: req.sequence_id.clone(),
+            deadline_unix_ns: deadline.unix_ns,
             ..Default::default()
         };
         // Capture before `meta` moves into `open_req` (used by the affinity pick below).
         let sequence_id = meta.sequence_id.clone();
+        // P-DEADLINE streaming bound, captured before spawn.
+        let (stream_deadline, stream_idle) = if deadline.client_specified {
+            (
+                crate::deadline::to_instant(deadline.unix_ns),
+                self.decoupled_idle_timeout,
+            )
+        } else {
+            (None, None)
+        };
 
         let stream_id = format!("grpc-stream-{}", Uuid::new_v4());
         let open_req = streaming::build_stream_open(stream_id.clone(), req.data, Some(meta), false);
@@ -655,7 +694,22 @@ impl GrpcService {
             // P2-1：流关闭时记一次整体 duration；中途 worker 错误按其状态族记。
             let mut stream_family = "2xx";
 
-            while let Some(chunk) = chunk_rx.recv().await {
+            loop {
+                let chunk = match streaming::recv_chunk(&mut chunk_rx, stream_deadline, stream_idle)
+                    .await
+                {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break, // worker closed the stream
+                    Err(elapsed) => {
+                        // P-DEADLINE (§4.0.4): overall deadline or chunk-idle fired.
+                        tracing::warn!(
+                            ?elapsed, stream_id = %stream_id,
+                            "stream closed: deadline/idle elapsed"
+                        );
+                        stream_family = "5xx";
+                        break;
+                    }
+                };
                 match chunk.payload {
                     Some(pb::stream_response::Payload::Chunk(ref c)) => {
                         if stream_metrics {
@@ -788,6 +842,11 @@ impl GrpcService {
         }
 
         let header_map: HashMap<String, String> = req.headers.clone();
+        // P-DEADLINE (§4.0.10): carry to worker; the always-on decoupled idle
+        // reclaim stays, with an overall deadline layered on when the CLIENT
+        // specifies one.
+        let deadline =
+            crate::deadline::resolve_from_grpc(&grpc_metadata, self.server_timeout.as_secs_f32());
         let meta = pb::RequestMeta {
             route: "/predict".to_string(),
             headers: header_map,
@@ -799,6 +858,7 @@ impl GrpcService {
                 .as_nanos() as i64,
             payload: req.data.clone(),
             sequence_id: req.sequence_id.clone(),
+            deadline_unix_ns: deadline.unix_ns,
             ..Default::default()
         };
         // Capture before `meta` moves into `open_req` (used by the affinity pick).
@@ -860,7 +920,14 @@ impl GrpcService {
             crate::metrics::prometheus::record_stream_open(&metrics_model, &metrics_version, "grpc");
         }
 
-        let idle = self.decoupled_idle_timeout;
+        // P-DEADLINE + P9-1: always-on decoupled idle reclaim, plus an overall
+        // deadline layered on only when the CLIENT specified one.
+        let stream_idle = self.decoupled_idle_timeout;
+        let stream_deadline = if deadline.client_specified {
+            crate::deadline::to_instant(deadline.unix_ns)
+        } else {
+            None
+        };
         tokio::spawn(async move {
             let open_time = std::time::Instant::now();
             let mut first_chunk = true;
@@ -869,24 +936,19 @@ impl GrpcService {
             let mut stream_family = "2xx";
 
             loop {
-                // P9-1 idle timeout: reclaim a channel the model left open if no
-                // chunk arrives within the configured window (None = disabled).
-                let item = match idle {
-                    Some(d) => match tokio::time::timeout(d, chunk_rx.recv()).await {
-                        Ok(v) => v,
-                        Err(_) => {
-                            tracing::warn!(
-                                "decoupled stream {} idle-timeout ({}s), closing",
-                                stream_id, d.as_secs()
-                            );
-                            break;
-                        }
-                    },
-                    None => chunk_rx.recv().await,
-                };
-                let chunk = match item {
-                    None => break, // actor dropped the route (Done/Error forwarded)
-                    Some(c) => c,
+                let chunk = match streaming::recv_chunk(&mut chunk_rx, stream_deadline, stream_idle)
+                    .await
+                {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break, // actor dropped the route (Done/Error forwarded)
+                    Err(elapsed) => {
+                        tracing::warn!(
+                            ?elapsed, stream_id = %stream_id,
+                            "decoupled stream closed: deadline/idle elapsed"
+                        );
+                        stream_family = "5xx";
+                        break;
+                    }
                 };
                 match chunk.payload {
                     Some(pb::stream_response::Payload::Chunk(ref c)) => {
@@ -974,6 +1036,11 @@ impl GrpcService {
         let request_id = cx.request_id;
         *request_id_out = request_id.clone();
         let client_ip = cx.client_ip;
+        // P-DEADLINE (§4.0.10): resolved here (grpc_metadata is in scope) and
+        // captured into the body below; bidi streaming two-stage bound activates
+        // only when the CLIENT specified a deadline.
+        let deadline =
+            crate::deadline::resolve_from_grpc(&grpc_metadata, self.server_timeout.as_secs_f32());
 
         // Wait for first message (must be BidiOpen)
         let first = stream
@@ -1061,6 +1128,7 @@ impl GrpcService {
                 .as_nanos() as i64,
             payload: initial_data.clone(),
             sequence_id: sequence_id.clone(),
+            deadline_unix_ns: deadline.unix_ns,
             ..Default::default()
         };
 
@@ -1123,6 +1191,15 @@ impl GrpcService {
 
         // Spawn forwarder: worker chunks -> gRPC stream
         let stream_id_for_incoming = stream_id.clone();
+        // P-DEADLINE streaming bound (client-specified only).
+        let (stream_deadline, stream_idle) = if deadline.client_specified {
+            (
+                crate::deadline::to_instant(deadline.unix_ns),
+                self.decoupled_idle_timeout,
+            )
+        } else {
+            (None, None)
+        };
         tokio::spawn(async move {
             // Forward incoming bidi chunks to worker as StreamRequest::Chunk.
             // These are fire-and-forget: the worker's response to each chunk
@@ -1157,7 +1234,22 @@ impl GrpcService {
             // P2-1：流关闭时记一次整体 duration；中途 worker 错误按其状态族记。
             let mut stream_family = "2xx";
 
-            while let Some(chunk) = chunk_rx.recv().await {
+            loop {
+                let chunk = match streaming::recv_chunk(&mut chunk_rx, stream_deadline, stream_idle)
+                    .await
+                {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break, // worker closed the stream
+                    Err(elapsed) => {
+                        // P-DEADLINE (§4.0.4): overall deadline or chunk-idle fired.
+                        tracing::warn!(
+                            ?elapsed, stream_id = %stream_id,
+                            "bidi stream closed: deadline/idle elapsed"
+                        );
+                        stream_family = "5xx";
+                        break;
+                    }
+                };
                 match chunk.payload {
                     Some(pb::stream_response::Payload::Chunk(ref c)) => {
                         if stream_metrics {

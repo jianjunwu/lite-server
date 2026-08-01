@@ -19,6 +19,13 @@ message RequestMeta {
   // to the worker (additive) for optional KV-cache/session reuse; the server
   // uses it to bias routing. Absent = no affinity (behavior unchanged).
   optional string sequence_id = 10;
+  // P-DEADLINE (蓝图 §4.0.10/§4.4): absolute per-request deadline as UNIX
+  // nanoseconds. Source = client (HTTP `x-lite-timeout` rel-secs header /
+  // gRPC standard `grpc-timeout` metadata), else `server.timeout` fallback.
+  // The worker reads it and stops cooperatively at the deadline; the server
+  // bounds unary/ensemble/streaming waits by it. Absent = no deadline
+  // (behavior unchanged — e.g. no client spec AND server.timeout<=0).
+  optional int64 deadline_unix_ns = 11;
 }
 
 // ===== Request Payloads =====

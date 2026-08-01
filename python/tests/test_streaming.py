@@ -1220,3 +1220,100 @@ class TestDecoupledStreaming:
         assert "s-cn" not in active
         assert not any(_is_done(r, "s-cn") for r in sock.stream_responses("s-cn"))
 
+
+# ---------------------------------------------------------------------------
+# P-DEADLINE — worker cooperative deadline check (蓝图 §4.0.10)
+# ---------------------------------------------------------------------------
+
+
+class TestStreamDeadline:
+    @pytest.mark.asyncio
+    async def test_stream_stops_at_deadline_before_all_chunks(self):
+        """A stream whose meta carries a deadline stops early: the framework's
+        cooperative check in _consume_stream breaks once the deadline passes,
+        so the stream ends (StreamDone) well before the generator is exhausted.
+        """
+        import time
+
+        # 10 chunks at ~50ms each (500ms total); deadline ~120ms in the future
+        # → only a couple of chunks should land before the deadline cuts in.
+        deadline_ns = (time.time_ns() // 1_000_000 + 120) * 1_000_000
+        meta = ProtoMeta(
+            route="/predict",
+            headers={},
+            client_ip="",
+            request_id="r-dl",
+            timestamp_ns=0,
+            deadline_unix_ns=deadline_ns,
+        )
+
+        class SlowStreamAPI(EchoAPI):
+            async def stream_predict(self, x):
+                for i in range(10):
+                    await asyncio.sleep(0.05)
+                    yield {"chunk": i}
+
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            SlowStreamAPI(), _stream_req("s-dl", b'{"prompt": "go"}', meta=meta), sock, {}, log
+        )
+        await sock.wait_for(lambda r: _is_done(r, "s-dl"))
+        responses = sock.stream_responses("s-dl")
+        chunks = [r for r in responses if r.stream.HasField("chunk")]
+        # The deadline (120ms) must cut the stream short of all 10 chunks.
+        assert len(chunks) < 10, f"deadline should cut the stream; got {len(chunks)} chunks"
+        # ... but at least one chunk lands before the deadline passes.
+        assert len(chunks) >= 1, f"expected >=1 chunk before deadline; got {len(chunks)}"
+        # A graceful StreamDone closes the stream.
+        assert any(_is_done(r, "s-dl") for r in responses)
+
+    @pytest.mark.asyncio
+    async def test_no_deadline_streams_all_chunks(self):
+        """No deadline (None) → behavior unchanged: all chunks + done."""
+        class StreamAPI(EchoAPI):
+            def stream_predict(self, x):
+                for i in range(4):
+                    yield {"chunk": i}
+
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            StreamAPI(), _stream_req("s-nodl", b'{"prompt": "go"}'), sock, {}, log
+        )
+        await sock.wait_for(lambda r: _is_done(r, "s-nodl"))
+        responses = sock.stream_responses("s-nodl")
+        chunks = [r for r in responses if r.stream.HasField("chunk")]
+        assert len(chunks) == 4
+        assert any(_is_done(r, "s-nodl") for r in responses)
+
+    def test_deadline_passed_helper(self):
+        """_deadline_passed: None→False, future→False, past→True."""
+        from lite_server.worker.streaming import _deadline_passed
+
+        meta_none = RequestMeta(
+            route="/predict", headers=Headers({}), client_ip="", request_id="r", timestamp_ns=0
+        )
+        assert _deadline_passed(RequestContext(meta=meta_none)) is False
+
+        import time
+
+        meta_future = RequestMeta(
+            route="/predict",
+            headers=Headers({}),
+            client_ip="",
+            request_id="r",
+            timestamp_ns=0,
+            deadline_unix_ns=time.time_ns() + 10_000_000_000,
+        )
+        assert _deadline_passed(RequestContext(meta=meta_future)) is False
+
+        meta_past = RequestMeta(
+            route="/predict",
+            headers=Headers({}),
+            client_ip="",
+            request_id="r",
+            timestamp_ns=0,
+            deadline_unix_ns=time.time_ns() - 1_000_000_000,
+        )
+        assert _deadline_passed(RequestContext(meta=meta_past)) is True
+
+

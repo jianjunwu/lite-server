@@ -4720,3 +4720,218 @@ fn next_test_port_is_unique_under_concurrency() {
         "concurrent port allocation collided — sibling tests could share a port"
     );
 }
+
+// ---------------------------------------------------------------------------
+// P-DEADLINE — per-request deadline propagation (蓝图 §4.0.10 / §4.4)
+// ---------------------------------------------------------------------------
+
+/// Slow model repo with configurable worker count. A unary server-side timeout
+/// does NOT cancel the worker (it keeps running its predict), so a single-worker
+/// model serializes slow requests behind timed-out ones. Multiple workers let
+/// concurrent deadline cases run independently.
+fn create_slow_model_repo_workers(sleep_secs: u64, workers: u32) -> std::path::PathBuf {
+    let tmp = std::env::temp_dir().join(format!(
+        "lite-server-sloww-{}-{}-{}",
+        std::process::id(),
+        sleep_secs,
+        workers
+    ));
+    let model_dir = tmp.join("slow_model/1");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    std::fs::write(
+        model_dir.join("model.py"),
+        format!(
+            r#"from lite_server import LitAPI
+import time
+
+
+class SlowAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        time.sleep({secs})
+        return {{"output": x * 2}}
+
+    def encode_response(self, output):
+        return output
+"#,
+            secs = sleep_secs
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        model_dir.join("config.yaml"),
+        format!(
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: {workers}\n",
+            workers = workers
+        ),
+    )
+    .unwrap();
+    tmp
+}
+
+// A slow model (2s predict, 4 workers) + a short `server.timeout` exercises the
+// three unary cases end-to-end. The 4 workers let the three concurrent requests
+// run independently (a unary server timeout does not cancel the still-running
+// worker, so a 1-worker model would serialize them):
+//   1. no client header  → server.timeout fallback fires (504).
+//   2. x-lite-timeout    → client deadline fires, tighter than the fallback.
+//   3. x-lite-timeout    → a generous client deadline lets the slow request
+//                          complete (200), proving the path is not broken.
+
+#[tokio::test]
+#[serial]
+async fn test_p_deadline_http_client_and_fallback() {
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = create_slow_model_repo_workers(2, 4);
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-pdeadline-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18212\n  timeout: 1.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: false\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 30).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "slow_model", "1").await;
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/v2/models/slow_model/versions/1/infer", base);
+
+    // 1. No header → server.timeout=1.0 fallback fires (504) well before the
+    //    2s predict finishes.
+    let t0 = std::time::Instant::now();
+    let resp = client
+        .post(&url)
+        .json(&json!({"input": 1}))
+        .send()
+        .await
+        .unwrap();
+    let elapsed_fallback = t0.elapsed();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::GATEWAY_TIMEOUT,
+        "fallback to server.timeout must 504"
+    );
+    assert!(
+        elapsed_fallback < Duration::from_secs(3),
+        "fallback should fire near the 1s server.timeout, took {elapsed_fallback:?}"
+    );
+
+    // 2. x-lite-timeout=0.5 → client deadline (tighter than the 1s fallback)
+    //    fires, faster than the fallback case.
+    let t0 = std::time::Instant::now();
+    let resp = client
+        .post(&url)
+        .header("x-lite-timeout", "0.5")
+        .json(&json!({"input": 1}))
+        .send()
+        .await
+        .unwrap();
+    let elapsed_client = t0.elapsed();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::GATEWAY_TIMEOUT,
+        "client x-lite-timeout must 504"
+    );
+    assert!(
+        elapsed_client < elapsed_fallback,
+        "client deadline (0.5s) should fire before the 1s fallback; client={elapsed_client:?} fallback={elapsed_fallback:?}"
+    );
+
+    // 3. x-lite-timeout=10 → generous client deadline lets the 2s predict
+    //    complete (200), proving the deadline path does not break normal flow.
+    let resp = client
+        .post(&url)
+        .header("x-lite-timeout", "10")
+        .json(&json!({"input": 21}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "generous deadline must let it complete");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["output"], 42, "slow predict result must come back");
+
+    unload_model(&base, "slow_model", "1").await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// gRPC unary deadline: a short `server.timeout` (no client grpc-timeout, no
+/// client-side timeout) makes the SERVER return DEADLINE_EXCEEDED — exercising
+/// the gRPC unary deadline wrap. (A client-sent `grpc-timeout` is also enforced
+/// client-side by tonic as `Cancelled`, so it cannot isolate the server wrap
+/// here; grpc-timeout parsing is covered by unit tests instead.)
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_p_deadline_grpc_server_timeout() {
+    use std::collections::HashMap;
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = create_slow_model_repo(5);
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "lite-server-pdeadline-grpc-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18212\n  timeout: 1.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 30).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "slow_model", "1").await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+    // No client timeout and no grpc-timeout: the client waits, so the server's
+    // own 1s deadline wrap must surface DEADLINE_EXCEEDED (5s predict > 1s).
+    let req = tonic::Request::new(InferRequest {
+        model_name: "slow_model".to_string(),
+        version: "1".to_string(),
+        data: br#"{"input":21}"#.to_vec().into(),
+        headers: HashMap::new(),
+        ..Default::default()
+    });
+    let status = client
+        .infer(req)
+        .await
+        .expect_err("must error — worker outlives the server timeout");
+    assert_eq!(
+        status.code(),
+        tonic::Code::DeadlineExceeded,
+        "server timeout must yield DEADLINE_EXCEEDED, got: {status}"
+    );
+
+    unload_model(&base, "slow_model", "1").await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let _ = std::fs::remove_dir_all(&repo);
+}

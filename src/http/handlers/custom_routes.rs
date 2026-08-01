@@ -183,10 +183,20 @@ pub async fn dispatch_custom_route(
     // Build the request: route_call reuses the SingleRequest body type; the
     // route tag discriminates dispatch in the worker. method/query/path_params
     // ride on RequestMeta (route_pattern == meta.route).
-    let mut meta = build_request_meta(headers, &serde_json::Value::Null, &route_pattern, cx);
+    let deadline = crate::deadline::resolve_from_http(headers, state.config.server.timeout);
+    let mut meta = build_request_meta(headers, &serde_json::Value::Null, &route_pattern, cx, deadline.unix_ns);
     meta.method = method_str.to_string();
     meta.query = query;
     meta.path_params = path_params;
+    // P-DEADLINE streaming bound for the route response body (client-specified only).
+    let (stream_deadline, stream_idle) = if deadline.client_specified {
+        (
+            crate::deadline::to_instant(deadline.unix_ns),
+            crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs),
+        )
+    } else {
+        (None, None)
+    };
 
     let uid = format!("route_{}_{}-{}", model_name, resolved_version, Uuid::new_v4());
     let request = pb::Request {
@@ -216,7 +226,7 @@ pub async fn dispatch_custom_route(
         )),
         RouteReply::Stream(frame) => match frame.payload {
             Some(pb::stream_response::Payload::Start(start)) => {
-                build_route_stream_http_response(start, chunk_rx)
+                build_route_stream_http_response(start, chunk_rx, stream_deadline, stream_idle)
             }
             _ => Err(AppError::WorkerCrashed(
                 "route stream missing start frame".to_string(),
@@ -284,6 +294,8 @@ async fn first_route_reply(
 fn build_route_stream_http_response(
     start: pb::StreamStart,
     chunk_rx: mpsc::Receiver<pb::StreamResponse>,
+    deadline: Option<std::time::Instant>,
+    idle: Option<std::time::Duration>,
 ) -> Result<Response, AppError> {
     let is_sse = start.media_type.starts_with("text/event-stream");
     let content_type = if start.media_type.is_empty() {
@@ -295,7 +307,16 @@ fn build_route_stream_http_response(
         if ended {
             return None;
         }
-        match rx.recv().await.map(|f| f.payload) {
+        // P-DEADLINE (§4.0.4): overall deadline / chunk-idle bound this recv.
+        let frame = match crate::streaming::recv_chunk(&mut rx, deadline, idle).await {
+            Ok(Some(f)) => Some(f),
+            Ok(None) => None, // worker closed the stream
+            Err(elapsed) => {
+                tracing::warn!(?elapsed, "route stream closed: deadline/idle elapsed");
+                None
+            }
+        };
+        match frame.map(|f| f.payload) {
             Some(Some(pb::stream_response::Payload::Chunk(c))) => {
                 let data = if is_sse { sse_frame(&c.data) } else { c.data.to_vec() };
                 Some((Ok::<_, Infallible>(bytes::Bytes::from(data)), (rx, false)))

@@ -218,6 +218,7 @@ pub async fn execute_ensemble(
     payload: Value,
     request_id: &str,
     client_ip: &str,
+    deadline_unix_ns: Option<i64>,
 ) -> Result<Value, AppError> {
     let model_dir = crate::validation::resolve_model_dir(
         &state.repo_path, model_name, version,
@@ -230,13 +231,13 @@ pub async fn execute_ensemble(
     let mut context: HashMap<String, Value> = HashMap::new();
     context.insert("request".to_string(), payload);
 
-    // #3: bound the WHOLE ensemble by a single deadline equal to one request's
-    // budget (server.timeout). Layers run serially, so without this an N-layer
-    // ensemble could otherwise run up to N × server.timeout — far longer than
-    // the parent request that triggered it (itself capped at server.timeout;
-    // see http/handlers.rs). The per-step timeout in execute_step stays as an
-    // inner safety net; this outer deadline is what actually bounds the total.
-    let total_budget = Duration::from_secs_f64(state.config.server.timeout as f64);
+    // #3: bound the WHOLE ensemble by a single shared deadline (P-DEADLINE
+    // §4.0.10): the parent request's deadline cascades across the whole DAG, so
+    // an N-layer ensemble can never exceed the parent. Layers run serially, so
+    // without this each layer could spend up to its own budget and amplify to
+    // N×. The per-step timeout in execute_step (parent − elapsed) is the inner
+    // safety net; this outer deadline is what actually bounds the total.
+    let total_budget = crate::deadline::remaining(deadline_unix_ns);
     let ensemble_run = async {
         for layer in layers {
             // P-FLOW (§4.0.9): a JoinSet per layer is the ensemble's shared
@@ -257,7 +258,9 @@ pub async fn execute_ensemble(
                 let client_ip = client_ip.to_string();
                 set.spawn(async move {
                     let start = Instant::now();
-                    let result = execute_step(state, &step, &ctx, &request_id, &client_ip).await;
+                    let result =
+                        execute_step(state, &step, &ctx, &request_id, &client_ip, deadline_unix_ns)
+                            .await;
                     let latency = start.elapsed().as_secs_f64();
                     crate::metrics::prometheus::record_ensemble_step_latency(
                         &ensemble_name, &step.name, &step.model, &step.version, latency,
@@ -285,12 +288,20 @@ pub async fn execute_ensemble(
         Ok::<(), AppError>(())
     };
 
-    tokio::time::timeout(total_budget, ensemble_run)
-        .await
-        .map_err(|_| AppError::InferenceTimeout(format!(
-            "ensemble {} {} exceeded total timeout of {:.1}s",
-            model_name, version, total_budget.as_secs_f64()
-        )))??;
+    match total_budget {
+        Some(b) => {
+            tokio::time::timeout(b, ensemble_run)
+                .await
+                .map_err(|_| AppError::InferenceTimeout(format!(
+                    "ensemble {} {} exceeded total deadline of {:.1}s",
+                    model_name, version, b.as_secs_f64()
+                )))??;
+        }
+        // No deadline (no client spec AND server.timeout<=0): unbounded DAG run.
+        None => {
+            ensemble_run.await?;
+        }
+    }
 
     // Return last step's output
     steps.last()
@@ -305,6 +316,7 @@ async fn execute_step(
     context: &HashMap<String, Value>,
     request_id: &str,
     client_ip: &str,
+    deadline_unix_ns: Option<i64>,
 ) -> Result<Value, AppError> {
     // Resolve inputs
     let mut payload = serde_json::Map::new();
@@ -376,6 +388,9 @@ async fn execute_step(
             .unwrap_or_default()
             .as_nanos() as i64,
         payload: bytes::Bytes::from(payload_bytes.clone()),
+        // P-DEADLINE cascade: child step shares the parent deadline so a single
+        // step cannot exceed it (budget = parent − already elapsed).
+        deadline_unix_ns,
         ..Default::default()
     };
 
@@ -403,19 +418,31 @@ async fn execute_step(
         }
     }
 
-    let timeout_duration = Duration::from_secs_f64(state.config.server.timeout as f64);
-    let response = match timeout(timeout_duration, response_rx).await {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(_)) => {
-            return Err(AppError::InferenceTimeout(format!(
-                "ensemble step {} response channel closed", step.name
-            )));
-        }
-        Err(_) => {
-            return Err(AppError::InferenceTimeout(format!(
-                "ensemble step {} timed out", step.name
-            )));
-        }
+    // P-DEADLINE cascade: bound this step by the parent deadline's remaining
+    // budget (None = no deadline → unbounded inner wait, outer DAG bound still
+    // applies via execute_ensemble's total_budget).
+    let response = match crate::deadline::remaining(deadline_unix_ns) {
+        Some(timeout_duration) => match timeout(timeout_duration, response_rx).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(_)) => {
+                return Err(AppError::InferenceTimeout(format!(
+                    "ensemble step {} response channel closed", step.name
+                )));
+            }
+            Err(_) => {
+                return Err(AppError::InferenceTimeout(format!(
+                    "ensemble step {} timed out", step.name
+                )));
+            }
+        },
+        None => match response_rx.await {
+            Ok(resp) => resp,
+            Err(_) => {
+                return Err(AppError::InferenceTimeout(format!(
+                    "ensemble step {} response channel closed", step.name
+                )));
+            }
+        },
     };
 
     match response.payload {

@@ -62,6 +62,59 @@ pub fn build_stream_cancel(stream_id: String) -> pb::Request {
     }
 }
 
+/// Why a bounded stream recv was terminated by P-DEADLINE (蓝图 §4.0.4 两段式).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvElapsed {
+    /// The overall per-request deadline fired.
+    Deadline,
+    /// The per-chunk idle budget fired.
+    Idle,
+}
+
+/// Receive the next worker stream chunk under a P-DEADLINE two-stage bound.
+///
+/// `deadline`: absolute overall deadline (None = no overall bound).
+/// `idle`: per-recv idle budget (None = no idle bound). When both are `None`
+/// this is a plain `recv()` — i.e. streaming behavior is unchanged when no
+/// client deadline is active. Regular streams gate both bounds on a client
+/// spec; decoupled keeps its always-on idle and only adds the overall bound
+/// when a client deadline is present.
+///
+/// Each call bounds THIS recv by `min(remaining-to-deadline, idle)`, so a
+/// stalled stream trips the idle bound even before the overall deadline.
+/// Returns `Ok(None)` when the worker closed the stream, `Ok(Some(chunk))`
+/// for the next chunk, or `Err(RecvElapsed)` when a bound fired (caller logs
+/// + breaks to end the stream, triggering the existing cancel/close cleanup).
+pub async fn recv_chunk(
+    rx: &mut tokio::sync::mpsc::Receiver<pb::StreamResponse>,
+    deadline: Option<std::time::Instant>,
+    idle: Option<std::time::Duration>,
+) -> Result<Option<pb::StreamResponse>, RecvElapsed> {
+    let now = std::time::Instant::now();
+    // Overall deadline: already-expired → stop immediately; else cap this recv.
+    if let Some(d) = deadline {
+        if d <= now {
+            return Err(RecvElapsed::Deadline);
+        }
+    }
+    let to_deadline = deadline.map(|d| d - now);
+    let per_recv = match (to_deadline, idle) {
+        (None, None) => return Ok(rx.recv().await),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (Some(a), Some(b)) => Some(if a < b { a } else { b }),
+    };
+    match tokio::time::timeout(per_recv.unwrap(), rx.recv()).await {
+        Ok(v) => Ok(v),
+        Err(_) => Err(match deadline {
+            // If the overall deadline has now passed, attribute it to Deadline;
+            // otherwise the (shorter) idle bound fired.
+            Some(d) if d <= std::time::Instant::now() => RecvElapsed::Deadline,
+            _ => RecvElapsed::Idle,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +218,84 @@ mod tests {
             },
             _ => panic!("expected stream"),
         }
+    }
+
+    // --- recv_chunk (P-DEADLINE two-stage) ---
+
+    fn rx_pair() -> (
+        tokio::sync::mpsc::Sender<pb::StreamResponse>,
+        tokio::sync::mpsc::Receiver<pb::StreamResponse>,
+    ) {
+        tokio::sync::mpsc::channel(4)
+    }
+    fn chunk() -> pb::StreamResponse {
+        pb::StreamResponse {
+            stream_id: "s".to_string(),
+            payload: Some(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
+                data: bytes::Bytes::from_static(b"x"),
+                is_final: false,
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_chunk_no_bounds_is_plain_recv() {
+        let (tx, mut rx) = rx_pair();
+        tx.send(chunk()).await.unwrap();
+        drop(tx); // close → next recv is None
+        let first = recv_chunk(&mut rx, None, None).await.unwrap();
+        assert!(first.is_some());
+        let second = recv_chunk(&mut rx, None, None).await.unwrap();
+        assert!(second.is_none(), "channel closed → None");
+    }
+
+    #[tokio::test]
+    async fn recv_chunk_expired_deadline_is_immediate() {
+        let (_tx, mut rx) = rx_pair();
+        let past = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        let elapsed = recv_chunk(&mut rx, Some(past), None).await.unwrap_err();
+        assert_eq!(elapsed, RecvElapsed::Deadline);
+    }
+
+    #[tokio::test]
+    async fn recv_chunk_idle_fires_on_stall() {
+        let (_tx, mut rx) = rx_pair();
+        // No sender, tiny idle → must trip Idle promptly.
+        let elapsed = recv_chunk(
+            &mut rx,
+            None,
+            Some(std::time::Duration::from_millis(20)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(elapsed, RecvElapsed::Idle);
+    }
+
+    #[tokio::test]
+    async fn recv_chunk_chunk_arrives_in_time() {
+        let (tx, mut rx) = rx_pair();
+        tx.send(chunk()).await.unwrap();
+        let got = recv_chunk(
+            &mut rx,
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+            Some(std::time::Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+        assert!(got.is_some());
+    }
+
+    #[tokio::test]
+    async fn recv_chunk_deadline_fires_when_shorter_than_idle() {
+        let (_tx, mut rx) = rx_pair();
+        // overall deadline is the tighter bound and fires first.
+        let elapsed = recv_chunk(
+            &mut rx,
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(20)),
+            Some(std::time::Duration::from_secs(60)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(elapsed, RecvElapsed::Deadline);
     }
 }

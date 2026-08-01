@@ -158,6 +158,12 @@ def _meta_from_proto(meta_pb) -> RequestMeta:
     # and the body is already decoded once from item data.  (Proto field
     # stays on the wire; Rust may stop sending it in a later release.)
     # method defaults to POST when unset (inference never sets it; routes do).
+    # P-DEADLINE: deadline_unix_ns is an optional field — present only when the
+    # Rust server resolved a deadline (client x-lite-timeout / grpc-timeout, or
+    # the server.timeout fallback).
+    deadline_unix_ns = (
+        meta_pb.deadline_unix_ns if meta_pb.HasField("deadline_unix_ns") else None
+    )
     return RequestMeta(
         route=meta_pb.route,
         headers=Headers(dict(meta_pb.headers)),
@@ -166,6 +172,7 @@ def _meta_from_proto(meta_pb) -> RequestMeta:
         timestamp_ns=meta_pb.timestamp_ns,
         method=meta_pb.method or "POST",
         query=dict(meta_pb.query),
+        deadline_unix_ns=deadline_unix_ns,
     )
 
 

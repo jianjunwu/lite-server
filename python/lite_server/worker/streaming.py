@@ -8,6 +8,7 @@ via its bottom re-export block.
 import asyncio
 import inspect
 import logging
+import time
 from typing import Any
 
 from lite_server.api import LitAPI
@@ -577,6 +578,16 @@ async def _process_stream_chunk(
     return True
 
 
+def _deadline_passed(ctx: RequestContext) -> bool:
+    """P-DEADLINE: True when the per-request deadline (UNIX ns) has passed.
+
+    ``None`` (no deadline) → False (unbounded, behavior unchanged). Wall-clock
+    comparison because ``deadline_unix_ns`` is an absolute UNIX timestamp.
+    """
+    ns = ctx.meta.deadline_unix_ns
+    return ns is not None and time.time_ns() >= ns
+
+
 async def _consume_stream(
     lit_api: LitAPI,
     pipe: Pipeline,
@@ -592,6 +603,12 @@ async def _consume_stream(
             async for output in generator:
                 if not await _process_stream_chunk(lit_api, pipe, ctx, output, stream_id, socket, log):
                     return
+                # P-DEADLINE (§4.0.10): cooperative check between chunks — stop
+                # emitting once the deadline has passed (best-effort resource
+                # release; the server also hard-closes the stream).
+                if _deadline_passed(ctx):
+                    log.info("stream %s stopping: deadline reached", stream_id)
+                    break
         else:
             while True:
                 output = await pipe.run_blocking(_next_or_sentinel, generator)
@@ -599,6 +616,9 @@ async def _consume_stream(
                     break
                 if not await _process_stream_chunk(lit_api, pipe, ctx, output, stream_id, socket, log):
                     return
+                if _deadline_passed(ctx):
+                    log.info("stream %s stopping: deadline reached", stream_id)
+                    break
     except asyncio.CancelledError:
         # Propagate cancellation; try to close the generator without waiting
         if not inspect.isasyncgen(generator):
