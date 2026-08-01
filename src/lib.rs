@@ -230,6 +230,7 @@ fn build_runtime(threads: Option<usize>) -> tokio::runtime::Runtime {
     ejection_error_threshold=None,
     ejection_timeout=None,
     ejection_max_percent=None,
+    ejection_max_timeout=None,
     max_retries=None,
     startup_timeout=None,
     health_check_timeout=None,
@@ -263,6 +264,7 @@ fn serve(
     ejection_error_threshold: Option<usize>,
     ejection_timeout: Option<f32>,
     ejection_max_percent: Option<usize>,
+    ejection_max_timeout: Option<f32>,
     max_retries: Option<usize>,
     startup_timeout: Option<f32>,
     health_check_timeout: Option<f32>,
@@ -270,19 +272,32 @@ fn serve(
     worker_kill_timeout: Option<f32>,
     hook_http_timeout: Option<f32>,
 ) -> PyResult<()> {
+    // 原型（方案 A）：tokio runtime 跑在独立 OS 线程，主线程只 join。
+    // 验证 PyO3 嵌入 + 单线程事件循环的每请求固定开销是否来自"事件循环
+    // 跑在 CPython 主线程上"。若有效再整理成正式实现，否则回退。
     pyo3::Python::with_gil(|py| {
         py.allow_threads(|| {
-            run_server(ServerOptions {
-                config, port, host, model_repo, threads, timeout, log_level,
-                log_info_output, log_error_output, log_rotation,
-                metrics_port, no_metrics, grpc_port, no_grpc, no_streaming_metrics,
-                max_queue_size, max_requests, max_requests_jitter, request_timeout,
-                health_check_interval, graceful_timeout, keepalive_timeout,
-                ejection_error_threshold, ejection_timeout, ejection_max_percent,
-                max_retries, startup_timeout, health_check_timeout,
-                health_check_kill_threshold, worker_kill_timeout, hook_http_timeout,
-            })
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+            std::thread::Builder::new()
+                .name("lite-server-main".into())
+                .spawn(move || {
+                    run_server(ServerOptions {
+                        config, port, host, model_repo, threads, timeout, log_level,
+                        log_info_output, log_error_output, log_rotation,
+                        metrics_port, no_metrics, grpc_port, no_grpc, no_streaming_metrics,
+                        max_queue_size, max_requests, max_requests_jitter, request_timeout,
+                        health_check_interval, graceful_timeout, keepalive_timeout,
+                        ejection_error_threshold, ejection_timeout, ejection_max_percent,
+                        ejection_max_timeout,
+                        max_retries, startup_timeout, health_check_timeout,
+                        health_check_kill_threshold, worker_kill_timeout, hook_http_timeout,
+                    })
+                })
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
+                .join()
+                .map_err(|_| {
+                    pyo3::exceptions::PyRuntimeError::new_err("server thread panicked")
+                })?
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })
     })
 }

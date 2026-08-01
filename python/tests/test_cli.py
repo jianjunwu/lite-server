@@ -558,6 +558,7 @@ class TestServeArgs:
             "ejection_error_threshold": 5,
             "ejection_timeout": 45.0,
             "ejection_max_percent": 40,
+            "ejection_max_timeout": 30.0,
             "max_retries": 2,
             "startup_timeout": 90.0,
             "health_check_timeout": 8.0,
@@ -575,5 +576,6 @@ class TestServeArgs:
         assert called_with["max_retries"] == 2
         assert called_with["startup_timeout"] == 90.0
         assert called_with["ejection_error_threshold"] == 5
+        assert called_with["ejection_max_timeout"] == 30.0
         assert called_with["hook_http_timeout"] == 7.0
         assert "transport" not in called_with

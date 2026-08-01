@@ -127,6 +127,12 @@ def main() -> int:
     parser.add_argument(
         "--core", action="store_true", help="Use lite-server-core binary instead of Python CLI"
     )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        help="Tokio worker threads for the Rust HTTP layer (default: auto = CPU cores)",
+    )
     args = parser.parse_args()
 
     # Resolve model repository
@@ -192,6 +198,8 @@ def main() -> int:
         "--log-level", "warning",
         "--timeout", str(args.duration + 10.0),
     ]
+    if args.threads:
+        cmd.extend(["--threads", str(args.threads)])
 
     label = "lite-server-core" if args.core else "lite-server"
     print(f"[{label}] Starting on port {args.port} with {args.workers} workers...")

@@ -48,6 +48,7 @@ def main(argv=None):
     serve_parser.add_argument("--ejection-error-threshold", type=int, help="Consecutive errors before a worker is ejected (0=disable)")
     serve_parser.add_argument("--ejection-timeout", type=float, help="Seconds a worker stays ejected before auto-recovery")
     serve_parser.add_argument("--ejection-max-percent", type=int, help="Max %% of workers ejectable at once (1-100)")
+    serve_parser.add_argument("--ejection-max-timeout", type=float, help="Upper bound for per-worker ejection backoff (seconds)")
     serve_parser.add_argument("--max-retries", type=int, help="Retry a failed batch on a different worker up to N times (0=disable)")
     serve_parser.add_argument("--startup-timeout", type=float, help="Max seconds to wait for a worker ready handshake")
     serve_parser.add_argument("--health-check-timeout", type=float, help="Seconds per health-check probe before timeout")
@@ -147,6 +148,7 @@ def _cmd_serve(args):
             ejection_error_threshold=args.ejection_error_threshold,
             ejection_timeout=args.ejection_timeout,
             ejection_max_percent=args.ejection_max_percent,
+            ejection_max_timeout=args.ejection_max_timeout,
             max_retries=args.max_retries,
             startup_timeout=args.startup_timeout,
             health_check_timeout=args.health_check_timeout,
