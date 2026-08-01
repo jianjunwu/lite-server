@@ -4,7 +4,9 @@
 //! parse proto → call `ModelRegistry` / `WorkerManager` / prometheus →
 //! serialize response. Control-plane mutations (Load / Unload / Reload /
 //! Activate / SetRouting) emit a structured audit log (D27, target
-//! `lite-server::audit`) carrying principal / peer / request_id / operation /
+//! `lite_server::audit` — underscore form so the default `lite_server=<level>`
+//! EnvFilter prefix matches it) carrying principal / peer / request_id /
+//! operation /
 //! target / before-after / result.
 //!
 //! Errors reuse the centralized mapper [`super::app_error_to_grpc_status`]
@@ -85,7 +87,7 @@ fn audit(cx: &Option<RequestContext>, action: &str, model: &str, version: Option
         None => ("", "", None),
     };
     tracing::info!(
-        target: "lite-server::audit",
+        target: "lite_server::audit",
         action = action,
         model = %model,
         version = ?version,
