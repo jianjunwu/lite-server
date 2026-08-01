@@ -153,6 +153,11 @@ pub struct ServerConfig {
     /// (SGLang `--balance-rel-threshold`, as a multiplier, e.g. 1.5 = +50%).
     /// 0.0 disables the relative check.
     pub balance_rel_threshold: f32,
+    /// P9-1 DecoupledInfer: server-side idle timeout (seconds) for a decoupled
+    /// stream — if no chunk arrives within this window, the server closes the
+    /// stream and cancels the worker (reclaims a channel the model left open).
+    /// 0 disables the idle timeout (stream lives until model close / cancel).
+    pub decoupled_idle_timeout_secs: f32,
 }
 
 impl Default for ServerConfig {
@@ -176,6 +181,7 @@ impl Default for ServerConfig {
             max_sequences: 65536,
             balance_abs_threshold: 2,
             balance_rel_threshold: 1.5,
+            decoupled_idle_timeout_secs: 300.0,
         }
     }
 }

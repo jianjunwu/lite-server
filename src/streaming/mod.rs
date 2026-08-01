@@ -1,13 +1,27 @@
 use crate::proto::liteserver as pb;
 
 /// Build a protobuf StreamRequest::Open.
-pub fn build_stream_open(stream_id: String, data: bytes::Bytes, meta: Option<pb::RequestMeta>) -> pb::Request {
+///
+/// `decoupled` (P9-1): when true, sets the additive `StreamOpen.decoupled`
+/// flag so the worker keeps the channel open after `predict_decoupled`
+/// returns (model-controlled lifetime). False/None preserves the existing
+/// stream_predict semantics on the wire.
+pub fn build_stream_open(
+    stream_id: String,
+    data: bytes::Bytes,
+    meta: Option<pb::RequestMeta>,
+    decoupled: bool,
+) -> pb::Request {
     pb::Request {
         uid: format!("stream-open-{}", stream_id),
         meta: meta.clone(),
         payload: Some(pb::request::Payload::Stream(pb::StreamRequest {
             stream_id,
-            action: Some(pb::stream_request::Action::Open(pb::StreamOpen { data, meta })),
+            action: Some(pb::stream_request::Action::Open(pb::StreamOpen {
+                data,
+                meta,
+                decoupled: if decoupled { Some(true) } else { None },
+            })),
         })),
     }
 }
@@ -56,7 +70,7 @@ mod tests {
 
     #[test]
     fn test_build_stream_open() {
-        let req = build_stream_open("s1".to_string(), bytes::Bytes::from_static(b"data"), None);
+        let req = build_stream_open("s1".to_string(), bytes::Bytes::from_static(b"data"), None, false);
         assert_eq!(req.uid, "stream-open-s1");
         match req.payload {
             Some(pb::request::Payload::Stream(s)) => {
@@ -64,10 +78,28 @@ mod tests {
                 match s.action {
                     Some(pb::stream_request::Action::Open(o)) => {
                         assert_eq!(o.data, &b"data"[..]);
+                        // decoupled=false → field absent (wire backward-compat).
+                        assert_eq!(o.decoupled, None);
                     }
                     _ => panic!("expected open action"),
                 }
             }
+            _ => panic!("expected stream payload"),
+        }
+    }
+
+    #[test]
+    fn test_build_stream_open_decoupled() {
+        // P9-1: decoupled=true sets the additive flag the worker reads to
+        // keep the channel open after predict_decoupled returns.
+        let req = build_stream_open("s1".to_string(), bytes::Bytes::from_static(b"data"), None, true);
+        match req.payload {
+            Some(pb::request::Payload::Stream(s)) => match s.action {
+                Some(pb::stream_request::Action::Open(o)) => {
+                    assert_eq!(o.decoupled, Some(true));
+                }
+                _ => panic!("expected open action"),
+            },
             _ => panic!("expected stream payload"),
         }
     }
@@ -122,7 +154,7 @@ mod tests {
             payload: Default::default(),
             ..Default::default()
         };
-        let req = build_stream_open("s1".to_string(), bytes::Bytes::from_static(b"d"), Some(meta));
+        let req = build_stream_open("s1".to_string(), bytes::Bytes::from_static(b"d"), Some(meta), false);
         match req.payload {
             Some(pb::request::Payload::Stream(s)) => match s.action {
                 Some(pb::stream_request::Action::Open(o)) => {

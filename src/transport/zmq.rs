@@ -726,6 +726,7 @@ mod tests {
                 action: Some(pb::stream_request::Action::Open(pb::StreamOpen {
                     data: bytes::Bytes::from_static(b"{}"),
                     meta: None,
+                    decoupled: None,
                 })),
             })),
         };

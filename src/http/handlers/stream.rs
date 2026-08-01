@@ -67,7 +67,7 @@ async fn open_worker_stream(
 
     let client = &clients[worker_id];
     let stream_id = format!("stream-{}", Uuid::new_v4());
-    let open_req = streaming::build_stream_open(stream_id.clone(), payload_bytes, Some(meta));
+    let open_req = streaming::build_stream_open(stream_id.clone(), payload_bytes, Some(meta), false);
 
     let chunk_rx = client.send_stream(open_req, stream_id.clone()).await?;
     Ok((stream_id, chunk_rx))

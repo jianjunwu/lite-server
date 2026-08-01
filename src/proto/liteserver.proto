@@ -90,6 +90,12 @@ message StreamRequest {
 message StreamOpen {
   bytes data = 1;
   RequestMeta meta = 2;
+  // P9-1 DecoupledInfer: when true, the worker must NOT emit StreamDone when
+  // its predict_decoupled() returns — the model holds the ResponseSender and
+  // pushes N chunks asynchronously, ending the stream with an explicit
+  // close() (or the server reclaims it via idle timeout / client cancel).
+  // Additive: absent/false = existing stream_predict semantics (unchanged).
+  optional bool decoupled = 3;
 }
 
 message StreamChunk {
@@ -210,6 +216,10 @@ service LiteServer {
   rpc BatchInfer(BatchInferRequest) returns (BatchInferResponse);
   rpc StreamInfer(StreamInferRequest) returns (stream StreamChunk);
   rpc BidiStream(stream BidiChunk) returns (stream BidiChunk);
+  // P9-1 (蓝图 §4.4, D18): one request → worker pushes N async responses
+  // over a long-lived channel whose lifetime the model controls (returns
+  // before close). Reuses the ZMQ stream mechanism with StreamOpen.decoupled.
+  rpc DecoupledInfer(DecoupledInferRequest) returns (stream DecoupledResponse);
 }
 
 message InferRequest {
@@ -266,6 +276,24 @@ message BidiData {
 }
 
 message BidiClose {
+}
+
+// P9-1 DecoupledInfer (蓝图 §4.4). gRPC-only messages — the worker never sees
+// these; it speaks the ZMQ stream protocol (StreamOpen{decoupled=true} +
+// StreamChunkResponse + StreamDone). The Rust handler translates between them.
+message DecoupledInferRequest {
+  string model_name = 1;
+  string version = 2;
+  bytes data = 3;
+  map<string, string> headers = 4;
+  optional string sequence_id = 5;   // P8-1 联动：粘性路由 hint
+}
+
+message DecoupledResponse {
+  bytes data = 1;
+  // true on the terminal frame (model called sender.close()); the stream ends
+  // after it. Non-terminal chunks carry the pushed payload.
+  bool is_final = 2;
 }
 
 // ===== Admin Service (P6, 蓝图 §4.1) =====

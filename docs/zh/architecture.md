@@ -132,6 +132,36 @@ lite-server 是 Rust + Python 混合架构的推理服务器。Rust 内核处理
 4. 连接关闭或取消 → on_close() → 清理资源
 ```
 
+### 解耦流式（P9-1）
+
+`DecoupledInfer`（gRPC）是 1:N 流，其通道生命周期由**模型**控制。与
+`stream_predict`（worker *拉取*的生成器，耗尽即结束）不同，模型在
+`predict_decoupled(data, sender)` 中收到一个异步 `sender`，且可**在流结束前
+返回**——异步推送 N 个响应（逐 token / 多候选 / 进度），最终
+`await sender.close()` 结束：
+
+```
+gRPC DecoupledInfer ──► Rust 以 StreamOpen.decoupled=true 开流
+        │
+        ▼
+Worker: predict_decoupled(data, sender) 返回（通道保持打开）
+        │
+        ▼
+sender.send(chunk) × N  ──►  DecoupledResponse{is_final=false}
+        │
+        ▼
+sender.close()  ──►  DecoupledResponse{is_final=true}（终结帧）
+```
+
+服务端经 `server.decoupled_idle_timeout_secs`（默认 300 秒；0 = 关闭）或客户端
+断连（cancel 传播至 worker，sender 失效）回收未关闭的通道。未实现
+`predict_decoupled` 的模型返回 `FailedPrecondition`。
+
+> **背压。** Rust↔worker 链路为 ZMQ `PAIR` + 阻塞发送——慢 worker 使发送方阻塞
+> 而非静默丢（P9-1 已核实）。Rust 进程内到 gRPC 客户端的 `mpsc(64)` 桥在慢
+> *端客户端*时驱逐流（load shedding）——这是所有流共有的既有行为，归可靠性
+> 阶段（P-FLOW）；DecoupledInfer 原样继承。
+
 ## Batching 模式
 
 当 `max_batch_size > 1` 时：

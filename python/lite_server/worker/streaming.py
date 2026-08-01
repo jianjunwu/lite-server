@@ -103,6 +103,90 @@ class _BidiSession:
         self.ctx = ctx
 
 
+class _DecoupledSession:
+    """Per-stream state for decoupled (predict_decoupled) streaming (P9-1).
+
+    The channel stays open after predict_decoupled returns; the model pushes
+    via ``sender`` and ends with ``sender.close()``. Outlives the open call,
+    like :class:`_BidiSession`, so close/cancel (client disconnect) and
+    shutdown can reach the sender.
+    """
+
+    __slots__ = ("sender", "ctx")
+
+    def __init__(self, sender: "_ResponseSender", ctx: RequestContext):
+        self.sender = sender
+        self.ctx = ctx
+
+
+class _ResponseSender:
+    """Concrete :class:`lite_server.api.ResponseSender` (P9-1) handed to
+    ``predict_decoupled``. The model pushes via :meth:`send` and ends with
+    :meth:`close`; after ``close()``/:meth:`cancel` the sender is closed and
+    further calls are no-ops.
+
+    Lives on the worker's single asyncio loop, so no locking is needed — but
+    the model must not push concurrently from multiple tasks on one sender
+    (``ctx`` is shared across sends).
+    """
+
+    def __init__(self, lit_api, pipe, stream_id, socket, log, ctx: RequestContext,
+                 active_streams: dict):
+        self._lit_api = lit_api
+        self._pipe = pipe
+        self._stream_id = stream_id
+        self._socket = socket
+        self._log = log
+        self._ctx = ctx
+        self._active_streams = active_streams
+        self.closed = False
+
+    async def send(self, obj: Any) -> None:
+        if self.closed:
+            return
+        # Mirror _process_stream_chunk: postprocess (on_output → encode →
+        # on_response) then emit one StreamChunkResponse.
+        self._ctx.output = obj
+        self._ctx.early = None
+        try:
+            await self._pipe.postprocess(self._ctx)
+        except HTTPException as e:
+            self._log.warning("decoupled send rejected for %s: %s", self._stream_id, e.detail)
+            await self._pipe.run_on_error(self._ctx, e)
+            await self._socket.send(_make_stream_error(self._stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
+            self.closed = True
+            return
+        except Exception as e:
+            self._log.error("decoupled send failed for %s: %s", self._stream_id, _format_exc_brief(e))
+            await self._pipe.run_on_error(self._ctx, e)
+            await self._socket.send(_make_stream_error(self._stream_id, f"send failed: {e}").SerializeToString())
+            self.closed = True
+            return
+        if self._ctx.early is not None:
+            await _send_stream_early(self._socket, self._stream_id, self._ctx.early, self._lit_api)
+            # An early return ends the stream.
+            await self.close()
+            return
+        body, _ = unwrap_response(self._ctx.response)
+        await self._socket.send(_make_stream_chunk(self._stream_id, serialize_body(body), is_final=False).SerializeToString())
+
+    async def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        metrics = collect_metrics(self._lit_api)
+        await self._socket.send(_make_stream_done(self._stream_id, metrics).SerializeToString())
+        # Model-initiated close: drop the session so the channel is reclaimed.
+        # (Server-initiated cancel pops active_streams before calling cancel().)
+        self._active_streams.pop(self._stream_id, None)
+
+    def cancel(self) -> None:
+        """Cooperative cancel (client disconnect / shutdown). Subsequent
+        send()/close() are no-ops. No StreamDone is sent (cancel semantics
+        match bidi/uni streams)."""
+        self.closed = True
+
+
 async def _close_bidi_quietly(on_close, ctx, stream_id, log) -> Any:
     """Best-effort bidi ``on_close`` (exception-isolated): balances a
     completed ``on_open`` exactly once — close/cancel, worker shutdown,
@@ -189,6 +273,10 @@ async def _handle_stream_async(
                 await entry
             except asyncio.CancelledError:
                 pass
+        elif isinstance(entry, _DecoupledSession):
+            # P9-1: cooperative cancel — signal the sender so the model's push
+            # loop stops. No StreamDone on cancel (matches bidi/uni semantics).
+            entry.sender.cancel()
 
 
 async def _handle_stream_open_async(
@@ -208,6 +296,59 @@ async def _handle_stream_open_async(
         route="", headers=Headers(), client_ip="", request_id="", timestamp_ns=0,
     )
     pipe = _get_pipeline(lit_api)
+
+    # --- Decoupled streaming (predict_decoupled, P9-1) --------------------
+    # The additive StreamOpen.decoupled flag is set by the Rust DecoupledInfer
+    # handler. Distinct from stream_predict: the channel stays open after
+    # predict_decoupled returns — the model pushes via sender and ends with
+    # close() (or the server reclaims via idle timeout / client disconnect).
+    # Checked before bidi/fallback/stream_predict because the flag is the
+    # explicit path signal.
+    is_decoupled = bool(open_req.decoupled) if open_req else False
+    if is_decoupled:
+        if not pipe.has_predict_decoupled:
+            log.warning("decoupled stream %s: model does not implement predict_decoupled", stream_id)
+            await socket.send(_make_stream_error(
+                stream_id, "predict_decoupled is not implemented by this model",
+                error_type="not_implemented").SerializeToString())
+            return
+        ctx = RequestContext(meta=meta, request={})
+        try:
+            ctx.request = _parse_json_payload(data)
+            await pipe.preprocess(ctx)
+        except HTTPException as e:
+            log.warning("decoupled preprocess rejected for %s: %s", stream_id, e.detail)
+            await pipe.run_on_error(ctx, e)
+            await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
+            return
+        except Exception as e:
+            log.warning("decoupled preprocess failed for %s: %s", stream_id, _format_exc_brief(e))
+            await pipe.run_on_error(ctx, e)
+            await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
+            return
+        if ctx.early is not None:
+            await _send_stream_early(socket, stream_id, ctx.early, lit_api)
+            return
+
+        sender = _ResponseSender(lit_api, pipe, stream_id, socket, log, ctx, active_streams)
+        try:
+            await pipe.predict_decoupled(ctx.input, sender, ctx=ctx)
+        except HTTPException as e:
+            log.warning("predict_decoupled rejected for %s: %s", stream_id, e.detail)
+            await pipe.run_on_error(ctx, e)
+            await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
+            return
+        except Exception as e:
+            log.error("predict_decoupled failed for %s: %s", stream_id, _format_exc_brief(e))
+            await pipe.run_on_error(ctx, e)
+            await socket.send(_make_stream_error(stream_id, f"predict_decoupled failed: {e}").SerializeToString())
+            return
+        # The model may have returned without closing (background pushing).
+        # Register a session so close/cancel and shutdown can find the sender
+        # — this is what keeps the channel open past the open call.
+        if not sender.closed:
+            active_streams[stream_id] = _DecoupledSession(sender, ctx)
+        return
 
     # --- Bidirectional streaming ------------------------------------------
     if pipe.has_bidi_stream:

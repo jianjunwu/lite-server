@@ -31,6 +31,9 @@ server:
   balance_abs_threshold: 2     # B2：粘性 worker 在途数超过最少负载 worker 多少即回退
                                # （SGLang --balance-abs-threshold 语义；0 = 关闭）
   balance_rel_threshold: 1.5   # B2：相对阈值（…× 倍数；0.0 = 关闭）
+  decoupled_idle_timeout_secs: 300.0  # P9-1：DecoupledInfer 流的 idle 超时（秒）——窗口内无
+                               # chunk 到达 → 服务端关闭并取消 worker。0 = 关闭
+                               # （流存活至模型 close / 客户端取消）
 
 logging:
   level: info                  # 日志级别：trace, debug, info, warn, error

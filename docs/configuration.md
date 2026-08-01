@@ -31,6 +31,9 @@ server:
   balance_abs_threshold: 2     # B2: abandon a sticky worker once its in-flight exceeds the
                                # least-loaded by this many (SGLang --balance-abs-threshold; 0 = off)
   balance_rel_threshold: 1.5   # B2: relative complement (...* multiplier; 0.0 = off)
+  decoupled_idle_timeout_secs: 300.0  # P9-1: idle timeout (s) for a DecoupledInfer stream — no
+                               # chunk within this window → server closes + cancels the worker.
+                               # 0 = disabled (stream lives until model close / client cancel)
 
 logging:
   level: info                  # Log level: trace, debug, info, warn, error

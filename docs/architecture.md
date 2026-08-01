@@ -133,6 +133,39 @@ When model implements `bidi_stream()` (ASR, real-time dialogue, etc.):
 4. Connection closed or cancelled → on_close() → cleanup resources
 ```
 
+### Decoupled Streaming (P9-1)
+
+`DecoupledInfer` (gRPC) is a 1:N stream whose channel lifetime the **model**
+controls. Unlike `stream_predict` (a generator the worker *pulls* from, ending
+when it exhausts), the model receives an async `sender` in
+`predict_decoupled(data, sender)` and may **return before the stream is done** —
+pushing N responses asynchronously (token-by-token, multiple candidates,
+progress) and ending with `await sender.close()`:
+
+```
+gRPC DecoupledInfer ──► Rust opens a stream with StreamOpen.decoupled=true
+        │
+        ▼
+Worker: predict_decoupled(data, sender) returns (channel stays open)
+        │
+        ▼
+sender.send(chunk) × N  ──►  DecoupledResponse{is_final=false}
+        │
+        ▼
+sender.close()  ──►  DecoupledResponse{is_final=true}  (terminal)
+```
+
+The server reclaims an open channel via `server.decoupled_idle_timeout_secs`
+(default 300s; 0 = disabled) or on client disconnect (cancel propagates to the
+worker, the sender is invalidated). A model without `predict_decoupled` fails
+with `FailedPrecondition`.
+
+> **Backpressure.** The Rust↔worker link is ZMQ `PAIR` with blocking sends — a
+> slow worker blocks the sender rather than silently dropping (verified for P9-1).
+> The in-process `mpsc(64)` bridge to the gRPC client evicts a stream on a slow
+> *end-client* (load shedding) — a pre-existing property shared with all streams,
+> owned by the reliability phase (P-FLOW); DecoupledInfer inherits it unchanged.
+
 ## Batching Mode
 
 When `max_batch_size > 1`:

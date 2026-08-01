@@ -353,6 +353,11 @@ async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.
         if isinstance(entry, _BidiSession):
             await _close_bidi_quietly(entry.on_close, entry.ctx, sid, log)
             active_streams.pop(sid, None)
+        elif isinstance(entry, _DecoupledSession):
+            # P9-1: signal the decoupled sender so the model's push loop can
+            # release resources (cooperative cancel, no StreamDone).
+            entry.sender.cancel()
+            active_streams.pop(sid, None)
 
     if cancelled:
         raise asyncio.CancelledError()
@@ -492,6 +497,7 @@ from lite_server.worker.streaming import (  # noqa: E402,F401
     _BidiSession,
     _close_bidi_quietly,
     _consume_stream,
+    _DecoupledSession,
     _handle_stream_async,
     _handle_stream_chunk_async,
     _handle_stream_open_async,

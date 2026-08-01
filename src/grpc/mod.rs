@@ -63,6 +63,10 @@ pub struct GrpcService {
     /// Per-request inference deadline. Mirrors the REST path's
     /// `config.server.timeout` so gRPC and HTTP share one request budget.
     server_timeout: Duration,
+    /// P9-1 DecoupledInfer: server-side idle timeout for a decoupled stream.
+    /// None = disabled (stream lives until model close / client cancel).
+    /// Derived from `config.server.decoupled_idle_timeout_secs` (0 → None).
+    decoupled_idle_timeout: Option<Duration>,
     /// Shared per-instance rate limiter（P3-1：构造上移 server/mod.rs，HTTP/gRPC
     /// 共用同一实例 + 60s cleanup task）。进程内 DashMap → per-instance（多副本
     /// 实际限额 = N×配置值；全局限流属上游网关职责，§4.1 P3-1 评审 2.2）。
@@ -86,6 +90,7 @@ impl GrpcService {
         shutdown_state: Arc<crate::server::ShutdownState>,
         server_timeout: Duration,
         rate_limiter: Arc<crate::rate_limit::RateLimiter>,
+        decoupled_idle_timeout: Option<Duration>,
         app_state: Arc<AppState>,
     ) -> Self {
         Self {
@@ -97,6 +102,7 @@ impl GrpcService {
             shutdown_state,
             server_timeout,
             rate_limiter,
+            decoupled_idle_timeout,
             app_state,
         }
     }
@@ -558,7 +564,7 @@ impl GrpcService {
         let sequence_id = meta.sequence_id.clone();
 
         let stream_id = format!("grpc-stream-{}", Uuid::new_v4());
-        let open_req = streaming::build_stream_open(stream_id.clone(), req.data, Some(meta));
+        let open_req = streaming::build_stream_open(stream_id.clone(), req.data, Some(meta), false);
 
         let clients = self
             .worker_manager
@@ -683,6 +689,240 @@ impl GrpcService {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
+    async fn decoupled_infer_impl(
+        &self,
+        request: Request<pb::DecoupledInferRequest>,
+        version_label: &mut String,
+        request_id_out: &mut String,
+        start: Instant,
+    ) -> Result<Response<ReceiverStream<Result<pb::DecoupledResponse, Status>>>, Status> {
+        // P9-1 (蓝图 §4.4, D18): DecoupledInfer = a stream whose channel the
+        // MODEL controls — predict_decoupled returns before close(), the worker
+        // pushes N async chunks, ending with sender.close(). Reuses the ZMQ
+        // stream mechanism with StreamOpen.decoupled=true; the only new logic
+        // vs stream_infer is the idle-timeout wrapper and the DecoupledResponse
+        // mapping. Thin translation layer (D3): resolve → auth → rate-limit →
+        // open a decoupled stream → forward chunks.
+        let remote_addr = request.remote_addr();
+        let (grpc_metadata, extensions, req) = request.into_parts();
+        let cx = interceptor::finalize_context(
+            extensions.get::<RequestContext>().cloned(),
+            &grpc_metadata,
+            &req.headers,
+            remote_addr,
+        );
+        let request_id = cx.request_id;
+        *request_id_out = request_id.clone();
+        let client_ip = cx.client_ip;
+        let model_name = &req.model_name;
+        let version = if req.version.is_empty() {
+            None
+        } else {
+            Some(req.version.as_str())
+        };
+
+        if let Err(e) = crate::validation::validate_identifier(model_name) {
+            return Err(err(Status::invalid_argument(e.to_string())));
+        }
+
+        let resolved_version = match version {
+            Some(v) => v.to_string(),
+            None => match canary_pin(
+                &self.registry,
+                self.canary_override,
+                model_name,
+                &grpc_metadata,
+                &req.headers,
+            )? {
+                Some(pin) => pin,
+                None => self
+                    .registry
+                    .routing_pick(model_name)
+                    .or_else(|| self.registry.get_active_version(model_name))
+                    .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
+            },
+        };
+        self.registry.touch_last_used(model_name, &resolved_version);
+        *version_label = resolved_version.clone();
+
+        if !self.registry.is_ready(model_name, Some(&resolved_version)) {
+            return Err(err(Status::unavailable(format!(
+                "{} version {} is not ready",
+                model_name, resolved_version
+            ))));
+        }
+
+        if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
+            enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
+            enforce_grpc_rate_limit(&self.rate_limiter, mv.policies.rate_limit.as_ref(), model_name, &client_ip)?;
+        }
+
+        let header_map: HashMap<String, String> = req.headers.clone();
+        let meta = pb::RequestMeta {
+            route: "/predict".to_string(),
+            headers: header_map,
+            client_ip,
+            request_id,
+            timestamp_ns: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i64,
+            payload: req.data.clone(),
+            sequence_id: req.sequence_id.clone(),
+            ..Default::default()
+        };
+        // Capture before `meta` moves into `open_req` (used by the affinity pick).
+        let sequence_id = meta.sequence_id.clone();
+
+        let stream_id = format!("grpc-decoupled-{}", Uuid::new_v4());
+        // decoupled=true → the worker keeps the channel open after
+        // predict_decoupled returns (model-controlled lifetime).
+        let open_req = streaming::build_stream_open(stream_id.clone(), req.data, Some(meta), true);
+
+        let clients = self
+            .worker_manager
+            .get_zmq_clients(model_name, &resolved_version)
+            .await
+            .ok_or_else(|| err(Status::unavailable("no workers available")))?;
+        if clients.is_empty() {
+            return Err(err(Status::unavailable("no workers available")));
+        }
+
+        // P8-1 sticky pick (same block as stream_infer — direct connect).
+        let outlier = self
+            .worker_manager
+            .get_outlier_state(model_name.as_str(), &resolved_version)
+            .await;
+        let seq_registry = self.app_state.inference_queue.sequence_registry();
+        let num_workers = clients.len();
+        let preferred = sequence_id.as_deref().and_then(|seq| {
+            let w = seq_registry.lookup(seq, model_name, &resolved_version)?;
+            let ejected = outlier.as_ref().map(|o| o.is_ejected(w)).unwrap_or(false);
+            (w < num_workers && !ejected).then_some(w)
+        });
+        let worker_id = preferred.unwrap_or_else(|| match &outlier {
+            Some(o) => crate::worker::pick_worker_skip_ejected(num_workers, o),
+            None => crate::worker::pick_worker_random(num_workers),
+        });
+        if let Some(seq) = sequence_id.as_deref() {
+            seq_registry.record(seq, model_name, &resolved_version, worker_id);
+        }
+        let client = clients[worker_id].clone();
+        crate::metrics::prometheus::record_worker_inference(
+            model_name,
+            &resolved_version,
+            worker_id,
+            1,
+        );
+
+        let mut chunk_rx = client
+            .send_stream(open_req, stream_id.clone())
+            .await
+            .map_err(|e| err(Status::internal(format!("worker stream error: {}", e))))?;
+
+        let (tx, rx) = mpsc::channel(64);
+        let cancel_client = client.clone();
+
+        let stream_metrics = self.streaming_metrics;
+        let metrics_model = model_name.to_string();
+        let metrics_version = resolved_version.clone();
+        if stream_metrics {
+            crate::metrics::prometheus::record_stream_open(&metrics_model, &metrics_version, "grpc");
+        }
+
+        let idle = self.decoupled_idle_timeout;
+        tokio::spawn(async move {
+            let open_time = std::time::Instant::now();
+            let mut first_chunk = true;
+            let mut last_chunk_time = open_time;
+            // P2-1：流关闭时记一次整体 duration；中途 worker 错误按其状态族记。
+            let mut stream_family = "2xx";
+
+            loop {
+                // P9-1 idle timeout: reclaim a channel the model left open if no
+                // chunk arrives within the configured window (None = disabled).
+                let item = match idle {
+                    Some(d) => match tokio::time::timeout(d, chunk_rx.recv()).await {
+                        Ok(v) => v,
+                        Err(_) => {
+                            tracing::warn!(
+                                "decoupled stream {} idle-timeout ({}s), closing",
+                                stream_id, d.as_secs()
+                            );
+                            break;
+                        }
+                    },
+                    None => chunk_rx.recv().await,
+                };
+                let chunk = match item {
+                    None => break, // actor dropped the route (Done/Error forwarded)
+                    Some(c) => c,
+                };
+                match chunk.payload {
+                    Some(pb::stream_response::Payload::Chunk(ref c)) => {
+                        if stream_metrics {
+                            if first_chunk {
+                                crate::metrics::prometheus::record_stream_ttft(&metrics_model, &metrics_version, "grpc", open_time.elapsed().as_secs_f64());
+                                first_chunk = false;
+                            } else {
+                                crate::metrics::prometheus::record_stream_tbt(&metrics_model, &metrics_version, "grpc", last_chunk_time.elapsed().as_secs_f64());
+                            }
+                            last_chunk_time = std::time::Instant::now();
+                            crate::metrics::prometheus::record_stream_chunk(&metrics_model, &metrics_version, "grpc");
+                        }
+                        let resp = pb::DecoupledResponse { data: c.data.clone(), is_final: false };
+                        if tx.send(Ok(resp)).await.is_err() {
+                            break; // client disconnect
+                        }
+                    }
+                    Some(pb::stream_response::Payload::Error(ref e)) => {
+                        let grpc_err = match serde_json::from_str::<serde_json::Value>(&e.message) {
+                            Ok(val) => {
+                                if let Some(parsed) = try_parse_model_error(&val) {
+                                    model_error_status(
+                                        error_type_to_grpc_code(&parsed.error_type),
+                                        &parsed,
+                                    )
+                                } else {
+                                    err(Status::internal(e.message.clone()))
+                                }
+                            }
+                            Err(_) => err(Status::internal(e.message.clone())),
+                        };
+                        stream_family = grpc_code_to_status_family(grpc_err.code());
+                        let _ = tx.send(Err(grpc_err)).await;
+                        break;
+                    }
+                    Some(pb::stream_response::Payload::Done(_)) => {
+                        // Model called sender.close(): emit the terminal is_final
+                        // frame, then end the gRPC stream.
+                        let _ = tx
+                            .send(Ok(pb::DecoupledResponse { data: Default::default(), is_final: true }))
+                            .await;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if stream_metrics {
+                crate::metrics::prometheus::record_stream_close(&metrics_model, &metrics_version, "grpc");
+            }
+            crate::metrics::prometheus::record_request_end(
+                &metrics_model,
+                &metrics_version,
+                stream_family,
+                start.elapsed().as_secs_f64(),
+            );
+            // Cleanup: cancel the worker. send_raw = fire-and-forget: a
+            // stream-cancel gets no unary reply, so this avoids the phantom
+            // 300s await of send() (对齐 HTTP stream.rs cancel path).
+            let cancel_req = streaming::build_stream_cancel(stream_id);
+            let _ = cancel_client.send_raw(cancel_req).await;
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
     async fn bidi_stream_impl(
         &self,
         request: Request<Streaming<pb::BidiChunk>>,
@@ -794,7 +1034,7 @@ impl GrpcService {
             ..Default::default()
         };
 
-        let open_req = streaming::build_stream_open(stream_id.clone(), initial_data, Some(meta));
+        let open_req = streaming::build_stream_open(stream_id.clone(), initial_data, Some(meta), false);
 
         let clients = self
             .worker_manager
@@ -1022,6 +1262,8 @@ fn error_type_to_grpc_code(error_type: &str) -> tonic::Code {
         "permission_denied_error" => tonic::Code::PermissionDenied,
         "not_found_error" => tonic::Code::NotFound,
         "service_unavailable" | "model_not_ready" => tonic::Code::Unavailable,
+        // P9-1: a decoupled stream on a model without predict_decoupled.
+        "not_implemented" => tonic::Code::FailedPrecondition,
         _ => tonic::Code::Internal,
     }
 }
@@ -1502,6 +1744,49 @@ impl LiteServer for GrpcService {
         echo_grpc_response_headers(result, &request_id, start)
     }
 
+    type DecoupledInferStream = ReceiverStream<Result<pb::DecoupledResponse, Status>>;
+
+    async fn decoupled_infer(
+        &self,
+        request: Request<pb::DecoupledInferRequest>,
+    ) -> Result<Response<Self::DecoupledInferStream>, Status> {
+        // P9-1 DecoupledInfer (蓝图 §4.4): same InflightGuard / span / metric /
+        // header-echo wrapper as stream_infer; the lifetime difference (model
+        // holds the channel open past predict_decoupled) is in _impl.
+        let _guard = InflightGuard::new(self.shutdown_state.clone());
+        let start = Instant::now();
+        let model_label = request.get_ref().model_name.clone();
+        let span_version = if request.get_ref().version.is_empty() {
+            "auto".to_string()
+        } else {
+            request.get_ref().version.clone()
+        };
+        let span_rid = metadata_request_id(request.metadata());
+        let span = tracing::info_span!(
+            "inference",
+            model = %model_label,
+            version = %span_version,
+            request_id = %span_rid,
+            method = "decoupled_infer",
+            pinned_version = tracing::field::Empty,
+        );
+        let mut version_label = request.get_ref().version.clone();
+        let mut request_id = String::new();
+        let result = self
+            .decoupled_infer_impl(request, &mut version_label, &mut request_id, start)
+            .instrument(span)
+            .await;
+        if let Err(s) = &result {
+            crate::metrics::prometheus::record_request_end(
+                &model_label,
+                &version_label,
+                grpc_code_to_status_family(s.code()),
+                start.elapsed().as_secs_f64(),
+            );
+        }
+        echo_grpc_response_headers(result, &request_id, start)
+    }
+
     type BidiStreamStream = ReceiverStream<Result<pb::BidiChunk, Status>>;
 
     async fn bidi_stream(
@@ -1605,6 +1890,12 @@ pub async fn start_grpc_server(
         shutdown_state,
         server_timeout,
         rate_limiter,
+        // P9-1: decoupled stream idle timeout (0 → disabled / None).
+        if config.server.decoupled_idle_timeout_secs > 0.0 {
+            Some(Duration::from_secs_f32(config.server.decoupled_idle_timeout_secs))
+        } else {
+            None
+        },
         app_state,
     );
     let server = LiteServerServer::new(service);
@@ -2273,6 +2564,8 @@ mod tests {
         assert_eq!(error_type_to_grpc_code("not_found_error"), tonic::Code::NotFound);
         assert_eq!(error_type_to_grpc_code("service_unavailable"), tonic::Code::Unavailable);
         assert_eq!(error_type_to_grpc_code("model_not_ready"), tonic::Code::Unavailable);
+        // P9-1: decoupled stream on a model without predict_decoupled.
+        assert_eq!(error_type_to_grpc_code("not_implemented"), tonic::Code::FailedPrecondition);
         // Unknown falls back to Internal
         assert_eq!(error_type_to_grpc_code("UNKNOWN_CODE"), tonic::Code::Internal);
     }
@@ -2657,6 +2950,7 @@ mod request_metrics_tests {
             Arc::new(crate::server::ShutdownState::new()),
             Duration::from_secs(5),
             Arc::new(crate::rate_limit::RateLimiter::default()),
+            None, // P9-1 decoupled idle timeout — unused in these unit tests.
             app_state,
         )
     }

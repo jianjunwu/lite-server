@@ -15,7 +15,7 @@ import logging
 import threading
 import warnings
 from dataclasses import dataclass
-from typing import Any, ClassVar, Iterator, List, Tuple
+from typing import Any, ClassVar, Iterator, List, Protocol, Tuple
 
 from lite_server.context import RequestContext
 
@@ -27,6 +27,22 @@ class _MetricSpec:
     name: str
     metric_type: str  # "gauge" | "counter" | "histogram"
     metric_id: int = 0  # per-type index for Rust-side Vec lookup
+
+
+class ResponseSender(Protocol):
+    """Push handle handed to :meth:`LitAPI.predict_decoupled` (P9-1).
+
+    The model calls ``await send(obj)`` per chunk and ``await close()`` to
+    end the stream. After ``close()`` or a server-side cancel, ``closed`` is
+    True and further ``send``/``close`` calls are no-ops. The concrete worker
+    implementation lives in ``lite_server.worker.streaming``.
+    """
+
+    closed: bool
+
+    async def send(self, obj: Any) -> None: ...
+    async def close(self) -> None: ...
+    def cancel(self) -> None: ...
 
 
 class BidiStreamHandler:
@@ -318,6 +334,35 @@ class LitAPI:
 
         The handler must implement ``on_open``, ``on_chunk``, and
         ``on_close`` — each may also declare ``ctx``.
+        """
+        raise NotImplementedError
+
+    async def predict_decoupled(self, data: Any, sender: "ResponseSender") -> None:
+        """Decoupled 1:N inference (P9-1 DecoupledInfer).
+
+        Unlike :meth:`stream_predict` (a generator the worker *pulls* from),
+        the model receives a push ``sender`` handle and may **return before
+        the stream is done** — pushing N responses asynchronously
+        (token-by-token, multiple candidates, progress) and ending with
+        ``await sender.close()``. The channel stays open after this method
+        returns; its lifetime is controlled explicitly by the model (or
+        reclaimed by the server via idle timeout / client disconnect).
+
+        Must be ``async`` (the sender is async). Override to enable;
+        otherwise a ``DecoupledInfer`` request fails with FailedPrecondition.
+
+        Example::
+
+            async def predict_decoupled(self, data, sender):
+                for tok in self.model.generate(data):
+                    await sender.send({"token": tok})
+                await sender.close()
+
+        To access the per-stream context, declare a parameter named exactly
+        ``ctx`` (after ``sender``)::
+
+            async def predict_decoupled(self, data, sender, ctx):
+                ...
         """
         raise NotImplementedError
 

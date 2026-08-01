@@ -360,6 +360,13 @@ class Pipeline:
             if self.has_bidi_stream
             else None
         )
+        # P9-1 DecoupledInfer: predict_decoupled(data, sender) — adapted with
+        # the same ctx-injecting wrapper (sender is passed positionally).
+        self._predict_decoupled = (
+            _wrap_ctx_method(lit_api.predict_decoupled, "predict_decoupled")
+            if self.has_predict_decoupled
+            else None
+        )
 
         # --- Hook chains: one wrapper for LitAPI and Callback hooks -------
         self._chains: dict[str, list[Callable]] = {name: [] for name in _DATA_HOOKS}
@@ -512,6 +519,12 @@ class Pipeline:
         return _overrides(type(self.lit_api), "bidi_stream", LitAPI)
 
     @property
+    def has_predict_decoupled(self) -> bool:
+        """True only when the subclass actually overrides predict_decoupled
+        (P9-1 DecoupledInfer)."""
+        return _overrides(type(self.lit_api), "predict_decoupled", LitAPI)
+
+    @property
     def has_batch_methods(self) -> bool:
         # The worker batch-predicts (batch → predict → unbatch) when EITHER
         # the server is configured to group requests (max_batch_size > 1) OR
@@ -661,6 +674,11 @@ class Pipeline:
     async def stream_predict(self, x: Any, ctx: RequestContext):
         """Return the user's (sync or async) generator for streaming."""
         return await self._stream_producer(x, ctx=ctx)
+
+    async def predict_decoupled(self, data: Any, sender, ctx: RequestContext) -> None:
+        """P9-1: invoke predict_decoupled(data, sender). The model may return
+        before closing; the channel stays open until sender.close()."""
+        await self._predict_decoupled(data, sender, ctx=ctx)
 
     def adapt_handler(self, handler: Any) -> tuple[Callable, Callable, Callable]:
         """Adapt a BidiStreamHandler's hooks; each may optionally declare ctx."""

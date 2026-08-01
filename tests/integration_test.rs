@@ -323,6 +323,40 @@ class RouteAPI(LitAPI):
     )
     .unwrap();
 
+    // decoupled_model: implements predict_decoupled (P9-1) — pushes N chunks
+    // (N = input) then closes. Used by the gRPC DecoupledInfer integration test.
+    let decoupled_dir = tmp.join("decoupled_model/1");
+    std::fs::create_dir_all(&decoupled_dir).unwrap();
+    std::fs::write(
+        decoupled_dir.join("model.py"),
+        r#"from lite_server import LitAPI
+
+
+class DecoupledAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    async def predict_decoupled(self, data, sender):
+        # Push N chunks (N = decoded input) then close. The channel may stay
+        # open past this method's return; here we close inline.
+        for i in range(data):
+            await sender.send({"index": i})
+        await sender.close()
+
+    def encode_response(self, output):
+        return output
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        decoupled_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+
     tmp
 }
 
@@ -1102,6 +1136,7 @@ async fn test_model_repository_index() {
 // ---------------------------------------------------------------------------
 
 const BATCH_MODEL: &str = "batch_model";
+const DECOUPLED_MODEL: &str = "decoupled_model";
 
 #[tokio::test]
 #[serial]
@@ -3178,6 +3213,144 @@ async fn test_grpc_infer_aggregates_into_batch() {
     assert_eq!(jb["batch_size"], 2, "gRPC infer B must be batched into size 2");
 
     unload_model(&base, BATCH_MODEL, "1").await;
+}
+
+// ---------------------------------------------------------------------------
+// P9-1: gRPC DecoupledInfer (1:N, model-controlled channel lifetime)
+// ---------------------------------------------------------------------------
+
+/// `DecoupledInfer` against `decoupled_model` (predict_decoupled pushes N
+/// chunks then closes): the client receives N `is_final=false` data frames
+/// followed by one terminal `is_final=true` frame, in order.
+#[tokio::test]
+#[serial]
+async fn test_grpc_decoupled_infer_pushes_chunks_then_final() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::DecoupledInferRequest;
+    use std::collections::HashMap;
+
+    // Dedicated server WITH gRPC (shared server runs --no-grpc).
+    let http_port = 18080u16;
+    let grpc_port = 18081u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = test_model_repo();
+    let _server = ServerGuard::start(&[
+        "--port",
+        &http_port.to_string(),
+        "--grpc-port",
+        &grpc_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-metrics",
+        "--log-level",
+        "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, DECOUPLED_MODEL, "1").await;
+
+    let mut client = LiteServerClient::connect(format!("http://127.0.0.1:{}", grpc_port))
+        .await
+        .expect("gRPC client must connect");
+
+    let payload = bytes::Bytes::from(serde_json::to_vec(&json!({"input": 3})).unwrap());
+    let req = DecoupledInferRequest {
+        model_name: DECOUPLED_MODEL.to_string(),
+        version: "1".to_string(),
+        data: payload,
+        headers: HashMap::new(),
+        ..Default::default()
+    };
+    let resp = client
+        .decoupled_infer(req)
+        .await
+        .expect("DecoupledInfer must open");
+    let mut stream = resp.into_inner();
+
+    let mut frames = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(15), stream.message()).await {
+            Ok(Ok(Some(frame))) => frames.push(frame),
+            Ok(Ok(None)) => break,
+            Ok(Err(status)) => panic!("DecoupledInfer stream error: {:?}", status),
+            Err(_) => panic!("DecoupledInfer stream did not close within 15s"),
+        }
+    }
+    // 3 data chunks (is_final=false) + 1 terminal (is_final=true).
+    assert_eq!(frames.len(), 4, "expected 4 frames: {:?}", frames);
+    for i in 0..3 {
+        assert!(!frames[i].is_final, "chunk {} must be non-final", i);
+        let v: Value = serde_json::from_slice(&frames[i].data).expect("chunk data is JSON");
+        assert_eq!(v["index"], i, "chunks must arrive in order");
+    }
+    assert!(frames[3].is_final, "last frame must be terminal is_final=true");
+
+    unload_model(&base, DECOUPLED_MODEL, "1").await;
+}
+
+/// `DecoupledInfer` against a model WITHOUT `predict_decoupled` (test_model)
+/// returns `FailedPrecondition` (worker emits a structured not_implemented
+/// error; Rust maps error_type→FailedPrecondition).
+#[tokio::test]
+#[serial]
+async fn test_grpc_decoupled_infer_not_implemented_is_failed_precondition() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::DecoupledInferRequest;
+    use std::collections::HashMap;
+
+    let http_port = 18082u16;
+    let grpc_port = 18083u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = test_model_repo();
+    let _server = ServerGuard::start(&[
+        "--port",
+        &http_port.to_string(),
+        "--grpc-port",
+        &grpc_port.to_string(),
+        "--model-repo",
+        &repo.to_string_lossy(),
+        "--no-metrics",
+        "--log-level",
+        "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, MODEL, "1").await;
+
+    let mut client = LiteServerClient::connect(format!("http://127.0.0.1:{}", grpc_port))
+        .await
+        .expect("gRPC client must connect");
+
+    let payload = bytes::Bytes::from(serde_json::to_vec(&json!({"input": 2})).unwrap());
+    let req = DecoupledInferRequest {
+        model_name: MODEL.to_string(),
+        version: "1".to_string(),
+        data: payload,
+        headers: HashMap::new(),
+        ..Default::default()
+    };
+    let resp = client.decoupled_infer(req).await;
+    // The stream opens (server returns Ok), then the first frame is the
+    // worker's StreamError → surfaced as a tonic Status on the stream.
+    let mut stream = resp.expect("open succeeds").into_inner();
+    let err = loop {
+        match tokio::time::timeout(Duration::from_secs(15), stream.message()).await {
+            Ok(Ok(Some(_))) => continue,
+            Ok(Ok(None)) => panic!("stream ended with no error"),
+            Ok(Err(status)) => break status,
+            Err(_) => panic!("timed out waiting for error frame"),
+        }
+    };
+    assert_eq!(
+        err.code(),
+        tonic::Code::FailedPrecondition,
+        "decoupled on a model without predict_decoupled → FailedPrecondition, got {:?}",
+        err
+    );
+
+    unload_model(&base, MODEL, "1").await;
 }
 
 // ---------------------------------------------------------------------------

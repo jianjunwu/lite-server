@@ -1099,3 +1099,124 @@ class TestBidiSessionLifecycle:
         sock = _LoopSocket([_open_bytes("s-shutdown")])
         await inference.run_async_loop(BidiAPI(), sock, "test-model", log)
         assert closed == [True]
+
+
+# ---------------------------------------------------------------------------
+# Decoupled streaming (predict_decoupled — P9-1 DecoupledInfer)
+# ---------------------------------------------------------------------------
+
+def _decoupled_req(stream_id: str, data: bytes = b"{}", meta=None) -> StreamRequest:
+    """A StreamOpen carrying the additive P9-1 `decoupled=true` flag."""
+    open_kw = {"data": data, "decoupled": True}
+    if meta is not None:
+        open_kw["meta"] = meta
+    return StreamRequest(stream_id=stream_id, open=StreamOpen(**open_kw))
+
+
+class TestDecoupledStreaming:
+    """P9-1: predict_decoupled(data, sender) holds a push handle; the channel
+    stays open after the call returns and the model pushes N chunks, ending
+    with sender.close(). Distinct from stream_predict (generator pull)."""
+
+    @pytest.mark.asyncio
+    async def test_pushes_chunks_then_done(self):
+        class DecoupledAPI(EchoAPI):
+            async def predict_decoupled(self, data, sender):
+                for i in range(3):
+                    await sender.send({"chunk": i})
+                await sender.close()
+
+        sock = AsyncSocket()
+        active = {}
+        await inference._handle_stream_open_async(
+            DecoupledAPI(), _decoupled_req("s-dc", b'{"prompt": "go"}'), sock, active, log
+        )
+        await sock.wait_for(lambda r: _is_done(r, "s-dc"))
+        responses = sock.stream_responses("s-dc")
+        assert len(responses) == 4  # 3 chunks + done
+        for i in range(3):
+            assert responses[i].stream.HasField("chunk")
+            assert responses[i].stream.chunk.is_final is False
+            assert json.loads(responses[i].stream.chunk.data)["chunk"] == i
+        assert responses[3].stream.HasField("done")
+        # Closed inline → no live session left registered.
+        assert "s-dc" not in active
+
+    @pytest.mark.asyncio
+    async def test_channel_open_after_return(self):
+        """Differentiator vs stream_predict: predict_decoupled returns BEFORE
+        closing; chunks arrive after the call returns and a session is
+        registered so close/cancel can find the sender."""
+
+        class DecoupledBgAPI(EchoAPI):
+            async def predict_decoupled(self, data, sender):
+                async def _push():
+                    for i in range(3):
+                        await asyncio.sleep(0.005)
+                        await sender.send({"chunk": i})
+                    await sender.close()
+
+                asyncio.create_task(_push())  # return immediately
+
+        sock = AsyncSocket()
+        active = {}
+        await inference._handle_stream_open_async(
+            DecoupledBgAPI(), _decoupled_req("s-bg"), sock, active, log
+        )
+        # After open returns, a live session is registered (channel open).
+        assert "s-bg" in active
+        await sock.wait_for(lambda r: _is_done(r, "s-bg"))
+        responses = sock.stream_responses("s-bg")
+        assert len(responses) == 4  # 3 chunks + done
+        for i in range(3):
+            assert json.loads(responses[i].stream.chunk.data)["chunk"] == i
+        # close() popped the session.
+        assert "s-bg" not in active
+
+    @pytest.mark.asyncio
+    async def test_not_implemented_sends_structured_error(self):
+        """decoupled=True on a model without predict_decoupled → structured
+        stream error (error_type=not_implemented maps to gRPC
+        FailedPrecondition on the Rust side)."""
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            EchoAPI(), _decoupled_req("s-ni"), sock, {}, log
+        )
+        err = [r for r in sock.stream_responses("s-ni") if r.stream.HasField("error")]
+        assert len(err) == 1
+        body = json.loads(err[0].stream.error.message)
+        assert body["error"]["type"] == "not_implemented"
+
+    @pytest.mark.asyncio
+    async def test_cancel_signals_sender_no_done(self):
+        """Client disconnect (server sends StreamCancel) → cooperative cancel:
+        the sender is flagged closed and NO StreamDone is emitted (cancel
+        semantics match bidi/uni streams)."""
+        class DecoupledCancelAPI(EchoAPI):
+            async def predict_decoupled(self, data, sender):
+                async def _push():
+                    for i in range(10):
+                        await asyncio.sleep(0.05)
+                        await sender.send({"chunk": i})
+                    await sender.close()
+
+                asyncio.create_task(_push())
+
+        sock = AsyncSocket()
+        active = {}
+        await inference._handle_stream_open_async(
+            DecoupledCancelAPI(), _decoupled_req("s-cn"), sock, active, log
+        )
+        assert "s-cn" in active
+        sender = active["s-cn"].sender
+        assert sender.closed is False
+
+        cancel_req = Request(stream=StreamRequest(stream_id="s-cn", cancel=StreamCancel()))
+        await inference._handle_stream_async(
+            DecoupledCancelAPI(), cancel_req, sock, active, log
+        )
+        # Cooperative cancel: sender flagged closed, session popped, no Done.
+        assert sender.closed is True
+        assert "s-cn" not in active
+        assert not any(_is_done(r, "s-cn") for r in sock.stream_responses("s-cn"))
+
