@@ -110,10 +110,13 @@ async fn do_infer(
     let start = Instant::now();
 
     // Build request metadata
-    let header_map: HashMap<String, String> = headers
+    let mut header_map: HashMap<String, String> = headers
         .iter()
         .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), s.to_string())))
         .collect();
+    // P-TRACE: inject the active inference span's trace context into the worker
+    // RequestMeta.headers (overwrites client traceparent → worker is a child).
+    crate::telemetry::inject(&mut header_map);
     let client_ip = cx.client_ip.clone();
     let timestamp_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -398,10 +401,13 @@ pub(super) async fn resolve_version(
 }
 
 pub(super) fn build_request_meta(headers: &HeaderMap, payload: &Value, route: &str, cx: &RequestContext, deadline_unix_ns: Option<i64>) -> pb::RequestMeta {
-    let header_map: HashMap<String, String> = headers
+    let mut header_map: HashMap<String, String> = headers
         .iter()
         .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), s.to_string())))
         .collect();
+    // P-TRACE: inject the active span's trace context (overwrites any client
+    // traceparent → worker is a child of the server span; D8 Rust-only).
+    crate::telemetry::inject(&mut header_map);
     let timestamp_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

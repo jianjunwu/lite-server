@@ -580,6 +580,13 @@ impl LiteServer {
             h.abort();
         }
 
+        // P-TRACE: flush OTel traces/metrics before reaping workers. The 0.30
+        // BatchSpanProcessor/PeriodicReader run on dedicated threads; force_flush +
+        // shutdown run on a blocking thread with a timeout cap so a slow collector
+        // cannot stall the graceful-shutdown window (蓝图 §4.3 force_flush 带超时;
+        // avoids the Drop-timeout deadlock in opentelemetry-rust #2715).
+        crate::telemetry::shutdown().await;
+
         self.worker_manager.shutdown().await;
 
         Ok(())

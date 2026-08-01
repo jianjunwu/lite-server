@@ -242,7 +242,11 @@ fn main() {
                 std::process::exit(1);
             }
 
-            // Initialize logging (level from config, overridable via --log-level CLI)
+            // Initialize logging (level from config, overridable via --log-level CLI).
+            // P-TRACE: build the OTel layer first (no-op unless telemetry.enabled +
+            // feature) so it rides the same subscriber; the 0.30 BatchSpanProcessor
+            // uses its own dedicated thread (no runtime context required).
+            let otel_layer = lite_server::telemetry::init(&cfg.telemetry);
             let _log_guard = lite_server::logging::init(
                 &cfg.logging.level,
                 cfg.logging.info_output.as_deref(),
@@ -251,6 +255,7 @@ fn main() {
                 cfg.logging.max_size,
                 cfg.logging.backup_count,
                 cfg.logging.hostname_in_log_name,
+                otel_layer,
             );
 
             info!("Starting lite-server v{}", env!("CARGO_PKG_VERSION"));

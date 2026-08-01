@@ -236,7 +236,11 @@ impl GrpcService {
             }
         }
 
-        let header_map: HashMap<String, String> = req.headers.clone();
+        let mut header_map: HashMap<String, String> = req.headers.clone();
+        // P-TRACE: inject the active inference span's trace context into the
+        // worker RequestMeta.headers (overwrites any client-supplied traceparent
+        // so the worker is a child of THIS span; D8 Rust-only).
+        crate::telemetry::inject(&mut header_map);
         // P8-1 (B3): envelope hints — parsed and surfaced, NOT yet consumed (define-only).
         let hints = crate::request_context::RequestHints::from_grpc(&req.headers);
         if !hints.is_empty() {
@@ -456,7 +460,11 @@ impl GrpcService {
             enforce_grpc_rate_limit(&self.rate_limiter, mv.policies.rate_limit.as_ref(), model_name, &client_ip)?;
         }
 
-        let header_map: HashMap<String, String> = req.headers.clone();
+        let mut header_map: HashMap<String, String> = req.headers.clone();
+        // P-TRACE: inject the active inference span's trace context into the
+        // worker RequestMeta.headers (overwrites any client-supplied traceparent
+        // so the worker is a child of THIS span; D8 Rust-only).
+        crate::telemetry::inject(&mut header_map);
         // P-DEADLINE (§4.0.10): carried to the worker so it can stop; batch
         // keeps its existing ZMQ send path (no server-side wrap change).
         let deadline =
@@ -607,7 +615,11 @@ impl GrpcService {
             enforce_grpc_rate_limit(&self.rate_limiter, mv.policies.rate_limit.as_ref(), model_name, &client_ip)?;
         }
 
-        let header_map: HashMap<String, String> = req.headers.clone();
+        let mut header_map: HashMap<String, String> = req.headers.clone();
+        // P-TRACE: inject the active inference span's trace context into the
+        // worker RequestMeta.headers (overwrites any client-supplied traceparent
+        // so the worker is a child of THIS span; D8 Rust-only).
+        crate::telemetry::inject(&mut header_map);
         // P-DEADLINE (§4.0.10): resolve + carry to worker; the streaming two-
         // stage bound below activates only when the CLIENT specified a deadline
         // (so the default config leaves streaming behavior unchanged).
@@ -852,7 +864,11 @@ impl GrpcService {
             enforce_grpc_rate_limit(&self.rate_limiter, mv.policies.rate_limit.as_ref(), model_name, &client_ip)?;
         }
 
-        let header_map: HashMap<String, String> = req.headers.clone();
+        let mut header_map: HashMap<String, String> = req.headers.clone();
+        // P-TRACE: inject the active inference span's trace context into the
+        // worker RequestMeta.headers (overwrites any client-supplied traceparent
+        // so the worker is a child of THIS span; D8 Rust-only).
+        crate::telemetry::inject(&mut header_map);
         // P-DEADLINE (§4.0.10): carry to worker; the always-on decoupled idle
         // reclaim stays, with an overall deadline layered on when the CLIENT
         // specifies one.
@@ -1125,13 +1141,19 @@ impl GrpcService {
             request_id = %request_id,
             pinned_version = tracing::field::Empty,
         );
+        // P-TRACE: link the bidi inference span to the inbound trace (D21 single
+        // extract — reuses the interceptor's RequestContext.trace_cx).
+        crate::telemetry::link_parent(&span, &cx.trace_cx);
         if let Some(p) = &pin {
             span.record("pinned_version", p.as_str());
         }
         async move {
+        // P-TRACE: inject the bidi inference span's trace context (worker child).
+        let mut bidi_headers = HashMap::new();
+        crate::telemetry::inject(&mut bidi_headers);
         let meta = pb::RequestMeta {
             route: "/predict".to_string(),
-            headers: HashMap::new(),
+            headers: bidi_headers,
             client_ip,
             request_id,
             timestamp_ns: std::time::SystemTime::now()
@@ -1806,6 +1828,11 @@ impl LiteServer for GrpcService {
             // P5-2: canary pin 命中时由 canary_pin record（蓝图 §4.4）。
             pinned_version = tracing::field::Empty,
         );
+        // P-TRACE: link the inference span to the inbound trace (D21 — read the
+        // interceptor-stashed RequestContext; no second propagator extract).
+        if let Some(rc) = request.extensions().get::<crate::request_context::RequestContext>() {
+            crate::telemetry::link_parent(&span, &rc.trace_cx);
+        }
         let mut version_label = request.get_ref().version.clone();
         let mut request_id = String::new();
         let result = self
@@ -1842,6 +1869,11 @@ impl LiteServer for GrpcService {
             // P5-2: canary pin 命中时由 canary_pin record（蓝图 §4.4）。
             pinned_version = tracing::field::Empty,
         );
+        // P-TRACE: link the inference span to the inbound trace (D21 — read the
+        // interceptor-stashed RequestContext; no second propagator extract).
+        if let Some(rc) = request.extensions().get::<crate::request_context::RequestContext>() {
+            crate::telemetry::link_parent(&span, &rc.trace_cx);
+        }
         let mut version_label = request.get_ref().version.clone();
         let mut request_id = String::new();
         let result = self
@@ -1883,6 +1915,11 @@ impl LiteServer for GrpcService {
             // P5-2: canary pin 命中时由 canary_pin record（蓝图 §4.4）。
             pinned_version = tracing::field::Empty,
         );
+        // P-TRACE: link the inference span to the inbound trace (D21 — read the
+        // interceptor-stashed RequestContext; no second propagator extract).
+        if let Some(rc) = request.extensions().get::<crate::request_context::RequestContext>() {
+            crate::telemetry::link_parent(&span, &rc.trace_cx);
+        }
         let mut version_label = request.get_ref().version.clone();
         let mut request_id = String::new();
         let result = self
@@ -1930,6 +1967,11 @@ impl LiteServer for GrpcService {
             method = "decoupled_infer",
             pinned_version = tracing::field::Empty,
         );
+        // P-TRACE: link the inference span to the inbound trace (D21 — read the
+        // interceptor-stashed RequestContext; no second propagator extract).
+        if let Some(rc) = request.extensions().get::<crate::request_context::RequestContext>() {
+            crate::telemetry::link_parent(&span, &rc.trace_cx);
+        }
         let mut version_label = request.get_ref().version.clone();
         let mut request_id = String::new();
         let result = self

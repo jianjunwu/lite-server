@@ -156,6 +156,31 @@ Rules enforced at startup:
 - The `metrics_port` listener stays **plaintext and unauthenticated** — bind it to an internal network or loopback. With TLS enabled, the main port's Prometheus/probe/internal clients must use HTTPS (ALPN includes `http/1.1` for simple clients).
 - The server warns at startup if the private key file is group/world-readable (`chmod 600` recommended); this is a warning, not a failure, to allow group-based deployments.
 
+## Telemetry / OpenTelemetry (P-TRACE)
+
+Full OpenTelemetry tracing + metrics SDK, exported over **OTLP/gRPC**. Two-level opt-in: a build-time cargo feature (`--features telemetry`) and a runtime switch (`telemetry.enabled`, default `false` → zero overhead). Both off ⇒ no OTel layer, no propagator, no exporter; the server behaves exactly as without OTel. Trace context reaches the Python worker via the existing `RequestMeta.headers` map (W3C `traceparent`/`tracestate`/`baggage`) — the worker reads it to correlate but creates no span (Rust-only; see [docs/otel-observability.md](otel-observability.md)).
+
+```yaml
+telemetry:
+  enabled: false                       # opt-in. false = no OTel (zero overhead).
+  otlp_endpoint: "http://localhost:4317"  # OTLP/gRPC collector (4317).
+  protocol: grpc                       # grpc only this period (http reserved).
+  sample_ratio: 1.0                    # ParentBased(TraceIdRatioBased(ratio)).
+  health_admin_sample_ratio: 0.0       # (reserved) per-class down-sample for probes.
+  service_name: "lite-server"
+  resource_attributes: {}              # merged with OTEL_RESOURCE_ATTRIBUTES env.
+  otlp_headers: {}                     # OTLP auth, e.g. {"Authorization":"Bearer ..."}.
+  export_interval_millis: 5000
+  max_queue_size: 2048
+  metrics_enabled: false               # OTel metrics SDK overlay (C4 exemplars).
+  exemplars_enabled: false             # (reserved) exemplar filter — see otel-observability.md.
+```
+
+- **Build**: `cargo build --features telemetry` (and `cargo test --features telemetry` for telemetry tests). The default build does not compile the OTel SDK/exporter.
+- **Sampling**: roots sampled at `sample_ratio`; child spans honour the inbound sampled flag.
+- **Exemplars (C4)**: with `metrics_enabled`, an `liteserver.request.duration` histogram is recorded over OTLP/metrics alongside the existing `/metrics`. Note: `opentelemetry_sdk 0.30` stubs exemplar reservoirs; real trace-linked exemplars need an SDK upgrade (tracked). Prometheus exemplar-storage + Grafana complete the metrics→trace link.
+- **Shutdown**: traces/metrics are force-flushed with a 5s cap during graceful shutdown.
+
 ## Model Configuration
 
 Path: `model_repo/{model_name}/{version}/config.yaml`

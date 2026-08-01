@@ -29,6 +29,9 @@ pub fn init(
     max_size: usize,
     backup_count: usize,
     include_hostname: bool,
+    // P-TRACE: optional OTel layer (`telemetry.enabled` + feature). Attached in the
+    // same `.init()` so tracing spans bridge to OTel spans when telemetry is on.
+    otel_layer: Option<crate::telemetry::BoxedLayer>,
 ) -> LogGuard {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("lite_server={},tokio=warn,hyper=warn", level)));
@@ -79,7 +82,15 @@ pub fn init(
         None
     };
 
+    // P-TRACE: the OTel layer is `Layer<Registry>` (a boxed trait object), so it
+    // must ride INNERMOST — applied to the bare registry before the fmt layers
+    // (which are `Layer<S>` for any subscriber and adapt on top). When telemetry
+    // is off, a no-op `Identity` layer keeps the subscriber type uniform.
+    use tracing_subscriber::layer::Identity;
+    let otel: crate::telemetry::BoxedLayer =
+        otel_layer.unwrap_or_else(|| Box::new(Identity::new()));
     tracing_subscriber::registry()
+        .with(otel)
         .with(filter)
         .with(stdout_layer)
         .with(info_layer)

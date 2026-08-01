@@ -376,9 +376,27 @@ async fn execute_step(
     let payload_value = Value::Object(payload);
     let payload_bytes = serde_json::to_vec(&payload_value).unwrap_or_default();
 
+    // P-TRACE (蓝图 §4.3 ensemble 接线，防 trace 断裂): the sub-step RequestMeta
+    // would otherwise carry empty headers, orphaning every step span from the
+    // parent request trace. Build a child `ensemble.step` span linked to the
+    // current (parent) trace and inject its context into the step headers so the
+    // worker spans land as children of the step (request_id is already
+    // `{parent}:{step}`, trace follows the same shape).
+    let mut step_headers = HashMap::new();
+    {
+        let step_span = tracing::info_span!(
+            "ensemble.step",
+            step = %step.name,
+            model = %step.model,
+        );
+        crate::telemetry::link_parent(&step_span, &opentelemetry::Context::current());
+        let _guard = step_span.enter();
+        crate::telemetry::inject(&mut step_headers);
+    }
+
     let meta = pb::RequestMeta {
         route: "/predict".to_string(),
-        headers: HashMap::new(),
+        headers: step_headers,
         client_ip: client_ip.to_string(),
         // Correlate sub-step requests with the client-facing request ID;
         // the step-name suffix keeps each step uniquely identifiable.

@@ -18,6 +18,7 @@ pub mod request_context;
 pub mod sequence;
 pub mod server;
 pub mod streaming;
+pub mod telemetry;
 #[cfg(feature = "python")]
 pub mod test_support;
 pub mod tls;
@@ -144,6 +145,11 @@ pub fn run_server(
     // of panicking at Duration::from_secs_f* during model load.
     cfg.validate()?;
 
+    // P-TRACE: build the OTel layer (if enabled + feature) BEFORE logging::init so
+    // it is attached in the same subscriber. No runtime context needed — the 0.30
+    // BatchSpanProcessor runs on its own dedicated thread (opentelemetry-rust #2715
+    // decoupled). Returns None (zero overhead) when telemetry is off.
+    let otel_layer = telemetry::init(&cfg.telemetry);
     let _log_guard = logging::init(
         &cfg.logging.level,
         cfg.logging.info_output.as_deref(),
@@ -152,6 +158,7 @@ pub fn run_server(
         cfg.logging.max_size,
         cfg.logging.backup_count,
         cfg.logging.hostname_in_log_name,
+        otel_layer,
     );
     info!("Starting lite-server v{}", env!("CARGO_PKG_VERSION"));
     info!("HTTP port: {}", cfg.server.http_port);

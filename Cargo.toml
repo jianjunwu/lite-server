@@ -40,8 +40,10 @@ subtle = "2"
 libc = "0.2"
 
 # gRPC
-tonic = { version = "0.12", features = ["gzip", "tls"] }
-tonic-health = { version = "0.12", features = ["transport"] }
+# P-TRACE (蓝图 §6.3): tonic 0.13 — opentelemetry-otlp 0.30 依赖 tonic ^0.13，
+# 升级全家桶到 0.13 统一单一 tonic 版本，消除 rustls/tonic 多版本分裂风险。
+tonic = { version = "0.13", features = ["gzip", "tls-ring"] }
+tonic-health = { version = "0.13" }
 tokio-stream = { version = "0.1", features = ["net"] }
 
 # TLS/mTLS (P5-1, 蓝图 §4.3): 统一 ring provider（评审 2.4）——axum-server 的
@@ -61,7 +63,18 @@ tower-service = "0.3"
 
 # OpenTelemetry core only (P-MW, 蓝图 §4.0.1 评审 1.10): RequestContext.trace_cx
 # 的类型载体。恒依赖、无 SDK/exporter（P-TRACE 才以 opt-in feature 引入）。
-opentelemetry = { version = "0.30", default-features = false }
+# P-TRACE：启用 `trace` feature（仍是 core API：SpanContext/TraceContextExt/Tracer
+# trait，不含 SDK/exporter），供 trace_cx span 检查与测试断言。
+opentelemetry = { version = "0.30", default-features = false, features = ["trace", "metrics"] }
+
+# P-TRACE (蓝图 §4.3 / §6.7): OTel SDK + OTLP/gRPC exporter + tracing 桥接 +
+# metrics SDK（exemplars）。feature-gated（`telemetry`，默认关）；版本互相对齐到
+# opentelemetry 0.30——opentelemetry-otlp 0.30 拉 tonic ^0.13（与上面 tonic 0.13
+# 统一）、reqwest ^0.12、prost ^0.13；tracing-opentelemetry 0.31 绑定 opentelemetry 0.30
+# （0.30 版绑定 0.29，故用 0.31）。
+opentelemetry_sdk = { version = "0.30", default-features = false, features = ["rt-tokio", "trace", "metrics"], optional = true }
+opentelemetry-otlp = { version = "0.30", default-features = false, features = ["grpc-tonic", "trace", "metrics"], optional = true }
+tracing-opentelemetry = { version = "0.31", default-features = false, optional = true }
 
 # transport
 zmq = "0.10"
@@ -114,14 +127,18 @@ reqwest = { version = "0.12", default-features = false, features = ["json"] }
 # Python interop
 pyo3 = { version = "0.24", features = ["serde", "abi3-py310", "extension-module"], optional = true }
 gethostname = "1.1.0"
-tonic-types = "0.12"
+tonic-types = "0.13"
 
 [features]
 default = []
 python = ["dep:pyo3"]
+# P-TRACE: OTel traces + metrics SDK (exemplars) + OTLP/gRPC exporter + tracing
+# 桥接。默认关——默认构建零 OTel 开销、CI 矩阵不受影响；运行时再由
+# `telemetry.enabled` opt-in。蓝图 §6.7 SDK/exporter feature-gated。
+telemetry = ["dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-build = "0.13"
 prost-build = "0.13"
 
 [dev-dependencies]

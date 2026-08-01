@@ -152,6 +152,31 @@ grpc:
 - `metrics_port` 监听器保持**明文且无鉴权**——请绑定内网或 loopback。启用 TLS 后，主端口的 Prometheus 抓取/探活/内部客户端须走 HTTPS（ALPN 含 `http/1.1`，简单客户端可用）。
 - 私钥文件为组/全员可读时启动仅告警（建议 `chmod 600`），不阻断基于用户组的部署。
 
+## 遥测 / OpenTelemetry（P-TRACE）
+
+全量 OpenTelemetry 追踪 + metrics SDK，经 **OTLP/gRPC** 导出。两级 opt-in：编译期 cargo feature（`--features telemetry`）+ 运行时开关（`telemetry.enabled`，默认 `false`→零开销）。两者皆关 ⇒ 无 OTel layer、无 propagator、无 exporter，行为与无 OTel 逐字节一致。trace context 经既有 `RequestMeta.headers` map（W3C `traceparent`/`tracestate`/`baggage`）到达 Python worker——worker 读 header 关联但不创 span（Rust-only，见 [docs/otel-observability.md](../otel-observability.md)）。
+
+```yaml
+telemetry:
+  enabled: false                       # opt-in。false=无 OTel（零开销）
+  otlp_endpoint: "http://localhost:4317"  # OTLP/gRPC collector（4317）
+  protocol: grpc                       # 本期仅 grpc（http 预留）
+  sample_ratio: 1.0                    # ParentBased(TraceIdRatioBased(ratio))
+  health_admin_sample_ratio: 0.0       # （预留）探活独立降采样
+  service_name: "lite-server"
+  resource_attributes: {}              # 与 OTEL_RESOURCE_ATTRIBUTES env 合并
+  otlp_headers: {}                     # OTLP 认证，如 {"Authorization":"Bearer ..."}
+  export_interval_millis: 5000
+  max_queue_size: 2048
+  metrics_enabled: false               # OTel metrics SDK 叠加（C4 exemplars）
+  exemplars_enabled: false             # （预留）exemplar filter，见 otel-observability.md
+```
+
+- **构建**：`cargo build --features telemetry`（telemetry 测试用 `cargo test --features telemetry`）。默认构建不编译 OTel SDK/exporter。
+- **采样**：root 按 `sample_ratio` 采样；子 span 遵循入站 sampled 标志。
+- **Exemplars（C4）**：`metrics_enabled` 时在既有 `/metrics` 之外经 OTLP/metrics 叠加记录 `liteserver.request.duration` histogram。注意：`opentelemetry_sdk 0.30` 的 exemplar 池为占位（exemplars 空），真正挂 trace_id 的 exemplar 需 SDK 升级（已记）。Prometheus exemplar-storage + Grafana 补全 metrics→trace 链路。
+- **停机**：优雅停机期间以 5s 上限 force_flush traces/metrics。
+
 ## 模型配置
 
 路径：`model_repo/{模型名}/{版本}/config.yaml`

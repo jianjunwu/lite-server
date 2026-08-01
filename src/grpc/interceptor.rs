@@ -14,7 +14,6 @@ use crate::access_control::{AccessControl, EndpointClass};
 use crate::callback::Protocol;
 use crate::client_ip::{extract_client_ip, merge_xff, TrustedNetworks};
 use crate::request_context::RequestContext;
-use opentelemetry::Context;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -54,7 +53,7 @@ impl RequestContext {
         Self {
             request_id,
             client_ip,
-            trace_cx: Context::new(), // P-TRACE 前为空 Context 占位
+            trace_cx: crate::telemetry::extract_grpc(metadata), // P-TRACE: W3C parent
             protocol: Protocol::Grpc,
             principal: None, // P5-1: context_interceptor 随后按 TlsConnectInfo 填充
         }

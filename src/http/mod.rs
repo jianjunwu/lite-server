@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::info;
+use tracing::{info, Instrument};
 use uuid::Uuid;
 
 async fn disable_keepalive_middleware(request: Request, next: Next) -> Response {
@@ -126,7 +126,30 @@ async fn observability_middleware(mut request: Request, next: Next) -> Response 
 
     request.extensions_mut().insert(RequestId(request_id.clone()));
 
-    let mut response = next.run(request).await;
+    // P-TRACE (蓝图 §4.2/§4.3): single-source OTel parent extraction (D21). The
+    // extracted context is stashed for `context_middleware` → `trace_cx`, and links
+    // the http.server span to the inbound trace so the request becomes a child.
+    let parent = crate::telemetry::extract(request.headers());
+    request
+        .extensions_mut()
+        .insert(crate::request_context::OtelParentContext(parent.clone()));
+
+    // http.server span (http.method/route/status). The handler's `inference` span
+    // nests under it (ambient); worker RequestMeta injection uses the active span.
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let span = tracing::info_span!(
+        "http.server",
+        "http.request.method" = %method,
+        "url.path" = %path,
+        "http.response.status_code" = tracing::field::Empty,
+    );
+    crate::telemetry::link_parent(&span, &parent);
+    let span_for_status = span.clone();
+
+    let mut response = next.run(request).instrument(span).await;
+
+    span_for_status.record("http.response.status_code", response.status().as_u16() as i64);
 
     // Overwrite headers — middleware is the authoritative source for these.
     if let Ok(v) = HeaderValue::from_str(&request_id) {

@@ -337,6 +337,9 @@ pub fn record_request_end(model: &str, version: &str, status: &str, duration_sec
     REQUESTS_TOTAL.with_label_values(&[model, version, status]).inc();
     REQUEST_DURATION.with_label_values(&[model, version]).observe(duration_secs);
     super::aggregator::TIMELINE.record_latency(model, version, duration_secs);
+    // P-TRACE C4: OTel metrics overlay (no-op unless telemetry.metrics_enabled +
+    // feature). Exemplar-ready plumbing; opentelemetry_sdk 0.30 stubs exemplars.
+    crate::telemetry::record_request_duration(status, duration_secs);
 }
 
 // ===== Outlier detection metrics =====

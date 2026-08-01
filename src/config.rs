@@ -21,6 +21,10 @@ pub struct Config {
     /// public. Per-model `policies.auth` (enforce_auth) is a separate, finer
     /// gate that stacks on top of this coarse class gate.
     pub access_control: AccessControlConfig,
+    /// P-TRACE (蓝图 §4.3): 全量 OTel——traces + metrics SDK（exemplars）经
+    /// OTLP/gRPC 导出。默认 `enabled=false`（opt-in，零开销）；SDK/exporter 本身
+    /// 经 cargo `telemetry` feature 门控。
+    pub telemetry: TelemetryConfig,
 }
 
 /// P7-1 access-control config (蓝图 §4.2). Three endpoint classes; admin and
@@ -406,6 +410,75 @@ impl Default for MetricsConfig {
         Self {
             enabled: true,
             metric_namespace: "liteserver".to_string(),
+        }
+    }
+}
+
+/// OTLP transport protocol (蓝图 §4.3 P-TRACE).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TelemetryProtocol {
+    Grpc,
+    Http,
+}
+
+impl Default for TelemetryProtocol {
+    fn default() -> Self {
+        TelemetryProtocol::Grpc
+    }
+}
+
+/// P-TRACE (蓝图 §4.3): 全量 OpenTelemetry 配置。
+///
+/// 两级 opt-in：① cargo `telemetry` feature（编译期，门控 SDK/exporter）；
+/// ② 运行时 `enabled`（默认 false，零开销）。`metrics_enabled` 单独门控 OTel
+/// metrics SDK + exemplars（叠加既有 prometheus 指标管线，不改默认）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TelemetryConfig {
+    /// 总开关。false → 不注册 OTel layer/propagator（零开销），行为与无 OTel 一致。
+    pub enabled: bool,
+    /// OTLP collector 端点（gRPC 默认 4317，HTTP 默认 4318）。
+    pub otlp_endpoint: String,
+    /// OTLP 传输协议。本期 gRPC（tonic 0.13）；http 预留。
+    pub protocol: TelemetryProtocol,
+    /// 通用采样率 `ParentBased(TraceIdRatioBased(sample_ratio))`。
+    pub sample_ratio: f64,
+    /// health/admin 探活高频，独立降采样（评审 2.2）；0 = 不采样探活 span。
+    pub health_admin_sample_ratio: f64,
+    /// `service.name` 资源属性。
+    pub service_name: String,
+    /// 附加资源属性（合并 `OTEL_RESOURCE_ATTRIBUTES` env）。
+    pub resource_attributes: std::collections::HashMap<String, String>,
+    /// OTLP exporter 认证 header/token（评审低#17），如 `{"Authorization":"Bearer ..."}`。
+    pub otlp_headers: std::collections::HashMap<String, String>,
+    /// BatchSpanProcessor / PeriodicReader 导出间隔（毫秒）。
+    pub export_interval_millis: u64,
+    /// BatchSpanProcessor 最大队列长度。
+    pub max_queue_size: usize,
+    /// OTel metrics SDK（C4 exemplars）开关：叠加记录 request-duration histogram
+    /// （在活跃 span 内观测→exemplars 挂 trace_id），经 OTLP/metrics 导出。不改默认
+    /// prometheus 指标管线。
+    pub metrics_enabled: bool,
+    /// metrics exemplar filter 开关（`trace_based`）：仅采样 span 的观测点挂 exemplar。
+    pub exemplars_enabled: bool,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            otlp_endpoint: "http://localhost:4317".to_string(),
+            protocol: TelemetryProtocol::Grpc,
+            sample_ratio: 1.0,
+            health_admin_sample_ratio: 0.0,
+            service_name: "lite-server".to_string(),
+            resource_attributes: std::collections::HashMap::new(),
+            otlp_headers: std::collections::HashMap::new(),
+            export_interval_millis: 5000,
+            max_queue_size: 2048,
+            metrics_enabled: false,
+            exemplars_enabled: false,
         }
     }
 }
