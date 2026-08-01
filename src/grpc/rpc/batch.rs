@@ -169,6 +169,17 @@ impl GrpcService {
                 .map_err(|e| err(Status::internal(format!("worker error: {}", e))))?,
         };
 
+        // Task A: record worker-reported metrics. The top-level Response.metrics
+        // (proto field 40) is the only metrics carrier for batch —
+        // BatchItemResponse has no per-item metrics field, so per-item
+        // InferResponse.metrics stays None (record the response-level metrics
+        // once, matching unary / streaming parity).
+        crate::metrics::prometheus::record_worker_metrics(
+            model_name,
+            &resolved_version,
+            resp.metrics.as_ref(),
+        );
+
         match resp.payload {
             Some(pb::response::Payload::Batch(batch_resp)) => {
                 let items: Vec<pb::InferResponse> = batch_resp

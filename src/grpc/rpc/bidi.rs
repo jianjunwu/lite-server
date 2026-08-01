@@ -140,8 +140,8 @@ impl GrpcService {
         let meta = pb::RequestMeta {
             route: "/predict".to_string(),
             headers: bidi_headers,
-            client_ip,
-            request_id,
+            client_ip: client_ip.clone(),
+            request_id: request_id.clone(),
             timestamp_ns: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -198,6 +198,22 @@ impl GrpcService {
             .send_stream(open_req, stream_id.clone())
             .await
             .map_err(|e| err(Status::internal(format!("worker stream error: {}", e))))?;
+
+        // Task D: fire InferenceRequest once the worker stream opened and arm
+        // the response callback. The inner forwarder spawn below does not
+        // capture `self`, so the runner is cloned here and moved in (unary
+        // parity). resp_ctx reuses metrics_model/metrics_version below.
+        let cb_runner = self.callback_runner.clone();
+        let req_ctx = crate::callback::InferenceContext {
+            model_name: model_name.clone(),
+            version: resolved_version.clone(),
+            route: "/predict".to_string(),
+            protocol: crate::callback::Protocol::Grpc,
+            request_id: request_id.clone(),
+            client_ip: client_ip.clone(),
+            elapsed_us: None,
+        };
+        crate::callback::fire_inference_request(&cb_runner, &req_ctx);
 
         let (tx, rx) = mpsc::channel(64);
         let worker_client = client.clone();
@@ -317,14 +333,23 @@ impl GrpcService {
                         stream_family = grpc_code_to_status_family(grpc_err.code());
                         let _ = tx.send(Err(grpc_err)).await;
                         let _ = tx.send(Ok(bidi_chunk)).await;
+                        crate::callback::fire_inference_response(&cb_runner, &req_ctx, start);
                         break;
                     }
-                    Some(pb::stream_response::Payload::Done(_)) => {
+                    Some(pb::stream_response::Payload::Done(done)) => {
+                        // Task A: record worker-reported metrics (HTTP parity).
+                        crate::metrics::prometheus::record_worker_metrics(
+                            &metrics_model,
+                            &metrics_version,
+                            done.metrics.as_ref(),
+                        );
                         let bidi_chunk = pb::BidiChunk {
                             stream_id: stream_id.clone(),
                             payload: Some(pb::bidi_chunk::Payload::Close(pb::BidiClose {})),
                         };
                         let _ = tx.send(Ok(bidi_chunk)).await;
+                        // Task D: terminal frame → InferenceResponse.
+                        crate::callback::fire_inference_response(&cb_runner, &req_ctx, start);
                         break;
                     }
                     _ => {}

@@ -164,6 +164,22 @@ async fn sse_infer_impl(
     };
     let (stream_id, mut chunk_rx) = open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await?;
 
+    // Task D: fire InferenceRequest once the worker stream opened and arm the
+    // response callback. cx is not captured by the spawn, so request_id /
+    // client_ip are cloned here and moved in. open_time (inside the spawn) is
+    // the elapsed reference for the response.
+    let cb_runner = state.callback_runner.clone();
+    let req_ctx = crate::callback::InferenceContext {
+        model_name: model_name.clone(),
+        version: resolved_version.clone(),
+        route: "/predict".to_string(),
+        protocol: crate::callback::Protocol::Sse,
+        request_id: cx.request_id.clone(),
+        client_ip: cx.client_ip.clone(),
+        elapsed_us: None,
+    };
+    crate::callback::fire_inference_request(&cb_runner, &req_ctx);
+
     let stream_metrics = state.config.features.streaming_metrics;
     if stream_metrics {
         prometheus::record_stream_open(&model_name, &resolved_version, "sse");
@@ -214,10 +230,14 @@ async fn sse_infer_impl(
                         }
                         _ => json!({"error": e.message}).to_string(),
                     };
+                    // Task D: terminal Error frame → InferenceResponse.
+                    crate::callback::fire_inference_response(&cb_runner, &req_ctx, open_time);
                     Event::default().data(event_data)
                 }
                 Some(pb::stream_response::Payload::Done(done)) => {
                     prometheus::record_worker_metrics(&model_name, &resolved_version, done.metrics.as_ref());
+                    // Task D: terminal Done frame → InferenceResponse.
+                    crate::callback::fire_inference_response(&cb_runner, &req_ctx, open_time);
                     Event::default().data("[DONE]")
                 }
                 _ => continue,
@@ -398,6 +418,22 @@ async fn handle_ws_stream(
         }
     };
 
+    // Task D: fire InferenceRequest once the worker stream opened and arm the
+    // response callback. cx is not captured by the spawn, so request_id /
+    // client_ip are cloned here and moved in. open_time (inside the spawn) is
+    // the elapsed reference for the response.
+    let cb_runner = state.callback_runner.clone();
+    let req_ctx = crate::callback::InferenceContext {
+        model_name: model_name.clone(),
+        version: resolved_version.clone(),
+        route: "/predict".to_string(),
+        protocol: crate::callback::Protocol::WebSocket,
+        request_id: cx.request_id.clone(),
+        client_ip: cx.client_ip.clone(),
+        elapsed_us: None,
+    };
+    crate::callback::fire_inference_request(&cb_runner, &req_ctx);
+
     let stream_metrics = state.config.features.streaming_metrics;
     if stream_metrics {
         prometheus::record_stream_open(&model_name, &resolved_version, "websocket");
@@ -450,10 +486,14 @@ async fn handle_ws_stream(
                         }
                         _ => json!({"error": e.message}).to_string(),
                     };
+                    // Task D: terminal Error frame → InferenceResponse.
+                    crate::callback::fire_inference_response(&cb_runner, &req_ctx, open_time);
                     Message::Text(event_data)
                 }
                 Some(pb::stream_response::Payload::Done(done)) => {
                     prometheus::record_worker_metrics(&model_name, &resolved_version, done.metrics.as_ref());
+                    // Task D: terminal Done frame → InferenceResponse.
+                    crate::callback::fire_inference_response(&cb_runner, &req_ctx, open_time);
                     Message::Text(json!({"done": true}).to_string())
                 }
                 _ => continue,
@@ -482,5 +522,333 @@ async fn handle_ws_stream(
     // Send cancel to clean up
     let cancel_req = streaming::build_stream_cancel(completed_stream_id);
     open_worker_stream_cancel(&state, &model_name_owned, &version_owned, cancel_req).await;
+}
+
+#[cfg(test)]
+mod tests {
+    //! Task D (HTTP): SSE inference callbacks. The forwarder spawns with a
+    //! 64-event buffer, so it processes the worker's Chunk + Done (and fires the
+    //! callback) independently of client draining — these tests therefore hold the
+    //! Sse and poll for the callback count rather than draining the body. WS uses
+    //! the identical fire_inference_request/response helpers (structural parity;
+    //! integration-covered).
+
+    use super::*;
+    use crate::callback::{Callback, CallbackRunner, InferenceContext, Protocol};
+    use crate::config::ModelConfig;
+    use crate::inference_queue::InferenceQueue;
+    use crate::registry::types::{ModelType, WorkerInfo, WorkerStatus};
+    use crate::registry::ModelRegistry;
+    use crate::request_context::RequestContext;
+    use crate::transport::zmq::WorkerZmqClient;
+    use crate::worker::WorkerManager;
+    use bytes::Bytes;
+    use prost::Message;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    fn ipc_endpoint(tag: &str) -> String {
+        #[cfg(unix)]
+        {
+            format!(
+                "ipc://{}",
+                std::env::temp_dir()
+                    .join(format!("sse-{}-{}.sock", tag, std::process::id()))
+                    .display()
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            format!("tcp://127.0.0.1:{}", 37000 + std::process::id() % 1000)
+        }
+    }
+
+    fn make_state(cb: Arc<CallbackRunner>) -> Arc<AppState> {
+        let registry = Arc::new(ModelRegistry::new());
+        let queue = Arc::new(InferenceQueue::new());
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            std::path::PathBuf::new(),
+            queue.clone(),
+            "warn".to_string(),
+            cb.clone(),
+        ));
+        Arc::new(AppState::new(
+            registry,
+            wm,
+            queue,
+            crate::config::Config::default(),
+            std::path::PathBuf::new(),
+            cb,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+        ))
+    }
+
+    /// Register a ready model backed by one ZMQ stream client (test hook).
+    async fn ready_state(model: &str, endpoint: String, cb: Arc<CallbackRunner>) -> Arc<AppState> {
+        let state = make_state(cb);
+        state
+            .registry
+            .register(model, "1", ModelConfig::default(), ModelType::LitAPI, std::path::PathBuf::new())
+            .unwrap();
+        state.registry.mark_ready(model, "1").unwrap();
+        // open_worker_stream checks mv.workers.len() > 0.
+        state
+            .registry
+            .set_workers(
+                model,
+                "1",
+                vec![WorkerInfo {
+                    worker_id: 0,
+                    device: "cpu:0".to_string(),
+                    endpoint: String::new(),
+                    pid: None,
+                    status: WorkerStatus::Ready,
+                    capacity: None,
+                }],
+            )
+            .unwrap();
+        let client = Arc::new(WorkerZmqClient::new(endpoint));
+        state
+            .worker_manager
+            .insert_zmq_clients_for_test(model, "1", vec![client])
+            .await;
+        state
+    }
+
+    /// PAIR worker: Open → one Chunk + Done.
+    fn spawn_done_worker(endpoint: String) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(5000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let is_open = matches!(
+                    req.payload,
+                    Some(pb::request::Payload::Stream(pb::StreamRequest {
+                        action: Some(pb::stream_request::Action::Open(_)),
+                        ..
+                    }))
+                );
+                if !is_open {
+                    let _ = s.send(pb::Response { uid: req.uid, ..Default::default() }.encode_to_vec(), 0);
+                    continue;
+                }
+                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                let mk = |payload| pb::Response {
+                    payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                        stream_id: st.stream_id.clone(),
+                        payload: Some(payload),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                let _ = s.send(
+                    mk(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
+                        data: Bytes::from_static(b"{}"),
+                        is_final: false,
+                    }))
+                    .encode_to_vec(),
+                    0,
+                );
+                let _ = s.send(mk(pb::stream_response::Payload::Done(pb::StreamDone::default())).encode_to_vec(), 0);
+            }
+        })
+    }
+
+    /// PAIR worker: Open → one Error frame, then close (forwarder breaks on the
+    /// peer disconnect after the Error callback fires).
+    fn spawn_error_worker(endpoint: String) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(5000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let is_open = matches!(
+                    req.payload,
+                    Some(pb::request::Payload::Stream(pb::StreamRequest {
+                        action: Some(pb::stream_request::Action::Open(_)),
+                        ..
+                    }))
+                );
+                if !is_open {
+                    continue;
+                }
+                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                let resp = pb::Response {
+                    payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                        stream_id: st.stream_id.clone(),
+                        payload: Some(pb::stream_response::Payload::Error(pb::StreamError {
+                            message: "boom".to_string(),
+                        })),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                let _ = s.send(resp.encode_to_vec(), 0);
+                return; // close → forwarder observes disconnect and breaks
+            }
+        })
+    }
+
+    struct CountingCallback {
+        req: AtomicUsize,
+        resp: AtomicUsize,
+        last: Mutex<Option<InferenceContext>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Callback for CountingCallback {
+        async fn on_inference_request(&self, _ctx: &InferenceContext) {
+            self.req.fetch_add(1, Ordering::Relaxed);
+        }
+        async fn on_inference_response(&self, ctx: &InferenceContext) {
+            self.resp.fetch_add(1, Ordering::Relaxed);
+            *self.last.lock().unwrap() = Some(ctx.clone());
+        }
+    }
+
+    async fn wait_for<F: Fn() -> bool>(cond: F, label: &str) {
+        for _ in 0..60 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("condition never met within ~1.5s: {}", label);
+    }
+
+    fn test_cx() -> RequestContext {
+        RequestContext {
+            request_id: "sse-rid".to_string(),
+            client_ip: "127.0.0.1".to_string(),
+            trace_cx: opentelemetry::Context::new(),
+            protocol: Protocol::Http,
+            principal: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_callbacks_fire_on_done() {
+        let model = "sse_done";
+        let endpoint = ipc_endpoint(model);
+        let _w = spawn_done_worker(endpoint.clone());
+        let cb = Arc::new(CountingCallback {
+            req: AtomicUsize::new(0),
+            resp: AtomicUsize::new(0),
+            last: Mutex::new(None),
+        });
+        let runner = Arc::new(CallbackRunner::new());
+        runner.register(cb.clone()).await;
+        let state = ready_state(model, endpoint, runner).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let sse = sse_infer_impl(
+            state,
+            model.to_string(),
+            "1".to_string(),
+            HeaderMap::new(),
+            json!({}),
+            test_cx(),
+        )
+        .await
+        .expect("sse must open");
+        // Hold the Sse so event_rx stays alive while the forwarder processes Done.
+        wait_for(|| cb.resp.load(Ordering::Relaxed) >= 1, "resp>=1").await;
+        drop(sse);
+
+        assert_eq!(cb.req.load(Ordering::Relaxed), 1, "request fires once");
+        assert_eq!(cb.resp.load(Ordering::Relaxed), 1, "Done fires response");
+        let protocol = cb
+            .last
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| c.protocol)
+            .unwrap_or(Protocol::Http);
+        assert_eq!(protocol, Protocol::Sse, "response ctx must carry the Sse protocol");
+        assert!(
+            cb.last.lock().unwrap().as_ref().unwrap().elapsed_us.is_some(),
+            "response elapsed_us must be set"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_callbacks_fire_on_error() {
+        let model = "sse_err";
+        let endpoint = ipc_endpoint(model);
+        let _w = spawn_error_worker(endpoint.clone());
+        let cb = Arc::new(CountingCallback {
+            req: AtomicUsize::new(0),
+            resp: AtomicUsize::new(0),
+            last: Mutex::new(None),
+        });
+        let runner = Arc::new(CallbackRunner::new());
+        runner.register(cb.clone()).await;
+        let state = ready_state(model, endpoint, runner).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let sse = sse_infer_impl(
+            state,
+            model.to_string(),
+            "1".to_string(),
+            HeaderMap::new(),
+            json!({}),
+            test_cx(),
+        )
+        .await
+        .expect("sse must open");
+        wait_for(|| cb.resp.load(Ordering::Relaxed) >= 1, "resp>=1").await;
+        drop(sse);
+
+        assert_eq!(cb.req.load(Ordering::Relaxed), 1);
+        assert_eq!(cb.resp.load(Ordering::Relaxed), 1, "Error frame fires response");
+    }
+
+    #[tokio::test]
+    async fn sse_callback_not_fired_when_stream_dropped() {
+        let model = "sse_drop";
+        let endpoint = ipc_endpoint(model);
+        let _w = spawn_done_worker(endpoint.clone());
+        let cb = Arc::new(CountingCallback {
+            req: AtomicUsize::new(0),
+            resp: AtomicUsize::new(0),
+            last: Mutex::new(None),
+        });
+        let runner = Arc::new(CallbackRunner::new());
+        runner.register(cb.clone()).await;
+        let state = ready_state(model, endpoint, runner).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let sse = sse_infer_impl(
+            state,
+            model.to_string(),
+            "1".to_string(),
+            HeaderMap::new(),
+            json!({}),
+            test_cx(),
+        )
+        .await
+        .expect("sse must open");
+        // Drop immediately → event_rx goes away → the forwarder's first
+        // event_tx.send errors, so it breaks before the Done frame: no response.
+        drop(sse);
+
+        wait_for(|| cb.req.load(Ordering::Relaxed) >= 1, "req>=1").await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(cb.req.load(Ordering::Relaxed), 1, "request still fires on cancel");
+        assert_eq!(cb.resp.load(Ordering::Relaxed), 0, "cancel must NOT fire response");
+    }
 }
 

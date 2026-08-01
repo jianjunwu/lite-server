@@ -106,8 +106,8 @@ impl GrpcService {
         let meta = pb::RequestMeta {
             route: "/predict".to_string(),
             headers: header_map,
-            client_ip,
-            request_id,
+            client_ip: client_ip.clone(),
+            request_id: request_id.clone(),
             timestamp_ns: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -165,6 +165,21 @@ impl GrpcService {
             .send_stream(open_req, stream_id.clone())
             .await
             .map_err(|e| err(Status::internal(format!("worker stream error: {}", e))))?;
+
+        // Task D: fire InferenceRequest once the worker stream opened (streaming
+        // bypasses the queue) and arm the response callback. `self` is not
+        // captured by the spawn, so clone the runner here (unary parity).
+        let cb_runner = self.callback_runner.clone();
+        let req_ctx = crate::callback::InferenceContext {
+            model_name: model_name.to_string(),
+            version: resolved_version.clone(),
+            route: "/predict".to_string(),
+            protocol: crate::callback::Protocol::Grpc,
+            request_id: request_id.clone(),
+            client_ip: client_ip.clone(),
+            elapsed_us: None,
+        };
+        crate::callback::fire_inference_request(&cb_runner, &req_ctx);
 
         let (tx, rx) = mpsc::channel(64);
         let cancel_client = client.clone();
@@ -239,14 +254,23 @@ impl GrpcService {
                         };
                         stream_family = grpc_code_to_status_family(grpc_err.code());
                         let _ = tx.send(Err(grpc_err)).await;
+                        crate::callback::fire_inference_response(&cb_runner, &req_ctx, start);
                         break;
                     }
-                    Some(pb::stream_response::Payload::Done(_)) => {
+                    Some(pb::stream_response::Payload::Done(done)) => {
+                        // Task A: record worker-reported metrics (HTTP parity).
+                        crate::metrics::prometheus::record_worker_metrics(
+                            &metrics_model,
+                            &metrics_version,
+                            done.metrics.as_ref(),
+                        );
                         // Model called sender.close(): emit the terminal is_final
                         // frame, then end the gRPC stream.
                         let _ = tx
                             .send(Ok(pb::DecoupledResponse { data: Default::default(), is_final: true }))
                             .await;
+                        // Task D: terminal frame → InferenceResponse.
+                        crate::callback::fire_inference_response(&cb_runner, &req_ctx, start);
                         break;
                     }
                     _ => {}

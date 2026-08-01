@@ -229,6 +229,15 @@ impl GrpcService {
             }
         };
 
+        // Task A: record worker-reported metrics (HTTP parity). The metrics field
+        // rides on the top-level Response (proto field 40); infer carries it on
+        // the InferResponse but never recorded it before.
+        crate::metrics::prometheus::record_worker_metrics(
+            model_name,
+            &resolved_version,
+            resp.metrics.as_ref(),
+        );
+
         match resp.payload {
             Some(pb::response::Payload::Single(single)) => {
                 let grpc_status = single.status.as_ref().map(|s| pb::Status {

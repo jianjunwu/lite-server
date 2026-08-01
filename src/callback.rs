@@ -14,8 +14,13 @@
 //! | ``ModelLoad``       | A model version finishes loading              |
 //! | ``ModelUnload``     | A model version is about to be unloaded       |
 //! | ``ModelReload``     | A model version is hot-reloaded               |
-//! | ``InferenceRequest``| An inference request arrives (before queue)   |
-//! | ``InferenceResponse``| An inference response is sent to the client |
+//! | ``InferenceRequest``| An inference request arrives (before queue).   |
+//! |                     | Streaming fires once the worker stream opens   |
+//! |                     | successfully (streaming bypasses the queue).   |
+//! | ``InferenceResponse``| An inference response is sent to the client.  |
+//! |                     | Streaming fires on the terminal Done/Error     |
+//! |                     | frame; cancel / disconnect / idle-truncate do  |
+//! |                     | not fire (no terminal frame reached).          |
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -238,6 +243,43 @@ impl Default for CallbackRunner {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming fire helpers (task A+D parity: gRPC stream/decoupled/bidi + HTTP
+// SSE/WS now trigger the inference callbacks like unary does).
+// ---------------------------------------------------------------------------
+
+/// Fire `InferenceRequest` off-thread. Used by streaming paths where the
+/// request callback fires once the worker stream opens successfully (streaming
+/// bypasses the queue, so open-success is the trigger). Spawns a task so the
+/// caller (handler / forwarder) is never blocked by callback dispatch.
+pub fn fire_inference_request(runner: &Arc<CallbackRunner>, ctx: &InferenceContext) {
+    let runner = Arc::clone(runner);
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        runner.on_inference_request(&ctx).await;
+    });
+}
+
+/// Fire `InferenceResponse` off-thread on a stream's terminal frame (Done or
+/// Error). `start` is the stream's reference Instant; `elapsed_us` is the wall
+/// clock up to that moment. Cancel / disconnect / idle-truncate do NOT fire
+/// (no terminal frame reached).
+pub fn fire_inference_response(
+    runner: &Arc<CallbackRunner>,
+    ctx: &InferenceContext,
+    start: std::time::Instant,
+) {
+    let elapsed_us = Some((start.elapsed().as_secs_f64() * 1_000_000.0) as u64);
+    let resp_ctx = InferenceContext {
+        elapsed_us,
+        ..ctx.clone()
+    };
+    let runner = Arc::clone(runner);
+    tokio::spawn(async move {
+        runner.on_inference_response(&resp_ctx).await;
+    });
 }
 
 // ============================================================================

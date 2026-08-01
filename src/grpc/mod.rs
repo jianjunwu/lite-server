@@ -1734,4 +1734,581 @@ mod request_metrics_tests {
         assert!(field("model").contains("span_404"), "span model field: {:?}", inference.1);
         assert!(field("request_id").contains("span-rid"), "span request_id field: {:?}", inference.1);
     }
+
+    // ===== Task A: gRPC worker metrics (infer / stream / decoupled / batch) =====
+    //
+    // HTTP already records worker metrics on the SSE/WS Done frames; the gRPC
+    // paths carried the field but never recorded. These guard the four new
+    // record points (bidi shares the identical Done-arm record — covered by the
+    // stream test + structural parity).
+
+    /// PAIR worker answering every unary request with Ok Single + top-level
+    /// Response.metrics (proto field 40) — drives the unary `infer` record.
+    fn spawn_ok_worker_with_metrics(endpoint: String, m: pb::Metrics) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(5000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let resp = pb::Response {
+                    uid: req.uid,
+                    metrics: Some(m.clone()),
+                    payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+                        data: Bytes::from_static(b"{\"ok\":true}"),
+                        status: Some(pb::Status { code: "Ok".to_string(), message: String::new() }),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                if s.send(resp.encode_to_vec(), 0).is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// PAIR worker answering a stream Open with one Chunk + a Done carrying
+    /// Metrics (proto StreamDone.metrics = 1) — drives stream/decoupled record.
+    fn spawn_stream_worker_with_metrics(endpoint: String, m: pb::Metrics) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(5000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let is_open = matches!(
+                    req.payload,
+                    Some(pb::request::Payload::Stream(pb::StreamRequest {
+                        action: Some(pb::stream_request::Action::Open(_)),
+                        ..
+                    }))
+                );
+                if !is_open {
+                    let ack = pb::Response { uid: req.uid, ..Default::default() };
+                    let _ = s.send(ack.encode_to_vec(), 0);
+                    continue;
+                }
+                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                let mk = |payload| pb::Response {
+                    payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                        stream_id: st.stream_id.clone(),
+                        payload: Some(payload),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                let _ = s.send(mk(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
+                    data: Bytes::from_static(b"{}"),
+                    is_final: false,
+                })).encode_to_vec(), 0);
+                let _ = s.send(
+                    mk(pb::stream_response::Payload::Done(pb::StreamDone { metrics: Some(m.clone()) }))
+                        .encode_to_vec(),
+                    0,
+                );
+            }
+        })
+    }
+
+    /// PAIR worker answering a Batch request by echoing each item back as a
+    /// BatchItemResponse, with top-level Response.metrics — drives batch record.
+    fn spawn_batch_worker_with_metrics(endpoint: String, m: pb::Metrics) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(5000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let items: Vec<pb::BatchItemResponse> = match req.payload {
+                    Some(pb::request::Payload::Batch(b)) => b
+                        .items
+                        .into_iter()
+                        .map(|it| pb::BatchItemResponse {
+                            uid: it.uid,
+                            data: it.data,
+                            status: Some(pb::Status { code: "Ok".to_string(), message: String::new() }),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    _ => vec![],
+                };
+                let resp = pb::Response {
+                    uid: req.uid,
+                    metrics: Some(m.clone()),
+                    payload: Some(pb::response::Payload::Batch(pb::BatchResponse {
+                        items,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                if s.send(resp.encode_to_vec(), 0).is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn grpc_infer_records_worker_metrics() {
+        let model = "wm_infer";
+        let endpoint = metric_test_endpoint(model);
+        let _w = spawn_ok_worker_with_metrics(
+            endpoint.clone(),
+            pb::Metrics { prefill_ms: 12.5, tokens_generated: 3, ..Default::default() },
+        );
+        let service = ready_service_with_worker(model, endpoint).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let resp = service.infer(infer_request(model, "1")).await;
+        assert!(resp.is_ok(), "infer must succeed: {:?}", resp.err());
+
+        let out = crate::metrics::prometheus::gather_metrics();
+        assert!(
+            out.contains(r#"lite_server_prefill_ms{model="wm_infer",version="1"} 12.5"#),
+            "prefill missing: {out}"
+        );
+        assert!(
+            out.contains(r#"lite_server_tokens_generated_total{model="wm_infer",version="1"} 3"#),
+            "tokens missing: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_stream_records_worker_metrics() {
+        let model = "wm_stream";
+        let endpoint = metric_test_endpoint(model);
+        let _w = spawn_stream_worker_with_metrics(
+            endpoint.clone(),
+            pb::Metrics { prefill_ms: 9.5, tokens_generated: 2, ..Default::default() },
+        );
+        let service = ready_service_with_worker(model, endpoint).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let resp = service
+            .stream_infer(Request::new(pb::StreamInferRequest {
+                model_name: model.to_string(),
+                version: "1".to_string(),
+                data: Bytes::from_static(b"{}"),
+                headers: HashMap::new(),
+                sequence_id: None,
+            }))
+            .await
+            .expect("stream must open");
+        use tokio_stream::StreamExt;
+        let mut s = resp.into_inner();
+        while let Some(c) = s.next().await {
+            c.expect("chunk must be Ok");
+        }
+
+        let out = crate::metrics::prometheus::gather_metrics();
+        assert!(
+            out.contains(r#"lite_server_prefill_ms{model="wm_stream",version="1"} 9.5"#),
+            "prefill missing: {out}"
+        );
+        assert!(
+            out.contains(r#"lite_server_tokens_generated_total{model="wm_stream",version="1"} 2"#),
+            "tokens missing: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_decoupled_records_worker_metrics() {
+        let model = "wm_dec";
+        let endpoint = metric_test_endpoint(model);
+        let _w = spawn_stream_worker_with_metrics(
+            endpoint.clone(),
+            pb::Metrics { prefill_ms: 5.5, tokens_generated: 4, ..Default::default() },
+        );
+        let service = ready_service_with_worker(model, endpoint).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let resp = service
+            .decoupled_infer(Request::new(pb::DecoupledInferRequest {
+                model_name: model.to_string(),
+                version: "1".to_string(),
+                data: Bytes::from_static(b"{}"),
+                headers: HashMap::new(),
+                sequence_id: None,
+            }))
+            .await
+            .expect("decoupled must open");
+        use tokio_stream::StreamExt;
+        let mut s = resp.into_inner();
+        while let Some(c) = s.next().await {
+            c.expect("decoupled chunk must be Ok");
+        }
+
+        let out = crate::metrics::prometheus::gather_metrics();
+        assert!(
+            out.contains(r#"lite_server_prefill_ms{model="wm_dec",version="1"} 5.5"#),
+            "prefill missing: {out}"
+        );
+        assert!(
+            out.contains(r#"lite_server_tokens_generated_total{model="wm_dec",version="1"} 4"#),
+            "tokens missing: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_batch_records_worker_metrics() {
+        let model = "wm_batch";
+        let endpoint = metric_test_endpoint(model);
+        let _w = spawn_batch_worker_with_metrics(
+            endpoint.clone(),
+            pb::Metrics { prefill_ms: 7.5, tokens_generated: 1, ..Default::default() },
+        );
+        let service = ready_service_with_worker(model, endpoint).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let resp = service
+            .batch_infer(Request::new(pb::BatchInferRequest {
+                model_name: model.to_string(),
+                version: "1".to_string(),
+                items: vec![Bytes::from_static(b"{}")],
+                headers: HashMap::new(),
+            }))
+            .await;
+        assert!(resp.is_ok(), "batch must succeed: {:?}", resp.err());
+
+        let out = crate::metrics::prometheus::gather_metrics();
+        assert!(
+            out.contains(r#"lite_server_prefill_ms{model="wm_batch",version="1"} 7.5"#),
+            "prefill missing: {out}"
+        );
+        assert!(
+            out.contains(r#"lite_server_tokens_generated_total{model="wm_batch",version="1"} 1"#),
+            "tokens missing: {out}"
+        );
+    }
+
+    // ===== Task D: streaming callbacks (request on open; response on Done/Error;
+    //       cancel/disconnect does not fire) =====
+    //
+    // bidi shares the identical fire_inference_request/response calls and
+    // Done/Error arms — covered by stream/decoupled here + structural parity
+    // (constructing a tonic `Streaming<BidiChunk>` in a unit test is impractical).
+
+    /// PAIR worker answering a stream Open with one Error frame — drives the
+    /// response-on-error path.
+    fn spawn_stream_error_worker(endpoint: String) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(5000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let is_open = matches!(
+                    req.payload,
+                    Some(pb::request::Payload::Stream(pb::StreamRequest {
+                        action: Some(pb::stream_request::Action::Open(_)),
+                        ..
+                    }))
+                );
+                if !is_open {
+                    let ack = pb::Response { uid: req.uid, ..Default::default() };
+                    let _ = s.send(ack.encode_to_vec(), 0);
+                    continue;
+                }
+                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                let resp = pb::Response {
+                    payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                        stream_id: st.stream_id.clone(),
+                        payload: Some(pb::stream_response::Payload::Error(pb::StreamError {
+                            message: "boom".to_string(),
+                        })),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                let _ = s.send(resp.encode_to_vec(), 0);
+            }
+        })
+    }
+
+    /// Callback counting request/response fires; stashes the last response ctx
+    /// so tests can assert elapsed_us is set.
+    struct CountingCallback {
+        req: std::sync::atomic::AtomicUsize,
+        resp: std::sync::atomic::AtomicUsize,
+        last_resp: std::sync::Mutex<Option<crate::callback::InferenceContext>>,
+    }
+
+    impl CountingCallback {
+        fn new() -> Self {
+            Self {
+                req: std::sync::atomic::AtomicUsize::new(0),
+                resp: std::sync::atomic::AtomicUsize::new(0),
+                last_resp: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::callback::Callback for CountingCallback {
+        async fn on_inference_request(&self, _ctx: &crate::callback::InferenceContext) {
+            self.req.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        async fn on_inference_response(&self, ctx: &crate::callback::InferenceContext) {
+            self.resp.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            *self.last_resp.lock().unwrap() = Some(ctx.clone());
+        }
+    }
+
+    /// Build a service whose GrpcService.callback_runner is the SHARED runner
+    /// (build_service_with_canary uses a fresh unobservable one). The WM/AppState
+    /// runners are separate and unused for inference callbacks.
+    fn build_service_with_callback(
+        registry: Arc<ModelRegistry>,
+        queue: Arc<InferenceQueue>,
+        cb: Arc<CallbackRunner>,
+    ) -> GrpcService {
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            std::env::temp_dir(),
+            queue,
+            "error".to_string(),
+            Arc::new(CallbackRunner::new()),
+        ));
+        let app_state = Arc::new(AppState::new(
+            registry.clone(),
+            wm.clone(),
+            wm.inference_queue().clone(),
+            crate::config::Config::default(),
+            std::env::temp_dir(),
+            Arc::new(CallbackRunner::new()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+        ));
+        GrpcService::new(
+            registry,
+            wm,
+            false,
+            false,
+            cb,
+            Arc::new(crate::server::ShutdownState::new()),
+            Duration::from_secs(5),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+            None,
+            app_state,
+            Arc::new(Vec::new()),
+        )
+    }
+
+    async fn ready_service_with_worker_cb(
+        model: &str,
+        endpoint: String,
+        cb: Arc<CallbackRunner>,
+    ) -> GrpcService {
+        let registry = Arc::new(ModelRegistry::new());
+        registry
+            .register(model, "1", test_config(1, 0.0, 10), ModelType::LitAPI, std::env::temp_dir())
+            .unwrap();
+        registry.mark_ready(model, "1").unwrap();
+        let queue = Arc::new(InferenceQueue::new());
+        let client = Arc::new(WorkerZmqClient::new(endpoint));
+        let (reload_tx, _rx) = mpsc::channel(8);
+        queue.register_model(
+            model, "1", &test_config(1, 0.0, 10), vec![],
+            vec![client.clone()],
+            reload_tx, Arc::new(OutlierState::new(1)), None,
+        );
+        let service = build_service_with_callback(registry, queue, cb);
+        service
+            .worker_manager
+            .insert_zmq_clients_for_test(model, "1", vec![client])
+            .await;
+        service
+    }
+
+    async fn wait_for<F: Fn() -> bool>(cond: F, label: &str) {
+        for _ in 0..60 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("condition never met within ~1.5s: {}", label);
+    }
+
+    #[tokio::test]
+    async fn stream_callback_fires_on_done() {
+        let model = "cb_stream_done";
+        let endpoint = metric_test_endpoint(model);
+        let _w = spawn_stream_worker(endpoint.clone());
+        let cb = Arc::new(CountingCallback::new());
+        let runner = Arc::new(CallbackRunner::new());
+        runner.register(cb.clone()).await;
+        let service = ready_service_with_worker_cb(model, endpoint, runner).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let resp = service
+            .stream_infer(Request::new(pb::StreamInferRequest {
+                model_name: model.to_string(),
+                version: "1".to_string(),
+                data: Bytes::from_static(b"{}"),
+                headers: HashMap::new(),
+                sequence_id: None,
+            }))
+            .await
+            .expect("stream must open");
+        use tokio_stream::StreamExt;
+        let mut s = resp.into_inner();
+        while let Some(c) = s.next().await {
+            c.expect("chunk must be Ok");
+        }
+
+        wait_for(|| cb.req.load(std::sync::atomic::Ordering::Relaxed) >= 1, "req>=1").await;
+        wait_for(|| cb.resp.load(std::sync::atomic::Ordering::Relaxed) >= 1, "resp>=1").await;
+        assert_eq!(cb.req.load(std::sync::atomic::Ordering::Relaxed), 1, "request fires once");
+        assert_eq!(cb.resp.load(std::sync::atomic::Ordering::Relaxed), 1, "response fires once");
+        let elapsed_set = cb
+            .last_resp
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| c.elapsed_us.is_some())
+            .unwrap_or(false);
+        assert!(elapsed_set, "response elapsed_us must be set");
+    }
+
+    #[tokio::test]
+    async fn stream_callback_fires_on_error() {
+        let model = "cb_stream_err";
+        let endpoint = metric_test_endpoint(model);
+        let _w = spawn_stream_error_worker(endpoint.clone());
+        let cb = Arc::new(CountingCallback::new());
+        let runner = Arc::new(CallbackRunner::new());
+        runner.register(cb.clone()).await;
+        let service = ready_service_with_worker_cb(model, endpoint, runner).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let resp = service
+            .stream_infer(Request::new(pb::StreamInferRequest {
+                model_name: model.to_string(),
+                version: "1".to_string(),
+                data: Bytes::from_static(b"{}"),
+                headers: HashMap::new(),
+                sequence_id: None,
+            }))
+            .await
+            .expect("stream must open");
+        use tokio_stream::StreamExt;
+        let mut s = resp.into_inner();
+        // Drain ignoring the terminal Err chunk.
+        while s.next().await.is_some() {}
+
+        wait_for(|| cb.resp.load(std::sync::atomic::Ordering::Relaxed) >= 1, "resp>=1").await;
+        assert_eq!(cb.req.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(cb.resp.load(std::sync::atomic::Ordering::Relaxed), 1, "Error frame fires response");
+    }
+
+    #[tokio::test]
+    async fn stream_callback_not_fired_on_cancel() {
+        let model = "cb_stream_cancel";
+        let endpoint = metric_test_endpoint(model);
+        let _w = spawn_stream_worker(endpoint.clone());
+        let cb = Arc::new(CountingCallback::new());
+        let runner = Arc::new(CallbackRunner::new());
+        runner.register(cb.clone()).await;
+        let service = ready_service_with_worker_cb(model, endpoint, runner).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let resp = service
+            .stream_infer(Request::new(pb::StreamInferRequest {
+                model_name: model.to_string(),
+                version: "1".to_string(),
+                data: Bytes::from_static(b"{}"),
+                headers: HashMap::new(),
+                sequence_id: None,
+            }))
+            .await
+            .expect("stream must open");
+        // Drop the client rx immediately → the forwarder's tx.send errors on the
+        // first chunk, so it breaks before the Done frame: no response callback.
+        drop(resp.into_inner());
+
+        wait_for(|| cb.req.load(std::sync::atomic::Ordering::Relaxed) >= 1, "req>=1").await;
+        // Give the forwarder a moment to observe the dropped rx and break.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(cb.req.load(std::sync::atomic::Ordering::Relaxed), 1, "request still fires on cancel");
+        assert_eq!(cb.resp.load(std::sync::atomic::Ordering::Relaxed), 0, "cancel must NOT fire response");
+    }
+
+    #[tokio::test]
+    async fn decoupled_callback_fires_on_done() {
+        let model = "cb_dec_done";
+        let endpoint = metric_test_endpoint(model);
+        let _w = spawn_stream_worker(endpoint.clone());
+        let cb = Arc::new(CountingCallback::new());
+        let runner = Arc::new(CallbackRunner::new());
+        runner.register(cb.clone()).await;
+        let service = ready_service_with_worker_cb(model, endpoint, runner).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let resp = service
+            .decoupled_infer(Request::new(pb::DecoupledInferRequest {
+                model_name: model.to_string(),
+                version: "1".to_string(),
+                data: Bytes::from_static(b"{}"),
+                headers: HashMap::new(),
+                sequence_id: None,
+            }))
+            .await
+            .expect("decoupled must open");
+        use tokio_stream::StreamExt;
+        let mut s = resp.into_inner();
+        while let Some(c) = s.next().await {
+            c.expect("decoupled chunk must be Ok");
+        }
+
+        wait_for(|| cb.resp.load(std::sync::atomic::Ordering::Relaxed) >= 1, "resp>=1").await;
+        assert_eq!(cb.req.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(cb.resp.load(std::sync::atomic::Ordering::Relaxed), 1, "decoupled Done fires response");
+    }
+
+    #[tokio::test]
+    async fn decoupled_callback_not_fired_on_cancel() {
+        let model = "cb_dec_cancel";
+        let endpoint = metric_test_endpoint(model);
+        let _w = spawn_stream_worker(endpoint.clone());
+        let cb = Arc::new(CountingCallback::new());
+        let runner = Arc::new(CallbackRunner::new());
+        runner.register(cb.clone()).await;
+        let service = ready_service_with_worker_cb(model, endpoint, runner).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let resp = service
+            .decoupled_infer(Request::new(pb::DecoupledInferRequest {
+                model_name: model.to_string(),
+                version: "1".to_string(),
+                data: Bytes::from_static(b"{}"),
+                headers: HashMap::new(),
+                sequence_id: None,
+            }))
+            .await
+            .expect("decoupled must open");
+        drop(resp.into_inner());
+
+        wait_for(|| cb.req.load(std::sync::atomic::Ordering::Relaxed) >= 1, "req>=1").await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(cb.req.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(cb.resp.load(std::sync::atomic::Ordering::Relaxed), 0, "cancel must NOT fire response");
+    }
 }
