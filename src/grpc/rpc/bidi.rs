@@ -34,8 +34,10 @@ impl GrpcService {
     ) -> Result<Response<ReceiverStream<Result<pb::BidiChunk, Status>>>, Status> {
         let remote_addr = request.remote_addr();
         let (grpc_metadata, extensions, mut stream) = request.into_parts();
-        // BidiOpen carries no headers map — metadata and the transport peer
-        // address are the only client-identity sources on this path.
+        // request_id / client_ip come from metadata + the transport peer only:
+        // BidiOpen.headers (task C) is decoded later and carries canary / auth
+        // / B3 hints — not client identity (structural: headers are unavailable
+        // at finalize_context time).
         let cx = interceptor::finalize_context(
             extensions.get::<RequestContext>().cloned(),
             &grpc_metadata,
@@ -58,7 +60,7 @@ impl GrpcService {
             .await
             .map_err(|e| err(Status::internal(format!("stream error: {}", e))))?;
 
-        let (model_name, resolved_version, stream_id, initial_data, sequence_id, pin) = match first {
+        let (model_name, resolved_version, stream_id, initial_data, sequence_id, pin, headers) = match first {
             Some(chunk) => match chunk.payload {
                 Some(pb::bidi_chunk::Payload::Open(open)) => {
                     let model_name = open.model_name;
@@ -72,13 +74,14 @@ impl GrpcService {
                         return Err(err(Status::invalid_argument(e.to_string())));
                     }
 
-                    // P5-2: bidi 仅 metadata 携带 pin（BidiOpen 无 headers map）。
+                    // P5-2: canary pin — metadata first, then BidiOpen.headers
+                    // (task C parity with unary's proto-headers fallback).
                     let pin = canary_pin(
                         &self.registry,
                         self.canary_override,
                         &model_name,
                         &grpc_metadata,
-                        &HashMap::new(),
+                        &open.headers,
                     )?;
 
                     // version="" → canary pin (P5-2, 开关开) → weighted routing
@@ -94,16 +97,15 @@ impl GrpcService {
                         ))));
                     }
 
-                    // BidiOpen has no headers map — transport metadata is the
-                    // only credential carrier on this path.
+                    // Auth: metadata first, then BidiOpen.headers (task C).
                     if let Some(mv) = self.registry.get(&model_name, Some(&resolved_version)) {
-                        enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &HashMap::new())?;
+                        enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &open.headers)?;
                         // bidi key="ip" 共享 bucket（注释注明：所有 bidi 请求归一）。
                         enforce_grpc_rate_limit(&self.rate_limiter, mv.policies.rate_limit.as_ref(), &model_name, &client_ip)?;
                     }
 
                     let sid = format!("grpc-bidi-{}", Uuid::new_v4());
-                    (model_name, resolved_version, sid, open.initial_data, open.sequence_id, pin)
+                    (model_name, resolved_version, sid, open.initial_data, open.sequence_id, pin, open.headers)
                 }
                 _ => return Err(err(Status::invalid_argument("first message must be BidiOpen"))),
             },
@@ -130,8 +132,10 @@ impl GrpcService {
             span.record("pinned_version", p.as_str());
         }
         async move {
-        // P-TRACE: inject the bidi inference span's trace context (worker child).
-        let mut bidi_headers = HashMap::new();
+        // P-TRACE: seed the worker meta with BidiOpen.headers (task C: canary /
+        // auth / B3 hints forwarded to the worker) + inject the bidi inference
+        // span's trace context (worker child).
+        let mut bidi_headers = headers;
         crate::telemetry::inject(&mut bidi_headers);
         let meta = pb::RequestMeta {
             route: "/predict".to_string(),

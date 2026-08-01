@@ -224,6 +224,30 @@ class TestBidiChunkSerialization:
         assert parsed.open.model_name == "asr"
         assert parsed.open.initial_data == b"audio_header"
 
+    def test_bidi_open_carries_headers(self):
+        # Task C: BidiOpen.headers carries B3 hints / canary / auth carriers
+        # (parity with StreamInferRequest.headers). Round-trips via BidiChunk.
+        chunk = BidiChunk(
+            stream_id="bidi-1",
+            open=BidiOpen(
+                model_name="asr",
+                version="",
+                initial_data=b"audio_header",
+                headers={
+                    "x-lite-version": "2",
+                    "x-lite-affinity-key": "session-42",
+                    "x-lite-worker-id": "0",
+                },
+            ),
+        )
+        raw = chunk.SerializeToString()
+        parsed = BidiChunk()
+        parsed.ParseFromString(raw)
+        assert parsed.HasField("open")
+        assert parsed.open.headers["x-lite-version"] == "2"
+        assert parsed.open.headers["x-lite-affinity-key"] == "session-42"
+        assert parsed.open.headers["x-lite-worker-id"] == "0"
+
     def test_bidi_data(self):
         chunk = BidiChunk(
             stream_id="bidi-1",

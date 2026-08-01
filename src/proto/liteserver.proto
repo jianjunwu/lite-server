@@ -276,6 +276,12 @@ message BidiOpen {
   string version = 2;
   bytes initial_data = 3;
   optional string sequence_id = 4;
+  // B3 hint + canary/auth carrier (parity with StreamInferRequest.headers).
+  // Field number 5 (not 4) because BidiOpen already has sequence_id=4; the
+  // ordering is intentionally reversed vs the sibling streaming messages
+  // (which use headers=4, sequence_id=5) to keep the additive field
+  // wire-compatible. gRPC-only — the ZMQ wire uses StreamOpen + RequestMeta.
+  map<string, string> headers = 5;
 }
 
 message BidiData {

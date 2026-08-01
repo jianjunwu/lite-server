@@ -5282,6 +5282,7 @@ async fn test_p_flow_grpc_bidi_disconnect_propagates_cancel() {
                 version: "1".to_string(),
                 initial_data: bytes::Bytes::from_static(b"{}"),
                 sequence_id: None,
+                ..Default::default()
             })),
         })
         .await
