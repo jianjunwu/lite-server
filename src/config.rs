@@ -274,6 +274,13 @@ pub struct GrpcConfig {
     pub mtls_ca_path: Option<String>,
     /// Minimum TLS version (P5-1): "1.2" (default) or "1.3".
     pub tls_min_version: Option<String>,
+    /// gRPC server reflection (评审低#12, opt-in). Default false. When true, the
+    /// v1 reflection service is mounted (main router, and the admin router when
+    /// `admin_bind` is set) so grpcurl/grpcui can discover LiteServer/Admin/
+    /// health without a local proto copy. Carries the Admin access class
+    /// (schema metadata is admin-plane information): fail-closed to loopback
+    /// unless `access_control` admin credentials are configured.
+    pub reflection: bool,
 }
 
 impl Default for GrpcConfig {
@@ -293,6 +300,7 @@ impl Default for GrpcConfig {
             tls_key_path: None,
             mtls_ca_path: None,
             tls_min_version: None,
+            reflection: false,
         }
     }
 }

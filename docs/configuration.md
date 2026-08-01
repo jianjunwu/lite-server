@@ -78,6 +78,7 @@ grpc:
   http2_adaptive_window: false         # BDP-adaptive HTTP/2 flow-control window
   http2_max_frame_size: null           # Max HTTP/2 frame payload (bytes); null = tonic default
   response_compression: false          # gzip gRPC responses (P1-3); inference service only
+  reflection: false                    # gRPC server reflection (opt-in): grpcurl/grpcui service discovery; carries the Admin access class (fail-closed to loopback unless access_control admin is configured)
   socket_mode: 0o666                   # chmod for a unix: gRPC UDS (P4-1)
   # TLS/mTLS — same semantics as the server.* TLS keys, applied to the gRPC listener
   tls_cert_path: null          # Server certificate chain PEM; requires tls_key_path

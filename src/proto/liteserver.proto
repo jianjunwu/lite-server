@@ -307,8 +307,8 @@ message DecoupledResponse {
 //
 // 11 RPCs mirroring the HTTP admin REST surface. Additive ONLY: a new service
 // + new messages; no existing message/field is touched (proto 双用途 gRPC+ZMQ，
-// additive 对 ZMQ wire 向后安全). gRPC reflection (评审低#12) is an opt-in
-// follow-up, not included here.
+// additive 对 ZMQ wire 向后安全). gRPC reflection (评审低#12) 已实现：opt-in
+// 配置 `grpc.reflection: true`（默认关），见 src/grpc/reflection.rs。
 service Admin {
   rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
   rpc ListModels(ListModelsRequest) returns (ListModelsResponse);

@@ -44,6 +44,9 @@ libc = "0.2"
 # 升级全家桶到 0.13 统一单一 tonic 版本，消除 rustls/tonic 多版本分裂风险。
 tonic = { version = "0.13", features = ["gzip", "tls-ring"] }
 tonic-health = { version = "0.13" }
+# gRPC reflection (评审低#12, opt-in): grpc.reflection=true 时挂载 v1 reflection
+# 服务，grpcurl/grpcui 免本地 proto 即可探测 LiteServer/Admin/health。默认关。
+tonic-reflection = { version = "0.13" }
 tokio-stream = { version = "0.1", features = ["net"] }
 
 # TLS/mTLS (P5-1, 蓝图 §4.3): 统一 ring provider（评审 2.4）——axum-server 的

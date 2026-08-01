@@ -73,6 +73,7 @@ grpc:
   http2_adaptive_window: false         # BDP 自适应 HTTP/2 流控窗口
   http2_max_frame_size: null           # HTTP/2 帧载荷上限（字节）；null = tonic 默认
   response_compression: false          # gzip gRPC 响应（P1-3）；仅推理服务
+  reflection: false                    # gRPC server reflection（opt-in）：grpcurl/grpcui 服务发现；挂 Admin 访问类（未配置 access_control admin 时 fail-closed 仅 loopback）
   socket_mode: 0o666                   # unix: gRPC UDS 的 chmod（P4-1）
   # TLS/mTLS——与 server.* 的 TLS 键语义相同，作用于 gRPC 监听器
   tls_cert_path: null          # 服务器证书链 PEM；须与 tls_key_path 同设

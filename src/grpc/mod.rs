@@ -20,6 +20,7 @@ mod auth;
 mod canary;
 mod error;
 mod metadata;
+mod reflection;
 mod rpc;
 
 pub use pb::lite_server_server::{LiteServer, LiteServerServer};
@@ -553,6 +554,29 @@ pub async fn start_grpc_server(
         main_router
     };
 
+    // gRPC reflection（评审低#12, opt-in，见 grpc/reflection.rs）：grpc.reflection
+    // =true 时挂载 v1 reflection——注册 liteserver proto + grpc.health.v1 描述符；
+    // 挂 Admin 访问类（schema 元数据属 admin 面，fail-closed 仅 loopback）。
+    let build_reflection = || -> Result<_, AppError> {
+        tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(crate::proto::FILE_DESCRIPTOR_SET)
+            .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
+            .build_v1()
+            .map_err(|e| AppError::Internal(format!("gRPC reflection build: {e}")))
+    };
+    let main_router = if grpc_config.reflection {
+        main_router.add_service(tonic::codegen::InterceptedService::new(
+            build_reflection()?,
+            interceptor::service_interceptor(
+                access_control.clone(),
+                EndpointClass::Admin,
+                trusted.clone(),
+            ),
+        ))
+    } else {
+        main_router
+    };
+
     // P4-2: one shutdown signal shared by every server (main + admin). Shared so
     // both observers fire on the single shutdown_rx; tls_incoming also takes a clone.
     let shutdown = futures::FutureExt::shared(async move {
@@ -578,6 +602,20 @@ pub async fn start_grpc_server(
         let admin_router = make_builder()
             .add_service(admin_server_opt.take().expect("admin_server staged"))
             .add_service(health_service);
+        // admin_bind 分离时 admin 面独立成服务组——reflection 同样挂载在此，
+        // 使 grpcurl 对 admin_bind 也可发现 Admin/health。
+        let admin_router = if grpc_config.reflection {
+            admin_router.add_service(tonic::codegen::InterceptedService::new(
+                build_reflection()?,
+                interceptor::service_interceptor(
+                    access_control.clone(),
+                    EndpointClass::Admin,
+                    trusted.clone(),
+                ),
+            ))
+        } else {
+            admin_router
+        };
         let admin_fut = serve_grpc_router(
             admin_router,
             admin_host,
