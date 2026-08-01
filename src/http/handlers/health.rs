@@ -90,6 +90,8 @@ pub async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
             "loaded_at": e.loaded_at
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs()),
+            // P-WARM / KServe ModelStatus: failure reason when status == failed.
+            "last_failure": e.last_failure,
         });
         if let Some(last) = models.last_mut() {
             if last["name"] == e.name {

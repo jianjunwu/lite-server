@@ -1279,8 +1279,20 @@ impl WorkerManager {
 
         self.registry
             .set_workers(model_name, version, worker_infos.clone())?;
-        self.registry
-            .mark_ready(model_name, version)?;
+
+        // P-WARM (§4.3): if warmup is enabled the version enters WarmingUp
+        // (NOT_SERVING) here; the final Ready transition is deferred until the
+        // dummy warmup below completes. Disabled → straight to Ready (legacy).
+        let warmup = model_config.policies.warmup.clone();
+        if let Some(ref p) = warmup {
+            if p.enabled {
+                self.registry.mark_warming_up(model_name, version)?;
+            } else {
+                self.registry.mark_ready(model_name, version)?;
+            }
+        } else {
+            self.registry.mark_ready(model_name, version)?;
+        }
 
         // Create shared OutlierState — single instance for batch_collector, health_checker, and streaming.
         // Ejection thresholds come from ModelConfig (§3); error_threshold == 0 disables ejection.
@@ -1303,6 +1315,45 @@ impl WorkerManager {
             workers.insert(key.clone(), worker_processes);
             clients.insert(key.clone(), zmq_clients_for_model);
             outliers.insert(key, outlier);
+        }
+
+        // P-WARM (§4.3): with the queue wired, drive N dummy inferences to warm
+        // the engine before the version becomes Ready. The version is still
+        // WarmingUp (NOT_SERVING) — readiness/routing exclude it. A warmup
+        // failure marks it Failed (D33: prefer delaying availability over
+        // serving an unwarmed/broken model). Skipped entirely when disabled.
+        if let Some(ref policy) = warmup {
+            if policy.enabled {
+                match self.run_warmup(model_name, version, &model_config, policy).await {
+                    Ok(()) => {
+                        self.registry.mark_ready(model_name, version)?;
+                        info!(
+                            model = %model_name, version = %version,
+                            iterations = policy.iterations,
+                            "warmup complete"
+                        );
+                    }
+                    Err(reason) => {
+                        error!(
+                            model = %model_name, version = %version,
+                            reason = %reason,
+                            "warmup failed; marking version Failed"
+                        );
+                        self.registry
+                            .mark_failed(model_name, version, &reason)?;
+                        self.sync_grpc_health().await;
+                        crate::metrics::prometheus::record_model_load(
+                            model_name,
+                            version,
+                            false,
+                        );
+                        return Err(AppError::WorkerCrashed(format!(
+                            "warmup failed for {} {}: {}",
+                            model_name, version, reason
+                        )));
+                    }
+                }
+            }
         }
 
         // Status coordinator: periodic Ready/Degraded reconciliation at the
@@ -1328,6 +1379,115 @@ impl WorkerManager {
             version: version.to_string(),
             device: config.devices.as_ref().and_then(|d| d.as_str().map(|s| s.to_string())),
         }).await;
+
+        Ok(())
+    }
+
+    /// P-WARM (§4.3): drive `iterations` dummy inferences through the inference
+    /// queue to warm the engine (CUDA graph capture / torch.compile / allocator
+    /// pools) before the version becomes `Ready`. The dummy input is the raw
+    /// `/predict` request body read from `<model_dir>/<dummy_input_ref>`, sent
+    /// verbatim — so it exercises the exact production path. Returns
+    /// `Err(reason)` on any failure (file unreadable, queue error, error
+    /// response, timeout); the caller marks the version `Failed`.
+    async fn run_warmup(
+        &self,
+        model_name: &str,
+        version: &str,
+        model_config: &ModelConfig,
+        policy: &crate::config::WarmupPolicy,
+    ) -> Result<(), String> {
+        // The dummy input is a file under the model dir holding the raw
+        // request body (the same JSON a real /predict carries).
+        let model_dir = self
+            .registry
+            .get(model_name, Some(version))
+            .map(|mv| mv.model_dir.clone())
+            .ok_or_else(|| format!("version {}/{} vanished during warmup", model_name, version))?;
+        let dummy_path = model_dir.join(&policy.dummy_input_ref);
+        let payload_bytes = tokio::fs::read(&dummy_path)
+            .await
+            .map_err(|e| format!("read dummy input {}: {}", dummy_path.display(), e))?;
+
+        let iterations = policy.iterations.max(1);
+        let timeout_opt = policy.effective_timeout(model_config.request_timeout);
+        let timestamp_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+
+        info!(
+            model = %model_name, version = %version,
+            iterations = iterations,
+            dummy = %dummy_path.display(),
+            "warming up model"
+        );
+
+        for i in 0..iterations {
+            let uid = format!("warmup_{}_{}_{}", model_name, version, i);
+            let meta = crate::proto::liteserver::RequestMeta {
+                route: "/predict".to_string(),
+                request_id: uid.clone(),
+                client_ip: "127.0.0.1".to_string(),
+                timestamp_ns,
+                payload: bytes::Bytes::from(payload_bytes.clone()),
+                ..Default::default()
+            };
+            let (response_tx, response_rx) = oneshot::channel();
+            let item = crate::inference_queue::QueueItem {
+                uid: uid.clone(),
+                data: bytes::Bytes::from(payload_bytes.clone()),
+                meta: Some(Arc::new(meta)),
+                response_tx,
+                inflight_guard: None,
+                enqueued_at: std::time::Instant::now(),
+            };
+            match self.inference_queue.try_submit(model_name, version, item) {
+                Ok(()) => {}
+                Err(crate::inference_queue::QueueError::Full) => {
+                    return Err("warmup queue full".to_string());
+                }
+                Err(_) => {
+                    return Err("warmup: inference queue not available".to_string());
+                }
+            }
+
+            // Bound the dummy inference by the warmup timeout (None = unbounded).
+            let response = match timeout_opt {
+                Some(t) => match timeout(t, response_rx).await {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(_)) => return Err("warmup: response channel closed".to_string()),
+                    Err(_) => {
+                        return Err(format!(
+                            "warmup: timed out after {:.1}s",
+                            t.as_secs_f32()
+                        ))
+                    }
+                },
+                None => match response_rx.await {
+                    Ok(r) => r,
+                    Err(_) => return Err("warmup: response channel closed".to_string()),
+                },
+            };
+
+            // A non-Ok status (or a non-Single payload) fails the warmup.
+            let ok = matches!(
+                response.payload,
+                Some(crate::proto::liteserver::response::Payload::Single(ref s))
+                    if s.status.as_ref().map(|st| st.code.as_str()).unwrap_or("Ok") != "Error"
+            );
+            if !ok {
+                let detail = match response.payload {
+                    Some(crate::proto::liteserver::response::Payload::Single(ref s)) => s
+                        .status
+                        .as_ref()
+                        .map(|st| st.message.clone())
+                        .unwrap_or_default(),
+                    _ => "unexpected response payload".to_string(),
+                };
+                return Err(format!("warmup inference returned error: {}", detail));
+            }
+        }
 
         Ok(())
     }
@@ -1474,6 +1634,7 @@ impl WorkerManager {
         crate::metrics::prometheus::record_model_unload(model_name, version);
         crate::metrics::prometheus::set_active_workers(model_name, version, 0.0);
         crate::metrics::prometheus::remove_version_weight(model_name, version);
+        crate::metrics::prometheus::remove_model_ready(model_name, version);
 
         info!("Model {} version {} unloaded", model_name, version);
         Ok(())
@@ -1838,11 +1999,19 @@ async fn sync_grpc_health(registry: &ModelRegistry, handle: &GrpcHealthHandle) {
     for e in &status.entries {
         // Per-version service "{model}/{version}" (§4.5).
         let version_svc = format!("{}/{}", e.name, e.version);
-        let version_status = if matches!(e.status, VersionStatus::Ready | VersionStatus::Degraded) {
+        let version_serving = matches!(
+            e.status,
+            VersionStatus::Ready | VersionStatus::Degraded
+        );
+        let version_status = if version_serving {
             ServingStatus::Serving
         } else {
             ServingStatus::NotServing
         };
+        // P-WARM (§4.3): mirror the per-version readiness to Prometheus so a
+        // WarmingUp/Failed version is visible to scrapers (gRPC health only
+        // carries a binary serving/not-serving per service).
+        crate::metrics::prometheus::set_model_ready(&e.name, &e.version, version_serving);
         state
             .reporter
             .set_service_status(version_svc.clone(), version_status)

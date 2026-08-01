@@ -6,16 +6,22 @@ use std::time::SystemTime;
 /// Explicit lifecycle state machine for a model version.
 ///
 /// ```text
-/// Pending ──spawn──▶ Loading ──handshake──▶ Ready ◀──▶ Degraded
-///                      │                     ▲            │
-///                      └──load failure──▶ Failed     (coordinator
-///                                                     reconciles)
+/// Pending ──spawn──▶ Loading ──handshake──▶ WarmingUp ──ok──▶ Ready ◀──▶ Degraded
+///                      │                         │                ▲            │
+///                      │                         └──fail──▶ Failed       (coordinator
+///                      └──load failure──▶ Failed                  reconciles)
 /// ```
 ///
-/// `Failed` is only set during load (startup crash / timeout); runtime worker
-/// loss is `Degraded` (outlier ejection auto-recovers). The status coordinator
-/// is the sole writer of `Ready`/`Degraded` transitions at runtime; `Loading`
-/// →`Ready` stays event-driven at the worker handshake.
+/// `WarmingUp` (P-WARM): workers have handshaked but the model is still being
+/// warmed with dummy inference — it is NOT serving and must not receive
+/// traffic (D33: warmup blocks readiness). On success it transitions to
+/// `Ready`; a warmup failure lands in `Failed` with `last_failure` set, just
+/// like a load failure.
+///
+/// `Failed` is only set during load/warmup (startup crash / timeout / warmup
+/// failure); runtime worker loss is `Degraded` (outlier ejection auto-recovers).
+/// The status coordinator is the sole writer of `Ready`/`Degraded` transitions
+/// at runtime; `Loading`→`WarmingUp`→`Ready` stays event-driven in the load path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VersionStatus {
@@ -23,11 +29,14 @@ pub enum VersionStatus {
     Pending,
     /// Workers spawning / model weights loading.
     Loading,
+    /// Workers handshaked; running warmup dummy inference before serving (P-WARM).
+    /// NOT serving — excluded from readiness/routing until it reaches `Ready`.
+    WarmingUp,
     /// All workers healthy, serving traffic.
     Ready,
     /// Serving but impaired (some/all workers ejected).
     Degraded,
-    /// Load failed; does not accept requests.
+    /// Load/warmup failed; does not accept requests.
     Failed,
     /// Unload in progress.
     Unloading,
@@ -81,6 +90,11 @@ pub struct ModelVersion {
     /// traffic (bare requests then fall back to the active version).
     #[serde(default)]
     pub weight: u32,
+    /// P-WARM / KServe ModelStatus semantics: human-readable reason the version
+    /// entered `Failed` (load crash, timeout, or warmup failure). Cleared on a
+    /// successful load. Surfaced to `/health` and metrics for diagnosis.
+    #[serde(default)]
+    pub last_failure: Option<String>,
     #[serde(default)]
     pub policies: crate::config::ModelPolicies,
     /// P-CORS: cached per-version CORS policy (Arc for cheap hot-path clone).
@@ -144,6 +158,8 @@ pub struct ServerStatusEntry {
     pub status: VersionStatus,
     pub workers: usize,
     pub loaded_at: Option<SystemTime>,
+    /// P-WARM: last failure reason when `status == Failed` (KServe ModelStatus).
+    pub last_failure: Option<String>,
 }
 
 /// Server-wide health rollup consumed by the /health, /readyz and /startupz
@@ -163,11 +179,19 @@ impl ServerStatus {
             .any(|e| matches!(e.status, VersionStatus::Ready | VersionStatus::Degraded))
     }
 
-    /// Versions still initializing (Pending or Loading), as (name, version).
+    /// Versions still initializing (Pending / Loading / WarmingUp), as
+    /// (name, version). P-WARM: `WarmingUp` counts as initializing so the
+    /// startup probe (`/startupz`) stays 503 until warmup completes — a slow
+    /// warmup must never trip liveness, and readiness must not turn green.
     pub fn initializing(&self) -> Vec<(String, String)> {
         self.entries
             .iter()
-            .filter(|e| matches!(e.status, VersionStatus::Pending | VersionStatus::Loading))
+            .filter(|e| {
+                matches!(
+                    e.status,
+                    VersionStatus::Pending | VersionStatus::Loading | VersionStatus::WarmingUp
+                )
+            })
             .map(|e| (e.name.clone(), e.version.clone()))
             .collect()
     }

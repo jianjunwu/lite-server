@@ -66,6 +66,17 @@ lazy_static! {
         &["model", "version"]
     ).unwrap();
 
+    // P-WARM (§4.3): per-version readiness. 1 while serving (Ready/Degraded),
+    // 0 otherwise (Pending/Loading/WarmingUp/Failed/Unloading) — so a version
+    // held in WarmingUp or parked in Failed is visible to scrapers/LB checks.
+    pub static ref MODEL_READY: GaugeVec = GaugeVec::new(
+        prometheus::Opts::new(
+            "liteserver_model_ready",
+            "1 when the version is serving (Ready/Degraded), 0 otherwise (incl. WarmingUp/Failed)"
+        ),
+        &["model", "version"]
+    ).unwrap();
+
     // Ensemble metrics
     pub static ref ENSEMBLE_STEP_LATENCY: HistogramVec = HistogramVec::new(
         HistogramOpts::new(
@@ -234,6 +245,7 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(VERSION_SWITCHES_TOTAL.clone()))?;
     REGISTRY.register(Box::new(ACTIVE_WORKERS.clone()))?;
     REGISTRY.register(Box::new(VERSION_WEIGHT.clone()))?;
+    REGISTRY.register(Box::new(MODEL_READY.clone()))?;
     REGISTRY.register(Box::new(ENSEMBLE_STEP_LATENCY.clone()))?;
     REGISTRY.register(Box::new(WORKER_EJECTIONS_TOTAL.clone()))?;
     REGISTRY.register(Box::new(RETRIES_TOTAL.clone()))?;
@@ -417,6 +429,20 @@ pub fn set_version_weight(model: &str, version: &str, weight: f64) {
 
 pub fn remove_version_weight(model: &str, version: &str) {
     let _ = VERSION_WEIGHT.remove_label_values(&[model, version]);
+}
+
+/// P-WARM (§4.3): set per-version readiness (1 = serving Ready/Degraded,
+/// 0 = not serving, incl. WarmingUp/Failed). Called from the health sync on
+/// every status transition so the gauge tracks the live state machine.
+pub fn set_model_ready(model: &str, version: &str, ready: bool) {
+    MODEL_READY
+        .with_label_values(&[model, version])
+        .set(if ready { 1.0 } else { 0.0 });
+}
+
+/// P-WARM: drop the readiness gauge label when a version is unloaded.
+pub fn remove_model_ready(model: &str, version: &str) {
+    let _ = MODEL_READY.remove_label_values(&[model, version]);
 }
 
 pub fn record_version_switch(model: &str, from: &str, to: &str) {

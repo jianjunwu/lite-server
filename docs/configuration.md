@@ -260,6 +260,11 @@ policies:
     allow_credentials: false     # true → ACAC: true; forbidden with "*"
     max_age_secs: 7200           # preflight cache (s); Chrome caps at 7200
   request_log: {}                # Access log: method, path, status, elapsed
+  warmup:                        # P-WARM: warm the engine before serving (default off)
+    enabled: true                #   false = version goes straight to Ready (no behavior change)
+    iterations: 3                #   number of dummy inferences to run (default 1)
+    dummy_input_ref: warmup/input.json  # path to the dummy request-body JSON, relative to the model dir
+    timeout_secs: 30.0           #   per-warmup budget (0 = fall back to request_timeout; 0 there = no bound)
 
 # Callbacks (data hooks around the inference pipeline)
 callbacks:                     # Callback class paths loaded at worker startup

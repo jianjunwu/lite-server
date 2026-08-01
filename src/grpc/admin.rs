@@ -68,6 +68,7 @@ fn version_status_str(s: &VersionStatus) -> &'static str {
     match s {
         Pending => "pending",
         Loading => "loading",
+        WarmingUp => "warming_up",
         Ready => "ready",
         Degraded => "degraded",
         Failed => "failed",

@@ -93,6 +93,7 @@ impl ModelRegistry {
                     status: mv.status,
                     workers: mv.workers.len(),
                     loaded_at: mv.loaded_at,
+                    last_failure: mv.last_failure.clone(),
                 });
             }
         }
@@ -174,6 +175,7 @@ impl ModelRegistry {
             loaded_at: None,
             last_used_at: None,
             weight: entry.weights.get(version).copied().unwrap_or(0),
+            last_failure: None,
             policies: Default::default(),
             cors: None,
         };
@@ -258,7 +260,8 @@ impl ModelRegistry {
 
     /// Transition a version to `Ready`, stamping `loaded_at` on the first
     /// arrival only. `Ready`→`Ready` (e.g. worker respawn) preserves the
-    /// original load timestamp.
+    /// original load timestamp. P-WARM: clears any prior `last_failure` — a
+    /// successful (re)load resolves the failure reason.
     pub fn mark_ready(&self, model_name: &str, version: &str) -> Result<(), AppError> {
         let mut entry = self
             .models
@@ -269,9 +272,49 @@ impl ModelRegistry {
             .get_mut(version)
             .ok_or_else(|| AppError::VersionNotFound(model_name.to_string(), version.to_string()))?;
         mv.status = VersionStatus::Ready;
+        mv.last_failure = None;
         if mv.loaded_at.is_none() {
             mv.loaded_at = Some(std::time::SystemTime::now());
         }
+        Ok(())
+    }
+
+    /// Transition a version to `WarmingUp` (P-WARM): workers have handshaked,
+    /// dummy warmup inference is in progress. NOT serving — readiness/routing
+    /// exclude this state. Idempotent re-entry preserves `loaded_at` (it is
+    /// stamped at `Ready`, not here).
+    pub fn mark_warming_up(&self, model_name: &str, version: &str) -> Result<(), AppError> {
+        let mut entry = self
+            .models
+            .get_mut(model_name)
+            .ok_or_else(|| AppError::ModelNotFound(model_name.to_string()))?;
+        let mv = entry
+            .versions
+            .get_mut(version)
+            .ok_or_else(|| AppError::VersionNotFound(model_name.to_string(), version.to_string()))?;
+        mv.status = VersionStatus::WarmingUp;
+        Ok(())
+    }
+
+    /// Transition a version to `Failed` with a human-readable reason (P-WARM /
+    /// KServe ModelStatus `lastFailure`). Used for load failures and warmup
+    /// failures; the reason is surfaced to `/health` and metrics.
+    pub fn mark_failed(
+        &self,
+        model_name: &str,
+        version: &str,
+        reason: impl Into<String>,
+    ) -> Result<(), AppError> {
+        let mut entry = self
+            .models
+            .get_mut(model_name)
+            .ok_or_else(|| AppError::ModelNotFound(model_name.to_string()))?;
+        let mv = entry
+            .versions
+            .get_mut(version)
+            .ok_or_else(|| AppError::VersionNotFound(model_name.to_string(), version.to_string()))?;
+        mv.status = VersionStatus::Failed;
+        mv.last_failure = Some(reason.into());
         Ok(())
     }
 
@@ -547,6 +590,7 @@ mod tests {
         let cases = [
             (VersionStatus::Pending, "pending"),
             (VersionStatus::Loading, "loading"),
+            (VersionStatus::WarmingUp, "warming_up"),
             (VersionStatus::Ready, "ready"),
             (VersionStatus::Degraded, "degraded"),
             (VersionStatus::Failed, "failed"),
@@ -557,6 +601,109 @@ mod tests {
             assert_eq!(json, format!("\"{}\"", expected));
             let back: VersionStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(back, status);
+        }
+    }
+
+    // --- P-WARM: WarmingUp state + last_failure ---
+
+    #[test]
+    fn test_mark_warming_up_sets_status_not_ready() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.mark_warming_up("m1", "1").unwrap();
+        let mv = reg.get("m1", Some("1")).unwrap();
+        assert_eq!(mv.status, VersionStatus::WarmingUp);
+        // WarmingUp is not Ready → not routable / not activatable.
+        assert!(!reg.is_ready("m1", Some("1")));
+    }
+
+    #[test]
+    fn test_mark_failed_sets_status_and_last_failure() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.mark_failed("m1", "1", "warmup inference returned error")
+            .unwrap();
+        let mv = reg.get("m1", Some("1")).unwrap();
+        assert_eq!(mv.status, VersionStatus::Failed);
+        assert_eq!(
+            mv.last_failure.as_deref(),
+            Some("warmup inference returned error")
+        );
+    }
+
+    #[test]
+    fn test_mark_ready_clears_last_failure() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.mark_failed("m1", "1", "prior load crash").unwrap();
+        assert!(reg.get("m1", Some("1")).unwrap().last_failure.is_some());
+
+        // A successful (re)load resolves the failure reason.
+        reg.mark_ready("m1", "1").unwrap();
+        let mv = reg.get("m1", Some("1")).unwrap();
+        assert_eq!(mv.status, VersionStatus::Ready);
+        assert!(mv.last_failure.is_none());
+    }
+
+    #[test]
+    fn test_mark_warming_up_and_failed_nonexistent_errors() {
+        let reg = ModelRegistry::new();
+        assert!(reg.mark_warming_up("nope", "1").is_err());
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        assert!(reg.mark_failed("m1", "9", "x").is_err());
+    }
+
+    #[test]
+    fn server_status_warming_up_is_initializing_not_serving() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.mark_warming_up("m1", "1").unwrap();
+        let status = reg.server_status();
+        assert!(!status.has_serving(), "WarmingUp must not count as serving");
+        assert_eq!(
+            status.initializing(),
+            vec![("m1".to_string(), "1".to_string())],
+            "WarmingUp must count as initializing (startupz)"
+        );
+        assert!(status.serving_model_names().is_empty());
+    }
+
+    #[test]
+    fn server_status_carries_last_failure() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.mark_failed("m1", "1", "cuda oom during warmup").unwrap();
+        let status = reg.server_status();
+        let e = status
+            .entries
+            .iter()
+            .find(|e| e.name == "m1" && e.version == "1")
+            .unwrap();
+        assert_eq!(e.status, VersionStatus::Failed);
+        assert_eq!(e.last_failure.as_deref(), Some("cuda oom during warmup"));
+    }
+
+    #[test]
+    fn routing_pick_excludes_warming_up() {
+        let reg = ModelRegistry::new();
+        for v in ["1", "2"] {
+            reg.register("m1", v, test_config(), ModelType::LitAPI, tmp_dir())
+                .unwrap();
+        }
+        reg.mark_ready("m1", "1").unwrap();
+        reg.mark_warming_up("m1", "2").unwrap();
+        reg.set_weights("m1", &HashMap::from([("1".into(), 1u32), ("2".into(), 100u32)]))
+            .unwrap();
+        // v2 has 100% weight but is WarmingUp → never picked; v1 is the only
+        // serving candidate. Run many times to be sure.
+        for _ in 0..50 {
+            assert_eq!(reg.routing_pick("m1"), Some("1".to_string()));
         }
     }
 

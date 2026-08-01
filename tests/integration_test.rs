@@ -381,6 +381,74 @@ class DecoupledAPI(LitAPI):
     )
     .unwrap();
 
+    // warmup_model (P-WARM): same logic as test_model (doubles input) but with
+    // warmup enabled — 2 dummy inferences of {"input": 5} must complete before
+    // the version becomes Ready. Proves warmup runs the real predict path and
+    // still serves traffic afterward.
+    let warmup_dir = tmp.join("warmup_model/1");
+    std::fs::create_dir_all(warmup_dir.join("warmup")).unwrap();
+    std::fs::write(
+        warmup_dir.join("model.py"),
+        r#"from lite_server import LitAPI
+
+
+class WarmupAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x * 2}
+
+    def encode_response(self, output):
+        return output
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        warmup_dir.join("warmup").join("input.json"),
+        "{\"input\": 5}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        warmup_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\npolicies:\n  warmup:\n    enabled: true\n    iterations: 2\n    dummy_input_ref: warmup/input.json\n",
+    )
+    .unwrap();
+
+    // warmup_fail_model (P-WARM / D33): warmup enabled but dummy_input_ref
+    // points to a missing file → run_warmup fails reading it → the version is
+    // marked Failed with last_failure, never serving.
+    let warmup_fail_dir = tmp.join("warmup_fail_model/1");
+    std::fs::create_dir_all(&warmup_fail_dir).unwrap();
+    std::fs::write(
+        warmup_fail_dir.join("model.py"),
+        r#"from lite_server import LitAPI
+
+
+class WarmupFailAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x * 2}
+
+    def encode_response(self, output):
+        return output
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        warmup_fail_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\npolicies:\n  warmup:\n    enabled: true\n    iterations: 1\n    dummy_input_ref: does_not_exist.json\n",
+    )
+    .unwrap();
+
     tmp
 }
 
@@ -838,6 +906,83 @@ async fn test_model_load_ready_infer_unload() {
         .send().await.unwrap();
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["ready"], false);
+}
+
+/// P-WARM (§4.3): a model with warmup enabled loads to Ready only after the
+/// dummy inferences complete, then serves real traffic normally. A Ready
+/// outcome under `warmup.enabled: true` is itself proof the warmup succeeded
+/// — a failed dummy inference would have marked the version Failed.
+#[tokio::test]
+#[serial]
+async fn test_warmup_enabled_model_loads_and_serves() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+    load_model(&base, "warmup_model", "1").await;
+
+    // Warmup completed → serving.
+    let resp = client
+        .get(format!("{}/v2/models/warmup_model/ready", base))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ready"], true);
+
+    // Real traffic still works after warmup (input doubled).
+    let resp = client
+        .post(format!("{}/v2/models/warmup_model/infer", base))
+        .json(&json!({"input": 7}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["output"], 14);
+
+    unload_model(&base, "warmup_model", "1").await;
+}
+
+/// P-WARM / D33: warmup failure (missing dummy input file) marks the version
+/// Failed with `last_failure`, never serving. The load returns an error and
+/// the model stays not-ready.
+#[tokio::test]
+#[serial]
+async fn test_warmup_failure_marks_version_failed() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    // Load returns an error (WorkerCrashed) — do not use load_model (asserts 200).
+    let resp = client
+        .post(format!("{}/v2/repository/models/warmup_fail_model/versions/1/load", base))
+        .send().await.unwrap();
+    assert!(
+        !resp.status().is_success(),
+        "warmup-failing load must error, got {}",
+        resp.status()
+    );
+
+    // Give the load a moment to settle into Failed, then confirm it never
+    // becomes Ready.
+    assert!(
+        !wait_model_ready(&base, "warmup_fail_model", 5).await,
+        "warmup-failing model must never become ready"
+    );
+
+    // /health exposes the Failed state + last_failure reason.
+    let resp = client.get(format!("{}/health", base)).send().await.unwrap();
+    let body: Value = resp.json().await.unwrap();
+    let entry = body["models"].as_array().unwrap().iter()
+        .find(|m| m["name"] == "warmup_fail_model")
+        .and_then(|m| m["versions"].as_array().unwrap().iter()
+            .find(|e| e["version"] == "1"))
+        .expect("warmup_fail_model/1 must be registered (Failed) in /health");
+    assert_eq!(entry["status"], "failed");
+    let reason = entry["last_failure"].as_str().expect("last_failure must be set");
+    assert!(
+        reason.contains("does_not_exist.json") || reason.contains("dummy input"),
+        "last_failure should mention the dummy input: {}",
+        reason
+    );
+
+    // Clean up the Failed version (its workers were spawned before warmup).
+    unload_model(&base, "warmup_fail_model", "1").await;
 }
 
 #[tokio::test]

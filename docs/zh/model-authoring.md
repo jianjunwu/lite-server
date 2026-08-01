@@ -369,6 +369,35 @@ policies:
   request_log: {}
 ```
 
+### 预热 Warmup（P-WARM）
+
+引擎会在首次请求时惰性初始化（CUDA graph capture、`torch.compile`、
+分配器缓冲池）——模型加载、扩容或滚动升级后的第一个用户请求可能卡顿
+20–30s。预热在加载阶段就跑一遍 dummy 推理，把这笔开销提前到版本接收
+流量之前。预热**默认关闭**；一旦开启会阻塞就绪（D33）：版本停留在
+`warming_up` 状态（`/readyz` 返回 503、gRPC health 为 `NOT_SERVING`、
+`/startupz` 为 `initializing`），预热完成后才翻转为 `ready`。若预热失败
+（dummy 输入错误、推理返回错误或超时），版本被标记为 `failed` 并带上
+`last_failure` 原因，而不是放出冷模型。
+
+dummy 输入是放在模型目录旁的原始 `/predict` 请求体文件，原样走正常推理
+路径派发：
+
+```yaml
+# model_repo/my_model/1/config.yaml
+policies:
+  warmup:
+    enabled: true
+    iterations: 3                       # 把 dummy 输入跑 N 次
+    dummy_input_ref: warmup/input.json  # 相对模型目录的路径
+    timeout_secs: 30.0                  # 0 = 使用 request_timeout
+```
+
+```json
+// model_repo/my_model/1/warmup/input.json —— 与客户端 POST 的请求体一致
+{ "prompt": "hello", "max_tokens": 8 }
+```
+
 > 0.7.6 起，`RequireApiKey` / `Cors` / `RateLimit` / `LogRequests` 四个
 > Python policy callback 已移除——它们与 Rust 侧执行是双实现，且按 worker
 > 声明存在一致性隐患（"最后声明者胜"）。在 ``callbacks:`` 列表中引用这些

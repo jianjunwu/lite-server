@@ -166,12 +166,13 @@ fn parse_status(s: &str) -> PyResult<VersionStatus> {
     match s {
         "Pending" => Ok(VersionStatus::Pending),
         "Loading" => Ok(VersionStatus::Loading),
+        "WarmingUp" => Ok(VersionStatus::WarmingUp),
         "Ready" => Ok(VersionStatus::Ready),
         "Degraded" => Ok(VersionStatus::Degraded),
         "Failed" => Ok(VersionStatus::Failed),
         "Unloading" => Ok(VersionStatus::Unloading),
         _ => Err(pyo3::exceptions::PyValueError::new_err(
-            format!("unknown status: {}; expected Pending|Loading|Ready|Degraded|Failed|Unloading", s),
+            format!("unknown status: {}; expected Pending|Loading|WarmingUp|Ready|Degraded|Failed|Unloading", s),
         )),
     }
 }

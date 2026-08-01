@@ -256,6 +256,11 @@ policies:
     allow_credentials: false     # true → ACAC: true；与 "*" 互斥
     max_age_secs: 7200           # 预检缓存（秒）；Chrome 上限 7200
   request_log: {}                # 访问日志：方法、路径、状态码、耗时
+  warmup:                        # P-WARM：服务前预热引擎（默认关闭）
+    enabled: true                #   false = 版本直接置 Ready（行为不变）
+    iterations: 3                #   执行 dummy 推理的次数（默认 1）
+    dummy_input_ref: warmup/input.json  # dummy 请求体 JSON 的路径，相对模型目录
+    timeout_secs: 30.0           #   单次预热预算（0 = 回退到 request_timeout；二者皆 0 = 无上限）
 
 # Callback（推理管线数据钩子）
 callbacks:                     # Worker 启动时加载的 callback 类路径列表

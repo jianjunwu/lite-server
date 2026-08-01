@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -842,6 +843,11 @@ pub struct ModelPolicies {
     pub cors: Option<CorsPolicy>,
     pub auth: Option<AuthPolicy>,
     pub request_log: Option<RequestLogPolicy>,
+    /// P-WARM (§4.3): model warmup before serving. Default None = disabled
+    /// (no behavior change). When enabled, the version stays `WarmingUp`
+    /// (NOT_SERVING) until N dummy inferences complete; failure marks it
+    /// `Failed` (D33).
+    pub warmup: Option<WarmupPolicy>,
 }
 
 impl ModelPolicies {
@@ -851,6 +857,59 @@ impl ModelPolicies {
             && self.cors.is_none()
             && self.auth.is_none()
             && self.request_log.is_none()
+            && self.warmup.is_none()
+    }
+}
+
+/// P-WARM (§4.3): warm a freshly loaded model with dummy inference before it
+/// becomes `Ready` (D33: warmup blocks readiness). The dummy input is the raw
+/// `/predict` request body stored in a file — the same JSON a real request
+/// carries — so it exercises the engine's lazy init (CUDA graph capture /
+/// torch.compile / allocator pools) at load time, not on the first user
+/// request. Disabled by default; no breaking change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WarmupPolicy {
+    /// Master switch. False = warmup skipped (version goes straight to Ready).
+    pub enabled: bool,
+    /// Number of dummy inferences to run. Defaults to 1; raise to stabilize
+    /// timing across batches.
+    pub iterations: u32,
+    /// Path to the dummy request-body JSON file, relative to the model
+    /// directory (e.g. `warmup/input.json`). Its content is sent verbatim as
+    /// the `/predict` payload.
+    pub dummy_input_ref: String,
+    /// Per-warmup budget in seconds. 0 = fall back to the model's
+    /// `request_timeout` (0 there = no bound). A warmup exceeding it fails the
+    /// version.
+    pub timeout_secs: f32,
+}
+
+impl Default for WarmupPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            iterations: 1,
+            dummy_input_ref: String::new(),
+            timeout_secs: 0.0,
+        }
+    }
+}
+
+impl WarmupPolicy {
+    /// Effective per-iteration timeout: own `timeout_secs`, else the model's
+    /// `request_timeout` (0 = unbounded).
+    pub fn effective_timeout(&self, model_request_timeout: f32) -> Option<Duration> {
+        let secs = if self.timeout_secs > 0.0 {
+            self.timeout_secs
+        } else {
+            model_request_timeout
+        };
+        if secs > 0.0 {
+            Some(Duration::from_secs_f32(secs))
+        } else {
+            None
+        }
     }
 }
 
@@ -1187,6 +1246,45 @@ mod tests {
     use std::fs;
 
     // --- Default values ---
+
+    #[test]
+    fn warmup_policy_default_is_disabled() {
+        let p = WarmupPolicy::default();
+        assert!(!p.enabled);
+        assert_eq!(p.iterations, 1);
+        assert!(p.dummy_input_ref.is_empty());
+        assert_eq!(p.timeout_secs, 0.0);
+    }
+
+    #[test]
+    fn warmup_effective_timeout_owns_then_falls_back_then_unbounded() {
+        // Own timeout wins.
+        let p = WarmupPolicy {
+            enabled: true,
+            timeout_secs: 5.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            p.effective_timeout(60.0),
+            Some(Duration::from_secs_f32(5.0))
+        );
+        // Falls back to the model request_timeout.
+        let p = WarmupPolicy::default();
+        assert_eq!(
+            p.effective_timeout(30.0),
+            Some(Duration::from_secs_f32(30.0))
+        );
+        // Both zero → unbounded.
+        assert_eq!(p.effective_timeout(0.0), None);
+    }
+
+    #[test]
+    fn model_policies_is_empty_includes_warmup() {
+        let mut p = ModelPolicies::default();
+        assert!(p.is_empty());
+        p.warmup = Some(WarmupPolicy::default());
+        assert!(!p.is_empty());
+    }
 
     #[test]
     fn test_server_config_defaults() {

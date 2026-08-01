@@ -352,6 +352,36 @@ policies:
   request_log: {}
 ```
 
+### Warmup (P-WARM)
+
+Engines lazy-initialize (CUDA graph capture, `torch.compile`, allocator pools)
+on the first request — the very first user request after a load, scale-up, or
+rolling upgrade can stall for 20–30s. Warmup runs dummy inference at load time
+so that cost is paid before the version accepts traffic. It is **off by
+default**; enabling it blocks readiness (D33): the version stays in the
+`warming_up` state (`/readyz` 503, gRPC health `NOT_SERVING`, `/startupz`
+`initializing`) until the warmup completes, then flips to `ready`. A warmup
+failure (bad dummy input, error response, or timeout) marks the version
+`failed` with a `last_failure` reason instead of serving cold.
+
+The dummy input is the raw `/predict` request body stored in a file next to the
+model, sent verbatim through the normal inference path:
+
+```yaml
+# model_repo/my_model/1/config.yaml
+policies:
+  warmup:
+    enabled: true
+    iterations: 3                       # run the dummy input N times
+    dummy_input_ref: warmup/input.json  # relative to the model dir
+    timeout_secs: 30.0                  # 0 = use request_timeout
+```
+
+```json
+// model_repo/my_model/1/warmup/input.json — same body a client would POST
+{ "prompt": "hello", "max_tokens": 8 }
+```
+
 > Since 0.7.6, the four Python policy callbacks (`RequireApiKey`, `Cors`,
 > `RateLimit`, `LogRequests`) are removed — they duplicated the Rust-side
 > enforcement, and per-worker declaration had a last-declaration-wins
