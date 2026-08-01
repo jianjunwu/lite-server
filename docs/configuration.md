@@ -21,6 +21,9 @@ server:
   cache_registry: false        # Cache model registry to disk (reserved — not yet implemented)
   graceful_timeout: 30.0       # Max seconds to wait for in-flight requests during shutdown
   keepalive_timeout: 5.0       # HTTP keep-alive timeout (seconds), 0 = disable
+  compression: false           # gzip HTTP responses (P1-4); SSE excluded, WS unaffected
+  socket_mode: 0o666           # chmod for a unix: UDS host (P4-1). The HTTP UDS also serves
+                               # admin, so on multi-tenant hosts set 0o600 (owner-only).
   # TLS/mTLS (see "TLS / mTLS" section below) — all optional, off by default
   tls_cert_path: null          # Server certificate chain PEM; requires tls_key_path
   tls_key_path: null           # Server private key PEM; requires tls_cert_path
@@ -74,6 +77,8 @@ grpc:
   http2_keepalive_timeout_secs: null   # PING ack timeout (needs the interval set)
   http2_adaptive_window: false         # BDP-adaptive HTTP/2 flow-control window
   http2_max_frame_size: null           # Max HTTP/2 frame payload (bytes); null = tonic default
+  response_compression: false          # gzip gRPC responses (P1-3); inference service only
+  socket_mode: 0o666                   # chmod for a unix: gRPC UDS (P4-1)
   # TLS/mTLS — same semantics as the server.* TLS keys, applied to the gRPC listener
   tls_cert_path: null          # Server certificate chain PEM; requires tls_key_path
   tls_key_path: null           # Server private key PEM; requires tls_cert_path
@@ -101,17 +106,17 @@ features:
   # header. Default false = the header is IGNORED (clients cannot pin themselves
   # onto canary versions). Enable only in gray/debug environments.
   canary_override: false
-  timeline: false              # Enable historical metric timeline
+  timeline: false              # (reserved — not yet enforced)
   system_overview: true        # (reserved — not yet implemented)
   custom_metrics: false        # (reserved — not yet implemented)
   benchmarks: true             # (reserved — not yet implemented)
   playground: false            # (reserved — not yet implemented)
-  alerts: true                 # Enable alert engine
+  alerts: true                 # (reserved — not yet enforced)
   version_compare: false       # (reserved — not yet implemented)
-  streaming: true              # Enable streaming endpoints
-  grpc_streaming: true         # Enable gRPC streaming
-  sse: true                    # Enable SSE streaming
-  websocket_streaming: true    # Enable WebSocket streaming
+  streaming: true              # (reserved — not yet enforced; streaming routes are always mounted)
+  grpc_streaming: true         # (reserved — not yet enforced)
+  sse: true                    # (reserved — not yet enforced)
+  websocket_streaming: true    # (reserved — not yet enforced)
   streaming_metrics: true      # Enable streaming-specific metrics
 
 model_defaults:                # CLI-level defaults applied to all models

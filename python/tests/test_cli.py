@@ -561,6 +561,7 @@ class TestServeArgs:
             "max_retries": 2,
             "startup_timeout": 90.0,
             "health_check_timeout": 8.0,
+            "health_check_kill_threshold": 3,
             "worker_kill_timeout": 15.0,
             "hook_http_timeout": 7.0,
         })()

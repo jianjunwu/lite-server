@@ -145,8 +145,19 @@ CONFIG_YAML_EXAMPLE = textwrap.dedent("""\
     # policies:
     #   auth: { header: "X-API-Key", keys: ["${API_KEYS}"] }  # ${VAR} = env var
     #   rate_limit: { requests_per_minute: 60, key: ip, burst: 100 }
-    #   cors: { allow_origins: ["*"], allow_methods: ["POST"], allow_headers: ["content-type"] }
+    #   cors:
+    #     allow_origins: ["https://app.example.com"]  # exact match; no reflection
+    #     allow_methods: [POST]
+    #     allow_headers: [content-type, authorization, x-request-id]
+    #     expose_headers: [x-request-id, x-processing-time-ms, retry-after]
+    #     allow_credentials: false   # true forbids ACAO:"*"
+    #     max_age_secs: 7200         # Chrome caps at 7200
     #   request_log: {}
+    #   warmup:                      # P-WARM: warm the engine before READY
+    #     enabled: false             # off = ready immediately (legacy behavior)
+    #     iterations: 1              # dummy inferences to run
+    #     dummy_input_ref: "warmup_input.json"  # raw /predict body under the model dir
+    #     timeout_secs: 0.0          # 0 = use request_timeout
 
     # ===== Callbacks (Inference Pipeline) =====
     # List of fully-qualified Callback subclass paths.  Each class must be
@@ -181,18 +192,80 @@ SERVER_YAML = textwrap.dedent("""\
       http_port: 8000
       grpc_port: 8001
       metrics_port: 8002
-      # timeout: 30.0               # Per-request timeout in seconds
+      # timeout: 30.0               # Per-request timeout in seconds (P-DEADLINE fallback)
       # threads: null               # Tokio worker threads (null = auto = CPU cores)
       # cache_registry: false       # Cache model/version lookups in HTTP layer
       # graceful_timeout: 30.0      # Max seconds for graceful shutdown
       # keepalive_timeout: 5.0      # HTTP keep-alive timeout (0 = disable)
+      # compression: false          # gzip HTTP responses (P1-4; SSE excluded)
+      # socket_mode: 0o666          # chmod for a unix: UDS host (P4-1); 0o600 on
+      #                              # multi-tenant hosts (HTTP UDS also serves admin)
+      # trusted_proxies: []         # CIDRs whose XFF/X-Real-IP are honored (P-XFF);
+      #                              # empty = use direct peer (fail-safe). Fronting
+      #                              # gateway must be listed for client-IP rate limiting.
+      # max_inflight: 0             # Global concurrent inference cap (P-FLOW); 0 = unlimited
+      # max_request_body_bytes: null # Per-request body cap (P-FLOW); null = platform default
+      # sequence_ttl_secs: 3600     # sequence_id affinity TTL (P8-1)
+      # max_sequences: 65536        # Max tracked sequence_id entries (P8-1)
+      # decoupled_idle_timeout_secs: 300 # Decoupled stream idle reclaim (P9-1)
+      # cors:                       # Global CORS policy (P-CORS); null = pass-through
+      #   allow_origins: ["https://app.example.com"]
+      #   allow_methods: [GET, POST, PUT, DELETE]
+      #   allow_headers: [content-type, authorization, x-request-id, traceparent, baggage]
+      #   expose_headers: [x-request-id, x-processing-time-ms, retry-after]
+      #   allow_credentials: true
+      #   max_age_secs: 7200
+      # tls_cert_path: null         # TLS cert (P5-1); set with tls_key_path to enable
+      # tls_key_path: null          # TLS key (P5-1)
+      # mtls_ca_path: null          # Client CA → require client certs (mTLS, P5-1)
+      # tls_min_version: "1.2"      # "1.2" or "1.3" (P5-1)
 
     grpc:
       enabled: {grpc}
       # max_workers: 10             # Max concurrent gRPC request handlers
+      # host: null                  # gRPC bind (null = follow server.host); unix:/path = UDS (P4-1)
+      # admin_bind: null            # Separate admin+health bind (P7-2); unix:/path forced 0o600
+      # socket_mode: 0o666          # chmod for a unix: gRPC UDS (P4-1)
+      # response_compression: false # gzip gRPC responses (P1-3)
+      # http2_keepalive_interval_secs: null # HTTP/2 keepalive (P1-2); null = off
+      # http2_keepalive_timeout_secs: null  # Needs interval to take effect (P1-2)
+      # http2_adaptive_window: false        # Adaptive conn window (P1-2)
+      # http2_max_frame_size: null          # Max HTTP/2 frame bytes (P1-2)
+      # tls_cert_path: null         # gRPC TLS (P5-1); set with tls_key_path
+      # tls_key_path: null
+      # mtls_ca_path: null
+      # tls_min_version: "1.2"
 
     metrics:
       enabled: {metrics}
+      # metric_namespace: liteserver # Prometheus name prefix (P2-1); "vllm" for GIE compat
+
+    # Endpoint access control (P7-1). Unconfigured: admin = loopback fail-closed,
+    # inference/health = public. Remote admin needs a key here or grpc.admin_bind.
+    # access_control:
+    #   admin:
+    #     http:
+    #       mode: key
+    #       key: "x-api-key"
+    #       value_env: "ADMIN_TOKEN"
+    #     grpc:
+    #       mode: key
+    #       key: "api-key"
+    #       value: "secret-token"
+    #   inference:
+    #     http:
+    #       mode: public
+    #   health:
+    #     mode: public
+
+    # OpenTelemetry export (P-TRACE). Default off = zero overhead.
+    # telemetry:
+    #   enabled: false              # opt-in
+    #   otlp_endpoint: "http://localhost:4317"
+    #   protocol: grpc             # grpc | http (http fails fast if unsupported)
+    #   sample_ratio: 1.0
+    #   health_admin_sample_ratio: 0.0  # down-sample high-frequency probes
+    #   service_name: "lite-server"
 
     logging:
       # level: info                 # Log level: trace, debug, info, warn, error

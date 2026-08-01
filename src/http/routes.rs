@@ -13,8 +13,8 @@ use tracing::info;
 
 /// Resolve the (model, version) an inference-path request targets, or None
 /// for non-model paths and model-scoped admin leaves (ready/health/routing/
-/// activate/compare/versions CRUD). Custom @route tails resolve to the active
-/// version — the fallback handler does the real matching.
+/// activate/compare/reload/versions CRUD). Custom @route tails resolve to the
+/// active version — the fallback handler does the real matching.
 pub(crate) fn access_log_target(path: &str) -> Option<(&str, Option<&str>)> {
     let rest = path.strip_prefix("/v2/models/")?;
     let mut segs = rest.split('/');
@@ -28,7 +28,13 @@ pub(crate) fn access_log_target(path: &str) -> Option<(&str, Option<&str>)> {
         ["infer" | "events" | "stream"] => Some((model, None)),
         ["versions", v, "infer" | "events" | "stream"] if !v.is_empty() => Some((model, Some(v))),
         ["versions", ..] => None,
-        ["ready" | "health" | "routing" | "activate" | "compare"] => None,
+        // B1 audit fix: bare `reload` is a registered state-changing ADMIN route
+        // (POST /v2/models/:m/reload → reload_model_handler, no enforce_auth).
+        // It MUST be in this exclusion list, else it falls to the custom-@route
+        // `_` arm → Some → classify_http_path returns Inference → unconfigured
+        // inference is public → remote unauthenticated reload (DoS). The
+        // versioned form is already Admin via the `["versions", ..]` arm.
+        ["ready" | "health" | "routing" | "activate" | "compare" | "reload"] => None,
         // Anything else under /v2/models/{m}/ is a custom @route tail.
         _ => Some((model, None)),
     }

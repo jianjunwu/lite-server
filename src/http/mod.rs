@@ -197,6 +197,14 @@ async fn admission_middleware(
     if admission.cap() == 0 {
         return next.run(request).await;
     }
+    // B4: CORS preflight (OPTIONS) is unauthenticated and must never consume an
+    // inference admission slot. Without this, a flood of preflights could
+    // saturate max_inflight and 503 real inference; and a 503'd preflight
+    // carries no CORS headers, which also blocks the browser's real request.
+    // OPTIONS has no handler beyond the CORS short-circuit.
+    if request.method() == axum::http::Method::OPTIONS {
+        return next.run(request).await;
+    }
     if crate::access_control::classify_http_path(request.uri().path())
         != crate::access_control::EndpointClass::Inference
     {
@@ -421,7 +429,9 @@ pub async fn start_http_server(
                 use std::os::unix::fs::PermissionsExt;
                 let metadata = std::fs::metadata(path).map_err(AppError::Io)?;
                 let mut permissions = metadata.permissions();
-                permissions.set_mode(0o666);
+                // B5: configurable via `server.socket_mode` (default 0o666). The
+                // HTTP UDS serves admin too — tighten to 0o600 on multi-tenant hosts.
+                permissions.set_mode(config.server.socket_mode);
                 std::fs::set_permissions(path, permissions).map_err(AppError::Io)?;
             }
             info!("Starting HTTP server on unix:{}", path);

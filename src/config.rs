@@ -129,6 +129,13 @@ pub struct ServerConfig {
     pub graceful_timeout: f32,
     /// HTTP keep-alive timeout in seconds. 0 = disable keep-alive.
     pub keepalive_timeout: f32,
+    /// P4-1/P7-2: filesystem mode (chmod) applied to a UDS `server.host`
+    /// (`unix:/path`). The HTTP UDS serves health/inference AND admin on one
+    /// socket, so the default 0o666 lets any local process reach admin
+    /// endpoints when admin is unconfigured (a UDS peer is treated as
+    /// loopback). On multi-tenant hosts set 0o600 (owner-only), or front admin
+    /// via a separate `grpc.admin_bind` UDS (P7-2 forces that one to 0o600).
+    pub socket_mode: u32,
     /// gzip response compression (P1-4). Default false. SSE responses are
     /// excluded (per-event flush semantics); WS upgrades are unaffected.
     pub compression: bool,
@@ -201,6 +208,7 @@ impl Default for ServerConfig {
             cache_registry: false,
             graceful_timeout: 30.0,
             keepalive_timeout: 5.0,
+            socket_mode: 0o666,
             compression: false,
             tls_cert_path: None,
             tls_key_path: None,

@@ -405,6 +405,33 @@ mod tests {
         assert_eq!(classify_http_path("/v2/models/m/ready"), EndpointClass::Admin);
     }
 
+    // AUDIT (P0): bare `POST /v2/models/:m/reload` is a registered state-changing
+    // ADMIN route (routes.rs:133) → reload_model_handler (admin.rs:353), which has
+    // NO enforce_auth/secondary gate. It MUST classify as Admin so that the
+    // default fail-closed policy (admin unconfigured → loopback-only, D14) protects
+    // it. `reload` is missing from access_log_target's admin-leaf exclusion list
+    // (routes.rs:31: only ready|health|routing|activate|compare), so the bare form
+    // falls to the custom-@route `_` arm → Some → **Inference** → unconfigured
+    // inference is PUBLIC (check() line 141) → a remote, unauthenticated caller can
+    // trigger a model reload (reinit storm / DoS). The versioned form is already
+    // Admin via the `["versions", ..]` arm. This test asserts the correct class and
+    // FAILS on the current code (returns Inference).
+    #[test]
+    fn classify_bare_reload_is_admin_not_inference() {
+        use crate::access_control::classify_http_path;
+        assert_eq!(
+            classify_http_path("/v2/models/m/reload"),
+            EndpointClass::Admin,
+            "bare /reload is an admin route; Inference classification lets a remote \
+             unauthenticated caller bypass admin fail-closed"
+        );
+        // Regression guard: the versioned form is already correct.
+        assert_eq!(
+            classify_http_path("/v2/models/m/versions/1/reload"),
+            EndpointClass::Admin
+        );
+    }
+
     // ===== admin_denies_non_loopback helper =====
 
     #[test]

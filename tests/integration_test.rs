@@ -567,6 +567,67 @@ class SlowAPI(LitAPI):
     tmp
 }
 
+/// A model with a `bidi_stream` handler (P-FLOW bidi cancel test): `on_chunk`
+/// sleeps 5s so a client disconnect lands mid-processing — the reply chunk
+/// produced after the sleep is what makes the server's dead-response-stream
+/// `tx.send` fail and its cleanup run; `on_close` writes `marker` so the test
+/// can observe that the server's StreamCancel reached the worker.
+#[cfg(unix)]
+fn create_bidi_model_repo(marker: &std::path::Path) -> std::path::PathBuf {
+    let tmp = std::env::temp_dir().join(format!(
+        "lite-server-bidi-{}",
+        std::process::id()
+    ));
+    let model_dir = tmp.join("bidi_model/1");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    std::fs::write(
+        model_dir.join("model.py"),
+        format!(
+            r#"from lite_server import LitAPI
+import time
+
+
+class BidiHandler:
+    def on_open(self, initial_data):
+        return {{"opened": True}}
+
+    def on_chunk(self, chunk):
+        time.sleep(5)
+        return {{"echo": chunk}}
+
+    def on_close(self):
+        with open("{marker}", "w") as f:
+            f.write("closed")
+
+
+class BidiAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request
+
+    def predict(self, x):
+        return {{"output": x}}
+
+    def encode_response(self, output):
+        return output
+
+    def bidi_stream(self):
+        return BidiHandler()
+"#,
+            marker = marker.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        model_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+    tmp
+}
+
 /// SIGTERM the server's MAIN process only (not its process group) so the Python
 /// worker stays alive long enough for an in-flight RPC to complete during drain.
 #[cfg(unix)]
@@ -5084,6 +5145,194 @@ async fn test_p_deadline_grpc_server_timeout() {
     );
 
     unload_model(&base, "slow_model", "1").await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// AUDIT (P1, P-DEADLINE): `batch_infer_impl` resolves the deadline
+/// (grpc/mod.rs:470-471) and writes it into `meta.deadline_unix_ns` (482), but —
+/// unlike unary `infer_impl` (307-323, which wraps `response_rx` in
+/// `tokio::time::timeout(remaining(...))`) — its response wait is the bare
+/// `client.send(internal_req).await` (grpc/mod.rs:530-533). So a BatchInfer
+/// whose worker outlives `server.timeout` is NOT bounded server-side; the server
+/// waits for the full worker run and returns Ok. This test sends a BatchInfer to
+/// the 5s slow model under `server.timeout: 1.0` and asserts the server enforces
+/// its own deadline (DEADLINE_EXCEEDED). It FAILS on the current code (returns Ok
+/// after the worker completes).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_p_deadline_grpc_batch_infer_must_enforce_server_timeout() {
+    use std::collections::HashMap;
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::BatchInferRequest;
+
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = create_slow_model_repo(5);
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "lite-server-pdeadline-grpc-batch-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18213\n  timeout: 1.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 30).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "slow_model", "1").await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+    // No client timeout / grpc-timeout: only the server's 1s deadline can bound
+    // the call. The 5s predict outlives it, so a wrapped wait must surface
+    // DEADLINE_EXCEEDED. Today batch_infer does not wrap → this returns Ok.
+    let req = tonic::Request::new(BatchInferRequest {
+        model_name: "slow_model".to_string(),
+        version: "1".to_string(),
+        items: vec![br#"{"input":21}"#.to_vec().into()],
+        headers: HashMap::new(),
+    });
+    let status = client
+        .batch_infer(req)
+        .await
+        .expect_err("batch_infer must be bounded by server.timeout like unary infer");
+    assert_eq!(
+        status.code(),
+        tonic::Code::DeadlineExceeded,
+        "batch_infer should surface DEADLINE_EXCEEDED under server.timeout, got: {status}"
+    );
+
+    unload_model(&base, "slow_model", "1").await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// AUDIT (P1, P-FLOW §4.0.9): `bidi_stream_impl`'s cleanup block never sent
+/// `build_stream_cancel` to the worker, unlike its siblings `stream_infer`
+/// (grpc/mod.rs:791-792) and `decoupled_infer` (:1038-1039). A bidi client
+/// dropping the RPC mid-session therefore orphaned the worker-side session
+/// (compute slot held until model unload / worker shutdown). This test opens
+/// a bidi stream, hard-drops the client while the fixture's `on_chunk` is
+/// mid-sleep, and asserts the cancel reaches the worker: the fixture's
+/// `on_close` (invoked exactly once per session, on close OR cancel) writes a
+/// marker file. FAILS on unfixed code (no cancel → no `on_close` → no marker).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_p_flow_grpc_bidi_disconnect_propagates_cancel() {
+    use lite_server::proto::liteserver as pb;
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "lite-server-bidi-cancel-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let marker = tmp_dir.join("cancel.marker");
+    let repo = create_bidi_model_repo(&marker);
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18214\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 30).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "bidi_model", "1").await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel::<pb::BidiChunk>(8);
+    // Pre-queue BidiOpen BEFORE the RPC: the server's handler awaits the first
+    // message before returning its Response, so the client future only resolves
+    // once an open is already flowing (else both sides wait on each other).
+    req_tx
+        .send(pb::BidiChunk {
+            stream_id: String::new(),
+            payload: Some(pb::bidi_chunk::Payload::Open(pb::BidiOpen {
+                model_name: "bidi_model".to_string(),
+                version: "1".to_string(),
+                initial_data: bytes::Bytes::from_static(b"{}"),
+                sequence_id: None,
+            })),
+        })
+        .await
+        .expect("queue BidiOpen failed");
+    let mut resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.bidi_stream(tonic::Request::new(
+            tokio_stream::wrappers::ReceiverStream::new(req_rx),
+        )),
+    )
+    .await
+    .expect("bidi_stream RPC did not resolve within 10s")
+    .expect("bidi_stream RPC failed")
+    .into_inner();
+    let first = tokio::time::timeout(Duration::from_secs(5), resp.message())
+        .await
+        .expect("timed out waiting for bidi on_open reply")
+        .expect("bidi stream errored before on_open reply")
+        .expect("bidi stream closed before on_open reply");
+    assert!(
+        matches!(first.payload, Some(pb::bidi_chunk::Payload::Data(_))),
+        "expected on_open data chunk, got: {:?}",
+        first.payload
+    );
+
+    // Send one chunk; the fixture's on_chunk sleeps 5s, so the worker session
+    // is still busy when the client vanishes below.
+    req_tx
+        .send(pb::BidiChunk {
+            stream_id: String::new(),
+            payload: Some(pb::bidi_chunk::Payload::Data(pb::BidiData {
+                data: bytes::Bytes::from_static(br#"{"input": 1}"#),
+            })),
+        })
+        .await
+        .expect("send BidiData failed");
+    sleep(Duration::from_millis(500)).await; // ensure on_chunk is mid-sleep
+
+    // Hard disconnect: dropping both halves makes tonic RST_STREAM the RPC.
+    drop(req_tx);
+    drop(resp);
+    drop(client);
+
+    // After on_chunk's sleep completes, the worker emits the reply chunk; the
+    // server's forward on the dead response stream fails, its cleanup must
+    // send StreamCancel, and the worker then runs on_close → marker file.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline && !marker.exists() {
+        sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        marker.exists(),
+        "worker never received StreamCancel: bidi on_close marker missing \
+         (P-FLOW cancel-propagation gap on the bidi path)"
+    );
+
+    unload_model(&base, "bidi_model", "1").await;
     let _ = std::fs::remove_dir_all(&tmp_dir);
     let _ = std::fs::remove_dir_all(&repo);
 }

@@ -217,7 +217,7 @@ mod tests {
     #[test]
     fn route_key_rate_limit_does_not_warn() {
         let repo = test_dir("rl-route");
-        let mut cfg = loopback_cfg(&repo);
+        let cfg = loopback_cfg(&repo);
         write_model(&repo, "m", "1", "name: m\npolicies:\n  rate_limit:\n    requests_per_minute: 100\n    key: route\n");
         assert!(startup_preflight(&cfg).iter().all(|w| !w.starts_with("M1:")));
     }

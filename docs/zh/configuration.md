@@ -21,6 +21,9 @@ server:
   cache_registry: false        # 缓存模型注册表到磁盘（预留 — 尚未实现）
   graceful_timeout: 30.0       # 优雅关闭时等待进行中请求的最大秒数
   keepalive_timeout: 5.0       # HTTP keep-alive 超时（秒），0 = 禁用
+  compression: false           # gzip HTTP 响应（P1-4）；排除 SSE，不影响 WS
+  socket_mode: 0o666           # unix: UDS host 的 chmod（P4-1）。HTTP UDS 同时服务 admin，
+                               # 多租户主机建议 0o600（仅 owner）
   # TLS/mTLS（见下文「TLS / mTLS」一节）——均可选，默认关闭
   tls_cert_path: null          # 服务器证书链 PEM；须与 tls_key_path 同设
   tls_key_path: null           # 服务器私钥 PEM；须与 tls_cert_path 同设
@@ -69,6 +72,8 @@ grpc:
   http2_keepalive_timeout_secs: null   # PING ACK 超时（须先设间隔）
   http2_adaptive_window: false         # BDP 自适应 HTTP/2 流控窗口
   http2_max_frame_size: null           # HTTP/2 帧载荷上限（字节）；null = tonic 默认
+  response_compression: false          # gzip gRPC 响应（P1-3）；仅推理服务
+  socket_mode: 0o666                   # unix: gRPC UDS 的 chmod（P4-1）
   # TLS/mTLS——与 server.* 的 TLS 键语义相同，作用于 gRPC 监听器
   tls_cert_path: null          # 服务器证书链 PEM；须与 tls_key_path 同设
   tls_key_path: null           # 服务器私钥 PEM；须与 tls_cert_path 同设
@@ -94,17 +99,17 @@ features:
   # P5-2 breaking（迁移 M3）：是否响应 x-lite-version canary pin 请求头。
   # 默认 false = 该头被忽略（客户端无法自行 pin 到 canary 版本）。仅灰度/调试环境开启
   canary_override: false
-  timeline: false              # 启用历史指标时间线
+  timeline: false              # （预留 — 尚未生效）
   system_overview: true        # （预留 — 尚未实现）
   custom_metrics: false        # （预留 — 尚未实现）
   benchmarks: true             # （预留 — 尚未实现）
   playground: false            # （预留 — 尚未实现）
-  alerts: true                 # 启用告警引擎
+  alerts: true                 # （预留 — 尚未生效）
   version_compare: false       # （预留 — 尚未实现）
-  streaming: true              # 启用流式端点
-  grpc_streaming: true         # 启用 gRPC 流式
-  sse: true                    # 启用 SSE 流式
-  websocket_streaming: true    # 启用 WebSocket 流式
+  streaming: true              # （预留 — 尚未生效；流式路由始终挂载）
+  grpc_streaming: true         # （预留 — 尚未生效）
+  sse: true                    # （预留 — 尚未生效）
+  websocket_streaming: true    # （预留 — 尚未生效）
   streaming_metrics: true      # 启用流式专用指标
 
 model_defaults:                # CLI 级别默认值，应用于所有模型

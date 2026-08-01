@@ -51,6 +51,7 @@ def main(argv=None):
     serve_parser.add_argument("--max-retries", type=int, help="Retry a failed batch on a different worker up to N times (0=disable)")
     serve_parser.add_argument("--startup-timeout", type=float, help="Max seconds to wait for a worker ready handshake")
     serve_parser.add_argument("--health-check-timeout", type=float, help="Seconds per health-check probe before timeout")
+    serve_parser.add_argument("--health-check-kill-threshold", type=int, help="Consecutive probe failures before kill + respawn (0=never)")
     serve_parser.add_argument("--worker-kill-timeout", type=float, help="Seconds to wait for the OS to reap a killed worker")
     serve_parser.add_argument("--hook-http-timeout", type=float, help="Seconds for a worker lifecycle HTTP hook request")
 
@@ -149,6 +150,7 @@ def _cmd_serve(args):
             max_retries=args.max_retries,
             startup_timeout=args.startup_timeout,
             health_check_timeout=args.health_check_timeout,
+            health_check_kill_threshold=args.health_check_kill_threshold,
             worker_kill_timeout=args.worker_kill_timeout,
             hook_http_timeout=args.hook_http_timeout,
         )

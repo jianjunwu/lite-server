@@ -465,8 +465,8 @@ impl GrpcService {
         // worker RequestMeta.headers (overwrites any client-supplied traceparent
         // so the worker is a child of THIS span; D8 Rust-only).
         crate::telemetry::inject(&mut header_map);
-        // P-DEADLINE (§4.0.10): carried to the worker so it can stop; batch
-        // keeps its existing ZMQ send path (no server-side wrap change).
+        // P-DEADLINE (§4.0.10): carried to the worker so it can stop; the batch
+        // response wait below is also bounded server-side by this deadline.
         let deadline =
             crate::deadline::resolve_from_grpc(&grpc_metadata, self.server_timeout.as_secs_f32());
         let meta = pb::RequestMeta {
@@ -527,10 +527,29 @@ impl GrpcService {
             batch_item_count,
         );
 
-        let resp = client
-            .send(internal_req)
-            .await
-            .map_err(|e| err(Status::internal(format!("worker error: {}", e))))?;
+        // B2 audit fix: bound the batch response wait by the resolved deadline,
+        // mirroring unary infer_impl (grpc/mod.rs:307-323). Previously this was a
+        // bare `client.send(...).await`, so a slow/hung worker made the server
+        // wait up to ~ZMQ_RESPONSE_TIMEOUT regardless of server.timeout/grpc-timeout.
+        let resp = match crate::deadline::remaining(deadline.unix_ns) {
+            Some(t) => match tokio::time::timeout(t, client.send(internal_req)).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    return Err(err(Status::internal(format!("worker error: {}", e))))
+                }
+                Err(_) => {
+                    return Err(err(Status::deadline_exceeded(format!(
+                        "inference timed out after {:.1}s",
+                        t.as_secs_f32()
+                    ))))
+                }
+            },
+            // No deadline (no client spec AND server.timeout<=0): unbounded.
+            None => client
+                .send(internal_req)
+                .await
+                .map_err(|e| err(Status::internal(format!("worker error: {}", e))))?,
+        };
 
         match resp.payload {
             Some(pb::response::Payload::Batch(batch_resp)) => {
@@ -1215,6 +1234,10 @@ impl GrpcService {
 
         let (tx, rx) = mpsc::channel(64);
         let worker_client = client.clone();
+        // B3: worker_client is moved into the incoming (client→worker) task below,
+        // so keep a separate clone for the cleanup cancel (aligned with stream_infer
+        // :722 / decoupled :960 `cancel_client`).
+        let cancel_client = client.clone();
 
         let stream_metrics = self.streaming_metrics;
         let metrics_model = model_name.clone();
@@ -1350,6 +1373,17 @@ impl GrpcService {
                 stream_family,
                 start.elapsed().as_secs_f64(),
             );
+
+            // B3 audit fix: cancel the worker on forwarder exit, aligned with
+            // stream_infer (grpc/mod.rs:791) and decoupled (:1038). bidi was
+            // previously the only streaming path that never sent a cancel on
+            // client disconnect / deadline / idle — the worker kept generating
+            // into an undrained ZMQ channel, pinning a worker slot. send_raw =
+            // fire-and-forget (a cancel draws no unary reply, so .send() would
+            // stall for ZMQ_RESPONSE_TIMEOUT). Harmless when the worker already
+            // stopped (Done/Error) — it ignores the cancel.
+            let cancel_req = streaming::build_stream_cancel(stream_id.clone());
+            let _ = cancel_client.send_raw(cancel_req).await;
 
             // #8: observe the incoming task so a panic is logged, not silently
             // dropped by a bare abort().

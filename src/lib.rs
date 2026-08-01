@@ -62,6 +62,7 @@ pub struct ServerOptions {
     pub max_retries: Option<usize>,
     pub startup_timeout: Option<f32>,
     pub health_check_timeout: Option<f32>,
+    pub health_check_kill_threshold: Option<usize>,
     pub worker_kill_timeout: Option<f32>,
     pub hook_http_timeout: Option<f32>,
 }
@@ -98,6 +99,7 @@ pub fn run_server(
         max_retries,
         startup_timeout,
         health_check_timeout,
+        health_check_kill_threshold,
         worker_kill_timeout,
         hook_http_timeout,
     } = opts;
@@ -136,6 +138,7 @@ pub fn run_server(
             max_retries,
             startup_timeout,
             health_check_timeout,
+            health_check_kill_threshold,
             worker_kill_timeout,
             hook_http_timeout,
             ..Default::default()
@@ -227,6 +230,7 @@ fn build_runtime(threads: Option<usize>) -> tokio::runtime::Runtime {
     max_retries=None,
     startup_timeout=None,
     health_check_timeout=None,
+    health_check_kill_threshold=None,
     worker_kill_timeout=None,
     hook_http_timeout=None,
 ))]
@@ -259,6 +263,7 @@ fn serve(
     max_retries: Option<usize>,
     startup_timeout: Option<f32>,
     health_check_timeout: Option<f32>,
+    health_check_kill_threshold: Option<usize>,
     worker_kill_timeout: Option<f32>,
     hook_http_timeout: Option<f32>,
 ) -> PyResult<()> {
@@ -272,7 +277,7 @@ fn serve(
                 health_check_interval, graceful_timeout, keepalive_timeout,
                 ejection_error_threshold, ejection_timeout, ejection_max_percent,
                 max_retries, startup_timeout, health_check_timeout,
-                worker_kill_timeout, hook_http_timeout,
+                health_check_kill_threshold, worker_kill_timeout, hook_http_timeout,
             })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })
