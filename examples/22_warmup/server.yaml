@@ -1,0 +1,12 @@
+# Model warmup (P-WARM): policies.warmup runs dummy inferences before the
+# version becomes Ready — /ready stays false (WarmingUp) until they finish.
+server:
+  http_port: 8000
+
+model_repository:
+  path: ./model_repo
+
+orchestration:
+  control_mode: explicit
+  load_models:
+    - warmup_echo

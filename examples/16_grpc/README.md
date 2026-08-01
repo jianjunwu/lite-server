@@ -39,6 +39,32 @@ grpcurl -plaintext \
 # => {"output": "grpc_echo: test"}
 ```
 
+## gRPC + Ensemble DAGs (P-ENSEMBLE-GRPC)
+
+A gRPC `Infer` call to an **ensemble** model executes the whole DAG
+server-side — the client sends one request and gets the final output; the
+graph fan-out/join happens inside the server, exactly like the HTTP path.
+
+```bash
+# Example 05's pipeline model over gRPC — one request, DAG executed:
+grpcurl -plaintext \
+  -d '{"model_name": "pipeline", "input": {"input": "hello"}}' \
+  localhost:8001 \
+  liteserver.LiteServer/Infer
+# => {"output": "preprocessed(hello) -> done"}
+```
+
+Notes:
+
+- Use `input` as the request body (it maps to the model's `decode_request`),
+  and `model_name` = the DAG's entry model. The `version` field stays
+  optional.
+- `deadline_unix_ns` propagation, canary routing (`x-lite-version` metadata)
+  and admission control (`max_inflight`) all apply to gRPC ensemble calls
+  identically.
+- Ensemble DAGs are defined in the entry model's `config.yaml` — see
+  [example 05](../05_ensemble/).
+
 ## What You Learn
 
 - How to enable gRPC via `server.grpc_port` and `grpc.enabled`

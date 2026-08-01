@@ -131,14 +131,17 @@ See [docs/benchmark.md](docs/benchmark.md) for full results and reproduction ste
 - **Standard batching** — group requests into batches for GPU efficiency
 - **Continuous batching** — for LLM workloads with prefill/step/has_finished hooks
 - **Streaming** — token-by-token output via SSE, WebSocket, or gRPC
-- **Ensemble** — DAG-based multi-model pipelines with parallel execution
+- **Decoupled streaming** — 1:N push streams over gRPC (`DecoupledInfer`) whose lifetime the model controls (`predict_decoupled`)
+- **Ensemble** — DAG-based multi-model pipelines with parallel execution, over HTTP and gRPC alike
 
 ### Model Management
 
 - **Triton-style repository** — `model_name/version/model.py` directory structure
 - **Hot reload** — modify model.py, server picks up changes automatically
 - **Multi-version** — load, unload, activate, deactivate versions independently
+- **Canary routing** — per-version traffic weights + `x-lite-version` request pinning (`canary_override`)
 - **Load policies** — `explicit`, `latest`, `all` for version management
+- **Model warmup** — dummy inferences run before a version reports Ready (`policies.warmup`), with a `WarmingUp` state machine
 - **Model packing** — `.lma` format with SHA256 + HMAC signature
 - **Model upload/download** — upload `.lma` artifacts or raw files via HTTP API, with auto-load support
 
@@ -159,13 +162,36 @@ See [docs/benchmark.md](docs/benchmark.md) for full results and reproduction ste
 - **Lifecycle hooks** — shell commands and HTTP callbacks on worker ready/exit/error for alerting and observability
 - **Per-request timeout** — hard timeout prevents stuck requests from blocking the queue
 
+### Traffic & Reliability
+
+- **Overload protection** — global `max_inflight` cap rejects excess inference with `503 + Retry-After` (health/admin stay reachable)
+- **Priority queue** — `x-lite-priority` header (higher = dispatched first) and per-model `queue_timeout` with `reject` action
+- **Per-request deadlines** — `x-lite-timeout` (HTTP) / `grpc-timeout` bound the wait; expiry returns `504`, propagated across ensemble DAGs
+- **Sequence-sticky routing** — `x-sequence-id` pins a client sequence to one worker (`sequence_ttl_secs` / `max_sequences`; soft pin with load-balancing thresholds)
+
+### Security
+
+- **TLS / mTLS** — rustls-based TLS on HTTP and gRPC, client-certificate mTLS, live certificate hot-rotation (file poll + SIGHUP)
+- **Endpoint access control** — per-class (admin / inference / health × http / grpc) API-key or loopback-only policies; admin is fail-closed by default; constant-time key comparison
+- **Trusted-proxy client IP** — `trusted_proxies` cleansing of `X-Forwarded-For` / `X-Real-IP`; fail-safe default (headers ignored) prevents forged-IP rate-limit bypass
+- **CORS + WebSocket Origin gate** — global or per-model CORS (exact-origin matching, `Vary: Origin`); WS handshakes checked at upgrade (403 on mismatched Origin)
+- **Admin API auth** — separate admin bind (`grpc.admin_bind`, e.g. UDS), API-key gating, structured audit log for every control-plane mutation
+
 ### Observability
 
 - **Prometheus metrics** — QPS, P50/P90/P99 latency, queue depth, TTFT, batch size, worker ejections
 - **Custom metrics** — gauge, counter, histogram from model code via `register_metric()` / `report_metric()`
+- **OpenTelemetry** — opt-in OTLP/gRPC traces + metrics SDK (cargo `telemetry` feature + `telemetry.enabled`), W3C traceparent bridging to workers
 - **Timeline** — historical metric sampling per model
 - **Alerts** — built-in alert rules for anomaly detection
-- **Structured logging** — tracing-based logs with model/worker context
+- **Structured logging** — tracing-based logs with model/worker context; `lite_server::audit` target for control-plane mutations
+
+### Operations
+
+- **Admin gRPC service** — 11 RPCs (GetInfo, ListModels, Load/Unload/Reload, ActivateVersion, SetRouting, GetModelStats, …) on a separate bind
+- **Unix-domain sockets** — HTTP (`server.host: unix:...`) and gRPC (`grpc.host` / `grpc.admin_bind`) with `socket_mode` control
+- **KEDA / autoscaler integration** — vLLM-compatible metric namespace (`{ns}:total_queued_requests`, `kv_cache_utilization`) + ScaledObject recipe
+- **Graceful shutdown** — drain in-flight requests, 503-drain gate, force-flushed telemetry with a capped drain window
 
 ## Installation
 
@@ -224,10 +250,33 @@ See [examples/](examples/) for runnable model repositories:
 | 13 | [bidi_streaming](examples/13_bidi_streaming/) | Bidirectional streaming for ASR |
 | 14 | [lifecycle_hooks](examples/14_lifecycle_hooks/) | Worker lifecycle hooks (shell + HTTP callbacks) |
 | 15 | [callbacks](examples/15_callbacks/) | Python callback pipeline (auth, cache, validation, error metrics) |
-| 16 | [grpc](examples/16_grpc/) | gRPC inference endpoints |
+| 16 | [grpc](examples/16_grpc/) | gRPC inference endpoints (incl. ensemble DAGs) |
 | 17 | [config_templates](examples/17_config_templates/) | Config templates, env vars, multi-env server.yaml |
+| 18 | [tls_mtls](examples/18_tls_mtls/) | TLS/mTLS + live certificate rotation |
+| 19 | [canary](examples/19_canary/) | Canary traffic weights + `x-lite-version` pinning |
+| 20 | [overload_control](examples/20_overload_control/) | max_inflight, queue timeouts, priorities, deadlines |
+| 21 | [admin_security](examples/21_admin_security/) | Admin gRPC on its own UDS, access control, audit log |
+| 22 | [warmup](examples/22_warmup/) | Model warmup + readiness state machine |
+| 23 | [advanced_routing](examples/23_advanced_routing/) | sequence_id stickiness + DecoupledInfer 1:N |
+| 24 | [proxy_security](examples/24_proxy_security/) | Trusted-proxy client IP, CORS, WebSocket Origin gate |
 
 See [examples/README.md](examples/README.md) for learning path and usage details.
+
+## Documentation
+
+| Doc | Covers |
+|-----|--------|
+| [Configuration](docs/configuration.md) ([中文](docs/zh/configuration.md)) | Full server / model / orchestration config reference |
+| [Model Authoring](docs/model-authoring.md) ([中文](docs/zh/model-authoring.md)) | LitAPI interface, streaming, continuous batching, best practices |
+| [CLI Reference](docs/cli.md) ([中文](docs/zh/cli.md)) | All CLI commands and flags |
+| [Architecture](docs/architecture.md) ([中文](docs/zh/architecture.md)) | System design, request flow, worker model |
+| [Observability / OpenTelemetry](docs/otel-observability.md) | OTLP traces + metrics, sampling, baggage allowlist |
+| [CORS Security Checklist](docs/cors-security-checklist.md) | CORS resolution rules and why each exists |
+| [Graceful Shutdown](docs/graceful-shutdown.md) | Drain semantics, signal handling, telemetry flush |
+| [KEDA Autoscaling](docs/keda.md) | vLLM-compatible metrics + ScaledObject for LLM autoscalers |
+| [Migration Guide](docs/migration.md) | 0.6.x → 0.7.x breaking changes, item by item |
+| [Benchmarks](docs/benchmark.md) | Benchmark methodology and results |
+| [Comparison](docs/comparison.md) | lite-server vs other serving frameworks |
 
 ## API Endpoints
 

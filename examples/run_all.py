@@ -53,16 +53,17 @@ Examples:
 # HTTP helpers
 # ---------------------------------------------------------------------------
 
-def http_json(method, path, body=None, headers=None, timeout=10):
+def http_json(method, path, body=None, headers=None, timeout=10,
+              base=BASE, context=None):
     """Return (status, parsed_body_or_text).  status is None on connection error."""
-    url = BASE + path
+    url = base + path
     data = json.dumps(body).encode() if body is not None else None
     hdrs = {"Content-Type": "application/json"}
     if headers:
         hdrs.update(headers)
     req = urllib.request.Request(url, data=data, method=method, headers=hdrs)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with urllib.request.urlopen(req, timeout=timeout, context=context) as r:
             txt = r.read().decode()
             try:
                 return r.status, json.loads(txt)
@@ -78,10 +79,11 @@ def http_json(method, path, body=None, headers=None, timeout=10):
         return None, f"{type(e).__name__}: {e}"
 
 
-def wait_ready(model, timeout=45):
+def wait_ready(model, timeout=45, base=BASE, context=None, headers=None):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        st, body = http_json("GET", f"/v2/models/{model}/ready", timeout=3)
+        st, body = http_json("GET", f"/v2/models/{model}/ready", timeout=3,
+                             base=base, context=context, headers=headers)
         if st == 200 and isinstance(body, dict) and body.get("ready"):
             return True
         time.sleep(0.5)
@@ -121,6 +123,14 @@ def read_sse(path, body, want_lines=4, deadline_s=8.0):
 # ---------------------------------------------------------------------------
 # Server lifecycle
 # ---------------------------------------------------------------------------
+
+def run_setup(example):
+    """Run example/setup.sh (if present) before the server starts. Used by
+    examples that need generated artifacts (e.g. TLS certificates)."""
+    setup = os.path.join(ROOT, example, "setup.sh")
+    if os.path.exists(setup):
+        subprocess.run(["bash", setup], cwd=os.path.join(ROOT, example), check=True)
+
 
 def start_server(example, env=None):
     # Check for port conflicts before launching.
@@ -412,6 +422,352 @@ def check_15():
     return ok, f"cache hit: HTTP {st} -> {r}"
 
 
+def tls_ctx():
+    """SSL context trusting the example's CA and presenting the client cert
+    (mTLS is mandatory in the TLS example — probes need it too)."""
+    import ssl
+    cert = os.path.join(ROOT, "18_tls_mtls", "certs")
+    ctx = ssl.create_default_context(cafile=os.path.join(cert, "ca.crt"))
+    ctx.load_cert_chain(os.path.join(cert, "client.crt"),
+                        os.path.join(cert, "client.key"))
+    return ctx
+
+
+def check_18():
+    """TLS/mTLS: mTLS request succeeds, no-client-cert handshake fails, and
+    the server certificate rotates live (SIGHUP) without a restart."""
+    import ssl
+    import subprocess as sp
+
+    CERT = os.path.join(ROOT, "18_tls_mtls", "certs")
+    ctx = ssl.create_default_context(cafile=os.path.join(CERT, "ca.crt"))
+    ctx.load_cert_chain(
+        os.path.join(CERT, "client.crt"), os.path.join(CERT, "client.key"))
+
+    def https_json(body):
+        url = "https://localhost:8000/v2/models/tls_echo/infer"
+        req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+            return r.status, json.loads(r.read().decode())
+
+    # 1) mTLS request works
+    try:
+        st, r = https_json({"input": 21})
+    except Exception as e:
+        return False, f"mTLS request failed: {type(e).__name__}: {e}"
+    if not (st == 200 and r.get("output") == 42):
+        return False, f"mTLS request: HTTP {st} -> {r}"
+
+    # 2) no client cert -> TLS handshake rejected
+    bare = ssl.create_default_context(cafile=os.path.join(CERT, "ca.crt"))
+    try:
+        req = urllib.request.Request(
+            "https://localhost:8000/v2/models/tls_echo/infer",
+            data=json.dumps({"input": 21}).encode(),
+            headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, context=bare, timeout=10).read()
+        return False, "expected handshake failure without client cert, but request succeeded"
+    except Exception:
+        pass  # handshake rejected — expected
+
+    # 3) rotate the server certificate and SIGHUP -> peer CN flips, no restart
+    sp.run(
+        ["bash", "-c",
+         "openssl req -newkey rsa:2048 -keyout certs/server.key -out /tmp/rot.csr "
+         "-nodes -subj '/CN=localhost-rotated' && "
+         "openssl x509 -req -in /tmp/rot.csr -CA certs/ca.crt -CAkey certs/ca.key "
+         "-CAcreateserial -out certs/server.crt -days 3650 "
+         "-extfile <(printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\\n"
+         "basicConstraints=critical,CA:false\\n"
+         "keyUsage=critical,digitalSignature,keyEncipherment\\n"
+         "extendedKeyUsage=serverAuth\\n') && "
+         "rm -f /tmp/rot.csr"],
+        cwd=os.path.join(ROOT, "18_tls_mtls"), capture_output=True, check=True)
+    try:
+        pid = int(sp.check_output(
+            ["pgrep", "-f", "lite_server serve"]).split()[-1])
+        os.kill(pid, signal.SIGHUP)
+    except Exception:
+        pass  # fall back to the 10s content poll below
+
+    # 3) assert the peer now presents the rotated certificate (direct TLS
+    #    handshake — independent of any HTTP client internals)
+    import socket
+    rotated = tls_ctx()
+    rotated.load_cert_chain(
+        os.path.join(CERT, "client.crt"), os.path.join(CERT, "client.key"))
+    deadline = time.time() + 12
+    cn = None
+    while time.time() < deadline:
+        try:
+            raw = socket.create_connection(("localhost", 8000), timeout=5)
+            with rotated.wrap_socket(raw, server_hostname="localhost") as ssock:
+                peer = ssock.getpeercert()
+                cn = next(v for subj in peer.get("subject", [])
+                          for k, v in subj if k == "commonName")
+                break
+        except Exception:
+            time.sleep(0.5)
+    if cn != "localhost-rotated":
+        return False, f"expected rotated CN=localhost-rotated, got {cn}"
+    return True, f"mTLS ok + no-cert rejected + live rotation CN={cn}"
+
+
+def check_19():
+    """Canary: weighted split favors v2, and x-lite-version pins requests."""
+    versions = []
+    for _ in range(40):
+        st, r = http_json("POST", "/v2/models/canary_echo/infer", {"input": 5})
+        if st == 200 and isinstance(r, dict):
+            versions.append(r.get("version"))
+    v1, v2 = versions.count("v1"), versions.count("v2")
+    if not (v1 > 0 and v2 > 0 and v2 > v1):
+        return False, f"weights not honored (want v2 majority): v1={v1} v2={v2}"
+    # x-lite-version pins
+    for pin, expect_out in (("v1", 6), ("v2", 10)):
+        st, r = http_json("POST", "/v2/models/canary_echo/infer",
+                          {"input": 5}, headers={"x-lite-version": pin})
+        if not (st == 200 and r.get("version") == pin and r.get("output") == expect_out):
+            return False, f"pin {pin}: HTTP {st} -> {r}"
+    return True, f"split v1={v1}/40 v2={v2}/40 | pins v1→6 v2→10 ok"
+
+
+def check_20():
+    """Overload: max_inflight rejects excess inference with 503 + Retry-After,
+    and x-lite-timeout returns 504 at the deadline."""
+    results = []
+    retry_afters = []
+    barrier = threading.Barrier(6)
+
+    def one():
+        barrier.wait()
+        url = "http://localhost:8000/v2/models/slow_echo/infer"
+        req = urllib.request.Request(url, data=json.dumps({"input": 1}).encode(),
+                                     method="POST",
+                                     headers={"Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(req, timeout=15).read()
+            results.append(200)
+        except urllib.error.HTTPError as e:
+            results.append(e.code)
+            if e.code == 503:
+                retry_afters.append(e.headers.get("Retry-After"))
+        except Exception:
+            results.append(0)
+
+    threads = [threading.Thread(target=one) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    ok200 = results.count(200)
+    ok503 = results.count(503)
+    if ok200 < 2 or ok503 < 1:
+        return False, f"expected >=2x200 and >=1x503, got {sorted(results)}"
+    if "1" not in retry_afters:
+        return False, f"503 responses missing Retry-After: 1, got {retry_afters}"
+
+    # deadline: x-lite-timeout 0.1s on a 0.8s model → 504
+    st, r = http_json("POST", "/v2/models/slow_echo/infer", {"input": 1},
+                      headers={"x-lite-timeout": "0.1"}, timeout=10)
+    if st != 504:
+        return False, f"expected 504 from x-lite-timeout, got HTTP {st} -> {r}"
+    return True, f"200x{ok200} 503x{ok503} + Retry-After + deadline 504 ok"
+
+
+def check_21():
+    """Admin security: HTTP admin 401 without key / ok with key; gRPC admin on
+    its UDS requires a key; a mutation lands in the audit log."""
+    import grpc.aio
+    from lite_server.proto.liteserver_pb2 import (
+        GetInfoRequest, GetInfoResponse,
+        ActivateVersionRequest, ActivateVersionResponse,
+    )
+
+    # 1) HTTP admin without key -> 401, with key -> ok
+    st, _ = http_json("POST", "/v2/models/admin_echo/versions/v1/activate")
+    if st != 401:
+        return False, f"expected 401 without admin key, got HTTP {st}"
+    st, r = http_json("POST", "/v2/models/admin_echo/versions/v1/activate",
+                      headers={"x-admin-key": "secret-admin-key"})
+    if not (st == 200 and isinstance(r, dict) and r.get("success") is True):
+        return False, f"admin activate with key: HTTP {st} -> {r}"
+
+    # 2) gRPC admin over its UDS — no key -> Unauthenticated, key -> ok.
+    #    grpc-python sends the socket path as :authority, which tonic rejects
+    #    with RST_STREAM/PROTOCOL_ERROR — pin it to localhost (grpcurl's
+    #    -authority localhost is the equivalent).
+    uds = "unix://" + os.path.join(ROOT, "21_admin_security", "admin.sock")
+    async def admin_call(rpc_name, req, resp_type, metadata=None, timeout=10):
+        ch = grpc.aio.insecure_channel(
+            uds, options=(("grpc.default_authority", "localhost"),))
+        try:
+            rpc = ch.unary_unary(
+                f"/liteserver.Admin/{rpc_name}",
+                request_serializer=req.SerializeToString,
+                response_deserializer=resp_type.FromString)
+            call = rpc(req, timeout=timeout,
+                       metadata=metadata or ())
+            try:
+                resp = await call
+                return 0, resp
+            except grpc.aio.AioRpcError as e:
+                return e.code(), None
+        finally:
+            await ch.close()
+
+    code, _ = asyncio.run(admin_call("GetInfo", GetInfoRequest(), GetInfoResponse))
+    if code != grpc.StatusCode.UNAUTHENTICATED:
+        return False, f"expected Unauthenticated on admin gRPC without key, got {code}"
+    code, resp = asyncio.run(admin_call(
+        "GetInfo", GetInfoRequest(), GetInfoResponse,
+        metadata=(("x-admin-key", "secret-admin-key"),)))
+    loaded = list(resp.loaded_models) if resp else []
+    if code != 0 or "admin_echo/v1" not in loaded:
+        return False, f"admin GetInfo with key failed: code={code} loaded={loaded}"
+
+    # 3) a mutation (activate) writes an audit record
+    code, _ = asyncio.run(admin_call(
+        "ActivateVersion",
+        ActivateVersionRequest(model_name="admin_echo", version="v1"),
+        ActivateVersionResponse,
+        metadata=(("x-admin-key", "secret-admin-key"),)))
+    if code != 0:
+        return False, f"ActivateVersion failed: {code}"
+    time.sleep(1.0)
+    audit_log = os.path.join(ROOT, "21_admin_security", "audit.log")
+    if not os.path.exists(audit_log):
+        return False, "audit.log not created"
+    with open(audit_log, encoding="utf-8", errors="replace") as f:
+        tail = f.read()
+    if "admin control-plane mutation" not in tail or "activate" not in tail:
+        return False, f"audit log missing activate record: {tail[-300:]!r}"
+    return True, "401-no-key + keyed HTTP admin + UDS gRPC auth + audit record ok"
+
+
+def check_22():
+    """Warmup: the model recorded exactly the configured dummy inferences,
+    proving the version warmed up before serving."""
+    st, r = http_json("GET", "/v2/models/warmup_echo/stats")
+    if not (st == 200 and isinstance(r, dict) and r.get("warmup_count") == 2):
+        return False, f"expected warmup_count=2, got HTTP {st} -> {r}"
+    # and normal inference still works
+    st, r = http_json("POST", "/v2/models/warmup_echo/infer", {"input": 21})
+    if not (st == 200 and isinstance(r, dict) and "warmup_count" in r.get("output", {})):
+        return False, f"infer after warmup: HTTP {st} -> {r}"
+    return True, "warmup_count=2 (iterations honored) + infer ok"
+
+
+def check_23():
+    """Advanced routing: x-sequence-id pins requests to one worker (pid), and
+    DecoupledInfer streams 3 chunks + final over gRPC."""
+    import grpc.aio
+    from lite_server.proto.liteserver_pb2 import (
+        DecoupledInferRequest, DecoupledResponse)
+
+    # 1) sticky routing — same sequence id → same worker pid
+    pids = []
+    for _ in range(5):
+        st, r = http_json("POST", "/v2/models/sticky_echo/infer", {"input": 1},
+                          headers={"x-sequence-id": "session-42"})
+        if st != 200 or "pid" not in r.get("output", {}):
+            return False, f"sticky infer: HTTP {st} -> {r}"
+        pids.append(r["output"]["pid"])
+    if len(set(pids)) != 1:
+        return False, f"sequence not sticky: pids={sorted(set(pids))}"
+
+    # 2) DecoupledInfer — model pushes 3 chunks, then closes (server streaming:
+    #    single request in, response stream out)
+    async def decoupled():
+        ch = grpc.aio.insecure_channel("localhost:8001")
+        try:
+            rpc = ch.unary_stream(
+                "/liteserver.LiteServer/DecoupledInfer",
+                request_serializer=DecoupledInferRequest.SerializeToString,
+                response_deserializer=DecoupledResponse.FromString)
+            call = rpc(DecoupledInferRequest(model_name="sticky_echo", data=b"{}"))
+            frames = []
+            while True:
+                r = await asyncio.wait_for(call.read(), timeout=10)
+                if r is grpc.aio.EOF:
+                    break
+                frames.append({"data": r.data, "final": r.is_final})
+                if r.is_final:
+                    break
+            return frames
+        finally:
+            await ch.close()
+
+    frames = asyncio.run(decoupled())
+    if len(frames) != 4:
+        return False, f"expected 3 chunks + final, got {len(frames)} frames"
+    if not (frames[3]["final"] and frames[0]["final"] is False):
+        return False, f"unexpected frame flags: {frames}"
+    return True, f"sticky pid={pids[0]} x5 | decoupled 3 chunks + final ok"
+
+
+def check_24():
+    """Proxy/browser security: XFF cleansing, CORS preflight headers, and the
+    WebSocket Origin gate (101 for a matching Origin, 403 otherwise)."""
+    # 1) client-IP cleansing
+    st, r = http_json("POST", "/v2/models/proxy_echo/infer", {"input": 1})
+    ip0 = r.get("output", {}).get("client_ip") if isinstance(r, dict) else None
+    st, r = http_json("POST", "/v2/models/proxy_echo/infer", {"input": 1},
+                      headers={"X-Forwarded-For": "1.2.3.4"})
+    ip1 = r.get("output", {}).get("client_ip") if isinstance(r, dict) else None
+    st, r = http_json("POST", "/v2/models/proxy_echo/infer", {"input": 1},
+                      headers={"X-Forwarded-For": "1.2.3.4, 5.6.7.8"})
+    ip2 = r.get("output", {}).get("client_ip") if isinstance(r, dict) else None
+    if not (ip0 == "127.0.0.1" and ip1 == "1.2.3.4" and ip2 == "5.6.7.8"):
+        return False, f"xff cleansing: no={ip0} one={ip1} chain={ip2}"
+
+    # 2) CORS preflight headers (raw request to read headers; keep the
+    #    HTTPMessage object — its get() is case-insensitive)
+    def options(origin):
+        req = urllib.request.Request(
+            "http://localhost:8000/v2/models/proxy_echo/infer", method="OPTIONS",
+            headers={"Origin": origin, "Access-Control-Request-Method": "POST"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.headers
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers
+
+    st_ok, h_ok = options("https://app.example.com")
+    st_bad, h_bad = options("https://evil.example.com")
+    acao = h_ok.get("Access-Control-Allow-Origin")
+    if not (st_ok == 204 and acao == "https://app.example.com"
+            and "origin" in h_ok.get("Vary", "").lower()):
+        return False, f"preflight ok-origin: HTTP {st_ok} acao={acao} vary={h_ok.get('Vary')}"
+    if h_bad.get("Access-Control-Allow-Origin"):
+        return False, f"preflight evil-origin got ACAO: {h_bad.get('Access-Control-Allow-Origin')}"
+
+    # 3) WebSocket Origin gate — raw upgrade probe
+    def ws_upgrade(origin):
+        conn = http.client.HTTPConnection(HOST, PORT, timeout=5)
+        try:
+            hdrs = {"Connection": "Upgrade", "Upgrade": "websocket",
+                    "Sec-WebSocket-Version": "13",
+                    "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ=="}
+            if origin is not None:
+                hdrs["Origin"] = origin
+            conn.request("GET", "/v2/models/proxy_echo/stream", headers=hdrs)
+            return conn.getresponse().status
+        except Exception:
+            return None
+        finally:
+            conn.close()
+
+    st_ws_ok = ws_upgrade("https://app.example.com")
+    st_ws_bad = ws_upgrade("https://evil.example.com")
+    if st_ws_ok != 101:
+        return False, f"ws matching origin: expected 101, got {st_ws_ok}"
+    if st_ws_bad != 403:
+        return False, f"ws evil origin: expected 403, got {st_ws_bad}"
+    return True, f"xff {ip0}/{ip1}/{ip2} + preflight ok/evil + ws 101/403"
+
+
 # example dir -> (primary model for readiness, check fn)
 SPECS = {
     "01_basic": ("echo", check_01),
@@ -431,6 +787,14 @@ SPECS = {
     "15_callbacks": ("callbacks_demo", check_15),
     "16_grpc": ("grpc_echo", check_16),
     "17_config_templates": ("env_demo", check_17, {"DEMO_API_KEY": "test-key-17"}),
+    "18_tls_mtls": ("tls_echo", check_18, None, "https://localhost:8000", tls_ctx),
+    "19_canary": ("canary_echo", check_19),
+    "20_overload_control": ("slow_echo", check_20),
+    "21_admin_security": ("admin_echo", check_21, None, None, None,
+                          {"x-admin-key": "secret-admin-key"}),
+    "22_warmup": ("warmup_echo", check_22),
+    "23_advanced_routing": ("sticky_echo", check_23),
+    "24_proxy_security": ("proxy_echo", check_24),
 }
 
 
@@ -442,12 +806,17 @@ def run_one(example, timeout=45, verbose=False):
     spec = SPECS[example]
     primary, check = spec[0], spec[1]
     env = spec[2] if len(spec) > 2 else None
+    base = spec[3] or BASE if len(spec) > 3 else BASE
+    run_setup(example)
+    ctx = spec[4]() if len(spec) > 4 and callable(spec[4]) else (spec[4] if len(spec) > 4 else None)
+    hdrs = spec[5] if len(spec) > 5 else None
     proc, log_path, log = start_server(example, env=env)
     result = {"example": example, "ready": False, "ok": False, "detail": "", "log": log_path}
     try:
         if verbose:
             print(f"  [startup] waiting up to {timeout}s for model '{primary}' ...", flush=True)
-        result["ready"] = wait_ready(primary, timeout=timeout)
+        result["ready"] = wait_ready(primary, timeout=timeout, base=base,
+                                     context=ctx, headers=hdrs)
         if not result["ready"]:
             result["detail"] = f"NOT READY within {timeout}s (primary model={primary})"
         else:

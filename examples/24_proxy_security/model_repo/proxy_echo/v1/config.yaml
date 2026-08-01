@@ -1,0 +1,11 @@
+# Per-model CORS policy (P-CORS): exact-origin matching, subdomain wildcard,
+# Vary: Origin on every CORS-relevant response. The same allow_origins gate
+# WebSocket handshakes (WS has no preflight — Origin is checked at upgrade).
+stream: true
+policies:
+  cors:
+    allow_origins: ["https://app.example.com"]
+    allow_methods: ["GET", "POST"]
+    allow_headers: ["Content-Type"]
+    expose_headers: ["x-request-id"]
+    max_age_secs: 7200

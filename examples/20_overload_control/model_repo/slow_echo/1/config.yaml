@@ -1,0 +1,7 @@
+# Per-model queue control (P-FLOW B1): a request that waits in the queue
+# longer than queue_timeout_secs is rejected with 503 (queue_full) + Retry-After.
+# With queue_timeout_action: delay (default) the hard request_timeout governs.
+queue_timeout_secs: 1.0
+queue_timeout_action: reject
+request_timeout: 10.0
+workers_per_device: 1

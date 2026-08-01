@@ -1,0 +1,14 @@
+# Overload control (P-FLOW / P-DEADLINE): a global in-flight cap rejects
+# excess inference with 503 + Retry-After; per-model queue timeout rejects
+# long-waited requests; clients can bound their wait with x-lite-timeout.
+server:
+  http_port: 8000
+  max_inflight: 2          # >2 concurrent inferences → 503 + Retry-After
+
+model_repository:
+  path: ./model_repo
+
+orchestration:
+  control_mode: explicit
+  load_models:
+    - slow_echo

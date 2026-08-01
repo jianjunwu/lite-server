@@ -1,0 +1,22 @@
+# Canary routing (P5-2): version v1 carries 20% of traffic, v2 80%.
+# features.canary_override honors the x-lite-version request header so a
+# client can pin itself to a specific version (off by default — see README).
+server:
+  http_port: 8000
+
+model_repository:
+  path: ./model_repo
+
+features:
+  canary_override: true
+
+orchestration:
+  control_mode: explicit
+  load_models:
+    - canary_echo
+  models:
+    - name: canary_echo
+      load_policy: all
+      weights:
+        "v1": 20
+        "v2": 80

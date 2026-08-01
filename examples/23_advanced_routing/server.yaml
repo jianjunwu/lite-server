@@ -1,0 +1,13 @@
+# Advanced routing (P8-1 / P9-1): sequence_id sticky routing across 3
+# workers, and DecoupledInfer 1:N push streaming over gRPC.
+server:
+  http_port: 8000
+  sequence_ttl_secs: 3600.0   # how long a sequence→worker pin is kept
+
+model_repository:
+  path: ./model_repo
+
+orchestration:
+  control_mode: explicit
+  load_models:
+    - sticky_echo

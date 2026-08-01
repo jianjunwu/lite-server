@@ -1,0 +1,3 @@
+# Three workers so sequence stickiness is observable (each responds with its
+# own pid) and DecoupledInfer has workers to spread across.
+workers_per_device: 3

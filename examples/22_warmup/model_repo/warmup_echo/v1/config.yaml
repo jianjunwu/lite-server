@@ -1,0 +1,8 @@
+# P-WARM: warm the engine before serving. 2 dummy inferences (each ~0.5s in
+# this model) must complete before the version reports Ready.
+policies:
+  warmup:
+    enabled: true
+    iterations: 2
+    dummy_input_ref: warmup/input.json
+    timeout_secs: 10.0

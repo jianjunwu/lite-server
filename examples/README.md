@@ -66,8 +66,20 @@ Start from example 01 and work your way up. Each example builds on concepts from
 | 13 | [bidi_streaming](13_bidi_streaming/) | Bidirectional streaming (ASR) | `BidiStreamHandler`, `on_open` / `on_chunk` / `on_close` |
 | 14 | [lifecycle_hooks](14_lifecycle_hooks/) | Worker lifecycle hooks | `on_ready` / `on_error` / `on_exit` shell + HTTP callbacks |
 | 15 | [callbacks](15_callbacks/) | Python Callback pipeline hooks | `on_request`/`on_input`/`on_output`/`on_response`, `ctx.respond()`, `HTTPException` rejection, both registration paths |
-| 16 | [grpc](16_grpc/) | gRPC inference endpoints | `grpc_port`, auto-generated gRPC from LitAPI |
+| 16 | [grpc](16_grpc/) | gRPC inference endpoints | `grpc_port`, auto-generated gRPC from LitAPI, ensemble DAGs over gRPC |
 | 17 | [config_templates](17_config_templates/) | Config templates & env vars | `os.environ`, `${VAR}` auth keys, multi-env server.yaml |
+
+### Production Hardening
+
+| # | Example | Description | Key Concept |
+|---|---------|-------------|-------------|
+| 18 | [tls_mtls](18_tls_mtls/) | TLS/mTLS + certificate rotation | `tls_cert_path` / `mtls_ca_path`, rustls, hot rotation (poll + SIGHUP) |
+| 19 | [canary](19_canary/) | Canary traffic split | `orchestration.models[].weights`, `x-lite-version` pinning, `canary_override` |
+| 20 | [overload_control](20_overload_control/) | Overload protection | `max_inflight` (503 + Retry-After), queue timeouts, `x-lite-priority`, `x-lite-timeout` deadlines |
+| 21 | [admin_security](21_admin_security/) | Admin API & access control | `grpc.admin_bind` UDS, `access_control` API keys, `lite_server::audit` log |
+| 22 | [warmup](22_warmup/) | Model warmup | `policies.warmup`, `WarmingUp` → `Ready` state machine, dummy inputs |
+| 23 | [advanced_routing](23_advanced_routing/) | Sticky + decoupled routing | `x-sequence-id` worker pinning, `predict_decoupled()` 1:N push streams |
+| 24 | [proxy_security](24_proxy_security/) | Proxy & browser security | `trusted_proxies` IP cleansing, per-model CORS, WS Origin gate |
 
 ## Running Any Example
 
