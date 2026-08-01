@@ -276,6 +276,28 @@ lite-server-core（主进程）
 - 队列路径在派发时结合实时负载与健康解析亲和：粘性 worker 过载（负载超过 `server.balance_abs_threshold` / `balance_rel_threshold`）→回退 power-of-two 选择；worker 下线→其 sequence 经 rendezvous hashing 重分布（平滑重哈希，迁移有界、无热点）。流式仅用核心粘性（无 per-worker 负载信号）。
 - **不带** `sequence_id` 的请求调度与现状**完全一致**——该特性纯可选。
 
+### Envelope hints（B3）：priority / affinity_key / direct_worker_id
+
+unary infer（HTTP + gRPC）另识别三个可选调度 hint，经 header（HTTP）或 proto
+`headers` map（gRPC）携带：
+
+- **`x-lite-priority: <int>`**——多级优先级队列（P-FLOW B1）；值越大越先派发
+  （并列 FIFO）。缺省 = 0 = 纯 FIFO。
+- **`x-lite-affinity-key: <string>`**——无状态内容亲和路由：key 经 rendezvous
+  哈希落到存活 worker，同一 key 确定性落同一 worker（无需服务端注册表；
+  worker 离开时平滑再分布）。`sequence_id` 是其特例且优先；与 `sequence_id`
+  不同，它不带跨请求注册表粘性、也不走负载阈值回退（纯哈希）。
+- **`x-lite-worker-id: <u32>`**——直连模式：钉到指定 worker 下标（"gateway
+  citizen" 扩展——服务端不接管决策）。提交即校验：下标越界或 worker 已被
+  剔除 → `400` / gRPC `InvalidArgument`（坏 pin 绝不静默改路由）。提交后到
+  派发前 worker 转不可用（剔除竞态/重试排除）→ warn 降级正常挑选——可用性
+  优先于 hint。
+
+所有 hint 均为未认证调度 hint，不构成隔离边界（同 `sequence_id`）。仅队列
+派发路径（unary infer）消费；batch/stream/bidi 直连 worker，忽略这些 hint。
+原预留的 `x-lite-expected-cost` 未兑现即移除——容量感知 picker 落地时可
+additive 重新引入。
+
 > **安全与隔离**：`sequence_id` 是**未认证的调度 hint，不构成隔离边界**。客户端只能影响自身请求的落点（猜/复用 sequence id），不能借此跨模型/跨租户访问——隔离仍由 access_control + worker 模型边界保证。错误响应不回显内部 `worker_id`/registry 结构。
 >
 > **多实例**：`SequenceRegistry` 为**per-process**——多副本下同一 `sequence_id` 在不同实例可能落不同 worker。全局粘性需上游会话亲和（如网关 sticky cookie）；本服务仅提供实例内粘性。

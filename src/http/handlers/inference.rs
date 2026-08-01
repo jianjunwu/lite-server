@@ -130,10 +130,10 @@ async fn do_infer(
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    // P8-1 (B3): envelope hints — parsed and surfaced, NOT yet consumed (define-only).
+    // P8-1 (B3): envelope hints — debug 记录；消费点在队列（priority/affinity_key/direct_worker_id）。
     let hints = crate::request_context::RequestHints::from_http(&headers);
     if !hints.is_empty() {
-        tracing::debug!(?hints, "envelope hints received (define-only, not consumed)");
+        tracing::debug!(?hints, "envelope hints received");
     }
 
     // Fire InferenceRequest callback (before values are moved into meta)
@@ -182,6 +182,10 @@ async fn do_infer(
             return Err(AppError::QueueFull(format!(
                 "Queue full for {} {}", model_name, resolved_version
             )));
+        }
+        Err(crate::inference_queue::QueueError::InvalidWorker(msg)) => {
+            // B3 direct-mode: x-lite-worker-id 不存在/已剔除 → 400（客户端错误）。
+            return Err(AppError::Validation(msg));
         }
         Err(_) => {
             return Err(AppError::ModelNotReady(format!(

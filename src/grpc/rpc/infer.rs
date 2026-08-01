@@ -125,10 +125,10 @@ impl GrpcService {
         // worker RequestMeta.headers (overwrites any client-supplied traceparent
         // so the worker is a child of THIS span; D8 Rust-only).
         crate::telemetry::inject(&mut header_map);
-        // P8-1 (B3): envelope hints — parsed and surfaced, NOT yet consumed (define-only).
+        // P8-1 (B3): envelope hints — debug 记录；消费点在队列（priority/affinity_key/direct_worker_id）。
         let hints = crate::request_context::RequestHints::from_grpc(&req.headers);
         if !hints.is_empty() {
-            tracing::debug!(?hints, "envelope hints received (define-only, not consumed)");
+            tracing::debug!(?hints, "envelope hints received");
         }
         // P-DEADLINE (§4.0.10): resolve the per-request deadline from the
         // client's `grpc-timeout` metadata, falling back to `server.timeout`.
@@ -215,6 +215,11 @@ impl GrpcService {
                     )),
                     1,
                 )));
+            }
+            Err(crate::inference_queue::QueueError::InvalidWorker(msg)) => {
+                // B3 direct-mode: x-lite-worker-id 不存在/已剔除 → InvalidArgument
+                // （对齐 HTTP 400，客户端错误不落 5xx）。
+                return Err(err(Status::invalid_argument(msg)));
             }
             Err(_) => {
                 return Err(err(Status::unavailable(format!(

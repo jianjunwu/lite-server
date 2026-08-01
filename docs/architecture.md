@@ -280,6 +280,33 @@ By default requests are routed statelessly: unary `Infer` through the per-(model
 - For the queue path, affinity is resolved at dispatch with live load/health, so an overloaded sticky worker (load beyond `server.balance_abs_threshold` / `balance_rel_threshold`) falls back to power-of-two selection, and a worker going offline redistributes its sequences via rendezvous hashing (smooth rehash — bounded movement, no hotspot). Streaming uses core stickiness only (it has no per-worker load signal).
 - Requests **without** a `sequence_id` route exactly as before — the feature is strictly opt-in.
 
+### Envelope Hints (B3): priority / affinity_key / direct_worker_id
+
+Unary infer (HTTP + gRPC) honors three more opt-in scheduling hints, carried as
+headers (HTTP) or the proto `headers` map (gRPC):
+
+- **`x-lite-priority: <int>`** — multi-level priority queue (P-FLOW B1); higher
+  values dispatch first (ties FIFO). Absent = 0 = plain FIFO.
+- **`x-lite-affinity-key: <string>`** — stateless content-affinity routing: the
+  key is rendezvous-hashed onto the live workers, so the same key deterministically
+  lands on the same worker without any server-side registry (smooth redistribution
+  when a worker leaves). `sequence_id` is the special case and wins when both are
+  present; unlike `sequence_id` it carries no cross-request registry stickiness
+  and no load-threshold fallback (pure hash).
+- **`x-lite-worker-id: <u32>`** — direct mode: pin the request to one worker
+  index ("gateway citizen" extension — the server does not take over the
+  decision). Validated at submit: an out-of-range or currently-ejected worker is
+  rejected with `400` / gRPC `InvalidArgument` (a bad pin never silently
+  reroutes). If the worker becomes unavailable between submit and dispatch
+  (ejection race / retry exclusion), the server warns and falls back to normal
+  selection — availability wins over the hint.
+
+All hints are unauthenticated scheduling hints, not an isolation boundary (same
+model as `sequence_id`). Consumed on the queue-dispatched paths (unary infer);
+batch/stream/bidi dispatch directly to workers and ignore them. The former
+`x-lite-expected-cost` reservation was removed unused — a capacity-aware picker
+can reintroduce it additively.
+
 > **Security & isolation.** `sequence_id` is an **unauthenticated scheduling hint, not an isolation boundary**. A client can influence where its own requests land (by guessing/reusing a sequence id) but cannot cross model or tenant boundaries — those stay enforced by access control + worker model scope. Error responses never echo internal `worker_id`/registry structure.
 >
 > **Multi-instance.** The `SequenceRegistry` is **per-process**: under multiple replicas the same `sequence_id` may land on different workers in different instances. Global stickiness requires upstream session affinity (e.g. a gateway sticky cookie); this server provides in-instance affinity only.

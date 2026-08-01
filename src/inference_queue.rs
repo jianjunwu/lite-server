@@ -83,6 +83,11 @@ pub enum QueueError {
     Closed,
     NotFound,
     Full,
+    /// B3 direct-mode: `x-lite-worker-id` named a worker that does not exist or
+    /// is currently ejected. Rejected at submit so a bad pin fails fast with a
+    /// clear error (HTTP 400 / gRPC InvalidArgument) instead of silently
+    /// rerouting deep in the collector.
+    InvalidWorker(String),
 }
 
 impl std::fmt::Display for QueueError {
@@ -91,6 +96,7 @@ impl std::fmt::Display for QueueError {
             QueueError::Closed => write!(f, "queue closed"),
             QueueError::NotFound => write!(f, "queue not found for model"),
             QueueError::Full => write!(f, "queue full"),
+            QueueError::InvalidWorker(msg) => write!(f, "invalid direct worker pin: {msg}"),
         }
     }
 }
@@ -508,6 +514,30 @@ fn item_priority(item: &QueueItem) -> i32 {
         .unwrap_or(0)
 }
 
+/// B3 direct-mode: parse the `x-lite-worker-id` pin off one item's meta headers
+/// (malformed values drop to `None` = no pin, hints are best-effort).
+fn direct_pin(item: &QueueItem) -> Option<usize> {
+    item.meta
+        .as_ref()
+        .and_then(|m| m.headers.get("x-lite-worker-id"))
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|v| v as usize)
+}
+
+/// Batch-level direct pin: `Some(w)` when every pin-carrying item agrees on
+/// worker `w` (items without a pin don't vote). Conflicting pins → `None`
+/// (fall back to normal selection — batches are not split for pins).
+fn batch_direct_pin(batch: &[QueueItem]) -> Option<usize> {
+    let mut pins = batch.iter().filter_map(direct_pin);
+    let first = pins.next()?;
+    if pins.all(|p| p == first) {
+        Some(first)
+    } else {
+        warn!("conflicting x-lite-worker-id pins within one batch — falling back to normal worker selection");
+        None
+    }
+}
+
 /// P-FLOW B1 (§4.0.9): reject a request that waited past `queue_timeout` by
 /// replying 503 (numeric `status.message` maps to HTTP 503 / gRPC Unavailable
 /// in both handlers) and dropping it. The item's `InflightGuard` decrements the
@@ -559,6 +589,8 @@ struct VersionQueue {
     health_checker: Option<std::sync::Arc<tokio::task::JoinHandle<()>>>,
     /// Requests accepted but not yet completed (§4.2 graceful drain).
     inflight_requests: Arc<AtomicUsize>,
+    /// Worker count at registration — bounds-checks B3 direct pins at submit.
+    worker_count: usize,
 }
 
 /// Handle to a draining queue (§4.2). The collector stays alive so
@@ -681,6 +713,9 @@ impl InferenceQueue {
         }
 
         let worker_count = workers.len();
+        // B3 direct-pin 边界检查口径：dispatch 索引空间是 zmq_clients（生产上
+        // 与 worker_infos 等长；单测常传空 worker_infos + 真实 clients）。
+        let dispatch_workers = zmq_clients.len();
         let handle = tokio::spawn(batch_collector(
             rx,
             max_batch,
@@ -727,6 +762,7 @@ impl InferenceQueue {
                 outlier,
                 health_checker: health_handle,
                 inflight_requests: Arc::new(AtomicUsize::new(0)),
+                worker_count: dispatch_workers,
             },
         );
         info!(
@@ -768,6 +804,22 @@ impl InferenceQueue {
                 .queues
                 .get(&key)
                 .ok_or(QueueError::NotFound)?;
+            // B3 direct-mode (x-lite-worker-id): 提交即校验 pin——worker 不存在
+            // 或已剔除 → fail-fast（HTTP 400 / gRPC InvalidArgument），不让坏 pin
+            // 潜入 collector 静默改路由。校验在计数前，拒绝不占容量/指标。
+            if let Some(w) = direct_pin(&item) {
+                if w >= entry.worker_count {
+                    return Err(QueueError::InvalidWorker(format!(
+                        "x-lite-worker-id {w} out of range for {model_name} {version} (workers: {})",
+                        entry.worker_count
+                    )));
+                }
+                if entry.outlier.is_ejected(w) {
+                    return Err(QueueError::InvalidWorker(format!(
+                        "x-lite-worker-id {w} is ejected for {model_name} {version}"
+                    )));
+                }
+            }
             (entry.tx.clone(), entry.inflight_requests.clone())
         };
         // Count from acceptance (not dispatch) so a drain starting right after
@@ -880,6 +932,10 @@ struct Affinity {
 /// Compute the batch's affinity hint from the `sequence_id` each item carries
 /// on its `RequestMeta`. Returns `None` when no item carries a sequence_id —
 /// non-affinity dispatch, which the picker then routes exactly as before.
+///
+/// B3 内容亲和：无 `sequence_id` 的项回落 `x-lite-affinity-key`——作为纯
+/// rendezvous 哈希 key（无注册表跟踪，preferred=None，无状态确定性路由）；
+/// 两类 key 同时存在时 `sequence_id` 优先（它是 affinity_key 的特例）。
 fn batch_affinity(
     batch: &[QueueItem],
     reg: &SequenceRegistry,
@@ -890,17 +946,25 @@ fn batch_affinity(
     let mut agreed: Option<usize> = None;
     let mut disagree = false;
     for item in batch {
-        let Some(seq) = item.meta.as_ref().and_then(|m| m.sequence_id.as_deref()) else {
-            continue;
-        };
+        let meta = item.meta.as_ref();
+        let seq = meta.and_then(|m| m.sequence_id.as_deref());
+        let key = seq.or_else(|| {
+            meta.and_then(|m| m.headers.get("x-lite-affinity-key"))
+                .map(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+        });
+        let Some(key) = key else { continue };
         if first_seq.is_none() {
-            first_seq = Some(seq.to_string());
+            first_seq = Some(key.to_string());
         }
-        if let Some(w) = reg.lookup(seq, model, version) {
-            match agreed {
-                None => agreed = Some(w),
-                Some(cur) if cur != w => disagree = true,
-                _ => {}
+        // 注册表粘性只跟 sequence_id（affinity_key 本身已是确定性哈希路由）。
+        if let Some(seq) = seq {
+            if let Some(w) = reg.lookup(seq, model, version) {
+                match agreed {
+                    None => agreed = Some(w),
+                    Some(cur) if cur != w => disagree = true,
+                    _ => {}
+                }
             }
         }
     }
@@ -1150,11 +1214,31 @@ async fn do_send_batch(
     }
 
     let batch_size = batch.len();
-    // P8-1: bias worker selection toward the affinity worker when the batch
-    // carries sequence_ids, falling back to least-loaded (no sequence_id ⇒
-    // `batch_affinity` returns None ⇒ `pick_worker` behaves exactly as before).
-    let affinity = batch_affinity(batch.as_slice(), sequence_registry, model_name, version);
-    let worker_idx = pick_worker(inflight, outlier, exclude, affinity, balance);
+    // B3 direct-mode pin（x-lite-worker-id）优先于一切挑选：pin 在提交时已校验
+    // （不存在/已剔除→400），此处仅剩提交后竞态（worker 被剔除/重试排除）——
+    // warn 降级正常挑选，可用性优先于 hint。
+    let pin = batch_direct_pin(batch.as_slice());
+    let worker_idx = match pin {
+        Some(w) if w < inflight.len() && !outlier.is_ejected(w) && !exclude.contains(&w) => w,
+        Some(w) => {
+            warn!(
+                worker_idx = w,
+                "direct pin became invalid after submit (ejected/excluded) — falling back to normal worker selection"
+            );
+            // P8-1: bias worker selection toward the affinity worker when the batch
+            // carries sequence_ids, falling back to least-loaded (no sequence_id ⇒
+            // `batch_affinity` returns None ⇒ `pick_worker` behaves exactly as before).
+            let affinity = batch_affinity(batch.as_slice(), sequence_registry, model_name, version);
+            pick_worker(inflight, outlier, exclude, affinity, balance)
+        }
+        None => {
+            // P8-1: bias worker selection toward the affinity worker when the batch
+            // carries sequence_ids, falling back to least-loaded (no sequence_id ⇒
+            // `batch_affinity` returns None ⇒ `pick_worker` behaves exactly as before).
+            let affinity = batch_affinity(batch.as_slice(), sequence_registry, model_name, version);
+            pick_worker(inflight, outlier, exclude, affinity, balance)
+        }
+    };
     debug!(
         model = %model_name,
         version = %version,
@@ -1871,6 +1955,202 @@ mod tests {
         let b = rendezvous_pick("seq-a", &inflight, &outlier, &[]).unwrap();
         assert_eq!(a, b, "same sequence → same worker (deterministic)");
         assert_ne!(a, 0, "an ejected worker is never chosen");
+    }
+
+    // ===== B3 hint 消费：affinity_key 内容亲和 + direct_worker_id 直连钉住 =====
+
+    fn meta_with_headers(headers: &[(&str, &str)]) -> Arc<pb::RequestMeta> {
+        Arc::new(pb::RequestMeta {
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    fn hint_item_rx(
+        uid: &str,
+        meta: Arc<pb::RequestMeta>,
+    ) -> (QueueItem, oneshot::Receiver<pb::Response>) {
+        let (tx, rx) = oneshot::channel();
+        let item = QueueItem {
+            uid: uid.to_string(),
+            data: Bytes::new(),
+            meta: Some(meta),
+            response_tx: tx,
+            inflight_guard: None,
+            enqueued_at: Instant::now(),
+        };
+        (item, rx)
+    }
+
+    fn hint_item(uid: &str, meta: Arc<pb::RequestMeta>) -> QueueItem {
+        hint_item_rx(uid, meta).0
+    }
+
+    #[test]
+    fn batch_affinity_uses_affinity_key_when_no_sequence_id() {
+        let reg = SequenceRegistry::new(Duration::from_secs(60), 16);
+        let batch =
+            vec![hint_item("a", meta_with_headers(&[("x-lite-affinity-key", "tenant-42")]))];
+        let aff = batch_affinity(&batch, &reg, "m", "1").expect("affinity from header key");
+        assert_eq!(aff.seq, "tenant-42");
+        assert_eq!(aff.preferred, None, "affinity_key 无注册表跟踪 → 纯内容哈希路由");
+    }
+
+    #[test]
+    fn batch_affinity_sequence_id_wins_over_affinity_key() {
+        let reg = SequenceRegistry::new(Duration::from_secs(60), 16);
+        reg.record("seq-1", "m", "1", 2);
+        let meta = pb::RequestMeta {
+            sequence_id: Some("seq-1".to_string()),
+            headers: [("x-lite-affinity-key".to_string(), "k".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let batch = vec![hint_item("a", Arc::new(meta))];
+        let aff = batch_affinity(&batch, &reg, "m", "1").unwrap();
+        assert_eq!(aff.seq, "seq-1", "sequence_id 是 affinity_key 的特例，优先");
+        assert_eq!(aff.preferred, Some(2), "sequence_id 保留注册表粘性");
+    }
+
+    #[test]
+    fn affinity_key_routes_deterministically_via_rendezvous() {
+        let outlier = OutlierState::new(4);
+        let inflight = mk_inflight(&[0; 4]);
+        let reg = SequenceRegistry::new(Duration::from_secs(60), 16);
+        let pick = |uid: &str| {
+            let batch =
+                vec![hint_item(uid, meta_with_headers(&[("x-lite-affinity-key", "tenant-42")]))];
+            let aff = batch_affinity(&batch, &reg, "m", "1");
+            pick_worker(&inflight, &outlier, &[], aff, BalanceConfig::default())
+        };
+        assert_eq!(pick("a"), pick("b"), "同一 affinity_key → 同一 worker（无状态确定性）");
+    }
+
+    #[test]
+    fn batch_direct_pin_requires_unanimous() {
+        let single =
+            vec![hint_item("a", meta_with_headers(&[("x-lite-worker-id", "1")]))];
+        assert_eq!(batch_direct_pin(&single), Some(1));
+
+        let conflict = vec![
+            hint_item("a", meta_with_headers(&[("x-lite-worker-id", "0")])),
+            hint_item("b", meta_with_headers(&[("x-lite-worker-id", "1")])),
+        ];
+        assert_eq!(batch_direct_pin(&conflict), None, "冲突 pin → 退回正常挑选");
+
+        let mixed = vec![
+            hint_item("a", meta_with_headers(&[("x-lite-worker-id", "1")])),
+            hint_item("b", meta_with_headers(&[])),
+        ];
+        assert_eq!(batch_direct_pin(&mixed), Some(1), "部分携带 pin → 按携带项");
+    }
+
+    /// 注册一个 2-worker 版本（echo worker 以各自 tag 回应，可分辨落点）。
+    async fn two_worker_queue(name: &str) -> (InferenceQueue, Arc<OutlierState>) {
+        let queue = InferenceQueue::new();
+        let config = ModelConfig {
+            max_queue_size: 10,
+            max_batch_size: 1,
+            batch_timeout: 0.0,
+            adaptive_batching: false,
+            min_batch_timeout: 0.0,
+            adaptive_queue_threshold: 0,
+            health_check_interval: 0.0,
+            ..Default::default()
+        };
+        let (reload_tx, _reload_rx) = mpsc::channel(8);
+        let outlier = Arc::new(OutlierState::new(2));
+        let mut clients = Vec::new();
+        for (i, tag) in [b"w0".as_slice(), b"w1".as_slice()].iter().enumerate() {
+            let endpoint = drain_test_endpoint(&format!("{name}-{i}"));
+            spawn_tagged_worker(endpoint.clone(), tag.to_vec());
+            clients.push(Arc::new(WorkerZmqClient::new(endpoint)));
+        }
+        queue.register_model("m", "1", &config, vec![], clients, reload_tx, outlier.clone(), None);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        (queue, outlier)
+    }
+
+    /// PAIR worker：每个请求回一个 data=tag 的 Single（分辨请求落点用）。
+    fn spawn_tagged_worker(endpoint: String, tag: Vec<u8>) -> std::thread::JoinHandle<()> {
+        use prost::Message;
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(5000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let resp = pb::Response {
+                    uid: req.uid,
+                    payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+                        data: Bytes::from(tag.clone()),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                if s.send(resp.encode_to_vec(), 0).is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn try_submit_rejects_direct_pin_out_of_range() {
+        let (queue, _outlier) = two_worker_queue("pin-range").await;
+        let item = hint_item("p", meta_with_headers(&[("x-lite-worker-id", "5")]));
+        let err = queue.try_submit("m", "1", item).unwrap_err();
+        assert!(
+            matches!(err, QueueError::InvalidWorker(_)),
+            "pin 到不存在的 worker → InvalidWorker，got {err:?}"
+        );
+        // 拒绝不消耗队列容量/计数——随后合法提交必须成功。
+        let ok = hint_item("ok", meta_with_headers(&[]));
+        assert!(queue.try_submit("m", "1", ok).is_ok());
+    }
+
+    #[tokio::test]
+    async fn try_submit_rejects_direct_pin_to_ejected_worker() {
+        let (queue, outlier) = two_worker_queue("pin-ejected").await;
+        for _ in 0..EjectionConfig::default().error_threshold {
+            outlier.record_error(1);
+        }
+        assert!(outlier.is_ejected(1), "setup: worker 1 ejected");
+
+        let item = hint_item("p", meta_with_headers(&[("x-lite-worker-id", "1")]));
+        let err = queue.try_submit("m", "1", item).unwrap_err();
+        assert!(matches!(err, QueueError::InvalidWorker(_)), "pin 已剔除 worker → InvalidWorker");
+
+        // pin 健康 worker 仍放行。
+        let ok = hint_item("ok", meta_with_headers(&[("x-lite-worker-id", "0")]));
+        assert!(queue.try_submit("m", "1", ok).is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_honors_direct_worker_pin() {
+        let (queue, _outlier) = two_worker_queue("pin-dispatch").await;
+        for (pin, want) in [(1u32, b"w1".as_slice()), (0, b"w0".as_slice())] {
+            let (item, rx) =
+                hint_item_rx("p", meta_with_headers(&[("x-lite-worker-id", &pin.to_string())]));
+            queue.try_submit("m", "1", item).unwrap();
+            let resp = tokio::time::timeout(Duration::from_secs(5), rx)
+                .await
+                .expect("response in time")
+                .expect("channel open");
+            let data = match resp.payload {
+                Some(pb::response::Payload::Single(s)) => s.data,
+                other => panic!("expected Single, got {other:?}"),
+            };
+            assert_eq!(data, want, "pin={pin} must land on worker {pin}");
+        }
     }
 
     // ===== Key pre-computation tests =====

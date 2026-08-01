@@ -160,27 +160,29 @@ impl<S: Send + Sync> FromRequestParts<S> for RequestContext {
 }
 
 /// P8-1 (B3): request envelope hints — additive scheduling hints an upstream
-/// gateway/orchestrator MAY attach. **Define-only this period**: parsed and
-/// surfaced (debug log) but NOT yet consumed by routing. `sequence_id` (P8-1
-/// core) is the consumed special case of `affinity_key`.
+/// gateway/orchestrator MAY attach. Consumption state (2026-08-02):
+/// - `priority` → B1 多级优先级队列（P-FLOW 已消费）；
+/// - `affinity_key` → 内容亲和路由：无 `sequence_id` 时作 rendezvous 哈希 key
+///   （`sequence_id` 是其特例，两者同时在时 `sequence_id` 优先）；
+/// - `direct_worker_id` → 直连钉住：提交时校验（不存在/已剔除 → 400/
+///   InvalidArgument），dispatch 优先于一切挑选。
+/// `expected_cost`（容量感知 picker 的预留字段）已移除——定义即债务；容量
+/// 感知 picker 落地时以 additive header 重新引入（§2.2 观察名单）。
 ///
 /// All fields are unauthenticated hints, not an isolation boundary — a client
 /// can influence its own routing/landing but cannot cross model or tenant
 /// boundaries (those stay enforced by `access_control` + worker model scope).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RequestHints {
-    /// Scheduling priority (lower = higher priority). Reserved for the multi-
-    /// level priority queue (B1); not consumed this period.
+    /// Scheduling priority (lower = higher priority). Consumed by the B1
+    /// multi-level priority queue (P-FLOW).
     pub priority: Option<i32>,
     /// Generic content-affinity key. `sequence_id` is its special case; when
-    /// both are present the explicit `sequence_id` wins. Not consumed this period.
+    /// both are present the explicit `sequence_id` wins.
     pub affinity_key: Option<String>,
-    /// Caller's expected request cost (relative weight). Reserved for
-    /// state-aware load scoring; not consumed this period.
-    pub expected_cost: Option<f64>,
-    /// Direct-mode: caller names a specific `worker_id`. Reserved ("gateway
-    /// citizen" extension — the server does not take over the decision); parsed
-    /// and validated-healthy in a follow-up, logged+ignored this period.
+    /// Direct-mode: caller names a specific `worker_id` ("gateway citizen"
+    /// extension — the server does not take over the decision). Validated at
+    /// submit (unknown/ejected worker → 400 / InvalidArgument).
     pub direct_worker_id: Option<u32>,
 }
 
@@ -191,7 +193,6 @@ impl RequestHints {
         Self {
             priority: header_str(headers, "x-lite-priority").and_then(|s| s.parse().ok()),
             affinity_key: header_str(headers, "x-lite-affinity-key").map(|s| s.to_string()),
-            expected_cost: header_str(headers, "x-lite-expected-cost").and_then(|s| s.parse().ok()),
             direct_worker_id: header_str(headers, "x-lite-worker-id").and_then(|s| s.parse().ok()),
         }
     }
@@ -202,7 +203,6 @@ impl RequestHints {
         Self {
             priority: get("x-lite-priority").and_then(|s| s.parse().ok()),
             affinity_key: get("x-lite-affinity-key").filter(|s| !s.is_empty()).map(|s| s.to_string()),
-            expected_cost: get("x-lite-expected-cost").and_then(|s| s.parse().ok()),
             direct_worker_id: get("x-lite-worker-id").and_then(|s| s.parse().ok()),
         }
     }
@@ -212,7 +212,6 @@ impl RequestHints {
     pub fn is_empty(&self) -> bool {
         self.priority.is_none()
             && self.affinity_key.is_none()
-            && self.expected_cost.is_none()
             && self.direct_worker_id.is_none()
     }
 }
@@ -228,22 +227,27 @@ mod tests {
     use axum::http::StatusCode;
     use tower::ServiceExt;
 
-    // ===== P8-1 (B3) RequestHints parsing (define-only) =====
+    // ===== P8-1 (B3) RequestHints parsing =====
 
     #[test]
     fn request_hints_parse_from_http_headers() {
         let h = headers_with(&[
             ("x-lite-priority", "5"),
             ("x-lite-affinity-key", "sess-42"),
-            ("x-lite-expected-cost", "1.25"),
             ("x-lite-worker-id", "3"),
         ]);
         let hints = RequestHints::from_http(&h);
         assert_eq!(hints.priority, Some(5));
         assert_eq!(hints.affinity_key.as_deref(), Some("sess-42"));
-        assert_eq!(hints.expected_cost, Some(1.25));
         assert_eq!(hints.direct_worker_id, Some(3));
         assert!(!hints.is_empty());
+    }
+
+    #[test]
+    fn request_hints_expected_cost_removed() {
+        // expected_cost 已移除（定义即债务）——旧 header 静默忽略，不进 hints。
+        let h = headers_with(&[("x-lite-expected-cost", "1.25")]);
+        assert!(RequestHints::from_http(&h).is_empty());
     }
 
     #[test]
