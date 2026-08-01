@@ -158,6 +158,17 @@ pub struct ServerConfig {
     /// stream and cancels the worker (reclaims a channel the model left open).
     /// 0 disables the idle timeout (stream lives until model close / cancel).
     pub decoupled_idle_timeout_secs: f32,
+    /// P-FLOW (§4.0.9): global in-flight admission cap for *inference*
+    /// requests. When > 0, inference requests beyond this concurrent count are
+    /// rejected with 503 / gRPC Unavailable (+ Retry-After). Health/admin
+    /// endpoints are exempt (probes must stay reachable under load). 0 =
+    /// unlimited (default; behavior unchanged).
+    pub max_inflight: usize,
+    /// P-FLOW (§4.0.9): per-request body size cap in bytes. When set, HTTP
+    /// bodies exceeding it return 413 and gRPC messages return
+    /// ResourceExhausted. None = platform default (axum 2MB / tonic 4MB,
+    /// verified at implementation); behavior unchanged.
+    pub max_request_body_bytes: Option<usize>,
 }
 
 impl Default for ServerConfig {
@@ -182,6 +193,8 @@ impl Default for ServerConfig {
             balance_abs_threshold: 2,
             balance_rel_threshold: 1.5,
             decoupled_idle_timeout_secs: 300.0,
+            max_inflight: 0,
+            max_request_body_bytes: None,
         }
     }
 }

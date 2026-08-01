@@ -1,3 +1,4 @@
+use crate::admission::AdmissionCounter;
 use crate::callback::CallbackRunner;
 use crate::config::Config;
 use crate::inference_queue::InferenceQueue;
@@ -26,6 +27,10 @@ pub struct AppState {
     pub callback_runner: Arc<CallbackRunner>,
     pub has_hot_reload: Arc<AtomicBool>,
     pub rate_limiter: Arc<RateLimiter>,
+    /// P-FLOW (§4.0.9): global in-flight admission cap for inference
+    /// requests. Health/admin traffic is exempt (enforced by the HTTP
+    /// middleware / gRPC handler which classify the endpoint).
+    pub admission: AdmissionCounter,
 }
 
 impl AppState {
@@ -39,6 +44,7 @@ impl AppState {
         has_hot_reload: Arc<AtomicBool>,
         rate_limiter: Arc<RateLimiter>,
     ) -> Self {
+        let admission = AdmissionCounter::new(config.server.max_inflight);
         Self {
             registry,
             worker_manager,
@@ -51,6 +57,7 @@ impl AppState {
             callback_runner,
             has_hot_reload,
             rate_limiter,
+            admission,
         }
     }
 }

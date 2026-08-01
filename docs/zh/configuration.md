@@ -34,6 +34,12 @@ server:
   decoupled_idle_timeout_secs: 300.0  # P9-1：DecoupledInfer 流的 idle 超时（秒）——窗口内无
                                # chunk 到达 → 服务端关闭并取消 worker。0 = 关闭
                                # （流存活至模型 close / 客户端取消）
+  # P-FLOW 过载保护（§4.0.9）——全部默认关闭，行为不变
+  max_inflight: 0             # 全局在途推理上限。>0 → 超过此并发数的推理请求被拒（503 /
+                               # gRPC Unavailable + Retry-After）。health/admin 端点豁免（探活
+                               # 不能挂）。0 = 无限。
+  max_request_body_bytes: null # 单请求体上限（字节）。超限 → HTTP 413 / gRPC
+                               # ResourceExhausted。null = 平台默认（axum 2MB / tonic 4MB）。
 
 logging:
   level: info                  # 日志级别：trace, debug, info, warn, error

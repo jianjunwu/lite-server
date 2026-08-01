@@ -456,6 +456,36 @@ Token-bucket-based rate limiting (`rate_limit.rs`), supporting:
 
 See [configuration.md](./configuration.md) for configuration examples.
 
+## Overload Protection & Cancellation (P-FLOW)
+
+Production services need explicit overload and cancellation semantics, or they
+cascade-fail under pressure (§4.0.9). P-FLOW lands these:
+
+- **Global in-flight cap** (`server.max_inflight`): inference requests beyond
+  this concurrent count are rejected with `503` / gRPC `Unavailable` +
+  `Retry-After`. **Health/admin endpoints are exempt** — probes must stay
+  reachable under load. Enforced by the HTTP admission middleware (inside
+  observability, classifies the path) and a guard at the top of each gRPC
+  inference handler. `0` = unlimited (default, behaviour unchanged). The guard
+  spans the call for unary RPCs; for SSE/WS/gRPC streaming it releases on
+  stream-open (the same header-semantic as the in-flight accounting middleware).
+- **Queue load shedding**: a full per-version queue returns `503` / `Unavailable`
+  + `Retry-After` (HTTP header / gRPC metadata). `ResourceExhausted` is reserved
+  for rate limiting (P3-1) — overload stays in the 5xx family.
+- **Request size cap** (`server.max_request_body_bytes`): oversized bodies return
+  `413` (HTTP) / `ResourceExhausted` (gRPC, tonic's fixed mapping). `null` =
+  platform default (axum 2MB / tonic 4MB).
+- **Cancel propagation**: client disconnect on any stream → a fire-and-forget
+  `Cancel` (`send_raw`) tells the worker to stop and release resources. Ensemble
+  sub-steps share one cancel: a per-layer `JoinSet` means a parent cancel (client
+  disconnect, total-budget timeout, or a sibling step error) **aborts every
+  in-flight sub-step** rather than leaving workers computing for a dead request.
+  Unary disconnect-cancel is intentionally not implemented (unary has no
+  stream_id; the worker may finish an already-received request).
+
+See [configuration.md](./configuration.md) for `max_inflight` /
+`max_request_body_bytes`.
+
 ## Callbacks
 
 The Python-side Callback system (`callbacks/`) injects custom logic at key points in the inference pipeline:

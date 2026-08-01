@@ -239,7 +239,15 @@ pub async fn execute_ensemble(
     let total_budget = Duration::from_secs_f64(state.config.server.timeout as f64);
     let ensemble_run = async {
         for layer in layers {
-            let mut futures = Vec::new();
+            // P-FLOW (§4.0.9): a JoinSet per layer is the ensemble's shared
+            // cancel. On any early exit — a step error, the outer total-budget
+            // timeout, or the parent request being dropped (client disconnect) —
+            // the JoinSet is dropped and tokio ABORTS every in-flight step task
+            // in the layer, so a cancelled ensemble does not leave sub-steps
+            // running on workers (detached `tokio::spawn` would outlive the
+            // parent). Completed tasks are no-ops to abort.
+            let mut set: tokio::task::JoinSet<(String, Result<Value, AppError>)> =
+                tokio::task::JoinSet::new();
             for step in layer {
                 let state = state.clone();
                 let ctx = context.clone();
@@ -247,7 +255,7 @@ pub async fn execute_ensemble(
                 let ensemble_name = model_name.to_string();
                 let request_id = request_id.to_string();
                 let client_ip = client_ip.to_string();
-                futures.push(tokio::spawn(async move {
+                set.spawn(async move {
                     let start = Instant::now();
                     let result = execute_step(state, &step, &ctx, &request_id, &client_ip).await;
                     let latency = start.elapsed().as_secs_f64();
@@ -255,11 +263,11 @@ pub async fn execute_ensemble(
                         &ensemble_name, &step.name, &step.model, &step.version, latency,
                     );
                     (step.name, result)
-                }));
+                });
             }
 
-            for handle in futures {
-                let (name, result) = handle.await.map_err(|e| {
+            while let Some(joined) = set.join_next().await {
+                let (name, result) = joined.map_err(|e| {
                     AppError::Internal(format!("ensemble step join error: {}", e))
                 })?;
                 match result {
@@ -525,5 +533,32 @@ mod tests {
         assert_eq!(resolve_ref("$request", &context).unwrap(), json!({"image": "cat.jpg"}));
         assert_eq!(resolve_ref("$request.image", &context).unwrap(), json!("cat.jpg"));
         assert_eq!(resolve_ref("$step1.output", &context).unwrap(), json!(42));
+    }
+
+    // ===== P-FLOW (§4.0.9): ensemble shared cancel =====
+
+    #[tokio::test]
+    async fn p_flow_ensemble_joinset_aborts_inflight_on_drop() {
+        // execute_ensemble uses a per-layer JoinSet: dropping it (parent
+        // disconnect, total-budget timeout, or a sibling step error) must
+        // ABORT in-flight sub-step tasks so workers are not left computing
+        // for a cancelled ensemble. This guards the invariant the executor
+        // relies on.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_clone = ran.clone();
+        let mut set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        set.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            ran_clone.store(true, Ordering::SeqCst);
+        });
+        // Simulate the ensemble future being dropped mid-layer.
+        drop(set);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "dropped JoinSet must abort its in-flight task (ensemble cancel)"
+        );
     }
 }

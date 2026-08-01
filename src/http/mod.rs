@@ -156,6 +156,46 @@ async fn inflight_middleware(
     response
 }
 
+/// P-FLOW (§4.0.9): global in-flight admission for *inference* requests.
+/// Placed inside observability (so the 503 carries x-request-id). Health/admin
+/// paths are exempt (probes must stay reachable under load). When `max_inflight`
+/// is 0 (unlimited, the default) this is a pass-through. The guard spans
+/// `next.run` — for unary it covers the full call; for SSE/WS it releases when
+/// headers are produced (same header-semantic as `inflight_middleware`).
+async fn admission_middleware(
+    State(admission): State<crate::admission::AdmissionCounter>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if admission.cap() == 0 {
+        return next.run(request).await;
+    }
+    if crate::access_control::classify_http_path(request.uri().path())
+        != crate::access_control::EndpointClass::Inference
+    {
+        return next.run(request).await;
+    }
+    let _guard = match admission.try_acquire() {
+        Some(g) => g,
+        None => {
+            tracing::warn!(
+                current = admission.current(),
+                cap = admission.cap(),
+                "admission rejected: inference at max_inflight cap"
+            );
+            let mut resp = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "max_inflight capacity reached",
+            )
+                .into_response();
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+            return resp;
+        }
+    };
+    next.run(request).await
+}
+
 /// C3 (P4-2): once draining, reject new non-probe requests with 503 so
 /// keep-alive clients (and LBs that miss readyz) add no new work during the
 /// drain window. Health probes (/livez, /readyz, /startupz, /health) bypass the
@@ -240,6 +280,7 @@ pub async fn start_http_server(
     let mut state = AppState::new(registry, worker_manager, inference_queue, config.clone(), repo_path, callback_runner, has_hot_reload, rate_limiter);
     state.shutdown_state = shutdown_state.clone();
     state.draining = draining.clone();
+    let state_admission = state.admission.clone();
 
     // P7-1: resolve endpoint-class access control (value_env/value_file read
     // here so a missing source fails fast at startup). Shared shape with gRPC.
@@ -248,6 +289,14 @@ pub async fn start_http_server(
     );
 
     let app = create_routes(state);
+
+    // P-FLOW (§4.0.9): per-request body cap. Oversized bodies → 413. None =
+    // axum default (2MB), behaviour unchanged.
+    let app = if let Some(n) = config.server.max_request_body_bytes {
+        app.layer(axum::extract::DefaultBodyLimit::max(n))
+    } else {
+        app
+    };
 
     // Peer-IP fallback (innermost): inject the TCP peer IP as a fallback
     // x-real-ip for direct (non-proxied) connections so client_ip is never
@@ -296,6 +345,14 @@ pub async fn start_http_server(
     // nor touches compression/observability semantics.
     let app =
         app.layer(axum::middleware::from_fn_with_state(draining.clone(), draining_gate));
+
+    // P-FLOW (§4.0.9): inference-only global admission cap. Inside
+    // observability (503 carries x-request-id); health/admin exempt via
+    // classify_http_path. No-op when `max_inflight` is 0.
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        state_admission.clone(),
+        admission_middleware,
+    ));
 
     // Observability middleware (captures total wall-clock duration and sets
     // x-request-id + x-processing-time-ms on ALL responses including errors and
@@ -482,6 +539,115 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let connection = response.headers().get("connection");
         assert!(connection.is_none() || connection != Some(&axum::http::HeaderValue::from_static("close")));
+    }
+
+    // ===== P-FLOW (§4.0.9) admission + body limit =====
+
+    fn admission_app(cap: usize) -> (axum::Router, crate::admission::AdmissionCounter) {
+        let admission = crate::admission::AdmissionCounter::new(cap);
+        let app = axum::Router::new()
+            .route(
+                "/v2/models/foo/infer",
+                axum::routing::any(|| async { "ok" }),
+            )
+            .route("/livez", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                admission.clone(),
+                admission_middleware,
+            ));
+        (app, admission)
+    }
+
+    #[tokio::test]
+    async fn p_flow_admission_rejects_inference_over_cap_with_retry_after() {
+        let (app, admission) = admission_app(1);
+        // Saturate the single slot.
+        let _fill = admission.try_acquire().expect("cap=1 admits one");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/models/foo/infer")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get("retry-after"),
+            Some(&axum::http::HeaderValue::from_static("1")),
+            "inference over cap must carry Retry-After"
+        );
+    }
+
+    #[tokio::test]
+    async fn p_flow_admission_exempts_health_under_cap() {
+        let (app, admission) = admission_app(1);
+        // Saturate the single slot — health must still pass (probes stay live).
+        let _fill = admission.try_acquire().expect("cap=1 admits one");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/livez")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn p_flow_admission_unlimited_when_cap_zero() {
+        let (app, admission) = admission_app(0);
+        for _ in 0..5 {
+            assert!(admission.try_acquire().is_some());
+        }
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/models/foo/infer")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn p_flow_body_limit_rejects_oversized_with_413() {
+        async fn handler(body: axum::body::Bytes) -> String {
+            format!("{}", body.len())
+        }
+        let app = axum::Router::new()
+            .route("/v2/models/foo/infer", axum::routing::post(handler))
+            .layer(axum::extract::DefaultBodyLimit::max(8));
+        // Within limit → ok.
+        let ok = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/models/foo/infer")
+                    .body(Body::from(&b"short"[..]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        // Over limit → 413.
+        let too_big = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/models/foo/infer")
+                    .body(Body::from(vec![0u8; 64]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(too_big.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     // ===== fallback tests =====

@@ -34,6 +34,12 @@ server:
   decoupled_idle_timeout_secs: 300.0  # P9-1: idle timeout (s) for a DecoupledInfer stream — no
                                # chunk within this window → server closes + cancels the worker.
                                # 0 = disabled (stream lives until model close / client cancel)
+  # P-FLOW overload protection (§4.0.9) — all default-off, behaviour unchanged
+  max_inflight: 0             # Global in-flight inference cap. >0 → inference beyond this concurrent
+                               # count is rejected 503 / gRPC Unavailable + Retry-After. Health/admin
+                               # endpoints are exempt (probes stay reachable). 0 = unlimited.
+  max_request_body_bytes: null # Per-request body cap (bytes). Oversized → HTTP 413 / gRPC
+                               # ResourceExhausted. null = platform default (axum 2MB / tonic 4MB).
 
 logging:
   level: info                  # Log level: trace, debug, info, warn, error

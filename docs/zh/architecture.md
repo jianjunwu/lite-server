@@ -452,6 +452,27 @@ lite-server 通过 `orchestration.control_mode` 控制模型版本的生命周�
 
 配置示例见 [configuration.md](./configuration.md)。
 
+## 过载保护与取消（P-FLOW）
+
+生产服务须有显式过载与取消语义，否则高压下雪崩（§4.0.9）。P-FLOW 落地：
+
+- **全局在途上限**（`server.max_inflight`）：超过此并发数的推理请求被拒
+  （`503` / gRPC `Unavailable` + `Retry-After`）。**health/admin 端点豁免**——
+  探活不能挂。由 HTTP admission 中间件（observability 内、按路径分类）与各 gRPC
+  推理 handler 顶部的 guard 强制。`0` = 无限（默认，行为不变）。guard 对 unary 覆盖
+  全程；对 SSE/WS/gRPC 流式在开流时释放（与在途计数中间件一致的 header 语义）。
+- **队列 load shedding**：per-version 队列满 → `503` / `Unavailable` + `Retry-After`
+  （HTTP header / gRPC metadata）。`ResourceExhausted` 专给限流（P3-1）——过载落 5xx 族。
+- **请求大小上限**（`server.max_request_body_bytes`）：超限 → `413`（HTTP）/
+  `ResourceExhausted`（gRPC，tonic 固定映射）。`null` = 平台默认（axum 2MB / tonic 4MB）。
+- **取消传播**：任一流上客户端断连 → fire-and-forget `Cancel`（`send_raw`）通知
+  worker 停止并释放资源。ensemble 子 step 共享一个取消：每层 `JoinSet` 意味着 parent
+  取消（客户端断连、总预算超时、或同层兄弟 step 出错）**abort 所有在途子 step**，
+  而非让 worker 为已死请求继续算。unary 断连取消有意不实现（unary 无 stream_id；
+  worker 可能跑完已收请求）。
+
+`max_inflight` / `max_request_body_bytes` 详见 [configuration.md](./configuration.md)。
+
 ## Callbacks
 
 Python 侧 Callback 系统（`callbacks/`）在推理管线的关键节点注入自定义逻辑：

@@ -107,6 +107,30 @@ impl GrpcService {
         }
     }
 
+    /// P-FLOW (§4.0.9): admit one inference request against the global cap.
+    /// Returns an RAII guard (held for the handler scope → unary spans the
+    /// full call; streaming releases on stream-open, the same header-semantic
+    /// as the HTTP middleware). Rejects with Unavailable + retry-after at cap;
+    /// no-op when `max_inflight` is 0 (unlimited).
+    fn acquire_admission(
+        &self,
+    ) -> Result<crate::admission::AdmissionGuard, Status> {
+        match self.app_state.admission.try_acquire() {
+            Some(g) => Ok(g),
+            None => {
+                tracing::warn!(
+                    current = self.app_state.admission.current(),
+                    cap = self.app_state.admission.cap(),
+                    "admission rejected: inference at max_inflight cap"
+                );
+                Err(with_retry_after(
+                    Status::unavailable("max_inflight capacity reached"),
+                    1,
+                ))
+            }
+        }
+    }
+
     async fn infer_impl(
         &self,
         request: Request<pb::InferRequest>,
@@ -267,12 +291,15 @@ impl GrpcService {
                 }
             },
             Err(crate::inference_queue::QueueError::Full) => {
-                // §4.0.9: queue-full/过载 → Unavailable（落 5xx）；
-                // ResourceExhausted 专给限流（P3-1）。
-                return Err(err(Status::unavailable(format!(
-                    "queue full for {} {}",
-                    model_name, resolved_version
-                ))));
+                // §4.0.9: queue-full/过载 → Unavailable（落 5xx）+
+                // retry-after（对齐 HTTP Retry-After）；ResourceExhausted 专给限流（P3-1）。
+                return Err(err(with_retry_after(
+                    Status::unavailable(format!(
+                        "queue full for {} {}",
+                        model_name, resolved_version
+                    )),
+                    1,
+                )));
             }
             Err(_) => {
                 return Err(err(Status::unavailable(format!(
@@ -681,9 +708,12 @@ impl GrpcService {
                 stream_family,
                 start.elapsed().as_secs_f64(),
             );
-            // Cleanup: send cancel to worker
+            // Cleanup: send cancel to worker. `send_raw` (fire-and-forget) —
+            // the worker signals the generator to stop and sends NO unary reply
+            // to a Cancel, so `.send()` would await the full ZMQ_RESPONSE_TIMEOUT
+            // (300s). Aligned with bidi/decoupled/HTTP stream (P-FLOW §4.0.9).
             let cancel_req = streaming::build_stream_cancel(stream_id);
-            let _ = cancel_client.send(cancel_req).await;
+            let _ = cancel_client.send_raw(cancel_req).await;
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -1490,6 +1520,16 @@ pub(crate) fn err(status: Status) -> Status {
     status
 }
 
+/// Attach a `retry-after` trailing metadata (seconds) to a Status — the gRPC
+/// analogue of HTTP's `Retry-After` header for load-shedding / admission
+/// rejection (§4.0.9; same metadata key the rate limiter uses).
+pub(crate) fn with_retry_after(mut status: Status, secs: u32) -> Status {
+    if let Ok(v) = MetadataValue::try_from(secs.to_string().as_str()) {
+        status.metadata_mut().insert("retry-after", v);
+    }
+    status
+}
+
 /// Headers that must not be set by user code (RFC 7230 §6.1 hop-by-hop headers
 /// and other transport headers managed by the server).
 const BLOCKED_RESPONSE_HEADERS: &[&str] = &[
@@ -1637,6 +1677,10 @@ impl LiteServer for GrpcService {
         request: Request<pb::InferRequest>,
     ) -> Result<Response<pb::InferResponse>, Status> {
         let _guard = InflightGuard::new(self.shutdown_state.clone());
+        // P-FLOW (§4.0.9): global in-flight admission cap (health/admin RPCs
+        // are separate services and never reach here). Held for the handler
+        // scope; streaming releases on stream-open (header-semantic).
+        let _admission = self.acquire_admission()?;
         // P2-1 请求指标：成功/失败统一在此记一次（version label 取解析后版本，
         // 解析失败保持请求原值；D5 无 protocol label，与 HTTP 共享计数）。
         // P2-2 回显：request_id/processing-time 注入响应或错误 metadata（对齐
@@ -1673,6 +1717,10 @@ impl LiteServer for GrpcService {
         request: Request<pb::BatchInferRequest>,
     ) -> Result<Response<pb::BatchInferResponse>, Status> {
         let _guard = InflightGuard::new(self.shutdown_state.clone());
+        // P-FLOW (§4.0.9): global in-flight admission cap (health/admin RPCs
+        // are separate services and never reach here). Held for the handler
+        // scope; streaming releases on stream-open (header-semantic).
+        let _admission = self.acquire_admission()?;
         // P2-1 请求指标 + P2-2 回显 + P2-3 span（同 infer 包装）。
         let start = Instant::now();
         let model_label = request.get_ref().model_name.clone();
@@ -1707,6 +1755,10 @@ impl LiteServer for GrpcService {
         request: Request<pb::StreamInferRequest>,
     ) -> Result<Response<Self::StreamInferStream>, Status> {
         let _guard = InflightGuard::new(self.shutdown_state.clone());
+        // P-FLOW (§4.0.9): global in-flight admission cap (health/admin RPCs
+        // are separate services and never reach here). Held for the handler
+        // scope; streaming releases on stream-open (header-semantic).
+        let _admission = self.acquire_admission()?;
         // P2-1 请求指标：open 失败在此记一次；open 成功后由转发 task 在流
         // 关闭处记一次整体 duration（蓝图 §4.3 P2-1 stream/bidi 语义）。
         // P2-2 回显：注入 stream open 的 initial metadata（processing-time 为
@@ -1754,6 +1806,10 @@ impl LiteServer for GrpcService {
         // header-echo wrapper as stream_infer; the lifetime difference (model
         // holds the channel open past predict_decoupled) is in _impl.
         let _guard = InflightGuard::new(self.shutdown_state.clone());
+        // P-FLOW (§4.0.9): global in-flight admission cap (health/admin RPCs
+        // are separate services and never reach here). Held for the handler
+        // scope; streaming releases on stream-open (header-semantic).
+        let _admission = self.acquire_admission()?;
         let start = Instant::now();
         let model_label = request.get_ref().model_name.clone();
         let span_version = if request.get_ref().version.is_empty() {
@@ -1794,6 +1850,10 @@ impl LiteServer for GrpcService {
         request: Request<Streaming<pb::BidiChunk>>,
     ) -> Result<Response<Self::BidiStreamStream>, Status> {
         let _guard = InflightGuard::new(self.shutdown_state.clone());
+        // P-FLOW (§4.0.9): global in-flight admission cap (health/admin RPCs
+        // are separate services and never reach here). Held for the handler
+        // scope; streaming releases on stream-open (header-semantic).
+        let _admission = self.acquire_admission()?;
         // P2-1 请求指标 + P2-2 回显（同 stream_infer；model 在 BidiOpen 前未知，
         // 早期失败以空 label 记录；request_id 来自 transport metadata）。
         let start = Instant::now();
@@ -1898,6 +1958,7 @@ pub async fn start_grpc_server(
         },
         app_state,
     );
+    let max_request_body_bytes = config.server.max_request_body_bytes;
     let server = LiteServerServer::new(service);
     // P1-3: gzip response compression is opt-in and applies to the
     // LiteServer inference service only (Admin/health stay uncompressed).
@@ -1905,6 +1966,13 @@ pub async fn start_grpc_server(
         server
             .send_compressed(tonic::codec::CompressionEncoding::Gzip)
             .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+    } else {
+        server
+    };
+    // P-FLOW (§4.0.9): per-request decode cap. Oversized messages decode-fail
+    // with ResourceExhausted (tonic's fixed mapping). None = tonic default 4MB.
+    let server = if let Some(n) = max_request_body_bytes {
+        server.max_decoding_message_size(n)
     } else {
         server
     };
@@ -1957,6 +2025,12 @@ pub async fn start_grpc_server(
         has_hot_reload,
     );
     let admin_server = crate::grpc::admin::AdminServer::new(admin_service);
+    // P-FLOW (§4.0.9): same per-request decode cap as inference.
+    let admin_server = if let Some(n) = max_request_body_bytes {
+        admin_server.max_decoding_message_size(n)
+    } else {
+        admin_server
+    };
     // P-MW 挂载矩阵 (§4.0.3) + P7-1: Admin service 挂 service_interceptor——
     // request_id / mTLS principal 供审计日志（D27），admin 类 access_control
     // fail-closed（未配置仅 loopback；D14）。
@@ -3243,6 +3317,98 @@ mod request_metrics_tests {
         assert_eq!(err.code(), tonic::Code::Unavailable,
             "§4.0.9: queue-full must be Unavailable (ResourceExhausted 专给限流)");
         assert_eq!(counter.get(), before + 1.0, "queue-full must record one 5xx request");
+        assert_eq!(
+            err.metadata().get("retry-after").and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "§4.0.9: queue-full/load-shedding must carry retry-after metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn p_flow_admission_rejects_over_cap_with_retry_after() {
+        // max_inflight=1: saturate the single slot, then the next inference RPC
+        // is rejected at the handler top (before any model lookup) with
+        // Unavailable + retry-after. Health/admin are separate services and
+        // never reach acquire_admission.
+        let registry = Arc::new(ModelRegistry::new());
+        let queue = Arc::new(InferenceQueue::new());
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            std::env::temp_dir(),
+            queue.clone(),
+            "error".to_string(),
+            Arc::new(CallbackRunner::new()),
+        ));
+        let mut cfg = crate::config::Config::default();
+        cfg.server.max_inflight = 1;
+        let app_state = Arc::new(AppState::new(
+            registry.clone(),
+            wm.clone(),
+            queue.clone(),
+            cfg,
+            std::env::temp_dir(),
+            Arc::new(CallbackRunner::new()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+        ));
+        let service = GrpcService::new(
+            registry,
+            wm,
+            false,
+            false,
+            Arc::new(CallbackRunner::new()),
+            Arc::new(crate::server::ShutdownState::new()),
+            Duration::from_secs(5),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+            None,
+            app_state,
+        );
+
+        // Saturate the single admission slot.
+        let _fill = service
+            .app_state
+            .admission
+            .try_acquire()
+            .expect("cap=1 admits one");
+
+        let err = service.infer(infer_request("any", "1")).await.unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::Unavailable,
+            "admission over cap must be Unavailable"
+        );
+        assert_eq!(
+            err.metadata().get("retry-after").and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "admission rejection must carry retry-after metadata"
+        );
+        assert_eq!(
+            service.app_state.admission.current(),
+            1,
+            "rejected request does not consume a slot"
+        );
+
+        // Releasing the slot re-admits.
+        drop(_fill);
+        assert!(service.app_state.admission.try_acquire().is_some());
+    }
+
+    #[tokio::test]
+    async fn p_flow_admission_unlimited_when_cap_zero() {
+        // Default max_inflight=0 → unlimited: build_service uses Config::default().
+        let model = "met_admit0";
+        let endpoint = metric_test_endpoint(model);
+        let _worker = spawn_ok_worker(endpoint.clone());
+        let service = ready_service_with_worker(model, endpoint).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Many acquires never saturate (cap 0).
+        for _ in 0..10 {
+            assert!(service.app_state.admission.try_acquire().is_some());
+        }
+        // And a real infer still succeeds (admission is a no-op pass-through).
+        let resp = service.infer(infer_request(model, "1")).await;
+        assert!(resp.is_ok(), "cap 0 must not reject: {:?}", resp.err());
     }
 
     #[tokio::test]
