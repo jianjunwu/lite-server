@@ -13,6 +13,7 @@ pub mod inference_queue;
 pub mod logging;
 pub mod metrics;
 pub mod proto;
+pub mod preflight;
 pub mod registry;
 pub mod request_context;
 pub mod sequence;

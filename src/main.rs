@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use lite_server::config::{CliOverrides, Config};
 use lite_server::server::LiteServer;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 #[derive(Parser)]
 #[command(name = "lite-server")]
@@ -259,6 +259,10 @@ fn main() {
             );
 
             info!("Starting lite-server v{}", env!("CARGO_PKG_VERSION"));
+            // B7（蓝图 §6.2，D30 配套）：旧配置形态迁移告警，点名 migration.md 条目。
+            for w in lite_server::preflight::startup_preflight(&cfg) {
+                warn!("config preflight: {w}");
+            }
             debug!("Configuration loaded, log level: {}", cfg.logging.level);
             debug!("Server config: {:?}", cfg.server);
             info!("HTTP port: {}", cfg.server.http_port);
@@ -282,6 +286,10 @@ fn main() {
                     println!("  gRPC port: {}", cfg.server.grpc_port);
                     println!("  Metrics port: {}", cfg.server.metrics_port);
                     println!("  Model repo: {}", cfg.model_repository.path);
+                    // B7: 配置体检顺带输出迁移预检告警（点名 migration.md 条目）。
+                    for w in lite_server::preflight::startup_preflight(&cfg) {
+                        println!("  preflight warning: {w}");
+                    }
                 }
                 Err(e) => {
                     eprintln!("Configuration error: {}", e);
