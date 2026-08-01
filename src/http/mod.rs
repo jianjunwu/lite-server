@@ -136,12 +136,15 @@ async fn observability_middleware(mut request: Request, next: Next) -> Response 
 
     // http.server span (http.method/route/status). The handler's `inference` span
     // nests under it (ambient); worker RequestMeta injection uses the active span.
+    // `endpoint.class` 在创建时 stamp——B4 分类采样器（health/admin 独立比率）
+    // 只能看到 span 创建时的属性，后 record 的不可见。
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     let span = tracing::info_span!(
         "http.server",
         "http.request.method" = %method,
         "url.path" = %path,
+        "endpoint.class" = crate::access_control::classify_http_path(&path).as_str(),
         "http.response.status_code" = tracing::field::Empty,
     );
     crate::telemetry::link_parent(&span, &parent);

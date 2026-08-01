@@ -261,6 +261,45 @@ mod otel {
         builder.build()
     }
 
+    /// 按端点类别独立采样（蓝图 §4.3 评审 2.2）：health/admin 探活高频 span 用
+    /// `health_admin_sample_ratio`（默认 0，防探活刷 collector 配额），其余端点
+    /// 用 `sample_ratio`。依据 span 创建时的 `endpoint.class` 属性分流（HTTP
+    /// `http.server` span 按路径 stamp；无属性 → 默认比率——gRPC handler span
+    /// 全为 inference 类，不 stamp）。根判定委托 `TraceIdRatioBased`；外层
+    /// `ParentBased` 保持父采样位语义。
+    #[derive(Debug, Clone)]
+    pub(super) struct PerClassSampler {
+        pub(super) default_ratio: f64,
+        pub(super) health_admin_ratio: f64,
+    }
+
+    impl opentelemetry_sdk::trace::ShouldSample for PerClassSampler {
+        fn should_sample(
+            &self,
+            parent_context: Option<&Context>,
+            trace_id: opentelemetry::trace::TraceId,
+            name: &str,
+            span_kind: &opentelemetry::trace::SpanKind,
+            attributes: &[KeyValue],
+            links: &[opentelemetry::trace::Link],
+        ) -> opentelemetry::trace::SamplingResult {
+            let ratio = match attributes.iter().find(|kv| kv.key.as_str() == "endpoint.class") {
+                Some(kv) if matches!(&*kv.value.as_str(), "health" | "admin") => {
+                    self.health_admin_ratio
+                }
+                _ => self.default_ratio,
+            };
+            opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(ratio).should_sample(
+                parent_context,
+                trace_id,
+                name,
+                span_kind,
+                attributes,
+                links,
+            )
+        }
+    }
+
     pub fn init(cfg: &TelemetryConfig) -> Option<BoxedLayer> {
         if !cfg.enabled {
             return None;
@@ -303,10 +342,13 @@ mod otel {
             .with_batch_config(batch_config)
             .build();
 
-        // ParentBased(root=TraceIdRatioBased(sample_ratio)): honour the inbound
-        // sampled flag, and down-sample roots. (Per-class health/admin down-sampling
-        // via health_admin_sample_ratio is a follow-up — the field is parsed today.)
-        let sampler = Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(cfg.sample_ratio)));
+        // ParentBased(root=PerClassSampler)：honour 入站采样位；根 span 按
+        // endpoint.class 分流——health/admin 用 health_admin_sample_ratio
+        // （默认 0，防探活刷 collector 配额，评审 2.2），其余用 sample_ratio。
+        let sampler = Sampler::ParentBased(Box::new(PerClassSampler {
+            default_ratio: cfg.sample_ratio,
+            health_admin_ratio: cfg.health_admin_sample_ratio,
+        }));
 
         let provider = SdkTracerProvider::builder()
             .with_span_processor(bsp)
@@ -474,6 +516,66 @@ mod tests {
         };
         let cx = cx_with_baggage(&[("a", "toolongvalue"), ("b", "xy")]);
         assert_eq!(baggage_keys(&scrub_baggage_with(cx, &policy)), ["b"]);
+    }
+
+    // ===== PerClassSampler：health/admin 独立采样（蓝图 §4.3 评审 2.2）=====
+
+    /// 接线护栏：sampler 只能看到 span **创建时**的属性——HTTP 根 span
+    /// （http.server）必须在创建时按路径 stamp `endpoint.class`（gRPC handler
+    /// 全为 inference 类，走默认比率分支，无需 stamp）。
+    #[test]
+    fn http_server_span_stamps_endpoint_class() {
+        let src = include_str!("http/mod.rs");
+        let boundary = src.find("#[cfg(test)]").unwrap_or(src.len());
+        assert!(
+            src[..boundary].contains("\"endpoint.class\" = crate::access_control::classify_http_path"),
+            "B4: http.server span 必须在创建时 stamp endpoint.class（分类采样依据）"
+        );
+    }
+
+    #[cfg(feature = "telemetry")]
+    fn sample_decision(
+        sampler: &super::otel::PerClassSampler,
+        attrs: &[opentelemetry::KeyValue],
+    ) -> opentelemetry::trace::SamplingDecision {
+        use opentelemetry_sdk::trace::ShouldSample;
+        sampler
+            .should_sample(
+                None,
+                opentelemetry::trace::TraceId::from_bytes([42u8; 16]),
+                "span",
+                &opentelemetry::trace::SpanKind::Server,
+                attrs,
+                &[],
+            )
+            .decision
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn health_admin_spans_use_independent_ratio() {
+        // default=1.0（全采）+ health_admin=0.0 → health/admin 全丢、其余全采。
+        let sampler =
+            super::otel::PerClassSampler { default_ratio: 1.0, health_admin_ratio: 0.0 };
+        use opentelemetry::trace::SamplingDecision::*;
+        let class = |c: &str| vec![opentelemetry::KeyValue::new("endpoint.class", c.to_string())];
+        assert_eq!(sample_decision(&sampler, &class("health")), Drop);
+        assert_eq!(sample_decision(&sampler, &class("admin")), Drop);
+        assert_eq!(sample_decision(&sampler, &class("inference")), RecordAndSample);
+        // 无 endpoint.class 属性 → 默认比率。
+        assert_eq!(sample_decision(&sampler, &[]), RecordAndSample);
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn health_admin_ratio_is_independent_of_default_ratio() {
+        // 反向：default=0.0 + health_admin=1.0 → health 采、inference 丢。
+        let sampler =
+            super::otel::PerClassSampler { default_ratio: 0.0, health_admin_ratio: 1.0 };
+        use opentelemetry::trace::SamplingDecision::*;
+        let class = |c: &str| vec![opentelemetry::KeyValue::new("endpoint.class", c.to_string())];
+        assert_eq!(sample_decision(&sampler, &class("health")), RecordAndSample);
+        assert_eq!(sample_decision(&sampler, &class("inference")), Drop);
     }
 
     #[test]

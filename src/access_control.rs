@@ -24,6 +24,18 @@ pub enum EndpointClass {
     Health,
 }
 
+impl EndpointClass {
+    /// OTel span 属性 `endpoint.class` 的取值（P-TRACE 分类采样，
+    /// telemetry::otel::PerClassSampler 依据此值分流采样率）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EndpointClass::Admin => "admin",
+            EndpointClass::Inference => "inference",
+            EndpointClass::Health => "health",
+        }
+    }
+}
+
 /// Map a wire-protocol to the access-control protocol axis. SSE/WebSocket ride
 /// the HTTP stack (same middleware), so they share the `http` cell.
 fn protocol_axis(protocol: Protocol) -> ProtocolAxis {

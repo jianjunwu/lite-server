@@ -1217,6 +1217,14 @@ impl Config {
         check_duration_secs("tunables.worker_stderr_drain_secs", self.tunables.worker_stderr_drain_secs)?;
         check_duration_secs("tunables.unpack_timeout_secs", self.tunables.unpack_timeout_secs)?;
         self.validate_tls()?;
+        // B6（蓝图 §4.3，本期 gRPC only）：protocol=http 被 serde 接受但未实现——
+        // 启动期 fail-fast，而非 warn 后 telemetry 整体静默关闭（docs 已标 reserved）。
+        if self.telemetry.enabled && self.telemetry.protocol == TelemetryProtocol::Http {
+            anyhow::bail!(
+                "config field `telemetry.protocol`: `http` is not implemented this period \
+                 (reserved); use `grpc` (default) or set telemetry.enabled=false"
+            );
+        }
         Ok(())
     }
 
@@ -1256,6 +1264,23 @@ mod tests {
     use std::fs;
 
     // --- Default values ---
+
+    #[test]
+    fn telemetry_protocol_http_fails_validation_when_enabled() {
+        // B6：protocol=http 本期未实现（docs 已标 reserved）——enabled 时启动
+        // fail-fast，而非 warn 后 telemetry 整体静默关闭。
+        let mut cfg = Config::default();
+        cfg.telemetry.enabled = true;
+        cfg.telemetry.protocol = TelemetryProtocol::Http;
+        let err = cfg.validate().expect_err("protocol=http + enabled 必须 fail-fast");
+        assert!(err.to_string().contains("telemetry.protocol"), "报错须点名字段: {err}");
+        // grpc（默认）与 enabled=false 不受影响。
+        cfg.telemetry.protocol = TelemetryProtocol::Grpc;
+        assert!(cfg.validate().is_ok());
+        cfg.telemetry.protocol = TelemetryProtocol::Http;
+        cfg.telemetry.enabled = false;
+        assert!(cfg.validate().is_ok());
+    }
 
     #[test]
     fn warmup_policy_default_is_disabled() {
