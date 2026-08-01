@@ -21,6 +21,16 @@ config shapes and logs `warn` lines pointing at the M-entries below
 Non-breaking phases (no action needed): P-MW, P-ENSEMBLE-GRPC, P-FLOW, P-DEADLINE,
 P-WARM, P-OAI (pure additions; defaults preserve prior behavior).
 
+> **Semantics note (P-DEADLINE):** an expired request budget returns **HTTP `504`
+> (not `408`)** / gRPC `DEADLINE_EXCEEDED`. `408` would mean "the client was too
+> slow sending", which is not the case here — the request was fully received and
+> the server-side budget (client-specified via `x-lite-timeout` / `grpc-timeout`,
+> or the `server.timeout` fallback) expired while waiting on the worker. The
+> existing `InferenceTimeout → 504` mapping is kept deliberately so clients
+> alerting on 504 do not silently break. Distinct neighbours: queue-wait timeout
+> REJECT → `503` / `Unavailable`; rate limiting → `429` / `RESOURCE_EXHAUSTED`.
+> See architecture.md "Deadline Propagation".
+
 ## M1 — XFF/X-Real-IP no longer trusted (P-XFF)
 
 **What changed:** `client_ip` is now derived from the direct peer address. Client

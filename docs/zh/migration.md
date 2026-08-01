@@ -19,6 +19,14 @@
 无 breaking 的阶段（无需动作）：P-MW、P-ENSEMBLE-GRPC、P-FLOW、P-DEADLINE、
 P-WARM、P-OAI（纯新增，默认值保持旧行为）。
 
+> **语义说明（P-DEADLINE）**：请求预算耗尽返回 **HTTP `504`（而非 `408`）** /
+> gRPC `DEADLINE_EXCEEDED`。`408` 意为"客户端发送太慢"，与实况不符——请求
+> 已完整到达，是服务端预算（客户端经 `x-lite-timeout` / `grpc-timeout` 指定，
+> 或 `server.timeout` 兜底）在等待 worker 时耗尽。既有 `InferenceTimeout → 504`
+> 映射有意保留，避免静默打破已在 504 上告警的客户端。邻近区分：排队超时
+> REJECT → `503` / `Unavailable`；限流 → `429` / `RESOURCE_EXHAUSTED`。
+> 详见 architecture.md「Deadline 传播与超时状态码」。
+
 ## M1 — 不再信任 XFF/X-Real-IP（P-XFF）
 
 **变化**：`client_ip` 改为取直连 peer 地址；仅当 peer 属于

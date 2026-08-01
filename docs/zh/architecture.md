@@ -505,6 +505,35 @@ lite-server 通过 `orchestration.control_mode` 控制模型版本的生命周�
 
 `max_inflight` / `max_request_body_bytes` 详见 [configuration.md](./configuration.md)。
 
+## Deadline 传播与超时状态码（P-DEADLINE）
+
+单请求预算端到端绑定，替代各处超时各自为政：
+
+- **HTTP**：发送 `x-lite-timeout: <秒>`（相对浮点，如 `2.5`）。
+- **gRPC**：发送标准 `grpc-timeout` metadata 键。
+- 两者皆无，回落 `server.timeout`。
+
+解析出的 deadline 以绝对 UNIX 纳秒时间戳传到 worker（`RequestMeta.deadline_unix_ns`），
+worker 协作式检查。ensemble DAG 共享一份 parent 预算（子 step 得 parent − 已耗）；
+流式为**两段式**——总时长上限 + chunk 间 idle 超时——仅在客户端显式指定 deadline
+时激活（未指定时保持旧流式行为不变）。
+
+**预算耗尽时的状态码**——写重试逻辑前请先读：
+
+| 面 | 状态码 | 含义 |
+|---|---|---|
+| HTTP（unary / batch / stream / ensemble） | `504 Gateway Timeout` | 服务端预算（客户端指定，或 `server.timeout` 兜底）在等待 worker 时耗尽。 |
+| gRPC | `DEADLINE_EXCEEDED` | 同上，gRPC 惯例。 |
+
+**为什么是 504 而非 408：** `408` 的语义是"客户端发送请求太慢"——而这里请求
+已完整到达，是*服务端*下游预算耗尽，正是 504 语义。既有 `InferenceTimeout → 504`
+映射有意保留（改它会静默打破已在 504 上告警的客户端）；蓝图早期草稿的 408
+在实施时被取代。实操：把 504 / `DEADLINE_EXCEEDED` 当"预算耗尽"处理——幂等请求
+可退避重试；`x-lite-timeout` 应小于你自己上游的预算，让 deadline 传播而非叠加。
+
+邻近区分：排队超时 REJECT → `503` / `Unavailable`（P-FLOW）；限流 →
+`429` / `RESOURCE_EXHAUSTED`（P3-1）。
+
 ## Callbacks
 
 Python 侧 Callback 系统（`callbacks/`）在推理管线的关键节点注入自定义逻辑：

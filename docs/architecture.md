@@ -530,6 +530,42 @@ cascade-fail under pressure (§4.0.9). P-FLOW lands these:
 See [configuration.md](./configuration.md) for `max_inflight` /
 `max_request_body_bytes`.
 
+## Deadline Propagation & Timeout Status (P-DEADLINE)
+
+A single request budget is bound end-to-end instead of letting scattered
+timeouts act independently:
+
+- **HTTP**: send `x-lite-timeout: <seconds>` (relative float, e.g. `2.5`).
+- **gRPC**: send the standard `grpc-timeout` metadata key.
+- Absent both, `server.timeout` is the fallback budget.
+
+The resolved deadline travels to the worker as an absolute UNIX-ns timestamp
+(`RequestMeta.deadline_unix_ns`) and the worker checks it cooperatively.
+Ensemble DAGs share one parent budget (each sub-step gets parent − elapsed);
+streaming enforces **two stages** — an overall deadline plus a chunk-idle
+timeout — activated only when the client specified a deadline (with none,
+legacy streaming behavior is unchanged).
+
+**Status when the budget expires** — read this before writing retry logic:
+
+| Surface | Status | Meaning |
+|---|---|---|
+| HTTP (unary / batch / stream / ensemble) | `504 Gateway Timeout` | The server-side budget (client-specified, or `server.timeout` fallback) expired while waiting on the worker. |
+| gRPC | `DEADLINE_EXCEEDED` | Same, per gRPC convention. |
+
+**Why 504 and not 408:** `408` means "the *client* was too slow to send its
+request" — here the request was fully received and the *server* exhausted its
+downstream budget, which is the 504 semantic. The pre-existing
+`InferenceTimeout → 504` mapping is kept deliberately (changing it would
+silently break clients already alerting on 504); the blueprint's original 408
+sketch was superseded during implementation. Treat 504 / `DEADLINE_EXCEEDED`
+as "budget exhausted": retryable for idempotent requests with backoff, and
+size `x-lite-timeout` below your own caller's budget so the deadline
+propagates rather than stacks.
+
+Distinct neighbours: queue-wait timeout REJECT → `503` / `Unavailable`
+(P-FLOW); rate limiting → `429` / `RESOURCE_EXHAUSTED` (P3-1).
+
 ## Callbacks
 
 The Python-side Callback system (`callbacks/`) injects custom logic at key points in the inference pipeline:
