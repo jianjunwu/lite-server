@@ -4,6 +4,8 @@
 
 lite-server uses three layers of configuration: **server config** (YAML file or CLI), **model config** (per-model `config.yaml`), and **orchestration config** (`orchestration` section in `server.yaml`). CLI flags override YAML values.
 
+> **Upgrading from a previous major?** Breaking changes and old→new mappings: [migration.md](migration.md).
+
 ## Server Configuration (`server.yaml`)
 
 Path: `server.yaml` (passed via `--config` or `-c`)
@@ -64,6 +66,14 @@ logging:
 grpc:
   enabled: true                # Enable gRPC server
   max_workers: 10              # Max gRPC worker threads (reserved — not yet implemented)
+  host: null                   # gRPC bind host; null = follow server.host ("unix:/path" = UDS)
+  # P7-2: separate bind for the LiteAdmin service only. UDS recommended — a UDS
+  # admin socket is created owner-only (0o600) by default.
+  admin_bind: null             # e.g. unix:/var/run/lite-admin.sock or 127.0.0.1:9001
+  http2_keepalive_interval_secs: null  # HTTP/2 PING interval; null = disabled
+  http2_keepalive_timeout_secs: null   # PING ack timeout (needs the interval set)
+  http2_adaptive_window: false         # BDP-adaptive HTTP/2 flow-control window
+  http2_max_frame_size: null           # Max HTTP/2 frame payload (bytes); null = tonic default
   # TLS/mTLS — same semantics as the server.* TLS keys, applied to the gRPC listener
   tls_cert_path: null          # Server certificate chain PEM; requires tls_key_path
   tls_key_path: null           # Server private key PEM; requires tls_cert_path
@@ -72,6 +82,11 @@ grpc:
 
 metrics:
   enabled: true                # Enable Prometheus metrics endpoint
+  # GIE/EPP-compatible metric namespace (P2-1, D32): exposes
+  # {namespace}:total_queued_requests / {namespace}:kv_cache_utilization on /metrics
+  # (vllm-compatible naming for the Kubernetes LLM-autoscaler ecosystem).
+  # Invalid namespaces fail fast at startup.
+  metric_namespace: liteserver
 
 rate_limit:
   max_buckets: 65536           # Max distinct rate-limit buckets (per IP/route key).
@@ -82,6 +97,10 @@ model_repository:
   path: ./model_repo           # Path to the model repository directory
 
 features:
+  # P5-2 breaking (migration M3): honor the x-lite-version canary-pin request
+  # header. Default false = the header is IGNORED (clients cannot pin themselves
+  # onto canary versions). Enable only in gray/debug environments.
+  canary_override: false
   timeline: false              # Enable historical metric timeline
   system_overview: true        # (reserved — not yet implemented)
   custom_metrics: false        # (reserved — not yet implemented)
@@ -156,6 +175,26 @@ Rules enforced at startup:
 - The `metrics_port` listener stays **plaintext and unauthenticated** — bind it to an internal network or loopback. With TLS enabled, the main port's Prometheus/probe/internal clients must use HTTPS (ALPN includes `http/1.1` for simple clients).
 - The server warns at startup if the private key file is group/world-readable (`chmod 600` recommended); this is a warning, not a failure, to allow group-based deployments.
 
+## Access Control (P7-1)
+
+Endpoint classes: `admin` (HTTP `/admin/*` + gRPC LiteAdmin service), `inference`, `health`. `admin` / `inference` are configured per protocol (`http` / `grpc`); `health` takes a single shorthand applied to both.
+
+- **Defaults (fail-closed admin)**: unconfigured `admin` → **loopback only** (UDS counts as loopback); unconfigured `inference` / `health` → public. P7-1 breaking — see [migration.md](migration.md) M4.
+- **Modes** (`mode` tag): `public` (explicitly open — the escape hatch) or `key` (API key: `key` = header name; secret from `value` / `value_env` / `value_file`, first present wins, resolved at startup — a missing source fails fast).
+- Key comparison is constant-time. Denials: HTTP 401 / gRPC Unauthenticated. The `metrics_port` listener is not covered — scrape Prometheus there.
+
+```yaml
+access_control:
+  admin:
+    http: { mode: key, key: x-admin-key, value_env: ADMIN_KEY }
+    grpc: { mode: key, key: x-admin-key, value_env: ADMIN_KEY }
+  inference:
+    http: { mode: public }       # explicit — same as the default
+  health: { mode: public }       # shorthand, applies to http + grpc
+```
+
+Per-model `policies.auth` is independent and stacks after this endpoint-level control.
+
 ## Telemetry / OpenTelemetry (P-TRACE)
 
 Full OpenTelemetry tracing + metrics SDK, exported over **OTLP/gRPC**. Two-level opt-in: a build-time cargo feature (`--features telemetry`) and a runtime switch (`telemetry.enabled`, default `false` → zero overhead). Both off ⇒ no OTel layer, no propagator, no exporter; the server behaves exactly as without OTel. Trace context reaches the Python worker via the existing `RequestMeta.headers` map (W3C `traceparent`/`tracestate`/`baggage`) — the worker reads it to correlate but creates no span (Rust-only; see [docs/otel-observability.md](otel-observability.md)).
@@ -164,9 +203,9 @@ Full OpenTelemetry tracing + metrics SDK, exported over **OTLP/gRPC**. Two-level
 telemetry:
   enabled: false                       # opt-in. false = no OTel (zero overhead).
   otlp_endpoint: "http://localhost:4317"  # OTLP/gRPC collector (4317).
-  protocol: grpc                       # grpc only this period (http reserved).
+  protocol: grpc                       # grpc only this period; http = startup fail-fast (reserved, M6).
   sample_ratio: 1.0                    # ParentBased(TraceIdRatioBased(ratio)).
-  health_admin_sample_ratio: 0.0       # (reserved) per-class down-sample for probes.
+  health_admin_sample_ratio: 0.0       # Per-class ratio for health/admin spans (0 = probes not sampled).
   service_name: "lite-server"
   resource_attributes: {}              # merged with OTEL_RESOURCE_ATTRIBUTES env.
   otlp_headers: {}                     # OTLP auth, e.g. {"Authorization":"Bearer ..."}.
@@ -174,10 +213,15 @@ telemetry:
   max_queue_size: 2048
   metrics_enabled: false               # OTel metrics SDK overlay (C4 exemplars).
   exemplars_enabled: false             # (reserved) exemplar filter — see otel-observability.md.
+  # Inbound W3C baggage is untrusted (M6): only allowlisted keys are kept and
+  # forwarded to workers. Default [] = drop ALL inbound baggage.
+  baggage_allowlist: []                # e.g. ["tenant", "experiment"]
+  baggage_max_entries: 16              # Cap on kept baggage entries.
+  baggage_max_entry_bytes: 128         # Per-entry key+value byte cap.
 ```
 
 - **Build**: `cargo build --features telemetry` (and `cargo test --features telemetry` for telemetry tests). The default build does not compile the OTel SDK/exporter.
-- **Sampling**: roots sampled at `sample_ratio`; child spans honour the inbound sampled flag.
+- **Sampling**: roots sampled at `sample_ratio`; child spans honour the inbound sampled flag. Health/admin roots use the independent `health_admin_sample_ratio` (default `0.0`) so high-frequency probes do not burn collector quota.
 - **Exemplars (C4)**: with `metrics_enabled`, an `liteserver.request.duration` histogram is recorded over OTLP/metrics alongside the existing `/metrics`. Note: `opentelemetry_sdk 0.30` stubs exemplar reservoirs; real trace-linked exemplars need an SDK upgrade (tracked). Prometheus exemplar-storage + Grafana complete the metrics→trace link.
 - **Shutdown**: traces/metrics are force-flushed with a 5s cap during graceful shutdown.
 

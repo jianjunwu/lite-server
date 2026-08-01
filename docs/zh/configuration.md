@@ -4,6 +4,8 @@
 
 lite-server 采用三层配置：**服务器配置**（YAML 文件或 CLI）、**模型配置**（每模型 `config.yaml`）和**编排配置**（`server.yaml` 中的 `orchestration` 段落）。CLI 参数覆盖 YAML 值。
 
+> **从旧版本升级？** breaking 变更与旧→新对照见[迁移指南](migration.md)。
+
 ## 服务器配置（`server.yaml`）
 
 路径：`server.yaml`（通过 `--config` 或 `-c` 传入）
@@ -60,6 +62,13 @@ logging:
 grpc:
   enabled: true                # 启用 gRPC 服务
   max_workers: 10              # gRPC 最大工作线程数（预留 — 尚未实现）
+  host: null                   # gRPC 绑定地址；null = 跟随 server.host（"unix:/路径" = UDS）
+  # P7-2：LiteAdmin 服务独立绑定。推荐 UDS——UDS admin socket 默认属主独占（0o600）创建
+  admin_bind: null             # 如 unix:/var/run/lite-admin.sock 或 127.0.0.1:9001
+  http2_keepalive_interval_secs: null  # HTTP/2 PING 间隔；null = 关闭
+  http2_keepalive_timeout_secs: null   # PING ACK 超时（须先设间隔）
+  http2_adaptive_window: false         # BDP 自适应 HTTP/2 流控窗口
+  http2_max_frame_size: null           # HTTP/2 帧载荷上限（字节）；null = tonic 默认
   # TLS/mTLS——与 server.* 的 TLS 键语义相同，作用于 gRPC 监听器
   tls_cert_path: null          # 服务器证书链 PEM；须与 tls_key_path 同设
   tls_key_path: null           # 服务器私钥 PEM；须与 tls_cert_path 同设
@@ -68,6 +77,10 @@ grpc:
 
 metrics:
   enabled: true                # 启用 Prometheus 指标端点
+  # GIE/EPP 兼容指标命名空间（P2-1，D32）：在 /metrics 暴露
+  # {namespace}:total_queued_requests / {namespace}:kv_cache_utilization
+  # （vllm 兼容命名，对接 K8s LLM 自动扩缩生态）。非法命名空间启动 fail-fast。
+  metric_namespace: liteserver
 
 rate_limit:
   max_buckets: 65536           # 限流桶数量上限（按 IP/路由 key），
@@ -78,6 +91,9 @@ model_repository:
   path: ./model_repo           # 模型仓库目录
 
 features:
+  # P5-2 breaking（迁移 M3）：是否响应 x-lite-version canary pin 请求头。
+  # 默认 false = 该头被忽略（客户端无法自行 pin 到 canary 版本）。仅灰度/调试环境开启
+  canary_override: false
   timeline: false              # 启用历史指标时间线
   system_overview: true        # （预留 — 尚未实现）
   custom_metrics: false        # （预留 — 尚未实现）
@@ -152,6 +168,26 @@ grpc:
 - `metrics_port` 监听器保持**明文且无鉴权**——请绑定内网或 loopback。启用 TLS 后，主端口的 Prometheus 抓取/探活/内部客户端须走 HTTPS（ALPN 含 `http/1.1`，简单客户端可用）。
 - 私钥文件为组/全员可读时启动仅告警（建议 `chmod 600`），不阻断基于用户组的部署。
 
+## 访问控制（P7-1）
+
+端点类别：`admin`（HTTP `/admin/*` + gRPC LiteAdmin 服务）、`inference`、`health`。`admin` / `inference` 按协议（`http` / `grpc`）分别配置；`health` 为单条简写、双协议同生效。
+
+- **默认（admin fail-closed）**：未配置 `admin` → **仅 loopback 可达**（UDS 视为 loopback）；未配置 `inference` / `health` → 公开。P7-1 breaking——见[迁移指南](migration.md) M4。
+- **模式**（`mode` 标签）：`public`（显式开放——逃生门）或 `key`（API key：`key` = header 名；密钥取 `value` / `value_env` / `value_file` 首个存在者，启动期解析，缺源 fail-fast）。
+- key 比较为恒定时间。拒绝返回 HTTP 401 / gRPC Unauthenticated。`metrics_port` 监听器不受此约束——Prometheus 抓取走该端口。
+
+```yaml
+access_control:
+  admin:
+    http: { mode: key, key: x-admin-key, value_env: ADMIN_KEY }
+    grpc: { mode: key, key: x-admin-key, value_env: ADMIN_KEY }
+  inference:
+    http: { mode: public }       # 显式声明——与默认相同
+  health: { mode: public }       # 简写，http + grpc 同生效
+```
+
+per-model `policies.auth` 独立于此端点级控制，叠加在其后。
+
 ## 遥测 / OpenTelemetry（P-TRACE）
 
 全量 OpenTelemetry 追踪 + metrics SDK，经 **OTLP/gRPC** 导出。两级 opt-in：编译期 cargo feature（`--features telemetry`）+ 运行时开关（`telemetry.enabled`，默认 `false`→零开销）。两者皆关 ⇒ 无 OTel layer、无 propagator、无 exporter，行为与无 OTel 逐字节一致。trace context 经既有 `RequestMeta.headers` map（W3C `traceparent`/`tracestate`/`baggage`）到达 Python worker——worker 读 header 关联但不创 span（Rust-only，见 [docs/otel-observability.md](../otel-observability.md)）。
@@ -160,9 +196,9 @@ grpc:
 telemetry:
   enabled: false                       # opt-in。false=无 OTel（零开销）
   otlp_endpoint: "http://localhost:4317"  # OTLP/gRPC collector（4317）
-  protocol: grpc                       # 本期仅 grpc（http 预留）
+  protocol: grpc                       # 本期仅 grpc；http = 启动 fail-fast（预留，M6）
   sample_ratio: 1.0                    # ParentBased(TraceIdRatioBased(ratio))
-  health_admin_sample_ratio: 0.0       # （预留）探活独立降采样
+  health_admin_sample_ratio: 0.0       # health/admin span 独立采样率（0 = 探活不采样）
   service_name: "lite-server"
   resource_attributes: {}              # 与 OTEL_RESOURCE_ATTRIBUTES env 合并
   otlp_headers: {}                     # OTLP 认证，如 {"Authorization":"Bearer ..."}
@@ -170,10 +206,15 @@ telemetry:
   max_queue_size: 2048
   metrics_enabled: false               # OTel metrics SDK 叠加（C4 exemplars）
   exemplars_enabled: false             # （预留）exemplar filter，见 otel-observability.md
+  # 入站 W3C baggage 不受信（M6）：仅白名单键被保留并透传到 worker。
+  # 默认 [] = 入站 baggage 全丢弃
+  baggage_allowlist: []                # 如 ["tenant", "experiment"]
+  baggage_max_entries: 16              # 保留条目数上限
+  baggage_max_entry_bytes: 128         # 单条目 key+value 字节上限
 ```
 
 - **构建**：`cargo build --features telemetry`（telemetry 测试用 `cargo test --features telemetry`）。默认构建不编译 OTel SDK/exporter。
-- **采样**：root 按 `sample_ratio` 采样；子 span 遵循入站 sampled 标志。
+- **采样**：root 按 `sample_ratio` 采样；子 span 遵循入站 sampled 标志。health/admin root 用独立的 `health_admin_sample_ratio`（默认 `0.0`），高频探活不刷 collector 配额。
 - **Exemplars（C4）**：`metrics_enabled` 时在既有 `/metrics` 之外经 OTLP/metrics 叠加记录 `liteserver.request.duration` histogram。注意：`opentelemetry_sdk 0.30` 的 exemplar 池为占位（exemplars 空），真正挂 trace_id 的 exemplar 需 SDK 升级（已记）。Prometheus exemplar-storage + Grafana 补全 metrics→trace 链路。
 - **停机**：优雅停机期间以 5s 上限 force_flush traces/metrics。
 

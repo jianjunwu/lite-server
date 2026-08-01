@@ -1,0 +1,35 @@
+name: Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # 蓝图 §6.7 评审 2.4：依赖安全公告扫描（RUSTSEC）。
+  cargo-audit:
+    name: cargo audit (RUSTSEC advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # 蓝图 §6.3：pb2/proto 漂移检查——proto 改动必须同步重生成签入的
+  # liteserver_pb2.py（regen_proto.sh 固定 grpcio-tools 1.62.x，无
+  # runtime_version guard；脚本内置 guard 检查）。
+  proto-drift:
+    name: pb2/proto drift check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Regenerate pb2 and fail on drift
+        run: |
+          tools/regen_proto.sh
+          git diff --exit-code -- python/lite_server/proto/
