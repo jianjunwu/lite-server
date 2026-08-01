@@ -893,41 +893,88 @@ impl ModelPolicies {
 }
 
 /// P-WARM (§4.3): warm a freshly loaded model with dummy inference before it
-/// becomes `Ready` (D33: warmup blocks readiness). The dummy input is the raw
+/// becomes `Ready` (D33: warmup blocks readiness). Each sample is the raw
 /// `/predict` request body stored in a file — the same JSON a real request
 /// carries — so it exercises the engine's lazy init (CUDA graph capture /
 /// torch.compile / allocator pools) at load time, not on the first user
-/// request. Disabled by default; no breaking change.
+/// request. Disabled by default.
+///
+/// **M7（major 硬切换）**：旧 `dummy_input_ref`/`iterations` 单样本形态已移除，
+/// 由 `samples` 列表取代（覆盖生产输入形状/batch，Triton ModelWarmup 范式）。
+/// 旧字段仅作迁移哨兵保留——出现即 fail-fast 并点名 `docs/migration.md#M7`，
+/// 绝不静默忽略（静默不跑 warmup = 悄悄放回首请求尖峰）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WarmupPolicy {
     /// Master switch. False = warmup skipped (version goes straight to Ready).
     pub enabled: bool,
-    /// Number of dummy inferences to run. Defaults to 1; raise to stabilize
-    /// timing across batches.
-    pub iterations: u32,
-    /// Path to the dummy request-body JSON file, relative to the model
-    /// directory (e.g. `warmup/input.json`). Its content is sent verbatim as
-    /// the `/predict` payload.
-    pub dummy_input_ref: String,
+    /// Warmup samples, consumed in order. Each = one dummy request-body file +
+    /// its iteration count. Must be non-empty when `enabled` is true.
+    pub samples: Vec<WarmupSample>,
     /// Per-warmup budget in seconds. 0 = fall back to the model's
     /// `request_timeout` (0 there = no bound). A warmup exceeding it fails the
     /// version.
     pub timeout_secs: f32,
+    /// M7 migration sentinel — removed config shape, never consumed.
+    pub dummy_input_ref: Option<String>,
+    /// M7 migration sentinel — removed config shape, never consumed.
+    pub iterations: Option<u32>,
+}
+
+/// One warmup sample: a dummy `/predict` request-body file run `iterations`
+/// times. Distinct samples cover distinct production input shapes/batches.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WarmupSample {
+    /// Path to the dummy request-body JSON file, relative to the model
+    /// directory (e.g. `warmup/batch1.json`). Sent verbatim as the payload.
+    pub input_ref: String,
+    /// Number of dummy inferences for this sample (default 1).
+    pub iterations: u32,
+}
+
+impl Default for WarmupSample {
+    fn default() -> Self {
+        Self { input_ref: String::new(), iterations: 1 }
+    }
 }
 
 impl Default for WarmupPolicy {
     fn default() -> Self {
         Self {
             enabled: false,
-            iterations: 1,
-            dummy_input_ref: String::new(),
+            samples: Vec::new(),
             timeout_secs: 0.0,
+            dummy_input_ref: None,
+            iterations: None,
         }
     }
 }
 
 impl WarmupPolicy {
+    /// Structural validation (M7 + sanity), invoked at model-config load.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.dummy_input_ref.is_some() || self.iterations.is_some() {
+            anyhow::bail!(
+                "policies.warmup: `dummy_input_ref`/`iterations` were removed in this major \
+                 (M7) — migrate to `samples: [{{input_ref: warmup/input.json, iterations: N}}]`; \
+                 see docs/migration.md#M7"
+            );
+        }
+        if self.enabled && self.samples.is_empty() {
+            anyhow::bail!(
+                "policies.warmup.enabled is true but `samples` is empty — add at least one \
+                 {{input_ref}} sample or disable warmup"
+            );
+        }
+        for (i, s) in self.samples.iter().enumerate() {
+            if s.input_ref.trim().is_empty() {
+                anyhow::bail!("policies.warmup.samples[{i}].input_ref must not be empty");
+            }
+        }
+        Ok(())
+    }
+
     /// Effective per-iteration timeout: own `timeout_secs`, else the model's
     /// `request_timeout` (0 = unbounded).
     pub fn effective_timeout(&self, model_request_timeout: f32) -> Option<Duration> {
@@ -1086,6 +1133,10 @@ impl ModelConfig {
         check_duration_secs("health_check_timeout", self.health_check_timeout)?;
         check_duration_secs("worker_kill_timeout", self.worker_kill_timeout)?;
         check_duration_secs("hook_http_timeout", self.hooks.hook_http_timeout)?;
+        // M7 迁移哨兵（与 load_model_config 同一道闸）。
+        if let Some(w) = &self.policies.warmup {
+            w.validate()?;
+        }
         Ok(())
     }
 }
@@ -1109,6 +1160,11 @@ pub fn load_model_config(path: &Path) -> anyhow::Result<ModelConfig> {
     let content = std::fs::read_to_string(path)?;
     let mut config: ModelConfig = serde_yaml::from_str(&content)?;
     expand_policy_env_vars(&mut config)?;
+    // M7 迁移哨兵：旧 warmup 形态在此 fail-fast（调用方必须把 Err  surfaced——
+    // reconcile/ensemble 不再 unwrap_or_default 吞掉）。
+    if let Some(w) = &config.policies.warmup {
+        w.validate()?;
+    }
     Ok(config)
 }
 
@@ -1313,9 +1369,68 @@ mod tests {
     fn warmup_policy_default_is_disabled() {
         let p = WarmupPolicy::default();
         assert!(!p.enabled);
-        assert_eq!(p.iterations, 1);
-        assert!(p.dummy_input_ref.is_empty());
+        assert!(p.samples.is_empty());
         assert_eq!(p.timeout_secs, 0.0);
+    }
+
+    #[test]
+    fn warmup_samples_parse_with_iteration_defaults() {
+        // 新 schema（M7）：samples 列表覆盖多输入形状/batch（Triton ModelWarmup
+        // 范式）；iterations 缺省 1。
+        let p: WarmupPolicy = serde_yaml::from_str(
+            "enabled: true\nsamples:\n  - input_ref: warmup/batch1.json\n  - input_ref: warmup/batch8.json\n    iterations: 4\ntimeout_secs: 10.0\n",
+        )
+        .unwrap();
+        assert!(p.enabled);
+        assert_eq!(p.samples.len(), 2);
+        assert_eq!(p.samples[0].input_ref, "warmup/batch1.json");
+        assert_eq!(p.samples[0].iterations, 1, "iterations 缺省 1");
+        assert_eq!(p.samples[1].iterations, 4);
+        assert_eq!(p.timeout_secs, 10.0);
+    }
+
+    #[test]
+    fn warmup_legacy_fields_fail_fast_with_migration_pointer() {
+        // M7：旧 dummy_input_ref/iterations 形态 → fail-fast 点名迁移（D30 硬
+        // 切换；静默 no-op 会悄悄放回首请求尖峰——比报错更糟）。
+        for yaml in [
+            "enabled: true\niterations: 2\ndummy_input_ref: warmup/input.json\n",
+            "enabled: true\ndummy_input_ref: warmup/input.json\n",
+        ] {
+            let p: WarmupPolicy = serde_yaml::from_str(yaml).unwrap();
+            let err = p.validate().expect_err("legacy warmup shape must fail validation");
+            assert!(err.to_string().contains("M7"), "error must name M7: {err}");
+        }
+    }
+
+    #[test]
+    fn warmup_enabled_requires_nonempty_samples_with_input_ref() {
+        let p: WarmupPolicy = serde_yaml::from_str("enabled: true\n").unwrap();
+        assert!(p.validate().is_err(), "enabled but samples empty → fail-fast");
+        let p: WarmupPolicy =
+            serde_yaml::from_str("enabled: true\nsamples:\n  - input_ref: \"\"\n").unwrap();
+        assert!(p.validate().is_err(), "empty input_ref → fail-fast");
+        // 显式 enabled:false + 空 samples 合法（预热关闭的显式表达）。
+        let p: WarmupPolicy = serde_yaml::from_str("enabled: false\n").unwrap();
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn warmup_legacy_config_file_fails_load() {
+        // 端到端：含旧字段的 config.yaml 经 load_model_config 直接报错（reconcile
+        // /ensemble 的吞错点已改为可见错误，不会再静默 default）。
+        let tmp =
+            std::env::temp_dir().join(format!("liteserver-warmup-m7-{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("config.yaml");
+        fs::write(
+            &path,
+            "policies:\n  warmup:\n    enabled: true\n    iterations: 2\n    dummy_input_ref: warmup/input.json\n",
+        )
+        .unwrap();
+        let err = load_model_config(&path).expect_err("legacy warmup config must fail to load");
+        assert!(err.to_string().contains("M7"), "error must name M7: {err}");
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]

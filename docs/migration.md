@@ -17,6 +17,7 @@ config shapes and logs `warn` lines pointing at the M-entries below
 | M4 | P7-1 | Admin endpoints are loopback-only when `access_control` is unconfigured |
 | M5 | P-TRACE | tonic 0.13 upgrade; OTel requires the `telemetry` cargo feature |
 | M6 | P-TRACE | `telemetry.protocol: http` fails at startup; inbound baggage dropped by default |
+| M7 | P-WARM | `policies.warmup.dummy_input_ref`/`iterations` removed → `samples` list (config fails to load) |
 
 Non-breaking phases (no action needed): P-MW, P-ENSEMBLE-GRPC, P-FLOW, P-DEADLINE,
 P-WARM, P-OAI (pure additions; defaults preserve prior behavior).
@@ -166,3 +167,31 @@ telemetry:
 3. `health_admin_sample_ratio` is now honored: health/admin endpoint spans are
    sampled at this independent rate (default `0.0`) so probes do not burn
    collector quota; other endpoints use `sample_ratio`.
+
+## M7 — warmup single-sample fields removed (P-WARM)
+
+**What changed:** `policies.warmup.dummy_input_ref` and `policies.warmup.iterations`
+were removed in favor of a `samples` list (multi-shape warmup, Triton
+ModelWarmup style). A config.yaml using the old keys **fails to load** with an
+error naming this entry — it never silently skips warmup (a silently skipped
+warmup quietly brings back the first-request latency spike).
+
+**Migrate:**
+
+```yaml
+# old
+policies:
+  warmup:
+    enabled: true
+    iterations: 2
+    dummy_input_ref: warmup/input.json
+
+# new — one file per input shape/batch, consumed in order
+policies:
+  warmup:
+    enabled: true
+    samples:
+      - input_ref: warmup/input.json
+        iterations: 2
+      - input_ref: warmup/batch8.json   # iterations defaults to 1
+```

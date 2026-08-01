@@ -382,9 +382,9 @@ class DecoupledAPI(LitAPI):
     .unwrap();
 
     // warmup_model (P-WARM): same logic as test_model (doubles input) but with
-    // warmup enabled — 2 dummy inferences of {"input": 5} must complete before
-    // the version becomes Ready. Proves warmup runs the real predict path and
-    // still serves traffic afterward.
+    // warmup enabled — M7 多样本：sample1 ×2 + sample2 ×1 = 3 dummy inferences
+    // must complete before the version becomes Ready. Proves warmup runs the
+    // real predict path (multi-sample loop) and still serves traffic afterward.
     let warmup_dir = tmp.join("warmup_model/1");
     std::fs::create_dir_all(warmup_dir.join("warmup")).unwrap();
     std::fs::write(
@@ -412,9 +412,15 @@ class WarmupAPI(LitAPI):
         "{\"input\": 5}\n",
     )
     .unwrap();
+    // M7 多样本：第二个样本文件（不同输入形状），iterations 缺省 1。
+    std::fs::write(
+        warmup_dir.join("warmup").join("input_batch.json"),
+        "{\"input\": [5, 6, 7]}\n",
+    )
+    .unwrap();
     std::fs::write(
         warmup_dir.join("config.yaml"),
-        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\npolicies:\n  warmup:\n    enabled: true\n    iterations: 2\n    dummy_input_ref: warmup/input.json\n",
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\npolicies:\n  warmup:\n    enabled: true\n    samples:\n      - input_ref: warmup/input.json\n        iterations: 2\n      - input_ref: warmup/input_batch.json\n",
     )
     .unwrap();
 
@@ -445,7 +451,7 @@ class WarmupFailAPI(LitAPI):
     .unwrap();
     std::fs::write(
         warmup_fail_dir.join("config.yaml"),
-        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\npolicies:\n  warmup:\n    enabled: true\n    iterations: 1\n    dummy_input_ref: does_not_exist.json\n",
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\npolicies:\n  warmup:\n    enabled: true\n    samples:\n      - input_ref: does_not_exist.json\n",
     )
     .unwrap();
 

@@ -7,8 +7,8 @@
 ## 本示例演示
 
 - `policies.warmup.enabled: true` —— 版本走 `WarmingUp` → `Ready` 两段状态，而不是直接 `Ready`。
-- `iterations: 2` —— 执行两次假推理（本模型每次 sleep 0.5 秒，因此就绪被推迟约 1 秒）。
-- `dummy_input_ref: warmup/input.json` —— 假请求体（相对模型目录）；这里是 `{"input": 42}`。
+- `samples: [{input_ref: warmup/input.json, iterations: 2}]` —— 对 `{"input": 42}` 执行两次假推理
+  （本模型每次 sleep 0.5 秒，因此就绪被推迟约 1 秒）。samples 列表（M7）可覆盖多种输入形状/batch，一样本一文件。
 - `timeout_secs` —— 单次预热的预算；预热失败会把版本标记为 `Failed`（带 `last_failure`），而不是冷启动服务。
 
 ## 目录结构

@@ -372,8 +372,9 @@ model, sent verbatim through the normal inference path:
 policies:
   warmup:
     enabled: true
-    iterations: 3                       # run the dummy input N times
-    dummy_input_ref: warmup/input.json  # relative to the model dir
+    samples:                            # one file per input shape/batch (M7)
+      - input_ref: warmup/input.json    # relative to the model dir
+        iterations: 3                   # run this sample N times (default 1)
     timeout_secs: 30.0                  # 0 = use request_timeout
 ```
 

@@ -331,9 +331,18 @@ async fn execute_step(
         let sub_model_dir = crate::validation::resolve_model_dir(
             &state.repo_path, &step.model, &step.version,
         )?;
-        let mut config = crate::config::load_model_config(
+        // 配置解析/校验失败必须可见（同 reconcile：不再 unwrap_or_default
+        // 静默回退默认配置；M7 迁移哨兵依赖此错误上浮）。
+        let mut config = match crate::config::load_model_config(
             &sub_model_dir.join("config.yaml")
-        ).unwrap_or_default();
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(AppError::ModelNotReady(format!(
+                    "sub-model {} v{} has invalid config.yaml: {}", step.model, step.version, e
+                )));
+            }
+        };
         state.config.apply_model_defaults(&mut config);
         if let Err(e) = state.worker_manager.load_model(&step.model, &step.version, &config).await {
             warn!("Failed to auto-load sub-model {} v{}: {}", step.model, step.version, e);

@@ -88,7 +88,16 @@ pub(super) async fn reconcile_models(
                 }
             }
             let config_path = repo_path.join(name).join(version).join("config.yaml");
-            let mut config = crate::config::load_model_config(&config_path).unwrap_or_default();
+            // 配置解析/校验失败必须可见（此前 unwrap_or_default 静默回退默认
+            // 配置——坏配置按默认值跑，比加载失败更难查；M7 迁移哨兵也依赖此
+            // 错误上浮）。
+            let mut config = match crate::config::load_model_config(&config_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Skipping {} version {}: invalid config.yaml: {}", name, version, e);
+                    continue;
+                }
+            };
             model_defaults.apply_to(&mut config);
 
             if let Err(e) = worker_manager.load_model(name, version, &config).await {

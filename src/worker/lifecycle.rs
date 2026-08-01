@@ -552,13 +552,14 @@ impl WorkerManager {
         Ok(())
     }
 
-    /// P-WARM (§4.3): drive `iterations` dummy inferences through the inference
-    /// queue to warm the engine (CUDA graph capture / torch.compile / allocator
-    /// pools) before the version becomes `Ready`. The dummy input is the raw
-    /// `/predict` request body read from `<model_dir>/<dummy_input_ref>`, sent
-    /// verbatim — so it exercises the exact production path. Returns
-    /// `Err(reason)` on any failure (file unreadable, queue error, error
-    /// response, timeout); the caller marks the version `Failed`.
+    /// P-WARM (§4.3): drive each warmup sample's dummy inferences through the
+    /// inference queue to warm the engine (CUDA graph capture / torch.compile /
+    /// allocator pools) before the version becomes `Ready`. Each sample is the
+    /// raw `/predict` request body read from `<model_dir>/<input_ref>`, sent
+    /// verbatim — multiple samples cover production input shapes/batches
+    /// (Triton ModelWarmup 范式, M7). Returns `Err(reason)` on any failure
+    /// (file unreadable, queue error, error response, timeout); the caller
+    /// marks the version `Failed`.
     async fn run_warmup(
         &self,
         model_name: &str,
@@ -566,95 +567,95 @@ impl WorkerManager {
         model_config: &ModelConfig,
         policy: &crate::config::WarmupPolicy,
     ) -> Result<(), String> {
-        // The dummy input is a file under the model dir holding the raw
-        // request body (the same JSON a real /predict carries).
         let model_dir = self
             .registry
             .get(model_name, Some(version))
             .map(|mv| mv.model_dir.clone())
             .ok_or_else(|| format!("version {}/{} vanished during warmup", model_name, version))?;
-        let dummy_path = model_dir.join(&policy.dummy_input_ref);
-        let payload_bytes = tokio::fs::read(&dummy_path)
-            .await
-            .map_err(|e| format!("read dummy input {}: {}", dummy_path.display(), e))?;
-
-        let iterations = policy.iterations.max(1);
         let timeout_opt = policy.effective_timeout(model_config.request_timeout);
         let timestamp_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
 
-        info!(
-            model = %model_name, version = %version,
-            iterations = iterations,
-            dummy = %dummy_path.display(),
-            "warming up model"
-        );
-
-        for i in 0..iterations {
-            let uid = format!("warmup_{}_{}_{}", model_name, version, i);
-            let meta = crate::proto::liteserver::RequestMeta {
-                route: "/predict".to_string(),
-                request_id: uid.clone(),
-                client_ip: "127.0.0.1".to_string(),
-                timestamp_ns,
-                payload: bytes::Bytes::from(payload_bytes.clone()),
-                ..Default::default()
-            };
-            let (response_tx, response_rx) = oneshot::channel();
-            let item = crate::inference_queue::QueueItem {
-                uid: uid.clone(),
-                data: bytes::Bytes::from(payload_bytes.clone()),
-                meta: Some(Arc::new(meta)),
-                response_tx,
-                inflight_guard: None,
-                enqueued_at: std::time::Instant::now(),
-            };
-            match self.inference_queue.try_submit(model_name, version, item) {
-                Ok(()) => {}
-                Err(crate::inference_queue::QueueError::Full) => {
-                    return Err("warmup queue full".to_string());
-                }
-                Err(_) => {
-                    return Err("warmup: inference queue not available".to_string());
-                }
-            }
-
-            // Bound the dummy inference by the warmup timeout (None = unbounded).
-            let response = match timeout_opt {
-                Some(t) => match timeout(t, response_rx).await {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(_)) => return Err("warmup: response channel closed".to_string()),
-                    Err(_) => {
-                        return Err(format!(
-                            "warmup: timed out after {:.1}s",
-                            t.as_secs_f32()
-                        ))
-                    }
-                },
-                None => match response_rx.await {
-                    Ok(r) => r,
-                    Err(_) => return Err("warmup: response channel closed".to_string()),
-                },
-            };
-
-            // A non-Ok status (or a non-Single payload) fails the warmup.
-            let ok = matches!(
-                response.payload,
-                Some(crate::proto::liteserver::response::Payload::Single(ref s))
-                    if s.status.as_ref().map(|st| st.code.as_str()).unwrap_or("Ok") != "Error"
+        for (si, sample) in policy.samples.iter().enumerate() {
+            let dummy_path = model_dir.join(&sample.input_ref);
+            let payload_bytes = tokio::fs::read(&dummy_path)
+                .await
+                .map_err(|e| format!("read dummy input {}: {}", dummy_path.display(), e))?;
+            let iterations = sample.iterations.max(1);
+            info!(
+                model = %model_name, version = %version,
+                sample = si,
+                iterations = iterations,
+                dummy = %dummy_path.display(),
+                "warming up model"
             );
-            if !ok {
-                let detail = match response.payload {
-                    Some(crate::proto::liteserver::response::Payload::Single(ref s)) => s
-                        .status
-                        .as_ref()
-                        .map(|st| st.message.clone())
-                        .unwrap_or_default(),
-                    _ => "unexpected response payload".to_string(),
+
+            for i in 0..iterations {
+                let uid = format!("warmup_{}_{}_{}_{}", model_name, version, si, i);
+                let meta = crate::proto::liteserver::RequestMeta {
+                    route: "/predict".to_string(),
+                    request_id: uid.clone(),
+                    client_ip: "127.0.0.1".to_string(),
+                    timestamp_ns,
+                    payload: bytes::Bytes::from(payload_bytes.clone()),
+                    ..Default::default()
                 };
-                return Err(format!("warmup inference returned error: {}", detail));
+                let (response_tx, response_rx) = oneshot::channel();
+                let item = crate::inference_queue::QueueItem {
+                    uid: uid.clone(),
+                    data: bytes::Bytes::from(payload_bytes.clone()),
+                    meta: Some(Arc::new(meta)),
+                    response_tx,
+                    inflight_guard: None,
+                    enqueued_at: std::time::Instant::now(),
+                };
+                match self.inference_queue.try_submit(model_name, version, item) {
+                    Ok(()) => {}
+                    Err(crate::inference_queue::QueueError::Full) => {
+                        return Err("warmup queue full".to_string());
+                    }
+                    Err(_) => {
+                        return Err("warmup: inference queue not available".to_string());
+                    }
+                }
+
+                // Bound the dummy inference by the warmup timeout (None = unbounded).
+                let response = match timeout_opt {
+                    Some(t) => match timeout(t, response_rx).await {
+                        Ok(Ok(r)) => r,
+                        Ok(Err(_)) => return Err("warmup: response channel closed".to_string()),
+                        Err(_) => {
+                            return Err(format!(
+                                "warmup: timed out after {:.1}s",
+                                t.as_secs_f32()
+                            ))
+                        }
+                    },
+                    None => match response_rx.await {
+                        Ok(r) => r,
+                        Err(_) => return Err("warmup: response channel closed".to_string()),
+                    },
+                };
+
+                // A non-Ok status (or a non-Single payload) fails the warmup.
+                let ok = matches!(
+                    response.payload,
+                    Some(crate::proto::liteserver::response::Payload::Single(ref s))
+                        if s.status.as_ref().map(|st| st.code.as_str()).unwrap_or("Ok") != "Error"
+                );
+                if !ok {
+                    let detail = match response.payload {
+                        Some(crate::proto::liteserver::response::Payload::Single(ref s)) => s
+                            .status
+                            .as_ref()
+                            .map(|st| st.message.clone())
+                            .unwrap_or_default(),
+                        _ => "unexpected response payload".to_string(),
+                    };
+                    return Err(format!("warmup inference returned error: {}", detail));
+                }
             }
         }
 

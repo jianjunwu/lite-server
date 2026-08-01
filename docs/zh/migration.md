@@ -15,6 +15,7 @@
 | M4 | P7-1 | 未配置 access_control 时 admin 仅 loopback 可达 |
 | M5 | P-TRACE | tonic 0.13 升级；OTel 需 `telemetry` cargo feature |
 | M6 | P-TRACE | `telemetry.protocol: http` 启动 fail-fast；入站 baggage 默认丢弃 |
+| M7 | P-WARM | `policies.warmup.dummy_input_ref`/`iterations` 已移除 → `samples` 列表（配置加载失败） |
 
 无 breaking 的阶段（无需动作）：P-MW、P-ENSEMBLE-GRPC、P-FLOW、P-DEADLINE、
 P-WARM、P-OAI（纯新增，默认值保持旧行为）。
@@ -152,3 +153,30 @@ telemetry:
 
 3. `health_admin_sample_ratio` 现已生效：health/admin 端点 span 按此独立比率
    采样（默认 `0.0`），探活不再刷 collector 配额；其余端点用 `sample_ratio`。
+
+## M7 — warmup 单样本字段移除（P-WARM）
+
+**变化：** `policies.warmup.dummy_input_ref` 与 `policies.warmup.iterations`
+已移除，由 `samples` 列表取代（多形状预热，Triton ModelWarmup 范式）。使用旧
+键的 config.yaml **加载直接失败**并点名本条目——绝不静默跳过预热（静默跳过
+= 悄悄放回首请求尖峰）。
+
+**迁移：**
+
+```yaml
+# 旧
+policies:
+  warmup:
+    enabled: true
+    iterations: 2
+    dummy_input_ref: warmup/input.json
+
+# 新——每样本一个文件，覆盖一种输入形状/batch，按序消费
+policies:
+  warmup:
+    enabled: true
+    samples:
+      - input_ref: warmup/input.json
+        iterations: 2
+      - input_ref: warmup/batch8.json   # iterations 缺省 1
+```

@@ -3,6 +3,7 @@
 policies:
   warmup:
     enabled: true
-    iterations: 2
-    dummy_input_ref: warmup/input.json
+    samples:
+      - input_ref: warmup/input.json
+        iterations: 2
     timeout_secs: 10.0

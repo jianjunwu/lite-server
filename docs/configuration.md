@@ -316,8 +316,11 @@ policies:
   request_log: {}                # Access log: method, path, status, elapsed
   warmup:                        # P-WARM: warm the engine before serving (default off)
     enabled: true                #   false = version goes straight to Ready (no behavior change)
-    iterations: 3                #   number of dummy inferences to run (default 1)
-    dummy_input_ref: warmup/input.json  # path to the dummy request-body JSON, relative to the model dir
+    samples:                     #   dummy inputs, consumed in order — one file per input
+                                 #   shape/batch (M7; legacy dummy_input_ref/iterations removed)
+      - input_ref: warmup/batch1.json   # dummy request-body JSON, relative to the model dir
+        iterations: 3            #   dummy inferences for this sample (default 1)
+      - input_ref: warmup/batch8.json   # another shape/batch (default iterations: 1)
     timeout_secs: 30.0           #   per-warmup budget (0 = fall back to request_timeout; 0 there = no bound)
 
 # Callbacks (data hooks around the inference pipeline)

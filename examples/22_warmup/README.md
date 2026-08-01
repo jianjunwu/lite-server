@@ -9,10 +9,10 @@ Run **dummy inferences before serving**: a version stays `WarmingUp`
 
 - `policies.warmup.enabled: true` — the version goes through `WarmingUp` →
   `Ready` instead of straight to `Ready`.
-- `iterations: 2` — two dummy inferences are executed (the model sleeps 0.5s
-  per call, so readiness is delayed ~1s).
-- `dummy_input_ref: warmup/input.json` — the dummy request body (relative to
-  the model directory); here `{"input": 42}`.
+- `samples: [{input_ref: warmup/input.json, iterations: 2}]` — two dummy
+  inferences of `{"input": 42}` are executed (the model sleeps 0.5s per call,
+  so readiness is delayed ~1s). The samples list (M7) covers multiple input
+  shapes/batches, one file per sample.
 - `timeout_secs` — per-warmup budget; a warmup failure marks the version
   `Failed` (with `last_failure`) instead of serving cold.
 

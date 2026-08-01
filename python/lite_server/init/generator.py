@@ -155,8 +155,9 @@ CONFIG_YAML_EXAMPLE = textwrap.dedent("""\
     #   request_log: {}
     #   warmup:                      # P-WARM: warm the engine before READY
     #     enabled: false             # off = ready immediately (legacy behavior)
-    #     iterations: 1              # dummy inferences to run
-    #     dummy_input_ref: "warmup_input.json"  # raw /predict body under the model dir
+    #     samples:                   # dummy inputs, consumed in order (M7 multi-sample)
+    #       - input_ref: "warmup_input.json"  # raw /predict body under the model dir
+    #         iterations: 1          # dummy inferences for this sample
     #     timeout_secs: 0.0          # 0 = use request_timeout
 
     # ===== Callbacks (Inference Pipeline) =====

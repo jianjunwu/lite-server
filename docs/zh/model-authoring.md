@@ -388,8 +388,9 @@ dummy 输入是放在模型目录旁的原始 `/predict` 请求体文件，原�
 policies:
   warmup:
     enabled: true
-    iterations: 3                       # 把 dummy 输入跑 N 次
-    dummy_input_ref: warmup/input.json  # 相对模型目录的路径
+    samples:                            # 每样本一个文件，覆盖多种输入形状/batch（M7）
+      - input_ref: warmup/input.json    # 相对模型目录的路径
+        iterations: 3                   # 该样本跑 N 次（默认 1）
     timeout_secs: 30.0                  # 0 = 使用 request_timeout
 ```
 
