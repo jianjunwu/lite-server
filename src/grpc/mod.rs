@@ -2314,4 +2314,153 @@ mod request_metrics_tests {
         assert_eq!(cb.req.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(cb.resp.load(std::sync::atomic::Ordering::Relaxed), 0, "cancel must NOT fire response");
     }
+
+    // ===== Task E: always-on chunk-idle reclaim (方案 C) =====
+    //
+    // A stalled stream (worker sends one chunk, then hangs) with NO client
+    // deadline must be reclaimed by the always-on chunk-idle (decoupled parity),
+    // not hang unbounded. The forwarder records 5xx on the idle-elapsed branch.
+
+    /// PAIR worker that answers a stream Open with ONE chunk, then stalls — it
+    /// never sends Done/close, so the server's chunk-idle reclaim must fire.
+    /// Subsequent requests (the cancel on forwarder exit) are acked.
+    fn spawn_stall_worker(endpoint: String) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(5000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let is_open = matches!(
+                    req.payload,
+                    Some(pb::request::Payload::Stream(pb::StreamRequest {
+                        action: Some(pb::stream_request::Action::Open(_)),
+                        ..
+                    }))
+                );
+                if !is_open {
+                    let ack = pb::Response { uid: req.uid, ..Default::default() };
+                    let _ = s.send(ack.encode_to_vec(), 0);
+                    continue;
+                }
+                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                let chunk = pb::Response {
+                    payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                        stream_id: st.stream_id.clone(),
+                        payload: Some(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
+                            data: Bytes::from_static(b"{}"),
+                            is_final: false,
+                        })),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                let _ = s.send(chunk.encode_to_vec(), 0);
+                // STALL: send no Done / close; loop acks the cancel on exit.
+            }
+        })
+    }
+
+    fn build_service_with_idle(
+        registry: Arc<ModelRegistry>,
+        queue: Arc<InferenceQueue>,
+        idle: Option<Duration>,
+    ) -> GrpcService {
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            std::env::temp_dir(),
+            queue,
+            "error".to_string(),
+            Arc::new(CallbackRunner::new()),
+        ));
+        let app_state = Arc::new(AppState::new(
+            registry.clone(),
+            wm.clone(),
+            wm.inference_queue().clone(),
+            crate::config::Config::default(),
+            std::env::temp_dir(),
+            Arc::new(CallbackRunner::new()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+        ));
+        GrpcService::new(
+            registry,
+            wm,
+            false,
+            false,
+            Arc::new(CallbackRunner::new()),
+            Arc::new(crate::server::ShutdownState::new()),
+            Duration::from_secs(5),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+            idle,
+            app_state,
+            Arc::new(Vec::new()),
+        )
+    }
+
+    async fn ready_service_with_worker_idle(
+        model: &str,
+        endpoint: String,
+        idle: Option<Duration>,
+    ) -> GrpcService {
+        let registry = Arc::new(ModelRegistry::new());
+        registry
+            .register(model, "1", test_config(1, 0.0, 10), ModelType::LitAPI, std::env::temp_dir())
+            .unwrap();
+        registry.mark_ready(model, "1").unwrap();
+        let queue = Arc::new(InferenceQueue::new());
+        let client = Arc::new(WorkerZmqClient::new(endpoint));
+        let (reload_tx, _rx) = mpsc::channel(8);
+        queue.register_model(
+            model, "1", &test_config(1, 0.0, 10), vec![],
+            vec![client.clone()],
+            reload_tx, Arc::new(OutlierState::new(1)), None,
+        );
+        let service = build_service_with_idle(registry, queue, idle);
+        service
+            .worker_manager
+            .insert_zmq_clients_for_test(model, "1", vec![client])
+            .await;
+        service
+    }
+
+    #[tokio::test]
+    async fn grpc_stream_idle_reclaims_a_stalled_stream() {
+        let model = "stall_stream";
+        let endpoint = metric_test_endpoint(model);
+        let _w = spawn_stall_worker(endpoint.clone());
+        // Short idle (200ms) so the test is fast. No grpc-timeout → the overall
+        // deadline is None; the always-on chunk-idle reclaim is what fires.
+        let service =
+            ready_service_with_worker_idle(model, endpoint, Some(Duration::from_millis(200))).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let resp = service
+            .stream_infer(Request::new(pb::StreamInferRequest {
+                model_name: model.to_string(),
+                version: "1".to_string(),
+                data: Bytes::from_static(b"{}"),
+                headers: HashMap::new(),
+                sequence_id: None,
+            }))
+            .await
+            .expect("stream must open");
+
+        let c5xx = REQUESTS_TOTAL.with_label_values(&[model, "1", "5xx"]);
+        let before = c5xx.get();
+        use tokio_stream::StreamExt;
+        let mut stream = resp.into_inner();
+        // Worker sends one chunk, then stalls: the always-on idle fires (~200ms),
+        // the forwarder records 5xx and ends the stream (not a clean 2xx close).
+        while stream.next().await.is_some() {}
+        wait_for(|| c5xx.get() > before, "idle reclaim records 5xx").await;
+        assert!(
+            c5xx.get() > before,
+            "stalled stream must be reclaimed by the always-on idle → 5xx"
+        );
+    }
 }

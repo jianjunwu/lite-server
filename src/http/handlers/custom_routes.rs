@@ -188,15 +188,14 @@ pub async fn dispatch_custom_route(
     meta.method = method_str.to_string();
     meta.query = query;
     meta.path_params = path_params;
-    // P-DEADLINE streaming bound for the route response body (client-specified only).
-    let (stream_deadline, stream_idle) = if deadline.client_specified {
-        (
-            crate::deadline::to_instant(deadline.unix_ns),
-            crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs),
-        )
+    // P-DEADLINE (方案 C): overall deadline client-specified only; chunk-idle
+    // reclaim always on (decoupled parity) for the route response body.
+    let stream_deadline = if deadline.client_specified {
+        crate::deadline::to_instant(deadline.unix_ns)
     } else {
-        (None, None)
+        None
     };
+    let stream_idle = crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
 
     let uid = format!("route_{}_{}-{}", model_name, resolved_version, Uuid::new_v4());
     let request = pb::Request {

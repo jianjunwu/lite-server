@@ -569,9 +569,13 @@ timeouts act independently:
 The resolved deadline travels to the worker as an absolute UNIX-ns timestamp
 (`RequestMeta.deadline_unix_ns`) and the worker checks it cooperatively.
 Ensemble DAGs share one parent budget (each sub-step gets parent − elapsed);
-streaming enforces **two stages** — an overall deadline plus a chunk-idle
-timeout — activated only when the client specified a deadline (with none,
-legacy streaming behavior is unchanged).
+streaming enforces **two stages**: an overall deadline plus a chunk-idle
+timeout. The chunk-idle timeout is **always on** (reusing
+`decoupled_idle_timeout_secs`, default 300s) so a stuck stream is recovered
+instead of hanging unbounded — long streams that keep producing chunks are
+unaffected; the overall deadline activates only when the client specified one
+(default config leaves long streams unbounded by overall deadline). Set
+`decoupled_idle_timeout_secs = 0` to disable idle reclaim.
 
 **Status when the budget expires** — read this before writing retry logic:
 

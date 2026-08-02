@@ -75,10 +75,15 @@ pub enum RecvElapsed {
 ///
 /// `deadline`: absolute overall deadline (None = no overall bound).
 /// `idle`: per-recv idle budget (None = no idle bound). When both are `None`
-/// this is a plain `recv()` — i.e. streaming behavior is unchanged when no
-/// client deadline is active. Regular streams gate both bounds on a client
-/// spec; decoupled keeps its always-on idle and only adds the overall bound
-/// when a client deadline is present.
+/// this is a plain `recv()`.
+///
+/// 方案 C: ALL streaming modes (regular stream/bidi/SSE/WS/custom-route +
+/// decoupled) keep chunk-idle reclaim ALWAYS on (decoupled parity) — a stuck
+/// stream is recovered instead of hanging unbounded, while long streams that
+/// keep producing chunks are unaffected. The OVERALL deadline activates only
+/// when the client specified one (default config leaves long streams unbounded
+/// by overall deadline). Escape hatch: `decoupled_idle_timeout_secs = 0`
+/// disables idle reclaim.
 ///
 /// Each call bounds THIS recv by `min(remaining-to-deadline, idle)`, so a
 /// stalled stream trips the idle bound even before the overall deadline.

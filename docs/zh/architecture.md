@@ -537,8 +537,10 @@ lite-server 通过 `orchestration.control_mode` 控制模型版本的生命周�
 
 解析出的 deadline 以绝对 UNIX 纳秒时间戳传到 worker（`RequestMeta.deadline_unix_ns`），
 worker 协作式检查。ensemble DAG 共享一份 parent 预算（子 step 得 parent − 已耗）；
-流式为**两段式**——总时长上限 + chunk 间 idle 超时——仅在客户端显式指定 deadline
-时激活（未指定时保持旧流式行为不变）。
+流式为**两段式**：总时长上限 + chunk 间 idle 超时。chunk-idle 超时**恒开**（复用
+`decoupled_idle_timeout_secs`，默认 300s）——卡死的流会被回收而非无界挂起，持续产
+chunk 的长流不受影响；总时长上限仅在客户端显式指定 deadline 时激活（默认配置下长流
+不被总时长截断）。设 `decoupled_idle_timeout_secs = 0` 可禁用 idle 回收。
 
 **预算耗尽时的状态码**——写重试逻辑前请先读：
 

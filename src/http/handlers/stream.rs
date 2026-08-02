@@ -166,15 +166,15 @@ async fn sse_infer_impl(
     let deadline = crate::deadline::resolve_from_http(&headers, state.config.server.timeout);
     let meta = span.in_scope(|| build_request_meta(&headers, &payload, "/predict", &cx, deadline.unix_ns));
     let payload_bytes = meta.payload.clone();
-    // P-DEADLINE streaming bound (client-specified only).
-    let (stream_deadline, stream_idle) = if deadline.client_specified {
-        (
-            crate::deadline::to_instant(deadline.unix_ns),
-            crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs),
-        )
+    // P-DEADLINE (方案 C): overall deadline only when the CLIENT specified one;
+    // chunk-idle reclaim is ALWAYS on (decoupled parity) so a stuck stream is
+    // recovered instead of hanging unbounded. Long streams keep flowing untouched.
+    let stream_deadline = if deadline.client_specified {
+        crate::deadline::to_instant(deadline.unix_ns)
     } else {
-        (None, None)
+        None
     };
+    let stream_idle = crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
     let (stream_id, mut chunk_rx) = open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await?;
 
     // Task D: fire InferenceRequest once the worker stream opened and arm the
@@ -423,15 +423,15 @@ async fn handle_ws_stream(
     let deadline = crate::deadline::resolve_from_http(&headers, state.config.server.timeout);
     let meta = span.in_scope(|| build_request_meta(&headers, &payload, "/predict", &cx, deadline.unix_ns));
     let payload_bytes = meta.payload.clone();
-    // P-DEADLINE streaming bound (client-specified only).
-    let (stream_deadline, stream_idle) = if deadline.client_specified {
-        (
-            crate::deadline::to_instant(deadline.unix_ns),
-            crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs),
-        )
+    // P-DEADLINE (方案 C): overall deadline only when the CLIENT specified one;
+    // chunk-idle reclaim is ALWAYS on (decoupled parity) so a stuck stream is
+    // recovered instead of hanging unbounded. Long streams keep flowing untouched.
+    let stream_deadline = if deadline.client_specified {
+        crate::deadline::to_instant(deadline.unix_ns)
     } else {
-        (None, None)
+        None
     };
+    let stream_idle = crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
 
     let (stream_id, mut chunk_rx) = match open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await {
         Ok(r) => r,
@@ -961,6 +961,145 @@ mod tests {
         assert!(field("model").contains("span_model"), "span model field: {:?}", inference.1);
         assert!(field("version").contains("1"), "span version field: {:?}", inference.1);
         assert!(field("request_id").contains("sse-rid"), "span request_id field: {:?}", inference.1);
+    }
+
+    /// Task E: a stalled SSE stream (worker sends one chunk, then hangs) with no
+    /// client deadline is reclaimed by the always-on chunk-idle (方案 C), not
+    /// left unbounded. The forwarder breaks on idle-elapsed without emitting
+    /// `[DONE]`, so draining the body completes within ~idle (not 300s).
+
+    fn make_state_with_idle(cb: Arc<CallbackRunner>, idle_secs: f32) -> Arc<AppState> {
+        let mut config = crate::config::Config::default();
+        config.server.decoupled_idle_timeout_secs = idle_secs;
+        let registry = Arc::new(ModelRegistry::new());
+        let queue = Arc::new(InferenceQueue::new());
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            std::path::PathBuf::new(),
+            queue.clone(),
+            "warn".to_string(),
+            cb.clone(),
+        ));
+        Arc::new(AppState::new(
+            registry,
+            wm,
+            queue,
+            config,
+            std::path::PathBuf::new(),
+            cb,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+        ))
+    }
+
+    async fn ready_state_with_idle(
+        model: &str,
+        endpoint: String,
+        cb: Arc<CallbackRunner>,
+        idle_secs: f32,
+    ) -> Arc<AppState> {
+        let state = make_state_with_idle(cb, idle_secs);
+        state
+            .registry
+            .register(model, "1", ModelConfig::default(), ModelType::LitAPI, std::path::PathBuf::new())
+            .unwrap();
+        state.registry.mark_ready(model, "1").unwrap();
+        state
+            .registry
+            .set_workers(
+                model,
+                "1",
+                vec![WorkerInfo {
+                    worker_id: 0,
+                    device: "cpu:0".to_string(),
+                    endpoint: String::new(),
+                    pid: None,
+                    status: WorkerStatus::Ready,
+                    capacity: None,
+                }],
+            )
+            .unwrap();
+        let client = Arc::new(WorkerZmqClient::new(endpoint));
+        state
+            .worker_manager
+            .insert_zmq_clients_for_test(model, "1", vec![client])
+            .await;
+        state
+    }
+
+    /// PAIR worker: Open → ONE chunk, then stall (no Done / close).
+    fn spawn_stall_worker(endpoint: String) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(5000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let is_open = matches!(
+                    req.payload,
+                    Some(pb::request::Payload::Stream(pb::StreamRequest {
+                        action: Some(pb::stream_request::Action::Open(_)),
+                        ..
+                    }))
+                );
+                if !is_open {
+                    let _ = s.send(pb::Response { uid: req.uid, ..Default::default() }.encode_to_vec(), 0);
+                    continue;
+                }
+                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                let chunk = pb::Response {
+                    payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                        stream_id: st.stream_id.clone(),
+                        payload: Some(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
+                            data: Bytes::from_static(b"{}"),
+                            is_final: false,
+                        })),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                let _ = s.send(chunk.encode_to_vec(), 0);
+                // STALL: send no Done / close.
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn sse_idle_reclaims_a_stalled_stream() {
+        let model = "sse_stall";
+        let endpoint = ipc_endpoint(model);
+        let _w = spawn_stall_worker(endpoint.clone());
+        let state =
+            ready_state_with_idle(model, endpoint, Arc::new(CallbackRunner::new()), 0.2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let start = std::time::Instant::now();
+        let sse = sse_infer_impl(
+            state,
+            model.to_string(),
+            "1".to_string(),
+            HeaderMap::new(),
+            json!({}),
+            test_cx(),
+        )
+        .await
+        .expect("sse must open");
+        let resp = sse.into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("drain sse body");
+        let elapsed = start.elapsed();
+
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(!body.contains("[DONE]"), "stalled stream must not reach Done: {body}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "stalled stream must be reclaimed by the always-on idle (~200ms), not hang; took {elapsed:?}"
+        );
     }
 }
 

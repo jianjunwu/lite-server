@@ -227,15 +227,14 @@ impl GrpcService {
 
         // Spawn forwarder: worker chunks -> gRPC stream
         let stream_id_for_incoming = stream_id.clone();
-        // P-DEADLINE streaming bound (client-specified only).
-        let (stream_deadline, stream_idle) = if deadline.client_specified {
-            (
-                crate::deadline::to_instant(deadline.unix_ns),
-                self.decoupled_idle_timeout,
-            )
+        // P-DEADLINE (方案 C): overall deadline client-specified only; chunk-idle
+        // reclaim always on (decoupled parity). Captured before spawn.
+        let stream_deadline = if deadline.client_specified {
+            crate::deadline::to_instant(deadline.unix_ns)
         } else {
-            (None, None)
+            None
         };
+        let stream_idle = self.decoupled_idle_timeout;
         tokio::spawn(async move {
             // Forward incoming bidi chunks to worker as StreamRequest::Chunk.
             // These are fire-and-forget: the worker's response to each chunk

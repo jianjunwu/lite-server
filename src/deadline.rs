@@ -6,6 +6,12 @@
 //! to `server.timeout`. The resolved deadline is carried to the worker as an
 //! absolute UNIX-nanosecond timestamp (`RequestMeta.deadline_unix_ns`, additive)
 //! and used to bound unary / ensemble / streaming waits.
+//!
+//! Streaming two-stage bound (方案 C): the OVERALL deadline activates only when
+//! the client specified one (default config leaves long streams unbounded by
+//! overall deadline); the chunk-idle reclaim is ALWAYS on (decoupled parity,
+//! `decoupled_idle_timeout_secs`) so a stuck stream is recovered instead of
+//! hanging unbounded.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,8 +32,9 @@ pub struct ResolvedDeadline {
     pub unix_ns: Option<i64>,
     /// True iff the client explicitly specified the deadline
     /// (`x-lite-timeout` / `grpc-timeout`). False for the `server.timeout`
-    /// fallback. Streaming two-stage enforcement is gated on this flag so the
-    /// default config leaves streaming behavior unchanged.
+    /// fallback. The streaming OVERALL deadline is gated on this flag (so the
+    /// default config does not truncate long LLM streams); the chunk-idle
+    /// reclaim is always on regardless — see [`idle_budget`].
     pub client_specified: bool,
 }
 

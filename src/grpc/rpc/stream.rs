@@ -109,15 +109,16 @@ impl GrpcService {
             deadline_unix_ns: deadline.unix_ns,
             ..Default::default()
         };
-        // P-DEADLINE streaming bound, captured before spawn.
-        let (stream_deadline, stream_idle) = if deadline.client_specified {
-            (
-                crate::deadline::to_instant(deadline.unix_ns),
-                self.decoupled_idle_timeout,
-            )
+        // P-DEADLINE (方案 C): overall deadline only when the CLIENT specified
+        // one; chunk-idle reclaim is ALWAYS on (decoupled parity) so a stuck
+        // stream is recovered instead of hanging unbounded. Long streams that
+        // keep producing chunks are unaffected. Captured before spawn.
+        let stream_deadline = if deadline.client_specified {
+            crate::deadline::to_instant(deadline.unix_ns)
         } else {
-            (None, None)
+            None
         };
+        let stream_idle = self.decoupled_idle_timeout;
 
         let stream_id = format!("grpc-stream-{}", Uuid::new_v4());
 
