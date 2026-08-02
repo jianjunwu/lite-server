@@ -4713,6 +4713,72 @@ async fn worker_self_terminates_when_server_killed() {
     );
 }
 
+/// R4: in PRODUCTION (no LITESERVER_DIE_WITH_PARENT), a worker must still
+/// self-terminate when its server is SIGKILLed. The worker's parent-death watch
+/// must be on by default — not gated by the test-only env flag — or a hard
+/// server crash (SIGKILL / abort, where kill_on_drop can't fire) orphans every
+/// worker. Identical to `worker_self_terminates_when_server_killed` except the
+/// env flag is NOT set.
+#[cfg(unix)]
+#[tokio::test]
+async fn worker_self_terminates_in_prod_no_env_flag() {
+    let port = next_test_port();
+    kill_stale_on_port(port);
+    let repo = test_model_repo();
+
+    // Inline command: identical to `start_server` EXCEPT no
+    // LITESERVER_DIE_WITH_PARENT — this is the production condition.
+    let mut cmd = Command::new(lite_server_bin());
+    cmd.arg("serve")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--model-repo")
+        .arg(repo)
+        .arg("--no-metrics")
+        .arg("--no-grpc")
+        .arg("--log-level")
+        .arg("warn")
+        .current_dir(project_root())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
+    let mut server = cmd.spawn().expect("Failed to start server");
+    let server_pid = server.id() as i32;
+    let base = format!("http://127.0.0.1:{}", port);
+
+    wait_for_server(port, 20).await;
+    load_model(&base, MODEL, "1").await;
+
+    let worker_pid = wait_for_worker_pid(server_pid, MODEL, 10)
+        .await
+        .expect("worker process not found");
+
+    // SIGKILL the server directly (not graceful) — its watchdog can't run, and
+    // kill_on_drop can't fire under SIGKILL. Only a worker-side parent watch
+    // can clean up.
+    unsafe {
+        libc::kill(server_pid, libc::SIGKILL);
+    }
+    let _ = server.wait();
+
+    let gone = wait_for_pid_gone(worker_pid, 8).await;
+    if !gone {
+        unsafe {
+            libc::kill(worker_pid, libc::SIGKILL);
+        }
+    }
+    assert!(
+        gone,
+        "worker did not self-terminate in prod (no env flag) within 8s after its server was SIGKILLed"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // P8-1: sequence_id cross-request worker affinity (sticky routing)
 // ---------------------------------------------------------------------------

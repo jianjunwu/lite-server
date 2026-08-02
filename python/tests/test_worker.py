@@ -3210,3 +3210,49 @@ class TestFileChangedDispatch:
         # Not an error status: handled=false tells the server to restart.
         assert resp.single.status.code == "Ok"
         assert json.loads(resp.single.data) == {"handled": False}
+
+
+class TestParentWatchpoint:
+    """R4: workers must self-terminate when their parent (the server) dies, even
+    in production (no LITESERVER_DIE_WITH_PARENT). Covers the two branches of
+    ``_start_parent_watchpoint``."""
+
+    def test_exits_immediately_when_already_orphaned(self, monkeypatch):
+        """B3: server died during fork→exec→watcher-startup (ppid already 1).
+        The worker must os._exit now — a watcher's ``1 != 1`` predicate would
+        never fire, orphaning it forever."""
+
+        class _ExitSignal(BaseException):
+            pass
+
+        exit_codes = []
+
+        def fake_exit(code=0):
+            exit_codes.append(code)
+            raise _ExitSignal
+
+        monkeypatch.setattr(os, "getppid", lambda: 1)
+        monkeypatch.setattr(os, "_exit", fake_exit)
+
+        with pytest.raises(_ExitSignal):
+            inference._start_parent_watchpoint(logging.getLogger("test"))
+        assert exit_codes == [0]
+
+    def test_installs_watcher_when_parent_alive(self, monkeypatch):
+        """Non-orphaned startup installs the 1Hz watcher task and does not exit."""
+
+        exited = []
+        monkeypatch.setattr(os, "getppid", lambda: 4242)
+        monkeypatch.setattr(os, "_exit", lambda code=0: exited.append(code))
+
+        async def _run():
+            task = inference._start_parent_watchpoint(logging.getLogger("t"))
+            assert task is not None
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(_run())
+        assert exited == []

@@ -253,31 +253,46 @@ def load_litapi(model_py_path: str, config: dict, device: str = "cpu"):
     return instance
 
 
+def _start_parent_watchpoint(log: logging.Logger):
+    """Best-effort 1Hz self-terminate if our parent (the server) dies.
+
+    Production-default (was test-only, gated by LITESERVER_DIE_WITH_PARENT).
+    Covers SIGKILL / abort of the server — paths its own watchdog and
+    ``kill_on_drop`` cannot reach. ``os._exit`` is intentional: the ZMQ sockets
+    are dead once the server is gone, so graceful teardown would just hang.
+    Best-effort 1Hz — inference must yield to the asyncio loop for the tick to
+    fire. Returns the watcher task (caller holds the strong ref) or exits the
+    process immediately if already orphaned at startup.
+    """
+    parent_pid = os.getppid()
+    if parent_pid == 1:
+        # Server died during fork→exec→watcher-startup; we are already reparented
+        # to init. Mirror src/server/mod.rs:766 (immediate-fire) or this worker
+        # orphans forever.
+        os._exit(0)
+
+    async def _watch_parent():
+        while True:
+            await asyncio.sleep(1)
+            if os.getppid() != parent_pid:
+                log.warning(
+                    "parent (server) pid %s exited; worker self-terminating",
+                    parent_pid,
+                )
+                os._exit(0)
+
+    return asyncio.create_task(_watch_parent())
+
+
 async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.Logger):
     """Handle single + batch + stream requests asynchronously."""
     pending_tasks: dict[str, asyncio.Task] = {}
     active_streams: dict[str, asyncio.Task] = {}
 
     # Self-terminate if the server (our parent) dies — including SIGKILL, which
-    # the server's own watchdog can't catch. Gated by LITESERVER_DIE_WITH_PARENT
-    # (inherited from the server's env; test-only). os._exit is intentional: the
-    # ZMQ sockets are dead once the server is gone, so graceful teardown would
-    # just hang. One getppid() per second, off the inference path.
-    if os.environ.get("LITESERVER_DIE_WITH_PARENT") == "1":
-        _parent_pid = os.getppid()
-
-        async def _watch_parent():
-            while True:
-                await asyncio.sleep(1)
-                if os.getppid() != _parent_pid:
-                    log.warning(
-                        "parent (server) pid %s exited; worker self-terminating",
-                        _parent_pid,
-                    )
-                    os._exit(0)
-
-        # Keep a strong reference so the task isn't garbage-collected mid-run.
-        _parent_watcher = asyncio.create_task(_watch_parent())
+    # the server's own watchdog can't catch. Production-default (was test-only).
+    # Hold a strong reference so the watcher task isn't garbage-collected.
+    _parent_watcher = _start_parent_watchpoint(log)
 
     cancelled = False
     try:
