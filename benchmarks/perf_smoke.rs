@@ -9,9 +9,9 @@
 //!   cargo build --release --example perf_smoke   # 需先 cargo build --release
 //!   cargo run  --release --example perf_smoke
 //!
-//! 当前为 informational（P-PERF-a）：永不以非零码退出（报告异常以 0 退出但
-//! 打印 ERROR）。阈值门控（p99 回归 +X% fail）属 P-PERF-b——需 CI runner 数据
-//! 校准后锁定（共享 runner 方差 >30%，勿用本机数直接当门槛）。
+//! 本地/手动测量工具（未接入 CI：共享 runner 方差 >30%，CI 性能门要么抖动
+//! 要么抓不到东西；待低方差 runner 再议）。永不以非零码退出——报告异常以 0
+//! 退出但打印 ERROR（不挡 shell），回归看两次运行之间的差值。
 
 use futures::stream::{self, StreamExt};
 use lite_server::proto::liteserver as pb;
@@ -28,7 +28,7 @@ const SSE_CHUNKS: u32 = 20;
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     if let Err(e) = run().await {
-        // informational：报告失败不以非零码退出（CI 不因此变红），但必须可见。
+        // 测量工具：报告失败不以非零码退出（不挡 shell），但必须可见。
         eprintln!("perf-smoke ERROR: {e}");
     }
 }
@@ -97,7 +97,7 @@ async fn run() -> Result<(), String> {
             "arch": std::env::consts::ARCH,
             "cores": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
             "rustc": rustc_version(),
-            "mode": "informational (P-PERF-a; thresholds locked in P-PERF-b)",
+            "mode": "local/manual measurement (P-PERF-a; not in CI — gating deferred until low-variance runner)",
             "note": "zero-compute echo models — numbers approximate SERVER-side overhead (protocol+queue+middleware), not model time",
         },
         "paths": {

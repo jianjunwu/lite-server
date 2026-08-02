@@ -161,7 +161,7 @@ proptest = "1"
 
 # P-PERF-a（蓝图 §4.0.8）：perf-smoke 自含测量（reqwest+tonic 客户端，零外部
 # 工具依赖）。`cargo run --release --example perf_smoke`，报告写
-# target/perf-smoke.json；CI informational（不 fail）。
+# target/perf-smoke.json。本地/手动测量工具，未接入 CI。
 [[example]]
 name = "perf_smoke"
 path = "benchmarks/perf_smoke.rs"

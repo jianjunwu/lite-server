@@ -5,8 +5,10 @@
 ## P-PERF-a 基线与 perf-smoke（2026-08-02）
 
 首轮实测基线（蓝图 §4.0.8）+ 可复现的自含 **perf-smoke** 测量设施。当前为
-**informational**——只报告、不让构建失败；回归阈值在 P-PERF-b 用 CI runner
-数据锁定（GitHub 共享 runner 方差 >30%，拿工作站数据定 p99 门槛必然抖动）。
+**本地/手动测量工具，未接入 CI**——GitHub 共享 runner 方差 >30%，在其上设 CI
+性能门要么抖动（紧阈值）要么抓不到东西（松阈值）。性能门推迟到有了低方差
+（自建/dedicated）runner 再议；在此之前回归靠 review（async 路径改动按 §6.5
+贴 perf 数据）+ 手动跑本设施兜底。
 
 ### 测量口径（含什么、不含什么）
 
@@ -31,8 +33,7 @@ cargo run --release --example perf_smoke  # 报告 → stdout + target/perf-smok
 ```
 
 要求 PATH 上的 `python` 可 import `lite_server`（worker 是 Python 进程；仓库
-根目录 `uv sync` 即可配好）。CI 跑同一命令（`checks.yml` 的 `perf-smoke`
-job，`continue-on-error: true`），报告以 artifact 上传。
+根目录 `uv sync` 即可配好）。
 
 ### 首轮基线
 
@@ -54,8 +55,9 @@ Python worker 往返（ZMQ IPC + 进程调度）且占大头——server 独占�
 ### SLO 对照 §4.0.8 状态
 
 - **基线**：已建立（本节 + 可复现设施）。✅
-- **CI 门槛**：informational 运行中；阈值数值（§4.0.8 的 `+10%` 占位）在
-  **P-PERF-b** 随 runner 数据锁定，mimalloc A/B 决策同批。⏳
+- **CI 门槛**：**未接入 CI。** 共享 runner 方差（>30%）使任何绝对阈值要么抖动
+  要么抓不到东西；门槛推迟到有低方差 runner 再议。§4.0.8 的 `+10%` 占位删去——
+  它只会是噪音。
 - **0.7.2 教训**：改动 async 路径须附本设施的 perf 数据（见 §6.5 验收）。
 
 ### Profiling runbook（测量可信化）

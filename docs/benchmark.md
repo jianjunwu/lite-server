@@ -5,10 +5,13 @@
 ## P-PERF-a baseline & perf-smoke (2026-08-02)
 
 The first measured baseline (blueprint §4.0.8) plus the self-contained
-**perf-smoke** harness that keeps it reproducible. The harness is
-**informational** — it reports but never fails the build; regression thresholds
-are locked in P-PERF-b once CI runner data exists (shared GitHub runners have
->30% variance, so p99-level gates calibrated on a workstation would flap).
+**perf-smoke** harness that keeps it reproducible. The harness is a
+**local/manual measurement tool** — it is not wired into CI. Shared GitHub
+runners have >30% run-to-run variance, so a CI perf gate calibrated on them
+would either flap (tight threshold) or catch nothing (loose threshold). Perf
+gating is deferred until a low-variance (self-hosted/dedicated) runner exists;
+until then regressions are caught by review (async-path changes attach perf
+data per §6.5) and manual runs of this harness.
 
 ### What is measured (and what is not)
 
@@ -36,9 +39,7 @@ cargo run --release --example perf_smoke  # report → stdout + target/perf-smok
 ```
 
 Requires `python` on PATH with `lite_server` importable (workers are Python
-processes; `uv sync` in the repo root sets this up). CI runs the same command
-(`checks.yml`, job `perf-smoke`, `continue-on-error: true`) and uploads
-`target/perf-smoke.json` as an artifact.
+processes; `uv sync` in the repo root sets this up).
 
 ### First baseline
 
@@ -62,9 +63,10 @@ from this harness by design. Decomposing it is the profiling runbook's job
 ### SLO status vs §4.0.8
 
 - **Baseline**: established (this section + reproducible harness). ✅
-- **CI gate**: running informational; threshold values (`+10%` placeholder in
-  §4.0.8) lock in **P-PERF-b** from runner data, together with the mimalloc
-  A/B decision. ⏳
+- **CI gate**: **not in CI.** Shared-runner variance (>30%) makes any absolute
+  threshold either flap or catch nothing; gating is deferred until a
+  low-variance runner exists. The `+10%` placeholder from §4.0.8 is dropped —
+  it would have been pure noise.
 - **0.7.2 lesson**: changes to async paths must attach perf data from this
   harness (see §6.5 acceptance).
 

@@ -40,7 +40,8 @@ python benchmarks/scripts/compare.py --model sleep_model --workers 1 2 4 --concu
 ## perf-smoke (P-PERF-a, self-contained)
 
 Zero-external-tool smoke of the key paths (HTTP/gRPC unary + SSE) — this is
-the §4.0.8 regression baseline harness (informational; CI uploads the report):
+the §4.0.8 regression baseline harness. A local/manual measurement tool (not
+wired into CI; see docs/benchmark.md for why):
 
 ```bash
 cargo build --release

@@ -51,30 +51,3 @@ jobs:
         run: |
           tools/regen_proto.sh
           git diff --exit-code -- python/lite_server/proto/
-
-  # P-PERF-a（蓝图 §4.0.8）：perf-smoke informational——关键路径烟测
-  # （HTTP/gRPC unary + SSE），报告上传 artifact，永不 fail。回归阈值
-  # （§4.0.8 的 +10% 占位）属 P-PERF-b：需 runner 数据校准后锁定。
-  perf-smoke:
-    name: perf-smoke (informational)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - name: Install protoc + libzmq (prost-build needs protoc; mirrors build-wheels Linux setup)
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libzmq3-dev
-      - name: Sync Python env (workers run Python; builds native ext)
-        run: uv sync
-      - name: Build server and perf-smoke
-        run: |
-          cargo build --release
-          cargo build --release --example perf_smoke
-      - name: Run perf-smoke
-        run: uv run cargo run --release --example perf_smoke
-      - name: Upload report
-        uses: actions/upload-artifact@v4
-        with:
-          name: perf-smoke-report
-          path: target/perf-smoke.json
-          if-no-files-found: ignore
