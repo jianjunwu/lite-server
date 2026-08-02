@@ -54,11 +54,26 @@ impl GrpcService {
         let deadline =
             crate::deadline::resolve_from_grpc(&grpc_metadata, self.server_timeout.as_secs_f32());
 
-        // Wait for first message (must be BidiOpen)
-        let first = stream
-            .message()
-            .await
-            .map_err(|e| err(Status::internal(format!("stream error: {}", e))))?;
+        // Wait for first message (must be BidiOpen). Bound the wait by the
+        // resolved deadline (server.timeout and/or client grpc-timeout); when no
+        // deadline is configured (server.timeout <= 0 and no client deadline) the
+        // wait stays unbounded, consistent with the documented P-DEADLINE semantics.
+        let first = match crate::deadline::to_instant(deadline.unix_ns) {
+            Some(instant) => match tokio::time::timeout_at(instant.into(), stream.message()).await {
+                Ok(res) => {
+                    res.map_err(|e| err(Status::internal(format!("stream error: {}", e))))?
+                }
+                Err(_) => {
+                    return Err(err(Status::deadline_exceeded(
+                        "bidi stream did not send the opening message before the deadline",
+                    )));
+                }
+            },
+            None => stream
+                .message()
+                .await
+                .map_err(|e| err(Status::internal(format!("stream error: {}", e))))?,
+        };
 
         let (model_name, resolved_version, stream_id, initial_data, sequence_id, pin, headers) = match first {
             Some(chunk) => match chunk.payload {

@@ -18,7 +18,9 @@ server:
   host: 0.0.0.0                # 绑定地址（支持 unix:/path/to/sock 使用 UDS）
   timeout: 30.0                # 全局请求超时（秒）
   threads: null                # Tokio 工作线程数（null = 自动 = CPU 核数）
-  cache_registry: false        # 缓存模型注册表到磁盘（预留 — 尚未实现）
+  cache_registry: false        # 停机时把注册表（策略 + 激活版本 pin）快照到
+                               # <repo>/.lite-server-registry.json，启动时恢复。
+                               # 容忍损坏文件；删除该文件即重置。
   graceful_timeout: 30.0       # 优雅关闭时等待进行中请求的最大秒数
   keepalive_timeout: 5.0       # HTTP keep-alive 超时（秒），0 = 禁用
   compression: false           # gzip HTTP 响应（P1-4）；排除 SSE，不影响 WS
@@ -64,7 +66,7 @@ logging:
 
 grpc:
   enabled: true                # 启用 gRPC 服务
-  max_workers: 10              # gRPC 最大工作线程数（预留 — 尚未实现）
+  max_workers: 10              # 每个模型的 worker 进程数上限。0 = 不限制。
   host: null                   # gRPC 绑定地址；null = 跟随 server.host（"unix:/路径" = UDS）
   # P7-2：LiteAdmin 服务独立绑定。推荐 UDS——UDS admin socket 默认属主独占（0o600）创建
   admin_bind: null             # 如 unix:/var/run/lite-admin.sock 或 127.0.0.1:9001
@@ -100,18 +102,15 @@ features:
   # P5-2 breaking（迁移 M3）：是否响应 x-lite-version canary pin 请求头。
   # 默认 false = 该头被忽略（客户端无法自行 pin 到 canary 版本）。仅灰度/调试环境开启
   canary_override: false
-  timeline: false              # （预留 — 尚未生效）
-  system_overview: true        # （预留 — 尚未实现）
-  custom_metrics: false        # （预留 — 尚未实现）
-  benchmarks: true             # （预留 — 尚未实现）
-  playground: false            # （预留 — 尚未实现）
-  alerts: true                 # （预留 — 尚未生效）
-  version_compare: false       # （预留 — 尚未实现）
-  streaming: true              # （预留 — 尚未生效；流式路由始终挂载）
-  grpc_streaming: true         # （预留 — 尚未生效）
-  sse: true                    # （预留 — 尚未生效）
-  websocket_streaming: true    # （预留 — 尚未生效）
-  streaming_metrics: true      # 启用流式专用指标
+  timeline: false              # 挂载 /metrics/timeline* 并运行后台采样任务
+  custom_metrics: false        # 注册 worker 声明的自定义指标（需显式开启）
+  alerts: true                 # 挂载 /metrics/alerts
+  version_compare: false       # 挂载 /v2/models/:model_name/compare
+  streaming: true              # SSE + WebSocket 路由总开关
+  grpc_streaming: true         # stream_infer / decoupled_infer / bidi_stream RPC（关闭时返回 Unimplemented）
+  sse: true                    # SSE 路由（另需 streaming: true）
+  websocket_streaming: true    # WebSocket 路由（另需 streaming: true）
+  streaming_metrics: true      # 流式专用指标
 
 model_defaults:                # CLI 级别默认值，应用于所有模型
   max_queue_size: null         # 覆盖所有模型的 max_queue_size

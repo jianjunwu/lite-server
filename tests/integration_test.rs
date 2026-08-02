@@ -5344,6 +5344,354 @@ async fn test_p_flow_grpc_bidi_disconnect_propagates_cancel() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
+/// WS6 (P-DEADLINE bidi parity): a bidi stream whose client never sends the
+/// opening message must be recovered after `server.timeout`, instead of
+/// hanging the handler unbounded. The server's `bidi_stream` reads the first
+/// message bounded by the resolved deadline; with `server.timeout: 2.0` and no
+/// client `grpc-timeout`, the wait is bounded to ~2s and the RPC fails with
+/// `DeadlineExceeded`.
+#[tokio::test]
+#[serial]
+async fn test_grpc_bidi_first_message_timeout() {
+    use lite_server::proto::liteserver as pb;
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "lite-server-bidi-fmto-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let marker = tmp_dir.join("fmto.marker");
+    let repo = create_bidi_model_repo(&marker);
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18215\n  log_level: warn\n  timeout: 2.0\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 30).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "bidi_model", "1").await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+    // Withhold the opening message: the client never sends BidiOpen, so the
+    // server's handler blocks on `stream.message()` until the deadline fires.
+    let (_withhold_tx, req_rx) = tokio::sync::mpsc::channel::<pb::BidiChunk>(8);
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.bidi_stream(tonic::Request::new(
+            tokio_stream::wrappers::ReceiverStream::new(req_rx),
+        )),
+    )
+    .await
+    .expect("bidi_stream RPC did not resolve within 10s");
+    let elapsed = started.elapsed();
+    let status = outcome.expect_err(
+        "bidi_stream must fail with DeadlineExceeded when the opening message is withheld",
+    );
+    assert_eq!(
+        status.code(),
+        tonic::Code::DeadlineExceeded,
+        "expected DeadlineExceeded, got: {status}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(1500) && elapsed <= Duration::from_secs(6),
+        "first-message timeout should fire ~2s after the RPC, got {elapsed:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// WS6 (P-DEADLINE WS parity): a WebSocket client that upgrades but never sends
+/// the first message must be closed after `server.timeout`, not held open
+/// forever. With `server.timeout: 2.0`, the server's first-message recv is
+/// bounded by the idle budget and the socket is closed.
+#[tokio::test]
+#[serial]
+async fn test_ws_first_message_timeout() {
+    use futures::StreamExt;
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "lite-server-ws-fmto-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let repo = create_test_model_repo();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18216\n  log_level: warn\n  timeout: 2.0\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 30).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "test_model", "1").await;
+
+    let ws_url = format!("ws://127.0.0.1:{}/v2/models/test_model/stream", http_port);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect failed");
+    // Withhold the first message: the server must close the socket after the
+    // ~2s first-message idle budget fires.
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(8), ws.next()).await;
+    let elapsed = started.elapsed();
+    // ws.next() resolves (None / Close / Error) once the server closes.
+    assert!(
+        outcome.is_ok(),
+        "server should close the idle WS within 8s (first-message timeout)"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(1500) && elapsed <= Duration::from_secs(6),
+        "first-message timeout should fire ~2s after upgrade, got {elapsed:?}"
+    );
+}
+
+/// WS4 (features.* gating): with the route-gated features off, the corresponding
+/// routes are unmounted (404 via route_fallback), while always-on routes stay up.
+#[tokio::test]
+#[serial]
+async fn test_feature_toggles_unmount_routes() {
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    let metrics_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    kill_stale_on_port(metrics_port);
+    let repo = create_test_model_repo();
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "lite-server-feat-off-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: {metrics_port}\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\nfeatures:\n  timeline: false\n  alerts: false\n  version_compare: false\n  streaming: false\n  sse: false\n  websocket_streaming: false\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            metrics_port = metrics_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 30).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "test_model", "1").await;
+
+    let client = reqwest::Client::new();
+    // Sanity: an always-on route still answers (server is up and routing).
+    assert_eq!(
+        client.get(format!("{}/health", base)).send().await.unwrap().status(),
+        200
+    );
+    // timeline / alerts / version_compare unmounted → 404.
+    assert_eq!(client.get(format!("{}/metrics/timeline", base)).send().await.unwrap().status(), 404);
+    assert_eq!(
+        client.get(format!("{}/metrics/timeline/test_model", base)).send().await.unwrap().status(),
+        404
+    );
+    assert_eq!(client.get(format!("{}/metrics/alerts", base)).send().await.unwrap().status(), 404);
+    assert_eq!(
+        client.get(format!("{}/v2/models/test_model/compare", base)).send().await.unwrap().status(),
+        404
+    );
+    // streaming off → SSE + WS routes unmounted → 404.
+    assert_eq!(
+        client
+            .post(format!("{}/v2/models/test_model/events", base))
+            .json(&json!({"input": 1}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    assert_eq!(
+        client.get(format!("{}/v2/models/test_model/stream", base)).send().await.unwrap().status(),
+        404
+    );
+}
+
+/// WS4 (features.grpc_streaming): with grpc_streaming off, the three streaming
+/// RPCs return UNIMPLEMENTED before admission. stream_infer is exercised here;
+/// batch_infer (unary) is ungated and unaffected.
+#[tokio::test]
+#[serial]
+async fn test_grpc_streaming_disabled_returns_unimplemented() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::StreamInferRequest;
+    use std::collections::HashMap;
+
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    let metrics_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    kill_stale_on_port(metrics_port);
+    let repo = test_model_repo();
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "lite-server-grpcs-off-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: {metrics_port}\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\nfeatures:\n  grpc_streaming: false\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            metrics_port = metrics_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 30).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, MODEL, "1").await;
+
+    let mut client = LiteServerClient::connect(format!("http://127.0.0.1:{}", grpc_port))
+        .await
+        .expect("gRPC client must connect");
+
+    let req = StreamInferRequest {
+        model_name: MODEL.to_string(),
+        version: "1".to_string(),
+        data: bytes::Bytes::from(serde_json::to_vec(&json!({"input": 2})).unwrap()),
+        headers: HashMap::new(),
+        ..Default::default()
+    };
+    let status = client
+        .stream_infer(req)
+        .await
+        .expect_err("stream_infer must return Unimplemented when grpc_streaming=false");
+    assert_eq!(
+        status.code(),
+        tonic::Code::Unimplemented,
+        "expected Unimplemented, got: {status}"
+    );
+}
+
+/// WS2 (cache_registry): on graceful shutdown the registry snapshot is written;
+/// on restart it is consumed. Boot a server with `cache_registry: true`, load +
+/// activate a version, SIGTERM, assert the snapshot file pins the version, then
+/// restart and confirm the server boots cleanly (restore ran).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_cache_registry_snapshots_and_restores() {
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    let metrics_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    kill_stale_on_port(metrics_port);
+
+    let repo_dir =
+        std::env::temp_dir().join(format!("lite-server-cache-int-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo_dir);
+    let model_dir = repo_dir.join("cm").join("1");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    std::fs::write(
+        model_dir.join("model.py"),
+        "from lite_server import LitAPI\nclass A(LitAPI):\n  def setup(self, d): pass\n  def decode_request(self, r): return r\n  def predict(self, x): return {\"out\": x}\n  def encode_response(self, o): return o\n",
+    )
+    .unwrap();
+    std::fs::write(
+        model_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+
+    let tmp_dir = std::env::temp_dir().join(format!("lite-server-cache-cfg-{}", std::process::id()));
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: {metrics_port}\n  log_level: warn\n  cache_registry: true\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            metrics_port = metrics_port,
+            repo = repo_dir.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let cfg_arg = server_yaml.to_string_lossy().to_string();
+
+    // --- Boot #1: load + activate, then graceful SIGTERM. ---
+    let mut child = start_server(&["--config", &cfg_arg]);
+    wait_for_server(http_port, 30).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "cm", "1").await;
+    // Explicitly activate so an active-version pin is recorded before shutdown.
+    let activate = reqwest::Client::new()
+        .post(format!("{}/v2/models/cm/versions/1/activate", base))
+        .send()
+        .await
+        .expect("activate request failed");
+    assert_eq!(activate.status(), 200, "activate failed");
+
+    send_sigterm(&child);
+    let exited = wait_for_exit(&mut child, 30).await;
+    assert!(exited, "server did not exit on SIGTERM");
+
+    // --- The snapshot file must exist and pin cm → 1. ---
+    let snap_path = repo_dir.join(".lite-server-registry.json");
+    let snap: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&snap_path).expect("snapshot file written"))
+            .expect("snapshot is valid JSON");
+    assert_eq!(
+        snap["active_versions"]["cm"].as_str(),
+        Some("1"),
+        "snapshot must pin the active version: {snap}"
+    );
+    assert!(
+        snap["models"]["cm"].is_object(),
+        "snapshot must include the model strategy: {snap}"
+    );
+
+    // --- Boot #2 (restart): restore consumes the snapshot; server boots clean. ---
+    let child2 = start_server(&["--config", &cfg_arg]);
+    wait_for_server(http_port, 30).await;
+    let health = reqwest::Client::new()
+        .get(format!("{}/health", base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status(), 200, "server must boot after restore");
+
+    stop_server(child2);
+    let _ = std::fs::remove_dir_all(&repo_dir);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
 // ===========================================================================
 // Multi-platform / multi-version audit regression tests (2026-08-02)
 // ===========================================================================

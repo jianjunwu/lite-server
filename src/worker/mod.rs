@@ -79,6 +79,14 @@ pub struct WorkerManager {
     // Server-level tunables from server.yaml `tunables:` (worker stderr
     // diagnostics bounds, FILE_CHANGED hook timeout).
     server_tunables: crate::config::ServerTunables,
+    // Cap on worker processes per model version from `grpc.max_workers`
+    // (config.rs). 0 = unlimited. Applied in lifecycle.rs after the
+    // devices × workers_per_device total is computed (admission.rs precedent).
+    max_workers: usize,
+    // Whether worker-declared custom metrics are registered. From
+    // `features.custom_metrics` (config.rs); false = registration skipped
+    // (recording then no-ops on unregistered ids — prometheus.rs).
+    custom_metrics: bool,
     // Fire-and-forget lifecycle hook tasks, aborted on shutdown (L2).
     hook_tasks: HookTasks,
 }
@@ -124,6 +132,8 @@ impl WorkerManager {
             server_http: None,
             unload_grace: Duration::from_secs(30),
             server_tunables: crate::config::ServerTunables::default(),
+            max_workers: 0,
+            custom_metrics: false,
             hook_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
         }
     }
@@ -146,6 +156,20 @@ impl WorkerManager {
     /// timeout). Builder-style, from `tunables:` in server.yaml.
     pub fn with_server_tunables(mut self, tunables: crate::config::ServerTunables) -> Self {
         self.server_tunables = tunables;
+        self
+    }
+
+    /// Set the per-model worker-process cap (`grpc.max_workers`). 0 = unlimited
+    /// (no cap), matching `max_inflight` semantics in admission.rs.
+    pub fn with_max_workers(mut self, max_workers: usize) -> Self {
+        self.max_workers = max_workers;
+        self
+    }
+
+    /// Set whether worker-declared custom metrics are registered
+    /// (`features.custom_metrics`).
+    pub fn with_custom_metrics(mut self, enabled: bool) -> Self {
+        self.custom_metrics = enabled;
         self
     }
 

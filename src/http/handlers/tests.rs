@@ -855,19 +855,19 @@ mod custom_route_callback_tests {
 
         let fn_body: Vec<&&str> = lines[fn_start..=fn_end].iter().collect();
 
-        // The inference path calls on_inference_request (in do_infer).
-        let has_inference_request = source.contains("on_inference_request");
+        // The inference path calls fire_inference_request (in do_infer).
+        let has_inference_request = source.contains("fire_inference_request");
         assert!(
             has_inference_request,
-            "sanity: handlers.rs must reference on_inference_request somewhere"
+            "sanity: handlers.rs must reference fire_inference_request somewhere"
         );
 
         let fn_has_req_cb = fn_body
             .iter()
-            .any(|l| l.contains("on_inference_request"));
+            .any(|l| l.contains("fire_inference_request"));
         let fn_has_resp_cb = fn_body
             .iter()
-            .any(|l| l.contains("on_inference_response"));
+            .any(|l| l.contains("fire_inference_response"));
 
         // B3: The defect — dispatch_custom_route does NOT fire inference
         // callbacks (the spec says model-level callbacks cover both inference
@@ -911,12 +911,12 @@ mod custom_route_callback_tests {
         let do_infer_body: Vec<&&str> =
             infer_lines[do_infer_start..=do_infer_end].iter().collect();
         assert!(
-            do_infer_body.iter().any(|l| l.contains("on_inference_request")),
-            "do_infer must fire on_inference_request (sanity check)"
+            do_infer_body.iter().any(|l| l.contains("fire_inference_request")),
+            "do_infer must fire fire_inference_request (sanity check)"
         );
         assert!(
-            do_infer_body.iter().any(|l| l.contains("on_inference_response")),
-            "do_infer must fire on_inference_response (sanity check)"
+            do_infer_body.iter().any(|l| l.contains("fire_inference_response")),
+            "do_infer must fire fire_inference_response (sanity check)"
         );
     }
 }

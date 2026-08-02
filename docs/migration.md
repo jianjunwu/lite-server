@@ -18,9 +18,11 @@ config shapes and logs `warn` lines pointing at the M-entries below
 | M5 | P-TRACE | tonic 0.13 upgrade; OTel requires the `telemetry` cargo feature |
 | M6 | P-TRACE | `telemetry.protocol: http` fails at startup; inbound baggage dropped by default |
 | M7 | P-WARM | `policies.warmup.dummy_input_ref`/`iterations` removed → `samples` list (config fails to load) |
+| M8 | 0.8.0-rc0 | `features.*` toggles now enforced; 3 reserved fields removed; `custom_metrics` now opt-in |
 
 Non-breaking phases (no action needed): P-MW, P-ENSEMBLE-GRPC, P-FLOW, P-DEADLINE,
-P-WARM, P-OAI (pure additions; defaults preserve prior behavior).
+P-WARM (pure additions; defaults preserve prior behavior). P-OAI is deferred to 0.9
+(not part of this release).
 
 > **Semantics note (P-DEADLINE):** an expired request budget returns **HTTP `504`
 > (not `408`)** / gRPC `DEADLINE_EXCEEDED`. `408` would mean "the client was too
@@ -195,3 +197,30 @@ policies:
         iterations: 2
       - input_ref: warmup/batch8.json   # iterations defaults to 1
 ```
+
+## M8 — feature toggles enforced; reserved fields removed (0.8.0-rc0)
+
+**What changed:** the `features.*` toggles were previously declared but ignored
+("(reserved)"). They now control real behavior:
+
+- `system_overview`, `benchmarks`, `playground` were **removed** from the
+  schema. They never had any effect; leaving them in an old `server.yaml` is
+  harmless (unknown keys are ignored), but they no longer appear in generated
+  configs.
+- `timeline` / `alerts` / `version_compare` now gate their HTTP routes: when
+  off, the routes are unmounted (404) and the timeline background sampler is a
+  no-op.
+- `streaming` is the master switch for SSE + WebSocket routes; `sse` and
+  `websocket_streaming` gate their own transport. Turning `streaming` off truly
+  unmounts the routes (previously they were always mounted).
+- `grpc_streaming` gates the three streaming RPCs (`stream_infer`,
+  `decoupled_infer`, `bidi_stream`); when off they return `UNIMPLEMENTED` before
+  admission. `batch_infer` (unary) is unaffected.
+- `custom_metrics` is now **opt-in** (default `false`): worker-declared custom
+  metrics are registered only when this is `true`. Previously they were always
+  registered; if your workers declare metrics, set `custom_metrics: true`.
+
+**Migrate:** no action required unless you relied on custom metrics (set
+`features.custom_metrics: true`) or on a streaming route being mounted while its
+toggle was `false` (set the relevant toggle to `true`).
+

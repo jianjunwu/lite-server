@@ -57,6 +57,10 @@ pub struct GrpcService {
     /// `x-lite-version` pin 被忽略（debug 日志），true 时参与版本解析
     /// （优先级：显式 version > pin > routing_pick > active，与 HTTP 一致）。
     canary_override: bool,
+    /// features.grpc_streaming——false 时三个流式 RPC（stream_infer /
+    /// decoupled_infer / bidi_stream）入口直接返回 Unimplemented（在
+    /// InflightGuard/admission 之前），batch_infer（unary）不受影响。
+    grpc_streaming: bool,
     callback_runner: Arc<CallbackRunner>,
     /// Graceful-shutdown in-flight tracker (P4-2). Held by the service so every
     /// inference handler can inc on entry / dec on exit — mirrors the HTTP
@@ -93,6 +97,7 @@ impl GrpcService {
         worker_manager: Arc<WorkerManager>,
         streaming_metrics: bool,
         canary_override: bool,
+        grpc_streaming: bool,
         callback_runner: Arc<CallbackRunner>,
         shutdown_state: Arc<crate::server::ShutdownState>,
         server_timeout: Duration,
@@ -106,6 +111,7 @@ impl GrpcService {
             worker_manager,
             streaming_metrics,
             canary_override,
+            grpc_streaming,
             callback_runner,
             shutdown_state,
             server_timeout,
@@ -235,6 +241,11 @@ impl LiteServer for GrpcService {
         &self,
         request: Request<pb::StreamInferRequest>,
     ) -> Result<Response<Self::StreamInferStream>, Status> {
+        if !self.grpc_streaming {
+            return Err(Status::unimplemented(
+                "gRPC streaming is disabled (features.grpc_streaming = false)",
+            ));
+        }
         let _guard = InflightGuard::new(self.shutdown_state.clone());
         // P-FLOW (§4.0.9): global in-flight admission cap (health/admin RPCs
         // are separate services and never reach here). Held for the handler
@@ -288,6 +299,11 @@ impl LiteServer for GrpcService {
         &self,
         request: Request<pb::DecoupledInferRequest>,
     ) -> Result<Response<Self::DecoupledInferStream>, Status> {
+        if !self.grpc_streaming {
+            return Err(Status::unimplemented(
+                "gRPC streaming is disabled (features.grpc_streaming = false)",
+            ));
+        }
         // P9-1 DecoupledInfer (蓝图 §4.4): same InflightGuard / span / metric /
         // header-echo wrapper as stream_infer; the lifetime difference (model
         // holds the channel open past predict_decoupled) is in _impl.
@@ -340,6 +356,11 @@ impl LiteServer for GrpcService {
         &self,
         request: Request<Streaming<pb::BidiChunk>>,
     ) -> Result<Response<Self::BidiStreamStream>, Status> {
+        if !self.grpc_streaming {
+            return Err(Status::unimplemented(
+                "gRPC streaming is disabled (features.grpc_streaming = false)",
+            ));
+        }
         let _guard = InflightGuard::new(self.shutdown_state.clone());
         // P-FLOW (§4.0.9): global in-flight admission cap (health/admin RPCs
         // are separate services and never reach here). Held for the handler
@@ -441,6 +462,7 @@ pub async fn start_grpc_server(
         worker_manager.clone(),
         streaming_metrics,
         canary_override,
+        config.features.grpc_streaming,
         callback_runner.clone(),
         shutdown_state,
         server_timeout,
@@ -1165,6 +1187,7 @@ mod request_metrics_tests {
             wm,
             false,
             canary_override,
+            true,
             Arc::new(CallbackRunner::new()),
             Arc::new(crate::server::ShutdownState::new()),
             Duration::from_secs(5),
@@ -1502,6 +1525,7 @@ mod request_metrics_tests {
             wm,
             false,
             false,
+            true,
             Arc::new(CallbackRunner::new()),
             Arc::new(crate::server::ShutdownState::new()),
             Duration::from_secs(5),
@@ -2104,6 +2128,7 @@ mod request_metrics_tests {
             wm,
             false,
             false,
+            true,
             cb,
             Arc::new(crate::server::ShutdownState::new()),
             Duration::from_secs(5),
@@ -2392,6 +2417,7 @@ mod request_metrics_tests {
             wm,
             false,
             false,
+            true,
             Arc::new(CallbackRunner::new()),
             Arc::new(crate::server::ShutdownState::new()),
             Duration::from_secs(5),

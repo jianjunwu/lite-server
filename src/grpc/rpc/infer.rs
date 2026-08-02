@@ -161,11 +161,7 @@ impl GrpcService {
             client_ip,
             elapsed_us: None,
         };
-        let cb_runner = self.callback_runner.clone();
-        let req_ctx_clone = req_ctx.clone();
-        tokio::spawn(async move {
-            cb_runner.on_inference_request(&req_ctx_clone).await;
-        });
+        crate::callback::fire_inference_request(&self.callback_runner, &req_ctx);
 
         // #1: route unary infer through the unified InferenceQueue — the same
         // path as REST — so gRPC inherits batch aggregation, least-loaded
@@ -279,13 +275,11 @@ impl GrpcService {
                         inject_grpc_metadata(response.metadata_mut(), &headers);
 
                         // Fire InferenceResponse callback
-                        let duration = start.elapsed().as_secs_f64();
-                        let resp_ctx = crate::callback::InferenceContext {
-                            elapsed_us: Some((duration * 1_000_000.0) as u64),
-                            ..req_ctx.clone()
-                        };
-                        let cb_runner = self.callback_runner.clone();
-                        tokio::spawn(async move { cb_runner.on_inference_response(&resp_ctx).await; });
+                        crate::callback::fire_inference_response(
+                            &self.callback_runner,
+                            &req_ctx,
+                            start,
+                        );
 
                         Ok(response)
                     }

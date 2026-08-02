@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod types;
 
 use crate::config::{ModelConfig, ModelStrategyConfig};
@@ -103,6 +104,41 @@ impl ModelRegistry {
 
     pub fn get_active_version(&self, model_name: &str) -> Option<String> {
         self.active_versions.get(model_name).map(|r| r.clone())
+    }
+
+    /// Snapshot all active-version pins as a sorted map (for the cache_registry
+    /// on-disk snapshot — BTreeMap for deterministic JSON key ordering).
+    pub fn snapshot_active_versions(&self) -> std::collections::BTreeMap<String, String> {
+        self.active_versions
+            .iter()
+            .map(|r| (r.key().clone(), r.value().clone()))
+            .collect()
+    }
+
+    /// Snapshot the per-model strategy fields that are not derivable from disk
+    /// (load_policy, max_loaded_versions, weights). Used by cache_registry so a
+    /// model added via admin/file-watcher (not in config) keeps its strategy
+    /// across a restart. Config-defined strategies are re-applied after restore,
+    /// so they win; this only matters for config-absent models.
+    pub fn snapshot_strategies(
+        &self,
+    ) -> Vec<(
+        String,
+        LoadPolicy,
+        Option<usize>,
+        std::collections::BTreeMap<String, u32>,
+    )> {
+        self.models
+            .iter()
+            .map(|r| {
+                (
+                    r.name.clone(),
+                    r.load_policy.clone(),
+                    r.max_loaded_versions,
+                    r.weights.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+                )
+            })
+            .collect()
     }
 
     /// Stamp `last_used_at` for LRU eviction (§4.2). Coarse by design: a touch
@@ -378,6 +414,17 @@ impl ModelRegistry {
 
         self.active_versions.insert(model_name.to_string(), version.to_string());
         Ok(true)
+    }
+
+    /// Seed an active-version pin WITHOUT the Ready gate (used by cache_registry
+    /// restore at startup, when no version is Ready yet). The normal load path
+    /// then spawns workers for the version; reconcile's auto-activate fallback is
+    /// suppressed because a pin already exists. Safe to call for a version whose
+    /// workers are still loading — `activate_version` would refuse (not Ready),
+    /// but the seeded pin is exactly what we want preserved across restart.
+    pub fn force_pin_active_version(&self, model_name: &str, version: &str) {
+        self.active_versions
+            .insert(model_name.to_string(), version.to_string());
     }
 
     pub fn deactivate(&self, model_name: &str) {

@@ -370,10 +370,7 @@ SERVER_YAML = textwrap.dedent("""\
     # Admin UI and API feature toggles.
     features:
       # timeline: false
-      system_overview: true
       # custom_metrics: false
-      benchmarks: true
-      # playground: false
       alerts: true
       # version_compare: false
       streaming: true

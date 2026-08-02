@@ -174,11 +174,7 @@ pub async fn dispatch_custom_route(
         client_ip: cx.client_ip.clone(),
         elapsed_us: None,
     };
-    let cb_runner = state.callback_runner.clone();
-    let req_ctx_clone = req_ctx.clone();
-    tokio::spawn(async move {
-        cb_runner.on_inference_request(&req_ctx_clone).await;
-    });
+    crate::callback::fire_inference_request(&state.callback_runner, &req_ctx);
 
     // Build the request: route_call reuses the SingleRequest body type; the
     // route tag discriminates dispatch in the worker. method/query/path_params
@@ -235,12 +231,7 @@ pub async fn dispatch_custom_route(
 
     // Fire InferenceResponse callback on success, mirroring do_infer.
     if result.is_ok() {
-        let resp_ctx = crate::callback::InferenceContext {
-            elapsed_us: Some(start.elapsed().as_micros() as u64),
-            ..req_ctx
-        };
-        let cb_runner = state.callback_runner.clone();
-        tokio::spawn(async move { cb_runner.on_inference_response(&resp_ctx).await; });
+        crate::callback::fire_inference_response(&state.callback_runner, &req_ctx, start);
     }
 
     result

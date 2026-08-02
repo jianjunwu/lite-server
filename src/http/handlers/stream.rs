@@ -389,13 +389,28 @@ async fn handle_ws_stream(
         }
     }
 
-    // Wait for first message from client (the request payload)
-    let first_msg = match socket.recv().await {
-        Some(Ok(Message::Text(text))) => text,
-        Some(Ok(Message::Binary(bin))) => String::from_utf8_lossy(&bin).to_string(),
-        _ => {
-            let _ = socket.close().await;
-            return;
+    // Wait for first message from client (the request payload). Bound the wait
+    // by server.timeout when one is configured; with server.timeout <= 0 the
+    // wait is unbounded (a client that upgrades but never sends keeps the
+    // handler open indefinitely).
+    let first_msg = {
+        let recv = match crate::deadline::idle_budget(state.config.server.timeout) {
+            Some(budget) => match tokio::time::timeout(budget, socket.recv()).await {
+                Ok(r) => r,
+                Err(_) => {
+                    let _ = socket.close().await;
+                    return;
+                }
+            },
+            None => socket.recv().await,
+        };
+        match recv {
+            Some(Ok(Message::Text(text))) => text,
+            Some(Ok(Message::Binary(bin))) => String::from_utf8_lossy(&bin).to_string(),
+            _ => {
+                let _ = socket.close().await;
+                return;
+            }
         }
     };
 

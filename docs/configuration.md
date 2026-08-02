@@ -18,7 +18,9 @@ server:
   host: 0.0.0.0                # Bind address (supports unix:/path/to/sock for UDS)
   timeout: 30.0                # Global request timeout (seconds)
   threads: null                # Tokio worker threads (null = auto = CPU cores)
-  cache_registry: false        # Cache model registry to disk (reserved — not yet implemented)
+  cache_registry: false        # Snapshot registry (strategy + active-version pins) to
+                               # <repo>/.lite-server-registry.json on shutdown; restore on
+                               # startup. Corrupt-file tolerant; delete the file to reset.
   graceful_timeout: 30.0       # Max seconds to wait for in-flight requests during shutdown
   keepalive_timeout: 5.0       # HTTP keep-alive timeout (seconds), 0 = disable
   compression: false           # gzip HTTP responses (P1-4); SSE excluded, WS unaffected
@@ -68,7 +70,7 @@ logging:
 
 grpc:
   enabled: true                # Enable gRPC server
-  max_workers: 10              # Max gRPC worker threads (reserved — not yet implemented)
+  max_workers: 10              # Max worker processes per model. 0 = no cap.
   host: null                   # gRPC bind host; null = follow server.host ("unix:/path" = UDS)
   # P7-2: separate bind for the LiteAdmin service only. UDS recommended — a UDS
   # admin socket is created owner-only (0o600) by default.
@@ -107,18 +109,15 @@ features:
   # header. Default false = the header is IGNORED (clients cannot pin themselves
   # onto canary versions). Enable only in gray/debug environments.
   canary_override: false
-  timeline: false              # (reserved — not yet enforced)
-  system_overview: true        # (reserved — not yet implemented)
-  custom_metrics: false        # (reserved — not yet implemented)
-  benchmarks: true             # (reserved — not yet implemented)
-  playground: false            # (reserved — not yet implemented)
-  alerts: true                 # (reserved — not yet enforced)
-  version_compare: false       # (reserved — not yet implemented)
-  streaming: true              # (reserved — not yet enforced; streaming routes are always mounted)
-  grpc_streaming: true         # (reserved — not yet enforced)
-  sse: true                    # (reserved — not yet enforced)
-  websocket_streaming: true    # (reserved — not yet enforced)
-  streaming_metrics: true      # Enable streaming-specific metrics
+  timeline: false              # Mount /metrics/timeline* and run the background sampler
+  custom_metrics: false        # Register worker-declared custom metrics (opt-in)
+  alerts: true                 # Mount /metrics/alerts
+  version_compare: false       # Mount /v2/models/:model_name/compare
+  streaming: true              # Master switch for SSE + WebSocket routes
+  grpc_streaming: true         # stream_infer / decoupled_infer / bidi_stream RPCs (else Unimplemented)
+  sse: true                    # SSE routes (also requires streaming: true)
+  websocket_streaming: true    # WebSocket routes (also requires streaming: true)
+  streaming_metrics: true      # Streaming-specific metrics
 
 model_defaults:                # CLI-level defaults applied to all models
   max_queue_size: null         # Override max_queue_size for all models

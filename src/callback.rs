@@ -148,6 +148,17 @@ impl CallbackRunner {
         self.callbacks.read().await.is_empty()
     }
 
+    /// Non-async fast path for the common (empty-runner) case: returns true when
+    /// no callbacks are registered, using a non-blocking lock attempt. Under lock
+    /// contention it conservatively returns false (falling back to a spawn),
+    /// so it is safe to call on every inference request/response without an await.
+    pub fn try_is_empty(&self) -> bool {
+        self.callbacks
+            .try_read()
+            .map(|g| g.is_empty())
+            .unwrap_or(false)
+    }
+
     // ---- Trigger helpers ----
 
     /// Fire an event on all registered callbacks sequentially in the current task.
@@ -255,6 +266,9 @@ impl Default for CallbackRunner {
 /// bypasses the queue, so open-success is the trigger). Spawns a task so the
 /// caller (handler / forwarder) is never blocked by callback dispatch.
 pub fn fire_inference_request(runner: &Arc<CallbackRunner>, ctx: &InferenceContext) {
+    if runner.try_is_empty() {
+        return;
+    }
     let runner = Arc::clone(runner);
     let ctx = ctx.clone();
     tokio::spawn(async move {
@@ -271,6 +285,9 @@ pub fn fire_inference_response(
     ctx: &InferenceContext,
     start: std::time::Instant,
 ) {
+    if runner.try_is_empty() {
+        return;
+    }
     let elapsed_us = Some((start.elapsed().as_secs_f64() * 1_000_000.0) as u64);
     let resp_ctx = InferenceContext {
         elapsed_us,

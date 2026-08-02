@@ -146,11 +146,7 @@ async fn do_infer(
         client_ip: client_ip.clone(),
         elapsed_us: None,
     };
-    let cb_runner = state.callback_runner.clone();
-    let req_ctx_clone = req_ctx.clone();
-    tokio::spawn(async move {
-        cb_runner.on_inference_request(&req_ctx_clone).await;
-    });
+    crate::callback::fire_inference_request(&state.callback_runner, &req_ctx);
 
     let meta = pb::RequestMeta {
         route,
@@ -236,12 +232,7 @@ async fn do_infer(
                 "Ok" => {
                     prometheus::record_request_end(&model_name, &resolved_version, status_family(single.status_code), duration);
                     // Fire InferenceResponse callback
-                    let resp_ctx = crate::callback::InferenceContext {
-                        elapsed_us: Some((duration * 1_000_000.0) as u64),
-                        ..req_ctx.clone()
-                    };
-                    let cb_runner = state.callback_runner.clone();
-                    tokio::spawn(async move { cb_runner.on_inference_response(&resp_ctx).await; });
+                    crate::callback::fire_inference_response(&state.callback_runner, &req_ctx, start);
                     let json_body = serde_json::to_string(&data).unwrap_or_default();
                     let content_type = if single.media_type.is_empty() {
                         "application/json; charset=utf-8"

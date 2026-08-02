@@ -110,13 +110,6 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
         .route("/info", get(info_handler))
         // Metrics
         .route("/metrics", get(metrics_handler))
-        // Timeline & Alerts
-        .route("/metrics/timeline", get(timeline_handler))
-        .route("/metrics/timeline/:model_name", get(timeline_model_handler))
-        .route("/metrics/timeline/:model_name/versions/:version", get(timeline_model_version_handler))
-        .route("/metrics/alerts", get(alerts_handler))
-        // Version compare
-        .route("/v2/models/:model_name/compare", get(compare_versions_handler))
         // Admin: list models
         .route("/v2/models", get(list_models_handler))
         // Admin: list versions
@@ -150,13 +143,37 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
         .route("/v2/models/:model_name/routing", put(set_routing_handler))
         // Inference (P-CORS: preflight handled by cors_middleware, no per-route .options())
         .route("/v2/models/:model_name/infer", post(infer_handler))
-        .route("/v2/models/:model_name/versions/:version/infer", post(infer_version_handler))
-        // SSE streaming
-        .route("/v2/models/:model_name/events", post(sse_infer_handler))
-        .route("/v2/models/:model_name/versions/:version/events", post(sse_infer_version_handler))
-        // WebSocket streaming
-        .route("/v2/models/:model_name/stream", get(ws_stream_handler))
-        .route("/v2/models/:model_name/versions/:version/stream", get(ws_stream_version_handler));
+        .route("/v2/models/:model_name/versions/:version/infer", post(infer_version_handler));
+
+    // Feature-gated routes: mounted only when their toggle is on, so a disabled
+    // feature 404s at the router. Handlers are untouched — tests that build
+    // their own Router against a handler keep working regardless of the toggle.
+    let features = &shared.config.features;
+    if features.timeline {
+        router = router
+            .route("/metrics/timeline", get(timeline_handler))
+            .route("/metrics/timeline/:model_name", get(timeline_model_handler))
+            .route("/metrics/timeline/:model_name/versions/:version", get(timeline_model_version_handler));
+    }
+    if features.alerts {
+        router = router.route("/metrics/alerts", get(alerts_handler));
+    }
+    if features.version_compare {
+        router = router.route("/v2/models/:model_name/compare", get(compare_versions_handler));
+    }
+    // `streaming` is the master switch for the two streaming transports; each
+    // transport also has its own toggle, so e.g. sse=false unmounts SSE while
+    // WS keeps flowing (as long as streaming + websocket_streaming are on).
+    if features.streaming && features.sse {
+        router = router
+            .route("/v2/models/:model_name/events", post(sse_infer_handler))
+            .route("/v2/models/:model_name/versions/:version/events", post(sse_infer_version_handler));
+    }
+    if features.streaming && features.websocket_streaming {
+        router = router
+            .route("/v2/models/:model_name/stream", get(ws_stream_handler))
+            .route("/v2/models/:model_name/versions/:version/stream", get(ws_stream_version_handler));
+    }
     // Custom @route dispatch (phase 2) is handled by the fallback handler
     // (see http::route_fallback): exact system leaves above are matched by
     // axum; any other `/v2/models/:m/<tail>` path falls through to it and is

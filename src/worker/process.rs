@@ -487,12 +487,16 @@ impl WorkerManager {
             )));
         }
 
-        // Register custom metrics from Python worker
-        if let Some(ref specs) = startup.metric_specs {
-            let spec_refs: Vec<(&str, &str)> = specs.iter()
-                .map(|s| (s.name.as_str(), s.metric_type.as_str()))
-                .collect();
-            crate::metrics::prometheus::register_custom_metrics(&spec_refs);
+        // Register custom metrics from Python worker (gated by
+        // features.custom_metrics; recording no-ops on unregistered ids).
+        if self.custom_metrics {
+            if let Some(ref specs) = startup.metric_specs {
+                let spec_refs: Vec<(&str, &str)> = specs
+                    .iter()
+                    .map(|s| (s.name.as_str(), s.metric_type.as_str()))
+                    .collect();
+                crate::metrics::prometheus::register_custom_metrics(&spec_refs);
+            }
         }
 
         // Store per-model policies declared in config.yaml

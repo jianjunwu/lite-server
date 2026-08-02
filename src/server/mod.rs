@@ -141,7 +141,9 @@ impl LiteServer {
             callback_runner.clone(),
         ).with_server_http(Self::loopback_http_base(&config))
          .with_unload_grace(Duration::from_secs_f32(config.server.timeout))
-         .with_server_tunables(config.tunables.clone()));
+         .with_server_tunables(config.tunables.clone())
+         .with_max_workers(config.grpc.max_workers)
+         .with_custom_metrics(config.features.custom_metrics));
 
         Self {
             config,
@@ -348,9 +350,16 @@ impl LiteServer {
             std::time::Duration::from_secs(10),
         );
 
-        // Start timeline sampler (uses list_loaded_keys to avoid cloning ModelVersion)
+        // Start timeline sampler (uses list_loaded_keys to avoid cloning ModelVersion).
+        // No-op when features.timeline is off: the task returns immediately and the
+        // abort below is safe on a completed handle. The /metrics/timeline routes
+        // are also unmounted (routes.rs), so sampling would serve no one.
+        let timeline_enabled = self.config.features.timeline;
         let registry_for_timeline = self.registry.clone();
         let timeline_handle = tokio::spawn(async move {
+            if !timeline_enabled {
+                return;
+            }
             let mut tick = interval(Duration::from_secs(10));
             loop {
                 tick.tick().await;
@@ -620,6 +629,16 @@ impl LiteServer {
         // avoids the Drop-timeout deadlock in opentelemetry-rust #2715).
         crate::telemetry::shutdown().await;
 
+        // cache_registry: snapshot strategy + active-version pins before
+        // worker_manager.shutdown() unloads everything (registry.remove empties
+        // the version table). A failure here must never block shutdown.
+        if self.config.server.cache_registry {
+            let repo_path = PathBuf::from(&self.config.model_repository.path);
+            if let Err(e) = crate::registry::cache::save(&self.registry, &repo_path).await {
+                warn!("registry cache snapshot failed: {e}");
+            }
+        }
+
         self.worker_manager.shutdown().await;
 
         // B1: surface a captured startup error now that the teardown above has
@@ -639,6 +658,17 @@ impl LiteServer {
     async fn load_initial_models(&self) -> Result<HashSet<(PathBuf, std::time::SystemTime)>, AppError> {
         let repo_path = PathBuf::from(&self.config.model_repository.path);
         let orch = &self.config.orchestration;
+
+        // cache_registry: restore strategy + active-version pins from the on-disk
+        // snapshot BEFORE the config-strategy loop, so config wins for strategy
+        // and reconcile's default_version branch can still override the pin. The
+        // version table is intentionally not restored (see registry::cache).
+        if self.config.server.cache_registry {
+            let restored = crate::registry::cache::restore(&self.registry, &repo_path).await;
+            if restored > 0 {
+                info!(restored, "restored model strategies from registry cache");
+            }
+        }
 
         // Apply strategies to registry
         for strategy in &orch.models {

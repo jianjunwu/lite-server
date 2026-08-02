@@ -21,8 +21,19 @@ def _read_pyproject_version():
 
 
 def test_version_matches_pyproject():
-    """__version__ must match pyproject.toml, not be hardcoded."""
+    """__version__ must match pyproject.toml, not be hardcoded.
+
+    Compared PEP 440-normalized: a pre-release has multiple equivalent spellings
+    (e.g. ``0.8.0-rc0`` in pyproject normalizes to ``0.8.0rc0`` in the installed
+    dist metadata), so literal equality would flake on any pre-release version.
+    """
     import lite_server
 
     expected = _read_pyproject_version()
-    assert lite_server.__version__ == expected
+    try:
+        from packaging.version import Version
+
+        assert Version(lite_server.__version__) == Version(expected)
+    except ImportError:
+        # packaging unavailable: fall back to literal equality.
+        assert lite_server.__version__ == expected

@@ -16,9 +16,10 @@
 | M5 | P-TRACE | tonic 0.13 升级；OTel 需 `telemetry` cargo feature |
 | M6 | P-TRACE | `telemetry.protocol: http` 启动 fail-fast；入站 baggage 默认丢弃 |
 | M7 | P-WARM | `policies.warmup.dummy_input_ref`/`iterations` 已移除 → `samples` 列表（配置加载失败） |
+| M8 | 0.8.0-rc0 | `features.*` 开关现已生效；移除 3 个预留字段；`custom_metrics` 改为显式开启 |
 
 无 breaking 的阶段（无需动作）：P-MW、P-ENSEMBLE-GRPC、P-FLOW、P-DEADLINE、
-P-WARM、P-OAI（纯新增，默认值保持旧行为）。
+P-WARM（纯新增，默认值保持旧行为）。P-OAI 延后至 0.9（不在本版本范围内）。
 
 > **语义说明（P-DEADLINE）**：请求预算耗尽返回 **HTTP `504`（而非 `408`）** /
 > gRPC `DEADLINE_EXCEEDED`。`408` 意为"客户端发送太慢"，与实况不符——请求
@@ -180,3 +181,16 @@ policies:
         iterations: 2
       - input_ref: warmup/batch8.json   # iterations 缺省 1
 ```
+
+## M8 — feature 开关生效；移除预留字段（0.8.0-rc0）
+
+**变更内容：** `features.*` 开关此前只是声明但不生效（"预留"）。现在它们真实门控行为：
+
+- `system_overview`、`benchmarks`、`playground` 已从 schema **移除**。它们从未生效；旧的 `server.yaml` 里保留这些键无害（未知键被忽略），但生成配置不再包含。
+- `timeline` / `alerts` / `version_compare` 现在门控各自的 HTTP 路由：关闭时路由卸载（404），timeline 后台采样任务也变 no-op。
+- `streaming` 是 SSE + WebSocket 路由总开关；`sse` 与 `websocket_streaming` 各自门控自己的传输。关闭 `streaming` 会真正卸载路由（此前始终挂载）。
+- `grpc_streaming` 门控三个流式 RPC（`stream_infer`、`decoupled_infer`、`bidi_stream`）；关闭时在 admission 之前返回 `UNIMPLEMENTED`。`batch_infer`（unary）不受影响。
+- `custom_metrics` 现为**显式开启**（默认 `false`）：仅当为 `true` 时才注册 worker 声明的自定义指标。此前总是注册；若你的 worker 声明了指标，请设置 `custom_metrics: true`。
+
+**迁移：** 除非你依赖自定义指标（设 `features.custom_metrics: true`），或依赖某个流式路由在开关为 `false` 时仍被挂载（把对应开关设为 `true`），否则无需动作。
+

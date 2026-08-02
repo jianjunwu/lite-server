@@ -575,10 +575,7 @@ impl Default for ModelRepositoryConfig {
 #[serde(default)]
 pub struct FeaturesConfig {
     pub timeline: bool,
-    pub system_overview: bool,
     pub custom_metrics: bool,
-    pub benchmarks: bool,
-    pub playground: bool,
     pub alerts: bool,
     pub version_compare: bool,
     pub streaming: bool,
@@ -596,10 +593,7 @@ impl Default for FeaturesConfig {
     fn default() -> Self {
         Self {
             timeline: false,
-            system_overview: true,
             custom_metrics: false,
-            benchmarks: true,
-            playground: false,
             alerts: true,
             version_compare: false,
             streaming: true,
@@ -1497,6 +1491,32 @@ mod tests {
         // Unset → default false (breaking 默认关).
         let cfg: Config = serde_yaml::from_str("features:\n  streaming: true\n").unwrap();
         assert!(!cfg.features.canary_override);
+    }
+
+    #[test]
+    fn features_defaults_and_removed_keys_ignored() {
+        let f = FeaturesConfig::default();
+        // 8 live toggles + their defaults.
+        assert!(!f.timeline);
+        assert!(!f.custom_metrics);
+        assert!(f.alerts);
+        assert!(!f.version_compare);
+        assert!(f.streaming);
+        assert!(f.grpc_streaming);
+        assert!(f.sse);
+        assert!(f.websocket_streaming);
+        // The two live fields that are not part of the 8 also keep their defaults.
+        assert!(f.streaming_metrics);
+        assert!(!f.canary_override);
+
+        // A server.yaml still listing the removed reserved keys must parse —
+        // serde ignores unknown fields, so old configs keep working.
+        let yaml = "features:\n  system_overview: true\n  benchmarks: true\n  playground: false\n";
+        let cfg: Config =
+            serde_yaml::from_str(yaml).expect("removed feature keys must be ignored, not error");
+        assert!(cfg.features.alerts);
+        assert!(cfg.features.streaming);
+        assert!(!cfg.features.timeline);
     }
 
     #[test]
