@@ -176,6 +176,14 @@ echo 模型立即返回（`benchmarks/models/echo_model`）——无 sleep，线
 微秒都是框架成本。三个服务器均跑 **2 workers**（`workers_per_device: 2`），
 HTTP 层按"测试环境"的线程注记对齐。每配置 25-30s，同一 `wrk` 负载。
 
+> **注意（负载不一致）：** LitServe 无法直接加载 `echo_model`。自 0.7.0 起
+> `lite_server.LitAPI` 自包含、**不是** `litserve.LitAPI` 子类，故
+> `benchmarks/scripts/run_litserve.py` 对其替换为 **1ms sleep mock**
+>（`_BUILTIN_SLEEP_MAP`）。因此本节 LitServe 列是 *零计算 echo（lite-server）
+> 对 1ms sleep（LitServe）*——非同构：1ms sleep 主导了 LitServe 的每请求成本，
+> 拉大了差距。请按"lite-server echo 对 LitServe 1ms-sleep 基线"读，而非
+> 零计算对零计算。同构的框架开销对比见上方 1ms-sleep 矩阵（双方都 sleep 1ms）。
+
 ### 默认形态（lite-server tokio 线程 = auto/16，LitServe 单进程）
 
 | Server | c=16 | c=64 |

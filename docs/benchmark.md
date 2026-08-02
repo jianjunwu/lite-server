@@ -192,6 +192,16 @@ so every microsecond on the wire is framework cost. All servers run **2 workers*
 (`workers_per_device: 2`); the HTTP layer is aligned per the threading note in
 "Test Environment". 25-30s per config, same `wrk` load.
 
+> **Caveat (workload mismatch):** LitServe cannot load `echo_model` directly.
+> Since 0.7.0 `lite_server.LitAPI` is self-contained and is **not** a
+> `litserve.LitAPI` subclass, so `benchmarks/scripts/run_litserve.py` substitutes
+> a **1 ms sleep mock** for it (`_BUILTIN_SLEEP_MAP`). The LitServe column below
+> is therefore *zero-compute echo (lite-server) vs 1 ms sleep (LitServe)* — not
+> like-for-like: the 1 ms sleep dominates LitServe's per-request cost and
+> inflates the gap. Read it as "lite-server echo vs LitServe 1 ms-sleep baseline,"
+> not zero-compute-vs-zero-compute. The 1 ms-sleep matrix above (both servers
+> sleeping 1 ms) is the apples-to-apples view.
+
 ### Default form (lite-server tokio threads = auto/16, LitServe 1 process)
 
 | Server | c=16 | c=64 |
