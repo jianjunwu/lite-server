@@ -200,8 +200,9 @@ lite-server init [项目名] [选项]
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `project_name` | string | （位置参数） | 项目目录名 |
+| `project_name` | string | （位置参数） | 项目目录名（`--model-only` 时为模型名） |
 | `--wizard`, `-w` | flag | false | 交互式向导模式 |
+| `--model-only` | flag | false | 只生成 `model_repo/<name>/1/`（model.py、callbacks.py、config.yaml、config.yaml.example）— 不生成项目外壳；目录已存在时报错 |
 
 ```bash
 # 创建新项目
@@ -209,6 +210,10 @@ lite-server init my-server
 
 # 交互式向导
 lite-server init --wizard
+
+# 给已有项目添加模型（不生成项目外壳）
+lite-server init --model-only my_model
+# -> 生成 model_repo/my_model/1/ — 通过 orchestration.load_models 加载
 ```
 
 ---

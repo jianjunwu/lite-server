@@ -200,8 +200,9 @@ lite-server init [PROJECT_NAME] [OPTIONS]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `project_name` | string | (positional) | Project directory name |
+| `project_name` | string | (positional) | Project directory name (or model name with `--model-only`) |
 | `--wizard`, `-w` | flag | false | Interactive wizard mode |
+| `--model-only` | flag | false | Generate only `model_repo/<name>/1/` (model.py, callbacks.py, config.yaml, config.yaml.example) — no project shell; fails if the directory exists |
 
 ```bash
 # Create a new project
@@ -209,6 +210,10 @@ lite-server init my-server
 
 # Interactive wizard
 lite-server init --wizard
+
+# Add a model to an existing project (no project shell)
+lite-server init --model-only my_model
+# -> creates model_repo/my_model/1/ — load it via orchestration.load_models
 ```
 
 ---
