@@ -414,6 +414,34 @@ class TestInit:
         assert cli._cmd_init(args) == 1
         assert "already exists" in caplog.text.lower()
 
+    def test_init_model_only(self, tmp_path, monkeypatch):
+        """--model-only: model version dir only, no project shell."""
+        monkeypatch.chdir(tmp_path)
+        args = type("Args", (), {
+            "project_name": "demo_model",
+            "wizard": False,
+            "model_only": True,
+        })()
+        assert cli._cmd_init(args) == 0
+        model_dir = tmp_path / "model_repo" / "demo_model" / "1"
+        assert (model_dir / "model.py").exists()
+        assert (model_dir / "config.yaml").exists()
+        assert (model_dir / "config.yaml.example").exists()
+        assert (model_dir / "callbacks.py").exists()
+        assert not (tmp_path / "server.yaml").exists()
+        assert not (tmp_path / "README.md").exists()
+
+    def test_init_model_only_existing_fails(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "model_repo" / "demo" / "1").mkdir(parents=True)
+        args = type("Args", (), {
+            "project_name": "demo",
+            "wizard": False,
+            "model_only": True,
+        })()
+        assert cli._cmd_init(args) == 1
+        assert "already exists" in caplog.text.lower()
+
     def test_init_default_project_name(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         args = type("Args", (), {

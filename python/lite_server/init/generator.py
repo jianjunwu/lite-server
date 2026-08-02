@@ -738,17 +738,7 @@ class ProjectGenerator:
 
         model_dir = root / "model_repo" / self.model_name / "1"
         model_dir.mkdir(parents=True)
-
-        model_py = _load_template("empty_model.py")
-        config_yaml = _render_config_yaml()
-
-        # Model files
-        (model_dir / "model.py").write_text(model_py)
-        (model_dir / "config.yaml").write_text(config_yaml)
-        (model_dir / "config.yaml.example").write_text(CONFIG_YAML_EXAMPLE)
-
-        # Callbacks example (always generated; uncomment callbacks in config.yaml to activate)
-        (model_dir / "callbacks.py").write_text(CALLBACKS_PY)
+        self._write_model_files(model_dir)
 
         # Server config
         (root / "server.yaml").write_text(
@@ -795,3 +785,29 @@ class ProjectGenerator:
         )
 
         return root
+
+    def _write_model_files(self, model_dir: Path) -> None:
+        """Write the model version files (model.py / config.yaml / example / callbacks.py)."""
+        model_py = _load_template("empty_model.py")
+        config_yaml = _render_config_yaml()
+
+        (model_dir / "model.py").write_text(model_py)
+        (model_dir / "config.yaml").write_text(config_yaml)
+        (model_dir / "config.yaml.example").write_text(CONFIG_YAML_EXAMPLE)
+
+        # Callbacks example (always generated; uncomment callbacks in config.yaml to activate)
+        (model_dir / "callbacks.py").write_text(CALLBACKS_PY)
+
+    def generate_model_only(self) -> Path:
+        """Create only the model version directory (no project shell).
+
+        Writes model_repo/<model_name>/1/ under output_dir — use it to add a
+        model to an existing project. Raises FileExistsError if the directory
+        already exists.
+        """
+        model_dir = self.output_dir / "model_repo" / self.model_name / "1"
+        if model_dir.exists():
+            raise FileExistsError(f"Directory already exists: {model_dir}")
+        model_dir.mkdir(parents=True)
+        self._write_model_files(model_dir)
+        return model_dir

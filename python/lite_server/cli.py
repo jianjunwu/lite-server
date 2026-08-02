@@ -91,6 +91,12 @@ def main(argv=None):
     init_parser = subparsers.add_parser("init", help="Initialize project")
     init_parser.add_argument("project_name", nargs="?")
     init_parser.add_argument("--wizard", "-w", action="store_true", help="Interactive wizard mode")
+    init_parser.add_argument(
+        "--model-only",
+        dest="model_only",
+        action="store_true",
+        help="Generate only model_repo/<name>/1/ (no project shell)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -480,15 +486,27 @@ def _cmd_init(args):
     project_name = args.project_name or "my_project"
 
     try:
-        gen = ProjectGenerator(
-            project_name=project_name,
-            output_dir=Path("."),
-        )
-        root = gen.generate()
-        print(f"Created project at: {root}")
-        print(f"\nNext steps:")
-        print(f"  cd {project_name}")
-        print(f"  lite-server serve --config server.yaml")
+        if getattr(args, "model_only", False):
+            gen = ProjectGenerator(
+                project_name=project_name,
+                output_dir=Path("."),
+                model_name=project_name,  # the positional arg is the MODEL name
+            )
+            model_dir = gen.generate_model_only()
+            print(f"Created model at: {model_dir}")
+            print(f"\nNext steps:")
+            print(f"  Add '{project_name}' to orchestration.load_models in "
+                  f"server.yaml (or use control_mode=auto)")
+        else:
+            gen = ProjectGenerator(
+                project_name=project_name,
+                output_dir=Path("."),
+            )
+            root = gen.generate()
+            print(f"Created project at: {root}")
+            print(f"\nNext steps:")
+            print(f"  cd {project_name}")
+            print(f"  lite-server serve --config server.yaml")
         return 0
     except FileExistsError as e:
         _logger.error("%s", e)

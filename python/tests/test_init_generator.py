@@ -186,6 +186,38 @@ class TestNoStandaloneOrchestration:
         assert not (root / "model_repo" / "orchestration.yaml").exists()
 
 
+class TestModelOnlyGeneration:
+    """generate_model_only(): model version dir only, no project shell."""
+
+    def test_creates_model_dir_with_four_files(self, tmp_path):
+        gen = ProjectGenerator("p", tmp_path, model_name="demo")
+        model_dir = gen.generate_model_only()
+        assert model_dir == tmp_path / "model_repo" / "demo" / "1"
+        for f in ("model.py", "callbacks.py", "config.yaml", "config.yaml.example"):
+            assert (model_dir / f).exists()
+
+    def test_no_project_shell_files(self, tmp_path):
+        gen = ProjectGenerator("p", tmp_path, model_name="demo")
+        gen.generate_model_only()
+        for f in ("server.yaml", "README.md", "Dockerfile", "Makefile",
+                  "docker-compose.yml", "requirements.txt", ".gitignore",
+                  "test_request.py"):
+            assert not (tmp_path / f).exists()
+
+    def test_raises_if_directory_exists(self, tmp_path):
+        gen = ProjectGenerator("p", tmp_path, model_name="demo")
+        gen.generate_model_only()
+        gen2 = ProjectGenerator("p", tmp_path, model_name="demo")
+        with pytest.raises(FileExistsError):
+            gen2.generate_model_only()
+
+    def test_generated_files_valid_python(self, tmp_path):
+        gen = ProjectGenerator("p", tmp_path, model_name="demo")
+        model_dir = gen.generate_model_only()
+        for f in ("model.py", "callbacks.py"):
+            compile((model_dir / f).read_text(), f, "exec")
+
+
 class TestDockerCompose:
     """docker-compose.yml should include healthcheck and restart."""
 
