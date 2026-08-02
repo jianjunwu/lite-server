@@ -114,6 +114,7 @@ CONFIG_YAML_EXAMPLE = textwrap.dedent("""\
     # max_retries: 3                # Retry a failed batch on another worker up to N times (0 = disable)
     # ejection_error_threshold: 3   # Consecutive errors before a worker is ejected (0 = disable)
     # ejection_timeout: 30.0        # Seconds an ejected worker stays out before auto-recovery
+    # ejection_max_timeout: 300.0   # Cap for the per-worker circuit-breaker backoff
     # ejection_max_percent: 50      # Max % of workers that may be ejected at once (1-100)
     # startup_timeout: 60.0         # Max seconds to wait for a worker "ready" handshake
     # health_check_timeout: 5.0     # Seconds per health-check probe before timing out

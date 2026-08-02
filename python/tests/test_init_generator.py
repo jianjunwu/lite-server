@@ -127,6 +127,14 @@ class TestConfigYamlStructure:
         text = example.read_text()
         assert "on_error_http" in text
 
+    def test_example_contains_ejection_max_timeout(self, tmp_path):
+        """Worker Resilience reference should include ejection_max_timeout (B1)."""
+        gen = ProjectGenerator("p", tmp_path)
+        root = gen.generate()
+        example = root / "model_repo" / "my_model" / "1" / "config.yaml.example"
+        text = example.read_text()
+        assert "ejection_max_timeout" in text
+
 
 class TestServerYamlEnhanced:
     """server.yaml should expose model_defaults, features and key defaults."""
