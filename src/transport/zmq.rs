@@ -771,4 +771,104 @@ mod tests {
         drop(chunk_rx);
         let _ = worker.join();
     }
+
+    // ── F4/F6 闸门测试 ──────────────────────────────────────────────────
+    // 决定走 Strategy 1(复用 bound PAIR socket)还是 Strategy 2(可换 slot + 代际 endpoint)。
+    // 声称: `WorkerZmqClient` 的 bound PAIR socket 在对端(worker 进程)死后,
+    //   不重 bind 即可接受新对端连接、流量恢复。
+    // 绿 → Strategy 1 可行且最简(respawn 不新建 client);红 → 走 Strategy 2。
+    #[tokio::test]
+    async fn bound_pair_survives_peer_death_and_reconnect() {
+        #[cfg(unix)]
+        let endpoint = {
+            let sock = std::env::temp_dir().join(format!(
+                "lite-server-zmq-reconnect-{}.sock",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&sock);
+            format!("ipc://{}", sock.display())
+        };
+        #[cfg(windows)]
+        let endpoint = format!("tcp://127.0.0.1:{}", 32000 + std::process::id() % 1000);
+
+        // 回一个 echo(uid)+ 标记 data 的 Single 响应后退出(= worker 进程死亡:
+        // socket 与 ctx 逆序释放)。注意 ctx 必须与 s 同为函数局部、不可放入子作用域,
+        // 否则 ctx 先于 socket 释放会 use-after-free。
+        fn run_worker(endpoint: String, marker: &'static [u8]) {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(2000);
+            let bytes = match s.recv_bytes(0) {
+                Ok(b) => b,
+                Err(_) => return,
+            };
+            let req = match pb::Request::decode(bytes.as_slice()) {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            let resp = pb::Response {
+                uid: req.uid.clone(),
+                payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+                    data: bytes::Bytes::from_static(marker),
+                    headers: HashMap::new(),
+                    status: Some(pb::Status {
+                        code: "Ok".to_string(),
+                        message: String::new(),
+                    }),
+                    ..Default::default()
+                })),
+                metrics: None,
+            };
+            let _ = s.send(resp.encode_to_vec(), 0);
+        }
+
+        // Strategy 1 要复用的 bound 端(真实 actor,带 wake socket + poll 循环)。
+        let client = WorkerZmqClient::new(endpoint.clone());
+
+        // ── peer-1:连接、答一个请求后死亡 ──
+        let ep = endpoint.clone();
+        let w1 = std::thread::spawn(move || run_worker(ep, b"{\"peer\":1}"));
+        tokio::time::sleep(Duration::from_millis(200)).await; // 让 bind + connect 建立
+
+        let r1 = client
+            .send_with_timeout(
+                pb::Request {
+                    uid: "peer-1".to_string(),
+                    meta: None,
+                    payload: Some(pb::request::Payload::Single(pb::SingleRequest {
+                        data: bytes::Bytes::from_static(b"{}"),
+                    })),
+                },
+                Duration::from_secs(3),
+            )
+            .await
+            .expect("peer-1 send");
+        assert_eq!(r1.uid, "peer-1");
+        let _ = w1.join(); // peer-1 彻底死亡(对端 socket 关闭)
+
+        // ── peer-2 连同一 endpoint:若 bound PAIR 接受新对端,Strategy 1 成立 ──
+        let ep = endpoint.clone();
+        let w2 = std::thread::spawn(move || run_worker(ep, b"{\"peer\":2}"));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // 决定性 recv:若 bound actor 没接受 peer-2,send 在此超时返回 Err。
+        let r2 = client
+            .send_with_timeout(
+                pb::Request {
+                    uid: "peer-2".to_string(),
+                    meta: None,
+                    payload: Some(pb::request::Payload::Single(pb::SingleRequest {
+                        data: bytes::Bytes::from_static(b"{}"),
+                    })),
+                },
+                Duration::from_secs(3),
+            )
+            .await
+            .expect("bound PAIR 未在 peer-1 死亡后接受 peer-2 —— Strategy 1 失败,改走 Strategy 2");
+        assert_eq!(r2.uid, "peer-2");
+
+        drop(client);
+        let _ = w2.join();
+    }
 }

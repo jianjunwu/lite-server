@@ -420,19 +420,15 @@ impl WorkerManager {
             let pid = child.id();
             let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-            // Spawn monitor task — owns the Child, detects exits and handles cleanup
-            let endpoint_clone = endpoint.clone();
+            // Spawn monitor task — owns the Child, detects exits and handles
+            // cleanup. The ZMQ client is reused across a worker's kill+respawn
+            // (the bound PAIR socket outlives any single worker process), so
+            // there is no `.sock` to clean on exit — `on_exit` is empty here;
+            // it stays a parameter because tests use it to observe the monitor ran.
             let hooks_arc = Arc::new(model_config.hooks.clone());
             let done_rx = spawn_worker_monitor(
                 child, model_name, version, worker_id as u32, shutdown_rx,
-                move || {
-                    // Best-effort socket cleanup on unexpected exit
-                    #[cfg(unix)]
-                    {
-                        let socket_str = endpoint_clone.strip_prefix("ipc://").unwrap_or(&endpoint_clone);
-                        let _ = std::fs::remove_file(socket_str);
-                    }
-                },
+                || {},
                 Some(hooks_arc),
                 self.hook_tasks.clone(),
             );

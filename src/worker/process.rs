@@ -6,7 +6,6 @@ use super::{HookTasks, WorkerManager, WorkerProcess};
 use crate::error::AppError;
 use crate::inference_queue::model_version_key;
 use crate::registry::types::*;
-use crate::transport::zmq::WorkerZmqClient;
 use crate::worker::protocol::*;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -241,31 +240,17 @@ pub(super) fn new_worker_command(python_module_dir: &str) -> Command {
     cmd
 }
 
-/// Replace the ZMQ client for `worker_id` in place.
-///
-/// Request routing indexes `clients[worker_id]` positionally, so a respawn
-/// must never shrink the list or shift slots. Appends only when `idx` is
-/// the next slot (first registration).
-fn upsert_zmq_client(
-    list: &mut Vec<Arc<WorkerZmqClient>>,
-    idx: usize,
-    client: Arc<WorkerZmqClient>,
-) {
-    if idx < list.len() {
-        list[idx] = client;
-    } else {
-        list.push(client);
-    }
-}
-
 /// Build a platform-appropriate ZMQ endpoint for a worker.
 /// - Unix: IPC socket in the system temp directory
 /// - Windows: TCP on localhost (IPC not supported)
-/// Per-process-unique worker endpoint: `{model}_{version}_{worker_id}_{pid}`.
-/// The pid component lets parallel server processes (integration tests, or
-/// stale `.sock` files left by killed runs/orphan workers) never collide on
-/// the same IPC path — a collided `bind` returns EEXIST, which the zmq crate
-/// escalates to a panic (unknown errno), killing the client actor.
+/// Per-process-unique worker endpoint: `{model}_{version}_{worker_id}_{pid}`,
+/// where `pid` is the SERVER process. The endpoint is therefore stable across
+/// a worker's kill+respawn within one server run, so `respawn_worker` reuses
+/// the already-bound PAIR socket (the replacement worker connects to the same
+/// path) and never re-binds. The pid component only prevents cross-run
+/// collisions (parallel server processes / orphaned `.sock` files); within a
+/// run no second `bind` ever occurs, so the EEXIST-on-rebind hazard does not
+/// apply.
 pub(super) fn worker_endpoint(model_name: &str, version: &str, worker_id: usize) -> String {
     #[cfg(unix)]
     {
@@ -368,32 +353,15 @@ impl WorkerManager {
             }
         }
 
-        // The old ZMQ client is dropped when the new one replaces it in
-        // place below — never remove() from the list, that would shift
-        // later workers' clients out of their worker_id slots.
+        // The ZMQ client is REUSED across respawn: the endpoint embeds the
+        // server pid (see `worker_endpoint`), so it is stable across this
+        // worker's kill+respawn and the already-bound PAIR socket accepts the
+        // replacement worker's reconnect. Do NOT create a new client or re-bind
+        // (a second `bind` hits EEXIST), and do NOT unlink the `.sock` here —
+        // the bound socket still owns it, and removing it breaks the new
+        // worker's connect. The `.sock` is cleaned only at genuine teardown
+        // (unload_version / load pre-bind), where the client is actually dropped.
         let endpoint = worker_endpoint(model_name, version, worker_id as usize);
-
-        // Remove stale socket (Unix only)
-        #[cfg(unix)]
-        {
-            let socket_str = endpoint.strip_prefix("ipc://").unwrap_or(&endpoint);
-            let socket_path = std::path::Path::new(socket_str);
-            let _ = tokio::fs::remove_file(socket_path).await;
-            if let Some(parent) = socket_path.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
-            }
-        }
-
-        // #12: on Windows the worker transport is TCP on a deterministic port
-        // (derive_port_from_path). The just-killed worker may not have released
-        // that port yet when the new worker rebinds the same endpoint, and a
-        // failed bind leaves the new worker silently broken. A brief pause
-        // (mirroring reload_model's 500ms) lets the OS free the port. Unix uses
-        // IPC sockets, recycled by the remove_file above, so it's unaffected.
-        #[cfg(windows)]
-        {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
 
         // Spawn new worker
         //
@@ -560,32 +528,18 @@ impl WorkerManager {
             }
         });
 
-        // Create ZMQ client
-        let zmq_client = Arc::new(WorkerZmqClient::new(endpoint.clone()));
-
-        // Insert new ZMQ client
-        {
-            let mut clients = self.zmq_clients.write().await;
-            if let Some(list) = clients.get_mut(&key) {
-                upsert_zmq_client(list, worker_id as usize, zmq_client.clone());
-            }
-        }
-
         let pid = child.id();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-        // Spawn monitor for the new worker
-        let endpoint_clone = endpoint.clone();
+        // Spawn monitor for the new worker. The ZMQ client is reused (not
+        // recreated) — the bound PAIR socket outlives this worker process and
+        // accepts the replacement's reconnect — so there is no `.sock` to clean
+        // on exit. `on_exit` stays a parameter: tests use it to observe that the
+        // monitor ran.
         let hooks_arc = Arc::new(model_config.hooks.clone());
         let done_rx = spawn_worker_monitor(
             child, model_name, version, worker_id, shutdown_rx,
-            move || {
-                #[cfg(unix)]
-                {
-                    let socket_str = endpoint_clone.strip_prefix("ipc://").unwrap_or(&endpoint_clone);
-                    let _ = std::fs::remove_file(socket_str);
-                }
-            },
+            || {},
             Some(hooks_arc),
             self.hook_tasks.clone(),
         );
@@ -678,8 +632,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Parallel server processes must never collide on worker IPC paths: the
-    /// endpoint embeds the pid, and stays stable within one process (worker
-    /// restarts rebind the same path after cleanup).
+    /// endpoint embeds the server pid, and stays stable within one process
+    /// across a worker's kill+respawn (the bound PAIR socket is reused, not
+    /// re-bound).
     #[test]
     fn worker_endpoint_is_pid_scoped_and_stable() {
         let ep = worker_endpoint("m", "1", 0);
@@ -868,52 +823,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(!alive, "dropped worker process {} should be killed via kill_on_drop", pid);
-    }
-
-    // ===== B5: respawn_worker ZMQ client vector index corruption =====
-
-    /// Regression for B5: respawn must replace the client at `worker_id`
-    /// in place. Callers index `clients[worker_id]` positionally, so the
-    /// list must stay aligned with worker ids — same length, other slots
-    /// untouched.
-    #[tokio::test]
-    async fn upsert_zmq_client_replaces_in_place_preserving_worker_alignment() {
-        let c = || {
-            Arc::new(WorkerZmqClient::new(
-                "ipc:///tmp/lite-b5-test.sock".to_string(),
-            ))
-        };
-        let mut list = vec![c(), c(), c()];
-        let keep1 = list[1].clone();
-        let keep2 = list[2].clone();
-
-        let new0 = c();
-        upsert_zmq_client(&mut list, 0, new0.clone());
-
-        assert_eq!(list.len(), 3, "list must not shrink on respawn");
-        assert!(Arc::ptr_eq(&list[0], &new0), "slot 0 holds the new client");
-        assert!(
-            Arc::ptr_eq(&list[1], &keep1),
-            "worker 1's client must survive respawn of worker 0"
-        );
-        assert!(Arc::ptr_eq(&list[2], &keep2), "worker 2's client untouched");
-    }
-
-    /// Appending is only for the next-slot case (e.g. first registration);
-    /// it must not create gaps.
-    #[tokio::test]
-    async fn upsert_zmq_client_appends_at_next_slot() {
-        let c = || {
-            Arc::new(WorkerZmqClient::new(
-                "ipc:///tmp/lite-b5-test.sock".to_string(),
-            ))
-        };
-        let mut list = vec![c()];
-        let new1 = c();
-        upsert_zmq_client(&mut list, 1, new1.clone());
-
-        assert_eq!(list.len(), 2);
-        assert!(Arc::ptr_eq(&list[1], &new1));
     }
 
     // ===== P0: worker startup stderr drain (diagnostics on early exit) =====

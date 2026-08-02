@@ -6109,3 +6109,130 @@ async fn test_log_level_warning_is_accepted() {
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+// F4/F6 — Strategy 1 e2e: after a health-check kill + respawn, the worker's
+// bound ZMQ PAIR socket is REUSED (respawn does not create a new client).
+//
+// Decisive assertion routes through `get_zmq_clients` (a custom @route): under
+// the pre-fix code the respawn replaces zmq_clients[key][0] with a fresh
+// client whose `bind` collides (EEXIST) on the stable endpoint and dies, so
+// the custom route errors; under Strategy 1 the slot keeps the original
+// client whose bound socket accepts the new worker's reconnect, so the route
+// succeeds. Unary /infer is routed via the inference_queue snapshot and would
+// pass under both codes (the snapshot's client stays bound), so it is only a
+// sanity check here — NOT decisive on its own.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_worker_respawn_after_health_check_kill_reuses_client() {
+    let http_port = next_test_port();
+    let metrics_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(metrics_port);
+    let repo = test_model_repo();
+
+    let child = start_server(&[
+        "--port", &http_port.to_string(),
+        "--metrics-port", &metrics_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-grpc",
+        "--log-level", "warn",
+        // Fast health-check cadence so a frozen worker is killed within
+        // ~0.3s — mirrors the in-crate kill-escalation test
+        // (inference_queue.rs:2961).
+        "--health-check-interval", "0.1",
+        "--health-check-timeout", "0.1",
+        "--health-check-kill-threshold", "2",
+        "--ejection-error-threshold", "1",
+        "--ejection-max-percent", "100",
+    ]);
+    let server_pid = child.id() as i32;
+    let _guard = ServerGuard(Some(child));
+
+    let base = format!("http://127.0.0.1:{http_port}");
+    wait_for_server(http_port, 20).await;
+    load_model(&base, "route_model", "1").await;
+
+    let client = reqwest::Client::new();
+
+    // Freeze the worker. SIGSTOP (not SIGKILL) keeps the process alive so the
+    // server's monitor does NOT observe a natural exit — the health-check
+    // probe path must drive the kill + respawn via RespawnSignal, which is the
+    // exact path under test.
+    let original_pid = wait_for_worker_pid(server_pid, "route_model", 10)
+        .await
+        .expect("route_model worker must spawn");
+    let _ = unsafe { libc::kill(original_pid, libc::SIGSTOP) };
+
+    // Wait for the server to kill the frozen worker and respawn a replacement:
+    // the respawns counter bumps (after mark_ready) and the original pid dies.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let body = match client
+            .get(format!("http://127.0.0.1:{metrics_port}/metrics"))
+            .send().await
+        {
+            Ok(r) => r.text().await.unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+        let respawned = body.contains("liteserver_worker_respawns_total")
+            && body.contains("reason=\"health_check\"");
+        let gone = unsafe { libc::kill(original_pid, 0) } != 0;
+        if respawned && gone {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "health-check kill+respawn did not occur within 30s \
+                 (respawned={respawned}, original_pid_gone={gone})"
+            );
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    // A replacement worker with a different pid must come up.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let new_pid = loop {
+        if let Some(p) = wait_for_worker_pid(server_pid, "route_model", 1).await {
+            if p != original_pid {
+                break p;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("replacement route_model worker pid did not appear");
+        }
+        sleep(Duration::from_millis(200)).await;
+    };
+    assert_ne!(new_pid, original_pid);
+    // Let the reused client + new connection settle.
+    sleep(Duration::from_millis(300)).await;
+
+    // DECISIVE — custom route dispatches via get_zmq_clients (the zmq_clients
+    // map), not the inference_queue snapshot:
+    //   pre-fix   → slot holds the colliding/dead replacement client → non-200
+    //   Strategy 1 → slot holds the reused original client → 200
+    let resp = client
+        .get(format!("{}/v2/models/route_model/status", base))
+        .timeout(Duration::from_secs(5))
+        .send().await
+        .expect("status route request failed");
+    assert_eq!(
+        resp.status(),
+        200,
+        "custom route (get_zmq_clients path) failed after respawn — \
+         the worker client was not reused"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["model_loaded"], true);
+
+    // SANITY — unary inference (inference_queue snapshot path).
+    let resp = client
+        .post(format!("{}/v2/models/route_model/infer", base))
+        .json(&json!({"input": 5}))
+        .timeout(Duration::from_secs(5))
+        .send().await
+        .expect("infer request failed");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["output"], 10);
+}

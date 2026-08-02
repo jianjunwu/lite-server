@@ -120,7 +120,7 @@ CONFIG_YAML_EXAMPLE = textwrap.dedent("""\
     # ejection_max_percent: 50      # Max % of workers that may be ejected at once (1-100)
     # startup_timeout: 60.0         # Max seconds to wait for a worker "ready" handshake
     # health_check_timeout: 5.0     # Seconds per health-check probe before timing out
-    # health_check_kill_threshold: 0 # [EXPERIMENTAL] probe failures before kill+respawn (0=never); respawn gaps fixed in 0.9
+    # health_check_kill_threshold: 0 # probe failures before kill+respawn (0=disabled); respawn reuses the worker's bound ZMQ socket
     # worker_kill_timeout: 10.0     # Seconds to wait for the OS to reap a killed worker
     # hook_http_timeout: 5.0        # Seconds for a worker lifecycle HTTP hook request
 
