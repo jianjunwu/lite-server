@@ -267,6 +267,12 @@ jobs:
     name: Release
     needs: [get-version, build-wheels]
     runs-on: ubuntu-latest
+    # Manual approval gate: tag pushes still auto-build all wheels, but the
+    # GitHub Release is NOT created until a reviewer approves this job. Create
+    # a `release` environment in repo Settings → Environments with required
+    # reviewers; without it this job 404s. Avoids "build → auto-release" on a
+    # tag when Checks/proto-smoke are still red.
+    environment: release
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write

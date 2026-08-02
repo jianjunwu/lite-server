@@ -44,6 +44,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+      - name: Install protoc + libzmq (prost-build needs protoc; mirrors build-wheels Linux setup)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libzmq3-dev
       - name: Sync Python env (workers run Python; builds native ext)
         run: uv sync
       - name: Build server and perf-smoke

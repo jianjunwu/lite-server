@@ -1,0 +1,30 @@
+# cargo-audit configuration (https://github.com/rustsec/cargo-audit).
+#
+# Each advisory below was reviewed for REACHABILITY before ignoring. All three
+# are unreachable in this codebase (verified by grep) and not fixable by a
+# semver bump — fixing them would require a risky, dedicated migration that is
+# tracked separately. Re-evaluate on every dependency bump.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2024-0437 — protobuf 2.28.0 (transitive via `prometheus` 0.13.4).
+    # DoS: stack overflow parsing untrusted protobuf (CodedInputStream::skip_group).
+    # UNREACHABLE: `prometheus` only SERIALIZES the metrics exposition format;
+    # it never parses untrusted protobuf. prometheus 0.13.4 is the latest release
+    # (still rust-protobuf 2.x) — no semver bump exists; removing it means
+    # replacing the metrics crate. Revisit during a metrics-stack overhaul.
+    "RUSTSEC-2024-0437",
+
+    # RUSTSEC-2026-0176 — pyo3 0.24: OOB read in Iterator::nth / nth_back for
+    # PyList/PyTuple when the index arithmetic overflows.
+    # UNREACHABLE: no .nth() / .nth_back() calls anywhere in src/. pyo3 is pinned
+    # at 0.24 (Cargo.toml); 0.24 -> 0.29 spans 5 breaking minor releases — a
+    # dedicated migration, not an rc0 hotfix. See RUSTSEC-2026-0177 too.
+    "RUSTSEC-2026-0176",
+
+    # RUSTSEC-2026-0177 — pyo3 0.24: PyCFunction::new_closure missing a Sync
+    # bound (data race under free-threaded Python).
+    # UNREACHABLE: no new_closure / PyCFunction usage in src/. Same pyo3
+    # 0.24 -> 0.29 migration deferral as RUSTSEC-2026-0176.
+    "RUSTSEC-2026-0177",
+]
