@@ -397,6 +397,113 @@ class TestStreamHooks:
         assert calls == ["on_request", "on_output", "on_output"]
 
     @pytest.mark.asyncio
+    async def test_on_stream_close_done_on_normal_end(self):
+        seen = []
+
+        class Rec(Callback):
+            def on_stream_close(self, ctx, reason):
+                seen.append(reason)
+
+        class StreamAPI(EchoAPI):
+            def stream_predict(self, x):
+                yield {"n": 1}
+                yield {"n": 2}
+
+        api = StreamAPI()
+        api._pipeline = Pipeline.build(api, [Rec()])
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            api, _stream_req("s-close-done"), sock, {}, log
+        )
+        await sock.wait_for(lambda r: _is_done(r, "s-close-done"))
+        assert seen == ["done"]
+
+    @pytest.mark.asyncio
+    async def test_on_stream_close_has_stream_stats(self):
+        seen = []
+
+        class Rec(Callback):
+            def on_stream_close(self, ctx, reason):
+                seen.append((reason, dict(ctx.stream_stats) if ctx.stream_stats else None))
+
+        class StreamAPI(EchoAPI):
+            def stream_predict(self, x):
+                yield {"n": 1}
+                yield {"n": 2}
+                yield {"n": 3}
+
+        api = StreamAPI()
+        api._pipeline = Pipeline.build(api, [Rec()])
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            api, _stream_req("s-stats"), sock, {}, log
+        )
+        await sock.wait_for(lambda r: _is_done(r, "s-stats"))
+        assert seen[0][0] == "done"
+        assert seen[0][1]["chunks"] == 3
+        assert seen[0][1]["bytes"] > 0
+
+    @pytest.mark.asyncio
+    async def test_on_stream_close_fallback_done(self):
+        seen = []
+
+        class Rec(Callback):
+            def on_stream_close(self, ctx, reason):
+                seen.append((reason, ctx.mode))
+
+        api = EchoAPI()  # no stream_predict → predict fallback path
+        api._pipeline = Pipeline.build(api, [Rec()])
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            api, _stream_req("s-fb-done"), sock, {}, log
+        )
+        await sock.wait_for(lambda r: _is_done(r, "s-fb-done"))
+        assert seen == [("done", "stream")]
+
+    @pytest.mark.asyncio
+    async def test_on_stream_close_fallback_error(self):
+        seen = []
+
+        class Rec(Callback):
+            def on_stream_close(self, ctx, reason):
+                seen.append(reason)
+
+        class BoomAPI(EchoAPI):  # no stream_predict → fallback; predict raises
+            def predict(self, x):
+                raise RuntimeError("boom")
+
+        api = BoomAPI()
+        api._pipeline = Pipeline.build(api, [Rec()])
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            api, _stream_req("s-fb-err"), sock, {}, log
+        )
+        await sock.wait_for(lambda r: _is_error(r, "s-fb-err"))
+        assert seen == ["error"]
+
+    @pytest.mark.asyncio
+    async def test_on_stream_close_error_on_generator_failure(self):
+        seen = []
+
+        class Rec(Callback):
+            def on_stream_close(self, ctx, reason):
+                seen.append(reason)
+
+        class StreamAPI(EchoAPI):
+            def stream_predict(self, x):
+                yield {"n": 1}
+                raise RuntimeError("boom")
+
+        api = StreamAPI()
+        api._pipeline = Pipeline.build(api, [Rec()])
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            api, _stream_req("s-close-err"), sock, {}, log
+        )
+        await sock.wait_for(lambda r: _is_error(r, "s-close-err"))
+        assert seen == ["error"]
+
+    @pytest.mark.asyncio
     async def test_callback_early_return_at_open(self):
         class CacheCB(Callback):
             def on_request(self, ctx):
@@ -1231,7 +1338,8 @@ class TestStreamDeadline:
     async def test_stream_stops_at_deadline_before_all_chunks(self):
         """A stream whose meta carries a deadline stops early: the framework's
         cooperative check in _consume_stream breaks once the deadline passes,
-        so the stream ends (StreamDone) well before the generator is exhausted.
+        so the stream ends with a StreamError (a deadline cut is abnormal — not
+        normal completion) well before the generator is exhausted.
         """
         import time
 
@@ -1257,15 +1365,15 @@ class TestStreamDeadline:
         await inference._handle_stream_open_async(
             SlowStreamAPI(), _stream_req("s-dl", b'{"prompt": "go"}', meta=meta), sock, {}, log
         )
-        await sock.wait_for(lambda r: _is_done(r, "s-dl"))
+        await sock.wait_for(lambda r: _is_error(r, "s-dl"))
         responses = sock.stream_responses("s-dl")
         chunks = [r for r in responses if r.stream.HasField("chunk")]
         # The deadline (120ms) must cut the stream short of all 10 chunks.
         assert len(chunks) < 10, f"deadline should cut the stream; got {len(chunks)} chunks"
         # ... but at least one chunk lands before the deadline passes.
         assert len(chunks) >= 1, f"expected >=1 chunk before deadline; got {len(chunks)}"
-        # A graceful StreamDone closes the stream.
-        assert any(_is_done(r, "s-dl") for r in responses)
+        # A deadline cut terminates with a StreamError (not StreamDone).
+        assert any(_is_error(r, "s-dl") for r in responses)
 
     @pytest.mark.asyncio
     async def test_no_deadline_streams_all_chunks(self):

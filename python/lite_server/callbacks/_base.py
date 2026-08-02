@@ -101,6 +101,28 @@ class Callback:
         """
         pass
 
+    # ---- Batch hooks (whole-batch view; has_batch_methods path only) ----
+
+    def on_batch_input(self, ctx_list: list[RequestContext], batched: Any) -> Any | None:
+        """Called after ``batch()``, before ``predict()`` — over the batched input.
+
+        The one hook with a view of the whole batched tensor (not per-item):
+        use for whole-batch transform / validation / stats.  ``ctx_list``
+        aligns positionally with the items.  Returns a replacement for
+        ``batched``, or None to pass through.  Raising ``HTTPException``
+        rejects the whole batch.  Driven only on the ``has_batch_methods``
+        path.
+        """
+        pass
+
+    def on_batch_output(self, ctx_list: list[RequestContext], outputs: list[Any]) -> Any | None:
+        """Called after ``unbatch()`` — over the per-item outputs list.
+
+        Returns a replacement for ``outputs`` (keep length-aligned), or None.
+        Raising ``HTTPException`` rejects the whole batch.
+        """
+        pass
+
     # ---- Error hook (exception-isolated) ----
 
     def on_error(self, ctx: RequestContext, exc: Exception) -> None:
@@ -109,6 +131,18 @@ class Callback:
         Driven exception-isolated: a failing on_error is logged, never
         masks the original error.  Return value ignored.  May be sync
         or async.  Streaming paths drive it once per failed chunk.
+        """
+        pass
+
+    def on_stream_close(self, ctx: RequestContext, reason: str) -> None:
+        """Called once when a stream terminates (stream/bidi/decoupled paths).
+
+        ``reason`` is ``"done"`` (StreamDone sent — normal end, early return,
+        or model-initiated close), ``"error"`` (StreamError sent — including a
+        server deadline cut), or ``"cancel"`` (client disconnect / cancel — no
+        terminal frame).  Driven exception-isolated: a failing hook is logged,
+        never propagated (the stream is already terminal).  CB mode does not
+        trigger it (no stream concept).  May be sync or async.
         """
         pass
 
@@ -141,6 +175,13 @@ _REMOVED_HOOKS = {
 _DATA_HOOKS = ("on_request", "on_input", "on_output", "on_response")
 
 _ERROR_HOOKS = ("on_error",)
+
+# Stream terminal hook: (ctx, reason) — driven once when a stream ends.
+_STREAM_HOOKS = ("on_stream_close",)
+
+# Whole-batch hooks: (ctx_list, value) — driven inside Pipeline.batch_predict
+# only on the has_batch_methods path.
+_BATCH_HOOKS = ("on_batch_input", "on_batch_output")
 
 _LIFECYCLE_HOOKS = ("on_before_setup", "on_after_setup", "on_teardown")
 
@@ -216,6 +257,13 @@ def validate_callback(cb: Callback) -> None:
     # on_error takes (self, ctx, exc) — two required positional params after self
     if _overrides(cls, "on_error", Callback):
         _check_on_error_sig(getattr(cb, "on_error"), f"Callback {cls.__name__}")
+    # on_stream_close takes (self, ctx, reason) — two required positional params.
+    if _overrides(cls, "on_stream_close", Callback):
+        _check_stream_close_sig(getattr(cb, "on_stream_close"), f"Callback {cls.__name__}")
+    # Batch hooks take (self, ctx_list, value) — two required positional params.
+    for name in _BATCH_HOOKS:
+        if _overrides(cls, name, Callback):
+            _check_batch_hook_sig(getattr(cb, name), f"Callback {cls.__name__}", name)
 
 
 def _check_on_error_sig(fn: callable, owner: str) -> None:
@@ -236,6 +284,48 @@ def _check_on_error_sig(fn: callable, owner: str) -> None:
     raise RuntimeError(
         f"{owner}.on_error must take exactly two arguments "
         f"(ctx: RequestContext, exc: Exception); got signature {fn}."
+    )
+
+
+def _check_batch_hook_sig(fn: callable, owner: str, name: str) -> None:
+    """Require exactly two required positional params (ctx_list, value)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return
+    required = [
+        p
+        for p in params.values()
+        if p.default is inspect.Parameter.empty
+        and p.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    if len(required) == 2:
+        return
+    raise RuntimeError(
+        f"{owner}.{name} must take exactly two arguments "
+        f"(ctx_list, value); got signature {fn}."
+    )
+
+
+def _check_stream_close_sig(fn: callable, owner: str) -> None:
+    """Require exactly two required positional params (ctx, reason)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return
+    required = [
+        p
+        for p in params.values()
+        if p.default is inspect.Parameter.empty
+        and p.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    if len(required) == 2:
+        return
+    raise RuntimeError(
+        f"{owner}.on_stream_close must take exactly two arguments "
+        f"(ctx, reason); got signature {fn}."
     )
 
 

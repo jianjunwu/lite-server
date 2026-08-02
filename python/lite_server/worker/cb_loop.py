@@ -63,7 +63,7 @@ class CBLoop:
         meta = _meta_from_proto(cb_add.meta) if cb_add.HasField("meta") else RequestMeta(
             route="", headers=Headers(), client_ip="", request_id="", timestamp_ns=0,
         )
-        ctx = RequestContext(meta=meta, request={})
+        ctx = RequestContext(meta=meta, request={}, mode="cb")
         try:
             ctx.request = _parse_json_payload(cb_add.data)
             self._drive(self.pipe.preprocess(ctx))

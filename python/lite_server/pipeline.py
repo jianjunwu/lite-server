@@ -36,9 +36,11 @@ from typing import Any, Awaitable, Callable
 
 from lite_server.api import LitAPI
 from lite_server.callbacks._base import (
+    _BATCH_HOOKS,
     _DATA_HOOKS,
     _ERROR_HOOKS,
     _LIFECYCLE_HOOKS,
+    _STREAM_HOOKS,
     Callback,
     _check_single_ctx_param,
     _overrides,
@@ -320,6 +322,10 @@ class Pipeline:
                 candidate_fns.append(getattr(cb, name))
             for name in _ERROR_HOOKS:
                 candidate_fns.append(getattr(cb, name))
+            for name in _BATCH_HOOKS:
+                candidate_fns.append(getattr(cb, name))
+            for name in _STREAM_HOOKS:
+                candidate_fns.append(getattr(cb, name))
         # API hooks (when overridden) also participate in async detection.
         api_cls = type(lit_api)
         if _overrides(api_cls, "on_request", LitAPI):
@@ -409,6 +415,19 @@ class Pipeline:
                 if _overrides(type(cb), name, Callback):
                     self._error_hooks.append(_adapt(getattr(cb, name)))
 
+        # Batch hooks: whole-batch view, driven inside batch_predict.
+        self._batch_hooks: dict[str, list[Callable]] = {name: [] for name in _BATCH_HOOKS}
+        for cb in self.callbacks:
+            for name in _BATCH_HOOKS:
+                if _overrides(type(cb), name, Callback):
+                    self._batch_hooks[name].append(_adapt(getattr(cb, name)))
+
+        # Stream-close hooks: driven once when a stream terminates (streaming.py).
+        self._stream_hooks: list[Callable] = []
+        for cb in self.callbacks:
+            if _overrides(type(cb), "on_stream_close", Callback):
+                self._stream_hooks.append(_adapt(cb.on_stream_close))
+
     # ---- Construction ----------------------------------------------------
 
     @classmethod
@@ -440,6 +459,13 @@ class Pipeline:
                     f"on_response, and on_error run. Move the logic into "
                     f"one of those hooks."
                 )
+            for _bname in _BATCH_HOOKS:
+                if _overrides(cls_type, _bname, Callback):
+                    raise RuntimeError(
+                        f"Callback {cls_type.__name__} defines '{_bname}', but "
+                        f"routes have no batch stage — only on_request, "
+                        f"on_response, and on_error run."
+                    )
 
         pipe = cls.__new__(cls)
         pipe.lit_api = None                      # 路由无模型
@@ -451,6 +477,8 @@ class Pipeline:
             for name in _DATA_HOOKS:
                 candidate_fns.append(getattr(cb, name))
             for name in _ERROR_HOOKS:
+                candidate_fns.append(getattr(cb, name))
+            for name in _STREAM_HOOKS:
                 candidate_fns.append(getattr(cb, name))
 
         pipe.any_async = any(_is_asyncish(f) for f in candidate_fns)
@@ -471,6 +499,11 @@ class Pipeline:
             for name in _ERROR_HOOKS:
                 if _overrides(type(cb), name, Callback):
                     pipe._error_hooks.append(_adapt(getattr(cb, name)))
+        pipe._batch_hooks = {name: [] for name in _BATCH_HOOKS}
+        pipe._stream_hooks = []
+        for cb in callbacks:
+            if _overrides(type(cb), "on_stream_close", Callback):
+                pipe._stream_hooks.append(_adapt(cb.on_stream_close))
         pipe._lifecycle = {name: [] for name in _LIFECYCLE_HOOKS}
         return pipe
 
@@ -506,6 +539,14 @@ class Pipeline:
                 await hook(ctx, exc)
             except Exception:
                 logger.warning("on_error hook failed", exc_info=True)
+
+    async def run_on_stream_close(self, ctx: RequestContext, reason: str) -> None:
+        """Drive on_stream_close hooks once; exception-isolated (stream is terminal)."""
+        for hook in self._stream_hooks:
+            try:
+                await hook(ctx, reason)
+            except Exception:
+                logger.warning("on_stream_close hook failed", exc_info=True)
 
     # ---- Capability detection (override-based, resolved at load) ---------
 
@@ -569,6 +610,16 @@ class Pipeline:
                 return
             await hook(ctx)
 
+    async def _run_batch_chain(
+        self, name: str, ctx_list: list[RequestContext], value: Any
+    ) -> Any:
+        """Drive a batch hook chain: each hook may replace *value* (None = pass)."""
+        for hook in self._batch_hooks.get(name, ()):
+            result = await hook(ctx_list, value)
+            if result is not None:
+                value = result
+        return value
+
     async def _stage(self, fn: Callable, value: Any, ctx: RequestContext, field: str) -> None:
         result = await fn(value, ctx=ctx)
         if isinstance(result, LiteResponse):
@@ -580,6 +631,7 @@ class Pipeline:
 
     async def preprocess(self, ctx: RequestContext) -> None:
         """on_request hooks → decode_request → on_input hooks."""
+        ctx.stage = "decode_request"
         await self._run_chain("on_request", ctx)
         if ctx.early is not None:
             return
@@ -590,10 +642,12 @@ class Pipeline:
 
     async def predict_value(self, ctx: RequestContext) -> None:
         """predict (single-item).  Batch/stream paths drive predict themselves."""
+        ctx.stage = "predict"
         await self._stage(self._predict, ctx.input, ctx, "output")
 
     async def postprocess(self, ctx: RequestContext) -> None:
         """on_output hooks → encode_response → on_response hooks."""
+        ctx.stage = "encode_response"
         await self._run_chain("on_output", ctx)
         if ctx.early is not None:
             return
@@ -605,14 +659,20 @@ class Pipeline:
     # ---- Entry points ----------------------------------------------------
 
     async def run_single(
-        self, data: bytes, meta: RequestMeta
+        self, data: bytes, meta: RequestMeta, *, mode: str = "unary",
+        ctx: RequestContext | None = None,
     ) -> tuple[bytes, Status, Metrics | None, dict[str, str] | None]:
         """Full pipeline for one request payload.
 
         Returns ``(body_bytes, status, metrics, headers)`` — same shape as
-        the pre-0.7 ``_run_predict*`` functions.
+        the pre-0.7 ``_run_predict*`` functions.  *mode* tags the scenario
+        (default ``"unary"``; the stream predict-fallback passes ``"stream"``)
+        so callbacks can branch on ``ctx.mode``.  Callers that already hold a
+        ctx (e.g. the stream fallback, which needs it to drive on_stream_close)
+        pass *ctx*; then *mode* is ignored.
         """
-        ctx = RequestContext(meta=meta, request={})
+        if ctx is None:
+            ctx = RequestContext(meta=meta, request={}, mode=mode)
         try:
             ctx.request = _parse_request_json(data)
             await self.preprocess(ctx)
@@ -662,9 +722,13 @@ class Pipeline:
         they declare a ``ctx`` parameter (injected as a list); methods that
         don't declare ``ctx`` ignore it (backward compatible).
         """
+        for ctx in ctx_list:
+            ctx.stage = "batch_predict"
         batched = await self._batch_fn(decodeds, ctx=ctx_list)
+        batched = await self._run_batch_chain("on_batch_input", ctx_list, batched)
         output = await self._predict(batched, ctx=ctx_list)
         outputs = await self._unbatch_fn(output, ctx=ctx_list)
+        outputs = await self._run_batch_chain("on_batch_output", ctx_list, outputs)
         if len(outputs) != len(decodeds):
             raise ValueError(
                 f"unbatch returned {len(outputs)} outputs, expected {len(decodeds)}"

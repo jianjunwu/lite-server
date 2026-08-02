@@ -79,7 +79,7 @@ async def _handle_route_call(
     ctx.server = getattr(lit_api, "_server_proxy", None)
     await route_pipe.run_route(ctx, handler)
     if isinstance(ctx.early, StreamingResponse):
-        await _send_route_stream(socket, uid, ctx.early, ctx, log)
+        await _send_route_stream(socket, uid, ctx.early, ctx, route_pipe, log)
         return None
     return _build_route_response(uid, ctx)
 
@@ -231,7 +231,7 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
 
     # Phase 1: per-item on_request → decode → on_input
     for item in batch.items:
-        ctx = RequestContext(meta=meta, request={})
+        ctx = RequestContext(meta=meta, request={}, mode="batch")
         try:
             ctx.request = _parse_json_payload(item.data)
             await pipe.preprocess(ctx)

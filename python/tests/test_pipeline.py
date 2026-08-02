@@ -127,6 +127,211 @@ class TestHookOrder:
         assert order == ["c1", "c2"]
 
 
+class TestModeThreading:
+    @pytest.mark.asyncio
+    async def test_run_single_defaults_mode_to_unary(self):
+        seen = {}
+
+        class Rec(Callback):
+            def on_request(self, ctx):
+                seen["mode"] = ctx.mode
+
+        pipe = Pipeline.build(EchoAPI(), [Rec()])
+        await pipe.run_single(b"{}", _make_meta())
+        assert seen["mode"] == "unary"
+
+    @pytest.mark.asyncio
+    async def test_run_single_threads_explicit_mode(self):
+        seen = {}
+
+        class Rec(Callback):
+            def on_request(self, ctx):
+                seen["mode"] = ctx.mode
+
+        pipe = Pipeline.build(EchoAPI(), [Rec()])
+        await pipe.run_single(b"{}", _make_meta(), mode="stream")
+        assert seen["mode"] == "stream"
+
+
+class TestStage:
+    @pytest.mark.asyncio
+    async def test_decode_stage_when_preprocess_fails(self):
+        seen = {}
+
+        class RecErr(Callback):
+            def on_error(self, ctx, exc):
+                seen["stage"] = ctx.stage
+
+        class API(EchoAPI):
+            def decode_request(self, request):
+                raise ValueError("boom")
+
+        pipe = Pipeline.build(API(), [RecErr()])
+        with pytest.raises(ValueError):
+            await pipe.run_single(b"{}", _make_meta())
+        assert seen["stage"] == "decode_request"
+
+    @pytest.mark.asyncio
+    async def test_predict_stage_when_predict_fails(self):
+        seen = {}
+
+        class RecErr(Callback):
+            def on_error(self, ctx, exc):
+                seen["stage"] = ctx.stage
+
+        class API(EchoAPI):
+            def predict(self, x):
+                raise ValueError("boom")
+
+        pipe = Pipeline.build(API(), [RecErr()])
+        with pytest.raises(ValueError):
+            await pipe.run_single(b"{}", _make_meta())
+        assert seen["stage"] == "predict"
+
+    @pytest.mark.asyncio
+    async def test_encode_stage_when_postprocess_fails(self):
+        seen = {}
+
+        class RecErr(Callback):
+            def on_error(self, ctx, exc):
+                seen["stage"] = ctx.stage
+
+        class API(EchoAPI):
+            def encode_response(self, output):
+                raise ValueError("boom")
+
+        pipe = Pipeline.build(API(), [RecErr()])
+        with pytest.raises(ValueError):
+            await pipe.run_single(b"{}", _make_meta())
+        assert seen["stage"] == "encode_response"
+
+    @pytest.mark.asyncio
+    async def test_batch_predict_stage_set_on_ctx_list(self):
+        class API(EchoAPI):
+            def batch(self, inputs):
+                raise ValueError("boom")
+
+        pipe = Pipeline.build(API(), [])
+        ctx_a = RequestContext(meta=_make_meta(), mode="batch")
+        ctx_b = RequestContext(meta=_make_meta(), mode="batch")
+        with pytest.raises(ValueError):
+            await pipe.batch_predict([1, 2], [ctx_a, ctx_b])
+        assert ctx_a.stage == "batch_predict"
+        assert ctx_b.stage == "batch_predict"
+
+
+class _BatchAPI(EchoAPI):
+    """Batch-capable stub: no-op batch/unbatch, predict = +1 per item."""
+
+    max_batch_size = 4
+
+    def batch(self, inputs):
+        return list(inputs)
+
+    def unbatch(self, output):
+        return list(output)
+
+    def predict(self, xs):
+        return [x + 1 for x in xs]
+
+
+class TestBatchHooks:
+    @pytest.mark.asyncio
+    async def test_on_batch_input_replaces_batched(self):
+        seen = {}
+
+        class Mul(Callback):
+            def on_batch_input(self, ctx_list, batched):
+                seen["batched"] = batched
+                return [v * 100 for v in batched]
+
+        pipe = Pipeline.build(_BatchAPI(), [Mul()])
+        ctxs = [RequestContext(meta=_make_meta(), mode="batch") for _ in range(2)]
+        outputs = await pipe.batch_predict([1, 2], ctxs)
+        assert outputs == [101, 201]
+        assert seen["batched"] == [1, 2]
+
+    @pytest.mark.asyncio
+    async def test_on_batch_output_replaces_outputs(self):
+        class Tag(Callback):
+            def on_batch_output(self, ctx_list, outputs):
+                return [f"out:{o}" for o in outputs]
+
+        pipe = Pipeline.build(_BatchAPI(), [Tag()])
+        ctxs = [RequestContext(meta=_make_meta(), mode="batch") for _ in range(2)]
+        outputs = await pipe.batch_predict([1, 2], ctxs)
+        assert outputs == ["out:2", "out:3"]
+
+    @pytest.mark.asyncio
+    async def test_on_batch_input_http_exception_rejects_whole_batch(self):
+        class Reject(Callback):
+            def on_batch_input(self, ctx_list, batched):
+                raise BadRequestError("bad batch")
+
+        pipe = Pipeline.build(_BatchAPI(), [Reject()])
+        ctxs = [RequestContext(meta=_make_meta(), mode="batch") for _ in range(2)]
+        with pytest.raises(HTTPException):
+            await pipe.batch_predict([1, 2], ctxs)
+
+    @pytest.mark.asyncio
+    async def test_batch_predict_unaffected_without_batch_hooks(self):
+        class NoOp(Callback):
+            def on_request(self, ctx):
+                pass
+
+        pipe = Pipeline.build(_BatchAPI(), [NoOp()])
+        ctxs = [RequestContext(meta=_make_meta(), mode="batch") for _ in range(2)]
+        outputs = await pipe.batch_predict([1, 2], ctxs)
+        assert outputs == [2, 3]
+
+    def test_for_route_rejects_batch_hooks(self):
+        class BadIn(Callback):
+            def on_batch_input(self, ctx_list, batched):
+                pass
+
+        class BadOut(Callback):
+            def on_batch_output(self, ctx_list, outputs):
+                pass
+
+        with pytest.raises(RuntimeError, match="on_batch_input"):
+            Pipeline.for_route([BadIn()])
+        with pytest.raises(RuntimeError, match="on_batch_output"):
+            Pipeline.for_route([BadOut()])
+
+
+class TestStreamClose:
+    @pytest.mark.asyncio
+    async def test_run_on_stream_close_drives_hooks_with_reason(self):
+        seen = []
+
+        class Rec(Callback):
+            def on_stream_close(self, ctx, reason):
+                seen.append((ctx.meta.request_id, reason))
+
+        pipe = Pipeline.build(EchoAPI(), [Rec()])
+        ctx = RequestContext(meta=_make_meta(), mode="stream")
+        await pipe.run_on_stream_close(ctx, "done")
+        assert seen == [("req-1", "done")]
+
+    @pytest.mark.asyncio
+    async def test_run_on_stream_close_is_exception_isolated(self):
+        calls = []
+
+        class Bad(Callback):
+            def on_stream_close(self, ctx, reason):
+                calls.append("bad")
+                raise RuntimeError("boom")
+
+        class Good(Callback):
+            def on_stream_close(self, ctx, reason):
+                calls.append("good")
+
+        pipe = Pipeline.build(EchoAPI(), [Bad(), Good()])
+        ctx = RequestContext(meta=_make_meta(), mode="stream")
+        await pipe.run_on_stream_close(ctx, "error")  # must not raise
+        assert calls == ["bad", "good"]
+
+
 # ---------------------------------------------------------------------------
 # Early return
 # ---------------------------------------------------------------------------

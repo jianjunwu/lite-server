@@ -40,6 +40,42 @@ class TestRequestContext:
         ctx.state["k"] = 1
         assert ctx.state["k"] == 1
 
+    def test_mode_defaults_to_none(self):
+        ctx = RequestContext(meta=_make_meta())
+        assert ctx.mode is None
+
+    def test_stage_defaults_to_none(self):
+        ctx = RequestContext(meta=_make_meta())
+        assert ctx.stage is None
+
+
+class TestDeadlineRemaining:
+    def test_returns_none_when_no_deadline(self):
+        ctx = RequestContext(meta=_make_meta())  # _make_meta omits deadline → None
+        assert ctx.deadline_remaining_ms() is None
+
+    def test_returns_positive_ms_when_deadline_in_future(self):
+        future_ns = time.time_ns() + 1_000_000_000  # 1s ahead
+        meta = RequestMeta(
+            route="/predict", headers=Headers({}), client_ip="127.0.0.1",
+            request_id="req-1", timestamp_ns=1, deadline_unix_ns=future_ns,
+        )
+        ctx = RequestContext(meta=meta)
+        remaining = ctx.deadline_remaining_ms()
+        assert remaining is not None
+        assert 0 < remaining <= 1000.0
+
+    def test_returns_negative_ms_when_deadline_passed(self):
+        past_ns = time.time_ns() - 1_000_000_000  # 1s ago
+        meta = RequestMeta(
+            route="/predict", headers=Headers({}), client_ip="127.0.0.1",
+            request_id="req-1", timestamp_ns=1, deadline_unix_ns=past_ns,
+        )
+        ctx = RequestContext(meta=meta)
+        remaining = ctx.deadline_remaining_ms()
+        assert remaining is not None
+        assert remaining < 0
+
 
 class TestValidateCallback:
     def test_new_style_callback_passes(self):
@@ -83,6 +119,22 @@ class TestValidateCallback:
                 pass
 
         with pytest.raises(RuntimeError, match="on_request"):
+            validate_callback(Bad())
+
+    def test_batch_hook_wrong_arity_raises(self):
+        class Bad(Callback):
+            def on_batch_input(self, ctx_list):  # needs (ctx_list, value)
+                pass
+
+        with pytest.raises(RuntimeError, match="on_batch_input"):
+            validate_callback(Bad())
+
+    def test_stream_close_wrong_arity_raises(self):
+        class Bad(Callback):
+            def on_stream_close(self, ctx):  # needs (ctx, reason)
+                pass
+
+        with pytest.raises(RuntimeError, match="on_stream_close"):
             validate_callback(Bad())
 
     def test_lifecycle_hooks_unaffected(self):

@@ -13,6 +13,7 @@ contract since 0.7.0.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -110,6 +111,9 @@ class RequestContext:
     early: Response | None = None  # set → pipeline short-circuits
     server: Any = None  # ServerProxy for @route handlers; None for inference
     response_headers: dict[str, str] = field(default_factory=dict)  # merged into final response
+    mode: str | None = None  # scenario: "unary"|"stream"|"bidi"|"decoupled"|"batch"|"cb"; None for @route
+    stage: str | None = None  # current pipeline stage (decode_request/predict/batch_predict/encode_response); on_error reads it to see which stage raised
+    stream_stats: dict[str, int] | None = None  # {chunks, bytes} for a uni-stream run; set by _consume_stream, read at on_stream_close
 
     def respond(
         self,
@@ -139,6 +143,19 @@ class RequestContext:
             media_type=media_type,
         )
         return self.early
+
+    def deadline_remaining_ms(self) -> float | None:
+        """Milliseconds until the per-request deadline; None when unbounded.
+
+        Negative once the deadline has passed.  Derived from
+        ``meta.deadline_unix_ns`` (absolute UNIX ns); a callback checks this
+        cooperatively (e.g. in ``on_output`` per chunk) to stop work before the
+        server hard-closes the stream.
+        """
+        ns = self.meta.deadline_unix_ns
+        if ns is None:
+            return None
+        return (ns - time.time_ns()) / 1_000_000.0
 
 
 class CBSequence:
