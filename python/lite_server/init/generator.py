@@ -60,9 +60,18 @@ def _render_config_yaml() -> str:
         "",
         "# ===== Callbacks =====",
         "# Register callback classes to hook into the inference pipeline.",
-        "# Each class must be a lite_server.Callback subclass (no-arg constructible).",
+        "# Each entry is a class path string (no-arg) or a single-key map",
+        "# {path: kwargs} with constructor arguments. Built-ins live in",
+        "# lite_server.callbacks (JsonSchemaValidator needs",
+        "# `pip install lite-server[validation]`).",
         "# callbacks:",
         "#   - callbacks.AuditLogger",
+        "#   - lite_server.callbacks.JsonSchemaValidator:",
+        "#       input_schema:",
+        "#         type: object",
+        "#         required: [prompt]",
+        "#         properties:",
+        "#           prompt: { type: string, minLength: 1, maxLength: 4096 }",
         "",
         "# ===== Custom Parameters =====",
         "# Add your own parameters below. Access them in model.py via self.config.get('key')",
@@ -161,13 +170,33 @@ CONFIG_YAML_EXAMPLE = textwrap.dedent("""\
     #     timeout_secs: 0.0          # 0 = use request_timeout
 
     # ===== Callbacks (Inference Pipeline) =====
-    # List of fully-qualified Callback subclass paths.  Each class must be
-    # no-arg constructible.  Callbacks chain in registration order and are
-    # validated at load time (pre-0.7 function-style signatures are rejected).
-    # See callbacks.py for an example.
+    # List of Callback subclass entries.  Two entry forms:
+    #   - "path.to.Callback"           # no-arg constructible
+    #   - path.to.Callback: {kwargs}   # single-key map with constructor args
+    # Callbacks chain in registration order and are validated at load time
+    # (pre-0.7 function-style signatures are rejected).
+    #
+    # Built-in class: lite_server.callbacks.JsonSchemaValidator validates the
+    # decoded request (on_input) and model output (on_output; unary/batch only)
+    # against JSON Schemas — needs `pip install lite-server[validation]`.
+    #
+    # Hooks beyond the data chain (on_request/on_input/on_output/on_response):
+    #   on_stream_close(ctx, reason)       # stream end: "done"|"error"|"cancel";
+    #                                      # ctx.stream_stats = {chunks, bytes}
+    #   on_batch_input(ctx_list, batched)  # after batch(), before predict()
+    #   on_batch_output(ctx_list, outputs) # after unbatch(), per-item outputs
+    # ctx helpers: ctx.elapsed_ms(), ctx.deadline_remaining_ms(), ctx.mode,
+    # ctx.stage.
     # callbacks:
     #   - "callbacks.AuditLogger"
-    #   - "my_package.callbacks.CustomAuth"
+    #   - lite_server.callbacks.JsonSchemaValidator:
+    #       input_schema:
+    #         type: object
+    #         required: [prompt]
+    #         additionalProperties: false
+    #         properties:
+    #           prompt: { type: string, minLength: 1, maxLength: 4096 }
+    #           max_tokens: { type: integer, minimum: 1, maximum: 2048 }
 
     # ===== Custom Parameters =====
     # Add your own parameters below. Access them in model.py via self.config.get('key')
@@ -348,6 +377,18 @@ CALLBACKS_PY = textwrap.dedent('''\
         callbacks:
           - callbacks.AuditLogger
 
+    Entries are class-path strings (no-arg) or single-key maps with constructor
+    arguments — e.g. the built-in JsonSchemaValidator (needs
+    ``pip install lite-server[validation]``)::
+
+        callbacks:
+          - lite_server.callbacks.JsonSchemaValidator:
+              input_schema:
+                type: object
+                required: [prompt]
+                properties:
+                  prompt: { type: string, minLength: 1 }
+
     You can also declare callbacks directly on your LitAPI class::
 
         from lite_server import LitAPI
@@ -356,25 +397,32 @@ CALLBACKS_PY = textwrap.dedent('''\
         class MyAPI(LitAPI):
             callbacks = (AuditLogger(),)
     """
-    import time
-
     from lite_server import Callback
 
 
     class AuditLogger(Callback):
         """Logs request method, route, and elapsed time for every request."""
 
-        def on_request(self, ctx):
-            ctx.state["_start_ns"] = time.time_ns()
-
         def on_response(self, ctx):
-            start = ctx.state.pop("_start_ns", None)
-            if start is None:
-                return
-            elapsed_ms = (time.time_ns() - start) / 1_000_000
             print(
                 f"[AuditLogger] {ctx.meta.method} {ctx.meta.route} "
-                f"→ {elapsed_ms:.2f}ms"
+                f"→ {ctx.elapsed_ms():.2f}ms"
+            )
+
+
+    class StreamStats(Callback):
+        """Logs chunk/byte stats when a streaming request ends.
+
+        ``on_stream_close`` fires once per stream with reason
+        ``"done" | "error" | "cancel"``; ``ctx.stream_stats`` carries
+        ``{chunks, bytes}`` (uni-stream only).
+        """
+
+        def on_stream_close(self, ctx, reason):
+            stats = ctx.stream_stats or {}
+            print(
+                f"[StreamStats] {ctx.meta.request_id} closed={reason} "
+                f"chunks={stats.get('chunks', 0)} bytes={stats.get('bytes', 0)}"
             )
 ''')
 
@@ -564,6 +612,10 @@ DOCKER_COMPOSE = textwrap.dedent("""\
 REQUIREMENTS_TXT = textwrap.dedent("""\
     lite-server
     requests
+
+    # Optional: JSON-Schema validation for the built-in JsonSchemaValidator
+    # callback (see config.yaml → callbacks). Uncomment to install:
+    # lite-server[validation]
 
     # Add your model-specific dependencies below
 """)

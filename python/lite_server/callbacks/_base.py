@@ -365,8 +365,10 @@ def load_callbacks(
     """Load and validate callback instances from config + LitAPI class attribute.
 
     ``LitAPI.callbacks`` class attribute takes priority — it supports
-    constructor arguments.  ``config.yaml`` callbacks are appended
-    (fully-qualified class paths, no-arg constructible).
+    constructor arguments.  ``config.yaml`` callbacks are appended, each
+    entry being a fully-qualified class path (no-arg) or a single-key map
+    ``{path: kwargs}`` (constructor args — same model as the class
+    attribute).
 
     Both sources pass through :func:`validate_callback` — a silently skipped
     callback could mean auth/validation logic that never runs.

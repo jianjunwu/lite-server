@@ -255,6 +255,9 @@ When any stage or hook raises, the pipeline short-circuits to ``on_error``, then
 | `on_input` | After `decode_request`, before `predict` | `ctx.input` |
 | `on_output` | After `predict`, before `encode_response` (per chunk when streaming) | `ctx.output` |
 | `on_response` | After `encode_response`, before sending (per chunk when streaming) | `ctx.response` |
+| `on_stream_close` | End of a streaming run (once per stream) | `ctx` + `reason`: `"done"` \| `"error"` \| `"cancel"`; read `ctx.stream_stats` |
+| `on_batch_input` | Batch mode: after `batch()`, before `predict()` (whole batch tensor) | `ctx_list` + `batched`; raising `HTTPException` rejects the whole batch |
+| `on_batch_output` | Batch mode: after `unbatch()` (per-item outputs) | `ctx_list` + `outputs` |
 | `on_error` | Any hook or stage raises an exception | `ctx` + `exc` (the exception) |
 | `on_before_setup` | Before `LitAPI.setup()` | `(config, device)` |
 | `on_after_setup` | After `LitAPI.setup()` succeeds | `(lit_api)` |
@@ -270,6 +273,11 @@ A data hook may mutate `ctx` in place or return a replacement value (`None` = pa
 | `ctx.request` / `ctx.input` / `ctx.output` / `ctx.response` | Pipeline values at each stage |
 | `ctx.state` | Per-request scratch dict shared across hooks — use this, **never** `self` attributes (shared across concurrent requests) |
 | `ctx.early` | Set → pipeline short-circuits |
+| `ctx.mode` | Scenario tag: `"unary"` \| `"stream"` \| `"bidi"` \| `"decoupled"` \| `"batch"` \| `"cb"` (`None` on `@route` models) — lets a callback skip e.g. streaming |
+| `ctx.stage` | Current pipeline stage (`decode_request` / `predict` / `batch_predict` / `encode_response`) — `on_error` reads it to see which stage raised |
+| `ctx.stream_stats` | `{chunks, bytes}` of a uni-stream run; populated by the stream consumer, read at `on_stream_close` |
+| `ctx.elapsed_ms()` | Milliseconds since the request started (based on `meta.timestamp_ns`) |
+| `ctx.deadline_remaining_ms()` | Milliseconds until the request deadline, or `None` (no deadline); negative once expired — check it per chunk to stop streaming cooperatively |
 
 ### Early Return and Validation
 
@@ -294,36 +302,75 @@ class Cache(Callback):
 
 ### Declarative Loading
 
-Declare callback class paths in `config.yaml` under the `callbacks` key. The server loads and registers them automatically on startup:
+Declare callback class paths in `config.yaml` under the `callbacks` key. The server loads and registers them automatically on startup. Each entry is either a class-path string (no-arg construction) or a **single-key map** `{path: kwargs}` passing constructor arguments:
 
 ```yaml
 # config.yaml
 callbacks:
-  - my_package.callbacks.AuditLogger
-  - my_package.callbacks.MetricsCollector
+  - my_package.callbacks.AuditLogger        # no-arg
+  - my_package.callbacks.MetricsCollector   # no-arg
+  - lite_server.callbacks.JsonSchemaValidator:  # map entry → cls(**kwargs)
+      input_schema:
+        type: object
+        required: [prompt]
+        properties:
+          prompt: { type: string, minLength: 1 }
 ```
 
-Each class must be a no-arg constructible `Callback` subclass. Loading fails loudly on import errors or pre-0.7 hook signatures — a silently skipped callback could mean auth/validation logic that never runs.
+Both forms are interchangeable with the class-attribute path (`LitAPI.callbacks = (JsonSchemaValidator(input_schema=...),)`) — they are the same constructor arguments. Loading fails loudly on import errors or pre-0.7 hook signatures — a silently skipped callback could mean auth/validation logic that never runs.
 
 ### Complete Example: Audit Logger
 
 ```python
 """Audit-logging callback: records input/output and latency per request."""
-import time
 from lite_server import Callback
 
 class AuditLogger(Callback):
     def on_request(self, ctx):
-        ctx.state["start_ns"] = time.time_ns()  # per-request, concurrency-safe
         ctx.request["_audit_id"] = ctx.meta.request_id
 
     def on_output(self, ctx):
-        elapsed_ms = (time.time_ns() - ctx.state["start_ns"]) / 1_000_000
-        print(f"[AUDIT] request_id={ctx.meta.request_id} latency={elapsed_ms:.2f}ms")
+        print(f"[AUDIT] request_id={ctx.meta.request_id} latency={ctx.elapsed_ms():.2f}ms")
 
     def on_teardown(self, lit_api):
         print(f"[AUDIT] model torn down, total handled: {lit_api.call_count}")
 ```
+
+### Built-in: JsonSchemaValidator (Schema Validation)
+
+`lite_server.callbacks.JsonSchemaValidator` validates the decoded request
+(`on_input`) and the model output (`on_output`) against JSON Schemas —
+declarative, no model-code changes:
+
+```yaml
+# config.yaml — requires `pip install lite-server[validation]`
+callbacks:
+  - lite_server.callbacks.JsonSchemaValidator:
+      input_schema:
+        type: object
+        required: [prompt]
+        additionalProperties: false
+        properties:
+          prompt: { type: string, minLength: 1, maxLength: 4096 }
+          max_tokens: { type: integer, minimum: 1, maximum: 2048 }
+      output_schema:                 # optional; validate model output too
+        type: object
+        required: [text]
+```
+
+- **Failure → structured 400**: `param` is the JSON Pointer of the single
+  best-match error (prefixed `body/`, e.g. `body/prompt`), `message` is the
+  error text. The schema draft is auto-detected from `$schema` (default
+  Draft 7); a malformed schema is rejected at load time (loud — a silent
+  skip would mean validation never ran).
+- **Output validation scope**: unary/batch only — streaming chunks are
+  partial JSON and never match a full schema, so they are skipped via
+  `ctx.mode`.
+- **Skipped payloads**: non-JSON values (plain text / bytes / tensors) are
+  left untouched; no `input_schema`/`output_schema` → that direction is not
+  validated. In batch mode each item is validated independently.
+- **Border**: a model with both `@route` and a global validator is rejected
+  at load time — don't attach route models to a global validator.
 
 ### Policies
 

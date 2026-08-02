@@ -345,6 +345,53 @@ class TestCallbacksPy:
         assert "Callback" in text
 
 
+class TestCallbacksCompanion:
+    """Generated configs/examples keep pace with the callback extensions
+    (builtin classes, single-key-map entries, ctx.elapsed_ms, new hooks)."""
+
+    def _config_yaml(self, tmp_path):
+        gen = ProjectGenerator("p", tmp_path)
+        root = gen.generate()
+        return (root / "model_repo" / "my_model" / "1" / "config.yaml").read_text()
+
+    def _example(self, tmp_path):
+        gen = ProjectGenerator("p", tmp_path)
+        root = gen.generate()
+        return (root / "model_repo" / "my_model" / "1" / "config.yaml.example").read_text()
+
+    def test_active_config_mentions_builtin_callback(self, tmp_path):
+        assert "JsonSchemaValidator" in self._config_yaml(tmp_path)
+
+    def test_example_documents_map_entry_with_kwargs(self, tmp_path):
+        """callbacks entries may be a single-key map {path: kwargs}."""
+        assert "kwargs" in self._example(tmp_path)
+
+    def test_example_documents_builtin_schema_validator(self, tmp_path):
+        example = self._example(tmp_path)
+        assert "JsonSchemaValidator" in example
+        assert "input_schema" in example
+        assert "lite-server[validation]" in example
+
+    def test_callbacks_py_uses_ctx_elapsed_ms(self, tmp_path):
+        gen = ProjectGenerator("p", tmp_path)
+        root = gen.generate()
+        cb = (root / "model_repo" / "my_model" / "1" / "callbacks.py").read_text()
+        assert "elapsed_ms" in cb
+        assert "time.time_ns" not in cb, "hand-rolled timing should be gone (B1)"
+
+    def test_callbacks_py_shows_stream_close_hook(self, tmp_path):
+        gen = ProjectGenerator("p", tmp_path)
+        root = gen.generate()
+        cb = (root / "model_repo" / "my_model" / "1" / "callbacks.py").read_text()
+        assert "on_stream_close" in cb
+
+    def test_requirements_mentions_validation_extra(self, tmp_path):
+        gen = ProjectGenerator("p", tmp_path)
+        root = gen.generate()
+        text = (root / "requirements.txt").read_text()
+        assert "lite-server[validation]" in text
+
+
 class TestHotReloadTemplateContent:
     """Generated templates reflect the reconcile + FILE_CHANGED semantics:
     hot_reload restarts/refreshes already-loaded versions (on_file_changed

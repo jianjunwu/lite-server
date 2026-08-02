@@ -287,6 +287,9 @@ on_request → decode_request → on_input → predict → on_output → encode_
 | `on_input` | `decode_request` 之后，`predict` 之前 | `ctx.input` |
 | `on_output` | `predict` 之后，`encode_response` 之前（流式时每个 chunk） | `ctx.output` |
 | `on_response` | `encode_response` 之后，发送前（流式时每个 chunk） | `ctx.response` |
+| `on_stream_close` | 流式结束（每个流触发一次） | `ctx` + `reason`：`"done"` \| `"error"` \| `"cancel"`；可读 `ctx.stream_stats` |
+| `on_batch_input` | batch 模式：`batch()` 之后、`predict()` 之前（整批张量） | `ctx_list` + `batched`；抛 `HTTPException` = 整批拒绝 |
+| `on_batch_output` | batch 模式：`unbatch()` 之后（per-item 输出） | `ctx_list` + `outputs` |
 | `on_error` | 任意钩子或阶段抛出异常时 | `ctx` + `exc`（异常对象） |
 | `on_before_setup` | `LitAPI.setup()` 之前 | `(config, device)` |
 | `on_after_setup` | `LitAPI.setup()` 完成后 | `(lit_api)` |
@@ -302,6 +305,11 @@ on_request → decode_request → on_input → predict → on_output → encode_
 | `ctx.request` / `ctx.input` / `ctx.output` / `ctx.response` | 各阶段的管线值 |
 | `ctx.state` | 跨钩子共享的**每请求**暂存字典 — 用它，**不要**用 `self` 属性（在并发请求间共享） |
 | `ctx.early` | 设置后管线短路 |
+| `ctx.mode` | 场景标注：`"unary"` \| `"stream"` \| `"bidi"` \| `"decoupled"` \| `"batch"` \| `"cb"`（`@route` 模型为 `None`）— 例如缓存类据此跳过流式 |
+| `ctx.stage` | 当前管线阶段（`decode_request` / `predict` / `batch_predict` / `encode_response`）— `on_error` 读取它判断哪个阶段抛错 |
+| `ctx.stream_stats` | uni-stream 的 `{chunks, bytes}` 统计；由流消费逻辑填充，在 `on_stream_close` 读取 |
+| `ctx.elapsed_ms()` | 请求开始以来的毫秒数（基于 `meta.timestamp_ns`） |
+| `ctx.deadline_remaining_ms()` | 距请求 deadline 的毫秒数；无 deadline 为 `None`，过期后为负数 — 每 chunk 检查可用于协作式停流 |
 
 ### Early Return 与参数校验
 
@@ -328,21 +336,50 @@ class Cache(Callback):
 
 ```python
 """审计日志 callback：记录每个请求的输入/输出和延迟。"""
-import time
 from lite_server import Callback
 
 class AuditLogger(Callback):
     def on_request(self, ctx):
-        ctx.state["start_ns"] = time.time_ns()  # 每请求存储，并发安全
         ctx.request["_audit_id"] = ctx.meta.request_id
 
     def on_output(self, ctx):
-        elapsed_ms = (time.time_ns() - ctx.state["start_ns"]) / 1_000_000
-        print(f"[AUDIT] request_id={ctx.meta.request_id} latency={elapsed_ms:.2f}ms")
+        print(f"[AUDIT] request_id={ctx.meta.request_id} latency={ctx.elapsed_ms():.2f}ms")
 
     def on_teardown(self, lit_api):
         print(f"[AUDIT] model torn down, class: {type(lit_api).__name__}")
 ```
+
+### 内置类：JsonSchemaValidator（Schema 校验）
+
+`lite_server.callbacks.JsonSchemaValidator` 对解码后的请求（`on_input`）
+和模型输出（`on_output`）做 JSON Schema 校验 — 纯声明式，模型代码零改动：
+
+```yaml
+# config.yaml — 需要 `pip install lite-server[validation]`
+callbacks:
+  - lite_server.callbacks.JsonSchemaValidator:
+      input_schema:
+        type: object
+        required: [prompt]
+        additionalProperties: false
+        properties:
+          prompt: { type: string, minLength: 1, maxLength: 4096 }
+          max_tokens: { type: integer, minimum: 1, maximum: 2048 }
+      output_schema:                 # 可选；一并校验模型输出
+        type: object
+        required: [text]
+```
+
+- **失败 → 结构化 400**：`param` 为单条 best-match 错误的 JSON Pointer
+  （前缀 `body/`，如 `body/prompt`），`message` 为错误原文。schema 草稿按
+  `$schema` 自动选择（缺省 Draft 7）；畸形 schema 在加载时响亮拒绝 —
+  静默跳过意味着校验从未执行。
+- **输出校验范围**：仅 unary/batch — 流式 chunk 是增量 JSON 必不匹配，
+  靠 `ctx.mode` 跳过。
+- **跳过规则**：非 JSON 载荷（纯文本 / bytes / tensor）不校验；未配置
+  `input_schema`/`output_schema` 的对应方向不校验。batch 模式按 item 独立校验。
+- **边界**：模型同时有 `@route` 和全局 validator 会在加载时被拒绝 —
+  不要在路由模型上挂全局 validator。
 
 ### 策略（Policies）
 
@@ -417,12 +454,22 @@ class MyModel(LitAPI):
     )
 ```
 
-**方式二：`config.yaml`**（无参构造）：
+**方式二：`config.yaml`**——每条目是类路径字符串（无参构造）或**单键
+map** `{path: kwargs}`（传构造参数），与类属性路径同构：
 
 ```yaml
 callbacks:
-  - my_package.callbacks.AuditLogger
+  - my_package.callbacks.AuditLogger            # 无参
+  - lite_server.callbacks.JsonSchemaValidator:  # map 条目 → cls(**kwargs)
+      input_schema:
+        type: object
+        required: [prompt]
+        properties:
+          prompt: { type: string, minLength: 1 }
 ```
+
+内置类位于 `lite_server.callbacks`（`JsonSchemaValidator` 需要
+`pip install lite-server[validation]`，详见上文 Schema 校验小节）。
 
 > 导入失败或 0.7 之前的旧钩子签名会在加载时响亮报错 —— 被静默跳过的
 > callback 可能意味着鉴权/校验逻辑从未执行。
