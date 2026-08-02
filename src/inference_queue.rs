@@ -2831,32 +2831,34 @@ mod tests {
 
     // ===== 熔断器：指数退避 + 半开试探（B1 sgl-router 清单兑现）=====
 
-    /// 短超时熔断配置：threshold=1 即熔断，base 60ms，上限 500ms。
+    /// 短超时熔断配置：threshold=1 即熔断。base 200ms / 上限 2000ms（不是 60ms：
+    /// 半开/退避测试用真实 sleep,60ms base + 80ms sleep 只留 20ms 余量,macOS
+    /// CI 定时器抖动会翻转边界断言;200ms base 留 ~100ms 余量,稳）。
     fn breaker_cfg() -> EjectionConfig {
         EjectionConfig {
             error_threshold: 1,
-            timeout: Duration::from_millis(60),
+            timeout: Duration::from_millis(200),
             max_percent: 50,
-            max_timeout: Duration::from_millis(500),
+            max_timeout: Duration::from_millis(2_000),
         }
     }
 
     #[test]
     fn half_open_probe_failure_reopens_with_longer_backoff() {
         let outlier = OutlierState::with_config(1, &breaker_cfg());
-        outlier.record_error(0); // threshold 1 → 熔断（series=1，退避 60ms）
+        outlier.record_error(0); // threshold 1 → 熔断（series=1，退避 200ms）
         assert!(outlier.is_ejected(0));
 
-        std::thread::sleep(Duration::from_millis(80)); // > 60ms
+        std::thread::sleep(Duration::from_millis(300)); // > 200ms → 半开
         assert!(!outlier.is_ejected(0), "退避期满 → 半开（可试探）");
 
-        // 半开试探失败 → 立即重熔断（不等 threshold），退避升为 2×base=120ms；
+        // 半开试探失败 → 立即重熔断（不等 threshold），退避升为 2×base=400ms；
         // 返回 true = 新熔断事件（指标记一次）。
         assert!(outlier.record_error(0), "half-open probe failure is a new ejection event");
         assert!(outlier.is_ejected(0));
-        std::thread::sleep(Duration::from_millis(80)); // > 60ms 但 < 120ms
+        std::thread::sleep(Duration::from_millis(300)); // < 400ms（2×base）仍熔断
         assert!(outlier.is_ejected(0), "第二次熔断退避应为 2×base（指数退避）");
-        std::thread::sleep(Duration::from_millis(60)); // 累计 ~140ms > 120ms
+        std::thread::sleep(Duration::from_millis(200)); // 累计 ~500ms > 400ms → 半开
         assert!(!outlier.is_ejected(0), "2×base 期满 → 再次半开");
     }
 
@@ -2864,17 +2866,17 @@ mod tests {
     fn half_open_probe_success_closes_and_resets_backoff_series() {
         let outlier = OutlierState::with_config(1, &breaker_cfg());
         outlier.record_error(0);
-        std::thread::sleep(Duration::from_millis(80));
+        std::thread::sleep(Duration::from_millis(300));
         assert!(!outlier.is_ejected(0)); // 半开
 
         outlier.record_success(0); // 试探成功 → 闭合 + 退避级数清零
         assert!(!outlier.is_ejected(0));
         assert_eq!(outlier.consecutive_errors(0), 0);
 
-        // 级数已清零：再次熔断回到 base 退避（60ms 后开），而非 2×base。
+        // 级数已清零：再次熔断回到 base 退避（200ms 后开），而非 2×base。
         outlier.record_error(0);
         assert!(outlier.is_ejected(0));
-        std::thread::sleep(Duration::from_millis(80));
+        std::thread::sleep(Duration::from_millis(300));
         assert!(!outlier.is_ejected(0), "series 清零后再次熔断应回到 base 退避");
     }
 
