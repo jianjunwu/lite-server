@@ -2845,39 +2845,63 @@ mod tests {
 
     #[test]
     fn half_open_probe_failure_reopens_with_longer_backoff() {
+        // A failed half-open probe must re-open the circuit with a LONGER
+        // (exponential) backoff: the ejection series increments, so
+        // backoff(series) doubles. Assert the series + backoff VALUE directly
+        // — the old sleep-based "still ejected at 2×base / half-open after
+        // 2×base" checks flaked on macOS CI (>30% timer variance). Only the
+        // half-open TRANSITION uses a real sleep (one timing point, generous
+        // margin) and it was reliable across CI runs.
         let outlier = OutlierState::with_config(1, &breaker_cfg());
-        outlier.record_error(0); // threshold 1 → 熔断（series=1，退避 200ms）
+        outlier.record_error(0); // threshold 1 → eject, series 1, backoff = base
         assert!(outlier.is_ejected(0));
+        assert_eq!(outlier.workers[0].ejection_series.load(Ordering::Relaxed), 1);
 
-        std::thread::sleep(Duration::from_millis(300)); // > 200ms → 半开
+        std::thread::sleep(Duration::from_millis(300)); // > 200ms base → half-open
         assert!(!outlier.is_ejected(0), "退避期满 → 半开（可试探）");
 
-        // 半开试探失败 → 立即重熔断（不等 threshold），退避升为 2×base=400ms；
-        // 返回 true = 新熔断事件（指标记一次）。
+        // 半开试探失败 → 立即重熔断（不等 threshold）；series 1→2，退避升为 2×base。
         assert!(outlier.record_error(0), "half-open probe failure is a new ejection event");
         assert!(outlier.is_ejected(0));
-        std::thread::sleep(Duration::from_millis(300)); // < 400ms（2×base）仍熔断
-        assert!(outlier.is_ejected(0), "第二次熔断退避应为 2×base（指数退避）");
-        std::thread::sleep(Duration::from_millis(200)); // 累计 ~500ms > 400ms → 半开
-        assert!(!outlier.is_ejected(0), "2×base 期满 → 再次半开");
+        assert_eq!(
+            outlier.workers[0].ejection_series.load(Ordering::Relaxed),
+            2,
+            "half-open probe failure doubles the backoff series"
+        );
+        assert_eq!(
+            outlier.backoff(2),
+            outlier.backoff(1) * 2,
+            "backoff(2) is exactly 2× backoff(1) — exponential, not capped here"
+        );
     }
 
     #[test]
     fn half_open_probe_success_closes_and_resets_backoff_series() {
+        // Assert the series counter directly (timing-free) instead of via
+        // wall-clock sleeps — see half_open_probe_failure_reopens_with_longer_backoff.
         let outlier = OutlierState::with_config(1, &breaker_cfg());
         outlier.record_error(0);
+        assert_eq!(outlier.workers[0].ejection_series.load(Ordering::Relaxed), 1);
         std::thread::sleep(Duration::from_millis(300));
         assert!(!outlier.is_ejected(0)); // 半开
 
         outlier.record_success(0); // 试探成功 → 闭合 + 退避级数清零
         assert!(!outlier.is_ejected(0));
         assert_eq!(outlier.consecutive_errors(0), 0);
+        assert_eq!(
+            outlier.workers[0].ejection_series.load(Ordering::Relaxed),
+            0,
+            "success closes the circuit and resets the backoff series"
+        );
 
-        // 级数已清零：再次熔断回到 base 退避（200ms 后开），而非 2×base。
+        // 级数已清零：再次熔断回到 series 1（base 退避），而非 2×base。
         outlier.record_error(0);
         assert!(outlier.is_ejected(0));
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(!outlier.is_ejected(0), "series 清零后再次熔断应回到 base 退避");
+        assert_eq!(
+            outlier.workers[0].ejection_series.load(Ordering::Relaxed),
+            1,
+            "series reset → next ejection starts at base backoff (series 1, not 2)"
+        );
     }
 
     #[test]
