@@ -8,6 +8,7 @@ mod routing;
 
 pub use hooks::execute_hook;
 pub use routing::{pick_worker_random, pick_worker_skip_ejected};
+pub(crate) use routing::pick_streaming_worker;
 
 use crate::callback::CallbackRunner;
 use crate::inference_queue::{

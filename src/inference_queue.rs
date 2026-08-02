@@ -1002,7 +1002,7 @@ fn pick_worker(
                 w
             }
         }
-        _ => rendezvous_pick(&seq, inflight, outlier, exclude)
+        _ => rendezvous_pick(&seq, inflight.len(), outlier, exclude)
             .unwrap_or_else(|| pick_worker_least_loaded(inflight, outlier, exclude)),
     }
 }
@@ -1077,16 +1077,16 @@ fn power_of_two_pick(
 /// redistribution with no ring data structure: only the sequences whose
 /// preferred worker died move, and they spread deterministically across the
 /// survivors. Returns `None` if no worker is live.
-fn rendezvous_pick(
+pub(crate) fn rendezvous_pick(
     seq: &str,
-    inflight: &[Arc<AtomicUsize>],
+    num_workers: usize,
     outlier: &OutlierState,
     exclude: &[usize],
 ) -> Option<usize> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut best: Option<(u64, usize)> = None;
-    for i in 0..inflight.len() {
+    for i in 0..num_workers {
         if outlier.is_ejected(i) || exclude.contains(&i) {
             continue;
         }
@@ -1951,8 +1951,8 @@ mod tests {
         let outlier = OutlierState::new(4);
         eject(&outlier, 0);
         let inflight = mk_inflight(&[0; 4]);
-        let a = rendezvous_pick("seq-a", &inflight, &outlier, &[]).unwrap();
-        let b = rendezvous_pick("seq-a", &inflight, &outlier, &[]).unwrap();
+        let a = rendezvous_pick("seq-a", inflight.len(), &outlier, &[]).unwrap();
+        let b = rendezvous_pick("seq-a", inflight.len(), &outlier, &[]).unwrap();
         assert_eq!(a, b, "same sequence → same worker (deterministic)");
         assert_ne!(a, 0, "an ejected worker is never chosen");
     }

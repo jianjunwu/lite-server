@@ -975,6 +975,9 @@ mod tests {
             include_str!("rpc/stream.rs"),
             include_str!("rpc/decoupled.rs"),
             include_str!("rpc/bidi.rs"),
+            // Task F: stream/decoupled/bidi now delegate worker selection to
+            // `pick_streaming_worker`, which is where skip-ejected lives.
+            include_str!("../worker/routing.rs"),
         ]
         .into_iter()
         .map(|s| {

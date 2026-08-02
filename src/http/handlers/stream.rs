@@ -49,18 +49,15 @@ async fn open_worker_stream(
     // connect directly to it (sticky); otherwise the normal pick, then record.
     let outlier = state.worker_manager.get_outlier_state(model_name, resolved_version).await;
     let seq_registry = state.inference_queue.sequence_registry();
-    let preferred = meta.sequence_id.as_deref().and_then(|seq| {
-        let w = seq_registry.lookup(seq, model_name, resolved_version)?;
-        let ejected = outlier.as_ref().map(|o| o.is_ejected(w)).unwrap_or(false);
-        (w < num_workers && !ejected).then_some(w)
-    });
-    let worker_id = preferred.unwrap_or_else(|| match &outlier {
-        Some(o) => crate::worker::pick_worker_skip_ejected(num_workers, o),
-        None => crate::worker::pick_worker_random(num_workers),
-    });
-    if let Some(seq) = meta.sequence_id.as_deref() {
-        seq_registry.record(seq, model_name, resolved_version, worker_id);
-    }
+    let worker_id = crate::worker::pick_streaming_worker(
+        &meta,
+        num_workers,
+        outlier.as_deref(),
+        seq_registry,
+        model_name,
+        resolved_version,
+    )
+    .map_err(|e| AppError::Validation(e.0))?;
 
     if worker_id >= clients.len() {
         return Err(AppError::WorkerCrashed("invalid worker index".to_string()));

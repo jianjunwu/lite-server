@@ -3,7 +3,9 @@
 //! shared by the gRPC/HTTP streaming paths.
 
 use super::WorkerManager;
-use crate::inference_queue::{model_version_key, OutlierState};
+use crate::inference_queue::{model_version_key, rendezvous_pick, OutlierState};
+use crate::proto::liteserver as pb;
+use crate::sequence::SequenceRegistry;
 use crate::worker::protocol::{is_reserved_route, RouteDecl};
 
 impl WorkerManager {
@@ -78,6 +80,82 @@ pub fn pick_worker_skip_ejected(num_workers: usize, outlier: &OutlierState) -> u
 
     // All ejected — fall back to random
     start
+}
+
+/// Error from [`pick_streaming_worker`]: a direct pin (`x-lite-worker-id`)
+/// named a worker that does not exist or is ejected. The call site maps this to
+/// HTTP 400 (`AppError::Validation`) / gRPC `InvalidArgument` — parity with the
+/// queue's `QueueError::InvalidWorker`.
+#[derive(Debug, Clone)]
+pub(crate) struct PickError(pub String);
+
+/// Streaming worker selection (task F): one shared pick replacing the four
+/// line-for-line copies in HTTP SSE/WS (`open_worker_stream`) + gRPC
+/// stream/decoupled/bidi. Priority mirrors the unary queue path
+/// (`inference_queue`): `x-lite-worker-id` direct pin > sequence_id stickiness >
+/// `x-lite-affinity-key` rendezvous > skip-ejected/random.
+///
+/// A direct pin to an out-of-range or ejected worker fails fast with
+/// [`PickError`] (so a bad pin can't silently reroute); the softer hints
+/// (sequence / affinity) are best-effort and fall back. When the request carries
+/// a sequence_id the chosen worker is recorded for future stickiness.
+///
+/// `meta.headers` is the same map forwarded to the worker, so the hints match
+/// what the client sent (call sites must invoke this before `meta` moves into
+/// the stream-open request).
+pub(crate) fn pick_streaming_worker(
+    meta: &pb::RequestMeta,
+    num_workers: usize,
+    outlier: Option<&OutlierState>,
+    seq_registry: &SequenceRegistry,
+    model: &str,
+    version: &str,
+) -> Result<usize, PickError> {
+    // 1. x-lite-worker-id direct pin — validated, fail-fast (parity with the
+    //    queue's try_submit direct-pin check at submit time).
+    if let Some(w) = meta
+        .headers
+        .get("x-lite-worker-id")
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        let ejected = outlier.map(|o| o.is_ejected(w)).unwrap_or(false);
+        if w >= num_workers {
+            return Err(PickError(format!(
+                "x-lite-worker-id {w} out of range (workers: {num_workers}) for {model} {version}"
+            )));
+        }
+        if ejected {
+            return Err(PickError(format!(
+                "x-lite-worker-id {w} is ejected for {model} {version}"
+            )));
+        }
+        return Ok(w);
+    }
+
+    // 2. sequence_id stickiness (best-effort) → 3. affinity_key rendezvous →
+    //    skip-ejected/random.
+    let preferred = meta.sequence_id.as_deref().and_then(|seq| {
+        let w = seq_registry.lookup(seq, model, version)?;
+        let ejected = outlier.map(|o| o.is_ejected(w)).unwrap_or(false);
+        (w < num_workers && !ejected).then_some(w)
+    });
+    let worker_id = preferred.unwrap_or_else(|| match outlier {
+        Some(o) => meta
+            .headers
+            .get("x-lite-affinity-key")
+            .map(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .and_then(|key| rendezvous_pick(key, num_workers, o, &[]))
+            .unwrap_or_else(|| pick_worker_skip_ejected(num_workers, o)),
+        None => pick_worker_random(num_workers),
+    });
+
+    // Record the sticky mapping so the next request with this sequence_id lands
+    // on the same worker (matches the prior inline behavior).
+    if let Some(seq) = meta.sequence_id.as_deref() {
+        seq_registry.record(seq, model, version, worker_id);
+    }
+    Ok(worker_id)
 }
 
 #[cfg(test)]
@@ -197,5 +275,95 @@ mod tests {
         // clear on unload removes them
         wm.clear_routes("m", "1").await;
         assert!(wm.get_routes("m", "1").await.is_empty());
+    }
+
+    // ===== Task F: pick_streaming_worker (B3 hint consumption) =====
+
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    fn hint_meta(headers: &[(&str, &str)], sequence_id: Option<&str>) -> pb::RequestMeta {
+        let mut h = HashMap::new();
+        for (k, v) in headers {
+            h.insert((*k).to_string(), (*v).to_string());
+        }
+        pb::RequestMeta {
+            headers: h,
+            sequence_id: sequence_id.map(|s| s.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Drive `record_error` until `idx` is ejected (threshold-agnostic).
+    fn force_eject(outlier: &OutlierState, idx: usize) {
+        for _ in 0..1000 {
+            outlier.record_error(idx);
+            if outlier.is_ejected(idx) {
+                return;
+            }
+        }
+        panic!("worker {idx} did not eject within 1000 errors");
+    }
+
+    #[test]
+    fn pick_respects_valid_direct_pin() {
+        let outlier = OutlierState::new(2);
+        let reg = SequenceRegistry::new(Duration::from_secs(60), 16);
+        let meta = hint_meta(&[("x-lite-worker-id", "1")], None);
+        let w = pick_streaming_worker(&meta, 2, Some(&outlier), &reg, "m", "1").unwrap();
+        assert_eq!(w, 1, "a valid in-range pin connects directly");
+    }
+
+    #[test]
+    fn pick_rejects_direct_pin_out_of_range() {
+        let outlier = OutlierState::new(2);
+        let reg = SequenceRegistry::new(Duration::from_secs(60), 16);
+        let meta = hint_meta(&[("x-lite-worker-id", "5")], None);
+        let err = pick_streaming_worker(&meta, 2, Some(&outlier), &reg, "m", "1").unwrap_err();
+        assert!(err.0.contains("out of range"), "expected out-of-range error, got: {}", err.0);
+    }
+
+    #[test]
+    fn pick_rejects_direct_pin_to_ejected_worker() {
+        let outlier = OutlierState::new(2);
+        force_eject(&outlier, 1);
+        let reg = SequenceRegistry::new(Duration::from_secs(60), 16);
+        let meta = hint_meta(&[("x-lite-worker-id", "1")], None);
+        let err = pick_streaming_worker(&meta, 2, Some(&outlier), &reg, "m", "1").unwrap_err();
+        assert!(err.0.contains("ejected"), "expected ejected error, got: {}", err.0);
+    }
+
+    #[test]
+    fn pick_affinity_key_is_deterministic() {
+        let outlier = OutlierState::new(4);
+        let reg = SequenceRegistry::new(Duration::from_secs(60), 16);
+        let a = hint_meta(&[("x-lite-affinity-key", "tenant-42")], None);
+        let b = hint_meta(&[("x-lite-affinity-key", "tenant-42")], None);
+        let wa = pick_streaming_worker(&a, 4, Some(&outlier), &reg, "m", "1").unwrap();
+        let wb = pick_streaming_worker(&b, 4, Some(&outlier), &reg, "m", "1").unwrap();
+        assert_eq!(wa, wb, "same affinity_key must route to the same worker");
+    }
+
+    #[test]
+    fn pick_sequence_stickiness_wins_over_affinity_key() {
+        let outlier = OutlierState::new(4);
+        let reg = SequenceRegistry::new(Duration::from_secs(60), 16);
+        // Pre-record: sequence "seq-1" is sticky to worker 2.
+        reg.record("seq-1", "m", "1", 2);
+        // Request carries BOTH a sequence_id and an affinity_key: stickiness
+        // (worker 2) must win over the affinity rendezvous hash.
+        let meta = hint_meta(&[("x-lite-affinity-key", "tenant-42")], Some("seq-1"));
+        let w = pick_streaming_worker(&meta, 4, Some(&outlier), &reg, "m", "1").unwrap();
+        assert_eq!(w, 2, "sequence_id stickiness must win over affinity_key");
+    }
+
+    #[test]
+    fn pick_records_sequence_stickiness_for_future_calls() {
+        let outlier = OutlierState::new(2);
+        let reg = SequenceRegistry::new(Duration::from_secs(60), 16);
+        // No prior mapping; a sequence_id request must record its chosen worker.
+        let meta = hint_meta(&[], Some("seq-rec"));
+        let w = pick_streaming_worker(&meta, 2, Some(&outlier), &reg, "m", "1").unwrap();
+        assert_eq!(reg.lookup("seq-rec", "m", "1"), Some(w), "chosen worker must be recorded");
     }
 }

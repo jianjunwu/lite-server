@@ -152,8 +152,6 @@ impl GrpcService {
             ..Default::default()
         };
 
-        let open_req = streaming::build_stream_open(stream_id.clone(), initial_data, Some(meta), false);
-
         let clients = self
             .worker_manager
             .get_zmq_clients(&model_name, &resolved_version)
@@ -164,27 +162,23 @@ impl GrpcService {
             return Err(err(Status::unavailable("no workers available")));
         }
 
-        // P8-1: connect directly to the worker that last served this
-        // sequence_id when it is still registered and not ejected; else the
-        // normal pick, then record the chosen worker.
+        // Task F: shared streaming worker pick (B3 hints: x-lite-worker-id pin >
+        // sequence_id stickiness > x-lite-affinity-key rendezvous >
+        // skip-ejected/random). A bad pin → InvalidArgument.
         let outlier = self
             .worker_manager
             .get_outlier_state(model_name.as_str(), &resolved_version)
             .await;
         let seq_registry = self.app_state.inference_queue.sequence_registry();
-        let num_workers = clients.len();
-        let preferred = sequence_id.as_deref().and_then(|seq| {
-            let w = seq_registry.lookup(seq, &model_name, &resolved_version)?;
-            let ejected = outlier.as_ref().map(|o| o.is_ejected(w)).unwrap_or(false);
-            (w < num_workers && !ejected).then_some(w)
-        });
-        let worker_id = preferred.unwrap_or_else(|| match &outlier {
-            Some(o) => crate::worker::pick_worker_skip_ejected(num_workers, o),
-            None => crate::worker::pick_worker_random(num_workers),
-        });
-        if let Some(seq) = sequence_id.as_deref() {
-            seq_registry.record(seq, &model_name, &resolved_version, worker_id);
-        }
+        let worker_id = crate::worker::pick_streaming_worker(
+            &meta,
+            clients.len(),
+            outlier.as_deref(),
+            seq_registry,
+            &model_name,
+            &resolved_version,
+        )
+        .map_err(|e| err(Status::invalid_argument(e.0)))?;
         let client = clients[worker_id].clone();
         // P6 GetModelStats: one bidi inference dispatched to this worker.
         crate::metrics::prometheus::record_worker_inference(
@@ -193,6 +187,8 @@ impl GrpcService {
             worker_id,
             1,
         );
+
+        let open_req = streaming::build_stream_open(stream_id.clone(), initial_data, Some(meta), false);
 
         let mut chunk_rx = client
             .send_stream(open_req, stream_id.clone())
