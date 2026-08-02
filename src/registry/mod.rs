@@ -81,6 +81,21 @@ impl ModelRegistry {
         }
     }
 
+    /// True iff the model's active version is `Ready`. A pin seeded by
+    /// cache_registry restore (`force_pin_active_version`) bypasses the Ready
+    /// gate, so it is only a hint: when the pinned version fails to reload
+    /// (corrupt model.py, missing dependency, worker crash → `Loading`/`Failed`)
+    /// the pin is NOT usable. Callers that gate on "has an active version"
+    /// (reconcile's auto-activate fallback) must use this rather than
+    /// `get_active_version(..).is_some()`, or a stale pin strands the model
+    /// with no serving version and no self-heal path (B1).
+    pub fn active_version_is_ready(&self, model_name: &str) -> bool {
+        match self.get_active_version(model_name) {
+            Some(v) => self.is_ready(model_name, Some(&v)),
+            None => false,
+        }
+    }
+
     /// Server-wide health rollup for the /health, /readyz and /startupz
     /// handlers and gRPC Health sync. Entries are sorted by (name, version)
     /// so responses are deterministic.
@@ -702,6 +717,50 @@ mod tests {
         reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
             .unwrap();
         assert!(reg.mark_failed("m1", "9", "x").is_err());
+    }
+
+    // --- cache_registry stale pin (B1): a pin seeded by restore is only a
+    // hint; when the pinned version fails to reload, it must read as not
+    // usable so reconcile's auto-activate fallback can promote a healthy one. ---
+
+    #[test]
+    fn active_version_is_ready_false_when_no_active_version() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.mark_ready("m1", "1").unwrap();
+        assert!(!reg.active_version_is_ready("m1"));
+    }
+
+    #[test]
+    fn active_version_is_ready_true_when_pinned_version_ready() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.mark_ready("m1", "1").unwrap();
+        reg.activate_version("m1", "1").unwrap();
+        assert!(reg.active_version_is_ready("m1"));
+    }
+
+    #[test]
+    fn active_version_is_ready_false_when_pinned_version_failed() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.force_pin_active_version("m1", "1");
+        reg.mark_failed("m1", "1", "warmup crash").unwrap();
+        assert!(!reg.active_version_is_ready("m1"));
+    }
+
+    #[test]
+    fn active_version_is_ready_false_when_pinned_version_loading() {
+        // SyntaxError crash: load_model returns Err, version left at Loading.
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.set_status("m1", "1", VersionStatus::Loading).unwrap();
+        reg.force_pin_active_version("m1", "1");
+        assert!(!reg.active_version_is_ready("m1"));
     }
 
     #[test]

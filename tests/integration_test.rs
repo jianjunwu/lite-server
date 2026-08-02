@@ -5692,6 +5692,193 @@ async fn test_cache_registry_snapshots_and_restores() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
+/// WS2 regression (cache_registry): with `cache_registry` on, a pinned
+/// (previously active) version that fails to load on restart suppresses
+/// reconcile's auto-activate fallback. Boot #1 pins cm → v1; v1's model.py is
+/// broken before boot #2. Observed defect: v2 loads fine but is never
+/// activated, so the model cannot serve — while a cache_registry-less restart
+/// auto-activates v2 and recovers by itself.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_cache_registry_stale_pin_blocks_auto_activation() {
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    let metrics_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    kill_stale_on_port(metrics_port);
+
+    // Model cm with two healthy versions: v1 (to be pinned) and v2.
+    let repo_dir =
+        std::env::temp_dir().join(format!("lite-server-cache-pin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo_dir);
+    let healthy_model = "from lite_server import LitAPI\nclass A(LitAPI):\n  def setup(self, d): pass\n  def decode_request(self, r): return r\n  def predict(self, x): return {\"out\": x}\n  def encode_response(self, o): return o\n";
+    let model_config = "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n";
+    for v in ["1", "2"] {
+        let model_dir = repo_dir.join("cm").join(v);
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.py"), healthy_model).unwrap();
+        std::fs::write(model_dir.join("config.yaml"), model_config).unwrap();
+    }
+
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-cache-pin-cfg-{}", std::process::id()));
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: {metrics_port}\n  log_level: warn\n  cache_registry: true\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\norchestration:\n  control_mode: all\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            metrics_port = metrics_port,
+            repo = repo_dir.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let cfg_arg = server_yaml.to_string_lossy().to_string();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let base = format!("http://127.0.0.1:{}", http_port);
+
+    // Poll /v2/models/cm until reconcile has loaded the given versions as Ready.
+    async fn wait_versions(
+        client: &reqwest::Client,
+        base: &str,
+        ready: &[&str],
+        timeout_secs: u64,
+    ) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        loop {
+            let resp = client
+                .get(format!("{}/v2/models/cm/versions", base))
+                .send()
+                .await
+                .unwrap();
+            if resp.status() == 200 {
+                let v: serde_json::Value = resp.json().await.unwrap();
+                let versions = v["versions"].as_array().cloned().unwrap_or_default();
+                let ready_ok = ready.iter().all(|want| {
+                    versions
+                        .iter()
+                        .any(|x| x["version"] == *want && x["status"] == "Ready")
+                });
+                if ready_ok {
+                    return v;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                return client
+                    .get(format!("{}/v2/models/cm/versions", base))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    // --- Boot #1: both versions healthy; activate v1; SIGTERM → snapshot pins cm → 1. ---
+    let mut child = start_server(&["--config", &cfg_arg]);
+    wait_for_server(http_port, 30).await;
+    wait_versions(&client, &base, &["1", "2"], 30).await;
+    let activate = client
+        .post(format!("{}/v2/models/cm/versions/1/activate", base))
+        .send()
+        .await
+        .expect("activate request failed");
+    assert_eq!(activate.status(), 200, "activate failed");
+    send_sigterm(&child);
+    let exited = wait_for_exit(&mut child, 30).await;
+    assert!(exited, "server did not exit on SIGTERM");
+
+    // --- Break v1: the pinned version must fail to load on restart. ---
+    std::fs::write(
+        repo_dir.join("cm").join("1").join("model.py"),
+        "def setup(:", // SyntaxError → the worker fails at import.
+    )
+    .unwrap();
+
+    // --- Boot #2: restore pins cm → 1; v1 load fails; v2 loads fine. ---
+    let child2 = start_server(&["--config", &cfg_arg]);
+    wait_for_server(http_port, 30).await;
+    let info = wait_versions(&client, &base, &["2"], 30).await;
+
+    // The seeded pin points at the broken v1, but reconcile's auto-activate
+    // fallback must still promote the healthy v2 — otherwise the model is
+    // stuck unusable after a restart (the defect this test pins down).
+    let v1 = info["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["version"] == "1")
+        .expect("v1 registered after the failed load");
+    assert_ne!(v1["status"], "Ready", "v1 must be broken after the failed load");
+    assert_eq!(
+        info["active_version"].as_str(),
+        Some("2"),
+        "auto-activate fallback must promote the healthy v2 (defect: stale pin blocks it)"
+    );
+    let infer = client
+        .post(format!("{}/v2/models/cm/infer", base))
+        .json(&json!({"input": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        infer.status(),
+        200,
+        "model must serve via the auto-activated healthy v2 (defect: routes to broken pin)"
+    );
+    stop_server(child2);
+
+    // --- Contrast: the same repo without cache_registry auto-activates v2. ---
+    let hp2 = next_test_port();
+    let gp2 = next_test_port();
+    let mp2 = next_test_port();
+    kill_stale_on_port(hp2);
+    kill_stale_on_port(gp2);
+    kill_stale_on_port(mp2);
+    let plain_yaml = tmp_dir.join("server-plain.yaml");
+    std::fs::write(
+        &plain_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {hp2}\n  grpc_port: {gp2}\n  metrics_port: {mp2}\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\norchestration:\n  control_mode: all\nmodel_repository:\n  path: {repo}\n",
+            hp2 = hp2,
+            gp2 = gp2,
+            mp2 = mp2,
+            repo = repo_dir.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let base2 = format!("http://127.0.0.1:{}", hp2);
+    let child3 = start_server(&["--config", &plain_yaml.to_string_lossy()]);
+    wait_for_server(hp2, 30).await;
+    let info3 = wait_versions(&client, &base2, &["2"], 30).await;
+    assert_eq!(
+        info3["active_version"].as_str(),
+        Some("2"),
+        "without cache_registry the restart must auto-activate the healthy v2"
+    );
+    let infer3 = client
+        .post(format!("{}/v2/models/cm/infer", base2))
+        .json(&json!({"input": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(infer3.status(), 200, "recovered model must serve");
+    stop_server(child3);
+
+    let _ = std::fs::remove_dir_all(&repo_dir);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
 // ===========================================================================
 // Multi-platform / multi-version audit regression tests (2026-08-02)
 // ===========================================================================

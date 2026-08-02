@@ -117,7 +117,12 @@ pub(super) async fn reconcile_models(
                     Err(e) => error!("Error activating default version {} for {}: {}", dv, name, e),
                 }
             }
-        } else if !versions_loaded.is_empty() && registry.get_active_version(name).is_none() {
+        } else if !versions_loaded.is_empty() && !registry.active_version_is_ready(name) {
+            // No default_version: auto-activate the first loaded version, but
+            // only when no usable active version remains. A stale pin seeded
+            // by cache_registry restore (force_pin) — pointing at a version
+            // that failed to reload — must read as "no active version" here,
+            // or the model is stuck unusable after restart (B1).
             match registry.activate_version(name, &versions_loaded[0]) {
                 Ok(true) => info!("Activated version {} for {}", versions_loaded[0], name),
                 Ok(false) => warn!("Failed to activate version {} for {} (not ready)", versions_loaded[0], name),
