@@ -109,6 +109,8 @@ CONFIG_YAML_EXAMPLE = textwrap.dedent("""\
     # max_requests: 0              # Auto-restart worker after N requests (0 = disabled)
     # max_requests_jitter: 0       # Random jitter for max_requests (prevents thundering herd)
     # health_check_interval: 15.0  # Active health check interval in seconds (0 = disabled)
+    # queue_timeout_secs: 0.0      # P-FLOW B1: max queue-wait secs before queue_timeout_action (0 = off)
+    # queue_timeout_action: delay  # P-FLOW B1: delay | reject (reject = 503 once queue wait elapses)
 
     # ===== Worker Resilience =====
     # max_retries: 3                # Retry a failed batch on another worker up to N times (0 = disable)
@@ -238,6 +240,8 @@ SERVER_YAML = textwrap.dedent("""\
       # max_request_body_bytes: null # Per-request body cap (P-FLOW); null = platform default
       # sequence_ttl_secs: 3600     # sequence_id affinity TTL (P8-1)
       # max_sequences: 65536        # Max tracked sequence_id entries (P8-1)
+      # balance_abs_threshold: 2   # P8-1: in-flight gap to fall back from sticky affinity (0 = off)
+      # balance_rel_threshold: 1.5 # P8-1: relative load multiplier (1.5 = +50%; 0.0 = off)
       # decoupled_idle_timeout_secs: 300 # Decoupled stream idle reclaim (P9-1)
       # cors:                       # Global CORS policy (P-CORS); null = pass-through
       #   allow_origins: ["https://app.example.com"]
@@ -297,6 +301,15 @@ SERVER_YAML = textwrap.dedent("""\
     #   sample_ratio: 1.0
     #   health_admin_sample_ratio: 0.0  # down-sample high-frequency probes
     #   service_name: "lite-server"
+    #   otlp_headers:               # OTLP auth headers map (P-TRACE); empty = none
+    #     Authorization: "Bearer <token>"
+    #   export_interval_millis: 5000 # Batch export interval (ms)
+    #   max_queue_size: 2048        # Batch processor queue length
+    #   metrics_enabled: false      # OTel metrics SDK + request-duration histogram
+    #   exemplars_enabled: false    # trace-based exemplar filter
+    #   baggage_allowlist: []       # Inbound baggage key allowlist (empty = drop all)
+    #   baggage_max_entries: 16     # Max baggage entries kept after allowlist
+    #   baggage_max_entry_bytes: 128 # Max bytes per baggage entry (key+value)
 
     logging:
       # level: info                 # Log level: trace, debug, info, warn, error
@@ -322,6 +335,9 @@ SERVER_YAML = textwrap.dedent("""\
       #     versions_to_load: ["1"]
       #     default_version: "1"
       #     max_loaded_versions: 3  # Max versions kept loaded (null = unlimited)
+      #     weights:               # Initial per-version traffic weights (canary)
+      #       "1": 50
+      #       "2": 50
 
     # Global defaults applied to every loaded model.  When set (non-null),
     # these override the corresponding per-model config.yaml values.
@@ -365,6 +381,7 @@ SERVER_YAML = textwrap.dedent("""\
       sse: true
       websocket_streaming: true
       streaming_metrics: true
+      # canary_override: false    # P5-2: allow x-lite-version pin to bypass canary weights
 """)
 
 CALLBACKS_PY = textwrap.dedent('''\

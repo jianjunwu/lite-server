@@ -177,6 +177,59 @@ class TestServerYamlEnhanced:
         assert "transport" not in text
 
 
+class TestTemplateRustSchemaParity:
+    """Templates must list every Rust-schema supported key (drift guard vs config.rs)."""
+
+    def test_example_contains_queue_timeout_keys(self, tmp_path):
+        """D1 (P-FLOW B1): config.yaml.example should surface queue_timeout_secs/action."""
+        gen = ProjectGenerator("p", tmp_path)
+        root = gen.generate()
+        text = (root / "model_repo" / "my_model" / "1" / "config.yaml.example").read_text()
+        assert "queue_timeout_secs" in text
+        assert "queue_timeout_action" in text
+
+    def test_server_yaml_contains_balance_thresholds(self, tmp_path):
+        """D2 (P8-1): server.yaml should expose affinity load-balance thresholds."""
+        gen = ProjectGenerator("p", tmp_path)
+        root = gen.generate()
+        text = (root / "server.yaml").read_text()
+        assert "balance_abs_threshold" in text
+        assert "balance_rel_threshold" in text
+
+    def test_server_yaml_telemetry_contains_all_export_keys(self, tmp_path):
+        """D3 (P-TRACE): telemetry block should list all 8 export knobs."""
+        gen = ProjectGenerator("p", tmp_path)
+        root = gen.generate()
+        text = (root / "server.yaml").read_text()
+        for key in (
+            "otlp_headers",
+            "export_interval_millis",
+            "metrics_enabled",
+            "exemplars_enabled",
+            "baggage_allowlist",
+            "baggage_max_entries",
+            "baggage_max_entry_bytes",
+        ):
+            assert key in text, f"telemetry missing {key}"
+        # max_queue_size also appears in model_defaults; disambiguate via the
+        # telemetry default value (2048, not null).
+        assert "max_queue_size: 2048" in text
+
+    def test_server_yaml_features_contains_canary_override(self, tmp_path):
+        """D4 (P5-2): features block should expose the canary pin override."""
+        gen = ProjectGenerator("p", tmp_path)
+        root = gen.generate()
+        text = (root / "server.yaml").read_text()
+        assert "canary_override" in text
+
+    def test_server_yaml_orchestration_models_shows_weights(self, tmp_path):
+        """D5 (canary §4.3): orchestration.models example should show weights."""
+        gen = ProjectGenerator("p", tmp_path)
+        root = gen.generate()
+        text = (root / "server.yaml").read_text()
+        assert "weights" in text
+
+
 class TestNoStandaloneOrchestration:
     """orchestration.yaml should NOT be generated standalone; server.yaml owns it."""
 
