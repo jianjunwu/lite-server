@@ -382,8 +382,25 @@ def load_callbacks(
             instances.append(cb)
             logger.debug("Loaded callback %s from LitAPI.callbacks", type(cb).__name__)
 
-    # config.yaml (append)
-    for path in config.get("callbacks", []) or []:
+    # config.yaml (append).  Each entry is either a dotted class path (str,
+    # no-arg) or a single-key map {path: kwargs} (constructor args) — same
+    # registration model as the LitAPI.callbacks class attribute.
+    for entry in config.get("callbacks", []) or []:
+        if isinstance(entry, dict):
+            if len(entry) != 1:
+                raise RuntimeError(
+                    f"callbacks: map entry must have exactly one key (the class "
+                    f"path); got {len(entry)}: {list(entry)}"
+                )
+            path, kwargs = next(iter(entry.items()))
+            kwargs = dict(kwargs or {})
+        elif isinstance(entry, str):
+            path, kwargs = entry, {}
+        else:
+            raise RuntimeError(
+                f"callbacks: entry must be a class-path string or a "
+                f"'{{path: kwargs}}' map; got {entry!r}"
+            )
         module_path, _, class_name = path.rpartition(".")
         if class_name in _REMOVED_POLICY_CLASSES:
             raise RuntimeError(f"Callback '{path}' was removed: {_REMOVED_POLICY_HINT}")
@@ -397,11 +414,11 @@ def load_callbacks(
                 f"Callback '{path}' is not a lite_server.Callback subclass"
             )
         try:
-            instance = cls()
+            instance = cls(**kwargs)
         except Exception as e:
+            kw_hint = f" with kwargs {kwargs}" if kwargs else " (must be no-arg constructible)"
             raise RuntimeError(
-                f"Failed to instantiate callback '{path}' (must be no-arg "
-                f"constructible): {e}"
+                f"Failed to instantiate callback '{path}'{kw_hint}: {e}"
             ) from e
         validate_callback(instance)
         instances.append(instance)

@@ -157,6 +157,13 @@ class RequestContext:
             return None
         return (ns - time.time_ns()) / 1_000_000.0
 
+    def elapsed_ms(self) -> float:
+        """Milliseconds since the request started (``meta.timestamp_ns``).
+
+        Replaces hand-rolled ``start_ns`` bookkeeping in timing/audit hooks.
+        """
+        return (time.time_ns() - self.meta.timestamp_ns) / 1_000_000.0
+
 
 class CBSequence:
     """One active sequence in continuous batching.

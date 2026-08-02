@@ -40,6 +40,7 @@ dev = [
     "grpcio>=1.62",
 ]
 benchmark = []
+validation = ["jsonschema>=4"]
 
 [tool.maturin]
 manifest-path = "Cargo.toml"

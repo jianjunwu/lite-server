@@ -49,6 +49,26 @@ class TestRequestContext:
         assert ctx.stage is None
 
 
+class TestElapsedMs:
+    def test_nonnegative_right_after_construction(self):
+        meta = RequestMeta(
+            route="/predict", headers=Headers({}), client_ip="127.0.0.1",
+            request_id="r", timestamp_ns=time.time_ns(),
+        )
+        ctx = RequestContext(meta=meta)
+        assert ctx.elapsed_ms() >= 0
+
+    def test_increases_with_time(self):
+        meta = RequestMeta(
+            route="/predict", headers=Headers({}), client_ip="127.0.0.1",
+            request_id="r", timestamp_ns=time.time_ns(),
+        )
+        ctx = RequestContext(meta=meta)
+        first = ctx.elapsed_ms()
+        time.sleep(0.01)
+        assert ctx.elapsed_ms() > first
+
+
 class TestDeadlineRemaining:
     def test_returns_none_when_no_deadline(self):
         ctx = RequestContext(meta=_make_meta())  # _make_meta omits deadline → None
@@ -207,6 +227,40 @@ class TestLoadCallbacks:
         monkeypatch.syspath_prepend(str(tmp_path))
         with pytest.raises(RuntimeError, match="on_before_decode"):
             load_callbacks({"callbacks": ["old_style.Old"]})
+
+    def test_loads_callback_with_map_kwargs(self, tmp_path, monkeypatch):
+        (tmp_path / "mapkw.py").write_text(
+            "from lite_server import Callback\n"
+            "class C(Callback):\n"
+            "    def __init__(self, tag='none'):\n"
+            "        self.tag = tag\n"
+        )
+        monkeypatch.syspath_prepend(str(tmp_path))
+        cbs = load_callbacks({"callbacks": [{"mapkw.C": {"tag": "x"}}]})
+        assert len(cbs) == 1
+        assert cbs[0].tag == "x"
+
+    def test_mixed_str_and_map_entries(self, tmp_path, monkeypatch):
+        (tmp_path / "mixkw.py").write_text(
+            "from lite_server import Callback\n"
+            "class C(Callback):\n"
+            "    def __init__(self, tag='none'):\n"
+            "        self.tag = tag\n"
+            "class D(Callback):\n"
+            "    pass\n"
+        )
+        monkeypatch.syspath_prepend(str(tmp_path))
+        cbs = load_callbacks({"callbacks": ["mixkw.D", {"mixkw.C": {"tag": "y"}}]})
+        assert [type(c).__name__ for c in cbs] == ["D", "C"]
+        assert cbs[1].tag == "y"
+
+    def test_map_entry_with_multiple_keys_raises(self):
+        with pytest.raises(RuntimeError, match="exactly one key"):
+            load_callbacks({"callbacks": [{"a.b": {}, "c.d": {}}]})
+
+    def test_non_str_non_dict_entry_raises(self):
+        with pytest.raises(RuntimeError, match="class-path string"):
+            load_callbacks({"callbacks": [42]})
 
 
 # ---------------------------------------------------------------------------

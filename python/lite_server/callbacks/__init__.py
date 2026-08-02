@@ -20,9 +20,11 @@ never propagated.
 """
 
 from lite_server.callbacks._base import Callback, load_callbacks, validate_callback
+from lite_server.callbacks.builtin import JsonSchemaValidator
 
 __all__ = [
     "Callback",
+    "JsonSchemaValidator",
     "load_callbacks",
     "validate_callback",
 ]
