@@ -30,6 +30,9 @@ pub mod worker;
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
+#[cfg(feature = "python")]
+use std::sync::{Mutex, OnceLock};
+use tokio::sync::oneshot;
 use tracing::info;
 
 /// CLI overrides grouped to keep `run_server`'s signature readable
@@ -71,6 +74,7 @@ pub struct ServerOptions {
 
 pub fn run_server(
     opts: ServerOptions,
+    shutdown_rx: Option<oneshot::Receiver<()>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ServerOptions {
         config,
@@ -178,7 +182,7 @@ pub fn run_server(
 
     let rt = build_runtime(threads);
     rt.block_on(async {
-        server.run().await.map_err(|e| {
+        server.run(shutdown_rx).await.map_err(|e| {
             Box::<dyn std::error::Error + Send + Sync>::from(format!("Server error: {}", e))
         })
     })
@@ -203,6 +207,55 @@ fn build_runtime(threads: Option<usize>) -> tokio::runtime::Runtime {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Process-global slot tracking the running serve() instance.
+//
+// Holds the Sender half of a oneshot channel that `stop_server()` signals to
+// trigger graceful shutdown, and doubles as the re-entrancy guard: Some(tx)
+// means a serve() is running, so a second serve() fails fast (before it can
+// race on the bind and wedge the tokio runtime drop on the Python CLI path).
+// ---------------------------------------------------------------------------
+#[cfg(feature = "python")]
+static SERVE_SLOT: OnceLock<Mutex<Option<oneshot::Sender<()>>>> = OnceLock::new();
+
+#[cfg(feature = "python")]
+fn serve_slot() -> &'static Mutex<Option<oneshot::Sender<()>>> {
+    SERVE_SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Clears the serve slot when serve() unwinds through any path (Ok, `?`-Err, or
+/// a server-thread panic propagating through join). Recovers from a poisoned
+/// mutex (mirrors ShutdownState at server/mod.rs:42) so a panic does not wedge
+/// the slot permanently and a later serve() can still run.
+#[cfg(feature = "python")]
+struct ServeSlotGuard;
+
+#[cfg(feature = "python")]
+impl Drop for ServeSlotGuard {
+    fn drop(&mut self) {
+        if let Ok(mut s) = serve_slot().lock() {
+            *s = None;
+        }
+    }
+}
+
+/// Run the server, blocking the calling thread until shutdown.
+///
+/// The server runs on a dedicated OS thread (`lite-server-main`) with the GIL
+/// released via `py.allow_threads`, so other Python threads progress while the
+/// embedding application is blocked here. The tokio runtime lives entirely on
+/// that thread, never on the CPython main thread; the inference hot path never
+/// touches the GIL (inference runs in separate Python worker processes over
+/// ZMQ).
+///
+/// Shutdown:
+///   * A signal (SIGINT/SIGTERM) drives graceful shutdown, after which `serve`
+///     returns and a `KeyboardInterrupt` propagates — embedders should wrap the
+///     call in `try/except KeyboardInterrupt` (the CLI already does).
+///   * For programmatic stop from another thread, call `stop_server()`.
+///
+/// Re-entrant calls (a second `serve` while one is running) fail fast with
+/// `RuntimeError("...already running...")`.
 #[cfg(feature = "python")]
 #[pyfunction]
 #[pyo3(signature = (
@@ -273,9 +326,24 @@ fn serve(
     worker_kill_timeout: Option<f32>,
     hook_http_timeout: Option<f32>,
 ) -> PyResult<()> {
-    // 原型（方案 A）：tokio runtime 跑在独立 OS 线程，主线程只 join。
-    // 验证 PyO3 嵌入 + 单线程事件循环的每请求固定开销是否来自"事件循环
-    // 跑在 CPython 主线程上"。若有效再整理成正式实现，否则回退。
+    // Re-entrancy guard + stop trigger. Claim the process-global slot before
+    // anything that could wedge: a second serve() racing on the bind deadlocks
+    // the tokio runtime drop on this Python CLI path. The slot holds the Sender
+    // stop_server() signals; ServeSlotGuard clears it on every exit path.
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    {
+        let mut slot = serve_slot().lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_some() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "lite-server is already running; call stop_server() or wait for the running instance to finish",
+            ));
+        }
+        *slot = Some(shutdown_tx);
+    }
+    let _guard = ServeSlotGuard;
+
+    // The tokio runtime runs on a dedicated OS thread; the calling (Python)
+    // thread blocks here in join() with the GIL released.
     pyo3::Python::with_gil(|py| {
         py.allow_threads(|| {
             std::thread::Builder::new()
@@ -291,7 +359,7 @@ fn serve(
                         ejection_max_timeout,
                         max_retries, startup_timeout, health_check_timeout,
                         health_check_kill_threshold, worker_kill_timeout, hook_http_timeout,
-                    })
+                    }, Some(shutdown_rx))
                 })
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
                 .join()
@@ -301,6 +369,26 @@ fn serve(
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })
     })
+}
+
+/// Trigger graceful shutdown of the running `serve()` and return immediately
+/// (non-blocking). Returns `True` if a running server was signaled, `False` if
+/// no `serve()` is currently running (idempotent — does not raise).
+///
+/// Must be called from a DIFFERENT thread than the one blocked in `serve()`;
+/// the caller is responsible for joining the `serve` thread. Typical embed:
+/// `t = threading.Thread(target=serve, ...); t.start(); ...; stop_server();
+/// t.join()`.
+#[cfg(feature = "python")]
+#[pyfunction]
+fn stop_server() -> bool {
+    match serve_slot().lock().unwrap_or_else(|e| e.into_inner()).take() {
+        Some(tx) => {
+            let _ = tx.send(());
+            true
+        }
+        None => false,
+    }
 }
 
 /// Validate a server config file with the same serde path used at startup,
@@ -327,6 +415,7 @@ fn validate_model_config(path: &str) -> PyResult<()> {
 #[pymodule]
 fn _lite_server(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(serve, m)?)?;
+    m.add_function(wrap_pyfunction!(stop_server, m)?)?;
     m.add_function(wrap_pyfunction!(validate_server_config, m)?)?;
     m.add_function(wrap_pyfunction!(validate_model_config, m)?)?;
     m.add_function(wrap_pyfunction!(test_support::validate_identifier, m)?)?;

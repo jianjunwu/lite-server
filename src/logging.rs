@@ -106,13 +106,19 @@ pub fn init(
     use tracing_subscriber::layer::Identity;
     let otel: crate::telemetry::BoxedLayer =
         otel_layer.unwrap_or_else(|| Box::new(Identity::new()));
-    tracing_subscriber::registry()
+    // Idempotent: the tracing global subscriber is a process singleton.
+    // `.init()` panics on a second call, which would crash a process that calls
+    // serve() again (e.g. stop_server() then restart, or an embedder re-entering
+    // serve after a graceful stop). Ignore SetGlobalDefaultError so the first
+    // subscriber stays installed; a later call's log level is not reapplied
+    // (acceptable for re-serve).
+    let _ = tracing_subscriber::registry()
         .with(otel)
         .with(filter)
         .with(stdout_layer)
         .with(info_layer)
         .with(error_layer)
-        .init();
+        .try_init();
 
     LogGuard {
         _info_guard: info_guard,

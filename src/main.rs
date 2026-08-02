@@ -278,7 +278,7 @@ fn main() {
             // Build tokio runtime with configured thread count
             let rt = build_runtime(cfg.server.threads);
             let server = LiteServer::new(cfg);
-            if let Err(e) = rt.block_on(server.run()) {
+            if let Err(e) = rt.block_on(server.run(None)) {
                 error!("Server error: {}", e);
                 std::process::exit(1);
             }

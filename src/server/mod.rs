@@ -169,7 +169,10 @@ impl LiteServer {
         Some(format!("http://{}:{}", host, config.server.http_port))
     }
 
-    pub async fn run(&self) -> Result<(), AppError> {
+    pub async fn run(
+        &self,
+        shutdown_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> Result<(), AppError> {
         // Register prometheus metrics
         if let Err(e) = prometheus::register_metrics() {
             error!("Failed to register metrics: {}", e);
@@ -459,7 +462,19 @@ impl LiteServer {
         // the ZMQ client map in unload_version and lets the actors exit), then
         // return Err at the end.
         let mut startup_error: Option<AppError> = None;
+        // Programmatic stop: `stop_server()` (Python) signals this oneshot from
+        // another thread. Hoisted as `async move` — an inline block can't move
+        // `shutdown_rx` by value into the select! arm. `None` (binary path)
+        // never resolves.
+        let stop_fut = async move {
+            if let Some(rx) = shutdown_rx {
+                let _ = rx.await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
         let shutdown_reason = tokio::select! {
+            _ = stop_fut => "stop_server".to_string(),
             result = &mut http_handle => {
                 match result {
                     Ok(Ok(())) => "http_server_finished".to_string(),
