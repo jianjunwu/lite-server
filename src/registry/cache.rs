@@ -1,7 +1,13 @@
 //! `cache_registry` (config.rs `server.cache_registry`): snapshot the model
 //! registry to disk on graceful shutdown and restore it on startup, so an
-//! admin-activated version or an admin-added model survives a restart without
-//! the operator re-issuing the calls.
+//! admin-activated version survives a restart without the operator re-issuing
+//! the call. Caveat for admin-ADDED models (no config entry): the restart
+//! load path only walks configured `load_models` outside `control_mode: "all"`
+//! (see `reconcile.rs`), so under `explicit`/`auto` a restored strategy+pin
+//! survives but the model stays inert (no workers) until it is added to config
+//! or `control_mode` becomes `"all"`. Admin-activated versions of config
+//! models work in every mode (the model loads from config; the pin re-picks
+//! the admin's version).
 //!
 //! What is persisted: per-model strategy (`load_policy`, `max_loaded_versions`,
 //! `weights`) and the active-version pins. The version table itself is NOT

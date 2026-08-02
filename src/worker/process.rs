@@ -397,12 +397,16 @@ impl WorkerManager {
 
         // Spawn new worker
         //
-        // The version dips to Loading while the replacement starts; the
-        // handshake marks it Ready again, a startup failure marks it
-        // Degraded (runtime worker loss, not a load failure — Failed is
+        // During respawn the version drops to Degraded (NOT Loading): with
+        // multiple workers the surviving slots keep serving, and Degraded still
+        // counts as serving (`routing_pick` / `has_serving`), so a single-slot
+        // respawn doesn't take the whole version out of rotation for the startup
+        // window. `Loading` would make `has_serving` false and stall all traffic.
+        // A successful handshake marks it Ready again; a startup failure leaves
+        // it Degraded (runtime worker loss, not a load failure — Failed is
         // load-phase only).
         self.registry
-            .set_status(model_name, version, VersionStatus::Loading)?;
+            .set_status(model_name, version, VersionStatus::Degraded)?;
         let accelerator = model_config.accelerator.as_deref().unwrap_or("cpu");
         let devices = match &model_config.devices {
             Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(1) as usize,

@@ -236,6 +236,21 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     bool::from(acc)
 }
 
+/// Constant-time "is `value` one of `keys`" for the per-model API-key list.
+/// Unlike `keys.iter().any(|k| k == value)`, this compares EVERY key in full
+/// regardless of an early hit — a plain `==`/`any` short-circuits at the first
+/// matching byte and at the first matching key, so a correct key returns
+/// faster than a wrong one and leaks via timing. `ct_eq` is constant-time per
+/// byte; folding with `|=` (not `||`) never short-circuits across keys.
+pub(crate) fn ct_contains(keys: &[String], value: &str) -> bool {
+    let v = value.as_bytes();
+    let mut found = false;
+    for k in keys {
+        found |= ct_eq(k.as_bytes(), v);
+    }
+    found
+}
+
 /// Classify an HTTP request path into an endpoint class (蓝图 §4.2). Health
 /// probes are an exact allowlist; inference = anything `access_log_target`
 /// treats as a model inference/custom-route path; everything else is admin.

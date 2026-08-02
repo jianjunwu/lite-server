@@ -120,7 +120,7 @@ CONFIG_YAML_EXAMPLE = textwrap.dedent("""\
     # ejection_max_percent: 50      # Max % of workers that may be ejected at once (1-100)
     # startup_timeout: 60.0         # Max seconds to wait for a worker "ready" handshake
     # health_check_timeout: 5.0     # Seconds per health-check probe before timing out
-    # health_check_kill_threshold: 0 # Consecutive probe failures before kill + respawn (0 = never)
+    # health_check_kill_threshold: 0 # [EXPERIMENTAL] probe failures before kill+respawn (0=never); respawn gaps fixed in 0.9
     # worker_kill_timeout: 10.0     # Seconds to wait for the OS to reap a killed worker
     # hook_http_timeout: 5.0        # Seconds for a worker lifecycle HTTP hook request
 
@@ -227,7 +227,7 @@ SERVER_YAML = textwrap.dedent("""\
       metrics_port: 8002
       # timeout: 30.0               # Per-request timeout in seconds (P-DEADLINE fallback)
       # threads: null               # Tokio worker threads (null = auto = CPU cores)
-      # cache_registry: false       # Cache model/version lookups in HTTP layer
+      # cache_registry: false       # Snapshot registry (strategy + active pins) on shutdown; restore on startup
       # graceful_timeout: 30.0      # Max seconds for graceful shutdown
       # keepalive_timeout: 5.0      # HTTP keep-alive timeout (0 = disable)
       # compression: false          # gzip HTTP responses (P1-4; SSE excluded)
@@ -257,7 +257,7 @@ SERVER_YAML = textwrap.dedent("""\
 
     grpc:
       enabled: {grpc}
-      # max_workers: 10             # Max concurrent gRPC request handlers
+      # max_workers: 10             # Max worker processes per model; 0 = no cap
       # host: null                  # gRPC bind (null = follow server.host); unix:/path = UDS (P4-1)
       # admin_bind: null            # Separate admin+health bind (P7-2); unix:/path forced 0o600
       # socket_mode: 0o666          # chmod for a unix: gRPC UDS (P4-1)

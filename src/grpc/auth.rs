@@ -38,7 +38,7 @@ pub(super) fn enforce_auth_grpc(
             auth.header
         ))));
     }
-    if !auth.keys.is_empty() && !auth.keys.iter().any(|k| k == &value) {
+    if !auth.keys.is_empty() && !crate::access_control::ct_contains(&auth.keys, &value) {
         return Err(err(Status::unauthenticated(format!(
             "invalid API key (header: {})",
             auth.header

@@ -1127,6 +1127,18 @@ impl ModelConfig {
         check_duration_secs("health_check_timeout", self.health_check_timeout)?;
         check_duration_secs("worker_kill_timeout", self.worker_kill_timeout)?;
         check_duration_secs("hook_http_timeout", self.hooks.hook_http_timeout)?;
+        // devices: a Number must be a positive integer (>= 1). `0` (or `0.0`)
+        // otherwise flows into the worker spawn loop as `worker_id % devices` =
+        // `0 % 0` and panics (worker/lifecycle.rs:247). "auto"/None/other
+        // strings resolve to 1 device in the loader and stay valid.
+        if let Some(serde_json::Value::Number(n)) = &self.devices {
+            if !matches!(n.as_u64(), Some(d) if d >= 1) {
+                anyhow::bail!(
+                    "config field `devices` must be a positive integer >= 1 \
+                     (or the string \"auto\"), got {n}"
+                );
+            }
+        }
         // M7 迁移哨兵（与 load_model_config 同一道闸）。
         if let Some(w) = &self.policies.warmup {
             w.validate()?;
@@ -2376,6 +2388,25 @@ policies:
         cfg.tunables.watcher_debounce_secs = f32::INFINITY;
         assert!(cfg.validate().is_err());
         assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn model_config_rejects_devices_zero_to_avoid_spawn_loop_panic() {
+        // Audit (0.8.0-rc0): `devices: 0` passes ModelConfig::validate() today,
+        // but worker/lifecycle.rs:247 computes `worker_id % devices` inside the
+        // spawn loop. With grpc.max_workers > 0 (default 10), clamp_worker_count
+        // (0, 10) = 1 (the `.max(1)` floor), so the loop runs worker_id=0 and
+        // executes `0 % 0` → divide-by-zero panic. validate() is the gate that
+        // load_model (lifecycle.rs:135) already calls, so rejecting devices<1
+        // there closes every load path (YAML / CLI defaults / Admin API / ensemble).
+        let cfg: ModelConfig = serde_yaml::from_str("devices: 0\n").expect("parses");
+        assert!(
+            cfg.validate().is_err(),
+            "devices:0 must be rejected at validation — else load_model panics on `worker_id % devices`"
+        );
+        // Sanity: a positive devices value stays valid.
+        let cfg_ok: ModelConfig = serde_yaml::from_str("devices: 1\n").expect("parses");
+        assert!(cfg_ok.validate().is_ok());
     }
 
     // ===== P5-1: TLS/mTLS config validation =====

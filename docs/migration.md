@@ -34,6 +34,14 @@ P-WARM (pure additions; defaults preserve prior behavior). P-OAI is deferred to 
 > REJECT → `503` / `Unavailable`; rate limiting → `429` / `RESOURCE_EXHAUSTED`.
 > See architecture.md "Deadline Propagation".
 
+> **Semantics note (stream idle reclaim):** `decoupled_idle_timeout_secs`
+> defaults to `300` and applies to EVERY streaming mode (regular stream / bidi
+> / SSE / WS / custom-route / gRPC). A stream that produces no chunk for that
+> long is closed and reclaimed, where previously a stalled stream with no
+> client deadline could hang unbounded. This is on by design (a stuck stream
+> is recovered instead of leaking). Set `decoupled_idle_timeout_secs: 0` to
+> restore the old unbounded-idle behavior.
+
 ## M1 — XFF/X-Real-IP no longer trusted (P-XFF)
 
 **What changed:** `client_ip` is now derived from the direct peer address. Client

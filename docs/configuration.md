@@ -277,7 +277,7 @@ ejection_max_timeout: 300.0    # Cap for the per-worker circuit-breaker backoff 
 ejection_max_percent: 50       # Max % of workers ejectable at once (1-100)
 startup_timeout: 60.0          # Max seconds to wait for a worker "ready" handshake
 health_check_timeout: 5.0      # Seconds per health-check probe before timing out
-health_check_kill_threshold: 0 # Consecutive probe failures before kill + respawn (0 = never)
+health_check_kill_threshold: 0 # [EXPERIMENTAL] probe failures before kill+respawn (0=never); respawn has known gaps (stale inference-queue client snapshot, dead-slot hygiene) fixed in 0.9
 worker_kill_timeout: 10.0      # Seconds to wait for the OS to reap a killed worker
 
 # Worker Lifecycle Hooks

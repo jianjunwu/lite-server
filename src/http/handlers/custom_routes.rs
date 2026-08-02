@@ -213,26 +213,41 @@ pub async fn dispatch_custom_route(
     let result = match first {
         RouteReply::Unary(Some(response)) => match response.payload {
             // Decode the SingleResponse (routes reuse the inference response shape).
-            Some(pb::response::Payload::Single(single)) => build_route_http_response(single),
+            Some(pb::response::Payload::Single(single)) => {
+                let r = build_route_http_response(single);
+                // Unary route: the response is complete when the Single reply
+                // arrives — fire InferenceResponse with the full duration.
+                if r.is_ok() {
+                    crate::callback::fire_inference_response(
+                        &state.callback_runner, &req_ctx, start,
+                    );
+                }
+                r
+            }
             _ => Err(AppError::WorkerCrashed("unexpected response type".to_string())),
         },
         RouteReply::Unary(None) => Err(AppError::WorkerCrashed(
             "route reply channel closed".to_string(),
         )),
         RouteReply::Stream(frame) => match frame.payload {
-            Some(pb::stream_response::Payload::Start(start)) => {
-                build_route_stream_http_response(start, chunk_rx, stream_deadline, stream_idle)
+            Some(pb::stream_response::Payload::Start(start_frame)) => {
+                // Stream route: InferenceResponse fires on the terminal frame
+                // inside the body (aligned with SSE/WS), not here at Start.
+                build_route_stream_http_response(
+                    start_frame,
+                    chunk_rx,
+                    stream_deadline,
+                    stream_idle,
+                    state.callback_runner.clone(),
+                    req_ctx.clone(),
+                    start,
+                )
             }
             _ => Err(AppError::WorkerCrashed(
                 "route stream missing start frame".to_string(),
             )),
         },
     };
-
-    // Fire InferenceResponse callback on success, mirroring do_infer.
-    if result.is_ok() {
-        crate::callback::fire_inference_response(&state.callback_runner, &req_ctx, start);
-    }
 
     result
 }
@@ -286,6 +301,9 @@ fn build_route_stream_http_response(
     chunk_rx: mpsc::Receiver<pb::StreamResponse>,
     deadline: Option<std::time::Instant>,
     idle: Option<std::time::Duration>,
+    callback_runner: std::sync::Arc<crate::callback::CallbackRunner>,
+    req_ctx: crate::callback::InferenceContext,
+    open_time: std::time::Instant,
 ) -> Result<Response, AppError> {
     let is_sse = start.media_type.starts_with("text/event-stream");
     let content_type = if start.media_type.is_empty() {
@@ -293,37 +311,50 @@ fn build_route_stream_http_response(
     } else {
         start.media_type.as_str()
     };
-    let body = futures::stream::unfold((chunk_rx, false), move |(mut rx, ended)| async move {
-        if ended {
-            return None;
-        }
-        // P-DEADLINE (§4.0.4): overall deadline / chunk-idle bound this recv.
-        let frame = match crate::streaming::recv_chunk(&mut rx, deadline, idle).await {
-            Ok(Some(f)) => Some(f),
-            Ok(None) => None, // worker closed the stream
-            Err(elapsed) => {
-                tracing::warn!(?elapsed, "route stream closed: deadline/idle elapsed");
-                None
+    // Thread the callback context through the unfold state so the terminal
+    // frame fires InferenceResponse exactly once with the FULL open→terminal
+    // elapsed — aligned with SSE/WS. Firing on the Start frame (the old
+    // behavior) reported only cold-start latency and fired before the body
+    // had streamed.
+    let body = futures::stream::unfold(
+        (chunk_rx, false, callback_runner, req_ctx, open_time),
+        move |(mut rx, ended, cb, ctx, t0)| async move {
+            if ended {
+                return None;
             }
-        };
-        match frame.map(|f| f.payload) {
-            Some(Some(pb::stream_response::Payload::Chunk(c))) => {
-                let data = if is_sse { sse_frame(&c.data) } else { c.data.to_vec() };
-                Some((Ok::<_, Infallible>(bytes::Bytes::from(data)), (rx, false)))
-            }
-            Some(Some(pb::stream_response::Payload::Error(e))) => {
-                warn!("route stream error: {}", e.message);
-                if is_sse {
-                    let event = sse_frame(e.message.as_bytes());
-                    Some((Ok(bytes::Bytes::from(event)), (rx, true)))
-                } else {
+            // P-DEADLINE (§4.0.4): overall deadline / chunk-idle bound this recv.
+            let frame = match crate::streaming::recv_chunk(&mut rx, deadline, idle).await {
+                Ok(Some(f)) => Some(f),
+                Ok(None) => None, // worker closed the stream
+                Err(elapsed) => {
+                    tracing::warn!(?elapsed, "route stream closed: deadline/idle elapsed");
+                    None
+                }
+            };
+            match frame.map(|f| f.payload) {
+                Some(Some(pb::stream_response::Payload::Chunk(c))) => {
+                    let data = if is_sse { sse_frame(&c.data) } else { c.data.to_vec() };
+                    Some((Ok::<_, Infallible>(bytes::Bytes::from(data)), (rx, false, cb, ctx, t0)))
+                }
+                Some(Some(pb::stream_response::Payload::Error(e))) => {
+                    warn!("route stream error: {}", e.message);
+                    // Terminal frame → fire the response callback (full elapsed).
+                    crate::callback::fire_inference_response(&cb, &ctx, t0);
+                    if is_sse {
+                        let event = sse_frame(e.message.as_bytes());
+                        Some((Ok(bytes::Bytes::from(event)), (rx, true, cb, ctx, t0)))
+                    } else {
+                        None
+                    }
+                }
+                // Done, channel closed, or an unexpected frame — terminal.
+                _ => {
+                    crate::callback::fire_inference_response(&cb, &ctx, t0);
                     None
                 }
             }
-            // Done, channel closed, or an unexpected frame — end the body.
-            _ => None,
-        }
-    });
+        },
+    );
     let mut builder = Response::builder().header("content-type", content_type);
     if start.status_code > 0 {
         if let Ok(sc) = axum::http::StatusCode::from_u16(start.status_code as u16) {

@@ -269,7 +269,7 @@ ejection_max_timeout: 300.0    # per-worker 熔断器退避上限（B1）
 ejection_max_percent: 50       # 同时最多剔除的 worker 比例（1-100）
 startup_timeout: 60.0          # 等待 worker "ready" 握手的最大秒数
 health_check_timeout: 5.0      # 单次健康探测超时秒数
-health_check_kill_threshold: 0 # 连续探测失败达到此次数后杀死并重启 worker（0 = 从不）
+health_check_kill_threshold: 0 # [实验性] 连续探测失败达到此次数后杀死并重启 worker（0 = 从不）；respawn 有已知缺陷（inference-queue 客户端快照变孤儿、死 slot 卫生），0.9 修复
 worker_kill_timeout: 10.0      # 杀死 worker 后等待 OS 回收的秒数
 
 # Worker 生命周期钩子

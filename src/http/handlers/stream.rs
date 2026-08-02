@@ -258,7 +258,15 @@ async fn sse_infer_impl(
             if event_tx.send(Ok(event)).await.is_err() {
                 break;
             }
-            if matches!(chunk.payload, Some(pb::stream_response::Payload::Done(_))) {
+            // Terminal frames end the stream. Error is terminal by contract
+            // (callback.rs) — breaking here also guarantees the
+            // InferenceResponse callback fires exactly once even if a worker
+            // sends Error followed by Done (the chunk path normally terminates
+            // on Error, but the forwarder must not rely on that side effect).
+            if matches!(
+                chunk.payload,
+                Some(pb::stream_response::Payload::Done(_) | pb::stream_response::Payload::Error(_))
+            ) {
                 break;
             }
         }
@@ -369,20 +377,28 @@ async fn handle_ws_stream(
     // RequestContext filled once by context_middleware (including the
     // direct-connection peer fallback), so key="ip" limits per real client.
     if let Some(mv) = state.registry.get(&model_name, Some(&resolved_version)) {
-        if enforce_auth(mv.policies.auth.as_ref(), &headers).is_err()
-            || enforce_rate_limit(
+        // Auth is checked before rate limiting (short-circuit), and each
+        // failure reports its OWN reason — the handshake already upgraded to
+        // 101 so there's no HTTP status to set; send an accurate error frame
+        // then close.
+        let auth_failed = enforce_auth(mv.policies.auth.as_ref(), &headers).is_err();
+        let rl_failed = !auth_failed
+            && enforce_rate_limit(
                 &state,
                 mv.policies.rate_limit.as_ref(),
                 &model_name,
                 &cx.client_ip,
             )
             .await
-            .is_err()
-        {
+            .is_err();
+        if auth_failed || rl_failed {
+            let reason = if auth_failed {
+                "unauthorized"
+            } else {
+                "rate limit exceeded"
+            };
             let _ = socket
-                .send(Message::Text(
-                    json!({"error": "rate limit exceeded"}).to_string(),
-                ))
+                .send(Message::Text(json!({ "error": reason }).to_string()))
                 .await;
             let _ = socket.close().await;
             return;
@@ -742,6 +758,59 @@ mod tests {
         })
     }
 
+    /// PAIR worker: Open → Error frame THEN Done frame, then close. Reproduces
+    /// the forwarder not terminating after the terminal Error frame: a streaming
+    /// framework surfacing an exception and then closing the channel sends Done
+    /// after Error, which today fires InferenceResponse a second time.
+    fn spawn_error_then_done_worker(endpoint: String) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(5000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let is_open = matches!(
+                    req.payload,
+                    Some(pb::request::Payload::Stream(pb::StreamRequest {
+                        action: Some(pb::stream_request::Action::Open(_)),
+                        ..
+                    }))
+                );
+                if !is_open {
+                    continue;
+                }
+                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                let mk = |payload| pb::Response {
+                    payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                        stream_id: st.stream_id.clone(),
+                        payload: Some(payload),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                let _ = s.send(
+                    mk(pb::stream_response::Payload::Error(pb::StreamError {
+                        message: "boom".to_string(),
+                    }))
+                    .encode_to_vec(),
+                    0,
+                );
+                let _ = s.send(
+                    mk(pb::stream_response::Payload::Done(pb::StreamDone::default()))
+                        .encode_to_vec(),
+                    0,
+                );
+                // Stay alive (loop) so both frames are reliably delivered — a PAIR
+                // socket closed immediately after send can drop the trailing Done.
+                continue;
+            }
+        })
+    }
+
     struct CountingCallback {
         req: AtomicUsize,
         resp: AtomicUsize,
@@ -854,6 +923,54 @@ mod tests {
 
         assert_eq!(cb.req.load(Ordering::Relaxed), 1);
         assert_eq!(cb.resp.load(Ordering::Relaxed), 1, "Error frame fires response");
+    }
+
+    #[tokio::test]
+    async fn sse_callback_fires_once_when_error_then_done() {
+        // Audit (0.8.0-rc0): the forwarder breaks only on the Done frame
+        // (stream.rs:261-263), not on the terminal Error frame. A worker that
+        // sends Error then Done (a framework surfacing an exception and then
+        // closing the channel) fires InferenceResponse a SECOND time on the
+        // trailing Done, and lets a [DONE] event follow the error event.
+        // callback.rs documents Error as a terminal frame, so it must fire once.
+        let model = "sse_err_done";
+        let endpoint = ipc_endpoint(model);
+        let _w = spawn_error_then_done_worker(endpoint.clone());
+        let cb = Arc::new(CountingCallback {
+            req: AtomicUsize::new(0),
+            resp: AtomicUsize::new(0),
+            last: Mutex::new(None),
+        });
+        let runner = Arc::new(CallbackRunner::new());
+        runner.register(cb.clone()).await;
+        let state = ready_state(model, endpoint, runner).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let sse = sse_infer_impl(
+            state,
+            model.to_string(),
+            "1".to_string(),
+            HeaderMap::new(),
+            json!({}),
+            test_cx(),
+        )
+        .await
+        .expect("sse must open");
+        // Wait for the Error frame to fire the first response...
+        wait_for(|| cb.resp.load(Ordering::Relaxed) >= 1, "resp>=1").await;
+        // ...then let the trailing Done frame be forwarded. The worker sends
+        // Error+Done back-to-back, so the Done is processed within a few ms;
+        // 150ms is generous. The response count must NOT climb to 2.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        drop(sse);
+
+        assert_eq!(cb.req.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            cb.resp.load(Ordering::Relaxed),
+            1,
+            "terminal Error frame must fire InferenceResponse exactly once \
+             (current code fires twice on Error→Done)"
+        );
     }
 
     #[tokio::test]

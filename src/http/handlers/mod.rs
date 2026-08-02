@@ -146,7 +146,7 @@ fn enforce_auth(
             auth.header
         )));
     }
-    if !auth.keys.is_empty() && !auth.keys.iter().any(|k| k == value) {
+    if !auth.keys.is_empty() && !crate::access_control::ct_contains(&auth.keys, value) {
         return Err(AppError::Unauthorized(format!(
             "invalid API key (header: {})",
             auth.header

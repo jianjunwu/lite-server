@@ -11,6 +11,7 @@ use crate::grpc::GrpcService;
 use crate::proto::liteserver as pb;
 use crate::request_context::RequestContext;
 use std::collections::HashMap;
+use std::time::Instant;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
@@ -77,6 +78,20 @@ impl GrpcService {
             enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
             enforce_grpc_rate_limit(&self.rate_limiter, mv.policies.rate_limit.as_ref(), model_name, &client_ip)?;
         }
+
+        // Fire InferenceRequest callback — batch_infer now mirrors unary
+        // infer_impl (previously it fired no callback at all). Built before
+        // `meta` below moves request_id / client_ip.
+        let req_ctx = crate::callback::InferenceContext {
+            model_name: model_name.to_string(),
+            version: resolved_version.clone(),
+            route: "/predict".to_string(),
+            protocol: crate::callback::Protocol::Grpc,
+            request_id: request_id.clone(),
+            client_ip: client_ip.clone(),
+            elapsed_us: None,
+        };
+        crate::callback::fire_inference_request(&self.callback_runner, &req_ctx);
 
         let mut header_map: HashMap<String, String> = req.headers.clone();
         // P-TRACE: inject the active inference span's trace context into the
@@ -149,6 +164,7 @@ impl GrpcService {
         // mirroring unary infer_impl (grpc/mod.rs:307-323). Previously this was a
         // bare `client.send(...).await`, so a slow/hung worker made the server
         // wait up to ~ZMQ_RESPONSE_TIMEOUT regardless of server.timeout/grpc-timeout.
+        let start = Instant::now();
         let resp = match crate::deadline::remaining(deadline.unix_ns) {
             Some(t) => match tokio::time::timeout(t, client.send(internal_req)).await {
                 Ok(Ok(r)) => r,
@@ -193,6 +209,8 @@ impl GrpcService {
                     .collect();
                 let mut response = Response::new(pb::BatchInferResponse { items });
                 inject_grpc_metadata(response.metadata_mut(), &batch_resp.headers);
+                // Fire InferenceResponse callback (aligned with unary infer_impl).
+                crate::callback::fire_inference_response(&self.callback_runner, &req_ctx, start);
                 Ok(response)
             }
             _ => Err(err(Status::internal("unexpected response type"))),

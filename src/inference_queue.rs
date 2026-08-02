@@ -447,7 +447,7 @@ impl PrioritySender {
     /// Push `item` at `priority`. Returns `Full` at capacity, mirroring
     /// `mpsc::Sender::try_send`.
     fn try_send(&self, item: QueueItem, priority: i32) -> Result<(), QueueError> {
-        let mut heap = self.inner.heap.lock().unwrap();
+        let mut heap = self.inner.heap.lock().unwrap_or_else(|e| e.into_inner());
         if heap.len() >= self.inner.cap {
             return Err(QueueError::Full);
         }
@@ -489,7 +489,7 @@ impl PriorityReceiver {
             // Register interest BEFORE checking state so a push or close that
             // happens between the heap check and the await is not lost.
             let notified = self.inner.notify.notified();
-            if let Some(ord) = self.inner.heap.lock().unwrap().pop() {
+            if let Some(ord) = self.inner.heap.lock().unwrap_or_else(|e| e.into_inner()).pop() {
                 return Some(ord.item);
             }
             if self.inner.senders.load(Ordering::Relaxed) == 0 {
@@ -500,7 +500,7 @@ impl PriorityReceiver {
     }
 
     fn len(&self) -> usize {
-        self.inner.heap.lock().unwrap().len()
+        self.inner.heap.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 

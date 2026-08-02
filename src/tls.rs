@@ -31,6 +31,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
 /// Which protocol a TLS listener terminates; drives the ALPN advertisement.
@@ -387,9 +388,26 @@ pub fn tls_incoming(
     stop: impl Future<Output = ()> + Send + 'static,
 ) -> impl tokio_stream::Stream<Item = io::Result<tokio_rustls::server::TlsStream<TcpStream>>> {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
+    // Bound concurrent TLS handshakes so a slow-loris-style attacker cannot
+    // pin unbounded tasks/connections in the handshake stage (the per-
+    // connection `TLS_HANDSHAKE_TIMEOUT` bounds each one; this caps how many
+    // run at once). The permit is acquired BEFORE accept so both in-flight
+    // connections and handshakes are capped; it is held only for the handshake
+    // duration and released when the spawned task ends.
+    const MAX_CONCURRENT_TLS_HANDSHAKES: usize = 1024;
+    let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_TLS_HANDSHAKES));
     tokio::spawn(async move {
         tokio::pin!(stop);
         loop {
+            let permit = tokio::select! {
+                biased;
+                _ = &mut stop => break,
+                p = permits.clone().acquire_owned() => match p {
+                    Ok(p) => p,
+                    // Semaphore never closes (its Arc outlives the loop).
+                    Err(_) => break,
+                },
+            };
             let accepted = tokio::select! {
                 res = listener.accept() => res,
                 _ = &mut stop => break,
@@ -399,8 +417,10 @@ pub fn tls_incoming(
                 Err(e) => {
                     // Transient accept failure (e.g. EMFILE): brief backoff,
                     // keep the listener alive (mirrors tonic's continue-on-
-                    // transient accept-error policy).
+                    // transient accept-error policy). Release the permit first
+                    // so the backoff doesn't hold a handshake slot.
                     tracing::debug!("TLS accept error: {}", e);
+                    drop(permit);
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
@@ -408,6 +428,7 @@ pub fn tls_incoming(
             let acceptor = store.acceptor();
             let tx = tx.clone();
             tokio::spawn(async move {
+                let _permit = permit; // released when the task ends
                 let result = match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
                     Ok(res) => res,
                     Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out")),

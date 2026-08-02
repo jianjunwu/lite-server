@@ -81,17 +81,29 @@ impl ModelRegistry {
         }
     }
 
-    /// True iff the model's active version is `Ready`. A pin seeded by
-    /// cache_registry restore (`force_pin_active_version`) bypasses the Ready
-    /// gate, so it is only a hint: when the pinned version fails to reload
-    /// (corrupt model.py, missing dependency, worker crash → `Loading`/`Failed`)
-    /// the pin is NOT usable. Callers that gate on "has an active version"
-    /// (reconcile's auto-activate fallback) must use this rather than
-    /// `get_active_version(..).is_some()`, or a stale pin strands the model
-    /// with no serving version and no self-heal path (B1).
+    /// True iff the model's active version is SERVING (`Ready` or `Degraded`).
+    /// A pin seeded by cache_registry restore (`force_pin_active_version`)
+    /// bypasses the Ready gate, so it is only a hint: when the pinned version
+    /// fails to reload (corrupt model.py, missing dependency, worker crash →
+    /// `Loading`/`Failed`) the pin is NOT usable. Callers that gate on "has a
+    /// serving active version" (reconcile's auto-activate fallback) must use
+    /// this rather than `get_active_version(..).is_some()`, or a stale pin
+    /// strands the model with no serving version and no self-heal path (B1).
+    ///
+    /// `Degraded` counts as serving — a transient worker ejection (outlier)
+    /// flips a version to `Degraded` while it keeps serving and self-heals, and
+    /// `routing_pick` / `has_serving` both treat `Ready | Degraded` as serving.
+    /// Reading a Degraded active version as "not usable" would let reconcile
+    /// steal activation away from a still-serving (admin-intended) version, so
+    /// this predicate aligns with the codebase's serving definition. The
+    /// stranded-pin case B1 targets (`Failed`/`Loading`/`WarmingUp`/`Pending`)
+    /// still reads false.
     pub fn active_version_is_ready(&self, model_name: &str) -> bool {
         match self.get_active_version(model_name) {
-            Some(v) => self.is_ready(model_name, Some(&v)),
+            Some(v) => match self.get(model_name, Some(&v)) {
+                Some(mv) => matches!(mv.status, VersionStatus::Ready | VersionStatus::Degraded),
+                None => false,
+            },
             None => false,
         }
     }
@@ -761,6 +773,34 @@ mod tests {
         reg.set_status("m1", "1", VersionStatus::Loading).unwrap();
         reg.force_pin_active_version("m1", "1");
         assert!(!reg.active_version_is_ready("m1"));
+    }
+
+    #[test]
+    fn active_version_is_ready_treats_degraded_as_serving() {
+        // Audit (0.8.0-rc0, B1 regression): `active_version_is_ready` gates
+        // reconcile's auto-activate fallback (reconcile.rs:120). It currently
+        // uses `is_ready`, which only accepts `Ready`. But `Degraded` is still
+        // SERVING — `routing_pick` (mod.rs:275) and `has_serving`
+        // (types.rs:179) both treat `Ready | Degraded` as serving, and a
+        // transient worker ejection (outlier) flips a version to `Degraded`
+        // while it keeps serving and self-heals. Reading a Degraded active
+        // version as "not usable" lets reconcile steal activation to
+        // `versions_loaded[0]` at runtime, abandoning the admin-intended
+        // (still-serving) version. The pin-stranded case B1 targets
+        // (Failed/Loading/WarmingUp/Pending) must still read false; Degraded
+        // must read true.
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.mark_ready("m1", "1").unwrap();
+        reg.activate_version("m1", "1").unwrap();
+        // Runtime: a worker is ejected → version degrades but KEEPS SERVING.
+        reg.set_status("m1", "1", VersionStatus::Degraded).unwrap();
+        assert!(
+            reg.active_version_is_ready("m1"),
+            "a Degraded active version is still serving (Ready|Degraded) and \
+             must read as usable, else reconcile steals activation at runtime"
+        );
     }
 
     #[test]
