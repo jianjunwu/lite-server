@@ -171,17 +171,29 @@ jobs:
             target: x86_64-unknown-linux-gnu
             platform: manylinux_2_28
             before-script: |
-              yum install -y protobuf-compiler
+              yum install -y unzip
               curl -fsSL -o /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
               bash /tmp/miniconda.sh -b -p /opt/miniconda
               /opt/miniconda/bin/conda install -y python=3.10
+              # yum's protobuf-compiler is too old for proto3 `optional` (needs
+              # protoc >= 3.15). Download modern protoc 25.x (matches
+              # tools/regen_proto.sh's pin) for the container's own arch.
+              PB_ARCH=x86_64; [ "$(uname -m)" = "aarch64" ] && PB_ARCH=aarch_64
+              curl -fsSL -o /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-linux-${PB_ARCH}.zip"
+              unzip -oq /tmp/protoc.zip -d /opt/protoc && /opt/protoc/bin/protoc --version
             interpreter: /opt/miniconda/bin/python3.10
           # Linux aarch64
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             platform: manylinux_2_28
             before-script: |
-              apt-get update && apt-get install -y protobuf-compiler
+              apt-get update && apt-get install -y curl unzip
+              # apt's protobuf-compiler is too old for proto3 `optional` (needs
+              # protoc >= 3.15). Download modern protoc 25.x for the container's
+              # arch (aarch64 under qemu, x86_64 if cross-compiling natively).
+              PB_ARCH=x86_64; [ "$(uname -m)" = "aarch64" ] && PB_ARCH=aarch_64
+              curl -fsSL -o /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-linux-${PB_ARCH}.zip"
+              unzip -oq /tmp/protoc.zip -d /opt/protoc && /opt/protoc/bin/protoc --version
             interpreter: python3.10
           # macOS x86_64 (disabled: macos-13 runner scarce)
           # - os: macos-13
@@ -243,7 +255,7 @@ jobs:
           manylinux: ${{ matrix.platform }}
           args: --release --interpreter ${{ matrix.interpreter }}
           before-script-linux: ${{ matrix.before-script }}
-          docker-options: -e PROTOC=/usr/bin/protoc
+          docker-options: -e PROTOC=/opt/protoc/bin/protoc
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
