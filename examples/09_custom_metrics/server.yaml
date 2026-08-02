@@ -1,6 +1,11 @@
 server:
   http_port: 8000
 
+# custom_metrics defaults to false (breaking, WS4); this demo must opt in so
+# the worker's demo_* metrics get registered and exposed on /metrics.
+features:
+  custom_metrics: true
+
 model_repository:
   path: ./model_repo
 
