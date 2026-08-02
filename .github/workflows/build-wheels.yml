@@ -280,11 +280,12 @@ jobs:
     needs: [get-version, build-wheels]
     runs-on: ubuntu-latest
     # Manual approval gate: tag pushes still auto-build all wheels, but the
-    # GitHub Release is NOT created until a reviewer approves this job. Create
-    # a `release` environment in repo Settings → Environments with required
-    # reviewers; without it this job 404s. Avoids "build → auto-release" on a
-    # tag when Checks/proto-smoke are still red.
-    environment: release
+    # GitHub Release is NOT created until a reviewer approves this job. Bound
+    # to the `required reviewers` environment (Settings → Environments) which
+    # requires `jianjunwu` + a 5min wait. Do NOT point this at an ungated env
+    # — GitHub auto-creates an unprotected env on first reference, which would
+    # silently auto-release (the rc0 2026-08-02 mishap).
+    environment: "required reviewers"
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
