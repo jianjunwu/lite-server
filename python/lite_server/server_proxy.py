@@ -20,10 +20,11 @@ thread); ``inference.infer`` is async and offloads the blocking call with
 from __future__ import annotations
 
 import asyncio
-import json
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
+
+from lite_server import _json
 
 # Registry lookups should resolve fast; inference may legitimately take long
 # (LLM generation) — the Rust side still bounds it by server.timeout.
@@ -45,13 +46,13 @@ def _request_json(url: str, *, payload: Any = None, timeout: float) -> Any:
     Raises :class:`ServerProxyError` on HTTP errors and connection failures —
     never leaks ``urllib`` exception types to handler code.
     """
-    data = None if payload is None else json.dumps(payload).encode()
+    data = None if payload is None else _json.dumps(payload)
     req = urllib.request.Request(url, data=data)
     if data is not None:
         req.add_header("content-type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode())
+            return _json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")[:500]
         raise ServerProxyError(

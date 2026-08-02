@@ -6,7 +6,6 @@ via its bottom re-export block.
 """
 
 import asyncio
-import json
 import logging
 import traceback
 from typing import Any
@@ -204,7 +203,7 @@ def _handle_file_changed(lit_api: LitAPI, uid: str, fc, log: logging.Logger) -> 
     return Response(
         uid=uid,
         single=SingleResponse(
-            data=json.dumps({"handled": handled}).encode(),
+            data=_json.dumps({"handled": handled}),
             status=_make_status(True),
         ),
     )
@@ -312,7 +311,7 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
             items.append(bir)
         else:
             err = error_map.get(item_uid, Exception("unknown error"))
-            err_bytes = json.dumps({"error": str(err)}).encode()
+            err_bytes = _json.dumps({"error": str(err)})
             bir = BatchItemResponse(
                 uid=item_uid,
                 data=err_bytes,

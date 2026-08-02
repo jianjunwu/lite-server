@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Optional
 
+from lite_server import _json
 from lite_server.artifact.unpacker import ModelUnpacker
 
 
@@ -22,7 +23,7 @@ class ArtifactCache:
     def _load_index(self) -> None:
         if self._index_path.exists():
             try:
-                self._index = json.loads(self._index_path.read_text())
+                self._index = _json.loads(self._index_path.read_text())
             except (json.JSONDecodeError, OSError):
                 self._index = {}
 

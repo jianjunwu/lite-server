@@ -9,6 +9,7 @@ import zipfile
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
+from lite_server import _json
 from lite_server.artifact.manifest import Manifest
 
 
@@ -38,7 +39,7 @@ class ModelUnpacker:
 
         with zipfile.ZipFile(self.artifact_path, "r") as zf:
             manifest_raw = zf.read("manifest.json").decode("utf-8")
-            manifest = Manifest.from_dict(json.loads(manifest_raw))
+            manifest = Manifest.from_dict(_json.loads(manifest_raw))
             self.manifest = manifest
 
             # Verify file checksums
@@ -56,7 +57,7 @@ class ModelUnpacker:
 
             # Verify signature (recompute HMAC over manifest without signature field)
             if verify_key and manifest.signature:
-                manifest_dict = json.loads(manifest_raw)
+                manifest_dict = _json.loads(manifest_raw)
                 manifest_dict.pop("signature", None)
                 canonical = json.dumps(manifest_dict, sort_keys=True, separators=(",", ":"))
                 expected = hmac.new(verify_key, canonical.encode(), hashlib.sha256).hexdigest()
@@ -131,7 +132,7 @@ class ModelUnpacker:
 
         with zipfile.ZipFile(self.artifact_path, "r") as zf:
             manifest_raw = zf.read("manifest.json").decode("utf-8")
-            manifest = Manifest.from_dict(json.loads(manifest_raw))
+            manifest = Manifest.from_dict(_json.loads(manifest_raw))
             self.manifest = manifest
 
             if prepend_name:
@@ -164,7 +165,7 @@ class ModelUnpacker:
 
             # Verify signature
             if verify_key and manifest.signature:
-                manifest_dict = json.loads(manifest_raw)
+                manifest_dict = _json.loads(manifest_raw)
                 manifest_dict.pop("signature", None)
                 canonical = json.dumps(manifest_dict, sort_keys=True, separators=(",", ":"))
                 expected = hmac.new(verify_key, canonical.encode(), hashlib.sha256).hexdigest()

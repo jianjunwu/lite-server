@@ -9,6 +9,7 @@ of the worker package — ``inference`` / ``dispatch`` / ``streaming`` /
 import json
 import traceback
 
+from lite_server import _json
 from lite_server.api import LitAPI
 from lite_server.context import Headers, RequestContext, RequestMeta
 from lite_server.exceptions import HTTPException
@@ -70,7 +71,7 @@ def _make_error_response(uid: str, message: str,
         "code": code,
         "param": param,
     }
-    data = json.dumps({"error": error_dict}).encode()
+    data = _json.dumps({"error": error_dict})
     status = Status(code="Error", message=str(status_code))
     single = SingleResponse(data=data, status=status)
     if headers:
