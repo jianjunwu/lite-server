@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections import deque
 from pathlib import Path
 from urllib import request
 
@@ -43,46 +44,79 @@ def wait_for_server(url: str, timeout: float = 30.0) -> bool:
     return False
 
 
+def _scrub_escapees(cmd):
+    """SIGKILL descendants that escaped the process-group kill.
+
+    LitServe's multiprocessing workers reparent to PID 1 (launchd/init) and
+    survive ``killpg``; each pegs ~1 core in a busy spin indefinitely. Measured
+    impact on the NEXT server's benchmark: ~6200 → ~4400 rps — i.e. the entire
+    spurious "core slower than lite" inversion was two of these orphans stealing
+    cores during whichever server ran right after LitServe (rotation only picks
+    the victim; cooldown does not kill them). Match survivors by the launched
+    script's basename and SIGKILL. Idempotent and safe: teardown-only, and
+    lite-server/lite-server-core workers stay in the group so this finds nothing
+    for them.
+    """
+    script = next((a for a in cmd[1:] if isinstance(a, str) and a.endswith(".py")), None)
+    if not script:
+        return
+    pat = os.path.basename(script)
+    try:
+        subprocess.run(
+            ["pkill", "-9", "-f", pat],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        )
+    except FileNotFoundError:
+        pass  # pkill unavailable (non-POSIX); group kill still ran
+
+
+def _terminate_process_group(proc):
+    """SIGTERM → SIGKILL the whole process group, best-effort."""
+    if proc.poll() is not None:
+        return
+    pgid = None
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        proc.wait(timeout=2)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        proc.kill()
+        proc.wait(timeout=1)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        pass
+
+
 @contextlib.contextmanager
 def _managed_popen(cmd, **kwargs):
-    """启动子进程并在退出时级联清理整个进程组（SIGTERM → SIGKILL）"""
+    """启动子进程并在退出时级联清理：先 kill 整个进程组，再 scrub 逃逸进程。
+
+    必须先 group-kill 再 scrub：group-kill 负责组内子进程（lite-server-core
+    二进制等）；scrub 才负责 LitServe 那些脱离进程组、被 launchd 收养（PPID=1）、
+    killpg 够不着的 multiprocessing worker。顺序反了会让 launcher 提前死掉、
+    poll() 非 None、跳过 group-kill，把真正的 server 子进程遗弃在端口上。
+    """
     proc = subprocess.Popen(cmd, start_new_session=True, **kwargs)
     try:
         yield proc
     finally:
-        if proc.poll() is not None:
-            return
-
-        pgid = None
-        try:
-            pgid = os.getpgid(proc.pid)
-            os.killpg(pgid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-
-        try:
-            proc.wait(timeout=5)
-            return
-        except subprocess.TimeoutExpired:
-            pass
-
-        if pgid is not None:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-
-        try:
-            proc.wait(timeout=2)
-            return
-        except subprocess.TimeoutExpired:
-            pass
-
-        try:
-            proc.kill()
-            proc.wait(timeout=1)
-        except (ProcessLookupError, subprocess.TimeoutExpired):
-            pass
+        _terminate_process_group(proc)
+        _scrub_escapees(cmd)
 
 
 def run_wrk(
@@ -240,6 +274,14 @@ def main() -> int:
         "--warmup", type=float, default=2.0, help="Warmup seconds after server becomes ready"
     )
     parser.add_argument(
+        "--cooldown",
+        type=float,
+        default=0.0,
+        help="Idle seconds between consecutive server runs. Cancels the "
+        "thermal/turbo ordering bias on laptops (whichever server runs "
+        "first/cool wins); 15 is a reasonable starting point. 0 = off.",
+    )
+    parser.add_argument(
         "--workers",
         nargs="+",
         type=int,
@@ -344,6 +386,18 @@ def main() -> int:
             print(f"ERROR: {name} exception: {exc}", file=sys.stderr)
             return {}
 
+    # Each entry: (name, port, extra_args). Order is rotated per cell so each
+    # server occupies each temporal position equally across the matrix — this
+    # cancels the monotonic thermal/turbo-decay bias (on laptops, whichever
+    # server runs first/cool wins; later runs are throttled). Pair with
+    # --cooldown for idle between runs.
+    server_specs = [
+        ("lite-server", 8000, None),
+        ("LitServe", 8001, None),
+        ("lite-server-core", 8002, ["--core"]),
+    ]
+
+    cell_index = 0
     for workers in workers_list:
         for conc in concurrency_list:
             banner = f"Workers={workers}, Concurrency={conc}"
@@ -351,9 +405,21 @@ def main() -> int:
             print(banner)
             print(f"{'=' * 60}")
 
-            lite_res = _run_server("lite-server", 8000)
-            lit_res = _run_server("LitServe", 8001)
-            core_res = _run_server("lite-server-core", 8002, extra_args=["--core"])
+            order = deque(server_specs)
+            order.rotate(-cell_index)  # different server goes first each cell
+            cell_index += 1
+            cd = f"  (cooldown {args.cooldown:.0f}s between runs)" if args.cooldown else ""
+            print(f"  run order: {' -> '.join(s[0] for s in order)}{cd}")
+
+            res: dict[str, dict[str, float]] = {}
+            for name, port, extra in order:
+                res[name] = _run_server(name, port, extra_args=extra)
+                if args.cooldown:
+                    time.sleep(args.cooldown)
+
+            lite_res = res["lite-server"]
+            lit_res = res["LitServe"]
+            core_res = res["lite-server-core"]
 
             row = {
                 "workers": workers,
