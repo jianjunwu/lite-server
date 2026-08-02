@@ -18,6 +18,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tracing::Instrument;
 use uuid::Uuid;
 
 async fn open_worker_stream(
@@ -150,8 +151,23 @@ async fn sse_infer_impl(
     cx: RequestContext,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, AppError> {
 
+    // Task B: inference span (parity with gRPC + unary HTTP). Created before
+    // build_request_meta and entered around it via in_scope so telemetry::inject
+    // (Context::current()) picks up THIS span, not the ambient http.server span
+    // — the worker then becomes a child of the inference span. pinned_version is
+    // left Empty (resolve_version already ran in sse_infer_entry; SSE has no
+    // canary path).
+    let span = tracing::info_span!(
+        "inference",
+        model = %model_name,
+        version = %resolved_version,
+        request_id = %cx.request_id,
+        pinned_version = tracing::field::Empty,
+    );
+    crate::telemetry::link_parent(&span, &cx.trace_cx);
+
     let deadline = crate::deadline::resolve_from_http(&headers, state.config.server.timeout);
-    let meta = build_request_meta(&headers, &payload, "/predict", &cx, deadline.unix_ns);
+    let meta = span.in_scope(|| build_request_meta(&headers, &payload, "/predict", &cx, deadline.unix_ns));
     let payload_bytes = meta.payload.clone();
     // P-DEADLINE streaming bound (client-specified only).
     let (stream_deadline, stream_idle) = if deadline.client_specified {
@@ -255,7 +271,8 @@ async fn sse_infer_impl(
         // Ensure stream is cleaned up on worker side
         let cancel_req = streaming::build_stream_cancel(stream_id);
         open_worker_stream_cancel(&state, &model_name, &resolved_version, cancel_req).await;
-    });
+    }
+    .instrument(span.clone()));
 
     Ok(Sse::new(ReceiverStream::new(event_rx)))
 }
@@ -396,8 +413,18 @@ async fn handle_ws_stream(
 
     // The original upgrade-request headers flow into meta; client_ip /
     // request_id come from the RequestContext (P-MW single fill).
+    // Task B: inference span (parity with gRPC + SSE). Entered around
+    // build_request_meta via in_scope so telemetry::inject picks up THIS span.
+    let span = tracing::info_span!(
+        "inference",
+        model = %model_name,
+        version = %resolved_version,
+        request_id = %cx.request_id,
+        pinned_version = tracing::field::Empty,
+    );
+    crate::telemetry::link_parent(&span, &cx.trace_cx);
     let deadline = crate::deadline::resolve_from_http(&headers, state.config.server.timeout);
-    let meta = build_request_meta(&headers, &payload, "/predict", &cx, deadline.unix_ns);
+    let meta = span.in_scope(|| build_request_meta(&headers, &payload, "/predict", &cx, deadline.unix_ns));
     let payload_bytes = meta.payload.clone();
     // P-DEADLINE streaming bound (client-specified only).
     let (stream_deadline, stream_idle) = if deadline.client_specified {
@@ -510,7 +537,8 @@ async fn handle_ws_stream(
             prometheus::record_stream_close(&model_name, &resolved_version, "websocket");
         }
         stream_id
-    });
+    }
+    .instrument(span.clone()));
 
     // For now, we don't handle bidirectional streaming over WebSocket
     // Just wait for the send task to complete
@@ -849,6 +877,93 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         assert_eq!(cb.req.load(Ordering::Relaxed), 1, "request still fires on cancel");
         assert_eq!(cb.resp.load(Ordering::Relaxed), 0, "cancel must NOT fire response");
+    }
+
+    /// Task B: SSE creates an `inference` span with model/version/request_id
+    /// fields (parity with gRPC + unary HTTP). Uses the same double-dispatch
+    /// anti-poisoning trick as `grpc::request_metrics_tests` — two live dispatches
+    /// (anchor + recording) defeat the callsite-interest fast path so the
+    /// recording layer always sees the span. The model is registered + ready but
+    /// has NO ZMQ client, so resolve succeeds, the span is built, and open fails
+    /// (WorkerCrashed) — the span is what we assert, not the stream.
+    #[test]
+    fn sse_creates_inference_span_with_fields() {
+        use tracing::field::Visit;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        #[derive(Default)]
+        struct FieldCollector(Vec<(String, String)>);
+        impl Visit for FieldCollector {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push((field.name().to_string(), format!("{:?}", value)));
+            }
+        }
+
+        type Recorded = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<(String, String)>)>>>;
+        struct SpanLayer(Recorded);
+        impl<S: tracing::Subscriber> Layer<S> for SpanLayer {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _id: &tracing::span::Id,
+                _ctx: Context<'_, S>,
+            ) {
+                let mut collector = FieldCollector::default();
+                attrs.record(&mut collector);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((attrs.metadata().name().to_string(), collector.0));
+            }
+        }
+
+        let recorded: Recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded_thread = recorded.clone();
+        let _anchor = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(SpanLayer(std::sync::Arc::new(std::sync::Mutex::new(
+                Vec::new(),
+            )))),
+        );
+        let recording = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(SpanLayer(recorded_thread)),
+        );
+        let handle = std::thread::spawn(move || {
+            let _guard = tracing::dispatcher::set_default(&recording);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let state = make_state(Arc::new(CallbackRunner::new()));
+                state
+                    .registry
+                    .register("span_model", "1", ModelConfig::default(), ModelType::LitAPI, std::path::PathBuf::new())
+                    .unwrap();
+                state.registry.mark_ready("span_model", "1").unwrap();
+                // No ZMQ client / workers → open_worker_stream fails, but the
+                // span is built before that. Explicit version so resolve
+                // succeeds without an active-version cutover.
+                let _ = sse_infer_entry(&state, "span_model", Some("1".to_string()), HeaderMap::new(), json!({}), test_cx()).await;
+            });
+        });
+        handle.join().expect("span test thread must not panic");
+
+        let spans = recorded.lock().unwrap();
+        let inference = spans
+            .iter()
+            .find(|(name, _)| name == "inference")
+            .expect("SSE must create an inference span");
+        let field = |key: &str| -> String {
+            inference
+                .1
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        assert!(field("model").contains("span_model"), "span model field: {:?}", inference.1);
+        assert!(field("version").contains("1"), "span version field: {:?}", inference.1);
+        assert!(field("request_id").contains("sse-rid"), "span request_id field: {:?}", inference.1);
     }
 }
 
