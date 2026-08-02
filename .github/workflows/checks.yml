@@ -16,9 +16,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # Run `cargo audit` directly (NOT the deprecated rustsec/audit-check
+      # action, which ignores ./audit.toml). A direct run auto-loads
+      # ./audit.toml and honors its [advisories].ignore list — the 3 reviewed,
+      # unreachable advisories documented there. Exits non-zero only on
+      # unignored vulnerabilities (unmaintained/unsound are warnings).
+      - name: cargo audit (reads ./audit.toml)
+        run: cargo audit
 
   # 蓝图 §6.3：pb2/proto 漂移检查——proto 改动必须同步重生成签入的
   # liteserver_pb2.py（regen_proto.sh 固定 grpcio-tools 1.62.x，无
