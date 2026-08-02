@@ -15,21 +15,21 @@ on_request → decode_request → on_input → predict
 
 Plus `on_error` (request failed) and three lifecycle hooks (`on_before_setup` / `on_after_setup` / `on_teardown`).
 
-This example registers six callbacks — see `model_repo/callbacks_demo/1/callbacks.py`:
+This example registers five callbacks plus one built-in class — see `model_repo/callbacks_demo/1/callbacks.py` and `config.yaml`:
 
 | Callback | Hook(s) | Demonstrates |
 |----------|---------|--------------|
 | `ApiKeyAuth` | `on_request` | Rejecting a request: raise `UnauthorizedError` → 401 |
 | `RequestTimer` | `on_request`, `on_response` | Per-request state in `ctx.state` (concurrency-safe) |
 | `SimpleCache` | `on_request`, `on_output` | Early return via `ctx.respond(...)`, custom response headers |
-| `InputValidator` | `on_input` | `async` hooks, raising `BadRequestError` → 400 |
+| `JsonSchemaValidator` (built-in) | `on_input` | Declarative schema validation from config.yaml — no Python code (needs `pip install lite-server[validation]`) |
 | `ErrorMetrics` | `on_error` | The exception-isolated error hook |
 | `LifecycleTracer` | setup/teardown | `on_before_setup` / `on_after_setup` / `on_teardown` |
 
 ### Two registration paths
 
 - **`LitAPI.callbacks` class attribute** (in `model.py`): takes priority and supports constructor arguments — use it when a callback needs configuration. Runs *before* config.yaml callbacks.
-- **`callbacks:` in config.yaml**: fully-qualified class paths, must be no-arg constructible. Appended after the class-attribute ones.
+- **`callbacks:` in config.yaml**: each entry is a fully-qualified class path (no-arg) or a single-key map `{path: kwargs}` with constructor arguments — the built-in `JsonSchemaValidator` here is configured declaratively with its `input_schema`. Appended after the class-attribute ones.
 
 Here `ApiKeyAuth` is registered via the class attribute (it takes the accepted keys as a constructor argument, so auth always runs before the cache), the rest via config.yaml.
 
@@ -48,6 +48,7 @@ Here `ApiKeyAuth` is registered via the class attribute (it takes the accepted k
 
 ```bash
 cd examples/15_callbacks
+pip install lite-server[validation]   # schema validation extra
 python -m lite_server serve --config server.yaml
 ```
 
@@ -62,11 +63,18 @@ curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
   -d '{"input": "hello"}'
 # => HTTP 401 {"error": {"type": "authentication_error", "message": "missing or invalid X-API-Key header"}}
 
-# Invalid input (empty string) -> 400 from InputValidator.on_input
+# Invalid input (empty string) -> 400 from the built-in JsonSchemaValidator;
+# the model's predict() never runs
 curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
   -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
   -d '{"input": ""}'
-# => HTTP 400 {"error": {"type": "invalid_request_error", "message": "input must be a non-empty string"}}
+# => HTTP 400 {"error": {"type": "invalid_request_error", "message": "'' should be non-empty", "param": "body"}}
+
+# Missing input field -> decode_request returns None -> also 400
+curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
+  -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
+  -d '{}'
+# => HTTP 400 {"error": {"type": "invalid_request_error", "message": "None is not of type 'string'", "param": "body"}}
 
 # Valid request -> 200; [RequestTimer] logs latency per request
 curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
@@ -89,7 +97,8 @@ On shutdown (Ctrl+C) you should see `[LifecycleTracer] model unloading, teardown
 ## What You Learn
 
 - All callback hook points and their order: `on_request` → decode → `on_input` → predict → `on_output` → encode → `on_response`, plus `on_error` and the lifecycle hooks
-- Both registration paths and when to use which (`LitAPI.callbacks` with constructor args vs `callbacks:` in config.yaml)
+- Both registration paths and when to use which (`LitAPI.callbacks` with constructor args vs `callbacks:` in config.yaml, string vs single-key-map entries)
 - Rejecting requests by raising `HTTPException` subclasses (401/400) from a data hook
+- Validating request input declaratively with the built-in `JsonSchemaValidator`
 - Short-circuiting with `ctx.respond(...)` and attaching custom response headers
-- Carrying per-request data in `ctx.state`; sync and `async` hooks
+- Carrying per-request data in `ctx.state`

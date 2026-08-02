@@ -5,11 +5,19 @@ devices: 1
 workers_per_device: 1
 
 # Inference pipeline callbacks (Python Callback subclasses).
-# Classes here must be no-arg constructible; they chain in order and run
-# AFTER LitAPI.callbacks (the class attribute in model.py).
+# Each entry is a class path (no-arg) or a single-key map {path: kwargs};
+# they chain in order and run AFTER LitAPI.callbacks (the class attribute
+# in model.py).
 callbacks:
   - callbacks.RequestTimer
   - callbacks.SimpleCache
-  - callbacks.InputValidator
+  # Built-in schema validation (needs `pip install lite-server[validation]`):
+  # validates the decoded input (ctx.input, a string here) — the model's
+  # predict() never runs on an invalid payload.
+  - lite_server.callbacks.JsonSchemaValidator:
+      input_schema:
+        type: string
+        minLength: 1
+        maxLength: 1000
   - callbacks.ErrorMetrics
   - callbacks.LifecycleTracer

@@ -376,8 +376,11 @@ callbacks:
   静默跳过意味着校验从未执行。
 - **输出校验范围**：仅 unary/batch — 流式 chunk 是增量 JSON 必不匹配，
   靠 `ctx.mode` 跳过。
-- **跳过规则**：非 JSON 载荷（纯文本 / bytes / tensor）不校验；未配置
-  `input_schema`/`output_schema` 的对应方向不校验。batch 模式按 item 独立校验。
+- **跳过规则**：schema 顶层为 `object`/`array` 时，非 JSON 载荷（纯文本 /
+  bytes / tensor）不校验；但**顶层标量 schema**（如 `type: string`）会正常
+  校验值本身（decode 出的 `None` 会报 `None is not of type 'string'`）。
+  未配置 `input_schema`/`output_schema` 的对应方向不校验。batch 模式按
+  item 独立校验。
 - **边界**：模型同时有 `@route` 和全局 validator 会在加载时被拒绝 —
   不要在路由模型上挂全局 validator。
 

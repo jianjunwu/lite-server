@@ -69,6 +69,21 @@ class TestJsonSchemaValidator:
         ctx = _ctx(input="plain text")  # str, not dict/list
         v.on_input(ctx)  # no raise
 
+    def test_string_schema_validates_string_input(self):
+        """A scalar top-level schema must NOT be skipped by the dict/list rule."""
+        v = JsonSchemaValidator(input_schema={"type": "string", "minLength": 1})
+        ctx = _ctx(input="")
+        with pytest.raises(BadRequestError) as ei:
+            v.on_input(ctx)
+        assert ei.value.param == "body"  # top-level scalar → no JSON pointer
+        v.on_input(_ctx(input="hello"))  # valid string passes
+
+    def test_string_schema_rejects_none(self):
+        v = JsonSchemaValidator(input_schema={"type": "string"})
+        ctx = _ctx(input=None)  # decode_request returned None for a missing field
+        with pytest.raises(BadRequestError):
+            v.on_input(ctx)
+
     def test_no_schema_skips_both_directions(self):
         v = JsonSchemaValidator()  # no schemas → nothing validated
         ctx = _ctx(input={"anything": 1}, output={"too": 2})

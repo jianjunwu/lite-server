@@ -5,14 +5,17 @@ Pipeline order for one request::
     on_request → decode_request → on_input → predict
     → on_output → encode_response → on_response
 
-Six callbacks are defined:
+Five callbacks are defined:
 
 - ApiKeyAuth:      rejects requests without a valid X-API-Key header (401)
 - RequestTimer:    per-request latency via ctx.state (concurrency-safe)
 - SimpleCache:     exact-match cache; ctx.respond() short-circuits on hit
-- InputValidator:  async semantic validation of the decoded input (400)
 - ErrorMetrics:    counts failed requests via on_error
 - LifecycleTracer: logs setup/teardown via the lifecycle hooks
+
+Input validation is declarative: config.yaml registers the built-in
+``lite_server.callbacks.JsonSchemaValidator`` (input_schema: string,
+minLength 1, maxLength 1000) — no Python validation code needed.
 
 Key rules (since 0.7.0):
 - Data hooks receive a single ``ctx`` (RequestContext) and may be sync or
@@ -33,7 +36,7 @@ import time
 from collections import OrderedDict
 
 from lite_server import Callback
-from lite_server.exceptions import BadRequestError, UnauthorizedError
+from lite_server.exceptions import UnauthorizedError
 
 # Log via the logging module (worker forwards it to the server over stderr).
 # Never print() from a callback — stdout carries the worker startup
@@ -111,24 +114,6 @@ class SimpleCache(Callback):
         self._cache[self._key(ctx)] = ctx.output
         if len(self._cache) > self.capacity:
             self._cache.popitem(last=False)
-
-
-class InputValidator(Callback):
-    """Async semantic validation of the decoded input.
-
-    Hooks may be ``async def`` — the pipeline adapts automatically.
-    Raising BadRequestError rejects the request with a 400 and a
-    machine-readable error body; the model's predict() never runs.
-    """
-
-    async def on_input(self, ctx):
-        x = ctx.input
-        if not isinstance(x, str) or not x.strip():
-            raise BadRequestError("input must be a non-empty string",
-                                  param="input")
-        if len(x) > 1000:
-            raise BadRequestError("input exceeds 1000 characters",
-                                  param="input")
 
 
 class ErrorMetrics(Callback):

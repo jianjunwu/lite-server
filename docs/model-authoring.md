@@ -366,8 +366,11 @@ callbacks:
 - **Output validation scope**: unary/batch only — streaming chunks are
   partial JSON and never match a full schema, so they are skipped via
   `ctx.mode`.
-- **Skipped payloads**: non-JSON values (plain text / bytes / tensors) are
-  left untouched; no `input_schema`/`output_schema` → that direction is not
+- **Skipped payloads**: when the top-level schema is `object`/`array`,
+  non-JSON values (plain text / bytes / tensors) are left untouched — but a
+  scalar top-level schema (e.g. `type: string`) validates the value itself
+  (a decoded `None` from a missing field fails as `None is not of type
+  'string'`). No `input_schema`/`output_schema` → that direction is not
   validated. In batch mode each item is validated independently.
 - **Border**: a model with both `@route` and a global validator is rejected
   at load time — don't attach route models to a global validator.

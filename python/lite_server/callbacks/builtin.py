@@ -68,8 +68,11 @@ class JsonSchemaValidator(Callback):
         return cls(schema)
 
     def _reject(self, value: Any, validator) -> None:
-        if not isinstance(value, (dict, list)):
-            return  # non-JSON payload (text / bytes / tensor / generator) → skip
+        top = validator.schema.get("type")
+        types = (top,) if isinstance(top, str) else tuple(top or ())
+        if "object" in types or "array" in types:
+            if not isinstance(value, (dict, list)):
+                return  # non-JSON payload (text / bytes / tensor / generator) → skip
         errors = list(validator.iter_errors(value))
         if not errors:
             return

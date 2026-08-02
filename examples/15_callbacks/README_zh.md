@@ -15,21 +15,21 @@ on_request → decode_request → on_input → predict
 
 此外还有 `on_error`（请求失败时）和三个生命周期钩子（`on_before_setup` / `on_after_setup` / `on_teardown`）。
 
-本示例注册了六个 callback —— 见 `model_repo/callbacks_demo/1/callbacks.py`：
+本示例注册了五个 callback 加一个内置类 —— 见 `model_repo/callbacks_demo/1/callbacks.py` 和 `config.yaml`：
 
 | Callback | 钩子 | 演示点 |
 |----------|------|--------|
 | `ApiKeyAuth` | `on_request` | 拒绝请求：抛 `UnauthorizedError` → 401 |
 | `RequestTimer` | `on_request`、`on_response` | 用 `ctx.state` 存每请求状态（并发安全） |
 | `SimpleCache` | `on_request`、`on_output` | `ctx.respond(...)` 短路早返、自定义响应头 |
-| `InputValidator` | `on_input` | `async` 钩子、抛 `BadRequestError` → 400 |
+| `JsonSchemaValidator`（内置） | `on_input` | config.yaml 声明式 schema 校验，零 Python 代码（需 `pip install lite-server[validation]`） |
 | `ErrorMetrics` | `on_error` | 异常隔离的错误钩子 |
 | `LifecycleTracer` | setup/teardown | `on_before_setup` / `on_after_setup` / `on_teardown` |
 
 ### 两种注册方式
 
 - **`LitAPI.callbacks` 类属性**（在 `model.py` 中）：优先级更高，支持构造参数 —— callback 需要配置时用它。先于 config.yaml 中的 callback 执行。
-- **config.yaml 的 `callbacks:`**：全限定类路径，必须无参可构造，追加在类属性之后。
+- **config.yaml 的 `callbacks:`**：每条目是全限定类路径（无参）或**单键 map** `{path: kwargs}`（传构造参数）——内置的 `JsonSchemaValidator` 就在这里用 `input_schema` 声明式配置。追加在类属性之后。
 
 本例中 `ApiKeyAuth` 通过类属性注册（接受合法 key 列表作为构造参数，保证鉴权先于缓存执行），其余通过 config.yaml 注册。
 
@@ -48,6 +48,7 @@ on_request → decode_request → on_input → predict
 
 ```bash
 cd examples/15_callbacks
+pip install lite-server[validation]   # schema 校验 extra
 python -m lite_server serve --config server.yaml
 ```
 
@@ -62,11 +63,18 @@ curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
   -d '{"input": "hello"}'
 # => HTTP 401 {"error": {"type": "authentication_error", "message": "missing or invalid X-API-Key header"}}
 
-# 非法输入（空字符串）-> InputValidator.on_input 返回 400
+# 非法输入（空字符串）-> 内置 JsonSchemaValidator 返回 400；
+# predict() 不会执行
 curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
   -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
   -d '{"input": ""}'
-# => HTTP 400 {"error": {"type": "invalid_request_error", "message": "input must be a non-empty string"}}
+# => HTTP 400 {"error": {"type": "invalid_request_error", "message": "'' should be non-empty", "param": "body"}}
+
+# 缺 input 字段 -> decode_request 返回 None -> 同样 400
+curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
+  -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
+  -d '{}'
+# => HTTP 400 {"error": {"type": "invalid_request_error", "message": "None is not of type 'string'", "param": "body"}}
 
 # 正常请求 -> 200；[RequestTimer] 每请求打印耗时
 curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
@@ -89,7 +97,8 @@ curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
 ## 学习要点
 
 - 全部 callback 钩子点及顺序：`on_request` → decode → `on_input` → predict → `on_output` → encode → `on_response`，外加 `on_error` 和生命周期钩子
-- 两种注册方式及适用场景（带构造参数的 `LitAPI.callbacks` vs config.yaml 的 `callbacks:`）
+- 两种注册方式及适用场景（带构造参数的 `LitAPI.callbacks` vs config.yaml 的 `callbacks:`，字符串与单键 map 条目）
 - 在数据钩子中抛 `HTTPException` 子类拒绝请求（401/400）
+- 用内置 `JsonSchemaValidator` 声明式校验请求输入
 - 用 `ctx.respond(...)` 短路管线并附加自定义响应头
-- 用 `ctx.state` 携带每请求数据；同步与 `async` 钩子
+- 用 `ctx.state` 携带每请求数据
