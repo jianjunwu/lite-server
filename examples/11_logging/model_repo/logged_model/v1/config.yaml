@@ -3,3 +3,7 @@ stream: false
 accelerator: cpu
 devices: 1
 workers_per_device: 1
+
+# Request/response hooks (logging + response headers) — see model.py.
+callbacks:
+  - model.RequestResponseLogger

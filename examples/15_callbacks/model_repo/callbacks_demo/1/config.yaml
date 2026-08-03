@@ -12,7 +12,7 @@ callbacks:
   - callbacks.RequestTimer
   - callbacks.SimpleCache
   # Built-in schema validation (needs `pip install lite-server[validation]`):
-  # validates the request body (ctx.request) in on_request, before
+  # validates the request body (ctx.request) in before_decode_request, before
   # decode_request runs — no model code (decode or predict) ever sees an
   # invalid payload. The schema demonstrates: required vs optional fields,
   # bounded numbers, a field that is required but may be null, lists of

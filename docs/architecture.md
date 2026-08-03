@@ -65,7 +65,7 @@ A single inference request follows this path:
         │
         ▼
 6. Python worker executes callback pipeline:
-   on_request() → decode_request() → on_input() → predict() → on_output() → encode_response() → on_response()
+   before_decode_request() → decode_request() → after_decode_request() → predict() → after_predict() → encode_response() → after_encode_response()
         │
         ▼
 7. Response sent back via ZMQ
@@ -222,7 +222,7 @@ Models can implement `prefill()` / `step()` / `has_finished()` hooks to implemen
 |-----------|---------|------|
 | CLI | `cli.py` | Command-line interface (serve, benchmark, init, etc.) |
 | LitAPI | `api.py` | Model authoring base class with predict / batch / stream / bidi_stream hooks |
-| Callbacks | `callbacks/` | Inference pipeline callbacks (on_request / on_input / on_output / on_response) + lifecycle hooks (on_before_setup / on_after_setup / on_teardown) |
+| Callbacks | `callbacks/` | Inference pipeline callbacks (before_decode_request / after_decode_request / after_predict / after_encode_response) + lifecycle hooks (on_before_setup / on_after_setup / on_teardown) |
 | Context | `context.py` | Request context (RequestContext, RequestMeta) with request_id, client_ip, etc. |
 | Pipeline | `pipeline.py` | Data pre/post-processing pipeline |
 | Route | `route.py` | `@route` decorator for declaring custom HTTP routes |
@@ -334,7 +334,7 @@ InferenceQueue: Arc<RequestMeta> (no data copy)
 ZMQ: protobuf serialize → send to worker
     │
     ▼
-Python: protobuf deserialize → on_request() → decode_request() → on_input() → [batch()] → predict() → [unbatch()] → on_output() → encode_response() → on_response()
+Python: protobuf deserialize → before_decode_request() → decode_request() → after_decode_request() → [batch()] → predict() → [unbatch()] → after_predict() → encode_response() → after_encode_response()
     │
     ▼
 ZMQ: protobuf serialize → send back
@@ -602,11 +602,11 @@ Distinct neighbours: queue-wait timeout REJECT → `503` / `Unavailable`
 The Python-side Callback system (`callbacks/`) injects custom logic at key points in the inference pipeline:
 
 ```
-on_request → [decode_request] → on_input → [predict] → on_output → [encode_response] → on_response
+before_decode_request → [decode_request] → after_decode_request → [predict] → after_predict → [encode_response] → after_encode_response
 ```
 
-**Data hooks** (`on_request` / `on_input` / `on_output` / `on_response`):
-Receive a `RequestContext`; can mutate data, return a `Response` for early exit, or raise `HTTPException` to reject the request. Sync and async are both supported. In streaming mode, `on_output` + `on_response` fire once per chunk.
+**Data hooks** (`before_decode_request` / `after_decode_request` / `after_predict` / `after_encode_response`):
+Receive a `RequestContext`; can mutate data, return a `Response` for early exit, or raise `HTTPException` to reject the request. Sync and async are both supported. In streaming mode, `after_predict` + `after_encode_response` fire once per chunk.
 
 **Lifecycle hooks** (`on_before_setup` / `on_after_setup` / `on_teardown`):
 Run outside the request path, exception-isolated (failures are logged, never propagated).

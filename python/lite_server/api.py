@@ -366,40 +366,6 @@ class LitAPI:
         """
         raise NotImplementedError
 
-    # ===== Request/Response Hooks =====
-
-    def on_request(self, ctx: RequestContext) -> Any | None:
-        """Called before decode_request.  Same contract as Callback hooks.
-
-        The place for auth, schema validation, and cache lookups.  Read
-        ``ctx.request`` (raw payload) and ``ctx.meta`` (headers, route,
-        client IP, request ID); share data with later stages via
-        ``ctx.state`` — never via ``self`` attributes.  Raising an
-        exception rejects the request with an Error response.
-
-        Returns:
-            Replacement for ``ctx.request``, a :class:`Response` (or
-            ``ctx.respond(...)``) for early return, or None to pass through.
-        """
-        return None
-
-    def on_response(self, ctx: RequestContext) -> Any | None:
-        """Called after encode_response — the last hook before sending.
-
-        To attach custom HTTP response headers::
-
-            def on_response(self, ctx):
-                return ctx.respond(
-                    ctx.response,
-                    headers={"X-Request-ID": ctx.meta.request_id},
-                )
-
-        Returns:
-            Replacement for ``ctx.response``, a :class:`Response` (or
-            ``ctx.respond(...)``), or None to pass through.
-        """
-        return None
-
     # ===== Continuous Batching Hooks (optional) =====
 
     def prefill(self, uid: str, decoded_input: Any) -> None:

@@ -275,7 +275,7 @@ class TestLoadLitAPI:
                 from lite_server.callbacks import Callback
 
                 class Tracker(Callback):
-                    def on_request(self, ctx):
+                    def before_decode_request(self, ctx):
                         ctx.request["_hooked"] = True
             '''))
 
@@ -299,9 +299,9 @@ class TestLoadLitAPI:
             if saved is not None:
                 sys.modules["callbacks"] = saved
 
-    def test_on_output_callback_ok_when_no_route_handlers(self, tmp_path):
-        """A model with on_output callbacks but NO @route handlers should load:
-        on_output is valid for the model pipeline (decode→predict→encode).
+    def test_after_predict_callback_ok_when_no_route_handlers(self, tmp_path):
+        """A model with after_predict callbacks but NO @route handlers should load:
+        after_predict is valid for the model pipeline (decode→predict→encode).
         Regression test for Pipeline.for_route rejecting valid model callbacks."""
         saved = sys.modules.pop("callbacks", None)
         try:
@@ -310,10 +310,10 @@ class TestLoadLitAPI:
                 from lite_server.callbacks import Callback
 
                 class AuditLogger(Callback):
-                    def on_request(self, ctx):
+                    def before_decode_request(self, ctx):
                         pass
 
-                    def on_output(self, ctx):
+                    def after_predict(self, ctx):
                         pass
             '''))
             model_py = tmp_path / "model.py"
@@ -333,8 +333,8 @@ class TestLoadLitAPI:
             config = {"callbacks": ["callbacks.AuditLogger"]}
             api = inference.load_litapi(str(model_py), config)
             assert hasattr(api, "_pipeline")
-            # on_output should be registered on the model pipeline
-            assert len(api._pipeline._chains.get("on_output", [])) == 1
+            # after_predict should be registered on the model pipeline
+            assert len(api._pipeline._chains.get("after_predict", [])) == 1
             # No @route handlers → _route_pipeline must NOT be built
             assert not hasattr(api, "_route_pipeline")
         finally:
@@ -342,8 +342,8 @@ class TestLoadLitAPI:
             if saved is not None:
                 sys.modules["callbacks"] = saved
 
-    def test_on_output_callback_rejected_when_route_handlers_present(self, tmp_path):
-        """When a model has @route handlers AND on_output callbacks, it must
+    def test_after_predict_callback_rejected_when_route_handlers_present(self, tmp_path):
+        """When a model has @route handlers AND after_predict callbacks, it must
         still be rejected — routes have no encode stage."""
         saved = sys.modules.pop("callbacks", None)
         try:
@@ -352,10 +352,10 @@ class TestLoadLitAPI:
                 from lite_server.callbacks import Callback
 
                 class AuditLogger(Callback):
-                    def on_request(self, ctx):
+                    def before_decode_request(self, ctx):
                         pass
 
-                    def on_output(self, ctx):
+                    def after_predict(self, ctx):
                         pass
             '''))
             model_py = tmp_path / "model.py"
@@ -371,7 +371,7 @@ class TestLoadLitAPI:
                         return {"ok": True}
             '''))
             config = {"callbacks": ["callbacks.AuditLogger"]}
-            with pytest.raises(RuntimeError, match="on_output"):
+            with pytest.raises(RuntimeError, match="after_predict"):
                 inference.load_litapi(str(model_py), config)
         finally:
             sys.modules.pop("callbacks", None)
@@ -420,28 +420,30 @@ class TestRunSingle:
         assert json.loads(resp_bytes) == {"output": 10}
         assert status.code == "Ok"
 
-    def test_on_request_hook_can_modify(self):
-        class HookAPI(LitAPI):
-            def on_request(self, ctx):
+    def test_before_decode_request_hook_can_modify(self):
+        class HookCB(Callback):
+            def before_decode_request(self, ctx):
                 ctx.request["input"] = ctx.request["input"] + 1
                 return ctx.request
 
+        class HookAPI(LitAPI):
             def predict(self, x):
                 return {"output": x["input"] * 2}
 
-        resp_bytes, status, metrics, _ = run_single(HookAPI())
+        resp_bytes, status, metrics, _ = run_single(HookAPI(), callbacks=[HookCB()])
         assert json.loads(resp_bytes) == {"output": 12}
 
-    def test_on_request_hook_can_reject(self):
-        class RejectAPI(LitAPI):
-            def on_request(self, ctx):
+    def test_before_decode_request_hook_can_reject(self):
+        class RejectCB(Callback):
+            def before_decode_request(self, ctx):
                 raise ValueError("rejected")
 
+        class RejectAPI(LitAPI):
             def predict(self, x):
                 return x
 
         with pytest.raises(ValueError, match="rejected"):
-            run_single(RejectAPI())
+            run_single(RejectAPI(), callbacks=[RejectCB()])
 
     def test_skips_hooks_when_not_implemented(self):
         class PlainAPI(LitAPI):
@@ -451,37 +453,41 @@ class TestRunSingle:
         resp_bytes, status, metrics, _ = run_single(PlainAPI())
         assert json.loads(resp_bytes) == {"output": 10}
 
-    def test_on_response_with_headers_returns_headers_in_tuple(self):
-        class HeaderAPI(LitAPI):
-            def predict(self, x):
-                return {"output": x.get("input", 0) * 2}
-
-            def on_response(self, ctx):
+    def test_after_encode_response_with_headers_returns_headers_in_tuple(self):
+        class HeaderCB(Callback):
+            def after_encode_response(self, ctx):
                 return ctx.respond(
                     ctx.response,
                     headers={"X-Custom": "hello", "X-Other": "world"},
                 )
 
-        resp_bytes, status, metrics, headers = run_single(HeaderAPI())
+        class HeaderAPI(LitAPI):
+            def predict(self, x):
+                return {"output": x.get("input", 0) * 2}
+
+        resp_bytes, status, metrics, headers = run_single(HeaderAPI(), callbacks=[HeaderCB()])
         assert json.loads(resp_bytes) == {"output": 10}
         assert status.code == "Ok"
         assert headers == {"X-Custom": "hello", "X-Other": "world"}
 
-    def test_async_on_response_with_headers(self):
-        class AsyncHeaderAPI(LitAPI):
-            async def predict(self, x):
-                return {"output": x.get("input", 0) * 2}
-
-            async def on_response(self, ctx):
+    def test_async_after_encode_response_with_headers(self):
+        class AsyncHeaderCB(Callback):
+            async def after_encode_response(self, ctx):
                 return ctx.respond(
                     ctx.response, headers={"X-Async": "true"},
                 )
 
-        resp_bytes, status, metrics, headers = run_single(AsyncHeaderAPI())
+        class AsyncHeaderAPI(LitAPI):
+            async def predict(self, x):
+                return {"output": x.get("input", 0) * 2}
+
+        resp_bytes, status, metrics, headers = run_single(
+            AsyncHeaderAPI(), callbacks=[AsyncHeaderCB()]
+        )
         assert json.loads(resp_bytes) == {"output": 10}
         assert headers == {"X-Async": "true"}
 
-    def test_async_predict_with_optional_hooks(self):
+    def test_async_predict(self):
         class SimpleAsyncAPI(LitAPI):
             async def predict(self, x):
                 return {"output": x["input"] * 3}
@@ -491,36 +497,38 @@ class TestRunSingle:
         assert status.code == "Ok"
 
     def test_mixed_sync_async_hooks(self):
-        class MixedAPI(LitAPI):
-            async def on_request(self, ctx):
+        class MixedCB(Callback):
+            async def before_decode_request(self, ctx):
                 ctx.request["hooked"] = True
                 return ctx.request
 
-            async def predict(self, x):
-                return x
-
-            def on_response(self, ctx):
+            def after_encode_response(self, ctx):
                 ctx.response["sync_hook"] = True
                 return ctx.response
 
+        class MixedAPI(LitAPI):
+            async def predict(self, x):
+                return x
+
         resp_bytes, status, metrics, _ = run_single(
-            MixedAPI(), data=json.dumps({"input": 1}).encode()
+            MixedAPI(), callbacks=[MixedCB()], data=json.dumps({"input": 1}).encode()
         )
         assert json.loads(resp_bytes) == {"input": 1, "hooked": True, "sync_hook": True}
 
-    def test_async_predict_without_optional_hooks(self):
+    def test_after_encode_response_wraps_response(self):
+        class WrapCB(Callback):
+            def after_encode_response(self, ctx):
+                return {"wrapped": ctx.response}
+
         class PlainAPI(LitAPI):
             def predict(self, x):
                 return {"output": x.get("input", 0) * 2}
 
-            def on_response(self, ctx):
-                return {"wrapped": ctx.response}
-
-        resp_bytes, status, metrics, headers = run_single(PlainAPI())
+        resp_bytes, status, metrics, headers = run_single(PlainAPI(), callbacks=[WrapCB()])
         assert json.loads(resp_bytes) == {"wrapped": {"output": 10}}
         assert headers is None
 
-    def test_no_on_response_still_returns_none_headers(self):
+    def test_no_hooks_still_returns_none_headers(self):
         class NoHookAPI(LitAPI):
             def predict(self, x):
                 return {"output": x.get("input", 0) + 1}
@@ -530,13 +538,18 @@ class TestRunSingle:
         assert headers is None
 
     def test_async_predict_pipeline(self):
+        class AsyncCB(Callback):
+            async def before_decode_request(self, ctx):
+                ctx.request["before_decode_request"] = True
+                return ctx.request
+
+            async def after_encode_response(self, ctx):
+                ctx.response["after_encode_response"] = True
+                return ctx.response
+
         class AsyncAPI(LitAPI):
             async def decode_request(self, req):
                 return {"decoded": req["input"]}
-
-            async def on_request(self, ctx):
-                ctx.request["on_request"] = True
-                return ctx.request
 
             async def predict(self, x):
                 return {"output": x["decoded"] * 2}
@@ -544,12 +557,8 @@ class TestRunSingle:
             async def encode_response(self, out):
                 return {"encoded": out["output"]}
 
-            async def on_response(self, ctx):
-                ctx.response["on_response"] = True
-                return ctx.response
-
-        resp_bytes, status, metrics, _ = run_single(AsyncAPI())
-        assert json.loads(resp_bytes) == {"encoded": 10, "on_response": True}
+        resp_bytes, status, metrics, _ = run_single(AsyncAPI(), callbacks=[AsyncCB()])
+        assert json.loads(resp_bytes) == {"encoded": 10, "after_encode_response": True}
         assert status.code == "Ok"
 
 
@@ -912,7 +921,7 @@ class TestAsyncLoop:
         from lite_server.exceptions import HTTPException
 
         class HeaderCB(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 ctx.response_headers["x-uni"] = "1"
 
         class FailModel(LitAPI):
@@ -1528,7 +1537,7 @@ class TestBatchPredict:
     def test_batch_error_item_carries_response_headers(self):
         """B6: ctx.response_headers set by a callback reach the failed item."""
         class HeaderCB(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 ctx.response_headers["x-batch"] = "1"
 
         class BrokenBatchModel(LitAPI):
@@ -1744,12 +1753,13 @@ class TestBatchPredict:
             f"batch-level headers must be empty, got {dict(resp.batch.headers)}"
         )
 
-    def test_single_on_request_before_decode(self):
-        class ModelWithHook(LitAPI):
-            def on_request(self, ctx):
+    def test_single_before_decode_request_hook(self):
+        class InjectCB(Callback):
+            def before_decode_request(self, ctx):
                 ctx.request["injected"] = True
                 return ctx.request
 
+        class ModelWithHook(LitAPI):
             def decode_request(self, request):
                 assert request.get("injected") is True
                 return {"decoded": request}
@@ -1757,22 +1767,25 @@ class TestBatchPredict:
             def predict(self, x):
                 return {"has_injected": x["decoded"].get("injected", False)}
 
+        model = ModelWithHook()
+        model._pipeline = Pipeline.build(model, [InjectCB()])
         socket = AsyncMockSocket()
         req = Request(uid="hook-1", single=SingleRequest(data=json.dumps({"input": 1}).encode()))
         socket.inject(req.SerializeToString())
-        drive_loop(ModelWithHook(), socket)
+        drive_loop(model, socket)
 
         resp = Response()
         resp.ParseFromString(socket._msgs[0])
         assert resp.uid == "hook-1"
         assert json.loads(resp.single.data)["has_injected"] is True
 
-    def test_async_single_on_request_before_decode(self):
-        class AsyncModelWithHook(LitAPI):
-            async def on_request(self, ctx):
+    def test_async_single_before_decode_request_hook(self):
+        class AsyncInjectCB(Callback):
+            async def before_decode_request(self, ctx):
                 ctx.request["async_injected"] = True
                 return ctx.request
 
+        class AsyncModelWithHook(LitAPI):
             async def decode_request(self, request):
                 assert request.get("async_injected") is True
                 return {"decoded": request}
@@ -1780,10 +1793,12 @@ class TestBatchPredict:
             async def predict(self, x):
                 return {"has_injected": x["decoded"].get("async_injected", False)}
 
+        model = AsyncModelWithHook()
+        model._pipeline = Pipeline.build(model, [AsyncInjectCB()])
         socket = AsyncMockSocket()
         req = Request(uid="async-hook-1", single=SingleRequest(data=json.dumps({"input": 1}).encode()))
         socket.inject(req.SerializeToString())
-        drive_loop(AsyncModelWithHook(), socket)
+        drive_loop(model, socket)
 
         resp = Response()
         resp.ParseFromString(socket._msgs[0])
@@ -1910,17 +1925,17 @@ class TestCBLoop:
         calls = []
 
         class CBTracker(Callback):
-            def on_request(self, ctx):
-                calls.append("on_request")
+            def before_decode_request(self, ctx):
+                calls.append("before_decode_request")
 
-            def on_input(self, ctx):
-                calls.append("on_input")
+            def after_decode_request(self, ctx):
+                calls.append("after_decode_request")
 
-            def on_output(self, ctx):
-                calls.append("on_output")
+            def after_predict(self, ctx):
+                calls.append("after_predict")
 
-            def on_response(self, ctx):
-                calls.append("on_response")
+            def after_encode_response(self, ctx):
+                calls.append("after_encode_response")
 
         class CBModel(LitAPI):
             def decode_request(self, req):
@@ -1949,13 +1964,13 @@ class TestCBLoop:
 
         response = wait_for_response(socket, "cb-hooks")
         assert json.loads(response.single.data) == {"out": ["tok:x"]}
-        assert calls == ["on_request", "on_input", "on_output", "on_response"]
+        assert calls == ["before_decode_request", "after_decode_request", "after_predict", "after_encode_response"]
 
     def test_cb_loop_early_return_skips_prefill(self):
         """Early return from a hook responds immediately — no prefill/step."""
 
         class CacheCB(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 ctx.respond({"cached": True})
 
         class CBModel(LitAPI):
@@ -1989,7 +2004,7 @@ class TestCBLoop:
         from lite_server.exceptions import BadRequestError
 
         class RejectCB(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 raise BadRequestError("cb rejected")
 
         class CBModel(LitAPI):
@@ -2025,7 +2040,7 @@ class TestCBLoop:
         from lite_server.exceptions import BadRequestError
 
         class HeaderCB(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 ctx.response_headers["x-cb"] = "yes"
                 raise BadRequestError("cb rejected")
 
@@ -2921,18 +2936,21 @@ class TestBidiStreamingAsyncLoop:
 
 class TestAsyncLoopStreamingHooks:
     def test_async_stream_with_hooks(self):
-        class HookedStreamModel(LitAPI):
-            async def on_request(self, ctx):
+        class AsyncHooksCB(Callback):
+            async def before_decode_request(self, ctx):
                 ctx.request["hooked"] = True
                 return ctx.request
 
-            async def stream_predict(self, x):
-                yield {"token": 0, "hooked": x.get("hooked")}
-
-            async def on_response(self, ctx):
+            async def after_encode_response(self, ctx):
                 ctx.response["async_hook"] = True
                 return ctx.response
 
+        class HookedStreamModel(LitAPI):
+            async def stream_predict(self, x):
+                yield {"token": 0, "hooked": x.get("hooked")}
+
+        model = HookedStreamModel()
+        model._pipeline = Pipeline.build(model, [AsyncHooksCB()])
         socket = AsyncMockSocket()
         from lite_server.proto import RequestMeta as ProtoMeta
         socket.inject(Request(
@@ -2945,7 +2963,7 @@ class TestAsyncLoopStreamingHooks:
                 ),
             ),
         ).SerializeToString())
-        drive_loop(HookedStreamModel(), socket, delay=0.03)
+        drive_loop(model, socket, delay=0.03)
 
         assert len(socket._msgs) >= 1
         resp = Response()

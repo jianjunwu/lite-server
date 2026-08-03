@@ -404,11 +404,11 @@ def check_17():
 def check_15():
     path = "/v2/models/callbacks_demo/infer"
     key = {"X-API-Key": "demo-key"}
-    # No API key -> 401 from ApiKeyAuth.on_request
+    # No API key -> 401 from ApiKeyAuth.before_decode_request
     st, r = http_json("POST", path, {"input": "hello"})
     if st != 401:
         return False, f"expected 401 without key, got HTTP {st} -> {r}"
-    # Empty input -> 400 from InputValidator.on_input
+    # Empty input -> 400 from InputValidator.after_decode_request
     st, r = http_json("POST", path, {"input": ""}, headers=key)
     if st != 400:
         return False, f"expected 400 for empty input, got HTTP {st} -> {r}"

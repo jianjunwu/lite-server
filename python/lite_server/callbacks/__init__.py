@@ -3,8 +3,8 @@
 Callbacks observe and transform the inference pipeline at four hook points
 around the three model stages::
 
-    on_request → decode_request → on_input → predict
-    → on_output → encode_response → on_response
+    before_decode_request → decode_request → after_decode_request → predict
+    → after_predict → encode_response → after_encode_response
 
 All data hooks receive a single :class:`RequestContext` argument and may be
 sync or async.  A data hook may:

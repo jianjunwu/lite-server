@@ -3,8 +3,8 @@
 Callbacks observe and transform the inference pipeline at four hook points
 around the three model stages::
 
-    on_request → decode_request → on_input → predict
-    → on_output → encode_response → on_response
+    before_decode_request → decode_request → after_decode_request → predict
+    → after_predict → encode_response → after_encode_response
 
 All data hooks receive a single :class:`RequestContext` argument and may be
 sync or async.  A data hook may:
@@ -42,13 +42,13 @@ class Callback:
 
     Hook order for a standard request::
 
-        on_request  →  decode_request  →  on_input  →  predict
-        →  on_output  →  encode_response  →  on_response
+        before_decode_request  →  decode_request  →  after_decode_request  →  predict
+        →  after_predict  →  encode_response  →  after_encode_response
     """
 
     # ---- Request pipeline (data hooks) ----
 
-    def on_request(self, ctx: RequestContext) -> Any | None:
+    def before_decode_request(self, ctx: RequestContext) -> Any | None:
         """Called on the raw request, before ``decode_request``.
 
         The right place for auth, schema validation, and cache lookups.
@@ -60,7 +60,7 @@ class Callback:
         """
         pass
 
-    def on_input(self, ctx: RequestContext) -> Any | None:
+    def after_decode_request(self, ctx: RequestContext) -> Any | None:
         """Called after ``decode_request``, before ``predict``.
 
         The right place for semantic validation of the decoded input.
@@ -71,7 +71,7 @@ class Callback:
         """
         pass
 
-    def on_output(self, ctx: RequestContext) -> Any | None:
+    def after_predict(self, ctx: RequestContext) -> Any | None:
         """Called after ``predict``, before ``encode_response``.
 
         In streaming mode this runs once per yielded chunk.
@@ -86,7 +86,7 @@ class Callback:
         """
         pass
 
-    def on_response(self, ctx: RequestContext) -> Any | None:
+    def after_encode_response(self, ctx: RequestContext) -> Any | None:
         """Called after ``encode_response`` — the last hook before sending.
 
         In streaming mode this runs once per yielded chunk.
@@ -103,7 +103,7 @@ class Callback:
 
     # ---- Batch hooks (whole-batch view; has_batch_methods path only) ----
 
-    def on_batch_input(self, ctx_list: list[RequestContext], batched: Any) -> Any | None:
+    def after_batch(self, ctx_list: list[RequestContext], batched: Any) -> Any | None:
         """Called after ``batch()``, before ``predict()`` — over the batched input.
 
         The one hook with a view of the whole batched tensor (not per-item):
@@ -115,7 +115,7 @@ class Callback:
         """
         pass
 
-    def on_batch_output(self, ctx_list: list[RequestContext], outputs: list[Any]) -> Any | None:
+    def after_unbatch(self, ctx_list: list[RequestContext], outputs: list[Any]) -> Any | None:
         """Called after ``unbatch()`` — over the per-item outputs list.
 
         Returns a replacement for ``outputs`` (keep length-aligned), or None.
@@ -164,15 +164,25 @@ class Callback:
 # Removed pre-0.7 hook names → their replacement.  Defining one of these on
 # a Callback subclass is a load-time error with migration instructions.
 _REMOVED_HOOKS = {
-    "on_before_decode": "on_request",
-    "on_after_decode": "on_input",
-    "on_before_predict": "on_input",
-    "on_after_predict": "on_output",
-    "on_before_encode": "on_output",
-    "on_after_encode": "on_response",
+    "on_before_decode": "before_decode_request",
+    "on_after_decode": "after_decode_request",
+    "on_before_predict": "after_decode_request",
+    "on_after_predict": "after_predict",
+    "on_before_encode": "after_predict",
+    "on_after_encode": "after_encode_response",
 }
 
-_DATA_HOOKS = ("on_request", "on_input", "on_output", "on_response")
+# 0.7–0.8 hook names → 0.8 names (pure rename: same hook, same position).
+_RENAMED_HOOKS = {
+    "on_request": "before_decode_request",
+    "on_input": "after_decode_request",
+    "on_output": "after_predict",
+    "on_response": "after_encode_response",
+    "on_batch_input": "after_batch",
+    "on_batch_output": "after_unbatch",
+}
+
+_DATA_HOOKS = ("before_decode_request", "after_decode_request", "after_predict", "after_encode_response")
 
 _ERROR_HOOKS = ("on_error",)
 
@@ -181,7 +191,7 @@ _STREAM_HOOKS = ("on_stream_close",)
 
 # Whole-batch hooks: (ctx_list, value) — driven inside Pipeline.batch_predict
 # only on the has_batch_methods path.
-_BATCH_HOOKS = ("on_batch_input", "on_batch_output")
+_BATCH_HOOKS = ("after_batch", "after_unbatch")
 
 _LIFECYCLE_HOOKS = ("on_before_setup", "on_after_setup", "on_teardown")
 
@@ -250,6 +260,13 @@ def validate_callback(cb: Callback) -> None:
                 f"'{new_name}(self, ctx)' — read/write ctx.{_field_for(new_name)} "
                 f"instead of the value parameter, use ctx.meta instead of meta, "
                 f"and ctx.state for per-request data."
+            )
+    for old_name, new_name in _RENAMED_HOOKS.items():
+        if _overrides(cls, old_name, Callback):
+            raise RuntimeError(
+                f"Callback {cls.__name__} defines '{old_name}', which was "
+                f"renamed in 0.8.0 to '{new_name}' — same hook, same position. "
+                f"Rename the method and it works unchanged."
             )
     for name in _DATA_HOOKS:
         if _overrides(cls, name, Callback):
@@ -331,10 +348,10 @@ def _check_stream_close_sig(fn: callable, owner: str) -> None:
 
 def _field_for(hook_name: str) -> str:
     return {
-        "on_request": "request",
-        "on_input": "input",
-        "on_output": "output",
-        "on_response": "response",
+        "before_decode_request": "request",
+        "after_decode_request": "input",
+        "after_predict": "output",
+        "after_encode_response": "response",
     }[hook_name]
 
 

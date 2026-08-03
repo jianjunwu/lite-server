@@ -163,7 +163,7 @@ class TestStreamOpenFallback:
         from lite_server.response import Response as LiteResponse
 
         class EarlyCB(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 return LiteResponse(content="early text")
 
         class StreamAPI(EchoAPI):
@@ -314,56 +314,65 @@ class TestStreamHooks:
         assert body["out"] == 15
 
     @pytest.mark.asyncio
-    async def test_on_request_hook_applied(self):
-        class HookStreamAPI(EchoAPI):
-            def on_request(self, ctx):
+    async def test_before_decode_request_hook_applied(self):
+        class HookCB(Callback):
+            def before_decode_request(self, ctx):
                 ctx.request["injected"] = True
                 return ctx.request
 
+        class HookStreamAPI(EchoAPI):
             def stream_predict(self, x):
                 yield x
 
+        api = HookStreamAPI()
+        api._pipeline = Pipeline.build(api, [HookCB()])
         sock = AsyncSocket()
         meta = ProtoMeta(route="/predict", headers={}, client_ip="", request_id="r1", timestamp_ns=0)
         await inference._handle_stream_open_async(
-            HookStreamAPI(), _stream_req("s-hook", b'{"q": 1}', meta), sock, {}, log
+            api, _stream_req("s-hook", b'{"q": 1}', meta), sock, {}, log
         )
         await sock.wait_for(lambda r: _is_done(r, "s-hook"))
         body = json.loads(sock.stream_responses("s-hook")[0].stream.chunk.data)
         assert body["injected"] is True
 
     @pytest.mark.asyncio
-    async def test_on_request_reject_sends_error(self):
-        class RejectStreamAPI(EchoAPI):
-            def on_request(self, ctx):
+    async def test_before_decode_request_reject_sends_error(self):
+        class RejectCB(Callback):
+            def before_decode_request(self, ctx):
                 raise ValueError("auth failed")
 
+        class RejectStreamAPI(EchoAPI):
             def stream_predict(self, x):
                 yield x
 
+        api = RejectStreamAPI()
+        api._pipeline = Pipeline.build(api, [RejectCB()])
         sock = AsyncSocket()
         meta = ProtoMeta(route="/predict", headers={}, client_ip="", request_id="r1", timestamp_ns=0)
         await inference._handle_stream_open_async(
-            RejectStreamAPI(), _stream_req("s-rej", b"{}", meta), sock, {}, log
+            api, _stream_req("s-rej", b"{}", meta), sock, {}, log
         )
         err = await sock.wait_for(lambda r: _is_error(r, "s-rej"))
         assert "auth failed" in err[0].stream.error.message
 
     @pytest.mark.asyncio
-    async def test_on_response_hook_applied_per_chunk(self):
-        class OnResponseStreamAPI(EchoAPI):
-            def on_response(self, ctx):
+    async def test_after_encode_response_hook_applied_per_chunk(self):
+        class OnResponseCB(Callback):
+            def after_encode_response(self, ctx):
                 ctx.response["tagged"] = ctx.meta.route
                 return ctx.response
 
+        class OnResponseStreamAPI(EchoAPI):
             def stream_predict(self, x):
                 yield {"a": 1}
                 yield {"b": 2}
 
+        api = OnResponseStreamAPI()
+        api._pipeline = Pipeline.build(api, [OnResponseCB()])
         sock = AsyncSocket()
         meta = ProtoMeta(route="/stream", headers={}, client_ip="", request_id="r2", timestamp_ns=0)
         await inference._handle_stream_open_async(
-            OnResponseStreamAPI(), _stream_req("s-onresp", b"{}", meta), sock, {}, log
+            api, _stream_req("s-onresp", b"{}", meta), sock, {}, log
         )
         await sock.wait_for(lambda r: _is_done(r, "s-onresp"))
         chunks = [r for r in sock.stream_responses("s-onresp") if r.stream.HasField("chunk")]
@@ -376,11 +385,11 @@ class TestStreamHooks:
         calls = []
 
         class StreamCB(Callback):
-            def on_request(self, ctx):
-                calls.append("on_request")
+            def before_decode_request(self, ctx):
+                calls.append("before_decode_request")
 
-            def on_output(self, ctx):
-                calls.append("on_output")
+            def after_predict(self, ctx):
+                calls.append("after_predict")
 
         class StreamAPI(EchoAPI):
             def stream_predict(self, x):
@@ -394,7 +403,7 @@ class TestStreamHooks:
             api, _stream_req("s-cb"), sock, {}, log
         )
         await sock.wait_for(lambda r: _is_done(r, "s-cb"))
-        assert calls == ["on_request", "on_output", "on_output"]
+        assert calls == ["before_decode_request", "after_predict", "after_predict"]
 
     @pytest.mark.asyncio
     async def test_on_stream_close_done_on_normal_end(self):
@@ -506,7 +515,7 @@ class TestStreamHooks:
     @pytest.mark.asyncio
     async def test_callback_early_return_at_open(self):
         class CacheCB(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 ctx.respond({"cached": True})
 
         class StreamAPI(EchoAPI):
@@ -1166,7 +1175,7 @@ class TestBidiSessionLifecycle:
                 closed.append(True)
 
         class EarlyCb(Callback):
-            def on_output(self, ctx):
+            def after_predict(self, ctx):
                 return ctx.respond({"final": True})
 
         class BidiAPI(EchoAPI):

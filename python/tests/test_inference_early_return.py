@@ -46,14 +46,6 @@ class _TrackerAPI(LitAPI):
         self.calls.append("encode_response")
         return output
 
-    def on_request(self, ctx):
-        self.calls.append("on_request")
-        return ctx.request
-
-    def on_response(self, ctx):
-        self.calls.append("on_response")
-        return ctx.response
-
 
 def _pipeline(api, callbacks=()):
     pipe = Pipeline.build(api, list(callbacks))
@@ -75,29 +67,31 @@ async def _run(api, callbacks=(), data=None, meta=None):
 
 class TestEarlyReturnPoints:
     @pytest.mark.asyncio
-    async def test_early_return_at_api_on_request(self):
-        api = _TrackerAPI()
-        api.on_request = lambda ctx: Response(
-            content={"early": True}, headers={"X-Stage": "on_request"}
-        )
+    async def test_early_return_at_before_decode_request(self):
+        class EarlyCB(Callback):
+            def before_decode_request(self, ctx):
+                return Response(
+                    content={"early": True}, headers={"X-Stage": "before_decode_request"}
+                )
 
-        resp_bytes, status, metrics, headers = await _run(api)
+        api = _TrackerAPI()
+        resp_bytes, status, metrics, headers = await _run(api, [EarlyCB()])
         assert resp_bytes == b'{"early":true}'
-        assert headers == {"X-Stage": "on_request"}
+        assert headers == {"X-Stage": "before_decode_request"}
         assert "decode_request" not in api.calls
         assert "predict" not in api.calls
         assert "encode_response" not in api.calls
 
     @pytest.mark.asyncio
-    async def test_early_return_at_callback_on_request(self):
+    async def test_early_return_at_callback_before_decode_request(self):
         class EarlyCB(Callback):
-            def on_request(self, ctx):
-                return Response(content={"from_cb": 1}, headers={"X-Cb": "on_request"})
+            def before_decode_request(self, ctx):
+                return Response(content={"from_cb": 1}, headers={"X-Cb": "before_decode_request"})
 
         api = _TrackerAPI()
         resp_bytes, status, metrics, headers = await _run(api, [EarlyCB()])
         assert resp_bytes == b'{"from_cb":1}'
-        assert headers == {"X-Cb": "on_request"}
+        assert headers == {"X-Cb": "before_decode_request"}
         assert "decode_request" not in api.calls
         assert "predict" not in api.calls
 
@@ -115,15 +109,15 @@ class TestEarlyReturnPoints:
         assert "encode_response" not in api.calls
 
     @pytest.mark.asyncio
-    async def test_early_return_at_callback_on_input(self):
+    async def test_early_return_at_callback_after_decode_request(self):
         class EarlyCB(Callback):
-            def on_input(self, ctx):
-                return Response(content={"from_cb": 2}, headers={"X-Cb": "on_input"})
+            def after_decode_request(self, ctx):
+                return Response(content={"from_cb": 2}, headers={"X-Cb": "after_decode_request"})
 
         api = _TrackerAPI()
         resp_bytes, status, metrics, headers = await _run(api, [EarlyCB()])
         assert resp_bytes == b'{"from_cb":2}'
-        assert headers == {"X-Cb": "on_input"}
+        assert headers == {"X-Cb": "after_decode_request"}
         assert "predict" not in api.calls
 
     @pytest.mark.asyncio
@@ -139,15 +133,15 @@ class TestEarlyReturnPoints:
         assert "encode_response" not in api.calls
 
     @pytest.mark.asyncio
-    async def test_early_return_at_callback_on_output(self):
+    async def test_early_return_at_callback_after_predict(self):
         class EarlyCB(Callback):
-            def on_output(self, ctx):
-                return Response(content={"from_cb": 4}, headers={"X-Cb": "on_output"})
+            def after_predict(self, ctx):
+                return Response(content={"from_cb": 4}, headers={"X-Cb": "after_predict"})
 
         api = _TrackerAPI()
         resp_bytes, status, metrics, headers = await _run(api, [EarlyCB()])
         assert resp_bytes == b'{"from_cb":4}'
-        assert headers == {"X-Cb": "on_output"}
+        assert headers == {"X-Cb": "after_predict"}
         assert "encode_response" not in api.calls
 
     @pytest.mark.asyncio
@@ -162,26 +156,28 @@ class TestEarlyReturnPoints:
         assert headers == {"X-Stage": "encode_response"}
 
     @pytest.mark.asyncio
-    async def test_early_return_at_callback_on_response(self):
+    async def test_early_return_at_callback_after_encode_response(self):
         class EarlyCB(Callback):
-            def on_response(self, ctx):
-                return Response(content={"from_cb": 6}, headers={"X-Cb": "on_response"})
+            def after_encode_response(self, ctx):
+                return Response(content={"from_cb": 6}, headers={"X-Cb": "after_encode_response"})
 
         api = _TrackerAPI()
         resp_bytes, status, metrics, headers = await _run(api, [EarlyCB()])
         assert resp_bytes == b'{"from_cb":6}'
-        assert headers == {"X-Cb": "on_response"}
+        assert headers == {"X-Cb": "after_encode_response"}
 
     @pytest.mark.asyncio
-    async def test_early_return_at_api_on_response(self):
-        api = _TrackerAPI()
-        api.on_response = lambda ctx: Response(
-            content={"final": True}, headers={"X-Stage": "on_response"}
-        )
+    async def test_early_return_at_after_encode_response(self):
+        class EarlyCB(Callback):
+            def after_encode_response(self, ctx):
+                return Response(
+                    content={"final": True}, headers={"X-Stage": "after_encode_response"}
+                )
 
-        resp_bytes, status, metrics, headers = await _run(api)
+        api = _TrackerAPI()
+        resp_bytes, status, metrics, headers = await _run(api, [EarlyCB()])
         assert resp_bytes == b'{"final":true}'
-        assert headers == {"X-Stage": "on_response"}
+        assert headers == {"X-Stage": "after_encode_response"}
 
     # ---- plain Response (status code / media type embedded) ----
 
@@ -221,7 +217,7 @@ class TestEarlyReturnPoints:
     @pytest.mark.asyncio
     async def test_ctx_respond_in_callback(self):
         class CacheCB(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 ctx.respond({"cached": True}, status_code=200, headers={"X-Cache": "1"})
 
         api = _TrackerAPI()
@@ -242,7 +238,7 @@ class TestEarlyReturnFlow:
         resp_bytes, status, metrics, headers = await _run(api)
         assert resp_bytes == b'{"input":"hello"}'
         assert headers is None
-        for name in ("on_request", "decode_request", "predict", "encode_response", "on_response"):
+        for name in ("decode_request", "predict", "encode_response"):
             assert name in api.calls
 
     @pytest.mark.asyncio
@@ -252,22 +248,22 @@ class TestEarlyReturnFlow:
         calls = []
 
         class CallbackA(Callback):
-            def on_request(self, ctx):
-                calls.append("A_on_request")
+            def before_decode_request(self, ctx):
+                calls.append("A_before_decode_request")
                 ctx.respond({"early": True}, headers={"X-Cb": "A"})
 
         class CallbackB(Callback):
-            def on_request(self, ctx):
-                calls.append("B_on_request")
+            def before_decode_request(self, ctx):
+                calls.append("B_before_decode_request")
 
-            def on_output(self, ctx):
-                calls.append("B_on_output")
+            def after_predict(self, ctx):
+                calls.append("B_after_predict")
 
         api = _TrackerAPI()
         resp_bytes, status, metrics, headers = await _run(api, [CallbackA(), CallbackB()])
         assert resp_bytes == b'{"early":true}'
         assert headers == {"X-Cb": "A"}
-        assert calls == ["A_on_request"]
+        assert calls == ["A_before_decode_request"]
         assert "predict" not in api.calls
 
     @pytest.mark.asyncio
@@ -275,7 +271,7 @@ class TestEarlyReturnFlow:
         from lite_server.api import _MetricSpec
 
         class MetricCB(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 ctx.respond("done")
 
         api = _TrackerAPI()
@@ -319,7 +315,7 @@ class TestEarlyReturnFlow:
     @pytest.mark.asyncio
     async def test_async_callback_early_return(self):
         class AsyncEarlyCB(Callback):
-            async def on_input(self, ctx):
+            async def after_decode_request(self, ctx):
                 return Response(content={"cb": 2}, headers={"X-Cb": "async"})
 
         api = _TrackerAPI()

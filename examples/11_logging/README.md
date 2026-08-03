@@ -32,4 +32,4 @@ curl -X POST http://localhost:8000/v2/models/logged_model/infer \
 - `self.logger` is available in every `LitAPI` method
 - Use `.debug()` / `.info()` / `.warning()` / `.error()` as appropriate
 - Control verbosity with `--log-level` (or the `log_level` config field)
-- Log in `on_request` / `on_response` to capture request metadata (client IP, request ID, route)
+- Log in `before_decode_request` / `after_encode_response` to capture request metadata (client IP, request ID, route)

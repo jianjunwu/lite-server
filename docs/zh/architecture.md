@@ -64,7 +64,7 @@ lite-server 是 Rust + Python 混合架构的推理服务器。Rust 内核处理
         │
         ▼
 6. Python worker 执行 callback 管线：
-   on_request() → decode_request() → on_input() → predict() → on_output() → encode_response() → on_response()
+   before_decode_request() → decode_request() → after_decode_request() → predict() → after_predict() → encode_response() → after_encode_response()
         │
         ▼
 7. 响应通过 ZMQ 返回
@@ -218,7 +218,7 @@ sender.close()  ──►  DecoupledResponse{is_final=true}（终结帧）
 |------|------|------|
 | CLI | `cli.py` | 命令行接口（serve、benchmark、init 等） |
 | LitAPI | `api.py` | 模型开发基类，支持 predict / batch / stream / bidi_stream 等钩子 |
-| Callbacks | `callbacks/` | 推理管线回调（on_request / on_input / on_output / on_response）+ 生命周期钩子（on_before_setup / on_after_setup / on_teardown） |
+| Callbacks | `callbacks/` | 推理管线回调（before_decode_request / after_decode_request / after_predict / after_encode_response）+ 生命周期钩子（on_before_setup / on_after_setup / on_teardown） |
 | Context | `context.py` | 请求上下文（RequestContext、RequestMeta），含 request_id、client_ip 等 |
 | Pipeline | `pipeline.py` | 数据预处理/后处理流水线 |
 | Route | `route.py` | `@route` 装饰器，声明自定义 HTTP 路由 |
@@ -325,7 +325,7 @@ InferenceQueue：Arc<RequestMeta>（无数据拷贝）
 ZMQ：protobuf 序列化 → 发送给 worker
     │
     ▼
-Python：protobuf 反序列化 → on_request() → decode_request() → on_input() → [batch()] → predict() → [unbatch()] → on_output() → encode_response() → on_response()
+Python：protobuf 反序列化 → before_decode_request() → decode_request() → after_decode_request() → [batch()] → predict() → [unbatch()] → after_predict() → encode_response() → after_encode_response()
     │
     ▼
 ZMQ：protobuf 序列化 → 发回
@@ -563,11 +563,11 @@ chunk 的长流不受影响；总时长上限仅在客户端显式指定 deadlin
 Python 侧 Callback 系统（`callbacks/`）在推理管线的关键节点注入自定义逻辑：
 
 ```
-on_request → [decode_request] → on_input → [predict] → on_output → [encode_response] → on_response
+before_decode_request → [decode_request] → after_decode_request → [predict] → after_predict → [encode_response] → after_encode_response
 ```
 
-**数据钩子**（`on_request` / `on_input` / `on_output` / `on_response`）：
-接收 `RequestContext`，可修改数据、提前返回 `Response`、或抛出 `HTTPException` 拒绝请求。支持 sync / async，流式模式下每个 chunk 各触发一次 `on_output` + `on_response`。
+**数据钩子**（`before_decode_request` / `after_decode_request` / `after_predict` / `after_encode_response`）：
+接收 `RequestContext`，可修改数据、提前返回 `Response`、或抛出 `HTTPException` 拒绝请求。支持 sync / async，流式模式下每个 chunk 各触发一次 `after_predict` + `after_encode_response`。
 
 **生命周期钩子**（`on_before_setup` / `on_after_setup` / `on_teardown`）：
 在请求路径之外运行，异常隔离（失败仅日志，不传播）。

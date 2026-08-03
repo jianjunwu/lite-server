@@ -148,8 +148,8 @@ class _ResponseSender:
     async def send(self, obj: Any) -> None:
         if self.closed:
             return
-        # Mirror _process_stream_chunk: postprocess (on_output → encode →
-        # on_response) then emit one StreamChunkResponse.
+        # Mirror _process_stream_chunk: postprocess (after_predict → encode →
+        # after_encode_response) then emit one StreamChunkResponse.
         self._ctx.output = obj
         self._ctx.early = None
         try:

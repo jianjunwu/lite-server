@@ -2,8 +2,8 @@
 
 Pipeline order for one request::
 
-    on_request → decode_request → on_input → predict
-    → on_output → encode_response → on_response
+    before_decode_request → decode_request → after_decode_request → predict
+    → after_predict → encode_response → after_encode_response
 
 Five callbacks are defined:
 
@@ -62,7 +62,7 @@ class ApiKeyAuth(Callback):
     def __init__(self, keys):
         self.keys = set(keys)
 
-    def on_request(self, ctx):
+    def before_decode_request(self, ctx):
         # ctx.meta.headers is case-insensitive
         if ctx.meta.headers.get("x-api-key") not in self.keys:
             raise UnauthorizedError("missing or invalid X-API-Key header")
@@ -75,10 +75,10 @@ class RequestTimer(Callback):
     self attributes which are shared by all requests hitting this instance.
     """
 
-    def on_request(self, ctx):
+    def before_decode_request(self, ctx):
         ctx.state["start_ns"] = time.time_ns()
 
-    def on_response(self, ctx):
+    def after_encode_response(self, ctx):
         elapsed_ms = (time.time_ns() - ctx.state["start_ns"]) / 1_000_000
         logger.info("[RequestTimer] request %s took %.2fms",
                     ctx.meta.request_id, elapsed_ms)
@@ -87,9 +87,9 @@ class RequestTimer(Callback):
 class SimpleCache(Callback):
     """Exact-match response cache demonstrating early return.
 
-    on_request checks the cache and short-circuits via ``ctx.respond(...)``
+    before_decode_request checks the cache and short-circuits via ``ctx.respond(...)``
     on a hit — decode/predict/encode and all later hooks are skipped.
-    on_output stores the fresh output on a miss.
+    after_predict stores the fresh output on a miss.
 
     The worker is a single event loop and sync hooks run on it, so a plain
     OrderedDict needs no locking here.
@@ -103,7 +103,7 @@ class SimpleCache(Callback):
     def _key(ctx):
         return json.dumps(ctx.request, sort_keys=True)
 
-    def on_request(self, ctx):
+    def before_decode_request(self, ctx):
         key = self._key(ctx)
         hit = self._cache.get(key)
         if hit is not None:
@@ -112,7 +112,7 @@ class SimpleCache(Callback):
             return ctx.respond({**hit, "cached": True},
                                headers={"X-Cache": "hit"})
 
-    def on_output(self, ctx):
+    def after_predict(self, ctx):
         self._cache[self._key(ctx)] = ctx.output
         if len(self._cache) > self.capacity:
             self._cache.popitem(last=False)

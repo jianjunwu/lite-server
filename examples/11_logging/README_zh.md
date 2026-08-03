@@ -34,4 +34,4 @@ curl -X POST http://localhost:8000/v2/models/logged_model/infer \
 - `self.logger` 在每个 `LitAPI` 方法中都可用
 - 使用 `.debug()` / `.info()` / `.warning()` / `.error()` 按需记录
 - 通过 `--log-level`（或 `log_level` 配置字段）控制详细程度
-- 在 `on_request` / `on_response` 中记录请求元数据（客户端 IP、请求 ID、路由）
+- 在 `before_decode_request` / `after_encode_response` 中记录请求元数据（客户端 IP、请求 ID、路由）

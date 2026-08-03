@@ -154,12 +154,12 @@ stream: true
 
 If `stream_predict()` is not implemented, the server falls back to `predict()` and sends the result as a single chunk.
 
-#### `on_request(self, ctx)`
+#### `before_decode_request(self, ctx)`
 
 Called before `decode_request()`, on the raw request. Use for auth, logging, or request modification. Receives a single :class:`RequestContext` argument (same contract as Callback hooks).
 
 ```python
-def on_request(self, ctx):
+def before_decode_request(self, ctx):
     self.logger.info(f"Request from {ctx.meta.client_ip}: {ctx.meta.request_id}")
     if not self._check_auth(ctx.meta.headers):
         raise PermissionError("Unauthorized")
@@ -168,12 +168,12 @@ def on_request(self, ctx):
 
 ``ctx.meta`` is a `RequestMeta` object with: `route`, `headers`, `client_ip`, `request_id`, `timestamp_ns`.
 
-#### `on_response(self, ctx)`
+#### `after_encode_response(self, ctx)`
 
 Called after `encode_response()`, before sending to client. Use for response modification or logging. Also called in the streaming path (after each chunk is encoded).
 
 ```python
-def on_response(self, ctx):
+def after_encode_response(self, ctx):
     ctx.response["latency_ms"] = (time.time_ns() - ctx.meta.timestamp_ns) / 1_000_000
     return ctx.response
 ```
@@ -181,7 +181,7 @@ def on_response(self, ctx):
 To attach custom HTTP response headers, use :meth:`ctx.respond() <lite_server.RequestContext.respond>`:
 
 ```python
-def on_response(self, ctx):
+def after_encode_response(self, ctx):
     return ctx.respond(
         ctx.response,
         headers={"X-Request-ID": ctx.meta.request_id},
@@ -222,7 +222,7 @@ def teardown(self):
 
 ## Callbacks
 
-Callbacks are a **composable, declarative** way to intercept the inference request lifecycle. Unlike inline `on_request`/`on_response` hooks, Callbacks are standalone classes that can be reused, shared, and combined across models.
+Callbacks are a **composable, declarative** way to intercept the inference request lifecycle. Unlike inline `before_decode_request`/`after_encode_response` hooks, Callbacks are standalone classes that can be reused, shared, and combined across models.
 
 ### Callback Base Class
 
@@ -232,11 +232,11 @@ Subclass `Callback` and override the hooks you care about. All hooks have defaul
 from lite_server import Callback
 
 class MyCallback(Callback):
-    def on_request(self, ctx):
+    def before_decode_request(self, ctx):
         """Called on the raw request, before decode_request."""
         ctx.request["_timestamp"] = ctx.meta.timestamp_ns
 
-    def on_output(self, ctx):
+    def after_predict(self, ctx):
         """Called after predict, before encode_response."""
         ctx.output["_latency_ns"] = time.time_ns() - ctx.meta.timestamp_ns
 ```
@@ -244,20 +244,20 @@ class MyCallback(Callback):
 **Hook points** (pipeline order):
 
 ```
-on_request → decode_request → on_input → predict → on_output → encode_response → on_response
+before_decode_request → decode_request → after_decode_request → predict → after_predict → encode_response → after_encode_response
 ```
 
 When any stage or hook raises, the pipeline short-circuits to ``on_error``, then an error response is returned to the client.
 
 | Hook | When | Reads / writes |
 |------|------|----------------|
-| `on_request` | Raw request, before `decode_request` | `ctx.request` |
-| `on_input` | After `decode_request`, before `predict` | `ctx.input` |
-| `on_output` | After `predict`, before `encode_response` (per chunk when streaming) | `ctx.output` |
-| `on_response` | After `encode_response`, before sending (per chunk when streaming) | `ctx.response` |
+| `before_decode_request` | Raw request, before `decode_request` | `ctx.request` |
+| `after_decode_request` | After `decode_request`, before `predict` | `ctx.input` |
+| `after_predict` | After `predict`, before `encode_response` (per chunk when streaming) | `ctx.output` |
+| `after_encode_response` | After `encode_response`, before sending (per chunk when streaming) | `ctx.response` |
 | `on_stream_close` | End of a streaming run (once per stream) | `ctx` + `reason`: `"done"` \| `"error"` \| `"cancel"`; read `ctx.stream_stats` |
-| `on_batch_input` | Batch mode: after `batch()`, before `predict()` (whole batch tensor) | `ctx_list` + `batched`; raising `HTTPException` rejects the whole batch |
-| `on_batch_output` | Batch mode: after `unbatch()` (per-item outputs) | `ctx_list` + `outputs` |
+| `after_batch` | Batch mode: after `batch()`, before `predict()` (whole batch tensor) | `ctx_list` + `batched`; raising `HTTPException` rejects the whole batch |
+| `after_unbatch` | Batch mode: after `unbatch()` (per-item outputs) | `ctx_list` + `outputs` |
 | `on_error` | Any hook or stage raises an exception | `ctx` + `exc` (the exception) |
 | `on_before_setup` | Before `LitAPI.setup()` | `(config, device)` |
 | `on_after_setup` | After `LitAPI.setup()` succeeds | `(lit_api)` |
@@ -289,12 +289,12 @@ A data hook may mutate `ctx` in place or return a replacement value (`None` = pa
 from lite_server import Callback, BadRequestError
 
 class Validator(Callback):
-    def on_request(self, ctx):
+    def before_decode_request(self, ctx):
         if "input" not in (ctx.request or {}):
             raise BadRequestError("missing field", param="input")
 
 class Cache(Callback):
-    def on_request(self, ctx):
+    def before_decode_request(self, ctx):
         hit = self._cache.get(key(ctx))
         if hit is not None:
             ctx.respond(hit, headers={"X-Cache-Hit": "1"})
@@ -326,10 +326,10 @@ Both forms are interchangeable with the class-attribute path (`LitAPI.callbacks 
 from lite_server import Callback
 
 class AuditLogger(Callback):
-    def on_request(self, ctx):
+    def before_decode_request(self, ctx):
         ctx.request["_audit_id"] = ctx.meta.request_id
 
-    def on_output(self, ctx):
+    def after_predict(self, ctx):
         print(f"[AUDIT] request_id={ctx.meta.request_id} latency={ctx.elapsed_ms():.2f}ms")
 
     def on_teardown(self, lit_api):
@@ -339,7 +339,7 @@ class AuditLogger(Callback):
 ### Built-in: JsonSchemaValidator (Schema Validation)
 
 `lite_server.callbacks.JsonSchemaValidator` validates the request body
-(`on_request`, before `decode_request`) and the response body (`on_response`,
+(`before_decode_request`, before `decode_request`) and the response body (`after_encode_response`,
 after `encode_response`) against JSON Schemas — declarative, no model-code
 changes. Both schemas describe the **wire payload** (what the client sends /
 receives), so an invalid request is rejected with 400 before any model code
@@ -375,7 +375,7 @@ callbacks:
   (a JSON `null` body fails as `None is not of type 'string'`). No
   `input_schema`/`output_schema` → that direction is not validated. In
   batch mode each item is validated independently.
-- **Custom routes**: the validator works there too — `on_request` runs
+- **Custom routes**: the validator works there too — `before_decode_request` runs
   before the route handler, so `input_schema` rejects an invalid route body
   the same way; `output_schema` is skipped on routes (only unary/batch).
 
@@ -443,16 +443,15 @@ policies:
 > consistency hazard. Referencing them in a `callbacks:` list is a load-time
 > error with migration instructions.
 
-### Callback vs LitAPI Inline Hooks
+### Where Hooks Live (0.8.0)
 
-| Aspect | `Callback` | `LitAPI.on_request` / `on_response` |
-|--------|-----------|--------------------------------------|
-| Definition | Standalone class, declarative registration | Inline method on model class |
-| Reusability | Shared across models | Per-model implementation |
-| Composability | Multiple callbacks chain together | Single implementation per model |
-| Registration | `callbacks:` field in config.yaml | Override method in model code |
-| Exceptions | `HTTPException` → structured error response | same |
-| Position | Registered order | `on_request` first, `on_response` last |
+All request hooks live on `Callback` subclasses — `LitAPI` only carries the
+pipeline stages (`setup` / `decode_request` / `predict` / `encode_response`
++ mode-specific methods). The 0.7–0.8 `LitAPI.on_request` / `on_response`
+methods were removed in 0.8.0: defining a hook on the model class is a
+load-time error pointing to the `Callback` migration. Callbacks register via
+the `callbacks:` field in config.yaml or the `LitAPI.callbacks` class
+attribute.
 
 See [examples/14_lifecycle_hooks](../examples/14_lifecycle_hooks/) for a runnable demo.
 
@@ -913,17 +912,17 @@ server:
 
 ### Per-Request Tracing
 
-Use `on_request` and `on_response` to log request metadata:
+Use `before_decode_request` and `after_encode_response` to log request metadata:
 
 ```python
-def on_request(self, ctx):
+def before_decode_request(self, ctx):
     self.logger.info(
         "Request from %s | route=%s | request_id=%s",
         ctx.meta.client_ip, ctx.meta.route, ctx.meta.request_id,
     )
     return ctx.request
 
-def on_response(self, ctx):
+def after_encode_response(self, ctx):
     self.logger.info(
         "Response ready | request_id=%s | latency_ms=%.2f",
         ctx.meta.request_id,
@@ -947,12 +946,12 @@ See [examples/11_logging](../examples/11_logging/) for a runnable demo.
 ### Error Handling
 
 - Raise exceptions in `predict()` to signal errors — the server retries on a different worker
-- Use `on_request()` for input validation — raise to reject early
+- Use `before_decode_request()` for input validation — raise to reject early
 - Avoid bare `except:` — let unexpected errors propagate for debugging
 
 #### Typed HTTP Errors
 
-Use `HTTPException` subclasses to return typed HTTP errors with structured responses. Subclasses work in **all hooks** (`predict`, `stream_predict`, `bidi_stream`, `decode_request`, `encode_response`, `on_request`, `on_response`, `prefill`, `step`) and across all protocols (HTTP, SSE, WebSocket, gRPC).
+Use `HTTPException` subclasses to return typed HTTP errors with structured responses. Subclasses work in **all hooks** (`predict`, `stream_predict`, `bidi_stream`, `decode_request`, `encode_response`, `before_decode_request`, `after_encode_response`, `prefill`, `step`) and across all protocols (HTTP, SSE, WebSocket, gRPC).
 
 ```python
 from lite_server.exceptions import (
@@ -972,7 +971,7 @@ class MyModel(LitAPI):
             raise ServiceUnavailableError("model not loaded yet")
         return self.model(x)
 
-    def on_request(self, ctx):
+    def before_decode_request(self, ctx):
         if not self._check_auth(ctx.meta.headers):
             raise UnauthorizedError("invalid or missing token")
         return ctx.request

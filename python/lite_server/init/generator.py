@@ -180,15 +180,15 @@ CONFIG_YAML_EXAMPLE = textwrap.dedent("""\
     # (pre-0.7 function-style signatures are rejected).
     #
     # Built-in class: lite_server.callbacks.JsonSchemaValidator validates the
-    # request body (on_request, before decode_request) and response body
-    # (on_response; unary/batch only) against JSON Schemas — needs
+    # request body (before_decode_request, before decode_request) and response body
+    # (after_encode_response; unary/batch only) against JSON Schemas — needs
     # `pip install lite-server[validation]`.
     #
-    # Hooks beyond the data chain (on_request/on_input/on_output/on_response):
+    # Hooks beyond the data chain (before_decode_request/after_decode_request/after_predict/after_encode_response):
     #   on_stream_close(ctx, reason)       # stream end: "done"|"error"|"cancel";
     #                                      # ctx.stream_stats = {chunks, bytes}
-    #   on_batch_input(ctx_list, batched)  # after batch(), before predict()
-    #   on_batch_output(ctx_list, outputs) # after unbatch(), per-item outputs
+    #   after_batch(ctx_list, batched)  # after batch(), before predict()
+    #   after_unbatch(ctx_list, outputs) # after unbatch(), per-item outputs
     # ctx helpers: ctx.elapsed_ms(), ctx.deadline_remaining_ms(), ctx.mode,
     # ctx.stage.
     # callbacks:
@@ -419,7 +419,7 @@ CALLBACKS_PY = textwrap.dedent('''\
     class AuditLogger(Callback):
         """Logs request method, route, and elapsed time for every request."""
 
-        def on_response(self, ctx):
+        def after_encode_response(self, ctx):
             print(
                 f"[AuditLogger] {ctx.meta.method} {ctx.meta.route} "
                 f"→ {ctx.elapsed_ms():.2f}ms"

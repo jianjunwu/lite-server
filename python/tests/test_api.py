@@ -340,7 +340,7 @@ class TestCollectMetrics:
 
 
 class TestUnwrapResponse:
-    """_unwrap_response: extract body and headers from on_response result."""
+    """_unwrap_response: extract body and headers from after_encode_response result."""
 
     def test_unwrap_plain_body_returns_none_headers(self):
         from lite_server.pipeline import unwrap_response as _unwrap_response

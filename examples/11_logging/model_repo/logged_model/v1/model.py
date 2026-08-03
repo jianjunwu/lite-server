@@ -1,9 +1,14 @@
 """Model demonstrating structured logging at different stages, plus
-response headers via :meth:`~lite_server.RequestContext.respond`."""
+response headers via :meth:`~lite_server.RequestContext.respond`.
 
+Request/response hooks live on a Callback subclass (below), not on LitAPI —
+since 0.8.0 LitAPI only carries the pipeline stages (decode/predict/encode).
+"""
+
+import logging
 import time
 
-from lite_server import LitAPI, RequestContext
+from lite_server import Callback, LitAPI, RequestContext
 
 
 class LoggedModelAPI(LitAPI):
@@ -38,14 +43,27 @@ class LoggedModelAPI(LitAPI):
         self.logger.debug("Debug: encode_response output=%s", output)
         return output
 
-    def on_request(self, ctx):
+
+class RequestResponseLogger(Callback):
+    """Request/response hooks (logging + custom response headers).
+
+    Registered via ``callbacks:`` in config.yaml — since 0.8.0 LitAPI only
+    carries the pipeline stages; hooks live on Callback subclasses.
+    """
+
+    def __init__(self):
+        self.call_count = 0
+        self.logger = logging.getLogger("RequestResponseLogger")
+
+    def before_decode_request(self, ctx):
+        self.call_count += 1
         self.logger.info(
             "Info: request from %s | route=%s | request_id=%s",
             ctx.meta.client_ip, ctx.meta.route, ctx.meta.request_id,
         )
         return ctx.request
 
-    def on_response(self, ctx):
+    def after_encode_response(self, ctx):
         self.logger.info(
             "Info: response ready | request_id=%s | output=%s",
             ctx.meta.request_id, ctx.response,

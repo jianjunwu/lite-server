@@ -100,10 +100,10 @@ class TestDeadlineRemaining:
 class TestValidateCallback:
     def test_new_style_callback_passes(self):
         class Good(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 pass
 
-            def on_output(self, ctx):
+            def after_predict(self, ctx):
                 pass
 
         validate_callback(Good())  # must not raise
@@ -114,12 +114,12 @@ class TestValidateCallback:
     @pytest.mark.parametrize(
         "old_name,new_name",
         [
-            ("on_before_decode", "on_request"),
-            ("on_after_decode", "on_input"),
-            ("on_before_predict", "on_input"),
-            ("on_after_predict", "on_output"),
-            ("on_before_encode", "on_output"),
-            ("on_after_encode", "on_response"),
+            ("on_before_decode", "before_decode_request"),
+            ("on_after_decode", "after_decode_request"),
+            ("on_before_predict", "after_decode_request"),
+            ("on_after_predict", "after_predict"),
+            ("on_before_encode", "after_predict"),
+            ("on_after_encode", "after_encode_response"),
         ],
     )
     def test_removed_hook_names_raise_with_migration_hint(self, old_name, new_name):
@@ -133,20 +133,43 @@ class TestValidateCallback:
         assert new_name in str(exc_info.value)
         assert "ctx" in str(exc_info.value)
 
+    @pytest.mark.parametrize(
+        "old_name,new_name",
+        [
+            ("on_request", "before_decode_request"),
+            ("on_input", "after_decode_request"),
+            ("on_output", "after_predict"),
+            ("on_response", "after_encode_response"),
+            ("on_batch_input", "after_batch"),
+            ("on_batch_output", "after_unbatch"),
+        ],
+    )
+    def test_renamed_hook_names_raise_with_rename_hint(self, old_name, new_name):
+        """0.7–0.8 hook names are a pure rename — loud error, not a silent skip."""
+        cls = type(
+            "Old",
+            (Callback,),
+            {old_name: lambda self, ctx: None},
+        )
+        with pytest.raises(RuntimeError, match=old_name) as exc_info:
+            validate_callback(cls())
+        assert new_name in str(exc_info.value)
+        assert "renamed" in str(exc_info.value)
+
     def test_wrong_arity_new_hook_raises(self):
         class Bad(Callback):
-            def on_request(self, ctx, meta):  # old two-arg shape on a new name
+            def before_decode_request(self, ctx, meta):  # old two-arg shape on a new name
                 pass
 
-        with pytest.raises(RuntimeError, match="on_request"):
+        with pytest.raises(RuntimeError, match="before_decode_request"):
             validate_callback(Bad())
 
     def test_batch_hook_wrong_arity_raises(self):
         class Bad(Callback):
-            def on_batch_input(self, ctx_list):  # needs (ctx_list, value)
+            def after_batch(self, ctx_list):  # needs (ctx_list, value)
                 pass
 
-        with pytest.raises(RuntimeError, match="on_batch_input"):
+        with pytest.raises(RuntimeError, match="after_batch"):
             validate_callback(Bad())
 
     def test_stream_close_wrong_arity_raises(self):
@@ -187,7 +210,7 @@ class TestLoadCallbacks:
         (tmp_path / "my_callbacks.py").write_text(
             "from lite_server import Callback\n"
             "class A(Callback):\n"
-            "    def on_request(self, ctx):\n"
+            "    def before_decode_request(self, ctx):\n"
             "        pass\n"
             "class B(Callback):\n"
             "    pass\n"

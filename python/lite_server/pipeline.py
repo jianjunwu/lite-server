@@ -4,8 +4,8 @@ Every request type — single, batch, streaming, bidirectional, continuous
 batching — flows through the same :class:`Pipeline`: callback hook chains
 wrapped around the three model stages::
 
-    on_request → decode_request → on_input → predict
-    → on_output → encode_response → on_response
+    before_decode_request → decode_request → after_decode_request → predict
+    → after_predict → encode_response → after_encode_response
 
 Design rules:
 
@@ -53,10 +53,10 @@ from lite_server.response import Response as LiteResponse
 logger = logging.getLogger("lite_server.pipeline")
 
 _HOOK_FIELD = {
-    "on_request": "request",
-    "on_input": "input",
-    "on_output": "output",
-    "on_response": "response",
+    "before_decode_request": "request",
+    "after_decode_request": "input",
+    "after_predict": "output",
+    "after_encode_response": "response",
 }
 
 
@@ -134,13 +134,6 @@ def _is_asyncish(fn: Callable) -> bool:
 # aligned with the inputs); only step is forbidden — its active_sequences
 # already carry per-sequence ctx via CBSequence.
 _CTX_FORBIDDEN = ("step",)
-
-# Error message fragment for LitAPI hooks that haven't been migrated to ctx.
-_API_HOOK_MIGRATION = (
-    "Since 0.7.0, LitAPI hooks receive a single RequestContext — same as "
-    "Callback hooks. Migrate: 'request' → ctx.request, 'meta' → ctx.meta, "
-    "early return via ctx.respond(...) (returning a Response still works)."
-)
 
 
 def _ctx_param(fn: Callable) -> inspect.Parameter | None:
@@ -326,12 +319,6 @@ class Pipeline:
                 candidate_fns.append(getattr(cb, name))
             for name in _STREAM_HOOKS:
                 candidate_fns.append(getattr(cb, name))
-        # API hooks (when overridden) also participate in async detection.
-        api_cls = type(lit_api)
-        if _overrides(api_cls, "on_request", LitAPI):
-            candidate_fns.append(lit_api.on_request)
-        if _overrides(api_cls, "on_response", LitAPI):
-            candidate_fns.append(lit_api.on_response)
 
         # Sync stages always run inline on the event loop (0.6.x semantics):
         # CPU-bound sync work is serialized by the GIL anyway, so an executor
@@ -374,32 +361,31 @@ class Pipeline:
             else None
         )
 
-        # --- Hook chains: one wrapper for LitAPI and Callback hooks -------
+        # --- Hook chains (Callback hooks only; LitAPI has no hooks) -------
         self._chains: dict[str, list[Callable]] = {name: [] for name in _DATA_HOOKS}
-        # Base implementations are skipped so a model that doesn't override
-        # them costs zero calls per request.
-        if _overrides(api_cls, "on_request", LitAPI):
-            _check_single_ctx_param(
-                lit_api.on_request, f"LitAPI {api_cls.__name__}",
-                "on_request", migration=_API_HOOK_MIGRATION,
-            )
-            self._chains["on_request"].append(
-                self._wrap_hook(lit_api.on_request, "on_request")
-            )
+        # 0.9 removed request hooks from LitAPI — hook logic lives on Callback
+        # subclasses.  Defining one on the model is a loud load-time error:
+        # a silent no-op would mean auth/validation that never runs.
+        api_cls = type(lit_api)
+        for _name in (
+            "before_decode_request", "after_decode_request", "after_predict",
+            "after_encode_response", "after_batch", "after_unbatch",
+            "on_request", "on_response",
+        ):
+            if _overrides(api_cls, _name, LitAPI):
+                raise RuntimeError(
+                    f"LitAPI {api_cls.__name__} defines '{_name}', but request "
+                    f"hooks were removed from LitAPI in 0.8.0. Implement a "
+                    f"Callback subclass instead and register it via the "
+                    f"'callbacks:' key in config.yaml or the LitAPI.callbacks "
+                    f"class attribute."
+                )
         for cb in self.callbacks:
             for name in _DATA_HOOKS:
                 if _overrides(type(cb), name, Callback):
                     self._chains[name].append(
                         self._wrap_hook(getattr(cb, name), name)
                     )
-        if _overrides(api_cls, "on_response", LitAPI):
-            _check_single_ctx_param(
-                lit_api.on_response, f"LitAPI {api_cls.__name__}",
-                "on_response", migration=_API_HOOK_MIGRATION,
-            )
-            self._chains["on_response"].append(
-                self._wrap_hook(lit_api.on_response, "on_response")
-            )
 
         # Lifecycle hooks: exception-isolated, run outside the event loop.
         self._lifecycle: dict[str, list[Callback]] = {name: [] for name in _LIFECYCLE_HOOKS}
@@ -439,32 +425,32 @@ class Pipeline:
         """Build a hook-only pipeline for custom routes.
 
         Loud rejection (load time): routes have no decode/predict/encode
-        stages, so on_input/on_output hooks would silently never run.
+        stages, so after_decode_request/after_predict hooks would silently never run.
         """
         for cb in callbacks:
             from lite_server.callbacks._base import validate_callback as _vc
             _vc(cb)
             cls_type = type(cb)
-            if _overrides(cls_type, "on_input", Callback):
+            if _overrides(cls_type, "after_decode_request", Callback):
                 raise RuntimeError(
-                    f"Callback {cls_type.__name__} defines 'on_input', but "
-                    f"routes have no decode stage — only on_request, "
-                    f"on_response, and on_error run. Move the logic into "
+                    f"Callback {cls_type.__name__} defines 'after_decode_request', but "
+                    f"routes have no decode stage — only before_decode_request, "
+                    f"after_encode_response, and on_error run. Move the logic into "
                     f"one of those hooks."
                 )
-            if _overrides(cls_type, "on_output", Callback):
+            if _overrides(cls_type, "after_predict", Callback):
                 raise RuntimeError(
-                    f"Callback {cls_type.__name__} defines 'on_output', but "
-                    f"routes have no encode stage — only on_request, "
-                    f"on_response, and on_error run. Move the logic into "
+                    f"Callback {cls_type.__name__} defines 'after_predict', but "
+                    f"routes have no encode stage — only before_decode_request, "
+                    f"after_encode_response, and on_error run. Move the logic into "
                     f"one of those hooks."
                 )
             for _bname in _BATCH_HOOKS:
                 if _overrides(cls_type, _bname, Callback):
                     raise RuntimeError(
                         f"Callback {cls_type.__name__} defines '{_bname}', but "
-                        f"routes have no batch stage — only on_request, "
-                        f"on_response, and on_error run."
+                        f"routes have no batch stage — only before_decode_request, "
+                        f"after_encode_response, and on_error run."
                     )
 
         pipe = cls.__new__(cls)
@@ -486,7 +472,7 @@ class Pipeline:
         # inline on the loop; no stage executor.
         pipe._gen_executor = None
 
-        # Hook chains: on_request → handler → on_response
+        # Hook chains: before_decode_request → handler → after_encode_response
         pipe._chains = {name: [] for name in _DATA_HOOKS}
         for cb in callbacks:
             for name in _DATA_HOOKS:
@@ -508,9 +494,9 @@ class Pipeline:
         return pipe
 
     async def run_route(self, ctx: RequestContext, handler: Callable) -> None:
-        """on_request → handler(ctx) → on_response; on_error on failure."""
+        """before_decode_request → handler(ctx) → after_encode_response; on_error on failure."""
         try:
-            await self._run_chain("on_request", ctx)
+            await self._run_chain("before_decode_request", ctx)
             if ctx.early is not None:
                 return
             result = handler(ctx)
@@ -522,7 +508,7 @@ class Pipeline:
             else:
                 ctx.response = result
             if ctx.early is None:
-                await self._run_chain("on_response", ctx)
+                await self._run_chain("after_encode_response", ctx)
         except Exception as e:
             await self.run_on_error(ctx, e)
             # Thread accumulated response headers onto the exception so the
@@ -630,15 +616,15 @@ class Pipeline:
     # ---- Pipeline halves -------------------------------------------------
 
     async def preprocess(self, ctx: RequestContext) -> None:
-        """on_request hooks → decode_request → on_input hooks."""
+        """before_decode_request hooks → decode_request → after_decode_request hooks."""
         ctx.stage = "decode_request"
-        await self._run_chain("on_request", ctx)
+        await self._run_chain("before_decode_request", ctx)
         if ctx.early is not None:
             return
         await self._stage(self._decode, ctx.request, ctx, "input")
         if ctx.early is not None:
             return
-        await self._run_chain("on_input", ctx)
+        await self._run_chain("after_decode_request", ctx)
 
     async def predict_value(self, ctx: RequestContext) -> None:
         """predict (single-item).  Batch/stream paths drive predict themselves."""
@@ -646,15 +632,15 @@ class Pipeline:
         await self._stage(self._predict, ctx.input, ctx, "output")
 
     async def postprocess(self, ctx: RequestContext) -> None:
-        """on_output hooks → encode_response → on_response hooks."""
+        """after_predict hooks → encode_response → after_encode_response hooks."""
         ctx.stage = "encode_response"
-        await self._run_chain("on_output", ctx)
+        await self._run_chain("after_predict", ctx)
         if ctx.early is not None:
             return
         await self._stage(self._encode, ctx.output, ctx, "response")
         if ctx.early is not None:
             return
-        await self._run_chain("on_response", ctx)
+        await self._run_chain("after_encode_response", ctx)
 
     # ---- Entry points ----------------------------------------------------
 
@@ -725,10 +711,10 @@ class Pipeline:
         for ctx in ctx_list:
             ctx.stage = "batch_predict"
         batched = await self._batch_fn(decodeds, ctx=ctx_list)
-        batched = await self._run_batch_chain("on_batch_input", ctx_list, batched)
+        batched = await self._run_batch_chain("after_batch", ctx_list, batched)
         output = await self._predict(batched, ctx=ctx_list)
         outputs = await self._unbatch_fn(output, ctx=ctx_list)
-        outputs = await self._run_batch_chain("on_batch_output", ctx_list, outputs)
+        outputs = await self._run_batch_chain("after_unbatch", ctx_list, outputs)
         if len(outputs) != len(decodeds):
             raise ValueError(
                 f"unbatch returned {len(outputs)} outputs, expected {len(decodeds)}"

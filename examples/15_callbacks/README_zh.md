@@ -9,8 +9,8 @@
 Callback 在模型三个阶段的上下游提供四个数据钩子点，可观察并改写推理管线：
 
 ```
-on_request → decode_request → on_input → predict
-→ on_output → encode_response → on_response
+before_decode_request → decode_request → after_decode_request → predict
+→ after_predict → encode_response → after_encode_response
 ```
 
 此外还有 `on_error`（请求失败时）和三个生命周期钩子（`on_before_setup` / `on_after_setup` / `on_teardown`）。
@@ -19,10 +19,10 @@ on_request → decode_request → on_input → predict
 
 | Callback | 钩子 | 演示点 |
 |----------|------|--------|
-| `ApiKeyAuth` | `on_request` | 拒绝请求：抛 `UnauthorizedError` → 401 |
-| `RequestTimer` | `on_request`、`on_response` | 用 `ctx.state` 存每请求状态（并发安全） |
-| `SimpleCache` | `on_request`、`on_output` | `ctx.respond(...)` 短路早返、自定义响应头 |
-| `JsonSchemaValidator`（内置） | `on_request`, `on_response` | config.yaml 声明式 schema 校验，零 Python 代码（需 `pip install lite-server[validation]`） |
+| `ApiKeyAuth` | `before_decode_request` | 拒绝请求：抛 `UnauthorizedError` → 401 |
+| `RequestTimer` | `before_decode_request`、`after_encode_response` | 用 `ctx.state` 存每请求状态（并发安全） |
+| `SimpleCache` | `before_decode_request`、`after_predict` | `ctx.respond(...)` 短路早返、自定义响应头 |
+| `JsonSchemaValidator`（内置） | `before_decode_request`, `after_encode_response` | config.yaml 声明式 schema 校验，零 Python 代码（需 `pip install lite-server[validation]`） |
 | `ErrorMetrics` | `on_error` | 异常隔离的错误钩子 |
 | `LifecycleTracer` | setup/teardown | `on_before_setup` / `on_after_setup` / `on_teardown` |
 
@@ -40,7 +40,7 @@ on_request → decode_request → on_input → predict
 - 数据钩子的异常**不会**被吞掉：抛 `HTTPException`（或 `BadRequestError` / `UnauthorizedError` 等子类）即以对应状态码拒绝请求，返回机器可读的错误体。
 - `ctx.respond(body, status_code=..., headers=...)` 短路管线 —— 后续阶段和钩子全部跳过。
 - `on_error` 和生命周期钩子是异常隔离的：失败只记日志，不传播。
-- 流式模式下，`on_output` / `on_response` 对每个 chunk 各调一次，`on_error` 对每个失败的 chunk 调一次。
+- 流式模式下，`after_predict` / `after_encode_response` 对每个 chunk 各调一次，`on_error` 对每个失败的 chunk 调一次。
 - 日志用 `logging` 模块，不要 `print()` —— stdout 承载 worker 启动握手协议，往里写（比如在 `on_before_setup` 中）会导致 worker 启动失败。
 - 生产环境的鉴权/限流/CORS 应使用 config.yaml 中声明式的 `policies:` 配置 —— 这里的 `ApiKeyAuth` 仅用于教学演示钩子机制。
 
@@ -59,7 +59,7 @@ python -m lite_server serve --config server.yaml
 `config.yaml` 中的 schema（`input_schema`）校验整个请求体：`text`（必填、非空字符串）、`note`（必填、但允许 `null`）、`max_tokens` / `temperature`（可选、有边界）、`messages`（可选的对象列表 `{role, content}`），并拒绝未知字段。400 错误里的 `param` 是指向出错位置的 JSON Pointer。
 
 ```bash
-# 无 API key -> ApiKeyAuth.on_request 返回 401
+# 无 API key -> ApiKeyAuth.before_decode_request 返回 401
 curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
   -H 'Content-Type: application/json' \
   -d '{"text": "hello", "note": null}'
@@ -123,7 +123,7 @@ curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
 
 ## 学习要点
 
-- 全部 callback 钩子点及顺序：`on_request` → decode → `on_input` → predict → `on_output` → encode → `on_response`，外加 `on_error` 和生命周期钩子
+- 全部 callback 钩子点及顺序：`before_decode_request` → decode → `after_decode_request` → predict → `after_predict` → encode → `after_encode_response`，外加 `on_error` 和生命周期钩子
 - 两种注册方式及适用场景（带构造参数的 `LitAPI.callbacks` vs config.yaml 的 `callbacks:`，字符串与单键 map 条目）
 - 在数据钩子中抛 `HTTPException` 子类拒绝请求（401/400）
 - 用内置 `JsonSchemaValidator` 声明式校验请求输入

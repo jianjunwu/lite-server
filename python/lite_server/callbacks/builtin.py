@@ -38,10 +38,10 @@ class JsonSchemaValidator(Callback):
     Both schemas describe the **wire payload** — what the client sends and
     what the client receives — not the model's internal shapes:
 
-    - ``input_schema`` validates ``ctx.request`` in ``on_request``, before
+    - ``input_schema`` validates ``ctx.request`` in ``before_decode_request``, before
       ``decode_request`` runs: an invalid request is rejected with 400 and
       no model code (decode included) ever sees it.
-    - ``output_schema`` validates ``ctx.response`` in ``on_response``, after
+    - ``output_schema`` validates ``ctx.response`` in ``after_encode_response``, after
       ``encode_response``, for **unary/batch only** — streaming chunks are
       partial JSON and never match a full schema, so they are skipped via
       ``ctx.mode``.
@@ -87,11 +87,11 @@ class JsonSchemaValidator(Callback):
         param = f"body{pointer}" if pointer else "body"
         raise BadRequestError(best.message, param=param)
 
-    def on_request(self, ctx: RequestContext) -> None:
+    def before_decode_request(self, ctx: RequestContext) -> None:
         if self._input_validator is not None:
             self._reject(ctx.request, self._input_validator)
 
-    def on_response(self, ctx: RequestContext) -> None:
+    def after_encode_response(self, ctx: RequestContext) -> None:
         if self._output_validator is None:
             return
         if ctx.mode not in ("unary", "batch"):

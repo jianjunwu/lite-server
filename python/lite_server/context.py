@@ -4,11 +4,11 @@
 request at the Rust→Python boundary.  ``RequestContext`` is the mutable
 per-request working context flowing through the inference pipeline::
 
-    on_request → decode_request → on_input → predict
-    → on_output → encode_response → on_response
+    before_decode_request → decode_request → after_decode_request → predict
+    → after_predict → encode_response → after_encode_response
 
-LitAPI hooks and Callback hooks share the same ``RequestContext``
-contract since 0.7.0.
+Callback hooks and LitAPI stages share the same ``RequestContext``
+contract.
 """
 
 from __future__ import annotations
@@ -127,10 +127,10 @@ class RequestContext:
 
         Later stages (decode/predict/encode and remaining hooks) are
         skipped; *body* is serialized and sent with the given status and
-        headers.  In ``on_response`` this is also the way to attach custom
+        headers.  In ``after_encode_response`` this is also the way to attach custom
         headers to the final response::
 
-            def on_response(self, ctx):
+            def after_encode_response(self, ctx):
                 return ctx.respond(
                     ctx.response,
                     headers={"X-Request-ID": ctx.meta.request_id},
@@ -149,7 +149,7 @@ class RequestContext:
 
         Negative once the deadline has passed.  Derived from
         ``meta.deadline_unix_ns`` (absolute UNIX ns); a callback checks this
-        cooperatively (e.g. in ``on_output`` per chunk) to stop work before the
+        cooperatively (e.g. in ``after_predict`` per chunk) to stop work before the
         server hard-closes the stream.
         """
         ns = self.meta.deadline_unix_ns

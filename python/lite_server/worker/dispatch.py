@@ -48,7 +48,7 @@ async def _handle_route_call(
 ) -> Response | None:
     """Dispatch a ``route_call`` to its discovered ``@route`` handler.
 
-    Reuses ``Pipeline.run_route`` (on_request → handler → on_response, with
+    Reuses ``Pipeline.run_route`` (before_decode_request → handler → after_encode_response, with
     on_error on failure). The handler result is encoded as a ``SingleResponse``
     (routes and inference share the response shape — phase 2 unification).
     ``ctx.server`` carries the worker-level ``ServerProxy`` (built at startup
@@ -228,7 +228,7 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
         sc, mt, clean = extract_response_meta(headers)
         final_map[item_uid] = (serialize_body(body), sc, mt, clean)
 
-    # Phase 1: per-item on_request → decode → on_input
+    # Phase 1: per-item before_decode_request → decode → after_decode_request
     for item in batch.items:
         ctx = RequestContext(meta=meta, request={}, mode="batch")
         try:
@@ -276,7 +276,7 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
                 err_headers_map[u] = _merge_err_headers(ctx_map[u], result)
                 error_map[u] = result
 
-    # Phase 3: per-item on_output → encode → on_response
+    # Phase 3: per-item after_predict → encode → after_encode_response
     for item_uid, ctx in ctx_map.items():
         if item_uid in error_map:
             continue

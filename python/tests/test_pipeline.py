@@ -60,10 +60,6 @@ class TestHookOrder:
         meta = _make_route_meta()
 
         class Ordered(EchoAPI):
-            def on_request(self, ctx):
-                order.append("api.on_request")
-                return ctx.request
-
             def decode_request(self, request):
                 order.append("decode")
                 return request
@@ -76,37 +72,31 @@ class TestHookOrder:
                 order.append("encode")
                 return output
 
-            def on_response(self, ctx):
-                order.append("api.on_response")
-                return ctx.response
-
         class CB(Callback):
-            def on_request(self, ctx):
-                order.append("cb.on_request")
+            def before_decode_request(self, ctx):
+                order.append("cb.before_decode_request")
 
-            def on_input(self, ctx):
-                order.append("cb.on_input")
+            def after_decode_request(self, ctx):
+                order.append("cb.after_decode_request")
 
-            def on_output(self, ctx):
-                order.append("cb.on_output")
+            def after_predict(self, ctx):
+                order.append("cb.after_predict")
 
-            def on_response(self, ctx):
-                order.append("cb.on_response")
+            def after_encode_response(self, ctx):
+                order.append("cb.after_encode_response")
 
         pipe = Pipeline.build(Ordered(), [CB()])
         resp_bytes, status, metrics, headers = await pipe.run_single(
             json.dumps({"input": 1}).encode(), meta
         )
         assert order == [
-            "api.on_request",
-            "cb.on_request",
+            "cb.before_decode_request",
             "decode",
-            "cb.on_input",
+            "cb.after_decode_request",
             "predict",
-            "cb.on_output",
+            "cb.after_predict",
             "encode",
-            "cb.on_response",
-            "api.on_response",
+            "cb.after_encode_response",
         ]
         assert status.code == "Ok"
         assert _body(resp_bytes) == {"input": 1}
@@ -116,11 +106,11 @@ class TestHookOrder:
         order = []
 
         class C1(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 order.append("c1")
 
         class C2(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 order.append("c2")
 
         pipe = Pipeline.build(EchoAPI(), [C1(), C2()])
@@ -134,7 +124,7 @@ class TestModeThreading:
         seen = {}
 
         class Rec(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 seen["mode"] = ctx.mode
 
         pipe = Pipeline.build(EchoAPI(), [Rec()])
@@ -146,7 +136,7 @@ class TestModeThreading:
         seen = {}
 
         class Rec(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 seen["mode"] = ctx.mode
 
         pipe = Pipeline.build(EchoAPI(), [Rec()])
@@ -238,11 +228,11 @@ class _BatchAPI(EchoAPI):
 
 class TestBatchHooks:
     @pytest.mark.asyncio
-    async def test_on_batch_input_replaces_batched(self):
+    async def test_after_batch_replaces_batched(self):
         seen = {}
 
         class Mul(Callback):
-            def on_batch_input(self, ctx_list, batched):
+            def after_batch(self, ctx_list, batched):
                 seen["batched"] = batched
                 return [v * 100 for v in batched]
 
@@ -253,9 +243,9 @@ class TestBatchHooks:
         assert seen["batched"] == [1, 2]
 
     @pytest.mark.asyncio
-    async def test_on_batch_output_replaces_outputs(self):
+    async def test_after_unbatch_replaces_outputs(self):
         class Tag(Callback):
-            def on_batch_output(self, ctx_list, outputs):
+            def after_unbatch(self, ctx_list, outputs):
                 return [f"out:{o}" for o in outputs]
 
         pipe = Pipeline.build(_BatchAPI(), [Tag()])
@@ -264,9 +254,9 @@ class TestBatchHooks:
         assert outputs == ["out:2", "out:3"]
 
     @pytest.mark.asyncio
-    async def test_on_batch_input_http_exception_rejects_whole_batch(self):
+    async def test_after_batch_http_exception_rejects_whole_batch(self):
         class Reject(Callback):
-            def on_batch_input(self, ctx_list, batched):
+            def after_batch(self, ctx_list, batched):
                 raise BadRequestError("bad batch")
 
         pipe = Pipeline.build(_BatchAPI(), [Reject()])
@@ -277,7 +267,7 @@ class TestBatchHooks:
     @pytest.mark.asyncio
     async def test_batch_predict_unaffected_without_batch_hooks(self):
         class NoOp(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 pass
 
         pipe = Pipeline.build(_BatchAPI(), [NoOp()])
@@ -287,16 +277,16 @@ class TestBatchHooks:
 
     def test_for_route_rejects_batch_hooks(self):
         class BadIn(Callback):
-            def on_batch_input(self, ctx_list, batched):
+            def after_batch(self, ctx_list, batched):
                 pass
 
         class BadOut(Callback):
-            def on_batch_output(self, ctx_list, outputs):
+            def after_unbatch(self, ctx_list, outputs):
                 pass
 
-        with pytest.raises(RuntimeError, match="on_batch_input"):
+        with pytest.raises(RuntimeError, match="after_batch"):
             Pipeline.for_route([BadIn()])
-        with pytest.raises(RuntimeError, match="on_batch_output"):
+        with pytest.raises(RuntimeError, match="after_unbatch"):
             Pipeline.for_route([BadOut()])
 
 
@@ -344,7 +334,7 @@ class TestEarlyReturn:
         called = []
 
         class CacheCB(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 return Response(
                     content={"cached": True}, status_code=200, headers={"X-Cache": "1"}
                 )
@@ -365,7 +355,7 @@ class TestEarlyReturn:
         called = []
 
         class Validator(Callback):
-            def on_input(self, ctx):
+            def after_decode_request(self, ctx):
                 if not isinstance(ctx.input, dict) or "x" not in ctx.input:
                     ctx.respond({"error": "missing x"}, status_code=400)
 
@@ -420,15 +410,15 @@ class TestEarlyReturn:
         order = []
 
         class First(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 order.append("first")
                 ctx.respond({"stop": True})
 
         class Second(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 order.append("second")
 
-            def on_output(self, ctx):
+            def after_predict(self, ctx):
                 order.append("second.output")
 
         pipe = Pipeline.build(EchoAPI(), [First(), Second()])
@@ -446,7 +436,7 @@ class TestErrorPropagation:
     @pytest.mark.asyncio
     async def test_http_exception_from_hook_propagates(self):
         class Auth(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 raise BadRequestError("bad input", param="x")
 
         pipe = Pipeline.build(EchoAPI(), [Auth()])
@@ -460,7 +450,7 @@ class TestErrorPropagation:
         """Data-hook exceptions are NOT swallowed (pre-0.7 they were)."""
 
         class Boom(Callback):
-            def on_output(self, ctx):
+            def after_predict(self, ctx):
                 raise ValueError("nope")
 
         pipe = Pipeline.build(EchoAPI(), [Boom()])
@@ -468,12 +458,12 @@ class TestErrorPropagation:
             await pipe.run_single(b"{}", _make_route_meta())
 
     @pytest.mark.asyncio
-    async def test_http_exception_from_api_on_request_propagates(self):
-        class API(EchoAPI):
-            def on_request(self, ctx):
+    async def test_http_exception_from_hook_propagates(self):
+        class Reject(Callback):
+            def before_decode_request(self, ctx):
                 raise BadRequestError("rejected")
 
-        pipe = Pipeline.build(API(), [])
+        pipe = Pipeline.build(EchoAPI(), [Reject()])
         with pytest.raises(HTTPException):
             await pipe.run_single(b"{}", _make_route_meta())
 
@@ -489,10 +479,10 @@ class TestContextState:
         seen = {}
 
         class Tracer(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 ctx.state["t0"] = 123
 
-            def on_output(self, ctx):
+            def after_predict(self, ctx):
                 seen["t0"] = ctx.state["t0"]
 
         pipe = Pipeline.build(EchoAPI(), [Tracer()])
@@ -502,7 +492,7 @@ class TestContextState:
     @pytest.mark.asyncio
     async def test_hook_return_replaces_value(self):
         class Rewrite(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 return {"replaced": True}
 
         seen = {}
@@ -519,7 +509,7 @@ class TestContextState:
     @pytest.mark.asyncio
     async def test_hook_inplace_mutation(self):
         class Mutate(Callback):
-            def on_input(self, ctx):
+            def after_decode_request(self, ctx):
                 ctx.input["extra"] = 1
 
         seen = {}
@@ -536,7 +526,7 @@ class TestContextState:
     @pytest.mark.asyncio
     async def test_state_is_per_request(self):
         class Counter(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 ctx.state["n"] = ctx.request.get("n")
 
         captured = []
@@ -650,13 +640,13 @@ class TestSyncAsyncAdaptation:
         order = []
 
         class AsyncCB(Callback):
-            async def on_request(self, ctx):
-                order.append("async.on_request")
+            async def before_decode_request(self, ctx):
+                order.append("async.before_decode_request")
 
         pipe = Pipeline.build(EchoAPI(), [AsyncCB()])
         assert pipe.any_async is True
         await pipe.run_single(b"{}", _make_route_meta())
-        assert order == ["async.on_request"]
+        assert order == ["async.before_decode_request"]
         pipe.close()
 
     @pytest.mark.asyncio
@@ -897,51 +887,42 @@ class TestFinalize:
 
 
 # ---------------------------------------------------------------------------
-# Ctx injection: API hooks unified with Callback hooks (0.7.0)
+# Ctx injection: all data hooks receive the same RequestContext (0.7.0)
 # ---------------------------------------------------------------------------
 
 
-class TestApiHookCtxUnification:
-    """LitAPI.on_request / on_response receive the same RequestContext as
-    Callback hooks — single ctx parameter, no more (request, meta)."""
-
+class TestHookCtx:
     @pytest.mark.asyncio
-    async def test_api_hook_receives_same_ctx_as_callbacks(self):
-        api_ctx = []
-        cb_ctx = []
+    async def test_all_hooks_share_same_ctx(self):
+        seen = []
 
-        class API(EchoAPI):
-            def on_request(self, ctx):
-                api_ctx.append(ctx)
-                return ctx.request
+        class CB1(Callback):
+            def before_decode_request(self, ctx):
+                seen.append(("b1", ctx))
 
-            def on_response(self, ctx):
-                api_ctx.append(ctx)
-                return ctx.response
+            def after_encode_response(self, ctx):
+                seen.append(("a1", ctx))
 
-        class CB(Callback):
-            def on_request(self, ctx):
-                cb_ctx.append(ctx)
+        class CB2(Callback):
+            def before_decode_request(self, ctx):
+                seen.append(("b2", ctx))
 
-            def on_response(self, ctx):
-                cb_ctx.append(ctx)
-
-        pipe = Pipeline.build(API(), [CB()])
+        pipe = Pipeline.build(EchoAPI(), [CB1(), CB2()])
         await pipe.run_single(b"{}", _make_route_meta())
-        assert len(api_ctx) == 2
-        assert len(cb_ctx) == 2
-        # All four hooks see the same ctx object
-        assert api_ctx[0] is cb_ctx[0] is api_ctx[1] is cb_ctx[1]
+        assert [s[0] for s in seen] == ["b1", "b2", "a1"]
+        # All hooks see the same ctx object
+        assert seen[0][1] is seen[1][1] is seen[2][1]
 
     @pytest.mark.asyncio
-    async def test_api_hook_early_return_via_respond(self):
-        """on_request returns ctx.respond(...) — pipeline short-circuits."""
+    async def test_hook_early_return_via_respond(self):
+        """before_decode_request returns ctx.respond(...) — pipeline short-circuits."""
         called = []
 
-        class API(EchoAPI):
-            def on_request(self, ctx):
+        class Reject(Callback):
+            def before_decode_request(self, ctx):
                 return ctx.respond({"denied": True}, status_code=401)
 
+        class API(EchoAPI):
             def decode_request(self, request):
                 called.append("decode")
                 return request
@@ -950,66 +931,36 @@ class TestApiHookCtxUnification:
                 called.append("predict")
                 return x
 
-        pipe = Pipeline.build(API(), [])
+        pipe = Pipeline.build(API(), [Reject()])
         resp_bytes, status, metrics, headers = await pipe.run_single(b"{}", _make_route_meta())
         assert called == []
         assert _body(resp_bytes) == {"denied": True}
         sc, mt, clean = extract_response_meta(headers)
         assert sc == 401
 
-    def test_old_two_arg_api_hook_fails_at_build(self):
+    def test_litapi_hook_raises_at_build(self):
+        """0.9 removed request hooks from LitAPI — defining one is a loud error
+        (a silent no-op would mean auth/validation that never runs)."""
+        for name in ("before_decode_request", "after_encode_response"):
+            class BadAPI(EchoAPI):
+                pass
+            setattr(BadAPI, name, lambda self, ctx: ctx)
+            with pytest.raises(RuntimeError, match="removed from LitAPI"):
+                Pipeline.build(BadAPI(), [])
+
+    def test_old_name_litapi_hook_raises_at_build(self):
+        """Pre-0.9 LitAPI hook names are caught by the same guard."""
         class OldAPI(EchoAPI):
-            def on_request(self, request, meta):
-                return request
-
-        with pytest.raises(RuntimeError, match="on_request"):
-            Pipeline.build(OldAPI(), [])
-
-    def test_old_two_arg_on_response_fails_at_build(self):
-        class OldAPI(EchoAPI):
-            def on_response(self, response, meta):
-                return response
-
-        with pytest.raises(RuntimeError, match="on_response"):
-            Pipeline.build(OldAPI(), [])
-
-    def test_single_param_named_request_fails_at_build(self):
-        """A hook with a single 'request' param (old shape with default meta)
-        must be rejected — silently binding ctx to 'request' is wrong."""
-
-        class BadAPI(EchoAPI):
-            def on_request(self, request, meta=None):
-                return request
-
-        with pytest.raises(RuntimeError, match="on_request"):
-            Pipeline.build(BadAPI(), [])
-
-
-class TestUnoverriddenApiHooksSkipped:
-    """When a LitAPI subclass does NOT override on_request/on_response,
-    the base no-ops must not be added to the hook chain — saves 2 async
-    calls per request."""
-
-    def test_unoverridden_api_hooks_not_in_chain(self):
-        pipe = Pipeline.build(EchoAPI(), [])
-        assert pipe._chains["on_request"] == []
-        assert pipe._chains["on_response"] == []
-
-    def test_overridden_on_request_added_to_chain(self):
-        class API(EchoAPI):
             def on_request(self, ctx):
                 return ctx.request
 
-        pipe = Pipeline.build(API(), [])
-        assert len(pipe._chains["on_request"]) == 1
+        with pytest.raises(RuntimeError, match="removed from LitAPI"):
+            Pipeline.build(OldAPI(), [])
 
-    def test_overridden_on_response_added_to_chain(self):
-        class API(EchoAPI):
-            def on_response(self, ctx):
-                return ctx.response
-
-        pipe = Pipeline.build(API(), [])
-        assert len(pipe._chains["on_response"]) == 1
+    def test_no_callbacks_chains_empty(self):
+        pipe = Pipeline.build(EchoAPI(), [])
+        assert pipe._chains["before_decode_request"] == []
+        assert pipe._chains["after_encode_response"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -1085,38 +1036,40 @@ class TestCtxInjection:
         assert _body(resp_bytes) == {"x": 1}
 
     @pytest.mark.asyncio
-    async def test_state_threaded_on_request_to_decode(self):
-        class API(EchoAPI):
-            def on_request(self, ctx):
+    async def test_state_threaded_before_decode_to_decode(self):
+        class Tracer(Callback):
+            def before_decode_request(self, ctx):
                 ctx.state["user"] = "alice"
                 return ctx.request
 
+        class API(EchoAPI):
             def decode_request(self, request, ctx: RequestContext | None = None):
                 return {"user": ctx.state["user"], **request}
 
             def predict(self, x):
                 return x
 
-        pipe = Pipeline.build(API(), [])
+        pipe = Pipeline.build(API(), [Tracer()])
         resp_bytes, *_ = await pipe.run_single(b'{"q": "hi"}', _make_route_meta())
         assert _body(resp_bytes)["user"] == "alice"
 
     @pytest.mark.asyncio
-    async def test_on_response_respond_attaches_headers(self):
-        """on_response can use ctx.respond() to attach custom headers —
+    async def test_after_encode_respond_attaches_headers(self):
+        """after_encode_response can use ctx.respond() to attach custom headers —
         replaces the old ResponseWithHeaders pattern."""
 
-        class API(EchoAPI):
-            def predict(self, x):
-                return {"result": x.get("val")}
-
-            def on_response(self, ctx):
+        class HeaderCB(Callback):
+            def after_encode_response(self, ctx):
                 return ctx.respond(
                     ctx.response,
                     headers={"X-Request-ID": ctx.meta.request_id, "X-Cache": "HIT"},
                 )
 
-        pipe = Pipeline.build(API(), [])
+        class API(EchoAPI):
+            def predict(self, x):
+                return {"result": x.get("val")}
+
+        pipe = Pipeline.build(API(), [HeaderCB()])
         resp_bytes, status, metrics, headers = await pipe.run_single(
             b'{"val": 42}', _make_route_meta()
         )
@@ -1285,28 +1238,28 @@ def _make_route_meta(**kwargs):
 
 
 class TestForRoute:
-    def test_rejects_on_input_hook(self):
+    def test_rejects_after_decode_request_hook(self):
         class BadCB(Callback):
-            def on_input(self, ctx):
+            def after_decode_request(self, ctx):
                 pass
 
-        with pytest.raises(RuntimeError, match="on_input"):
+        with pytest.raises(RuntimeError, match="after_decode_request"):
             Pipeline.for_route([BadCB()])
 
-    def test_rejects_on_output_hook(self):
+    def test_rejects_after_predict_hook(self):
         class BadCB(Callback):
-            def on_output(self, ctx):
+            def after_predict(self, ctx):
                 pass
 
-        with pytest.raises(RuntimeError, match="on_output"):
+        with pytest.raises(RuntimeError, match="after_predict"):
             Pipeline.for_route([BadCB()])
 
-    def test_accepts_on_request_and_on_response(self):
+    def test_accepts_before_decode_and_after_encode_hooks(self):
         class GoodCB(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 pass
 
-            def on_response(self, ctx):
+            def after_encode_response(self, ctx):
                 pass
 
         pipe = Pipeline.for_route([GoodCB()])
@@ -1329,7 +1282,7 @@ class DummyLitAPI(LitAPI):
 
 
 # ---------------------------------------------------------------------------
-# JsonSchemaValidator hook placement: on_request (input_schema) / on_response
+# JsonSchemaValidator hook placement: before_decode_request (input_schema) / after_encode_response
 # (output_schema) — schema validation runs on the wire payload, before any
 # model code on the input side and after encode on the output side.
 # ---------------------------------------------------------------------------
@@ -1379,7 +1332,7 @@ class TestJsonSchemaValidatorHooks:
         pipe = Pipeline.build(Model(), [v])
         with pytest.raises(BadRequestError):
             await pipe.run_single(json.dumps({"x": 1}).encode(), _make_meta())
-        assert calls == ["encode"]  # on_response 在 encode_response 之后校验
+        assert calls == ["encode"]  # after_encode_response 在 encode_response 之后校验
 
     def test_for_route_accepts_json_schema_validator(self):
         v = JsonSchemaValidator(input_schema={
@@ -1428,7 +1381,7 @@ class TestRunRoute:
         even when an async callback makes the pipeline mixed-mode."""
 
         class AsyncCB(Callback):
-            async def on_request(self, ctx):
+            async def before_decode_request(self, ctx):
                 pass
 
         pipe = Pipeline.for_route([AsyncCB()])
@@ -1445,9 +1398,9 @@ class TestRunRoute:
         assert seen == [loop_ident]
 
     @pytest.mark.asyncio
-    async def test_on_request_early_return_skips_handler(self):
+    async def test_before_decode_early_return_skips_handler(self):
         class EarlyCB(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 ctx.respond({"blocked": True}, status_code=403)
 
         pipe = Pipeline.for_route([EarlyCB()])
@@ -1475,11 +1428,11 @@ class TestRunRoute:
         assert ctx.response == {"result": "ok"}
 
     @pytest.mark.asyncio
-    async def test_on_response_after_handler(self):
+    async def test_after_encode_response_after_handler(self):
         responses = []
 
         class TrackCB(Callback):
-            def on_response(self, ctx):
+            def after_encode_response(self, ctx):
                 responses.append(ctx.response)
 
         pipe = Pipeline.for_route([TrackCB()])
@@ -1553,7 +1506,7 @@ class TestRunRoute:
     async def test_sync_handler_in_async_pipeline(self):
         """Sync handler runs on executor when any callback is async."""
         class AsyncCB(Callback):
-            async def on_request(self, ctx):
+            async def before_decode_request(self, ctx):
                 pass
 
         pipe = Pipeline.for_route([AsyncCB()])
@@ -1574,7 +1527,7 @@ class TestRunRoute:
         import asyncio
 
         class AsyncCB(Callback):
-            async def on_request(self, ctx):
+            async def before_decode_request(self, ctx):
                 pass
 
         pipe = Pipeline.for_route([AsyncCB()])
@@ -1605,7 +1558,7 @@ class TestRunSingleOnError:
                 errors.append(exc)
 
         class FailingCB(Callback):
-            def on_request(self, ctx):
+            def before_decode_request(self, ctx):
                 raise BadRequestError("bad input")
 
         api = DummyLitAPI()

@@ -9,8 +9,8 @@ A detailed tour of the Python `Callback` system: every hook point, both registra
 Callbacks observe and transform the inference pipeline at four data hook points around the three model stages:
 
 ```
-on_request → decode_request → on_input → predict
-→ on_output → encode_response → on_response
+before_decode_request → decode_request → after_decode_request → predict
+→ after_predict → encode_response → after_encode_response
 ```
 
 Plus `on_error` (request failed) and three lifecycle hooks (`on_before_setup` / `on_after_setup` / `on_teardown`).
@@ -19,10 +19,10 @@ This example registers five callbacks plus one built-in class — see `model_rep
 
 | Callback | Hook(s) | Demonstrates |
 |----------|---------|--------------|
-| `ApiKeyAuth` | `on_request` | Rejecting a request: raise `UnauthorizedError` → 401 |
-| `RequestTimer` | `on_request`, `on_response` | Per-request state in `ctx.state` (concurrency-safe) |
-| `SimpleCache` | `on_request`, `on_output` | Early return via `ctx.respond(...)`, custom response headers |
-| `JsonSchemaValidator` (built-in) | `on_request`, `on_response` | Declarative schema validation from config.yaml — no Python code (needs `pip install lite-server[validation]`) |
+| `ApiKeyAuth` | `before_decode_request` | Rejecting a request: raise `UnauthorizedError` → 401 |
+| `RequestTimer` | `before_decode_request`, `after_encode_response` | Per-request state in `ctx.state` (concurrency-safe) |
+| `SimpleCache` | `before_decode_request`, `after_predict` | Early return via `ctx.respond(...)`, custom response headers |
+| `JsonSchemaValidator` (built-in) | `before_decode_request`, `after_encode_response` | Declarative schema validation from config.yaml — no Python code (needs `pip install lite-server[validation]`) |
 | `ErrorMetrics` | `on_error` | The exception-isolated error hook |
 | `LifecycleTracer` | setup/teardown | `on_before_setup` / `on_after_setup` / `on_teardown` |
 
@@ -40,7 +40,7 @@ Here `ApiKeyAuth` is registered via the class attribute (it takes the accepted k
 - Exceptions from data hooks are **not** swallowed: raising `HTTPException` (or a subclass like `BadRequestError` / `UnauthorizedError`) rejects the request with that status and a machine-readable error body.
 - `ctx.respond(body, status_code=..., headers=...)` short-circuits the pipeline — later stages and hooks are skipped.
 - `on_error` and the lifecycle hooks are exception-isolated: failures are logged, never propagated.
-- In streaming mode, `on_output` / `on_response` run **once per yielded chunk**, and `on_error` runs once per failed chunk.
+- In streaming mode, `after_predict` / `after_encode_response` run **once per yielded chunk**, and `on_error` runs once per failed chunk.
 - Log with the `logging` module, never `print()` — stdout carries the worker startup handshake, and writing to it (e.g. from `on_before_setup`) breaks worker startup.
 - Auth / rate-limit / CORS for production should use the declarative `policies:` section in config.yaml — `ApiKeyAuth` here only teaches the hook mechanism.
 
@@ -63,7 +63,7 @@ allowed), `max_tokens` / `temperature` (optional, bounded), `messages`
 `param` in the 400 error is a JSON Pointer to the failing location.
 
 ```bash
-# No API key -> 401 from ApiKeyAuth.on_request
+# No API key -> 401 from ApiKeyAuth.before_decode_request
 curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
   -H 'Content-Type: application/json' \
   -d '{"text": "hello", "note": null}'
@@ -130,7 +130,7 @@ On shutdown (Ctrl+C) you should see `[LifecycleTracer] model unloading, teardown
 
 ## What You Learn
 
-- All callback hook points and their order: `on_request` → decode → `on_input` → predict → `on_output` → encode → `on_response`, plus `on_error` and the lifecycle hooks
+- All callback hook points and their order: `before_decode_request` → decode → `after_decode_request` → predict → `after_predict` → encode → `after_encode_response`, plus `on_error` and the lifecycle hooks
 - Both registration paths and when to use which (`LitAPI.callbacks` with constructor args vs `callbacks:` in config.yaml, string vs single-key-map entries)
 - Rejecting requests by raising `HTTPException` subclasses (401/400) from a data hook
 - Validating request input declaratively with the built-in `JsonSchemaValidator`

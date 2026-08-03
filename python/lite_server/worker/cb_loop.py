@@ -34,8 +34,8 @@ class CBLoop:
 
     ``prefill`` / ``step`` / ``has_finished`` may be sync or async; all are
     driven on a dedicated event loop inside the step thread.  Requests flow
-    through the Pipeline, so CB gets the same hook coverage (on_request →
-    decode → on_input on add; on_output → encode → on_response on complete)
+    through the Pipeline, so CB gets the same hook coverage (before_decode_request →
+    decode → after_decode_request on add; after_predict → encode → after_encode_response on complete)
     and early-return support as every other mode.
     """
 
@@ -78,7 +78,7 @@ class CBLoop:
             self.socket.send(err_resp.SerializeToString())
             return
         if ctx.early is not None:
-            # Early return (e.g. cache hit in on_request): respond now,
+            # Early return (e.g. cache hit in before_decode_request): respond now,
             # skip prefill entirely.
             self._send_ctx_response(cb_add.uid, ctx)
             return

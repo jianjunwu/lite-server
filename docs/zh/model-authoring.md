@@ -182,14 +182,14 @@ stream: true
 
 如果未实现 `stream_predict()`，服务器回退到 `predict()` 并将结果作为单个 chunk 发送。
 
-#### `on_request(self, ctx)`
+#### `before_decode_request(self, ctx)`
 
 在 `decode_request()` 之前对原始请求调用。用于鉴权、日志或请求修改。接收单个 :class:`RequestContext` 参数（与 Callback 钩子契约一致）。
 
 ```python
 from lite_server.exceptions import UnauthorizedError
 
-def on_request(self, ctx):
+def before_decode_request(self, ctx):
     self.logger.info(f"Request from {ctx.meta.client_ip}: {ctx.meta.request_id}")
     if not self._check_auth(ctx.meta.headers):
         raise UnauthorizedError("invalid or missing token")
@@ -198,12 +198,12 @@ def on_request(self, ctx):
 
 ``ctx.meta`` 是 `RequestMeta` 对象，包含：`route`、`method`、`headers`、`query`、`client_ip`、`request_id`、`timestamp_ns`。其中 `method` 和 `query` 主要用于自定义路由处理器。
 
-#### `on_response(self, ctx)`
+#### `after_encode_response(self, ctx)`
 
 在 `encode_response()` 之后、发送给客户端之前调用。用于响应修改或日志。流式路径中也会调用（每个 chunk 编码后）。
 
 ```python
-def on_response(self, ctx):
+def after_encode_response(self, ctx):
     ctx.response["latency_ms"] = (time.time_ns() - ctx.meta.timestamp_ns) / 1_000_000
     return ctx.response
 ```
@@ -211,7 +211,7 @@ def on_response(self, ctx):
 要附加自定义 HTTP 响应头，使用 :meth:`ctx.respond() <lite_server.RequestContext.respond>`：
 
 ```python
-def on_response(self, ctx):
+def after_encode_response(self, ctx):
     return ctx.respond(
         ctx.response,
         headers={"X-Request-ID": ctx.meta.request_id},
@@ -250,7 +250,7 @@ def teardown(self):
 
 ## Callbacks 回调系统
 
-Callbacks 是一种**可组合的、声明式的**拦截推理请求生命周期的方式。与内联的 `on_request`/`on_response` 钩子不同，Callbacks 是独立的类，可以被复用、共享并跨模型组合。
+Callbacks 是一种**可组合的、声明式的**拦截推理请求生命周期的方式。与内联的 `before_decode_request`/`after_encode_response` 钩子不同，Callbacks 是独立的类，可以被复用、共享并跨模型组合。
 
 ### Callback 基类
 
@@ -260,11 +260,11 @@ Callbacks 是一种**可组合的、声明式的**拦截推理请求生命周期
 from lite_server import Callback
 
 class MyCallback(Callback):
-    def on_request(self, ctx):
+    def before_decode_request(self, ctx):
         """在 decode_request 之前对原始请求调用。"""
         ctx.request["_timestamp"] = ctx.meta.timestamp_ns
 
-    def on_output(self, ctx):
+    def after_predict(self, ctx):
         """在 predict 之后、encode_response 之前调用。"""
         ctx.output["_latency_ns"] = time.time_ns() - ctx.meta.timestamp_ns
 
@@ -276,20 +276,20 @@ class MyCallback(Callback):
 **管线阶段**（正常路径）：
 
 ```
-on_request → decode_request → on_input → predict → on_output → encode_response → on_response
+before_decode_request → decode_request → after_decode_request → predict → after_predict → encode_response → after_encode_response
 ```
 
 任意阶段或钩子抛出异常时，管线短路到 ``on_error``，之后返回错误响应给客户端。
 
 | 钩子 | 触发时机 | 读写字段 |
 |------|---------|---------|
-| `on_request` | 原始请求，`decode_request` 之前 | `ctx.request` |
-| `on_input` | `decode_request` 之后，`predict` 之前 | `ctx.input` |
-| `on_output` | `predict` 之后，`encode_response` 之前（流式时每个 chunk） | `ctx.output` |
-| `on_response` | `encode_response` 之后，发送前（流式时每个 chunk） | `ctx.response` |
+| `before_decode_request` | 原始请求，`decode_request` 之前 | `ctx.request` |
+| `after_decode_request` | `decode_request` 之后，`predict` 之前 | `ctx.input` |
+| `after_predict` | `predict` 之后，`encode_response` 之前（流式时每个 chunk） | `ctx.output` |
+| `after_encode_response` | `encode_response` 之后，发送前（流式时每个 chunk） | `ctx.response` |
 | `on_stream_close` | 流式结束（每个流触发一次） | `ctx` + `reason`：`"done"` \| `"error"` \| `"cancel"`；可读 `ctx.stream_stats` |
-| `on_batch_input` | batch 模式：`batch()` 之后、`predict()` 之前（整批张量） | `ctx_list` + `batched`；抛 `HTTPException` = 整批拒绝 |
-| `on_batch_output` | batch 模式：`unbatch()` 之后（per-item 输出） | `ctx_list` + `outputs` |
+| `after_batch` | batch 模式：`batch()` 之后、`predict()` 之前（整批张量） | `ctx_list` + `batched`；抛 `HTTPException` = 整批拒绝 |
+| `after_unbatch` | batch 模式：`unbatch()` 之后（per-item 输出） | `ctx_list` + `outputs` |
 | `on_error` | 任意钩子或阶段抛出异常时 | `ctx` + `exc`（异常对象） |
 | `on_before_setup` | `LitAPI.setup()` 之前 | `(config, device)` |
 | `on_after_setup` | `LitAPI.setup()` 完成后 | `(lit_api)` |
@@ -321,12 +321,12 @@ on_request → decode_request → on_input → predict → on_output → encode_
 from lite_server import Callback, BadRequestError
 
 class Validator(Callback):
-    def on_request(self, ctx):
+    def before_decode_request(self, ctx):
         if "input" not in (ctx.request or {}):
             raise BadRequestError("missing field", param="input")
 
 class Cache(Callback):
-    def on_request(self, ctx):
+    def before_decode_request(self, ctx):
         hit = self._cache.get(key(ctx))
         if hit is not None:
             ctx.respond(hit, headers={"X-Cache-Hit": "1"})
@@ -339,10 +339,10 @@ class Cache(Callback):
 from lite_server import Callback
 
 class AuditLogger(Callback):
-    def on_request(self, ctx):
+    def before_decode_request(self, ctx):
         ctx.request["_audit_id"] = ctx.meta.request_id
 
-    def on_output(self, ctx):
+    def after_predict(self, ctx):
         print(f"[AUDIT] request_id={ctx.meta.request_id} latency={ctx.elapsed_ms():.2f}ms")
 
     def on_teardown(self, lit_api):
@@ -351,8 +351,8 @@ class AuditLogger(Callback):
 
 ### 内置类：JsonSchemaValidator（Schema 校验）
 
-`lite_server.callbacks.JsonSchemaValidator` 对请求体（`on_request`，
-`decode_request` 之前）和响应体（`on_response`，`encode_response` 之后）
+`lite_server.callbacks.JsonSchemaValidator` 对请求体（`before_decode_request`，
+`decode_request` 之前）和响应体（`after_encode_response`，`encode_response` 之后）
 做 JSON Schema 校验 — 纯声明式，模型代码零改动。两个 schema 描述的都是
 **线上载荷**（客户端发来的 / 客户端收到的）：非法请求在 400 拒绝，
 任何模型代码（含 decode）都不会看到它：
@@ -384,7 +384,7 @@ callbacks:
   校验值本身（JSON `null` 请求体报 `None is not of type 'string'`）。
   未配置 `input_schema`/`output_schema` 的对应方向不校验。batch 模式按
   item 独立校验。
-- **Custom route**：validator 在路由上同样可用 — `on_request` 在路由
+- **Custom route**：validator 在路由上同样可用 — `before_decode_request` 在路由
   handler 之前执行，`input_schema` 以同样方式拒绝非法路由请求体；
   `output_schema` 在路由上跳过（仅 unary/batch）。
 
@@ -481,16 +481,13 @@ callbacks:
 > 导入失败或 0.7 之前的旧钩子签名会在加载时响亮报错 —— 被静默跳过的
 > callback 可能意味着鉴权/校验逻辑从未执行。
 
-### Callback vs LitAPI 内联 Hook
+### Hook 归属（0.8.0）
 
-| 方面 | `Callback` | `LitAPI.on_request` / `on_response` |
-|------|-----------|--------------------------------------|
-| 定义方式 | 独立类，声明式注册 | 在模型类中内联定义 |
-| 复用性 | 可跨模型共享 | 每个模型单独实现 |
-| 组合性 | 多个 callback 可链式组合 | 只能在模型内实现一次 |
-| 注册方式 | config.yaml 中 `callbacks:` 字段 | 模型代码中覆盖方法 |
-| 异常 | `HTTPException` → 结构化错误响应 | 相同 |
-| 位置 | 按注册顺序 | `on_request` 在最前，`on_response` 在最后 |
+所有请求 hook 都定义在 `Callback` 子类上 — `LitAPI` 只承载管线阶段
+（`setup` / `decode_request` / `predict` / `encode_response` + 各模式方法）。
+0.7–0.8 的 `LitAPI.on_request` / `on_response` 已在 0.8.0 移除：在模型类上
+定义 hook 是加载期错误，报错信息会指向 `Callback` 迁移。Callback 通过
+config.yaml 的 `callbacks:` 字段或 `LitAPI.callbacks` 类属性注册。
 
 参见 [examples/14_lifecycle_hooks](../examples/14_lifecycle_hooks/) 获取可运行示例。
 
@@ -994,17 +991,17 @@ server:
 
 ### 按请求追踪
 
-使用 `on_request` 和 `on_response` 记录请求元数据：
+使用 `before_decode_request` 和 `after_encode_response` 记录请求元数据：
 
 ```python
-def on_request(self, ctx):
+def before_decode_request(self, ctx):
     self.logger.info(
         "Request from %s | route=%s | request_id=%s",
         ctx.meta.client_ip, ctx.meta.route, ctx.meta.request_id,
     )
     return ctx.request
 
-def on_response(self, ctx):
+def after_encode_response(self, ctx):
     self.logger.info(
         "Response ready | request_id=%s | latency_ms=%.2f",
         ctx.meta.request_id,
@@ -1028,12 +1025,12 @@ def on_response(self, ctx):
 ### 错误处理
 
 - 在 `predict()` 中抛出异常以发出错误信号 — 服务器会在不同 worker 上重试
-- 使用 `on_request()` 进行输入验证 — 抛出异常以提前拒绝
+- 使用 `before_decode_request()` 进行输入验证 — 抛出异常以提前拒绝
 - 避免裸 `except:` — 让意外错误传播以便调试
 
 #### 类型化 HTTP 错误
 
-使用 `HTTPException` 子类返回带有结构化错误信息的类型化 HTTP 错误。子类可用于**所有钩子**（`predict`、`stream_predict`、`bidi_stream`、`decode_request`、`encode_response`、`on_request`、`on_response`、`prefill`、`step`）以及所有协议（HTTP、SSE、WebSocket、gRPC）。
+使用 `HTTPException` 子类返回带有结构化错误信息的类型化 HTTP 错误。子类可用于**所有钩子**（`predict`、`stream_predict`、`bidi_stream`、`decode_request`、`encode_response`、`before_decode_request`、`after_encode_response`、`prefill`、`step`）以及所有协议（HTTP、SSE、WebSocket、gRPC）。
 
 ```python
 from lite_server.exceptions import (
@@ -1053,7 +1050,7 @@ class MyModel(LitAPI):
             raise ServiceUnavailableError("model not loaded yet")
         return self.model(x)
 
-    def on_request(self, ctx):
+    def before_decode_request(self, ctx):
         if not self._check_auth(ctx.meta.headers):
             raise UnauthorizedError("invalid or missing token")
         return ctx.request

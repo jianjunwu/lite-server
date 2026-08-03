@@ -2627,7 +2627,7 @@ mod tests {
     #[test]
     fn test_batch_item_to_single_propagates_per_item_fields() {
         // A batch item carrying its own status_code / media_type / headers
-        // (e.g. early 400 from on_request, custom headers from on_response)
+        // (e.g. early 400 from before_decode_request, custom headers from after_encode_response)
         // must reach the caller's SingleResponse intact.
         let headers = std::collections::HashMap::from([(
             "x-item".to_string(),
