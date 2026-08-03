@@ -56,39 +56,73 @@ On startup you should see `[LifecycleTracer] before setup` / `setup done` as the
 
 ## Test
 
+The schema in `config.yaml` (`input_schema`) validates the whole request
+body: `text` (required, non-empty string), `note` (required, but `null`
+allowed), `max_tokens` / `temperature` (optional, bounded), `messages`
+(optional list of `{role, content}` objects), and no unknown fields. The
+`param` in the 400 error is a JSON Pointer to the failing location.
+
 ```bash
 # No API key -> 401 from ApiKeyAuth.on_request
 curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
   -H 'Content-Type: application/json' \
-  -d '{"input": "hello"}'
+  -d '{"text": "hello", "note": null}'
 # => HTTP 401 {"error": {"type": "authentication_error", "message": "missing or invalid X-API-Key header"}}
 
-# Invalid input (empty string) -> 400 from the built-in JsonSchemaValidator;
+# Missing required field (text) -> 400 from the built-in JsonSchemaValidator;
 # the model's predict() never runs
 curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
   -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
-  -d '{"input": ""}'
-# => HTTP 400 {"error": {"type": "invalid_request_error", "message": "'' should be non-empty", "param": "body"}}
+  -d '{"note": null}'
+# => HTTP 400 ... "'text' is a required property", "param": "body"
+# (a missing-field error has an empty JSON Pointer, so param is the root)
 
-# Missing input field -> decode_request returns None -> also 400
+# Empty string (text has minLength: 1)
 curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
   -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
-  -d '{}'
-# => HTTP 400 {"error": {"type": "invalid_request_error", "message": "None is not of type 'string'", "param": "body"}}
+  -d '{"text": "", "note": null}'
+# => HTTP 400 ... "'' should be non-empty", "param": "body/text"
 
-# Valid request -> 200; [RequestTimer] logs latency per request
+# Number out of range (temperature has maximum: 2.0)
 curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
   -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
-  -d '{"input": "hello"}'
-# => HTTP 200 {"output": "hello"}
+  -d '{"text": "hello", "note": null, "temperature": 3.0}'
+# => HTTP 400 ... "3.0 is greater than the maximum of 2.0", "param": "body/temperature"
+
+# Invalid enum inside a list item -> the pointer walks into the array
+curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
+  -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
+  -d '{"text": "hello", "note": null, "messages": [{"role": "admin", "content": "hi"}]}'
+# => HTTP 400 ... "'admin' is not one of ['user', 'assistant', 'system']",
+#    "param": "body/messages/0/role"
+
+# Unknown field (additionalProperties: false)
+curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
+  -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
+  -d '{"text": "hello", "note": null, "extra": 1}'
+# => HTTP 400 ... "Additional properties are not allowed ('extra' was unexpected)",
+#    "param": "body"
+
+# Valid request -> 200; note is required but may be null.
+# [RequestTimer] logs latency per request
+curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
+  -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
+  -d '{"text": "hello", "note": null, "max_tokens": 128, "temperature": 0.7,
+       "messages": [{"role": "user", "content": "hi"}]}'
+# => HTTP 200 {"output": {"text": "hello", "note": null, "max_tokens": 128, ...}}
 
 # Same request again -> cache hit: X-Cache header + "cached": true,
 # predict() never runs
 curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
   -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
-  -d '{"input": "hello"}'
-# => HTTP 200, X-Cache: hit, {"output": "hello", "cached": true}
+  -d '{"text": "hello", "note": null, "max_tokens": 128, "temperature": 0.7,
+       "messages": [{"role": "user", "content": "hi"}]}'
+# => HTTP 200, X-Cache: hit, {"output": {...}, "cached": true}
 ```
+
+> Note: fire the failing curls above slowly — the server ejects a worker
+> after consecutive rejected requests (30s backoff), during which infer
+> returns a transient `503 model_not_ready`. It auto-recovers.
 
 The accepted keys default to `demo-key`; override with `DEMO_API_KEYS=key1,key2`.
 

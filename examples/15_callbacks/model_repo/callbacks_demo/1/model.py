@@ -27,7 +27,9 @@ class CallbacksDemoAPI(LitAPI):
         self.device = device
 
     def decode_request(self, request, ctx: RequestContext | None = None):
-        return request.get("input")
+        # Pass the full request body through: the JsonSchemaValidator in
+        # config.yaml validates the whole object (ctx.input) before predict.
+        return request
 
     def predict(self, x, ctx: RequestContext | None = None):
         return {"output": x}

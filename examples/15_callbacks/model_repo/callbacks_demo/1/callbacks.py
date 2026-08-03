@@ -14,8 +14,10 @@ Five callbacks are defined:
 - LifecycleTracer: logs setup/teardown via the lifecycle hooks
 
 Input validation is declarative: config.yaml registers the built-in
-``lite_server.callbacks.JsonSchemaValidator`` (input_schema: string,
-minLength 1, maxLength 1000) — no Python validation code needed.
+``lite_server.callbacks.JsonSchemaValidator`` (a structured object schema:
+required + optional fields, bounded numbers, required-but-nullable, arrays
+of objects with enums, unknown fields rejected) — no Python validation code
+needed.
 
 Key rules (since 0.7.0):
 - Data hooks receive a single ``ctx`` (RequestContext) and may be sync or

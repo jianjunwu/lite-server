@@ -56,39 +56,66 @@ python -m lite_server serve --config server.yaml
 
 ## 测试
 
+`config.yaml` 中的 schema（`input_schema`）校验整个请求体：`text`（必填、非空字符串）、`note`（必填、但允许 `null`）、`max_tokens` / `temperature`（可选、有边界）、`messages`（可选的对象列表 `{role, content}`），并拒绝未知字段。400 错误里的 `param` 是指向出错位置的 JSON Pointer。
+
 ```bash
 # 无 API key -> ApiKeyAuth.on_request 返回 401
 curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
   -H 'Content-Type: application/json' \
-  -d '{"input": "hello"}'
+  -d '{"text": "hello", "note": null}'
 # => HTTP 401 {"error": {"type": "authentication_error", "message": "missing or invalid X-API-Key header"}}
 
-# 非法输入（空字符串）-> 内置 JsonSchemaValidator 返回 400；
+# 缺必填字段（text）-> 内置 JsonSchemaValidator 返回 400；
 # predict() 不会执行
 curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
   -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
-  -d '{"input": ""}'
-# => HTTP 400 {"error": {"type": "invalid_request_error", "message": "'' should be non-empty", "param": "body"}}
+  -d '{"note": null}'
+# => HTTP 400 ... "'text' is a required property", "param": "body"
+# （缺字段错误的 JSON Pointer 为空，param 指向根）
 
-# 缺 input 字段 -> decode_request 返回 None -> 同样 400
+# 空字符串（text 有 minLength: 1）
 curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
   -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
-  -d '{}'
-# => HTTP 400 {"error": {"type": "invalid_request_error", "message": "None is not of type 'string'", "param": "body"}}
+  -d '{"text": "", "note": null}'
+# => HTTP 400 ... "'' should be non-empty", "param": "body/text"
 
-# 正常请求 -> 200；[RequestTimer] 每请求打印耗时
+# 数值越界（temperature 有 maximum: 2.0）
 curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
   -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
-  -d '{"input": "hello"}'
-# => HTTP 200 {"output": "hello"}
+  -d '{"text": "hello", "note": null, "temperature": 3.0}'
+# => HTTP 400 ... "3.0 is greater than the maximum of 2.0", "param": "body/temperature"
+
+# 列表元素里的 enum 非法 -> 指针一路指进数组
+curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
+  -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
+  -d '{"text": "hello", "note": null, "messages": [{"role": "admin", "content": "hi"}]}'
+# => HTTP 400 ... "'admin' is not one of ['user', 'assistant', 'system']",
+#    "param": "body/messages/0/role"
+
+# 未知字段（additionalProperties: false）
+curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
+  -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
+  -d '{"text": "hello", "note": null, "extra": 1}'
+# => HTTP 400 ... "Additional properties are not allowed ('extra' was unexpected)",
+#    "param": "body"
+
+# 正常请求 -> 200；note 必填但允许为 null。[RequestTimer] 每请求打印耗时
+curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
+  -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
+  -d '{"text": "hello", "note": null, "max_tokens": 128, "temperature": 0.7,
+       "messages": [{"role": "user", "content": "hi"}]}'
+# => HTTP 200 {"output": {"text": "hello", "note": null, "max_tokens": 128, ...}}
 
 # 相同请求再来一次 -> 缓存命中：X-Cache 响应头 + "cached": true，
 # predict() 不会执行
 curl -i -X POST http://localhost:8000/v2/models/callbacks_demo/infer \
   -H 'Content-Type: application/json' -H 'X-API-Key: demo-key' \
-  -d '{"input": "hello"}'
-# => HTTP 200, X-Cache: hit, {"output": "hello", "cached": true}
+  -d '{"text": "hello", "note": null, "max_tokens": 128, "temperature": 0.7,
+       "messages": [{"role": "user", "content": "hi"}]}'
+# => HTTP 200, X-Cache: hit, {"output": {...}, "cached": true}
 ```
+
+> 注意：上面几个失败的 curl 要慢慢发——服务端对连续被拒请求会驱逐 worker（30s 退避），期间 infer 返回临时的 `503 model_not_ready`，会自动恢复。
 
 合法 key 默认为 `demo-key`，可用 `DEMO_API_KEYS=key1,key2` 覆盖。
 
