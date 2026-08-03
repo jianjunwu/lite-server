@@ -222,7 +222,7 @@ Models can implement `prefill()` / `step()` / `has_finished()` hooks to implemen
 |-----------|---------|------|
 | CLI | `cli.py` | Command-line interface (serve, benchmark, init, etc.) |
 | LitAPI | `api.py` | Model authoring base class with predict / batch / stream / bidi_stream hooks |
-| Callbacks | `callbacks/` | Inference pipeline callbacks (before_decode_request / after_decode_request / after_predict / after_encode_response) + lifecycle hooks (on_before_setup / on_after_setup / on_teardown) |
+| Callbacks | `callbacks/` | Inference pipeline callbacks (before_decode_request / after_decode_request / after_predict / after_encode_response) + lifecycle hooks (before_setup / after_setup / before_teardown / after_teardown) |
 | Context | `context.py` | Request context (RequestContext, RequestMeta) with request_id, client_ip, etc. |
 | Pipeline | `pipeline.py` | Data pre/post-processing pipeline |
 | Route | `route.py` | `@route` decorator for declaring custom HTTP routes |
@@ -268,7 +268,7 @@ lite-server-core (main process)
 - Outlier detection ejects unhealthy workers (Envoy-style consecutive error counting)
 - Heartbeat probing detects stuck workers and auto-restarts them
 - Worker lifecycle hooks (shell commands + HTTP callbacks): `on_ready`, `on_exit`, `on_error`
-- Python Callback lifecycle hooks: `on_before_setup` / `on_after_setup` / `on_teardown` (exception-isolated, failures never propagated)
+- Python Callback lifecycle hooks: `before_setup` / `after_setup` / `before_teardown` / `after_teardown` (exception-isolated, failures never propagated)
 - Weighted routing enables canary deployments (multi-version traffic splitting)
 - Adaptive batching adjusts batch_timeout dynamically based on queue depth
 
@@ -608,7 +608,7 @@ before_decode_request → [decode_request] → after_decode_request → [predict
 **Data hooks** (`before_decode_request` / `after_decode_request` / `after_predict` / `after_encode_response`):
 Receive a `RequestContext`; can mutate data, return a `Response` for early exit, or raise `HTTPException` to reject the request. Sync and async are both supported. In streaming mode, `after_predict` + `after_encode_response` fire once per chunk.
 
-**Lifecycle hooks** (`on_before_setup` / `on_after_setup` / `on_teardown`):
+**Lifecycle hooks** (`before_setup` / `after_setup` / `before_teardown` / `after_teardown`):
 Run outside the request path, exception-isolated (failures are logged, never propagated).
 
 **Error hook** (`on_error`):

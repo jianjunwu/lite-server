@@ -13,7 +13,7 @@ before_decode_request → decode_request → after_decode_request → predict
 → after_predict → encode_response → after_encode_response
 ```
 
-此外还有 `on_error`（请求失败时）和三个生命周期钩子（`on_before_setup` / `on_after_setup` / `on_teardown`）。
+此外还有 `on_error`（请求失败时）和四个生命周期钩子（`before_setup` / `after_setup` / `before_teardown` / `after_teardown`）。
 
 本示例注册了五个 callback 加一个内置类 —— 见 `model_repo/callbacks_demo/1/callbacks.py` 和 `config.yaml`：
 
@@ -24,7 +24,7 @@ before_decode_request → decode_request → after_decode_request → predict
 | `SimpleCache` | `before_decode_request`、`after_predict` | `ctx.respond(...)` 短路早返、自定义响应头 |
 | `JsonSchemaValidator`（内置） | `before_decode_request`, `after_encode_response` | config.yaml 声明式 schema 校验，零 Python 代码（需 `pip install lite-server[validation]`） |
 | `ErrorMetrics` | `on_error` | 异常隔离的错误钩子 |
-| `LifecycleTracer` | setup/teardown | `on_before_setup` / `on_after_setup` / `on_teardown` |
+| `LifecycleTracer` | setup/teardown | `before_setup` / `after_setup` / `before_teardown` / `after_teardown` |
 
 ### 两种注册方式
 
@@ -41,7 +41,7 @@ before_decode_request → decode_request → after_decode_request → predict
 - `ctx.respond(body, status_code=..., headers=...)` 短路管线 —— 后续阶段和钩子全部跳过。
 - `on_error` 和生命周期钩子是异常隔离的：失败只记日志，不传播。
 - 流式模式下，`after_predict` / `after_encode_response` 对每个 chunk 各调一次，`on_error` 对每个失败的 chunk 调一次。
-- 日志用 `logging` 模块，不要 `print()` —— stdout 承载 worker 启动握手协议，往里写（比如在 `on_before_setup` 中）会导致 worker 启动失败。
+- 日志用 `logging` 模块，不要 `print()` —— stdout 承载 worker 启动握手协议，往里写（比如在 `before_setup` 中）会导致 worker 启动失败。
 - 生产环境的鉴权/限流/CORS 应使用 config.yaml 中声明式的 `policies:` 配置 —— 这里的 `ApiKeyAuth` 仅用于教学演示钩子机制。
 
 ## 运行

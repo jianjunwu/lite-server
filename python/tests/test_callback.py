@@ -142,6 +142,9 @@ class TestValidateCallback:
             ("on_response", "after_encode_response"),
             ("on_batch_input", "after_batch"),
             ("on_batch_output", "after_unbatch"),
+            ("on_before_setup", "before_setup"),
+            ("on_after_setup", "after_setup"),
+            ("on_teardown", "before_teardown"),
         ],
     )
     def test_renamed_hook_names_raise_with_rename_hint(self, old_name, new_name):
@@ -182,13 +185,16 @@ class TestValidateCallback:
 
     def test_lifecycle_hooks_unaffected(self):
         class LC(Callback):
-            def on_before_setup(self, config, device):
+            def before_setup(self, config, device):
                 pass
 
-            def on_after_setup(self, lit_api):
+            def after_setup(self, lit_api):
                 pass
 
-            def on_teardown(self, lit_api):
+            def before_teardown(self, lit_api):
+                pass
+
+            def after_teardown(self, lit_api):
                 pass
 
         validate_callback(LC())  # must not raise

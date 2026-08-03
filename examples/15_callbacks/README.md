@@ -13,7 +13,7 @@ before_decode_request → decode_request → after_decode_request → predict
 → after_predict → encode_response → after_encode_response
 ```
 
-Plus `on_error` (request failed) and three lifecycle hooks (`on_before_setup` / `on_after_setup` / `on_teardown`).
+Plus `on_error` (request failed) and four lifecycle hooks (`before_setup` / `after_setup` / `before_teardown` / `after_teardown`).
 
 This example registers five callbacks plus one built-in class — see `model_repo/callbacks_demo/1/callbacks.py` and `config.yaml`:
 
@@ -24,7 +24,7 @@ This example registers five callbacks plus one built-in class — see `model_rep
 | `SimpleCache` | `before_decode_request`, `after_predict` | Early return via `ctx.respond(...)`, custom response headers |
 | `JsonSchemaValidator` (built-in) | `before_decode_request`, `after_encode_response` | Declarative schema validation from config.yaml — no Python code (needs `pip install lite-server[validation]`) |
 | `ErrorMetrics` | `on_error` | The exception-isolated error hook |
-| `LifecycleTracer` | setup/teardown | `on_before_setup` / `on_after_setup` / `on_teardown` |
+| `LifecycleTracer` | setup/teardown | `before_setup` / `after_setup` / `before_teardown` / `after_teardown` |
 
 ### Two registration paths
 
@@ -41,7 +41,7 @@ Here `ApiKeyAuth` is registered via the class attribute (it takes the accepted k
 - `ctx.respond(body, status_code=..., headers=...)` short-circuits the pipeline — later stages and hooks are skipped.
 - `on_error` and the lifecycle hooks are exception-isolated: failures are logged, never propagated.
 - In streaming mode, `after_predict` / `after_encode_response` run **once per yielded chunk**, and `on_error` runs once per failed chunk.
-- Log with the `logging` module, never `print()` — stdout carries the worker startup handshake, and writing to it (e.g. from `on_before_setup`) breaks worker startup.
+- Log with the `logging` module, never `print()` — stdout carries the worker startup handshake, and writing to it (e.g. from `before_setup`) breaks worker startup.
 - Auth / rate-limit / CORS for production should use the declarative `policies:` section in config.yaml — `ApiKeyAuth` here only teaches the hook mechanism.
 
 ## Run

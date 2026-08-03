@@ -291,9 +291,10 @@ before_decode_request → decode_request → after_decode_request → predict �
 | `after_batch` | batch 模式：`batch()` 之后、`predict()` 之前（整批张量） | `ctx_list` + `batched`；抛 `HTTPException` = 整批拒绝 |
 | `after_unbatch` | batch 模式：`unbatch()` 之后（per-item 输出） | `ctx_list` + `outputs` |
 | `on_error` | 任意钩子或阶段抛出异常时 | `ctx` + `exc`（异常对象） |
-| `on_before_setup` | `LitAPI.setup()` 之前 | `(config, device)` |
-| `on_after_setup` | `LitAPI.setup()` 完成后 | `(lit_api)` |
-| `on_teardown` | 模型卸载 / worker 关闭时 | `(lit_api)` |
+| `before_setup` | `LitAPI.setup()` 之前 | `(config, device)` |
+| `after_setup` | `LitAPI.setup()` 完成后 | `(lit_api)` |
+| `before_teardown` | `LitAPI.teardown()` 之前（模型卸载 / worker 关闭时） | `(lit_api)` |
+| `after_teardown` | `LitAPI.teardown()` 成功完成后（卸载完成） | `(lit_api)` |
 
 数据钩子可以原地修改 `ctx`，也可以返回替换值（返回 `None` 表示透传）。
 
@@ -315,7 +316,7 @@ before_decode_request → decode_request → after_decode_request → predict �
 
 - **Early return**（如缓存命中）：在任意钩子中调用 `ctx.respond(body, status_code=..., headers=...)` 或返回一个 `Response`。后续阶段和之前链上的剩余钩子被跳过。终链 `after_encode_response` 例外：即使已有钩子 `respond(...)`，所有注册的钩子仍会执行——其后没有阶段，respond 只是附加响应头而非短路（保证后续的校验/审计钩子不因注册顺序失效）。
 - **参数校验 / 拒绝**：在任意钩子中抛出 `HTTPException`（`BadRequestError`、`UnauthorizedError` 等）。客户端收到对应状态码的结构化错误 — 数据钩子的异常**不会**被吞掉。
-- 生命周期钩子（`on_before_setup` / `on_after_setup` / `on_teardown`）和 `on_error` 保持异常隔离：失败只记日志，不传播（`on_error` 自身的异常也不会掩盖原始错误）。
+- 生命周期钩子（`before_setup` / `after_setup` / `before_teardown` / `after_teardown`）和 `on_error` 保持异常隔离：失败只记日志，不传播（`on_error` 自身的异常也不会掩盖原始错误）。
 
 ```python
 from lite_server import Callback, BadRequestError
@@ -345,7 +346,7 @@ class AuditLogger(Callback):
     def after_predict(self, ctx):
         print(f"[AUDIT] request_id={ctx.meta.request_id} latency={ctx.elapsed_ms():.2f}ms")
 
-    def on_teardown(self, lit_api):
+    def before_teardown(self, lit_api):
         print(f"[AUDIT] model torn down, class: {type(lit_api).__name__}")
 ```
 

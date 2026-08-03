@@ -764,49 +764,58 @@ class TestLifecycleHooks:
         order = []
 
         class LC(Callback):
-            def on_before_setup(self, config, device):
+            def before_setup(self, config, device):
                 order.append(("before", device))
 
-            def on_after_setup(self, lit_api):
+            def after_setup(self, lit_api):
                 order.append(("after", type(lit_api).__name__))
 
-            def on_teardown(self, lit_api):
-                order.append(("teardown",))
+            def before_teardown(self, lit_api):
+                order.append(("before_teardown",))
+
+            def after_teardown(self, lit_api):
+                order.append(("after_teardown",))
 
         api = EchoAPI()
         pipe = Pipeline.build(api, [LC()])
-        pipe.trigger_lifecycle("on_before_setup", {"k": 1}, "cpu")
+        pipe.trigger_lifecycle("before_setup", {"k": 1}, "cpu")
         api.setup("cpu")
-        pipe.trigger_lifecycle("on_after_setup", api)
-        pipe.trigger_lifecycle("on_teardown", api)
-        assert order == [("before", "cpu"), ("after", "EchoAPI"), ("teardown",)]
+        pipe.trigger_lifecycle("after_setup", api)
+        pipe.trigger_lifecycle("before_teardown", api)
+        pipe.trigger_lifecycle("after_teardown", api)
+        assert order == [
+            ("before", "cpu"),
+            ("after", "EchoAPI"),
+            ("before_teardown",),
+            ("after_teardown",),
+        ]
 
     def test_lifecycle_exceptions_are_isolated(self):
         class Bad(Callback):
-            def on_teardown(self, lit_api):
+            def before_teardown(self, lit_api):
                 raise RuntimeError("boom")
 
         class Good(Callback):
             def __init__(self):
                 self.called = False
 
-            def on_teardown(self, lit_api):
+            def before_teardown(self, lit_api):
                 self.called = True
 
         good = Good()
         pipe = Pipeline.build(EchoAPI(), [Bad(), good])
-        pipe.trigger_lifecycle("on_teardown", EchoAPI())  # must not raise
+        pipe.trigger_lifecycle("before_teardown", EchoAPI())  # must not raise
         assert good.called is True
 
     def test_async_lifecycle_hook_is_driven(self):
         called = []
 
         class AsyncLC(Callback):
-            async def on_after_setup(self, lit_api):
+            async def after_setup(self, lit_api):
                 called.append("async setup")
 
         pipe = Pipeline.build(EchoAPI(), [AsyncLC()])
-        pipe.trigger_lifecycle("on_after_setup", EchoAPI())
+        pipe.trigger_lifecycle("after_setup", EchoAPI())
         assert called == ["async setup"]
 
     def test_multiple_async_lifecycle_hooks_all_driven(self):
@@ -814,15 +823,15 @@ class TestLifecycleHooks:
         called = []
 
         class LC1(Callback):
-            async def on_teardown(self, lit_api):
+            async def before_teardown(self, lit_api):
                 called.append("lc1")
 
         class LC2(Callback):
-            async def on_teardown(self, lit_api):
+            async def before_teardown(self, lit_api):
                 called.append("lc2")
 
         pipe = Pipeline.build(EchoAPI(), [LC1(), LC2()])
-        pipe.trigger_lifecycle("on_teardown", EchoAPI())
+        pipe.trigger_lifecycle("before_teardown", EchoAPI())
         assert called == ["lc1", "lc2"]
 
     def test_async_lifecycle_exception_isolation(self):
@@ -830,16 +839,16 @@ class TestLifecycleHooks:
         called = []
 
         class BadLC(Callback):
-            async def on_teardown(self, lit_api):
+            async def before_teardown(self, lit_api):
                 raise RuntimeError("boom")
 
         class GoodLC(Callback):
-            async def on_teardown(self, lit_api):
+            async def before_teardown(self, lit_api):
                 called.append("good")
 
         pipe = Pipeline.build(EchoAPI(), [BadLC(), GoodLC()])
         # Must not raise
-        pipe.trigger_lifecycle("on_teardown", EchoAPI())
+        pipe.trigger_lifecycle("before_teardown", EchoAPI())
         assert called == ["good"]
 
 

@@ -218,7 +218,7 @@ sender.close()  ──►  DecoupledResponse{is_final=true}（终结帧）
 |------|------|------|
 | CLI | `cli.py` | 命令行接口（serve、benchmark、init 等） |
 | LitAPI | `api.py` | 模型开发基类，支持 predict / batch / stream / bidi_stream 等钩子 |
-| Callbacks | `callbacks/` | 推理管线回调（before_decode_request / after_decode_request / after_predict / after_encode_response）+ 生命周期钩子（on_before_setup / on_after_setup / on_teardown） |
+| Callbacks | `callbacks/` | 推理管线回调（before_decode_request / after_decode_request / after_predict / after_encode_response）+ 生命周期钩子（before_setup / after_setup / before_teardown / after_teardown） |
 | Context | `context.py` | 请求上下文（RequestContext、RequestMeta），含 request_id、client_ip 等 |
 | Pipeline | `pipeline.py` | 数据预处理/后处理流水线 |
 | Route | `route.py` | `@route` 装饰器，声明自定义 HTTP 路由 |
@@ -264,7 +264,7 @@ lite-server-core（主进程）
 - 异常检测剔除不健康 worker（Envoy 风格的连续错误计数）
 - 心跳探测检测卡死 worker 并自动重启
 - Worker 生命周期钩子（shell 命令 + HTTP 回调）：`on_ready`、`on_exit`、`on_error`
-- Python Callback 生命周期钩子：`on_before_setup` / `on_after_setup` / `on_teardown`（异常隔离，失败不传播）
+- Python Callback 生命周期钩子：`before_setup` / `after_setup` / `before_teardown` / `after_teardown`（异常隔离，失败不传播）
 - 加权路由支持金丝雀发布（多版本按权重分流）
 - 自适应批处理根据队列深度动态调整 batch_timeout
 
@@ -569,7 +569,7 @@ before_decode_request → [decode_request] → after_decode_request → [predict
 **数据钩子**（`before_decode_request` / `after_decode_request` / `after_predict` / `after_encode_response`）：
 接收 `RequestContext`，可修改数据、提前返回 `Response`、或抛出 `HTTPException` 拒绝请求。支持 sync / async，流式模式下每个 chunk 各触发一次 `after_predict` + `after_encode_response`。
 
-**生命周期钩子**（`on_before_setup` / `on_after_setup` / `on_teardown`）：
+**生命周期钩子**（`before_setup` / `after_setup` / `before_teardown` / `after_teardown`）：
 在请求路径之外运行，异常隔离（失败仅日志，不传播）。
 
 **错误钩子**（`on_error`）：

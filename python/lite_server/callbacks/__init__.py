@@ -14,7 +14,8 @@ sync or async.  A data hook may:
 - raise ``HTTPException`` to reject the request (validation, auth, ...)
   — exceptions from data hooks are NOT swallowed; they become error responses
 
-Lifecycle hooks (``on_before_setup`` / ``on_after_setup`` / ``on_teardown``)
+Lifecycle hooks (``before_setup`` / ``after_setup`` / ``before_teardown`` /
+``after_teardown``)
 run outside the request path and are exception-isolated: failures are logged,
 never propagated.
 """

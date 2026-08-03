@@ -14,9 +14,9 @@ sync or async.  A data hook may:
 - raise ``HTTPException`` to reject the request (validation, auth, ...)
   — exceptions from data hooks are NOT swallowed; they become error responses
 
-Lifecycle hooks (``on_before_setup`` / ``on_after_setup`` / ``on_teardown``)
-run outside the request path and are exception-isolated: failures are logged,
-never propagated.
+Lifecycle hooks (``before_setup`` / ``after_setup`` / ``before_teardown`` /
+``after_teardown``) run outside the request path and are exception-isolated:
+failures are logged, never propagated.
 """
 
 from __future__ import annotations
@@ -148,16 +148,25 @@ class Callback:
 
     # ---- Setup / Teardown (lifecycle hooks, exception-isolated) ----
 
-    def on_before_setup(self, config: dict[str, Any], device: str) -> None:
+    def before_setup(self, config: dict[str, Any], device: str) -> None:
         """Called before ``LitAPI.setup()``."""
         pass
 
-    def on_after_setup(self, lit_api: "LitAPI") -> None:
+    def after_setup(self, lit_api: "LitAPI") -> None:
         """Called after ``LitAPI.setup()`` completes successfully."""
         pass
 
-    def on_teardown(self, lit_api: "LitAPI") -> None:
-        """Called when the model is unloaded / worker shuts down."""
+    def before_teardown(self, lit_api: "LitAPI") -> None:
+        """Called before ``LitAPI.teardown()`` — the model is unloaded /
+        worker shuts down."""
+        pass
+
+    def after_teardown(self, lit_api: "LitAPI") -> None:
+        """Called after ``LitAPI.teardown()`` completes successfully —
+        the unload-done signal.
+
+        Not called when teardown raises (mirrors ``after_setup``).
+        """
         pass
 
 
@@ -180,6 +189,9 @@ _RENAMED_HOOKS = {
     "on_response": "after_encode_response",
     "on_batch_input": "after_batch",
     "on_batch_output": "after_unbatch",
+    "on_before_setup": "before_setup",
+    "on_after_setup": "after_setup",
+    "on_teardown": "before_teardown",
 }
 
 _DATA_HOOKS = ("before_decode_request", "after_decode_request", "after_predict", "after_encode_response")
@@ -193,7 +205,7 @@ _STREAM_HOOKS = ("on_stream_close",)
 # only on the has_batch_methods path.
 _BATCH_HOOKS = ("after_batch", "after_unbatch")
 
-_LIFECYCLE_HOOKS = ("on_before_setup", "on_after_setup", "on_teardown")
+_LIFECYCLE_HOOKS = ("before_setup", "after_setup", "before_teardown", "after_teardown")
 
 
 def _overrides(cls: type, name: str, base: type) -> bool:

@@ -28,7 +28,8 @@ Key rules (since 0.7.0):
   subclass like BadRequestError/UnauthorizedError), or short-circuit it
   via ``ctx.respond(...)``. Exceptions from data hooks are NOT swallowed —
   they become error responses.
-- Lifecycle hooks (on_before_setup / on_after_setup / on_teardown) and
+- Lifecycle hooks (before_setup / after_setup / before_teardown /
+  after_teardown) and
   on_error are exception-isolated: failures are logged, never propagated.
 """
 
@@ -143,11 +144,14 @@ class LifecycleTracer(Callback):
     failures are logged, never propagated.
     """
 
-    def on_before_setup(self, config, device):
+    def before_setup(self, config, device):
         logger.info("[LifecycleTracer] before setup: device=%s", device)
 
-    def on_after_setup(self, lit_api):
+    def after_setup(self, lit_api):
         logger.info("[LifecycleTracer] setup done: %s", type(lit_api).__name__)
 
-    def on_teardown(self, lit_api):
-        logger.info("[LifecycleTracer] model unloading, teardown")
+    def before_teardown(self, lit_api):
+        logger.info("[LifecycleTracer] model unloading, before teardown")
+
+    def after_teardown(self, lit_api):
+        logger.info("[LifecycleTracer] teardown done")

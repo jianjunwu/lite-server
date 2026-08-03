@@ -259,9 +259,10 @@ When any stage or hook raises, the pipeline short-circuits to ``on_error``, then
 | `after_batch` | Batch mode: after `batch()`, before `predict()` (whole batch tensor) | `ctx_list` + `batched`; raising `HTTPException` rejects the whole batch |
 | `after_unbatch` | Batch mode: after `unbatch()` (per-item outputs) | `ctx_list` + `outputs` |
 | `on_error` | Any hook or stage raises an exception | `ctx` + `exc` (the exception) |
-| `on_before_setup` | Before `LitAPI.setup()` | `(config, device)` |
-| `on_after_setup` | After `LitAPI.setup()` succeeds | `(lit_api)` |
-| `on_teardown` | Model unload / worker shutdown | `(lit_api)` |
+| `before_setup` | Before `LitAPI.setup()` | `(config, device)` |
+| `after_setup` | After `LitAPI.setup()` succeeds | `(lit_api)` |
+| `before_teardown` | Before `LitAPI.teardown()` (model unload / worker shutdown) | `(lit_api)` |
+| `after_teardown` | After `LitAPI.teardown()` succeeds (unload done) | `(lit_api)` |
 
 A data hook may mutate `ctx` in place or return a replacement value (`None` = pass through).
 
@@ -283,7 +284,7 @@ A data hook may mutate `ctx` in place or return a replacement value (`None` = pa
 
 - **Early return** (e.g. cache hit): call `ctx.respond(body, status_code=..., headers=...)` or return a `Response` from any hook. Later stages and remaining hooks of earlier chains are skipped. The terminal `after_encode_response` chain is the exception: every registered hook runs there even after a `respond(...)` — no stages follow, so responding is header-attach, not short-circuit (this keeps later validation/audit hooks effective regardless of registration order).
 - **Validation / rejection**: raise `HTTPException` (`BadRequestError`, `UnauthorizedError`, ...) from any hook. The client receives the structured error with the exception's status code — data-hook exceptions are **not** swallowed.
-- Lifecycle hooks (`on_before_setup` / `on_after_setup` / `on_teardown`) and `on_error` are exception-isolated: failures are logged, never propagated (a failing `on_error` also never masks the original error).
+- Lifecycle hooks (`before_setup` / `after_setup` / `before_teardown` / `after_teardown`) and `on_error` are exception-isolated: failures are logged, never propagated (a failing `on_error` also never masks the original error).
 
 ```python
 from lite_server import Callback, BadRequestError
@@ -332,7 +333,7 @@ class AuditLogger(Callback):
     def after_predict(self, ctx):
         print(f"[AUDIT] request_id={ctx.meta.request_id} latency={ctx.elapsed_ms():.2f}ms")
 
-    def on_teardown(self, lit_api):
+    def before_teardown(self, lit_api):
         print(f"[AUDIT] model torn down, total handled: {lit_api.call_count}")
 ```
 

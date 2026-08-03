@@ -234,11 +234,9 @@ def load_litapi(model_py_path: str, config: dict, device: str = "cpu"):
 
         pipeline = Pipeline.build(instance, callbacks)
 
-        pipeline.trigger_lifecycle("on_before_setup", config, device)
-        if hasattr(instance, "pre_setup"):
-            instance.pre_setup()
+        pipeline.trigger_lifecycle("before_setup", config, device)
         instance.setup(device)
-        pipeline.trigger_lifecycle("on_after_setup", instance)
+        pipeline.trigger_lifecycle("after_setup", instance)
 
     # Store pipeline on the instance for later use
     instance._pipeline = pipeline
@@ -409,11 +407,15 @@ def _run_teardown(lit_api, log):
     # Fire callback teardown hooks
     pipe = getattr(lit_api, "_pipeline", None)
     if pipe is not None:
-        pipe.trigger_lifecycle("on_teardown", lit_api)
+        pipe.trigger_lifecycle("before_teardown", lit_api)
     try:
         lit_api.teardown()
     except Exception as e:
         log.error(f"teardown error: {e}")
+    else:
+        # Unload-done signal — mirrors after_setup: fires only on success.
+        if pipe is not None:
+            pipe.trigger_lifecycle("after_teardown", lit_api)
     if pipe is not None:
         pipe.close()
 

@@ -183,21 +183,18 @@ class TestLoadLitAPI:
         # The pipeline is built and attached at load time
         assert isinstance(api._pipeline, Pipeline)
 
-    def test_calls_setup_and_pre_setup(self, tmp_path):
+    def test_calls_setup_with_device(self, tmp_path):
         model_py = tmp_path / "model.py"
         model_py.write_text(textwrap.dedent('''
             from lite_server import LitAPI
 
             class MyModel(LitAPI):
-                def pre_setup(self):
-                    self.pre = True
                 def setup(self, device):
                     self.dev = device
                 def predict(self, x):
                     return x
         '''))
         api = inference.load_litapi(str(model_py), {}, device="cpu:0")
-        assert api.pre is True
         assert api.dev == "cpu:0"
 
     def test_raises_when_no_predict(self, tmp_path):
@@ -2368,19 +2365,55 @@ class TestTeardownHelper:
         # Base-class teardown is a no-op — must not raise
         _run_teardown(LitAPI(), test_log)
 
-    def test_callback_on_teardown_fires(self):
+    def test_callback_before_teardown_fires(self):
         from lite_server.worker.inference import _run_teardown
 
         calls = []
 
         class TeardownCB(Callback):
-            def on_teardown(self, lit_api):
-                calls.append("on_teardown")
+            def before_teardown(self, lit_api):
+                calls.append("before_teardown")
 
         model = LitAPI()
         model._pipeline = Pipeline.build(model, [TeardownCB()])
         _run_teardown(model, log)
-        assert calls == ["on_teardown"]
+        assert calls == ["before_teardown"]
+
+    def test_callback_after_teardown_fires_on_success(self):
+        from lite_server.worker.inference import _run_teardown
+
+        calls = []
+
+        class TeardownCB(Callback):
+            def before_teardown(self, lit_api):
+                calls.append("before_teardown")
+
+            def after_teardown(self, lit_api):
+                calls.append("after_teardown")
+
+        model = LitAPI()
+        model._pipeline = Pipeline.build(model, [TeardownCB()])
+        _run_teardown(model, log)
+        assert calls == ["before_teardown", "after_teardown"]
+
+    def test_callback_after_teardown_skipped_on_teardown_error(self):
+        from lite_server.worker.inference import _run_teardown
+
+        calls = []
+
+        class Model(LitAPI):
+            def teardown(self):
+                raise RuntimeError("boom")
+
+        class TeardownCB(Callback):
+            def after_teardown(self, lit_api):
+                calls.append("after_teardown")
+
+        model = Model()
+        model._pipeline = Pipeline.build(model, [TeardownCB()])
+        test_log = logging.getLogger("test_teardown_after_error")
+        _run_teardown(model, test_log)
+        assert calls == []  # after_teardown mirrors after_setup: success only
 
 
 # ---------------------------------------------------------------------------
