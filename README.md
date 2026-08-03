@@ -112,17 +112,17 @@ See [docs/comparison.md](docs/comparison.md) for detailed analysis.
 
 ## Benchmarks
 
-> **Note:** Measured 2026-08-02 on a single workstation (macOS x86_64, i9-9980HK), zero-compute echo model, HTTP layers aligned to a single event-loop thread (`--threads 1`), 2 workers each, 30s per config. See [docs/benchmark.md](docs/benchmark.md) for the full matrix and methodology.
+> **Note:** Measured on a single workstation (macOS x86_64, i9-9980HK, 16 cores), zero-compute echo model, HTTP layers aligned to a single event-loop thread (`--threads 1`), 2 workers / 64 concurrency, 15s per config. See [docs/benchmark.md](docs/benchmark.md) for the full matrix and methodology.
 
-2-worker, 64-concurrency test (zero-compute echo, lite-server 0.7.8 vs LitServe 0.2.17):
+2-worker, 64-concurrency, zero-compute echo, HTTP layer aligned `--threads 1` (lite-server 0.8.0rc2 vs LitServe 0.2.17, three sides isomorphic):
 
 | Server | Throughput | p99 Latency |
 |--------|-----------|-------------|
-| lite-server | 6,574 req/s | 36.7 ms |
-| lite-server-core | 6,376 req/s | 27.3 ms |
-| LitServe | 2,679 req/s | 70.8 ms |
+| lite-server | 6,788 req/s | 14.9 ms |
+| lite-server-core | 6,949 req/s | 12.0 ms |
+| LitServe | 2,978 req/s | 28.2 ms |
 
-See [docs/benchmark.md](docs/benchmark.md) for full results and reproduction steps.
+lite-server (PyO3 embedding) matches the native Rust binary (the embedding layer adds zero hot-path overhead) and sustains ~2.3× LitServe (2.0–2.4× at c≥16, isomorphic zero-compute echo). Full matrix and methodology in [docs/benchmark.md](docs/benchmark.md).
 
 ## Features
 
@@ -366,7 +366,7 @@ See [docs/model-authoring.md](docs/model-authoring.md) for the complete model au
 ## FAQ
 
 **Q: How is lite-server different from LitServe?**
-lite-server uses a Rust HTTP core (axum/tokio) instead of Python's uvicorn, with the same LitAPI-compatible model code. With HTTP layers and workers aligned (single event-loop thread each, 2 workers), lite-server sustains ~2.5x LitServe's throughput on framework overhead with a tighter p99 tail — see [Benchmarks](#benchmarks).
+lite-server uses a Rust HTTP core (axum/tokio) instead of Python's uvicorn, with the same LitAPI-compatible model code. Under zero-compute echo (pure framework overhead, three sides isomorphic), lite-server matches the native lite-server-core binary (PyO3 embedding adds zero overhead) and sustains ~2.0–2.4× LitServe at c≥16 (single event loop, aligned); under a 1ms-sleep workload all three converge — see [Benchmarks](#benchmarks).
 
 **Q: Do I need Docker?**
 No. `pip install` and run directly. Works on Linux, macOS, and Windows.

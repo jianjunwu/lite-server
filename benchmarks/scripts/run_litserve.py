@@ -115,6 +115,30 @@ class _BuiltinSleepAPI(ls.LitAPI):
         return output
 
 
+class _BuiltinEchoAPI(ls.LitAPI):
+    """Zero-compute echo for LitServe — mirrors ``benchmarks/models/echo_model``
+    so the framework-overhead comparison is isomorphic (both sides pure echo,
+    no sleep). Used when echo_model can't be loaded directly because
+    ``lite_server.LitAPI`` is not a ``litserve.LitAPI`` subclass."""
+
+    def __init__(self, model_name: str = "echo_model"):
+        super().__init__(api_path=f"/v2/models/{model_name}/infer")
+
+    def setup(self, device):
+        self.device = device
+
+    def decode_request(self, request, **kwargs):
+        return request.get("input", "")
+
+    def predict(self, inputs, **kwargs):
+        if isinstance(inputs, list):
+            return [{"output": i} for i in inputs]
+        return {"output": inputs}
+
+    def encode_response(self, output, **kwargs):
+        return output
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run LitServe benchmark target")
     parser.add_argument("--port", type=int, default=8001)
@@ -143,15 +167,25 @@ def main() -> int:
             return 1
         loaded_name, api = _load_model_from_repo(repo_path, target_name=args.model)
         if api is None:
-            # Model is likely a lite_server model (inherits from lite_server.LitAPI,
-            # not litserve.LitAPI).  Use built-in with equivalent workload.
-            sleep_ms = _BUILTIN_SLEEP_MAP.get(args.model, 1)
-            api = _BuiltinSleepAPI(sleep_ms=sleep_ms, model_name=args.model)
+            # Model inherits lite_server.LitAPI (not litserve.LitAPI), so LitServe
+            # can't load it directly. Substitute a litserve-native equivalent that
+            # matches the workload: zero-compute echo for echo_model (keeps the
+            # framework-overhead comparison isomorphic — both sides pure echo),
+            # else a sleep mock of equal duration.
             model_name = args.model
-            print(
-                f"No litserve-compatible LitAPI found; "
-                f"using built-in {sleep_ms}ms sleep model (equivalent workload)"
-            )
+            if args.model == "echo_model":
+                api = _BuiltinEchoAPI(model_name=args.model)
+                print(
+                    "No litserve-compatible LitAPI found; "
+                    "using built-in zero-compute echo (isomorphic workload)"
+                )
+            else:
+                sleep_ms = _BUILTIN_SLEEP_MAP.get(args.model, 1)
+                api = _BuiltinSleepAPI(sleep_ms=sleep_ms, model_name=args.model)
+                print(
+                    f"No litserve-compatible LitAPI found; "
+                    f"using built-in {sleep_ms}ms sleep model (equivalent workload)"
+                )
         else:
             model_name = loaded_name
             print(f"Loaded model '{model_name}' from {repo_path}")

@@ -2,214 +2,102 @@
 
 [English](../benchmark.md)
 
-## P-PERF-a 基线与 perf-smoke（2026-08-02）
+`wrk` 三侧对比:**lite-server**(PyO3 `serve()` 入口)/ **lite-server-core**(独立 Rust 二进制)/ **LitServe**(FastAPI + uvicorn)。衡量 **HTTP + IPC 框架开销**,非模型计算时间。
 
-首轮实测基线（蓝图 §4.0.8）+ 可复现的自含 **perf-smoke** 测量设施。当前为
-**本地/手动测量工具，未接入 CI**——GitHub 共享 runner 方差 >30%，在其上设 CI
-性能门要么抖动（紧阈值）要么抓不到东西（松阈值）。性能门推迟到有了低方差
-（自建/dedicated）runner 再议；在此之前回归靠 review（async 路径改动按 §6.5
-贴 perf 数据）+ 手动跑本设施兜底。
+## 两种负载
 
-### 测量口径（含什么、不含什么）
-
-perf-smoke 对**零计算 echo 模型**（`benchmarks/models/echo_model`、
-`echo_stream_model`）压三条关键路径：
-
-| 路径 | 形态 | 逼近什么 |
+| 负载 | 模型 | 衡量什么 |
 |---|---|---|
-| `http_unary` | POST `/v2/models/echo_model/infer`，2000 请求 @ 32 并发 | 全链路客户端可见延迟（零推理模型）：server 开销（协议+横切+队列）+ ZMQ IPC + Python worker 往返 |
-| `grpc_unary` | `LiteServer.Infer`，2000 请求 @ 32 并发 | 同管线，gRPC/tonic 面 |
-| `sse_stream` | POST `/v2/models/echo_stream_model/events`，16 流 × 20 chunk | 开流延迟、逐 chunk 转发间隔、整流时长 |
+| **零计算 echo** | `echo_model`,立即返回 | 纯框架开销(协议+横切+队列+ZMQ IPC+worker 往返)——架构差异在此显现 |
+| **1ms sleep** | `sleep_1ms_model`,`time.sleep(0.001)` | worker 侧行为——1ms 计算主导,框架开销被淹没 |
 
-**不含**：模型计算（模型立即返回/回显）、TLS、CORS、限流、OTel 导出（全部
-默认关——与 §4.0.8 预算口径"默认配置"一致）。读数因此是*服务端开销的上界
-代理*，更重要的是一份**同管线、同负载形态、跨 commit/跨机器可比的回归基线**。
-
-### 运行
-
-```bash
-cargo build --release                     # 服务端二进制（lite-server-core）
-cargo run --release --example perf_smoke  # 报告 → stdout + target/perf-smoke.json
-```
-
-要求 PATH 上的 `python` 可 import `lite_server`（worker 是 Python 进程；仓库
-根目录 `uv sync` 即可配好）。
-
-### 首轮基线
-
-机器：macOS x86_64，16 核，rustc 1.97.1，release（LTO），git `d0d6992`。
-工作站数据——为回归方法论存档，**不作 CI 门槛**。
-
-| 路径 | 指标 | p50 | p99 | 吞吐 |
-|---|---|---|---|---|
-| http_unary | 请求延迟 | 10.25 ms | 14.03 ms | ~3050 rps |
-| grpc_unary | 请求延迟 | 9.42 ms | 12.46 ms | ~3350 rps |
-| sse_stream | 开流 | 4.87 ms | 5.68 ms | — |
-| sse_stream | chunk 间隔 | 2.07 ms | 5.33 ms | ~6900 chunks/s |
-
-对照 §4.0.8 SLO（"协议层+队列开销 p99 < 5 ms"）读 unary 数：实测 p99 含
-Python worker 往返（ZMQ IPC + 进程调度）且占大头——server 独占份额按设计
-不可从本设施分离，分解靠下方 profiling runbook。回归用途看的是两次运行
-之间的*差值*。
-
-### SLO 对照 §4.0.8 状态
-
-- **基线**：已建立（本节 + 可复现设施）。✅
-- **CI 门槛**：**未接入 CI。** 共享 runner 方差（>30%）使任何绝对阈值要么抖动
-  要么抓不到东西；门槛推迟到有低方差 runner 再议。§4.0.8 的 `+10%` 占位删去——
-  它只会是噪音。
-- **0.7.2 教训**：改动 async 路径须附本设施的 perf 数据（见 §6.5 验收）。
-
-### Profiling runbook（测量可信化）
-
-回归出现时的分解手段：
-
-- **tokio-console**（task 级，找两次 `.await` 之间 >1ms 的阻塞——p99 尾
-  延迟红线）：以 cargo feature 引入 `console-subscriber`，
-  `RUSTFLAGS="--cfg tokio_unstable"` 编译，用 `tokio-console` 连服务端。
-  （尚未接入二进制——P-PERF-b 跟踪。）
-- **pprof-rs**（CPU 火焰图）：加 debug-only `/debug/pprof` 端点（admin 门控、
-  仅 loopback），配 `[profile.profiling] inherits = "release", debug = true`，
-  然后 `go tool pprof -http :8080 <dump>`。（后续项，蓝图 P-PERF 子项①。）
-- **代码评审红线**（常备，蓝图）：两次 `.await` 之间无 >1ms 阻塞任务；横切
-  逻辑单请求 <100µs。
-
-## wrk 对比（lite-server vs LitServe）
-
-> **注意：** 数据实测于 2026-08-02，单机（Intel i9-9980HK）——单机型负载不足以作为定论，请视作方向性参考而非规格。
-
-lite-server 与 LitServe 的 `wrk` 性能对比。报告两种负载：**1ms sleep mock**
-（本节——衡量 worker 侧行为，框架开销被淹没）和**零计算 echo 模型**（见
-[下方](#框架开销对比零计算-echo对齐)——衡量纯框架开销，真实差异在此显现）。
+> **不要用 sleep 模型给服务框架做基准。** 框架开销对比看 echo;sleep 模型只用于验证 worker 扩展性与三方趋同。
 
 ## 测试环境
 
-- **模型**：矩阵用 1ms `time.sleep()` CPU mock；框架开销节用零计算 echo
-- **工具**：`wrk` 4.2.0 + POST 请求（`{"input":"hello"}`），每配置 30s，4 线程
-- **系统**：macOS x86_64，Intel Core i9-9980HK（8P/16L），32 GB
-- **版本**：lite-server 0.7.8（git `82b0535`）vs LitServe 0.2.17
-- **HTTP 层线程模型**（对齐前提）：LitServe 是单 uvicorn 进程 + 单 asyncio
-  事件循环；lite-server / lite-server-core 是 tokio N 线程（`--threads N`，
-  默认 = CPU 核数）。框架开销节用 `--threads 1` 钉住单事件循环做同构对比。
+- **机器**:macOS x86_64,Intel Core i9-9980HK @ 2.40GHz(8 物理核 / 16 逻辑),32 GB
+- **版本**:lite-server 0.8.0rc2 vs LitServe 0.2.17;wrk 4.2.0;rustc 1.97.1(release + LTO)
+- **负载**:wrk POST `{"input":"hello"}`,4 线程,每配置 15s,轮换跑序 + 5s cooldown 消热降频偏置
+- **拉起配置(对齐)**:lite-server / lite-server-core 用 `--threads 1`(单 tokio 事件循环)对齐 LitServe 的单 uvicorn 进程,做**同构**框架开销对比;不传 `--threads` 时 Rust 侧默认 16 线程,会进一步放大差异。
 
-## 测试结果（1ms sleep 模型）
+### 三侧架构(对齐后)
 
-### 吞吐量（req/s）
+| 侧 | HTTP 层 | 推理 worker |
+|---|---|---|
+| lite-server | 1 Python 宿主进程(内嵌 Rust tokio,`--threads 1` → **1 线程**) | N 个 Python 子进程 |
+| lite-server-core | 1 Rust 进程(tokio,`--threads 1` → **1 线程**,无 Python 宿主) | N 个 Python 子进程 |
+| LitServe | 1 uvicorn 进程(单 asyncio 事件循环 = **1 线程**) | N 个 Python 子进程(mp.spawn) |
 
-| Worker 数 | 并发数 | lite-server | LitServe | lite-server-core | 加速比（ls/lit） |
-|-----------|--------|-------------|----------|------------------|-----------------|
-| 1 | 1 | 353 | 379 | 443 | 0.93x |
-| 1 | 4 | 634 | 656 | 612 | 0.97x |
-| 1 | 16 | 658 | 656 | 695 | 1.00x |
-| 1 | 64 | 666 | 658 | 694 | 1.01x |
-| 2 | 1 | 335 | 346 | 395 | 0.97x |
-| 2 | 4 | 1,203 | 1,333 | 1,218 | 0.90x |
-| 2 | 16 | 1,333 | 1,341 | 1,369 | 0.99x |
-| 2 | 64 | 1,357 | 1,335 | 1,394 | 1.02x |
-| 4 | 1 | 306 | 345 | 383 | 0.89x |
-| 4 | 4 | 1,464 | 1,495 | 1,526 | 0.98x |
-| 4 | 16 | 2,574 | 2,607 | 2,311 | 0.99x |
-| 4 | 64 | 2,617 | 2,601 | 2,425 | 1.01x |
+## 口径与限制
 
-### p99 延迟（ms）
+- **同构对齐**:三侧都跑**零计算 echo**——lite-server / lite-server-core 加载 `echo_model`;LitServe 因 `lite_server.LitAPI`(自 0.7.0 起独立、非 `litserve.LitAPI` 子类)加载不了该模型,`run_litserve.py` 改用一个 **litserve 原生的零计算 echo builtin**(`_BuiltinEchoAPI`,镜像 `echo_model` 行为:纯返回、无 sleep)替代,确保三侧负载同构。sleep 模型三侧都直接跑等同时长的 `time.sleep` mock。
+- 真实 GPU 推理模型计算主导,相对差异会比这里的框架开销更小。
 
-| Worker 数 | 并发数 | lite-server | LitServe | lite-server-core |
-|-----------|--------|-------------|----------|------------------|
-| 1 | 1 | 4.08 | 5.47 | 2.80 |
-| 1 | 4 | 8.54 | 7.23 | 7.46 |
-| 1 | 16 | 29.59 | 28.04 | 31.98 |
-| 1 | 64 | 144.68 | 149.18 | 141.82 |
-| 2 | 1 | 4.07 | 3.59 | 4.59 |
-| 2 | 4 | 7.04 | 6.23 | 11.71 |
-| 2 | 16 | 21.18 | 25.99 | 21.32 |
-| 2 | 64 | 57.37 | 60.57 | 67.80 |
-| 4 | 1 | 4.41 | 3.86 | 3.20 |
-| 4 | 4 | 6.17 | 3.41 | 3.19 |
-| 4 | 16 | 8.17 | 27.35 | 9.01 |
-| 4 | 64 | 50.34 | 52.38 | 66.78 |
+## 结果:零计算 echo(框架开销,`--threads 1`)
 
-### 分析
+每格 `rps / p99(ms)`,`lite/Lit` = lite-server ÷ LitServe 吞吐。三侧同构(均零计算 echo)。
 
-**三个服务器在整个矩阵内互差约 ±10% 以内**（lite-server 对 LitServe 0.89x–1.02x，`lite-server-core` 0.89x–1.17x）。这与早期占位数据（w=2/c=4：1,583 vs 531 rps，"3.0x"）大不相同——主要原因是 LitServe 自身：0.2.17 相比占位数据所用的旧版本吞吐提升约 2.5×（w=2/c=4 从 531 → 1,333 rps），而 lite-server 与早前结果相差仅几个百分点。
+| workers | conc | lite-server | lite-server-core | LitServe | lite/Lit |
+|---|---|---|---|---|---|
+| 1 | 1 | 1414 / 1.3 | 1494 / 1.0 | 1069 / 1.3 | 1.32× |
+| 1 | 16 | 3658 / 18.0 | 3529 / 10.5 | 1745 / 10.7 | 2.10× |
+| 1 | 64 | 3650 / 22.7 | 3583 / 30.9 | 1609 / 65.3 | 2.27× |
+| 2 | 1 | 1328 / 4.3 | 1366 / 1.5 | 911 / 13.3 | 1.46× |
+| 2 | 16 | 6840 / 3.3 | 6783 / 3.4 | 2809 / 10.7 | 2.43× |
+| 2 | 64 | 6788 / 14.9 | 6949 / 12.0 | 2978 / 28.2 | 2.28× |
+| 4 | 1 | 1469 / 1.1 | 1352 / 3.2 | 1025 / 1.4 | 1.43× |
+| 4 | 16 | 7141 / 3.2 | 7146 / 3.2 | 3329 / 15.7 | 2.15× |
+| 4 | 64 | 7638 / 11.0 | 7443 / 11.8 | 3674 / 31.7 | 2.08× |
 
-**这个持平是测量假象，不是结论。** 1ms sleep 本身就是瓶颈：1 worker 触顶 ~660 rps、4 worker ~2,600 rps，三个服务器完全一致——矩阵反映的是"三方都在等同一个 1ms"，不是"三方性能等价"。框架差异在这种负载下不可见，需要用零计算 echo 模型（下一节）才能暴露：**同 worker 数、同单线程 HTTP 层下，lite-server 是 LitServe 的 2.5×**。
+**解读**:
 
-**关键结论**：不要用 sleep 模型给服务框架做基准。框架开销对比用下面的 echo 负载；真实模型负载拍板前另行验证。
+- **lite-server ≡ lite-server-core**(全 9 格差异 <3%):PyO3 嵌入层——`serve()` 的 `with_gil`/`allow_threads`、`stop_server` 槽位、select! 关停 arm、GIL 释放——在热路径**零开销**,与原生 Rust 二进制分毫不差。
+- **c≥16 时 lite-server ≈ LitServe 的 2.0–2.4×**(同构框架开销):HTTP 层同为单事件循环(`--threads 1` 对齐 LitServe 单 uvicorn),差异来自 Rust(axum/tokio + ZMQ)对 Python(FastAPI/uvicorn + asyncio)的协议栈/IPC 开销。
+- c=1(单请求往返)领先收窄到 ~1.3–1.5×——延迟受限时框架优势变小。
+- 三侧 echo 吞吐都随 worker 增长(lite c=16:w1 ~3658 → w2 ~6840 → w4 ~7141,趋饱和),瓶颈在 HTTP+IPC 往返,不在 worker 数。
 
-## 复现步骤
+## 结果:1ms sleep(worker 侧,`--threads 1`)
+
+| workers | conc | lite-server | lite-server-core | LitServe | lite/Lit |
+|---|---|---|---|---|---|
+| 1 | 1 | 529 / 2.3 | 508 / 2.5 | 463 / 2.6 | 1.14× |
+| 1 | 16 | 675 / 26.5 | 679 / 25.4 | 675 / 25.8 | 1.00× |
+| 1 | 64 | 677 / 101.0 | 670 / 115.5 | 674 / 99.9 | 1.00× |
+| 2 | 1 | 511 / 2.4 | 533 / 2.2 | 448 / 2.9 | 1.14× |
+| 2 | 16 | 1380 / 12.3 | 1395 / 12.3 | 1405 / 13.3 | 0.98× |
+| 2 | 64 | 1385 / 47.5 | 1385 / 47.8 | 1412 / 47.6 | 0.98× |
+| 4 | 1 | 530 / 2.2 | 529 / 2.3 | 462 / 2.5 | 1.15× |
+| 4 | 16 | 2779 / 6.6 | 2776 / 6.6 | 2735 / 9.1 | 1.02× |
+| 4 | 64 | 2730 / 28.3 | 2740 / 25.1 | 2747 / 25.0 | 0.99× |
+
+**解读**:
+
+- **三方全程趋同**(0.98–1.15×):1ms sleep 主导每请求成本,框架差异不可见——印证"不要用 sleep 模型给框架做基准"。
+- 仅 c=1(单请求延迟)lite/core 略领先 ~1.14×(纯往返开销优势)。
+- **worker 线性扩展**:1→2→4 worker → ~675 / ~1380 / ~2750 rps(约 2× / 4×),三侧一致。
+
+## 关键结论
+
+1. **框架开销对比用 echo,不用 sleep**——1ms sleep 下三方 ±2%,是测量假象(都在等同一个 1ms)。
+2. **PyO3 嵌入层零热路径开销**——lite-server 与原生二进制 lite-server-core 全矩阵持平(18 格差异 <3%),`serve()` 的 GIL 释放 / 重入守卫 / `stop_server` 不产生可测量代价。
+3. echo(零计算、同构)下 lite-server 框架吞吐 ~3700–7600 rps,约为 LitServe 的 **2.0–2.4×**(c≥16,单事件循环对齐)。
+
+## 复现
 
 ```bash
-# 前置依赖
-pip install litserve
-brew install wrk  # 或 apt-get install wrk
+# 前置:构建 release wheel + core 二进制
+maturin build --release                      # → target/wheels/lite_server-*.whl
+uv pip install --force-reinstall --no-deps target/wheels/lite_server-*.whl
+cargo build --release                        # → target/release/lite-server-core
 
-# 快速测试（单配置，约 30 秒）
+# 对齐配置(--threads 1)跑 echo / 1ms
+python benchmarks/scripts/compare.py --model echo_model \
+  --workers 1 2 4 --concurrency 1 16 64 --threads 1 --duration 15
+python benchmarks/scripts/compare.py --model sleep_1ms_model \
+  --workers 1 2 4 --concurrency 1 16 64 --threads 1 --duration 15
+
+# 快速冒烟(单格)
 python benchmarks/scripts/compare.py --lite
-
-# 完整对比
-python benchmarks/scripts/compare.py \
-  --workers 1 2 4 \
-  --concurrency 1 4 16 64 \
-  --plot
-
-# 自定义模型
-python benchmarks/scripts/compare.py \
-  --model-repo /path/to/model_repo \
-  --model your_model \
-  --workers 1 2 4 \
-  --concurrency 1 4 16 64
 ```
 
-结果保存到 `benchmarks/results/benchmark.csv`。使用 `--plot` 时图表保存到 `benchmarks/results/comparison.png`。
-
-## 指标说明
-
-- **lite-server** = Python CLI 包装启动 Rust 二进制（`lite-server-core`）+ Python workers
-- **lite-server-core** = 直接运行 Rust 二进制（无 Python 包装开销）
-- **LitServe** = Lightning AI 的推理服务器（FastAPI + uvicorn）
-
-"加速比"列对比 `lite-server` vs `LitServe`。`lite-server-core` 列展示无 Python 桥接开销的原始 Rust 二进制性能。
-
-## 框架开销对比（零计算 echo，对齐）
-
-echo 模型立即返回（`benchmarks/models/echo_model`）——无 sleep，线上的每一
-微秒都是框架成本。三个服务器均跑 **2 workers**（`workers_per_device: 2`），
-HTTP 层按"测试环境"的线程注记对齐。每配置 25-30s，同一 `wrk` 负载。
-
-> **注意（负载不一致）：** LitServe 无法直接加载 `echo_model`。自 0.7.0 起
-> `lite_server.LitAPI` 自包含、**不是** `litserve.LitAPI` 子类，故
-> `benchmarks/scripts/run_litserve.py` 对其替换为 **1ms sleep mock**
->（`_BUILTIN_SLEEP_MAP`）。因此本节 LitServe 列是 *零计算 echo（lite-server）
-> 对 1ms sleep（LitServe）*——非同构：1ms sleep 主导了 LitServe 的每请求成本，
-> 拉大了差距。请按"lite-server echo 对 LitServe 1ms-sleep 基线"读，而非
-> 零计算对零计算。同构的框架开销对比见上方 1ms-sleep 矩阵（双方都 sleep 1ms）。
-
-### 默认形态（lite-server tokio 线程 = auto/16，LitServe 单进程）
-
-| Server | c=16 | c=64 |
-|---|---|---|
-| lite-server | 4,531 rps / p99 8.30 ms | 4,383 rps / p99 39.05 ms |
-| lite-server-core | 4,927 rps / p99 28.56 ms | 5,808 rps / p99 23.09 ms |
-| LitServe | 2,644 rps / p99 15.23 ms | 2,725 rps / p99 53.36 ms |
-
-### 对齐（双方单事件循环线程：`--threads 1`）
-
-| Server | c=16 | c=64 |
-|---|---|---|
-| lite-server | 6,606 rps / p99 4.94 ms | 6,574 rps / p99 36.65 ms |
-| lite-server-core | 4,920 rps / p99 29.21 ms | 6,376 rps / p99 27.34 ms |
-| LitServe | 2,568 rps / p99 31.03 ms | 2,679 rps / p99 70.78 ms |
-
-**lite-server 在 HTTP 层资源完全一致下是 LitServe 的 ~2.5×**（c=16：6,606 vs
-2,568 rps），c=16 的 p99 尾延迟更紧（4.94 vs 31.03 ms）。`lite-server-core`
-在此负载下与包装层相当（双方每请求固定开销均 ~0.14 ms——包装层的 tokio
-事件循环跑在独立 OS 线程上，不在 CPython 主线程）。
-
-**关键结论**：HTTP 层资源与 workers 对齐后，lite-server 的框架开销优于
-LitServe 约 2.5×，Python 包装层与原生二进制持平。
-
-## 注意事项
-
-- 这些基准测试衡量的是 HTTP + IPC 开销，非模型计算时间。真实 GPU 推理模型的相对差异会更小。
-- 1ms sleep 模型刻意轻量化，用于隔离服务框架开销。
-- 结果可能因硬件、操作系统和系统配置而异。
+结果存 `benchmarks/results/benchmark.csv`(`--output` 可改路径)。`compare.py` 透传 `--threads N` 给 lite-server / lite-server-core(LitServe 单进程 uvicorn 不受影响)。

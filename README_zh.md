@@ -110,17 +110,17 @@ Rust 内核处理所有 I/O（HTTP、gRPC、IPC、指标、文件监听），Pyt
 
 ## 性能基准
 
-> **注意：** 数据实测于 2026-08-02，单机（macOS x86_64，i9-9980HK），零计算 echo 模型，HTTP 层对齐为单事件循环线程（`--threads 1`），三方各 2 workers，每配置 30s。完整矩阵与方法见 [docs/zh/benchmark.md](docs/zh/benchmark.md)。
+> **注意：** 本机实测（macOS x86_64，i9-9980HK，16 核），零计算 echo 模型，HTTP 层对齐为单事件循环线程（`--threads 1`），2 workers / 64 并发，每配置 15s。完整矩阵与方法见 [docs/zh/benchmark.md](docs/zh/benchmark.md)。
 
-2 worker、64 并发测试（零计算 echo，lite-server 0.7.8 vs LitServe 0.2.17）：
+2 worker、64 并发，零计算 echo，HTTP 层对齐 `--threads 1`（lite-server 0.8.0rc2 vs LitServe 0.2.17，三侧同构）：
 
 | 服务器 | 吞吐量 | p99 延迟 |
 |--------|--------|---------|
-| lite-server | 6,574 req/s | 36.7 ms |
-| lite-server-core | 6,376 req/s | 27.3 ms |
-| LitServe | 2,679 req/s | 70.8 ms |
+| lite-server | 6,788 req/s | 14.9 ms |
+| lite-server-core | 6,949 req/s | 12.0 ms |
+| LitServe | 2,978 req/s | 28.2 ms |
 
-详见 [docs/zh/benchmark.md](docs/zh/benchmark.md)。
+lite-server（PyO3 嵌入）与原生 Rust 二进制持平（嵌入层零热路径开销），且约为 LitServe 的 2.3×（c≥16 区间 2.0–2.4×，同构零计算 echo）。完整矩阵与方法见 [docs/zh/benchmark.md](docs/zh/benchmark.md)。
 
 ## 功能特性
 
@@ -315,7 +315,7 @@ hooks:
 ## 常见问题
 
 **Q: lite-server 和 LitServe 有什么区别？**
-lite-server 用 Rust HTTP 内核（axum/tokio）替代了 Python 的 uvicorn，模型代码写法一样（兼容 LitAPI）。HTTP 层与 workers 对齐（双方单事件循环线程、各 2 worker）的框架开销实测中，lite-server 吞吐约为 LitServe 的 2.5 倍，p99 尾延迟更紧——见[性能基准](#性能基准)。
+lite-server 用 Rust HTTP 内核（axum/tokio）替代了 Python 的 uvicorn，模型代码写法一样（兼容 LitAPI）。零计算 echo（纯框架开销、三侧同构）下，lite-server 与原生 Rust 二进制持平（PyO3 嵌入零开销），且约为 LitServe 的 2.0–2.4×（c≥16，单事件循环对齐）；1ms sleep 同负载下三方吞吐持平——见[性能基准](#性能基准)。
 
 **Q: 需要 Docker 吗？**
 不需要。`pip install` 后直接运行。支持 Linux、macOS、Windows。

@@ -289,6 +289,15 @@ def main() -> int:
         help="Inference worker counts to test",
     )
     parser.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        help="Tokio HTTP-layer worker threads for lite-server / lite-server-core "
+        "(default: auto = CPU cores). Pass 1 to pin a single event loop and "
+        "align with LitServe's single-process uvicorn for an isomorphic "
+        "framework-overhead comparison. LitServe is unaffected (single loop).",
+    )
+    parser.add_argument(
         "--concurrency",
         nargs="+",
         type=int,
@@ -368,6 +377,12 @@ def main() -> int:
         ]
         if extra_args:
             cmd.extend(extra_args)
+        # Align the Rust HTTP layer's event-loop count with LitServe's single
+        # uvicorn process: --threads 1 pins tokio to one worker thread so the
+        # framework-overhead comparison is isomorphic (same single-loop HTTP
+        # layer on both sides). LitServe has no --threads (single loop always).
+        if args.threads is not None and name != "LitServe":
+            cmd.extend(["--threads", str(args.threads)])
 
         print(f"[{name}] Starting...")
         try:
