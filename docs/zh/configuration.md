@@ -323,8 +323,10 @@ callbacks:                     # Worker 启动时加载的 callback 类路径列
 > （或经 `on_file_changed` 钩子进程内刷新）。`control_mode: "auto"` 时，
 > 版本目录的新增/删除完全由 reconcile 任务负责。在非 auto 的
 > `control_mode` 下 `hot_reload: true` 自动**加载**新版本目录的旧行为已
-> 于 **0.7.7 移除**——新版本目录仅记录日志，请改用 Admin API 显式加载或
-> 切换到 `control_mode: "auto"`。
+> 于 **0.7.7 移除**——仅**目录创建事件**会以 WARN 提示新版本出现（不会
+> 自动加载）；在已存在但未加载的版本目录内修改文件只记 debug 日志，
+> 不打扰正常开发。加载请改用 Admin API 显式加载或切换到
+> `control_mode: "auto"`。
 
 ## 编排配置
 

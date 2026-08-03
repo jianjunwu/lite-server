@@ -239,7 +239,10 @@ impl LiteServer {
         if has_hot_reload.load(Ordering::Relaxed) {
             info!("Hot reload: enabled models detected, starting file watcher");
         } else {
-            info!("Hot reload: no enabled models, file watcher will start on demand");
+            // The watcher still runs (unconditionally, below) — without
+            // hot_reload models it gates events: lifecycle-only (dir-gone
+            // unloads, auto-mode reconcile).
+            info!("Hot reload: no models with hot_reload enabled — watcher active for lifecycle events only");
         }
 
         let repo_path = PathBuf::from(&self.config.model_repository.path)
@@ -377,7 +380,7 @@ impl LiteServer {
         // forwarded — directory-level events feed the reconcile task even
         // when no loaded model has hot_reload enabled.
         let auto_mode = self.config.orchestration.control_mode == "auto";
-        let (watch_tx, mut watch_rx) = mpsc::channel::<Vec<PathBuf>>(32);
+        let (watch_tx, mut watch_rx) = mpsc::channel::<Vec<(PathBuf, WatchEventKind)>>(32);
         let has_hot_reload_for_watcher = has_hot_reload.clone();
         let watcher_handle = tokio::spawn(start_file_watcher(
             repo_path.clone(),
@@ -418,9 +421,9 @@ impl LiteServer {
         let has_hot_reload_for_reload = has_hot_reload.clone();
         let reload_handle = tokio::spawn(async move {
             let mut last_reload: std::collections::HashMap<(String, String), Instant> = std::collections::HashMap::new();
-            while let Some(paths) = watch_rx.recv().await {
+            while let Some(events) = watch_rx.recv().await {
                 if let Err(e) = process_watch_events(
-                    paths,
+                    events,
                     repo_path.clone(),
                     reload_worker.clone(),
                     reload_registry.clone(),

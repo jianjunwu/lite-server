@@ -333,9 +333,11 @@ callbacks:                     # Callback class paths loaded at worker startup
 > `control_mode: "auto"`, adding/removing version directories is handled
 > exclusively by the reconcile task. The legacy behavior of auto-**loading**
 > brand-new versions under `hot_reload: true` with a non-auto
-> `control_mode` was **removed in 0.7.7** — new version directories are
-> only logged; load explicitly via the Admin API or switch to
-> `control_mode: "auto"`.
+> `control_mode` was **removed in 0.7.7** — only a **directory Create
+> event** logs a WARN that a new version appeared (never auto-loaded);
+> editing files inside an existing unloaded version directory is debug-level
+> only, so normal development is not noisy. Load explicitly via the Admin
+> API or switch to `control_mode: "auto"`.
 
 ## Orchestration Configuration
 

@@ -9,6 +9,30 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, Duration, Instant};
 use tracing::{debug, error, info, warn};
 
+/// File-event kind preserved through the watcher's debounce.
+///
+/// Only ``Create`` carries lifecycle signal — a directory appearing in the
+/// repo announces a new version; ``Modify``/``Remove``/``Other`` inside an
+/// existing directory are ordinary file churn.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(super) enum WatchEventKind {
+    Create,
+    Modify,
+    Remove,
+    Other,
+}
+
+impl From<notify::EventKind> for WatchEventKind {
+    fn from(kind: notify::EventKind) -> Self {
+        match kind {
+            notify::EventKind::Create(_) => WatchEventKind::Create,
+            notify::EventKind::Modify(_) => WatchEventKind::Modify,
+            notify::EventKind::Remove(_) => WatchEventKind::Remove,
+            _ => WatchEventKind::Other,
+        }
+    }
+}
+
 /// Process a debounced batch of file events.
 ///
 /// Classification is registry-based, not directory-shape-based:
@@ -19,12 +43,13 @@ use tracing::{debug, error, info, warn};
 ///   lifecycle event. In auto mode (`reconcile_trigger` = Some) these only
 ///   trigger a reconcile — the reconciler is the single authority on version
 ///   load/unload, applying load_policy and max_loaded_versions. In manual
-///   mode the user is the lifecycle owner: new version dirs are only
-///   reported (warn log), never auto-loaded. A version dir that disappeared
-///   is unloaded directly in every mode — the files are gone, the worker
-///   cannot serve.
+///   mode the user is the lifecycle owner: only a **directory Create** event
+///   announces a new version (warn log — never auto-loaded); file edits
+///   inside an existing unloaded version dir are ordinary dev churn
+///   (debug log). A version dir that disappeared is unloaded directly in
+///   every mode — the files are gone, the worker cannot serve.
 pub(super) async fn process_watch_events(
-    paths: Vec<PathBuf>,
+    events: Vec<(PathBuf, WatchEventKind)>,
     repo_path: PathBuf,
     worker_manager: Arc<WorkerManager>,
     registry: Arc<ModelRegistry>,
@@ -40,8 +65,11 @@ pub(super) async fn process_watch_events(
     let mut trigger_files: std::collections::HashMap<(String, String), Vec<PathBuf>> =
         std::collections::HashMap::new();
     let mut lifecycle_candidates: HashSet<(String, String)> = HashSet::new();
+    // Keys whose event batch contains a directory Create — the signal that a
+    // genuinely new version dir appeared (vs. churn inside an existing one).
+    let mut new_version_candidates: HashSet<(String, String)> = HashSet::new();
 
-    for path in paths {
+    for (path, kind) in events {
         // Skip endpoint files and Python cache
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
             if name.ends_with("_endpoint.py") || name == "__pycache__" || name.ends_with(".pyc") || name.ends_with(".pyo") {
@@ -81,7 +109,13 @@ pub(super) async fn process_watch_events(
                         // Dir events on a live version (e.g. mtime changes
                         // when files are written inside) carry no signal.
                         if !is_live {
-                            lifecycle_candidates.insert(key);
+                            lifecycle_candidates.insert(key.clone());
+                            // Only a directory Create announces a genuinely
+                            // new version; mtime/attr churn on an existing
+                            // directory does not.
+                            if kind == WatchEventKind::Create {
+                                new_version_candidates.insert(key);
+                            }
                         }
                     } else if is_live {
                         models_to_reload.insert(key.clone());
@@ -173,12 +207,22 @@ pub(super) async fn process_watch_events(
             for (name, version) in lifecycle_candidates {
                 let version_dir = repo_path.join(&name).join(&version);
                 if version_dir.exists() {
-                    warn!(
-                        "New version {} {} detected under manual control_mode — \
-                         not loading; load explicitly via the Admin API or \
-                         switch to control_mode: \"auto\"",
-                        name, version
-                    );
+                    if new_version_candidates.contains(&(name.clone(), version.clone())) {
+                        warn!(
+                            "New version {} {} detected under manual control_mode — \
+                             not loading; load explicitly via the Admin API or \
+                             switch to control_mode: \"auto\"",
+                            name, version
+                        );
+                    } else {
+                        // Ordinary file churn inside a version dir that is
+                        // not loaded (dev workflow) — traceable, not noisy.
+                        debug!(
+                            "File change in unloaded version {} {} — not loading \
+                             (load via the Admin API or control_mode: \"auto\")",
+                            name, version
+                        );
+                    }
                 } else {
                     // Dir gone → unload. This invariant holds in every mode:
                     // the files no longer exist, the worker cannot serve.
@@ -213,7 +257,7 @@ pub(super) async fn process_watch_events(
 pub(super) async fn start_file_watcher(
     repo_path: PathBuf,
     _worker_manager: Arc<WorkerManager>,
-    tx: mpsc::Sender<Vec<PathBuf>>,
+    tx: mpsc::Sender<Vec<(PathBuf, WatchEventKind)>>,
     has_hot_reload: Arc<AtomicBool>,
     always_forward: bool,
     debounce: Duration,
@@ -245,7 +289,7 @@ pub(super) async fn start_file_watcher(
 
     // Debounce: collect events over 1.5s windows
     let mut debounce_deadline: Option<Instant> = None;
-    let mut pending_paths: Vec<PathBuf> = Vec::new();
+    let mut pending_paths: Vec<(PathBuf, WatchEventKind)> = Vec::new();
     let mut tick = interval(Duration::from_millis(200));
 
     loop {
@@ -266,6 +310,9 @@ pub(super) async fn start_file_watcher(
                             continue;
                         }
 
+                        // The kind applies to every path in this event
+                        // (notify delivers one kind per event batch).
+                        let kind = WatchEventKind::from(event.kind);
                         for path in event.paths {
                             // Skip UDS sockets, temp files, hidden files, Python cache
                             if path.extension().map(|e| e == "sock").unwrap_or(false) {
@@ -285,7 +332,7 @@ pub(super) async fn start_file_watcher(
                             {
                                 continue;
                             }
-                            pending_paths.push(path);
+                            pending_paths.push((path, kind));
                         }
                         debounce_deadline = Some(Instant::now() + debounce);
                     }
@@ -300,7 +347,8 @@ pub(super) async fn start_file_watcher(
                         // Deduplicate
                         pending_paths.sort();
                         pending_paths.dedup();
-                        let paths: Vec<PathBuf> = std::mem::take(&mut pending_paths);
+                        let paths: Vec<(PathBuf, WatchEventKind)> =
+                            std::mem::take(&mut pending_paths);
                         let _ = tx.send(paths).await;
                         debounce_deadline = None;
                     }
@@ -334,7 +382,7 @@ mod tests {
             callback_runner,
         ));
 
-        let (tx, _rx) = mpsc::channel::<Vec<PathBuf>>(32);
+        let (tx, _rx) = mpsc::channel::<Vec<(PathBuf, WatchEventKind)>>(32);
         let has_hot_reload = Arc::new(AtomicBool::new(true));
         let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload, false, Duration::from_millis(2500), registry));
 
@@ -371,7 +419,7 @@ mod tests {
             callback_runner,
         ));
 
-        let (tx, mut rx) = mpsc::channel::<Vec<PathBuf>>(32);
+        let (tx, mut rx) = mpsc::channel::<Vec<(PathBuf, WatchEventKind)>>(32);
         let has_hot_reload = Arc::new(AtomicBool::new(true));
         let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload, false, Duration::from_millis(2500), registry));
 
@@ -388,7 +436,7 @@ mod tests {
         ).await.expect("Timeout waiting for watcher event").expect("Channel closed");
 
         // Check if strip_prefix works
-        for p in &paths {
+        for (p, _kind) in &paths {
             let _stripped = p.strip_prefix(&tmp_dir);
         }
 
@@ -436,7 +484,7 @@ mod tests {
         let flag = AtomicBool::new(true);
 
         process_watch_events(
-            vec![version_dir.join("config.yaml")],
+            vec![(version_dir.join("config.yaml"), WatchEventKind::Create)],
             tmp.clone(),
             wm,
             registry.clone(),
@@ -474,7 +522,7 @@ mod tests {
         let flag = AtomicBool::new(true);
 
         process_watch_events(
-            vec![tmp.join("m").join("1").join("model.py")],
+            vec![(tmp.join("m").join("1").join("model.py"), WatchEventKind::Remove)],
             tmp.clone(),
             wm,
             registry.clone(),
@@ -517,7 +565,7 @@ mod tests {
         let flag = AtomicBool::new(true);
 
         process_watch_events(
-            vec![model_py],
+            vec![(model_py, WatchEventKind::Modify)],
             tmp.clone(),
             wm,
             registry.clone(),
@@ -552,7 +600,7 @@ mod tests {
         let flag = AtomicBool::new(true);
 
         process_watch_events(
-            vec![tmp.join("m").join("1").join("model.py")],
+            vec![(tmp.join("m").join("1").join("model.py"), WatchEventKind::Remove)],
             tmp.clone(),
             wm,
             registry.clone(),
@@ -586,7 +634,7 @@ mod tests {
         let registry = Arc::new(ModelRegistry::new());
         let worker_manager = build_test_worker_manager(tmp_dir.clone(), registry.clone());
 
-        let (tx, mut rx) = mpsc::channel::<Vec<PathBuf>>(32);
+        let (tx, mut rx) = mpsc::channel::<Vec<(PathBuf, WatchEventKind)>>(32);
         let has_hot_reload = Arc::new(AtomicBool::new(false));
         let handle = tokio::spawn(start_file_watcher(tmp_dir.clone(), worker_manager, tx, has_hot_reload, true, Duration::from_millis(2500), registry));
 
@@ -634,7 +682,7 @@ mod tests {
             .unwrap();
         let worker_manager = build_test_worker_manager(tmp_dir.clone(), registry.clone());
 
-        let (tx, mut rx) = mpsc::channel::<Vec<PathBuf>>(32);
+        let (tx, mut rx) = mpsc::channel::<Vec<(PathBuf, WatchEventKind)>>(32);
         let has_hot_reload = Arc::new(AtomicBool::new(false));
         let handle = tokio::spawn(start_file_watcher(
             tmp_dir.clone(), worker_manager, tx, has_hot_reload,
@@ -678,7 +726,7 @@ mod tests {
         let registry = Arc::new(ModelRegistry::new());
         let worker_manager = build_test_worker_manager(tmp_dir.clone(), registry.clone());
 
-        let (tx, mut rx) = mpsc::channel::<Vec<PathBuf>>(32);
+        let (tx, mut rx) = mpsc::channel::<Vec<(PathBuf, WatchEventKind)>>(32);
         let has_hot_reload = Arc::new(AtomicBool::new(false));
         let handle = tokio::spawn(start_file_watcher(
             tmp_dir.clone(), worker_manager, tx, has_hot_reload,
@@ -766,14 +814,16 @@ mod tests {
 
         let messages = run_capturing_logs(|| {
             let tmp = tmp.clone();
+            let version_dir = version_dir.clone();
             async move {
                 let registry = Arc::new(ModelRegistry::new());
                 let wm = build_test_worker_manager(tmp.clone(), registry.clone());
                 let trigger: Option<mpsc::Sender<()>> = None;
                 let mut last_reload = std::collections::HashMap::new();
                 let flag = AtomicBool::new(true);
+                // A directory Create event announces a genuinely new version.
                 let _ = process_watch_events(
-                    vec![tmp.join("m").join("1").join("config.yaml")],
+                    vec![(version_dir, WatchEventKind::Create)],
                     tmp.clone(),
                     wm,
                     registry.clone(),
@@ -798,6 +848,59 @@ mod tests {
         assert!(
             !messages.iter().any(|m| m.contains("auto-loading") || m.contains("Hot load failed")),
             "manual mode: no load attempt may happen; got: {:?}",
+            messages
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn manual_mode_file_edit_in_unloaded_version_does_not_warn() {
+        // Regression: editing files inside a version directory that exists
+        // but is not loaded must NOT nag with "New version ... not loading"
+        // on every save — only a directory Create event announces a new
+        // version. The "dir gone → unload" invariant is unaffected (covered
+        // by manual_mode_removed_version_unloads_directly).
+        let tmp = test_repo_dir("no-nag");
+        let version_dir = tmp.join("m").join("1");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(version_dir.join("model.py"), "x = 1\n").unwrap();
+
+        let messages = run_capturing_logs(|| {
+            let tmp = tmp.clone();
+            let version_dir = version_dir.clone();
+            async move {
+                let registry = Arc::new(ModelRegistry::new());
+                let wm = build_test_worker_manager(tmp.clone(), registry.clone());
+                let trigger: Option<mpsc::Sender<()>> = None;
+                let mut last_reload = std::collections::HashMap::new();
+                let flag = AtomicBool::new(true);
+                let _ = process_watch_events(
+                    vec![(version_dir.join("model.py"), WatchEventKind::Modify)],
+                    tmp.clone(),
+                    wm,
+                    registry.clone(),
+                    &mut last_reload,
+                    &crate::config::ServerTunables::default(),
+                    &flag,
+                    &trigger,
+                ).await;
+                assert!(
+                    registry.get("m", Some("1")).is_none(),
+                    "manual mode: a file edit must not load the version"
+                );
+            }
+        });
+
+        assert!(
+            !messages.iter().any(|m| m.contains("manual") && m.contains("Admin API")),
+            "file edit in an existing unloaded version must not warn; got: {:?}",
+            messages
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("unloaded version")),
+            "file edit in an existing unloaded version should still be traceable \
+             at debug level; got: {:?}",
             messages
         );
 
