@@ -38,6 +38,7 @@ dev = [
     "pytest-timeout>=2.0",
     "psutil>=5.9",
     "grpcio>=1.62",
+    "numpy>=1.24",
 ]
 benchmark = []
 validation = ["jsonschema>=4"]

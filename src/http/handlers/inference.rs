@@ -222,22 +222,33 @@ async fn do_infer(
     // Parse protobuf response
     match response.payload {
         Some(pb::response::Payload::Single(single)) => {
-            let data = if single.data.is_empty() {
-                json!({})
-            } else {
-                serde_json::from_slice(&single.data).unwrap_or(json!({}))
-            };
             let code = single.status.as_ref().map(|s| s.code.as_str()).unwrap_or("Ok");
             match code {
                 "Ok" => {
                     prometheus::record_request_end(&model_name, &resolved_version, status_family(single.status_code), duration);
                     // Fire InferenceResponse callback
                     crate::callback::fire_inference_response(&state.callback_runner, &req_ctx, start);
-                    let json_body = serde_json::to_string(&data).unwrap_or_default();
-                    let content_type = if single.media_type.is_empty() {
-                        "application/json; charset=utf-8"
+                    // P1 (unary binary passthrough): a non-JSON media_type
+                    // declares the payload opaque bytes — forward `data`
+                    // verbatim (no parse, no re-encode). The JSON path
+                    // (media_type empty or application/json) keeps the
+                    // parse/re-encode, byte-identical to before.
+                    let passthrough = !single.media_type.is_empty()
+                        && !single.media_type.starts_with("application/json");
+                    let (body, content_type) = if passthrough {
+                        (axum::body::Body::from(single.data), single.media_type)
+                    } else if single.data.is_empty() {
+                        (
+                            axum::body::Body::from(bytes::Bytes::from_static(b"{}")),
+                            "application/json; charset=utf-8".to_string(),
+                        )
                     } else {
-                        &single.media_type
+                        let data = serde_json::from_slice(&single.data).unwrap_or(json!({}));
+                        let json_body = serde_json::to_string(&data).unwrap_or_default();
+                        (
+                            axum::body::Body::from(json_body),
+                            "application/json; charset=utf-8".to_string(),
+                        )
                     };
                     let mut builder = Response::builder()
                         .header("content-type", content_type);
@@ -249,10 +260,18 @@ async fn do_infer(
                     }
                     let builder = inject_response_headers(builder, &single.headers);
                     builder
-                        .body(axum::body::Body::from(json_body))
+                        .body(body)
                         .map_err(|e| AppError::Internal(format!("build response: {}", e)))
                 }
                 "Error" => {
+                    // Only the error arm needs the parsed JSON value (to
+                    // extract the structured error body); the Ok arm forwards
+                    // `data` verbatim when media_type declares opaque bytes.
+                    let data = if single.data.is_empty() {
+                        json!({})
+                    } else {
+                        serde_json::from_slice(&single.data).unwrap_or(json!({}))
+                    };
                     let msg = single.status.as_ref().and_then(|s| {
                         if s.message.is_empty() { None } else { Some(s.message.clone()) }
                     }).unwrap_or_else(|| "unknown worker error".to_string());
@@ -309,6 +328,11 @@ async fn do_infer(
                 }
                 _ => {
                     prometheus::record_request_end(&model_name, &resolved_version, status_family(single.status_code), duration);
+                    let data = if single.data.is_empty() {
+                        json!({})
+                    } else {
+                        serde_json::from_slice(&single.data).unwrap_or(json!({}))
+                    };
                     let json_body = serde_json::to_string(&data).unwrap_or_default();
                     let content_type = if single.media_type.is_empty() {
                         "application/json; charset=utf-8"

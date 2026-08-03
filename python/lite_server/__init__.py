@@ -33,6 +33,7 @@ from lite_server.response import (
     RedirectResponse,
     Response,
     StreamingResponse,
+    encode_tensor,
 )
 from lite_server.server_proxy import ServerProxy
 
@@ -60,5 +61,6 @@ __all__ = [
     "FileResponse",
     "StreamingResponse",
     "BackgroundTask",
+    "encode_tensor",
     "Headers",
 ]

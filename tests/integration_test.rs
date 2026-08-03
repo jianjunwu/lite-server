@@ -151,6 +151,70 @@ class TestAPI(LitAPI):
     )
     .unwrap();
 
+    // bin_model: unary binary passthrough (P1) — encode_response declares a
+    // non-JSON media_type and returns raw bytes; the server must forward them
+    // verbatim instead of JSON-parsing (which collapses non-JSON to `{}`).
+    let bin_dir = tmp.join("bin_model/1");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::write(
+        bin_dir.join("model.py"),
+        r#"from lite_server import LitAPI
+from lite_server.response import Response
+
+
+class BinAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request
+
+    def predict(self, x):
+        return bytes(range(256))
+
+    def encode_response(self, output):
+        return Response(content=output, media_type="application/octet-stream")
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        bin_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+
+    // ord_model: multi-key JSON response. The unary JSON path re-encodes via
+    // serde_json (BTreeMap → sorted keys); byte-identity of that output is
+    // pinned by test_unary_json_response_byte_identical so the P1 passthrough
+    // change cannot silently alter the JSON path.
+    let ord_dir = tmp.join("ord_model/1");
+    std::fs::create_dir_all(&ord_dir).unwrap();
+    std::fs::write(
+        ord_dir.join("model.py"),
+        r#"from lite_server import LitAPI
+
+
+class OrdAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request
+
+    def predict(self, x):
+        return {"z": 1, "a": 2}
+
+    def encode_response(self, output):
+        return output
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        ord_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+
     // batch_model: max_batch_size=2 so concurrent requests aggregate into
     // one BatchRequest.  predict() records the aggregated batch size in each
     // item's body; encode_response() gives the "bad" item its own 400 status
@@ -6301,4 +6365,66 @@ async fn test_worker_respawn_after_health_check_kill_reuses_client() {
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["output"], 10);
+}
+
+// ---------------------------------------------------------------------------
+// P1: unary binary passthrough (media_type non-JSON → data verbatim)
+// ---------------------------------------------------------------------------
+
+/// A model that declares media_type=application/octet-stream and returns raw
+/// bytes must have those bytes forwarded verbatim. Before P1 the unary Ok
+/// path JSON-parsed every response and collapsed non-JSON payloads to `{}`.
+#[tokio::test]
+#[serial]
+async fn test_unary_binary_media_type_passthrough() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+    load_model(&base, "bin_model", "1").await;
+
+    let resp = client
+        .post(format!("{}/v2/models/bin_model/infer", base))
+        .json(&json!({"input": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .map(|v| v.to_str().unwrap_or("").to_string())
+        .unwrap_or_default();
+    assert!(
+        ct.starts_with("application/octet-stream"),
+        "content-type should be application/octet-stream, got {ct:?}"
+    );
+
+    let body = resp.bytes().await.unwrap();
+    let expected: Vec<u8> = (0u8..=255).collect();
+    assert_eq!(
+        body.as_ref(),
+        expected.as_slice(),
+        "binary payload must arrive byte-identical (0x00..0xFF)"
+    );
+}
+
+/// P1 guard: the JSON path (media_type empty) must stay byte-identical,
+/// including serde_json's sorted-key re-encode. Pins ord_model's response so
+/// the passthrough change cannot silently alter the JSON path.
+#[tokio::test]
+#[serial]
+async fn test_unary_json_response_byte_identical() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+    load_model(&base, "ord_model", "1").await;
+
+    let resp = client
+        .post(format!("{}/v2/models/ord_model/infer", base))
+        .json(&json!({"input": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    assert_eq!(text, r#"{"a":2,"z":1}"#, "JSON path must stay byte-identical");
 }

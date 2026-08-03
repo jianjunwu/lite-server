@@ -302,3 +302,35 @@ class StreamingResponse(Response):
             headers=headers or {},
             media_type=media_type,
         )
+
+
+def encode_tensor(arr) -> Response:
+    """Encode a numpy ndarray (or torch tensor) as a binary Response.
+
+    The worker wire format carries a single opaque bytes payload, so a tensor
+    goes out as raw (contiguous) bytes with shape/dtype riding in headers:
+
+      content                  = arr.tobytes()
+      media_type               = "application/octet-stream"
+      x-tensor-dtype (header)  = arr.dtype.str   (e.g. "<f4")
+      x-tensor-shape (header)  = "d1,d2,..."     (e.g. "2,3")
+
+    The client restores with::
+
+      np.frombuffer(body, dtype=np.dtype(resp.headers["x-tensor-dtype"])) \\
+        .reshape(int(d) for d in resp.headers["x-tensor-shape"].split(","))
+
+    torch tensors are accepted by duck-typing (``detach().cpu().numpy()``);
+    no numpy/torch import is required by this helper itself. Pair with the
+    server's unary binary passthrough: a non-JSON media_type forwards
+    ``content`` verbatim (P1), so no base64/JSON-text inflation is paid.
+    """
+    if hasattr(arr, "detach"):  # torch tensor (or duck-typed equivalent)
+        arr = arr.detach().cpu().numpy()
+    dtype = arr.dtype.str
+    shape = ",".join(str(d) for d in arr.shape)
+    return Response(
+        content=arr.tobytes(),
+        media_type="application/octet-stream",
+        headers={"x-tensor-dtype": dtype, "x-tensor-shape": shape},
+    )

@@ -10,6 +10,7 @@ from lite_server.response import (
     RedirectResponse,
     FileResponse,
     StreamingResponse,
+    encode_tensor,
     _render_cookie,
     _delete_cookie_header,
 )
@@ -331,3 +332,76 @@ class TestStreamingResponse:
             yield "data"
         r = StreamingResponse(content=gen(), headers={"x-stream": "1"})
         assert r.headers["x-stream"] == "1"
+
+
+# ============================================================================
+# encode_tensor (P2: binary tensor payloads for embedding/image/TTS workloads)
+# ============================================================================
+
+class TestEncodeTensor:
+    """Contract: raw bytes body + shape/dtype headers + octet-stream media."""
+
+    def test_float32_1d_roundtrip(self):
+        np = pytest.importorskip("numpy")
+        arr = np.array([1.5, -2.25, 3e10], dtype=np.float32)
+        resp = encode_tensor(arr)
+        assert resp.media_type == "application/octet-stream"
+        assert resp.headers["x-tensor-dtype"] == "<f4"
+        assert resp.headers["x-tensor-shape"] == "3"
+        assert resp.content == arr.tobytes()
+        restored = np.frombuffer(resp.content, dtype=np.float32)
+        np.testing.assert_array_equal(restored, arr)
+
+    def test_2d_shape_and_dtype_headers(self):
+        np = pytest.importorskip("numpy")
+        arr = np.arange(6, dtype=np.float64).reshape(2, 3)
+        resp = encode_tensor(arr)
+        assert resp.headers["x-tensor-shape"] == "2,3"
+        assert resp.headers["x-tensor-dtype"] == "<f8"
+        restored = np.frombuffer(resp.content, dtype=np.float64).reshape(2, 3)
+        np.testing.assert_array_equal(restored, arr)
+
+    def test_float16_width_preserved(self):
+        np = pytest.importorskip("numpy")
+        arr = np.array([1.5, -1.0, 0.0], dtype=np.float16)
+        resp = encode_tensor(arr)
+        assert resp.headers["x-tensor-dtype"] == "<f2"
+        assert len(resp.content) == 6  # 3 elements × 2 bytes each
+        restored = np.frombuffer(resp.content, dtype=np.float16)
+        np.testing.assert_array_equal(restored, arr)
+
+    def test_int64_2d(self):
+        np = pytest.importorskip("numpy")
+        arr = np.array([[1, -2], [3, 4]], dtype=np.int64)
+        resp = encode_tensor(arr)
+        assert resp.headers["x-tensor-dtype"] == "<i8"
+        restored = np.frombuffer(resp.content, dtype=np.int64).reshape(2, 2)
+        np.testing.assert_array_equal(restored, arr)
+
+    def test_non_contiguous_slice(self):
+        np = pytest.importorskip("numpy")
+        arr = np.arange(10, dtype=np.float32)[::2]  # strided view
+        resp = encode_tensor(arr)
+        restored = np.frombuffer(resp.content, dtype=np.float32)
+        np.testing.assert_array_equal(restored, arr)
+
+    def test_torch_tensor_ducktyped(self):
+        np = pytest.importorskip("numpy")
+        arr = np.array([1.0, 2.0], dtype=np.float32)
+
+        class FakeTensor:
+            """Duck-typed torch tensor: detach().cpu().numpy() only."""
+
+            def detach(self):
+                return self
+
+            def cpu(self):
+                return self
+
+            def numpy(self):
+                return arr
+
+        resp = encode_tensor(FakeTensor())
+        assert resp.headers["x-tensor-dtype"] == "<f4"
+        assert resp.headers["x-tensor-shape"] == "2"
+        assert resp.content == arr.tobytes()
