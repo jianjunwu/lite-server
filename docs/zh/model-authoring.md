@@ -351,8 +351,11 @@ class AuditLogger(Callback):
 
 ### 内置类：JsonSchemaValidator（Schema 校验）
 
-`lite_server.callbacks.JsonSchemaValidator` 对解码后的请求（`on_input`）
-和模型输出（`on_output`）做 JSON Schema 校验 — 纯声明式，模型代码零改动：
+`lite_server.callbacks.JsonSchemaValidator` 对请求体（`on_request`，
+`decode_request` 之前）和响应体（`on_response`，`encode_response` 之后）
+做 JSON Schema 校验 — 纯声明式，模型代码零改动。两个 schema 描述的都是
+**线上载荷**（客户端发来的 / 客户端收到的）：非法请求在 400 拒绝，
+任何模型代码（含 decode）都不会看到它：
 
 ```yaml
 # config.yaml — 需要 `pip install lite-server[validation]`
@@ -378,11 +381,12 @@ callbacks:
   靠 `ctx.mode` 跳过。
 - **跳过规则**：schema 顶层为 `object`/`array` 时，非 JSON 载荷（纯文本 /
   bytes / tensor）不校验；但**顶层标量 schema**（如 `type: string`）会正常
-  校验值本身（decode 出的 `None` 会报 `None is not of type 'string'`）。
+  校验值本身（JSON `null` 请求体报 `None is not of type 'string'`）。
   未配置 `input_schema`/`output_schema` 的对应方向不校验。batch 模式按
   item 独立校验。
-- **边界**：模型同时有 `@route` 和全局 validator 会在加载时被拒绝 —
-  不要在路由模型上挂全局 validator。
+- **Custom route**：validator 在路由上同样可用 — `on_request` 在路由
+  handler 之前执行，`input_schema` 以同样方式拒绝非法路由请求体；
+  `output_schema` 在路由上跳过（仅 unary/batch）。
 
 ### 策略（Policies）
 

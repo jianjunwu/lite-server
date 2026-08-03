@@ -33,12 +33,18 @@ except ImportError:  # pragma: no cover - only hit without the extra
 
 
 class JsonSchemaValidator(Callback):
-    """Validate request input / model output against JSON Schemas.
+    """Validate the request body / response body against JSON Schemas.
 
-    - ``on_input`` validates the decoded payload (``ctx.input``).
-    - ``on_output`` validates ``ctx.output`` for **unary/batch only** —
-      streaming chunks are partial JSON and never match a full schema, so
-      they are skipped via ``ctx.mode``.
+    Both schemas describe the **wire payload** — what the client sends and
+    what the client receives — not the model's internal shapes:
+
+    - ``input_schema`` validates ``ctx.request`` in ``on_request``, before
+      ``decode_request`` runs: an invalid request is rejected with 400 and
+      no model code (decode included) ever sees it.
+    - ``output_schema`` validates ``ctx.response`` in ``on_response``, after
+      ``encode_response``, for **unary/batch only** — streaming chunks are
+      partial JSON and never match a full schema, so they are skipped via
+      ``ctx.mode``.
 
     On failure raises a structured ``BadRequestError`` (400) carrying the
     single best-match error: ``param`` is the JSON Pointer to the failing
@@ -81,13 +87,13 @@ class JsonSchemaValidator(Callback):
         param = f"body{pointer}" if pointer else "body"
         raise BadRequestError(best.message, param=param)
 
-    def on_input(self, ctx: RequestContext) -> None:
+    def on_request(self, ctx: RequestContext) -> None:
         if self._input_validator is not None:
-            self._reject(ctx.input, self._input_validator)
+            self._reject(ctx.request, self._input_validator)
 
-    def on_output(self, ctx: RequestContext) -> None:
+    def on_response(self, ctx: RequestContext) -> None:
         if self._output_validator is None:
             return
         if ctx.mode not in ("unary", "batch"):
             return  # stream/bidi/decoupled/cb chunks aren't validated
-        self._reject(ctx.output, self._output_validator)
+        self._reject(ctx.response, self._output_validator)

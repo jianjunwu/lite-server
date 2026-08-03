@@ -28,7 +28,8 @@ class CallbacksDemoAPI(LitAPI):
 
     def decode_request(self, request, ctx: RequestContext | None = None):
         # Pass the full request body through: the JsonSchemaValidator in
-        # config.yaml validates the whole object (ctx.input) before predict.
+        # config.yaml already validated it (ctx.request, in on_request) —
+        # decode and predict never see an invalid payload.
         return request
 
     def predict(self, x, ctx: RequestContext | None = None):

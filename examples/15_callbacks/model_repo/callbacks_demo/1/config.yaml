@@ -12,11 +12,11 @@ callbacks:
   - callbacks.RequestTimer
   - callbacks.SimpleCache
   # Built-in schema validation (needs `pip install lite-server[validation]`):
-  # validates the decoded input (ctx.input = the full request body here) —
-  # the model's predict() never runs on an invalid payload. The schema
-  # demonstrates: required vs optional fields, bounded numbers, a field that
-  # is required but may be null, lists of objects with enums, and rejection
-  # of unknown fields.
+  # validates the request body (ctx.request) in on_request, before
+  # decode_request runs — no model code (decode or predict) ever sees an
+  # invalid payload. The schema demonstrates: required vs optional fields,
+  # bounded numbers, a field that is required but may be null, lists of
+  # objects with enums, and rejection of unknown fields.
   - lite_server.callbacks.JsonSchemaValidator:
       input_schema:
         type: object

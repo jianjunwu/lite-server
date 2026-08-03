@@ -22,7 +22,7 @@ on_request → decode_request → on_input → predict
 | `ApiKeyAuth` | `on_request` | 拒绝请求：抛 `UnauthorizedError` → 401 |
 | `RequestTimer` | `on_request`、`on_response` | 用 `ctx.state` 存每请求状态（并发安全） |
 | `SimpleCache` | `on_request`、`on_output` | `ctx.respond(...)` 短路早返、自定义响应头 |
-| `JsonSchemaValidator`（内置） | `on_input` | config.yaml 声明式 schema 校验，零 Python 代码（需 `pip install lite-server[validation]`） |
+| `JsonSchemaValidator`（内置） | `on_request`, `on_response` | config.yaml 声明式 schema 校验，零 Python 代码（需 `pip install lite-server[validation]`） |
 | `ErrorMetrics` | `on_error` | 异常隔离的错误钩子 |
 | `LifecycleTracer` | setup/teardown | `on_before_setup` / `on_after_setup` / `on_teardown` |
 

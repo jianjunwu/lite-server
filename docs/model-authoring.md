@@ -338,9 +338,12 @@ class AuditLogger(Callback):
 
 ### Built-in: JsonSchemaValidator (Schema Validation)
 
-`lite_server.callbacks.JsonSchemaValidator` validates the decoded request
-(`on_input`) and the model output (`on_output`) against JSON Schemas —
-declarative, no model-code changes:
+`lite_server.callbacks.JsonSchemaValidator` validates the request body
+(`on_request`, before `decode_request`) and the response body (`on_response`,
+after `encode_response`) against JSON Schemas — declarative, no model-code
+changes. Both schemas describe the **wire payload** (what the client sends /
+receives), so an invalid request is rejected with 400 before any model code
+(decode included) runs:
 
 ```yaml
 # config.yaml — requires `pip install lite-server[validation]`
@@ -369,11 +372,12 @@ callbacks:
 - **Skipped payloads**: when the top-level schema is `object`/`array`,
   non-JSON values (plain text / bytes / tensors) are left untouched — but a
   scalar top-level schema (e.g. `type: string`) validates the value itself
-  (a decoded `None` from a missing field fails as `None is not of type
-  'string'`). No `input_schema`/`output_schema` → that direction is not
-  validated. In batch mode each item is validated independently.
-- **Border**: a model with both `@route` and a global validator is rejected
-  at load time — don't attach route models to a global validator.
+  (a JSON `null` body fails as `None is not of type 'string'`). No
+  `input_schema`/`output_schema` → that direction is not validated. In
+  batch mode each item is validated independently.
+- **Custom routes**: the validator works there too — `on_request` runs
+  before the route handler, so `input_schema` rejects an invalid route body
+  the same way; `output_schema` is skipped on routes (only unary/batch).
 
 ### Policies
 

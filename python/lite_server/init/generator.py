@@ -180,8 +180,9 @@ CONFIG_YAML_EXAMPLE = textwrap.dedent("""\
     # (pre-0.7 function-style signatures are rejected).
     #
     # Built-in class: lite_server.callbacks.JsonSchemaValidator validates the
-    # decoded request (on_input) and model output (on_output; unary/batch only)
-    # against JSON Schemas — needs `pip install lite-server[validation]`.
+    # request body (on_request, before decode_request) and response body
+    # (on_response; unary/batch only) against JSON Schemas — needs
+    # `pip install lite-server[validation]`.
     #
     # Hooks beyond the data chain (on_request/on_input/on_output/on_response):
     #   on_stream_close(ctx, reason)       # stream end: "done"|"error"|"cancel";

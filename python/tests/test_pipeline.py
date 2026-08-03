@@ -13,6 +13,7 @@ import pytest
 from lite_server.api import LitAPI
 from lite_server.callbacks import (
     Callback,
+    JsonSchemaValidator,
 )
 from lite_server.context import RequestContext, RequestMeta, Headers
 from lite_server.exceptions import BadRequestError, HTTPException
@@ -1325,6 +1326,86 @@ class TestForRoute:
 class DummyLitAPI(LitAPI):
     def predict(self, x):
         return x
+
+
+# ---------------------------------------------------------------------------
+# JsonSchemaValidator hook placement: on_request (input_schema) / on_response
+# (output_schema) — schema validation runs on the wire payload, before any
+# model code on the input side and after encode on the output side.
+# ---------------------------------------------------------------------------
+
+
+class TestJsonSchemaValidatorHooks:
+    @pytest.mark.asyncio
+    async def test_input_rejected_before_decode_and_predict(self):
+        calls = []
+
+        class Guarded(EchoAPI):
+            def decode_request(self, request):
+                calls.append("decode")
+                return request
+
+            def predict(self, x):
+                calls.append("predict")
+                return x
+
+        v = JsonSchemaValidator(input_schema={
+            "type": "object",
+            "required": ["sessionId"],
+            "properties": {"sessionId": {"type": "string", "minLength": 1}},
+        })
+        pipe = Pipeline.build(Guarded(), [v])
+        with pytest.raises(BadRequestError) as ei:
+            await pipe.run_single(json.dumps({"unitName": "x"}).encode(), _make_meta())
+        assert ei.value.status_code == 400
+        assert calls == []  # decode_request 与 predict 都未运行
+
+    @pytest.mark.asyncio
+    async def test_output_rejected_after_encode_response(self):
+        calls = []
+
+        class Model(EchoAPI):
+            def predict(self, x):
+                return {"wrong": 1}
+
+            def encode_response(self, output):
+                calls.append("encode")
+                return output
+
+        v = JsonSchemaValidator(output_schema={
+            "type": "object",
+            "required": ["text"],
+        })
+        pipe = Pipeline.build(Model(), [v])
+        with pytest.raises(BadRequestError):
+            await pipe.run_single(json.dumps({"x": 1}).encode(), _make_meta())
+        assert calls == ["encode"]  # on_response 在 encode_response 之后校验
+
+    def test_for_route_accepts_json_schema_validator(self):
+        v = JsonSchemaValidator(input_schema={
+            "type": "object",
+            "required": ["sessionId"],
+        })
+        pipe = Pipeline.for_route([v])
+        assert len(pipe.callbacks) == 1
+
+    @pytest.mark.asyncio
+    async def test_route_input_rejected_before_handler(self):
+        v = JsonSchemaValidator(input_schema={
+            "type": "object",
+            "required": ["sessionId"],
+        })
+        pipe = Pipeline.for_route([v])
+        ctx = RequestContext(meta=_make_route_meta(), request={"unitName": "x"})
+        called = False
+
+        async def handler(ctx_arg):
+            nonlocal called
+            called = True
+
+        with pytest.raises(BadRequestError):
+            await pipe.run_route(ctx, handler)
+        assert not called
 
 
 class TestRunRoute:

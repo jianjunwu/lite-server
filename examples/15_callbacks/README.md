@@ -22,7 +22,7 @@ This example registers five callbacks plus one built-in class — see `model_rep
 | `ApiKeyAuth` | `on_request` | Rejecting a request: raise `UnauthorizedError` → 401 |
 | `RequestTimer` | `on_request`, `on_response` | Per-request state in `ctx.state` (concurrency-safe) |
 | `SimpleCache` | `on_request`, `on_output` | Early return via `ctx.respond(...)`, custom response headers |
-| `JsonSchemaValidator` (built-in) | `on_input` | Declarative schema validation from config.yaml — no Python code (needs `pip install lite-server[validation]`) |
+| `JsonSchemaValidator` (built-in) | `on_request`, `on_response` | Declarative schema validation from config.yaml — no Python code (needs `pip install lite-server[validation]`) |
 | `ErrorMetrics` | `on_error` | The exception-isolated error hook |
 | `LifecycleTracer` | setup/teardown | `on_before_setup` / `on_after_setup` / `on_teardown` |
 
