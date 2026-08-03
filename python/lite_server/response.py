@@ -318,15 +318,24 @@ def encode_tensor(arr) -> Response:
     The client restores with::
 
       np.frombuffer(body, dtype=np.dtype(resp.headers["x-tensor-dtype"])) \\
-        .reshape(int(d) for d in resp.headers["x-tensor-shape"].split(","))
+        .reshape(tuple(int(d) for d in resp.headers["x-tensor-shape"].split(",")))
 
     torch tensors are accepted by duck-typing (``detach().cpu().numpy()``);
     no numpy/torch import is required by this helper itself. Pair with the
     server's unary binary passthrough: a non-JSON media_type forwards
     ``content`` verbatim (P1), so no base64/JSON-text inflation is paid.
+
+    Raises ``ValueError`` for 0-d tensors: the comma-separated shape header
+    cannot express an empty shape, so ``reshape`` the array to ``(1,)``
+    first.
     """
     if hasattr(arr, "detach"):  # torch tensor (or duck-typed equivalent)
         arr = arr.detach().cpu().numpy()
+    if not arr.shape:
+        raise ValueError(
+            "encode_tensor: 0-d tensors (shape ()) have no dims to carry in "
+            "the x-tensor-shape header; reshape to (1,) before encoding"
+        )
     dtype = arr.dtype.str
     shape = ",".join(str(d) for d in arr.shape)
     return Response(

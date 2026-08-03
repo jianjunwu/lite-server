@@ -385,6 +385,25 @@ class TestEncodeTensor:
         restored = np.frombuffer(resp.content, dtype=np.float32)
         np.testing.assert_array_equal(restored, arr)
 
+    def test_documented_client_restore_code_roundtrips(self):
+        """The restore snippet in encode_tensor's docstring is the client-side
+        contract — pasting it verbatim must decode an ordinary tensor."""
+        np = pytest.importorskip("numpy")
+        arr = np.arange(6, dtype=np.float32).reshape(2, 3)
+        resp = encode_tensor(arr)
+        # Exact client code from the encode_tensor docstring:
+        restored = np.frombuffer(resp.content, dtype=np.dtype(resp.headers["x-tensor-dtype"])) \
+            .reshape(tuple(int(d) for d in resp.headers["x-tensor-shape"].split(",")))
+        np.testing.assert_array_equal(restored, arr)
+
+    def test_zero_dimensional_tensor_rejected(self):
+        """A 0-d tensor (shape ()) has no dims to carry in the comma-separated
+        shape header — reject loudly with guidance instead of emitting a
+        response the client cannot decode."""
+        np = pytest.importorskip("numpy")
+        with pytest.raises(ValueError, match=r"0-d.*reshape"):
+            encode_tensor(np.array(2.5, dtype=np.float32))
+
     def test_torch_tensor_ducktyped(self):
         np = pytest.importorskip("numpy")
         arr = np.array([1.0, 2.0], dtype=np.float32)
