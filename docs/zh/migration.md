@@ -17,6 +17,7 @@
 | M6 | P-TRACE | `telemetry.protocol: http` 启动 fail-fast；入站 baggage 默认丢弃 |
 | M7 | P-WARM | `policies.warmup.dummy_input_ref`/`iterations` 已移除 → `samples` 列表（配置加载失败） |
 | M8 | 0.8.0 | `features.*` 开关现已生效；移除 3 个预留字段；`custom_metrics` 改为显式开启 |
+| M9 | 0.8.0 | Callback 生命周期钩子改名（`on_*` → 位置化 `before_*`/`after_*`）；鸭子类型 `pre_setup` 已删除 |
 
 无 breaking 的阶段（无需动作）：P-MW、P-ENSEMBLE-GRPC、P-FLOW、P-DEADLINE、
 P-WARM（纯新增，默认值保持旧行为）。P-OAI 延后至 0.9（不在本版本范围内）。
@@ -193,4 +194,33 @@ policies:
 - `custom_metrics` 现为**显式开启**（默认 `false`）：仅当为 `true` 时才注册 worker 声明的自定义指标。此前总是注册；若你的 worker 声明了指标，请设置 `custom_metrics: true`。
 
 **迁移：** 除非你依赖自定义指标（设 `features.custom_metrics: true`），或依赖某个流式路由在开关为 `false` 时仍被挂载（把对应开关设为 `true`），否则无需动作。
+
+## M9 — Callback 生命周期钩子改名；`pre_setup` 已删除（0.8.0）
+
+**变更内容：** 三个 Callback 生命周期钩子改为位置化 `before_*`/`after_*` 命名，并新增第四个：
+
+| 旧（0.7） | 新（0.8） | 触发位置 |
+|---|---|---|
+| `on_before_setup(config, device)` | `before_setup(config, device)` | `LitAPI.setup()` 之前 |
+| `on_after_setup(lit_api)` | `after_setup(lit_api)` | `setup()` 成功之后 |
+| `on_teardown(lit_api)` | `before_teardown(lit_api)` | `LitAPI.teardown()` 之前 |
+| — | `after_teardown(lit_api)` | `teardown()` 成功之后（新增；teardown 抛异常时不触发） |
+
+命名规则就此统一：阶段包装器用 `before_X`/`after_X`，事件处理器保留 `on_*`
+（`on_error`、`on_stream_close`）。仍定义旧名的回调会在**加载时报
+`RuntimeError`**，错误信息给出确切的新名字——不会静默失效。
+
+两项相关变更：
+
+- `LitAPI` 上未文档化的鸭子类型 `pre_setup()` 调用被**静默删除**（无加载时报错）：
+  定义了 `pre_setup` 的模型升级后它根本不会被调用（其位置与受支持的
+  `before_setup` 重叠）。请把 `pre_setup` 逻辑迁入 `setup()` 或 `before_setup` 回调。
+- `LitAPI.teardown()` 与 `before_teardown`/`after_teardown` 回调现在在生产中
+  **真正执行**（此前 worker 一律被 SIGKILL,Python 侧从无机会运行）：卸载/重载/
+  驱逐/优雅关闭时 worker 会收到 stop 消息，并有 `worker_kill_timeout` 时长完成
+  teardown，超时才回退 SIGKILL。完整触发矩阵见 model-authoring.md 的
+  `teardown()` 章节。
+
+**迁移：** 按上表改名三个钩子；把 `pre_setup` 逻辑迁入 `setup()` 或
+`before_setup` 回调。
 

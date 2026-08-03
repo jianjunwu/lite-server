@@ -248,6 +248,16 @@ def teardown(self):
     torch.cuda.empty_cache()
 ```
 
+自 0.8.0 起该方法在生产中真正执行：模型卸载、重载、LRU 驱逐与服务器优雅
+关闭（SIGTERM/SIGINT）时，服务端向 worker 发送 stop 消息，worker 在退出前
+运行 `teardown()`（位于 `before_teardown` / `after_teardown` 回调之间）。
+它必须在 `worker_kill_timeout`（默认 10 秒）内完成——超时的 worker 会在
+teardown 中途被 SIGKILL。
+
+以下路径**不会**执行 `teardown()`：worker 被直接杀死的情形——崩溃/OOM、
+健康检查击杀 + respawn、服务器自身死亡（worker 的父进程看门狗经
+`os._exit` 硬退出）。切勿把不可丢失的持久化逻辑放在这里。
+
 ## Callbacks 回调系统
 
 Callbacks 是一种**可组合的、声明式的**拦截推理请求生命周期的方式。与内联的 `before_decode_request`/`after_encode_response` 钩子不同，Callbacks 是独立的类，可以被复用、共享并跨模型组合。

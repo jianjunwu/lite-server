@@ -19,6 +19,7 @@ config shapes and logs `warn` lines pointing at the M-entries below
 | M6 | P-TRACE | `telemetry.protocol: http` fails at startup; inbound baggage dropped by default |
 | M7 | P-WARM | `policies.warmup.dummy_input_ref`/`iterations` removed → `samples` list (config fails to load) |
 | M8 | 0.8.0 | `features.*` toggles now enforced; 3 reserved fields removed; `custom_metrics` now opt-in |
+| M9 | 0.8.0 | Callback lifecycle hooks renamed (`on_*` → positional `before_*`/`after_*`); duck-typed `pre_setup` removed |
 
 Non-breaking phases (no action needed): P-MW, P-ENSEMBLE-GRPC, P-FLOW, P-DEADLINE,
 P-WARM (pure additions; defaults preserve prior behavior). P-OAI is deferred to 0.9
@@ -231,4 +232,37 @@ policies:
 **Migrate:** no action required unless you relied on custom metrics (set
 `features.custom_metrics: true`) or on a streaming route being mounted while its
 toggle was `false` (set the relevant toggle to `true`).
+
+## M9 — Callback lifecycle hooks renamed; `pre_setup` removed (0.8.0)
+
+**What changed:** the three Callback lifecycle hooks were renamed to positional
+`before_*`/`after_*` names, and a fourth was added:
+
+| old (0.7) | new (0.8) | position |
+|---|---|---|
+| `on_before_setup(config, device)` | `before_setup(config, device)` | before `LitAPI.setup()` |
+| `on_after_setup(lit_api)` | `after_setup(lit_api)` | after `setup()` succeeds |
+| `on_teardown(lit_api)` | `before_teardown(lit_api)` | before `LitAPI.teardown()` |
+| — | `after_teardown(lit_api)` | after `teardown()` succeeds (new; skipped when teardown raises) |
+
+The naming rule is now consistent: stage wrappers use `before_X`/`after_X`;
+event handlers keep `on_*` (`on_error`, `on_stream_close`). A callback that
+still defines an old name fails at load time with a `RuntimeError` naming the
+exact rename — nothing silently stops running.
+
+Two related changes:
+
+- The undocumented duck-typed `pre_setup()` call on `LitAPI` was **removed
+  without a load-time error**: a model defining `pre_setup` simply never has it
+  called (it overlapped with `before_setup`, the supported position). Move any
+  `pre_setup` logic into `setup()` or a `before_setup` callback.
+- `LitAPI.teardown()` and the `before_teardown`/`after_teardown` callbacks now
+  actually run in production (previously workers were always SIGKILLed before
+  Python could run them): on unload/reload/eviction/graceful shutdown the
+  worker gets a stop message and `worker_kill_timeout` to finish teardown
+  before the SIGKILL fallback. See model-authoring.md `teardown()` for the
+  full trigger matrix.
+
+**Migrate:** rename the three hooks per the table; move `pre_setup` logic into
+`setup()` or a `before_setup` callback.
 

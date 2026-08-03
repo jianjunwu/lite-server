@@ -270,7 +270,8 @@ ejection_max_percent: 50       # 同时最多剔除的 worker 比例（1-100）
 startup_timeout: 60.0          # 等待 worker "ready" 握手的最大秒数
 health_check_timeout: 5.0      # 单次健康探测超时秒数
 health_check_kill_threshold: 0 # [实验性] 连续探测失败达到此次数后杀死并重启 worker（0 = 从不）；respawn 有已知缺陷（inference-queue 客户端快照变孤儿、死 slot 卫生），0.9 修复
-worker_kill_timeout: 10.0      # 杀死 worker 后等待 OS 回收的秒数
+worker_kill_timeout: 10.0      # 优雅停止预算：卸载/关闭时 worker 收到 stop 消息后须在此秒数内
+                               # 运行完 teardown() 并退出，否则被 SIGKILL；兼作杀死后等待 OS 回收的秒数
 
 # Worker 生命周期钩子
 hooks:
@@ -423,7 +424,7 @@ lite-server serve [参数]
 | `--startup-timeout` | worker ready 握手超时（秒） | `model_defaults.startup_timeout` |
 | `--health-check-timeout` | 健康探测超时（秒） | `model_defaults.health_check_timeout` |
 | `--health-check-kill-threshold` | 连续探测失败 N 次后杀死并重启 worker（0=禁用） | `model_defaults.health_check_kill_threshold` |
-| `--worker-kill-timeout` | 杀死后等待 OS 回收（秒） | `model_defaults.worker_kill_timeout` |
+| `--worker-kill-timeout` | 优雅停止/teardown 预算，超时 SIGKILL；兼作杀死后 OS 回收等待（秒） | `model_defaults.worker_kill_timeout` |
 | `--hook-http-timeout` | 生命周期 HTTP 钩子超时（秒） | `model_defaults.hook_http_timeout` |
 
 ## 优先级

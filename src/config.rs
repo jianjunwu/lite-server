@@ -1054,7 +1054,9 @@ pub struct ModelConfig {
     /// Consecutive health-probe failures before killing + respawning the
     /// worker. 0 = never kill (ejection-only). Requires health_check_interval > 0.
     pub health_check_kill_threshold: usize,
-    /// Seconds to wait for the OS to reap a killed worker process.
+    /// Graceful-stop budget: seconds a worker may take to finish teardown and
+    /// exit after the stop message before SIGKILL; also the OS reap wait after
+    /// the kill.
     pub worker_kill_timeout: f32,
     /// P-FLOW B1 (§4.0.9): max seconds a request may wait in the queue before
     /// `queue_timeout_action` applies. 0 = disabled (default).

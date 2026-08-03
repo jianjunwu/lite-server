@@ -220,6 +220,18 @@ def teardown(self):
     torch.cuda.empty_cache()
 ```
 
+Since 0.8.0 this actually runs in production: on model unload, reload, LRU
+eviction and graceful server shutdown (SIGTERM/SIGINT) the server sends the
+worker a stop message, and the worker runs `teardown()` — between the
+`before_teardown` / `after_teardown` callbacks — before exiting. It must
+complete within `worker_kill_timeout` (default 10s): a worker that overruns is
+SIGKILLed mid-teardown.
+
+`teardown()` does **not** run when the worker is killed outright: crash/OOM,
+health-check kill + respawn, or the server itself dying (the worker's
+parent-watchdog hard-exits via `os._exit`). Never put must-not-lose
+persistence here.
+
 ## Callbacks
 
 Callbacks are a **composable, declarative** way to intercept the inference request lifecycle. Unlike inline `before_decode_request`/`after_encode_response` hooks, Callbacks are standalone classes that can be reused, shared, and combined across models.

@@ -128,7 +128,9 @@ enum Commands {
         #[arg(long)]
         health_check_kill_threshold: Option<usize>,
 
-        /// Seconds to wait for the OS to reap a killed worker (overrides model config)
+        /// Graceful-stop budget: seconds a worker may take to finish teardown
+        /// and exit after the stop message before SIGKILL; also the OS reap
+        /// wait after the kill (overrides model config)
         #[arg(long)]
         worker_kill_timeout: Option<f32>,
 

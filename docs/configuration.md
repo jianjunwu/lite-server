@@ -278,7 +278,9 @@ ejection_max_percent: 50       # Max % of workers ejectable at once (1-100)
 startup_timeout: 60.0          # Max seconds to wait for a worker "ready" handshake
 health_check_timeout: 5.0      # Seconds per health-check probe before timing out
 health_check_kill_threshold: 0 # probe failures before kill+respawn (0=disabled); on reaching it the worker is killed and respawned, reusing its bound ZMQ socket
-worker_kill_timeout: 10.0      # Seconds to wait for the OS to reap a killed worker
+worker_kill_timeout: 10.0      # Graceful-stop budget: on unload/shutdown the worker receives a
+                               # stop message and has this long to run teardown() and exit before
+                               # SIGKILL; also the OS reap wait after the kill
 
 # Worker Lifecycle Hooks
 hooks:
@@ -440,7 +442,7 @@ lite-server serve [flags]
 | `--startup-timeout` | Worker ready-handshake timeout (s) | `model_defaults.startup_timeout` |
 | `--health-check-timeout` | Health probe timeout (s) | `model_defaults.health_check_timeout` |
 | `--health-check-kill-threshold` | Probe failures before kill + respawn (0=disable) | `model_defaults.health_check_kill_threshold` |
-| `--worker-kill-timeout` | OS reap wait after kill (s) | `model_defaults.worker_kill_timeout` |
+| `--worker-kill-timeout` | Graceful-stop/teardown budget before SIGKILL; also OS reap wait after kill (s) | `model_defaults.worker_kill_timeout` |
 | `--hook-http-timeout` | Lifecycle HTTP hook timeout (s) | `model_defaults.hook_http_timeout` |
 
 ## Precedence
