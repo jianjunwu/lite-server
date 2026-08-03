@@ -13,7 +13,10 @@ use tracing::{debug, error, info, warn};
 ///
 /// Only ``Create`` carries lifecycle signal — a directory appearing in the
 /// repo announces a new version; ``Modify``/``Remove``/``Other`` inside an
-/// existing directory are ordinary file churn.
+/// existing directory are ordinary file churn. Renames count as
+/// ``Create``: moving a directory into the repo (the atomic-deploy
+/// pattern) is reported by notify as ``Modify(Name(..))`` — IN_MOVED_TO
+/// on Linux, ItemRenamed under FSEvents — not as ``Create``.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(super) enum WatchEventKind {
     Create,
@@ -26,6 +29,7 @@ impl From<notify::EventKind> for WatchEventKind {
     fn from(kind: notify::EventKind) -> Self {
         match kind {
             notify::EventKind::Create(_) => WatchEventKind::Create,
+            notify::EventKind::Modify(notify::event::ModifyKind::Name(_)) => WatchEventKind::Create,
             notify::EventKind::Modify(_) => WatchEventKind::Modify,
             notify::EventKind::Remove(_) => WatchEventKind::Remove,
             _ => WatchEventKind::Other,
@@ -110,10 +114,12 @@ pub(super) async fn process_watch_events(
                         // when files are written inside) carry no signal.
                         if !is_live {
                             lifecycle_candidates.insert(key.clone());
-                            // Only a directory Create announces a genuinely
-                            // new version; mtime/attr churn on an existing
-                            // directory does not.
-                            if kind == WatchEventKind::Create {
+                            // Only the creation of the version dir itself
+                            // (components = [model, version]) announces a
+                            // genuinely new version; Creates of nested
+                            // subdirs and mtime/attr churn on an existing
+                            // directory do not.
+                            if kind == WatchEventKind::Create && components.len() == 2 {
                                 new_version_candidates.insert(key);
                             }
                         }
@@ -901,6 +907,161 @@ mod tests {
             messages.iter().any(|m| m.contains("unloaded version")),
             "file edit in an existing unloaded version should still be traceable \
              at debug level; got: {:?}",
+            messages
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ===== /audit 604c558: two confirmed defects (tests must FAIL on current code) =====
+
+    #[test]
+    fn audit_manual_mode_version_dir_moved_into_repo_warns_new_version() {
+        // 数据/范围假设: a new version directory deployed by rename/move
+        // (the standard atomic-deploy pattern, e.g. `mv staging repo/m/2`
+        // on the same filesystem) is delivered by notify as
+        // EventKind::Modify(ModifyKind::Name(RenameMode::To)) — IN_MOVED_TO
+        // on Linux, ItemRenamed under FSEvents — NOT EventKind::Create.
+        // Collapsing every Modify subkind into plain WatchEventKind::Modify
+        // loses the "a directory appeared" signal: manual mode then never
+        // warns that the new version is not loaded. Pre-604c558, ANY event
+        // on an unknown existing version dir produced the WARN, so this is
+        // a regression of the new-version notification for move-deploys.
+        let tmp = test_repo_dir("audit-rename-in");
+        let version_dir = tmp.join("m").join("2");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(version_dir.join("model.py"), "x = 1\n").unwrap();
+
+        let messages = run_capturing_logs(|| {
+            let tmp = tmp.clone();
+            let version_dir = version_dir.clone();
+            async move {
+                let registry = Arc::new(ModelRegistry::new());
+                let wm = build_test_worker_manager(tmp.clone(), registry.clone());
+                let trigger: Option<mpsc::Sender<()>> = None;
+                let mut last_reload = std::collections::HashMap::new();
+                let flag = AtomicBool::new(true);
+                // What notify actually delivers for a dir moved INTO the repo.
+                let kind = WatchEventKind::from(notify::EventKind::Modify(
+                    notify::event::ModifyKind::Name(notify::event::RenameMode::To),
+                ));
+                let _ = process_watch_events(
+                    vec![(version_dir, kind)],
+                    tmp.clone(),
+                    wm,
+                    registry.clone(),
+                    &mut last_reload,
+                    &crate::config::ServerTunables::default(),
+                    &flag,
+                    &trigger,
+                ).await;
+                assert!(
+                    registry.get("m", Some("2")).is_none(),
+                    "manual mode: a moved-in version must not be auto-loaded"
+                );
+            }
+        });
+
+        assert!(
+            messages.iter().any(|m| m.contains("manual") && m.contains("Admin API")),
+            "a version dir appearing via rename/move must warn like a dir Create; got: {:?}",
+            messages
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn audit_manual_mode_subdir_create_inside_unloaded_version_does_not_warn() {
+        // 范围假设: creating a SUBDIRECTORY inside an existing, unloaded
+        // version dir (e.g. `mkdir repo/m/1/checkpoints`) delivers a Create
+        // event whose path is the subdirectory — the version dir itself is
+        // NOT new, so the "New version ... not loading" WARN must not fire.
+        // Keying the new-version signal off any descendant Create mislabels
+        // ordinary churn as a new version and brings back the WARN noise
+        // this commit set out to remove (checkpoint/output dirs are created
+        // routinely during development).
+        let tmp = test_repo_dir("audit-subdir-create");
+        let version_dir = tmp.join("m").join("1");
+        let sub_dir = version_dir.join("checkpoints");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+
+        let messages = run_capturing_logs(|| {
+            let tmp = tmp.clone();
+            let sub_dir = sub_dir.clone();
+            async move {
+                let registry = Arc::new(ModelRegistry::new());
+                let wm = build_test_worker_manager(tmp.clone(), registry.clone());
+                let trigger: Option<mpsc::Sender<()>> = None;
+                let mut last_reload = std::collections::HashMap::new();
+                let flag = AtomicBool::new(true);
+                let _ = process_watch_events(
+                    vec![(sub_dir, WatchEventKind::Create)],
+                    tmp.clone(),
+                    wm,
+                    registry.clone(),
+                    &mut last_reload,
+                    &crate::config::ServerTunables::default(),
+                    &flag,
+                    &trigger,
+                ).await;
+                assert!(
+                    registry.get("m", Some("1")).is_none(),
+                    "manual mode: mkdir inside an unloaded version must not load it"
+                );
+            }
+        });
+
+        assert!(
+            !messages.iter().any(|m| m.contains("manual") && m.contains("Admin API")),
+            "mkdir inside an existing unloaded version must not warn 'New version'; got: {:?}",
+            messages
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn audit_manual_mode_dir_mtime_churn_on_unloaded_version_does_not_warn() {
+        // Guard for the From<notify::EventKind> mapping boundary: only
+        // ModifyKind::Name (rename = appeared) may promote to Create.
+        // Ordinary dir mtime churn — Modify(Any/Data/Metadata), delivered
+        // whenever files are written inside an existing unloaded version
+        // dir — must stay Modify and remain debug-level, or the WARN noise
+        // this change removed comes back on every save.
+        let tmp = test_repo_dir("audit-mtime-churn");
+        let version_dir = tmp.join("m").join("1");
+        std::fs::create_dir_all(&version_dir).unwrap();
+
+        let messages = run_capturing_logs(|| {
+            let tmp = tmp.clone();
+            let version_dir = version_dir.clone();
+            async move {
+                let registry = Arc::new(ModelRegistry::new());
+                let wm = build_test_worker_manager(tmp.clone(), registry.clone());
+                let trigger: Option<mpsc::Sender<()>> = None;
+                let mut last_reload = std::collections::HashMap::new();
+                let flag = AtomicBool::new(true);
+                // What notify delivers for dir mtime/attr churn.
+                let kind = WatchEventKind::from(notify::EventKind::Modify(
+                    notify::event::ModifyKind::Any,
+                ));
+                let _ = process_watch_events(
+                    vec![(version_dir, kind)],
+                    tmp.clone(),
+                    wm,
+                    registry.clone(),
+                    &mut last_reload,
+                    &crate::config::ServerTunables::default(),
+                    &flag,
+                    &trigger,
+                ).await;
+            }
+        });
+
+        assert!(
+            !messages.iter().any(|m| m.contains("manual") && m.contains("Admin API")),
+            "dir mtime churn on an existing unloaded version must stay debug; got: {:?}",
             messages
         );
 
