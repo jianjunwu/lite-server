@@ -50,6 +50,20 @@ pub fn build_stream_close(stream_id: String) -> pb::Request {
     }
 }
 
+/// Build a graceful-stop control message (server unload / shutdown).
+///
+/// The worker breaks its recv loop, runs the Python teardown path
+/// (_run_teardown: LitAPI.teardown + lifecycle callbacks) and exits cleanly;
+/// the server SIGKILLs it only if it never reads this message (hung worker).
+/// The worker does not reply — the server observes the natural process exit.
+pub fn build_stop_request() -> pb::Request {
+    pb::Request {
+        uid: "stop".to_string(),
+        meta: None,
+        payload: Some(pb::request::Payload::Stop(pb::StopRequest {})),
+    }
+}
+
 /// Build a protobuf StreamRequest::Cancel.
 pub fn build_stream_cancel(stream_id: String) -> pb::Request {
     pb::Request {

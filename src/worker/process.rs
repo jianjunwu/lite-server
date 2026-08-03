@@ -7,6 +7,49 @@ use crate::error::AppError;
 use crate::inference_queue::model_version_key;
 use crate::registry::types::*;
 use crate::worker::protocol::*;
+
+/// Await a worker's natural exit, bounded by its `kill_timeout`; escalate to
+/// the monitor's SIGKILL (via `shutdown_tx`) only when the worker is hung
+/// (never read the graceful-stop message). Always waits for the reap — an
+/// un-reaped worker is an orphan whose ZMQ auto-reconnect steals the
+/// re-bound socket on reload/restart.
+pub(super) async fn stop_worker_gracefully(
+    proc: &mut super::WorkerProcess,
+    model_name: &str,
+    version: &str,
+) {
+    match proc.done_rx.take() {
+        None => {
+            if let Some(tx) = proc.shutdown_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+        Some(rx) => {
+            let rx = rx;
+            tokio::pin!(rx);
+            let mut escalated = false;
+            loop {
+                tokio::select! {
+                    _ = &mut rx => break,
+                    _ = tokio::time::sleep(proc.kill_timeout) => {
+                        if escalated {
+                            break;
+                        }
+                        escalated = true;
+                        tracing::warn!(
+                            model = %model_name, version = %version,
+                            worker_id = proc.worker_id,
+                            "Worker did not exit gracefully within kill_timeout; SIGKILLing"
+                        );
+                        if let Some(tx) = proc.shutdown_tx.take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -340,6 +383,15 @@ impl WorkerManager {
             })
         };
         if let Some(mut proc) = old_proc {
+            // NO graceful stop here — kill escalation only. This path targets
+            // a worker that failed health probes (likely hung), so teardown
+            // would hang the respawn anyway; and a stop message sent now would
+            // be replayed to the replacement worker when it reconnects to the
+            // reused bound socket (ZMQ PAIR keeps queued messages across a
+            // dead peer's reconnect), instantly killing the replacement in a
+            // kill→respawn→kill loop. The graceful stop-then-wait sequence
+            // (stop_worker_gracefully) belongs to the unload path only, where
+            // the client socket is dropped and its queue dies with it.
             if let Some(tx) = proc.shutdown_tx.take() {
                 let _ = tx.send(());
             }

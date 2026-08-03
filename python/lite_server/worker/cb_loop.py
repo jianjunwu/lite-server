@@ -195,6 +195,12 @@ class CBLoop:
                     self.log.warning("cb protobuf parse error: %s", e)
                     continue
 
+                if request.HasField("stop"):
+                    # Graceful stop (server unload / shutdown): break the recv
+                    # loop — run_cb_loop returns and worker_main's finally
+                    # fires _run_teardown (LitAPI.teardown + lifecycle hooks).
+                    break
+
                 with self.lock:
                     if request.HasField("cb_add"):
                         self._handle_add(request.cb_add)

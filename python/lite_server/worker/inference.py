@@ -309,6 +309,13 @@ async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.
                 await socket.send(_make_error_response("", f"Protobuf parse: {e}").SerializeToString())
                 continue
 
+            if request.HasField("stop"):
+                # Graceful stop (server unload / shutdown): break the recv
+                # loop — the cleanup below (cancel pending tasks, close bidi
+                # sessions) runs, then worker_main's finally fires
+                # _run_teardown (LitAPI.teardown + lifecycle callbacks).
+                break
+
             if request.HasField("stream"):
                 stream_id = request.stream.stream_id
                 action = request.stream.WhichOneof("action")

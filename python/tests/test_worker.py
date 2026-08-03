@@ -1229,6 +1229,28 @@ class TestAsyncLoop:
         # Some chunks arrived before cancel; the stream task was cancelled
         assert len(socket._msgs) >= 1
 
+    def test_async_loop_stop_message_exits_cleanly(self):
+        """A stop control message breaks the recv loop → loop returns normally.
+
+        The graceful-exit cleanup (cancel pending tasks, close bidi sessions)
+        must run — the same path that was only reachable via SIGINT before.
+        """
+
+        class EchoAPI(LitAPI):
+            def predict(self, x):
+                return x
+
+        socket = AsyncMockSocket()
+        stop = Request(uid="stop-1")
+        stop.stop.SetInParent()
+        socket.inject(stop.SerializeToString())
+
+        async def runner():
+            # Must return normally — not raise, not need cancellation.
+            await inference.run_async_loop(EchoAPI(), socket, "test", log)
+
+        asyncio.run(runner())
+
     def test_async_concurrent_requests(self):
         class SlowModel(LitAPI):
             def __init__(self):
@@ -1839,6 +1861,34 @@ class TestCBLoop:
         data = json.loads(response.single.data)
         # CB encode_response receives accumulated token list
         assert data == {"output": ["cb_echo: hello"]}, f"Unexpected output: {data}"
+
+    def test_cb_loop_stop_message_exits_cleanly(self):
+        """A stop control message breaks the CB recv loop → run() returns."""
+
+        class EchoCBModel(LitAPI):
+            def decode_request(self, req):
+                return req.get("input", "")
+
+            def prefill(self, uid, decoded_input):
+                pass
+
+            def step(self, active_sequences):
+                return ["done"]
+
+            def has_finished(self, uid, token, generated_sequence):
+                return True
+
+            def encode_response(self, output):
+                return {"output": output}
+
+        socket = SyncMockSocket()
+        stop = Request(uid="stop-1")
+        stop.stop.SetInParent()
+        socket.inject(stop.SerializeToString())
+        t = start_cb_loop(EchoCBModel(), socket)
+
+        t.join(timeout=5)
+        assert not t.is_alive(), "CB loop did not exit on stop message"
 
     def test_cb_loop_single_request_with_multiple_sequences(self):
         """Multiple concurrent SingleRequests should batch in CB pipeline."""

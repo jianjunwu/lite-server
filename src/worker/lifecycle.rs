@@ -764,38 +764,44 @@ impl WorkerManager {
             .set_status(model_name, version, VersionStatus::Unloading)?;
 
         let key = model_version_key(model_name, version);
-        let procs = {
+        let (procs, clients) = {
             let mut workers = self.workers.write().await;
-            let mut clients = self.zmq_clients.write().await;
+            let mut zmq_clients = self.zmq_clients.write().await;
             let mut outliers = self.outlier_states.write().await;
             let mut routes = self.route_table.write().await;
             outliers.remove(&key);
-            clients.remove(&key);
+            let clients = zmq_clients.remove(&key);
             routes.remove(&key);
-            workers.remove(&key)
+            (workers.remove(&key), clients)
         };
 
         if let Some(mut procs) = procs {
-            // Signal every monitor to kill its worker first so the kills run
-            // concurrently, then wait for each monitor to confirm the process
-            // was reaped. Without this wait, unload/shutdown returns while a
-            // worker is still alive — an orphan whose ZMQ auto-reconnect
-            // steals the re-bound socket on reload/restart.
-            for proc in procs.iter_mut() {
-                if let Some(tx) = proc.shutdown_tx.take() {
-                    let _ = tx.send(());
+            // Phase 1 — graceful: send each worker the ZMQ stop message.
+            // Ordered after any in-flight request on the same PAIR socket, so
+            // a worker still serving finishes first; the worker then breaks
+            // its recv loop, runs the Python teardown (_run_teardown:
+            // LitAPI.teardown + before/after_teardown callbacks) and exits
+            // cleanly (observed by the monitor as a clean child exit).
+            if let Some(clients) = clients {
+                let stop_req = crate::streaming::build_stop_request();
+                for client in &clients {
+                    let _ = client.send_raw(stop_req.clone()).await;
                 }
             }
+
+            // Phase 2 — await each worker's natural exit, bounded by
+            // kill_timeout; escalate to the monitor's SIGKILL only when the
+            // worker is hung (never read the stop message). Waiting for the
+            // reap preserves the original no-orphan guarantee — without it,
+            // unload/shutdown returns while a worker is still alive, an
+            // orphan whose ZMQ auto-reconnect steals the re-bound socket on
+            // reload/restart.
+            for proc in procs.iter_mut() {
+                super::process::stop_worker_gracefully(proc, model_name, version).await;
+            }
+
+            // Phase 3 — clean up ZMQ socket files (Unix only).
             for proc in procs {
-                if let Some(done_rx) = proc.done_rx {
-                    if timeout(proc.kill_timeout, done_rx).await.is_err() {
-                        error!(
-                            model = %model_name, version = %version, worker_id = proc.worker_id,
-                            "Timed out waiting for worker process to die; cleaning up anyway"
-                        );
-                    }
-                }
-                // Clean up ZMQ socket file (Unix only)
                 #[cfg(unix)]
                 {
                     let socket_str = proc.endpoint.strip_prefix("ipc://").unwrap_or(&proc.endpoint);

@@ -49,9 +49,19 @@ message Request {
     FileChangedRequest file_changed = 13;
     CBAddRequest cb_add = 20;
     CBRemoveRequest cb_remove = 21;
+    // Graceful stop: the server signals the worker to break its recv loop,
+    // run the teardown path (_run_teardown: LitAPI.teardown + lifecycle
+    // callbacks), and exit cleanly. Sent on unload/respawn BEFORE the
+    // SIGKILL fallback (worker_kill_timeout). The worker does NOT reply —
+    // the monitor observes the natural process exit instead. A hung worker
+    // that never reads this message is SIGKILLed after the timeout.
+    StopRequest stop = 22;
     StreamRequest stream = 30;
   }
 }
+
+// Graceful-stop control message. See Request.stop for the contract.
+message StopRequest {}
 
 message SingleRequest {
   bytes data = 1;
