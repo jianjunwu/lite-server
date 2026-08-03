@@ -64,10 +64,28 @@ class TestJsonSchemaValidator:
         ctx = _ctx(response={"nope": 1}, mode="stream")
         v.after_encode_response(ctx)  # no raise — stream chunks not validated
 
-    def test_non_dict_request_is_skipped(self):
+    def test_scalar_request_violates_object_schema(self):
+        """ctx.request is always the parsed JSON body — a scalar/null body
+        fails an object schema's top-level type (no dict/list skip on the
+        request side)."""
         v = JsonSchemaValidator(input_schema=INPUT_SCHEMA)
-        ctx = _ctx(request="plain text")  # str, not dict/list
-        v.before_decode_request(ctx)  # no raise
+        with pytest.raises(BadRequestError):
+            v.before_decode_request(_ctx(request="plain text"))
+        with pytest.raises(BadRequestError):
+            v.before_decode_request(_ctx(request=None))
+
+    def test_non_json_response_is_skipped(self):
+        """Text/bytes passthrough responses are genuinely non-JSON — an
+        object/array output schema does not apply to them."""
+        v = JsonSchemaValidator(output_schema={"type": "object", "required": ["x"]})
+        v.after_encode_response(_ctx(response="plain text"))  # no raise
+        v.after_encode_response(_ctx(response=b"\x89PNG"))  # no raise
+
+    def test_output_validated_on_route_mode(self):
+        """Route ctx (mode None) carries a complete payload — output_schema applies."""
+        v = JsonSchemaValidator(output_schema={"type": "object", "required": ["text"]})
+        with pytest.raises(BadRequestError):
+            v.after_encode_response(_ctx(response={"nope": 1}, mode=None))
 
     def test_string_schema_validates_string_request(self):
         """A scalar top-level schema must NOT be skipped by the dict/list rule."""

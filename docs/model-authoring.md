@@ -281,7 +281,7 @@ A data hook may mutate `ctx` in place or return a replacement value (`None` = pa
 
 ### Early Return and Validation
 
-- **Early return** (e.g. cache hit): call `ctx.respond(body, status_code=..., headers=...)` or return a `Response` from any hook. Later stages and remaining hooks are skipped.
+- **Early return** (e.g. cache hit): call `ctx.respond(body, status_code=..., headers=...)` or return a `Response` from any hook. Later stages and remaining hooks of earlier chains are skipped. The terminal `after_encode_response` chain is the exception: every registered hook runs there even after a `respond(...)` — no stages follow, so responding is header-attach, not short-circuit (this keeps later validation/audit hooks effective regardless of registration order).
 - **Validation / rejection**: raise `HTTPException` (`BadRequestError`, `UnauthorizedError`, ...) from any hook. The client receives the structured error with the exception's status code — data-hook exceptions are **not** swallowed.
 - Lifecycle hooks (`on_before_setup` / `on_after_setup` / `on_teardown`) and `on_error` are exception-isolated: failures are logged, never propagated (a failing `on_error` also never masks the original error).
 
@@ -366,18 +366,21 @@ callbacks:
   error text. The schema draft is auto-detected from `$schema` (default
   Draft 7); a malformed schema is rejected at load time (loud — a silent
   skip would mean validation never ran).
-- **Output validation scope**: unary/batch only — streaming chunks are
-  partial JSON and never match a full schema, so they are skipped via
-  `ctx.mode`.
-- **Skipped payloads**: when the top-level schema is `object`/`array`,
-  non-JSON values (plain text / bytes / tensors) are left untouched — but a
-  scalar top-level schema (e.g. `type: string`) validates the value itself
-  (a JSON `null` body fails as `None is not of type 'string'`). No
+- **Output validation scope**: unary/batch and custom-route responses —
+  streaming chunks are partial JSON and never match a full schema, so they
+  are skipped via `ctx.mode`.
+- **Skipped payloads**: `ctx.request` is always the parsed JSON body, so on
+  the request side every value is validated — a scalar / `null` body fails
+  an `object`/`array` schema's top-level type. On the response side a
+  text/bytes passthrough payload is genuinely non-JSON, so `object`/`array`
+  schemas leave it untouched (a scalar top-level schema such as
+  `type: string` still validates the value itself). No
   `input_schema`/`output_schema` → that direction is not validated. In
   batch mode each item is validated independently.
 - **Custom routes**: the validator works there too — `before_decode_request` runs
   before the route handler, so `input_schema` rejects an invalid route body
-  the same way; `output_schema` is skipped on routes (only unary/batch).
+  the same way, and `output_schema` validates the route's (complete)
+  response payload.
 
 ### Policies
 

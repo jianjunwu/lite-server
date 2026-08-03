@@ -40,11 +40,14 @@ class JsonSchemaValidator(Callback):
 
     - ``input_schema`` validates ``ctx.request`` in ``before_decode_request``, before
       ``decode_request`` runs: an invalid request is rejected with 400 and
-      no model code (decode included) ever sees it.
+      no model code (decode included) ever sees it.  ``ctx.request`` is
+      always the parsed JSON body, so a scalar / ``null`` body is a schema
+      violation like any other.
     - ``output_schema`` validates ``ctx.response`` in ``after_encode_response``, after
-      ``encode_response``, for **unary/batch only** — streaming chunks are
-      partial JSON and never match a full schema, so they are skipped via
-      ``ctx.mode``.
+      ``encode_response`` — unary/batch and custom-route responses only.
+      Streaming chunks are partial JSON and never match a full schema, so
+      they are skipped via ``ctx.mode``.  A text/bytes passthrough response
+      is genuinely non-JSON, so object/array schemas skip it.
 
     On failure raises a structured ``BadRequestError`` (400) carrying the
     single best-match error: ``param`` is the JSON Pointer to the failing
@@ -73,12 +76,13 @@ class JsonSchemaValidator(Callback):
         cls.check_schema(schema)  # loud: malformed schema → error at load
         return cls(schema)
 
-    def _reject(self, value: Any, validator) -> None:
-        top = validator.schema.get("type")
-        types = (top,) if isinstance(top, str) else tuple(top or ())
-        if "object" in types or "array" in types:
-            if not isinstance(value, (dict, list)):
-                return  # non-JSON payload (text / bytes / tensor / generator) → skip
+    def _reject(self, value: Any, validator, *, skip_non_json: bool) -> None:
+        if skip_non_json:
+            top = validator.schema.get("type")
+            types = (top,) if isinstance(top, str) else tuple(top or ())
+            if "object" in types or "array" in types:
+                if not isinstance(value, (dict, list)):
+                    return  # non-JSON payload (text / bytes passthrough) → skip
         errors = list(validator.iter_errors(value))
         if not errors:
             return
@@ -89,11 +93,15 @@ class JsonSchemaValidator(Callback):
 
     def before_decode_request(self, ctx: RequestContext) -> None:
         if self._input_validator is not None:
-            self._reject(ctx.request, self._input_validator)
+            # ctx.request is always the parsed JSON body on every path — a
+            # scalar / null here violates the schema's top-level type, it is
+            # not a non-JSON payload.
+            self._reject(ctx.request, self._input_validator, skip_non_json=False)
 
     def after_encode_response(self, ctx: RequestContext) -> None:
         if self._output_validator is None:
             return
-        if ctx.mode not in ("unary", "batch"):
+        # mode None = custom route: a complete payload, validated like unary.
+        if ctx.mode is not None and ctx.mode not in ("unary", "batch"):
             return  # stream/bidi/decoupled/cb chunks aren't validated
-        self._reject(ctx.response, self._output_validator)
+        self._reject(ctx.response, self._output_validator, skip_non_json=True)

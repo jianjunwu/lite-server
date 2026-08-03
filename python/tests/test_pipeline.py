@@ -939,7 +939,7 @@ class TestHookCtx:
         assert sc == 401
 
     def test_litapi_hook_raises_at_build(self):
-        """0.9 removed request hooks from LitAPI — defining one is a loud error
+        """0.8.0 removed request hooks from LitAPI — defining one is a loud error
         (a silent no-op would mean auth/validation that never runs)."""
         for name in ("before_decode_request", "after_encode_response"):
             class BadAPI(EchoAPI):
@@ -949,7 +949,7 @@ class TestHookCtx:
                 Pipeline.build(BadAPI(), [])
 
     def test_old_name_litapi_hook_raises_at_build(self):
-        """Pre-0.9 LitAPI hook names are caught by the same guard."""
+        """0.7-era LitAPI hook names are caught by the same guard."""
         class OldAPI(EchoAPI):
             def on_request(self, ctx):
                 return ctx.request

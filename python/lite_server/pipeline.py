@@ -363,7 +363,7 @@ class Pipeline:
 
         # --- Hook chains (Callback hooks only; LitAPI has no hooks) -------
         self._chains: dict[str, list[Callable]] = {name: [] for name in _DATA_HOOKS}
-        # 0.9 removed request hooks from LitAPI — hook logic lives on Callback
+        # 0.8.0 removed request hooks from LitAPI — hook logic lives on Callback
         # subclasses.  Defining one on the model is a loud load-time error:
         # a silent no-op would mean auth/validation that never runs.
         api_cls = type(lit_api)
@@ -591,8 +591,13 @@ class Pipeline:
             setattr(ctx, field, result)
 
     async def _run_chain(self, name: str, ctx: RequestContext) -> None:
+        # The terminal chain always runs every hook: no stages follow
+        # after_encode_response, so a respond() there is the header-attach
+        # idiom, not a short-circuit — stopping would silently skip later
+        # hooks (validation, audit) purely by registration order.
+        stop_on_early = name != "after_encode_response"
         for hook in self._chains[name]:
-            if ctx.early is not None:
+            if stop_on_early and ctx.early is not None:
                 return
             await hook(ctx)
 

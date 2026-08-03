@@ -125,10 +125,12 @@ class RequestContext:
     ) -> Response:
         """Short-circuit the pipeline with an immediate response.
 
-        Later stages (decode/predict/encode and remaining hooks) are
-        skipped; *body* is serialized and sent with the given status and
-        headers.  In ``after_encode_response`` this is also the way to attach custom
-        headers to the final response::
+        Later stages (decode/predict/encode) and the remaining hooks of
+        earlier chains are skipped; *body* is serialized and sent with the
+        given status and headers.  In ``after_encode_response`` this is also
+        the way to attach custom headers to the final response — there every
+        registered hook still runs (no stages follow, so responding is
+        header-attach, not short-circuit)::
 
             def after_encode_response(self, ctx):
                 return ctx.respond(

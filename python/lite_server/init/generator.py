@@ -181,7 +181,7 @@ CONFIG_YAML_EXAMPLE = textwrap.dedent("""\
     #
     # Built-in class: lite_server.callbacks.JsonSchemaValidator validates the
     # request body (before_decode_request, before decode_request) and response body
-    # (after_encode_response; unary/batch only) against JSON Schemas — needs
+    # (after_encode_response; unary/batch/custom-route) against JSON Schemas — needs
     # `pip install lite-server[validation]`.
     #
     # Hooks beyond the data chain (before_decode_request/after_decode_request/after_predict/after_encode_response):

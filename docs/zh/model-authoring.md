@@ -313,7 +313,7 @@ before_decode_request → decode_request → after_decode_request → predict �
 
 ### Early Return 与参数校验
 
-- **Early return**（如缓存命中）：在任意钩子中调用 `ctx.respond(body, status_code=..., headers=...)` 或返回一个 `Response`。后续阶段和剩余钩子被跳过。
+- **Early return**（如缓存命中）：在任意钩子中调用 `ctx.respond(body, status_code=..., headers=...)` 或返回一个 `Response`。后续阶段和之前链上的剩余钩子被跳过。终链 `after_encode_response` 例外：即使已有钩子 `respond(...)`，所有注册的钩子仍会执行——其后没有阶段，respond 只是附加响应头而非短路（保证后续的校验/审计钩子不因注册顺序失效）。
 - **参数校验 / 拒绝**：在任意钩子中抛出 `HTTPException`（`BadRequestError`、`UnauthorizedError` 等）。客户端收到对应状态码的结构化错误 — 数据钩子的异常**不会**被吞掉。
 - 生命周期钩子（`on_before_setup` / `on_after_setup` / `on_teardown`）和 `on_error` 保持异常隔离：失败只记日志，不传播（`on_error` 自身的异常也不会掩盖原始错误）。
 
@@ -377,16 +377,17 @@ callbacks:
   （前缀 `body/`，如 `body/prompt`），`message` 为错误原文。schema 草稿按
   `$schema` 自动选择（缺省 Draft 7）；畸形 schema 在加载时响亮拒绝 —
   静默跳过意味着校验从未执行。
-- **输出校验范围**：仅 unary/batch — 流式 chunk 是增量 JSON 必不匹配，
-  靠 `ctx.mode` 跳过。
-- **跳过规则**：schema 顶层为 `object`/`array` 时，非 JSON 载荷（纯文本 /
-  bytes / tensor）不校验；但**顶层标量 schema**（如 `type: string`）会正常
-  校验值本身（JSON `null` 请求体报 `None is not of type 'string'`）。
+- **输出校验范围**：unary/batch 及 custom route 响应 — 流式 chunk 是增量
+  JSON 必不匹配，靠 `ctx.mode` 跳过。
+- **跳过规则**：`ctx.request` 恒为已解析的 JSON 请求体，请求侧所有值都
+  参与校验 — 标量 / `null` 请求体会触犯 `object`/`array` schema 的顶层
+  类型。响应侧纯文本 / bytes 直通载荷是真非 JSON，`object`/`array`
+  schema 对其跳过（顶层标量 schema 如 `type: string` 仍正常校验值本身）。
   未配置 `input_schema`/`output_schema` 的对应方向不校验。batch 模式按
   item 独立校验。
 - **Custom route**：validator 在路由上同样可用 — `before_decode_request` 在路由
   handler 之前执行，`input_schema` 以同样方式拒绝非法路由请求体；
-  `output_schema` 在路由上跳过（仅 unary/batch）。
+  `output_schema` 校验路由的（完整）响应载荷。
 
 ### 策略（Policies）
 
