@@ -18,7 +18,7 @@ config shapes and logs `warn` lines pointing at the M-entries below
 | M5 | P-TRACE | tonic 0.13 upgrade; OTel requires the `telemetry` cargo feature |
 | M6 | P-TRACE | `telemetry.protocol: http` fails at startup; inbound baggage dropped by default |
 | M7 | P-WARM | `policies.warmup.dummy_input_ref`/`iterations` removed → `samples` list (config fails to load) |
-| M8 | 0.8.0-rc0 | `features.*` toggles now enforced; 3 reserved fields removed; `custom_metrics` now opt-in |
+| M8 | 0.8.0 | `features.*` toggles now enforced; 3 reserved fields removed; `custom_metrics` now opt-in |
 
 Non-breaking phases (no action needed): P-MW, P-ENSEMBLE-GRPC, P-FLOW, P-DEADLINE,
 P-WARM (pure additions; defaults preserve prior behavior). P-OAI is deferred to 0.9
@@ -206,7 +206,7 @@ policies:
       - input_ref: warmup/batch8.json   # iterations defaults to 1
 ```
 
-## M8 — feature toggles enforced; reserved fields removed (0.8.0-rc0)
+## M8 — feature toggles enforced; reserved fields removed (0.8.0)
 
 **What changed:** the `features.*` toggles were previously declared but ignored
 ("(reserved)"). They now control real behavior:

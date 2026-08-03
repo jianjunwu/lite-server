@@ -16,7 +16,7 @@
 | M5 | P-TRACE | tonic 0.13 升级；OTel 需 `telemetry` cargo feature |
 | M6 | P-TRACE | `telemetry.protocol: http` 启动 fail-fast；入站 baggage 默认丢弃 |
 | M7 | P-WARM | `policies.warmup.dummy_input_ref`/`iterations` 已移除 → `samples` 列表（配置加载失败） |
-| M8 | 0.8.0-rc0 | `features.*` 开关现已生效；移除 3 个预留字段；`custom_metrics` 改为显式开启 |
+| M8 | 0.8.0 | `features.*` 开关现已生效；移除 3 个预留字段；`custom_metrics` 改为显式开启 |
 
 无 breaking 的阶段（无需动作）：P-MW、P-ENSEMBLE-GRPC、P-FLOW、P-DEADLINE、
 P-WARM（纯新增，默认值保持旧行为）。P-OAI 延后至 0.9（不在本版本范围内）。
@@ -182,7 +182,7 @@ policies:
       - input_ref: warmup/batch8.json   # iterations 缺省 1
 ```
 
-## M8 — feature 开关生效；移除预留字段（0.8.0-rc0）
+## M8 — feature 开关生效；移除预留字段（0.8.0）
 
 **变更内容：** `features.*` 开关此前只是声明但不生效（"预留"）。现在它们真实门控行为：
 
