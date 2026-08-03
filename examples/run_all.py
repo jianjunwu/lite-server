@@ -404,20 +404,21 @@ def check_17():
 def check_15():
     path = "/v2/models/callbacks_demo/infer"
     key = {"X-API-Key": "demo-key"}
+    valid = {"text": "hello", "note": None}  # schema: text required, note required-but-null
     # No API key -> 401 from ApiKeyAuth.before_decode_request
-    st, r = http_json("POST", path, {"input": "hello"})
+    st, r = http_json("POST", path, valid)
     if st != 401:
         return False, f"expected 401 without key, got HTTP {st} -> {r}"
-    # Empty input -> 400 from InputValidator.after_decode_request
-    st, r = http_json("POST", path, {"input": ""}, headers=key)
+    # Empty text -> 400 from the built-in JsonSchemaValidator (minLength: 1)
+    st, r = http_json("POST", path, {"text": "", "note": None}, headers=key)
     if st != 400:
-        return False, f"expected 400 for empty input, got HTTP {st} -> {r}"
-    # Valid request -> 200
-    st, r = http_json("POST", path, {"input": "hello"}, headers=key)
-    if not (st == 200 and isinstance(r, dict) and r.get("output") == "hello"):
+        return False, f"expected 400 for empty text, got HTTP {st} -> {r}"
+    # Valid request -> 200; the schema-valid body is echoed back in output
+    st, r = http_json("POST", path, valid, headers=key)
+    if not (st == 200 and isinstance(r, dict) and r.get("output") == valid):
         return False, f"valid request failed: HTTP {st} -> {r}"
     # Same request again -> SimpleCache short-circuits with cached body
-    st, r = http_json("POST", path, {"input": "hello"}, headers=key)
+    st, r = http_json("POST", path, valid, headers=key)
     ok = st == 200 and isinstance(r, dict) and r.get("cached") is True
     return ok, f"cache hit: HTTP {st} -> {r}"
 
