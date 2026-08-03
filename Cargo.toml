@@ -166,6 +166,13 @@ proptest = "1"
 name = "perf_smoke"
 path = "benchmarks/perf_smoke.rs"
 
+# 流式路径 per-chunk 固定开销测量（gRPC bidi RTT + SSE/WS 逐 chunk 间隔）。
+# 本地/手动测量工具，未接入 CI。
+[[example]]
+name = "stream_chunk_overhead"
+path = "benchmarks/stream_chunk_overhead.rs"
+
+
 [lib]
 name = "lite_server"
 crate-type = ["cdylib", "rlib"]
