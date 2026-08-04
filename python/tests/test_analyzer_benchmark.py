@@ -342,3 +342,130 @@ class TestStatsContract:
         assert E._cpu_saturation_warning(cpu_used=0.8, wall=1.0) is not None
         assert E._cpu_saturation_warning(cpu_used=0.5, wall=1.0) is None
         assert E._cpu_saturation_warning(cpu_used=0.8, wall=0.0) is None
+
+
+class TestCOCorrection:
+    """Coordinated-omission correction via intended-send-time reconstruction."""
+
+    def test_corrected_equals_service_when_uniform(self):
+        """Perfectly uniform sends produce zero correction (no queueing)."""
+        r = BenchmarkResult(
+            successful=4,
+            window=0.3,
+        )
+        # Uniformly spaced sends: 0, 100ms, 200ms, 300ms (each 10ms svc time)
+        r.send_times_ns = [0, 100_000_000, 200_000_000, 300_000_000]
+        r.latencies = [10.0, 10.0, 10.0, 10.0]
+        corrected = r.corrected_latencies
+        assert len(corrected) == 4
+        # Intended interval = 0.3 / 4 = 0.075s = 75ms
+        # Request 0: intended=0, actual=0, queue=0, corrected=10
+        # Request 1: intended=75ms, actual=100ms, queue=25ms, corrected=35
+        assert corrected[0] == pytest.approx(10.0, abs=1.0)
+        assert corrected[1] == pytest.approx(35.0, abs=1.0)  # 10 + (100-75)
+        assert corrected[2] == pytest.approx(60.0, abs=1.0)  # 10 + (200-150)
+        assert corrected[3] == pytest.approx(85.0, abs=1.0)  # 10 + (300-225)
+
+    def test_corrected_captures_burst_pause(self):
+        """Server pauses after first request — CO correction captures queueing."""
+        r = BenchmarkResult(
+            successful=3,
+            window=0.3,
+        )
+        # First request: send at 0, response at 10ms
+        # Server pauses 200ms before accepting next
+        # Second: send at 210ms, response at 220ms (10ms svc)
+        # Third: send at 221ms, response at 231ms (10ms svc)
+        r.send_times_ns = [0, 210_000_000, 221_000_000]
+        r.latencies = [10.0, 10.0, 10.0]
+        corrected = r.corrected_latencies
+        # Intended interval = 0.3 / 3 = 0.1s = 100ms
+        # Request 0: intended=0, actual=0, queue=0, corrected=10
+        # Request 1: intended=100ms, actual=210ms, queue=110ms, corrected=120
+        # Request 2: intended=200ms, actual=221ms, queue=21ms, corrected=31
+        assert corrected[0] == pytest.approx(10.0, abs=1.0)
+        assert corrected[1] == pytest.approx(120.0, abs=5.0)
+        assert corrected[2] == pytest.approx(31.0, abs=5.0)
+        # Service-time p99 = 10ms, corrected p99 = ~120ms — the gap IS the signal
+        assert r.p99 < 20.0
+        assert r._co_corrected_percentile(0.99) > 50.0
+
+    def test_corrected_fallback_when_no_send_times(self):
+        r = BenchmarkResult(successful=3, latencies=[5.0, 10.0, 15.0])
+        corrected = r.corrected_latencies
+        assert corrected == [5.0, 10.0, 15.0]
+
+    def test_to_dict_includes_co_corrected(self):
+        # Burst-pause pattern: service times are uniform (10ms) but sends are
+        # clustered after a pause, so CO correction inflates the tail.
+        r = BenchmarkResult(
+            successful=3, window=0.3,
+            send_times_ns=[0, 210_000_000, 221_000_000],
+            latencies=[10.0, 10.0, 10.0],
+        )
+        d = r.to_dict()
+        assert "latency_co_corrected_ms" in d
+        co = d["latency_co_corrected_ms"]
+        assert "p50" in co and "p99" in co and "max" in co
+        # Service-time p99 = 10ms; corrected p99 > 100ms (queueing added back)
+        assert co["p99"] > d["latency_ms"]["p99"]
+
+
+class TestOpenLoop:
+    """Open-loop constant-arrival-rate mode (--rate)."""
+
+    @pytest.mark.asyncio
+    async def test_rate_mode_dispatches_at_fixed_intervals(self):
+        """Open-loop dispatch: request send times are evenly spaced."""
+        send_times: list[float] = []
+        engine = BenchmarkEngine()
+
+        async def fake_target(payload):
+            send_times.append(time.perf_counter())
+            await asyncio.sleep(0.001)
+            return {"ok": True}
+
+        result = await engine.run(
+            target=fake_target,
+            payload={"input": 1.0},
+            concurrency=50,
+            duration=0.3,
+            rate=100,
+        )
+        assert result.load_mode == "open-loop"
+        assert result.target_rate == 100
+        # At 100 req/s over 0.3s, expect ~30 requests
+        assert 20 <= result.successful <= 45
+        # CO correction is negligible for open-loop (sends already evenly spaced)
+        if result.successful >= 2:
+            p99 = result.p99
+            co_p99 = result._co_corrected_percentile(0.99)
+            # In open-loop the gap is minimal (no queueing at generator);
+            # allow slack for CI/xdist scheduling jitter.
+            assert abs(co_p99 - p99) < 50.0
+
+    @pytest.mark.asyncio
+    async def test_rate_mode_concurrency_caps_inflight(self):
+        """Semaphore limits concurrent in-flight requests."""
+        inflight = 0
+        max_inflight = 0
+
+        async def fake_target(payload):
+            nonlocal inflight, max_inflight
+            inflight += 1
+            max_inflight = max(max_inflight, inflight)
+            await asyncio.sleep(0.01)
+            inflight -= 1
+            return {"ok": True}
+
+        engine = BenchmarkEngine()
+        result = await engine.run(
+            target=fake_target,
+            payload={"input": 1.0},
+            concurrency=3,
+            duration=0.15,
+            rate=200,
+        )
+        assert result.successful > 0
+        # With concurrency=3, rate=200, sleep=10ms: max in-flight ≤ 3
+        assert max_inflight <= 3

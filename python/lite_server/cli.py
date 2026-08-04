@@ -65,7 +65,9 @@ def main(argv=None):
     bench_parser.add_argument("--url", default="http://127.0.0.1:8000")
     bench_parser.add_argument("--model", required=True)
     bench_parser.add_argument("--version", default=None)
-    bench_parser.add_argument("--concurrency", type=int, default=8)
+    bench_parser.add_argument("--concurrency", default="8",
+                              help="Concurrency level (N), or sweep range "
+                                   "(start:end:step, e.g. 1:16:2 => 1,3,5,...,15)")
     term_group = bench_parser.add_mutually_exclusive_group()
     term_group.add_argument("--duration", type=float, default=None,
                             help="Run for N seconds (default: 30; mutually exclusive with --requests)")
@@ -77,11 +79,22 @@ def main(argv=None):
     bench_parser.add_argument("--grace-period", type=float, default=30.0,
                               help="After the deadline, wait at most N seconds for in-flight "
                                    "requests to drain (duration mode)")
+    bench_parser.add_argument("--rate", type=float, default=None,
+                              help="Constant arrival rate in req/s (open-loop); "
+                                   "dispatch requests on a fixed-interval schedule "
+                                   "independent of response times")
+    bench_parser.add_argument("--latency-threshold", type=float, default=None,
+                              help="During concurrency sweep, stop early when p99 "
+                                   "exceeds MS milliseconds (perf_analyzer convention)")
     payload_group = bench_parser.add_mutually_exclusive_group()
     payload_group.add_argument("--payload", default=None,
                                help="Inline JSON request body (default: '{\"input\": 1.0}')")
     payload_group.add_argument("--payload-file", action="append", default=None,
                                help="JSON file with request body; repeatable, round-robin")
+    payload_group.add_argument("--payload-random", default=None, metavar="TEMPLATE",
+                               help="Randomize id/request_id/uuid fields per request "
+                                    "using TEMPLATE as the base JSON body "
+                                    "(default: '{\"input\": 1.0}')")
     bench_parser.add_argument("--export", default=None,
                               help="Write authoritative JSON record to PATH (stdout table unchanged)")
     bench_parser.add_argument("--max-error-rate", type=float, default=None,
@@ -256,6 +269,27 @@ def _cmd_config_check(args):
         return 1
 
 
+def _parse_concurrency(raw: str) -> list[int]:
+    """Parse --concurrency argument: single int or start:end:step sweep."""
+    if ":" in raw:
+        parts = raw.split(":")
+        if len(parts) != 3:
+            raise ValueError(
+                f"Concurrency sweep must be start:end:step, got {raw!r}"
+            )
+        start, end, step = int(parts[0]), int(parts[1]), int(parts[2])
+        if start < 1 or end < start or step < 1:
+            raise ValueError(
+                f"Concurrency sweep requires 1 <= start <= end and step >= 1, "
+                f"got {raw!r}"
+            )
+        levels = list(range(start, end + 1, step))
+        if not levels:
+            raise ValueError(f"Concurrency sweep {raw!r} produces no levels")
+        return levels
+    return [int(raw)]
+
+
 def _resolve_benchmark_payloads(args) -> list[dict]:
     """Resolve request payloads from --payload / --payload-file / default."""
     if args.payload is not None:
@@ -268,6 +302,85 @@ def _resolve_benchmark_payloads(args) -> list[dict]:
     return [{"input": 1.0}]
 
 
+def _random_payload_factory(template: dict) -> "Callable[[], dict]":
+    """Return a callable that yields ``template`` with random id/uuid fields.
+
+    Fields ``id``, ``request_id``, and ``uuid`` are replaced with random
+    values on each call so the server cannot serve from a hot cache.
+    A ``_r`` nonce is injected when none of those fields are present in the
+    template (ensuring at least one per-request variation).
+    """
+    import random as _random
+    import uuid as _uuid
+
+    has_random_field = any(k in template for k in ("id", "request_id", "uuid"))
+
+    def _fab() -> dict:
+        d = dict(template)
+        if "id" in d:
+            d["id"] = str(_uuid.uuid4())
+        if "request_id" in d:
+            d["request_id"] = str(_uuid.uuid4())
+        if "uuid" in d:
+            d["uuid"] = str(_uuid.uuid4())
+        if not has_random_field:
+            d["_r"] = _random.randint(0, 2**63 - 1)
+        return d
+
+    return _fab
+
+
+def _run_concurrency_sweep(args, levels: list[int], duration, run_one) -> int:
+    """Run benchmark at each concurrency level; print sweep summary table."""
+    import asyncio
+
+    results: list[tuple[int, "BenchmarkResult"]] = []
+    print(f"Concurrency sweep: {levels}")
+
+    for c in levels:
+        print(f"\n--- concurrency={c} ---")
+        try:
+            result = asyncio.run(run_one(c))
+        except KeyboardInterrupt:
+            print("\nSweep interrupted.")
+            return 130
+        if result.total_requests == 0:
+            print(f"  (no requests completed — skipping remaining levels)")
+            break
+        _print_benchmark_summary(result, args, duration, c)
+        results.append((c, result))
+        if args.latency_threshold is not None and result.p99 > args.latency_threshold:
+            print(f"  p99 {result.p99:.2f}ms > {args.latency_threshold}ms threshold — stopping sweep")
+            break
+
+    # Sweep summary table
+    if results:
+        print(f"\n{'='*70}")
+        print(f"Sweep Summary ({args.model})")
+        print(f"{'C':>4} {'Throughput':>10} {'p50':>8} {'p90':>8} {'p95':>8} {'p99':>8} {'max':>8}")
+        print("-" * 62)
+        for c, r in results:
+            print(f"{c:>4} {r.throughput:>10.1f} {r.p50:>8.1f} {r.p90:>8.1f} "
+                  f"{r.p95:>8.1f} {r.p99:>8.1f} {r.max_latency:>8.1f}")
+        print(f"{'='*70}")
+
+    return 0
+
+
+def _print_benchmark_summary(result, args, duration, concurrency) -> None:
+    """Print single-run benchmark summary (used by sweep and single modes)."""
+    print(f"  Mode:            {'open-loop' if args.rate else 'closed-loop'}")
+    if args.rate:
+        print(f"  Target rate:     {args.rate} req/s")
+    print(f"  Throughput:      {result.throughput:.2f} req/s")
+    print(f"  Success/Failed:  {result.successful}/{result.failed}")
+    if result.latencies:
+        print(f"  p50/p90/p95/p99: {result.p50:.1f}/{result.p90:.1f}/"
+              f"{result.p95:.1f}/{result.p99:.1f} ms (max {result.max_latency:.1f})")
+    for w in result.warnings:
+        print(f"  WARNING: {w}")
+
+
 def _cmd_benchmark(args):
     """Run benchmark: thin shell over BenchmarkEngine (closed-loop, worker pool).
 
@@ -277,6 +390,14 @@ def _cmd_benchmark(args):
     """
     import itertools
     import sys
+
+    # Parse concurrency — single int or sweep range
+    try:
+        concurrency_levels = _parse_concurrency(args.concurrency)
+    except ValueError as e:
+        _logger.error("--concurrency: %s", e)
+        return 2
+    sweep_mode = len(concurrency_levels) > 1
 
     from lite_server.analyzer.benchmark import (
         BenchmarkEngine,
@@ -292,6 +413,16 @@ def _cmd_benchmark(args):
         _logger.error("payload error: %s", e)
         return 2
 
+    if args.payload_random is not None:
+        try:
+            template = json.loads(args.payload_random)
+        except json.JSONDecodeError as e:
+            _logger.error("payload-random template is not valid JSON: %s", e)
+            return 2
+        payload_factory = _random_payload_factory(template)
+    else:
+        payload_factory = None
+
     duration = args.duration
     if duration is None and args.requests is None:
         duration = 30.0
@@ -300,18 +431,24 @@ def _cmd_benchmark(args):
     if args.version:
         url = f"{args.url}/v2/models/{args.model}/versions/{args.version}/infer"
 
-    async def run_benchmark():
+    async def run_benchmark(c: int | None = None):
         import httpx
 
+        concurrency = c if c is not None else concurrency_levels[0]
         mode = f"duration={duration}s" if duration is not None else f"requests={args.requests}"
-        print(f"Benchmarking {args.model} (concurrency={args.concurrency}, "
+        print(f"Benchmarking {args.model} (concurrency={concurrency}, "
               f"{mode}, warmup={args.warmup_requests})")
 
-        payload_cycle = itertools.cycle(payloads)
+        if payload_factory is not None:
+            final_payload = payload_factory
+        else:
+            payload_cycle = itertools.cycle(payloads)
+            final_payload = lambda: next(payload_cycle)
+
         timeout = httpx.Timeout(30.0, connect=5.0, pool=5.0)
         limits = httpx.Limits(
-            max_connections=max(args.concurrency, 1),
-            max_keepalive_connections=max(args.concurrency, 1),
+            max_connections=max(concurrency, 1),
+            max_keepalive_connections=max(concurrency, 1),
             keepalive_expiry=15.0,
         )
         async with httpx.AsyncClient(limits=limits) as client:
@@ -331,17 +468,24 @@ def _cmd_benchmark(args):
             engine = BenchmarkEngine()
             return await engine.run(
                 target=target,
-                payload=lambda: next(payload_cycle),
-                concurrency=args.concurrency,
+                payload=final_payload,
+                concurrency=concurrency,
                 duration=duration,
                 total_requests=args.requests,
                 warmup_requests=args.warmup_requests,
                 grace_period=args.grace_period,
+                rate=args.rate,
             )
 
     # Windows: use SelectorEventLoop for subprocess compat
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    if sweep_mode:
+        return _run_concurrency_sweep(
+            args, concurrency_levels, duration,
+            lambda c: run_benchmark(c),
+        )
 
     try:
         result = asyncio.run(run_benchmark())
@@ -354,7 +498,11 @@ def _cmd_benchmark(args):
         return 1
 
     print(f"\nBenchmark Results ({args.model}):")
-    print("  Mode:            closed-loop (service-time latencies)")
+    mode_label = "open-loop" if args.rate else "closed-loop"
+    latency_label = "open-loop (realistic)" if args.rate else "closed-loop (service-time latencies)"
+    print(f"  Mode:            {mode_label} ({latency_label})")
+    if args.rate:
+        print(f"  Target rate:     {args.rate} req/s")
     if duration is not None:
         print(f"  Duration:        {duration}s (measured window {result.window:.3f}s)")
     else:
@@ -371,7 +519,7 @@ def _cmd_benchmark(args):
               f"Dropped in-flight: {result.dropped_inflight}")
 
     if result.latencies:
-        print("  Latency (ms) [percentile method: linear]:")
+        print("  Latency (ms) [service-time, percentile method: linear]:")
         print(f"    mean: {result.mean_latency:.2f}")
         print(f"    p50:  {result.p50:.2f}")
         print(f"    p90:  {result.p90:.2f}")
@@ -379,6 +527,16 @@ def _cmd_benchmark(args):
         print(f"    p99:  {result.p99:.2f}")
         print(f"    min:  {result.min_latency:.2f}")
         print(f"    max:  {result.max_latency:.2f}")
+        # CO-corrected latencies (always computed; non-zero gap from
+        # service-time is the coordinated-omission detection signal)
+        if result.successful >= 2:
+            print("  Latency (ms) [CO-corrected, percentile method: linear]:")
+            print(f"    p50:  {result._co_corrected_percentile(0.50):.2f}")
+            print(f"    p90:  {result._co_corrected_percentile(0.90):.2f}")
+            print(f"    p95:  {result._co_corrected_percentile(0.95):.2f}")
+            print(f"    p99:  {result._co_corrected_percentile(0.99):.2f}")
+            c_max = max(result.corrected_latencies) if result.corrected_latencies else 0.0
+            print(f"    max:  {c_max:.2f}")
 
     for w in result.warnings:
         print(f"  WARNING: {w}")
@@ -389,7 +547,7 @@ def _cmd_benchmark(args):
                 "url": url,
                 "model": args.model,
                 "version": args.version,
-                "concurrency": args.concurrency,
+                "concurrency": concurrency_levels[0] if not sweep_mode else args.concurrency,
                 "duration": duration,
                 "requests": args.requests,
                 "warmup_requests": args.warmup_requests,

@@ -553,16 +553,18 @@ class TestBenchmark:
             "url": "http://127.0.0.1:8000",
             "model": "test_model",
             "version": None,
-            "concurrency": 1,
+            "concurrency": "1",
             "duration": None,
             "requests": 5,
             "warmup_requests": 0,
             "grace_period": 1.0,
             "payload": None,
             "payload_file": None,
+            "payload_random": None,
             "export": None,
             "max_error_rate": None,
             "max_p99": None,
+            "rate": None,
         }
         base.update(overrides)
         return type("Args", (), base)()
@@ -753,3 +755,35 @@ class TestServeArgs:
         assert called_with["ejection_max_timeout"] == 30.0
         assert called_with["hook_http_timeout"] == 7.0
         assert "transport" not in called_with
+
+
+class TestPayloadRandom:
+    """--payload-random: per-request template randomization."""
+
+    def test_factory_randomizes_id_field(self):
+        from lite_server.cli import _random_payload_factory
+        fab = _random_payload_factory({"input": 1.0, "id": "fixed"})
+        ids = {fab()["id"] for _ in range(10)}
+        # With 10 UUIDs the chance of collision is astronomically low
+        assert len(ids) == 10
+
+    def test_factory_randomizes_request_id_field(self):
+        from lite_server.cli import _random_payload_factory
+        fab = _random_payload_factory({"request_id": "fixed"})
+        vals = {fab()["request_id"] for _ in range(10)}
+        assert len(vals) == 10
+
+    def test_factory_injects_nonce_when_no_id_field(self):
+        from lite_server.cli import _random_payload_factory
+        fab = _random_payload_factory({"input": 1.0})
+        samples = [fab() for _ in range(10)]
+        assert all("_r" in s for s in samples)
+        nonces = {s["_r"] for s in samples}
+        assert len(nonces) == 10
+
+    def test_factory_preserves_other_fields(self):
+        from lite_server.cli import _random_payload_factory
+        fab = _random_payload_factory({"input": 42, "stream": True})
+        sample = fab()
+        assert sample["input"] == 42
+        assert sample["stream"] is True
