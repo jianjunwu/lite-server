@@ -823,6 +823,53 @@ mod tests {
             "error hook should NOT fire when draining=true (found {} tasks)", tasks.len());
     }
 
+    /// B1 inverse (audit 2026-08-04): with draining=false a non-zero worker exit
+    /// is a genuine crash — the error hook MUST fire. The committed B1 test only
+    /// covers the draining=true direction, so an unconditional suppression would
+    /// pass the suite; this pins the normal-operation contract.
+    #[tokio::test]
+    async fn test_worker_monitor_not_draining_fires_error_hook() {
+        #[cfg(unix)]
+        let child = tokio::process::Command::new("false")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        #[cfg(windows)]
+        let child = tokio::process::Command::new("cmd")
+            .args(["/c", "exit", "1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let hook_tasks = Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new()));
+        let hook_tasks_clone = hook_tasks.clone();
+
+        let hooks = crate::config::WorkerHooksConfig {
+            on_error: Some("echo 'crash-hook'".to_string()),
+            ..Default::default()
+        };
+
+        let done_rx = spawn_worker_monitor(
+            child, "test_model", "1", 0, shutdown_rx,
+            || {},
+            Some(Arc::new(hooks)),
+            hook_tasks_clone,
+            Arc::new(AtomicBool::new(false)), // draining=false — real crash
+        );
+
+        timeout(Duration::from_secs(5), done_rx)
+            .await
+            .expect("monitor should signal completion")
+            .expect("completion channel should not be dropped");
+
+        let tasks = hook_tasks.lock().unwrap();
+        assert!(!tasks.is_empty(),
+            "error hook MUST fire on unexpected exit when draining=false");
+    }
+
     // ===== Respawn tests =====
 
     #[tokio::test]

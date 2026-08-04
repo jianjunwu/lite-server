@@ -156,18 +156,23 @@ class _ResponseSender:
             await self._pipe.postprocess(self._ctx)
         except HTTPException as e:
             self._log.warning("decoupled send rejected for %s: %s", self._stream_id, e.detail)
+            # Terminal-first: reclaim the session before the terminal frames so
+            # a server cleanup cancel interleaving the awaits finds nothing and
+            # cannot double-fire on_stream_close.
+            self.closed = True
+            self._active_streams.pop(self._stream_id, None)
             await _handle_stream_error(self._pipe, self._ctx, e, self._socket,
                                         self._stream_id, self._lit_api, self._log,
                                         detail=e.detail, error_type=e.error_type,
                                         code=e.code, param=e.param)
-            self.closed = True
             return
         except Exception as e:
             self._log.error("decoupled send failed for %s: %s", self._stream_id, _format_exc_brief(e))
+            self.closed = True
+            self._active_streams.pop(self._stream_id, None)
             await _handle_stream_error(self._pipe, self._ctx, e, self._socket,
                                         self._stream_id, self._lit_api, self._log,
                                         detail=f"send failed: {e}")
-            self.closed = True
             return
         if self._ctx.early is not None:
             await _send_stream_early(self._socket, self._stream_id, self._ctx.early, self._lit_api)
@@ -575,14 +580,22 @@ async def _handle_stream_chunk_async(
         output = await session.on_chunk(raw, ctx=session.ctx)
     except HTTPException as e:
         log.warning("bidi on_chunk rejected for %s: %s", stream_id, e.detail)
+        # Terminal: reclaim the session up front (the stream ends here) so a
+        # later server cancel is a no-op; extra_cleanup keeps on_close balanced.
+        active_streams.pop(stream_id, None)
         await _handle_stream_error(pipe, session.ctx, e, socket, stream_id, lit_api, log,
                                     detail=e.detail, error_type=e.error_type,
-                                    code=e.code, param=e.param)
+                                    code=e.code, param=e.param,
+                                    extra_cleanup=lambda: _close_bidi_quietly(
+                                        session.on_close, session.ctx, stream_id, log))
         return
     except Exception as e:
         log.error("bidi on_chunk failed for %s: %s", stream_id, _format_exc_brief(e))
+        active_streams.pop(stream_id, None)
         await _handle_stream_error(pipe, session.ctx, e, socket, stream_id, lit_api, log,
-                                    detail=f"on_chunk failed: {e}")
+                                    detail=f"on_chunk failed: {e}",
+                                    extra_cleanup=lambda: _close_bidi_quietly(
+                                        session.on_close, session.ctx, stream_id, log))
         return
 
     if output is None:
@@ -595,14 +608,21 @@ async def _handle_stream_chunk_async(
         await pipe.postprocess(ctx)
     except HTTPException as e:
         log.warning("bidi encode rejected for %s: %s", stream_id, e.detail)
+        # Terminal: same reclaim + on_close balance as the on_chunk error path.
+        active_streams.pop(stream_id, None)
         await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
                                     detail=e.detail, error_type=e.error_type,
-                                    code=e.code, param=e.param)
+                                    code=e.code, param=e.param,
+                                    extra_cleanup=lambda: _close_bidi_quietly(
+                                        session.on_close, ctx, stream_id, log))
         return
     except Exception as e:
         log.error("bidi encode failed for %s: %s", stream_id, _format_exc_brief(e))
+        active_streams.pop(stream_id, None)
         await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
-                                    detail=f"encode failed: {e}")
+                                    detail=f"encode failed: {e}",
+                                    extra_cleanup=lambda: _close_bidi_quietly(
+                                        session.on_close, ctx, stream_id, log))
         return
     if ctx.early is not None:
         await _send_stream_early(socket, stream_id, ctx.early, lit_api)
