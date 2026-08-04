@@ -8,6 +8,7 @@ configured fail severity, 2 = analysis itself failed → exception raised).
 
 import json
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -377,3 +378,284 @@ class TestReportContract:
         _make_model(tmp_path, name="alpha")
         _make_model(tmp_path, name="beta")
         assert StaticAnalyzer(tmp_path).list_models() == ["alpha", "beta"]
+
+
+class TestDangerousCalls:
+    """P2 security: Bandit-style dangerous call detection (LS3xx)."""
+
+    def test_ls301_eval_detected(self, tmp_path):
+        src = (
+            "from lite_server import LitAPI\n\n"
+            "class MyModel(LitAPI):\n"
+            "    def predict(self, x):\n"
+            "        return eval('1 + 1')\n"
+        )
+        _make_model(tmp_path, model_py=src)
+        report = StaticAnalyzer(tmp_path).analyze_model("test_model")
+        assert "LS301" in _rule_ids(report)
+        ls301 = [f for f in report.findings if f.rule_id == "LS301"]
+        assert ls301 and ls301[0].severity == "warning"
+
+    def test_ls302_subprocess_detected(self, tmp_path):
+        src = (
+            "import subprocess\n"
+            "from lite_server import LitAPI\n\n"
+            "class MyModel(LitAPI):\n"
+            "    def setup(self, device):\n"
+            "        subprocess.run(['echo', 'hello'])\n"
+            "    def predict(self, x): return x\n"
+        )
+        _make_model(tmp_path, model_py=src)
+        report = StaticAnalyzer(tmp_path).analyze_model("test_model")
+        assert "LS302" in _rule_ids(report)
+
+    def test_ls302_subprocess_aliased(self, tmp_path):
+        src = (
+            "from subprocess import run\n"
+            "from lite_server import LitAPI\n\n"
+            "class MyModel(LitAPI):\n"
+            "    def predict(self, x):\n"
+            "        run(['ls'])\n"
+            "        return x\n"
+        )
+        _make_model(tmp_path, model_py=src)
+        report = StaticAnalyzer(tmp_path).analyze_model("test_model")
+        assert "LS302" in _rule_ids(report)
+
+    def test_ls303_network_detected(self, tmp_path):
+        src = (
+            "import urllib.request\n"
+            "from lite_server import LitAPI\n\n"
+            "class MyModel(LitAPI):\n"
+            "    def predict(self, x):\n"
+            "        urllib.request.urlopen('http://evil.com')\n"
+            "        return x\n"
+        )
+        _make_model(tmp_path, model_py=src)
+        report = StaticAnalyzer(tmp_path).analyze_model("test_model")
+        assert "LS303" in _rule_ids(report)
+
+    def test_ls304_pickle_deserialization_detected(self, tmp_path):
+        src = (
+            "import pickle\n"
+            "from lite_server import LitAPI\n\n"
+            "class MyModel(LitAPI):\n"
+            "    def setup(self, device):\n"
+            "        pickle.load(open('model.pkl', 'rb'))\n"
+            "    def predict(self, x): return x\n"
+        )
+        _make_model(tmp_path, model_py=src)
+        report = StaticAnalyzer(tmp_path).analyze_model("test_model")
+        assert "LS304" in _rule_ids(report)
+
+    def test_ls305_destructive_filesystem_detected(self, tmp_path):
+        src = (
+            "import os\n"
+            "from lite_server import LitAPI\n\n"
+            "class MyModel(LitAPI):\n"
+            "    def teardown(self):\n"
+            "        os.remove('/tmp/cache')\n"
+            "    def predict(self, x): return x\n"
+        )
+        _make_model(tmp_path, model_py=src)
+        report = StaticAnalyzer(tmp_path).analyze_model("test_model")
+        assert "LS305" in _rule_ids(report)
+
+    def test_clean_model_no_dangerous_finding(self, tmp_path):
+        _make_model(tmp_path)
+        report = StaticAnalyzer(tmp_path).analyze_model("test_model")
+        assert "LS301" not in _rule_ids(report)
+        assert "LS302" not in _rule_ids(report)
+        assert "LS303" not in _rule_ids(report)
+        assert "LS304" not in _rule_ids(report)
+        assert "LS305" not in _rule_ids(report)
+        assert "no-dangerous-calls-detected" in report.checks_passed
+
+    def test_dangerous_call_at_module_level_detected(self, tmp_path):
+        src = (
+            "import os\n"
+            "os.system('echo bad')\n"
+            "from lite_server import LitAPI\n\n"
+            "class MyModel(LitAPI):\n"
+            "    def predict(self, x): return x\n"
+        )
+        _make_model(tmp_path, model_py=src)
+        report = StaticAnalyzer(tmp_path).analyze_model("test_model")
+        assert "LS302" in _rule_ids(report)
+
+    def test_dangerous_call_in_helper_function_detected(self, tmp_path):
+        src = (
+            "import pickle\n"
+            "from lite_server import LitAPI\n\n"
+            "def load_weights():\n"
+            "    return pickle.loads(b'some_data')\n\n"
+            "class MyModel(LitAPI):\n"
+            "    def setup(self, device):\n"
+            "        self.model = load_weights()\n"
+            "    def predict(self, x): return x\n"
+        )
+        _make_model(tmp_path, model_py=src)
+        report = StaticAnalyzer(tmp_path).analyze_model("test_model")
+        assert "LS304" in _rule_ids(report)
+
+
+class TestDeepMode:
+    """P2: optional subprocess import mode with timeout isolation."""
+
+    def test_deep_sets_executed_user_code_true(self, tmp_path):
+        """AST can't resolve dynamic base → deep runs → executed_user_code=True."""
+        src = (
+            "from lite_server import LitAPI\n\n"
+            "def make_base():\n"
+            "    return LitAPI\n\n"
+            "Base = make_base()\n\n"
+            "class MyModel(Base):\n"
+            "    def predict(self, x): return x\n"
+        )
+        _make_model(tmp_path, model_py=src)
+        report = StaticAnalyzer(tmp_path).analyze_model("test_model", deep=True)
+        assert report.executed_user_code is True
+
+    def test_deep_skips_on_exact_match(self, tmp_path):
+        """When AST already has an exact hit, deep skips subprocess."""
+        _make_model(tmp_path)
+        with mock.patch("subprocess.run") as mock_run:
+            report = StaticAnalyzer(tmp_path).analyze_model("test_model", deep=True)
+            mock_run.assert_not_called()
+        assert report.api_class["confidence"] == "exact"
+
+    def test_deep_not_called_when_disabled(self, tmp_path):
+        """deep=False never invokes subprocess."""
+        src = (
+            "from lite_server import LitAPI\n\n"
+            "class MyModel(LitAPI):\n"
+            "    def predict(self, x): return x\n"
+        )
+        _make_model(tmp_path, model_py=src)
+        with mock.patch("subprocess.run") as mock_run:
+            StaticAnalyzer(tmp_path).analyze_model("test_model")
+            mock_run.assert_not_called()
+
+    def test_deep_timeout_emits_warning(self, tmp_path):
+        """Model with unresolved base + sleep → deep times out, warning emitted."""
+        src = (
+            "import time\n"
+            "from lite_server import LitAPI\n\n"
+            "time.sleep(60)\n\n"
+            "def make_base():\n"
+            "    return LitAPI\n\n"
+            "Base = make_base()\n\n"
+            "class MyModel(Base):\n"
+            "    def predict(self, x): return x\n"
+        )
+        _make_model(tmp_path, model_py=src)
+        report = StaticAnalyzer(tmp_path).analyze_model(
+            "test_model", deep=True, deep_timeout=0.5
+        )
+        assert report.executed_user_code is True
+        deep_warnings = [f for f in report.findings
+                         if "deep" in f.message.lower()]
+        assert len(deep_warnings) >= 1
+
+    def test_deep_import_failure_emits_warning(self, tmp_path):
+        """Syntax error in model.py — deep import fails, warning emitted."""
+        src = "this is not valid python!!!"
+        _make_model(tmp_path, model_py=src)
+        report = StaticAnalyzer(tmp_path).analyze_model(
+            "test_model", deep=True, deep_timeout=10
+        )
+        assert report.executed_user_code is True
+        deep_warnings = [f for f in report.findings
+                         if "deep" in f.message.lower()]
+        assert len(deep_warnings) >= 1
+
+
+class TestKserveV2Profile:
+    """P2: KServe V2 inference protocol interop checks (LS401-LS404)."""
+
+    def test_profile_kserve_v2_fully_ready(self, tmp_path):
+        """Model with all methods + config name → all kserve checks pass."""
+        src = (
+            "from lite_server import LitAPI\n\n"
+            "class MyModel(LitAPI):\n"
+            "    def setup(self, device): pass\n"
+            "    def decode_request(self, request): return request\n"
+            "    def predict(self, x): return x\n"
+            "    def encode_response(self, output): return output\n"
+        )
+        _make_model(tmp_path, model_py=src, config="name: my_model\n")
+        report = StaticAnalyzer(tmp_path).analyze_model(
+            "test_model", profile="kserve-v2"
+        )
+        assert "kserve-v2-health" in report.checks_passed
+        assert "kserve-v2-infer-ready" in report.checks_passed
+        assert "kserve-v2-ready-ok" in report.checks_passed
+        assert "kserve-v2-metadata-ready" in report.checks_passed
+
+    def test_profile_asymmetric_codec_is_ls401(self, tmp_path):
+        """decode implemented, encode default → LS401."""
+        src = (
+            "from lite_server import LitAPI\n\n"
+            "class MyModel(LitAPI):\n"
+            "    def decode_request(self, request): return request\n"
+            "    def predict(self, x): return x\n"
+        )
+        _make_model(tmp_path, model_py=src)
+        report = StaticAnalyzer(tmp_path).analyze_model(
+            "test_model", profile="kserve-v2"
+        )
+        assert "LS401" in _rule_ids(report)
+
+    def test_profile_missing_name_is_ls402(self, tmp_path):
+        """config.yaml without name/version → LS402."""
+        src = (
+            "from lite_server import LitAPI\n\n"
+            "class MyModel(LitAPI):\n"
+            "    def predict(self, x): return x\n"
+        )
+        _make_model(tmp_path, model_py=src)
+        report = StaticAnalyzer(tmp_path).analyze_model(
+            "test_model", profile="kserve-v2"
+        )
+        assert "LS402" in _rule_ids(report)
+
+    def test_profile_stream_without_generator_is_ls403(self, tmp_path):
+        """stream=true but no stream_predict generator → LS403."""
+        src = (
+            "from lite_server import LitAPI\n\n"
+            "class MyModel(LitAPI):\n"
+            "    def predict(self, x): return x\n"
+        )
+        _make_model(tmp_path, model_py=src, config="stream: true\n")
+        report = StaticAnalyzer(tmp_path).analyze_model(
+            "test_model", profile="kserve-v2"
+        )
+        assert "LS403" in _rule_ids(report)
+
+    def test_profile_generator_stream_predict_passes_ls403(self, tmp_path):
+        """stream=true + generator stream_predict → no LS403."""
+        src = (
+            "from lite_server import LitAPI\n\n"
+            "class MyModel(LitAPI):\n"
+            "    def predict(self, x): return x\n"
+            "    def stream_predict(self, request):\n"
+            "        yield 'ok'\n"
+        )
+        _make_model(tmp_path, model_py=src, config="stream: true\n")
+        report = StaticAnalyzer(tmp_path).analyze_model(
+            "test_model", profile="kserve-v2"
+        )
+        assert "LS403" not in _rule_ids(report)
+        assert "kserve-v2-stream-ready" in report.checks_passed
+
+    def test_profile_default_off(self, tmp_path):
+        """No profile → no LS4xx findings."""
+        src = (
+            "from lite_server import LitAPI\n\n"
+            "class MyModel(LitAPI):\n"
+            "    def predict(self, x): return x\n"
+        )
+        _make_model(tmp_path, model_py=src)
+        report = StaticAnalyzer(tmp_path).analyze_model("test_model")
+        for f in report.findings:
+            assert not f.rule_id.startswith("LS4")

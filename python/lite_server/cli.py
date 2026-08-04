@@ -105,6 +105,15 @@ def main(argv=None):
                                 help="Minimum severity that exits 1 (default: error)")
     analyze_parser.add_argument("--strict", action="store_true",
                                 help="Shortcut for --fail-severity warning")
+    analyze_parser.add_argument("--deep", action="store_true", default=False,
+                                help="Resolve statically-unresolvable classes by "
+                                     "importing model.py in an isolated subprocess "
+                                     "(EXECUTES MODEL CODE — opt-in)")
+    analyze_parser.add_argument("--deep-timeout", type=float, default=30.0,
+                                help="Seconds before --deep import is killed (default: 30)")
+    analyze_parser.add_argument("--profile", choices=["kserve-v2"], default=None,
+                                help="Run an optional interop profile check "
+                                     "(kserve-v2: KServe V2 inference protocol)")
 
     # pack
     pack_parser = subparsers.add_parser("pack", help="Pack model into artifact")
@@ -417,7 +426,11 @@ def _cmd_analyze(args):
 
     try:
         analyzer = StaticAnalyzer(Path(args.model_repo))
-        report = analyzer.analyze_model(args.model, version=args.version)
+        report = analyzer.analyze_model(
+            args.model, version=args.version,
+            deep=args.deep, deep_timeout=args.deep_timeout,
+            profile=args.profile,
+        )
     except (ValueError, FileNotFoundError) as e:
         _logger.error("%s", e)
         return 2
@@ -425,6 +438,10 @@ def _cmd_analyze(args):
     command = f"lite-server analyze --model {args.model}"
     if args.version:
         command += f" --version {args.version}"
+    if args.deep:
+        command += " --deep"
+    if args.profile:
+        command += f" --profile {args.profile}"
     report_dict = report.to_dict(tool_version=f"lite-server {_pkg_version}",
                                  command=command)
 

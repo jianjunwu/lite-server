@@ -43,6 +43,9 @@ class TestAnalyze:
             "output_dir": str(output_dir) if output_dir else None,
             "fail_severity": "error",
             "strict": False,
+            "deep": False,
+            "deep_timeout": 30.0,
+            "profile": None,
         }
         base.update(overrides)
         return type("Args", (), base)()
