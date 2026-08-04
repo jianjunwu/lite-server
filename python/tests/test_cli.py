@@ -28,102 +28,141 @@ class TestVersion:
 # ===== analyze =====
 
 class TestAnalyze:
-    def test_analyze_valid_model(self, tmp_path, monkeypatch):
-        repo = tmp_path / "model_repo"
-        model_dir = repo / "test_model" / "1"
-        model_dir.mkdir(parents=True)
+    """CLI is a thin shell over StaticAnalyzer: args, rendering, exit codes.
 
-        model_py = model_dir / "model.py"
-        model_py.write_text(textwrap.dedent('''
-            class MyModel:
+    Exit code protocol: 0 = no error-level findings, 1 = findings at the
+    configured --fail-severity, 2 = analysis itself failed.
+    """
+
+    def _args(self, repo, model, output_dir=None, **overrides):
+        base = {
+            "model_repo": str(repo),
+            "model": model,
+            "version": None,
+            "format": "json",
+            "output_dir": str(output_dir) if output_dir else None,
+            "fail_severity": "error",
+            "strict": False,
+        }
+        base.update(overrides)
+        return type("Args", (), base)()
+
+    def _make_model(self, repo, name, model_py, config=None):
+        vdir = repo / name / "1"
+        vdir.mkdir(parents=True)
+        (vdir / "model.py").write_text(textwrap.dedent(model_py))
+        if config:
+            (vdir / "config.yaml").write_text(config)
+        return vdir
+
+    def test_analyze_valid_model(self, tmp_path, capsys):
+        repo = tmp_path / "model_repo"
+        self._make_model(repo, "test_model", '''
+            from lite_server import LitAPI
+
+            class MyModel(LitAPI):
                 def setup(self, device):
                     pass
-                def decode_request(self, request):
-                    return request.get("input", 0)
                 def predict(self, x):
                     return {"output": x * 2}
                 def encode_response(self, output):
                     return output
-        '''))
-
-        config_yaml = model_dir / "config.yaml"
-        config_yaml.write_text("max_batch_size: 4\nbatch_timeout: 0.01\naccelerator: cpu\n")
-
+        ''', config="max_batch_size: 1\n")
         out_dir = tmp_path / "reports"
-        args = type("Args", (), {
-            "model_repo": str(repo),
-            "model": "test_model",
-            "output_dir": str(out_dir),
-        })()
-        assert cli._cmd_analyze(args) == 0
-        assert out_dir.exists()
-        report_files = list(out_dir.iterdir())
-        assert len(report_files) == 1
-        report = json.loads(report_files[0].read_text())
-        assert report["model_name"] == "test_model"
-        assert report["version"] == "1"
-        assert report["has_model_py"] is True
-        assert report["has_config"] is True
-        assert "predict" in report["methods"]
-        assert "decode_request" in report["methods"]
-        assert "encode_response" in report["methods"]
-        assert report["config"]["max_batch_size"] == 4
+
+        rc = cli._cmd_analyze(self._args(repo, "test_model", out_dir))
+        assert rc == 0
+
+        # stdout carries the authoritative schema v1 JSON
+        report = json.loads(capsys.readouterr().out)
+        assert report["schema_version"] == 1
+        assert report["target"]["model_name"] == "test_model"
+        assert report["target"]["executed_user_code"] is False
+        assert report["api_class"]["name"] == "MyModel"
+        assert report["api_class"]["confidence"] == "exact"
+        assert report["methods"]["core_required"]["predict"] == "implemented"
+        assert report["config"]["max_batch_size"] == 1
+
+        # --output-dir additionally persists json + markdown
+        files = {f.name for f in out_dir.iterdir()}
+        assert files == {"test_model_analysis.json", "test_model_analysis.md"}
 
     def test_analyze_missing_model(self, tmp_path, caplog):
-        args = type("Args", (), {
-            "model_repo": str(tmp_path / "model_repo"),
-            "model": "missing",
-            "output_dir": str(tmp_path / "reports"),
-        })()
-        assert cli._cmd_analyze(args) == 1
+        repo = tmp_path / "model_repo"
+        repo.mkdir()
+        rc = cli._cmd_analyze(self._args(repo, "missing"))
+        assert rc == 2
         assert "not found" in caplog.text.lower()
 
-    def test_analyze_missing_predict(self, tmp_path, monkeypatch):
+    def test_analyze_missing_predict_exits_1(self, tmp_path, capsys):
         repo = tmp_path / "model_repo"
-        model_dir = repo / "bad_model" / "1"
-        model_dir.mkdir(parents=True)
+        self._make_model(repo, "bad_model", '''
+            from lite_server import LitAPI
 
-        model_py = model_dir / "model.py"
-        model_py.write_text(textwrap.dedent('''
-            class BadModel:
+            class BadModel(LitAPI):
                 def setup(self, device):
                     pass
-        '''))
+        ''')
+        rc = cli._cmd_analyze(self._args(repo, "bad_model"))
+        assert rc == 1
+        report = json.loads(capsys.readouterr().out)
+        ls001 = [f for f in report["findings"] if f["rule_id"] == "LS001"]
+        assert ls001 and ls001[0]["severity"] == "error"
 
-        out_dir = tmp_path / "reports"
-        args = type("Args", (), {
-            "model_repo": str(repo),
-            "model": "bad_model",
-            "output_dir": str(out_dir),
-        })()
-        assert cli._cmd_analyze(args) == 0
-        report_files = list(out_dir.iterdir())
-        report = json.loads(report_files[0].read_text())
-        assert report["has_model_py"] is True
-        assert "predict" not in report["methods"]
-        assert report["warnings"]
-
-    def test_analyze_no_config(self, tmp_path):
+    def test_analyze_no_config(self, tmp_path, capsys):
         repo = tmp_path / "model_repo"
-        model_dir = repo / "test_model" / "1"
-        model_dir.mkdir(parents=True)
-        model_dir.joinpath("model.py").write_text(textwrap.dedent('''
-            class MyModel:
+        self._make_model(repo, "test_model", '''
+            from lite_server import LitAPI
+
+            class MyModel(LitAPI):
+                def setup(self, device):
+                    pass
                 def predict(self, x):
                     return x
-        '''))
-
-        out_dir = tmp_path / "reports"
-        args = type("Args", (), {
-            "model_repo": str(repo),
-            "model": "test_model",
-            "output_dir": str(out_dir),
-        })()
-        assert cli._cmd_analyze(args) == 0
-        report_files = list(out_dir.iterdir())
-        report = json.loads(report_files[0].read_text())
-        assert report["has_config"] is False
+        ''')
+        rc = cli._cmd_analyze(self._args(repo, "test_model"))
+        assert rc == 0
+        report = json.loads(capsys.readouterr().out)
+        assert report["files"]["has_config"] is False
         assert report["config"] == {}
+
+    def test_analyze_format_markdown(self, tmp_path, capsys):
+        repo = tmp_path / "model_repo"
+        self._make_model(repo, "test_model", '''
+            from lite_server import LitAPI
+
+            class MyModel(LitAPI):
+                def setup(self, device):
+                    pass
+                def predict(self, x):
+                    return x
+        ''')
+        rc = cli._cmd_analyze(self._args(repo, "test_model", format="markdown"))
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "# Analysis Report: test_model" in out
+        assert "MyModel" in out
+
+    def test_analyze_strict_promotes_warnings(self, tmp_path, capsys):
+        repo = tmp_path / "model_repo"
+        # missing setup → LS102 warning; implicit latest → LS111 warning
+        self._make_model(repo, "test_model", '''
+            from lite_server import LitAPI
+
+            class MyModel(LitAPI):
+                def predict(self, x):
+                    return x
+        ''')
+        capsys.readouterr()
+        assert cli._cmd_analyze(self._args(repo, "test_model")) == 0
+        capsys.readouterr()
+        assert cli._cmd_analyze(self._args(repo, "test_model", strict=True)) == 1
+
+    def test_analyze_path_traversal_returns_2(self, tmp_path, caplog):
+        repo = tmp_path / "model_repo"
+        repo.mkdir()
+        rc = cli._cmd_analyze(self._args(repo, "../outside"))
+        assert rc == 2
 
 
 # ===== pack / unpack =====
@@ -466,16 +505,17 @@ class TestInit:
 # ===== benchmark =====
 
 class TestBenchmark:
-    def test_benchmark_uses_client_context_manager(self, monkeypatch):
-        """Verify benchmark reuses a single httpx.AsyncClient instead of creating
-        a new connection per request."""
-        import time
-        import sys
-        import asyncio
+    """CLI is a thin shell over BenchmarkEngine: arg parsing, httpx target
+    construction, output rendering, exit codes — no benchmark logic inline."""
 
-        mock_response = type("Response", (), {"status_code": 200})()
-        post_calls = []
-        client_instances = []
+    def _fake_httpx(self, status_code=200):
+        mock_response = type("Response", (), {"status_code": status_code})()
+        calls = []
+        instances = []
+
+        class FakeTimeout:
+            def __init__(self, *args, **kwargs):
+                pass
 
         class FakeLimits:
             def __init__(self, *args, **kwargs):
@@ -483,45 +523,148 @@ class TestBenchmark:
 
         class FakeAsyncClient:
             def __init__(self, *args, **kwargs):
-                client_instances.append(self)
+                instances.append(self)
+
             async def __aenter__(self):
                 return self
+
             async def __aexit__(self, *args):
                 return False
+
             async def post(self, url, **kwargs):
-                post_calls.append((url, kwargs))
+                calls.append((url, kwargs))
                 return mock_response
 
-        fake_httpx = type("FakeHttpx", (), {
+        fake = type("FakeHttpx", (), {
             "AsyncClient": FakeAsyncClient,
             "Limits": FakeLimits,
-            "Timeout": lambda *args, **kwargs: type("FakeTimeout", (), {})(),
+            "Timeout": FakeTimeout,
+            "TimeoutException": type("TimeoutException", (Exception,), {}),
+            "ConnectError": type("ConnectError", (Exception,), {}),
+            "TransportError": type("TransportError", (Exception,), {}),
         })()
-        monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+        return fake, calls, instances
 
-        # time.monotonic is called extensively; make it monotonically increase
-        # so the benchmark loop runs a few rounds then exits.
-        t = [0.0]
-        def fake_monotonic():
-            t[0] += 0.001
-            return t[0]
-
-        monkeypatch.setattr(time, "monotonic", fake_monotonic)
-
-        args = type("Args", (), {
+    def _args(self, **overrides):
+        base = {
             "url": "http://127.0.0.1:8000",
             "model": "test_model",
             "version": None,
             "concurrency": 1,
-            "duration": 0.005,
-        })()
-        cli._cmd_benchmark(args)
+            "duration": None,
+            "requests": 5,
+            "warmup_requests": 0,
+            "grace_period": 1.0,
+            "payload": None,
+            "payload_file": None,
+            "export": None,
+            "max_error_rate": None,
+            "max_p99": None,
+        }
+        base.update(overrides)
+        return type("Args", (), base)()
 
-        # Exactly one AsyncClient instance should be created
-        assert len(client_instances) == 1, f"Expected 1 AsyncClient, got {len(client_instances)}"
-        assert len(post_calls) >= 1
-        for url, kwargs in post_calls:
+    def test_delegates_with_single_client_and_warmup(self, monkeypatch, capsys):
+        """One AsyncClient reused; warmup requests sent but not counted."""
+        import sys
+
+        fake, calls, instances = self._fake_httpx()
+        monkeypatch.setitem(sys.modules, "httpx", fake)
+
+        rc = cli._cmd_benchmark(self._args(requests=5, warmup_requests=2))
+
+        assert rc == 0
+        assert len(instances) == 1, f"Expected 1 AsyncClient, got {len(instances)}"
+        assert len(calls) == 5 + 2, "5 measured + 2 warmup requests"
+        for url, kwargs in calls:
             assert kwargs.get("json") == {"input": 1.0}
+        out = capsys.readouterr().out
+        assert "closed-loop" in out
+        assert "p95" in out
+
+    def test_duration_and_requests_mutually_exclusive(self):
+        import pytest
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main([
+                "benchmark", "--model", "m",
+                "--duration", "5", "--requests", "10",
+            ])
+        assert exc_info.value.code == 2
+
+    def test_max_error_rate_violation_exits_99(self, monkeypatch):
+        import sys
+
+        fake, calls, _ = self._fake_httpx(status_code=500)
+        monkeypatch.setitem(sys.modules, "httpx", fake)
+
+        rc = cli._cmd_benchmark(self._args(requests=3, max_error_rate=0.01))
+        assert rc == 99
+
+    def test_max_p99_violation_exits_99(self, monkeypatch):
+        import sys
+
+        fake, calls, _ = self._fake_httpx()
+        monkeypatch.setitem(sys.modules, "httpx", fake)
+
+        rc = cli._cmd_benchmark(self._args(requests=3, max_p99=-1.0))
+        assert rc == 99
+
+    def test_export_writes_json(self, monkeypatch, tmp_path):
+        import sys
+        import json
+
+        fake, calls, _ = self._fake_httpx()
+        monkeypatch.setitem(sys.modules, "httpx", fake)
+        export_path = tmp_path / "result.json"
+
+        rc = cli._cmd_benchmark(self._args(requests=5, export=str(export_path)))
+
+        assert rc == 0
+        data = json.loads(export_path.read_text())
+        assert data["load_mode"] == "closed-loop"
+        assert data["latency_basis"] == "service-time"
+        assert data["percentile_method"] == "linear"
+        assert data["successful"] == 5
+        assert data["config"]["model"] == "test_model"
+        assert data["config"]["requests"] == 5
+
+    def test_payload_inline_json(self, monkeypatch):
+        import sys
+
+        fake, calls, _ = self._fake_httpx()
+        monkeypatch.setitem(sys.modules, "httpx", fake)
+
+        rc = cli._cmd_benchmark(self._args(requests=2, payload='{"x": 9}'))
+
+        assert rc == 0
+        assert all(kwargs["json"] == {"x": 9} for _, kwargs in calls)
+
+    def test_payload_file_round_robin(self, monkeypatch, tmp_path):
+        import sys
+
+        p1 = tmp_path / "p1.json"
+        p2 = tmp_path / "p2.json"
+        p1.write_text('{"a": 1}')
+        p2.write_text('{"b": 2}')
+        fake, calls, _ = self._fake_httpx()
+        monkeypatch.setitem(sys.modules, "httpx", fake)
+
+        rc = cli._cmd_benchmark(
+            self._args(requests=4, payload_file=[str(p1), str(p2)])
+        )
+
+        assert rc == 0
+        bodies = [kwargs["json"] for _, kwargs in calls]
+        assert bodies == [{"a": 1}, {"b": 2}, {"a": 1}, {"b": 2}]
+
+    def test_payload_file_missing_returns_2(self, caplog):
+        rc = cli._cmd_benchmark(self._args(payload_file=["/nonexistent/x.json"]))
+        assert rc == 2
+
+    def test_invalid_payload_json_returns_2(self, caplog):
+        rc = cli._cmd_benchmark(self._args(payload="{not json"))
+        assert rc == 2
 
 
 # ===== serve CLI args parity with Rust =====

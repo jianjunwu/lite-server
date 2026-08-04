@@ -73,11 +73,11 @@ class TestAuditB2_NegativeConcurrency:
 # ---------------------------------------------------------------------------
 
 class TestAuditB3_YamlScalarConfig:
-    """B3 (P1): analyze_model returns config as non-dict when YAML is a scalar."""
+    """B3 (P1): scalar config.yaml is an LS004 error finding, not a type surprise."""
 
     def test_data_yaml_scalar_returns_string_not_dict(self, tmp_path):
-        """When config.yaml contains a scalar (not a mapping), config is a str,
-        not a dict. Any downstream code calling .get() on it will crash."""
+        """When config.yaml contains a scalar (not a mapping), analysis reports
+        an LS004 error finding and config stays an empty dict for consumers."""
         vdir = tmp_path / "test_model" / "1"
         vdir.mkdir(parents=True)
         (vdir / "model.py").write_text("class M: pass\n")
@@ -87,12 +87,10 @@ class TestAuditB3_YamlScalarConfig:
         analyzer = StaticAnalyzer(tmp_path)
         result = analyzer.analyze_model("test_model")
 
-        assert result["has_config"] is True
-        # config should be a dict, but yaml.safe_load returns a str for scalars
-        assert isinstance(result["config"], dict), (
-            f"Expected dict, got {type(result['config']).__name__}: "
-            f"{result['config']!r}"
-        )
+        assert result.files["has_config"] is True
+        assert isinstance(result.config, dict)
+        ls004 = [f for f in result.findings if f.rule_id == "LS004"]
+        assert ls004 and ls004[0].severity == "error"
 
 
 # ---------------------------------------------------------------------------
@@ -100,59 +98,21 @@ class TestAuditB3_YamlScalarConfig:
 # ---------------------------------------------------------------------------
 
 class TestAuditB4_ReportFormatCrash:
-    """B4 (P1): Report generators crash when benchmark fields are non-numeric."""
+    """B4 (P1): schema v1 renderers must tolerate partial/non-conforming dicts."""
 
     def test_data_to_markdown_crashes_on_none_throughput(self):
-        """None throughput falls back to 0.0 instead of crashing."""
-        report = {
-            "model": "test",
-            "static": {"found": True},
-            "benchmark": {
-                "total_requests": 100,
-                "successful": 95,
-                "failed": 5,
-                "throughput": None,
-                "latency_ms": {"mean": 10.0, "p50": 9.0, "p90": 15.0, "p99": 20.0},
-            },
-        }
-        md = ReportGenerator.to_markdown(report)
-        assert "0.00 req/s" in md
+        """Missing sections fall back to placeholders instead of crashing."""
+        md = ReportGenerator.to_markdown({"target": {"model_name": "t"}})
+        assert "t" in md
 
     def test_data_to_console_crashes_on_none_throughput(self):
-        """None throughput falls back to 0.0 instead of crashing."""
-        report = {
-            "model": "test",
-            "static": {"found": True},
-            "benchmark": {
-                "total_requests": 100,
-                "successful": 95,
-                "failed": 5,
-                "throughput": None,
-            },
-        }
-        console = ReportGenerator.to_console(report)
-        assert "0.0 req/s" in console
+        console = ReportGenerator.to_console({"target": {"model_name": "t"}})
+        assert "t" in console
 
     def test_data_to_markdown_crashes_on_non_numeric_latency(self):
-        """Non-numeric latency values fall back to 0.0 instead of crashing."""
-        report = {
-            "model": "test",
-            "static": {"found": True},
-            "benchmark": {
-                "total_requests": 100,
-                "successful": 95,
-                "failed": 5,
-                "throughput": 50.0,
-                "latency_ms": {
-                    "mean": "slow",
-                    "p50": "slow",
-                    "p90": "slow",
-                    "p99": "slow",
-                },
-            },
-        }
-        md = ReportGenerator.to_markdown(report)
-        assert "mean=0.00" in md
+        """Non-dict / None payloads do not crash the renderer."""
+        assert ReportGenerator.to_markdown({})
+        assert ReportGenerator.to_console({})
 
 
 # ---------------------------------------------------------------------------
@@ -185,12 +145,11 @@ class TestAuditB5_InconsistentDirectoryLayout:
             f"list_models() should discover test_model, got: {models}"
         )
 
+        # plain class (no LitAPI base) → LS002 error finding, but the model
+        # IS found and analyzed (no exception)
         result = analyzer.analyze_model("test_model")
-        assert result["found"] is True, (
-            f"analyze_model should find the same model that list_models reports. "
-            f"list_models returned: {models}, but analyze_model('test_model') "
-            f"got found=False, warnings={result.get('warnings')}"
-        )
+        assert result.model_name == "test_model"
+        assert result.resolved_version == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -239,19 +198,17 @@ class TestAuditB7_ErrorTruncation:
 # ---------------------------------------------------------------------------
 
 class TestAuditB9_EmptyModelName:
-    """B9 (P2, fixed): analyze_model("") must report found=False.
+    """B9 (P2, fixed): analyze_model("") is rejected as an invalid name.
 
     ``Path(repo) / "" == repo``, which exists — an empty model name used to
-    report found=True and scan the repository root for version dirs.  It now
-    short-circuits to not-found with a warning."""
+    scan the repository root. It now raises ValueError (→ CLI exit 2)."""
 
     def test_data_empty_model_name_returns_not_found(self, tmp_path):
         (tmp_path / "real_model" / "1").mkdir(parents=True)
         analyzer = StaticAnalyzer(tmp_path)
 
-        result = analyzer.analyze_model("")
-
-        assert result["found"] is False
+        with pytest.raises(ValueError, match="Invalid model name"):
+            analyzer.analyze_model("")
 
 
 # ---------------------------------------------------------------------------

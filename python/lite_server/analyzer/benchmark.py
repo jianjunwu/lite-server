@@ -1,12 +1,55 @@
-"""Benchmark engine for lite-server analyzer."""
+"""Benchmark engine for lite-server analyzer.
+
+Closed-loop load generation: a fixed pool of N worker coroutines sends
+requests serially (k6 constant-vus / perf_analyzer concurrency mode).
+Reported latencies are service-time only — queueing at the load generator
+is not measured (coordinated omission is inherent to closed-loop); the
+output contract labels this explicitly via ``load_mode``/``latency_basis``.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import os
 import statistics
 import time
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Union
+
+import numpy as np
+
+Payload = Union[dict, Callable[[], dict]]
+
+#: Below this many completed requests, percentile conclusions (esp. p99) are
+#: unreliable: max(300, 10 * concurrency). 300 = AIPerf SLA "coarse" tier;
+#: 10x concurrency = rule of thumb for reaching steady state per slot.
+MIN_SAMPLES_BASE = 300
+
+
+class RequestError(Exception):
+    """Base for classified request failures (see ``error_kinds``)."""
+
+    kind = "transport"
+
+
+class RequestTimeoutError(RequestError):
+    kind = "timeout"
+
+
+class RequestConnectError(RequestError):
+    kind = "connect"
+
+
+class RequestTransportError(RequestError):
+    kind = "transport"
+
+
+class RequestStatusError(RequestError):
+    kind = "status"
+
+    def __init__(self, status_code: int):
+        super().__init__(f"HTTP status {status_code}")
+        self.status_code = status_code
 
 
 @dataclass
@@ -19,10 +62,19 @@ class BenchmarkResult:
     latencies: list[float] = field(default_factory=list)
     duration: float = 0.0
     errors: list[str] = field(default_factory=list)
+    # Measured window in seconds: first request sent -> last successful
+    # response received. Throughput is computed over this window so trailing
+    # idle time and failed fast-paths do not distort the rate.
+    window: float = 0.0
+    warmup_requests: int = 0
+    drained_in_grace: int = 0
+    dropped_inflight: int = 0
+    error_kinds: dict[str, int] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def throughput(self) -> float:
-        return self.total_requests / self.duration if self.duration > 0 else 0.0
+        return self.successful / self.window if self.window > 0 else 0.0
 
     @property
     def mean_latency(self) -> float:
@@ -35,6 +87,10 @@ class BenchmarkResult:
     @property
     def p90(self) -> float:
         return self._percentile(0.9)
+
+    @property
+    def p95(self) -> float:
+        return self._percentile(0.95)
 
     @property
     def p99(self) -> float:
@@ -51,26 +107,33 @@ class BenchmarkResult:
     def _percentile(self, p: float) -> float:
         if not self.latencies:
             return 0.0
-        sorted_lat = sorted(self.latencies)
-        idx = int(len(sorted_lat) * p)
-        idx = min(idx, len(sorted_lat) - 1)
-        return sorted_lat[idx]
+        return float(np.percentile(self.latencies, p * 100, method="linear"))
 
     def to_dict(self) -> dict:
         return {
+            "load_mode": "closed-loop",
+            "latency_basis": "service-time",
+            "percentile_method": "linear",
             "total_requests": self.total_requests,
             "successful": self.successful,
             "failed": self.failed,
+            "error_kinds": dict(self.error_kinds),
             "throughput": round(self.throughput, 2),
             "duration": round(self.duration, 3),
+            "window": round(self.window, 3),
+            "warmup_requests": self.warmup_requests,
+            "drained_in_grace": self.drained_in_grace,
+            "dropped_inflight": self.dropped_inflight,
             "latency_ms": {
                 "mean": round(self.mean_latency, 2),
                 "p50": round(self.p50, 2),
                 "p90": round(self.p90, 2),
+                "p95": round(self.p95, 2),
                 "p99": round(self.p99, 2),
                 "min": round(self.min_latency, 2),
                 "max": round(self.max_latency, 2),
             },
+            "warnings": list(self.warnings),
             "errors": self.errors,
         }
 
@@ -80,22 +143,27 @@ class BenchmarkEngine:
 
     async def run(
         self,
-        target: Callable[..., Awaitable[dict]],
-        payload: dict,
+        target: Callable[[dict], Awaitable[dict]],
+        payload: Payload,
         concurrency: int = 1,
         duration: float | None = None,
         total_requests: int | None = None,
         warmup_requests: int = 0,
+        grace_period: float = 30.0,
     ) -> BenchmarkResult:
         """Run benchmark and return results.
 
         Args:
             target: Async callable that sends one inference request.
-            payload: Request payload dict.
-            concurrency: Number of concurrent requesters.
+            payload: Request payload dict, or a zero-arg callable returning a
+                fresh payload per request (e.g. round-robin over files).
+            concurrency: Number of worker coroutines (fixed pool).
             duration: Run for N seconds (fixed-duration mode).
             total_requests: Run exactly N requests (fixed-count mode).
-            warmup_requests: Number of warmup requests before measurement.
+            warmup_requests: Number of warmup requests before measurement;
+                their samples are discarded.
+            grace_period: After the deadline, stop dispatching and wait at
+                most this many seconds for in-flight requests (drain).
 
         Either ``duration`` or ``total_requests`` must be provided.
         """
@@ -104,12 +172,15 @@ class BenchmarkEngine:
         if concurrency < 1:
             raise ValueError(f"concurrency must be >= 1, got {concurrency}")
 
-        result = BenchmarkResult()
+        payload_factory = payload if callable(payload) else (lambda: payload)
 
-        # Warmup
+        cpu0 = os.times()
+        wall0 = time.perf_counter()
+
+        # Warmup — samples discarded, not measured.
         for _ in range(warmup_requests):
             try:
-                await target(payload)
+                await target(payload_factory())
             except Exception:
                 pass
 
@@ -117,83 +188,139 @@ class BenchmarkEngine:
 
         if total_requests is not None:
             result = await self._run_fixed_count(
-                target, payload, concurrency, total_requests
+                target, payload_factory, concurrency, total_requests
             )
         else:
             result = await self._run_fixed_duration(
-                target, payload, concurrency, duration or 0.0
+                target, payload_factory, concurrency, duration or 0.0, grace_period
             )
 
         result.duration = time.perf_counter() - start_time
+        result.warmup_requests = warmup_requests
+
+        min_samples = max(MIN_SAMPLES_BASE, 10 * concurrency)
+        if result.successful < min_samples:
+            result.warnings.append(
+                f"Sample size {result.successful} < {min_samples} "
+                f"(max(300, 10*concurrency)); latency percentiles (esp. p99) "
+                f"may be unreliable — increase duration/requests"
+            )
+
+        cpu1 = os.times()
+        cpu_used = (cpu1.user + cpu1.system) - (cpu0.user + cpu0.system)
+        warning = self._cpu_saturation_warning(
+            cpu_used=cpu_used, wall=time.perf_counter() - wall0
+        )
+        if warning:
+            result.warnings.append(warning)
+
         return result
+
+    @staticmethod
+    def _cpu_saturation_warning(cpu_used: float, wall: float) -> str | None:
+        """Warn when the load generator itself nears single-core saturation."""
+        if wall <= 0:
+            return None
+        if cpu_used / wall > 0.7:
+            return (
+                "Benchmark client CPU usage exceeded 70% of one core — the "
+                "load generator may be the bottleneck and results may be "
+                "distorted; cross-check with lower concurrency"
+            )
+        return None
+
+    async def _send(
+        self,
+        target: Callable[[dict], Awaitable[dict]],
+        payload_factory: Callable[[], dict],
+        result: BenchmarkResult,
+        state: dict,
+        deadline_ns: int | None,
+    ) -> None:
+        """Send one request and record the outcome into ``result``/``state``."""
+        payload = payload_factory()
+        state["started"] += 1
+        t0 = time.perf_counter_ns()
+        if state["first_t0_ns"] is None:
+            state["first_t0_ns"] = t0
+        try:
+            await target(payload)
+        except asyncio.CancelledError:
+            # In-flight at grace expiry: must propagate; NOT counted in
+            # total_requests — dropped_inflight = started - total_requests.
+            raise
+        except Exception as e:
+            kind = e.kind if isinstance(e, RequestError) else "unknown"
+            result.error_kinds[kind] = result.error_kinds.get(kind, 0) + 1
+            result.failed += 1
+            result.errors.append(str(e))
+            result.total_requests += 1
+        else:
+            t1 = time.perf_counter_ns()
+            result.latencies.append((t1 - t0) / 1e6)
+            result.successful += 1
+            result.total_requests += 1
+            state["last_t1_ns"] = t1
+            if deadline_ns is not None and t1 > deadline_ns:
+                result.drained_in_grace += 1
+
+    def _finish_window(self, result: BenchmarkResult, state: dict) -> None:
+        if state["first_t0_ns"] is not None and state["last_t1_ns"] is not None:
+            result.window = (state["last_t1_ns"] - state["first_t0_ns"]) / 1e9
 
     async def _run_fixed_duration(
         self,
-        target: Callable[..., Awaitable[dict]],
-        payload: dict,
+        target: Callable[[dict], Awaitable[dict]],
+        payload_factory: Callable[[], dict],
         concurrency: int,
         duration: float,
+        grace_period: float,
     ) -> BenchmarkResult:
         result = BenchmarkResult()
-        end_time = time.perf_counter() + duration
-        semaphore = asyncio.Semaphore(concurrency)
+        state = {"started": 0, "first_t0_ns": None, "last_t1_ns": None}
+        deadline_ns = time.perf_counter_ns() + int(duration * 1e9)
 
-        async def _send() -> None:
-            async with semaphore:
-                if time.perf_counter() >= end_time:
-                    return
-                t0 = time.perf_counter()
-                try:
-                    await target(payload)
-                    t1 = time.perf_counter()
-                    result.latencies.append((t1 - t0) * 1000)
-                    result.successful += 1
-                except Exception as e:
-                    result.failed += 1
-                    result.errors.append(str(e))
-                result.total_requests += 1
+        async def worker() -> None:
+            while time.perf_counter_ns() < deadline_ns:
+                await self._send(target, payload_factory, result, state, deadline_ns)
 
-        tasks = []
-        while time.perf_counter() < end_time:
-            tasks.append(asyncio.create_task(_send()))
-            # Throttle task creation to avoid unbounded growth
-            if len(tasks) >= concurrency * 4:
-                await asyncio.gather(*tasks[:concurrency])
-                tasks = tasks[concurrency:]
+        workers = [asyncio.create_task(worker()) for _ in range(concurrency)]
+        remaining = (deadline_ns - time.perf_counter_ns()) / 1e9
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*workers), timeout=max(remaining, 0.0) + grace_period
+            )
+        except asyncio.TimeoutError:
+            for w in workers:
+                w.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
 
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
+        result.dropped_inflight = state["started"] - result.total_requests
+        self._finish_window(result, state)
         return result
 
     async def _run_fixed_count(
         self,
-        target: Callable[..., Awaitable[dict]],
-        payload: dict,
+        target: Callable[[dict], Awaitable[dict]],
+        payload_factory: Callable[[], dict],
         concurrency: int,
         total_requests: int,
     ) -> BenchmarkResult:
         result = BenchmarkResult()
+        state = {"started": 0, "first_t0_ns": None, "last_t1_ns": None}
         counter = 0
-        semaphore = asyncio.Semaphore(concurrency)
 
-        async def _send() -> None:
+        async def worker() -> None:
             nonlocal counter
-            async with semaphore:
+            while True:
                 if counter >= total_requests:
                     return
-                counter += 1
-                t0 = time.perf_counter()
-                try:
-                    await target(payload)
-                    t1 = time.perf_counter()
-                    result.latencies.append((t1 - t0) * 1000)
-                    result.successful += 1
-                except Exception as e:
-                    result.failed += 1
-                    result.errors.append(str(e))
-                result.total_requests += 1
+                counter += 1  # no await between check and increment — atomic
+                await self._send(target, payload_factory, result, state, None)
 
-        tasks = [asyncio.create_task(_send()) for _ in range(total_requests)]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        worker_count = min(concurrency, total_requests)
+        workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+        await asyncio.gather(*workers)
+
+        self._finish_window(result, state)
         return result

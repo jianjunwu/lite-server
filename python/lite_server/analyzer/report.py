@@ -1,23 +1,19 @@
-"""Report generation for analyzer results."""
+"""Report renderers for analyze results.
+
+JSON (produced by AnalysisReport.to_dict) is the single authoritative
+representation; Markdown/console are one-way renderings of that same
+schema v1 dict — there is no second writer, so the formats cannot drift.
+"""
 
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
-def _num(value: Any, default: float = 0.0) -> float:
-    """Coerce value to float, falling back to default for None/non-numeric."""
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
 class ReportGenerator:
-    """Generate human-readable reports from analysis results."""
+    """Render analyze schema v1 reports to JSON / Markdown / console."""
 
     @staticmethod
     def to_json(report: dict[str, Any], indent: int = 2) -> str:
@@ -26,103 +22,125 @@ class ReportGenerator:
 
     @staticmethod
     def to_markdown(report: dict[str, Any]) -> str:
-        """Generate a Markdown report."""
+        """Render a schema v1 report dict as Markdown (tolerates missing keys)."""
         lines: list[str] = []
-        model = report.get("model", "unknown")
+        target = report.get("target") or {}
+        model = target.get("model_name", "unknown")
         lines.append(f"# Analysis Report: {model}\n")
 
-        # Timestamp
-        when = report.get("analyzed_at", datetime.now(timezone.utc).isoformat())
-        lines.append(f"**Analyzed at:** {when}\n")
+        lines.append(f"- **Tool:** {report.get('tool_version', '?')}")
+        lines.append(f"- **Schema:** v{report.get('schema_version', '?')}")
+        lines.append(f"- **Generated:** {report.get('generated_at', '?')}")
+        lines.append(f"- **Command:** `{report.get('command', '?')}`")
+        lines.append(
+            f"- **Version:** {target.get('resolved_version', '?')}"
+            f" (requested: {target.get('requested_version') or 'latest'})"
+        )
+        lines.append(
+            f"- **Executed user code:** {target.get('executed_user_code', False)}\n"
+        )
 
-        # Static analysis
-        static = report.get("static", {})
-        lines.append("## Static Analysis\n")
-        if not static.get("found"):
-            lines.append("Model not found in repository.\n")
-        else:
-            lines.append(f"- **Versions:** {', '.join(static.get('versions', []))}\n")
-            lines.append(f"- **Has model.py:** {'yes' if static.get('has_model_py') else 'no'}\n")
-            lines.append(f"- **Has config.yaml:** {'yes' if static.get('has_config') else 'no'}\n")
-            lines.append(f"- **Has requirements.txt:** {'yes' if static.get('has_requirements') else 'no'}\n")
-            if static.get("methods"):
-                lines.append(f"- **Methods:** {', '.join(static['methods'])}\n")
-            if static.get("optional_methods"):
-                lines.append(f"- **Optional methods:** {', '.join(static['optional_methods'])}\n")
+        summary = report.get("summary") or {}
+        lines.append(
+            f"**Summary:** {summary.get('errors', 0)} errors / "
+            f"{summary.get('warnings', 0)} warnings / "
+            f"{summary.get('infos', 0)} infos / "
+            f"{summary.get('checks_passed', 0)} checks passed\n"
+        )
 
-        # Warnings
-        warnings = static.get("warnings", [])
-        if warnings:
-            lines.append("\n### Warnings\n")
-            for w in warnings:
-                lines.append(f"- {w}\n")
+        versions = report.get("versions") or {}
+        if versions.get("found"):
+            lines.append(
+                f"**Versions found:** {', '.join(str(v) for v in versions['found'])}"
+                f" → resolved {versions.get('resolved', '?')}"
+                f"{' (implicit latest)' if versions.get('implicit_latest') else ''}\n"
+            )
 
-        # Benchmark results
-        benchmark = report.get("benchmark")
-        if benchmark:
-            lines.append("\n## Benchmark Results\n")
-            if isinstance(benchmark, dict):
-                lines.append(f"- **Total requests:** {benchmark.get('total_requests', 0)}\n")
-                lines.append(f"- **Successful:** {benchmark.get('successful', 0)}\n")
-                lines.append(f"- **Failed:** {benchmark.get('failed', 0)}\n")
-                lines.append(f"- **Throughput:** {_num(benchmark.get('throughput')):.2f} req/s\n")
-                lat = benchmark.get("latency_ms", {})
-                if lat:
-                    lines.append(f"- **Latency (ms):** mean={_num(lat.get('mean')):.2f}, "
-                                 f"p50={_num(lat.get('p50')):.2f}, "
-                                 f"p90={_num(lat.get('p90')):.2f}, "
-                                 f"p99={_num(lat.get('p99')):.2f}\n")
+        api_class = report.get("api_class")
+        if api_class:
+            loc = api_class.get("location") or {}
+            lines.append("## API Class\n")
+            lines.append(f"- **Name:** {api_class.get('name', '?')}")
+            lines.append(f"- **Bases:** {', '.join(api_class.get('bases') or [])}")
+            lines.append(f"- **Confidence:** {api_class.get('confidence', '?')}")
+            lines.append(f"- **Location:** {loc.get('file', '?')}:{loc.get('line', '?')}\n")
 
-        # Recommendations
-        recommendations = report.get("recommendations", [])
-        if recommendations:
-            lines.append("\n## Recommendations\n")
-            for rec in recommendations:
-                lines.append(f"- **{rec.get('field', '?')}** = {rec.get('value', '?')} — {rec.get('reason', '')}\n")
+        methods = report.get("methods") or {}
+        if methods:
+            lines.append("## Methods\n")
+            for group, entries in methods.items():
+                lines.append(f"### {group}\n")
+                for name, status in entries.items():
+                    if name == "required_by" and status:
+                        lines.append(f"- required by: `{status}`")
+                    elif name != "required_by":
+                        lines.append(f"- `{name}`: {status}")
+                lines.append("")
+
+        findings = report.get("findings") or []
+        if findings:
+            lines.append("## Findings\n")
+            for severity in ("error", "warning", "info"):
+                group = [f for f in findings if f.get("severity") == severity]
+                if not group:
+                    continue
+                lines.append(f"### {severity.upper()} ({len(group)})\n")
+                for f in group:
+                    loc = f.get("location") or {}
+                    where = (
+                        f" ({loc['file']}:{loc['line']})" if loc.get("file") else ""
+                    )
+                    lines.append(f"- **{f.get('rule_id', '?')}**{where}: "
+                                 f"{f.get('message', '')}")
+                    if f.get("hint"):
+                        lines.append(f"  - hint: {f['hint']}")
+                lines.append("")
+
+        checks = report.get("checks_passed") or []
+        if checks:
+            lines.append("## Checks Passed\n")
+            for c in checks:
+                lines.append(f"- {c}")
 
         return "\n".join(lines)
 
     @staticmethod
     def to_console(report: dict[str, Any]) -> str:
-        """Generate a concise console summary."""
+        """Concise console summary of a schema v1 report (tolerates missing keys)."""
         lines: list[str] = []
-        model = report.get("model", "unknown")
-        lines.append(f"Analysis: {model}")
+        target = report.get("target") or {}
+        model = target.get("model_name", "unknown")
+        lines.append(f"Analysis: {model} (version {target.get('resolved_version', '?')})")
         lines.append("-" * 40)
 
-        static = report.get("static", {})
-        if not static.get("found"):
-            lines.append("  Model not found")
-        else:
-            lines.append(f"  Versions: {', '.join(static.get('versions', []))}")
-            lines.append(f"  Methods: {', '.join(static.get('methods', []))}")
+        api_class = report.get("api_class")
+        if api_class:
+            lines.append(f"  API class: {api_class.get('name', '?')} "
+                         f"({api_class.get('confidence', '?')})")
 
-        warnings = static.get("warnings", [])
-        if warnings:
-            lines.append("  Warnings:")
-            for w in warnings:
-                lines.append(f"    - {w}")
+        summary = report.get("summary") or {}
+        lines.append(f"  errors={summary.get('errors', 0)} "
+                     f"warnings={summary.get('warnings', 0)} "
+                     f"infos={summary.get('infos', 0)}")
 
-        benchmark = report.get("benchmark")
-        if benchmark and isinstance(benchmark, dict):
-            lines.append(f"  Benchmark: {benchmark.get('total_requests', 0)} requests, "
-                         f"{_num(benchmark.get('throughput')):.1f} req/s")
-
-        recommendations = report.get("recommendations", [])
-        if recommendations:
-            lines.append("  Recommendations:")
-            for rec in recommendations:
-                lines.append(f"    - {rec.get('field')} = {rec.get('value')}")
+        for f in report.get("findings") or []:
+            lines.append(f"  [{f.get('severity', '?')}] {f.get('rule_id', '?')}: "
+                         f"{f.get('message', '')}")
 
         return "\n".join(lines)
 
     @staticmethod
     def save(report: dict[str, Any], output_dir: Path | str) -> Path:
-        """Save JSON and Markdown reports to output_dir."""
+        """Save JSON and Markdown reports to output_dir; returns the JSON path.
+
+        Model names with path separators are sanitized so the files always
+        land directly inside output_dir (audit B8).
+        """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        model = report.get("model", "unknown")
-        safe_model = str(model).replace("/", "-").replace("\\", "-")
+        target = report.get("target") or {}
+        model = str(target.get("model_name", "unknown"))
+        safe_model = model.replace("/", "-").replace("\\", "-")
         base = output_dir / f"{safe_model}_analysis"
 
         json_path = base.with_suffix(".json")

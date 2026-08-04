@@ -66,13 +66,45 @@ def main(argv=None):
     bench_parser.add_argument("--model", required=True)
     bench_parser.add_argument("--version", default=None)
     bench_parser.add_argument("--concurrency", type=int, default=8)
-    bench_parser.add_argument("--duration", type=float, default=30.0)
+    term_group = bench_parser.add_mutually_exclusive_group()
+    term_group.add_argument("--duration", type=float, default=None,
+                            help="Run for N seconds (default: 30; mutually exclusive with --requests)")
+    term_group.add_argument("--requests", type=int, default=None,
+                            help="Run exactly N requests (mutually exclusive with --duration)")
+    bench_parser.add_argument("--warmup-requests", type=int, default=0,
+                              help="Warmup requests before measurement; samples discarded "
+                                   "(recommended: ~= concurrency)")
+    bench_parser.add_argument("--grace-period", type=float, default=30.0,
+                              help="After the deadline, wait at most N seconds for in-flight "
+                                   "requests to drain (duration mode)")
+    payload_group = bench_parser.add_mutually_exclusive_group()
+    payload_group.add_argument("--payload", default=None,
+                               help="Inline JSON request body (default: '{\"input\": 1.0}')")
+    payload_group.add_argument("--payload-file", action="append", default=None,
+                               help="JSON file with request body; repeatable, round-robin")
+    bench_parser.add_argument("--export", default=None,
+                              help="Write authoritative JSON record to PATH (stdout table unchanged)")
+    bench_parser.add_argument("--max-error-rate", type=float, default=None,
+                              help="Exit 99 if failed/total exceeds R (e.g. 0.01)")
+    bench_parser.add_argument("--max-p99", type=float, default=None,
+                              help="Exit 99 if p99 latency exceeds MS milliseconds")
 
     # analyze
     analyze_parser = subparsers.add_parser("analyze", help="Run model analyzer")
     analyze_parser.add_argument("--model-repo", default="./model_repo")
     analyze_parser.add_argument("--model", required=True)
-    analyze_parser.add_argument("--output-dir", default="./reports")
+    analyze_parser.add_argument("--version", default=None,
+                                help="Model version (default: latest; warns LS111)")
+    analyze_parser.add_argument("--format", choices=["json", "markdown"], default="json",
+                                help="Output format (default: json; markdown is rendered "
+                                     "from the same schema v1 data)")
+    analyze_parser.add_argument("--output-dir", default=None,
+                                help="Additionally save report files (json+md) to DIR")
+    analyze_parser.add_argument("--fail-severity", choices=["error", "warning"],
+                                default="error",
+                                help="Minimum severity that exits 1 (default: error)")
+    analyze_parser.add_argument("--strict", action="store_true",
+                                help="Shortcut for --fail-severity warning")
 
     # pack
     pack_parser = subparsers.add_parser("pack", help="Pack model into artifact")
@@ -215,15 +247,45 @@ def _cmd_config_check(args):
         return 1
 
 
+def _resolve_benchmark_payloads(args) -> list[dict]:
+    """Resolve request payloads from --payload / --payload-file / default."""
+    if args.payload is not None:
+        return [json.loads(args.payload)]
+    if args.payload_file:
+        return [
+            json.loads(Path(p).read_text(encoding="utf-8"))
+            for p in args.payload_file
+        ]
+    return [{"input": 1.0}]
+
+
 def _cmd_benchmark(args):
-    """Run benchmark against running server using async HTTP with precise concurrency control."""
-    import asyncio
-    import time
-    import statistics
-    import json
+    """Run benchmark: thin shell over BenchmarkEngine (closed-loop, worker pool).
+
+    CLI responsibilities only: arg validation, httpx target construction,
+    output rendering, threshold gate. All measurement logic lives in
+    lite_server.analyzer.benchmark.BenchmarkEngine.
+    """
+    import itertools
     import sys
 
-    payload = {"input": 1.0}
+    from lite_server.analyzer.benchmark import (
+        BenchmarkEngine,
+        RequestConnectError,
+        RequestStatusError,
+        RequestTimeoutError,
+        RequestTransportError,
+    )
+
+    try:
+        payloads = _resolve_benchmark_payloads(args)
+    except (OSError, ValueError) as e:
+        _logger.error("payload error: %s", e)
+        return 2
+
+    duration = args.duration
+    if duration is None and args.requests is None:
+        duration = 30.0
 
     url = f"{args.url}/v2/models/{args.model}/infer"
     if args.version:
@@ -232,178 +294,151 @@ def _cmd_benchmark(args):
     async def run_benchmark():
         import httpx
 
-        print(f"Benchmarking {args.model} (concurrency={args.concurrency}, duration={args.duration}s)")
+        mode = f"duration={duration}s" if duration is not None else f"requests={args.requests}"
+        print(f"Benchmarking {args.model} (concurrency={args.concurrency}, "
+              f"{mode}, warmup={args.warmup_requests})")
 
-        results: list[dict] = []
-        sem = asyncio.Semaphore(args.concurrency)
-        running = True
-
-        async def send_request(client: httpx.AsyncClient):
-            async with sem:
-                t0 = time.monotonic()
+        payload_cycle = itertools.cycle(payloads)
+        timeout = httpx.Timeout(30.0, connect=5.0, pool=5.0)
+        limits = httpx.Limits(
+            max_connections=max(args.concurrency, 1),
+            max_keepalive_connections=max(args.concurrency, 1),
+            keepalive_expiry=15.0,
+        )
+        async with httpx.AsyncClient(limits=limits) as client:
+            async def target(payload: dict) -> dict:
                 try:
-                    resp = await client.post(
-                        url, json=payload,
-                        timeout=httpx.Timeout(30.0, connect=5.0),
-                    )
-                    results.append({
-                        "success": resp.status_code == 200,
-                        "latency_ms": (time.monotonic() - t0) * 1000,
-                    })
-                except Exception as e:
-                    results.append({
-                        "success": False,
-                        "latency_ms": (time.monotonic() - t0) * 1000,
-                        "error": str(e),
-                    })
+                    resp = await client.post(url, json=payload, timeout=timeout)
+                except httpx.TimeoutException as e:
+                    raise RequestTimeoutError() from e
+                except httpx.ConnectError as e:
+                    raise RequestConnectError() from e
+                except httpx.TransportError as e:
+                    raise RequestTransportError() from e
+                if resp.status_code != 200:
+                    raise RequestStatusError(resp.status_code)
+                return {"ok": True}
 
-        async with httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=args.concurrency * 2, max_keepalive_connections=args.concurrency),
-        ) as client:
-            tasks: list[asyncio.Task] = []
-            deadline = time.monotonic() + args.duration
-
-            while time.monotonic() < deadline:
-                tasks.append(asyncio.create_task(send_request(client)))
-                # Trim completed tasks periodically to bound memory
-                if len(tasks) > args.concurrency * 4:
-                    tasks = [t for t in tasks if not t.done()]
-
-            # Wait for remaining tasks to finish
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-        return results
+            engine = BenchmarkEngine()
+            return await engine.run(
+                target=target,
+                payload=lambda: next(payload_cycle),
+                concurrency=args.concurrency,
+                duration=duration,
+                total_requests=args.requests,
+                warmup_requests=args.warmup_requests,
+                grace_period=args.grace_period,
+            )
 
     # Windows: use SelectorEventLoop for subprocess compat
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     try:
-        results = asyncio.run(run_benchmark())
+        result = asyncio.run(run_benchmark())
     except KeyboardInterrupt:
         print("\nBenchmark interrupted.")
         return 130
 
-    total = len(results)
-    if total == 0:
+    if result.total_requests == 0:
         print("No requests completed — is the server running?")
         return 1
 
-    success = sum(1 for r in results if r.get("success"))
-    failed = total - success
-    latencies = [r["latency_ms"] for r in results if r.get("success")]
-
-    throughput = total / args.duration if args.duration > 0 else 0
-
     print(f"\nBenchmark Results ({args.model}):")
-    print(f"  Duration:        {args.duration}s")
-    print(f"  Total requests:  {total}")
-    print(f"  Success:         {success}")
-    print(f"  Failed:          {failed}")
-    print(f"  Throughput:      {throughput:.2f} req/s")
+    print("  Mode:            closed-loop (service-time latencies)")
+    if duration is not None:
+        print(f"  Duration:        {duration}s (measured window {result.window:.3f}s)")
+    else:
+        print(f"  Requests:        {args.requests} (measured window {result.window:.3f}s)")
+    print(f"  Total requests:  {result.total_requests}")
+    print(f"  Success:         {result.successful}")
+    print(f"  Failed:          {result.failed}")
+    if result.error_kinds:
+        kinds = ", ".join(f"{k}={v}" for k, v in sorted(result.error_kinds.items()))
+        print(f"    by kind:       {kinds}")
+    print(f"  Throughput:      {result.throughput:.2f} req/s")
+    if duration is not None:
+        print(f"  Drained/grace:   {result.drained_in_grace}  "
+              f"Dropped in-flight: {result.dropped_inflight}")
 
-    if latencies:
-        latencies.sort()
-        print(f"  Latency (ms):")
-        print(f"    mean: {statistics.mean(latencies):.2f}")
-        print(f"    p50:  {statistics.median(latencies):.2f}")
-        print(f"    p90:  {latencies[int(len(latencies) * 0.9)]:.2f}")
-        print(f"    p99:  {latencies[int(len(latencies) * 0.99)]:.2f}")
-        print(f"    min:  {min(latencies):.2f}")
-        print(f"    max:  {max(latencies):.2f}")
+    if result.latencies:
+        print("  Latency (ms) [percentile method: linear]:")
+        print(f"    mean: {result.mean_latency:.2f}")
+        print(f"    p50:  {result.p50:.2f}")
+        print(f"    p90:  {result.p90:.2f}")
+        print(f"    p95:  {result.p95:.2f}")
+        print(f"    p99:  {result.p99:.2f}")
+        print(f"    min:  {result.min_latency:.2f}")
+        print(f"    max:  {result.max_latency:.2f}")
+
+    for w in result.warnings:
+        print(f"  WARNING: {w}")
+
+    if args.export:
+        export_data = {
+            "config": {
+                "url": url,
+                "model": args.model,
+                "version": args.version,
+                "concurrency": args.concurrency,
+                "duration": duration,
+                "requests": args.requests,
+                "warmup_requests": args.warmup_requests,
+                "grace_period": args.grace_period,
+            },
+            **result.to_dict(),
+        }
+        Path(args.export).write_text(json.dumps(export_data, indent=2), encoding="utf-8")
+        print(f"  Exported: {args.export}")
+
+    violations = []
+    if args.max_error_rate is not None:
+        rate = result.failed / result.total_requests
+        if rate > args.max_error_rate:
+            violations.append(f"error rate {rate:.3f} > {args.max_error_rate}")
+    if args.max_p99 is not None and result.p99 > args.max_p99:
+        violations.append(f"p99 {result.p99:.2f}ms > {args.max_p99}ms")
+    if violations:
+        for v in violations:
+            print(f"  THRESHOLD VIOLATION: {v}")
+        return 99
 
     return 0
 
 
 def _cmd_analyze(args):
-    """Static model analyzer: inspect model.py, config.yaml, deps, generate JSON report."""
-    import importlib.util
-    from datetime import datetime, timezone
+    """Analyze a model: thin shell over StaticAnalyzer (pure AST, zero execution).
 
-    repo = Path(args.model_repo)
-    model_dir = repo / args.model
+    Exit code protocol: 0 = no finding at --fail-severity, 1 = finding(s) at
+    or above it, 2 = analysis itself failed (path escape, not found, ...).
+    """
+    from lite_server.analyzer.report import ReportGenerator
+    from lite_server.analyzer.static import StaticAnalyzer
 
-    if not model_dir.exists():
-        _logger.error("Model not found: %s", model_dir)
-        return 1
+    try:
+        analyzer = StaticAnalyzer(Path(args.model_repo))
+        report = analyzer.analyze_model(args.model, version=args.version)
+    except (ValueError, FileNotFoundError) as e:
+        _logger.error("%s", e)
+        return 2
 
-    # Find version directory (use first numeric dir, or '1')
-    version_dirs = [d for d in model_dir.iterdir() if d.is_dir() and d.name.isdigit()]
-    version_dir = version_dirs[0] if version_dirs else model_dir / "1"
-    version = version_dir.name
+    command = f"lite-server analyze --model {args.model}"
+    if args.version:
+        command += f" --version {args.version}"
+    report_dict = report.to_dict(tool_version=f"lite-server {_pkg_version}",
+                                 command=command)
 
-    model_py = version_dir / "model.py"
-    config_yaml = version_dir / "config.yaml"
-    requirements_txt = model_dir / "requirements.txt"
-
-    report = {
-        "model_name": args.model,
-        "version": version,
-        "analyzed_at": datetime.now(timezone.utc).isoformat(),
-        "has_model_py": model_py.exists(),
-        "has_config": config_yaml.exists(),
-        "has_requirements": requirements_txt.exists(),
-        "config": {},
-        "methods": [],
-        "warnings": [],
-    }
-
-    # Parse config
-    if config_yaml.exists():
-        try:
-            import yaml
-            report["config"] = yaml.safe_load(config_yaml.read_text()) or {}
-        except Exception as e:
-            report["warnings"].append(f"config.yaml parse error: {e}")
-
-    # Analyze model.py
-    if model_py.exists():
-        try:
-            spec = importlib.util.spec_from_file_location("analyzed_model", model_py)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-
-            # Find the API class
-            api_class = None
-            for name in dir(module):
-                obj = getattr(module, name)
-                if isinstance(obj, type) and name != "LitAPI":
-                    api_class = obj
-                    break
-
-            if api_class:
-                for method in ("setup", "decode_request", "predict", "encode_response",
-                               "batch", "unbatch", "predict_step", "stream_open",
-                               "stream_chunk", "stream_close", "stream_cancel"):
-                    if hasattr(api_class, method) and callable(getattr(api_class, method)):
-                        report["methods"].append(method)
-
-                if "predict" not in report["methods"]:
-                    report["warnings"].append("No predict() method found")
-            else:
-                report["warnings"].append("No LitAPI subclass found")
-        except Exception as e:
-            report["warnings"].append(f"model.py load error: {e}")
+    if args.format == "markdown":
+        print(ReportGenerator.to_markdown(report_dict))
     else:
-        report["warnings"].append("model.py not found")
+        print(ReportGenerator.to_json(report_dict))
 
-    # Check requirements
-    if requirements_txt.exists():
-        deps = [line.strip() for line in requirements_txt.read_text().splitlines() if line.strip()]
-        report["dependencies"] = deps
+    if args.output_dir:
+        saved = ReportGenerator.save(report_dict, args.output_dir)
+        print(f"Reports saved: {saved} (+ .md)", file=sys.stderr)
 
-    # Write report
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    report_path = output_dir / f"{args.model}_v{version}_report.json"
-    report_path.write_text(json.dumps(report, indent=2))
-
-    print(f"Analysis report: {report_path}")
-    if report["warnings"]:
-        for w in report["warnings"]:
-            print(f"  Warning: {w}")
-    return 0
+    fail_severity = "warning" if args.strict else args.fail_severity
+    return report.exit_code(fail_severity)
 
 
 def _cmd_pack(args):
