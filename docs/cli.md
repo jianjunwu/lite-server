@@ -135,12 +135,33 @@ lite-server benchmark --model <MODEL> [OPTIONS]
 | `--url` | string | http://127.0.0.1:8000 | Server URL |
 | `--model` | string | (required) | Model name to benchmark |
 | `--version` | string | (latest) | Model version |
-| `--concurrency` | int | 8 | Number of concurrent requests |
-| `--duration` | float | 30.0 | Benchmark duration in seconds |
+| `--concurrency` | int | 8 | Closed-loop worker coroutines (fixed pool) |
+| `--duration` | float | 30.0 | Run for N seconds (mutually exclusive with `--requests`) |
+| `--requests` | int | — | Run exactly N requests (mutually exclusive with `--duration`) |
+| `--warmup-requests` | int | 0 | Warmup requests before measurement; samples discarded (recommended: ~= concurrency) |
+| `--grace-period` | float | 30.0 | After the deadline, wait at most N seconds for in-flight requests to drain |
+| `--payload` | string | `{"input": 1.0}` | Inline JSON request body |
+| `--payload-file` | path | — | JSON file with request body; repeatable, round-robin |
+| `--export` | path | — | Write authoritative JSON record to PATH (stdout table unchanged) |
+| `--max-error-rate` | float | — | Exit 99 if failed/total exceeds R (e.g. 0.01) |
+| `--max-p99` | float | — | Exit 99 if p99 latency exceeds MS milliseconds |
+
+**Measurement contract** (closed-loop, service-time):
+
+- Latencies are **service-time only**: queueing at the load generator is not measured (inherent to closed-loop; the output labels this as `load_mode: closed-loop`, `latency_basis: service-time`).
+- Warmup samples are discarded; in-flight requests at the deadline are drained up to `--grace-period` (completions kept, the rest reported as `dropped_inflight`).
+- Throughput = `successful / (last response − first request)` (measured window), percentiles use numpy `linear` interpolation (p50/p90/p95/p99/max reported).
+- Insufficient samples (`< max(300, 10 × concurrency)`) and client CPU saturation (>70% of one core) produce explicit warnings in stdout and JSON.
+
+**Exit codes**: `0` pass · `1` execution error (e.g. no requests completed) · `2` argument/payload error · `99` threshold violation.
 
 ```bash
 # Benchmark my_model for 60 seconds with 16 concurrent requests
 lite-server benchmark --model my_model --concurrency 16 --duration 60
+
+# CI smoke: fixed count, warmup, JSON export, error-rate gate
+lite-server benchmark --model my_model --requests 200 --concurrency 4 \
+  --warmup-requests 4 --max-error-rate 0.01 --export smoke.json
 ```
 
 ---
@@ -155,7 +176,36 @@ lite-server analyze --model <MODEL> [OPTIONS]
 |------|------|---------|-------------|
 | `--model-repo` | string | ./model_repo | Model repository path |
 | `--model` | string | (required) | Model name to analyze |
-| `--output-dir` | string | ./reports | Output directory for reports |
+| `--version` | string | (latest) | Model version (default resolves latest and warns LS111) |
+| `--format` | json\|markdown | json | Output format; markdown is rendered from the same schema v1 data |
+| `--output-dir` | string | — | Additionally save report files (json+md) to DIR |
+| `--fail-severity` | error\|warning | error | Minimum finding severity that exits 1 |
+| `--strict` | flag | false | Shortcut for `--fail-severity warning` |
+
+**Pure static analysis — user code is never executed.** model.py is parsed as
+AST (no import side effects), paths are confined to the repository root
+(`..`/symlink escapes rejected with exit 2), and config.yaml is validated
+through the same Rust serde path as `config-check`.
+
+**Exit codes**: `0` no finding at `--fail-severity` · `1` finding(s) at or above it · `2` analysis itself failed (model/version not found, path escape).
+
+| rule_id | severity | Trigger |
+|---------|----------|---------|
+| LS001 | error | `predict` not implemented (LitAPI base raises NotImplementedError) |
+| LS002 | error | Zero or multiple LitAPI subclasses (most-derived class counts) |
+| LS004 | error | config.yaml failed validation (Rust serde) or is not a mapping |
+| LS005 | error | .py file has a syntax error |
+| LS101 | warning | `max_batch_size > 1` but neither `batch` nor `unbatch` overridden |
+| LS102 | warning | `setup` not overridden (base defaults to pass) |
+| LS103 | warning | `stream: true` but `stream_predict` not overridden or not a generator |
+| LS104 | warning | requirements.txt line not parseable |
+| LS111 | warning | No `--version` given; resolved latest(1) |
+| LS201 | info | Lifecycle hooks (`teardown`/`on_file_changed`) not overridden |
+| LS202 | info | Possible LitAPI subclass with unresolvable base (no silent false negatives) |
+
+The JSON report is schema v1 (`schema_version: 1`) and is the single
+authoritative representation — CI gates and downstream tools should consume
+it (via stdout or `--output-dir`), not the markdown rendering.
 
 ---
 

@@ -135,12 +135,33 @@ lite-server benchmark --model <模型名> [选项]
 | `--url` | string | http://127.0.0.1:8000 | 服务器 URL |
 | `--model` | string | （必填） | 要测试的模型名 |
 | `--version` | string | （最新版） | 模型版本 |
-| `--concurrency` | int | 8 | 并发请求数 |
-| `--duration` | float | 30.0 | 测试持续时间（秒） |
+| `--concurrency` | int | 8 | 闭环 worker 协程数（固定池） |
+| `--duration` | float | 30.0 | 持续 N 秒（与 `--requests` 互斥） |
+| `--requests` | int | — | 固定发送 N 个请求（与 `--duration` 互斥） |
+| `--warmup-requests` | int | 0 | 预热请求数，样本丢弃（推荐 ≈ 并发数） |
+| `--grace-period` | float | 30.0 | 到期后等待在途请求完成的上限（秒） |
+| `--payload` | string | `{"input": 1.0}` | 内联 JSON 请求体 |
+| `--payload-file` | path | — | JSON 请求体文件；可重复指定，轮询发送 |
+| `--export` | path | — | 将权威 JSON 记录写入 PATH（stdout 表格不变） |
+| `--max-error-rate` | float | — | 错误率超过 R 时退出码 99（如 0.01） |
+| `--max-p99` | float | — | p99 延迟超过 MS 毫秒时退出码 99 |
+
+**测量口径**（闭环，service-time）：
+
+- 延迟为**纯服务时间**：不含负载发生器侧排队（闭环固有；输出标注 `load_mode: closed-loop`、`latency_basis: service-time`）。
+- 预热样本丢弃；到期在途请求按 `--grace-period` 有界 drain（grace 内完成计入统计，其余记为 `dropped_inflight`）。
+- 吞吐 = `成功数 / (末响应 − 首请求)`（实测窗口）；百分位统一 numpy `linear` 插值（报告 p50/p90/p95/p99/max）。
+- 样本不足（`< max(300, 10 × 并发数)`）与客户端 CPU 饱和（单核 >70%）会在 stdout 与 JSON 中显式告警。
+
+**退出码**：`0` 通过 · `1` 执行错误（如无请求完成） · `2` 参数/payload 错误 · `99` 阈值违例。
 
 ```bash
 # 对 my_model 做 60 秒、16 并发的基准测试
 lite-server benchmark --model my_model --concurrency 16 --duration 60
+
+# CI 冒烟：固定次数 + 预热 + JSON 导出 + 错误率门禁
+lite-server benchmark --model my_model --requests 200 --concurrency 4 \
+  --warmup-requests 4 --max-error-rate 0.01 --export smoke.json
 ```
 
 ---
@@ -155,7 +176,35 @@ lite-server analyze --model <模型名> [选项]
 |------|------|--------|------|
 | `--model-repo` | string | ./model_repo | 模型仓库路径 |
 | `--model` | string | （必填） | 要分析的模型名 |
-| `--output-dir` | string | ./reports | 报告输出目录 |
+| `--version` | string | （最新版） | 模型版本（缺省按 latest 解析并产生 LS111 警告） |
+| `--format` | json\|markdown | json | 输出格式；markdown 由同一份 schema v1 数据渲染 |
+| `--output-dir` | string | — | 额外将报告文件（json+md）保存到 DIR |
+| `--fail-severity` | error\|warning | error | 触发退出码 1 的最低严重度 |
+| `--strict` | flag | false | `--fail-severity warning` 的简写 |
+
+**纯静态分析——用户代码绝不执行。** model.py 以 AST 解析（无 import 副
+作用）；路径限定在仓库根内（`..`/符号链接逃逸以退出码 2 拒绝）；
+config.yaml 走与 `config-check` 相同的 Rust serde 校验路径。
+
+**退出码**：`0` 无达到 `--fail-severity` 的发现 · `1` 有达到该级别的发现 · `2` 分析本身失败（模型/版本不存在、路径越界）。
+
+| rule_id | 严重度 | 触发条件 |
+|---------|--------|---------|
+| LS001 | error | `predict` 未实现（LitAPI 基类抛 NotImplementedError） |
+| LS002 | error | LitAPI 子类为零或多个（按最派生类计） |
+| LS004 | error | config.yaml 未通过校验（Rust serde）或顶层非 mapping |
+| LS005 | error | .py 文件语法错误 |
+| LS101 | warning | `max_batch_size > 1` 但 `batch`/`unbatch` 均未覆写 |
+| LS102 | warning | `setup` 未覆写（基类默认 pass） |
+| LS103 | warning | `stream: true` 但 `stream_predict` 未覆写或非 generator |
+| LS104 | warning | requirements.txt 存在无法解析的行 |
+| LS111 | warning | 未指定 `--version`，按 latest(1) 解析 |
+| LS201 | info | 生命周期钩子（`teardown`/`on_file_changed`）未覆写 |
+| LS202 | info | 疑似 LitAPI 子类但基类无法静态解析（假阴性不静默） |
+
+JSON 报告为 schema v1（`schema_version: 1`），是唯一权威表示——CI 门
+禁与下游工具应消费 JSON（经 stdout 或 `--output-dir`），而非 markdown
+渲染层。
 
 ---
 
