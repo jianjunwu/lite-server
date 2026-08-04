@@ -416,3 +416,226 @@ class TestAuditHypotheses:
         assert on_close_calls == ["close"], (
             f"on_close fired more than once: {on_close_calls}"
         )
+
+
+class TestAuditReverseRace:
+    """Reverse race: a server cancel lands while on_chunk / send() is suspended
+    at an await. The cancel path terminalizes the stream (close 'cancel' +
+    on_close for bidi); when the suspended work resumes it must NOT send
+    frames, re-run cleanup, or fire on_stream_close again."""
+
+    @pytest.mark.asyncio
+    async def test_bidi_cancel_during_on_chunk_then_error_single_close(self):
+        close_reasons = []
+        on_close_calls = []
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class CloseRecCB(Callback):
+            def on_stream_close(self, ctx, reason):
+                close_reasons.append(reason)
+
+        class BlockingHandler(BidiStreamHandler):
+            async def on_open(self, data, ctx=None):
+                return None
+
+            async def on_chunk(self, data, ctx=None):
+                entered.set()
+                await release.wait()
+                raise RuntimeError("chunk boom")
+
+            async def on_close(self, ctx=None):
+                on_close_calls.append("close")
+                return None
+
+        class BidiAPI(EchoAPI):
+            def bidi_stream(self, ctx=None):
+                return BlockingHandler()
+
+        api = BidiAPI()
+        api._pipeline = Pipeline.build(api, [CloseRecCB()])
+        sock = AsyncSocket()
+        active = {}
+        await inference._handle_stream_open_async(
+            api, _stream_req("b-rr"), sock, active, log
+        )
+        assert "b-rr" in active
+
+        from lite_server.proto import (
+            Request, StreamCancel, StreamChunk, StreamRequest,
+        )
+        chunk_req = Request(stream=StreamRequest(
+            stream_id="b-rr", chunk=StreamChunk(data=b"{}")))
+        chunk_task = asyncio.create_task(
+            inference._handle_stream_async(api, chunk_req, sock, active, log)
+        )
+        await entered.wait()
+
+        cancel_req = Request(stream=StreamRequest(
+            stream_id="b-rr", cancel=StreamCancel()))
+        await inference._handle_stream_async(api, cancel_req, sock, active, log)
+        assert close_reasons == ["cancel"]
+        assert on_close_calls == ["close"]
+
+        release.set()
+        await chunk_task
+
+        # The resumed on_chunk error must be swallowed: no StreamError frame,
+        # no second on_close, no second on_stream_close.
+        errors = [r for r in sock.stream_responses("b-rr") if r.stream.HasField("error")]
+        assert errors == [], "frames must not be sent after cancel"
+        assert on_close_calls == ["close"], (
+            f"on_close fired more than once: {on_close_calls}"
+        )
+        assert close_reasons == ["cancel"], (
+            f"on_stream_close fired more than once: {close_reasons}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_bidi_cancel_during_on_chunk_success_drops_chunk(self):
+        close_reasons = []
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class CloseRecCB(Callback):
+            def on_stream_close(self, ctx, reason):
+                close_reasons.append(reason)
+
+        class BlockingHandler(BidiStreamHandler):
+            async def on_open(self, data, ctx=None):
+                return None
+
+            async def on_chunk(self, data, ctx=None):
+                entered.set()
+                await release.wait()
+                return {"late": "chunk"}
+
+            async def on_close(self, ctx=None):
+                return None
+
+        class BidiAPI(EchoAPI):
+            def bidi_stream(self, ctx=None):
+                return BlockingHandler()
+
+        api = BidiAPI()
+        api._pipeline = Pipeline.build(api, [CloseRecCB()])
+        sock = AsyncSocket()
+        active = {}
+        await inference._handle_stream_open_async(
+            api, _stream_req("b-rs"), sock, active, log
+        )
+
+        from lite_server.proto import (
+            Request, StreamCancel, StreamChunk, StreamRequest,
+        )
+        chunk_req = Request(stream=StreamRequest(
+            stream_id="b-rs", chunk=StreamChunk(data=b"{}")))
+        chunk_task = asyncio.create_task(
+            inference._handle_stream_async(api, chunk_req, sock, active, log)
+        )
+        await entered.wait()
+
+        cancel_req = Request(stream=StreamRequest(
+            stream_id="b-rs", cancel=StreamCancel()))
+        await inference._handle_stream_async(api, cancel_req, sock, active, log)
+        assert close_reasons == ["cancel"]
+
+        release.set()
+        await chunk_task
+
+        # The late chunk must be dropped — the client is gone.
+        chunks = [r for r in sock.stream_responses("b-rs") if r.stream.HasField("chunk")]
+        assert chunks == [], "chunk must not be sent after cancel"
+        assert close_reasons == ["cancel"]
+
+    @pytest.mark.asyncio
+    async def test_decoupled_cancel_during_send_then_error_single_close(self):
+        close_reasons = []
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        holder = {}
+
+        class CloseRecCB(Callback):
+            def on_stream_close(self, ctx, reason):
+                close_reasons.append(reason)
+
+        class BlockingEncodeCB(Callback):
+            async def after_predict(self, ctx):
+                entered.set()
+                await release.wait()
+                raise RuntimeError("encode boom")
+
+        class DecoupledAPI(EchoAPI):
+            async def predict_decoupled(self, data, sender):
+                holder["sender"] = sender
+
+        api = DecoupledAPI()
+        api._pipeline = Pipeline.build(api, [CloseRecCB(), BlockingEncodeCB()])
+        sock = AsyncSocket()
+        active = {}
+        await inference._handle_stream_open_async(
+            api, _decoupled_req("dc-rr"), sock, active, log
+        )
+        assert "dc-rr" in active
+
+        send_task = asyncio.create_task(holder["sender"].send({"x": 1}))
+        await entered.wait()
+
+        from lite_server.proto import Request, StreamCancel, StreamRequest
+        cancel_req = Request(stream=StreamRequest(
+            stream_id="dc-rr", cancel=StreamCancel()))
+        await inference._handle_stream_async(api, cancel_req, sock, active, log)
+        assert close_reasons == ["cancel"]
+
+        release.set()
+        await send_task
+
+        errors = [r for r in sock.stream_responses("dc-rr") if r.stream.HasField("error")]
+        assert errors == [], "frames must not be sent after cancel"
+        assert close_reasons == ["cancel"], (
+            f"on_stream_close fired more than once: {close_reasons}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_decoupled_cancel_during_send_success_drops_chunk(self):
+        close_reasons = []
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        holder = {}
+
+        class CloseRecCB(Callback):
+            def on_stream_close(self, ctx, reason):
+                close_reasons.append(reason)
+
+        class BlockingEncodeCB(Callback):
+            async def after_predict(self, ctx):
+                entered.set()
+                await release.wait()
+
+        class DecoupledAPI(EchoAPI):
+            async def predict_decoupled(self, data, sender):
+                holder["sender"] = sender
+
+        api = DecoupledAPI()
+        api._pipeline = Pipeline.build(api, [CloseRecCB(), BlockingEncodeCB()])
+        sock = AsyncSocket()
+        active = {}
+        await inference._handle_stream_open_async(
+            api, _decoupled_req("dc-rs"), sock, active, log
+        )
+
+        send_task = asyncio.create_task(holder["sender"].send({"x": 1}))
+        await entered.wait()
+
+        from lite_server.proto import Request, StreamCancel, StreamRequest
+        cancel_req = Request(stream=StreamRequest(
+            stream_id="dc-rs", cancel=StreamCancel()))
+        await inference._handle_stream_async(api, cancel_req, sock, active, log)
+        assert close_reasons == ["cancel"]
+
+        release.set()
+        await send_task
+
+        chunks = [r for r in sock.stream_responses("dc-rs") if r.stream.HasField("chunk")]
+        assert chunks == [], "chunk must not be sent after cancel"
+        assert close_reasons == ["cancel"]

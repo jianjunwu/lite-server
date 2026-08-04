@@ -96,15 +96,22 @@ async def _send_route_stream(socket, stream_id: str, resp, ctx: RequestContext,
 # ---------------------------------------------------------------------------
 
 class _BidiSession:
-    """Per-stream state for bidirectional streaming."""
+    """Per-stream state for bidirectional streaming.
 
-    __slots__ = ("handler", "on_chunk", "on_close", "ctx")
+    ``closed`` is the terminal flag: set by the close/cancel path the moment
+    the session is reclaimed. An on_chunk/encode call that was suspended at
+    an await when the cancel landed checks it on resume and stops without
+    sending frames, re-running on_close, or re-firing on_stream_close.
+    """
+
+    __slots__ = ("handler", "on_chunk", "on_close", "ctx", "closed")
 
     def __init__(self, handler, on_chunk, on_close, ctx: RequestContext):
         self.handler = handler
         self.on_chunk = on_chunk
         self.on_close = on_close
         self.ctx = ctx
+        self.closed = False
 
 
 class _DecoupledSession:
@@ -156,6 +163,8 @@ class _ResponseSender:
             await self._pipe.postprocess(self._ctx)
         except HTTPException as e:
             self._log.warning("decoupled send rejected for %s: %s", self._stream_id, e.detail)
+            if self.closed:
+                return  # cancel/close landed mid-await: already terminalized
             # Terminal-first: reclaim the session before the terminal frames so
             # a server cleanup cancel interleaving the awaits finds nothing and
             # cannot double-fire on_stream_close.
@@ -168,12 +177,16 @@ class _ResponseSender:
             return
         except Exception as e:
             self._log.error("decoupled send failed for %s: %s", self._stream_id, _format_exc_brief(e))
+            if self.closed:
+                return  # cancel/close landed mid-await: already terminalized
             self.closed = True
             self._active_streams.pop(self._stream_id, None)
             await _handle_stream_error(self._pipe, self._ctx, e, self._socket,
                                         self._stream_id, self._lit_api, self._log,
                                         detail=f"send failed: {e}")
             return
+        if self.closed:
+            return  # cancel/close landed during postprocess: drop the late chunk
         if self._ctx.early is not None:
             await _send_stream_early(self._socket, self._stream_id, self._ctx.early, self._lit_api)
             # An early return ends the stream.
@@ -307,6 +320,7 @@ async def _handle_stream_async(
         entry = active_streams.pop(stream_id, None)
         pipe = _get_pipeline(lit_api)
         if isinstance(entry, _BidiSession):
+            entry.closed = True  # terminal flag: in-flight chunk processing stops
             on_close_output = await _close_bidi_quietly(
                 entry.on_close, entry.ctx, stream_id, log
             )
@@ -580,8 +594,11 @@ async def _handle_stream_chunk_async(
         output = await session.on_chunk(raw, ctx=session.ctx)
     except HTTPException as e:
         log.warning("bidi on_chunk rejected for %s: %s", stream_id, e.detail)
+        if session.closed:
+            return  # cancel landed mid-await: already terminalized
         # Terminal: reclaim the session up front (the stream ends here) so a
         # later server cancel is a no-op; extra_cleanup keeps on_close balanced.
+        session.closed = True
         active_streams.pop(stream_id, None)
         await _handle_stream_error(pipe, session.ctx, e, socket, stream_id, lit_api, log,
                                     detail=e.detail, error_type=e.error_type,
@@ -591,6 +608,9 @@ async def _handle_stream_chunk_async(
         return
     except Exception as e:
         log.error("bidi on_chunk failed for %s: %s", stream_id, _format_exc_brief(e))
+        if session.closed:
+            return  # cancel landed mid-await: already terminalized
+        session.closed = True
         active_streams.pop(stream_id, None)
         await _handle_stream_error(pipe, session.ctx, e, socket, stream_id, lit_api, log,
                                     detail=f"on_chunk failed: {e}",
@@ -598,6 +618,8 @@ async def _handle_stream_chunk_async(
                                         session.on_close, session.ctx, stream_id, log))
         return
 
+    if session.closed:
+        return  # cancel landed during on_chunk: drop the late output
     if output is None:
         return
 
@@ -608,7 +630,10 @@ async def _handle_stream_chunk_async(
         await pipe.postprocess(ctx)
     except HTTPException as e:
         log.warning("bidi encode rejected for %s: %s", stream_id, e.detail)
+        if session.closed:
+            return  # cancel landed mid-await: already terminalized
         # Terminal: same reclaim + on_close balance as the on_chunk error path.
+        session.closed = True
         active_streams.pop(stream_id, None)
         await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
                                     detail=e.detail, error_type=e.error_type,
@@ -618,12 +643,17 @@ async def _handle_stream_chunk_async(
         return
     except Exception as e:
         log.error("bidi encode failed for %s: %s", stream_id, _format_exc_brief(e))
+        if session.closed:
+            return  # cancel landed mid-await: already terminalized
+        session.closed = True
         active_streams.pop(stream_id, None)
         await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
                                     detail=f"encode failed: {e}",
                                     extra_cleanup=lambda: _close_bidi_quietly(
                                         session.on_close, ctx, stream_id, log))
         return
+    if session.closed:
+        return  # cancel landed during postprocess: drop the late chunk
     if ctx.early is not None:
         await _send_stream_early(socket, stream_id, ctx.early, lit_api)
         # Symmetric with the on_open early path: release the session now.
