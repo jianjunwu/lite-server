@@ -9,7 +9,7 @@ import asyncio
 import inspect
 import logging
 import time
-from typing import Any
+from typing import Any, Callable
 
 from lite_server.api import LitAPI
 from lite_server.context import Headers, RequestContext, RequestMeta
@@ -156,16 +156,17 @@ class _ResponseSender:
             await self._pipe.postprocess(self._ctx)
         except HTTPException as e:
             self._log.warning("decoupled send rejected for %s: %s", self._stream_id, e.detail)
-            await self._pipe.run_on_error(self._ctx, e)
-            await self._socket.send(_make_stream_error(self._stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-            await self._pipe.run_on_stream_close(self._ctx, "error")
+            await _handle_stream_error(self._pipe, self._ctx, e, self._socket,
+                                        self._stream_id, self._lit_api, self._log,
+                                        detail=e.detail, error_type=e.error_type,
+                                        code=e.code, param=e.param)
             self.closed = True
             return
         except Exception as e:
             self._log.error("decoupled send failed for %s: %s", self._stream_id, _format_exc_brief(e))
-            await self._pipe.run_on_error(self._ctx, e)
-            await self._socket.send(_make_stream_error(self._stream_id, f"send failed: {e}").SerializeToString())
-            await self._pipe.run_on_stream_close(self._ctx, "error")
+            await _handle_stream_error(self._pipe, self._ctx, e, self._socket,
+                                        self._stream_id, self._lit_api, self._log,
+                                        detail=f"send failed: {e}")
             self.closed = True
             return
         if self._ctx.early is not None:
@@ -240,6 +241,45 @@ async def _send_stream_early(socket, stream_id: str, early_response, lit_api: Li
     await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
     metrics = collect_metrics(lit_api)
     await socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
+
+
+async def _handle_stream_error(
+    pipe: Pipeline,
+    ctx: RequestContext,
+    exc: Exception,
+    socket,
+    stream_id: str,
+    lit_api: LitAPI,
+    log: logging.Logger,
+    *,
+    detail: str | None = None,
+    error_type: str | None = None,
+    code: str | None = None,
+    param: str | None = None,
+    extra_cleanup: Callable | None = None,
+) -> None:
+    """Run on_error hooks → send terminal stream frame → cleanup → close.
+
+    If an on_error hook returned a Response, sends StreamChunk + StreamDone
+    as a graceful custom error response; otherwise sends StreamError per
+    the existing contract.  BOTH branches run extra_cleanup (bidi on_close
+    stays balanced) and close with reason "error" (the request terminated
+    because of an exception — reason describes why the stream ended, not
+    which frame format was sent).
+    """
+    custom = await pipe.run_on_error(ctx, exc)
+    if custom is not None:
+        await _send_stream_early(socket, stream_id, custom, lit_api)
+    else:
+        if detail is None:
+            detail = str(exc)
+        await socket.send(_make_stream_error(
+            stream_id, detail,
+            error_type=error_type, code=code, param=param,
+        ).SerializeToString())
+    if extra_cleanup is not None:
+        await extra_cleanup()
+    await pipe.run_on_stream_close(ctx, "error")
 
 
 async def _handle_stream_async(
@@ -332,15 +372,14 @@ async def _handle_stream_open_async(
             await pipe.preprocess(ctx)
         except HTTPException as e:
             log.warning("decoupled preprocess rejected for %s: %s", stream_id, e.detail)
-            await pipe.run_on_error(ctx, e)
-            await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-            await pipe.run_on_stream_close(ctx, "error")
+            await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
+                                        detail=e.detail, error_type=e.error_type,
+                                        code=e.code, param=e.param)
             return
         except Exception as e:
             log.warning("decoupled preprocess failed for %s: %s", stream_id, _format_exc_brief(e))
-            await pipe.run_on_error(ctx, e)
-            await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
-            await pipe.run_on_stream_close(ctx, "error")
+            await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
+                                        detail=str(e))
             return
         if ctx.early is not None:
             await _send_stream_early(socket, stream_id, ctx.early, lit_api)
@@ -351,15 +390,14 @@ async def _handle_stream_open_async(
             await pipe.predict_decoupled(ctx.input, sender, ctx=ctx)
         except HTTPException as e:
             log.warning("predict_decoupled rejected for %s: %s", stream_id, e.detail)
-            await pipe.run_on_error(ctx, e)
-            await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-            await pipe.run_on_stream_close(ctx, "error")
+            await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
+                                        detail=e.detail, error_type=e.error_type,
+                                        code=e.code, param=e.param)
             return
         except Exception as e:
             log.error("predict_decoupled failed for %s: %s", stream_id, _format_exc_brief(e))
-            await pipe.run_on_error(ctx, e)
-            await socket.send(_make_stream_error(stream_id, f"predict_decoupled failed: {e}").SerializeToString())
-            await pipe.run_on_stream_close(ctx, "error")
+            await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
+                                        detail=f"predict_decoupled failed: {e}")
             return
         # The model may have returned without closing (background pushing).
         # Register a session so close/cancel and shutdown can find the sender
@@ -376,15 +414,14 @@ async def _handle_stream_open_async(
             await pipe.preprocess(ctx)
         except HTTPException as e:
             log.warning("bidi preprocess rejected for %s: %s", stream_id, e.detail)
-            await pipe.run_on_error(ctx, e)
-            await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-            await pipe.run_on_stream_close(ctx, "error")
+            await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
+                                        detail=e.detail, error_type=e.error_type,
+                                        code=e.code, param=e.param)
             return
         except Exception as e:
             log.warning("bidi preprocess failed for %s: %s", stream_id, _format_exc_brief(e))
-            await pipe.run_on_error(ctx, e)
-            await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
-            await pipe.run_on_stream_close(ctx, "error")
+            await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
+                                        detail=str(e))
             return
         if ctx.early is not None:
             await _send_stream_early(socket, stream_id, ctx.early, lit_api)
@@ -394,15 +431,14 @@ async def _handle_stream_open_async(
             handler = await pipe.bidi_stream(ctx=ctx)
         except HTTPException as e:
             log.warning("bidi_stream rejected for %s: %s", stream_id, e.detail)
-            await pipe.run_on_error(ctx, e)
-            await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-            await pipe.run_on_stream_close(ctx, "error")
+            await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
+                                        detail=e.detail, error_type=e.error_type,
+                                        code=e.code, param=e.param)
             return
         except Exception as e:
             log.error("bidi_stream failed for %s: %s", stream_id, _format_exc_brief(e))
-            await pipe.run_on_error(ctx, e)
-            await socket.send(_make_stream_error(stream_id, f"bidi_stream failed: {e}").SerializeToString())
-            await pipe.run_on_stream_close(ctx, "error")
+            await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
+                                        detail=f"bidi_stream failed: {e}")
             return
 
         on_open, on_chunk, on_close = pipe.adapt_handler(handler)
@@ -411,15 +447,14 @@ async def _handle_stream_open_async(
             output = await on_open(ctx.input, ctx=ctx)
         except HTTPException as e:
             log.warning("bidi on_open rejected for %s: %s", stream_id, e.detail)
-            await pipe.run_on_error(ctx, e)
-            await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-            await pipe.run_on_stream_close(ctx, "error")
+            await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
+                                        detail=e.detail, error_type=e.error_type,
+                                        code=e.code, param=e.param)
             return
         except Exception as e:
             log.error("bidi on_open failed for %s: %s", stream_id, _format_exc_brief(e))
-            await pipe.run_on_error(ctx, e)
-            await socket.send(_make_stream_error(stream_id, f"on_open failed: {e}").SerializeToString())
-            await pipe.run_on_stream_close(ctx, "error")
+            await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
+                                        detail=f"on_open failed: {e}")
             return
 
         if output is not None:
@@ -428,17 +463,19 @@ async def _handle_stream_open_async(
                 await pipe.postprocess(ctx)
             except HTTPException as e:
                 log.warning("bidi on_open encode rejected for %s: %s", stream_id, e.detail)
-                await pipe.run_on_error(ctx, e)
-                await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-                await _close_bidi_quietly(on_close, ctx, stream_id, log)
-                await pipe.run_on_stream_close(ctx, "error")
+                await _handle_stream_error(
+                    pipe, ctx, e, socket, stream_id, lit_api, log,
+                    detail=e.detail, error_type=e.error_type, code=e.code, param=e.param,
+                    extra_cleanup=lambda: _close_bidi_quietly(on_close, ctx, stream_id, log),
+                )
                 return
             except Exception as e:
                 log.error("bidi on_open encode failed for %s: %s", stream_id, _format_exc_brief(e))
-                await pipe.run_on_error(ctx, e)
-                await socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
-                await _close_bidi_quietly(on_close, ctx, stream_id, log)
-                await pipe.run_on_stream_close(ctx, "error")
+                await _handle_stream_error(
+                    pipe, ctx, e, socket, stream_id, lit_api, log,
+                    detail=f"encode failed: {e}",
+                    extra_cleanup=lambda: _close_bidi_quietly(on_close, ctx, stream_id, log),
+                )
                 return
             if ctx.early is not None:
                 await _send_stream_early(socket, stream_id, ctx.early, lit_api)
@@ -464,7 +501,7 @@ async def _handle_stream_open_async(
             resp_bytes, status, metrics, _ = await pipe.run_single(data, meta, ctx=ctx)
             await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=True).SerializeToString())
             await socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
-            await pipe.run_on_stream_close(ctx, "done")
+            await pipe.run_on_stream_close(ctx, "error" if ctx.error_overridden else "done")
         except HTTPException as e:
             log.warning("stream fallback predict rejected for %s: %s", stream_id, e.detail)
             await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
@@ -482,15 +519,14 @@ async def _handle_stream_open_async(
         await pipe.preprocess(ctx)
     except HTTPException as e:
         log.warning("stream preprocess rejected for %s: %s", stream_id, e.detail)
-        await pipe.run_on_error(ctx, e)
-        await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-        await pipe.run_on_stream_close(ctx, "error")
+        await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
+                                    detail=e.detail, error_type=e.error_type,
+                                    code=e.code, param=e.param)
         return
     except Exception as e:
         log.warning("stream preprocess failed for %s: %s", stream_id, _format_exc_brief(e))
-        await pipe.run_on_error(ctx, e)
-        await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
-        await pipe.run_on_stream_close(ctx, "error")
+        await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
+                                    detail=str(e))
         return
     if ctx.early is not None:
         await _send_stream_early(socket, stream_id, ctx.early, lit_api)
@@ -501,15 +537,14 @@ async def _handle_stream_open_async(
         generator = await pipe.stream_predict(ctx.input, ctx=ctx)
     except HTTPException as e:
         log.warning("stream_predict rejected for %s: %s", stream_id, e.detail)
-        await pipe.run_on_error(ctx, e)
-        await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-        await pipe.run_on_stream_close(ctx, "error")
+        await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
+                                    detail=e.detail, error_type=e.error_type,
+                                    code=e.code, param=e.param)
         return
     except Exception as e:
         log.error("stream_predict failed for %s: %s", stream_id, _format_exc_brief(e))
-        await pipe.run_on_error(ctx, e)
-        await socket.send(_make_stream_error(stream_id, f"stream_predict failed: {e}").SerializeToString())
-        await pipe.run_on_stream_close(ctx, "error")
+        await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
+                                    detail=f"stream_predict failed: {e}")
         return
 
     task = asyncio.create_task(
@@ -540,15 +575,14 @@ async def _handle_stream_chunk_async(
         output = await session.on_chunk(raw, ctx=session.ctx)
     except HTTPException as e:
         log.warning("bidi on_chunk rejected for %s: %s", stream_id, e.detail)
-        await pipe.run_on_error(session.ctx, e)
-        await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-        await pipe.run_on_stream_close(session.ctx, "error")
+        await _handle_stream_error(pipe, session.ctx, e, socket, stream_id, lit_api, log,
+                                    detail=e.detail, error_type=e.error_type,
+                                    code=e.code, param=e.param)
         return
     except Exception as e:
         log.error("bidi on_chunk failed for %s: %s", stream_id, _format_exc_brief(e))
-        await pipe.run_on_error(session.ctx, e)
-        await socket.send(_make_stream_error(stream_id, f"on_chunk failed: {e}").SerializeToString())
-        await pipe.run_on_stream_close(session.ctx, "error")
+        await _handle_stream_error(pipe, session.ctx, e, socket, stream_id, lit_api, log,
+                                    detail=f"on_chunk failed: {e}")
         return
 
     if output is None:
@@ -561,15 +595,14 @@ async def _handle_stream_chunk_async(
         await pipe.postprocess(ctx)
     except HTTPException as e:
         log.warning("bidi encode rejected for %s: %s", stream_id, e.detail)
-        await pipe.run_on_error(ctx, e)
-        await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-        await pipe.run_on_stream_close(ctx, "error")
+        await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
+                                    detail=e.detail, error_type=e.error_type,
+                                    code=e.code, param=e.param)
         return
     except Exception as e:
         log.error("bidi encode failed for %s: %s", stream_id, _format_exc_brief(e))
-        await pipe.run_on_error(ctx, e)
-        await socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
-        await pipe.run_on_stream_close(ctx, "error")
+        await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
+                                    detail=f"encode failed: {e}")
         return
     if ctx.early is not None:
         await _send_stream_early(socket, stream_id, ctx.early, lit_api)
@@ -606,15 +639,14 @@ async def _process_stream_chunk(
         await pipe.postprocess(ctx)
     except HTTPException as e:
         log.warning("stream encode rejected for %s: %s", stream_id, e.detail)
-        await pipe.run_on_error(ctx, e)
-        await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-        await pipe.run_on_stream_close(ctx, "error")
+        await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
+                                    detail=e.detail, error_type=e.error_type,
+                                    code=e.code, param=e.param)
         return False
     except Exception as e:
         log.error("encode failed for stream %s: %s", stream_id, _format_exc_brief(e))
-        await pipe.run_on_error(ctx, e)
-        await socket.send(_make_stream_error(stream_id, f"encode failed: {e}").SerializeToString())
-        await pipe.run_on_stream_close(ctx, "error")
+        await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
+                                    detail=f"encode failed: {e}")
         return False
     if ctx.early is not None:
         await _send_stream_early(socket, stream_id, ctx.early, lit_api)
@@ -691,15 +723,14 @@ async def _consume_stream(
         raise
     except HTTPException as e:
         log.warning("stream_predict rejected for %s: %s", stream_id, e.detail)
-        await pipe.run_on_error(ctx, e)
-        await socket.send(_make_stream_error(stream_id, e.detail, error_type=e.error_type, code=e.code, param=e.param).SerializeToString())
-        await pipe.run_on_stream_close(ctx, "error")
+        await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
+                                    detail=e.detail, error_type=e.error_type,
+                                    code=e.code, param=e.param)
         return
     except Exception as e:
         log.error("stream_predict error for %s: %s", stream_id, _format_exc_brief(e))
-        await pipe.run_on_error(ctx, e)
-        await socket.send(_make_stream_error(stream_id, str(e)).SerializeToString())
-        await pipe.run_on_stream_close(ctx, "error")
+        await _handle_stream_error(pipe, ctx, e, socket, stream_id, lit_api, log,
+                                    detail=str(e))
         return
 
     if deadline_cut:

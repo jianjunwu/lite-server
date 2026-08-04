@@ -510,7 +510,10 @@ class Pipeline:
             if ctx.early is None:
                 await self._run_chain("after_encode_response", ctx)
         except Exception as e:
-            await self.run_on_error(ctx, e)
+            custom = await self.run_on_error(ctx, e)
+            if custom is not None:
+                ctx.early = custom
+                return  # caller (_handle_route_call) reads ctx.early via _build_route_response
             # Thread accumulated response headers onto the exception so the
             # unary handler can merge them into the error response (parity
             # with run_single).
@@ -518,13 +521,26 @@ class Pipeline:
                 e._response_headers = dict(ctx.response_headers)  # type: ignore[attr-defined]
             raise
 
-    async def run_on_error(self, ctx: RequestContext, exc: Exception) -> None:
-        """Drive on_error hooks, exception-isolated (never masks *exc*)."""
+    async def run_on_error(self, ctx: RequestContext, exc: Exception) -> LiteResponse | None:
+        """Drive on_error hooks, exception-isolated (never masks *exc*).
+
+        Returns the last Response returned by a hook (registration order),
+        or None.  The caller decides delivery (finalize for unary,
+        _send_stream_early for streaming) and sets ctx.early itself —
+        ctx.early is never touched here, so an early response left by an
+        earlier data hook (e.g. after_encode_response, which runs all hooks
+        even when early is set) can never masquerade as an on_error
+        override and swallow the exception.
+        """
+        custom: LiteResponse | None = None
         for hook in self._error_hooks:
             try:
-                await hook(ctx, exc)
+                result = await hook(ctx, exc)
+                if isinstance(result, LiteResponse):
+                    custom = result
             except Exception:
                 logger.warning("on_error hook failed", exc_info=True)
+        return custom
 
     async def run_on_stream_close(self, ctx: RequestContext, reason: str) -> None:
         """Drive on_stream_close hooks once; exception-isolated (stream is terminal)."""
@@ -672,7 +688,11 @@ class Pipeline:
             if ctx.early is None:
                 await self.postprocess(ctx)
         except Exception as e:
-            await self.run_on_error(ctx, e)
+            custom = await self.run_on_error(ctx, e)
+            if custom is not None:                  # on_error 自定义响应
+                ctx.early = custom
+                ctx.error_overridden = True         # stream fallback 的 close-reason 依据
+                return self.finalize(ctx)
             # Thread accumulated response headers onto the exception so the
             # unary handler can merge them into the error response (B6). The
             # ctx itself is internal to the pipeline and not visible there.

@@ -114,6 +114,7 @@ class RequestContext:
     mode: str | None = None  # scenario: "unary"|"stream"|"bidi"|"decoupled"|"batch"|"cb"; None for @route
     stage: str | None = None  # current pipeline stage (decode_request/predict/batch_predict/encode_response); on_error reads it to see which stage raised
     stream_stats: dict[str, int] | None = None  # {chunks, bytes} for a uni-stream run; set by _consume_stream, read at on_stream_close
+    error_overridden: bool = False  # on_error returned a custom Response → stream fallback close reason "error" (not "done")
 
     def respond(
         self,

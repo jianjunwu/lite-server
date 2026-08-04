@@ -524,6 +524,7 @@ from lite_server.worker.streaming import (  # noqa: E402,F401
     _DecoupledSession,
     _handle_stream_async,
     _handle_stream_chunk_async,
+    _handle_stream_error,
     _handle_stream_open_async,
     _next_or_sentinel,
     _process_stream_chunk,

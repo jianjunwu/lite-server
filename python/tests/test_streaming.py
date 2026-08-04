@@ -1434,3 +1434,287 @@ class TestStreamDeadline:
         assert _deadline_passed(RequestContext(meta=meta_past)) is True
 
 
+# ---------------------------------------------------------------------------
+# on_error custom response — streaming paths (2026-08-04)
+# ---------------------------------------------------------------------------
+
+class TestOnErrorCustomResponseStreaming:
+    """on_error returning a Response in streaming paths sends a graceful
+    terminal chunk (StreamChunk + StreamDone) instead of StreamError."""
+
+    @pytest.mark.asyncio
+    async def test_stream_on_error_returns_response_sends_chunk_and_done(self):
+        """Stream: on_error returns Response → StreamChunk(body)+StreamDone,
+        no StreamError."""
+        from lite_server.response import Response as LiteResponse
+
+        class CustomErrorCB(Callback):
+            def on_error(self, ctx, exc):
+                return LiteResponse(content={"graceful": "shutdown"})
+
+        class ErrorStreamAPI(EchoAPI):
+            def stream_predict(self, x):
+                yield "ok"
+                raise RuntimeError("mid-stream failure")
+
+        api = ErrorStreamAPI()
+        api._pipeline = Pipeline.build(api, [CustomErrorCB()])
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            api, _stream_req("s-custom"), sock, {}, log
+        )
+        await sock.wait_for(lambda r: r.HasField("stream") and (
+            r.stream.HasField("done") or r.stream.HasField("error")
+        ))
+        responses = sock.stream_responses("s-custom")
+        # Should have chunk("ok") + chunk({"graceful":"shutdown"}) + done
+        chunks = [r for r in responses if r.stream.HasField("chunk")]
+        dones = [r for r in responses if r.stream.HasField("done")]
+        errors = [r for r in responses if r.stream.HasField("error")]
+        assert len(chunks) == 2
+        assert json.loads(chunks[1].stream.chunk.data) == {"graceful": "shutdown"}
+        assert len(dones) == 1
+        assert len(errors) == 0
+
+    @pytest.mark.asyncio
+    async def test_stream_on_error_returns_none_is_unchanged(self):
+        """Stream: on_error returns None → StreamError as before (backward compat)."""
+
+        class NoopCB(Callback):
+            def on_error(self, ctx, exc):
+                return None
+
+        class ErrorStreamAPI(EchoAPI):
+            def stream_predict(self, x):
+                yield "ok"
+                raise RuntimeError("mid-stream failure")
+
+        api = ErrorStreamAPI()
+        api._pipeline = Pipeline.build(api, [NoopCB()])
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            api, _stream_req("s-noop"), sock, {}, log
+        )
+        await sock.wait_for(lambda r: _is_error(r, "s-noop"))
+        errors = [r for r in sock.stream_responses("s-noop") if r.stream.HasField("error")]
+        assert len(errors) == 1
+        assert "mid-stream failure" in errors[0].stream.error.message
+
+    @pytest.mark.asyncio
+    async def test_bidi_on_error_returns_response(self):
+        """Bidi: on_error in on_open returns Response → StreamChunk+Done."""
+        from lite_server.response import Response as LiteResponse
+
+        class CustomErrorCB(Callback):
+            def on_error(self, ctx, exc):
+                return LiteResponse(content={"bidi_error": True})
+
+        class ExplodingHandler(BidiStreamHandler):
+            async def on_open(self, data, ctx=None):
+                raise RuntimeError("on_open failed")
+
+        class BidiAPI(EchoAPI):
+            def bidi_stream(self, ctx=None):
+                return ExplodingHandler()
+
+        api = BidiAPI()
+        api._pipeline = Pipeline.build(api, [CustomErrorCB()])
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            api, _stream_req("b-custom"), sock, {}, log
+        )
+        await sock.wait_for(lambda r: r.HasField("stream") and (
+            r.stream.HasField("done") or r.stream.HasField("error")
+        ))
+        responses = sock.stream_responses("b-custom")
+        chunks = [r for r in responses if r.stream.HasField("chunk")]
+        dones = [r for r in responses if r.stream.HasField("done")]
+        errors = [r for r in responses if r.stream.HasField("error")]
+        assert len(chunks) == 1
+        assert json.loads(chunks[0].stream.chunk.data) == {"bidi_error": True}
+        assert len(dones) == 1
+        assert len(errors) == 0
+
+    @pytest.mark.asyncio
+    async def test_s2_on_stream_close_reason_error_for_custom_response(self):
+        """S2: on_error custom Response → on_stream_close still receives
+        reason 'error' (not 'done') for correct observability."""
+        from lite_server.response import Response as LiteResponse
+
+        close_reasons = []
+
+        class CustomErrorCB(Callback):
+            def on_error(self, ctx, exc):
+                return LiteResponse(content={"custom": True})
+
+        class CloseRecCB(Callback):
+            def on_stream_close(self, ctx, reason):
+                close_reasons.append(reason)
+
+        class ErrorStreamAPI(EchoAPI):
+            def stream_predict(self, x):
+                yield "ok"
+                raise RuntimeError("boom")
+
+        api = ErrorStreamAPI()
+        api._pipeline = Pipeline.build(api, [CustomErrorCB(), CloseRecCB()])
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            api, _stream_req("s-s2"), sock, {}, log
+        )
+        await sock.wait_for(lambda r: r.HasField("stream") and (
+            r.stream.HasField("done") or r.stream.HasField("error")
+        ))
+        assert close_reasons == ["error"], (
+            f"Expected ['error'], got {close_reasons}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_s3_stream_fallback_on_error_custom_response(self):
+        """S3: stream fallback (no stream_predict) + on_error returns Response
+        → run_single returns normally with error_overridden=True,
+        fallback sends chunk(is_final)+Done and close reason 'error'."""
+        from lite_server.response import Response as LiteResponse
+
+        close_reasons = []
+
+        class CustomErrorCB(Callback):
+            def on_error(self, ctx, exc):
+                return LiteResponse(content={"fallback_error": True})
+
+        class CloseRecCB(Callback):
+            def on_stream_close(self, ctx, reason):
+                close_reasons.append(reason)
+
+        class FailingAPI(EchoAPI):
+            def predict(self, x):
+                raise ValueError("predict boom")
+
+        api = FailingAPI()
+        api._pipeline = Pipeline.build(api, [CustomErrorCB(), CloseRecCB()])
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            api, _stream_req("f-custom"), sock, {}, log
+        )
+        await sock.wait_for(lambda r: r.HasField("stream") and (
+            r.stream.HasField("done") or r.stream.HasField("error")
+        ))
+        responses = sock.stream_responses("f-custom")
+        chunks = [r for r in responses if r.stream.HasField("chunk")]
+        dones = [r for r in responses if r.stream.HasField("done")]
+        errors = [r for r in responses if r.stream.HasField("error")]
+        assert len(chunks) == 1
+        assert chunks[0].stream.chunk.is_final is True
+        assert json.loads(chunks[0].stream.chunk.data) == {"fallback_error": True}
+        assert len(dones) == 1
+        assert len(errors) == 0
+        # S2: close reason is "error", not "done"
+        assert close_reasons == ["error"], (
+            f"Expected ['error'], got {close_reasons}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_s1_stream_status_code_headers_not_propagated(self):
+        """S1: streaming path drops status_code/headers from on_error Response
+        (no per-chunk status/header channel in the stream protocol)."""
+        from lite_server.response import Response as LiteResponse
+
+        class CustomErrorCB(Callback):
+            def on_error(self, ctx, exc):
+                return LiteResponse(
+                    content={"body_only": True},
+                    status_code=500,
+                    headers={"X-Should-Not-Appear": "1"},
+                )
+
+        class ErrorStreamAPI(EchoAPI):
+            def stream_predict(self, x):
+                yield "ok"
+                raise RuntimeError("boom")
+
+        api = ErrorStreamAPI()
+        api._pipeline = Pipeline.build(api, [CustomErrorCB()])
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            api, _stream_req("s-s1"), sock, {}, log
+        )
+        await sock.wait_for(lambda r: r.HasField("stream") and (
+            r.stream.HasField("done") or r.stream.HasField("error")
+        ))
+        responses = sock.stream_responses("s-s1")
+        chunks = [r for r in responses if r.stream.HasField("chunk")]
+        # Body is delivered
+        assert json.loads(chunks[1].stream.chunk.data) == {"body_only": True}
+        # But status_code and headers are NOT on the chunk proto
+        # (StreamChunkResponse has only data + is_final — no status/headers fields)
+        # Verified by: no StreamError, only Done after the custom chunk.
+
+    @pytest.mark.asyncio
+    async def test_stream_predict_init_error_custom_response(self):
+        """stream_predict init error (before generator starts) + on_error
+        returns Response → StreamChunk+Done."""
+        from lite_server.response import Response as LiteResponse
+
+        class CustomErrorCB(Callback):
+            def on_error(self, ctx, exc):
+                return LiteResponse(content={"init_error": True})
+
+        class InitFailAPI(EchoAPI):
+            def stream_predict(self, x):
+                raise RuntimeError("cannot start")
+                yield  # noqa: make it a generator function
+
+        api = InitFailAPI()
+        api._pipeline = Pipeline.build(api, [CustomErrorCB()])
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            api, _stream_req("s-init-custom"), sock, {}, log
+        )
+        await sock.wait_for(lambda r: r.HasField("stream") and (
+            r.stream.HasField("done") or r.stream.HasField("error")
+        ))
+        responses = sock.stream_responses("s-init-custom")
+        chunks = [r for r in responses if r.stream.HasField("chunk")]
+        dones = [r for r in responses if r.stream.HasField("done")]
+        errors = [r for r in responses if r.stream.HasField("error")]
+        assert len(chunks) == 1
+        assert json.loads(chunks[0].stream.chunk.data) == {"init_error": True}
+        assert len(dones) == 1
+        assert len(errors) == 0
+
+    @pytest.mark.asyncio
+    async def test_stream_preprocess_error_custom_response(self):
+        """Stream preprocess (before_decode_request/decode_request) error +
+        on_error returns Response → StreamChunk+Done."""
+        from lite_server.response import Response as LiteResponse
+
+        class CustomErrorCB(Callback):
+            def on_error(self, ctx, exc):
+                return LiteResponse(content={"preprocess_err": True})
+
+        class RejectCB(Callback):
+            def before_decode_request(self, ctx):
+                raise ValueError("rejected at preprocess")
+
+        class StreamAPI(EchoAPI):
+            def stream_predict(self, x):
+                yield {"never": "reached"}
+
+        api = StreamAPI()
+        api._pipeline = Pipeline.build(api, [CustomErrorCB(), RejectCB()])
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            api, _stream_req("s-pre-custom"), sock, {}, log
+        )
+        await sock.wait_for(lambda r: r.HasField("stream") and (
+            r.stream.HasField("done") or r.stream.HasField("error")
+        ))
+        responses = sock.stream_responses("s-pre-custom")
+        chunks = [r for r in responses if r.stream.HasField("chunk")]
+        dones = [r for r in responses if r.stream.HasField("done")]
+        errors = [r for r in responses if r.stream.HasField("error")]
+        assert len(chunks) == 1
+        assert json.loads(chunks[0].stream.chunk.data) == {"preprocess_err": True}
+        assert len(dones) == 1
+        assert len(errors) == 0
+

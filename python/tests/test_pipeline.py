@@ -1755,3 +1755,234 @@ class TestFinalizeBytesPassthrough:
             "_json.dumps(bytes) must not return raw bytes; "
             "batch/streaming paths diverge from Pipeline.finalize passthrough"
         )
+
+
+# ---------------------------------------------------------------------------
+# on_error custom response (2026-08-04)
+# ---------------------------------------------------------------------------
+
+class TestOnErrorCustomResponse:
+    """on_error hook may return a Response to override the default error response."""
+
+    @pytest.mark.asyncio
+    async def test_unary_on_error_returns_response_400(self):
+        """on_error returning Response(400) → body/status/headers from Response,
+        not the default {"error": {...}}."""
+        from lite_server.response import Response as LiteResponse
+
+        class CustomErrorCB(Callback):
+            def on_error(self, ctx, exc):
+                return LiteResponse(
+                    content={"custom": "bad request"},
+                    status_code=400,
+                    headers={"X-Custom": "yes"},
+                )
+
+        class FailingAPI(EchoAPI):
+            def predict(self, x):
+                raise ValueError("boom")
+
+        pipe = Pipeline.build(FailingAPI(), [CustomErrorCB()])
+        body, status, metrics, headers = await pipe.run_single(b"{}", _make_meta())
+        assert json.loads(body) == {"custom": "bad request"}
+        assert headers is not None
+        assert headers.get("_sc") == "400"
+        assert headers.get("X-Custom") == "yes"
+
+    @pytest.mark.asyncio
+    async def test_unary_on_error_returns_response_500(self):
+        """on_error returning Response(500) + custom body."""
+        from lite_server.response import Response as LiteResponse
+
+        class CustomErrorCB(Callback):
+            def on_error(self, ctx, exc):
+                return LiteResponse(
+                    content={"error": "internal", "request_id": ctx.meta.request_id},
+                    status_code=500,
+                )
+
+        class FailingAPI(EchoAPI):
+            def predict(self, x):
+                raise RuntimeError("boom")
+
+        pipe = Pipeline.build(FailingAPI(), [CustomErrorCB()])
+        meta = _make_meta()
+        body, status, metrics, headers = await pipe.run_single(b"{}", meta)
+        data = json.loads(body)
+        assert data["error"] == "internal"
+        assert data["request_id"] == meta.request_id
+        assert headers is not None
+        assert headers.get("_sc") == "500"
+
+    @pytest.mark.asyncio
+    async def test_unary_on_error_returns_none_is_backward_compat(self):
+        """on_error returning None → original exception re-raised (unchanged)."""
+
+        class NoopErrorCB(Callback):
+            def on_error(self, ctx, exc):
+                return None
+
+        class FailingAPI(EchoAPI):
+            def predict(self, x):
+                raise ValueError("boom")
+
+        pipe = Pipeline.build(FailingAPI(), [NoopErrorCB()])
+        with pytest.raises(ValueError, match="boom"):
+            await pipe.run_single(b"{}", _make_meta())
+
+    @pytest.mark.asyncio
+    async def test_unary_no_on_error_hook_is_unchanged(self):
+        """No on_error hook → original exception re-raised (unchanged)."""
+
+        class FailingAPI(EchoAPI):
+            def predict(self, x):
+                raise ValueError("boom")
+
+        pipe = Pipeline.build(FailingAPI(), [])
+        with pytest.raises(ValueError, match="boom"):
+            await pipe.run_single(b"{}", _make_meta())
+
+    @pytest.mark.asyncio
+    async def test_multi_hook_last_response_wins(self):
+        """Multiple on_error hooks: last returning Response wins."""
+        from lite_server.response import Response as LiteResponse
+
+        class FirstCB(Callback):
+            def on_error(self, ctx, exc):
+                return LiteResponse(content={"from": "first"}, status_code=400)
+
+        class SecondCB(Callback):
+            def on_error(self, ctx, exc):
+                return LiteResponse(content={"from": "second"}, status_code=500)
+
+        class FailingAPI(EchoAPI):
+            def predict(self, x):
+                raise ValueError("boom")
+
+        pipe = Pipeline.build(FailingAPI(), [FirstCB(), SecondCB()])
+        body, status, metrics, headers = await pipe.run_single(b"{}", _make_meta())
+        assert json.loads(body) == {"from": "second"}
+        assert headers.get("_sc") == "500"
+
+    @pytest.mark.asyncio
+    async def test_multi_hook_first_wins_when_second_returns_none(self):
+        """Multiple hooks: first returns Response, second None → first wins."""
+        from lite_server.response import Response as LiteResponse
+
+        class FirstCB(Callback):
+            def on_error(self, ctx, exc):
+                return LiteResponse(content={"from": "first"}, status_code=400)
+
+        class SecondCB(Callback):
+            def on_error(self, ctx, exc):
+                return None
+
+        class FailingAPI(EchoAPI):
+            def predict(self, x):
+                raise ValueError("boom")
+
+        pipe = Pipeline.build(FailingAPI(), [FirstCB(), SecondCB()])
+        body, status, metrics, headers = await pipe.run_single(b"{}", _make_meta())
+        assert json.loads(body) == {"from": "first"}
+
+    @pytest.mark.asyncio
+    async def test_failing_on_error_hook_does_not_break_collection(self):
+        """A failing on_error hook is logged but doesn't prevent later hooks
+        from providing a custom response."""
+        from lite_server.response import Response as LiteResponse
+
+        class ExplodingCB(Callback):
+            def on_error(self, ctx, exc):
+                raise RuntimeError("on_error itself failed")
+
+        class FallbackCB(Callback):
+            def on_error(self, ctx, exc):
+                return LiteResponse(content={"recovered": True}, status_code=500)
+
+        class FailingAPI(EchoAPI):
+            def predict(self, x):
+                raise ValueError("boom")
+
+        pipe = Pipeline.build(FailingAPI(), [ExplodingCB(), FallbackCB()])
+        body, status, metrics, headers = await pipe.run_single(b"{}", _make_meta())
+        assert json.loads(body) == {"recovered": True}
+
+    @pytest.mark.asyncio
+    async def test_route_on_error_returns_response(self):
+        """Route: on_error returning Response → _build_route_response reads ctx.early."""
+        from lite_server.response import Response as LiteResponse
+
+        class CustomErrorCB(Callback):
+            def on_error(self, ctx, exc):
+                return LiteResponse(
+                    content={"route_error": True},
+                    status_code=503,
+                    headers={"X-Route-Error": "1"},
+                )
+
+        pipe = Pipeline.for_route([CustomErrorCB()])
+        ctx = RequestContext(meta=_make_route_meta())
+
+        async def handler(ctx_arg):
+            raise RuntimeError("route boom")
+
+        await pipe.run_route(ctx, handler)
+        assert ctx.early is not None
+        assert ctx.early.status_code == 503
+        assert ctx.early.content == {"route_error": True}
+
+    @pytest.mark.asyncio
+    async def test_d2_after_encode_response_early_plus_error_does_not_swallow(self):
+        """D2: after_encode_response hook A returns Response (ctx.early set),
+        hook B raises, on_error returns None → exception re-raised normally
+        (ctx.early from A is NOT used, the exception is not swallowed)."""
+        from lite_server.response import Response as LiteResponse
+
+        calls = []
+
+        class HookA(Callback):
+            def after_encode_response(self, ctx):
+                calls.append("A")
+                return LiteResponse(content={"from": "A"})
+
+        class HookB(Callback):
+            def after_encode_response(self, ctx):
+                calls.append("B")
+                raise RuntimeError("hook B failed")
+
+        class NoopErrorCB(Callback):
+            def on_error(self, ctx, exc):
+                calls.append("on_error")
+                return None
+
+        class API(EchoAPI):
+            pass
+
+        pipe = Pipeline.build(API(), [HookA(), HookB(), NoopErrorCB()])
+        with pytest.raises(RuntimeError, match="hook B failed"):
+            await pipe.run_single(b"{}", _make_meta())
+        assert "A" in calls
+        assert "B" in calls
+        assert "on_error" in calls
+
+    @pytest.mark.asyncio
+    async def test_error_overridden_flag_set_on_custom_response(self):
+        """run_single sets ctx.error_overridden=True when on_error returns a Response."""
+        from lite_server.response import Response as LiteResponse
+
+        flag_value = None
+
+        class CustomErrorCB(Callback):
+            def on_error(self, ctx, exc):
+                nonlocal flag_value
+                flag_value = ctx.error_overridden  # should be False at hook time
+                return LiteResponse(content={"ok": True})
+
+        class FailingAPI(EchoAPI):
+            def predict(self, x):
+                raise ValueError("boom")
+
+        pipe = Pipeline.build(FailingAPI(), [CustomErrorCB()])
+        body, status, metrics, headers = await pipe.run_single(b"{}", _make_meta())
+        # At hook time error_overridden is False (set by caller AFTER hook returns)
+        assert flag_value is False

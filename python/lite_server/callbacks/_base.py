@@ -125,12 +125,27 @@ class Callback:
 
     # ---- Error hook (exception-isolated) ----
 
-    def on_error(self, ctx: RequestContext, exc: Exception) -> None:
+    def on_error(self, ctx: RequestContext, exc: Exception) -> Any | None:
         """Called when the request fails (a hook or stage raised).
 
+        May return a Response to replace the default error response with a
+        graceful terminal response.  Per-path semantics:
+
+        - unary: full customization — body, status_code, headers (HTTP);
+          gRPC unary delivers body + headers-as-metadata with OK status
+          (status_code is NOT mapped — pre-existing early-response gap).
+        - stream / bidi / decoupled: body only, sent as the terminal chunk
+          and the stream ends normally (HTTP SSE: data event + [DONE];
+          gRPC: StreamChunk + OK).  status_code/headers are DROPPED — the
+          stream protocols have no status/header channel mid-stream.
+          The stream still closes with reason "error" for observability.
+
+        To signal a protocol-level error instead (HTTP default error body;
+        gRPC non-OK status via the error_type→code mapping), return None.
+
         Driven exception-isolated: a failing on_error is logged, never
-        masks the original error.  Return value ignored.  May be sync
-        or async.  Streaming paths drive it once per failed chunk.
+        masks the original error.  Multiple hooks chain in registration
+        order — the last Response wins.  May be sync or async.
         """
         pass
 
