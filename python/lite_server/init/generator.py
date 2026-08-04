@@ -258,7 +258,7 @@ SERVER_YAML = textwrap.dedent("""\
 
     grpc:
       enabled: {grpc}
-      # max_workers: 10             # Max worker processes per model; 0 = no cap
+
       # host: null                  # gRPC bind (null = follow server.host); unix:/path = UDS (P4-1)
       # admin_bind: null            # Separate admin+health bind (P7-2); unix:/path forced 0o600
       # socket_mode: 0o666          # chmod for a unix: gRPC UDS (P4-1)

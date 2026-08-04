@@ -66,7 +66,6 @@ logging:
 
 grpc:
   enabled: true                # 启用 gRPC 服务
-  max_workers: 10              # 每个模型的 worker 进程数上限。0 = 不限制。
   host: null                   # gRPC 绑定地址；null = 跟随 server.host（"unix:/路径" = UDS）
   # P7-2：LiteAdmin 服务独立绑定。推荐 UDS——UDS admin socket 默认属主独占（0o600）创建
   admin_bind: null             # 如 unix:/var/run/lite-admin.sock 或 127.0.0.1:9001

@@ -70,7 +70,6 @@ logging:
 
 grpc:
   enabled: true                # Enable gRPC server
-  max_workers: 10              # Max worker processes per model. 0 = no cap.
   host: null                   # gRPC bind host; null = follow server.host ("unix:/path" = UDS)
   # P7-2: separate bind for the LiteAdmin service only. UDS recommended — a UDS
   # admin socket is created owner-only (0o600) by default.

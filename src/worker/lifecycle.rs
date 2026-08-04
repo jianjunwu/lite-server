@@ -231,13 +231,7 @@ impl WorkerManager {
         } else {
             devices * workers_per_device
         };
-        let total_workers = clamp_worker_count(computed, self.max_workers);
-        if total_workers < computed {
-            warn!(
-                "grpc.max_workers={} caps {} workers for {}/{} down to {}",
-                self.max_workers, computed, model_name, version, total_workers
-            );
-        }
+        let total_workers = computed;
 
         let mut worker_infos = Vec::new();
         let mut worker_processes = Vec::new();
@@ -870,18 +864,6 @@ impl WorkerManager {
     }
 }
 
-/// Cap the number of workers spawned for a model version. `max == 0` means no
-/// cap (returns `total` unchanged); otherwise returns `min(total, max)`,
-/// floored at 1 so a configured model always gets at least one worker.
-/// Mirrors the `cap == 0 → unlimited` convention in `admission.rs`.
-fn clamp_worker_count(total: usize, max: usize) -> usize {
-    if max == 0 {
-        total
-    } else {
-        total.min(max).max(1)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -889,34 +871,6 @@ mod tests {
     use crate::inference_queue::InferenceQueue;
     use crate::registry::ModelRegistry;
     use tokio::sync::mpsc;
-
-    // ===== grpc.max_workers clamp tests =====
-
-    #[test]
-    fn clamp_worker_count_caps_when_max_set() {
-        assert_eq!(clamp_worker_count(16, 10), 10);
-        // never go below 1 even if max is tiny
-        assert_eq!(clamp_worker_count(16, 1), 1);
-    }
-
-    #[test]
-    fn clamp_worker_count_unlimited_when_max_zero() {
-        assert_eq!(clamp_worker_count(16, 0), 16);
-    }
-
-    #[test]
-    fn clamp_worker_count_no_cap_below_max() {
-        assert_eq!(clamp_worker_count(1, 2), 1);
-    }
-
-    #[test]
-    fn grpc_max_workers_default_is_ten() {
-        assert_eq!(
-            crate::config::Config::default().grpc.max_workers,
-            10,
-            "grpc.max_workers default must be 10 (config.rs)"
-        );
-    }
 
     // ===== Reload Channel tests =====
 

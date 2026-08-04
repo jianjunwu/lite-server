@@ -231,7 +231,6 @@ impl Default for ServerConfig {
 #[serde(default)]
 pub struct GrpcConfig {
     pub enabled: bool,
-    pub max_workers: usize,
     /// gRPC bind target (P4-1). None = follow `server.host`, falling back to
     /// TCP `127.0.0.1` when `server.host` is a Unix socket — gRPC stays on TCP
     /// unless this is explicitly set to `unix:/path` to bind a UDS. See
@@ -287,7 +286,6 @@ impl Default for GrpcConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_workers: 10,
             host: None,
             admin_bind: None,
             socket_mode: 0o666,
@@ -2396,8 +2394,7 @@ policies:
     fn model_config_rejects_devices_zero_to_avoid_spawn_loop_panic() {
         // Audit (0.8.0-rc0): `devices: 0` passes ModelConfig::validate() today,
         // but worker/lifecycle.rs:247 computes `worker_id % devices` inside the
-        // spawn loop. With grpc.max_workers > 0 (default 10), clamp_worker_count
-        // (0, 10) = 1 (the `.max(1)` floor), so the loop runs worker_id=0 and
+        // spawn loop. With devices=0 the loop runs worker_id=0 and
         // executes `0 % 0` → divide-by-zero panic. validate() is the gate that
         // load_model (lifecycle.rs:135) already calls, so rejecting devices<1
         // there closes every load path (YAML / CLI defaults / Admin API / ensemble).
