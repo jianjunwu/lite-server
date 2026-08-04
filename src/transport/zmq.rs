@@ -410,7 +410,17 @@ fn drain_commands(
             Ok(ZmqCommand::Raw { request }) => {
                 let bytes = request.encode_to_vec();
                 if let Err(e) = socket.send(&bytes, 0) {
-                    error!("ZMQ raw send error: {}", e);
+                    // B2: stop messages are sent during unload/shutdown; if the
+                    // worker has already exited (e.g. SIGINT from terminal),
+                    // the PAIR socket peer is gone and send fails with EAGAIN.
+                    // Log at WARN instead of ERROR — this is expected during
+                    // graceful shutdown, not a transport fault.
+                    let is_stop = request.uid == "stop";
+                    if is_stop {
+                        warn!("ZMQ stop send failed (worker already gone): {}", e);
+                    } else {
+                        error!("ZMQ raw send error: {}", e);
+                    }
                 }
             }
             Ok(ZmqCommand::RouteOrStream { request, response_tx, chunk_tx }) => {
@@ -870,5 +880,37 @@ mod tests {
 
         drop(client);
         let _ = w2.join();
+    }
+
+    /// B2: stop request (used during unload/shutdown) should NOT panic or
+    /// produce unexpected errors when the worker is gone. If the transport
+    /// thread is still alive but the peer disconnected, the send fails with a
+    /// warning — not an error — because this is expected during graceful
+    /// shutdown (not a transport fault).
+    #[tokio::test]
+    async fn stop_request_send_raw_tolerates_missing_peer() {
+        #[cfg(unix)]
+        let endpoint = {
+            let sock = std::env::temp_dir().join(format!(
+                "lite-server-zmq-stop-{}.sock", std::process::id()
+            ));
+            format!("ipc://{}", sock.display())
+        };
+        #[cfg(windows)]
+        let endpoint = format!("tcp://127.0.0.1:{}", 34000 + std::process::id() % 1000);
+
+        let client = WorkerZmqClient::new(endpoint.clone());
+
+        // Send a stop request — the worker peer never existed, so this may fail
+        // at the transport level, but it must not crash.
+        let stop_req = crate::streaming::build_stop_request();
+        assert_eq!(stop_req.uid, "stop", "stop request uid must be 'stop' for B2 detection");
+
+        // send_raw is fire-and-forget; it should not panic even with no peer.
+        // The transport thread may or may not still be alive — either result
+        // is acceptable. The key assertion: no panic, no deadlock.
+        let _ = tokio::time::timeout(Duration::from_secs(3), client.send_raw(stop_req)).await;
+        // Clean up (will shut down the transport thread)
+        drop(client);
     }
 }

@@ -431,6 +431,7 @@ impl WorkerManager {
                 || {},
                 Some(hooks_arc),
                 self.hook_tasks.clone(),
+                self.draining.clone(),
             );
 
             let info = WorkerInfo {

@@ -89,6 +89,9 @@ pub struct WorkerManager {
     custom_metrics: bool,
     // Fire-and-forget lifecycle hook tasks, aborted on shutdown (L2).
     hook_tasks: HookTasks,
+    /// B1: set true at shutdown start so worker monitors know to suppress
+    /// ERROR-level "exited unexpectedly" for workers killed during drain.
+    draining: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct WorkerProcess {
@@ -135,6 +138,7 @@ impl WorkerManager {
             max_workers: 0,
             custom_metrics: false,
             hook_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -210,6 +214,9 @@ impl WorkerManager {
     }
 
     pub async fn shutdown(&self) {
+        // B1: signal all worker monitors that we're in draining mode so they
+        // suppress spurious "exited unexpectedly" errors during teardown.
+        self.draining.store(true, std::sync::atomic::Ordering::Relaxed);
         info!("Shutting down all workers");
         let workers = self.workers.read().await;
         let keys: Vec<String> = workers.keys().cloned().collect();

@@ -52,13 +52,14 @@ pub(super) async fn stop_worker_gracefully(
 }
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // ===== stderr capture (crash diagnostics) =====
 
@@ -195,6 +196,7 @@ pub(super) fn spawn_worker_monitor(
     on_exit: impl FnOnce() + Send + 'static,
     hooks: Option<Arc<crate::config::WorkerHooksConfig>>,
     hook_tasks: HookTasks,
+    draining: Arc<AtomicBool>,
 ) -> oneshot::Receiver<()> {
     let (done_tx, done_rx) = oneshot::channel::<()>();
     let model = model_name.to_string();
@@ -219,16 +221,29 @@ pub(super) fn spawn_worker_monitor(
                             }
                         } else {
                             let exit_code = status.code().unwrap_or(-1);
-                            error!(
-                                model = %model, version = %ver, worker_id,
-                                exit_code,
-                                "Worker process exited unexpectedly"
-                            );
-                            if let Some(ref h) = hooks {
-                                let mut vars = hook_vars.clone();
-                                vars.push(("$EXIT_CODE".to_string(), exit_code.to_string()));
-                                vars.push(("$REASON".to_string(), "crash".to_string()));
-                                execute_hook("error", h, vars, &hook_tasks);
+                            // B1: during draining/shutdown, a worker exit (including via
+                            // signal) is expected — the server is shutting workers down.
+                            // Log at WARN instead of ERROR and skip the error hook to
+                            // avoid spurious alerts. Outside of draining this is a real
+                            // worker crash and logged as ERROR.
+                            if draining.load(Ordering::Relaxed) {
+                                warn!(
+                                    model = %model, version = %ver, worker_id,
+                                    exit_code,
+                                    "Worker process exited during drain (not unexpected)"
+                                );
+                            } else {
+                                error!(
+                                    model = %model, version = %ver, worker_id,
+                                    exit_code,
+                                    "Worker process exited unexpectedly"
+                                );
+                                if let Some(ref h) = hooks {
+                                    let mut vars = hook_vars.clone();
+                                    vars.push(("$EXIT_CODE".to_string(), exit_code.to_string()));
+                                    vars.push(("$REASON".to_string(), "crash".to_string()));
+                                    execute_hook("error", h, vars, &hook_tasks);
+                                }
                             }
                         }
                     }
@@ -278,6 +293,19 @@ pub(super) fn new_worker_command(python_module_dir: &str) -> Command {
             { format!("{}:{}", current_pythonpath, python_module_dir) }
         };
         cmd.env("PYTHONPATH", new_pythonpath);
+    }
+    #[cfg(unix)]
+    {
+        // Detach this worker from the terminal's process group so Ctrl+C (SIGINT)
+        // only reaches the server — not the workers. Without this the workers
+        // catch KeyboardInterrupt and start their own teardown, racing with the
+        // server's graceful shutdown and producing spurious errors:
+        //   • "exited unexpectedly" (worker already killed by signal)
+        //   • "ZMQ raw send error" (socket closed before the server's stop msg).
+        // SIGKILL (kill_on_drop) works across process groups, so orphan protection
+        // is intact. tokio::process::Command exposes process_group() directly (no
+        // need for std::os::unix::process::CommandExt).
+        cmd.process_group(0);
     }
     cmd.kill_on_drop(true);
     cmd
@@ -594,6 +622,7 @@ impl WorkerManager {
             || {},
             Some(hooks_arc),
             self.hook_tasks.clone(),
+            self.draining.clone(),
         );
 
         // Update registry worker info
@@ -728,6 +757,7 @@ mod tests {
             move || { cleaned_up_clone.store(true, Ordering::SeqCst); },
             None,
             Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
+            Arc::new(AtomicBool::new(false)),
         );
 
         // Wait for the monitor to detect the exit and run cleanup
@@ -736,6 +766,61 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(cleaned_up.load(Ordering::SeqCst), "monitor should have triggered cleanup");
+    }
+
+    /// B1: when draining is set, a worker exit (even non-zero) must NOT trigger
+    /// the error hook. During normal operation (draining=false), the error hook
+    /// fires on unexpected exit.
+    #[tokio::test]
+    async fn test_worker_monitor_draining_suppresses_error_hook() {
+        // Spawn a process that exits with code 1 (simulates crash / signal kill)
+        #[cfg(unix)]
+        let child = tokio::process::Command::new("false")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        #[cfg(windows)]
+        let child = tokio::process::Command::new("cmd")
+            .args(["/c", "exit", "1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let cleaned_up = Arc::new(AtomicBool::new(false));
+        let cleaned_up_clone = cleaned_up.clone();
+
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let hook_tasks = Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new()));
+        let hook_tasks_clone = hook_tasks.clone();
+
+        // Configure an on_error hook — it should NOT fire when draining=true
+        let hooks = crate::config::WorkerHooksConfig {
+            on_error: Some("echo 'should-not-run'".to_string()),
+            ..Default::default()
+        };
+
+        let done_rx = spawn_worker_monitor(
+            child, "test_model", "1", 0, shutdown_rx,
+            move || { cleaned_up_clone.store(true, Ordering::SeqCst); },
+            Some(Arc::new(hooks)),
+            hook_tasks_clone,
+            Arc::new(AtomicBool::new(true)), // draining=true
+        );
+
+        // Await the monitor's completion signal
+        timeout(Duration::from_secs(5), done_rx)
+            .await
+            .expect("monitor should signal completion even during drain")
+            .expect("completion channel should not be dropped");
+
+        assert!(cleaned_up.load(Ordering::SeqCst), "on_exit callback must fire during drain");
+
+        // The error hook task should NOT have been spawned (draining suppresses it)
+        let tasks = hook_tasks.lock().unwrap();
+        assert!(tasks.is_empty(),
+            "error hook should NOT fire when draining=true (found {} tasks)", tasks.len());
     }
 
     // ===== Respawn tests =====
@@ -769,6 +854,7 @@ mod tests {
             move || { done_c.store(true, Ordering::SeqCst); },
             None,
             Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
+            Arc::new(AtomicBool::new(false)),
         );
 
         // Send shutdown
@@ -796,6 +882,7 @@ mod tests {
             || {},
             None,
             Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
+            Arc::new(AtomicBool::new(false)),
         );
 
         shutdown_tx.send(()).unwrap();
@@ -838,6 +925,7 @@ mod tests {
             || {},
             None,
             Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
+            Arc::new(AtomicBool::new(false)),
         );
 
         timeout(Duration::from_secs(5), done_rx)
@@ -875,6 +963,36 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(!alive, "dropped worker process {} should be killed via kill_on_drop", pid);
+    }
+
+    /// Worker processes MUST be in their own process group so terminal SIGINT
+    /// (Ctrl+C) only reaches the server, not the workers. Without this, SIGINT
+    /// kills workers before the server can run graceful shutdown, producing
+    /// spurious "exited unexpectedly" errors and ZMQ send failures.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_worker_command_uses_own_process_group() {
+        let child = new_worker_command("")
+            .arg("-c")
+            .arg("import time; time.sleep(10)")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let child_pid = child.id().unwrap() as i32;
+        let server_pgid = unsafe { libc::getpgid(0) };
+        let child_pgid = unsafe { libc::getpgid(child_pid) };
+
+        // The child must be in its own process group (PGID == its own PID when
+        // spawned with process_group(0)), different from the server's PGID.
+        assert_eq!(child_pgid, child_pid,
+            "worker should be process group leader (PGID == PID)");
+        assert_ne!(child_pgid, server_pgid,
+            "worker process group {} must differ from server process group {}",
+            child_pgid, server_pgid);
+
+        // Clean up
+        unsafe { libc::kill(child_pid, libc::SIGKILL) };
     }
 
     // ===== P0: worker startup stderr drain (diagnostics on early exit) =====
