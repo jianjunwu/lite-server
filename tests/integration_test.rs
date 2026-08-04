@@ -6268,9 +6268,9 @@ async fn test_worker_respawn_after_health_check_kill_reuses_client() {
         "--no-grpc",
         "--log-level", "warn",
         // Fast health-check cadence so a frozen worker is killed within
-        // ~0.3s — mirrors the in-crate kill-escalation test
+        // ~1s — mirrors the in-crate kill-escalation test
         // (inference_queue.rs:2961).
-        "--health-check-interval", "0.1",
+        "--health-check-interval", "0.5",
         "--health-check-timeout", "0.1",
         "--health-check-kill-threshold", "2",
         "--ejection-error-threshold", "1",
