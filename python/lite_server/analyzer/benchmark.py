@@ -424,8 +424,16 @@ class BenchmarkEngine:
         payload_factory = payload if callable(payload) else (lambda: payload)
 
         records: list[StreamRequestRecord] = []
+        warmup_left = warmup_requests
 
         async def adapter(p: dict) -> dict:
+            nonlocal warmup_left
+            # Warmup calls (run() discards their samples) must not leak
+            # into stream metrics either — record only measured requests.
+            is_warmup = warmup_left > 0
+            if is_warmup:
+                warmup_left -= 1
+
             t0 = time.perf_counter_ns()
             rec = StreamRequestRecord()
             if request_meta is not None:
@@ -475,7 +483,8 @@ class BenchmarkEngine:
             t1 = time.perf_counter_ns()
             if chunk_idx > 0:
                 rec.total_ms = (t1 - t0) / 1e6
-            records.append(rec)
+            if not is_warmup:
+                records.append(rec)
             return {"ok": True}
 
         # Call unmodified run() — the adapter is a normal unary target
@@ -499,6 +508,13 @@ class BenchmarkEngine:
                 f"{sm.zero_chunk_requests}/{sm.requests} requests "
                 f"received zero chunks — check model output format or "
                 f"increase stream-read-timeout"
+            )
+
+        if sm.token_count_basis == "mixed":
+            result.warnings.append(
+                "Mixed token count basis: some requests reported "
+                "token_count metadata, others fell back to chunk_count "
+                "estimation — token metrics are partially estimated"
             )
 
         return result

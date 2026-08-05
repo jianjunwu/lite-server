@@ -653,7 +653,7 @@ def _cmd_benchmark(args):
                 # Streaming path: SSE target → run_stream()
                 from lite_server.analyzer.sse_target import sse_stream_target
 
-                stream_target = sse_stream_target(client, url)
+                stream_target = sse_stream_target(client, url, timeout=timeout)
 
                 # STT request_meta: extract audio_duration_ms from payload
                 request_meta_fn = None

@@ -43,6 +43,7 @@ def sse_stream_target(
     client,
     url: str,
     *,
+    timeout=None,
     done_marker: str = "[DONE]",
     chunk_meta: Callable[[str], dict | None] = default_chunk_meta,
 ) -> Callable[[dict], AsyncIterator[StreamChunk]]:
@@ -51,6 +52,9 @@ def sse_stream_target(
     Args:
         client: An ``httpx.AsyncClient`` instance.
         url: Full SSE endpoint URL.
+        timeout: Per-request httpx timeout (e.g. ``httpx.Timeout``).  When
+            ``None`` the client default applies.  Note httpx read timeout
+            re-arms per chunk read, so this is the inter-chunk idle budget.
         done_marker: The ``data:`` value that signals stream completion.
         chunk_meta: Callable that extracts optional metadata from each
             ``data:`` string (default: parse JSON → dict or None).
@@ -64,12 +68,12 @@ def sse_stream_target(
         import httpx
 
         try:
-            async with client.stream("POST", url, json=payload) as response:
+            request_kwargs: dict = {"json": payload}
+            if timeout is not None:
+                request_kwargs["timeout"] = timeout
+            async with client.stream("POST", url, **request_kwargs) as response:
                 if response.status_code != 200:
-                    try:
-                        response.raise_for_status()
-                    except httpx.HTTPStatusError:
-                        raise RequestStatusError(response.status_code)
+                    raise RequestStatusError(response.status_code)
 
                 data_lines: list[str] = []
 

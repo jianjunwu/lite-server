@@ -187,7 +187,7 @@ def _compute_llm(
         sm.tokens_per_sec_e2e = (total_tokens / e2e_ms) * 1000.0
 
     # aggregate (system) throughput: total_tokens / window_secs
-    if window_secs is not None and window_secs > 0:
+    if window_secs is not None and window_secs > 0 and total_tokens > 0:
         sm.tokens_per_sec_aggregate = total_tokens / window_secs
 
 
