@@ -101,6 +101,19 @@ def main(argv=None):
                               help="Exit 99 if failed/total exceeds R (e.g. 0.01)")
     bench_parser.add_argument("--max-p99", type=float, default=None,
                               help="Exit 99 if p99 latency exceeds MS milliseconds")
+    bench_parser.add_argument("--stream", action="store_true", default=False,
+                              help="Use SSE streaming endpoint /v2/models/{m}/events")
+    bench_parser.add_argument("--model-type", choices=["llm", "tts", "stt"],
+                              default="llm",
+                              help="Streaming metric interpretation (default: llm)")
+    bench_parser.add_argument("--stream-read-timeout", type=float, default=300.0,
+                              help="Seconds between stream chunks before timeout "
+                                   "(default: 300)")
+    bench_parser.add_argument("--max-ttft-ms", type=float, default=None,
+                              help="Exit 99 if TTFT p99 exceeds MS (requires --stream)")
+    bench_parser.add_argument("--max-rtf", type=float, default=None,
+                              help="Exit 99 if RTF p99 exceeds VAL "
+                                   "(requires --stream and --model-type tts/stt)")
 
     # analyze
     analyze_parser = subparsers.add_parser("analyze", help="Run model analyzer")
@@ -354,6 +367,8 @@ def _run_concurrency_sweep(args, levels: list[int], duration, run_one) -> int:
             print(f"  (no requests completed — skipping remaining levels)")
             break
         _print_benchmark_summary(result, args, duration, c)
+        if result.stream_metrics is not None:
+            _print_stream_section(result)
         results.append((c, result))
 
         # Per-level threshold gate (A4)
@@ -398,6 +413,23 @@ def _check_threshold_gate(result: "BenchmarkResult", args) -> int:
             violations.append(f"error rate {rate:.3f} > {args.max_error_rate}")
     if args.max_p99 is not None and result.p99 > args.max_p99:
         violations.append(f"p99 {result.p99:.2f}ms > {args.max_p99}ms")
+    # Stream thresholds (R3) — use getattr for backward compat
+    max_ttft_ms = getattr(args, "max_ttft_ms", None)
+    max_rtf = getattr(args, "max_rtf", None)
+    if max_ttft_ms is not None and result.stream_metrics is not None:
+        ttft_p99 = result.stream_metrics.ttft_ms.get("p99", 0.0)
+        if ttft_p99 > max_ttft_ms:
+            violations.append(
+                f"TTFT p99 {ttft_p99:.2f}ms > {max_ttft_ms}ms"
+            )
+    if max_rtf is not None and result.stream_metrics is not None:
+        rtf = result.stream_metrics.rtf
+        if rtf is not None:
+            rtf_p99 = rtf.get("p99", 0.0)
+            if rtf_p99 > max_rtf:
+                violations.append(
+                    f"RTF p99 {rtf_p99:.2f} > {max_rtf}"
+                )
     if violations:
         for v in violations:
             print(f"  THRESHOLD VIOLATION: {v}")
@@ -411,9 +443,15 @@ def _export_sweep_results(args, results: list[tuple[int, "BenchmarkResult"]]) ->
     from datetime import datetime, timezone
     from pathlib import Path
 
-    url = f"{args.url}/v2/models/{args.model}/infer"
-    if args.version:
-        url = f"{args.url}/v2/models/{args.model}/versions/{args.version}/infer"
+    is_stream = getattr(args, "stream", False)
+    if is_stream:
+        url = f"{args.url}/v2/models/{args.model}/events"
+        if args.version:
+            url = f"{args.url}/v2/models/{args.model}/versions/{args.version}/events"
+    else:
+        url = f"{args.url}/v2/models/{args.model}/infer"
+        if args.version:
+            url = f"{args.url}/v2/models/{args.model}/versions/{args.version}/infer"
 
     export_data = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -427,6 +465,8 @@ def _export_sweep_results(args, results: list[tuple[int, "BenchmarkResult"]]) ->
             "warmup_requests": args.warmup_requests,
             "grace_period": args.grace_period,
             "payload": _payload_source(args),
+            "stream": is_stream,
+            "model_type": getattr(args, "model_type", "llm"),
         },
         "mode": "sweep",
         "levels": [
@@ -436,6 +476,45 @@ def _export_sweep_results(args, results: list[tuple[int, "BenchmarkResult"]]) ->
     }
     Path(args.export).write_text(json.dumps(export_data, indent=2), encoding="utf-8")
     print(f"  Exported: {args.export}")
+
+
+def _print_stream_section(result: "BenchmarkResult") -> None:
+    """Print streaming-specific metrics section."""
+    sm = result.stream_metrics
+    if sm is None:
+        return
+
+    def _p(d: dict) -> str:
+        return f"{d.get('mean', 0):.1f}/{d.get('p50', 0):.1f}/{d.get('p90', 0):.1f}/{d.get('p95', 0):.1f}/{d.get('p99', 0):.1f}"
+
+    print(f"\n  Stream Metrics (mode={sm.model_type}):")
+    print(f"    Requests:       {sm.requests}  "
+          f"(zero-chunk: {sm.zero_chunk_requests})")
+    print(f"    Chunks:         {sm.total_chunks} "
+          f"({sm.chunks_per_request.get('mean', 0):.1f}/req)")
+    print(f"    TTFT (ms)       [mean/p50/p90/p95/p99]: "
+          f"{_p(sm.ttft_ms)}")
+    print(f"    E2E (ms)        [mean/p50/p90/p95/p99]: "
+          f"{_p(sm.total_ms)}")
+
+    if sm.model_type == "llm":
+        if sm.itl_ms is not None:
+            print(f"    ITL (ms)        [mean/p50/p90/p95/p99]: "
+                  f"{_p(sm.itl_ms)}")
+        if sm.tpot_ms is not None:
+            print(f"    TPOT (ms)       [mean/p50/p90/p95/p99]: "
+                  f"{_p(sm.tpot_ms)}")
+        if sm.tokens_per_sec is not None:
+            print(f"    Tokens/sec      (decode): {sm.tokens_per_sec:.1f}")
+        if sm.tokens_per_sec_e2e is not None:
+            print(f"    Tokens/sec      (e2e):    {sm.tokens_per_sec_e2e:.1f}")
+        if sm.tokens_per_sec_aggregate is not None:
+            print(f"    Tokens/sec      (agg):    {sm.tokens_per_sec_aggregate:.1f}")
+        if sm.token_count_basis is not None:
+            print(f"    Token basis:    {sm.token_count_basis}")
+    elif sm.model_type in ("tts", "stt") and sm.rtf is not None:
+        print(f"    RTF             [mean/p50/p90/p95/p99]: "
+              f"{_p(sm.rtf)}")
 
 
 def _payload_source(args) -> str:
@@ -473,6 +552,29 @@ def _cmd_benchmark(args):
     import itertools
     import sys
 
+    # ── Streaming flag defaults (backward compat with non-CLI callers) ──
+    if not hasattr(args, "stream"):
+        args.stream = False
+    if not hasattr(args, "model_type"):
+        args.model_type = "llm"
+    if not hasattr(args, "stream_read_timeout"):
+        args.stream_read_timeout = 300.0
+    if not hasattr(args, "max_ttft_ms"):
+        args.max_ttft_ms = None
+    if not hasattr(args, "max_rtf"):
+        args.max_rtf = None
+
+    if args.max_ttft_ms is not None and not args.stream:
+        _logger.error("--max-ttft-ms requires --stream")
+        return 2
+    if args.max_rtf is not None:
+        if not args.stream:
+            _logger.error("--max-rtf requires --stream")
+            return 2
+        if args.model_type == "llm":
+            _logger.error("--max-rtf requires --model-type tts or stt, got llm")
+            return 2
+
     # Parse concurrency — single int or sweep range
     try:
         concurrency_levels = _parse_concurrency(args.concurrency)
@@ -509,17 +611,24 @@ def _cmd_benchmark(args):
     if duration is None and args.requests is None:
         duration = 30.0
 
-    url = f"{args.url}/v2/models/{args.model}/infer"
-    if args.version:
-        url = f"{args.url}/v2/models/{args.model}/versions/{args.version}/infer"
+    # URL: streaming uses /events, non-streaming uses /infer
+    if args.stream:
+        url = f"{args.url}/v2/models/{args.model}/events"
+        if args.version:
+            url = f"{args.url}/v2/models/{args.model}/versions/{args.version}/events"
+    else:
+        url = f"{args.url}/v2/models/{args.model}/infer"
+        if args.version:
+            url = f"{args.url}/v2/models/{args.model}/versions/{args.version}/infer"
 
     async def run_benchmark(c: int | None = None):
         import httpx
 
         concurrency = c if c is not None else concurrency_levels[0]
         mode = f"duration={duration}s" if duration is not None else f"requests={args.requests}"
+        stream_label = ", streaming" if args.stream else ""
         print(f"Benchmarking {args.model} (concurrency={concurrency}, "
-              f"{mode}, warmup={args.warmup_requests})")
+              f"{mode}{stream_label}, warmup={args.warmup_requests})")
 
         if payload_factory is not None:
             final_payload = payload_factory
@@ -527,37 +636,72 @@ def _cmd_benchmark(args):
             payload_cycle = itertools.cycle(payloads)
             final_payload = lambda: next(payload_cycle)
 
-        timeout = httpx.Timeout(30.0, connect=5.0, pool=5.0)
+        if args.stream:
+            read_timeout = args.stream_read_timeout
+        else:
+            read_timeout = 30.0
+        timeout = httpx.Timeout(read_timeout, connect=5.0, pool=5.0)
         limits = httpx.Limits(
             max_connections=max(concurrency, 1),
             max_keepalive_connections=max(concurrency, 1),
             keepalive_expiry=15.0,
         )
         async with httpx.AsyncClient(limits=limits) as client:
-            async def target(payload: dict) -> dict:
-                try:
-                    resp = await client.post(url, json=payload, timeout=timeout)
-                except httpx.TimeoutException as e:
-                    raise RequestTimeoutError() from e
-                except httpx.ConnectError as e:
-                    raise RequestConnectError() from e
-                except httpx.TransportError as e:
-                    raise RequestTransportError() from e
-                if resp.status_code != 200:
-                    raise RequestStatusError(resp.status_code)
-                return {"ok": True}
-
             engine = BenchmarkEngine()
-            return await engine.run(
-                target=target,
-                payload=final_payload,
-                concurrency=concurrency,
-                duration=duration,
-                total_requests=args.requests,
-                warmup_requests=args.warmup_requests,
-                grace_period=args.grace_period,
-                rate=args.rate,
-            )
+
+            if args.stream:
+                # Streaming path: SSE target → run_stream()
+                from lite_server.analyzer.sse_target import sse_stream_target
+
+                stream_target = sse_stream_target(client, url)
+
+                # STT request_meta: extract audio_duration_ms from payload
+                request_meta_fn = None
+                if args.model_type == "stt":
+                    def _stt_request_meta(p: dict) -> dict | None:
+                        val = p.get("audio_duration_ms")
+                        if isinstance(val, (int, float)):
+                            return {"audio_duration_ms": float(val)}
+                        return None
+                    request_meta_fn = _stt_request_meta
+
+                return await engine.run_stream(
+                    target=stream_target,
+                    payload=final_payload,
+                    concurrency=concurrency,
+                    duration=duration,
+                    total_requests=args.requests,
+                    warmup_requests=args.warmup_requests,
+                    grace_period=args.grace_period,
+                    rate=args.rate,
+                    model_type=args.model_type,
+                    request_meta=request_meta_fn,
+                )
+            else:
+                # Non-streaming path (unchanged)
+                async def target(payload: dict) -> dict:
+                    try:
+                        resp = await client.post(url, json=payload, timeout=timeout)
+                    except httpx.TimeoutException as e:
+                        raise RequestTimeoutError() from e
+                    except httpx.ConnectError as e:
+                        raise RequestConnectError() from e
+                    except httpx.TransportError as e:
+                        raise RequestTransportError() from e
+                    if resp.status_code != 200:
+                        raise RequestStatusError(resp.status_code)
+                    return {"ok": True}
+
+                return await engine.run(
+                    target=target,
+                    payload=final_payload,
+                    concurrency=concurrency,
+                    duration=duration,
+                    total_requests=args.requests,
+                    warmup_requests=args.warmup_requests,
+                    grace_period=args.grace_period,
+                    rate=args.rate,
+                )
 
     # Windows: use SelectorEventLoop for subprocess compat
     if sys.platform == "win32":
@@ -626,6 +770,10 @@ def _cmd_benchmark(args):
     for w in result.warnings:
         print(f"  WARNING: {w}")
 
+    # ── Stream section ──────────────────────────────────────────────────
+    if result.stream_metrics is not None:
+        _print_stream_section(result)
+
     if args.export:
         from datetime import datetime, timezone
         export_data = {
@@ -640,6 +788,8 @@ def _cmd_benchmark(args):
                 "warmup_requests": args.warmup_requests,
                 "grace_period": args.grace_period,
                 "payload": _payload_source(args),
+                "stream": args.stream,
+                "model_type": args.model_type,
             },
             **result.to_dict(),
         }

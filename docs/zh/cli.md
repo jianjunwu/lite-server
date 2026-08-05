@@ -148,6 +148,11 @@ lite-server benchmark --model <模型名> [选项]
 | `--export` | path | — | 将权威 JSON 记录写入 PATH（stdout 表格不变） |
 | `--max-error-rate` | float | — | 错误率超过 R 时退出码 99（如 0.01） |
 | `--max-p99` | float | — | p99 延迟超过 MS 毫秒时退出码 99 |
+| `--stream` | flag | off | 使用 SSE 流式端点 `/v2/models/{m}/events` |
+| `--model-type` | llm\|tts\|stt | llm | 流式指标的语义解释 |
+| `--stream-read-timeout` | float | 300.0 | 流式 chunk 间超时秒数 |
+| `--max-ttft-ms` | float | — | TTFT p99 超过 MS 毫秒时退出码 99（需配合 `--stream`） |
+| `--max-rtf` | float | — | RTF p99 超过 VAL 时退出码 99（需 `--stream` + `--model-type tts/stt`） |
 
 **测量口径**（闭环：service-time；开环：`--rate`）：
 
@@ -156,6 +161,16 @@ lite-server benchmark --model <模型名> [选项]
 - 预热样本丢弃；到期在途请求按 `--grace-period` 有界 drain（grace 内完成计入统计，其余记为 `dropped_inflight`）。
 - 吞吐 = `成功数 / (末响应 − 首请求)`（实测窗口）；百分位统一 numpy `linear` 插值（报告 p50/p90/p95/p99/max）。
 - 样本不足（`< max(300, 10 × 并发数)`）与客户端 CPU 饱和（单核 >70%）会在 stdout 与 JSON 中显式告警。
+
+**流式测量口径**（`--stream`）：
+
+- 流式适配器将 SSE 响应包装为单次调用；`latency_ms` 仍报告端到端流延迟。每个 chunk 的指标（TTFT、ITL、TPOT）在 JSON `"stream"` 段中。
+- 空 chunk（keepalive、`data: [DONE]`）不计入 TTFT/ITL/chunk 数，但其字节仍计入总量。
+- **LLM**（`--model-type llm`，默认）：token 数默认按 `chunk_count` 估算（estimated）。当模型在 chunk 元数据中提供 `token_count` 时标记为 exact。部分有、部分无标记为 mixed，仍计算指标但附注警告。
+- **TTS**（`--model-type tts`）：RTF = `total_ms / audio_duration_ms`，从 chunk 元数据提取。
+- **STT**（`--model-type stt`）：RTF = `total_ms / audio_duration_ms`，从请求 payload 提取。**约定**：在 JSON payload 中包含 `"audio_duration_ms"`（float，毫秒）——CLI 会自动提取。不含此字段的请求不参与 RTF 计算。
+- **组合矩阵**：`--stream` 与 `--concurrency start:end:step`、`--rate`、`--version` 自由组合，无需额外参数。
+- **阈值**：`--max-ttft-ms` 与 `--max-rtf` 按 p99 门禁；fail-closed（缺少 `--stream` 时 exit 2）。
 
 **退出码**：`0` 通过 · `1` 执行错误（如无请求完成） · `2` 参数/payload 错误 · `99` 阈值违例。
 
@@ -166,6 +181,24 @@ lite-server benchmark --model my_model --concurrency 16 --duration 60
 # CI 冒烟：固定次数 + 预热 + JSON 导出 + 错误率门禁
 lite-server benchmark --model my_model --requests 200 --concurrency 4 \
   --warmup-requests 4 --max-error-rate 0.01 --export smoke.json
+
+# LLM 流式：SSE 端点 + token 级指标
+lite-server benchmark --model llama --stream --model-type llm --duration 60 --concurrency 16
+
+# TTS 流式：基于 RTF 的评估
+lite-server benchmark --model xtts --stream --model-type tts --concurrency 4 \
+  --payload '{"text": "你好世界"}'
+
+# STT 流式：RTF 从 payload 的 audio_duration_ms 计算
+lite-server benchmark --model whisper --stream --model-type stt --duration 60 \
+  --payload '{"audio_duration_ms": 5000}'
+
+# 流式 + 延迟阈值（超出则 exit 99）
+lite-server benchmark --model llama --stream --requests 100 \
+  --max-ttft-ms 200 --max-p99 500
+
+# 流式并发扫描
+lite-server benchmark --model llama --stream --concurrency 1:16:2 --duration 30
 ```
 
 ---

@@ -5,6 +5,11 @@ requests serially (k6 constant-vus / perf_analyzer concurrency mode).
 Reported latencies are service-time only — queueing at the load generator
 is not measured (coordinated omission is inherent to closed-loop); the
 output contract labels this explicitly via ``load_mode``/``latency_basis``.
+
+Streaming (PR-4): ``run_stream()`` wraps a streaming target (async iterator
+over ``StreamChunk``) as a unary callable, delegates to the unmodified
+``run()``, and attaches ``StreamMetrics`` to the result.  Model-specific
+metric computation lives in ``stream_metrics.py``.
 """
 
 from __future__ import annotations
@@ -14,9 +19,102 @@ import os
 import statistics
 import time
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Union
+from typing import Any, AsyncIterator, Awaitable, Callable, Union
 
 import numpy as np
+
+# ── Streaming datatypes (PR-4) ───────────────────────────────────────────
+
+
+@dataclass
+class StreamChunk:
+    """One chunk from a streaming response (SSE event, WS frame, etc.)."""
+
+    data: Any = None
+    meta: dict | None = None  # {"token_count": 3} or {"audio_duration_ms": 320}
+    size_bytes: int | None = None  # falls back to len(data) for bytes/str
+
+
+@dataclass
+class StreamRequestRecord:
+    """Per-request raw stream measurements (one per successful stream)."""
+
+    chunk_count: int = 0
+    total_bytes: int = 0
+    ttft_ms: float | None = None  # first chunk offset from send time
+    total_ms: float | None = None  # last chunk offset (== e2e latency)
+    inter_chunk_ms: list[float] = field(default_factory=list)
+    chunk_metas: list[dict] = field(default_factory=list)
+    meta_totals: dict[str, float] = field(default_factory=dict)
+    request_meta: dict | None = None  # STT input audio_duration_ms
+
+
+@dataclass
+class StreamMetrics:
+    """Aggregated streaming metrics for one benchmark run.
+
+    ``model_type`` is stored on the dataclass; ``to_dict()`` emits it as
+    ``"mode"`` (§1.12.4).
+    """
+
+    model_type: str
+    requests: int
+    zero_chunk_requests: int
+    total_chunks: int
+    total_bytes: int
+    chunks_per_request: dict  # mean/p50/p90/p95/p99/min/max
+    ttft_ms: dict  # same percentile shape
+    total_ms: dict  # e2e stream latency
+
+    # LLM-specific (None for TTS/STT/generic)
+    itl_ms: dict | None = None  # pooled inter-chunk latency
+    tpot_ms: dict | None = None  # per-request TPOT percentiles (R2)
+    tokens_per_sec: float | None = None  # decode-phase throughput
+    tokens_per_sec_e2e: float | None = None  # incl. TTFT
+    tokens_per_sec_aggregate: float | None = None  # total_tokens / window (R2)
+    tokens_per_request: dict | None = None  # per-request token counts
+    token_count_basis: str | None = None  # "exact" | "estimated" | "mixed"
+
+    # TTS/STT-specific (None for LLM/generic)
+    rtf: dict | None = None  # real-time factor percentiles
+
+    def to_dict(self) -> dict:
+        d: dict = {
+            "mode": self.model_type,
+            "requests": self.requests,
+            "zero_chunk_requests": self.zero_chunk_requests,
+            "total_chunks": self.total_chunks,
+            "total_bytes": self.total_bytes,
+            "chunks_per_request": _round_percentiles(self.chunks_per_request),
+            "ttft_ms": _round_percentiles(self.ttft_ms),
+            "total_ms": _round_percentiles(self.total_ms),
+        }
+        # LLM section
+        if self.model_type == "llm":
+            if self.itl_ms is not None:
+                d["itl_ms"] = _round_percentiles(self.itl_ms)
+            if self.tpot_ms is not None:
+                d["tpot_ms"] = _round_percentiles(self.tpot_ms)
+            if self.tokens_per_sec is not None:
+                d["tokens_per_sec"] = round(self.tokens_per_sec, 2)
+            if self.tokens_per_sec_e2e is not None:
+                d["tokens_per_sec_e2e"] = round(self.tokens_per_sec_e2e, 2)
+            if self.tokens_per_sec_aggregate is not None:
+                d["tokens_per_sec_aggregate"] = round(self.tokens_per_sec_aggregate, 2)
+            if self.tokens_per_request is not None:
+                d["tokens_per_request"] = _round_percentiles(self.tokens_per_request)
+            if self.token_count_basis is not None:
+                d["token_count_basis"] = self.token_count_basis
+        # TTS / STT section
+        if self.model_type in ("tts", "stt") and self.rtf is not None:
+            d["rtf"] = _round_percentiles(self.rtf)
+        return d
+
+
+def _round_percentiles(p: dict) -> dict:
+    """Round all values in a percentile dict to 2 decimal places."""
+    return {k: round(v, 2) for k, v in p.items()}
+
 
 Payload = Union[dict, Callable[[], dict]]
 
@@ -52,6 +150,12 @@ class RequestStatusError(RequestError):
         self.status_code = status_code
 
 
+class RequestStreamError(RequestError):
+    """SSE ``{"error": "..."}`` event or stream-level protocol error."""
+
+    kind = "stream"
+
+
 @dataclass
 class BenchmarkResult:
     """Results from a benchmark run."""
@@ -76,6 +180,7 @@ class BenchmarkResult:
     warnings: list[str] = field(default_factory=list)
     load_mode: str = "closed-loop"
     target_rate: float | None = None
+    stream_metrics: StreamMetrics | None = None
 
     @property
     def throughput(self) -> float:
@@ -184,6 +289,7 @@ class BenchmarkResult:
             },
             "warnings": list(self.warnings),
             "errors": self.errors,
+            "stream": self.stream_metrics.to_dict() if self.stream_metrics else None,
         }
         if self.target_rate is not None:
             d["target_rate"] = self.target_rate
@@ -280,6 +386,120 @@ class BenchmarkEngine:
         )
         if warning:
             result.warnings.append(warning)
+
+        return result
+
+    async def run_stream(
+        self,
+        target: Callable[[dict], AsyncIterator[StreamChunk]],
+        payload: Payload,
+        concurrency: int = 1,
+        duration: float | None = None,
+        total_requests: int | None = None,
+        warmup_requests: int = 0,
+        grace_period: float = 30.0,
+        rate: float | None = None,
+        model_type: str = "llm",
+        request_meta: Callable[[dict], dict | None] | None = None,
+    ) -> BenchmarkResult:
+        """Run streaming benchmark — adapter over unmodified ``run()``.
+
+        Wraps a streaming *target* (``async for chunk in target(payload)``)
+        as a unary callable that fully consumes the stream, records raw
+        ``StreamRequestRecord`` timings, and returns ``{"ok": True}``.
+        The adapter is passed to the unmodified ``run()``, so warmup,
+        worker pool, grace drain, window, sample-size/CPU warnings are
+        all reused with zero changes.
+
+        After ``run()`` returns, ``compute_stream_metrics`` is called to
+        produce model-specific metrics and attached to ``result.stream_metrics``.
+        """
+        from lite_server.analyzer.stream_metrics import MODEL_TYPES, compute_stream_metrics
+
+        if model_type not in MODEL_TYPES:
+            raise ValueError(
+                f"model_type must be one of {MODEL_TYPES}, got {model_type!r}"
+            )
+
+        payload_factory = payload if callable(payload) else (lambda: payload)
+
+        records: list[StreamRequestRecord] = []
+
+        async def adapter(p: dict) -> dict:
+            t0 = time.perf_counter_ns()
+            rec = StreamRequestRecord()
+            if request_meta is not None:
+                rec.request_meta = request_meta(p)
+
+            prev_ts_ns: int | None = None
+            chunk_idx = 0
+
+            try:
+                async for chunk in target(p):
+                    now_ns = time.perf_counter_ns()
+
+                    # Empty-chunk filtering (§1.12.1): chunks with no data
+                    # are not counted toward chunk_count / TTFT / ITL, but
+                    # their bytes still count and their meta still aggregates.
+                    is_empty = chunk.data is None or (
+                        isinstance(chunk.data, (str, bytes)) and len(chunk.data) == 0
+                    )
+
+                    if not is_empty:
+                        chunk_idx += 1
+                        if rec.ttft_ms is None:
+                            rec.ttft_ms = (now_ns - t0) / 1e6
+                        if prev_ts_ns is not None:
+                            rec.inter_chunk_ms.append((now_ns - prev_ts_ns) / 1e6)
+                        prev_ts_ns = now_ns
+
+                    # Bytes: use explicit size or fall back to len(data)
+                    if chunk.size_bytes is not None:
+                        rec.total_bytes += chunk.size_bytes
+                    elif isinstance(chunk.data, (str, bytes)):
+                        rec.total_bytes += len(chunk.data)
+
+                    # Meta aggregation
+                    if chunk.meta is not None:
+                        rec.chunk_metas.append(chunk.meta)
+                        for mk, mv in chunk.meta.items():
+                            if isinstance(mv, (int, float)):
+                                rec.meta_totals[mk] = rec.meta_totals.get(mk, 0.0) + mv
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                raise
+
+            rec.chunk_count = chunk_idx
+            t1 = time.perf_counter_ns()
+            if chunk_idx > 0:
+                rec.total_ms = (t1 - t0) / 1e6
+            records.append(rec)
+            return {"ok": True}
+
+        # Call unmodified run() — the adapter is a normal unary target
+        result = await self.run(
+            target=adapter,
+            payload=payload_factory,
+            concurrency=concurrency,
+            duration=duration,
+            total_requests=total_requests,
+            warmup_requests=warmup_requests,
+            grace_period=grace_period,
+            rate=rate,
+        )
+
+        # Compute stream metrics and attach
+        sm = compute_stream_metrics(records, model_type, window_secs=result.window or None)
+        result.stream_metrics = sm
+
+        if sm.zero_chunk_requests > 0:
+            result.warnings.append(
+                f"{sm.zero_chunk_requests}/{sm.requests} requests "
+                f"received zero chunks — check model output format or "
+                f"increase stream-read-timeout"
+            )
 
         return result
 

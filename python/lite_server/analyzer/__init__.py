@@ -10,8 +10,12 @@ from lite_server.analyzer.benchmark import (
     RequestConnectError,
     RequestError,
     RequestStatusError,
+    RequestStreamError,
     RequestTimeoutError,
     RequestTransportError,
+    StreamChunk,
+    StreamMetrics,
+    StreamRequestRecord,
 )
 from lite_server.analyzer.report import ReportGenerator
 from lite_server.analyzer.static import StaticAnalyzer
@@ -23,7 +27,11 @@ __all__ = [
     "RequestConnectError",
     "RequestError",
     "RequestStatusError",
+    "RequestStreamError",
     "RequestTimeoutError",
     "RequestTransportError",
     "StaticAnalyzer",
+    "StreamChunk",
+    "StreamMetrics",
+    "StreamRequestRecord",
 ]

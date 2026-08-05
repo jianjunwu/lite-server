@@ -148,6 +148,11 @@ lite-server benchmark --model <MODEL> [OPTIONS]
 | `--export` | path | — | Write authoritative JSON record to PATH (stdout table unchanged) |
 | `--max-error-rate` | float | — | Exit 99 if failed/total exceeds R (e.g. 0.01) |
 | `--max-p99` | float | — | Exit 99 if p99 latency exceeds MS milliseconds |
+| `--stream` | flag | off | Use SSE streaming endpoint `/v2/models/{m}/events` |
+| `--model-type` | llm\|tts\|stt | llm | Streaming metric interpretation semantics |
+| `--stream-read-timeout` | float | 300.0 | Seconds between stream chunks before timeout |
+| `--max-ttft-ms` | float | — | Exit 99 if TTFT p99 exceeds MS (requires `--stream`) |
+| `--max-rtf` | float | — | Exit 99 if RTF p99 exceeds VAL (requires `--stream` + `--model-type tts/stt`) |
 
 **Measurement contract** (closed-loop: service-time; open-loop: `--rate`):
 
@@ -156,6 +161,16 @@ lite-server benchmark --model <MODEL> [OPTIONS]
 - Warmup samples are discarded; in-flight requests at the deadline are drained up to `--grace-period` (completions kept, the rest reported as `dropped_inflight`).
 - Throughput = `successful / (last response − first request)` (measured window), percentiles use numpy `linear` interpolation (p50/p90/p95/p99/max reported).
 - Insufficient samples (`< max(300, 10 × concurrency)`) and client CPU saturation (>70% of one core) produce explicit warnings in stdout and JSON.
+
+**Streaming measurement contract** (`--stream`):
+
+- The stream adapter wraps the SSE response as a unary callable; `latency_ms` still reports e2e stream latency at the request level. Per-chunk metrics (TTFT, ITL, TPOT) are in the `"stream"` JSON section.
+- Empty chunks (keepalives, `data: [DONE]`) are filtered from TTFT / ITL / chunk count but their bytes are still counted.
+- **LLM** (`--model-type llm`, default): token count defaults to `chunk_count` (estimated). When the model emits `token_count` in chunk metadata, the basis becomes `exact`. Mixed (some with, some without) is labeled `mixed` and metrics still compute with a warning.
+- **TTS** (`--model-type tts`): RTF = `total_ms / audio_duration_ms` from chunk metadata.
+- **STT** (`--model-type stt`): RTF = `total_ms / audio_duration_ms` from the request payload. **Convention**: include `"audio_duration_ms"` (float, milliseconds) in the JSON payload — the CLI extracts it automatically. Requests without `audio_duration_ms` are excluded from RTF calculation.
+- **Sweep + rate + version**: `--stream` composes with `--concurrency start:end:step`, `--rate`, and `--version` — no extra flags needed.
+- **Thresholds**: `--max-ttft-ms` and `--max-rtf` gate on p99; fail-closed (exit 2 when used without `--stream`).
 
 **Exit codes**: `0` pass · `1` execution error (e.g. no requests completed) · `2` argument/payload error · `99` threshold violation.
 
@@ -166,6 +181,24 @@ lite-server benchmark --model my_model --concurrency 16 --duration 60
 # CI smoke: fixed count, warmup, JSON export, error-rate gate
 lite-server benchmark --model my_model --requests 200 --concurrency 4 \
   --warmup-requests 4 --max-error-rate 0.01 --export smoke.json
+
+# LLM streaming: SSE endpoint with token-level metrics
+lite-server benchmark --model llama --stream --model-type llm --duration 60 --concurrency 16
+
+# TTS streaming: RTF-based evaluation
+lite-server benchmark --model xtts --stream --model-type tts --concurrency 4 \
+  --payload '{"text": "hello world"}'
+
+# STT streaming: RTF from audio_duration_ms in payload
+lite-server benchmark --model whisper --stream --model-type stt --duration 60 \
+  --payload '{"audio_duration_ms": 5000}'
+
+# Streaming with latency thresholds (exit 99 on violation)
+lite-server benchmark --model llama --stream --requests 100 \
+  --max-ttft-ms 200 --max-p99 500
+
+# Streaming concurrency sweep
+lite-server benchmark --model llama --stream --concurrency 1:16:2 --duration 30
 ```
 
 ---
