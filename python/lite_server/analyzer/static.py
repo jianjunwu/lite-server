@@ -69,11 +69,13 @@ _DANGEROUS_CALLS: dict[str, tuple[str, str]] = {
     "shutil.rmtree": ("LS305", "destructive filesystem: shutil.rmtree()"),
 }
 
-#: Python script for --deep subprocess import (tokens replaced at runtime).
+#: Python script for --deep subprocess import.
+#: sys.path JSON is passed via argv[1] (not string interpolation) to avoid
+#: quote-escaping bugs when sys.path entries contain double-quotes.
 _DEEP_IMPORT_SCRIPT = r"""
 import importlib.util, inspect, json, sys
 
-sys.path[:] = json.loads("__SYSPATH_JSON__")
+sys.path[:] = json.loads(sys.argv[1])
 sys.path.insert(0, r"__VERSION_DIR__")
 sys.path.insert(0, r"__MODEL_DIR__")
 
@@ -90,6 +92,7 @@ try:
     sys.modules["_ls_deep_model"] = mod
     spec.loader.exec_module(mod)
 
+    _litapi_bases = {lite_server.LitAPI, object}
     classes = []
     for _name, _obj in inspect.getmembers(mod, inspect.isclass):
         if getattr(_obj, "__module__", "") != "_ls_deep_model":
@@ -104,13 +107,16 @@ try:
             _is_gen = inspect.isgeneratorfunction(_obj.stream_predict)
         except Exception:
             _is_gen = False
+        # Only count methods defined in the class's own __dict__ or in
+        # repo-internal intermediate bases — NOT methods inherited from
+        # LitAPI itself (which are defaults, not real implementations).
+        _mro_to_check = [c for c in _obj.__mro__ if c not in _litapi_bases]
         _methods = []
         for _mn in HOOK_NAMES:
-            _m = getattr(_obj, _mn, None)
-            if _m is not None and callable(_m) and not (
-                hasattr(_m, "__isabstractmethod__") and _m.__isabstractmethod__
-            ):
-                _methods.append(_mn)
+            for _cls in _mro_to_check:
+                if _mn in _cls.__dict__ and callable(_cls.__dict__[_mn]):
+                    _methods.append(_mn)
+                    break
         classes.append({
             "name": _name,
             "bases": [b.__name__ for b in _obj.__bases__],
@@ -283,6 +289,15 @@ class StaticAnalyzer:
             ))
         report.resolved_version = resolved
         version_dir = resolved_model_dir / resolved
+        # Whitelist the version directory too: resolve symlinks and reject paths
+        # that escape the repository root (model-level check at L245-249 only
+        # covers model_dir; a symlinked version dir like model/1 -> /outside
+        # would otherwise be followed silently).
+        resolved_version_dir = version_dir.resolve()
+        if not resolved_version_dir.is_relative_to(self._repo_root):
+            raise ValueError(
+                f"Version path escapes repository root: {model_name!r}/{resolved}"
+            )
 
         # --- config.yaml ---------------------------------------------------------
         config_path = version_dir / "config.yaml"
@@ -298,6 +313,15 @@ class StaticAnalyzer:
         py_files = sorted(version_dir.glob("*.py")) + sorted(resolved_model_dir.glob("*.py"))
         if model_py.exists():
             self._analyze_sources(py_files, config, report)
+        elif "ensemble" not in config:
+            # A2: the server scanner skips version dirs without model.py
+            # unless the config has an ensemble key.  A non-ensemble model
+            # without model.py can never be served — surface as an error.
+            report.findings.append(Finding(
+                "LS002", "error",
+                "未找到 model.py（非 ensemble 模型无法被服务端加载）",
+                hint="添加 model.py 并定义 LitAPI 子类，或在 config.yaml 中配置 ensemble 调度",
+            ))
 
         # --- requirements.txt ----------------------------------------------------
         req_file = resolved_model_dir / "requirements.txt"
@@ -323,7 +347,15 @@ class StaticAnalyzer:
         """Parse config.yaml for display + conditional rules; delegate type
         validation to the Rust serde path (single source of truth)."""
         try:
-            parsed = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            raw = config_path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError) as e:
+            report.findings.append(Finding(
+                "LS004", "error", f"config.yaml 无法读取: {e}",
+                file=config_path.name,
+            ))
+            return {}
+        try:
+            parsed = yaml.safe_load(raw)
         except yaml.YAMLError as e:
             report.findings.append(Finding(
                 "LS004", "error", f"config.yaml 解析失败: {e}",
@@ -357,10 +389,16 @@ class StaticAnalyzer:
     # ------------------------------------------------------------- requirements
 
     def _check_requirements(self, req_file: Path, report: AnalysisReport) -> None:
+        try:
+            lines = req_file.read_text(encoding="utf-8").splitlines()
+        except (UnicodeDecodeError, OSError) as e:
+            report.findings.append(Finding(
+                "LS104", "warning", f"requirements.txt 无法读取: {e}",
+                file=req_file.name,
+            ))
+            return
         bad = 0
-        for lineno, line in enumerate(
-            req_file.read_text(encoding="utf-8").splitlines(), start=1
-        ):
+        for lineno, line in enumerate(lines, start=1):
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
                 continue
@@ -640,13 +678,11 @@ class StaticAnalyzer:
             "__MODEL_DIR__", str(model_dir)
         ).replace(
             "__MODEL_PY__", str(version_dir / "model.py")
-        ).replace(
-            "__SYSPATH_JSON__", json.dumps(sys.path)
         )
-        report.executed_user_code = True
+        sys_path_json = json.dumps(sys.path)
         try:
             proc = subprocess.run(
-                [sys.executable, "-c", code],
+                [sys.executable, "-c", code, sys_path_json],
                 capture_output=True, text=True, timeout=timeout,
                 cwd=str(self._repo_root),
             )
@@ -682,6 +718,7 @@ class StaticAnalyzer:
                 hint="check that model.py imports resolve; --deep failure does not invalidate static analysis",
             ))
             return
+        report.executed_user_code = True
         self._merge_deep_results(report, result, config)
 
     def _merge_deep_results(

@@ -331,11 +331,17 @@ def _random_payload_factory(template: dict) -> "Callable[[], dict]":
 
 
 def _run_concurrency_sweep(args, levels: list[int], duration, run_one) -> int:
-    """Run benchmark at each concurrency level; print sweep summary table."""
+    """Run benchmark at each concurrency level; print sweep summary table.
+
+    Returns the most severe exit code across all levels: 99 (threshold
+    violation) > 1 (no results) > 0 (pass).  Exports all level results
+    to ``--export`` path when specified.
+    """
     import asyncio
 
     results: list[tuple[int, "BenchmarkResult"]] = []
     print(f"Concurrency sweep: {levels}")
+    worst_rc = 0
 
     for c in levels:
         print(f"\n--- concurrency={c} ---")
@@ -349,6 +355,12 @@ def _run_concurrency_sweep(args, levels: list[int], duration, run_one) -> int:
             break
         _print_benchmark_summary(result, args, duration, c)
         results.append((c, result))
+
+        # Per-level threshold gate (A4)
+        level_rc = _check_threshold_gate(result, args)
+        if level_rc == 99:
+            worst_rc = 99
+
         if args.latency_threshold is not None and result.p99 > args.latency_threshold:
             print(f"  p99 {result.p99:.2f}ms > {args.latency_threshold}ms threshold — stopping sweep")
             break
@@ -363,8 +375,78 @@ def _run_concurrency_sweep(args, levels: list[int], duration, run_one) -> int:
             print(f"{c:>4} {r.throughput:>10.1f} {r.p50:>8.1f} {r.p90:>8.1f} "
                   f"{r.p95:>8.1f} {r.p99:>8.1f} {r.max_latency:>8.1f}")
         print(f"{'='*70}")
+    else:
+        # A5: all levels failed → exit 1 (consistent with single-run mode)
+        return 1
 
+    # Export sweep results
+    if args.export:
+        _export_sweep_results(args, results)
+
+    return worst_rc
+
+
+def _check_threshold_gate(result: "BenchmarkResult", args) -> int:
+    """Check threshold violations for a single benchmark result.
+
+    Returns 99 if any threshold is violated, 0 otherwise.
+    """
+    violations = []
+    if args.max_error_rate is not None:
+        rate = result.failed / result.total_requests if result.total_requests else 0
+        if rate > args.max_error_rate:
+            violations.append(f"error rate {rate:.3f} > {args.max_error_rate}")
+    if args.max_p99 is not None and result.p99 > args.max_p99:
+        violations.append(f"p99 {result.p99:.2f}ms > {args.max_p99}ms")
+    if violations:
+        for v in violations:
+            print(f"  THRESHOLD VIOLATION: {v}")
+        return 99
     return 0
+
+
+def _export_sweep_results(args, results: list[tuple[int, "BenchmarkResult"]]) -> None:
+    """Write all sweep level results to --export path."""
+    import json
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    url = f"{args.url}/v2/models/{args.model}/infer"
+    if args.version:
+        url = f"{args.url}/v2/models/{args.model}/versions/{args.version}/infer"
+
+    export_data = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "config": {
+            "url": url,
+            "model": args.model,
+            "version": args.version,
+            "concurrency": args.concurrency,
+            "duration": args.duration,
+            "requests": args.requests,
+            "warmup_requests": args.warmup_requests,
+            "grace_period": args.grace_period,
+            "payload": _payload_source(args),
+        },
+        "mode": "sweep",
+        "levels": [
+            {"concurrency": c, **r.to_dict()}
+            for c, r in results
+        ],
+    }
+    Path(args.export).write_text(json.dumps(export_data, indent=2), encoding="utf-8")
+    print(f"  Exported: {args.export}")
+
+
+def _payload_source(args) -> str:
+    """Describe the payload source for the export contract (A10)."""
+    if args.payload_random is not None:
+        return f"random-template: {args.payload_random}"
+    if args.payload is not None:
+        return "inline"
+    if args.payload_file:
+        return f"file: {', '.join(args.payload_file)}"
+    return "default: {\"input\": 1.0}"
 
 
 def _print_benchmark_summary(result, args, duration, concurrency) -> None:
@@ -489,6 +571,9 @@ def _cmd_benchmark(args):
 
     try:
         result = asyncio.run(run_benchmark())
+    except ValueError as e:
+        _logger.error("%s", e)
+        return 2
     except KeyboardInterrupt:
         print("\nBenchmark interrupted.")
         return 130
@@ -542,7 +627,9 @@ def _cmd_benchmark(args):
         print(f"  WARNING: {w}")
 
     if args.export:
+        from datetime import datetime, timezone
         export_data = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
             "config": {
                 "url": url,
                 "model": args.model,
@@ -552,25 +639,14 @@ def _cmd_benchmark(args):
                 "requests": args.requests,
                 "warmup_requests": args.warmup_requests,
                 "grace_period": args.grace_period,
+                "payload": _payload_source(args),
             },
             **result.to_dict(),
         }
         Path(args.export).write_text(json.dumps(export_data, indent=2), encoding="utf-8")
         print(f"  Exported: {args.export}")
 
-    violations = []
-    if args.max_error_rate is not None:
-        rate = result.failed / result.total_requests
-        if rate > args.max_error_rate:
-            violations.append(f"error rate {rate:.3f} > {args.max_error_rate}")
-    if args.max_p99 is not None and result.p99 > args.max_p99:
-        violations.append(f"p99 {result.p99:.2f}ms > {args.max_p99}ms")
-    if violations:
-        for v in violations:
-            print(f"  THRESHOLD VIOLATION: {v}")
-        return 99
-
-    return 0
+    return _check_threshold_gate(result, args)
 
 
 def _cmd_analyze(args):

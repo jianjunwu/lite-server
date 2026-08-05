@@ -149,6 +149,7 @@ class BenchmarkResult:
         return float(np.percentile(self.latencies, p * 100, method="linear"))
 
     def to_dict(self) -> dict:
+        achieved_rate = self.total_requests / self.window if self.window > 0 else 0.0
         d: dict = {
             "load_mode": self.load_mode,
             "latency_basis": "service-time",
@@ -158,6 +159,7 @@ class BenchmarkResult:
             "failed": self.failed,
             "error_kinds": dict(self.error_kinds),
             "throughput": round(self.throughput, 2),
+            "achieved_rate": round(achieved_rate, 2),
             "duration": round(self.duration, 3),
             "window": round(self.window, 3),
             "warmup_requests": self.warmup_requests,
@@ -165,6 +167,7 @@ class BenchmarkResult:
             "dropped_inflight": self.dropped_inflight,
             "latency_ms": {
                 "mean": round(self.mean_latency, 2),
+                "stddev": round(statistics.stdev(self.latencies) if len(self.latencies) >= 2 else 0.0, 2),
                 "p50": round(self.p50, 2),
                 "p90": round(self.p90, 2),
                 "p95": round(self.p95, 2),
@@ -246,7 +249,7 @@ class BenchmarkEngine:
         if rate is not None:
             result = await self._run_open_loop(
                 target, payload_factory, concurrency, rate,
-                duration or 0.0, grace_period,
+                duration or 0.0, total_requests, grace_period,
             )
             result.load_mode = "open-loop"
             result.target_rate = rate
@@ -371,33 +374,54 @@ class BenchmarkEngine:
         concurrency: int,
         rate: float,
         duration: float,
+        total_requests: int | None,
         grace_period: float,
     ) -> BenchmarkResult:
         """Open-loop: dispatch requests at ``rate`` req/s, cap at ``concurrency``.
 
         Requests are sent on a fixed-interval schedule independent of response
         times, so coordinated omission is structurally avoided.
+
+        Terminates when *either* the duration deadline expires or
+        ``total_requests`` have been dispatched (whichever comes first).
         """
         result = BenchmarkResult()
-        state: dict = {"started": 0, "first_t0_ns": None, "last_t1_ns": None}
+        state: dict = {
+            "started": 0, "first_t0_ns": None, "last_t1_ns": None,
+            "schedule_misses": 0, "sem_wait_total_ns": 0,
+        }
         interval_s = 1.0 / rate
         sem = asyncio.Semaphore(concurrency)
         deadline_ns = time.perf_counter_ns() + int(duration * 1e9)
 
         async def do_one() -> None:
+            _before_sem = time.perf_counter_ns()
             async with sem:
+                _after_sem = time.perf_counter_ns()
+                state["sem_wait_total_ns"] += _after_sem - _before_sem
                 await self._send(target, payload_factory, result, state, deadline_ns)
 
         tasks: list[asyncio.Task] = []
         next_tick = time.perf_counter_ns()
+        dispatched = 0
 
-        while time.perf_counter_ns() < deadline_ns:
+        def _should_continue() -> bool:
+            if total_requests is not None and dispatched >= total_requests:
+                return False
+            if duration > 0 and time.perf_counter_ns() >= deadline_ns:
+                return False
+            return True
+
+        while _should_continue():
             tasks.append(asyncio.create_task(do_one()))
+            dispatched += 1
             next_tick += int(interval_s * 1e9)
             now_ns = time.perf_counter_ns()
             sleep_ns = next_tick - now_ns
             if sleep_ns > 0:
                 await asyncio.sleep(sleep_ns / 1e9)
+            else:
+                state["schedule_misses"] += 1
 
         # Drain: wait for in-flight requests up to grace_period
         if tasks:
@@ -413,6 +437,31 @@ class BenchmarkEngine:
 
         result.dropped_inflight = state["started"] - result.total_requests
         self._finish_window(result, state)
+
+        # A7: warn when the load generator cannot sustain the target rate
+        dispatched_count = dispatched
+        if dispatched_count > 0 and result.window > 0:
+            achieved = dispatched_count / result.window
+            shortfall = (rate - achieved) / rate if rate > 0 else 0.0
+            miss_pct = state["schedule_misses"] / dispatched_count
+            sem_wait_ms = state["sem_wait_total_ns"] / 1e6
+            if miss_pct > 0.05:
+                result.warnings.append(
+                    f"Open-loop dispatch fell behind schedule on "
+                    f"{state['schedule_misses']}/{dispatched_count} ticks "
+                    f"({miss_pct:.1%}); target rate {rate:.0f} req/s but "
+                    f"achieved only {achieved:.0f} req/s "
+                    f"(shortfall {shortfall:.1%})"
+                )
+            elif shortfall > 0.1:
+                result.warnings.append(
+                    f"Target rate {rate:.0f} req/s but achieved dispatch "
+                    f"rate is only {achieved:.0f} req/s "
+                    f"(shortfall {shortfall:.1%}); semaphore wait "
+                    f"{sem_wait_ms:.0f}ms — concurrency={concurrency} "
+                    f"may be the bottleneck"
+                )
+
         return result
 
     async def _run_fixed_count(

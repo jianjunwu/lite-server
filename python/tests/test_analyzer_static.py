@@ -552,7 +552,7 @@ class TestDeepMode:
         report = StaticAnalyzer(tmp_path).analyze_model(
             "test_model", deep=True, deep_timeout=0.5
         )
-        assert report.executed_user_code is True
+        assert report.executed_user_code is False  # timed out before model code ran
         deep_warnings = [f for f in report.findings
                          if "deep" in f.message.lower()]
         assert len(deep_warnings) >= 1
@@ -564,7 +564,7 @@ class TestDeepMode:
         report = StaticAnalyzer(tmp_path).analyze_model(
             "test_model", deep=True, deep_timeout=10
         )
-        assert report.executed_user_code is True
+        assert report.executed_user_code is False  # model code failed to execute
         deep_warnings = [f for f in report.findings
                          if "deep" in f.message.lower()]
         assert len(deep_warnings) >= 1

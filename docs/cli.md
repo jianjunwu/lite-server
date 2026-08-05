@@ -135,20 +135,24 @@ lite-server benchmark --model <MODEL> [OPTIONS]
 | `--url` | string | http://127.0.0.1:8000 | Server URL |
 | `--model` | string | (required) | Model name to benchmark |
 | `--version` | string | (latest) | Model version |
-| `--concurrency` | int | 8 | Closed-loop worker coroutines (fixed pool) |
+| `--concurrency` | int \| start:end:step | 8 | Concurrency level, or sweep range (e.g. `1:16:2` → 1,3,5,…,15) |
 | `--duration` | float | 30.0 | Run for N seconds (mutually exclusive with `--requests`) |
 | `--requests` | int | — | Run exactly N requests (mutually exclusive with `--duration`) |
 | `--warmup-requests` | int | 0 | Warmup requests before measurement; samples discarded (recommended: ~= concurrency) |
 | `--grace-period` | float | 30.0 | After the deadline, wait at most N seconds for in-flight requests to drain |
+| `--rate` | float | — | Constant arrival rate in req/s (open-loop); eliminates coordinated omission at the load generator |
+| `--latency-threshold` | float | — | During concurrency sweep, stop early when p99 exceeds MS |
 | `--payload` | string | `{"input": 1.0}` | Inline JSON request body |
 | `--payload-file` | path | — | JSON file with request body; repeatable, round-robin |
+| `--payload-random` | string | — | Randomize id/request_id/uuid per request using TEMPLATE as the base JSON |
 | `--export` | path | — | Write authoritative JSON record to PATH (stdout table unchanged) |
 | `--max-error-rate` | float | — | Exit 99 if failed/total exceeds R (e.g. 0.01) |
 | `--max-p99` | float | — | Exit 99 if p99 latency exceeds MS milliseconds |
 
-**Measurement contract** (closed-loop, service-time):
+**Measurement contract** (closed-loop: service-time; open-loop: `--rate`):
 
-- Latencies are **service-time only**: queueing at the load generator is not measured (inherent to closed-loop; the output labels this as `load_mode: closed-loop`, `latency_basis: service-time`).
+- **Closed-loop** (`load_mode: closed-loop`, `latency_basis: service-time`): queueing at the load generator is not measured (inherent to the model).
+- **Open-loop** (`load_mode: open-loop`, `latency_basis: service-time`): requests dispatched on a fixed-interval schedule. Achieved dispatch rate (`achieved_rate`) is reported alongside throughput. A warning is emitted when the generator cannot sustain the target rate (schedule misses or semaphore saturation).
 - Warmup samples are discarded; in-flight requests at the deadline are drained up to `--grace-period` (completions kept, the rest reported as `dropped_inflight`).
 - Throughput = `successful / (last response − first request)` (measured window), percentiles use numpy `linear` interpolation (p50/p90/p95/p99/max reported).
 - Insufficient samples (`< max(300, 10 × concurrency)`) and client CPU saturation (>70% of one core) produce explicit warnings in stdout and JSON.
@@ -181,6 +185,9 @@ lite-server analyze --model <MODEL> [OPTIONS]
 | `--output-dir` | string | — | Additionally save report files (json+md) to DIR |
 | `--fail-severity` | error\|warning | error | Minimum finding severity that exits 1 |
 | `--strict` | flag | false | Shortcut for `--fail-severity warning` |
+| `--deep` | flag | false | Resolve statically-unresolvable classes by importing model.py in an isolated subprocess (**executes model code** — opt-in) |
+| `--deep-timeout` | float | 30.0 | Seconds before `--deep` import is killed |
+| `--profile` | kserve-v2 | — | Run an optional interop profile check (kserve-v2: KServe V2 inference protocol) |
 
 **Pure static analysis — user code is never executed.** model.py is parsed as
 AST (no import side effects), paths are confined to the repository root
@@ -192,7 +199,7 @@ through the same Rust serde path as `config-check`.
 | rule_id | severity | Trigger |
 |---------|----------|---------|
 | LS001 | error | `predict` not implemented (LitAPI base raises NotImplementedError) |
-| LS002 | error | Zero or multiple LitAPI subclasses (most-derived class counts) |
+| LS002 | error | Zero or multiple LitAPI subclasses (most-derived class counts), or non-ensemble model missing model.py |
 | LS004 | error | config.yaml failed validation (Rust serde) or is not a mapping |
 | LS005 | error | .py file has a syntax error |
 | LS101 | warning | `max_batch_size > 1` but neither `batch` nor `unbatch` overridden |
@@ -202,6 +209,18 @@ through the same Rust serde path as `config-check`.
 | LS111 | warning | No `--version` given; resolved latest(1) |
 | LS201 | info | Lifecycle hooks (`teardown`/`on_file_changed`) not overridden |
 | LS202 | info | Possible LitAPI subclass with unresolvable base (no silent false negatives) |
+| LS203 | warning | `--deep` import failed (timeout, non-zero exit, invalid output, or runtime error) |
+| LS204 | info | `--deep` resolved API class at runtime |
+| LS205 | info | `--deep` resolved a different API class than AST |
+| LS301 | warning | Dynamic code execution: `eval()`/`exec()`/`compile()` |
+| LS302 | warning | System call: `os.system()`/`subprocess.*` |
+| LS303 | warning | Network call: `socket`/`urllib`/`requests`/`httpx` |
+| LS304 | warning | Deserialization: `pickle.load()`/`torch.load()`/`yaml.load()` |
+| LS305 | warning | Destructive filesystem: `os.remove()`/`os.unlink()`/`shutil.rmtree()` |
+| LS401 | info | KServe V2: `decode_request`/`encode_response` overrides are asymmetric |
+| LS402 | info | KServe V2: config.yaml has no `name`/`version` for model metadata endpoint |
+| LS403 | info | KServe V2: `stream: true` but `stream_predict` not a generator |
+| LS404 | warning | KServe V2: `predict` not implemented; V2 infer will return 500 |
 
 The JSON report is schema v1 (`schema_version: 1`) and is the single
 authoritative representation — CI gates and downstream tools should consume
