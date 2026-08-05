@@ -237,6 +237,8 @@ lite-server init my_project           # 脚手架创建项目
 | POST | `/v2/models/{name}/versions/{v}/events` | SSE 流式（指定版本） |
 | GET | `/v2/models/{name}/stream` | WebSocket 流式 |
 | GET | `/v2/models/{name}/versions/{v}/stream` | WebSocket 流式（指定版本） |
+| POST | `/v2/models/{name}/bidi` | HTTP/2 双向流式（LPM 帧；仅 h2） |
+| POST | `/v2/models/{name}/versions/{v}/bidi` | HTTP/2 双向流式（指定版本） |
 | GET | `/v2/models` | 列出已加载模型 |
 | GET | `/v2/models/{name}/versions` | 多版本总览（状态 / 活跃 / 权重 / worker / loaded_at） |
 | GET | `/v2/models/{name}/ready` | 就绪检查（活跃版本） |

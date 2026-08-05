@@ -270,6 +270,7 @@ See [examples/README.md](examples/README.md) for learning path and usage details
 | [Model Authoring](docs/model-authoring.md) ([中文](docs/zh/model-authoring.md)) | LitAPI interface, streaming, continuous batching, best practices |
 | [CLI Reference](docs/cli.md) ([中文](docs/zh/cli.md)) | All CLI commands and flags |
 | [Architecture](docs/architecture.md) ([中文](docs/zh/architecture.md)) | System design, request flow, worker model |
+| [HTTP Bidirectional Streaming](docs/http-bidi.md) ([中文](docs/zh/http-bidi.md)) | WS `/stream` bidi frames, h2 `/bidi` endpoint (LPM, client requirements) |
 | [Observability / OpenTelemetry](docs/otel-observability.md) | OTLP traces + metrics, sampling, baggage allowlist |
 | [CORS Security Checklist](docs/cors-security-checklist.md) | CORS resolution rules and why each exists |
 | [Graceful Shutdown](docs/graceful-shutdown.md) | Drain semantics, signal handling, telemetry flush |
@@ -288,6 +289,8 @@ See [examples/README.md](examples/README.md) for learning path and usage details
 | POST | `/v2/models/{name}/versions/{v}/events` | SSE streaming (specific version) |
 | GET | `/v2/models/{name}/stream` | WebSocket streaming |
 | GET | `/v2/models/{name}/versions/{v}/stream` | WebSocket streaming (specific version) |
+| POST | `/v2/models/{name}/bidi` | HTTP/2 bidirectional streaming (LPM frames; h2 only) |
+| POST | `/v2/models/{name}/versions/{v}/bidi` | HTTP/2 bidirectional streaming (specific version) |
 | GET | `/v2/models` | List loaded models |
 | GET | `/v2/models/{name}/versions` | Multi-version overview (status / active / weight / workers / loaded_at) |
 | GET | `/v2/models/{name}/ready` | Readiness check (active version) |
