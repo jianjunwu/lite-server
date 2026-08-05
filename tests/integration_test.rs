@@ -2046,6 +2046,73 @@ async fn test_sse_streaming() {
 }
 
 // ---------------------------------------------------------------------------
+// SSE decoupled streaming (HTTP decoupled plan PR-1)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn test_http_sse_decoupled_pushes_chunks_then_done() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+
+    load_model(&base, DECOUPLED_MODEL, "1").await;
+
+    // POST to the decoupled SSE endpoint. decoupled_model with input=3
+    // pushes 3 chunks ({"index": 0..2}) then [DONE].
+    let resp = client
+        .post(format!("{}/v2/models/{}/decoupled", base, DECOUPLED_MODEL))
+        .json(&json!({"input": 3}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        content_type.contains("text/event-stream"),
+        "expected SSE content-type, got: {}",
+        content_type
+    );
+
+    let body = tokio::time::timeout(Duration::from_secs(15), resp.text())
+        .await
+        .expect("SSE decoupled response body did not close within 15s")
+        .unwrap();
+
+    // Parse SSE lines: "data: <json>\n\n". Each chunk is a "data:" line.
+    let data_lines: Vec<&str> = body
+        .lines()
+        .filter(|l| l.starts_with("data: "))
+        .collect();
+    // 3 data chunks + [DONE] = 4 data lines
+    assert_eq!(
+        data_lines.len(),
+        4,
+        "expected 4 data lines (3 chunks + [DONE]); got body: {body}"
+    );
+
+    // First 3 are chunks with ordered indices.
+    for i in 0..3 {
+        let json_str = data_lines[i].strip_prefix("data: ").unwrap();
+        let v: Value = serde_json::from_str(json_str).expect("chunk data is JSON");
+        assert_eq!(v["index"], i, "chunks must arrive in order");
+    }
+    // Last line is [DONE].
+    assert_eq!(
+        data_lines[3], "data: [DONE]",
+        "terminal event must be [DONE]; got: {}",
+        data_lines[3]
+    );
+
+    unload_model(&base, DECOUPLED_MODEL, "1").await;
+}
+
+// ---------------------------------------------------------------------------
 // WebSocket streaming
 // ---------------------------------------------------------------------------
 

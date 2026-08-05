@@ -29,6 +29,7 @@ async fn open_worker_stream(
     resolved_version: &str,
     meta: pb::RequestMeta,
     payload_bytes: bytes::Bytes,
+    decoupled: bool,
 ) -> Result<(String, Arc<WorkerZmqClient>, mpsc::Receiver<pb::StreamResponse>), AppError> {
     let mv = state
         .registry
@@ -67,7 +68,7 @@ async fn open_worker_stream(
 
     let client = &clients[worker_id];
     let stream_id = format!("stream-{}", Uuid::new_v4());
-    let open_req = streaming::build_stream_open(stream_id.clone(), payload_bytes, Some(meta), false);
+    let open_req = streaming::build_stream_open(stream_id.clone(), payload_bytes, Some(meta), decoupled);
 
     let chunk_rx = client.send_stream(open_req, stream_id.clone()).await?;
     Ok((stream_id, Arc::clone(client), chunk_rx))
@@ -83,7 +84,7 @@ pub async fn sse_infer_handler(
     ApiJson(payload): ApiJson<Value>,
 ) -> Response {
     // P-CORS: CORS headers are attached by `cors_middleware` (no longer per-handler).
-    sse_infer_entry(&state, &model_name, None, headers, payload, cx)
+    sse_infer_entry(&state, &model_name, None, headers, payload, cx, false)
         .await
         .into_response()
 }
@@ -96,10 +97,36 @@ pub async fn sse_infer_version_handler(
     ApiJson(payload): ApiJson<Value>,
 ) -> Response {
     sse_infer_entry(
-        &state, &model_name, Some(version), headers, payload, cx,
+        &state, &model_name, Some(version), headers, payload, cx, false,
     )
     .await
     .into_response()
+}
+
+// ===== SSE Decoupled =====
+
+pub async fn sse_decoupled_handler(
+    State(state): State<Arc<AppState>>,
+    Path(model_name): Path<String>,
+    headers: HeaderMap,
+    cx: RequestContext,
+    ApiJson(payload): ApiJson<Value>,
+) -> Response {
+    sse_infer_entry(&state, &model_name, None, headers, payload, cx, true)
+        .await
+        .into_response()
+}
+
+pub async fn sse_decoupled_version_handler(
+    State(state): State<Arc<AppState>>,
+    Path((model_name, version)): Path<(String, String)>,
+    headers: HeaderMap,
+    cx: RequestContext,
+    ApiJson(payload): ApiJson<Value>,
+) -> Response {
+    sse_infer_entry(&state, &model_name, Some(version), headers, payload, cx, true)
+        .await
+        .into_response()
 }
 
 /// Shared entry for SSE inference: validation, ready check, rate limiting,
@@ -112,6 +139,7 @@ async fn sse_infer_entry(
     headers: HeaderMap,
     payload: Value,
     cx: RequestContext,
+    decoupled: bool,
 ) -> Result<Response, AppError> {
     crate::validation::validate_identifier(model_name)?;
     if let Some(ref v) = version {
@@ -136,6 +164,7 @@ async fn sse_infer_entry(
         headers,
         payload,
         cx,
+        decoupled,
     )
     .await?;
     Ok(sse.into_response())
@@ -148,6 +177,7 @@ async fn sse_infer_impl(
     headers: HeaderMap,
     payload: Value,
     cx: RequestContext,
+    decoupled: bool,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, AppError> {
 
     // Task B: inference span (parity with gRPC + unary HTTP). Created before
@@ -177,7 +207,7 @@ async fn sse_infer_impl(
         None
     };
     let stream_idle = crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
-    let (stream_id, _worker_client, mut chunk_rx) = open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await?;
+    let (stream_id, worker_client, mut chunk_rx) = open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes, decoupled).await?;
 
     // Task D: fire InferenceRequest once the worker stream opened and arm the
     // response callback. cx is not captured by the spawn, so request_id /
@@ -201,6 +231,14 @@ async fn sse_infer_impl(
     }
 
     let (event_tx, event_rx) = mpsc::channel(64);
+
+    // D4: decoupled path keeps the client for targeted cancel (vs coupled
+    // broadcast). Clone before the spawn so the Arc stays alive.
+    let cancel_client = if decoupled {
+        Some(Arc::clone(&worker_client))
+    } else {
+        None
+    };
 
     tokio::spawn(async move {
         let open_time = std::time::Instant::now();
@@ -275,9 +313,15 @@ async fn sse_infer_impl(
         if stream_metrics {
             prometheus::record_stream_close(&model_name, &resolved_version, "sse");
         }
-        // Ensure stream is cleaned up on worker side
+        // Ensure stream is cleaned up on worker side.
+        // D4: decoupled → targeted cancel (parity with WS/gRPC);
+        // coupled → broadcast (existing behavior, unchanged).
         let cancel_req = streaming::build_stream_cancel(stream_id);
-        open_worker_stream_cancel(&state, &model_name, &resolved_version, cancel_req).await;
+        if let Some(client) = cancel_client {
+            let _ = client.send_raw(cancel_req).await;
+        } else {
+            open_worker_stream_cancel(&state, &model_name, &resolved_version, cancel_req).await;
+        }
     }
     .instrument(span.clone()));
 
@@ -478,7 +522,7 @@ async fn handle_ws_stream(
     };
     let stream_idle = crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
 
-    let (stream_id, worker_client, mut chunk_rx) = match open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await {
+    let (stream_id, worker_client, mut chunk_rx) = match open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes, false).await {
         Ok(r) => r,
         Err(e) => {
             let _ = socket.send(Message::Text(json!({"error": e.to_string()}).to_string())).await;
@@ -693,6 +737,7 @@ mod tests {
     use prost::Message;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
 
     fn ipc_endpoint(tag: &str) -> String {
         #[cfg(unix)]
@@ -961,6 +1006,7 @@ mod tests {
             HeaderMap::new(),
             json!({}),
             test_cx(),
+            false,
         )
         .await
         .expect("sse must open");
@@ -1006,6 +1052,7 @@ mod tests {
             HeaderMap::new(),
             json!({}),
             test_cx(),
+            false,
         )
         .await
         .expect("sse must open");
@@ -1044,6 +1091,7 @@ mod tests {
             HeaderMap::new(),
             json!({}),
             test_cx(),
+            false,
         )
         .await
         .expect("sse must open");
@@ -1086,6 +1134,7 @@ mod tests {
             HeaderMap::new(),
             json!({}),
             test_cx(),
+            false,
         )
         .await
         .expect("sse must open");
@@ -1163,7 +1212,7 @@ mod tests {
                 // No ZMQ client / workers → open_worker_stream fails, but the
                 // span is built before that. Explicit version so resolve
                 // succeeds without an active-version cutover.
-                let _ = sse_infer_entry(&state, "span_model", Some("1".to_string()), HeaderMap::new(), json!({}), test_cx()).await;
+                let _ = sse_infer_entry(&state, "span_model", Some("1".to_string()), HeaderMap::new(), json!({}), test_cx(), false).await;
             });
         });
         handle.join().expect("span test thread must not panic");
@@ -1308,6 +1357,7 @@ mod tests {
             HeaderMap::new(),
             json!({}),
             test_cx(),
+            false,
         )
         .await
         .expect("sse must open");
@@ -1605,6 +1655,440 @@ mod tests {
             1,
             "terminal Error frame must fire InferenceResponse exactly once \
              (current code fires twice on Error→Done)"
+        );
+    }
+
+    // ==== SSE decoupled (PR-1) test helpers ====
+
+    /// PAIR worker: records (action, decoupled_flag_from_open); after Open,
+    /// sends `respond_chunks` chunks then Done. `respond_chunks == 0` means
+    /// stall after Open (no Done, no chunks — for idle-reclaim tests).
+    fn spawn_decoupled_recording_worker(
+        endpoint: String,
+        respond_chunks: usize,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Receiver<(String, Option<bool>)>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel::<(String, Option<bool>)>();
+        let handle = std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(10000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                    let _ = s.send(
+                        pb::Response { uid: req.uid, ..Default::default() }.encode_to_vec(),
+                        0,
+                    );
+                    continue;
+                };
+                match st.action {
+                    Some(pb::stream_request::Action::Open(o)) => {
+                        let decoupled = o.decoupled.unwrap_or(false);
+                        let _ = tx.send(("open".to_string(), Some(decoupled)));
+                        let mk = |payload| pb::Response {
+                            payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                                stream_id: st.stream_id.clone(),
+                                payload: Some(payload),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        };
+                        for i in 0..respond_chunks {
+                            let _ = s.send(
+                                mk(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
+                                    data: bytes::Bytes::from(format!("chunk-{}", i)),
+                                    is_final: false,
+                                }))
+                                .encode_to_vec(),
+                                0,
+                            );
+                        }
+                        if respond_chunks > 0 {
+                            let _ = s.send(
+                                mk(pb::stream_response::Payload::Done(
+                                    pb::StreamDone::default(),
+                                ))
+                                .encode_to_vec(),
+                                0,
+                            );
+                        }
+                        // Stay alive to receive Cancel (or stall if respond_chunks==0).
+                    }
+                    Some(pb::stream_request::Action::Cancel(_)) => {
+                        let _ = tx.send(("cancel".to_string(), None));
+                    }
+                    _ => {}
+                }
+            }
+        });
+        (handle, rx)
+    }
+
+    /// PAIR worker: records actions received but sends nothing back. Used as
+    /// the "bystander" worker in targeted-cancel contract tests — it proves
+    /// the Cancel does NOT broadcast.
+    fn spawn_silent_recording_worker(
+        endpoint: String,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Receiver<String>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let handle = std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(10000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                match st.action {
+                    Some(pb::stream_request::Action::Open(_)) => {
+                        let _ = tx.send("open".to_string());
+                    }
+                    Some(pb::stream_request::Action::Cancel(_)) => {
+                        let _ = tx.send("cancel".to_string());
+                    }
+                    _ => {}
+                }
+            }
+        });
+        (handle, rx)
+    }
+
+    /// Register two workers (id 0 and 1) for the same model version, each
+    /// with its own ZMQ endpoint. Used by the targeted-cancel contract test.
+    async fn ready_state_two_workers(
+        model: &str,
+        endpoints: [String; 2],
+        cb: Arc<CallbackRunner>,
+    ) -> Arc<AppState> {
+        let state = make_state(cb);
+        state
+            .registry
+            .register(
+                model, "1", ModelConfig::default(), ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
+            .unwrap();
+        state.registry.mark_ready(model, "1").unwrap();
+        state
+            .registry
+            .set_workers(
+                model, "1",
+                vec![
+                    WorkerInfo {
+                        worker_id: 0, device: "cpu:0".to_string(),
+                        endpoint: String::new(), pid: None,
+                        status: WorkerStatus::Ready, capacity: None,
+                    },
+                    WorkerInfo {
+                        worker_id: 1, device: "cpu:1".to_string(),
+                        endpoint: String::new(), pid: None,
+                        status: WorkerStatus::Ready, capacity: None,
+                    },
+                ],
+            )
+            .unwrap();
+        let client0 = Arc::new(WorkerZmqClient::new(endpoints[0].clone()));
+        let client1 = Arc::new(WorkerZmqClient::new(endpoints[1].clone()));
+        state
+            .worker_manager
+            .insert_zmq_clients_for_test(model, "1", vec![client0, client1])
+            .await;
+        state
+    }
+
+    /// Build an AppState with a custom FeaturesConfig (for feature-gating
+    /// route-mount tests).
+    fn make_state_with_features(
+        features: crate::config::FeaturesConfig,
+        cb: Arc<CallbackRunner>,
+    ) -> Arc<AppState> {
+        let mut config = crate::config::Config::default();
+        config.features = features;
+        let registry = Arc::new(ModelRegistry::new());
+        let queue = Arc::new(InferenceQueue::new());
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            std::path::PathBuf::new(),
+            queue.clone(),
+            "warn".to_string(),
+            cb.clone(),
+        ));
+        Arc::new(AppState::new(
+            registry,
+            wm,
+            queue,
+            config,
+            std::path::PathBuf::new(),
+            cb,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+        ))
+    }
+
+    // ==== SSE decoupled tests ====
+
+    /// PR-1 test 1: the decoupled path sets StreamOpen.decoupled = true.
+    #[tokio::test]
+    async fn sse_decoupled_open_carries_decoupled_true() {
+        let model = "sse_dc_open";
+        let endpoint = ipc_endpoint(model);
+        let (_w, actions) = spawn_decoupled_recording_worker(endpoint.clone(), 1);
+        let state = ready_state(model, endpoint, Arc::new(CallbackRunner::new())).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let sse = sse_infer_impl(
+            state,
+            model.to_string(),
+            "1".to_string(),
+            HeaderMap::new(),
+            json!({}),
+            test_cx(),
+            true, // decoupled
+        )
+        .await
+        .expect("sse must open");
+
+        let (action, decoupled) = actions
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("open action");
+        assert_eq!(action, "open");
+        assert_eq!(
+            decoupled,
+            Some(true),
+            "StreamOpen.decoupled must be true for decoupled path"
+        );
+        drop(sse);
+    }
+
+    /// PR-1 test 2: decoupled SSE forwards 2 chunks + [DONE]; CountingCallback
+    /// fires once per request/response with Protocol::Sse and elapsed_us.
+    #[tokio::test]
+    async fn sse_decoupled_chunks_done_and_callbacks() {
+        let model = "sse_dc_2ch";
+        let endpoint = ipc_endpoint(model);
+        let (_w, _actions) = spawn_decoupled_recording_worker(endpoint.clone(), 2);
+        let cb = Arc::new(CountingCallback {
+            req: AtomicUsize::new(0),
+            resp: AtomicUsize::new(0),
+            last: Mutex::new(None),
+        });
+        let runner = Arc::new(CallbackRunner::new());
+        runner.register(cb.clone()).await;
+        let state = ready_state(model, endpoint, runner).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let sse = sse_infer_impl(
+            state,
+            model.to_string(),
+            "1".to_string(),
+            HeaderMap::new(),
+            json!({}),
+            test_cx(),
+            true, // decoupled
+        )
+        .await
+        .expect("sse must open");
+
+        let resp = sse.into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("drain sse body");
+        let body = String::from_utf8_lossy(&bytes);
+
+        // 2 data chunks + [DONE]
+        assert!(
+            body.contains("data: chunk-0"),
+            "must contain first chunk; got: {body}"
+        );
+        assert!(
+            body.contains("data: chunk-1"),
+            "must contain second chunk; got: {body}"
+        );
+        assert!(
+            body.contains("data: [DONE]"),
+            "must contain terminal [DONE]; got: {body}"
+        );
+
+        wait_for(|| cb.resp.load(Ordering::Relaxed) >= 1, "resp>=1").await;
+        assert_eq!(cb.req.load(Ordering::Relaxed), 1, "request fires once");
+        assert_eq!(cb.resp.load(Ordering::Relaxed), 1, "Done fires response");
+        let protocol = cb
+            .last
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| c.protocol)
+            .unwrap_or(Protocol::Http);
+        assert_eq!(
+            protocol, Protocol::Sse,
+            "response ctx must carry the Sse protocol"
+        );
+        assert!(
+            cb.last.lock().unwrap().as_ref().unwrap().elapsed_us.is_some(),
+            "response elapsed_us must be set"
+        );
+    }
+
+    /// PR-1 test 3 (D4 contract): targeted cancel only reaches the pinned
+    /// worker — the bystander receives no frames at all.
+    #[tokio::test]
+    async fn sse_decoupled_targeted_cancel_reaches_only_pinned_worker() {
+        let model = "sse_dc_pin";
+        let ep0 = ipc_endpoint(&format!("{}-0", model));
+        let ep1 = ipc_endpoint(&format!("{}-1", model));
+
+        // Worker 0: responds with 1 chunk + Done (the stream completes).
+        let (_w0, actions0) = spawn_decoupled_recording_worker(ep0.clone(), 1);
+        // Worker 1: silent bystander — records everything, sends nothing.
+        let (_w1, actions1) = spawn_silent_recording_worker(ep1.clone());
+
+        let state =
+            ready_state_two_workers(model, [ep0, ep1], Arc::new(CallbackRunner::new())).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Pin to worker 0 via x-lite-worker-id header.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-lite-worker-id", "0".parse().unwrap());
+
+        let sse = sse_infer_impl(
+            state,
+            model.to_string(),
+            "1".to_string(),
+            headers,
+            json!({}),
+            test_cx(),
+            true, // decoupled
+        )
+        .await
+        .expect("sse must open");
+
+        // Drain to completion so the targeted cancel fires.
+        let resp = sse.into_response();
+        let _bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("drain sse body");
+
+        // Worker 0 must see open + cancel.
+        let a0: Vec<String> = std::iter::from_fn(|| {
+            actions0
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .ok()
+                .map(|(a, _)| a)
+        })
+        .collect();
+        assert!(
+            a0.contains(&"open".to_string()),
+            "worker 0 must receive open; got: {a0:?}"
+        );
+        assert!(
+            a0.contains(&"cancel".to_string()),
+            "worker 0 must receive targeted cancel; got: {a0:?}"
+        );
+
+        // Worker 1 must receive NOTHING — no broadcast.
+        let a1: Vec<String> = std::iter::from_fn(|| {
+            actions1
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .ok()
+        })
+        .collect();
+        assert!(
+            a1.is_empty(),
+            "worker 1 must receive no frames (targeted cancel, not broadcast); got: {a1:?}"
+        );
+    }
+
+    /// PR-1 test 4: a stalled decoupled SSE stream (worker sends one chunk,
+    /// then hangs) is reclaimed by the always-on chunk-idle, not left
+    /// unbounded.
+    #[tokio::test]
+    async fn sse_decoupled_idle_reclaims_stalled_stream() {
+        let model = "sse_dc_stall";
+        let endpoint = ipc_endpoint(model);
+        // respond_chunks=0: worker sends nothing after Open → stall.
+        let (_w, _actions) = spawn_decoupled_recording_worker(endpoint.clone(), 0);
+        let state =
+            ready_state_with_idle(model, endpoint, Arc::new(CallbackRunner::new()), 0.2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let start = std::time::Instant::now();
+        let sse = sse_infer_impl(
+            state,
+            model.to_string(),
+            "1".to_string(),
+            HeaderMap::new(),
+            json!({}),
+            test_cx(),
+            true, // decoupled
+        )
+        .await
+        .expect("sse must open");
+        let resp = sse.into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("drain sse body");
+        let elapsed = start.elapsed();
+
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            !body.contains("[DONE]"),
+            "stalled stream must not reach Done: {body}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "stalled decoupled stream must be reclaimed by idle (~200ms), not hang; took {elapsed:?}"
+        );
+    }
+
+    /// PR-1 test 5: when features.decoupled=false, the decoupled route is
+    /// not mounted — POST returns 404.
+    #[tokio::test]
+    async fn decoupled_routes_unmounted_when_feature_off() {
+        let mut features = crate::config::FeaturesConfig::default();
+        features.decoupled = false;
+        let state = make_state_with_features(features, Arc::new(CallbackRunner::new()));
+        // Register a model so route matching doesn't fail before the
+        // feature gate check; the fallback handler needs the registry
+        // to contain the model.
+        state
+            .registry
+            .register(
+                "m", "1", ModelConfig::default(), ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
+            .unwrap();
+
+        let app = crate::http::routes::create_routes(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v2/models/m/decoupled")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "decoupled route must 404 when features.decoupled=false"
         );
     }
 }

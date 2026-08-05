@@ -583,6 +583,11 @@ pub struct FeaturesConfig {
     /// HTTP/2 bidirectional streaming endpoint (D3, 蓝图 HTTP bidi).
     /// Default true — gated on `streaming && http_bidi` for route mounting.
     pub http_bidi: bool,
+    /// HTTP decoupled streaming (SSE + WebSocket). When true, the decoupled
+    /// endpoints are mounted alongside the coupled ones (gated on the
+    /// transport's own toggle: `streaming && sse && decoupled` for SSE,
+    /// `streaming && websocket_streaming && decoupled` for WS). Default true.
+    pub decoupled: bool,
     pub streaming_metrics: bool,
     /// P5-2 (蓝图 §4.4, D16): 允许 `x-lite-version` pin 绕过权重路由（HTTP 与
     /// gRPC 双侧门控一致）。默认 false（breaking）——生产上 pin 可绕过灰度
@@ -602,6 +607,7 @@ impl Default for FeaturesConfig {
             sse: true,
             websocket_streaming: true,
             http_bidi: true,
+            decoupled: true,
             streaming_metrics: true,
             canary_override: false,
         }
