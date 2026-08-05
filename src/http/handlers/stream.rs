@@ -1324,5 +1324,288 @@ mod tests {
             "stalled stream must be reclaimed by the always-on idle (~200ms), not hang; took {elapsed:?}"
         );
     }
+
+    // ===== WS bidi (§5.5): loopback WS server + PAIR recording worker =======
+
+    /// Loopback axum server exposing only the WS stream route.
+    async fn spawn_ws_server(state: Arc<AppState>) -> String {
+        let app = axum::Router::new()
+            .route(
+                "/v2/models/:model_name/stream",
+                axum::routing::get(ws_stream_handler),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("ws://127.0.0.1:{}/v2/models", port)
+    }
+
+    /// PAIR worker: records (action, chunk-bytes); holds the stream after
+    /// Open (no spontaneous output); on Close → record + reply Done so the
+    /// downstream completes; on Cancel → record.
+    fn spawn_recording_worker(
+        endpoint: String,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Receiver<(String, Vec<u8>)>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel::<(String, Vec<u8>)>();
+        let handle = std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(10000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                    let _ = s.send(
+                        pb::Response { uid: req.uid, ..Default::default() }.encode_to_vec(),
+                        0,
+                    );
+                    continue;
+                };
+                match st.action {
+                    Some(pb::stream_request::Action::Open(_)) => {
+                        let _ = tx.send(("open".to_string(), Vec::new()));
+                    }
+                    Some(pb::stream_request::Action::Chunk(c)) => {
+                        let _ = tx.send(("chunk".to_string(), c.data.to_vec()));
+                    }
+                    Some(pb::stream_request::Action::Close(_)) => {
+                        let _ = tx.send(("close".to_string(), Vec::new()));
+                        let done = pb::Response {
+                            payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                                stream_id: st.stream_id.clone(),
+                                payload: Some(pb::stream_response::Payload::Done(
+                                    pb::StreamDone::default(),
+                                )),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        };
+                        let _ = s.send(done.encode_to_vec(), 0);
+                    }
+                    Some(pb::stream_request::Action::Cancel(_)) => {
+                        let _ = tx.send(("cancel".to_string(), Vec::new()));
+                    }
+                    None => {}
+                }
+            }
+        });
+        (handle, rx)
+    }
+
+    /// §5.5-1/2: Binary frames after the first frame reach the worker as
+    /// byte-identical ordered Chunks; an app-level {"type":"close"} reaches
+    /// the worker as Close and the downstream terminal frame still arrives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ws_bidi_binary_chunks_and_app_close_reach_worker() {
+        use futures::{SinkExt, StreamExt};
+
+        let model = "ws_rec";
+        let endpoint = ipc_endpoint(model);
+        let (_w, actions) = spawn_recording_worker(endpoint.clone());
+        let state = ready_state(model, endpoint, Arc::new(CallbackRunner::new())).await;
+        state.registry.activate_version(model, "1").unwrap();
+        let base = spawn_ws_server(state).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{}/{}/stream", base, model))
+            .await
+            .expect("WS connect failed");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"input": 1}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![1, 2, 3]))
+            .await
+            .unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![4, 5, 6]))
+            .await
+            .unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"close"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+
+        // Worker receives, in order: open, chunk(1,2,3), chunk(4,5,6), close.
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(
+                actions
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .expect("worker action"),
+            );
+        }
+        assert_eq!(seen[0].0, "open");
+        assert_eq!(seen[1], ("chunk".to_string(), vec![1u8, 2, 3]));
+        assert_eq!(seen[2], ("chunk".to_string(), vec![4u8, 5, 6]));
+        assert_eq!(seen[3].0, "close");
+
+        // Downstream: the terminal {"done":true} still arrives after the
+        // app-level close (input closed ≠ output closed).
+        let mut got_done = false;
+        while let Ok(Some(Ok(msg))) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await
+        {
+            if let tokio_tungstenite::tungstenite::Message::Text(t) = msg {
+                if t.contains("\"done\":true") {
+                    got_done = true;
+                    break;
+                }
+            }
+        }
+        assert!(got_done, "terminal Done frame must arrive after app-level close");
+    }
+
+    /// §5.5-4: an unknown Text control frame → client gets the protocol error
+    /// AND the worker receives Cancel (not just an idle-timeout cleanup).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ws_bidi_unknown_control_frame_errors_and_cancels_worker() {
+        use futures::{SinkExt, StreamExt};
+
+        let model = "ws_bogus";
+        let endpoint = ipc_endpoint(model);
+        let (_w, actions) = spawn_recording_worker(endpoint.clone());
+        let state = ready_state(model, endpoint, Arc::new(CallbackRunner::new())).await;
+        state.registry.activate_version(model, "1").unwrap();
+        let base = spawn_ws_server(state).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{}/{}/stream", base, model))
+            .await
+            .expect("WS connect failed");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"input": 1}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"bogus"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let mut got_error = false;
+        while let Ok(Some(Ok(msg))) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await
+        {
+            if let tokio_tungstenite::tungstenite::Message::Text(t) = msg {
+                assert!(
+                    t.contains("unknown control frame"),
+                    "unexpected text frame: {t}"
+                );
+                got_error = true;
+            }
+        }
+        assert!(got_error, "client must receive the protocol error frame");
+
+        let mut got_cancel = false;
+        while let Ok((a, _)) = actions.recv_timeout(std::time::Duration::from_secs(3)) {
+            if a == "cancel" {
+                got_cancel = true;
+                break;
+            }
+        }
+        assert!(got_cancel, "worker must receive Cancel after protocol error");
+    }
+
+    /// §5.5-5: hard client disconnect → the gone signal terminates the writer
+    /// and the worker receives Cancel promptly (seconds), not via the 300s
+    /// chunk-idle fallback.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ws_bidi_client_disconnect_cancels_worker_promptly() {
+        use futures::SinkExt;
+
+        let model = "ws_disc";
+        let endpoint = ipc_endpoint(model);
+        let (_w, actions) = spawn_recording_worker(endpoint.clone());
+        let state = ready_state(model, endpoint, Arc::new(CallbackRunner::new())).await;
+        state.registry.activate_version(model, "1").unwrap();
+        let base = spawn_ws_server(state).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{}/{}/stream", base, model))
+            .await
+            .expect("WS connect failed");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"input": 1}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            actions
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .map(|a| a.0),
+            Ok("open".to_string())
+        );
+
+        // Abrupt drop: no WS close handshake — the reader must see the
+        // transport failure and signal gone.
+        drop(ws);
+
+        let mut got_cancel = false;
+        while let Ok((a, _)) = actions.recv_timeout(std::time::Duration::from_secs(5)) {
+            if a == "cancel" {
+                got_cancel = true;
+                break;
+            }
+        }
+        assert!(
+            got_cancel,
+            "worker must receive Cancel promptly on client disconnect (gone signal)"
+        );
+    }
+
+    /// §5.5-6: terminal Error fires InferenceResponse exactly once — an
+    /// Error→Done worker (framework raises, then closes the channel) must
+    /// not double-fire (SSE parity: Error is terminal).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ws_bidi_callback_fires_once_when_error_then_done() {
+        use futures::{SinkExt, StreamExt};
+
+        let model = "ws_err_done";
+        let endpoint = ipc_endpoint(model);
+        let _w = spawn_error_then_done_worker(endpoint.clone());
+        let cb = Arc::new(CountingCallback {
+            req: AtomicUsize::new(0),
+            resp: AtomicUsize::new(0),
+            last: Mutex::new(None),
+        });
+        let runner = Arc::new(CallbackRunner::new());
+        runner.register(cb.clone()).await;
+        let state = ready_state(model, endpoint, runner).await;
+        state.registry.activate_version(model, "1").unwrap();
+        let base = spawn_ws_server(state).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{}/{}/stream", base, model))
+            .await
+            .expect("WS connect failed");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"input": 1}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+
+        // Drain until the server closes the socket.
+        while let Ok(Some(Ok(_))) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await
+        {}
+        // Generous window for a (buggy) trailing-Done second fire.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        assert_eq!(cb.req.load(Ordering::Relaxed), 1, "request fires once");
+        assert_eq!(
+            cb.resp.load(Ordering::Relaxed),
+            1,
+            "terminal Error frame must fire InferenceResponse exactly once \
+             (current code fires twice on Error→Done)"
+        );
+    }
 }
 

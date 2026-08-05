@@ -5692,7 +5692,9 @@ class BidiAPI(LitAPI):
         &server_yaml,
         format!(
             "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18214\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {}\n",
-            model_dir.parent().unwrap().to_string_lossy()
+            // Repository ROOT (contains <model>/<version>/); model_dir is the
+            // version dir itself — parent() alone would point one level too deep.
+            tmp_dir.to_string_lossy()
         ),
     )
     .unwrap();
@@ -5775,6 +5777,203 @@ class BidiAPI(LitAPI):
     drop(client);
 
     unload_model(&base, "bidi_hc", "1").await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// §6.9-6: real h2 end-to-end — dedicated server (h2c prior-knowledge via
+/// hyper auto-detect) + reqwest prior-knowledge client, full-duplex roundtrip
+/// through a `bidi_stream` echo model: Open → on_open Data; mid-stream Data →
+/// echo Data; Close → terminal Close frame + body EOF.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_h2_bidi_prior_knowledge_full_duplex() {
+    use lite_server::proto::liteserver as pb;
+    use lite_server::streaming::lpm;
+
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "lite-server-h2bidi-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let model_dir = tmp_dir.join("h2bidi/1");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    std::fs::write(
+        model_dir.join("model.py"),
+        r#"from lite_server import LitAPI
+
+
+class BidiHandler:
+    def on_open(self, initial_data):
+        return {"opened": True}
+
+    def on_chunk(self, chunk):
+        return {"echo": chunk}
+
+    def on_close(self):
+        pass
+
+
+class BidiAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+
+    def bidi_stream(self):
+        return BidiHandler()
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        model_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18216\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {}\n",
+            tmp_dir.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 30).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "h2bidi", "1").await;
+
+    // h2 prior-knowledge client with a live, streamed request body.
+    // (reqwest's wrap_stream needs a Sync stream; poll the tokio mpsc
+    // receiver through a mutex — poll_recv never blocks.)
+    let (body_tx, body_rx) =
+        tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(8);
+    let body_rx = std::sync::Arc::new(std::sync::Mutex::new(body_rx));
+    let body_stream = futures::stream::poll_fn(move |cx| {
+        body_rx.lock().unwrap().poll_recv(cx)
+    });
+    let client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    // Full-duplex bootstrap (plan §8): the client MUST start streaming the
+    // body immediately — the server awaits the first LPM frame (bounded by
+    // server.timeout) before committing the 200, so queue BidiOpen up front.
+    body_tx
+        .send(Ok(lpm::encode_frame(&pb::BidiChunk {
+            stream_id: String::new(),
+            payload: Some(pb::bidi_chunk::Payload::Open(pb::BidiOpen {
+                initial_data: bytes::Bytes::from_static(b"{}"),
+                ..Default::default()
+            })),
+        })))
+        .await
+        .unwrap();
+    let resp = client
+        .post(format!("{}/v2/models/h2bidi/bidi", base))
+        .header("content-type", "application/x-lite-bidi")
+        .body(reqwest::Body::wrap_stream(body_stream))
+        .send()
+        .await
+        .expect("h2 bidi POST failed");
+    assert_eq!(resp.status(), 200, "h2 bidi must accept the session");
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/x-lite-bidi"
+    );
+    assert_eq!(resp.version(), reqwest::Version::HTTP_2, "must be real h2");
+
+    // Read one LPM frame from the response stream (10s budget).
+    async fn read_frame(
+        stream: &mut (impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin),
+        buf: &mut bytes::BytesMut,
+    ) -> pb::BidiChunk {
+        use futures::StreamExt;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(Some(c)) = lpm::try_decode_frame(buf) {
+                return c;
+            }
+            let next = tokio::time::timeout_at(deadline, stream.next())
+                .await
+                .expect("timed out waiting for LPM frame")
+                .expect("response stream ended before frame");
+            buf.extend_from_slice(&next.expect("response stream error"));
+        }
+    }
+
+    let mut resp_stream = resp.bytes_stream();
+    let mut buf = bytes::BytesMut::new();
+
+    // 1. The queued Open → on_open Data frame.
+    let f = read_frame(&mut resp_stream, &mut buf).await;
+    match f.payload {
+        Some(pb::bidi_chunk::Payload::Data(d)) => {
+            assert!(String::from_utf8_lossy(&d.data).contains("opened"));
+        }
+        other => panic!("expected on_open Data frame, got {other:?}"),
+    }
+    assert!(f.stream_id.starts_with("http-bidi-"));
+
+    // 2. Full-duplex: Data sent mid-stream → echo Data frame.
+    body_tx
+        .send(Ok(lpm::encode_frame(&pb::BidiChunk {
+            stream_id: String::new(),
+            payload: Some(pb::bidi_chunk::Payload::Data(pb::BidiData {
+                data: bytes::Bytes::from_static(br#"{"chunk": 1}"#),
+            })),
+        })))
+        .await
+        .unwrap();
+    let f = read_frame(&mut resp_stream, &mut buf).await;
+    match f.payload {
+        Some(pb::bidi_chunk::Payload::Data(d)) => {
+            assert!(String::from_utf8_lossy(&d.data).contains("echo"));
+        }
+        other => panic!("expected echo Data frame, got {other:?}"),
+    }
+
+    // 3. Close → terminal Close frame, then body EOF.
+    body_tx
+        .send(Ok(lpm::encode_frame(&pb::BidiChunk {
+            stream_id: String::new(),
+            payload: Some(pb::bidi_chunk::Payload::Close(pb::BidiClose {})),
+        })))
+        .await
+        .unwrap();
+    let f = read_frame(&mut resp_stream, &mut buf).await;
+    assert!(
+        matches!(f.payload, Some(pb::bidi_chunk::Payload::Close(_))),
+        "expected terminal Close frame, got {:?}",
+        f.payload
+    );
+    {
+        use futures::StreamExt;
+        while let Some(item) = tokio::time::timeout(Duration::from_secs(5), resp_stream.next())
+            .await
+            .expect("timed out waiting for response EOF")
+        {
+            buf.extend_from_slice(&item.expect("response stream error"));
+        }
+        assert!(
+            lpm::try_decode_frame(&mut buf).ok().flatten().is_none(),
+            "no frames after terminal Close"
+        );
+    }
+
+    unload_model(&base, "h2bidi", "1").await;
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 

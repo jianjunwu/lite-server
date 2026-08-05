@@ -210,12 +210,17 @@ mod tests {
         assert_eq!(access_log_target("/v2/models/m/infer"), Some(("m", None)));
         assert_eq!(access_log_target("/v2/models/m/events"), Some(("m", None)));
         assert_eq!(access_log_target("/v2/models/m/stream"), Some(("m", None)));
+        assert_eq!(access_log_target("/v2/models/m/bidi"), Some(("m", None)));
         assert_eq!(
             access_log_target("/v2/models/m/versions/2/infer"),
             Some(("m", Some("2")))
         );
         assert_eq!(
             access_log_target("/v2/models/m/versions/2/events"),
+            Some(("m", Some("2")))
+        );
+        assert_eq!(
+            access_log_target("/v2/models/m/versions/2/bidi"),
             Some(("m", Some("2")))
         );
     }
