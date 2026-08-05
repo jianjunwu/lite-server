@@ -271,6 +271,7 @@ See [examples/README.md](examples/README.md) for learning path and usage details
 | [CLI Reference](docs/cli.md) ([中文](docs/zh/cli.md)) | All CLI commands and flags |
 | [Architecture](docs/architecture.md) ([中文](docs/zh/architecture.md)) | System design, request flow, worker model |
 | [HTTP Bidirectional Streaming](docs/http-bidi.md) ([中文](docs/zh/http-bidi.md)) | WS `/stream` bidi frames, h2 `/bidi` endpoint (LPM, client requirements) |
+| [HTTP Decoupled Streaming](docs/http-decoupled.md) ([中文](docs/zh/http-decoupled.md)) | SSE `/decoupled` + WS `/decoupled-stream` (model-driven streams, control frames) |
 | [Observability / OpenTelemetry](docs/otel-observability.md) | OTLP traces + metrics, sampling, baggage allowlist |
 | [CORS Security Checklist](docs/cors-security-checklist.md) | CORS resolution rules and why each exists |
 | [Graceful Shutdown](docs/graceful-shutdown.md) | Drain semantics, signal handling, telemetry flush |
@@ -291,6 +292,10 @@ See [examples/README.md](examples/README.md) for learning path and usage details
 | GET | `/v2/models/{name}/versions/{v}/stream` | WebSocket streaming (specific version) |
 | POST | `/v2/models/{name}/bidi` | HTTP/2 bidirectional streaming (LPM frames; h2 only) |
 | POST | `/v2/models/{name}/versions/{v}/bidi` | HTTP/2 bidirectional streaming (specific version) |
+| POST | `/v2/models/{name}/decoupled` | SSE decoupled streaming (model-driven) |
+| POST | `/v2/models/{name}/versions/{v}/decoupled` | SSE decoupled streaming (specific version) |
+| GET | `/v2/models/{name}/decoupled-stream` | WebSocket decoupled streaming (model-driven) |
+| GET | `/v2/models/{name}/versions/{v}/decoupled-stream` | WebSocket decoupled streaming (specific version) |
 | GET | `/v2/models` | List loaded models |
 | GET | `/v2/models/{name}/versions` | Multi-version overview (status / active / weight / workers / loaded_at) |
 | GET | `/v2/models/{name}/ready` | Readiness check (active version) |
