@@ -6,6 +6,7 @@ use crate::metrics::prometheus;
 use crate::proto::liteserver as pb;
 use crate::request_context::RequestContext;
 use crate::streaming;
+use crate::transport::zmq::WorkerZmqClient;
 use axum::{
     extract::{Path, State},
     http::HeaderMap,
@@ -27,7 +28,7 @@ async fn open_worker_stream(
     resolved_version: &str,
     meta: pb::RequestMeta,
     payload_bytes: bytes::Bytes,
-) -> Result<(String, mpsc::Receiver<pb::StreamResponse>), AppError> {
+) -> Result<(String, Arc<WorkerZmqClient>, mpsc::Receiver<pb::StreamResponse>), AppError> {
     let mv = state
         .registry
         .get(model_name, Some(resolved_version))
@@ -68,7 +69,7 @@ async fn open_worker_stream(
     let open_req = streaming::build_stream_open(stream_id.clone(), payload_bytes, Some(meta), false);
 
     let chunk_rx = client.send_stream(open_req, stream_id.clone()).await?;
-    Ok((stream_id, chunk_rx))
+    Ok((stream_id, Arc::clone(client), chunk_rx))
 }
 
 // ===== SSE Streaming =====
@@ -175,7 +176,7 @@ async fn sse_infer_impl(
         None
     };
     let stream_idle = crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
-    let (stream_id, mut chunk_rx) = open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await?;
+    let (stream_id, _worker_client, mut chunk_rx) = open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await?;
 
     // Task D: fire InferenceRequest once the worker stream opened and arm the
     // response callback. cx is not captured by the spawn, so request_id /
@@ -464,7 +465,7 @@ async fn handle_ws_stream(
     };
     let stream_idle = crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
 
-    let (stream_id, mut chunk_rx) = match open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await {
+    let (stream_id, _worker_client, mut chunk_rx) = match open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await {
         Ok(r) => r,
         Err(e) => {
             let _ = socket.send(Message::Text(json!({"error": e.to_string()}).to_string())).await;

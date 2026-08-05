@@ -5474,6 +5474,164 @@ async fn test_p_flow_grpc_bidi_disconnect_propagates_cancel() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
+/// D4 half-close (蓝图 §4 HTTP bidi): when a gRPC bidi client ends its request
+/// stream without sending an explicit `BidiClose`, the server must send
+/// `StreamRequest::Close` to the worker so the input side is gracefully
+/// terminated (rather than hanging until the forwarder's cleanup Cancel).
+/// The fixture's `on_close` writes a marker — the test verifies it appears.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_d4_grpc_bidi_half_close_sends_close_to_worker() {
+    use lite_server::proto::liteserver as pb;
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "lite-server-bidi-halfclose-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let marker = tmp_dir.join("halfclose.marker");
+    let model_dir = tmp_dir.join("bidi_hc/1");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    std::fs::write(
+        model_dir.join("model.py"),
+        format!(
+            r#"from lite_server import LitAPI
+
+
+class BidiHandler:
+    def on_open(self, initial_data):
+        return {{"opened": True}}
+
+    def on_chunk(self, chunk):
+        return {{"echo": chunk}}
+
+    def on_close(self):
+        with open("{marker}", "w") as f:
+            f.write("closed")
+
+
+class BidiAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request
+
+    def predict(self, x):
+        return {{"output": x}}
+
+    def encode_response(self, output):
+        return output
+
+    def bidi_stream(self):
+        return BidiHandler()
+"#,
+            marker = marker.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        model_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18214\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {}\n",
+            model_dir.parent().unwrap().to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 30).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "bidi_hc", "1").await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel::<pb::BidiChunk>(8);
+    req_tx
+        .send(pb::BidiChunk {
+            stream_id: String::new(),
+            payload: Some(pb::bidi_chunk::Payload::Open(pb::BidiOpen {
+                model_name: "bidi_hc".to_string(),
+                version: "1".to_string(),
+                initial_data: bytes::Bytes::from_static(b"{}"),
+                sequence_id: None,
+                ..Default::default()
+            })),
+        })
+        .await
+        .expect("queue BidiOpen failed");
+    let mut resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.bidi_stream(tonic::Request::new(
+            tokio_stream::wrappers::ReceiverStream::new(req_rx),
+        )),
+    )
+    .await
+    .expect("bidi_stream RPC did not resolve within 10s")
+    .expect("bidi_stream RPC failed")
+    .into_inner();
+
+    // Read on_open response.
+    let first = tokio::time::timeout(Duration::from_secs(5), resp.message())
+        .await
+        .expect("timed out waiting for on_open reply")
+        .expect("bidi stream errored before on_open reply")
+        .expect("bidi stream closed before on_open reply");
+    assert!(
+        matches!(first.payload, Some(pb::bidi_chunk::Payload::Data(_))),
+        "expected on_open data chunk"
+    );
+
+    // Send one Data chunk so the worker has received input.
+    req_tx
+        .send(pb::BidiChunk {
+            stream_id: String::new(),
+            payload: Some(pb::bidi_chunk::Payload::Data(pb::BidiData {
+                data: bytes::Bytes::from_static(br#"{"chunk": 1}"#),
+            })),
+        })
+        .await
+        .expect("send BidiData failed");
+
+    // Half-close: drop ONLY the sender. The receiver stays alive so the gRPC
+    // stream signals end-of-stream (not RST_STREAM), and the server's
+    // incoming_task must send Close for the worker.
+    drop(req_tx);
+
+    // The worker should receive Close and call on_close → marker written.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline && !marker.exists() {
+        sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        marker.exists(),
+        "D4 half-close: worker never received Close (on_close marker missing after client half-close)"
+    );
+
+    // Drain remaining responses (on_chunk echo + close frame).
+    while let Ok(Ok(Some(_chunk))) =
+        tokio::time::timeout(Duration::from_secs(3), resp.message()).await
+    {
+        // consume
+    }
+    drop(resp);
+    drop(client);
+
+    unload_model(&base, "bidi_hc", "1").await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
 /// WS6 (P-DEADLINE bidi parity): a bidi stream whose client never sends the
 /// opening message must be recovered after `server.timeout`, instead of
 /// hanging the handler unbounded. The server's `bidi_stream` reads the first

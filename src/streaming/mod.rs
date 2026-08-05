@@ -1,4 +1,6 @@
 use crate::proto::liteserver as pb;
+use std::time::Duration;
+use tracing::warn;
 
 /// Build a protobuf StreamRequest::Open.
 ///
@@ -134,9 +136,47 @@ pub async fn recv_chunk(
     }
 }
 
+/// Observe a spawned bidi helper task instead of silently dropping its handle
+/// (#8). `abort()` alone discards any panic payload; awaiting the handle first
+/// — bounded by a short grace — surfaces a panic as a `JoinError` so we can
+/// log it. If the task is still running when the grace expires, abort it to
+/// release the client stream promptly. Returns `true` if the task panicked
+/// (kept as a return value so the panic-detection path is unit-testable).
+pub(crate) async fn observe_or_abort(mut task: tokio::task::JoinHandle<()>) -> bool {
+    match tokio::time::timeout(Duration::from_millis(500), &mut task).await {
+        Ok(Ok(())) => false,
+        Ok(Err(join_err)) if join_err.is_panic() => {
+            warn!("bidi incoming task panicked during shutdown");
+            true
+        }
+        _ => {
+            task.abort();
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- observe_or_abort ---
+
+    #[tokio::test]
+    async fn observe_or_abort_detects_panicked_task() {
+        let task = tokio::spawn(async {
+            panic!("boom");
+        });
+        let panicked = observe_or_abort(task).await;
+        assert!(panicked, "a panicked task must report panicked=true");
+    }
+
+    #[tokio::test]
+    async fn observe_or_abort_clean_finish_is_not_panic() {
+        let task = tokio::spawn(async {});
+        let panicked = observe_or_abort(task).await;
+        assert!(!panicked);
+    }
 
     // --- build_stream_* helpers ---
 

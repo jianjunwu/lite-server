@@ -15,11 +15,10 @@ use crate::proto::liteserver as pb;
 use crate::request_context::RequestContext;
 use crate::streaming;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::warn;
 use tracing::Instrument;
 use uuid::Uuid;
 
@@ -258,6 +257,7 @@ impl GrpcService {
             // would await a unary reply that never matches and stall for
             // ZMQ_RESPONSE_TIMEOUT between chunks.
             let incoming_task = tokio::spawn(async move {
+                let mut close_sent = false;
                 while let Some(Ok(chunk)) = stream.message().await.transpose() {
                     match chunk.payload {
                         Some(pb::bidi_chunk::Payload::Data(data)) => {
@@ -270,10 +270,18 @@ impl GrpcService {
                         Some(pb::bidi_chunk::Payload::Close(_)) => {
                             let close_req = streaming::build_stream_close(stream_id_for_incoming.clone());
                             let _ = worker_client.send_raw(close_req).await;
+                            close_sent = true;
                             break;
                         }
                         _ => {}
                     }
+                }
+                // D4: client half-close (transport-level input end without an
+                // explicit BidiClose) → gracefully end worker input. Also covers
+                // the stream-error path (Some(Err(_))). Fire-and-forget — harmless
+                // when the worker already stopped.
+                if !close_sent {
+                    let _ = worker_client.send_raw(streaming::build_stream_close(stream_id_for_incoming)).await;
                 }
             });
 
@@ -389,54 +397,10 @@ impl GrpcService {
 
             // #8: observe the incoming task so a panic is logged, not silently
             // dropped by a bare abort().
-            observe_or_abort(incoming_task).await;
+            streaming::observe_or_abort(incoming_task).await;
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
         }.instrument(span).await
-    }
-}
-
-/// Observe a spawned bidi helper task instead of silently dropping its handle
-/// (#8). `abort()` alone discards any panic payload; awaiting the handle first
-/// — bounded by a short grace — surfaces a panic as a `JoinError` so we can
-/// log it. If the task is still running when the grace expires, abort it to
-/// release the client stream promptly. Returns `true` if the task panicked
-/// (kept as a return value so the panic-detection path is unit-testable).
-async fn observe_or_abort(mut task: tokio::task::JoinHandle<()>) -> bool {
-    match tokio::time::timeout(Duration::from_millis(500), &mut task).await {
-        Ok(Ok(())) => false,
-        Ok(Err(join_err)) if join_err.is_panic() => {
-            warn!("bidi incoming task panicked during shutdown");
-            true
-        }
-        _ => {
-            task.abort();
-            false
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn observe_or_abort_detects_panicked_task() {
-        // #8: a panic inside the bidi incoming task must be observable. abort()
-        // alone discards the panic payload; awaiting the handle (bounded by a
-        // grace) surfaces it as a JoinError with is_panic() == true.
-        let task = tokio::spawn(async {
-            panic!("boom");
-        });
-        let panicked = observe_or_abort(task).await;
-        assert!(panicked, "a panicked task must report panicked=true");
-    }
-
-    #[tokio::test]
-    async fn observe_or_abort_clean_finish_is_not_panic() {
-        let task = tokio::spawn(async {});
-        let panicked = observe_or_abort(task).await;
-        assert!(!panicked);
     }
 }
