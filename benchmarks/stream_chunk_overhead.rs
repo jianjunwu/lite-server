@@ -244,6 +244,9 @@ async fn recv_echo(resp: &mut tonic::Streaming<pb::BidiChunk>) -> Result<serde_j
             Some(pb::bidi_chunk::Payload::Open(_)) => {
                 Err("unexpected Open frame".to_string())
             }
+            Some(pb::bidi_chunk::Payload::Error(e)) => {
+                Err(format!("bidi error frame: {}", e.message))
+            }
             None => Err("empty payload frame".to_string()),
         },
         Ok(Ok(None)) => Err("stream ended".to_string()),

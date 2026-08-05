@@ -22,7 +22,6 @@ use axum::{
     response::Response,
 };
 use bytes::{Bytes, BytesMut};
-use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -95,9 +94,10 @@ async fn h2_bidi_entry(
 
     // 3. Read the first LPM frame (must be Open) from the body stream, with
     // an idle budget from server.timeout. Returns the frame + buffered
-    // remaining bytes for the incoming task.
+    // remaining bytes + the body stream itself, which the incoming task keeps
+    // reading for the rest of the session (bidi C→S direction).
     let body_stream = request.into_body().into_data_stream();
-    let (first_frame, remainder_buf) =
+    let (first_frame, remainder_buf, body_stream) =
         read_first_lpm_frame(body_stream, state.config.server.timeout).await?;
 
     let initial_data = match &first_frame.payload {
@@ -173,9 +173,13 @@ async fn h2_bidi_entry(
 
     tokio::spawn(
         async move {
-            // Incoming task: decode remaining LPM frames → worker (fire-and-forget).
+            // Incoming task: decode LPM frames from the request body → worker
+            // (fire-and-forget). The body stream is OWNED here for the whole
+            // session — frames may arrive long after Open (full-duplex).
             let incoming_task = tokio::spawn(async move {
                 let mut buf = remainder_buf;
+                let mut body_stream = body_stream;
+                let mut close_sent = false;
                 loop {
                     match lpm::try_decode_frame(&mut buf) {
                         Ok(Some(chunk)) => {
@@ -192,19 +196,30 @@ async fn h2_bidi_entry(
                                         stream_id_inc.clone(),
                                     );
                                     let _ = incoming_client.send_raw(req).await;
-                                    return; // graceful close
+                                    close_sent = true;
+                                    break; // graceful close
                                 }
                                 _ => {} // Open after first frame → ignore; Error → ignore
                             }
                         }
                         Ok(None) => {
-                            // Need more data — but the body stream was fully
-                            // consumed in read_first_lpm_frame. The remaining
-                            // bytes are in `buf`. If we can't decode, we're done.
-                            return;
+                            // Need more data — read the next body chunk.
+                            match body_stream.next().await {
+                                Some(Ok(bytes)) => buf.extend_from_slice(&bytes),
+                                // Transport error / body EOF → D4 close below.
+                                Some(Err(_)) | None => break,
+                            }
                         }
-                        Err(_) => return, // frame error → stop
+                        Err(_) => return, // frame error → stop (protocol violation)
                     }
+                }
+                // D4: body EOF (or transport error) without an explicit Close
+                // frame → gracefully end worker input (same half-close
+                // semantics as gRPC bidi, PR-1).
+                if !close_sent {
+                    let _ = incoming_client
+                        .send_raw(streaming::build_stream_close(stream_id_inc))
+                        .await;
                 }
             });
 
@@ -431,12 +446,16 @@ async fn open_worker_stream_bidi(
 }
 
 /// Read the first LPM frame from a body data stream, bounded by an idle budget.
-/// Returns the decoded `BidiChunk` and a buffer of any remaining (unconsumed)
-/// bytes from the stream.
-async fn read_first_lpm_frame(
-    mut body_stream: impl futures::Stream<Item = Result<Bytes, axum::Error>> + Unpin,
+/// Returns the decoded `BidiChunk`, a buffer of any remaining (unconsumed)
+/// bytes, and the body stream itself — the caller (incoming task) must keep
+/// reading it for the rest of the bidi session.
+async fn read_first_lpm_frame<S>(
+    mut body_stream: S,
     server_timeout: f32,
-) -> Result<(pb::BidiChunk, BytesMut), AppError> {
+) -> Result<(pb::BidiChunk, BytesMut, S), AppError>
+where
+    S: futures::Stream<Item = Result<Bytes, axum::Error>> + Unpin,
+{
     use futures::StreamExt;
 
     let idle = crate::deadline::idle_budget(server_timeout);
@@ -445,7 +464,7 @@ async fn read_first_lpm_frame(
     loop {
         // Try to decode from current buffer.
         if let Some(chunk) = lpm::try_decode_frame(&mut buf).map_err(lpm_error_to_app)? {
-            return Ok((chunk, buf));
+            return Ok((chunk, buf, body_stream));
         }
 
         // Need more data — read next chunk from body stream.
@@ -495,6 +514,7 @@ mod tests {
     use crate::registry::ModelRegistry;
     use crate::worker::WorkerManager;
     use axum::body::Body;
+    use prost::Message;
     use std::sync::Arc;
 
     fn ipc_endpoint(tag: &str) -> String {
@@ -514,6 +534,10 @@ mod tests {
     }
 
     fn make_state(cb: Arc<CallbackRunner>) -> Arc<AppState> {
+        make_state_with_config(cb, crate::config::Config::default())
+    }
+
+    fn make_state_with_config(cb: Arc<CallbackRunner>, config: crate::config::Config) -> Arc<AppState> {
         let registry = Arc::new(ModelRegistry::new());
         let queue = Arc::new(InferenceQueue::new());
         let wm = Arc::new(WorkerManager::new(
@@ -527,7 +551,7 @@ mod tests {
             registry,
             wm,
             queue,
-            crate::config::Config::default(),
+            config,
             std::path::PathBuf::new(),
             cb,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -572,8 +596,71 @@ mod tests {
         state
     }
 
-    /// PAIR worker: Open → one Chunk + Done.
-    fn spawn_done_worker(endpoint: String) -> std::thread::JoinHandle<()> {
+    /// PAIR worker: records actions; on Open → one Chunk + Done.
+    fn spawn_chunk_done_recording_worker(
+        endpoint: String,
+    ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<String>) {
+        let (action_tx, action_rx) = std::sync::mpsc::channel::<String>();
+        let handle = std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(10000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                    let _ = s.send(
+                        pb::Response { uid: req.uid, ..Default::default() }.encode_to_vec(),
+                        0,
+                    );
+                    continue;
+                };
+                let mk = |payload| pb::Response {
+                    payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                        stream_id: st.stream_id.clone(),
+                        payload: Some(payload),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                match st.action {
+                    Some(pb::stream_request::Action::Open(_)) => {
+                        let _ = action_tx.send("open".to_string());
+                        let _ = s.send(
+                            mk(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
+                                data: Bytes::from_static(b"{}"),
+                                is_final: false,
+                            }))
+                            .encode_to_vec(),
+                            0,
+                        );
+                        let _ = s.send(
+                            mk(pb::stream_response::Payload::Done(pb::StreamDone::default()))
+                                .encode_to_vec(),
+                            0,
+                        );
+                    }
+                    Some(pb::stream_request::Action::Chunk(_)) => {
+                        let _ = action_tx.send("chunk".to_string());
+                    }
+                    Some(pb::stream_request::Action::Close(_)) => {
+                        let _ = action_tx.send("close".to_string());
+                    }
+                    Some(pb::stream_request::Action::Cancel(_)) => {
+                        let _ = action_tx.send("cancel".to_string());
+                    }
+                    None => {}
+                }
+            }
+        });
+        (handle, action_rx)
+    }
+
+    /// PAIR worker: Open → Error frame, then nothing.
+    fn spawn_error_worker_bidi(endpoint: String) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let ctx = zmq::Context::new();
             let s = ctx.socket(zmq::PAIR).expect("worker socket");
@@ -593,11 +680,7 @@ mod tests {
                 );
                 if !is_open {
                     let _ = s.send(
-                        pb::Response {
-                            uid: req.uid,
-                            ..Default::default()
-                        }
-                        .encode_to_vec(),
+                        pb::Response { uid: req.uid, ..Default::default() }.encode_to_vec(),
                         0,
                     );
                     continue;
@@ -605,29 +688,32 @@ mod tests {
                 let Some(pb::request::Payload::Stream(st)) = req.payload else {
                     continue;
                 };
-                let mk = |payload| pb::Response {
-                    payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
-                        stream_id: st.stream_id.clone(),
-                        payload: Some(payload),
+                let _ = s.send(
+                    pb::Response {
+                        payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                            stream_id: st.stream_id.clone(),
+                            payload: Some(pb::stream_response::Payload::Error(
+                                pb::StreamError { message: "boom".to_string() },
+                            )),
+                            ..Default::default()
+                        })),
                         ..Default::default()
-                    })),
-                    ..Default::default()
-                };
-                let _ = s.send(
-                    mk(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
-                        data: Bytes::from_static(b"{}"),
-                        is_final: false,
-                    }))
+                    }
                     .encode_to_vec(),
-                    0,
-                );
-                let _ = s.send(
-                    mk(pb::stream_response::Payload::Done(pb::StreamDone::default()))
-                        .encode_to_vec(),
                     0,
                 );
             }
         })
+    }
+
+    /// Decode all complete LPM frames from a collected response body.
+    fn decode_all_frames(bytes: &[u8]) -> Vec<pb::BidiChunk> {
+        let mut buf = BytesMut::from(bytes);
+        let mut out = Vec::new();
+        while let Ok(Some(c)) = lpm::try_decode_frame(&mut buf) {
+            out.push(c);
+        }
+        out
     }
 
     fn test_cx() -> RequestContext {
@@ -640,53 +726,156 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn h2_bidi_handler_streams_response() {
-        let model = "bidi_hdlr";
+    /// §6.9-2/5: full handler session — worker Chunk+Done → downstream LPM
+    /// [Data, Close] frames + body EOF; the worker observes Open plus the D4
+    /// Close from the client's body half-close.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn h2_bidi_handler_full_session_frames_and_worker_actions() {
+        let model = "bidi_full";
         let endpoint = ipc_endpoint(model);
-        let _w = spawn_done_worker(endpoint.clone());
+        let (_w, actions) = spawn_chunk_done_recording_worker(endpoint.clone());
         let state = ready_state(model, endpoint).await;
+        state.registry.activate_version(model, "1").unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // Build an LPM body with BidiOpen frame.
-        let open_frame = lpm::encode_frame(&pb::BidiChunk {
+        // Body: Open frame only, then EOF (client pipelines + half-closes).
+        let (body_tx, resp) = start_bidi_session(model, state).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            BIDI_CONTENT_TYPE
+        );
+        drop(body_tx); // body EOF → D4 Close
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("drain body");
+        let frames = decode_all_frames(&body_bytes);
+        assert_eq!(frames.len(), 2, "expected [Data, Close] frames, got {frames:?}");
+        assert!(
+            matches!(frames[0].payload, Some(pb::bidi_chunk::Payload::Data(_))),
+            "first downstream frame must be Data"
+        );
+        assert!(
+            matches!(frames[1].payload, Some(pb::bidi_chunk::Payload::Close(_))),
+            "terminal downstream frame must be Close"
+        );
+        // §6.5: server-generated stream_id echoed on every frame.
+        assert!(frames[0].stream_id.starts_with("http-bidi-"));
+        assert_eq!(frames[0].stream_id, frames[1].stream_id);
+
+        // Worker saw Open; the D4 half-close delivered Close (the EOF-Close
+        // may race the worker's own Done, so don't assert full ordering).
+        let mut seen = Vec::new();
+        while let Ok(a) = actions.recv_timeout(std::time::Duration::from_secs(3)) {
+            seen.push(a);
+            if seen.len() >= 3 {
+                break;
+            }
+        }
+        assert_eq!(seen.first().map(String::as_str), Some("open"));
+        assert!(
+            seen.iter().any(|a| a == "close"),
+            "D4 close must reach the worker, got {seen:?}"
+        );
+    }
+
+    /// §6.9-5: worker Error → in-band error frame + body EOF (terminal).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn h2_bidi_worker_error_yields_error_frame_then_eof() {
+        let model = "bidi_err";
+        let endpoint = ipc_endpoint(model);
+        let _w = spawn_error_worker_bidi(endpoint.clone());
+        let state = ready_state(model, endpoint).await;
+        state.registry.activate_version(model, "1").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let (body_tx, resp) = start_bidi_session(model, state).await;
+        drop(body_tx);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("drain body");
+        let frames = decode_all_frames(&body_bytes);
+        assert_eq!(frames.len(), 1, "expected exactly one error frame, got {frames:?}");
+        match &frames[0].payload {
+            Some(pb::bidi_chunk::Payload::Error(e)) => assert_eq!(e.message, "boom"),
+            other => panic!("expected error frame, got {other:?}"),
+        }
+    }
+
+    /// §6.9-5: the first LPM frame must be BidiOpen — anything else is
+    /// rejected before the response commits (400-class HTTP error).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn h2_bidi_first_frame_not_open_is_rejected() {
+        let model = "bidi_first";
+        let endpoint = ipc_endpoint(model);
+        let state = ready_state(model, endpoint).await;
+        state.registry.activate_version(model, "1").unwrap();
+
+        let data_first = lpm::encode_frame(&pb::BidiChunk {
             stream_id: String::new(),
-            payload: Some(pb::bidi_chunk::Payload::Open(pb::BidiOpen {
-                model_name: String::new(),
-                version: String::new(),
-                initial_data: Bytes::from_static(b"{}"),
-                ..Default::default()
+            payload: Some(pb::bidi_chunk::Payload::Data(pb::BidiData {
+                data: Bytes::from_static(b"x"),
             })),
         });
-
-        let body = Body::from(open_frame.to_vec());
         let req = axum::http::Request::builder()
             .method("POST")
             .uri(format!("/v2/models/{}/bidi", model))
             .version(axum::http::Version::HTTP_2)
             .header("content-type", BIDI_CONTENT_TYPE)
-            .body(body)
+            .body(Body::from(data_first.to_vec()))
             .unwrap();
 
-        // Verify the request is h2 and the handler produces a response.
-        let version = req.version();
-        assert_eq!(version, axum::http::Version::HTTP_2);
-
-        // The handler requires running in an axum Router context (extractors).
-        // We test indirectly: the handler compiles, all wiring is in place,
-        // and the full end-to-end path is covered by the integration tests.
-        // This test validates that the request can be constructed and the body
-        // contains a valid LPM frame.
-        let body_bytes = axum::body::to_bytes(req.into_body(), 1 << 20)
-            .await
-            .expect("read body");
-        let mut buf = BytesMut::from(body_bytes.as_ref());
-        let decoded = lpm::try_decode_frame(&mut buf)
-            .expect("decode")
-            .expect("frame");
+        let err = h2_bidi_handler(
+            State(state),
+            Path(model.to_string()),
+            HeaderMap::new(),
+            test_cx(),
+            req,
+        )
+        .await
+        .expect_err("first frame not Open must be rejected");
         assert!(
-            matches!(decoded.payload, Some(pb::bidi_chunk::Payload::Open(_))),
-            "body must contain BidiOpen frame"
+            matches!(err, AppError::InvalidRequestBody(_)),
+            "expected InvalidRequestBody (400), got {err:?}"
+        );
+    }
+
+    /// §6.9-7: `features.http_bidi = false` unmounts /bidi (404); the default
+    /// (true) mounts it — an h1 request then reaches the version gate (426).
+    #[tokio::test]
+    async fn h2_bidi_route_gated_by_feature_flag() {
+        use tower::ServiceExt;
+
+        let mk_req = || {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v2/models/m/bidi")
+                .version(axum::http::Version::HTTP_11)
+                .header("content-type", BIDI_CONTENT_TYPE)
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // Default (true) → mounted: h1 hits the handler's version gate → 426.
+        let cb = Arc::new(CallbackRunner::new());
+        let app = crate::http::routes::create_routes(make_state(cb.clone()));
+        let resp = app.oneshot(mk_req()).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::UPGRADE_REQUIRED,
+            "mounted /bidi must 426 on h1"
+        );
+
+        // http_bidi = false → route unmounted → 404.
+        let mut cfg = crate::config::Config::default();
+        cfg.features.http_bidi = false;
+        let app = crate::http::routes::create_routes(make_state_with_config(cb, cfg));
+        let resp = app.oneshot(mk_req()).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "http_bidi=false must unmount /bidi"
         );
     }
 
@@ -719,6 +908,199 @@ mod tests {
             resp.status(),
             axum::http::StatusCode::UPGRADE_REQUIRED,
             "h1 request to /bidi must return 426"
+        );
+    }
+
+    // ===== AUDIT-REPRO (2026-08-05, /audit http-bidi) =======================
+    // B1: the incoming (C→S) direction of the h2 bidi handler drops the
+    // request body stream — `read_first_lpm_frame` consumes it and returns
+    // only the bytes buffered alongside the FIRST frame. LPM frames the
+    // client sends afterwards (the entire point of bidi) never reach the
+    // worker, and D4 (body EOF → worker Close) is not implemented.
+
+    /// PAIR worker that records every StreamRequest action it receives and
+    /// holds the stream open until Close arrives (then replies Done).
+    fn spawn_recording_worker(
+        endpoint: String,
+    ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<String>) {
+        let (action_tx, action_rx) = std::sync::mpsc::channel::<String>();
+        let handle = std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(10000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                    // Handshake / unary — ack so the client never stalls.
+                    let _ = s.send(
+                        pb::Response { uid: req.uid, ..Default::default() }.encode_to_vec(),
+                        0,
+                    );
+                    continue;
+                };
+                match st.action {
+                    Some(pb::stream_request::Action::Open(_)) => {
+                        let _ = action_tx.send("open".to_string());
+                    }
+                    Some(pb::stream_request::Action::Chunk(_)) => {
+                        let _ = action_tx.send("chunk".to_string());
+                    }
+                    Some(pb::stream_request::Action::Close(_)) => {
+                        let _ = action_tx.send("close".to_string());
+                        let done = pb::Response {
+                            payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                                stream_id: st.stream_id.clone(),
+                                payload: Some(pb::stream_response::Payload::Done(
+                                    pb::StreamDone::default(),
+                                )),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        };
+                        let _ = s.send(done.encode_to_vec(), 0);
+                    }
+                    Some(pb::stream_request::Action::Cancel(_)) => {
+                        let _ = action_tx.send("cancel".to_string());
+                    }
+                    None => {}
+                }
+            }
+        });
+        (handle, action_rx)
+    }
+
+    fn open_frame_bytes() -> Bytes {
+        lpm::encode_frame(&pb::BidiChunk {
+            stream_id: String::new(),
+            payload: Some(pb::bidi_chunk::Payload::Open(pb::BidiOpen {
+                model_name: String::new(),
+                version: String::new(),
+                initial_data: Bytes::from_static(b"{}"),
+                ..Default::default()
+            })),
+        })
+    }
+
+    /// Build the handler request with a live, streamed h2 body and invoke the
+    /// handler directly. Returns (body sender, response).
+    async fn start_bidi_session(
+        model: &str,
+        state: Arc<AppState>,
+    ) -> (
+        tokio::sync::mpsc::Sender<Result<Bytes, axum::Error>>,
+        Response,
+    ) {
+        let (body_tx, body_rx) =
+            tokio::sync::mpsc::channel::<Result<Bytes, axum::Error>>(8);
+        let body = Body::from_stream(ReceiverStream::new(body_rx));
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v2/models/{}/bidi", model))
+            .version(axum::http::Version::HTTP_2)
+            .header("content-type", BIDI_CONTENT_TYPE)
+            .body(body)
+            .unwrap();
+
+        body_tx
+            .send(Ok(open_frame_bytes()))
+            .await
+            .expect("send Open frame");
+
+        let resp = h2_bidi_handler(
+            State(state),
+            Path(model.to_string()),
+            HeaderMap::new(),
+            test_cx(),
+            req,
+        )
+        .await
+        .expect("handler must accept the session");
+        (body_tx, resp)
+    }
+
+    /// B1 repro #1: an LPM Data frame sent AFTER the Open frame (the normal
+    /// full-duplex case) must reach the worker as StreamRequest::Chunk.
+    /// Current code drops the body stream after the first frame → the Chunk
+    /// never arrives → this test FAILS until the incoming task keeps reading
+    /// the body stream.
+    // NOTE: multi_thread — the std-mpsc recv_timeout waits below must not
+    // starve the spawned handler/forwarder tasks (current_thread runtime
+    // would be blocked by a blocking wait on the test future itself).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn audit_h2_bidi_data_frames_after_open_reach_worker() {
+        let model = "bidi_audit_data";
+        let endpoint = ipc_endpoint(model);
+        let (_w, actions) = spawn_recording_worker(endpoint.clone());
+        let state = ready_state(model, endpoint).await;
+        state.registry.activate_version(model, "1").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let (body_tx, resp) = start_bidi_session(model, state).await;
+        // Drain the response so the outgoing task never blocks on tx.
+        tokio::spawn(async move {
+            let _ = axum::body::to_bytes(resp.into_body(), 1 << 20).await;
+        });
+
+        assert_eq!(
+            actions.recv_timeout(std::time::Duration::from_secs(3)).as_deref(),
+            Ok("open"),
+            "worker must see StreamOpen"
+        );
+
+        // The bidi moment: client sends more input mid-stream.
+        let data_frame = lpm::encode_frame(&pb::BidiChunk {
+            stream_id: String::new(),
+            payload: Some(pb::bidi_chunk::Payload::Data(pb::BidiData {
+                data: Bytes::from_static(b"more-input"),
+            })),
+        });
+        body_tx
+            .send(Ok(data_frame))
+            .await
+            .expect("body stream must stay alive for the bidi session");
+
+        assert_eq!(
+            actions.recv_timeout(std::time::Duration::from_secs(2)).as_deref(),
+            Ok("chunk"),
+            "worker must receive StreamRequest::Chunk for a Data frame sent after Open"
+        );
+    }
+
+    /// B1 repro #2 (D4, plan §6.6 step 6 + §6.9-3): body EOF without a Close
+    /// frame must send StreamRequest::Close to the worker (same half-close
+    /// semantics PR-1 added to gRPC bidi). Current code has no EOF handling —
+    /// the incoming task exits on an empty remainder → FAILS until D4 lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn audit_h2_bidi_body_eof_sends_close_to_worker() {
+        let model = "bidi_audit_eof";
+        let endpoint = ipc_endpoint(model);
+        let (_w, actions) = spawn_recording_worker(endpoint.clone());
+        let state = ready_state(model, endpoint).await;
+        state.registry.activate_version(model, "1").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let (body_tx, resp) = start_bidi_session(model, state).await;
+        tokio::spawn(async move {
+            let _ = axum::body::to_bytes(resp.into_body(), 1 << 20).await;
+        });
+
+        assert_eq!(
+            actions.recv_timeout(std::time::Duration::from_secs(3)).as_deref(),
+            Ok("open"),
+            "worker must see StreamOpen"
+        );
+
+        // Client ends its input at the transport level: body EOF, no Close frame.
+        drop(body_tx);
+
+        assert_eq!(
+            actions.recv_timeout(std::time::Duration::from_secs(2)).as_deref(),
+            Ok("close"),
+            "D4: body EOF must send StreamRequest::Close to the worker"
         );
     }
 }
