@@ -25,8 +25,8 @@ pub(crate) fn access_log_target(path: &str) -> Option<(&str, Option<&str>)> {
     let segs: Vec<&str> = segs.collect();
     match segs.as_slice() {
         [] => None,
-        ["infer" | "events" | "stream" | "bidi" | "decoupled"] => Some((model, None)),
-        ["versions", v, "infer" | "events" | "stream" | "bidi" | "decoupled"] if !v.is_empty() => Some((model, Some(v))),
+        ["infer" | "events" | "stream" | "bidi" | "decoupled" | "decoupled-stream"] => Some((model, None)),
+        ["versions", v, "infer" | "events" | "stream" | "bidi" | "decoupled" | "decoupled-stream"] if !v.is_empty() => Some((model, Some(v))),
         ["versions", ..] => None,
         // B1 audit fix: bare `reload` is a registered state-changing ADMIN route
         // (POST /v2/models/:m/reload → reload_model_handler, no enforce_auth).
@@ -182,6 +182,17 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
             .route("/v2/models/:model_name/stream", get(ws_stream_handler))
             .route("/v2/models/:model_name/versions/:version/stream", get(ws_stream_version_handler));
     }
+    if features.streaming && features.websocket_streaming && features.decoupled {
+        router = router
+            .route(
+                "/v2/models/:model_name/decoupled-stream",
+                get(ws_decoupled_handler),
+            )
+            .route(
+                "/v2/models/:model_name/versions/:version/decoupled-stream",
+                get(ws_decoupled_version_handler),
+            );
+    }
     // D3: h2 bidi endpoints — gated on streaming + http_bidi (default true).
     if features.streaming && features.http_bidi {
         router = router
@@ -220,6 +231,7 @@ mod tests {
         assert_eq!(access_log_target("/v2/models/m/stream"), Some(("m", None)));
         assert_eq!(access_log_target("/v2/models/m/bidi"), Some(("m", None)));
         assert_eq!(access_log_target("/v2/models/m/decoupled"), Some(("m", None)));
+        assert_eq!(access_log_target("/v2/models/m/decoupled-stream"), Some(("m", None)));
         assert_eq!(
             access_log_target("/v2/models/m/versions/2/infer"),
             Some(("m", Some("2")))
@@ -234,6 +246,10 @@ mod tests {
         );
         assert_eq!(
             access_log_target("/v2/models/m/versions/2/decoupled"),
+            Some(("m", Some("2")))
+        );
+        assert_eq!(
+            access_log_target("/v2/models/m/versions/2/decoupled-stream"),
             Some(("m", Some("2")))
         );
     }

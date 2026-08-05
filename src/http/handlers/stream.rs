@@ -376,7 +376,7 @@ pub async fn ws_stream_handler(
     if !crate::http::cors::ws_origin_allowed(&state, &model_name, None, &headers) {
         return (axum::http::StatusCode::FORBIDDEN, "WebSocket Origin not allowed").into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, headers, socket, cx))
+    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, headers, socket, cx, false))
 }
 
 pub async fn ws_stream_version_handler(
@@ -395,7 +395,44 @@ pub async fn ws_stream_version_handler(
     if !crate::http::cors::ws_origin_allowed(&state, &model_name, Some(&version), &headers) {
         return (axum::http::StatusCode::FORBIDDEN, "WebSocket Origin not allowed").into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), headers, socket, cx))
+    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), headers, socket, cx, false))
+}
+
+// ===== WS Decoupled =====
+
+pub async fn ws_decoupled_handler(
+    State(state): State<Arc<AppState>>,
+    Path(model_name): Path<String>,
+    headers: HeaderMap,
+    ws: axum::extract::WebSocketUpgrade,
+    cx: RequestContext,
+) -> Response {
+    if let Err(e) = crate::validation::validate_identifier(&model_name) {
+        return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+    }
+    if !crate::http::cors::ws_origin_allowed(&state, &model_name, None, &headers) {
+        return (axum::http::StatusCode::FORBIDDEN, "WebSocket Origin not allowed").into_response();
+    }
+    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, headers, socket, cx, true))
+}
+
+pub async fn ws_decoupled_version_handler(
+    State(state): State<Arc<AppState>>,
+    Path((model_name, version)): Path<(String, String)>,
+    headers: HeaderMap,
+    ws: axum::extract::WebSocketUpgrade,
+    cx: RequestContext,
+) -> Response {
+    if let Err(e) = crate::validation::validate_identifier(&model_name) {
+        return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+    }
+    if let Err(e) = crate::validation::validate_version(&version) {
+        return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+    }
+    if !crate::http::cors::ws_origin_allowed(&state, &model_name, Some(&version), &headers) {
+        return (axum::http::StatusCode::FORBIDDEN, "WebSocket Origin not allowed").into_response();
+    }
+    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), headers, socket, cx, true))
 }
 
 /// Detect a WS bidi app-level close control frame: `{"type":"close"}`.
@@ -410,6 +447,19 @@ fn is_close_frame(text: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Detect a WS decoupled cancel-or-close control frame (D1):
+/// `{"type":"cancel"}` or `{"type":"close"}` — aliases in decoupled mode.
+fn is_cancel_or_close_frame(text: &str) -> bool {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|v| {
+            v.get("type")
+                .and_then(|t| t.as_str())
+                .map(|s| s == "cancel" || s == "close")
+        })
+        .unwrap_or(false)
+}
+
 async fn handle_ws_stream(
     state: Arc<AppState>,
     model_name: String,
@@ -417,6 +467,7 @@ async fn handle_ws_stream(
     headers: HeaderMap,
     mut socket: WebSocket,
     cx: RequestContext,
+    decoupled: bool,
 ) {
     let resolved_version = match resolve_version(&state, &model_name, version, &headers).await {
         Ok(v) => v,
@@ -522,7 +573,7 @@ async fn handle_ws_stream(
     };
     let stream_idle = crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
 
-    let (stream_id, worker_client, mut chunk_rx) = match open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes, false).await {
+    let (stream_id, worker_client, mut chunk_rx) = match open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes, decoupled).await {
         Ok(r) => r,
         Err(e) => {
             let _ = socket.send(Message::Text(json!({"error": e.to_string()}).to_string())).await;
@@ -571,6 +622,14 @@ async fn handle_ws_stream(
     let reader = tokio::spawn(async move {
         while let Some(msg) = ws_stream.next().await {
             match msg {
+                // D1: decoupled stream accepts no data frames after the first.
+                Ok(Message::Binary(_bin)) if decoupled => {
+                    let _ = gone_tx_reader.send(Some(
+                        "decoupled stream accepts no data frames".to_string(),
+                    ));
+                    break;
+                }
+                // Coupled: forward Binary as stream chunk (existing behavior).
                 Ok(Message::Binary(bin)) => {
                     let chunk_req = streaming::build_stream_chunk(
                         reader_stream_id.clone(),
@@ -578,7 +637,16 @@ async fn handle_ws_stream(
                     );
                     let _ = reader_client.send_raw(chunk_req).await;
                 }
-                Ok(Message::Text(t)) if is_close_frame(&t) => {
+                // D1: decoupled cancel/close are aliases → cancel worker, signal gone.
+                Ok(Message::Text(t)) if decoupled && is_cancel_or_close_frame(&t) => {
+                    let cancel_req =
+                        streaming::build_stream_cancel(reader_stream_id.clone());
+                    let _ = reader_client.send_raw(cancel_req).await;
+                    let _ = gone_tx_reader.send(Some(String::new()));
+                    break;
+                }
+                // Coupled: app-level close → send close to worker (existing).
+                Ok(Message::Text(t)) if !decoupled && is_close_frame(&t) => {
                     let close_req =
                         streaming::build_stream_close(reader_stream_id.clone());
                     let _ = reader_client.send_raw(close_req).await;
@@ -2089,6 +2157,288 @@ mod tests {
             response.status(),
             axum::http::StatusCode::NOT_FOUND,
             "decoupled route must 404 when features.decoupled=false"
+        );
+    }
+
+    // ==== WS decoupled (PR-2) test helpers ====
+
+    /// Loopback axum server exposing the WS decoupled-stream route.
+    async fn spawn_ws_decoupled_server(state: Arc<AppState>) -> String {
+        let app = axum::Router::new()
+            .route(
+                "/v2/models/:model_name/decoupled-stream",
+                axum::routing::get(ws_decoupled_handler),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("ws://127.0.0.1:{}/v2/models", port)
+    }
+
+    // ==== WS decoupled tests ====
+
+    /// PR-2 test 1: first frame opens a decoupled stream; worker pushes 2
+    /// chunks + Done → client receives Binary×2 + {"done":true}.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ws_decoupled_open_flag_and_chunks_reach_client() {
+        use futures::{SinkExt, StreamExt};
+
+        let model = "ws_dc_open";
+        let endpoint = ipc_endpoint(model);
+        let (_w, actions) = spawn_decoupled_recording_worker(endpoint.clone(), 2);
+        let state = ready_state(model, endpoint, Arc::new(CallbackRunner::new())).await;
+        state.registry.activate_version(model, "1").unwrap();
+        let base = spawn_ws_decoupled_server(state).await;
+
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("{}/{}/decoupled-stream", base, model))
+                .await
+                .expect("WS connect failed");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"input": 1}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+
+        // Collect all messages from server.
+        let mut msgs: Vec<String> = Vec::new();
+        while let Ok(Some(Ok(msg))) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await
+        {
+            match msg {
+                tokio_tungstenite::tungstenite::Message::Binary(b) => {
+                    msgs.push(format!("bin:{}", String::from_utf8_lossy(&b)));
+                }
+                tokio_tungstenite::tungstenite::Message::Text(t) => {
+                    msgs.push(format!("txt:{}", t));
+                }
+                _ => {}
+            }
+        }
+
+        // 2 Binary chunks + terminal {"done":true}
+        assert_eq!(msgs.len(), 3, "expected 3 messages; got: {msgs:?}");
+        assert!(msgs[0].starts_with("bin:chunk-0"), "chunk 0: {msgs:?}");
+        assert!(msgs[1].starts_with("bin:chunk-1"), "chunk 1: {msgs:?}");
+        assert_eq!(msgs[2], "txt:{\"done\":true}", "terminal Done: {msgs:?}");
+
+        // Worker must have received Open with decoupled=true.
+        let (action, decoupled) = actions
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("open action");
+        assert_eq!(action, "open");
+        assert_eq!(decoupled, Some(true), "StreamOpen.decoupled must be true");
+    }
+
+    /// PR-2 test 2 (D1): `{"type":"cancel"}` → worker receives Cancel →
+    /// WS closes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ws_decoupled_cancel_frame_cancels_worker_and_closes() {
+        use futures::SinkExt;
+
+        let model = "ws_dc_cancel";
+        let endpoint = ipc_endpoint(model);
+        // respond_chunks=0: stall after Open, no spontaneous Done.
+        let (_w, actions) = spawn_decoupled_recording_worker(endpoint.clone(), 0);
+        let state = ready_state(model, endpoint, Arc::new(CallbackRunner::new())).await;
+        state.registry.activate_version(model, "1").unwrap();
+        let base = spawn_ws_decoupled_server(state).await;
+
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("{}/{}/decoupled-stream", base, model))
+                .await
+                .expect("WS connect failed");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"input": 1}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+
+        // Wait for open to be recorded.
+        assert_eq!(
+            actions
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .map(|a| a.0),
+            Ok("open".to_string())
+        );
+
+        // Send cancel frame.
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"cancel"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+
+        // Worker must receive Cancel.
+        let mut got_cancel = false;
+        while let Ok((a, _)) = actions.recv_timeout(std::time::Duration::from_secs(3)) {
+            if a == "cancel" {
+                got_cancel = true;
+                break;
+            }
+        }
+        assert!(got_cancel, "worker must receive Cancel after cancel frame");
+    }
+
+    /// PR-2 test 3 (D1): `{"type":"close"}` is a cancel alias — worker
+    /// receives Cancel + WS closes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ws_decoupled_close_frame_is_cancel_alias() {
+        use futures::SinkExt;
+
+        let model = "ws_dc_close_alias";
+        let endpoint = ipc_endpoint(model);
+        let (_w, actions) = spawn_decoupled_recording_worker(endpoint.clone(), 0);
+        let state = ready_state(model, endpoint, Arc::new(CallbackRunner::new())).await;
+        state.registry.activate_version(model, "1").unwrap();
+        let base = spawn_ws_decoupled_server(state).await;
+
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("{}/{}/decoupled-stream", base, model))
+                .await
+                .expect("WS connect failed");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"input": 1}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            actions
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .map(|a| a.0),
+            Ok("open".to_string())
+        );
+
+        // Send close frame (alias for cancel in decoupled mode).
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"close"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let mut got_cancel = false;
+        while let Ok((a, _)) = actions.recv_timeout(std::time::Duration::from_secs(3)) {
+            if a == "cancel" {
+                got_cancel = true;
+                break;
+            }
+        }
+        assert!(
+            got_cancel,
+            "worker must receive Cancel after close frame (decoupled alias)"
+        );
+    }
+
+    /// PR-2 test 4 (D1): Binary frame after the first payload frame →
+    /// protocol error → client gets error → worker receives Cancel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ws_decoupled_binary_frame_is_protocol_error() {
+        use futures::{SinkExt, StreamExt};
+
+        let model = "ws_dc_bin_err";
+        let endpoint = ipc_endpoint(model);
+        let (_w, actions) = spawn_decoupled_recording_worker(endpoint.clone(), 0);
+        let state = ready_state(model, endpoint, Arc::new(CallbackRunner::new())).await;
+        state.registry.activate_version(model, "1").unwrap();
+        let base = spawn_ws_decoupled_server(state).await;
+
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("{}/{}/decoupled-stream", base, model))
+                .await
+                .expect("WS connect failed");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"input": 1}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            actions
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .map(|a| a.0),
+            Ok("open".to_string())
+        );
+
+        // Send Binary after first frame → protocol error.
+        ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![
+            1, 2, 3,
+        ]))
+        .await
+        .unwrap();
+
+        // Client must receive the protocol error frame.
+        let mut got_error = false;
+        while let Ok(Some(Ok(msg))) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await
+        {
+            if let tokio_tungstenite::tungstenite::Message::Text(t) = msg {
+                assert!(
+                    t.contains("no data frames"),
+                    "unexpected text frame: {t}"
+                );
+                got_error = true;
+            }
+        }
+        assert!(got_error, "client must receive the protocol error frame");
+
+        // Worker must receive Cancel.
+        let mut got_cancel = false;
+        while let Ok((a, _)) = actions.recv_timeout(std::time::Duration::from_secs(3)) {
+            if a == "cancel" {
+                got_cancel = true;
+                break;
+            }
+        }
+        assert!(got_cancel, "worker must receive Cancel after protocol error");
+    }
+
+    /// PR-2 test 5 (D1): hard client disconnect → gone signal →
+    /// worker receives Cancel promptly (not via idle timeout).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ws_decoupled_client_disconnect_cancels_worker_promptly() {
+        use futures::SinkExt;
+
+        let model = "ws_dc_disc";
+        let endpoint = ipc_endpoint(model);
+        let (_w, actions) = spawn_decoupled_recording_worker(endpoint.clone(), 0);
+        let state = ready_state(model, endpoint, Arc::new(CallbackRunner::new())).await;
+        state.registry.activate_version(model, "1").unwrap();
+        let base = spawn_ws_decoupled_server(state).await;
+
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("{}/{}/decoupled-stream", base, model))
+                .await
+                .expect("WS connect failed");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"input": 1}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            actions
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .map(|a| a.0),
+            Ok("open".to_string())
+        );
+
+        // Abrupt drop: no WS close handshake.
+        drop(ws);
+
+        let mut got_cancel = false;
+        while let Ok((a, _)) = actions.recv_timeout(std::time::Duration::from_secs(5)) {
+            if a == "cancel" {
+                got_cancel = true;
+                break;
+            }
+        }
+        assert!(
+            got_cancel,
+            "worker must receive Cancel promptly on client disconnect (gone signal)"
         );
     }
 }

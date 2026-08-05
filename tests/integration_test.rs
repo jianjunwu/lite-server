@@ -2169,6 +2169,64 @@ async fn test_websocket_streaming() {
     unload_model(&base, MODEL, "1").await;
 }
 
+/// WS decoupled streaming: first Text frame payload → worker pushes N
+/// Binary chunks + {"done":true} (model-driven lifetime).
+#[tokio::test]
+#[serial]
+async fn test_http_ws_decoupled_pushes_chunks_then_done() {
+    use tokio_tungstenite::connect_async;
+    use futures::SinkExt;
+    use futures::StreamExt;
+
+    let base = shared_base().await;
+
+    load_model(&base, DECOUPLED_MODEL, "1").await;
+
+    let ws_url = format!(
+        "ws://127.0.0.1:{}/v2/models/{}/decoupled-stream",
+        SHARED_PORT, DECOUPLED_MODEL
+    );
+    let (mut ws, _) = connect_async(&ws_url).await.expect("WS connect failed");
+
+    // First frame = request payload (input=3 → worker pushes 3 chunks).
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&json!({"input": 3})).unwrap(),
+    ))
+    .await
+    .expect("WS send failed");
+
+    // Collect messages until the server closes the socket after Done.
+    let mut msgs: Vec<String> = Vec::new();
+    while let Ok(Some(Ok(msg))) =
+        tokio::time::timeout(Duration::from_secs(10), ws.next()).await
+    {
+        match msg {
+            tokio_tungstenite::tungstenite::Message::Binary(b) => {
+                msgs.push(format!("bin:{}", String::from_utf8_lossy(&b)));
+            }
+            tokio_tungstenite::tungstenite::Message::Text(t) => {
+                msgs.push(format!("txt:{}", t));
+            }
+            _ => {}
+        }
+    }
+
+    // 3 Binary chunks + terminal {"done":true}
+    assert_eq!(msgs.len(), 4, "expected 4 messages; got: {msgs:?}");
+    for i in 0..3 {
+        assert!(
+            msgs[i].starts_with("bin:"),
+            "message {i} must be Binary chunk; got: {msgs:?}"
+        );
+        let json_str = &msgs[i][4..]; // strip "bin:" prefix
+        let v: Value = serde_json::from_str(json_str).expect("chunk data is JSON");
+        assert_eq!(v["index"], i, "chunks must arrive in order");
+    }
+    assert_eq!(msgs[3], "txt:{\"done\":true}", "terminal frame must be Done");
+
+    unload_model(&base, DECOUPLED_MODEL, "1").await;
+}
+
 /// WS bidi: client sends first Text frame + 2 Binary frames; the bidi reader
 /// forwards them to the worker as chunks, and the stream completes normally.
 #[tokio::test]
