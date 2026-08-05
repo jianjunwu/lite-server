@@ -50,6 +50,22 @@ cargo run --release --example perf_smoke   # → stdout + target/perf-smoke.json
 
 Methodology + first baseline: [docs/benchmark.md](../docs/benchmark.md).
 
+## stream-chunk-overhead (self-contained)
+
+Zero-external-tool measurement of per-chunk plumbing overhead on streaming paths —
+gRPC bidi ping-pong RTT + SSE chunk intervals + WS chunk intervals. Uses zero-compute
+`bidi_echo_model` / `echo_stream_model` so the numbers isolate server-side overhead
+(gRPC+ZMQ+worker dispatch / SSE+WS forward loop), not model time:
+
+```bash
+cargo build --release
+cargo run --release --example stream_chunk_overhead   # → stdout + target/stream-chunk-overhead.json
+```
+
+Two bidi modes:
+- **Burst** (1000 ping-pong chunks) — pipeline latency floor
+- **Paced 40ms** (300 chunks, 25 fps ASR rhythm) — reports how many RTTs exceed the pace (real-time viability)
+
 ## Custom Model Repository
 
 Both `run_liteserver.py` and `run_litserve.py` support `--model-repo` to point to a custom model directory.
@@ -84,6 +100,80 @@ class MyAPI(LitAPI):
     def encode_response(self, output):
         return output
 ```
+
+### Streaming models
+
+For SSE/WS streaming benchmarks, implement `stream_predict`:
+
+```python
+from lite_server import LitAPI
+
+class EchoStreamAPI(LitAPI):
+    def setup(self, device):
+        self.device = device
+
+    def decode_request(self, request):
+        return request
+
+    def predict(self, inputs):
+        return inputs
+
+    def stream_predict(self, inputs):
+        n = int(inputs.get("n", 20)) if isinstance(inputs, dict) else 20
+        for i in range(n):
+            yield {"chunk": i, "n": n}
+
+    def encode_response(self, output):
+        return output
+```
+
+For gRPC bidi / WS bidi benchmarks, implement `bidi_stream`:
+
+```python
+from lite_server import LitAPI, BidiStreamHandler
+
+class BidiEchoHandler(BidiStreamHandler):
+    def on_open(self, initial_data, ctx=None):
+        return {"status": "ready"}
+
+    def on_chunk(self, chunk, ctx=None):
+        return {"echo": chunk}
+
+    def on_close(self, ctx=None):
+        return {"final": True}
+
+class BidiEchoAPI(LitAPI):
+    def setup(self, device):
+        self.device = device
+
+    async def decode_request(self, request, ctx=None):
+        return request
+
+    async def predict(self, x, ctx=None):
+        return {"output": "sync fallback"}
+
+    async def encode_response(self, output, ctx=None):
+        return output
+
+    def bidi_stream(self, ctx=None):
+        return BidiEchoHandler()
+```
+
+Pre-built zero-compute models are in `benchmarks/models/`:
+`echo_model`, `echo_stream_model`, `bidi_echo_model`, `sleep_model`, `sleep_1ms_model`.
+
+## Streaming Benchmarks (lite-server CLI)
+
+For high-level streaming metrics (TTFT, ITL, TPOT, tokens/sec, RTF) with LLM/TTS/STT
+semantics, use the built-in `lite-server bench` command instead of the wrk scripts
+below. wrk only covers HTTP unary — streaming comparison uses the CLI engine:
+
+```bash
+lite-server bench --stream --model-type llm --duration 60 --concurrency 8 --url http://127.0.0.1:8000
+```
+
+See `lite-server bench --help` and [docs/cli.md](../docs/cli.md) for flags, model types,
+and threshold gates.
 
 ## Manual Run
 
@@ -146,3 +236,7 @@ Default comparison covers:
 | Inference layer | Python workers (LitAPI-compatible)   | Python workers (LitAPI)     |
 | IPC             | UDS + bincode                        | MPQueue / ZMQ               |
 | Process spawn   | `std::process::Command`              | `mp.spawn`                  |
+| HTTP unary      | POST /v2/models/.../infer            | POST /predict               |
+| HTTP streaming  | POST /v2/models/.../events (SSE)     | —                           |
+| WS streaming    | GET /v2/models/.../stream            | —                           |
+| gRPC bidi       | LiteServer.BidiStream                | —                           |
