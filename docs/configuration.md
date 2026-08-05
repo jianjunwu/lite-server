@@ -116,6 +116,7 @@ features:
   grpc_streaming: true         # stream_infer / decoupled_infer / bidi_stream RPCs (else Unimplemented)
   sse: true                    # SSE routes (also requires streaming: true)
   websocket_streaming: true    # WebSocket routes (also requires streaming: true)
+  http_bidi: true              # h2 /bidi endpoint (also requires streaming: true)
   streaming_metrics: true      # Streaming-specific metrics
 
 model_defaults:                # CLI-level defaults applied to all models

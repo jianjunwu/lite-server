@@ -109,6 +109,7 @@ features:
   grpc_streaming: true         # stream_infer / decoupled_infer / bidi_stream RPC（关闭时返回 Unimplemented）
   sse: true                    # SSE 路由（另需 streaming: true）
   websocket_streaming: true    # WebSocket 路由（另需 streaming: true）
+  http_bidi: true              # h2 /bidi 端点（另需 streaming: true）
   streaming_metrics: true      # 流式专用指标
 
 model_defaults:                # CLI 级别默认值，应用于所有模型
