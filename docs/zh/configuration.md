@@ -110,6 +110,7 @@ features:
   sse: true                    # SSE 路由（另需 streaming: true）
   websocket_streaming: true    # WebSocket 路由（另需 streaming: true）
   http_bidi: true              # h2 /bidi 端点（另需 streaming: true）
+  decoupled: true             # SSE /decoupled + WS /decoupled-stream（另需 streaming + 传输开关）
   streaming_metrics: true      # 流式专用指标
 
 model_defaults:                # CLI 级别默认值，应用于所有模型

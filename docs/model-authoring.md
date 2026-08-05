@@ -733,6 +733,46 @@ from the method itself and served over gRPC; no config flag is required.
 > chunks arrive.  The per-chunk data is available via the handler's
 > ``on_chunk(chunk)`` argument.
 
+## Decoupled Streaming
+
+For model-driven streaming (lifetime controlled by the model, not the client):
+
+```python
+class MyModel(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    async def predict_decoupled(self, data, sender):
+        for i in range(data):
+            await sender.send({"index": i})
+        await sender.close()
+
+    def encode_response(self, output):
+        return output
+```
+
+- ``predict_decoupled(data, sender)`` replaces ``predict`` for decoupled
+  models. It receives decoded input and a ``ResponseSender``.
+- Call ``sender.send(payload)`` to push a chunk; call ``sender.close()``
+  to signal completion.
+- The method returns immediately — chunk delivery is asynchronous.
+
+Implementing ``predict_decoupled`` is all that's needed — sessions are
+detected from the method itself and served over:
+
+| Transport | Endpoint |
+|-----------|----------|
+| gRPC | `DecoupledInfer` RPC (under `features.grpc_streaming`) |
+| HTTP SSE | `POST /v2/models/{m}/decoupled` (+ `/versions/{v}/decoupled`) |
+| HTTP WebSocket | `GET /v2/models/{m}/decoupled-stream` (+ `/versions/{v}/decoupled-stream`) |
+
+Idle streams are reclaimed after `server.decoupled_idle_timeout_secs`
+(default 300s). See [HTTP Decoupled Streaming](http-decoupled.md) for
+frame conventions and transport details.
+
 ## Custom Metrics
 
 Collect application-level metrics (gauges, counters, histograms) from your model code. Metrics flow through the same Prometheus endpoint as built-in server metrics (`/metrics`).

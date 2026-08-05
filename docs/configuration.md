@@ -117,6 +117,7 @@ features:
   sse: true                    # SSE routes (also requires streaming: true)
   websocket_streaming: true    # WebSocket routes (also requires streaming: true)
   http_bidi: true              # h2 /bidi endpoint (also requires streaming: true)
+  decoupled: true             # SSE /decoupled + WS /decoupled-stream (also requires streaming + transport toggle)
   streaming_metrics: true      # Streaming-specific metrics
 
 model_defaults:                # CLI-level defaults applied to all models

@@ -806,6 +806,43 @@ class ASRModel(LitAPI):
 > ``ctx.input`` 始终指向初始的 open 负载——它们不会随 chunk 到达而变化。
 > 每个 chunk 的数据通过 handler 的 ``on_chunk(chunk)`` 参数获取。
 
+## Decoupled 流式
+
+用于模型驱动流式（生命周期由模型控制，非客户端）：
+
+```python
+class MyModel(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    async def predict_decoupled(self, data, sender):
+        for i in range(data):
+            await sender.send({"index": i})
+        await sender.close()
+
+    def encode_response(self, output):
+        return output
+```
+
+- ``predict_decoupled(data, sender)`` 替代 ``predict``，接收解码后的输入和
+  ``ResponseSender``。
+- 调用 ``sender.send(payload)`` 推送 chunk；调用 ``sender.close()`` 结束流。
+- 方法立即返回——chunk 投递是异步的。
+
+只需实现 ``predict_decoupled`` 即可——会话由该方法自动检测并通过以下传输提供服务：
+
+| 传输 | 端点 |
+|------|------|
+| gRPC | `DecoupledInfer` RPC（挂 `features.grpc_streaming` 下） |
+| HTTP SSE | `POST /v2/models/{m}/decoupled`（含 `/versions/{v}/decoupled`） |
+| HTTP WebSocket | `GET /v2/models/{m}/decoupled-stream`（含 `/versions/{v}/decoupled-stream`） |
+
+空闲流在 `server.decoupled_idle_timeout_secs`（默认 300s）后回收。帧约定和传输
+细节见 [HTTP Decoupled 流式](http-decoupled.md)。
+
 ## 自定义指标
 
 从模型代码中采集应用级指标（Gauge、Counter、Histogram）。指标通过 Prometheus 端点 `/metrics` 自动暴露。
