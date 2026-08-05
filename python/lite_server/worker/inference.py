@@ -307,17 +307,28 @@ def _start_parent_watchpoint(log: logging.Logger, server_pid=None):
     return asyncio.create_task(_watch_parent())
 
 
-def _start_parent_watchpoint_sync(server_pid=None):
+def _start_parent_watchpoint_sync(log: logging.Logger, server_pid=None, stop_event=None):
     """Daemon-thread variant of :func:`_start_parent_watchpoint` for use with
     the synchronous CB loop.  Same semantics: compare *server_pid* against the
     live ``getppid()``; return a started daemon thread that exits the process
     if the parent ever changes.  See the async version for details on the
     *server_pid* contract.
+
+    *stop_event* is a test hook: when given, the 1 Hz tick waits on it and the
+    thread returns cleanly once set — letting tests ``join()`` the thread
+    before monkeypatch teardown restores the real ``os.getppid``/``os._exit``
+    (an unstoppable thread would fire the real ``os._exit`` in the middle of
+    the suite).  Production never passes it: the daemon thread dies with the
+    process.
     """
     parent_pid = os.getppid()
 
     if server_pid is not None:
         if parent_pid != server_pid:
+            log.warning(
+                "server pid %s but parent is %s; server died during worker init",
+                server_pid, parent_pid,
+            )
             os._exit(0)
     else:
         if parent_pid == 1:
@@ -325,8 +336,16 @@ def _start_parent_watchpoint_sync(server_pid=None):
 
     def _watch():
         while True:
-            time.sleep(1)
+            if stop_event is not None:
+                if stop_event.wait(1):
+                    return
+            else:
+                time.sleep(1)
             if os.getppid() != parent_pid:
+                log.warning(
+                    "parent (server) pid %s exited; worker self-terminating",
+                    parent_pid,
+                )
                 os._exit(0)
 
     t = threading.Thread(target=_watch, daemon=True)
@@ -540,7 +559,7 @@ def worker_main():
             log.info(f"Connected ZMQ PAIR to {args.endpoint}")
             # Start the parent watcher as a daemon thread (CB is sync ZMQ —
             # no asyncio event loop, so we can't use _start_parent_watchpoint).
-            _watcher_thread = _start_parent_watchpoint_sync(server_pid)
+            _watcher_thread = _start_parent_watchpoint_sync(log, server_pid)
             run_cb_loop(lit_api, socket, args.model_name, log)
         except KeyboardInterrupt:
             log.info("Interrupted, shutting down")

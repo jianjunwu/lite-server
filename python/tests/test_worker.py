@@ -3436,15 +3436,39 @@ class TestParentWatchpointSync:
         monkeypatch.setattr(os, "_exit", fake_exit)
         return sig, codes
 
+    @pytest.fixture
+    def watcher_factory(self, monkeypatch):
+        """Start a sync watcher whose thread is guaranteed to stop BEFORE
+        monkeypatch teardown.  Without the stop_event the infinite-loop
+        thread outlives the test; once the real ``os.getppid``/``os._exit``
+        are restored its next tick sees the real ppid (≠ the stubbed one)
+        and fires the real ``os._exit(0)``, killing pytest with exit code 0.
+        Depending on monkeypatch makes this fixture tear down first."""
+        stop = threading.Event()
+        threads = []
+
+        def make(**kw):
+            t = inference._start_parent_watchpoint_sync(
+                logging.getLogger("t"), stop_event=stop, **kw,
+            )
+            threads.append(t)
+            return t
+
+        yield make
+
+        stop.set()
+        for t in threads:
+            t.join(timeout=2)
+
     # ── tests ────────────────────────────────────────────────────────────
 
-    def test_container_server_is_pid_1_no_false_positive(self, monkeypatch):
+    def test_container_server_is_pid_1_no_false_positive(self, monkeypatch, watcher_factory):
         """Container: server IS pid 1 → ppid==1 is normal, no suicide."""
         self._install_getppid_stub(monkeypatch, 1)
         exited = []
         monkeypatch.setattr(os, "_exit", lambda code=0: exited.append(code))
 
-        t = inference._start_parent_watchpoint_sync(server_pid=1)
+        t = watcher_factory(server_pid=1)
         assert t is not None
         assert t.is_alive()
         assert exited == [], (
@@ -3457,16 +3481,16 @@ class TestParentWatchpointSync:
         _ExitSignal, codes = self._install_exit_stub(monkeypatch)
 
         with pytest.raises(_ExitSignal):
-            inference._start_parent_watchpoint_sync(server_pid=42)
+            inference._start_parent_watchpoint_sync(logging.getLogger("t"), server_pid=42)
         assert codes == [0]
 
-    def test_server_pid_match_starts_watcher(self, monkeypatch):
+    def test_server_pid_match_starts_watcher(self, monkeypatch, watcher_factory):
         """server_pid == ppid → daemon watcher thread started, no exit."""
         self._install_getppid_stub(monkeypatch, 42)
         exited = []
         monkeypatch.setattr(os, "_exit", lambda code=0: exited.append(code))
 
-        t = inference._start_parent_watchpoint_sync(server_pid=42)
+        t = watcher_factory(server_pid=42)
         assert t is not None
         assert t.is_alive()
         assert exited == []
@@ -3477,16 +3501,16 @@ class TestParentWatchpointSync:
         _ExitSignal, codes = self._install_exit_stub(monkeypatch)
 
         with pytest.raises(_ExitSignal):
-            inference._start_parent_watchpoint_sync()
+            inference._start_parent_watchpoint_sync(logging.getLogger("t"))
         assert codes == [0]
 
-    def test_legacy_no_server_pid_ppid_not_1_starts_watcher(self, monkeypatch):
+    def test_legacy_no_server_pid_ppid_not_1_starts_watcher(self, monkeypatch, watcher_factory):
         """Backward compat: no server_pid + ppid≠1 → watcher started."""
         self._install_getppid_stub(monkeypatch, 42)
         exited = []
         monkeypatch.setattr(os, "_exit", lambda code=0: exited.append(code))
 
-        t = inference._start_parent_watchpoint_sync()
+        t = watcher_factory()
         assert t is not None
         assert t.is_alive()
         assert exited == []
