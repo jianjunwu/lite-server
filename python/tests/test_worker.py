@@ -3318,42 +3318,175 @@ class TestParentWatchpoint:
     in production (no LITESERVER_DIE_WITH_PARENT). Covers the two branches of
     ``_start_parent_watchpoint``."""
 
-    def test_exits_immediately_when_already_orphaned(self, monkeypatch):
-        """B3: server died during fork→exec→watcher-startup (ppid already 1).
-        The worker must os._exit now — a watcher's ``1 != 1`` predicate would
-        never fire, orphaning it forever."""
+    # ── helpers ──────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _install_getppid_stub(monkeypatch, ppid):
+        """Make ``os.getppid()`` return *ppid*."""
+        monkeypatch.setattr(os, "getppid", lambda: ppid)
+
+    @staticmethod
+    def _install_exit_stub(monkeypatch):
+        """Replace ``os._exit`` with a spy that records the exit code and
+        raises ``_ExitSignal`` so the call site is interrupted."""
         class _ExitSignal(BaseException):
             pass
 
-        exit_codes = []
-
+        codes = []
         def fake_exit(code=0):
-            exit_codes.append(code)
+            codes.append(code)
             raise _ExitSignal
 
-        monkeypatch.setattr(os, "getppid", lambda: 1)
         monkeypatch.setattr(os, "_exit", fake_exit)
+        return _ExitSignal, codes
+
+    @staticmethod
+    async def _run_watcher_and_cancel(server_pid):
+        """Call ``_start_parent_watchpoint`` with an explicit *server_pid*,
+        cancel the returned task, and await it to avoid warnings."""
+        t = inference._start_parent_watchpoint(
+            logging.getLogger("t"), server_pid=server_pid,
+        )
+        assert t is not None
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+
+    # ── legacy backward-compat: no server_pid ────────────────────────────
+
+    def test_legacy_no_server_pid_ppid_1_exits(self, monkeypatch):
+        """Without *server_pid*, the old heuristic is preserved:
+        ppid == 1 is treated as orphaned → immediate exit."""
+        self._install_getppid_stub(monkeypatch, 1)
+        _ExitSignal, codes = self._install_exit_stub(monkeypatch)
 
         with pytest.raises(_ExitSignal):
             inference._start_parent_watchpoint(logging.getLogger("test"))
-        assert exit_codes == [0]
+        assert codes == [0]
 
-    def test_installs_watcher_when_parent_alive(self, monkeypatch):
-        """Non-orphaned startup installs the 1Hz watcher task and does not exit."""
-
+    def test_legacy_no_server_pid_ppid_not_1_installs_watcher(self, monkeypatch):
+        """Without *server_pid*, ppid != 1 installs the watcher."""
+        self._install_getppid_stub(monkeypatch, 4242)
         exited = []
-        monkeypatch.setattr(os, "getppid", lambda: 4242)
         monkeypatch.setattr(os, "_exit", lambda code=0: exited.append(code))
 
-        async def _run():
-            task = inference._start_parent_watchpoint(logging.getLogger("t"))
-            assert task is not None
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        asyncio.run(self._run_watcher_and_cancel(server_pid=None))
+        assert exited == []
 
-        asyncio.run(_run())
+    # ── precise (server_pid is set) ──────────────────────────────────────
+
+    def test_container_server_is_pid_1_no_false_positive(self, monkeypatch):
+        """Container scenario: the server IS pid 1, so ppid == 1 is *normal*.
+        The watcher must install, NOT exit."""
+        self._install_getppid_stub(monkeypatch, 1)
+        exited = []
+        monkeypatch.setattr(os, "_exit", lambda code=0: exited.append(code))
+
+        asyncio.run(self._run_watcher_and_cancel(server_pid=1))
+        assert exited == [], (
+            "ppid==1 must NOT trigger suicide when server_pid==1 (container)"
+        )
+
+    def test_server_pid_match_installs_watcher(self, monkeypatch):
+        """When ppid matches server_pid, the watcher is installed."""
+        self._install_getppid_stub(monkeypatch, 42)
+        exited = []
+        monkeypatch.setattr(os, "_exit", lambda code=0: exited.append(code))
+
+        asyncio.run(self._run_watcher_and_cancel(server_pid=42))
+        assert exited == []
+
+    def test_server_pid_mismatch_exits_immediately(self, monkeypatch):
+        """server_pid != ppid → server died during worker init; suicide."""
+        self._install_getppid_stub(monkeypatch, 1)
+        _ExitSignal, codes = self._install_exit_stub(monkeypatch)
+
+        with pytest.raises(_ExitSignal):
+            inference._start_parent_watchpoint(
+                logging.getLogger("test"), server_pid=42,
+            )
+        assert codes == [0]
+
+
+class TestParentWatchpointSync:
+    """Sync (daemon-thread) parent watcher for the CB loop path.
+    Same logic as ``_start_parent_watchpoint`` but returns a started
+    daemon thread instead of an asyncio task."""
+
+    # ── helpers ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _install_getppid_stub(monkeypatch, ppid):
+        monkeypatch.setattr(os, "getppid", lambda: ppid)
+
+    class _ExitSignal(BaseException):
+        pass
+
+    @classmethod
+    def _install_exit_stub(cls, monkeypatch):
+        codes = []
+        sig = cls._ExitSignal
+
+        def fake_exit(code=0):
+            codes.append(code)
+            raise sig
+
+        monkeypatch.setattr(os, "_exit", fake_exit)
+        return sig, codes
+
+    # ── tests ────────────────────────────────────────────────────────────
+
+    def test_container_server_is_pid_1_no_false_positive(self, monkeypatch):
+        """Container: server IS pid 1 → ppid==1 is normal, no suicide."""
+        self._install_getppid_stub(monkeypatch, 1)
+        exited = []
+        monkeypatch.setattr(os, "_exit", lambda code=0: exited.append(code))
+
+        t = inference._start_parent_watchpoint_sync(server_pid=1)
+        assert t is not None
+        assert t.is_alive()
+        assert exited == [], (
+            "ppid==1 must NOT trigger suicide when server_pid==1"
+        )
+
+    def test_server_pid_mismatch_exits_immediately(self, monkeypatch):
+        """server_pid != ppid → server died during init; immediate exit."""
+        self._install_getppid_stub(monkeypatch, 1)
+        _ExitSignal, codes = self._install_exit_stub(monkeypatch)
+
+        with pytest.raises(_ExitSignal):
+            inference._start_parent_watchpoint_sync(server_pid=42)
+        assert codes == [0]
+
+    def test_server_pid_match_starts_watcher(self, monkeypatch):
+        """server_pid == ppid → daemon watcher thread started, no exit."""
+        self._install_getppid_stub(monkeypatch, 42)
+        exited = []
+        monkeypatch.setattr(os, "_exit", lambda code=0: exited.append(code))
+
+        t = inference._start_parent_watchpoint_sync(server_pid=42)
+        assert t is not None
+        assert t.is_alive()
+        assert exited == []
+
+    def test_legacy_no_server_pid_ppid_1_exits(self, monkeypatch):
+        """Backward compat: no server_pid + ppid==1 → legacy heuristic exit."""
+        self._install_getppid_stub(monkeypatch, 1)
+        _ExitSignal, codes = self._install_exit_stub(monkeypatch)
+
+        with pytest.raises(_ExitSignal):
+            inference._start_parent_watchpoint_sync()
+        assert codes == [0]
+
+    def test_legacy_no_server_pid_ppid_not_1_starts_watcher(self, monkeypatch):
+        """Backward compat: no server_pid + ppid≠1 → watcher started."""
+        self._install_getppid_stub(monkeypatch, 42)
+        exited = []
+        monkeypatch.setattr(os, "_exit", lambda code=0: exited.append(code))
+
+        t = inference._start_parent_watchpoint_sync()
+        assert t is not None
+        assert t.is_alive()
         assert exited == []

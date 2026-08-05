@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 import traceback
 from contextlib import contextmanager
@@ -251,7 +252,7 @@ def load_litapi(model_py_path: str, config: dict, device: str = "cpu"):
     return instance
 
 
-def _start_parent_watchpoint(log: logging.Logger):
+def _start_parent_watchpoint(log: logging.Logger, server_pid=None):
     """Best-effort 1Hz self-terminate if our parent (the server) dies.
 
     Production-default (was test-only, gated by LITESERVER_DIE_WITH_PARENT).
@@ -261,13 +262,37 @@ def _start_parent_watchpoint(log: logging.Logger):
     Best-effort 1Hz — inference must yield to the asyncio loop for the tick to
     fire. Returns the watcher task (caller holds the strong ref) or exits the
     process immediately if already orphaned at startup.
+
+    *server_pid* is the pid of the server process captured when ``worker_main``
+    first runs — before any model loading or I/O that could delay execution.
+    Two outcomes are possible at this point:
+
+    * **Match** — the current ppid still equals *server_pid*: the server is
+      alive; install a 1 Hz watcher that exits the worker if the ppid ever
+      changes.
+    * **Mismatch** — the ppid already differs from *server_pid* (e.g. the OS
+      reparented us to init 1): the server died during worker init; exit
+      immediately so we don't orphan.
+
+    When *server_pid* is ``None`` (legacy callers / tests) the old heuristic
+    is preserved: ppid == 1 is assumed to mean orphaned.  Production code
+    always sets *server_pid* explicitly, which fixes a false positive when
+    lite-server itself is pid 1 inside a container.
     """
     parent_pid = os.getppid()
-    if parent_pid == 1:
-        # Server died during fork→exec→watcher-startup; we are already reparented
-        # to init. Mirror src/server/mod.rs:766 (immediate-fire) or this worker
-        # orphans forever.
-        os._exit(0)
+
+    if server_pid is not None:
+        # Precise check: bail out only if the ppid already changed.
+        if parent_pid != server_pid:
+            log.warning(
+                "server pid %s but parent is %s; server died during worker init",
+                server_pid, parent_pid,
+            )
+            os._exit(0)
+    else:
+        # Legacy heuristic (no server_pid captured) — kept for back-compat.
+        if parent_pid == 1:
+            os._exit(0)
 
     async def _watch_parent():
         while True:
@@ -282,7 +307,34 @@ def _start_parent_watchpoint(log: logging.Logger):
     return asyncio.create_task(_watch_parent())
 
 
-async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.Logger):
+def _start_parent_watchpoint_sync(server_pid=None):
+    """Daemon-thread variant of :func:`_start_parent_watchpoint` for use with
+    the synchronous CB loop.  Same semantics: compare *server_pid* against the
+    live ``getppid()``; return a started daemon thread that exits the process
+    if the parent ever changes.  See the async version for details on the
+    *server_pid* contract.
+    """
+    parent_pid = os.getppid()
+
+    if server_pid is not None:
+        if parent_pid != server_pid:
+            os._exit(0)
+    else:
+        if parent_pid == 1:
+            os._exit(0)
+
+    def _watch():
+        while True:
+            time.sleep(1)
+            if os.getppid() != parent_pid:
+                os._exit(0)
+
+    t = threading.Thread(target=_watch, daemon=True)
+    t.start()
+    return t
+
+
+async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.Logger, server_pid=None):
     """Handle single + batch + stream requests asynchronously."""
     pending_tasks: dict[str, asyncio.Task] = {}
     active_streams: dict[str, asyncio.Task] = {}
@@ -290,7 +342,7 @@ async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.
     # Self-terminate if the server (our parent) dies — including SIGKILL, which
     # the server's own watchdog can't catch. Production-default (was test-only).
     # Hold a strong reference so the watcher task isn't garbage-collected.
-    _parent_watcher = _start_parent_watchpoint(log)
+    _parent_watcher = _start_parent_watchpoint(log, server_pid=server_pid)
 
     cancelled = False
     try:
@@ -428,6 +480,14 @@ def _run_teardown(lit_api, log):
 
 
 def worker_main():
+    # Capture the server pid *before* anything else — model loading may take
+    # many seconds and the server could die in that window.  When we reach
+    # _start_parent_watchpoint we compare the live ppid against this snapshot
+    # to decide whether we were orphaned during init.  Using a snapshot also
+    # fixes the ppid==1 false-positive when lite-server itself is pid 1 in a
+    # container (docker commit / docker run without --init).
+    server_pid = os.getppid()
+
     import zmq
 
     args = parse_args()
@@ -478,6 +538,9 @@ def worker_main():
             # doesn't out-wait its sndtimeo racing a not-yet-connected peer.
             print(ready_payload, flush=True)
             log.info(f"Connected ZMQ PAIR to {args.endpoint}")
+            # Start the parent watcher as a daemon thread (CB is sync ZMQ —
+            # no asyncio event loop, so we can't use _start_parent_watchpoint).
+            _watcher_thread = _start_parent_watchpoint_sync(server_pid)
             run_cb_loop(lit_api, socket, args.model_name, log)
         except KeyboardInterrupt:
             log.info("Interrupted, shutting down")
@@ -496,7 +559,7 @@ def worker_main():
             # See above: ready follows connect, never precedes it.
             print(ready_payload, flush=True)
             log.info(f"Connected async ZMQ PAIR to {args.endpoint}")
-            asyncio.run(run_async_loop(lit_api, async_socket, args.model_name, log))
+            asyncio.run(run_async_loop(lit_api, async_socket, args.model_name, log, server_pid=server_pid))
         except KeyboardInterrupt:
             log.info("Interrupted, shutting down")
         finally:
