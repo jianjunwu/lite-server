@@ -14,6 +14,7 @@ use axum::{
 };
 use axum::extract::ws::{Message, WebSocket};
 use axum::response::sse::{Event, Sse};
+use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -353,6 +354,18 @@ pub async fn ws_stream_version_handler(
     ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), headers, socket, cx))
 }
 
+/// Detect a WS bidi app-level close control frame: `{"type":"close"}`.
+fn is_close_frame(text: &str) -> bool {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|v| {
+            v.get("type")
+                .and_then(|t| t.as_str())
+                .map(|s| s == "close")
+        })
+        .unwrap_or(false)
+}
+
 async fn handle_ws_stream(
     state: Arc<AppState>,
     model_name: String,
@@ -465,7 +478,7 @@ async fn handle_ws_stream(
     };
     let stream_idle = crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
 
-    let (stream_id, _worker_client, mut chunk_rx) = match open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await {
+    let (stream_id, worker_client, mut chunk_rx) = match open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes).await {
         Ok(r) => r,
         Err(e) => {
             let _ = socket.send(Message::Text(json!({"error": e.to_string()}).to_string())).await;
@@ -495,26 +508,90 @@ async fn handle_ws_stream(
         prometheus::record_stream_open(&model_name, &resolved_version, "websocket");
     }
 
-    // Clone before move so cancel can reference them after the task completes
-    let model_name_owned = model_name.clone();
-    let version_owned = resolved_version.clone();
+    // Split socket for independent read/write halves (bidi).
+    let (mut ws_sink, mut ws_stream) = socket.split();
 
-    // Spawn task to forward worker chunks -> WebSocket
+    // gone_tx: carries an optional error message from the reader to the writer.
+    // None = no signal (writer keeps running); Some("") = client disconnect
+    // (writer breaks); Some("msg") = protocol error (writer sends msg then breaks).
+    // The main task holds the primary sender so the watch channel stays alive
+    // after the reader exits (preventing spurious wake-ups on drop).
+    let (gone_tx, mut gone_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+    let gone_tx_reader = gone_tx.clone();
+
+    // Reader task: C→S frames. Forwards binary chunks and close to worker.
+    // Exits silently on app-level close (writer keeps going); signals gone on
+    // hard disconnect so the writer can terminate promptly.
+    let reader_stream_id = stream_id.clone();
+    let reader_client = Arc::clone(&worker_client);
+    let reader = tokio::spawn(async move {
+        while let Some(msg) = ws_stream.next().await {
+            match msg {
+                Ok(Message::Binary(bin)) => {
+                    let chunk_req = streaming::build_stream_chunk(
+                        reader_stream_id.clone(),
+                        bytes::Bytes::from(bin),
+                    );
+                    let _ = reader_client.send_raw(chunk_req).await;
+                }
+                Ok(Message::Text(t)) if is_close_frame(&t) => {
+                    let close_req =
+                        streaming::build_stream_close(reader_stream_id.clone());
+                    let _ = reader_client.send_raw(close_req).await;
+                    return; // graceful: don't signal gone, writer continues
+                }
+                Ok(Message::Close(_)) | Err(_) => {
+                    // Client disconnect → signal writer to terminate.
+                    let _ = gone_tx_reader.send(Some(String::new()));
+                    break;
+                }
+                Ok(Message::Text(_)) => {
+                    // Unknown control frame → protocol error.
+                    let _ = gone_tx_reader.send(Some("unknown control frame".to_string()));
+                    break;
+                }
+                _ => {} // Ping/Pong ignored
+            }
+        }
+    });
+
+    // Clone before move so cancel can reference them after the tasks complete.
+    let stream_id_for_writer = stream_id.clone();
+    let cancel_client = Arc::clone(&worker_client);
+
+    // Writer task: S→C. Forwards worker chunks to the WebSocket, with early
+    // termination via gone_rx when the client disconnects. Closes ws_sink on
+    // exit so the main task doesn't need to hold a reference.
     let send_task = tokio::spawn(async move {
         let open_time = std::time::Instant::now();
         let mut first_chunk = true;
         let mut last_chunk_time = open_time;
 
         loop {
-            let chunk = match streaming::recv_chunk(&mut chunk_rx, stream_deadline, stream_idle)
-                .await
-            {
+            let chunk = tokio::select! {
+                c = streaming::recv_chunk(&mut chunk_rx, stream_deadline, stream_idle) => c,
+                _ = gone_rx.changed() => {
+                    // Reader signalled: send error (if any) to client, then break.
+                    let err_msg = match &*gone_rx.borrow() {
+                        Some(msg) if !msg.is_empty() => Some(msg.clone()),
+                        _ => None,
+                    };
+                    drop(gone_rx.borrow());
+                    if let Some(msg) = err_msg {
+                        let _ = ws_sink.send(Message::Text(
+                            json!({"error": msg}).to_string(),
+                        )).await;
+                    }
+                    break;
+                }
+            };
+            let chunk = match chunk {
                 Ok(Some(c)) => c,
                 Ok(None) => break, // worker closed the stream
                 Err(elapsed) => {
                     // P-DEADLINE (§4.0.4): overall deadline or chunk-idle fired.
                     tracing::warn!(
-                        ?elapsed, stream_id = %stream_id,
+                        ?elapsed, stream_id = %stream_id_for_writer,
                         "websocket stream closed: deadline/idle elapsed"
                     );
                     break;
@@ -554,31 +631,44 @@ async fn handle_ws_stream(
                 }
                 _ => continue,
             };
-            if socket.send(msg).await.is_err() {
+            if ws_sink.send(msg).await.is_err() {
                 break;
             }
             if matches!(chunk.payload, Some(pb::stream_response::Payload::Done(_))) {
-                let _ = socket.close().await;
                 break;
             }
         }
         if stream_metrics {
             prometheus::record_stream_close(&model_name, &resolved_version, "websocket");
         }
-        stream_id
+        // Close the sink gracefully (moved here so main doesn't need ws_sink).
+        let _ = ws_sink.close().await;
+        // drop(gone_rx) is implicit when the closure exits
+        stream_id_for_writer
     }
     .instrument(span.clone()));
 
-    // For now, we don't handle bidirectional streaming over WebSocket
-    // Just wait for the send task to complete
+    // Wait for the writer task to complete (terminal frame or error).
     let completed_stream_id = match send_task.await {
         Ok(sid) => sid,
-        Err(_) => return,
+        Err(_) => {
+            // Writer panicked — still clean up the reader and worker.
+            drop(gone_tx);
+            let cancel_req = streaming::build_stream_cancel(stream_id);
+            let _ = worker_client.send_raw(cancel_req).await;
+            streaming::observe_or_abort(reader).await;
+            return;
+        }
     };
 
-    // Send cancel to clean up
+    drop(gone_tx);
+
+    // Targeted cancel (replaces broadcast open_worker_stream_cancel).
     let cancel_req = streaming::build_stream_cancel(completed_stream_id);
-    open_worker_stream_cancel(&state, &model_name_owned, &version_owned, cancel_req).await;
+    let _ = cancel_client.send_raw(cancel_req).await;
+
+    // Observe reader task for panics.
+    streaming::observe_or_abort(reader).await;
 }
 
 #[cfg(test)]

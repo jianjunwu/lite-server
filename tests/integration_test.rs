@@ -2102,6 +2102,152 @@ async fn test_websocket_streaming() {
     unload_model(&base, MODEL, "1").await;
 }
 
+/// WS bidi: client sends first Text frame + 2 Binary frames; the bidi reader
+/// forwards them to the worker as chunks, and the stream completes normally.
+#[tokio::test]
+#[serial]
+async fn test_ws_bidi_binary_forwarding() {
+    use futures::StreamExt;
+    use futures::SinkExt;
+    use tokio_tungstenite::connect_async;
+
+    let base = shared_base().await;
+    load_model(&base, MODEL, "1").await;
+
+    let ws_url = format!("ws://127.0.0.1:{}/v2/models/{}/stream", SHARED_PORT, MODEL);
+    let (mut ws, _) = connect_async(&ws_url).await.expect("WS connect failed");
+
+    // First frame: JSON payload (legacy).
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&json!({"input": 1})).unwrap(),
+    )).await.expect("WS send first frame failed");
+
+    // Two additional Binary frames (bidi).
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![1, 2, 3]))
+        .await.expect("WS send binary 1 failed");
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![4, 5, 6]))
+        .await.expect("WS send binary 2 failed");
+
+    // Collect messages until done/error or timeout.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut got_terminal = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+            Ok(Some(Ok(msg))) => {
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+                    let body: Value = serde_json::from_str(&text).unwrap_or(json!({}));
+                    if body.get("done").is_some() || body.get("error").is_some() {
+                        got_terminal = true;
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(got_terminal, "WS bidi: expected terminal frame after binary chunks");
+    let _ = ws.close(None).await;
+
+    unload_model(&base, MODEL, "1").await;
+}
+
+/// WS bidi: app-level `{"type":"close"}` gracefully ends the input side;
+/// the output side continues and the terminal Done frame still arrives.
+#[tokio::test]
+#[serial]
+async fn test_ws_bidi_app_level_close() {
+    use futures::StreamExt;
+    use futures::SinkExt;
+    use tokio_tungstenite::connect_async;
+
+    let base = shared_base().await;
+    load_model(&base, MODEL, "1").await;
+
+    let ws_url = format!("ws://127.0.0.1:{}/v2/models/{}/stream", SHARED_PORT, MODEL);
+    let (mut ws, _) = connect_async(&ws_url).await.expect("WS connect failed");
+
+    // First frame: JSON payload.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&json!({"input": 2})).unwrap(),
+    )).await.expect("WS send first frame failed");
+
+    // App-level close frame.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"type":"close"}"#.to_string(),
+    )).await.expect("WS send close frame failed");
+
+    // Collect messages until done/error or timeout.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut got_terminal = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+            Ok(Some(Ok(msg))) => {
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+                    let body: Value = serde_json::from_str(&text).unwrap_or(json!({}));
+                    if body.get("done").is_some() || body.get("error").is_some() {
+                        got_terminal = true;
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(got_terminal, "WS bidi close: expected terminal frame after app-level close");
+    let _ = ws.close(None).await;
+
+    unload_model(&base, MODEL, "1").await;
+}
+
+/// WS bidi: an unknown Text control frame after the first frame triggers a
+/// protocol error — the server sends `{"error":"unknown control frame"}` and
+/// closes the connection.
+#[tokio::test]
+#[serial]
+async fn test_ws_bidi_unknown_control_frame() {
+    use futures::StreamExt;
+    use futures::SinkExt;
+    use tokio_tungstenite::connect_async;
+
+    let base = shared_base().await;
+    load_model(&base, MODEL, "1").await;
+
+    let ws_url = format!("ws://127.0.0.1:{}/v2/models/{}/stream", SHARED_PORT, MODEL);
+    let (mut ws, _) = connect_async(&ws_url).await.expect("WS connect failed");
+
+    // First frame: JSON payload.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&json!({"input": 3})).unwrap(),
+    )).await.expect("WS send first frame failed");
+
+    // Unknown control frame.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"type":"unknown_cmd"}"#.to_string(),
+    )).await.expect("WS send unknown frame failed");
+
+    // Collect until error or timeout.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut got_error = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+            Ok(Some(Ok(msg))) => {
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+                    let body: Value = serde_json::from_str(&text).unwrap_or(json!({}));
+                    if body.get("error").is_some() {
+                        got_error = true;
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(got_error, "WS bidi: expected error frame after unknown control frame");
+    let _ = ws.close(None).await;
+
+    unload_model(&base, MODEL, "1").await;
+}
+
 // ---------------------------------------------------------------------------
 // Metrics
 // ---------------------------------------------------------------------------
