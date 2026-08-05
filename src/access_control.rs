@@ -41,7 +41,7 @@ impl EndpointClass {
 fn protocol_axis(protocol: Protocol) -> ProtocolAxis {
     match protocol {
         Protocol::Grpc => ProtocolAxis::Grpc,
-        Protocol::Http | Protocol::Sse | Protocol::WebSocket => ProtocolAxis::Http,
+        Protocol::Http | Protocol::Sse | Protocol::WebSocket | Protocol::Http2 => ProtocolAxis::Http,
     }
 }
 

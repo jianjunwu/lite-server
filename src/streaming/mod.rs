@@ -1,3 +1,5 @@
+pub mod lpm;
+
 use crate::proto::liteserver as pb;
 use std::time::Duration;
 use tracing::warn;

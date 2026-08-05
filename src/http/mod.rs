@@ -289,7 +289,7 @@ impl tower_http::compression::predicate::Predicate for NotEventStream {
             .headers()
             .get(http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .map(|ct| !ct.starts_with("text/event-stream"))
+            .map(|ct| !ct.starts_with("text/event-stream") && !ct.starts_with("application/x-lite-bidi"))
             .unwrap_or(true)
     }
 }

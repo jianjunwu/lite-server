@@ -278,6 +278,9 @@ message BidiChunk {
     BidiOpen open = 2;
     BidiData data = 3;
     BidiClose close = 4;
+    // h2 bidi: worker Error is delivered as an in-band error frame (h2 has no
+    // trailing status). Additive — gRPC/ZMQ wire backward-compatible.
+    BidiError error = 5;
   }
 }
 
@@ -299,6 +302,12 @@ message BidiData {
 }
 
 message BidiClose {
+}
+
+message BidiError {
+  string message = 1;
+  // Structured error type (aligns with model_error_status type field).
+  string error_type = 2;
 }
 
 // P9-1 DecoupledInfer (蓝图 §4.4). gRPC-only messages — the worker never sees

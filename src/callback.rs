@@ -37,6 +37,7 @@ pub enum Protocol {
     Grpc,
     Sse,
     WebSocket,
+    Http2,
 }
 
 impl std::fmt::Display for Protocol {
@@ -46,6 +47,7 @@ impl std::fmt::Display for Protocol {
             Protocol::Grpc => write!(f, "grpc"),
             Protocol::Sse => write!(f, "sse"),
             Protocol::WebSocket => write!(f, "ws"),
+            Protocol::Http2 => write!(f, "http2"),
         }
     }
 }

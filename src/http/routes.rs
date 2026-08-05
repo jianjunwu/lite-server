@@ -25,8 +25,8 @@ pub(crate) fn access_log_target(path: &str) -> Option<(&str, Option<&str>)> {
     let segs: Vec<&str> = segs.collect();
     match segs.as_slice() {
         [] => None,
-        ["infer" | "events" | "stream"] => Some((model, None)),
-        ["versions", v, "infer" | "events" | "stream"] if !v.is_empty() => Some((model, Some(v))),
+        ["infer" | "events" | "stream" | "bidi"] => Some((model, None)),
+        ["versions", v, "infer" | "events" | "stream" | "bidi"] if !v.is_empty() => Some((model, Some(v))),
         ["versions", ..] => None,
         // B1 audit fix: bare `reload` is a registered state-changing ADMIN route
         // (POST /v2/models/:m/reload → reload_model_handler, no enforce_auth).
@@ -173,6 +173,12 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
         router = router
             .route("/v2/models/:model_name/stream", get(ws_stream_handler))
             .route("/v2/models/:model_name/versions/:version/stream", get(ws_stream_version_handler));
+    }
+    // D3: h2 bidi endpoints — gated on streaming + http_bidi (default true).
+    if features.streaming && features.http_bidi {
+        router = router
+            .route("/v2/models/:model_name/bidi", post(h2_bidi_handler))
+            .route("/v2/models/:model_name/versions/:version/bidi", post(h2_bidi_version_handler));
     }
     // Custom @route dispatch (phase 2) is handled by the fallback handler
     // (see http::route_fallback): exact system leaves above are matched by

@@ -79,6 +79,8 @@ pub mod custom_routes;
 pub use custom_routes::*;
 pub mod stream;
 pub use stream::*;
+pub mod bidi;
+pub use bidi::*;
 pub mod files;
 pub use files::*;
 
