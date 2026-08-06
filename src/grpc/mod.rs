@@ -20,6 +20,7 @@ mod auth;
 mod canary;
 mod error;
 mod metadata;
+mod payload;
 mod reflection;
 mod rpc;
 
@@ -171,6 +172,9 @@ impl LiteServer for GrpcService {
             request.get_ref().version.clone()
         };
         let span_rid = metadata_request_id(request.metadata());
+        // FD-2: D11 body fields on the inference span (HTTP handler parity).
+        let body_bytes = request.get_ref().data.len() as i64;
+        let body_kind = crate::grpc::payload::body_kind_label(&request.get_ref().headers);
         let span = tracing::info_span!(
             "inference",
             model = %model_label,
@@ -178,6 +182,8 @@ impl LiteServer for GrpcService {
             request_id = %span_rid,
             // P5-2: canary pin 命中时由 canary_pin record（蓝图 §4.4）。
             pinned_version = tracing::field::Empty,
+            body_bytes,
+            body_kind,
         );
         // P-TRACE: link the inference span to the inbound trace (D21 — read the
         // interceptor-stashed RequestContext; no second propagator extract).
@@ -212,6 +218,9 @@ impl LiteServer for GrpcService {
             request.get_ref().version.clone()
         };
         let span_rid = metadata_request_id(request.metadata());
+        // FD-2: D11 body fields (batch body size = Σ items).
+        let body_bytes = request.get_ref().items.iter().map(|i| i.len()).sum::<usize>() as i64;
+        let body_kind = crate::grpc::payload::body_kind_label(&request.get_ref().headers);
         let span = tracing::info_span!(
             "inference",
             model = %model_label,
@@ -219,6 +228,8 @@ impl LiteServer for GrpcService {
             request_id = %span_rid,
             // P5-2: canary pin 命中时由 canary_pin record（蓝图 §4.4）。
             pinned_version = tracing::field::Empty,
+            body_bytes,
+            body_kind,
         );
         // P-TRACE: link the inference span to the inbound trace (D21 — read the
         // interceptor-stashed RequestContext; no second propagator extract).
@@ -263,6 +274,9 @@ impl LiteServer for GrpcService {
             request.get_ref().version.clone()
         };
         let span_rid = metadata_request_id(request.metadata());
+        // FD-2: D11 body fields on the inference span (HTTP handler parity).
+        let body_bytes = request.get_ref().data.len() as i64;
+        let body_kind = crate::grpc::payload::body_kind_label(&request.get_ref().headers);
         let span = tracing::info_span!(
             "inference",
             model = %model_label,
@@ -270,6 +284,8 @@ impl LiteServer for GrpcService {
             request_id = %span_rid,
             // P5-2: canary pin 命中时由 canary_pin record（蓝图 §4.4）。
             pinned_version = tracing::field::Empty,
+            body_bytes,
+            body_kind,
         );
         // P-TRACE: link the inference span to the inbound trace (D21 — read the
         // interceptor-stashed RequestContext; no second propagator extract).
@@ -320,6 +336,9 @@ impl LiteServer for GrpcService {
             request.get_ref().version.clone()
         };
         let span_rid = metadata_request_id(request.metadata());
+        // FD-2: D11 body fields on the inference span (HTTP handler parity).
+        let body_bytes = request.get_ref().data.len() as i64;
+        let body_kind = crate::grpc::payload::body_kind_label(&request.get_ref().headers);
         let span = tracing::info_span!(
             "inference",
             model = %model_label,
@@ -327,6 +346,8 @@ impl LiteServer for GrpcService {
             request_id = %span_rid,
             method = "decoupled_infer",
             pinned_version = tracing::field::Empty,
+            body_bytes,
+            body_kind,
         );
         // P-TRACE: link the inference span to the inbound trace (D21 — read the
         // interceptor-stashed RequestContext; no second propagator extract).
@@ -2027,7 +2048,8 @@ mod request_metrics_tests {
     //
     // bidi shares the identical fire_inference_request/response calls and
     // Done/Error arms — covered by stream/decoupled here + structural parity
-    // (constructing a tonic `Streaming<BidiChunk>` in a unit test is impractical).
+    // (bidi's own channel-level coverage uses `bidi_open_request`, see the
+    // FD-4 terminal-error test below).
 
     /// PAIR worker answering a stream Open with one Error frame — drives the
     /// response-on-error path.
@@ -2248,33 +2270,25 @@ mod request_metrics_tests {
         assert_eq!(cb.resp.load(std::sync::atomic::Ordering::Relaxed), 1, "Error frame fires response");
     }
 
-    /// FD-4 (audit 2026-08-06): a worker Error frame is TERMINAL on the gRPC
-    /// bidi path — the response channel must yield exactly one `Err(status)`
-    /// and nothing after it. tonic's encode layer stops polling the source
-    /// stream at the first `Err` item (codec/encode.rs), so a trailing
-    /// `Ok(BidiClose)` is unreachable dead code; observing the channel
-    /// directly fails while that dead send exists.
-    #[tokio::test]
-    async fn bidi_worker_error_yields_single_terminal_err() {
+    /// Build an in-process client bidi request stream carrying one
+    /// gRPC-framed BidiOpen (then EOF → the server's D4 close). tonic 0.13
+    /// exposes `Streaming::new_request`; the body is an axum Body over an
+    /// mpsc channel, so no real h2 transport is needed.
+    fn bidi_open_request(
+        model: &str,
+        version: &str,
+        initial_data: &'static [u8],
+        headers: HashMap<String, String>,
+    ) -> Request<Streaming<pb::BidiChunk>> {
         use bytes::BufMut;
-        use tokio_stream::StreamExt;
-
-        let model = "bidi_fd4_terminal";
-        let endpoint = metric_test_endpoint(model);
-        let _w = spawn_stream_error_worker(endpoint.clone());
-        let service = ready_service_with_worker(model, endpoint).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // In-process Streaming<BidiChunk>: one gRPC-framed BidiOpen, then EOF
-        // (the D4 close this triggers is harmless for the error worker).
         let open = pb::BidiChunk {
             stream_id: String::new(),
             payload: Some(pb::bidi_chunk::Payload::Open(pb::BidiOpen {
                 model_name: model.to_string(),
-                version: "1".to_string(),
-                initial_data: Bytes::from_static(b"{}"),
+                version: version.to_string(),
+                initial_data: Bytes::from_static(initial_data),
                 sequence_id: None,
-                ..Default::default()
+                headers,
             })),
         };
         let msg = open.encode_to_vec();
@@ -2283,7 +2297,7 @@ mod request_metrics_tests {
         framed.put_u32(msg.len() as u32);
         framed.extend_from_slice(&msg);
         let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
-        body_tx.send(Ok(framed.freeze())).await.expect("send open frame");
+        body_tx.try_send(Ok(framed.freeze())).expect("send open frame");
         drop(body_tx);
         let body = axum::body::Body::from_stream(ReceiverStream::new(body_rx));
         let mut codec = tonic::codec::ProstCodec::<pb::BidiChunk, pb::BidiChunk>::default();
@@ -2293,9 +2307,27 @@ mod request_metrics_tests {
             None,
             None,
         );
+        Request::new(streaming)
+    }
+
+    /// FD-4 (audit 2026-08-06): a worker Error frame is TERMINAL on the gRPC
+    /// bidi path — the response channel must yield exactly one `Err(status)`
+    /// and nothing after it. tonic's encode layer stops polling the source
+    /// stream at the first `Err` item (codec/encode.rs), so a trailing
+    /// `Ok(BidiClose)` is unreachable dead code; observing the channel
+    /// directly fails while that dead send exists.
+    #[tokio::test]
+    async fn bidi_worker_error_yields_single_terminal_err() {
+        use tokio_stream::StreamExt;
+
+        let model = "bidi_fd4_terminal";
+        let endpoint = metric_test_endpoint(model);
+        let _w = spawn_stream_error_worker(endpoint.clone());
+        let service = ready_service_with_worker(model, endpoint).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         let resp = service
-            .bidi_stream(Request::new(streaming))
+            .bidi_stream(bidi_open_request(model, "1", b"{}", HashMap::new()))
             .await
             .expect("bidi must open");
         let mut s = resp.into_inner();
@@ -2319,6 +2351,344 @@ mod request_metrics_tests {
         assert!(
             rest.is_empty(),
             "no frame may follow the terminal Err on the bidi channel, got {rest:?}"
+        );
+    }
+
+    // ===== FD-1 (audit 2026-08-06): gRPC gateway-side payload JSON =====
+    // validation — parity with HTTP ApiBody (D3) and h2 bidi B1. Malformed
+    // JSON under a JSON content-type must be rejected with InvalidArgument
+    // BEFORE any worker stream is opened; raw content-types pass through
+    // opaque; empty payloads skip validation (Python
+    // `_parse_request_json(b"")` → {}).
+
+    fn json_ct_headers() -> HashMap<String, String> {
+        let mut h = HashMap::new();
+        h.insert("content-type".to_string(), "application/json".to_string());
+        h
+    }
+
+    #[tokio::test]
+    async fn stream_infer_rejects_malformed_json_payload() {
+        let model = "fd1_stream_rej";
+        let endpoint = metric_test_endpoint(model);
+        // No worker thread: validation must fire before any ZMQ traffic.
+        let service = ready_service_with_worker(model, endpoint).await;
+        let err = service
+            .stream_infer(Request::new(pb::StreamInferRequest {
+                model_name: model.to_string(),
+                version: "1".to_string(),
+                data: Bytes::from_static(b"not-json{"),
+                headers: json_ct_headers(),
+                sequence_id: None,
+            }))
+            .await
+            .expect_err("malformed JSON must be rejected at the gateway");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn stream_infer_raw_content_type_bypasses_validation() {
+        use tokio_stream::StreamExt;
+        let model = "fd1_stream_raw";
+        let endpoint = metric_test_endpoint(model);
+        let _w = spawn_stream_worker(endpoint.clone());
+        let service = ready_service_with_worker(model, endpoint).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut headers = HashMap::new();
+        headers.insert(
+            "content-type".to_string(),
+            "application/octet-stream".to_string(),
+        );
+        let resp = service
+            .stream_infer(Request::new(pb::StreamInferRequest {
+                model_name: model.to_string(),
+                version: "1".to_string(),
+                data: Bytes::from_static(b"\x00\xff not json"),
+                headers,
+                sequence_id: None,
+            }))
+            .await
+            .expect("raw content-type must pass through opaque");
+        let mut s = resp.into_inner();
+        let first = tokio::time::timeout(Duration::from_secs(3), s.next())
+            .await
+            .expect("chunk within 3s")
+            .expect("stream yields a chunk");
+        assert!(first.is_ok(), "raw payload must reach the worker, got {first:?}");
+    }
+
+    #[tokio::test]
+    async fn decoupled_infer_rejects_malformed_json_payload() {
+        let model = "fd1_dec_rej";
+        let endpoint = metric_test_endpoint(model);
+        let service = ready_service_with_worker(model, endpoint).await;
+        let err = service
+            .decoupled_infer(Request::new(pb::DecoupledInferRequest {
+                model_name: model.to_string(),
+                version: "1".to_string(),
+                data: Bytes::from_static(b"not-json{"),
+                headers: json_ct_headers(),
+                sequence_id: None,
+            }))
+            .await
+            .expect_err("malformed JSON must be rejected at the gateway");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn bidi_stream_rejects_malformed_json_initial_data() {
+        let model = "fd1_bidi_rej";
+        let endpoint = metric_test_endpoint(model);
+        let service = ready_service_with_worker(model, endpoint).await;
+        let err = service
+            .bidi_stream(bidi_open_request(model, "1", b"not-json{", json_ct_headers()))
+            .await
+            .expect_err("malformed JSON initial_data must be rejected at the gateway");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn infer_rejects_malformed_json_payload() {
+        let model = "fd1_unary_rej";
+        let endpoint = metric_test_endpoint(model);
+        let service = ready_service_with_worker(model, endpoint).await;
+        let err = service
+            .infer(Request::new(pb::InferRequest {
+                model_name: model.to_string(),
+                version: "1".to_string(),
+                data: Bytes::from_static(b"not-json{"),
+                headers: json_ct_headers(),
+                sequence_id: None,
+            }))
+            .await
+            .expect_err("malformed JSON must be rejected at the gateway");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn infer_missing_content_type_defaults_to_json() {
+        let model = "fd1_unary_missing_ct";
+        let endpoint = metric_test_endpoint(model);
+        let service = ready_service_with_worker(model, endpoint).await;
+        let err = service
+            .infer(Request::new(pb::InferRequest {
+                model_name: model.to_string(),
+                version: "1".to_string(),
+                data: Bytes::from_static(b"not-json{"),
+                headers: HashMap::new(), // missing CT → JSON default (D2 parity)
+                sequence_id: None,
+            }))
+            .await
+            .expect_err("missing content-type defaults to JSON and must be validated");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn infer_empty_payload_skips_validation() {
+        let model = "fd1_unary_empty";
+        let endpoint = metric_test_endpoint(model);
+        let _w = spawn_ok_worker(endpoint.clone());
+        let service = ready_service_with_worker(model, endpoint).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let resp = service
+            .infer(Request::new(pb::InferRequest {
+                model_name: model.to_string(),
+                version: "1".to_string(),
+                data: Bytes::new(), // empty → skip (Python _parse_request_json(b"") → {})
+                headers: json_ct_headers(),
+                sequence_id: None,
+            }))
+            .await
+            .expect("empty payload must not be rejected");
+        assert_eq!(resp.get_ref().data.as_ref(), b"{\"ok\":true}");
+    }
+
+    // ===== FD-2 (audit 2026-08-06): gRPC inference spans must carry =====
+    // body_bytes / body_kind like every HTTP handler (D11). The wrappers set
+    // them as span-creation values (request.get_ref() is in scope), so the
+    // layer captures attributes in on_new_span.
+
+    struct SpanFieldVisitor(Vec<(String, String)>);
+    impl tracing::field::Visit for SpanFieldVisitor {
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push((field.name().to_string(), format!("{:?}", value)));
+        }
+    }
+    type SpanRecorded = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<(String, String)>)>>>;
+    struct SpanRecLayer(SpanRecorded);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SpanRecLayer {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut vis = SpanFieldVisitor(Vec::new());
+            attrs.record(&mut vis);
+            self.0
+                .lock()
+                .unwrap()
+                .push((attrs.metadata().name().to_string(), vis.0));
+        }
+    }
+
+    /// Run `f` on a dedicated thread with a span-recording dispatcher and
+    /// return the captured (span name, fields) pairs. Same double-dispatch
+    /// anti-poisoning trick as the HTTP D11 span tests.
+    fn with_span_recording<F: FnOnce() + Send + 'static>(
+        f: F,
+    ) -> Vec<(String, Vec<(String, String)>)> {
+        use tracing_subscriber::layer::SubscriberExt;
+        let recorded: SpanRecorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded_thread = recorded.clone();
+        let _anchor = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(SpanRecLayer(std::sync::Arc::new(
+                std::sync::Mutex::new(Vec::new()),
+            ))),
+        );
+        let recording = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(SpanRecLayer(recorded_thread)),
+        );
+        let handle = std::thread::spawn(move || {
+            let _guard = tracing::dispatcher::set_default(&recording);
+            f();
+        });
+        handle.join().expect("span test thread must not panic");
+        let recorded = recorded.lock().unwrap();
+        recorded.clone()
+    }
+
+    #[test]
+    fn grpc_wrapper_spans_record_body_fields() {
+        let spans = with_span_recording(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let service = build_service(
+                    Arc::new(ModelRegistry::new()),
+                    Arc::new(InferenceQueue::new()),
+                );
+                let mut h = HashMap::new();
+                h.insert(
+                    "content-type".to_string(),
+                    "application/octet-stream".to_string(),
+                );
+                // Each RPC fails inside its impl (model not found) — the
+                // wrapper span created before the impl is what we assert.
+                let _ = service
+                    .infer(Request::new(pb::InferRequest {
+                        model_name: "m".into(),
+                        version: "1".into(),
+                        data: Bytes::from_static(b"\x00\x01"),
+                        headers: h.clone(),
+                        sequence_id: None,
+                    }))
+                    .await;
+                let _ = service
+                    .stream_infer(Request::new(pb::StreamInferRequest {
+                        model_name: "m".into(),
+                        version: "1".into(),
+                        data: Bytes::from_static(b"\x00\x01"),
+                        headers: h.clone(),
+                        sequence_id: None,
+                    }))
+                    .await;
+                let _ = service
+                    .decoupled_infer(Request::new(pb::DecoupledInferRequest {
+                        model_name: "m".into(),
+                        version: "1".into(),
+                        data: Bytes::from_static(b"\x00\x01"),
+                        headers: h.clone(),
+                        sequence_id: None,
+                    }))
+                    .await;
+                let _ = service
+                    .batch_infer(Request::new(pb::BatchInferRequest {
+                        model_name: "m".into(),
+                        version: "1".into(),
+                        items: vec![
+                            Bytes::from_static(b"\x00\x01"),
+                            Bytes::from_static(b"\x02"),
+                        ],
+                        headers: h.clone(),
+                    }))
+                    .await;
+            });
+        });
+        let inference: Vec<_> = spans.iter().filter(|(n, _)| n == "inference").collect();
+        assert_eq!(
+            inference.len(),
+            4,
+            "4 RPC wrappers must each create an inference span: {spans:?}"
+        );
+        for (name, fields) in &inference {
+            assert!(
+                fields.iter().any(|(k, v)| k == "body_kind" && v == "raw"),
+                "{name} span must carry body_kind=raw (FD-2); got {fields:?}"
+            );
+        }
+        // unary/stream/decoupled: 2 bytes each; batch: Σ items = 3 bytes.
+        let body_bytes: Vec<String> = inference
+            .iter()
+            .map(|(_, f)| {
+                f.iter()
+                    .find(|(k, _)| k == "body_bytes")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| "missing".to_string())
+            })
+            .collect();
+        assert_eq!(
+            body_bytes,
+            vec!["2", "2", "2", "3"],
+            "body_bytes per RPC (FD-2): {inference:?}"
+        );
+    }
+
+    #[test]
+    fn bidi_span_records_body_fields() {
+        let spans = with_span_recording(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let model = "fd2_bidi_span";
+                let endpoint = metric_test_endpoint(model);
+                let service = ready_service_with_worker(model, endpoint).await;
+                let mut h = HashMap::new();
+                h.insert(
+                    "content-type".to_string(),
+                    "application/octet-stream".to_string(),
+                );
+                // No worker thread: the impl proceeds past span creation and
+                // stalls on the dead endpoint — bound it and move on.
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    service.bidi_stream(bidi_open_request(model, "1", b"\x00\xff", h)),
+                )
+                .await;
+            });
+        });
+        let inference = spans
+            .iter()
+            .find(|(n, _)| n == "inference")
+            .expect("bidi must create an inference span");
+        let fields = &inference.1;
+        assert!(
+            fields.iter().any(|(k, v)| k == "body_kind" && v == "raw"),
+            "bidi span must carry body_kind=raw (FD-2); got {fields:?}"
+        );
+        assert!(
+            fields.iter().any(|(k, v)| k == "body_bytes" && v == "2"),
+            "bidi span must carry body_bytes=2 (FD-2); got {fields:?}"
         );
     }
 

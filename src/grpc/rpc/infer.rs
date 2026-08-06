@@ -140,6 +140,11 @@ impl GrpcService {
             }
         }
 
+        // FD-1: gateway-side JSON validation (HTTP ApiBody D3 parity). The
+        // ensemble branch above is excluded on purpose — gRPC ensemble treats
+        // `data` as opaque bytes (B3/E6) and keeps that semantic.
+        crate::grpc::payload::validate_json_payload(&req.headers, &req.data).map_err(err)?;
+
         let mut header_map: HashMap<String, String> = req.headers.clone();
         // P-TRACE: inject the active inference span's trace context into the
         // worker RequestMeta.headers (overwrites any client-supplied traceparent

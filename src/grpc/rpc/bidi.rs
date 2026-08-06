@@ -126,18 +126,27 @@ impl GrpcService {
             None => return Err(err(Status::invalid_argument("empty stream"))),
         };
 
+        // FD-1: gateway-side JSON validation of BidiOpen.initial_data (HTTP
+        // h2 bidi B1 parity) — before any worker stream is opened. Dispatch
+        // reads BidiOpen.headers, the same map the worker sees.
+        crate::grpc::payload::validate_json_payload(&headers, &initial_data).map_err(err)?;
+
         *model_label = model_name.clone();
         *version_label = resolved_version.clone();
 
         // P2-3 span：覆盖 bidi handler 全程（model/version 在 Open 解码后已知）。
         // P5-2：pin 命中记 pinned_version（bidi span 在解析后才创建，无法走
         // canary_pin 内的 Span::current().record，在此补记）。
+        // FD-2: D11 body fields — initial_data/headers decoded above (HTTP
+        // handler parity); bidi has no wrapper-level span to carry them.
         let span = tracing::info_span!(
             "inference",
             model = %model_name,
             version = %resolved_version,
             request_id = %request_id,
             pinned_version = tracing::field::Empty,
+            body_bytes = initial_data.len() as i64,
+            body_kind = crate::grpc::payload::body_kind_label(&headers),
         );
         // P-TRACE: link the bidi inference span to the inbound trace (D21 single
         // extract — reuses the interceptor's RequestContext.trace_cx).

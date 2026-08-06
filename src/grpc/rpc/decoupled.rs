@@ -93,6 +93,11 @@ impl GrpcService {
             enforce_grpc_rate_limit(&self.rate_limiter, mv.policies.rate_limit.as_ref(), model_name, &client_ip)?;
         }
 
+        // FD-1: gateway-side JSON validation (HTTP ApiBody/B1 parity) —
+        // malformed JSON under a JSON content-type is rejected before a
+        // worker stream is opened; raw content-types pass through opaque.
+        crate::grpc::payload::validate_json_payload(&req.headers, &req.data).map_err(err)?;
+
         let mut header_map: HashMap<String, String> = req.headers.clone();
         // P-TRACE: inject the active inference span's trace context into the
         // worker RequestMeta.headers (overwrites any client-supplied traceparent
