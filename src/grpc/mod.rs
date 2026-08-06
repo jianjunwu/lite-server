@@ -1184,6 +1184,22 @@ mod request_metrics_tests {
         queue: Arc<InferenceQueue>,
         canary_override: bool,
     ) -> GrpcService {
+        build_service_full(
+            registry,
+            queue,
+            canary_override,
+            Duration::from_secs(5),
+            None,
+        )
+    }
+
+    fn build_service_full(
+        registry: Arc<ModelRegistry>,
+        queue: Arc<InferenceQueue>,
+        canary_override: bool,
+        server_timeout: Duration,
+        decoupled_idle_timeout: Option<Duration>,
+    ) -> GrpcService {
         let wm = Arc::new(WorkerManager::new(
             registry.clone(),
             std::env::temp_dir(),
@@ -1212,9 +1228,9 @@ mod request_metrics_tests {
             true,
             Arc::new(CallbackRunner::new()),
             Arc::new(crate::server::ShutdownState::new()),
-            Duration::from_secs(5),
+            server_timeout,
             Arc::new(crate::rate_limit::RateLimiter::default()),
-            None, // P9-1 decoupled idle timeout — unused in these unit tests.
+            decoupled_idle_timeout,
             app_state,
             Arc::new(Vec::new()), // P-XFF trusted — empty (fail-safe) in unit tests.
         )
@@ -2690,6 +2706,41 @@ mod request_metrics_tests {
             fields.iter().any(|(k, v)| k == "body_bytes" && v == "2"),
             "bidi span must carry body_bytes=2 (FD-2); got {fields:?}"
         );
+    }
+
+    /// FD-5 (audit 2026-08-06): with no client grpc-timeout and
+    /// server.timeout disabled, the wait for the first bidi message falls
+    /// back to the decoupled idle budget — a connected-but-silent client
+    /// cannot pin the handler forever. (Bounded-red: the outer timeout fails
+    /// this test in 2s while the wait is unbounded.)
+    #[tokio::test]
+    async fn bidi_first_message_wait_backstopped_by_decoupled_idle() {
+        let service = build_service_full(
+            Arc::new(ModelRegistry::new()),
+            Arc::new(InferenceQueue::new()),
+            false,
+            Duration::ZERO, // server.timeout disabled → no resolved deadline
+            Some(Duration::from_millis(50)),
+        );
+        // Client connects but never sends BidiOpen (sender held, no EOF).
+        let (_body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        let body = axum::body::Body::from_stream(ReceiverStream::new(body_rx));
+        let mut codec = tonic::codec::ProstCodec::<pb::BidiChunk, pb::BidiChunk>::default();
+        let streaming = tonic::Streaming::new_request(
+            tonic::codec::Codec::decoder(&mut codec),
+            body,
+            None,
+            None,
+        );
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            service.bidi_stream(Request::new(streaming)),
+        )
+        .await;
+        let err = res
+            .expect("RPC must return within the idle backstop")
+            .expect_err("first-message wait must be reclaimed");
+        assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
     }
 
     #[tokio::test]

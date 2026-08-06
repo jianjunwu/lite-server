@@ -54,9 +54,11 @@ impl GrpcService {
             crate::deadline::resolve_from_grpc(&grpc_metadata, self.server_timeout.as_secs_f32());
 
         // Wait for first message (must be BidiOpen). Bound the wait by the
-        // resolved deadline (server.timeout and/or client grpc-timeout); when no
-        // deadline is configured (server.timeout <= 0 and no client deadline) the
-        // wait stays unbounded, consistent with the documented P-DEADLINE semantics.
+        // resolved deadline (server.timeout and/or client grpc-timeout); when
+        // no deadline resolves, FD-5 falls back to the always-on decoupled
+        // idle budget so a connected-but-silent client cannot pin the handler
+        // forever. Only when the operator disabled BOTH budgets does the wait
+        // stay unbounded (documented P-DEADLINE semantics).
         let first = match crate::deadline::to_instant(deadline.unix_ns) {
             Some(instant) => match tokio::time::timeout_at(instant.into(), stream.message()).await {
                 Ok(res) => {
@@ -68,10 +70,22 @@ impl GrpcService {
                     )));
                 }
             },
-            None => stream
-                .message()
-                .await
-                .map_err(|e| err(Status::internal(format!("stream error: {}", e))))?,
+            None => match self.decoupled_idle_timeout {
+                Some(idle) => match tokio::time::timeout(idle, stream.message()).await {
+                    Ok(res) => {
+                        res.map_err(|e| err(Status::internal(format!("stream error: {}", e))))?
+                    }
+                    Err(_) => {
+                        return Err(err(Status::deadline_exceeded(
+                            "bidi stream did not send the opening message within the idle budget",
+                        )));
+                    }
+                },
+                None => stream
+                    .message()
+                    .await
+                    .map_err(|e| err(Status::internal(format!("stream error: {}", e))))?,
+            },
         };
 
         let (model_name, resolved_version, stream_id, initial_data, sequence_id, pin, headers) = match first {

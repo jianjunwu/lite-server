@@ -105,9 +105,14 @@ async fn h2_bidi_entry(
     // an idle budget from server.timeout. Returns the frame + buffered
     // remaining bytes + the body stream itself, which the incoming task keeps
     // reading for the rest of the session (bidi C→S direction).
+    // FD-5: when server.timeout is disabled (<=0), fall back to the always-on
+    // decoupled idle budget so a connected-but-silent client cannot pin the
+    // handler forever; only both budgets disabled leaves the wait unbounded.
+    let first_frame_idle = crate::deadline::idle_budget(state.config.server.timeout)
+        .or_else(|| crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs));
     let body_stream = request.into_body().into_data_stream();
     let (first_frame, remainder_buf, body_stream) =
-        read_first_lpm_frame(body_stream, state.config.server.timeout).await?;
+        read_first_lpm_frame(body_stream, first_frame_idle).await?;
 
     let initial_data = match &first_frame.payload {
         Some(pb::bidi_chunk::Payload::Open(open)) => open.initial_data.clone(),
@@ -437,20 +442,21 @@ async fn open_worker_stream_bidi(
     Ok((Arc::clone(client), chunk_rx))
 }
 
-/// Read the first LPM frame from a body data stream, bounded by an idle budget.
-/// Returns the decoded `BidiChunk`, a buffer of any remaining (unconsumed)
-/// bytes, and the body stream itself — the caller (incoming task) must keep
-/// reading it for the rest of the bidi session.
+/// Read the first LPM frame from a body data stream, bounded by an idle
+/// budget (`None` = unbounded — only when the operator disabled both
+/// server.timeout and the decoupled idle backstop, FD-5). Returns the decoded
+/// `BidiChunk`, a buffer of any remaining (unconsumed) bytes, and the body
+/// stream itself — the caller (incoming task) must keep reading it for the
+/// rest of the bidi session.
 async fn read_first_lpm_frame<S>(
     mut body_stream: S,
-    server_timeout: f32,
+    idle: Option<std::time::Duration>,
 ) -> Result<(pb::BidiChunk, BytesMut, S), AppError>
 where
     S: futures::Stream<Item = Result<Bytes, axum::Error>> + Unpin,
 {
     use futures::StreamExt;
 
-    let idle = crate::deadline::idle_budget(server_timeout);
     let mut buf = BytesMut::new();
 
     loop {
@@ -581,8 +587,16 @@ mod tests {
     }
 
     async fn ready_state(model: &str, endpoint: String) -> Arc<AppState> {
+        ready_state_with_config(model, endpoint, crate::config::Config::default()).await
+    }
+
+    async fn ready_state_with_config(
+        model: &str,
+        endpoint: String,
+        config: crate::config::Config,
+    ) -> Arc<AppState> {
         let cb = Arc::new(CallbackRunner::new());
-        let state = make_state(cb);
+        let state = make_state_with_config(cb, config);
         state
             .registry
             .register(
@@ -1179,5 +1193,52 @@ mod tests {
         assert!(!bidi_initial_data_is_json(&ct_header(
             "not-a-valid/content-type!!!"
         )));
+    }
+
+    /// FD-5 (audit 2026-08-06): with server.timeout disabled (<=0), the
+    /// first-LPM-frame wait falls back to the always-on decoupled idle
+    /// budget — a client that connects but never sends BidiOpen is reclaimed
+    /// instead of pinning the handler forever. (Bounded-red: the outer
+    /// timeout fails this test in 2s while the wait is unbounded.)
+    #[tokio::test]
+    async fn h2_bidi_first_frame_wait_backstopped_by_decoupled_idle() {
+        let model = "bidi_fd5";
+        let endpoint = ipc_endpoint(model);
+        let mut cfg = crate::config::Config::default();
+        cfg.server.timeout = 0.0; // deadline disabled
+        cfg.server.decoupled_idle_timeout_secs = 0.05;
+        let state = ready_state_with_config(model, endpoint, cfg).await;
+        state.registry.activate_version(model, "1").unwrap();
+
+        // Body stream that never yields and never EOFs (sender held).
+        let (_body_tx, body_rx) =
+            tokio::sync::mpsc::channel::<Result<Bytes, axum::Error>>(1);
+        let body = Body::from_stream(ReceiverStream::new(body_rx));
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v2/models/{}/bidi", model))
+            .version(axum::http::Version::HTTP_2)
+            .header("content-type", BIDI_CONTENT_TYPE)
+            .body(body)
+            .unwrap();
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            h2_bidi_handler(
+                State(state),
+                Path(model.to_string()),
+                HeaderMap::new(),
+                test_cx(),
+                req,
+            ),
+        )
+        .await;
+        let err = res
+            .expect("handler must return within the idle backstop")
+            .expect_err("first-frame wait must be reclaimed");
+        assert!(
+            matches!(err, AppError::InferenceTimeout(_)),
+            "expected InferenceTimeout, got {err:?}"
+        );
     }
 }
