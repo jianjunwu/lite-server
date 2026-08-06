@@ -2,6 +2,7 @@ use crate::error::AppError;
 use crate::http::state::AppState;
 use crate::proto::liteserver as pb;
 use crate::registry::types::ModelType;
+use bytes::Bytes;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -13,6 +14,21 @@ use tokio::sync::oneshot;
 use tokio::time::{timeout, Duration};
 use tracing::{info, warn};
 use uuid::Uuid;
+
+// ===== EnsembleValue: typed step input/output (B3, E6) =====
+
+/// A value flowing through an ensemble DAG edge.
+///
+/// `Json` is the historical path — all steps participate in field-level
+/// `$ref` resolution and merge into JSON objects. `Binary` is the
+/// passthrough path — root input or final-step output can be opaque bytes,
+/// but binary values MUST NOT flow between internal DAG steps (Option A
+/// scope; internal binary flow is reserved for Option B).
+#[derive(Debug, Clone)]
+pub enum EnsembleValue {
+    Json(serde_json::Value),
+    Binary(Bytes, String /* content_type */),
+}
 
 // ===== Config parsing =====
 
@@ -185,7 +201,7 @@ fn topological_layers(steps: &[EnsembleStep]) -> Vec<Vec<&EnsembleStep>> {
     layers
 }
 
-fn resolve_ref(ref_str: &str, context: &HashMap<String, Value>) -> Result<Value, AppError> {
+fn resolve_ref(ref_str: &str, context: &HashMap<String, EnsembleValue>) -> Result<EnsembleValue, AppError> {
     let caps = REF_RE.captures(ref_str).ok_or_else(|| {
         AppError::Config(format!("invalid reference: {}", ref_str))
     })?;
@@ -196,16 +212,42 @@ fn resolve_ref(ref_str: &str, context: &HashMap<String, Value>) -> Result<Value,
         AppError::Config(format!("reference source not found: {}", source))
     })?;
 
-    match field {
-        None => Ok(source_data.clone()),
-        Some(f) => {
-            source_data.get(f).cloned().ok_or_else(|| {
-                AppError::Config(format!(
-                    "cannot resolve '{}' from {}",
-                    ref_str, source_data
-                ))
-            })
-        }
+    match source_data {
+        EnsembleValue::Binary(_, _) => match field {
+            // E7: $request (whole) on Binary → passthrough (root binary to first layer)
+            None => {
+                if source == "request" {
+                    Ok(source_data.clone())
+                } else {
+                    // E7: $stepN (whole) on Binary → 400 (Option A scope boundary:
+                    // binary must not flow between internal DAG steps)
+                    Err(AppError::InvalidRequestBody(format!(
+                        "cannot reference binary step output '{}' as a whole; \
+                         binary values may only flow from the root input to the first layer \
+                         or from the final layer to the client",
+                        ref_str
+                    )))
+                }
+            }
+            // E7: $request.field on Binary → 400 (no field semantics on bytes)
+            Some(_) => Err(AppError::InvalidRequestBody(format!(
+                "cannot extract field '{}' from binary data; \
+                 binary values have no field-level semantics",
+                ref_str
+            ))),
+        },
+        EnsembleValue::Json(v) => match field {
+            None => Ok(EnsembleValue::Json(v.clone())),
+            Some(f) => {
+                let field_val = v.get(f).cloned().ok_or_else(|| {
+                    AppError::Config(format!(
+                        "cannot resolve '{}' from {}",
+                        ref_str, v
+                    ))
+                })?;
+                Ok(EnsembleValue::Json(field_val))
+            }
+        },
     }
 }
 
@@ -215,11 +257,11 @@ pub async fn execute_ensemble(
     state: Arc<AppState>,
     model_name: &str,
     version: &str,
-    payload: Value,
+    payload: EnsembleValue,
     request_id: &str,
     client_ip: &str,
     deadline_unix_ns: Option<i64>,
-) -> Result<Value, AppError> {
+) -> Result<EnsembleValue, AppError> {
     let model_dir = crate::validation::resolve_model_dir(
         &state.repo_path, model_name, version,
     )?;
@@ -228,7 +270,7 @@ pub async fn execute_ensemble(
     let steps = parse_ensemble_config(&config_path).await?;
     let layers = topological_layers(&steps);
 
-    let mut context: HashMap<String, Value> = HashMap::new();
+    let mut context: HashMap<String, EnsembleValue> = HashMap::new();
     context.insert("request".to_string(), payload);
 
     // #3: bound the WHOLE ensemble by a single shared deadline (P-DEADLINE
@@ -247,7 +289,7 @@ pub async fn execute_ensemble(
             // in the layer, so a cancelled ensemble does not leave sub-steps
             // running on workers (detached `tokio::spawn` would outlive the
             // parent). Completed tasks are no-ops to abort.
-            let mut set: tokio::task::JoinSet<(String, Result<Value, AppError>)> =
+            let mut set: tokio::task::JoinSet<(String, Result<EnsembleValue, AppError>)> =
                 tokio::task::JoinSet::new();
             for step in layer {
                 let state = state.clone();
@@ -278,9 +320,11 @@ pub async fn execute_ensemble(
                         context.insert(name, value);
                     }
                     Err(e) => {
-                        return Err(AppError::Internal(format!(
-                            "ensemble step failed: {}", e
-                        )));
+                        // B3: propagate step errors directly — client errors
+                        // (e.g. InvalidRequestBody from resolve_ref E7 rules)
+                        // must reach the HTTP/gRPC layer with their correct
+                        // status code, not be wrapped in Internal(500).
+                        return Err(e);
                     }
                 }
             }
@@ -313,17 +357,52 @@ pub async fn execute_ensemble(
 async fn execute_step(
     state: Arc<AppState>,
     step: &EnsembleStep,
-    context: &HashMap<String, Value>,
+    context: &HashMap<String, EnsembleValue>,
     request_id: &str,
     client_ip: &str,
     deadline_unix_ns: Option<i64>,
-) -> Result<Value, AppError> {
-    // Resolve inputs
-    let mut payload = serde_json::Map::new();
+) -> Result<EnsembleValue, AppError> {
+    // Resolve inputs into EnsembleValues.
+    let mut resolved: HashMap<String, EnsembleValue> = HashMap::new();
     for (key, ref_str) in &step.inputs {
         let value = resolve_ref(ref_str, context)?;
-        payload.insert(key.clone(), value);
+        resolved.insert(key.clone(), value);
     }
+
+    // B3 (E7): input assembly — three branches.
+    // Build the JSON payload / binary passthrough from resolved inputs.
+    let (payload_bytes, content_type_for_step) = {
+        let binary_count = resolved.values().filter(|v| matches!(v, EnsembleValue::Binary(_, _))).count();
+
+        if binary_count == 0 {
+            // All Json → build JSON object (historical path).
+            let mut obj = serde_json::Map::new();
+            for (key, val) in &resolved {
+                match val {
+                    EnsembleValue::Json(v) => { obj.insert(key.clone(), v.clone()); }
+                    EnsembleValue::Binary(_, _) => unreachable!(),
+                }
+            }
+            let payload_value = Value::Object(obj);
+            // serde_json::to_vec on a Value is infallible (E8 cleanup note).
+            let bytes = serde_json::to_vec(&payload_value).expect("Value serialization is infallible");
+            (bytes, None)
+        } else if resolved.len() == 1 && binary_count == 1 {
+            // Exactly one input and it is Binary → raw bytes passthrough.
+            let (data, ct) = match resolved.values().next().unwrap() {
+                EnsembleValue::Binary(data, ct) => (data.clone(), ct.clone()),
+                EnsembleValue::Json(_) => unreachable!(),
+            };
+            (data.to_vec(), Some(ct))
+        } else {
+            // Mixed or multiple inputs with any Binary → 400 (Option B scope).
+            return Err(AppError::InvalidRequestBody(format!(
+                "step '{}' has {} input(s) with mixed JSON/Binary; \
+                 a binary input must be the step's sole whole input (Option B scope)",
+                step.name, resolved.len()
+            )));
+        }
+    };
 
     // Ensure sub-model is ready
     if !state.registry.is_ready(&step.model, Some(&step.version)) {
@@ -382,8 +461,6 @@ async fn execute_step(
 
     // Send inference request through the unified queue
     let uid = format!("ensemble_{}_{}_{}", step.model, step.version, Uuid::new_v4());
-    let payload_value = Value::Object(payload);
-    let payload_bytes = serde_json::to_vec(&payload_value).unwrap_or_default();
 
     // P-TRACE (蓝图 §4.3 ensemble 接线，防 trace 断裂): the sub-step RequestMeta
     // would otherwise carry empty headers, orphaning every step span from the
@@ -392,6 +469,10 @@ async fn execute_step(
     // worker spans land as children of the step (request_id is already
     // `{parent}:{step}`, trace follows the same shape).
     let mut step_headers = HashMap::new();
+    // B3 (E7): when the step input is binary, tell the worker via content-type.
+    if let Some(ref ct) = content_type_for_step {
+        step_headers.insert("content-type".to_string(), ct.clone());
+    }
     {
         let step_span = tracing::info_span!(
             "ensemble.step",
@@ -477,12 +558,24 @@ async fn execute_step(
             let code = single.status.as_ref().map(|s| s.code.as_str()).unwrap_or("Ok");
             match code {
                 "Ok" => {
-                    let data = if single.data.is_empty() {
-                        json!({})
+                    // B3 (E8): typed output — mirror unary media_type dispatch
+                    // (inference.rs:266-267). Binary step output is a first-class
+                    // EnsembleValue; JSON is validated and errors are NOT swallowed.
+                    let is_binary = !single.media_type.is_empty()
+                        && !single.media_type.starts_with("application/json");
+                    if is_binary {
+                        Ok(EnsembleValue::Binary(single.data, single.media_type))
+                    } else if single.data.is_empty() {
+                        Ok(EnsembleValue::Json(json!({})))
                     } else {
-                        serde_json::from_slice(&single.data).unwrap_or(json!({}))
-                    };
-                    Ok(data)
+                        let v: Value = serde_json::from_slice(&single.data).map_err(|e| {
+                            AppError::Internal(format!(
+                                "ensemble step {} returned invalid JSON: {}",
+                                step.name, e
+                            ))
+                        })?;
+                        Ok(EnsembleValue::Json(v))
+                    }
                 }
                 _ => Err(AppError::WorkerCrashed(
                     single.status.as_ref().and_then(|s| {
@@ -581,12 +674,88 @@ mod tests {
     #[test]
     fn test_resolve_ref() {
         let mut context = HashMap::new();
-        context.insert("request".to_string(), json!({"image": "cat.jpg"}));
-        context.insert("step1".to_string(), json!({"output": 42}));
+        context.insert("request".to_string(), EnsembleValue::Json(json!({"image": "cat.jpg"})));
+        context.insert("step1".to_string(), EnsembleValue::Json(json!({"output": 42})));
 
-        assert_eq!(resolve_ref("$request", &context).unwrap(), json!({"image": "cat.jpg"}));
-        assert_eq!(resolve_ref("$request.image", &context).unwrap(), json!("cat.jpg"));
-        assert_eq!(resolve_ref("$step1.output", &context).unwrap(), json!(42));
+        assert_eq!(
+            match resolve_ref("$request", &context).unwrap() {
+                EnsembleValue::Json(v) => v,
+                _ => panic!("expected Json"),
+            },
+            json!({"image": "cat.jpg"})
+        );
+        assert_eq!(
+            match resolve_ref("$request.image", &context).unwrap() {
+                EnsembleValue::Json(v) => v,
+                _ => panic!("expected Json"),
+            },
+            json!("cat.jpg")
+        );
+        assert_eq!(
+            match resolve_ref("$step1.output", &context).unwrap() {
+                EnsembleValue::Json(v) => v,
+                _ => panic!("expected Json"),
+            },
+            json!(42)
+        );
+    }
+
+    // === B3: resolve_ref Binary rules (E7) ===
+
+    #[test]
+    fn b3_resolve_ref_request_whole_binary_passthrough() {
+        let mut context = HashMap::new();
+        context.insert(
+            "request".to_string(),
+            EnsembleValue::Binary(Bytes::from_static(b"hello"), "text/plain".to_string()),
+        );
+        let result = resolve_ref("$request", &context).unwrap();
+        match result {
+            EnsembleValue::Binary(data, ct) => {
+                assert_eq!(data.as_ref(), b"hello");
+                assert_eq!(ct, "text/plain");
+            }
+            _ => panic!("expected Binary passthrough"),
+        }
+    }
+
+    #[test]
+    fn b3_resolve_ref_request_field_on_binary_is_400() {
+        let mut context = HashMap::new();
+        context.insert(
+            "request".to_string(),
+            EnsembleValue::Binary(Bytes::from_static(b"hello"), "text/plain".to_string()),
+        );
+        let err = resolve_ref("$request.field", &context).unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidRequestBody(_)),
+            "field access on binary must be 400, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("field"),
+            "error must mention field extraction, got: {err}"
+        );
+    }
+
+    #[test]
+    fn b3_resolve_ref_step_binary_is_400() {
+        let mut context = HashMap::new();
+        context.insert(
+            "step1".to_string(),
+            EnsembleValue::Binary(Bytes::from_static(b"hello"), "text/plain".to_string()),
+        );
+        // Whole step reference on binary → 400 (Option A boundary).
+        let err = resolve_ref("$step1", &context).unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidRequestBody(_)),
+            "step binary reference must be 400, got {err:?}"
+        );
+        // Field access on step binary → same 400.
+        let err = resolve_ref("$step1.field", &context).unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidRequestBody(_)),
+            "step binary field access must be 400, got {err:?}"
+        );
     }
 
     // ===== P-FLOW (§4.0.9): ensemble shared cancel =====

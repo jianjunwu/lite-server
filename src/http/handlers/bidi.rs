@@ -6,7 +6,7 @@
 //! URL path and HTTP headers (not from the `BidiOpen` fields on this path).
 
 use super::inference::{build_request_meta, resolve_version};
-use super::{enforce_auth, enforce_rate_limit};
+use super::{enforce_auth, enforce_rate_limit, is_json_content_type};
 use crate::error::AppError;
 use crate::http::state::AppState;
 use crate::metrics::prometheus;
@@ -118,6 +118,18 @@ async fn h2_bidi_entry(
         }
     };
 
+    // B1: validate JSON initial_data before it reaches the worker
+    // (mirrors Python _payload_content_type, streaming.py:48).
+    // Empty initial_data is legal and skips validation (E2: Python
+    // _parse_request_json(b"") → {}).
+    let initial_is_json = bidi_initial_data_is_json(&headers);
+    let initial_body_len = initial_data.len();
+    if !initial_data.is_empty() && initial_is_json {
+        serde_json::from_slice::<&serde_json::value::RawValue>(&initial_data)
+            .map_err(|e| AppError::InvalidRequestBody(
+                format!("invalid JSON in BidiOpen initial_data: {e}")))?;
+    }
+
     // 4. Build RequestMeta from HTTP headers + initial_data bytes.
     let deadline = crate::deadline::resolve_from_http(&headers, state.config.server.timeout);
     let meta = build_request_meta(
@@ -177,8 +189,15 @@ async fn h2_bidi_entry(
         version = %resolved_version,
         request_id = %cx.request_id,
         pinned_version = tracing::field::Empty,
+        body_bytes = tracing::field::Empty,
+        body_kind = tracing::field::Empty,
     );
     crate::telemetry::link_parent(&span, &cx.trace_cx);
+    // D11: record body size with content-type label (unary/SSE/WS parity).
+    let body_kind_str: &str = if initial_is_json { "json" } else { "raw" };
+    prometheus::record_request_body_bytes(body_kind_str, "/predict", initial_body_len);
+    span.record("body_bytes", initial_body_len as i64);
+    span.record("body_kind", body_kind_str);
 
     tokio::spawn(
         async move {
@@ -475,6 +494,35 @@ where
 /// Convert an LPM error to an AppError.
 fn lpm_error_to_app(e: lpm::LpmError) -> AppError {
     AppError::InvalidRequestBody(format!("LPM frame error: {e}"))
+}
+
+/// B1 (tensor-bytes-consistency): replicate Python `_payload_content_type`
+/// (streaming.py:48) so Rust and Python share one dispatch rule for bidi
+/// initial_data. The bidi framing type `application/x-lite-bidi` is a
+/// transport wrapper — it says nothing about the payload, so it is treated
+/// as absent (→ JSON default), exactly as the Python side does.
+///
+/// Returns true when the initial_data MUST be valid JSON; false when it
+/// MUST be treated as opaque bytes.
+fn bidi_initial_data_is_json(headers: &HeaderMap) -> bool {
+    match headers.get(axum::http::header::CONTENT_TYPE) {
+        None => true, // missing → JSON default (D2)
+        Some(v) => {
+            let base = v
+                .to_str()
+                .unwrap_or("")
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
+            if base == "application/x-lite-bidi" {
+                true // framing CT → JSON default (E1, mirror Python)
+            } else {
+                is_json_content_type(v) // delegate to D1 (parse failure → raw)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1075,5 +1123,61 @@ mod tests {
             Ok("close"),
             "D4: body EOF must send StreamRequest::Close to the worker"
         );
+    }
+
+    // === B1: bidi_initial_data_is_json 7-state unit tests ===
+
+    fn ct_header(val: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(axum::http::header::CONTENT_TYPE, val.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn bidi_is_json_missing_ct_is_true() {
+        assert!(bidi_initial_data_is_json(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn bidi_is_json_framing_ct_is_true() {
+        assert!(bidi_initial_data_is_json(&ct_header("application/x-lite-bidi")));
+    }
+
+    #[test]
+    fn bidi_is_json_framing_ct_with_params_is_true() {
+        assert!(bidi_initial_data_is_json(&ct_header(
+            "application/x-lite-bidi; charset=utf-8"
+        )));
+    }
+
+    #[test]
+    fn bidi_is_json_application_json_is_true() {
+        assert!(bidi_initial_data_is_json(&ct_header("application/json")));
+    }
+
+    #[test]
+    fn bidi_is_json_suffix_json_is_true() {
+        assert!(bidi_initial_data_is_json(&ct_header(
+            "application/vnd.api+json"
+        )));
+    }
+
+    #[test]
+    fn bidi_is_json_image_png_is_false() {
+        assert!(!bidi_initial_data_is_json(&ct_header("image/png")));
+    }
+
+    #[test]
+    fn bidi_is_json_octet_stream_is_false() {
+        assert!(!bidi_initial_data_is_json(&ct_header(
+            "application/octet-stream"
+        )));
+    }
+
+    #[test]
+    fn bidi_is_json_malformed_ct_is_false() {
+        assert!(!bidi_initial_data_is_json(&ct_header(
+            "not-a-valid/content-type!!!"
+        )));
     }
 }

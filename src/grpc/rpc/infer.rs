@@ -93,7 +93,18 @@ impl GrpcService {
         // HTTP which also only ensembles in do_infer).
         if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
             if mv.model_type == ModelType::Ensemble {
-                let payload = serde_json::from_slice(&req.data).unwrap_or(serde_json::Value::Null);
+                // B3 (E6): gRPC ensemble — parse JSON into Json variant,
+                // fall back to Binary so malformed JSON is no longer silently
+                // swallowed as Value::Null (the old unwrap_or behaviour).
+                // gRPC `data` is opaque bytes; this is self-consistent.
+                let ensemble_input =
+                    match serde_json::from_slice::<serde_json::Value>(&req.data) {
+                        Ok(v) => crate::ensemble::EnsembleValue::Json(v),
+                        Err(_) => crate::ensemble::EnsembleValue::Binary(
+                            req.data.clone(),
+                            "application/octet-stream".to_string(),
+                        ),
+                    };
                 // P-DEADLINE: resolve here (grpc_metadata still in scope) and
                 // pass to the ensemble cascade.
                 let ensemble_deadline = crate::deadline::resolve_from_grpc(
@@ -104,14 +115,23 @@ impl GrpcService {
                     self.app_state.clone(),
                     model_name,
                     &resolved_version,
-                    payload,
+                    ensemble_input,
                     &request_id,
                     &client_ip,
                     ensemble_deadline.unix_ns,
                 )
                 .await
                 .map_err(|e| err(app_error_to_grpc_status(&e)))?;
-                let data = bytes::Bytes::from(serde_json::to_vec(&result).unwrap_or_default());
+                // B3 (E6) egress: Json → serialized bytes (historical path);
+                // Binary → raw bytes (CT dropped, gRPC has no media_type field;
+                // client must know the model contract, consistent with gRPC
+                // unary semantics).
+                let data = match result {
+                    crate::ensemble::EnsembleValue::Json(v) => {
+                        bytes::Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
+                    }
+                    crate::ensemble::EnsembleValue::Binary(b, _ct) => b,
+                };
                 return Ok(Response::new(pb::InferResponse {
                     data,
                     status: None,

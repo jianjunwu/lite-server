@@ -103,28 +103,37 @@ async fn do_infer(
 
     // Handle ensemble
     if mv.model_type == ModelType::Ensemble {
-        let payload_value = match &body {
-            RequestBody::Json(b) => serde_json::from_slice::<Value>(b)
-                .map_err(|e| AppError::InvalidRequestBody(format!(
-                    "ensemble requires valid JSON input: {e}"
-                )))?,
-            RequestBody::Raw(_, ct) => {
-                warn!(
-                    model = %model_name,
-                    content_type = %ct,
-                    "ensemble received non-JSON body, rejecting"
-                );
-                return Err(AppError::InvalidRequestBody(format!(
-                    "ensemble requires JSON input, got {}",
-                    ct
-                )));
+        let ensemble_input = match &body {
+            RequestBody::Json(b) => {
+                let v = serde_json::from_slice::<Value>(b)
+                    .map_err(|e| AppError::InvalidRequestBody(format!(
+                        "ensemble requires valid JSON input: {e}"
+                    )))?;
+                crate::ensemble::EnsembleValue::Json(v)
+            }
+            // B3 (E6): binary root input — D7 400 is replaced by passthrough
+            // (parent plan §9.6). Raw bytes go straight to the first layer.
+            RequestBody::Raw(bytes, ct) => {
+                crate::ensemble::EnsembleValue::Binary(bytes.clone(), ct.clone())
             }
         };
         let result = crate::ensemble::execute_ensemble(
-            state, &model_name, &resolved_version, payload_value,
+            state, &model_name, &resolved_version, ensemble_input,
             &request_id, &cx.client_ip, deadline.unix_ns,
         ).await?;
-        return Ok(Json(result).into_response());
+        // B3 (E6) egress: Json → historical Json(response).into_response();
+        // Binary → body bytes + content-type header (mirror unary passthrough,
+        // inference.rs:266-283).
+        return match result {
+            crate::ensemble::EnsembleValue::Json(v) => Ok(Json(v).into_response()),
+            crate::ensemble::EnsembleValue::Binary(data, ct) => {
+                Ok(Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, &ct)
+                    .body(axum::body::Body::from(data))
+                    .unwrap())
+            }
+        };
     }
 
     // Pick worker info (needed for both paths)

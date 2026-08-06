@@ -474,7 +474,7 @@ async fn handle_ws_stream(
     state: Arc<AppState>,
     model_name: String,
     version: Option<String>,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     mut socket: WebSocket,
     cx: RequestContext,
     decoupled: bool,
@@ -528,7 +528,16 @@ async fn handle_ws_stream(
     // by server.timeout when one is configured; with server.timeout <= 0 the
     // wait is unbounded (a client that upgrades but never sends keeps the
     // handler open indefinitely).
-    let first_msg = {
+    //
+    // B2 (E3, E4): frame type is the sole dispatch signal — Text → JSON
+    // (RawValue validation, legacy path); Binary → opaque bytes (skip
+    // validation). The browser WebSocket API cannot set custom headers on the
+    // upgrade request, so frame type is the only client-controlled signal.
+    enum FirstFrame {
+        Json(String),
+        Raw(bytes::Bytes),
+    }
+    let first_frame = {
         let recv = match crate::deadline::idle_budget(state.config.server.timeout) {
             Some(budget) => match tokio::time::timeout(budget, socket.recv()).await {
                 Ok(r) => r,
@@ -540,8 +549,8 @@ async fn handle_ws_stream(
             None => socket.recv().await,
         };
         match recv {
-            Some(Ok(Message::Text(text))) => text,
-            Some(Ok(Message::Binary(bin))) => String::from_utf8_lossy(&bin).to_string(),
+            Some(Ok(Message::Text(text))) => FirstFrame::Json(text),
+            Some(Ok(Message::Binary(bin))) => FirstFrame::Raw(bytes::Bytes::from(bin)),
             _ => {
                 let _ = socket.close().await;
                 return;
@@ -549,11 +558,19 @@ async fn handle_ws_stream(
         }
     };
 
-    // D3: zero-allocation JSON syntax validation via &RawValue.
-    if let Err(_) = serde_json::from_slice::<&serde_json::value::RawValue>(first_msg.as_bytes()) {
-        let _ = socket.send(Message::Text(json!({"error": "invalid JSON"}).to_string())).await;
-        let _ = socket.close().await;
-        return;
+    // D3 / B2: JSON validation only applies to Text first frames.
+    // Binary first frames skip validation entirely (E3, frame type wins).
+    match &first_frame {
+        FirstFrame::Json(text) => {
+            if serde_json::from_slice::<&serde_json::value::RawValue>(text.as_bytes()).is_err() {
+                let _ = socket.send(Message::Text(json!({"error": "invalid JSON"}).to_string())).await;
+                let _ = socket.close().await;
+                return;
+            }
+        }
+        FirstFrame::Raw(_) => {
+            // No validation for Binary first frame (E3).
+        }
     }
 
     // The original upgrade-request headers flow into meta; client_ip /
@@ -571,14 +588,55 @@ async fn handle_ws_stream(
     );
     crate::telemetry::link_parent(&span, &cx.trace_cx);
     let deadline = crate::deadline::resolve_from_http(&headers, state.config.server.timeout);
-    let payload_bytes: bytes::Bytes = first_msg.into_bytes().into();
-    // D11: same body fields as unary/SSE. The WS upgrade request carries no
-    // body; kind derives from the upgrade request's Content-Type (missing →
-    // JSON, same default as ApiBody).
-    let body_kind = match headers.get(axum::http::header::CONTENT_TYPE) {
-        None => "json",
-        Some(v) if is_json_content_type(v) => "json",
-        Some(_) => "raw",
+    // B2 (E4): payload_bytes from frame type; body_kind from frame type
+    // (Text → json, Binary → raw). CT normalization: write the effective
+    // content-type into meta.headers so the Python side's D9 dispatch
+    // receives a single-source-of-truth header.
+    let (payload_bytes, body_kind) = match &first_frame {
+        FirstFrame::Json(text) => {
+            // Text first frame → JSON (legacy path, no CT normalization).
+            (bytes::Bytes::from(text.as_bytes().to_vec()), "json")
+        }
+        FirstFrame::Raw(bin) => {
+            // Binary first frame → raw bytes. Normalize the content-type
+            // header for Python's D9 dispatch (E4 table):
+            //   missing CT  → inject application/octet-stream
+            //   non-JSON CT → keep as-is (payload metadata)
+            //   JSON CT     → rewrite to application/octet-stream + warn
+            //     (contradictory signal: frame type wins over header)
+            let existing_ct = headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            match existing_ct {
+                None => {
+                    headers.insert(
+                        axum::http::header::CONTENT_TYPE,
+                        axum::http::HeaderValue::from_static("application/octet-stream"),
+                    );
+                }
+                Some(ref ct) if is_json_content_type(
+                    &axum::http::HeaderValue::from_str(ct).unwrap_or_else(|_| {
+                        axum::http::HeaderValue::from_static("application/octet-stream")
+                    }),
+                ) => {
+                    tracing::warn!(
+                        model = %model_name,
+                        content_type = %ct,
+                        "WS Binary first frame with JSON Content-Type; \
+                         frame type wins — rewriting to application/octet-stream"
+                    );
+                    headers.insert(
+                        axum::http::header::CONTENT_TYPE,
+                        axum::http::HeaderValue::from_static("application/octet-stream"),
+                    );
+                }
+                Some(_) => {
+                    // Non-JSON CT preserved as-is (payload metadata).
+                }
+            }
+            (bin.clone(), "raw")
+        }
     };
     span.record("body_bytes", payload_bytes.len() as i64);
     span.record("body_kind", body_kind);

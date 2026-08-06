@@ -177,7 +177,7 @@ where
 /// `application/json` and `application/*+json`, case-insensitive, ignores
 /// parameters. Text subtypes (`text/json`) and unknown suffixes are NOT
 /// matched — safer than prefix matching, less risk of misclassification.
-fn is_json_content_type(value: &axum::http::HeaderValue) -> bool {
+pub(super) fn is_json_content_type(value: &axum::http::HeaderValue) -> bool {
     let Ok(value) = value.to_str() else {
         return false; // non-ASCII garbage → raw (D2)
     };

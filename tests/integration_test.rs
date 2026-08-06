@@ -7324,10 +7324,10 @@ ensemble:
     let _ = std::fs::remove_dir_all(&repo);
 }
 
-/// §6.3 test_ensemble_rejects_binary (P0): HTTP ensemble + non-JSON
-/// Content-Type → 400 "ensemble requires JSON input" (D7). The Value
-/// materialization happens only inside the ensemble branch; raw bytes have
-/// no DAG semantics and must be rejected, not silently misparsed.
+/// §6.3 test_ensemble_rejects_binary (P0 → B3): HTTP ensemble + non-JSON
+/// Content-Type is now accepted as binary root input (B3, E6 — D7 relaxed).
+/// However, field-level access (`$request.x`) on binary data is rejected
+/// because bytes carry no field semantics (E7).
 #[cfg(unix)]
 #[tokio::test]
 #[serial]
@@ -7373,12 +7373,14 @@ ensemble:
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 400, "ensemble + raw bytes must be rejected");
+    // B3: binary root input is accepted (D7 relaxed), but field access
+    // ($request.x) on binary → 400 (E7: no field semantics on bytes).
+    assert_eq!(resp.status(), 400, "field access on binary root must be 400");
     let body: Value = resp.json().await.unwrap();
     let msg = body["error"]["message"].as_str().unwrap();
     assert!(
-        msg.contains("ensemble requires JSON input"),
-        "error must name the JSON requirement, got: {msg}"
+        msg.contains("field"),
+        "error must mention field extraction from binary, got: {msg}"
     );
 
     let _ = std::fs::remove_dir_all(&repo);
