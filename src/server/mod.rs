@@ -708,16 +708,6 @@ impl LiteServer {
     }
 }
 
-/// Reconcile registry state with the model repository: load versions that
-/// should be present per the orchestration config, unload managed versions
-/// that should no longer be present (declarative semantics — the config is
-/// the source of truth for models in scope). Runs once at startup (initial
-/// load) and on every poll tick when control_mode = "auto".
-///
-/// `seen_lma` tracks (path, mtime) of .lma artifacts already unpacked so the
-/// poller doesn't re-unpack — and thereby overwrite — the same file every
-/// tick. A replaced artifact has a new mtime and is unpacked again.
-
 async fn start_metrics_server(host: String, port: u16) -> Result<(), AppError> {
     let addr: std::net::SocketAddr = format!("{}:{}", host, port)
         .parse()

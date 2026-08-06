@@ -10,6 +10,16 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// (model_name, load_policy, max_loaded_versions, weights) row returned by
+/// [`ModelRegistry::snapshot_strategies`] — BTreeMap for deterministic JSON
+/// key ordering in the cache_registry snapshot.
+pub type StrategySnapshot = (
+    String,
+    LoadPolicy,
+    Option<usize>,
+    std::collections::BTreeMap<String, u32>,
+);
+
 #[derive(Debug, Clone)]
 pub struct ModelRegistry {
     models: DashMap<String, ModelEntry>,
@@ -147,14 +157,7 @@ impl ModelRegistry {
     /// model added via admin/file-watcher (not in config) keeps its strategy
     /// across a restart. Config-defined strategies are re-applied after restore,
     /// so they win; this only matters for config-absent models.
-    pub fn snapshot_strategies(
-        &self,
-    ) -> Vec<(
-        String,
-        LoadPolicy,
-        Option<usize>,
-        std::collections::BTreeMap<String, u32>,
-    )> {
+    pub fn snapshot_strategies(&self) -> Vec<StrategySnapshot> {
         self.models
             .iter()
             .map(|r| {

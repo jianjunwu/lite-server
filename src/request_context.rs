@@ -166,6 +166,7 @@ impl<S: Send + Sync> FromRequestParts<S> for RequestContext {
 ///   （`sequence_id` 是其特例，两者同时在时 `sequence_id` 优先）；
 /// - `direct_worker_id` → 直连钉住：提交时校验（不存在/已剔除 → 400/
 ///   InvalidArgument），dispatch 优先于一切挑选。
+///
 /// `expected_cost`（容量感知 picker 的预留字段）已移除——定义即债务；容量
 /// 感知 picker 落地时以 additive header 重新引入（§2.2 观察名单）。
 ///

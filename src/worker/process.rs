@@ -314,6 +314,7 @@ pub(super) fn new_worker_command(python_module_dir: &str) -> Command {
 /// Build a platform-appropriate ZMQ endpoint for a worker.
 /// - Unix: IPC socket in the system temp directory
 /// - Windows: TCP on localhost (IPC not supported)
+///
 /// Per-process-unique worker endpoint: `{model}_{version}_{worker_id}_{pid}`,
 /// where `pid` is the SERVER process. The endpoint is therefore stable across
 /// a worker's kill+respawn within one server run, so `respawn_worker` reuses

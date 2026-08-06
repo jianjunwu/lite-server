@@ -10,6 +10,15 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn, Instrument};
 
+/// Reconcile registry state with the model repository: load versions that
+/// should be present per the orchestration config, unload managed versions
+/// that should no longer be present (declarative semantics — the config is
+/// the source of truth for models in scope). Runs once at startup (initial
+/// load) and on every poll tick when control_mode = "auto".
+///
+/// `seen_lma` tracks (path, mtime) of .lma artifacts already unpacked so the
+/// poller doesn't re-unpack — and thereby overwrite — the same file every
+/// tick. A replaced artifact has a new mtime and is unpacked again.
 pub(super) async fn reconcile_models(
     repo_path: &Path,
     orch: &OrchestrationConfig,

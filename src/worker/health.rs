@@ -28,6 +28,7 @@ pub(super) type GrpcHealthHandle = Arc<RwLock<Option<GrpcHealthState>>>;
 /// - service `""` — whole server: SERVING while any version is Ready/Degraded
 /// - service `"{model}"` — SERVING when the model's active version is
 ///   Ready/Degraded; Loading/Failed/no-active → NOT_SERVING
+///
 /// Degraded counts as SERVING: it still takes traffic. Services for models
 /// no longer in the registry are cleared.
 async fn sync_grpc_health(registry: &ModelRegistry, handle: &GrpcHealthHandle) {

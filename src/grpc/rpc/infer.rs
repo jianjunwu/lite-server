@@ -288,7 +288,7 @@ impl GrpcService {
                             });
                         }
                         // Not a numeric status code — internal worker error.
-                        return Err(err(Status::internal(msg)));
+                        Err(err(Status::internal(msg)))
                     }
                     _ => {
                         let headers = single.headers.clone();

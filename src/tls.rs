@@ -48,9 +48,9 @@ pub enum TlsProtocol {
 /// on the accept path.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-static TLS_VERSIONS_12_UP: &[&'static rustls::SupportedProtocolVersion] =
+static TLS_VERSIONS_12_UP: &[&rustls::SupportedProtocolVersion] =
     &[&rustls::version::TLS12, &rustls::version::TLS13];
-static TLS_VERSIONS_13_ONLY: &[&'static rustls::SupportedProtocolVersion] =
+static TLS_VERSIONS_13_ONLY: &[&rustls::SupportedProtocolVersion] =
     &[&rustls::version::TLS13];
 
 /// Atomic (hash + config) pair so a rotation never exposes a mismatched view.

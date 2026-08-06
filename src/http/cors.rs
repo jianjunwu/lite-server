@@ -269,14 +269,14 @@ pub async fn cors_middleware(
     let headers = response.headers_mut();
     vary(headers, "origin");
     if let Some(acao) = acao {
-        if apply_acao(headers, &acao, policy.allow_credentials) {
-            if !policy.expose_headers.is_empty() {
-                if let Ok(v) = HeaderValue::from_str(&policy.expose_headers.join(", ")) {
-                    headers.insert(
-                        HeaderName::from_static("access-control-expose-headers"),
-                        v,
-                    );
-                }
+        if apply_acao(headers, &acao, policy.allow_credentials)
+            && !policy.expose_headers.is_empty()
+        {
+            if let Ok(v) = HeaderValue::from_str(&policy.expose_headers.join(", ")) {
+                headers.insert(
+                    HeaderName::from_static("access-control-expose-headers"),
+                    v,
+                );
             }
         }
     }
@@ -306,7 +306,7 @@ fn preflight_response(
             .iter()
             .any(|am| am == "*" || am.eq_ignore_ascii_case(m))
     });
-    let headers_ok = req_headers.map_or(true, |h| {
+    let headers_ok = req_headers.is_none_or(|h| {
         h.split(',')
             .map(str::trim)
             .filter(|h| !h.is_empty())

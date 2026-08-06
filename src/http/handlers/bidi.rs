@@ -63,14 +63,14 @@ async fn h2_bidi_entry(
 ) -> Result<Response, AppError> {
     // 1. h2 version gate: h1 → 426 Upgrade Required.
     if request.version() != axum::http::Version::HTTP_2 {
-        return Ok(Response::builder()
+        return Response::builder()
             .status(axum::http::StatusCode::UPGRADE_REQUIRED)
             .header(axum::http::header::UPGRADE, "h2c")
             .header(axum::http::header::CONTENT_TYPE, "application/json")
             .body(Body::from(
                 r#"{"error":{"message":"HTTP/2 bidirectional streaming requires h2. Use prior knowledge or TLS ALPN.","type":"upgrade_required"}}"#,
             ))
-            .map_err(|e| AppError::Internal(format!("build response: {e}")))?);
+            .map_err(|e| AppError::Internal(format!("build response: {e}")));
     }
 
     // D6: Content-Encoding is not supported — reject before reading the body
@@ -368,13 +368,13 @@ async fn h2_bidi_entry(
 
     // 7. 200 + application/x-lite-bidi + streaming body.
     let body = Body::from_stream(
-        ReceiverStream::new(rx).map(|b| Ok::<Bytes, axum::Error>(b)),
+        ReceiverStream::new(rx).map(Ok::<Bytes, axum::Error>),
     );
-    Ok(Response::builder()
+    Response::builder()
         .status(axum::http::StatusCode::OK)
         .header(axum::http::header::CONTENT_TYPE, BIDI_CONTENT_TYPE)
         .body(body)
-        .map_err(|e| AppError::Internal(format!("build response: {e}")))?)
+        .map_err(|e| AppError::Internal(format!("build response: {e}")))
 }
 
 /// Open a worker stream for bidi.

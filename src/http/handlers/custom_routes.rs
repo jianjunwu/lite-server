@@ -198,7 +198,6 @@ pub async fn dispatch_custom_route(
         uid,
         meta: Some(meta),
         payload: Some(pb::request::Payload::RouteCall(pb::SingleRequest { data: body })),
-        ..Default::default()
     };
 
     let (resp_rx, mut chunk_rx) = client.send_route_or_stream(request).await?;
@@ -210,7 +209,7 @@ pub async fn dispatch_custom_route(
     .await
     .map_err(|_| AppError::InferenceTimeout("route response timeout".to_string()))?;
 
-    let result = match first {
+    match first {
         RouteReply::Unary(Some(response)) => match response.payload {
             // Decode the SingleResponse (routes reuse the inference response shape).
             Some(pb::response::Payload::Single(single)) => {
@@ -247,9 +246,7 @@ pub async fn dispatch_custom_route(
                 "route stream missing start frame".to_string(),
             )),
         },
-    };
-
-    result
+    }
 }
 
 /// Bound on waiting for a route call's first reply frame (unary or stream

@@ -149,7 +149,6 @@ pub fn run_server(
             health_check_kill_threshold,
             worker_kill_timeout,
             hook_http_timeout,
-            ..Default::default()
         },
     });
 

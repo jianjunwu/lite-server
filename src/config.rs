@@ -431,17 +431,12 @@ impl Default for MetricsConfig {
 }
 
 /// OTLP transport protocol (蓝图 §4.3 P-TRACE).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TelemetryProtocol {
+    #[default]
     Grpc,
     Http,
-}
-
-impl Default for TelemetryProtocol {
-    fn default() -> Self {
-        TelemetryProtocol::Grpc
-    }
 }
 
 /// P-TRACE (蓝图 §4.3): 全量 OpenTelemetry 配置。
@@ -996,19 +991,14 @@ impl WarmupPolicy {
 
 /// P-FLOW B1 (§4.0.9): action when a request waits longer than
 /// `queue_timeout_secs` (Triton `QueuePolicy.timeout_action`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum QueueTimeoutAction {
     /// Let `request_timeout` govern (no proactive rejection) — the default.
+    #[default]
     Delay,
     /// Return 503 / gRPC Unavailable once the queue delay elapses.
     Reject,
-}
-
-impl Default for QueueTimeoutAction {
-    fn default() -> Self {
-        QueueTimeoutAction::Delay
-    }
 }
 
 
