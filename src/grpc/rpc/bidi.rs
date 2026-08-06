@@ -331,10 +331,6 @@ impl GrpcService {
                         }
                     }
                     Some(pb::stream_response::Payload::Error(ref e)) => {
-                        let bidi_chunk = pb::BidiChunk {
-                            stream_id: stream_id.clone(),
-                            payload: Some(pb::bidi_chunk::Payload::Close(pb::BidiClose {})),
-                        };
                         let grpc_err = match serde_json::from_str::<serde_json::Value>(&e.message) {
                             Ok(val) => {
                                 if let Some(parsed) = try_parse_model_error(&val) {
@@ -349,8 +345,10 @@ impl GrpcService {
                             Err(_) => err(Status::internal(e.message.clone())),
                         };
                         stream_family = grpc_code_to_status_family(grpc_err.code());
+                        // Terminal: tonic's encode layer stops polling at the
+                        // first Err item, so nothing may follow it on this
+                        // channel (stream_infer / decoupled parity, FD-4).
                         let _ = tx.send(Err(grpc_err)).await;
-                        let _ = tx.send(Ok(bidi_chunk)).await;
                         crate::callback::fire_inference_response(&cb_runner, &req_ctx, start);
                         break;
                     }

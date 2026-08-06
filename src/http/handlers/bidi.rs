@@ -70,7 +70,7 @@ async fn h2_bidi_entry(
             .body(Body::from(
                 r#"{"error":{"message":"HTTP/2 bidirectional streaming requires h2. Use prior knowledge or TLS ALPN.","type":"upgrade_required"}}"#,
             ))
-            .unwrap());
+            .map_err(|e| AppError::Internal(format!("build response: {e}")))?);
     }
 
     // D6: Content-Encoding is not supported — reject before reading the body
@@ -369,7 +369,7 @@ async fn h2_bidi_entry(
         .status(axum::http::StatusCode::OK)
         .header(axum::http::header::CONTENT_TYPE, BIDI_CONTENT_TYPE)
         .body(body)
-        .unwrap())
+        .map_err(|e| AppError::Internal(format!("build response: {e}")))?)
 }
 
 /// Open a worker stream for bidi.

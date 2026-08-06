@@ -2248,6 +2248,80 @@ mod request_metrics_tests {
         assert_eq!(cb.resp.load(std::sync::atomic::Ordering::Relaxed), 1, "Error frame fires response");
     }
 
+    /// FD-4 (audit 2026-08-06): a worker Error frame is TERMINAL on the gRPC
+    /// bidi path — the response channel must yield exactly one `Err(status)`
+    /// and nothing after it. tonic's encode layer stops polling the source
+    /// stream at the first `Err` item (codec/encode.rs), so a trailing
+    /// `Ok(BidiClose)` is unreachable dead code; observing the channel
+    /// directly fails while that dead send exists.
+    #[tokio::test]
+    async fn bidi_worker_error_yields_single_terminal_err() {
+        use bytes::BufMut;
+        use tokio_stream::StreamExt;
+
+        let model = "bidi_fd4_terminal";
+        let endpoint = metric_test_endpoint(model);
+        let _w = spawn_stream_error_worker(endpoint.clone());
+        let service = ready_service_with_worker(model, endpoint).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // In-process Streaming<BidiChunk>: one gRPC-framed BidiOpen, then EOF
+        // (the D4 close this triggers is harmless for the error worker).
+        let open = pb::BidiChunk {
+            stream_id: String::new(),
+            payload: Some(pb::bidi_chunk::Payload::Open(pb::BidiOpen {
+                model_name: model.to_string(),
+                version: "1".to_string(),
+                initial_data: Bytes::from_static(b"{}"),
+                sequence_id: None,
+                ..Default::default()
+            })),
+        };
+        let msg = open.encode_to_vec();
+        let mut framed = bytes::BytesMut::with_capacity(5 + msg.len());
+        framed.put_u8(0); // uncompressed
+        framed.put_u32(msg.len() as u32);
+        framed.extend_from_slice(&msg);
+        let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        body_tx.send(Ok(framed.freeze())).await.expect("send open frame");
+        drop(body_tx);
+        let body = axum::body::Body::from_stream(ReceiverStream::new(body_rx));
+        let mut codec = tonic::codec::ProstCodec::<pb::BidiChunk, pb::BidiChunk>::default();
+        let streaming = tonic::Streaming::new_request(
+            tonic::codec::Codec::decoder(&mut codec),
+            body,
+            None,
+            None,
+        );
+
+        let resp = service
+            .bidi_stream(Request::new(streaming))
+            .await
+            .expect("bidi must open");
+        let mut s = resp.into_inner();
+
+        let first = tokio::time::timeout(Duration::from_secs(3), s.next())
+            .await
+            .expect("terminal item within 3s")
+            .expect("stream yields the terminal error");
+        let status = first.expect_err("first item must be the error status");
+        assert_eq!(status.message(), "boom");
+
+        let rest = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut items = Vec::new();
+            while let Some(i) = s.next().await {
+                items.push(i);
+            }
+            items
+        })
+        .await
+        .expect("stream must end after the terminal error");
+        assert!(
+            rest.is_empty(),
+            "no frame may follow the terminal Err on the bidi channel, got {rest:?}"
+        );
+    }
+
     #[tokio::test]
     async fn stream_callback_not_fired_on_cancel() {
         let model = "cb_stream_cancel";
