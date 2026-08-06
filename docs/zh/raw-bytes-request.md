@@ -109,6 +109,27 @@ class MyAPI(LitAPI):
 - **shape 固定的模型**可跳过 header 解析，直接用 `setup()` 里读出的
   `self.input_shape`——但 dtype 字节序仍建议走 header，避免硬编码漂移。
 
+## Ensemble 模型
+
+Ensemble 模型接受原始字节根输入（0.8.3 移除了"ensemble 只收 JSON"的
+拒绝逻辑）：字节原样流向第一层，请求的 Content-Type 透传给该 step 的
+worker。典型链路——图片字节进、首层返回 JSON 特征、后续 step 保持
+JSON——端到端可用。
+
+Binary 流动被刻意限制在 DAG 的两条外沿：
+
+| 引用形态 | 作用于 binary 数据时 | 结果 |
+|---|---|---|
+| `$request`（整体） | 根 binary 输入 | 透传给该 step |
+| `$request.field` | — | **400**（字节无字段语义） |
+| `$stepN`（整体或字段） | binary step 输出 | **400**(binary 不许在 step 间流动） |
+
+消费 binary 输入的 step 必须把它声明为*唯一*输入——JSON+binary 混合
+输入集会被 400 拒绝。末层 step 自身也可以返回 binary(worker 响应携带
+非 JSON `media_type`)：此时 HTTP 响应原样携带字节与 worker 声明的
+Content-Type，与 unary 透传完全一致。gRPC 侧字节经 `InferResponse.data`
+返回（proto 不携带 content type，客户端按模型契约自知）。
+
 ## 请求体大小限制
 
 默认 **64 MiB**。通过 `server.max_request_body_bytes` 配置。超限返回
@@ -128,6 +149,6 @@ class MyAPI(LitAPI):
 | 状态码 | 错误码                      | 触发条件                                     |
 |--------|----------------------------|----------------------------------------------|
 | 400    | `invalid_request_body`     | JSON 语法错误                                |
-| 400    | `invalid_request_body`     | Ensemble 收到非 JSON body                    |
+| 400    | `invalid_request_body`     | Ensemble：对 binary 数据取字段、binary step 输出被下游引用、或 JSON+binary 混合 step 输入 |
 | 413    | `payload_too_large`         | Body 超过 `max_request_body_bytes`           |
 | 415    | `unsupported_media_type`    | 请求携带 `Content-Encoding` 头               |

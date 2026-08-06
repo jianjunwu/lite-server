@@ -22,13 +22,26 @@ first frame.
 
 | Direction | Frame | Format | Meaning |
 |-----------|-------|--------|---------|
-| C→S | first frame | Text JSON payload (a Binary frame is decoded as lossy UTF-8 JSON) | initial input (`on_open`) |
+| C→S | first frame | **Text** = JSON payload; **Binary** = raw bytes — the frame type alone decides | initial input (`on_open`) |
 | C→S | Data ×N | **Binary** — raw bytes | appended input (`on_chunk`) |
 | C→S | Close | Text `{"type":"close"}` | end input gracefully (`on_close`); output continues |
 | C→S | any other Text | — | protocol error: server sends `{"error":"unknown control frame"}`, closes, cancels the worker |
 | S→C | Data ×N | Binary | worker output chunks |
 | S→C | Error | Text `{"error":...}` | terminal frame |
 | S→C | Done | Text `{"done":true}` | terminal frame, then the socket closes |
+
+**First-frame dispatch (0.8.3):** the frame *type* — not any header — decides
+how the first frame is interpreted, because browser WebSocket clients cannot
+set custom headers on the upgrade request:
+
+| First frame | Server validation | Content-Type the worker sees |
+|---|---|---|
+| Text | must be valid JSON (else `{"error":"invalid JSON"}` + close) | upgrade request's, unchanged |
+| Binary | none (opaque bytes) | missing → `application/octet-stream` injected; a non-JSON value is kept as payload metadata; a JSON value is rewritten to `application/octet-stream` (logged as a warning) |
+
+> **Behavior change (0.8.3):** in 0.8.2 a Binary first frame was lossy
+> UTF-8-decoded and required to contain JSON text. Binary first frames are
+> now opaque bytes end-to-end — **send JSON payloads as Text frames**.
 
 A client disconnect cancels the worker promptly (no idle-timeout wait).
 
@@ -77,6 +90,12 @@ S→C  LPM(BidiChunk{close:{}})               # worker Done; or LPM(BidiChunk{er
 - First frame not `open` → 400 (the response is not yet committed, so plain
   HTTP errors work). Auth / readiness / rate-limit failures are likewise plain
   4xx/404/503.
+- `open.initial_data` is validated against the request Content-Type **before
+  the worker stream opens** (0.8.3): under a JSON content type (missing
+  header, or the `application/x-lite-bidi` framing type itself) malformed
+  JSON → 400; a raw content type (e.g. `application/octet-stream`) skips
+  validation and the bytes reach `on_open` untouched. Empty `initial_data`
+  is always legal (the worker maps it to `{}`).
 - Ending the request body without a `close` frame still ends worker input
   gracefully (half-close, same semantics as gRPC).
 

@@ -19,13 +19,25 @@ RPC 相同的 worker 流协议（模型侧的 `on_open` / `on_chunk` / `on_close
 
 | 方向 | 帧 | 格式 | 含义 |
 |------|----|----|------|
-| C→S | 首帧 | Text JSON payload(Binary 按 lossy UTF-8 解码为 JSON) | 初始输入(`on_open`) |
+| C→S | 首帧 | **Text** = JSON payload;**Binary** = 原始字节——由帧类型单独决定 | 初始输入(`on_open`) |
 | C→S | Data ×N | **Binary**——原始字节 | 追加输入(`on_chunk`) |
 | C→S | Close | Text `{"type":"close"}` | 优雅结束输入(`on_close`)；下行继续 |
 | C→S | 其他 Text | — | 协议错误：服务端发 `{"error":"unknown control frame"}`、关闭连接、Cancel worker |
 | S→C | Data ×N | Binary | worker 输出块 |
 | S→C | Error | Text `{"error":...}` | 终止帧 |
 | S→C | Done | Text `{"done":true}` | 终止帧，随后关闭连接 |
+
+**首帧分流（0.8.3）：**由帧*类型*——而非任何 header——决定首帧的解释
+方式，因为浏览器 WebSocket 客户端无法在升级请求上设置自定义 header:
+
+| 首帧 | 服务端校验 | worker 看到的 Content-Type |
+|------|-----------|---------------------------|
+| Text | 必须是合法 JSON（否则 `{"error":"invalid JSON"}` + 关闭） | 升级请求原值，不动 |
+| Binary | 无（不透明字节） | 缺失 → 注入 `application/octet-stream`;非 JSON 值保留（作为 payload 元数据）;JSON 值改写为 `application/octet-stream`（记 warning 日志） |
+
+> **行为变更（0.8.3）:**0.8.2 中 Binary 首帧会被 lossy UTF-8 解码并要求
+> 内容是 JSON 文本；现在 Binary 首帧全链路按不透明字节处理——
+> **JSON payload 请用 Text 帧发送**。
 
 客户端断开会立即 Cancel worker（不等 idle 超时）。
 
@@ -72,6 +84,11 @@ S→C  LPM(BidiChunk{close:{}})               # worker Done;失败时为 LPM(Bid
 - `stream_id` 由服务端生成（`http-bidi-<uuid>`)，在每一帧下行帧中回显。
 - 首帧非 `open` → 400（响应尚未提交，普通 HTTP 错误）。鉴权 / 未就绪 /
   限流失败同样是普通 4xx/404/503。
+- `open.initial_data` 在 **worker 流打开之前**按请求 Content-Type 校验
+  (0.8.3):JSON 类 content type（含 header 缺失、以及
+  `application/x-lite-bidi` 帧格式类型本身）下畸形 JSON → 400；原始字节
+  类 content type（如 `application/octet-stream`）跳过校验，字节原样
+  到达 `on_open`。空 `initial_data` 始终合法（worker 映射为 `{}`)。
 - 请求 body 结束而未发 `close` 帧时，服务端仍会优雅结束 worker 输入
   (half-close，与 gRPC 语义一致）。
 

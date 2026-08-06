@@ -52,8 +52,11 @@ Client disconnect → `event_tx` fails → forwarder breaks → targeted cancel
 Handshake: GET /v2/models/{m}/decoupled-stream  → 101
            (CORS: browsers send no preflight for WS, so Origin is checked
            at upgrade — `ws_origin_allowed`)
-C→S       Text {"prompt": ...}         first frame = request payload
-                                       (Binary is accepted, decoded as lossy UTF-8)
+C→S       Text {"prompt": ...}         first frame = request payload (Text = JSON)
+C→S       Binary <raw bytes>           ...or a Binary first frame = raw bytes
+                                       (frame type decides, same rule as /stream —
+                                       see http-bidi.md; 0.8.2 lossy UTF-8 decoding
+                                       was removed in 0.8.3)
 S→C       Binary <chunk>               model push ×N
 C→S       Text {"type":"cancel"}       optional cancel
 C→S       Text {"type":"close"}        cancel alias (same behavior)

@@ -470,6 +470,68 @@ fn is_cancel_or_close_frame(text: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// B2 (E3): the first WS frame carries the request payload; frame type is
+/// the sole dispatch signal. Text → JSON (RawValue-validated legacy path);
+/// Binary → opaque bytes (no validation). The browser WebSocket API cannot
+/// set custom headers on the upgrade request, so frame type is the only
+/// client-controlled signal.
+enum FirstFrame {
+    Json(String),
+    Raw(bytes::Bytes),
+}
+
+impl FirstFrame {
+    /// D11 body_kind label derived from frame type (E4: Text → json,
+    /// Binary → raw), aligned with the unary/SSE D11 semantics.
+    fn body_kind(&self) -> &'static str {
+        match self {
+            FirstFrame::Json(_) => "json",
+            FirstFrame::Raw(_) => "raw",
+        }
+    }
+}
+
+/// B2 (E4): normalize the content-type written into meta.headers for a
+/// Binary first frame, so the Python side's D9 dispatch receives a
+/// single-source-of-truth header:
+///   missing CT  → inject application/octet-stream
+///   non-JSON CT → keep as-is (payload metadata, usable by the model)
+///   JSON CT     → rewrite to application/octet-stream + warn
+///     (contradictory signal: frame type wins over header)
+fn normalize_binary_first_frame_ct(headers: &mut HeaderMap, model_name: &str) {
+    let existing_ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    match existing_ct {
+        None => {
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/octet-stream"),
+            );
+        }
+        Some(ref ct) if is_json_content_type(
+            &axum::http::HeaderValue::from_str(ct).unwrap_or_else(|_| {
+                axum::http::HeaderValue::from_static("application/octet-stream")
+            }),
+        ) => {
+            tracing::warn!(
+                model = %model_name,
+                content_type = %ct,
+                "WS Binary first frame with JSON Content-Type; \
+                 frame type wins — rewriting to application/octet-stream"
+            );
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/octet-stream"),
+            );
+        }
+        Some(_) => {
+            // Non-JSON CT preserved as-is (payload metadata).
+        }
+    }
+}
+
 async fn handle_ws_stream(
     state: Arc<AppState>,
     model_name: String,
@@ -529,14 +591,8 @@ async fn handle_ws_stream(
     // wait is unbounded (a client that upgrades but never sends keeps the
     // handler open indefinitely).
     //
-    // B2 (E3, E4): frame type is the sole dispatch signal — Text → JSON
-    // (RawValue validation, legacy path); Binary → opaque bytes (skip
-    // validation). The browser WebSocket API cannot set custom headers on the
-    // upgrade request, so frame type is the only client-controlled signal.
-    enum FirstFrame {
-        Json(String),
-        Raw(bytes::Bytes),
-    }
+    // B2 (E3): Text → JSON (RawValue validation, legacy path); Binary →
+    // opaque bytes (skip validation). See FirstFrame / E4 normalization.
     let first_frame = {
         let recv = match crate::deadline::idle_budget(state.config.server.timeout) {
             Some(budget) => match tokio::time::timeout(budget, socket.recv()).await {
@@ -589,53 +645,19 @@ async fn handle_ws_stream(
     crate::telemetry::link_parent(&span, &cx.trace_cx);
     let deadline = crate::deadline::resolve_from_http(&headers, state.config.server.timeout);
     // B2 (E4): payload_bytes from frame type; body_kind from frame type
-    // (Text → json, Binary → raw). CT normalization: write the effective
-    // content-type into meta.headers so the Python side's D9 dispatch
-    // receives a single-source-of-truth header.
-    let (payload_bytes, body_kind) = match &first_frame {
+    // (Text → json, Binary → raw). CT normalization for Binary frames writes
+    // the effective content-type into meta.headers so the Python side's D9
+    // dispatch receives a single-source-of-truth header. Matched by value so
+    // the legacy Text path stays zero-copy (String::into_bytes).
+    let body_kind = first_frame.body_kind();
+    let payload_bytes = match first_frame {
         FirstFrame::Json(text) => {
             // Text first frame → JSON (legacy path, no CT normalization).
-            (bytes::Bytes::from(text.as_bytes().to_vec()), "json")
+            bytes::Bytes::from(text.into_bytes())
         }
         FirstFrame::Raw(bin) => {
-            // Binary first frame → raw bytes. Normalize the content-type
-            // header for Python's D9 dispatch (E4 table):
-            //   missing CT  → inject application/octet-stream
-            //   non-JSON CT → keep as-is (payload metadata)
-            //   JSON CT     → rewrite to application/octet-stream + warn
-            //     (contradictory signal: frame type wins over header)
-            let existing_ct = headers
-                .get(axum::http::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
-            match existing_ct {
-                None => {
-                    headers.insert(
-                        axum::http::header::CONTENT_TYPE,
-                        axum::http::HeaderValue::from_static("application/octet-stream"),
-                    );
-                }
-                Some(ref ct) if is_json_content_type(
-                    &axum::http::HeaderValue::from_str(ct).unwrap_or_else(|_| {
-                        axum::http::HeaderValue::from_static("application/octet-stream")
-                    }),
-                ) => {
-                    tracing::warn!(
-                        model = %model_name,
-                        content_type = %ct,
-                        "WS Binary first frame with JSON Content-Type; \
-                         frame type wins — rewriting to application/octet-stream"
-                    );
-                    headers.insert(
-                        axum::http::header::CONTENT_TYPE,
-                        axum::http::HeaderValue::from_static("application/octet-stream"),
-                    );
-                }
-                Some(_) => {
-                    // Non-JSON CT preserved as-is (payload metadata).
-                }
-            }
-            (bin.clone(), "raw")
+            normalize_binary_first_frame_ct(&mut headers, &model_name);
+            bin
         }
     };
     span.record("body_bytes", payload_bytes.len() as i64);
@@ -2641,6 +2663,56 @@ mod tests {
         assert!(
             got_cancel,
             "worker must receive Cancel promptly on client disconnect (gone signal)"
+        );
+    }
+
+    // === B2: first-frame dispatch unit tests (E3/E4) ===
+
+    fn ct_map(val: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(axum::http::header::CONTENT_TYPE, val.parse().unwrap());
+        h
+    }
+
+    fn ct_of(h: &HeaderMap) -> String {
+        h.get(axum::http::header::CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap_or("").to_string())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn b2_ct_normalization_missing_injects_octet_stream() {
+        let mut h = HeaderMap::new();
+        normalize_binary_first_frame_ct(&mut h, "m");
+        assert_eq!(ct_of(&h), "application/octet-stream");
+    }
+
+    #[test]
+    fn b2_ct_normalization_non_json_preserved() {
+        let mut h = ct_map("image/png");
+        normalize_binary_first_frame_ct(&mut h, "m");
+        assert_eq!(ct_of(&h), "image/png", "payload metadata must pass through");
+    }
+
+    #[test]
+    fn b2_ct_normalization_json_rewritten() {
+        for ct in ["application/json", "application/vnd.api+json"] {
+            let mut h = ct_map(ct);
+            normalize_binary_first_frame_ct(&mut h, "m");
+            assert_eq!(
+                ct_of(&h),
+                "application/octet-stream",
+                "JSON CT with a Binary frame is contradictory — frame type wins ({ct})"
+            );
+        }
+    }
+
+    #[test]
+    fn b2_body_kind_from_frame_type() {
+        assert_eq!(FirstFrame::Json("{}".to_string()).body_kind(), "json");
+        assert_eq!(
+            FirstFrame::Raw(bytes::Bytes::from_static(b"\x00")).body_kind(),
+            "raw"
         );
     }
 }

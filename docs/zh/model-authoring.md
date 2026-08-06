@@ -42,7 +42,7 @@ model_repo/
 - `model_name`：字母、数字、下划线、连字符，最长 64 字符（如 `my_model`、`resnet-v2`）。点号 `.` 不允许。
 - `version`：字母、数字、点号、下划线、连字符，最长 64 字符。必须以字母或数字开头，不能以点号开头或结尾，不能含 `..`（如 `1`、`v2`、`latest`、`1.0.0`）
 
-对于 **ensemble 模型**，`model.py` 可以省略——只需在 `config.yaml` 中定义顶层 `ensemble` 字段即可，模型完全由配置描述。
+对于 **ensemble 模型**，`model.py` 可以省略——只需在 `config.yaml` 中定义顶层 `ensemble` 字段即可，模型完全由配置描述。ensemble 也接受原始字节根请求（字节直送第一层，binary 值的引用方式有限制）——见[原始字节 / Tensor 请求](raw-bytes-request.md)的 *Ensemble 模型* 一节。
 
 模型根目录（`{model_name}/`）下还可以放置 `requirements.txt`（Python 依赖）和 `README.md`，打包为 `.lma` 时会自动包含。
 

@@ -127,11 +127,14 @@ async fn do_infer(
         return match result {
             crate::ensemble::EnsembleValue::Json(v) => Ok(Json(v).into_response()),
             crate::ensemble::EnsembleValue::Binary(data, ct) => {
-                Ok(Response::builder()
+                // Same builder-error handling as the unary passthrough
+                // (inference.rs:291-302): a worker-supplied media_type that is
+                // not a valid header value must become a 500, never a panic.
+                Response::builder()
                     .status(axum::http::StatusCode::OK)
                     .header(axum::http::header::CONTENT_TYPE, &ct)
                     .body(axum::body::Body::from(data))
-                    .unwrap())
+                    .map_err(|e| AppError::Internal(format!("build response: {e}")))
             }
         };
     }

@@ -44,8 +44,11 @@ RPC 相同的 worker 流协议（模型侧的 `predict_decoupled`——见
 ```
 握手: GET /v2/models/{m}/decoupled-stream  → 101
       （CORS：浏览器 WS 无 preflight，升级时校验 Origin——ws_origin_allowed）
-C→S   Text {"prompt": ...}         首帧 = 请求 payload
-                                   （Binary 亦可，UTF-8 lossy 解码）
+C→S   Text {"prompt": ...}         首帧 = 请求 payload（Text = JSON）
+C→S   Binary <原始字节>            ……首帧也可以是 Binary = 原始字节
+                                   （由帧类型决定，规则与 /stream 相同——
+                                   见 http-bidi.md;0.8.2 的 lossy UTF-8
+                                   解码已于 0.8.3 移除）
 S→C   Binary <chunk>               模型推送 ×N
 C→S   Text {"type":"cancel"}       可选取消
 C→S   Text {"type":"close"}        cancel 别名（行为相同）

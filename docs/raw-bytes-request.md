@@ -116,6 +116,30 @@ class MyAPI(LitAPI):
   `self.input_shape` from `setup()` instead — but dtype byte-order should
   still come from headers, not hardcoded.
 
+## Ensemble Models
+
+Ensemble models accept a raw-bytes root input (the `ensemble requires JSON
+input` rejection was lifted in 0.8.3): the bytes flow to the first layer
+untouched, with the request's Content-Type forwarded to the step's worker.
+The canonical chain — image bytes in, the first step returns JSON features,
+later steps stay JSON — works end to end.
+
+Binary flow is deliberately limited to the two outer edges of the DAG:
+
+| Reference | On binary data | Result |
+|---|---|---|
+| `$request` (whole) | root binary input | passthrough to the step |
+| `$request.field` | — | **400** (bytes have no field semantics) |
+| `$stepN` (whole or field) | binary step output | **400** (binary must not flow between steps) |
+
+A step consuming the binary input must declare it as its *only* input —
+mixed JSON+binary input sets are rejected with 400. A final step may itself
+return binary (a non-JSON `media_type` on the worker response): the HTTP
+response then carries the bytes and the worker-declared Content-Type
+verbatim, exactly like the unary passthrough. On gRPC the bytes are returned
+in `InferResponse.data` (the proto carries no content type; the client knows
+the model contract).
+
 ## Body Size Limit
 
 Default: **64 MiB**. Controlled by `server.max_request_body_bytes` in the
@@ -136,6 +160,6 @@ limit for your instance size and expected concurrency.
 | Status | Code                        | Trigger                                      |
 |--------|-----------------------------|----------------------------------------------|
 | 400    | `invalid_request_body`      | Invalid JSON syntax                          |
-| 400    | `invalid_request_body`      | Ensemble receives non-JSON body              |
+| 400    | `invalid_request_body`      | Ensemble: field access on binary data, binary step output referenced downstream, or mixed JSON+binary step inputs |
 | 413    | `payload_too_large`         | Body exceeds `max_request_body_bytes`        |
 | 415    | `unsupported_media_type`    | `Content-Encoding` header present            |

@@ -20,6 +20,7 @@ config shapes and logs `warn` lines pointing at the M-entries below
 | M7 | P-WARM | `policies.warmup.dummy_input_ref`/`iterations` removed → `samples` list (config fails to load) |
 | M8 | 0.8.0 | `features.*` toggles now enforced; 3 reserved fields removed; `custom_metrics` now opt-in |
 | M9 | 0.8.0 | Callback lifecycle hooks renamed (`on_*` → positional `before_*`/`after_*`); duck-typed `pre_setup` removed |
+| M10 | 0.8.3 | WebSocket Binary first frame is now raw bytes (was: lossy UTF-8 decoded as JSON) — send JSON as a Text frame |
 
 Non-breaking phases (no action needed): P-MW, P-ENSEMBLE-GRPC, P-FLOW, P-DEADLINE,
 P-WARM (pure additions; defaults preserve prior behavior). P-OAI is deferred to 0.9
@@ -265,4 +266,24 @@ Two related changes:
 
 **Migrate:** rename the three hooks per the table; move `pre_setup` logic into
 `setup()` or a `before_setup` callback.
+
+## M10 — WebSocket Binary first frame is raw bytes (0.8.3)
+
+**What changed:** on the WS streaming endpoints (`/stream`,
+`/decoupled-stream`, and their versioned variants), how the first frame is
+interpreted is now decided by the frame *type* alone. In 0.8.2 a Binary first
+frame was lossy UTF-8-decoded and had to contain JSON text; it is now treated
+as opaque bytes and forwarded to the worker untouched, with the Content-Type
+the worker sees normalized to `application/octet-stream` when the upgrade
+request carried none or a JSON one (a non-JSON value, e.g. `image/png`, is
+kept as payload metadata).
+
+**Migrate:** if your client sends its JSON payload as a **Binary** WS frame,
+switch to a Text frame (`ws.send(JSON.stringify(payload))` in browsers,
+`Message::Text(...)` in tungstenite). Text-frame clients are unaffected.
+
+Related 0.8.3 additions (non-breaking): h2 bidi validates `open.initial_data`
+JSON at the edge (400 instead of a worker-side failure — raw content types
+skip validation), and ensemble models accept a raw-bytes root input (see
+[Raw Bytes / Tensor Request](raw-bytes-request.md) → *Ensemble Models*).
 

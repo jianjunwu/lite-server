@@ -552,6 +552,62 @@ class WarmupFailAPI(LitAPI):
     )
     .unwrap();
 
+    // ws_probe_model (B2): reports how the worker dispatched the first WS
+    // frame — raw bytes vs parsed JSON — plus the content-type it saw in
+    // meta.headers, so tests can pin the E3/E4 dispatch and CT normalization.
+    let ws_probe_dir = tmp.join("ws_probe_model/1");
+    std::fs::create_dir_all(&ws_probe_dir).unwrap();
+    std::fs::write(
+        ws_probe_dir.join("model.py"),
+        r#"from lite_server import LitAPI
+
+
+def _report(data, ctx):
+    ct = ctx.meta.headers.get("content-type", "") if ctx is not None else ""
+    if isinstance(data, bytes):
+        return {"kind": "bytes", "len": len(data), "ct": ct}
+    return {"kind": "json", "ct": ct}
+
+
+class ProbeHandler:
+    def on_open(self, initial_data, ctx=None):
+        return _report(initial_data, ctx)
+
+    def on_chunk(self, chunk):
+        return None
+
+    def on_close(self):
+        pass
+
+
+class WsProbeAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+
+    def bidi_stream(self):
+        return ProbeHandler()
+
+    async def predict_decoupled(self, data, sender, ctx=None):
+        await sender.send(_report(data, ctx))
+        await sender.close()
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        ws_probe_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+
     tmp
 }
 
@@ -2404,6 +2460,206 @@ async fn test_ws_bidi_unknown_control_frame() {
     let _ = ws.close(None).await;
 
     unload_model(&base, MODEL, "1").await;
+}
+
+// ---------------------------------------------------------------------------
+// B2 (tensor-bytes-consistency): WS first-frame dispatch (E3/E4/E5)
+// ---------------------------------------------------------------------------
+
+/// Connect a WS client, optionally setting Content-Type on the upgrade
+/// request (non-browser clients can; browsers cannot — which is why the
+/// frame type is the dispatch signal).
+#[cfg(unix)]
+async fn ws_connect_with_ct(
+    url: &str,
+    ct: Option<&str>,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = url.into_client_request().expect("WS request build failed");
+    if let Some(ct) = ct {
+        req.headers_mut()
+            .insert("content-type", ct.parse().unwrap());
+    }
+    let (ws, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("WS connect failed");
+    ws
+}
+
+/// Send a Binary first frame and read the probe model's report back as JSON.
+/// Bidi (`/stream`) reports in a Text frame; decoupled (`/decoupled-stream`)
+/// reports in a Binary chunk — accept either.
+#[cfg(unix)]
+async fn ws_binary_first_frame_probe(ws_url: &str, ct: Option<&str>) -> Value {
+    use futures::{SinkExt, StreamExt};
+    let mut ws = ws_connect_with_ct(ws_url, ct).await;
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+        b"\x00\x01\x02".to_vec(),
+    ))
+    .await
+    .expect("WS send Binary first frame failed");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let msg = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .expect("timed out waiting for probe report")
+            .expect("WS closed before probe report")
+            .expect("WS error before probe report");
+        let text = match msg {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t,
+            tokio_tungstenite::tungstenite::Message::Binary(b) => {
+                String::from_utf8_lossy(&b).to_string()
+            }
+            _ => continue,
+        };
+        if let Ok(v) = serde_json::from_str::<Value>(&text) {
+            if v.get("kind").is_some() {
+                let _ = ws.close(None).await;
+                return v;
+            }
+        }
+    }
+}
+
+/// B2 §7.2 (regression): a Text first frame that is not valid JSON is
+/// rejected with {"error":"invalid JSON"} then close — the legacy path is
+/// byte-identical to 0.8.2.
+#[tokio::test]
+#[serial]
+async fn test_ws_first_frame_text_invalid_json_rejected() {
+    use futures::{SinkExt, StreamExt};
+    let base = shared_base().await;
+    load_model(&base, "ws_probe_model", "1").await;
+
+    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ws_probe_model/stream", SHARED_PORT);
+    let mut ws = ws_connect_with_ct(&ws_url, None).await;
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        "this is not json".to_string(),
+    ))
+    .await
+    .expect("WS send failed");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut got_error = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                let body: Value = serde_json::from_str(&text).unwrap_or(json!({}));
+                if body.get("error").is_some() {
+                    assert_eq!(
+                        body["error"], "invalid JSON",
+                        "Text first frame must keep the legacy rejection"
+                    );
+                    got_error = true;
+                    break;
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => break,
+        }
+    }
+    assert!(got_error, "expected invalid-JSON error frame");
+    let _ = ws.close(None).await;
+    unload_model(&base, "ws_probe_model", "1").await;
+}
+
+/// B2 §7.2 (E4): Binary first frame + missing upgrade CT → raw bytes to the
+/// worker with content-type injected as application/octet-stream.
+#[tokio::test]
+#[serial]
+async fn test_ws_first_frame_binary_missing_ct_injected() {
+    let base = shared_base().await;
+    load_model(&base, "ws_probe_model", "1").await;
+
+    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ws_probe_model/stream", SHARED_PORT);
+    let v = ws_binary_first_frame_probe(&ws_url, None).await;
+    assert_eq!(v["kind"], "bytes", "Binary first frame must dispatch raw");
+    assert_eq!(v["len"], 3, "all 3 bytes must arrive");
+    assert_eq!(
+        v["ct"], "application/octet-stream",
+        "missing CT must be injected as octet-stream"
+    );
+
+    unload_model(&base, "ws_probe_model", "1").await;
+}
+
+/// B2 §7.2 (E4): Binary first frame + non-JSON CT → CT preserved as payload
+/// metadata for the model.
+#[tokio::test]
+#[serial]
+async fn test_ws_first_frame_binary_non_json_ct_preserved() {
+    let base = shared_base().await;
+    load_model(&base, "ws_probe_model", "1").await;
+
+    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ws_probe_model/stream", SHARED_PORT);
+    let v = ws_binary_first_frame_probe(&ws_url, Some("image/png")).await;
+    assert_eq!(v["kind"], "bytes");
+    assert_eq!(
+        v["ct"], "image/png",
+        "non-JSON CT must pass through to the worker"
+    );
+
+    unload_model(&base, "ws_probe_model", "1").await;
+}
+
+/// B2 §7.2 (E4/E5 pin): Binary first frame + JSON CT is contradictory —
+/// frame type wins and the CT is rewritten to octet-stream (0.8.2 parsed
+/// such frames as JSON; this is the documented behavior change).
+#[tokio::test]
+#[serial]
+async fn test_ws_first_frame_binary_json_ct_rewritten() {
+    let base = shared_base().await;
+    load_model(&base, "ws_probe_model", "1").await;
+
+    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ws_probe_model/stream", SHARED_PORT);
+    // Binary frame carrying non-UTF8 bytes + a JSON upgrade CT: 0.8.2 lossy-
+    // decoded and rejected it; now the frame type wins and it stays raw.
+    let v = ws_binary_first_frame_probe(&ws_url, Some("application/json")).await;
+    assert_eq!(v["kind"], "bytes", "frame type must win over a JSON CT");
+    assert_eq!(
+        v["ct"], "application/octet-stream",
+        "JSON CT must be rewritten to octet-stream"
+    );
+
+    unload_model(&base, "ws_probe_model", "1").await;
+}
+
+/// B2 §7.2: decoupled WS shares handle_ws_stream — the missing-CT injection
+/// must behave identically on /decoupled-stream.
+#[tokio::test]
+#[serial]
+async fn test_ws_decoupled_first_frame_binary_missing_ct_injected() {
+    let base = shared_base().await;
+    load_model(&base, "ws_probe_model", "1").await;
+
+    let ws_url = format!(
+        "ws://127.0.0.1:{}/v2/models/ws_probe_model/decoupled-stream",
+        SHARED_PORT
+    );
+    let v = ws_binary_first_frame_probe(&ws_url, None).await;
+    assert_eq!(v["kind"], "bytes", "decoupled: Binary first frame must dispatch raw");
+    assert_eq!(v["len"], 3);
+    assert_eq!(v["ct"], "application/octet-stream");
+
+    unload_model(&base, "ws_probe_model", "1").await;
+}
+
+/// B2 §7.2: decoupled WS — JSON CT rewrite parity with /stream.
+#[tokio::test]
+#[serial]
+async fn test_ws_decoupled_first_frame_binary_json_ct_rewritten() {
+    let base = shared_base().await;
+    load_model(&base, "ws_probe_model", "1").await;
+
+    let ws_url = format!(
+        "ws://127.0.0.1:{}/v2/models/ws_probe_model/decoupled-stream",
+        SHARED_PORT
+    );
+    let v = ws_binary_first_frame_probe(&ws_url, Some("application/json")).await;
+    assert_eq!(v["kind"], "bytes");
+    assert_eq!(v["ct"], "application/octet-stream");
+
+    unload_model(&base, "ws_probe_model", "1").await;
 }
 
 // ---------------------------------------------------------------------------
@@ -6135,6 +6391,218 @@ class BidiAPI(LitAPI):
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
+// ---------------------------------------------------------------------------
+// B1 (tensor-bytes-consistency): h2 bidi initial_data Content-Type dispatch
+// ---------------------------------------------------------------------------
+
+/// Shared fixture for the B1 dispatch tests: a bidi model whose `on_open`
+/// reports how the worker dispatched the initial_data (raw bytes vs parsed
+/// JSON), so the test can assert the Rust/Python dispatch agreement.
+#[cfg(unix)]
+async fn start_h2_bidi_ct_server(tag: &str) -> (String, ServerGuard, std::path::PathBuf) {
+    let http_port = next_test_port();
+    kill_stale_on_port(http_port);
+    let repo = std::env::temp_dir().join(format!(
+        "lite-server-h2bidi-ct-{tag}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&repo);
+    let model_dir = repo.join("h2bidi/1");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    std::fs::write(
+        model_dir.join("model.py"),
+        r#"from lite_server import LitAPI
+
+
+class BidiHandler:
+    def on_open(self, initial_data):
+        if isinstance(initial_data, bytes):
+            return {"kind": "bytes", "len": len(initial_data)}
+        return {"kind": "json", "value": initial_data}
+
+    def on_chunk(self, chunk):
+        return {"echo": chunk}
+
+    def on_close(self):
+        pass
+
+
+class BidiAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+
+    def bidi_stream(self):
+        return BidiHandler()
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        model_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+    let server = ServerGuard::start(&[
+        "--port", &http_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-grpc", "--no-metrics", "--log-level", "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "h2bidi", "1").await;
+    (base, server, repo)
+}
+
+/// POST a single LPM BidiOpen frame with a static body (frame + END_STREAM)
+/// and the given Content-Type; returns the raw response.
+#[cfg(unix)]
+async fn h2_bidi_open(base: &str, ct: &str, initial_data: &'static [u8]) -> reqwest::Response {
+    use lite_server::proto::liteserver as pb;
+    use lite_server::streaming::lpm;
+    let frame = lpm::encode_frame(&pb::BidiChunk {
+        stream_id: String::new(),
+        payload: Some(pb::bidi_chunk::Payload::Open(pb::BidiOpen {
+            initial_data: bytes::Bytes::from_static(initial_data),
+            ..Default::default()
+        })),
+    });
+    reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap()
+        .post(format!("{}/v2/models/h2bidi/bidi", base))
+        .header("content-type", ct)
+        .body(frame)
+        .send()
+        .await
+        .expect("h2 bidi POST failed")
+}
+
+/// Read the first Data frame payload from an accepted bidi response.
+#[cfg(unix)]
+async fn h2_bidi_first_data(resp: reqwest::Response) -> Vec<u8> {
+    use futures::StreamExt;
+    use lite_server::proto::liteserver as pb;
+    use lite_server::streaming::lpm;
+    let mut stream = resp.bytes_stream();
+    let mut buf = bytes::BytesMut::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(Some(c)) = lpm::try_decode_frame(&mut buf) {
+            match c.payload {
+                Some(pb::bidi_chunk::Payload::Data(d)) => return d.data.to_vec(),
+                other => panic!("expected on_open Data frame, got {other:?}"),
+            }
+        }
+        let next = tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .expect("timed out waiting for LPM frame")
+            .expect("response stream ended before frame");
+        buf.extend_from_slice(&next.expect("response stream error"));
+    }
+}
+
+/// B1 §7.1: JSON Content-Type + malformed initial_data → 400 before the
+/// worker stream opens (a committed 200 would prove the worker opened).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_h2_bidi_initial_data_invalid_json_ct_400() {
+    let (base, _server, repo) = start_h2_bidi_ct_server("badjson").await;
+
+    let resp = h2_bidi_open(&base, "application/json", b"{not-json").await;
+    assert_eq!(
+        resp.status(),
+        400,
+        "malformed JSON initial_data must be rejected at the edge"
+    );
+    let body: Value = resp.json().await.unwrap();
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("invalid JSON in BidiOpen initial_data"),
+        "error must name the initial_data validation, got: {msg}"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// B1 §7.1 (E1 pin): the framing Content-Type is treated as absent (JSON
+/// default), so malformed JSON under application/x-lite-bidi must ALSO 400 —
+/// without the E1 mirror rule this would slip through as "raw".
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_h2_bidi_initial_data_framing_ct_invalid_json_400() {
+    let (base, _server, repo) = start_h2_bidi_ct_server("framing").await;
+
+    let resp = h2_bidi_open(&base, "application/x-lite-bidi", b"\xff\xfe garbage").await;
+    assert_eq!(
+        resp.status(),
+        400,
+        "framing CT must keep JSON-default dispatch (E1), got {}",
+        resp.status()
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// B1 §7.1: application/octet-stream + arbitrary bytes → no validation, the
+/// worker receives raw bytes (Python raw branch).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_h2_bidi_initial_data_octet_stream_raw_passthrough() {
+    let (base, _server, repo) = start_h2_bidi_ct_server("raw").await;
+
+    let resp = h2_bidi_open(&base, "application/octet-stream", b"\x00\x01\x02").await;
+    assert_eq!(resp.status(), 200, "raw CT must skip JSON validation");
+    let data = h2_bidi_first_data(resp).await;
+    let v: Value = serde_json::from_slice(&data).unwrap();
+    assert_eq!(
+        v["kind"], "bytes",
+        "worker must receive raw bytes, got: {v}"
+    );
+    assert_eq!(v["len"], 3, "all 3 bytes must arrive, got: {v}");
+
+    unload_model(&base, "h2bidi", "1").await;
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// B1 §7.1 (E2 pin): empty initial_data with a JSON Content-Type is legal —
+/// Python maps it to {} — and must not be rejected by the Rust validation.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_h2_bidi_initial_data_empty_skips_validation() {
+    let (base, _server, repo) = start_h2_bidi_ct_server("empty").await;
+
+    let resp = h2_bidi_open(&base, "application/json", b"").await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "empty initial_data must skip validation (E2), got {}",
+        resp.status()
+    );
+    let data = h2_bidi_first_data(resp).await;
+    let v: Value = serde_json::from_slice(&data).unwrap();
+    assert_eq!(
+        v["kind"], "json",
+        "Python must map empty payload to {{}} (json branch), got: {v}"
+    );
+    assert_eq!(v["value"], json!({}), "empty payload maps to empty object");
+
+    unload_model(&base, "h2bidi", "1").await;
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
 /// WS6 (P-DEADLINE bidi parity): a bidi stream whose client never sends the
 /// opening message must be recovered after `server.timeout`, instead of
 /// hanging the handler unbounded. The server's `bidi_stream` reads the first
@@ -7324,14 +7792,14 @@ ensemble:
     let _ = std::fs::remove_dir_all(&repo);
 }
 
-/// §6.3 test_ensemble_rejects_binary (P0 → B3): HTTP ensemble + non-JSON
-/// Content-Type is now accepted as binary root input (B3, E6 — D7 relaxed).
-/// However, field-level access (`$request.x`) on binary data is rejected
-/// because bytes carry no field semantics (E7).
+/// §6.3 test_ensemble_binary_root_field_access_400 (P0 → B3): HTTP ensemble
+/// + non-JSON Content-Type is now accepted as binary root input (B3, E6 —
+/// D7 relaxed). However, field-level access (`$request.x`) on binary data is
+/// rejected because bytes carry no field semantics (E7).
 #[cfg(unix)]
 #[tokio::test]
 #[serial]
-async fn test_ensemble_rejects_binary() {
+async fn test_ensemble_binary_root_field_access_400() {
     let http_port = next_test_port();
     kill_stale_on_port(http_port);
 
@@ -7384,6 +7852,442 @@ ensemble:
     );
 
     let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// AUDIT (B3 egress, inference.rs): a final-step binary output whose
+/// media_type is not a valid HTTP header value must NOT panic the request
+/// handler. The unary binary passthrough this egress mirrors
+/// (inference.rs:291-302) builds the response with
+/// `.body(...).map_err(AppError::Internal)`; the B3 ensemble egress calls
+/// `.unwrap()` on the same builder, so a worker-controlled media_type
+/// containing CR/LF turns into a handler panic and the connection drops
+/// without any response. Correct behavior (unary parity): a 500 response.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_audit_ensemble_binary_egress_invalid_media_type() {
+    let http_port = next_test_port();
+    kill_stale_on_port(http_port);
+
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-http-ensemble-badmt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    // Submodel declares a non-JSON media_type containing CR/LF (invalid in an
+    // HTTP header value). Content is raw bytes, so the step output becomes
+    // EnsembleValue::Binary and reaches the B3 HTTP egress.
+    let dir = repo.join("badmt/1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("model.py"),
+        r#"from lite_server import LitAPI
+from lite_server.response import Response
+
+
+class BadMtAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request
+
+    def predict(self, x):
+        return b"payload"
+
+    def encode_response(self, output):
+        return Response(content=output, media_type="text/plain\r\nX-Injected: 1")
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+    let ens_dir = repo.join("ensemble_model/1");
+    std::fs::create_dir_all(&ens_dir).unwrap();
+    std::fs::write(
+        ens_dir.join("config.yaml"),
+        r#"
+ensemble:
+  steps:
+    - name: only
+      model: badmt
+      version: "1"
+      inputs:
+        x: "$request.x"
+"#,
+    )
+    .unwrap();
+
+    let _server = ServerGuard::start(&[
+        "--port", &http_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-grpc", "--no-metrics", "--log-level", "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "badmt", "1").await;
+    load_model(&base, "ensemble_model", "1").await;
+
+    let client = reqwest::Client::new();
+    let result = client
+        .post(format!("{}/v2/models/ensemble_model/infer", base))
+        .json(&json!({"x": 1}))
+        .send()
+        .await;
+    let resp = result.expect(
+        "handler must not panic on invalid media_type — a response must come back",
+    );
+    assert_eq!(
+        resp.status(),
+        500,
+        "invalid media_type must map to 500 (unary passthrough parity), got {}",
+        resp.status()
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// B3 §7.3 (Option A full chain): image bytes → ensemble root (Binary) →
+/// first layer receives raw bytes → JSON features → final layer → JSON out.
+/// Pins root→first-layer binary passthrough AND mid-DAG Json flow together.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_ensemble_binary_root_to_json_chain() {
+    let http_port = next_test_port();
+    kill_stale_on_port(http_port);
+
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-ensemble-binchain-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    // vision: reports whether it received raw bytes and how many.
+    write_submodel(
+        &repo,
+        "vision",
+        "        return {\"features\": [len(x)] if isinstance(x, (bytes, bytearray)) else [], \"was_bytes\": isinstance(x, (bytes, bytearray))}",
+    );
+    // classifier: consumes the JSON features.
+    write_submodel(
+        &repo,
+        "classifier",
+        "        return {\"label\": \"cat\", \"wb\": x.get(\"wb\"), \"n\": len(x.get(\"feats\", []))}",
+    );
+    let ens_dir = repo.join("ensemble_model/1");
+    std::fs::create_dir_all(&ens_dir).unwrap();
+    std::fs::write(
+        ens_dir.join("config.yaml"),
+        r#"
+ensemble:
+  steps:
+    - name: vision
+      model: vision
+      version: "1"
+      inputs:
+        img: "$request"
+    - name: classifier
+      model: classifier
+      version: "1"
+      inputs:
+        feats: "$vision.features"
+        wb: "$vision.was_bytes"
+"#,
+    )
+    .unwrap();
+
+    let _server = ServerGuard::start(&[
+        "--port", &http_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-grpc", "--no-metrics", "--log-level", "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "vision", "1").await;
+    load_model(&base, "classifier", "1").await;
+    load_model(&base, "ensemble_model", "1").await;
+
+    let image: Vec<u8> = (0u8..=255).collect();
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ensemble_model/infer", base))
+        .header("content-type", "application/octet-stream")
+        .body(image.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "binary root chain must succeed");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["label"], "cat");
+    assert_eq!(
+        body["wb"], true,
+        "first layer must have received raw bytes, got: {body}"
+    );
+    assert_eq!(body["n"], 1, "features list must flow through, got: {body}");
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// Write a sub-model whose encode_response declares a non-JSON media_type
+/// and returns raw bytes 0x00..=0xFF (ensemble step output becomes Binary).
+#[cfg(unix)]
+fn write_binary_submodel(repo: &std::path::Path, name: &str) {
+    let dir = repo.join(format!("{}/1", name));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("model.py"),
+        r#"from lite_server import LitAPI
+from lite_server.response import Response
+
+
+class BinOutAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request
+
+    def predict(self, x):
+        return bytes(range(256))
+
+    def encode_response(self, output):
+        return Response(content=output, media_type="application/octet-stream")
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+}
+
+/// B3 §7.3 (E7 boundary): a step's binary output referenced by a downstream
+/// step → 400 (binary must not flow between internal DAG steps; Option A
+/// scope). Regression pin for the Option-B slope.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_ensemble_step_binary_output_referenced_downstream_400() {
+    let http_port = next_test_port();
+    kill_stale_on_port(http_port);
+
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-ensemble-stepbin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    write_binary_submodel(&repo, "binout");
+    write_submodel(&repo, "echo", r#"        return {"out": x}"#);
+    let ens_dir = repo.join("ensemble_model/1");
+    std::fs::create_dir_all(&ens_dir).unwrap();
+    std::fs::write(
+        ens_dir.join("config.yaml"),
+        r#"
+ensemble:
+  steps:
+    - name: produce
+      model: binout
+      version: "1"
+      inputs:
+        x: "$request.x"
+    - name: consume
+      model: echo
+      version: "1"
+      inputs:
+        x: "$produce"
+"#,
+    )
+    .unwrap();
+
+    let _server = ServerGuard::start(&[
+        "--port", &http_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-grpc", "--no-metrics", "--log-level", "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "binout", "1").await;
+    load_model(&base, "echo", "1").await;
+    load_model(&base, "ensemble_model", "1").await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ensemble_model/infer", base))
+        .json(&json!({"x": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "referencing a binary step output downstream must be 400, got {}",
+        resp.status()
+    );
+    let body: Value = resp.json().await.unwrap();
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("binary step output"),
+        "error must name the binary-flow boundary, got: {msg}"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// B3 §7.3: final-step binary output → HTTP response passes the bytes and
+/// content-type through verbatim (mirrors the unary passthrough).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_ensemble_final_binary_output_http_passthrough() {
+    let http_port = next_test_port();
+    kill_stale_on_port(http_port);
+
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-ensemble-finalbin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    write_binary_submodel(&repo, "binout");
+    let ens_dir = repo.join("ensemble_model/1");
+    std::fs::create_dir_all(&ens_dir).unwrap();
+    std::fs::write(
+        ens_dir.join("config.yaml"),
+        r#"
+ensemble:
+  steps:
+    - name: only
+      model: binout
+      version: "1"
+      inputs:
+        x: "$request.x"
+"#,
+    )
+    .unwrap();
+
+    let _server = ServerGuard::start(&[
+        "--port", &http_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-grpc", "--no-metrics", "--log-level", "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "binout", "1").await;
+    load_model(&base, "ensemble_model", "1").await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ensemble_model/infer", base))
+        .json(&json!({"x": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .map(|v| v.to_str().unwrap_or("").to_string())
+        .unwrap_or_default();
+    assert!(
+        ct.starts_with("application/octet-stream"),
+        "final binary output must pass its content-type through, got {ct:?}"
+    );
+    let body = resp.bytes().await.unwrap();
+    let expected: Vec<u8> = (0u8..=255).collect();
+    assert_eq!(
+        body.as_ref(),
+        expected.as_slice(),
+        "final binary output must arrive byte-identical"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// B3 §7.3 (infer.rs:96 regression pin): gRPC ensemble with malformed-JSON
+/// `data` falls back to Binary (opaque bytes reach the first layer) instead
+/// of the old silent `Value::Null` swallow.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_grpc_ensemble_malformed_json_becomes_binary() {
+    use std::collections::HashMap;
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-grpc-ensemble-bin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    // probe: reports whether it received raw bytes and how many.
+    write_submodel(
+        &repo,
+        "probe",
+        "        return {\"was_bytes\": isinstance(x, (bytes, bytearray)), \"len\": len(x) if isinstance(x, (bytes, bytearray)) else -1}",
+    );
+    let ens_dir = repo.join("ensemble_model/1");
+    std::fs::create_dir_all(&ens_dir).unwrap();
+    std::fs::write(
+        ens_dir.join("config.yaml"),
+        r#"
+ensemble:
+  steps:
+    - name: only
+      model: probe
+      version: "1"
+      inputs:
+        data: "$request"
+"#,
+    )
+    .unwrap();
+
+    let tmp_dir = std::env::temp_dir()
+        .join(format!("lite-server-grpc-ensemble-bin-yaml-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18353\n  timeout: 30.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let _guard = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 30).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "probe", "1").await;
+    load_model(&base, "ensemble_model", "1").await;
+
+    let payload = b"\xff\xfe not json";
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+    let resp = client
+        .infer(InferRequest {
+            model_name: "ensemble_model".to_string(),
+            version: "1".to_string(),
+            data: bytes::Bytes::from_static(payload),
+            headers: HashMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("malformed JSON gRPC ensemble input must not error")
+        .into_inner();
+
+    let got: Value = serde_json::from_slice(&resp.data).expect("response must be JSON");
+    assert_eq!(
+        got["was_bytes"], true,
+        "malformed JSON must reach the first layer as raw bytes, got: {got}"
+    );
+    assert_eq!(
+        got["len"].as_u64(),
+        Some(payload.len() as u64),
+        "all raw bytes must arrive, got: {got}"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
 /// §6.3 test_sse_raw_bytes_input (P0): SSE + application/octet-stream →

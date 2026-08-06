@@ -18,6 +18,7 @@
 | M7 | P-WARM | `policies.warmup.dummy_input_ref`/`iterations` 已移除 → `samples` 列表（配置加载失败） |
 | M8 | 0.8.0 | `features.*` 开关现已生效；移除 3 个预留字段；`custom_metrics` 改为显式开启 |
 | M9 | 0.8.0 | Callback 生命周期钩子改名（`on_*` → 位置化 `before_*`/`after_*`）；鸭子类型 `pre_setup` 已删除 |
+| M10 | 0.8.3 | WebSocket Binary 首帧改为原始字节（原为 lossy UTF-8 解码当 JSON）——JSON 请用 Text 帧发送 |
 
 无 breaking 的阶段（无需动作）：P-MW、P-ENSEMBLE-GRPC、P-FLOW、P-DEADLINE、
 P-WARM（纯新增，默认值保持旧行为）。P-OAI 延后至 0.9（不在本版本范围内）。
@@ -223,4 +224,22 @@ policies:
 
 **迁移：** 按上表改名三个钩子；把 `pre_setup` 逻辑迁入 `setup()` 或
 `before_setup` 回调。
+
+## M10 — WebSocket Binary 首帧改为原始字节（0.8.3）
+
+**变更内容：** 在 WS 流式端点（`/stream`、`/decoupled-stream` 及其版本化
+变体）上，首帧的解释方式改为由帧*类型*单独决定。0.8.2 中 Binary 首帧会
+被 lossy UTF-8 解码并要求内容是 JSON 文本；现在按不透明字节处理、原样
+转发给 worker,worker 看到的 Content-Type 在升级请求缺失或携带 JSON 值
+时归一化为 `application/octet-stream`（非 JSON 值如 `image/png` 保留为
+payload 元数据）。
+
+**迁移：** 如果客户端把 JSON payload 放在 **Binary** WS 帧里发送，请改用
+Text 帧（浏览器用 `ws.send(JSON.stringify(payload))`,tungstenite 用
+`Message::Text(...)`)。使用 Text 帧的客户端不受影响。
+
+0.8.3 的相关新增（非破坏）:h2 bidi 在边界校验 `open.initial_data` 的
+JSON（400 取代 worker 侧报错——原始字节类 content type 跳过校验）;
+ensemble 模型接受原始字节根输入（见[原始字节 / Tensor 请求](raw-bytes-request.md)
+的 *Ensemble 模型* 一节）。
 

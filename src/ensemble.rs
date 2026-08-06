@@ -354,6 +354,74 @@ pub async fn execute_ensemble(
         .ok_or_else(|| AppError::Internal("ensemble produced no output".to_string()))
 }
 
+/// B3 (E7): step input assembly — three branches.
+///   all Json                                → build a JSON object (historical path)
+///   exactly one input, a whole Binary       → raw bytes passthrough + content-type
+///   any other combination involving Binary  → 400 (Option B scope)
+fn assemble_step_payload(
+    step_name: &str,
+    resolved: &HashMap<String, EnsembleValue>,
+) -> Result<(Vec<u8>, Option<String>), AppError> {
+    let binary_count = resolved
+        .values()
+        .filter(|v| matches!(v, EnsembleValue::Binary(_, _)))
+        .count();
+
+    if binary_count == 0 {
+        // All Json → build JSON object (historical path).
+        let mut obj = serde_json::Map::new();
+        for (key, val) in resolved {
+            match val {
+                EnsembleValue::Json(v) => {
+                    obj.insert(key.clone(), v.clone());
+                }
+                EnsembleValue::Binary(_, _) => unreachable!(),
+            }
+        }
+        let payload_value = Value::Object(obj);
+        // serde_json::to_vec on a Value is infallible (E8 cleanup note).
+        let bytes = serde_json::to_vec(&payload_value).expect("Value serialization is infallible");
+        Ok((bytes, None))
+    } else if resolved.len() == 1 && binary_count == 1 {
+        // Exactly one input and it is Binary → raw bytes passthrough.
+        let (data, ct) = match resolved.values().next().unwrap() {
+            EnsembleValue::Binary(data, ct) => (data.clone(), ct.clone()),
+            EnsembleValue::Json(_) => unreachable!(),
+        };
+        Ok((data.to_vec(), Some(ct)))
+    } else {
+        // Mixed or multiple inputs with any Binary → 400 (Option B scope).
+        Err(AppError::InvalidRequestBody(format!(
+            "step '{}' has {} input(s) with mixed JSON/Binary; \
+             a binary input must be the step's sole whole input (Option B scope)",
+            step_name,
+            resolved.len()
+        )))
+    }
+}
+
+/// B3 (E8): typed step output — mirrors the unary media_type dispatch
+/// (inference.rs:266-267). A non-JSON media_type declares the payload opaque
+/// bytes; the JSON path is validated and errors are NOT swallowed (the old
+/// code collapsed invalid JSON to `{}` — this is the regression pin).
+fn parse_step_output(step_name: &str, single: pb::SingleResponse) -> Result<EnsembleValue, AppError> {
+    let is_binary = !single.media_type.is_empty()
+        && !single.media_type.starts_with("application/json");
+    if is_binary {
+        Ok(EnsembleValue::Binary(single.data, single.media_type))
+    } else if single.data.is_empty() {
+        Ok(EnsembleValue::Json(json!({})))
+    } else {
+        let v: Value = serde_json::from_slice(&single.data).map_err(|e| {
+            AppError::Internal(format!(
+                "ensemble step {} returned invalid JSON: {}",
+                step_name, e
+            ))
+        })?;
+        Ok(EnsembleValue::Json(v))
+    }
+}
+
 async fn execute_step(
     state: Arc<AppState>,
     step: &EnsembleStep,
@@ -369,40 +437,8 @@ async fn execute_step(
         resolved.insert(key.clone(), value);
     }
 
-    // B3 (E7): input assembly — three branches.
-    // Build the JSON payload / binary passthrough from resolved inputs.
-    let (payload_bytes, content_type_for_step) = {
-        let binary_count = resolved.values().filter(|v| matches!(v, EnsembleValue::Binary(_, _))).count();
-
-        if binary_count == 0 {
-            // All Json → build JSON object (historical path).
-            let mut obj = serde_json::Map::new();
-            for (key, val) in &resolved {
-                match val {
-                    EnsembleValue::Json(v) => { obj.insert(key.clone(), v.clone()); }
-                    EnsembleValue::Binary(_, _) => unreachable!(),
-                }
-            }
-            let payload_value = Value::Object(obj);
-            // serde_json::to_vec on a Value is infallible (E8 cleanup note).
-            let bytes = serde_json::to_vec(&payload_value).expect("Value serialization is infallible");
-            (bytes, None)
-        } else if resolved.len() == 1 && binary_count == 1 {
-            // Exactly one input and it is Binary → raw bytes passthrough.
-            let (data, ct) = match resolved.values().next().unwrap() {
-                EnsembleValue::Binary(data, ct) => (data.clone(), ct.clone()),
-                EnsembleValue::Json(_) => unreachable!(),
-            };
-            (data.to_vec(), Some(ct))
-        } else {
-            // Mixed or multiple inputs with any Binary → 400 (Option B scope).
-            return Err(AppError::InvalidRequestBody(format!(
-                "step '{}' has {} input(s) with mixed JSON/Binary; \
-                 a binary input must be the step's sole whole input (Option B scope)",
-                step.name, resolved.len()
-            )));
-        }
-    };
+    // B3 (E7): input assembly — three branches (see assemble_step_payload).
+    let (payload_bytes, content_type_for_step) = assemble_step_payload(&step.name, &resolved)?;
 
     // Ensure sub-model is ready
     if !state.registry.is_ready(&step.model, Some(&step.version)) {
@@ -558,24 +594,8 @@ async fn execute_step(
             let code = single.status.as_ref().map(|s| s.code.as_str()).unwrap_or("Ok");
             match code {
                 "Ok" => {
-                    // B3 (E8): typed output — mirror unary media_type dispatch
-                    // (inference.rs:266-267). Binary step output is a first-class
-                    // EnsembleValue; JSON is validated and errors are NOT swallowed.
-                    let is_binary = !single.media_type.is_empty()
-                        && !single.media_type.starts_with("application/json");
-                    if is_binary {
-                        Ok(EnsembleValue::Binary(single.data, single.media_type))
-                    } else if single.data.is_empty() {
-                        Ok(EnsembleValue::Json(json!({})))
-                    } else {
-                        let v: Value = serde_json::from_slice(&single.data).map_err(|e| {
-                            AppError::Internal(format!(
-                                "ensemble step {} returned invalid JSON: {}",
-                                step.name, e
-                            ))
-                        })?;
-                        Ok(EnsembleValue::Json(v))
-                    }
+                    // B3 (E8): typed output (see parse_step_output).
+                    parse_step_output(&step.name, single)
                 }
                 _ => Err(AppError::WorkerCrashed(
                     single.status.as_ref().and_then(|s| {
@@ -783,5 +803,121 @@ mod tests {
             !ran.load(Ordering::SeqCst),
             "dropped JoinSet must abort its in-flight task (ensemble cancel)"
         );
+    }
+
+    // === B3: input assembly three branches (E7) ===
+
+    fn bin(data: &'static [u8], ct: &str) -> EnsembleValue {
+        EnsembleValue::Binary(Bytes::from_static(data), ct.to_string())
+    }
+
+    #[test]
+    fn b3_assemble_all_json_builds_object() {
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), EnsembleValue::Json(json!(1)));
+        resolved.insert("b".to_string(), EnsembleValue::Json(json!("x")));
+        let (bytes, ct) = assemble_step_payload("s", &resolved).unwrap();
+        assert!(ct.is_none(), "all-Json assembly must not set a content-type");
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v, json!({"a": 1, "b": "x"}));
+    }
+
+    #[test]
+    fn b3_assemble_single_binary_passthrough_with_ct() {
+        let mut resolved = HashMap::new();
+        resolved.insert("img".to_string(), bin(b"\x00\x01\x02", "image/png"));
+        let (bytes, ct) = assemble_step_payload("s", &resolved).unwrap();
+        assert_eq!(bytes, b"\x00\x01\x02", "binary payload must pass verbatim");
+        assert_eq!(ct.as_deref(), Some("image/png"), "CT must be forwarded");
+    }
+
+    #[test]
+    fn b3_assemble_mixed_binary_json_is_400() {
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), bin(b"x", "application/octet-stream"));
+        resolved.insert("b".to_string(), EnsembleValue::Json(json!(1)));
+        let err = assemble_step_payload("s", &resolved).unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidRequestBody(_)),
+            "mixed JSON/Binary inputs must be 400, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn b3_assemble_two_binary_inputs_is_400() {
+        // Even two whole-Binary inputs violate the "sole whole input" rule.
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), bin(b"x", "application/octet-stream"));
+        resolved.insert("b".to_string(), bin(b"y", "application/octet-stream"));
+        let err = assemble_step_payload("s", &resolved).unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidRequestBody(_)),
+            "two binary inputs must be 400, got {err:?}"
+        );
+    }
+
+    // === B3: step output typed parse (E8) ===
+
+    fn single(data: &'static [u8], media_type: &str) -> pb::SingleResponse {
+        pb::SingleResponse {
+            data: Bytes::from_static(data),
+            media_type: media_type.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn b3_output_parse_json_media_type() {
+        let out = parse_step_output("s", single(br#"{"a":1}"#, "application/json")).unwrap();
+        match out {
+            EnsembleValue::Json(v) => assert_eq!(v, json!({"a": 1})),
+            _ => panic!("expected Json"),
+        }
+    }
+
+    #[test]
+    fn b3_output_parse_empty_media_type_defaults_json() {
+        let out = parse_step_output("s", single(br#"{"a":1}"#, "")).unwrap();
+        match out {
+            EnsembleValue::Json(v) => assert_eq!(v, json!({"a": 1})),
+            _ => panic!("expected Json"),
+        }
+    }
+
+    #[test]
+    fn b3_output_parse_invalid_json_not_swallowed() {
+        // Regression pin for the old `:483` behaviour: invalid JSON from a
+        // worker must surface as an error naming the step, never collapse
+        // into a silent `{}` that the DAG keeps running on.
+        let err = parse_step_output("mystep", single(b"{oops", "")).unwrap_err();
+        assert!(
+            matches!(err, AppError::Internal(_)),
+            "invalid JSON must be an Internal error, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("mystep"),
+            "error must name the failing step, got: {err}"
+        );
+    }
+
+    #[test]
+    fn b3_output_parse_binary_media_type() {
+        let out = parse_step_output("s", single(b"\x00\xff", "application/octet-stream")).unwrap();
+        match out {
+            EnsembleValue::Binary(d, ct) => {
+                assert_eq!(d.as_ref(), b"\x00\xff");
+                assert_eq!(ct, "application/octet-stream");
+            }
+            _ => panic!("expected Binary"),
+        }
+    }
+
+    #[test]
+    fn b3_output_parse_empty_data_is_empty_object() {
+        let out = parse_step_output("s", single(b"", "")).unwrap();
+        match out {
+            EnsembleValue::Json(v) => assert_eq!(v, json!({})),
+            _ => panic!("expected Json empty object"),
+        }
     }
 }
