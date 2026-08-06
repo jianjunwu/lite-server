@@ -1,3 +1,8 @@
+// tonic 边界一律以 `Status` 为错误类型(service trait 与 interceptor 签名
+// 由 tonic 固定,不可 Box),`Result<_, Status>` 自带 ~180B 栈帧;这是 RPC
+// 边界而非热路径,模块级放行 result_large_err(对齐 tonic 生态惯例;与
+// AppError 侧 adf47bb Box 化根治的决定不冲突——那里的 Err 是自控类型)。
+#![allow(clippy::result_large_err)]
 use crate::access_control::EndpointClass;
 use crate::callback::CallbackRunner;
 use crate::error::AppError;
