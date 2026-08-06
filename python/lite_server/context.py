@@ -91,6 +91,16 @@ class RequestMeta:
     # it in the streaming consume loop. None = unbounded (behavior unchanged).
     deadline_unix_ns: Optional[int] = None
 
+    def __post_init__(self) -> None:
+        # Coerce a plain dict into the declared Headers type at the single
+        # construction point. Production (_meta_from_proto) already passes
+        # Headers; tests and user code that pass a raw dict otherwise get an
+        # object missing Headers' read-only contract (case-insensitive get,
+        # getlist) — and dict-only methods like setdefault appear to work in
+        # tests while crashing in production (0.8.3 audit B1/B2).
+        if isinstance(self.headers, dict):
+            object.__setattr__(self, "headers", Headers(self.headers))
+
 
 @dataclass(slots=True)
 class RequestContext:

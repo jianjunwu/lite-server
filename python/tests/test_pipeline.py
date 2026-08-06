@@ -2116,9 +2116,10 @@ class TestContentTypeRustPythonParity:
         assert _is_json_content_type("application/json; charset=utf-8; boundary=foo") is True
 
     def test_parity_leading_trailing_whitespace(self):
-        # Whitespace around the mime type
-        assert _is_json_content_type(" application/json") is True
-        assert _is_json_content_type("application/json ") is True
+        # Whitespace in/around the mime type → unparseable for the mime
+        # crate → raw dispatch on the Rust (authoritative, D9) side.
+        assert _is_json_content_type(" application/json") is False
+        assert _is_json_content_type("application/json ") is False
 
 
 class TestRunSingleBatchBytesInput:
@@ -2165,3 +2166,125 @@ class TestRunSingleBatchBytesInput:
 
         # Both items must have received raw bytes (not parsed JSON)
         assert seen == ["bytes", "bytes"], f"expected both items as bytes, got {seen}"
+
+
+# ---------------------------------------------------------------------------
+# /audit fdbd1c9 evidence tests (must FAIL on the audited commit)
+# ---------------------------------------------------------------------------
+
+
+class TestAuditProductionHeadersType:
+    """run_single must work with the PRODUCTION headers type.
+
+    Production builds RequestMeta via ``_meta_from_proto`` which wraps wire
+    headers in the read-only ``Headers`` class (worker/common.py:170).
+    fdbd1c9 added ``meta.headers.setdefault(...)`` to run_single, which
+    assumes a plain dict — every real request crashes with
+    ``AttributeError: 'Headers' object has no attribute 'setdefault'``.
+    The commit's own TestRunSingleContentType tests pass ``headers={}``
+    (a plain dict, violating the declared ``headers: Headers`` field type),
+    which is why they stayed green while 29 pre-existing tests that use
+    ``Headers({})`` all fail.
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_single_with_production_headers_type(self):
+        meta = RequestMeta(
+            route="/predict",
+            headers=Headers({"content-type": "application/json"}),
+            client_ip="127.0.0.1",
+            request_id="req-audit-headers",
+            timestamp_ns=1,
+        )
+        pipe = Pipeline.build(EchoAPI(), [])
+        body, status, _, _ = await pipe.run_single(b'{"input": 1}', meta)
+        assert status.code == "Ok"
+        assert _body(body) == {"echo": {"input": 1}}
+
+
+class TestAuditContentTypeParityMalformedParams:
+    """/audit fdbd1c9 (D9): the Rust extractor is the authoritative
+    dispatcher. For malformed parameter lists the Rust mime parse fails
+    (→ raw dispatch), but Python's ``split(';')`` shortcut still answers
+    JSON — the two sides diverge, undocumented. The parity suite shipped
+    with fdbd1c9 only covers well-formed values.
+
+    Rust verdicts pinned by
+    ``api_body_tests::test_audit_mime_malformed_params_rust_verdict``.
+    """
+
+    @pytest.mark.parametrize(
+        "ct",
+        [
+            "application/json;;",
+            "application/json; charset",
+            "application/json ;charset=utf-8",
+            'application/json;foo="bar',
+            " application/json",
+            "application/json ",
+            "application/json; charset = utf-8",
+            "application/json; charset= utf-8",
+            "application/json; charset=utf-8 ",
+            "application/json;\tcharset=utf-8",
+        ],
+    )
+    def test_malformed_params_match_rust_verdict(self, ct):
+        # Rust is_json_content_type (mime crate) verdict for these: False.
+        assert _is_json_content_type(ct) is False
+
+    @pytest.mark.parametrize(
+        "ct",
+        [
+            "application/json;",
+            "application/json;charset=utf-8",
+            "application/json; charset=utf-8",
+            "application/json;  charset=utf-8",
+            'application/json; charset="utf-8"',
+            "application/json; charset=utf-8;",
+            "application/json; charset=utf-8; ",
+            "application/json; charset=UTF-8",
+        ],
+    )
+    def test_strict_but_legal_forms_match_rust_verdict(self, ct):
+        # Rust verdict for these: True — the Python mirror must not be
+        # tightened past the mime crate's grammar.
+        assert _is_json_content_type(ct) is True
+
+
+class TestAuditByteIdenticalWire:
+    """Plan §6.3 test_unary_json_request_byte_identical, worker-side half:
+    the bytes handed to the worker's JSON parser must be the client's exact
+    bytes (no re-serialization anywhere). The Rust-side half is locked by
+    the extractor byte-identical tests + build_request_meta passthrough +
+    the Bytes ptr-identity test; the proto hop is byte-preserving by
+    construction (prost bytes field).
+    """
+
+    @pytest.mark.asyncio
+    async def test_json_parser_receives_byte_identical_input(self, monkeypatch):
+        from lite_server import pipeline as pl
+
+        seen = []
+        orig = pl._parse_request_json
+
+        def spy(data):
+            seen.append(data)
+            return orig(data)
+
+        monkeypatch.setattr(pl, "_parse_request_json", spy)
+
+        raw = b'  {  "z" : 1 , "a" : 2 }  '  # non-canonical JSON
+        meta = RequestMeta(
+            route="/predict",
+            headers=Headers({"content-type": "application/json"}),
+            client_ip="127.0.0.1",
+            request_id="req-audit-byteid",
+            timestamp_ns=1,
+        )
+        pipe = Pipeline.build(EchoAPI(), [])
+        body, status, _, _ = await pipe.run_single(raw, meta)
+        assert status.code == "Ok"
+        assert seen == [raw], (
+            "worker JSON parser must receive the client's exact bytes; "
+            f"got {seen!r}"
+        )

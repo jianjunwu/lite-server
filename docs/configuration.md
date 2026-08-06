@@ -45,8 +45,9 @@ server:
   max_inflight: 0             # Global in-flight inference cap. >0 → inference beyond this concurrent
                                # count is rejected 503 / gRPC Unavailable + Retry-After. Health/admin
                                # endpoints are exempt (probes stay reachable). 0 = unlimited.
-  max_request_body_bytes: null # Per-request body cap (bytes). Oversized → HTTP 413 / gRPC
-                               # ResourceExhausted. null = platform default (axum 2MB / tonic 4MB).
+  max_request_body_bytes: 67108864 # Per-request body cap (bytes). Oversized → HTTP 413 / gRPC
+                               # ResourceExhausted. Default 64 MiB; null = platform default
+                               # (axum 2MB / tonic 4MB). Memory budget: value × in-flight requests.
   # P-XFF trusted-proxy client-IP cleansing — fail-safe by default.
   trusted_proxies: []          # CIDRs/IPs of fronting proxies whose X-Forwarded-For /
                                # X-Real-IP are honored. Empty (default) = the direct TCP peer is

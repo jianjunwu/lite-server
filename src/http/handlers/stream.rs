@@ -201,8 +201,12 @@ async fn sse_infer_impl(
     let payload_bytes = body.bytes();
     // D11: record body size with content-type label.
     prometheus::record_request_body_bytes(body.kind(), "/predict", payload_bytes.len());
-    tracing::Span::current().record("body_bytes", payload_bytes.len() as i64);
-    tracing::Span::current().record("body_kind", body.kind());
+    // Record onto the inference span explicitly — `Span::current()` here is
+    // the ambient (http.server) span since this span is only entered via
+    // in_scope below; recording on current() silently dropped the fields
+    // (0.8.3 audit B4).
+    span.record("body_bytes", payload_bytes.len() as i64);
+    span.record("body_kind", body.kind());
     let meta = span.in_scope(|| build_request_meta(&headers, payload_bytes.clone(), "/predict", &cx, deadline.unix_ns));
     // P-DEADLINE (方案 C): overall deadline only when the CLIENT specified one;
     // chunk-idle reclaim is ALWAYS on (decoupled parity) so a stuck stream is
@@ -562,10 +566,22 @@ async fn handle_ws_stream(
         version = %resolved_version,
         request_id = %cx.request_id,
         pinned_version = tracing::field::Empty,
+        body_bytes = tracing::field::Empty,
+        body_kind = tracing::field::Empty,
     );
     crate::telemetry::link_parent(&span, &cx.trace_cx);
     let deadline = crate::deadline::resolve_from_http(&headers, state.config.server.timeout);
     let payload_bytes: bytes::Bytes = first_msg.into_bytes().into();
+    // D11: same body fields as unary/SSE. The WS upgrade request carries no
+    // body; kind derives from the upgrade request's Content-Type (missing →
+    // JSON, same default as ApiBody).
+    let body_kind = match headers.get(axum::http::header::CONTENT_TYPE) {
+        None => "json",
+        Some(v) if is_json_content_type(v) => "json",
+        Some(_) => "raw",
+    };
+    span.record("body_bytes", payload_bytes.len() as i64);
+    span.record("body_kind", body_kind);
     let meta = span.in_scope(|| build_request_meta(&headers, payload_bytes.clone(), "/predict", &cx, deadline.unix_ns));
     // P-DEADLINE (方案 C): overall deadline only when the CLIENT specified one;
     // chunk-idle reclaim is ALWAYS on (decoupled parity) so a stuck stream is
@@ -1310,6 +1326,125 @@ mod tests {
         assert!(field("model").contains("span_model"), "span model field: {:?}", inference.1);
         assert!(field("version").contains("1"), "span version field: {:?}", inference.1);
         assert!(field("request_id").contains("sse-rid"), "span request_id field: {:?}", inference.1);
+    }
+
+    /// /audit fdbd1c9 (D11): the SSE inference span must carry body_bytes /
+    /// body_kind like the unary path (do_infer records them inside its
+    /// instrumented block). sse_infer_impl records via
+    /// `tracing::Span::current()` while the inference span is never entered —
+    /// the fields land on the ambient span (or nowhere), leaving the
+    /// inference span's body fields permanently Empty.
+    #[test]
+    fn sse_inference_span_records_body_fields() {
+        use tracing::field::Visit;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        #[derive(Default)]
+        struct Rec {
+            names: std::collections::HashMap<tracing::span::Id, String>,
+            records: std::collections::HashMap<tracing::span::Id, Vec<(String, String)>>,
+        }
+        struct RecLayer(std::sync::Arc<std::sync::Mutex<Rec>>);
+        struct FieldVisitor(Vec<(String, String)>);
+        impl Visit for FieldVisitor {
+            fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+                self.0.push((field.name().to_string(), value.to_string()));
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.push((field.name().to_string(), value.to_string()));
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push((field.name().to_string(), format!("{:?}", value)));
+            }
+        }
+        impl<S: tracing::Subscriber> Layer<S> for RecLayer {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                id: &tracing::span::Id,
+                _ctx: Context<'_, S>,
+            ) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .names
+                    .insert(id.clone(), attrs.metadata().name().to_string());
+            }
+            fn on_record(
+                &self,
+                id: &tracing::span::Id,
+                values: &tracing::span::Record<'_>,
+                _ctx: Context<'_, S>,
+            ) {
+                let mut vis = FieldVisitor(Vec::new());
+                values.record(&mut vis);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .records
+                    .entry(id.clone())
+                    .or_default()
+                    .extend(vis.0);
+            }
+        }
+
+        let rec = std::sync::Arc::new(std::sync::Mutex::new(Rec::default()));
+        let rec_thread = rec.clone();
+        // Same double-dispatch anti-poisoning trick as
+        // sse_creates_inference_span_with_fields.
+        let _anchor = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(RecLayer(std::sync::Arc::new(
+                std::sync::Mutex::new(Rec::default()),
+            ))),
+        );
+        let recording = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(RecLayer(rec_thread)),
+        );
+        let handle = std::thread::spawn(move || {
+            let _guard = tracing::dispatcher::set_default(&recording);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let state = make_state(Arc::new(CallbackRunner::new()));
+                state
+                    .registry
+                    .register("span_body_model", "1", ModelConfig::default(), ModelType::LitAPI, std::path::PathBuf::new())
+                    .unwrap();
+                state.registry.mark_ready("span_body_model", "1").unwrap();
+                // No workers/ZMQ → open_worker_stream fails AFTER the
+                // body-field record calls run — the span is what we assert.
+                let _ = sse_infer_entry(
+                    &state,
+                    "span_body_model",
+                    Some("1".to_string()),
+                    HeaderMap::new(),
+                    json_body(json!({"x": 1})),
+                    test_cx(),
+                    false,
+                )
+                .await;
+            });
+        });
+        handle.join().expect("span test thread must not panic");
+
+        let rec = rec.lock().unwrap();
+        let inference_id = rec
+            .names
+            .iter()
+            .find(|(_, n)| *n == "inference")
+            .map(|(id, _)| id.clone())
+            .expect("SSE must create an inference span");
+        let fields = rec.records.get(&inference_id).cloned().unwrap_or_default();
+        assert!(
+            fields.iter().any(|(k, _)| k == "body_bytes"),
+            "inference span must record body_bytes (D11); got records: {fields:?}"
+        );
+        assert!(
+            fields.iter().any(|(k, v)| k == "body_kind" && v == "json"),
+            "inference span must record body_kind=json (D11); got records: {fields:?}"
+        );
     }
 
     /// Task E: a stalled SSE stream (worker sends one chunk, then hangs) with no

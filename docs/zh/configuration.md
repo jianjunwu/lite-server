@@ -45,8 +45,9 @@ server:
   max_inflight: 0             # 全局在途推理上限。>0 → 超过此并发数的推理请求被拒（503 /
                                # gRPC Unavailable + Retry-After）。health/admin 端点豁免（探活
                                # 不能挂）。0 = 无限。
-  max_request_body_bytes: null # 单请求体上限（字节）。超限 → HTTP 413 / gRPC
-                               # ResourceExhausted。null = 平台默认（axum 2MB / tonic 4MB）。
+  max_request_body_bytes: 67108864 # 单请求体上限（字节）。超限 → HTTP 413 / gRPC
+                               # ResourceExhausted。默认 64 MiB；null = 平台默认
+                               #（axum 2MB / tonic 4MB）。内存预算：该值 × 在途请求数。
   # P-XFF 受信代理 client-IP 清洗——默认 fail-safe。
   trusted_proxies: []          # 前置代理的 CIDR/IP，其 X-Forwarded-For / X-Real-IP 才被信任。
                                # 空（默认）= 一律用直连 TCP peer、忽略客户端代理头（防伪造 IP 绕过

@@ -7091,7 +7091,7 @@ async fn test_unary_json_response_byte_identical() {
 }
 
 // ---------------------------------------------------------------------------
-// tensor/bytes request (0.9.0) — Content-Type dispatch, error semantics
+// tensor/bytes request (0.8.3) — Content-Type dispatch, error semantics
 // ---------------------------------------------------------------------------
 
 /// End-to-end: POST raw bytes (application/octet-stream) → worker receives
@@ -7117,6 +7117,7 @@ async fn test_unary_raw_bytes_request_passthrough() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["raw_len"], 256,
         "worker must receive all 256 raw bytes unchanged");
+    unload_model(&base, "raw_echo_model", "1").await;
 }
 
 /// Backward compat: missing Content-Type → default JSON. Uses the same
@@ -7135,6 +7136,7 @@ async fn test_unary_missing_content_type_defaults_json() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "JSON request without content-type must succeed");
+    unload_model(&base, "raw_echo_model", "1").await;
 }
 
 /// D6: Content-Encoding on any inference route → 415.
@@ -7157,6 +7159,7 @@ async fn test_unary_415_content_encoding() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "unsupported_media_type");
     assert!(body["error"]["message"].as_str().unwrap().contains("Content-Encoding"));
+    unload_model(&base, "raw_echo_model", "1").await;
 }
 
 /// 8 MB JSON payload (> old 2 MB default) → 200 with new 64 MiB default.
@@ -7189,6 +7192,7 @@ async fn test_unary_large_json_payload_8mb() {
         .unwrap();
     assert_eq!(resp.status(), 200,
         "8 MB JSON must succeed with new 64 MiB default body limit");
+    unload_model(&base, "raw_echo_model", "1").await;
 }
 
 /// D11: metrics endpoint must expose `lite_server_http_request_body_bytes`
@@ -7241,4 +7245,226 @@ async fn test_unary_metrics_body_bytes() {
         metrics_text.contains(r#"content_type="raw""#),
         "metrics must include raw label"
     );
+    unload_model(&base, "raw_echo_model", "1").await;
+}
+
+/// §6.3 test_ensemble_accepts_json (P0): HTTP ensemble + JSON walks the DAG
+/// (parallel recall_a ∥ recall_b → serial merge; {x:5} → {out:10}). The
+/// ensemble branch materializes Value from the validated JSON bytes — the
+/// DAG must behave exactly as before the Content-Type dispatch change.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_ensemble_accepts_json() {
+    let http_port = next_test_port();
+    kill_stale_on_port(http_port);
+
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-http-ensemble-ct-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    write_submodel(
+        &repo,
+        "echo",
+        r#"        return {"out": x.get("x", 0) if isinstance(x, dict) else x}"#,
+    );
+    write_submodel(
+        &repo,
+        "summer",
+        "        a = x.get(\"a\", 0)\n        b = x.get(\"b\", 0)\n        return {\"out\": a + b}",
+    );
+    let ens_dir = repo.join("ensemble_model/1");
+    std::fs::create_dir_all(&ens_dir).unwrap();
+    std::fs::write(
+        ens_dir.join("config.yaml"),
+        r#"
+ensemble:
+  steps:
+    - name: recall_a
+      model: echo
+      version: "1"
+      inputs:
+        x: "$request.x"
+    - name: recall_b
+      model: echo
+      version: "1"
+      inputs:
+        x: "$request.x"
+    - name: merge
+      model: summer
+      version: "1"
+      inputs:
+        a: "$recall_a.out"
+        b: "$recall_b.out"
+"#,
+    )
+    .unwrap();
+
+    let _server = ServerGuard::start(&[
+        "--port", &http_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-grpc", "--no-metrics", "--log-level", "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "echo", "1").await;
+    load_model(&base, "summer", "1").await;
+    load_model(&base, "ensemble_model", "1").await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ensemble_model/infer", base))
+        .json(&json!({"x": 5}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "ensemble + JSON must succeed");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["out"], 10, "DAG merge must produce out=10, got {body}");
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// §6.3 test_ensemble_rejects_binary (P0): HTTP ensemble + non-JSON
+/// Content-Type → 400 "ensemble requires JSON input" (D7). The Value
+/// materialization happens only inside the ensemble branch; raw bytes have
+/// no DAG semantics and must be rejected, not silently misparsed.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_ensemble_rejects_binary() {
+    let http_port = next_test_port();
+    kill_stale_on_port(http_port);
+
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-http-ensemble-raw-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    write_submodel(&repo, "echo", r#"        return {"out": x}"#);
+    let ens_dir = repo.join("ensemble_model/1");
+    std::fs::create_dir_all(&ens_dir).unwrap();
+    std::fs::write(
+        ens_dir.join("config.yaml"),
+        r#"
+ensemble:
+  steps:
+    - name: only
+      model: echo
+      version: "1"
+      inputs:
+        x: "$request.x"
+"#,
+    )
+    .unwrap();
+
+    let _server = ServerGuard::start(&[
+        "--port", &http_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-grpc", "--no-metrics", "--log-level", "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "echo", "1").await;
+    load_model(&base, "ensemble_model", "1").await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ensemble_model/infer", base))
+        .header("content-type", "application/octet-stream")
+        .body(vec![0u8, 1, 2, 3])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "ensemble + raw bytes must be rejected");
+    let body: Value = resp.json().await.unwrap();
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("ensemble requires JSON input"),
+        "error must name the JSON requirement, got: {msg}"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// §6.3 test_sse_raw_bytes_input (P0): SSE + application/octet-stream →
+/// the worker receives raw bytes (D3 zero-round-trip applies to the SSE
+/// path too — audit B confirmed sse_infer_impl never reads JSON fields).
+/// (§6.3 test_sse_json_input is already covered by test_sse_streaming.)
+#[tokio::test]
+#[serial]
+async fn test_sse_raw_bytes_input() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+    load_model(&base, "raw_echo_model", "1").await;
+
+    let raw_body: Vec<u8> = (0u8..=255).collect();
+    let resp = client
+        .post(format!("{}/v2/models/raw_echo_model/events", base))
+        .header("content-type", "application/octet-stream")
+        .body(raw_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "SSE raw bytes request must succeed");
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(ct.contains("text/event-stream"), "expected SSE, got: {ct}");
+
+    let body = tokio::time::timeout(Duration::from_secs(15), resp.text())
+        .await
+        .expect("SSE body did not close within 15s")
+        .unwrap();
+    assert!(
+        body.contains("\"raw_len\": 256") || body.contains("\"raw_len\":256"),
+        "worker must have received all 256 raw bytes; SSE body: {body}"
+    );
+    unload_model(&base, "raw_echo_model", "1").await;
+}
+
+/// §6.3 test_unary_413_body_too_large (P0 status assertion; P1 structured
+/// fields): a body over server.max_request_body_bytes → 413 with max_size,
+/// and actual_size when Content-Length is known (B3 fix, e2e lock).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_unary_413_body_too_large() {
+    let http_port = next_test_port();
+    kill_stale_on_port(http_port);
+
+    let tmp_dir = std::env::temp_dir()
+        .join(format!("lite-server-413-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: 0\n  metrics_port: 0\n  log_level: warn\n  max_request_body_bytes: 16\nmetrics:\n  enabled: false\ngrpc:\n  enabled: false\nmodel_repository:\n  path: {}\n",
+            tmp_dir.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 20).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/v2/models/whatever/infer", http_port))
+        .header("content-type", "application/octet-stream")
+        .body(vec![b'x'; 64])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 413, "body over the 16-byte limit must be 413");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "payload_too_large");
+    assert_eq!(body["error"]["max_size"], 16);
+    assert_eq!(
+        body["error"]["actual_size"], 64,
+        "actual_size must be reported when Content-Length is known"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }

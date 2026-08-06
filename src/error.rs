@@ -366,16 +366,19 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for AppError {
 
 /// Map axum `Bytes` body-extraction rejection to [`AppError`].
 /// Length-limit (body too large) → `PayloadTooLarge`; everything else → `InvalidRequestBody`.
+/// `actual_size` is the client-advertised Content-Length when present (D4/D5:
+/// lets clients self-correct); chunked/unknown-length bodies carry None.
 pub(crate) fn map_body_rejection(
     rejection: axum::extract::rejection::BytesRejection,
     max_size: usize,
+    actual_size: Option<u64>,
 ) -> AppError {
     use axum::response::IntoResponse;
     let status = rejection.into_response().status();
     if status == axum::http::StatusCode::PAYLOAD_TOO_LARGE {
         AppError::PayloadTooLarge {
             max_size,
-            actual_size: None,
+            actual_size,
         }
     } else {
         AppError::InvalidRequestBody("failed to read request body".into())

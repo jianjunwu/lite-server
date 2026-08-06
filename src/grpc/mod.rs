@@ -488,7 +488,8 @@ pub async fn start_grpc_server(
         server
     };
     // P-FLOW (§4.0.9): per-request decode cap. Oversized messages decode-fail
-    // with ResourceExhausted (tonic's fixed mapping). None = tonic default 4MB.
+    // with ResourceExhausted (tonic's fixed mapping). None = tonic default 4MB;
+    // the config default is Some(64 MiB) since 0.8.3 (shared with the HTTP body cap).
     let server = if let Some(n) = max_request_body_bytes {
         server.max_decoding_message_size(n)
     } else {

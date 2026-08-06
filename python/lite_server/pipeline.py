@@ -84,12 +84,54 @@ def _is_json_content_type(content_type: str) -> bool:
     ``application/json`` and ``application/*+json``, case-insensitive,
     ignores parameters. Everything else (including text/json, garbage)
     returns False.
+
+    Parameter lists are validated with the same strictness as the Rust
+    ``mime`` crate (D9: Rust is the authoritative dispatcher): whitespace
+    inside the type/subtype, empty parameter segments (``a;;b``), parameters
+    without ``=``, and unterminated quoted values all make the whole header
+    unparseable → raw dispatch. A single trailing semicolon
+    (``application/json;``) stays valid, matching the mime crate.
     """
-    mime = content_type.split(";", 1)[0].strip().lower()
+    type_part, _, params = content_type.partition(";")
+    mime = type_part.strip().lower()
+    # The mime crate rejects any whitespace inside/around the type-subtype
+    # tokens (e.g. "application/json ;charset=..."); .strip() alone would
+    # mask it.
+    if type_part != type_part.strip() or any(c.isspace() for c in mime):
+        return False
     if not mime.startswith("application/"):
         return False
     subtype = mime[len("application/"):]
-    return subtype == "json" or subtype.endswith("+json")
+    if subtype != "json" and not subtype.endswith("+json"):
+        return False
+    if not params:
+        return True  # no params, or a single trailing ";" (mime crate: ok)
+    # Parameter grammar mirrors the mime crate exactly (probed matrix locked
+    # by api_body_tests::test_audit_mime_malformed_params_rust_verdict):
+    # after each ';' only SP (' ') is skipped (tab is rejected); a param is
+    # token "=" value with no whitespace around '='; an unquoted value is a
+    # whitespace-free token, a quoted value must be terminated; an empty
+    # segment is allowed only as the final one (trailing ";" / "; ").
+    segments = params.split(";")
+    for i, segment in enumerate(segments):
+        seg = segment.lstrip(" ")
+        if not seg:
+            if i == len(segments) - 1:
+                continue  # trailing ";" or "; "
+            return False  # empty mid-list segment ("a;;b")
+        name, eq, value = seg.partition("=")
+        if not eq or not name or name != name.strip():
+            return False
+        if any(c.isspace() for c in name):
+            return False
+        if not value or value != value.strip():
+            return False
+        if value.startswith('"'):
+            if len(value) < 2 or not value.endswith('"'):
+                return False  # unterminated quoted-string
+        elif any(c.isspace() for c in value):
+            return False
+    return True
 
 
 def _adapt(fn: Callable) -> Callable[..., Awaitable]:
@@ -693,11 +735,11 @@ class Pipeline:
         """
         if ctx is None:
             ctx = RequestContext(meta=meta, request={}, mode=mode)
-        # D9: converge the Content-Type default in one place so the key is
-        # always present (defensive — the Rust extractor already defaults to
-        # JSON when the header is missing).
-        meta.headers.setdefault("content-type", "application/json")
         try:
+            # D9: missing Content-Type defaults to JSON (the Rust extractor
+            # applies the same default). meta.headers is the read-only
+            # Headers class — .get's default carries the fallback, no
+            # mutation needed (or possible).
             content_type = meta.headers.get("content-type", "application/json")
             if _is_json_content_type(content_type):
                 ctx.request = _parse_request_json(data)

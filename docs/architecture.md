@@ -537,8 +537,8 @@ cascade-fail under pressure (§4.0.9). P-FLOW lands these:
   + `Retry-After` (HTTP header / gRPC metadata). `ResourceExhausted` is reserved
   for rate limiting (P3-1) — overload stays in the 5xx family.
 - **Request size cap** (`server.max_request_body_bytes`): oversized bodies return
-  `413` (HTTP) / `ResourceExhausted` (gRPC, tonic's fixed mapping). `null` =
-  platform default (axum 2MB / tonic 4MB).
+  `413` (HTTP) / `ResourceExhausted` (gRPC, tonic's fixed mapping). Default
+  64 MiB (67,108,864); `null` = platform default (axum 2MB / tonic 4MB).
 - **Multi-level priority queue** (B1): each per-version queue is a priority heap
   keyed by the request's `x-lite-priority` header (higher = dispatched first,
   ties FIFO). With the header absent (default 0) the queue is plain FIFO, so

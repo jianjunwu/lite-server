@@ -159,6 +159,9 @@ rcgen = "0.13"
 # baggage 清洗）。选 proptest 而非 cargo-fuzz：stable 工具链、CI 友好，§6.7 原文
 # "cargo-fuzz 或 quickcheck" 二选一。
 proptest = "1"
+# §6.4 性能验收（tensor/bytes v2）：v1(Value 往返) vs v2(&RawValue+Bytes)
+# 提取器对比基准。criterion 仅用于 benches/，不进生产依赖。
+criterion = "0.5"
 
 # P-PERF-a（蓝图 §4.0.8）：perf-smoke 自含测量（reqwest+tonic 客户端，零外部
 # 工具依赖）。`cargo run --release --example perf_smoke`，报告写
@@ -182,3 +185,7 @@ crate-type = ["cdylib", "rlib"]
 opt-level = 3
 lto = true
 codegen-units = 1
+
+[[bench]]
+name = "extractor_v1_vs_v2"
+harness = false

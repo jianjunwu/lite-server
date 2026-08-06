@@ -1718,3 +1718,115 @@ class TestOnErrorCustomResponseStreaming:
         assert len(dones) == 1
         assert len(errors) == 0
 
+
+
+# ---------------------------------------------------------------------------
+# /audit fdbd1c9 evidence tests (must FAIL on the audited commit)
+# ---------------------------------------------------------------------------
+
+
+class TestAuditBidiChunkContentType:
+    """A bidi stream opened with a non-JSON Content-Type must deliver
+    mid-stream chunks to on_chunk as raw bytes.
+
+    fdbd1c9 made the three stream-OPEN paths Content-Type aware but left
+    ``_handle_stream_chunk_async`` hardcoded to ``_parse_json_payload`` —
+    a raw-bytes chunk dies as a 400 stream error before reaching the model,
+    so a bidi stream opened with application/octet-stream breaks on its
+    first data frame.
+    """
+
+    @pytest.mark.asyncio
+    async def test_bidi_chunk_raw_bytes_reach_on_chunk(self):
+        from lite_server.proto import StreamChunk
+        from lite_server.worker import streaming as worker_streaming
+
+        received = []
+
+        async def on_chunk(data, ctx=None):
+            received.append(data)
+            return None  # no output → handler returns right after on_chunk
+
+        async def on_close(ctx=None):
+            return None
+
+        meta = RequestMeta(
+            route="/predict",
+            headers=Headers({"content-type": "application/octet-stream"}),
+            client_ip="127.0.0.1",
+            request_id="req-audit-bidi",
+            timestamp_ns=1,
+        )
+        ctx = RequestContext(meta=meta, request={}, mode="bidi")
+        active = {"s1": worker_streaming._BidiSession(object(), on_chunk, on_close, ctx)}
+        sock = AsyncSocket()
+        raw = b"\x00\xff\xfe" * 4
+        req = StreamRequest(stream_id="s1", chunk=StreamChunk(data=raw))
+
+        await worker_streaming._handle_stream_chunk_async(EchoAPI(), req, sock, active, log)
+
+        assert received == [raw], (
+            "raw-bytes chunk must reach on_chunk unchanged; "
+            f"received={received!r}, socket_frames={sock.sent!r}"
+        )
+
+
+class TestBidiFramingContentType:
+    """h2 bidi clients send ``content-type: application/x-lite-bidi`` on the
+    session POST — that names the LPM framing, not the payload. Payload
+    dispatch must ignore it and keep the JSON default (pre-0.8.3 semantics);
+    the h2 full-duplex integration test exercises this end to end.
+    """
+
+    @pytest.mark.asyncio
+    async def test_bidi_open_and_chunk_with_framing_ct_parse_json(self):
+        from lite_server.proto import StreamChunk, StreamOpen
+        from lite_server.proto import RequestMeta as ProtoMeta
+        from lite_server.worker import streaming as worker_streaming
+
+        received = []
+
+        class H:
+            def on_open(self, initial_data):
+                return None
+
+            def on_chunk(self, chunk):
+                received.append(chunk)
+                return None
+
+            def on_close(self):
+                pass
+
+        class BidiAPI(EchoAPI):
+            def bidi_stream(self):
+                return H()
+
+        meta = ProtoMeta(
+            route="/predict",
+            headers={"content-type": "application/x-lite-bidi"},
+            client_ip="",
+            request_id="r",
+            timestamp_ns=1,
+        )
+        sock = AsyncSocket()
+        active = {}
+        open_req = StreamRequest(
+            stream_id="s-fr",
+            open=StreamOpen(data=b'{"init": 1}', meta=meta),
+        )
+        await worker_streaming._handle_stream_open_async(
+            BidiAPI(), open_req, sock, active, log
+        )
+        session = active.get("s-fr")
+        assert session is not None, "bidi session must be registered"
+        # initial_data JSON-parsed despite the framing content-type
+        assert session.ctx.request == {"init": 1}
+
+        chunk_req = StreamRequest(
+            stream_id="s-fr",
+            chunk=StreamChunk(data=b'{"chunk": 1}'),
+        )
+        await worker_streaming._handle_stream_chunk_async(
+            BidiAPI(), chunk_req, sock, active, log
+        )
+        assert received == [{"chunk": 1}]

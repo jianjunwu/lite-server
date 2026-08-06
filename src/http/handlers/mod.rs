@@ -87,12 +87,6 @@ pub enum RequestBody {
     Raw(Bytes, String),
 }
 
-impl From<serde_json::Value> for RequestBody {
-    fn from(v: serde_json::Value) -> Self {
-        RequestBody::Json(Bytes::from(serde_json::to_vec(&v).unwrap()))
-    }
-}
-
 impl RequestBody {
     /// Metrics / trace label.
     pub fn kind(&self) -> &'static str {
@@ -129,7 +123,7 @@ where
 
     async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
         // Materialize header decisions before moving the request into parts.
-        let (is_json, content_type, has_content_encoding) = {
+        let (is_json, content_type, has_content_encoding, content_length) = {
             let headers = req.headers();
             let ct_header = headers.get(axum::http::header::CONTENT_TYPE);
             let is_json = match ct_header {
@@ -140,7 +134,12 @@ where
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
             let has_encoding = headers.contains_key(axum::http::header::CONTENT_ENCODING);
-            (is_json, content_type, has_encoding)
+            // D4/D5 (P1): advertised body size for the 413 error body.
+            let content_length = headers
+                .get(axum::http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            (is_json, content_type, has_encoding, content_length)
         };
 
         // D6: no decompression layer — any Content-Encoding → 415.
@@ -159,7 +158,7 @@ where
             state,
         )
         .await
-        .map_err(|rejection| crate::error::map_body_rejection(rejection, max_size))?;
+        .map_err(|rejection| crate::error::map_body_rejection(rejection, max_size, content_length))?;
 
         if is_json {
             // D3: zero-allocation syntax validation via `&RawValue` —
@@ -894,6 +893,84 @@ mod api_body_tests {
     // ------------------------------------------------------------------
     // test_payload_ptr_identity (P0): Bytes clone shares same buffer
     // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // /audit fdbd1c9 evidence tests (must FAIL on the audited commit)
+    // ------------------------------------------------------------------
+
+    /// D4/D5 (P1 acceptance): when the client sent a Content-Length, the 413
+    /// error body must carry `actual_size` so clients can self-correct.
+    /// The audited commit hardcodes `actual_size: None` in map_body_rejection.
+    #[tokio::test]
+    async fn test_audit_413_reports_actual_size_when_content_length_known() {
+        let app = test_app(8);
+        let payload = "this body is way longer than 8 bytes"; // 36 bytes
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/echo-kind")
+                    .method("POST")
+                    .header("content-type", "application/octet-stream")
+                    .header("content-length", payload.len().to_string())
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = read_error_body(response).await;
+        assert_eq!(body["error"]["max_size"], 8);
+        assert_eq!(
+            body["error"]["actual_size"],
+            serde_json::json!(payload.len()),
+            "actual_size must be reported when Content-Length is known (plan §7.6 P1)"
+        );
+    }
+
+    /// D9 parity: pin Rust's authoritative verdicts for the full probed
+    /// Content-Type matrix. The Python `_is_json_content_type` must answer
+    /// identically — locked by
+    /// `TestAuditContentTypeParityMalformedParams` / the parity suite.
+    #[test]
+    fn test_audit_mime_malformed_params_rust_verdict() {
+        // Malformed parameter lists / whitespace in tokens → raw dispatch.
+        for v in [
+            "application/json;;",
+            "application/json; charset",
+            "application/json ;charset=utf-8",
+            "application/json;foo=\"bar",
+            " application/json",
+            "application/json ",
+            "application/json; charset = utf-8",
+            "application/json; charset= utf-8",
+            "application/json; charset=utf-8 ",
+            "application/json;\tcharset=utf-8",
+        ] {
+            let hv = axum::http::HeaderValue::from_str(v).unwrap();
+            assert!(
+                !is_json_content_type(&hv),
+                "Rust (authoritative, D9) must dispatch {v:?} to raw"
+            );
+        }
+        // Strict-but-legal forms stay JSON (regression lock for the Python
+        // mirror — these must NOT be tightened away).
+        for v in [
+            "application/json;",
+            "application/json;charset=utf-8",
+            "application/json; charset=utf-8",
+            "application/json;  charset=utf-8",
+            "application/json; charset=\"utf-8\"",
+            "application/json; charset=utf-8;",
+            "application/json; charset=utf-8; ",
+            "application/json; charset=UTF-8",
+        ] {
+            let hv = axum::http::HeaderValue::from_str(v).unwrap();
+            assert!(
+                is_json_content_type(&hv),
+                "Rust must keep dispatching {v:?} to JSON"
+            );
+        }
+    }
 
     #[test]
     fn test_request_body_bytes_shares_underlying_buffer() {

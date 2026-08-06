@@ -513,7 +513,8 @@ lite-server 通过 `orchestration.control_mode` 控制模型版本的生命周�
 - **队列 load shedding**：per-version 队列满 → `503` / `Unavailable` + `Retry-After`
   （HTTP header / gRPC metadata）。`ResourceExhausted` 专给限流（P3-1）——过载落 5xx 族。
 - **请求大小上限**（`server.max_request_body_bytes`）：超限 → `413`（HTTP）/
-  `ResourceExhausted`（gRPC，tonic 固定映射）。`null` = 平台默认（axum 2MB / tonic 4MB）。
+  `ResourceExhausted`（gRPC，tonic 固定映射）。默认 64 MiB（67,108,864）；
+  `null` = 平台默认（axum 2MB / tonic 4MB）。
 - **多级优先级队列**（B1）：每个 per-version 队列是按请求 `x-lite-priority` header
   （越大越先派发，同优先级 FIFO）排序的优先级堆。无 header（默认 0）时退化为普通 FIFO，
   行为不变。**排队超时 REJECT**（`queue_timeout_secs` + `queue_timeout_action: reject`）

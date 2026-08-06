@@ -37,6 +37,26 @@ def _serialize_route_chunk(item) -> bytes:
     return serialize_body(item)
 
 
+#: h2 bidi transport framing type (mirrors BIDI_CONTENT_TYPE in
+#: src/http/handlers/bidi.rs). It names the LPM frame protocol, NOT the
+#: payload: bidi clients send it on the session POST regardless of what the
+#: frames carry, so it must never switch payload dispatch to raw bytes
+#: (pre-0.8.3 bidi payloads were always JSON-parsed).
+_BIDI_FRAMING_CONTENT_TYPE = "application/x-lite-bidi"
+
+
+def _payload_content_type(headers: Headers) -> str:
+    """The Content-Type describing a stream's *payload*.
+
+    The bidi framing type is treated as absent (JSON default); every other
+    value (or a missing header) is the payload's own content type.
+    """
+    ct = headers.get("content-type", "application/json")
+    if ct.split(";", 1)[0].strip().lower() == _BIDI_FRAMING_CONTENT_TYPE:
+        return "application/json"
+    return ct
+
+
 async def _send_route_stream(socket, stream_id: str, resp, ctx: RequestContext,
                              pipe, log: logging.Logger) -> None:
     """Stream a route handler's ``StreamingResponse`` over the worker channel.
@@ -392,9 +412,8 @@ async def _handle_stream_open_async(
                 error_type="not_implemented").SerializeToString())
             return
         ctx = RequestContext(meta=meta, request={}, mode="decoupled")
-        meta.headers.setdefault("content-type", "application/json")
         try:
-            if _is_json_content_type(meta.headers.get("content-type", "application/json")):
+            if _is_json_content_type(_payload_content_type(meta.headers)):
                 ctx.request = _parse_json_payload(data)
             else:
                 ctx.request = data
@@ -438,9 +457,8 @@ async def _handle_stream_open_async(
     # --- Bidirectional streaming ------------------------------------------
     if pipe.has_bidi_stream:
         ctx = RequestContext(meta=meta, request={}, mode="bidi")
-        meta.headers.setdefault("content-type", "application/json")
         try:
-            if _is_json_content_type(meta.headers.get("content-type", "application/json")):
+            if _is_json_content_type(_payload_content_type(meta.headers)):
                 ctx.request = _parse_json_payload(data)
             else:
                 ctx.request = data
@@ -547,9 +565,8 @@ async def _handle_stream_open_async(
 
     # --- Uni-directional streaming -----------------------------------------
     ctx = RequestContext(meta=meta, request={}, mode="stream")
-    meta.headers.setdefault("content-type", "application/json")
     try:
-        if _is_json_content_type(meta.headers.get("content-type", "application/json")):
+        if _is_json_content_type(_payload_content_type(meta.headers)):
             ctx.request = _parse_json_payload(data)
         else:
             ctx.request = data
@@ -608,7 +625,13 @@ async def _handle_stream_chunk_async(
     data = stream_req.chunk.data if stream_req.chunk else b""
 
     try:
-        raw = _parse_json_payload(data)
+        # D9: same Content-Type dispatch as the open path — a stream opened
+        # with a non-JSON content-type receives mid-stream chunks as raw
+        # bytes; the content-type is locked at open time via the session ctx.
+        if _is_json_content_type(_payload_content_type(session.ctx.meta.headers)):
+            raw = _parse_json_payload(data)
+        else:
+            raw = data
         output = await session.on_chunk(raw, ctx=session.ctx)
     except HTTPException as e:
         log.warning("bidi on_chunk rejected for %s: %s", stream_id, e.detail)

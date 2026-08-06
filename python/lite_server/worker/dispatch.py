@@ -230,7 +230,8 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
         final_map[item_uid] = (serialize_body(body), sc, mt, clean)
 
     # Phase 1: per-item before_decode_request → decode → after_decode_request
-    meta.headers.setdefault("content-type", "application/json")
+    # D9: missing Content-Type defaults to JSON via .get's default;
+    # meta.headers is the read-only Headers class — no mutation.
     content_type = meta.headers.get("content-type", "application/json")
     for item in batch.items:
         ctx = RequestContext(meta=meta, request={}, mode="batch")

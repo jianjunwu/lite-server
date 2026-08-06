@@ -281,6 +281,7 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(IN_FLIGHT_REQUESTS.clone()))?;
     REGISTRY.register(Box::new(QUEUE_WAIT_SECONDS.clone()))?;
     REGISTRY.register(Box::new(WORKER_SATURATION.clone()))?;
+    REGISTRY.register(Box::new(HTTP_REQUEST_BODY_BYTES.clone()))?;
     Ok(())
 }
 
