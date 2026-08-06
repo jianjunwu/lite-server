@@ -5,7 +5,7 @@
 //! The first frame must be `BidiOpen`; model/version/headers are taken from the
 //! URL path and HTTP headers (not from the `BidiOpen` fields on this path).
 
-use super::inference::resolve_version;
+use super::inference::{build_request_meta, resolve_version};
 use super::{enforce_auth, enforce_rate_limit};
 use crate::error::AppError;
 use crate::http::state::AppState;
@@ -22,7 +22,6 @@ use axum::{
     response::Response,
 };
 use bytes::{Bytes, BytesMut};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use futures::StreamExt;
@@ -74,6 +73,16 @@ async fn h2_bidi_entry(
             .unwrap());
     }
 
+    // D6: Content-Encoding is not supported — reject before reading the body
+    // stream so clients get a consistent 415 on all inference routes.
+    if headers.contains_key(axum::http::header::CONTENT_ENCODING) {
+        return Err(AppError::UnsupportedMediaType(
+            "Content-Encoding (compressed request body) is not supported; \
+             send the request body uncompressed"
+                .into(),
+        ));
+    }
+
     // 2. Path validation → resolve_version → ready → auth → rate limit.
     crate::validation::validate_identifier(model_name)?;
     if let Some(ref v) = version {
@@ -111,7 +120,7 @@ async fn h2_bidi_entry(
 
     // 4. Build RequestMeta from HTTP headers + initial_data bytes.
     let deadline = crate::deadline::resolve_from_http(&headers, state.config.server.timeout);
-    let meta = build_request_meta_bytes(
+    let meta = build_request_meta(
         &headers,
         initial_data,
         "/predict",
@@ -342,42 +351,6 @@ async fn h2_bidi_entry(
         .header(axum::http::header::CONTENT_TYPE, BIDI_CONTENT_TYPE)
         .body(body)
         .unwrap())
-}
-
-/// Build a `RequestMeta` from raw bytes instead of a JSON `Value`.
-fn build_request_meta_bytes(
-    headers: &HeaderMap,
-    payload_bytes: Bytes,
-    route: &str,
-    cx: &RequestContext,
-    deadline_unix_ns: Option<i64>,
-) -> pb::RequestMeta {
-    let mut header_map: HashMap<String, String> = headers
-        .iter()
-        .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), s.to_string())))
-        .collect();
-    crate::telemetry::inject(&mut header_map);
-    let timestamp_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as i64;
-    let sequence_id = headers
-        .get("x-sequence-id")
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
-
-    pb::RequestMeta {
-        route: route.to_string(),
-        headers: header_map,
-        client_ip: cx.client_ip.clone(),
-        request_id: cx.request_id.clone(),
-        timestamp_ns,
-        payload: payload_bytes,
-        sequence_id,
-        deadline_unix_ns,
-        ..Default::default()
-    }
 }
 
 /// Open a worker stream for bidi.

@@ -61,3 +61,12 @@ impl AppState {
         }
     }
 }
+
+impl crate::http::handlers::HasBodyLimit for std::sync::Arc<AppState> {
+    fn max_body_bytes(&self) -> usize {
+        self.config
+            .server
+            .max_request_body_bytes
+            .unwrap_or(64 * 1024 * 1024)
+    }
+}

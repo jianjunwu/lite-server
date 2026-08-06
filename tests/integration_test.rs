@@ -215,6 +215,39 @@ class OrdAPI(LitAPI):
     )
     .unwrap();
 
+    // raw_echo_model: accepts raw bytes requests (application/octet-stream)
+    // and echoes the byte length back as JSON — end-to-end proof that the
+    // Content-Type dispatch reaches the worker with raw bytes intact (D9).
+    let raw_echo_dir = tmp.join("raw_echo_model/1");
+    std::fs::create_dir_all(&raw_echo_dir).unwrap();
+    std::fs::write(
+        raw_echo_dir.join("model.py"),
+        r#"from lite_server import LitAPI
+
+
+class RawEchoAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        if isinstance(request, bytes):
+            return {"raw_len": len(request)}
+        return request  # JSON path
+
+    def predict(self, x):
+        return x
+
+    def encode_response(self, output):
+        return output
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        raw_echo_dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+
     // batch_model: max_batch_size=2 so concurrent requests aggregate into
     // one BatchRequest.  predict() records the aggregated batch size in each
     // item's body; encode_response() gives the "bad" item its own 400 status
@@ -7055,4 +7088,157 @@ async fn test_unary_json_response_byte_identical() {
     assert_eq!(resp.status(), 200);
     let text = resp.text().await.unwrap();
     assert_eq!(text, r#"{"a":2,"z":1}"#, "JSON path must stay byte-identical");
+}
+
+// ---------------------------------------------------------------------------
+// tensor/bytes request (0.9.0) — Content-Type dispatch, error semantics
+// ---------------------------------------------------------------------------
+
+/// End-to-end: POST raw bytes (application/octet-stream) → worker receives
+/// raw bytes → echoes length back. Proves the Content-Type dispatch chain
+/// (ApiBody → do_infer → ZMQ → Python worker) is byte-native end-to-end.
+#[tokio::test]
+#[serial]
+async fn test_unary_raw_bytes_request_passthrough() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+    load_model(&base, "raw_echo_model", "1").await;
+
+    let raw_body: Vec<u8> = (0u8..=255).collect();
+    let resp = client
+        .post(format!("{}/v2/models/raw_echo_model/infer", base))
+        .header("content-type", "application/octet-stream")
+        .body(raw_body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "raw bytes request must succeed");
+
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["raw_len"], 256,
+        "worker must receive all 256 raw bytes unchanged");
+}
+
+/// Backward compat: missing Content-Type → default JSON. Uses the same
+/// raw_echo_model but omits the content-type header.
+#[tokio::test]
+#[serial]
+async fn test_unary_missing_content_type_defaults_json() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+    load_model(&base, "raw_echo_model", "1").await;
+
+    let resp = client
+        .post(format!("{}/v2/models/raw_echo_model/infer", base))
+        .json(&json!({"input": 42}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "JSON request without content-type must succeed");
+}
+
+/// D6: Content-Encoding on any inference route → 415.
+#[tokio::test]
+#[serial]
+async fn test_unary_415_content_encoding() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+    load_model(&base, "raw_echo_model", "1").await;
+
+    let resp = client
+        .post(format!("{}/v2/models/raw_echo_model/infer", base))
+        .header("content-type", "application/json")
+        .header("content-encoding", "gzip")
+        .body(r#"{"input": 1}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 415, "Content-Encoding must return 415");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_media_type");
+    assert!(body["error"]["message"].as_str().unwrap().contains("Content-Encoding"));
+}
+
+/// 8 MB JSON payload (> old 2 MB default) → 200 with new 64 MiB default.
+#[tokio::test]
+#[serial]
+async fn test_unary_large_json_payload_8mb() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+    load_model(&base, "raw_echo_model", "1").await;
+
+    // Build an 8 MB JSON object.
+    let mut large = String::from(r#"{"data":["#);
+    // Each entry is ~8 bytes: "X,". We need ~1M entries for 8 MB.
+    let entries = 1_000_000usize;
+    large.reserve(entries * 8 + 10);
+    for i in 0..entries {
+        if i > 0 {
+            large.push(',');
+        }
+        large.push_str(&i.to_string());
+    }
+    large.push_str("]}");
+
+    let resp = client
+        .post(format!("{}/v2/models/raw_echo_model/infer", base))
+        .header("content-type", "application/json")
+        .body(large)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200,
+        "8 MB JSON must succeed with new 64 MiB default body limit");
+}
+
+/// D11: metrics endpoint must expose `lite_server_http_request_body_bytes`
+/// with `content_type="json"` and `content_type="raw"` labels.
+#[tokio::test]
+#[serial]
+async fn test_unary_metrics_body_bytes() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+    load_model(&base, "raw_echo_model", "1").await;
+
+    // Send one JSON request and one raw-bytes request.
+    let _ = client
+        .post(format!("{}/v2/models/raw_echo_model/infer", base))
+        .json(&json!({"input": 1}))
+        .send()
+        .await
+        .unwrap();
+
+    let raw_body: Vec<u8> = (0u8..=255).collect();
+    let _ = client
+        .post(format!("{}/v2/models/raw_echo_model/infer", base))
+        .header("content-type", "application/octet-stream")
+        .body(raw_body)
+        .send()
+        .await
+        .unwrap();
+
+    // Scrape metrics endpoint.
+    let metrics_resp = client
+        .get(format!("{}/metrics", base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(metrics_resp.status(), 200);
+    let metrics_text = metrics_resp.text().await.unwrap();
+
+    // Histogram must be present.
+    assert!(
+        metrics_text.contains("lite_server_http_request_body_bytes"),
+        "metrics must expose lite_server_http_request_body_bytes histogram\n{}",
+        metrics_text.lines().take(5).collect::<Vec<_>>().join("\n")
+    );
+    // Both content_type labels must appear.
+    assert!(
+        metrics_text.contains(r#"content_type="json""#),
+        "metrics must include json label"
+    );
+    assert!(
+        metrics_text.contains(r#"content_type="raw""#),
+        "metrics must include raw label"
+    );
 }

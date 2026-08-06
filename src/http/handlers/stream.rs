@@ -81,10 +81,10 @@ pub async fn sse_infer_handler(
     Path(model_name): Path<String>,
     headers: HeaderMap,
     cx: RequestContext,
-    ApiJson(payload): ApiJson<Value>,
+    ApiBody(body): ApiBody,
 ) -> Response {
     // P-CORS: CORS headers are attached by `cors_middleware` (no longer per-handler).
-    sse_infer_entry(&state, &model_name, None, headers, payload, cx, false)
+    sse_infer_entry(&state, &model_name, None, headers, body, cx, false)
         .await
         .into_response()
 }
@@ -94,10 +94,10 @@ pub async fn sse_infer_version_handler(
     Path((model_name, version)): Path<(String, String)>,
     headers: HeaderMap,
     cx: RequestContext,
-    ApiJson(payload): ApiJson<Value>,
+    ApiBody(body): ApiBody,
 ) -> Response {
     sse_infer_entry(
-        &state, &model_name, Some(version), headers, payload, cx, false,
+        &state, &model_name, Some(version), headers, body, cx, false,
     )
     .await
     .into_response()
@@ -110,9 +110,9 @@ pub async fn sse_decoupled_handler(
     Path(model_name): Path<String>,
     headers: HeaderMap,
     cx: RequestContext,
-    ApiJson(payload): ApiJson<Value>,
+    ApiBody(body): ApiBody,
 ) -> Response {
-    sse_infer_entry(&state, &model_name, None, headers, payload, cx, true)
+    sse_infer_entry(&state, &model_name, None, headers, body, cx, true)
         .await
         .into_response()
 }
@@ -122,9 +122,9 @@ pub async fn sse_decoupled_version_handler(
     Path((model_name, version)): Path<(String, String)>,
     headers: HeaderMap,
     cx: RequestContext,
-    ApiJson(payload): ApiJson<Value>,
+    ApiBody(body): ApiBody,
 ) -> Response {
-    sse_infer_entry(&state, &model_name, Some(version), headers, payload, cx, true)
+    sse_infer_entry(&state, &model_name, Some(version), headers, body, cx, true)
         .await
         .into_response()
 }
@@ -137,7 +137,7 @@ async fn sse_infer_entry(
     model_name: &str,
     version: Option<String>,
     headers: HeaderMap,
-    payload: Value,
+    body: RequestBody,
     cx: RequestContext,
     decoupled: bool,
 ) -> Result<Response, AppError> {
@@ -162,7 +162,7 @@ async fn sse_infer_entry(
         model_name.to_string(),
         resolved_version,
         headers,
-        payload,
+        body,
         cx,
         decoupled,
     )
@@ -175,7 +175,7 @@ async fn sse_infer_impl(
     model_name: String,
     resolved_version: String,
     headers: HeaderMap,
-    payload: Value,
+    body: RequestBody,
     cx: RequestContext,
     decoupled: bool,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, AppError> {
@@ -192,12 +192,18 @@ async fn sse_infer_impl(
         version = %resolved_version,
         request_id = %cx.request_id,
         pinned_version = tracing::field::Empty,
+        body_bytes = tracing::field::Empty,
+        body_kind = tracing::field::Empty,
     );
     crate::telemetry::link_parent(&span, &cx.trace_cx);
 
     let deadline = crate::deadline::resolve_from_http(&headers, state.config.server.timeout);
-    let meta = span.in_scope(|| build_request_meta(&headers, &payload, "/predict", &cx, deadline.unix_ns));
-    let payload_bytes = meta.payload.clone();
+    let payload_bytes = body.bytes();
+    // D11: record body size with content-type label.
+    prometheus::record_request_body_bytes(body.kind(), "/predict", payload_bytes.len());
+    tracing::Span::current().record("body_bytes", payload_bytes.len() as i64);
+    tracing::Span::current().record("body_kind", body.kind());
+    let meta = span.in_scope(|| build_request_meta(&headers, payload_bytes.clone(), "/predict", &cx, deadline.unix_ns));
     // P-DEADLINE (方案 C): overall deadline only when the CLIENT specified one;
     // chunk-idle reclaim is ALWAYS on (decoupled parity) so a stuck stream is
     // recovered instead of hanging unbounded. Long streams keep flowing untouched.
@@ -539,14 +545,12 @@ async fn handle_ws_stream(
         }
     };
 
-    let payload: Value = match serde_json::from_str(&first_msg) {
-        Ok(v) => v,
-        Err(_) => {
-            let _ = socket.send(Message::Text(json!({"error": "invalid JSON"}).to_string())).await;
-            let _ = socket.close().await;
-            return;
-        }
-    };
+    // D3: zero-allocation JSON syntax validation via &RawValue.
+    if let Err(_) = serde_json::from_slice::<&serde_json::value::RawValue>(first_msg.as_bytes()) {
+        let _ = socket.send(Message::Text(json!({"error": "invalid JSON"}).to_string())).await;
+        let _ = socket.close().await;
+        return;
+    }
 
     // The original upgrade-request headers flow into meta; client_ip /
     // request_id come from the RequestContext (P-MW single fill).
@@ -561,8 +565,8 @@ async fn handle_ws_stream(
     );
     crate::telemetry::link_parent(&span, &cx.trace_cx);
     let deadline = crate::deadline::resolve_from_http(&headers, state.config.server.timeout);
-    let meta = span.in_scope(|| build_request_meta(&headers, &payload, "/predict", &cx, deadline.unix_ns));
-    let payload_bytes = meta.payload.clone();
+    let payload_bytes: bytes::Bytes = first_msg.into_bytes().into();
+    let meta = span.in_scope(|| build_request_meta(&headers, payload_bytes.clone(), "/predict", &cx, deadline.unix_ns));
     // P-DEADLINE (方案 C): overall deadline only when the CLIENT specified one;
     // chunk-idle reclaim is ALWAYS on (decoupled parity) so a stuck stream is
     // recovered instead of hanging unbounded. Long streams keep flowing untouched.
@@ -793,6 +797,11 @@ mod tests {
     //! integration-covered).
 
     use super::*;
+
+    /// Test helper: wrap a JSON `Value` as `RequestBody::Json(Bytes)`.
+    fn json_body(v: serde_json::Value) -> RequestBody {
+        RequestBody::Json(bytes::Bytes::from(serde_json::to_vec(&v).unwrap()))
+    }
     use crate::callback::{Callback, CallbackRunner, InferenceContext, Protocol};
     use crate::config::ModelConfig;
     use crate::inference_queue::InferenceQueue;
@@ -1072,7 +1081,7 @@ mod tests {
             model.to_string(),
             "1".to_string(),
             HeaderMap::new(),
-            json!({}),
+            json_body(json!({})),
             test_cx(),
             false,
         )
@@ -1118,7 +1127,7 @@ mod tests {
             model.to_string(),
             "1".to_string(),
             HeaderMap::new(),
-            json!({}),
+            json_body(json!({})),
             test_cx(),
             false,
         )
@@ -1157,7 +1166,7 @@ mod tests {
             model.to_string(),
             "1".to_string(),
             HeaderMap::new(),
-            json!({}),
+            json_body(json!({})),
             test_cx(),
             false,
         )
@@ -1200,7 +1209,7 @@ mod tests {
             model.to_string(),
             "1".to_string(),
             HeaderMap::new(),
-            json!({}),
+            json_body(json!({})),
             test_cx(),
             false,
         )
@@ -1280,7 +1289,7 @@ mod tests {
                 // No ZMQ client / workers → open_worker_stream fails, but the
                 // span is built before that. Explicit version so resolve
                 // succeeds without an active-version cutover.
-                let _ = sse_infer_entry(&state, "span_model", Some("1".to_string()), HeaderMap::new(), json!({}), test_cx(), false).await;
+                let _ = sse_infer_entry(&state, "span_model", Some("1".to_string()), HeaderMap::new(), json_body(json!({})), test_cx(), false).await;
             });
         });
         handle.join().expect("span test thread must not panic");
@@ -1423,7 +1432,7 @@ mod tests {
             model.to_string(),
             "1".to_string(),
             HeaderMap::new(),
-            json!({}),
+            json_body(json!({})),
             test_cx(),
             false,
         )
@@ -1922,7 +1931,7 @@ mod tests {
             model.to_string(),
             "1".to_string(),
             HeaderMap::new(),
-            json!({}),
+            json_body(json!({})),
             test_cx(),
             true, // decoupled
         )
@@ -1963,7 +1972,7 @@ mod tests {
             model.to_string(),
             "1".to_string(),
             HeaderMap::new(),
-            json!({}),
+            json_body(json!({})),
             test_cx(),
             true, // decoupled
         )
@@ -2036,7 +2045,7 @@ mod tests {
             model.to_string(),
             "1".to_string(),
             headers,
-            json!({}),
+            json_body(json!({})),
             test_cx(),
             true, // decoupled
         )
@@ -2098,7 +2107,7 @@ mod tests {
             model.to_string(),
             "1".to_string(),
             HeaderMap::new(),
-            json!({}),
+            json_body(json!({})),
             test_cx(),
             true, // decoupled
         )

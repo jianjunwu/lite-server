@@ -19,6 +19,7 @@ from lite_server.context import RequestContext, RequestMeta, Headers
 from lite_server.exceptions import BadRequestError, HTTPException
 from lite_server.pipeline import (
     Pipeline,
+    _is_json_content_type,
     collect_metrics,
     extract_response_meta,
     unwrap_response,
@@ -1986,3 +1987,181 @@ class TestOnErrorCustomResponse:
         body, status, metrics, headers = await pipe.run_single(b"{}", _make_meta())
         # At hook time error_overridden is False (set by caller AFTER hook returns)
         assert flag_value is False
+# --- Content-Type dispatch tests (D9) ---
+
+class TestIsJsonContentType:
+    """Unit tests for _is_json_content_type parity with Rust is_json_content_type."""
+
+    def test_application_json(self):
+        assert _is_json_content_type("application/json") is True
+
+    def test_with_charset(self):
+        assert _is_json_content_type("application/json; charset=utf-8") is True
+
+    def test_suffix_problem_json(self):
+        assert _is_json_content_type("application/problem+json") is True
+
+    def test_suffix_vnd_api_json(self):
+        assert _is_json_content_type("application/vnd.api+json") is True
+
+    def test_case_insensitive(self):
+        assert _is_json_content_type("Application/JSON") is True
+        assert _is_json_content_type("APPLICATION/JSON") is True
+
+    def test_text_json_rejected(self):
+        assert _is_json_content_type("text/json") is False
+
+    def test_application_jsonx_rejected(self):
+        assert _is_json_content_type("application/jsonx") is False
+
+    def test_garbage_rejected(self):
+        assert _is_json_content_type("not-even-a-mime") is False
+
+    def test_empty_string_rejected(self):
+        assert _is_json_content_type("") is False
+
+
+class TestRunSingleContentType:
+    """run_single dispatches JSON vs raw bytes based on Content-Type header."""
+
+    @pytest.mark.asyncio
+    async def test_json_input_default(self):
+        """No content-type header → defaults to JSON (backward compat)."""
+        meta = RequestMeta(
+            route="/predict",
+            headers={},  # no content-type
+            client_ip="127.0.0.1",
+            request_id="req-ct-1",
+            timestamp_ns=123456789,
+        )
+        pipe = Pipeline.build(EchoAPI(), [])
+        body, status, _, _ = await pipe.run_single(b'{"input": 1}', meta)
+        assert status.code == "Ok"
+
+    @pytest.mark.asyncio
+    async def test_raw_bytes_input(self):
+        """Non-JSON content-type → raw bytes pass through."""
+        meta = RequestMeta(
+            route="/predict",
+            headers={"content-type": "application/octet-stream"},
+            client_ip="127.0.0.1",
+            request_id="req-ct-2",
+            timestamp_ns=123456789,
+        )
+        # Use an API that echoes its raw bytes request.
+        class RawEchoAPI(LitAPI):
+            def setup(self, device):
+                pass
+            def decode_request(self, request, ctx):
+                # request should be raw bytes, not a dict
+                assert isinstance(request, bytes), f"expected bytes, got {type(request)}"
+                return request
+            def predict(self, x):
+                return x
+            def encode_response(self, output):
+                return {"raw_len": len(output)}
+
+        pipe = Pipeline.build(RawEchoAPI(), [])
+        body, status, _, _ = await pipe.run_single(b"\x00\x01\x02\x03", meta)
+        assert status.code == "Ok"
+        result = json.loads(body)
+        assert result["raw_len"] == 4
+
+
+class TestContentTypeRustPythonParity:
+    """P1: _is_json_content_type parity with Rust is_json_content_type (D9).
+
+    These values MUST produce the same result on both sides. When they don't,
+    Rust (the extractor) wins and the difference is documented.
+    """
+
+    # --- Cases where both sides MUST agree ---
+
+    def test_parity_application_json(self):
+        assert _is_json_content_type("application/json") is True
+
+    def test_parity_charset_utf8(self):
+        assert _is_json_content_type("application/json; charset=utf-8") is True
+
+    def test_parity_charset_quoted(self):
+        # quoted parameter — both sides must strip parameters before matching
+        assert _is_json_content_type('application/json; charset="utf-8"') is True
+
+    def test_parity_suffix_problem(self):
+        assert _is_json_content_type("application/problem+json") is True
+
+    def test_parity_suffix_vnd(self):
+        assert _is_json_content_type("application/vnd.api+json") is True
+
+    def test_parity_case_insensitive(self):
+        assert _is_json_content_type("Application/JSON") is True
+        assert _is_json_content_type("APPLICATION/JSON") is True
+        assert _is_json_content_type("application/JSON") is True
+
+    def test_parity_text_json(self):
+        assert _is_json_content_type("text/json") is False
+
+    def test_parity_jsonx(self):
+        assert _is_json_content_type("application/jsonx") is False
+
+    def test_parity_garbage(self):
+        assert _is_json_content_type("not-even-mime") is False
+        assert _is_json_content_type("") is False
+
+    def test_parity_octet_stream(self):
+        assert _is_json_content_type("application/octet-stream") is False
+
+    def test_parity_extra_params(self):
+        # Multiple params; first is charset, others ignored
+        assert _is_json_content_type("application/json; charset=utf-8; boundary=foo") is True
+
+    def test_parity_leading_trailing_whitespace(self):
+        # Whitespace around the mime type
+        assert _is_json_content_type(" application/json") is True
+        assert _is_json_content_type("application/json ") is True
+
+
+class TestRunSingleBatchBytesInput:
+    """P1: run_single with non-JSON Content-Type for batch-mode simulation.
+
+    Each item in a batch shares the same meta (proto limitation). When the
+    shared Content-Type is non-JSON, every item must receive raw bytes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_batch_style_items_all_raw_bytes(self):
+        """Simulate two batch items: both receive raw bytes."""
+        meta = RequestMeta(
+            route="/predict",
+            headers={"content-type": "application/octet-stream"},
+            client_ip="127.0.0.1",
+            request_id="req-batch-raw",
+            timestamp_ns=123456789,
+        )
+
+        seen = []
+
+        class BatchRawAPI(LitAPI):
+            def setup(self, device):
+                pass
+
+            def decode_request(self, request, ctx):
+                seen.append(type(request).__name__)
+                return request
+
+            def predict(self, x):
+                return x
+
+            def encode_response(self, output):
+                return {"seen": seen}
+
+        pipe = Pipeline.build(BatchRawAPI(), [])
+        # Item 1
+        body1, st1, _, _ = await pipe.run_single(b"\x00\x01", meta)
+        assert st1.code == "Ok"
+        # Item 2 (same meta)
+        body2, st2, _, _ = await pipe.run_single(b"\xff\xfe", meta)
+        assert st2.code == "Ok"
+
+        # Both items must have received raw bytes (not parsed JSON)
+        assert seen == ["bytes", "bytes"], f"expected both items as bytes, got {seen}"

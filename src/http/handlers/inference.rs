@@ -26,12 +26,12 @@ pub async fn infer_handler(
     Path(model_name): Path<String>,
     headers: HeaderMap,
     cx: RequestContext,
-    ApiJson(payload): ApiJson<Value>,
+    ApiBody(body): ApiBody,
 ) -> Result<Response, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     let result = do_infer(
         state.clone(), model_name.clone(), None,
-        "/predict".to_string(), headers, payload, cx,
+        "/predict".to_string(), headers, body, cx,
     ).await;
     // P-CORS: CORS headers are attached by `cors_middleware` (no longer per-handler).
     result
@@ -42,13 +42,13 @@ pub async fn infer_version_handler(
     Path((model_name, version)): Path<(String, String)>,
     headers: HeaderMap,
     cx: RequestContext,
-    ApiJson(payload): ApiJson<Value>,
+    ApiBody(body): ApiBody,
 ) -> Result<Response, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
     let result = do_infer(
         state.clone(), model_name.clone(), Some(version),
-        "/predict".to_string(), headers, payload, cx,
+        "/predict".to_string(), headers, body, cx,
     ).await;
     result
 }
@@ -58,7 +58,7 @@ async fn do_infer(
     version: Option<String>,
     route: String,
     headers: HeaderMap,
-    payload: Value,
+    body: RequestBody,
     cx: RequestContext,
 ) -> Result<Response, AppError> {
     let request_id = cx.request_id.clone();
@@ -69,12 +69,21 @@ async fn do_infer(
         request_id = %request_id,
         // P5-2: canary pin 命中时由 resolve_version record（蓝图 §4.4）。
         pinned_version = tracing::field::Empty,
+        // D11: body metadata — recorded once body is available.
+        body_bytes = tracing::field::Empty,
+        body_kind = tracing::field::Empty,
     );
     async move {
     let resolved_version = resolve_version(&state, &model_name, version, &headers).await?;
     // P-DEADLINE (§4.0.10): resolved once — shared by the ensemble cascade and
     // the unary worker wait. Client `x-lite-timeout` else server.timeout.
     let deadline = crate::deadline::resolve_from_http(&headers, state.config.server.timeout);
+
+    // D11: record body size with content-type label (before any processing).
+    prometheus::record_request_body_bytes(body.kind(), &route, body.bytes().len());
+    // D11: enrich inference span with body metadata.
+    tracing::Span::current().record("body_bytes", body.bytes().len() as i64);
+    tracing::Span::current().record("body_kind", body.kind());
 
     // Check ready
     if !state.registry.is_ready(&model_name, Some(&resolved_version)) {
@@ -94,7 +103,27 @@ async fn do_infer(
 
     // Handle ensemble
     if mv.model_type == ModelType::Ensemble {
-        let result = crate::ensemble::execute_ensemble(state, &model_name, &resolved_version, payload, &request_id, &cx.client_ip, deadline.unix_ns).await?;
+        let payload_value = match &body {
+            RequestBody::Json(b) => serde_json::from_slice::<Value>(b)
+                .map_err(|e| AppError::InvalidRequestBody(format!(
+                    "ensemble requires valid JSON input: {e}"
+                )))?,
+            RequestBody::Raw(_, ct) => {
+                warn!(
+                    model = %model_name,
+                    content_type = %ct,
+                    "ensemble received non-JSON body, rejecting"
+                );
+                return Err(AppError::InvalidRequestBody(format!(
+                    "ensemble requires JSON input, got {}",
+                    ct
+                )));
+            }
+        };
+        let result = crate::ensemble::execute_ensemble(
+            state, &model_name, &resolved_version, payload_value,
+            &request_id, &cx.client_ip, deadline.unix_ns,
+        ).await?;
         return Ok(Json(result).into_response());
     }
 
@@ -122,7 +151,7 @@ async fn do_infer(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as i64;
-    let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    let payload_bytes = body.bytes();
 
     // P8-1: cross-request sequence_id affinity hint (optional, unauthenticated).
     let sequence_id = headers
@@ -154,7 +183,7 @@ async fn do_infer(
         client_ip,
         request_id,
         timestamp_ns,
-        payload: bytes::Bytes::from(payload_bytes),
+        payload: payload_bytes,
         sequence_id,
         deadline_unix_ns: deadline.unix_ns,
         ..Default::default()
@@ -419,7 +448,7 @@ pub(super) async fn resolve_version(
     Ok(resolved)
 }
 
-pub(super) fn build_request_meta(headers: &HeaderMap, payload: &Value, route: &str, cx: &RequestContext, deadline_unix_ns: Option<i64>) -> pb::RequestMeta {
+pub(super) fn build_request_meta(headers: &HeaderMap, payload_bytes: Bytes, route: &str, cx: &RequestContext, deadline_unix_ns: Option<i64>) -> pb::RequestMeta {
     let mut header_map: HashMap<String, String> = headers
         .iter()
         .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), s.to_string())))
@@ -431,7 +460,6 @@ pub(super) fn build_request_meta(headers: &HeaderMap, payload: &Value, route: &s
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as i64;
-    let payload_bytes = bytes::Bytes::from(serde_json::to_vec(payload).unwrap_or_default());
     // P8-1: sequence_id affinity hint.
     let sequence_id = headers
         .get("x-sequence-id")
@@ -467,19 +495,17 @@ mod streaming_tests {
     }
 
     #[test]
-    fn test_build_request_meta_payload_matches_serialized() {
-        // build_request_meta already serializes payload into meta.payload.
-        // This test proves that meta.payload is identical to direct serialization,
-        // confirming that streaming handlers don't need a separate serde_json::to_vec call.
+    fn test_build_request_meta_payload_passthrough() {
+        // build_request_meta takes raw Bytes and passes them through
+        // into meta.payload byte-identical (no JSON round-trip).
         let headers = HeaderMap::new();
-        let payload = serde_json::json!({"prompt": "hello", "max_tokens": 100});
-        let direct_bytes = bytes::Bytes::from(serde_json::to_vec(&payload).unwrap_or_default());
+        let payload_bytes = bytes::Bytes::from_static(b"{\"prompt\": \"hello\", \"max_tokens\": 100}");
         let cx = test_cx("test-id-001", "");
 
-        let meta = build_request_meta(&headers, &payload, "/predict", &cx, None);
+        let meta = build_request_meta(&headers, payload_bytes.clone(), "/predict", &cx, None);
 
-        assert_eq!(meta.payload, direct_bytes,
-            "meta.payload should equal direct serde_json::to_vec output");
+        assert_eq!(meta.payload, payload_bytes,
+            "meta.payload must preserve the input bytes byte-identical");
     }
 
     #[test]
@@ -487,9 +513,9 @@ mod streaming_tests {
         // P-MW: request_id / client_ip come from the RequestContext filled
         // once by context_middleware — never re-extracted from headers here.
         let headers = HeaderMap::new();
-        let payload = serde_json::json!({"x": 1});
+        let payload_bytes = bytes::Bytes::from_static(b"{\"x\": 1}");
         let cx = test_cx("test-id-002", "10.0.0.7");
-        let meta = build_request_meta(&headers, &payload, "/custom", &cx, None);
+        let meta = build_request_meta(&headers, payload_bytes, "/custom", &cx, None);
 
         assert_eq!(meta.route, "/custom");
         assert_eq!(meta.client_ip, "10.0.0.7");

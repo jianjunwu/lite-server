@@ -76,6 +76,22 @@ def decode_request(self, request):
     }
 ```
 
+**Raw bytes requests (0.8.3):** When the client sends a non-JSON Content-Type
+(e.g. `application/octet-stream`), `request` is raw `bytes` instead of a
+dict. Branch with `isinstance`:
+
+```python
+def decode_request(self, request, ctx):
+    if isinstance(request, bytes):
+        h = ctx.meta.headers
+        dtype = np.dtype(h["x-tensor-dtype"])
+        shape = tuple(int(d) for d in h["x-tensor-shape"].split(","))
+        return np.frombuffer(request, dtype=dtype).reshape(shape)
+    return {"prompt": request["prompt"]}
+```
+
+See [Raw Bytes / Tensor Request](raw-bytes-request.md) for details.
+
 #### `predict(self, x)`
 
 Run inference. Receives the output of `decode_request()`.

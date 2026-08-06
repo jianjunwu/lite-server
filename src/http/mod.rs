@@ -333,13 +333,11 @@ pub async fn start_http_server(
     let shared = std::sync::Arc::new(state);
     let app = create_routes(shared.clone());
 
-    // P-FLOW (§4.0.9): per-request body cap. Oversized bodies → 413. None =
-    // axum default (2MB), behaviour unchanged.
-    let app = if let Some(n) = config.server.max_request_body_bytes {
-        app.layer(axum::extract::DefaultBodyLimit::max(n))
-    } else {
-        app
-    };
+    // P-FLOW (§4.0.9): per-request body cap (default 64 MiB). Oversized
+    // bodies → 413. DefaultBodyLimit::max is infallible for non-zero values.
+    let app = app.layer(axum::extract::DefaultBodyLimit::max(
+        config.server.max_request_body_bytes.unwrap_or(64 * 1024 * 1024),
+    ));
 
     // Peer-IP fallback (innermost): inject the TCP peer IP as a fallback
     // x-real-ip for direct (non-proxied) connections so client_ip is never

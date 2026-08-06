@@ -176,10 +176,11 @@ pub struct ServerConfig {
     /// endpoints are exempt (probes must stay reachable under load). 0 =
     /// unlimited (default; behavior unchanged).
     pub max_inflight: usize,
-    /// P-FLOW (§4.0.9): per-request body size cap in bytes. When set, HTTP
-    /// bodies exceeding it return 413 and gRPC messages return
-    /// ResourceExhausted. None = platform default (axum 2MB / tonic 4MB,
-    /// verified at implementation); behavior unchanged.
+    /// P-FLOW (§4.0.9): per-request body size cap in bytes. HTTP bodies
+    /// exceeding it return 413 and gRPC messages return ResourceExhausted.
+    /// Default 64 MiB (67_108_864). Memory budget: peak ≈ this × concurrent
+    /// in-flight requests; size your instance accordingly or lower this limit
+    /// when concurrency is high.
     pub max_request_body_bytes: Option<usize>,
     /// P-XFF: trusted-proxy CIDRs (or bare IPs) whose `X-Forwarded-For` /
     /// `X-Real-IP` headers are honored for client-IP cleansing. Empty
@@ -220,7 +221,7 @@ impl Default for ServerConfig {
             balance_rel_threshold: 1.5,
             decoupled_idle_timeout_secs: 300.0,
             max_inflight: 0,
-            max_request_body_bytes: None,
+            max_request_body_bytes: Some(64 * 1024 * 1024), // 64 MiB
             trusted_proxies: Vec::new(),
             cors: None,
         }

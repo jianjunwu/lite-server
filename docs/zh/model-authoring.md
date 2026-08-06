@@ -84,6 +84,24 @@ def decode_request(self, request, ctx):
     return {"prompt": request["prompt"]}
 ```
 
+**原始字节请求（0.8.3）**：当客户端发送非 JSON Content-Type（如
+`application/octet-stream`）时，`request` 参数为原始 `bytes`，而非
+JSON 字典。用 `isinstance` 分支处理：
+
+```python
+def decode_request(self, request, ctx):
+    if isinstance(request, bytes):
+        # 原始 tensor 字节：从 header 读 shape/dtype
+        h = ctx.meta.headers
+        dtype = np.dtype(h["x-tensor-dtype"])
+        shape = tuple(int(d) for d in h["x-tensor-shape"].split(","))
+        return np.frombuffer(request, dtype=dtype).reshape(shape)
+    # JSON 路径
+    return {"prompt": request["prompt"]}
+```
+
+详见 [原始字节 / Tensor 请求](raw-bytes-request.md)。
+
 #### `predict(self, x)`
 
 运行推理。接收 `decode_request()` 的输出。

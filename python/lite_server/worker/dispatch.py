@@ -16,6 +16,7 @@ from lite_server.context import Headers, RequestContext, RequestMeta
 from lite_server.exceptions import HTTPException
 from lite_server.pipeline import (
     Pipeline,
+    _is_json_content_type,
     collect_metrics,
     extract_response_meta,
     serialize_body,
@@ -229,10 +230,15 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
         final_map[item_uid] = (serialize_body(body), sc, mt, clean)
 
     # Phase 1: per-item before_decode_request → decode → after_decode_request
+    meta.headers.setdefault("content-type", "application/json")
+    content_type = meta.headers.get("content-type", "application/json")
     for item in batch.items:
         ctx = RequestContext(meta=meta, request={}, mode="batch")
         try:
-            ctx.request = _parse_json_payload(item.data)
+            if _is_json_content_type(content_type):
+                ctx.request = _parse_json_payload(item.data)
+            else:
+                ctx.request = item.data  # raw bytes (D9)
             await pipe.preprocess(ctx)
         except Exception as e:
             log.warning("batch item %s preprocess failed: %s", item.uid, _format_exc_brief(e))

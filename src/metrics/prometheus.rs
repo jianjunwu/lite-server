@@ -208,6 +208,23 @@ lazy_static! {
         &["model", "version"]
     ).unwrap();
 
+    /// HTTP request body size histogram (D11: Content-Type dispatch
+    /// observability). `content_type` = "json" | "raw"; `route` =
+    /// matched-path pattern. Buckets cover 1 KB to 256 MB so the
+    /// distribution is visible for small JSON payloads through large
+    /// tensor bodies.
+    pub static ref HTTP_REQUEST_BODY_BYTES: HistogramVec = HistogramVec::new(
+        HistogramOpts::new(
+            "lite_server_http_request_body_bytes",
+            "HTTP request body size in bytes by content-type and route"
+        ).buckets(vec![
+            1_024.0, 4_096.0, 16_384.0, 65_536.0, 262_144.0,
+            1_048_576.0, 4_194_304.0, 16_777_216.0, 67_108_864.0,
+            268_435_456.0,
+        ]),
+        &["content_type", "route"]
+    ).unwrap();
+
     /// Worker 饱和度：各 worker 并发 in-flight batch 数的最大值（最热
     /// worker）。label 白名单不含 worker_id，故以聚合 gauge 呈现；
     /// autoscaler 结合 liteserver_active_workers 解读。
@@ -352,6 +369,13 @@ pub fn record_request_end(model: &str, version: &str, status: &str, duration_sec
     // P-TRACE C4: OTel metrics overlay (no-op unless telemetry.metrics_enabled +
     // feature). Exemplar-ready plumbing; opentelemetry_sdk 0.30 stubs exemplars.
     crate::telemetry::record_request_duration(status, duration_secs);
+}
+
+/// Record HTTP request body size with content-type and route labels (D11).
+pub fn record_request_body_bytes(content_type: &str, route: &str, size_bytes: usize) {
+    HTTP_REQUEST_BODY_BYTES
+        .with_label_values(&[content_type, route])
+        .observe(size_bytes as f64);
 }
 
 // ===== Outlier detection metrics =====

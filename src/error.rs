@@ -73,6 +73,15 @@ pub enum AppError {
     #[error("invalid query parameter: {0}")]
     InvalidQueryParam(String),
 
+    /// Request body exceeded `server.max_request_body_bytes` (HTTP 413).
+    #[error("payload too large: {max_size} bytes max")]
+    PayloadTooLarge { max_size: usize, actual_size: Option<u64> },
+
+    /// Content-Encoding (compression) is not supported on inference routes
+    /// (HTTP 415). The detail is client-facing.
+    #[error("unsupported media type: {0}")]
+    UnsupportedMediaType(String),
+
     /// Rate limit exceeded — HTTP 429 with Retry-After header.
     #[error("rate limit exceeded")]
     RateLimitExceeded { retry_after_secs: u64 },
@@ -137,6 +146,8 @@ impl AppError {
             AppError::MethodNotAllowed => "method not allowed",
             AppError::InvalidRequestBody(_) => "invalid request body",
             AppError::InvalidQueryParam(_) => "invalid query parameter",
+            AppError::PayloadTooLarge { .. } => "payload too large",
+            AppError::UnsupportedMediaType(_) => "unsupported media type",
             AppError::RateLimitExceeded { .. } => "rate limit exceeded",
             AppError::Unauthorized(_) => "unauthorized",
             // ModelError is handled specially in IntoResponse
@@ -152,6 +163,20 @@ impl AppError {
         match self {
             AppError::InvalidRequestBody(detail) => detail.clone(),
             AppError::InvalidQueryParam(detail) => detail.clone(),
+            AppError::PayloadTooLarge { max_size, actual_size } => {
+                if let Some(actual) = actual_size {
+                    format!(
+                        "request body too large: {} bytes exceeds the {} bytes limit",
+                        actual, max_size
+                    )
+                } else {
+                    format!(
+                        "request body exceeds the {} bytes limit",
+                        max_size
+                    )
+                }
+            }
+            AppError::UnsupportedMediaType(detail) => detail.clone(),
             AppError::Unauthorized(detail) => detail.clone(),
             _ => self.pub_error_message().to_string(),
         }
@@ -180,6 +205,8 @@ impl AppError {
             AppError::MethodNotAllowed => "method_not_allowed",
             AppError::InvalidRequestBody(_) => "invalid_request_body",
             AppError::InvalidQueryParam(_) => "invalid_query_param",
+            AppError::PayloadTooLarge { .. } => "payload_too_large",
+            AppError::UnsupportedMediaType(_) => "unsupported_media_type",
             AppError::RateLimitExceeded { .. } => "rate_limit_exceeded",
             AppError::Unauthorized(_) => "unauthorized",
             // ModelError code comes from the Python worker; fallback to its error_type
@@ -227,6 +254,23 @@ impl IntoResponse for AppError {
             return resp;
         }
 
+        // PayloadTooLarge carries size info in the error body so clients can
+        // adjust their requests programmatically.
+        if let AppError::PayloadTooLarge { max_size, actual_size } = &self {
+            let status = StatusCode::PAYLOAD_TOO_LARGE;
+            let error_obj = json!({
+                "type": "invalid_request_error",
+                "message": self.client_message(),
+                "code": self.error_code(),
+                "param": null,
+                "max_size": max_size,
+                "actual_size": actual_size,
+            });
+            let body = Json(json!({ "error": error_obj }));
+            let resp = (status, body).into_response();
+            return resp;
+        }
+
         let (status, error_type) = match &self {
             AppError::ModelNotFound(_) => (StatusCode::NOT_FOUND, "not_found_error"),
             AppError::ModelNotReady(_) => (StatusCode::SERVICE_UNAVAILABLE, "model_not_ready"),
@@ -247,6 +291,8 @@ impl IntoResponse for AppError {
             AppError::MethodNotAllowed => (StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),
             AppError::InvalidRequestBody(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
             AppError::InvalidQueryParam(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
+            AppError::PayloadTooLarge { .. } => (StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error"),
+            AppError::UnsupportedMediaType(_) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "invalid_request_error"),
             AppError::RateLimitExceeded { .. } => (StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded"),
             AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "authentication_error"),
             // Handled above via early return; should never reach here.
@@ -315,6 +361,24 @@ impl From<anyhow::Error> for AppError {
 impl From<Box<dyn std::error::Error + Send + Sync>> for AppError {
     fn from(err: Box<dyn std::error::Error + Send + Sync>) -> Self {
         AppError::Internal(err.to_string())
+    }
+}
+
+/// Map axum `Bytes` body-extraction rejection to [`AppError`].
+/// Length-limit (body too large) → `PayloadTooLarge`; everything else → `InvalidRequestBody`.
+pub(crate) fn map_body_rejection(
+    rejection: axum::extract::rejection::BytesRejection,
+    max_size: usize,
+) -> AppError {
+    use axum::response::IntoResponse;
+    let status = rejection.into_response().status();
+    if status == axum::http::StatusCode::PAYLOAD_TOO_LARGE {
+        AppError::PayloadTooLarge {
+            max_size,
+            actual_size: None,
+        }
+    } else {
+        AppError::InvalidRequestBody("failed to read request body".into())
     }
 }
 

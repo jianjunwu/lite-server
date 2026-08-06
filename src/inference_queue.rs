@@ -50,7 +50,7 @@ pub fn compute_jittered_max_requests(max_requests: usize, jitter: usize) -> usiz
 /// A single item waiting in the inference queue.
 pub struct QueueItem {
     pub uid: String,
-    pub data: Bytes, // JSON-encoded request body (zero-copy shared buffer)
+    pub data: Bytes, // Request body bytes (JSON or raw; zero-copy shared buffer)
     pub meta: Option<Arc<pb::RequestMeta>>, // shared via Arc (refcount-cloned)
     pub response_tx: oneshot::Sender<pb::Response>,
     /// RAII decrement for the per-version in-flight counter, attached by

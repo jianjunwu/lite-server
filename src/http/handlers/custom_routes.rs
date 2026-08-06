@@ -180,7 +180,7 @@ pub async fn dispatch_custom_route(
     // route tag discriminates dispatch in the worker. method/query/path_params
     // ride on RequestMeta (route_pattern == meta.route).
     let deadline = crate::deadline::resolve_from_http(headers, state.config.server.timeout);
-    let mut meta = build_request_meta(headers, &serde_json::Value::Null, &route_pattern, cx, deadline.unix_ns);
+    let mut meta = build_request_meta(headers, bytes::Bytes::from_static(b"null"), &route_pattern, cx, deadline.unix_ns);
     meta.method = method_str.to_string();
     meta.query = query;
     meta.path_params = path_params;

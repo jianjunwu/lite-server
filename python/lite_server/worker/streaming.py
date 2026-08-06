@@ -14,7 +14,13 @@ from typing import Any, Callable
 from lite_server.api import LitAPI
 from lite_server.context import Headers, RequestContext, RequestMeta
 from lite_server.exceptions import HTTPException
-from lite_server.pipeline import Pipeline, collect_metrics, serialize_body, unwrap_response
+from lite_server.pipeline import (
+    Pipeline,
+    _is_json_content_type,
+    collect_metrics,
+    serialize_body,
+    unwrap_response,
+)
 from lite_server.proto import Request, Response, StreamDone, StreamRequest, StreamResponse
 from lite_server.worker.common import (
     _format_exc_brief,
@@ -386,8 +392,12 @@ async def _handle_stream_open_async(
                 error_type="not_implemented").SerializeToString())
             return
         ctx = RequestContext(meta=meta, request={}, mode="decoupled")
+        meta.headers.setdefault("content-type", "application/json")
         try:
-            ctx.request = _parse_json_payload(data)
+            if _is_json_content_type(meta.headers.get("content-type", "application/json")):
+                ctx.request = _parse_json_payload(data)
+            else:
+                ctx.request = data
             await pipe.preprocess(ctx)
         except HTTPException as e:
             log.warning("decoupled preprocess rejected for %s: %s", stream_id, e.detail)
@@ -428,8 +438,12 @@ async def _handle_stream_open_async(
     # --- Bidirectional streaming ------------------------------------------
     if pipe.has_bidi_stream:
         ctx = RequestContext(meta=meta, request={}, mode="bidi")
+        meta.headers.setdefault("content-type", "application/json")
         try:
-            ctx.request = _parse_json_payload(data)
+            if _is_json_content_type(meta.headers.get("content-type", "application/json")):
+                ctx.request = _parse_json_payload(data)
+            else:
+                ctx.request = data
             await pipe.preprocess(ctx)
         except HTTPException as e:
             log.warning("bidi preprocess rejected for %s: %s", stream_id, e.detail)
@@ -533,8 +547,12 @@ async def _handle_stream_open_async(
 
     # --- Uni-directional streaming -----------------------------------------
     ctx = RequestContext(meta=meta, request={}, mode="stream")
+    meta.headers.setdefault("content-type", "application/json")
     try:
-        ctx.request = _parse_json_payload(data)
+        if _is_json_content_type(meta.headers.get("content-type", "application/json")):
+            ctx.request = _parse_json_payload(data)
+        else:
+            ctx.request = data
         await pipe.preprocess(ctx)
     except HTTPException as e:
         log.warning("stream preprocess rejected for %s: %s", stream_id, e.detail)

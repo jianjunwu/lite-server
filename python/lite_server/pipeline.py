@@ -79,6 +79,19 @@ def _parse_request_json(data: bytes | None) -> dict:
         ) from e
 
 
+def _is_json_content_type(content_type: str) -> bool:
+    """Mirror the Rust-side ``is_json_content_type`` (D1/D9):
+    ``application/json`` and ``application/*+json``, case-insensitive,
+    ignores parameters. Everything else (including text/json, garbage)
+    returns False.
+    """
+    mime = content_type.split(";", 1)[0].strip().lower()
+    if not mime.startswith("application/"):
+        return False
+    subtype = mime[len("application/"):]
+    return subtype == "json" or subtype.endswith("+json")
+
+
 def _adapt(fn: Callable) -> Callable[..., Awaitable]:
     """Wrap *fn* (sync or async) into an async callable.
 
@@ -680,8 +693,16 @@ class Pipeline:
         """
         if ctx is None:
             ctx = RequestContext(meta=meta, request={}, mode=mode)
+        # D9: converge the Content-Type default in one place so the key is
+        # always present (defensive — the Rust extractor already defaults to
+        # JSON when the header is missing).
+        meta.headers.setdefault("content-type", "application/json")
         try:
-            ctx.request = _parse_request_json(data)
+            content_type = meta.headers.get("content-type", "application/json")
+            if _is_json_content_type(content_type):
+                ctx.request = _parse_request_json(data)
+            else:
+                ctx.request = data  # raw bytes — user's decode_request handles it
             await self.preprocess(ctx)
             if ctx.early is None:
                 await self.predict_value(ctx)
