@@ -1253,6 +1253,268 @@ class TestGrpcTarget:
                 pass
 
 
+# ── Phase 4w: ws_target.py (批次 1d, plan §2.5.2/§3.4 R4) ───────────────────
+
+class _FakeConnectionClosedOK(Exception):
+    pass
+
+
+class _FakeConnectionClosedError(Exception):
+    pass
+
+
+class _FakeInvalidHandshake(Exception):
+    pass
+
+
+class TestWsTarget:
+    """WS /stream + /decoupled-stream targets over a fake websockets module.
+
+    Wire protocol (R4): C→S first frame = Text JSON payload; S→C chunks are
+    Binary frames; Text frames are control only ({"done":true} terminal,
+    {"error":...} error).
+    """
+
+    @staticmethod
+    def _fake_ws_env(messages, recv_error=None, connect_error=None):
+        """Build (fake_connect, fake_modules, ws) for monkeypatching.
+
+        ``messages``: frames the server sends, in order (bytes = Binary,
+        str = Text).  ``recv_error``: exception raised by recv() once
+        messages are exhausted.  ``connect_error``: raised by connect().
+        """
+        import types
+
+        class FakeWS:
+            def __init__(self):
+                self.sent = []
+
+            async def send(self, data):
+                self.sent.append(data)
+
+            async def recv(self):
+                if messages:
+                    return messages.pop(0)
+                if recv_error is not None:
+                    raise recv_error
+                raise _FakeConnectionClosedOK()
+
+        class _ConnectCtx:
+            def __init__(self, ws):
+                self._ws = ws
+
+            async def __aenter__(self):
+                if connect_error is not None:
+                    raise connect_error
+                return self._ws
+
+            async def __aexit__(self, *args):
+                return False
+
+        ws = FakeWS()
+        connect_calls = []
+
+        def fake_connect(url):
+            connect_calls.append(url)
+            return _ConnectCtx(ws)
+
+        fake_exceptions = types.ModuleType("websockets.exceptions")
+        fake_exceptions.ConnectionClosedOK = _FakeConnectionClosedOK
+        fake_exceptions.ConnectionClosedError = _FakeConnectionClosedError
+        fake_exceptions.InvalidHandshake = _FakeInvalidHandshake
+
+        fake_pkg = types.ModuleType("websockets")
+        fake_pkg.exceptions = fake_exceptions
+
+        modules = {
+            "websockets": fake_pkg,
+            "websockets.exceptions": fake_exceptions,
+        }
+        return fake_connect, modules, ws, connect_calls
+
+    def _patch(self, monkeypatch, modules):
+        for name, mod in modules.items():
+            monkeypatch.setitem(__import__("sys").modules, name, mod)
+
+    # ── Chunk / control frames ───────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_binary_frames_become_chunks(self, monkeypatch):
+        from lite_server.analyzer.ws_target import ws_stream_target
+
+        connect, modules, ws, _ = self._fake_ws_env([
+            b'{"token_count": 1}',
+            b'{"token_count": 2}',
+            '{"done": true}',
+        ])
+        self._patch(monkeypatch, modules)
+        target_fn = ws_stream_target(connect, "ws://x/v2/models/m/stream")
+
+        chunks = []
+        async for c in target_fn({"input": 1}):
+            chunks.append(c)
+
+        assert len(chunks) == 2
+        assert chunks[0].data == b'{"token_count": 1}'
+        assert chunks[0].meta == {"token_count": 1}
+        assert chunks[0].size_bytes == len(b'{"token_count": 1}')
+
+    @pytest.mark.asyncio
+    async def test_payload_sent_as_first_text_frame(self, monkeypatch):
+        import json
+        from lite_server.analyzer.ws_target import ws_stream_target
+
+        connect, modules, ws, connect_calls = self._fake_ws_env(
+            ['{"done": true}'],
+        )
+        self._patch(monkeypatch, modules)
+        target_fn = ws_stream_target(connect, "ws://x/v2/models/m/decoupled-stream")
+        async for _ in target_fn({"input": 42}):
+            pass
+
+        assert connect_calls == ["ws://x/v2/models/m/decoupled-stream"]
+        assert json.loads(ws.sent[0]) == {"input": 42}
+        assert isinstance(ws.sent[0], str)  # Text frame, not bytes
+
+    @pytest.mark.asyncio
+    async def test_error_text_frame_raises_stream_error(self, monkeypatch):
+        from lite_server.analyzer.ws_target import ws_stream_target
+        from lite_server.analyzer.benchmark import RequestStreamError
+
+        connect, modules, _, _ = self._fake_ws_env([
+            b"f1",
+            '{"error": "model exploded"}',
+        ])
+        self._patch(monkeypatch, modules)
+        target_fn = ws_stream_target(connect, "ws://x/stream")
+
+        chunks = []
+        with pytest.raises(RequestStreamError, match="model exploded"):
+            async for c in target_fn({}):
+                chunks.append(c)
+        assert len(chunks) == 1  # chunk before the error was delivered
+
+    @pytest.mark.asyncio
+    async def test_non_json_text_frame_tolerated(self, monkeypatch):
+        from lite_server.analyzer.ws_target import ws_stream_target
+
+        connect, modules, _, _ = self._fake_ws_env([
+            "garbage text frame",
+            b"chunk",
+            '{"done": true}',
+        ])
+        self._patch(monkeypatch, modules)
+        target_fn = ws_stream_target(connect, "ws://x/stream")
+
+        chunks = []
+        async for c in target_fn({}):
+            chunks.append(c)
+        assert [c.data for c in chunks] == [b"chunk"]
+
+    # ── Close / timeout / connect failures ───────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_clean_close_without_done_tolerated(self, monkeypatch):
+        from lite_server.analyzer.ws_target import ws_stream_target
+
+        connect, modules, _, _ = self._fake_ws_env([b"f1"])  # then ClosedOK
+        self._patch(monkeypatch, modules)
+        target_fn = ws_stream_target(connect, "ws://x/stream")
+
+        chunks = []
+        async for c in target_fn({}):
+            chunks.append(c)
+        assert [c.data for c in chunks] == [b"f1"]
+
+    @pytest.mark.asyncio
+    async def test_abnormal_close_raises_stream_error(self, monkeypatch):
+        from lite_server.analyzer.ws_target import ws_stream_target
+        from lite_server.analyzer.benchmark import RequestStreamError
+
+        connect, modules, _, _ = self._fake_ws_env(
+            [b"f1"], recv_error=_FakeConnectionClosedError("1006"),
+        )
+        self._patch(monkeypatch, modules)
+        target_fn = ws_stream_target(connect, "ws://x/stream")
+
+        chunks = []
+        with pytest.raises(RequestStreamError):
+            async for c in target_fn({}):
+                chunks.append(c)
+        assert len(chunks) == 1
+
+    @pytest.mark.asyncio
+    async def test_recv_timeout_maps_to_timeout_error(self, monkeypatch):
+        import asyncio
+        from lite_server.analyzer.ws_target import ws_stream_target
+        from lite_server.analyzer.benchmark import RequestTimeoutError
+
+        connect, modules, ws, _ = self._fake_ws_env([])
+
+        async def hanging_recv():
+            await asyncio.sleep(60)
+
+        ws.recv = hanging_recv  # never returns → wait_for times out
+        self._patch(monkeypatch, modules)
+        target_fn = ws_stream_target(connect, "ws://x/stream", timeout=0.01)
+
+        with pytest.raises(RequestTimeoutError):
+            async for _ in target_fn({}):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_connect_oserror_maps_to_connect_error(self, monkeypatch):
+        from lite_server.analyzer.ws_target import ws_stream_target
+        from lite_server.analyzer.benchmark import RequestConnectError
+
+        connect, modules, _, _ = self._fake_ws_env(
+            [], connect_error=OSError("connection refused"),
+        )
+        self._patch(monkeypatch, modules)
+        target_fn = ws_stream_target(connect, "ws://x/stream")
+
+        with pytest.raises(RequestConnectError):
+            async for _ in target_fn({}):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_handshake_with_status_maps_to_status_error(self, monkeypatch):
+        """WS upgrade rejected with HTTP status → status bucket (parity w/ SSE)."""
+        from lite_server.analyzer.ws_target import ws_stream_target
+        from lite_server.analyzer.benchmark import RequestStatusError
+
+        class FakeInvalidStatus(_FakeInvalidHandshake):
+            def __init__(self, status_code):
+                super().__init__(f"server rejected: {status_code}")
+                self.status_code = status_code
+
+        connect, modules, _, _ = self._fake_ws_env(
+            [], connect_error=FakeInvalidStatus(404),
+        )
+        self._patch(monkeypatch, modules)
+        target_fn = ws_stream_target(connect, "ws://x/stream")
+
+        with pytest.raises(RequestStatusError) as exc_info:
+            async for _ in target_fn({}):
+                pass
+        assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_handshake_without_status_maps_to_connect_error(self, monkeypatch):
+        from lite_server.analyzer.ws_target import ws_stream_target
+        from lite_server.analyzer.benchmark import RequestConnectError
+
+        connect, modules, _, _ = self._fake_ws_env(
+            [], connect_error=_FakeInvalidHandshake("bad upgrade"),
+        )
+        self._patch(monkeypatch, modules)
+        target_fn = ws_stream_target(connect, "ws://x/stream")
+
+        with pytest.raises(RequestConnectError):
+            async for _ in target_fn({}):
+                pass
+
+
 # ── Phase 5: CLI ─────────────────────────────────────────────────────────────
 
 class TestStreamingCLI:

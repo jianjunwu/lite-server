@@ -21,7 +21,7 @@ from lite_server.analyzer.benchmark import (
     RequestTimeoutError,
     StreamChunk,
 )
-from lite_server.analyzer.sse_target import default_chunk_meta
+from lite_server.analyzer.sse_target import bytes_chunk_meta
 
 
 def grpc_stream_target(
@@ -70,7 +70,7 @@ def grpc_stream_target(
             async for resp in call:
                 raw = resp.data
                 yield StreamChunk(
-                    data=raw, meta=_bytes_meta(raw), size_bytes=len(raw),
+                    data=raw, meta=bytes_chunk_meta(raw), size_bytes=len(raw),
                 )
                 if decoupled and resp.is_final:
                     break
@@ -78,15 +78,6 @@ def grpc_stream_target(
             raise _map_rpc_error(e) from e
 
     return target
-
-
-def _bytes_meta(raw: bytes) -> dict | None:
-    """Extract chunk meta from JSON-object bytes; None for non-JSON/binary."""
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-    return default_chunk_meta(text)
 
 
 def _map_rpc_error(err) -> RequestError:

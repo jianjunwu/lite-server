@@ -39,6 +39,15 @@ def default_chunk_meta(data: str) -> dict | None:
     return None
 
 
+def bytes_chunk_meta(data: bytes) -> dict | None:
+    """``default_chunk_meta`` for bytes payloads (WS Binary / gRPC chunks)."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return default_chunk_meta(text)
+
+
 def sse_stream_target(
     client,
     url: str,
