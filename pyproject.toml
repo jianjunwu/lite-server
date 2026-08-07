@@ -3,7 +3,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "lite-server"
+name = "miraserver"
 version = "0.8.3rc1"
 description = "High-performance inference server (Rust core + Python workers)"
 readme = "README.md"

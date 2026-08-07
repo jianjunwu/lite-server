@@ -47,7 +47,7 @@
 
 ```bash
 # 1. 安装
-pip install lite-server
+pip install miraserver
 
 # 2. 脚手架创建项目
 python -m lite_server init my_project --template empty
@@ -172,7 +172,7 @@ lite-server（PyO3 嵌入）与原生 Rust 二进制持平（嵌入层零热路�
 支持 Linux、macOS、Windows（x86_64 + aarch64），Python 3.10-3.14：
 
 ```bash
-pip install lite-server-<version>-py3-none-<platform>.whl
+pip install miraserver-<version>-py3-none-<platform>.whl
 ```
 
 ### 从源码编译

@@ -5,7 +5,7 @@
 ## Installation
 
 ```bash
-pip install lite-server
+pip install miraserver
 ```
 
 ## Global Options
@@ -160,7 +160,7 @@ lite-server benchmark --model <MODEL> [OPTIONS]
 | `--read-delay-ms` | float | — | Slow-consumer scenario: sleep MS after each chunk (requires `--stream`) |
 | `--goodput` | string | — | SLO expression, e.g. `ttft:500 tpot:50 e2el:2000` (ms; requires `--stream`; `tpot` is llm-only) |
 | `--slo-attainment` | float | 0.95 | Exit 99 if SLO attainment is below R (requires `--goodput`) |
-| `--tokenizer` | string | — | Client-side exact token counting (local file or hub id; requires `--stream` + `--model-type llm`; needs `pip install lite-server[benchmark]`) |
+| `--tokenizer` | string | — | Client-side exact token counting (local file or hub id; requires `--stream` + `--model-type llm`; needs `pip install miraserver[benchmark]`) |
 | `--text-field` | string | text→token | Chunk JSON field holding the text to tokenize (requires `--tokenizer`) |
 | `--stream-read-timeout` | float | 300.0 | Seconds between stream chunks before timeout |
 | `--max-ttft-ms` | float | — | Exit 99 if TTFT p99 exceeds MS (requires `--stream`) |
@@ -209,7 +209,7 @@ lite-server benchmark --model <MODEL> [OPTIONS]
 
 **Exact token counting** (`--tokenizer`, `--stream --model-type llm` only):
 
-- Loads a `tokenizers` tokenizer from a local file (`Tokenizer.from_file`) or a HuggingFace hub id (`from_pretrained`, needs network). Requires `pip install lite-server[benchmark]`.
+- Loads a `tokenizers` tokenizer from a local file (`Tokenizer.from_file`) or a HuggingFace hub id (`from_pretrained`, needs network). Requires `pip install miraserver[benchmark]`.
 - Per chunk, the text field (`--text-field`, default `"text"` then `"token"`) is tokenized client-side and fed into the token metrics — TPOT / tokens-per-sec become exact. Chunks whose meta already carries `token_count` keep the server value (never double-counted); chunks with no text count 0 and produce a warning.
 - Token counting adds client CPU; watch the built-in CPU-saturation warning.
 

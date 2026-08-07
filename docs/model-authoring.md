@@ -375,7 +375,7 @@ receives), so an invalid request is rejected with 400 before any model code
 (decode included) runs:
 
 ```yaml
-# config.yaml — requires `pip install lite-server[validation]`
+# config.yaml — requires `pip install miraserver[validation]`
 callbacks:
   - lite_server.callbacks.JsonSchemaValidator:
       input_schema:

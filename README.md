@@ -48,7 +48,7 @@ High-performance model inference server — Rust core for I/O, Python for infere
 
 ```bash
 # 1. Install
-pip install lite-server
+pip install miraserver
 
 # 2. Scaffold a project
 python -m lite_server init my_project --template empty
@@ -200,7 +200,7 @@ lite-server (PyO3 embedding) matches the native Rust binary (the embedding layer
 Pre-built wheels for Linux (x86_64 + aarch64), macOS (Apple Silicon), and Windows (x86_64), Python 3.10-3.14:
 
 ```bash
-pip install lite-server-<version>-cp310-abi3-<platform>.whl
+pip install miraserver-<version>-cp310-abi3-<platform>.whl
 ```
 
 ### From Source

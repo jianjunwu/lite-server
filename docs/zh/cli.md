@@ -5,7 +5,7 @@
 ## 安装
 
 ```bash
-pip install lite-server
+pip install miraserver
 ```
 
 ## 全局选项
@@ -160,7 +160,7 @@ lite-server benchmark --model <模型名> [选项]
 | `--read-delay-ms` | float | — | 慢消费者场景：每 chunk 后睡眠 MS 毫秒（需配合 `--stream`） |
 | `--goodput` | string | — | SLO 表达式，如 `ttft:500 tpot:50 e2el:2000`（毫秒；需配合 `--stream`；`tpot` 仅 llm） |
 | `--slo-attainment` | float | 0.95 | SLO 达标率低于 R 时退出码 99（需配合 `--goodput`） |
-| `--tokenizer` | string | — | 客户端精确 token 计数（本地文件或 hub id；需 `--stream` + `--model-type llm`；需 `pip install lite-server[benchmark]`） |
+| `--tokenizer` | string | — | 客户端精确 token 计数（本地文件或 hub id；需 `--stream` + `--model-type llm`；需 `pip install miraserver[benchmark]`） |
 | `--text-field` | string | text→token | chunk JSON 中待分词文本所在字段（需配合 `--tokenizer`） |
 | `--stream-read-timeout` | float | 300.0 | 流式 chunk 间超时秒数 |
 | `--max-ttft-ms` | float | — | TTFT p99 超过 MS 毫秒时退出码 99（需配合 `--stream`） |
@@ -209,7 +209,7 @@ lite-server benchmark --model <模型名> [选项]
 
 **精确 token 计数**（`--tokenizer`，仅 `--stream --model-type llm`）：
 
-- 从本地文件（`Tokenizer.from_file`）或 HuggingFace hub id（`from_pretrained`，需联网）加载 `tokenizers` 分词器。需 `pip install lite-server[benchmark]`。
+- 从本地文件（`Tokenizer.from_file`）或 HuggingFace hub id（`from_pretrained`，需联网）加载 `tokenizers` 分词器。需 `pip install miraserver[benchmark]`。
 - 逐 chunk 对文本字段（`--text-field`，默认先试 `"text"` 再试 `"token"`）做客户端分词并馈入 token 指标——TPOT / tokens/sec 变为精确值。chunk meta 已带 `token_count` 时保留服务端值（绝不重复计数）；无文本字段的 chunk 计 0 并产生告警。
 - 分词增加客户端 CPU；留意内置的 CPU 饱和告警。
 

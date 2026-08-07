@@ -387,7 +387,7 @@ class AuditLogger(Callback):
 任何模型代码（含 decode）都不会看到它：
 
 ```yaml
-# config.yaml — 需要 `pip install lite-server[validation]`
+# config.yaml — 需要 `pip install miraserver[validation]`
 callbacks:
   - lite_server.callbacks.JsonSchemaValidator:
       input_schema:
@@ -506,7 +506,7 @@ callbacks:
 ```
 
 内置类位于 `lite_server.callbacks`（`JsonSchemaValidator` 需要
-`pip install lite-server[validation]`，详见上文 Schema 校验小节）。
+`pip install miraserver[validation]`，详见上文 Schema 校验小节）。
 
 > 导入失败或 0.7 之前的旧钩子签名会在加载时响亮报错 —— 被静默跳过的
 > callback 可能意味着鉴权/校验逻辑从未执行。
