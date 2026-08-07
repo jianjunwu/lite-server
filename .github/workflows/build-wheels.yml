@@ -6,6 +6,10 @@ on:
       - 'v*'
   pull_request:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g. v0.8.3-rc1); must normalize to the pyproject.toml version'
+        required: false
 
 permissions:
   contents: read
@@ -297,7 +301,7 @@ jobs:
     # — GitHub auto-creates an unprotected env on first reference, which would
     # silently auto-release (the rc0 2026-08-02 mishap).
     environment: "required reviewers"
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     permissions:
       contents: write
     steps:
@@ -308,9 +312,19 @@ jobs:
           pattern: wheel-*
           merge-multiple: true
 
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG=${GITHUB_REF#refs/tags/v}
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
       - name: Verify version matches tag
         run: |
-          TAG=${GITHUB_REF#refs/tags/v}
+          TAG="${{ steps.tag.outputs.tag }}"
           VERSION="${{ needs.get-version.outputs.version }}"
           # rc prereleases: pyproject.toml must be PEP 440 (0.8.3rc1) for PyPI,
           # while tags keep the v0.8.3-rc1 convention — normalize by stripping
@@ -325,11 +339,13 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ needs.get-version.outputs.version }}
-          name: lite-server v${{ needs.get-version.outputs.version }}
+          tag_name: v${{ steps.tag.outputs.tag }}
+          name: lite-server v${{ steps.tag.outputs.tag }}
           files: wheels/*.whl
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_TOKEN }}
+          packages-dir: wheels
+          attestations: false
