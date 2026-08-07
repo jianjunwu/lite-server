@@ -103,9 +103,14 @@ def main(argv=None):
                               help="Exit 99 if p99 latency exceeds MS milliseconds")
     bench_parser.add_argument("--stream", action="store_true", default=False,
                               help="Use SSE streaming endpoint /v2/models/{m}/events")
-    bench_parser.add_argument("--model-type", choices=["llm", "tts", "stt"],
+    bench_parser.add_argument("--model-type", choices=["llm", "tts", "stt", "generic"],
                               default="llm",
-                              help="Streaming metric interpretation (default: llm)")
+                              help="Streaming metric interpretation (default: llm); "
+                                   "'generic' reports common section only (decoupled)")
+    bench_parser.add_argument("--endpoint", choices=["events", "decoupled"],
+                              default="events",
+                              help="Streaming endpoint variant (default: events; "
+                                   "decoupled → /v2/models/{m}/decoupled, requires --stream)")
     bench_parser.add_argument("--stream-read-timeout", type=float, default=300.0,
                               help="Seconds between stream chunks before timeout "
                                    "(default: 300)")
@@ -563,6 +568,8 @@ def _cmd_benchmark(args):
         args.max_ttft_ms = None
     if not hasattr(args, "max_rtf"):
         args.max_rtf = None
+    if not hasattr(args, "endpoint"):
+        args.endpoint = "events"
 
     if args.max_ttft_ms is not None and not args.stream:
         _logger.error("--max-ttft-ms requires --stream")
@@ -571,9 +578,13 @@ def _cmd_benchmark(args):
         if not args.stream:
             _logger.error("--max-rtf requires --stream")
             return 2
-        if args.model_type == "llm":
-            _logger.error("--max-rtf requires --model-type tts or stt, got llm")
+        if args.model_type not in ("tts", "stt"):
+            _logger.error("--max-rtf requires --model-type tts or stt, got %s",
+                          args.model_type)
             return 2
+    if args.endpoint != "events" and not args.stream:
+        _logger.error("--endpoint requires --stream")
+        return 2
 
     # Parse concurrency — single int or sweep range
     try:
@@ -611,11 +622,11 @@ def _cmd_benchmark(args):
     if duration is None and args.requests is None:
         duration = 30.0
 
-    # URL: streaming uses /events, non-streaming uses /infer
+    # URL: streaming uses /events or /decoupled, non-streaming uses /infer
     if args.stream:
-        url = f"{args.url}/v2/models/{args.model}/events"
+        url = f"{args.url}/v2/models/{args.model}/{args.endpoint}"
         if args.version:
-            url = f"{args.url}/v2/models/{args.model}/versions/{args.version}/events"
+            url = f"{args.url}/v2/models/{args.model}/versions/{args.version}/{args.endpoint}"
     else:
         url = f"{args.url}/v2/models/{args.model}/infer"
         if args.version:
@@ -790,6 +801,7 @@ def _cmd_benchmark(args):
                 "payload": _payload_source(args),
                 "stream": args.stream,
                 "model_type": args.model_type,
+                "endpoint": args.endpoint if args.stream else None,
             },
             **result.to_dict(),
         }

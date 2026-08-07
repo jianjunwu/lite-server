@@ -18,6 +18,9 @@ Metric semantics per model type:
 
   STT  TTFT = first transcription result latency
         RTF  = total_ms / request_meta["audio_duration_ms"]
+
+  generic  (decoupled / non-token streams, §3.2): common section only —
+        chunks_per_request / ttft_ms / total_ms; no ITL/tokens/RTF.
 """
 
 from __future__ import annotations
@@ -26,7 +29,7 @@ import numpy as np
 
 from lite_server.analyzer.benchmark import StreamMetrics, StreamRequestRecord
 
-MODEL_TYPES = ("llm", "tts", "stt")
+MODEL_TYPES = ("llm", "tts", "stt", "generic")
 
 _PERCENTILE_KEYS = ("mean", "p50", "p90", "p95", "p99", "min", "max")
 
@@ -61,7 +64,7 @@ def compute_stream_metrics(
 
     Args:
         records: Per-request raw measurements from ``run_stream()``.
-        model_type: One of ``"llm"``, ``"tts"``, ``"stt"``.
+        model_type: One of ``"llm"``, ``"tts"``, ``"stt"``, ``"generic"``.
         window_secs: Measured window for aggregate throughput (R2).
             When provided, ``tokens_per_sec_aggregate`` is computed as
             total_tokens / window_secs.

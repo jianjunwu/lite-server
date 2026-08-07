@@ -149,7 +149,8 @@ lite-server benchmark --model <MODEL> [OPTIONS]
 | `--max-error-rate` | float | — | Exit 99 if failed/total exceeds R (e.g. 0.01) |
 | `--max-p99` | float | — | Exit 99 if p99 latency exceeds MS milliseconds |
 | `--stream` | flag | off | Use SSE streaming endpoint `/v2/models/{m}/events` |
-| `--model-type` | llm\|tts\|stt | llm | Streaming metric interpretation semantics |
+| `--model-type` | llm\|tts\|stt\|generic | llm | Streaming metric interpretation semantics (`generic`: common section only) |
+| `--endpoint` | events\|decoupled | events | Streaming endpoint variant (`decoupled` → `/v2/models/{m}/decoupled`, requires `--stream`) |
 | `--stream-read-timeout` | float | 300.0 | Seconds between stream chunks before timeout |
 | `--max-ttft-ms` | float | — | Exit 99 if TTFT p99 exceeds MS (requires `--stream`) |
 | `--max-rtf` | float | — | Exit 99 if RTF p99 exceeds VAL (requires `--stream` + `--model-type tts/stt`) |
@@ -169,6 +170,8 @@ lite-server benchmark --model <MODEL> [OPTIONS]
 - **LLM** (`--model-type llm`, default): token count defaults to `chunk_count` (estimated). When the model emits `token_count` in chunk metadata, the basis becomes `exact`. Mixed (some with, some without) is labeled `mixed` and metrics still compute with a warning.
 - **TTS** (`--model-type tts`): RTF = `total_ms / audio_duration_ms` from chunk metadata.
 - **STT** (`--model-type stt`): RTF = `total_ms / audio_duration_ms` from the request payload. **Convention**: include `"audio_duration_ms"` (float, milliseconds) in the JSON payload — the CLI extracts it automatically. Requests without `audio_duration_ms` are excluded from RTF calculation.
+- **Generic** (`--model-type generic`): common section only (chunks_per_request / TTFT / e2e) — no ITL/tokens/RTF. Intended for decoupled and other non-token streams.
+- **Decoupled** (`--endpoint decoupled`): benchmarks `POST /v2/models/{m}/decoupled` (server-push, `is_final` terminated). Same SSE wire format as `/events`; typically paired with `--model-type generic`. Set `decoupled_idle_timeout_secs` large enough that it never fires within the run — idle truncation is client-indistinguishable from a normal close.
 - **Sweep + rate + version**: `--stream` composes with `--concurrency start:end:step`, `--rate`, and `--version` — no extra flags needed.
 - **Thresholds**: `--max-ttft-ms` and `--max-rtf` gate on p99; fail-closed (exit 2 when used without `--stream`).
 
@@ -196,6 +199,10 @@ lite-server benchmark --model whisper --stream --model-type stt --duration 60 \
 # Streaming with latency thresholds (exit 99 on violation)
 lite-server benchmark --model llama --stream --requests 100 \
   --max-ttft-ms 200 --max-p99 500
+
+# Decoupled streaming: server-push endpoint with generic metrics
+lite-server benchmark --model detector --stream --endpoint decoupled \
+  --model-type generic --duration 60 --concurrency 8
 
 # Streaming concurrency sweep
 lite-server benchmark --model llama --stream --concurrency 1:16:2 --duration 30

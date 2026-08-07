@@ -149,7 +149,8 @@ lite-server benchmark --model <模型名> [选项]
 | `--max-error-rate` | float | — | 错误率超过 R 时退出码 99（如 0.01） |
 | `--max-p99` | float | — | p99 延迟超过 MS 毫秒时退出码 99 |
 | `--stream` | flag | off | 使用 SSE 流式端点 `/v2/models/{m}/events` |
-| `--model-type` | llm\|tts\|stt | llm | 流式指标的语义解释 |
+| `--model-type` | llm\|tts\|stt\|generic | llm | 流式指标的语义解释（`generic`：仅通用节） |
+| `--endpoint` | events\|decoupled | events | 流式端点变体（`decoupled` → `/v2/models/{m}/decoupled`，需配合 `--stream`） |
 | `--stream-read-timeout` | float | 300.0 | 流式 chunk 间超时秒数 |
 | `--max-ttft-ms` | float | — | TTFT p99 超过 MS 毫秒时退出码 99（需配合 `--stream`） |
 | `--max-rtf` | float | — | RTF p99 超过 VAL 时退出码 99（需 `--stream` + `--model-type tts/stt`） |
@@ -169,6 +170,8 @@ lite-server benchmark --model <模型名> [选项]
 - **LLM**（`--model-type llm`，默认）：token 数默认按 `chunk_count` 估算（estimated）。当模型在 chunk 元数据中提供 `token_count` 时标记为 exact。部分有、部分无标记为 mixed，仍计算指标但附注警告。
 - **TTS**（`--model-type tts`）：RTF = `total_ms / audio_duration_ms`，从 chunk 元数据提取。
 - **STT**（`--model-type stt`）：RTF = `total_ms / audio_duration_ms`，从请求 payload 提取。**约定**：在 JSON payload 中包含 `"audio_duration_ms"`（float，毫秒）——CLI 会自动提取。不含此字段的请求不参与 RTF 计算。
+- **Generic**（`--model-type generic`）：仅通用节（chunks_per_request / TTFT / e2e），不计算 ITL/tokens/RTF。面向 decoupled 及其他非 token 流。
+- **Decoupled**（`--endpoint decoupled`）：压测 `POST /v2/models/{m}/decoupled`（服务端异步推送，`is_final` 终止）。与 `/events` 同一 SSE wire 格式；通常搭配 `--model-type generic`。压测前把 `decoupled_idle_timeout_secs` 设足够大——idle 截断在客户端无法与正常关流区分。
 - **组合矩阵**：`--stream` 与 `--concurrency start:end:step`、`--rate`、`--version` 自由组合，无需额外参数。
 - **阈值**：`--max-ttft-ms` 与 `--max-rtf` 按 p99 门禁；fail-closed（缺少 `--stream` 时 exit 2）。
 
@@ -196,6 +199,10 @@ lite-server benchmark --model whisper --stream --model-type stt --duration 60 \
 # 流式 + 延迟阈值（超出则 exit 99）
 lite-server benchmark --model llama --stream --requests 100 \
   --max-ttft-ms 200 --max-p99 500
+
+# Decoupled 流式：服务端推送端点 + generic 指标
+lite-server benchmark --model detector --stream --endpoint decoupled \
+  --model-type generic --duration 60 --concurrency 8
 
 # 流式并发扫描
 lite-server benchmark --model llama --stream --concurrency 1:16:2 --duration 30

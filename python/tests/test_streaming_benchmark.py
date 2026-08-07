@@ -507,6 +507,66 @@ class TestComputeStreamMetricsEdgeCases:
             compute_stream_metrics([], "LLM")
 
 
+class TestGenericModelType:
+    """--model-type generic: common section only, no LLM/TTS/STT metrics (§3.2)."""
+
+    def test_generic_in_model_types(self):
+        from lite_server.analyzer.stream_metrics import MODEL_TYPES
+
+        assert "generic" in MODEL_TYPES
+
+    def test_generic_computes_common_section_only(self):
+        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+
+        records = [
+            StreamRequestRecord(
+                chunk_count=5, total_bytes=500, ttft_ms=50.0, total_ms=300.0,
+                inter_chunk_ms=[60.0, 60.0, 60.0, 60.0],
+                meta_totals={"token_count": 5.0},
+            ),
+        ]
+        sm = compute_stream_metrics(records, "generic")
+        assert sm.model_type == "generic"
+        assert sm.requests == 1
+        assert sm.chunks_per_request["mean"] == 5.0
+        assert sm.ttft_ms["mean"] == 50.0
+        assert sm.total_ms["mean"] == 300.0
+        # No model-specific metrics — even when token_count meta is present
+        assert sm.itl_ms is None
+        assert sm.tpot_ms is None
+        assert sm.tokens_per_sec is None
+        assert sm.tokens_per_sec_e2e is None
+        assert sm.tokens_per_sec_aggregate is None
+        assert sm.tokens_per_request is None
+        assert sm.token_count_basis is None
+        assert sm.rtf is None
+
+    def test_generic_to_dict_has_no_model_specific_keys(self):
+        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+
+        records = [
+            StreamRequestRecord(
+                chunk_count=3, total_bytes=100, ttft_ms=10.0, total_ms=100.0,
+                inter_chunk_ms=[40.0, 40.0],
+                meta_totals={"token_count": 3.0, "audio_duration_ms": 960.0},
+            ),
+        ]
+        d = compute_stream_metrics(records, "generic").to_dict()
+        assert d["mode"] == "generic"
+        for key in ("itl_ms", "tpot_ms", "tokens_per_sec", "tokens_per_sec_e2e",
+                    "tokens_per_sec_aggregate", "tokens_per_request",
+                    "token_count_basis", "rtf"):
+            assert key not in d
+
+    def test_generic_empty_records_zero_structure(self):
+        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+
+        sm = compute_stream_metrics([], "generic")
+        assert sm.model_type == "generic"
+        assert sm.requests == 0
+        assert sm.ttft_ms["mean"] == 0.0
+
+
 # ── Phase 3: run_stream() adapter ────────────────────────────────────────────
 
 class TestRunStreamAdapter:
@@ -621,6 +681,31 @@ class TestRunStreamAdapter:
                 total_requests=1,
                 model_type="image",
             )
+
+    @pytest.mark.asyncio
+    async def test_generic_model_type_accepted(self):
+        """model_type='generic' runs and reports common section only (§3.2)."""
+        engine = BenchmarkEngine()
+
+        async def target(payload):
+            for data in ["f1", "f2", "f3"]:
+                await asyncio.sleep(0.001)
+                yield StreamChunk(data=data)
+
+        result = await engine.run_stream(
+            target=target,
+            payload={"input": "test"},
+            concurrency=1,
+            total_requests=3,
+            model_type="generic",
+        )
+        assert result.successful == 3
+        sm = result.stream_metrics
+        assert sm is not None
+        assert sm.model_type == "generic"
+        assert sm.total_chunks == 9
+        assert sm.itl_ms is None
+        assert sm.rtf is None
 
     @pytest.mark.asyncio
     async def test_mid_stream_error_classified(self):
@@ -1045,6 +1130,7 @@ class TestStreamingCLI:
             "stream_read_timeout": 300.0,
             "max_ttft_ms": None,
             "max_rtf": None,
+            "endpoint": "events",
         }
         base.update(overrides)
         return type("Args", (), base)()
@@ -1093,6 +1179,88 @@ class TestStreamingCLI:
         assert len(post_calls) > 0
         url = post_calls[0][0]
         assert "/infer" in url
+
+    # ── Endpoint routing (§3.4) ──────────────────────────────────────────
+
+    def test_endpoint_decoupled_uses_decoupled_url(self, monkeypatch):
+        """--stream --endpoint decoupled → /v2/models/{m}/decoupled."""
+        import sys
+        from lite_server import cli
+
+        fake, _, stream_calls = self._fake_httpx_stream()
+        monkeypatch.setitem(sys.modules, "httpx", fake)
+
+        rc = cli._cmd_benchmark(self._stream_args(
+            stream=True, endpoint="decoupled", requests=3,
+        ))
+        assert rc == 0
+        assert len(stream_calls) > 0
+        url = stream_calls[0][0]
+        assert url.endswith("/v2/models/test_model/decoupled")
+
+    def test_endpoint_decoupled_with_version_url(self, monkeypatch):
+        """--stream --endpoint decoupled --version → /versions/{v}/decoupled."""
+        import sys
+        from lite_server import cli
+
+        fake, _, stream_calls = self._fake_httpx_stream()
+        monkeypatch.setitem(sys.modules, "httpx", fake)
+
+        rc = cli._cmd_benchmark(self._stream_args(
+            stream=True, endpoint="decoupled", version="3", requests=3,
+        ))
+        assert rc == 0
+        url = stream_calls[0][0]
+        assert "/versions/3/decoupled" in url
+
+    def test_endpoint_default_is_events(self, monkeypatch):
+        """Default endpoint stays /events (backward compat)."""
+        import sys
+        from lite_server import cli
+
+        fake, _, stream_calls = self._fake_httpx_stream()
+        monkeypatch.setitem(sys.modules, "httpx", fake)
+
+        rc = cli._cmd_benchmark(self._stream_args(stream=True, requests=3))
+        assert rc == 0
+        assert stream_calls[0][0].endswith("/events")
+
+    def test_endpoint_decoupled_without_stream_exits_2(self):
+        """--endpoint decoupled without --stream → exit 2 (fail-closed)."""
+        from lite_server import cli
+
+        rc = cli._cmd_benchmark(self._stream_args(
+            stream=False, endpoint="decoupled", requests=3,
+        ))
+        assert rc == 2
+
+    def test_max_rtf_with_generic_model_exits_2(self):
+        """--max-rtf with --model-type generic → exit 2 (no RTF for generic)."""
+        from lite_server import cli
+
+        rc = cli._cmd_benchmark(self._stream_args(
+            stream=True, model_type="generic", requests=3, max_rtf=2.0,
+        ))
+        assert rc == 2
+
+    def test_export_config_includes_endpoint(self, monkeypatch, tmp_path):
+        """Export config records the endpoint used."""
+        import sys
+        import json
+        from lite_server import cli
+
+        fake, _, _ = self._fake_httpx_stream()
+        monkeypatch.setitem(sys.modules, "httpx", fake)
+        export_path = tmp_path / "result.json"
+
+        rc = cli._cmd_benchmark(self._stream_args(
+            stream=True, endpoint="decoupled", model_type="generic",
+            requests=3, export=str(export_path),
+        ))
+        assert rc == 0
+        data = json.loads(export_path.read_text())
+        assert data["config"]["endpoint"] == "decoupled"
+        assert data["stream"]["mode"] == "generic"
 
     # ── Output rendering ─────────────────────────────────────────────────
 
