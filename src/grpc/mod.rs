@@ -312,6 +312,8 @@ impl LiteServer for GrpcService {
             pinned_version = tracing::field::Empty,
             body_bytes,
             body_kind,
+            // G3:转发 task 内补记(单 span 覆盖 open→全流→close)。
+            stream_id = tracing::field::Empty,
         );
         // P-TRACE: link the inference span to the inbound trace (D21 — read the
         // interceptor-stashed RequestContext; no second propagator extract).
@@ -321,7 +323,7 @@ impl LiteServer for GrpcService {
         let mut version_label = request.get_ref().version.clone();
         let mut request_id = String::new();
         let result = self
-            .stream_infer_impl(request, &mut version_label, &mut request_id, start)
+            .stream_infer_impl(request, &mut version_label, &mut request_id, start, span.clone())
             .instrument(span)
             .await;
         if let Err(s) = &result {
@@ -374,6 +376,8 @@ impl LiteServer for GrpcService {
             pinned_version = tracing::field::Empty,
             body_bytes,
             body_kind,
+            // G3:转发 task 内补记(单 span 覆盖 open→全流→close)。
+            stream_id = tracing::field::Empty,
         );
         // P-TRACE: link the inference span to the inbound trace (D21 — read the
         // interceptor-stashed RequestContext; no second propagator extract).
@@ -383,7 +387,7 @@ impl LiteServer for GrpcService {
         let mut version_label = request.get_ref().version.clone();
         let mut request_id = String::new();
         let result = self
-            .decoupled_infer_impl(request, &mut version_label, &mut request_id, start)
+            .decoupled_infer_impl(request, &mut version_label, &mut request_id, start, span.clone())
             .instrument(span)
             .await;
         if let Err(s) = &result {
@@ -3082,5 +3086,198 @@ mod request_metrics_tests {
             req_before + 1.0,
             "D1: disconnect keeps 2xx family + separate cancel counter"
         );
+    }
+
+
+    // ===== G3 (批次 4):gRPC 流式 span 覆盖全流 + stream_id =====
+
+    /// 捕获 on_new_span/on_record 字段与 on_enter 顺序,验证转发 task 在
+    /// inference span 内执行(单 span 覆盖 open→全流→close)且 stream_id 已补记。
+    #[derive(Default)]
+    struct G3Rec {
+        names: std::collections::HashMap<tracing::span::Id, String>,
+        fields: std::collections::HashMap<tracing::span::Id, Vec<(String, String)>>,
+        enters: Vec<tracing::span::Id>,
+    }
+    struct G3Layer(std::sync::Arc<std::sync::Mutex<G3Rec>>);
+    #[derive(Default)]
+    struct G3Collector(Vec<(String, String)>);
+    impl tracing::field::Visit for G3Collector {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push((field.name().to_string(), format!("{value:?}")));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+    }
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for G3Layer {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut rec = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            let mut collector = G3Collector::default();
+            attrs.record(&mut collector);
+            rec.names.insert(id.clone(), attrs.metadata().name().to_string());
+            rec.fields.entry(id.clone()).or_default().extend(collector.0);
+        }
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut rec = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            let mut collector = G3Collector::default();
+            values.record(&mut collector);
+            rec.fields.entry(id.clone()).or_default().extend(collector.0);
+        }
+        fn on_enter(&self, id: &tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).enters.push(id.clone());
+        }
+    }
+
+    /// 断言 helper:inference span 存在、stream_id 已记录、转发 task enter 过。
+    fn assert_forwarder_span(rec: &G3Rec) {
+        let mut inf_id = None;
+        let mut stream_id = None;
+        for (id, name) in &rec.names {
+            if name != "inference" {
+                continue;
+            }
+            inf_id = Some(id.clone());
+            if let Some(fields) = rec.fields.get(id) {
+                stream_id = fields
+                    .iter()
+                    .find(|(k, _)| k == "stream_id")
+                    .map(|(_, v)| v.clone());
+            }
+        }
+        let id = inf_id.expect("inference span must exist");
+        let sid = stream_id.expect("stream_id must be recorded on the inference span");
+        assert!(!sid.is_empty() && sid != "Empty", "stream_id must be non-empty, got {sid:?}");
+        assert!(
+            rec.enters.contains(&id),
+            "forwarder task must run inside the inference span (instrument)"
+        );
+    }
+
+    #[test]
+    fn grpc_stream_span_covers_forwarder_with_stream_id() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let recorded: std::sync::Arc<std::sync::Mutex<G3Rec>> = Default::default();
+        let recording = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(G3Layer(recorded.clone())),
+        );
+        let handle = std::thread::spawn(move || {
+            let _guard = tracing::dispatcher::set_default(&recording);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let model = "g3_stream";
+                let endpoint = metric_test_endpoint(model);
+                let _w = spawn_stream_worker(endpoint.clone());
+                let service = ready_service_with_worker(model, endpoint).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let resp = service
+                    .stream_infer(Request::new(pb::StreamInferRequest {
+                        model_name: model.to_string(),
+                        version: "1".to_string(),
+                        data: Bytes::from_static(b"{}"),
+                        headers: HashMap::new(),
+                        sequence_id: None,
+                    }))
+                    .await
+                    .expect("stream must open");
+                use tokio_stream::StreamExt;
+                let mut stream = resp.into_inner();
+                while stream.next().await.is_some() {}
+            });
+        });
+        handle.join().expect("g3 stream thread must not panic");
+        assert_forwarder_span(&recorded.lock().unwrap());
+    }
+
+    #[test]
+    fn grpc_decoupled_span_covers_forwarder_with_stream_id() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let recorded: std::sync::Arc<std::sync::Mutex<G3Rec>> = Default::default();
+        let recording = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(G3Layer(recorded.clone())),
+        );
+        let handle = std::thread::spawn(move || {
+            let _guard = tracing::dispatcher::set_default(&recording);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let model = "g3_decoupled";
+                let endpoint = metric_test_endpoint(model);
+                let _w = spawn_stream_worker(endpoint.clone());
+                let service = ready_service_with_worker(model, endpoint).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let resp = service
+                    .decoupled_infer(Request::new(pb::DecoupledInferRequest {
+                        model_name: model.to_string(),
+                        version: "1".to_string(),
+                        data: Bytes::from_static(b"{}"),
+                        headers: HashMap::new(),
+                        sequence_id: None,
+                    }))
+                    .await
+                    .expect("decoupled must open");
+                use tokio_stream::StreamExt;
+                let mut s = resp.into_inner();
+                while s.next().await.is_some() {}
+            });
+        });
+        handle.join().expect("g3 decoupled thread must not panic");
+        assert_forwarder_span(&recorded.lock().unwrap());
+    }
+
+    #[test]
+    fn grpc_bidi_span_covers_forwarder_with_stream_id() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let recorded: std::sync::Arc<std::sync::Mutex<G3Rec>> = Default::default();
+        let recording = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(G3Layer(recorded.clone())),
+        );
+        let handle = std::thread::spawn(move || {
+            let _guard = tracing::dispatcher::set_default(&recording);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let model = "g3_bidi";
+                let endpoint = metric_test_endpoint(model);
+                let _w = spawn_stream_worker(endpoint.clone());
+                let service = ready_service_with_worker(model, endpoint).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let resp = service
+                    .bidi_stream(bidi_open_request(model, "1", b"{}", HashMap::new()))
+                    .await
+                    .expect("bidi must open");
+                use tokio_stream::StreamExt;
+                let mut s = resp.into_inner();
+                while s.next().await.is_some() {}
+            });
+        });
+        handle.join().expect("g3 bidi thread must not panic");
+        assert_forwarder_span(&recorded.lock().unwrap());
     }
 }

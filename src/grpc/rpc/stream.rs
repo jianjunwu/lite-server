@@ -18,6 +18,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+use tracing::Instrument;
 use uuid::Uuid;
 
 impl GrpcService {
@@ -27,6 +28,7 @@ impl GrpcService {
         version_label: &mut String,
         request_id_out: &mut String,
         start: Instant,
+        span: tracing::Span,
     ) -> Result<Response<ReceiverStream<Result<pb::StreamChunk, Status>>>, Status> {
         let remote_addr = request.remote_addr();
         let (grpc_metadata, extensions, req) = request.into_parts();
@@ -126,6 +128,8 @@ impl GrpcService {
         let stream_idle = self.decoupled_idle_timeout;
 
         let stream_id = format!("grpc-stream-{}", Uuid::new_v4());
+        // G3:补记 stream_id,转发 spawn 在 span 内执行(单 span 覆盖全流)。
+        span.record("stream_id", stream_id.as_str());
 
         let clients = self
             .worker_manager
@@ -193,7 +197,7 @@ impl GrpcService {
         let metrics_model = model_name.to_string();
         let metrics_version = resolved_version.clone();
         if stream_metrics {
-            crate::metrics::prometheus::record_stream_open(&metrics_model, &metrics_version, "grpc");
+            crate::metrics::prometheus::record_stream_open(&metrics_model, &metrics_version, "grpc", &stream_id, false);
         }
 
         tokio::spawn(async move {
@@ -309,7 +313,8 @@ impl GrpcService {
             // (300s). Aligned with bidi/decoupled/HTTP stream (P-FLOW §4.0.9).
             let cancel_req = streaming::build_stream_cancel(stream_id);
             let _ = cancel_client.send_raw(cancel_req).await;
-        });
+        }
+        .instrument(span));
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }

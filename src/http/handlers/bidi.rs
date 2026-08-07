@@ -202,7 +202,7 @@ async fn h2_bidi_entry_impl(
 
     let stream_metrics = state.config.features.streaming_metrics;
     if stream_metrics {
-        prometheus::record_stream_open(model_name, &resolved_version, "http2");
+        prometheus::record_stream_open(model_name, &resolved_version, "http2", &stream_id, false);
     }
 
     // P-DEADLINE: overall deadline client-specified only; chunk-idle always on.

@@ -278,7 +278,7 @@ async fn sse_infer_impl(
 
     let stream_metrics = state.config.features.streaming_metrics;
     if stream_metrics {
-        prometheus::record_stream_open(&model_name, &resolved_version, "sse");
+        prometheus::record_stream_open(&model_name, &resolved_version, "sse", &stream_id, decoupled);
     }
 
     let (event_tx, event_rx) = mpsc::channel(64);
@@ -839,7 +839,7 @@ async fn handle_ws_stream(
 
     let stream_metrics = state.config.features.streaming_metrics;
     if stream_metrics {
-        prometheus::record_stream_open(&model_name, &resolved_version, "websocket");
+        prometheus::record_stream_open(&model_name, &resolved_version, "websocket", &stream_id, decoupled);
     }
 
     // Split socket for independent read/write halves (bidi).

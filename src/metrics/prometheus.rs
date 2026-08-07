@@ -224,15 +224,6 @@ lazy_static! {
         "Number of in-flight requests during shutdown"
     ).unwrap();
 
-    // Connection tracking
-    pub static ref OPEN_CONNECTIONS: GaugeVec = GaugeVec::new(
-        prometheus::Opts::new(
-            "liteserver_open_connections",
-            "Current open connections by type"
-        ),
-        &["type"]
-    ).unwrap();
-
     // ===== P2-1 扩展: 扩缩一等指标（autoscaling 信号）=====
     // label 仅封闭枚举 model/version（§6.5 约束 10）。
 
@@ -327,7 +318,6 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(WORKER_INFERENCE_TOTAL.clone()))?;
     REGISTRY.register(Box::new(WORKER_RESPAWNS_TOTAL.clone()))?;
     REGISTRY.register(Box::new(SHUTDOWN_PENDING_REQUESTS.clone()))?;
-    REGISTRY.register(Box::new(OPEN_CONNECTIONS.clone()))?;
     REGISTRY.register(Box::new(IN_FLIGHT_REQUESTS.clone()))?;
     REGISTRY.register(Box::new(QUEUE_WAIT_SECONDS.clone()))?;
     REGISTRY.register(Box::new(WORKER_SATURATION.clone()))?;
@@ -532,12 +522,26 @@ pub fn record_ensemble_step_latency(ensemble: &str, step: &str, model: &str, ver
 
 // ===== Streaming metrics =====
 
-pub fn record_stream_open(model: &str, version: &str, protocol: &str) {
+/// `stream_id`/`decoupled` 仅用于 G5 生命周期日志(metrics label 不含)。
+/// 门控继承:调用点都在 `if stream_metrics` 内。
+pub fn record_stream_open(model: &str, version: &str, protocol: &str, stream_id: &str, decoupled: bool) {
     STREAMING_CONNECTIONS.with_label_values(&[model, version, protocol]).inc();
+    // G5:流 open 生命周期事件。
+    tracing::info!(
+        model,
+        version,
+        protocol,
+        stream_id,
+        decoupled,
+        "stream opened"
+    );
 }
 
 pub fn record_stream_chunk(model: &str, version: &str, protocol: &str) {
     STREAMING_CHUNKS_TOTAL.with_label_values(&[model, version, protocol]).inc();
+    // G2:OTel 流式镜像(双重门控:调用点在 streaming_metrics 内,OTel 侧
+    // metrics_enabled 关时 meter 为 no-op)。
+    crate::telemetry::record_stream_chunks(protocol, 1);
 }
 
 pub fn record_stream_close(model: &str, version: &str, protocol: &str) {
@@ -621,7 +625,31 @@ pub fn record_stream_terminal(
     streaming_metrics: bool,
     output_bytes: u64,
 ) {
-    record_request_end(model, version, family, open_time.elapsed().as_secs_f64());
+    let duration_secs = open_time.elapsed().as_secs_f64();
+    record_request_end(model, version, family, duration_secs);
+    // G5:流 close 生命周期事件(reason 即收口枚举,单一来源);error/cancel
+    // 降级 warn。不门控——排查通道,metrics 关时仍可见。
+    tracing::info!(
+        model,
+        version,
+        protocol,
+        stream_kind,
+        reason = ?reason,
+        duration_secs,
+        output_bytes,
+        "stream closed"
+    );
+    if let Some(kind) = reason.error_kind() {
+        tracing::warn!(
+            model, version, stream_kind, kind,
+            "stream ended with error"
+        );
+    } else if reason == StreamCloseReason::Cancel {
+        tracing::warn!(
+            model, version, protocol,
+            "stream cancelled by client"
+        );
+    }
     if streaming_metrics {
         if reason == StreamCloseReason::Cancel {
             STREAM_CANCELLED_TOTAL
@@ -635,7 +663,9 @@ pub fn record_stream_terminal(
         }
         STREAM_DURATION_SECONDS
             .with_label_values(&[model, version, stream_kind])
-            .observe(open_time.elapsed().as_secs_f64());
+            .observe(duration_secs);
+        // G2:OTel 流式镜像(双重门控:streaming_metrics ∩ telemetry.metrics_enabled)。
+        crate::telemetry::record_stream_duration(stream_kind, duration_secs);
         if output_bytes > 0 {
             STREAM_OUTPUT_BYTES_TOTAL
                 .with_label_values(&[model, version, stream_kind])
@@ -828,10 +858,14 @@ pub fn record_custom_metrics(
 
 pub fn record_stream_ttft(model: &str, version: &str, protocol: &str, ttft_secs: f64) {
     STREAMING_TTFT.with_label_values(&[model, version, protocol]).observe(ttft_secs);
+    // G2:OTel 镜像。
+    crate::telemetry::record_stream_ttft(protocol, ttft_secs);
 }
 
 pub fn record_stream_tbt(model: &str, version: &str, protocol: &str, tbt_secs: f64) {
     STREAMING_TBT.with_label_values(&[model, version, protocol]).observe(tbt_secs);
+    // G2:OTel 镜像。
+    crate::telemetry::record_stream_tbt(protocol, tbt_secs);
 }
 
 // ===== Health check metric recording functions =====
@@ -896,7 +930,7 @@ mod tests {
         let version = "1";
         let protocol = "sse";
         let before = STREAMING_CONNECTIONS.with_label_values(&[model, version, protocol]).get();
-        record_stream_open(model, version, protocol);
+        record_stream_open(model, version, protocol, "test-stream", false);
         let after = STREAMING_CONNECTIONS.with_label_values(&[model, version, protocol]).get();
         assert_eq!(after, before + 1.0);
         // cleanup
@@ -908,7 +942,7 @@ mod tests {
         let model = "close_model";
         let version = "1";
         let protocol = "sse";
-        record_stream_open(model, version, protocol);
+        record_stream_open(model, version, protocol, "test-stream", false);
         record_stream_close(model, version, protocol);
         // net zero — gauge should be back to its value before open
         // (other tests may have incremented, so just check relative)
@@ -927,9 +961,9 @@ mod tests {
 
     #[test]
     fn test_streaming_metrics_distinguished_by_protocol() {
-        record_stream_open("proto_m", "1", "sse");
-        record_stream_open("proto_m", "1", "websocket");
-        record_stream_open("proto_m", "1", "grpc");
+        record_stream_open("proto_m", "1", "sse", "test-s", false);
+        record_stream_open("proto_m", "1", "websocket", "test-w", false);
+        record_stream_open("proto_m", "1", "grpc", "test-g", false);
 
         let sse = STREAMING_CONNECTIONS.with_label_values(&["proto_m", "1", "sse"]).get();
         let ws = STREAMING_CONNECTIONS.with_label_values(&["proto_m", "1", "websocket"]).get();
@@ -1304,7 +1338,7 @@ mod tests {
     fn record_stream_terminal_cancel_counts_when_gated() {
         let model = "term_cancel_on";
         let version = "1";
-        record_stream_open(model, version, "sse");
+        record_stream_open(model, version, "sse", "test-s", false);
         let req_before = REQUESTS_TOTAL.with_label_values(&[model, version, "2xx"]).get();
         let canc_before = STREAM_CANCELLED_TOTAL.with_label_values(&[model, version, "sse"]).get();
         let conn_before = STREAMING_CONNECTIONS.with_label_values(&[model, version, "sse"]).get();
@@ -1334,7 +1368,7 @@ mod tests {
     fn record_stream_terminal_cancel_not_counted_when_gated_off() {
         let model = "term_cancel_off";
         let version = "1";
-        record_stream_open(model, version, "websocket");
+        record_stream_open(model, version, "websocket", "test-w", false);
         let req_before = REQUESTS_TOTAL.with_label_values(&[model, version, "2xx"]).get();
         let canc_before = STREAM_CANCELLED_TOTAL.with_label_values(&[model, version, "websocket"]).get();
         let conn_before = STREAMING_CONNECTIONS.with_label_values(&[model, version, "websocket"]).get();
@@ -1476,6 +1510,19 @@ mod tests {
         record_stream_tbt(model, version, "sse", 1.0);
         let le1 = histogram_bucket_count("liteserver_streaming_tbt_seconds", model, 1.0);
         assert!(le1 >= 1, "1.0s TBT must land in the new le=1 bucket (got {le1})");
+    }
+
+    // ===== G1 (批次 4):OPEN_CONNECTIONS 死代码已删除 =====
+
+    /// G1:删除后 gather 不再暴露 open_connections(编译级 + 输出级双重保证)。
+    #[test]
+    fn open_connections_removed_from_gather() {
+        let output = gather_metrics();
+        assert!(
+            !output.contains("open_connections"),
+            "G1: dead OPEN_CONNECTIONS gauge must be removed: {}",
+            output
+        );
     }
 
     // ===== S4/S5/S6 (批次 3):errors 计数 + stream_kind label + duration/bytes =====

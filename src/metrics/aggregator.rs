@@ -21,6 +21,9 @@ pub struct TimelineEntry {
     pub p99_ms: f64,
     pub queue_depth: i64,
     pub active_workers: i64,
+    /// G6:活跃流式连接(STREAMING_CONNECTIONS 跨 protocol 求和;
+    /// streaming_metrics 关时 gauge 恒 0,随之 0——继承既有门控语义)。
+    pub active_streams: i64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -99,12 +102,17 @@ impl TimelineAggregator {
         let queue_depth = read_gauge(&super::prometheus::QUEUE_DEPTH, &[model, version]);
         let active_workers = read_gauge(&super::prometheus::ACTIVE_WORKERS, &[model, version]);
 
+        // G6:活跃流式连接——跨 protocol 求和(read_gauge 传固定 label 会因
+        // 基数不符 panic,须遍历子序列过滤)。
+        let active_streams = read_active_streams(model, version);
+
         let entry = TimelineEntry {
             timestamp: now,
             qps,
             p99_ms,
             queue_depth: queue_depth as i64,
             active_workers: active_workers as i64,
+            active_streams,
         };
 
         {
@@ -410,9 +418,57 @@ fn read_gauge(gauge: &GaugeVec, labels: &[&str]) -> f64 {
     gauge.with_label_values(labels).get()
 }
 
+/// G6:STREAMING_CONNECTIONS 跨 protocol 求和(按 model/version 过滤)。
+/// 不硬编码 protocol 值——耐未来新增(评审更正:read_gauge 的
+/// with_label_values 要求 3 个 label,传 2 个会基数不符 panic)。
+fn read_active_streams(model: &str, version: &str) -> i64 {
+    let families = super::prometheus::REGISTRY.gather();
+    let Some(family) = families
+        .iter()
+        .find(|mf| mf.get_name() == "liteserver_streaming_connections")
+    else {
+        return 0;
+    };
+    let mut total = 0.0;
+    for m in family.get_metric() {
+        let labels_ok = m.get_label().iter().any(|l| l.get_name() == "model" && l.get_value() == model)
+            && m.get_label().iter().any(|l| l.get_name() == "version" && l.get_value() == version);
+        if labels_ok {
+            total += m.get_gauge().get_value();
+        }
+    }
+    total as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G6 (批次 4):timeline sample 后 entry.active_streams 反映 STREAMING_CONNECTIONS
+    /// gauge 跨 protocol 求和(不硬编码 protocol 值)。
+    #[tokio::test]
+    async fn sample_records_active_streams() {
+        use crate::metrics::prometheus;
+        // read_active_streams 走 REGISTRY.gather——先注册(AlreadyReg 忽略)。
+        let _ = prometheus::register_metrics();
+        let agg = TimelineAggregator::new();
+        // 3 个 protocol 各 1 个连接。
+        prometheus::record_stream_open("asm", "1", "sse", "test-s", false);
+        prometheus::record_stream_open("asm", "1", "websocket", "test-w", false);
+        prometheus::record_stream_open("asm", "1", "http2", "test-h", false);
+        // 第一次 sample 不受节流限制。
+        agg.sample("asm", "1").await;
+        let entries = agg.get_timeline("asm", "1").await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].active_streams, 3,
+            "active_streams must sum across protocols"
+        );
+        // cleanup
+        prometheus::record_stream_close("asm", "1", "sse");
+        prometheus::record_stream_close("asm", "1", "websocket");
+        prometheus::record_stream_close("asm", "1", "http2");
+    }
 
     #[test]
     fn test_record_latency_stores_sample() {

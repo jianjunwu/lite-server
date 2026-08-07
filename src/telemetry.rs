@@ -451,9 +451,76 @@ mod otel {
 #[cfg(feature = "telemetry")]
 pub use otel::{init, shutdown};
 
+/// G2 (批次 4):OTel 流式镜像记录——no-op 安全(无 SDK / telemetry 关闭时
+/// 全局 meter 是 no-op,调用零开销)。与 record_request_duration 同模式。
+static STREAM_TTFT: once_cell::sync::OnceCell<opentelemetry::metrics::Histogram<f64>> =
+    once_cell::sync::OnceCell::new();
+static STREAM_TBT: once_cell::sync::OnceCell<opentelemetry::metrics::Histogram<f64>> =
+    once_cell::sync::OnceCell::new();
+static STREAM_DURATION: once_cell::sync::OnceCell<opentelemetry::metrics::Histogram<f64>> =
+    once_cell::sync::OnceCell::new();
+static STREAM_CHUNKS: once_cell::sync::OnceCell<opentelemetry::metrics::Counter<u64>> =
+    once_cell::sync::OnceCell::new();
+
+pub fn record_stream_ttft(protocol: &str, seconds: f64) {
+    use opentelemetry::KeyValue;
+    let histogram = STREAM_TTFT.get_or_init(|| {
+        opentelemetry::global::meter("lite-server")
+            .f64_histogram("liteserver.stream.ttft")
+            .with_unit("s")
+            .build()
+    });
+    histogram.record(seconds, &[KeyValue::new("protocol", protocol.to_string())]);
+}
+
+pub fn record_stream_tbt(protocol: &str, seconds: f64) {
+    use opentelemetry::KeyValue;
+    let histogram = STREAM_TBT.get_or_init(|| {
+        opentelemetry::global::meter("lite-server")
+            .f64_histogram("liteserver.stream.tbt")
+            .with_unit("s")
+            .build()
+    });
+    histogram.record(seconds, &[KeyValue::new("protocol", protocol.to_string())]);
+}
+
+/// stream_kind 是 S5 的 6 值封闭枚举(与 Prometheus 侧一致)。
+pub fn record_stream_duration(stream_kind: &str, seconds: f64) {
+    use opentelemetry::KeyValue;
+    let histogram = STREAM_DURATION.get_or_init(|| {
+        opentelemetry::global::meter("lite-server")
+            .f64_histogram("liteserver.stream.duration")
+            .with_unit("s")
+            .build()
+    });
+    histogram.record(seconds, &[KeyValue::new("stream_kind", stream_kind.to_string())]);
+}
+
+pub fn record_stream_chunks(protocol: &str, count: u64) {
+    use opentelemetry::KeyValue;
+    let counter = STREAM_CHUNKS.get_or_init(|| {
+        opentelemetry::global::meter("lite-server")
+            .u64_counter("liteserver.stream.chunks")
+            .build()
+    });
+    counter.add(count, &[KeyValue::new("protocol", protocol.to_string())]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===== G2 (批次 4):OTel 流式镜像 no-op 安全 =====
+
+    /// 无 SDK / telemetry 关闭时全局 meter 是 no-op——四个镜像记录调用
+    /// 不 panic、不产生副作用,零开销。
+    #[test]
+    fn record_stream_metrics_noop_safe() {
+        record_stream_ttft("sse", 0.05);
+        record_stream_tbt("sse", 0.01);
+        record_stream_duration("sse", 1.5);
+        record_stream_chunks("sse", 3);
+    }
 
     // ===== inject / extract: always-available, no-op without a propagator =====
 

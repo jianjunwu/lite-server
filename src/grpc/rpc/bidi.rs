@@ -155,6 +155,7 @@ impl GrpcService {
         // handler parity); bidi has no wrapper-level span to carry them.
         let span = tracing::info_span!(
             "inference",
+            stream_id = tracing::field::Empty,
             model = %model_name,
             version = %resolved_version,
             request_id = %request_id,
@@ -168,6 +169,9 @@ impl GrpcService {
         if let Some(p) = &pin {
             span.record("pinned_version", p.as_str());
         }
+        // async move 实现块会带走 span(record 在块内使用)——结尾的
+        // .instrument 用预克隆,避免 use-after-move。
+        let tail_span = span.clone();
         async move {
         // P-TRACE: seed the worker meta with BidiOpen.headers (task C: canary /
         // auth / B3 hints forwarded to the worker) + inject the bidi inference
@@ -259,9 +263,11 @@ impl GrpcService {
         let metrics_model = model_name.clone();
         let metrics_version = resolved_version.clone();
         if stream_metrics {
-            crate::metrics::prometheus::record_stream_open(&metrics_model, &metrics_version, "grpc");
+            crate::metrics::prometheus::record_stream_open(&metrics_model, &metrics_version, "grpc", &stream_id, false);
         }
 
+        // G3:补记 stream_id,转发 spawn 在 span 内执行(单 span 覆盖全流)。
+        span.record("stream_id", stream_id.as_str());
         // Spawn forwarder: worker chunks -> gRPC stream
         let stream_id_for_incoming = stream_id.clone();
         // P-DEADLINE (方案 C): overall deadline client-specified only; chunk-idle
@@ -442,9 +448,10 @@ impl GrpcService {
             // #8: observe the incoming task so a panic is logged, not silently
             // dropped by a bare abort().
             streaming::observe_or_abort(incoming_task).await;
-        });
+        }
+        .instrument(span.clone()));
 
         Ok(Response::new(ReceiverStream::new(rx)))
-        }.instrument(span).await
+        }.instrument(tail_span).await
     }
 }

@@ -21,6 +21,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+use tracing::Instrument;
 use uuid::Uuid;
 
 impl GrpcService {
@@ -30,6 +31,7 @@ impl GrpcService {
         version_label: &mut String,
         request_id_out: &mut String,
         start: Instant,
+        span: tracing::Span,
     ) -> Result<Response<ReceiverStream<Result<pb::DecoupledResponse, Status>>>, Status> {
         // P9-1 (蓝图 §4.4, D18): DecoupledInfer = a stream whose channel the
         // MODEL controls — predict_decoupled returns before close(), the worker
@@ -123,6 +125,8 @@ impl GrpcService {
             ..Default::default()
         };
         let stream_id = format!("grpc-decoupled-{}", Uuid::new_v4());
+        // G3:补记 stream_id,转发 spawn 在 span 内执行(单 span 覆盖全流)。
+        span.record("stream_id", stream_id.as_str());
 
         let clients = self
             .worker_manager
@@ -189,7 +193,7 @@ impl GrpcService {
         let metrics_model = model_name.to_string();
         let metrics_version = resolved_version.clone();
         if stream_metrics {
-            crate::metrics::prometheus::record_stream_open(&metrics_model, &metrics_version, "grpc");
+            crate::metrics::prometheus::record_stream_open(&metrics_model, &metrics_version, "grpc", &stream_id, true);
         }
 
         // P-DEADLINE + P9-1: always-on decoupled idle reclaim, plus an overall
@@ -314,7 +318,8 @@ impl GrpcService {
             // 300s await of send() (对齐 HTTP stream.rs cancel path).
             let cancel_req = streaming::build_stream_cancel(stream_id);
             let _ = cancel_client.send_raw(cancel_req).await;
-        });
+        }
+        .instrument(span));
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
