@@ -156,6 +156,15 @@ class RequestStreamError(RequestError):
     kind = "stream"
 
 
+class RequestGrpcError(RequestError):
+    """gRPC non-OK status (server rejection or mid-stream RPC failure).
+
+    Buckets as ``"status"`` — the gRPC counterpart of an HTTP error status.
+    """
+
+    kind = "status"
+
+
 @dataclass
 class BenchmarkResult:
     """Results from a benchmark run."""

@@ -1027,6 +1027,232 @@ class TestSSETarget:
         assert client.last_kwargs.get("json") == {"key": "val"}
 
 
+# ── Phase 4g: grpc_target.py (批次 1c, plan §2.5.3/§3.4) ─────────────────────
+
+class TestGrpcTarget:
+    """gRPC StreamInfer/DecoupledInfer targets over a fake channel."""
+
+    @staticmethod
+    def _fake_channel(responses, error=None):
+        """Fake grpc.aio.Channel: unary_stream returns recorded fake calls.
+
+        ``responses`` are already-deserialized pb2 messages (the fake bypasses
+        the wire; request serialization is still exercised via the recorded
+        request object).
+        """
+        calls = []
+
+        class FakeCall:
+            def __aiter__(self):
+                async def gen():
+                    for r in responses:
+                        yield r
+                    if error is not None:
+                        raise error
+                return gen()
+
+        class FakeChannel:
+            def unary_stream(self, path, request_serializer=None,
+                             response_deserializer=None):
+                def multi_callable(request, timeout=None):
+                    calls.append({
+                        "path": path,
+                        "request": request,
+                        "timeout": timeout,
+                    })
+                    return FakeCall()
+                return multi_callable
+
+            def unary_unary(self, path, request_serializer=None,
+                            response_deserializer=None):
+                return None  # eagerly constructed by stub init; unused
+
+            def stream_stream(self, path, request_serializer=None,
+                              response_deserializer=None):
+                return None  # eagerly constructed by stub init; unused
+
+        return FakeChannel(), calls
+
+    @staticmethod
+    def _rpc_error(code, details="boom"):
+        import grpc
+
+        return grpc.aio.AioRpcError(
+            code, grpc.aio.Metadata(), grpc.aio.Metadata(), details=details,
+        )
+
+    # ── StreamInfer ──────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_stream_infer_yields_chunks_with_meta(self):
+        from lite_server.analyzer.grpc_target import grpc_stream_target
+        from lite_server.proto import liteserver_pb2
+
+        responses = [
+            liteserver_pb2.StreamChunk(data=b'{"token_count": 1}'),
+            liteserver_pb2.StreamChunk(data=b'{"token_count": 2}'),
+        ]
+        channel, _ = self._fake_channel(responses)
+        target_fn = grpc_stream_target(channel, "my_model")
+
+        chunks = []
+        async for c in target_fn({"input": 1}):
+            chunks.append(c)
+
+        assert len(chunks) == 2
+        assert chunks[0].data == b'{"token_count": 1}'
+        assert chunks[0].meta == {"token_count": 1}
+        assert chunks[0].size_bytes == len(b'{"token_count": 1}')
+
+    @pytest.mark.asyncio
+    async def test_stream_infer_request_fields(self):
+        """Request carries model_name/version and payload as JSON bytes."""
+        import json
+        from lite_server.analyzer.grpc_target import grpc_stream_target
+
+        channel, calls = self._fake_channel([])
+        target_fn = grpc_stream_target(channel, "my_model", version="3")
+        async for _ in target_fn({"input": 42}):
+            pass
+
+        assert len(calls) == 1
+        assert calls[0]["path"] == "/liteserver.LiteServer/StreamInfer"
+        req = calls[0]["request"]
+        assert req.model_name == "my_model"
+        assert req.version == "3"
+        assert json.loads(req.data.decode()) == {"input": 42}
+
+    @pytest.mark.asyncio
+    async def test_stream_infer_timeout_passed_to_call(self):
+        from lite_server.analyzer.grpc_target import grpc_stream_target
+
+        channel, calls = self._fake_channel([])
+        target_fn = grpc_stream_target(channel, "m", timeout=12.5)
+        async for _ in target_fn({}):
+            pass
+
+        assert calls[0]["timeout"] == 12.5
+
+    # ── DecoupledInfer ───────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_decoupled_stops_at_is_final(self):
+        from lite_server.analyzer.grpc_target import grpc_stream_target
+        from lite_server.proto import liteserver_pb2
+
+        responses = [
+            liteserver_pb2.DecoupledResponse(data=b"f1", is_final=False),
+            liteserver_pb2.DecoupledResponse(data=b"f2", is_final=False),
+            liteserver_pb2.DecoupledResponse(data=b"", is_final=True),
+            liteserver_pb2.DecoupledResponse(data=b"never", is_final=False),
+        ]
+        channel, calls = self._fake_channel(responses)
+        target_fn = grpc_stream_target(channel, "m", decoupled=True)
+
+        chunks = []
+        async for c in target_fn({}):
+            chunks.append(c)
+
+        assert calls[0]["path"] == "/liteserver.LiteServer/DecoupledInfer"
+        # is_final frame is yielded (empty data filtered by engine), then stop
+        assert [c.data for c in chunks] == [b"f1", b"f2", b""]
+
+    @pytest.mark.asyncio
+    async def test_decoupled_final_frame_with_data_yielded(self):
+        from lite_server.analyzer.grpc_target import grpc_stream_target
+        from lite_server.proto import liteserver_pb2
+
+        responses = [
+            liteserver_pb2.DecoupledResponse(data=b"f1", is_final=False),
+            liteserver_pb2.DecoupledResponse(data=b"last", is_final=True),
+        ]
+        channel, _ = self._fake_channel(responses)
+        target_fn = grpc_stream_target(channel, "m", decoupled=True)
+
+        chunks = []
+        async for c in target_fn({}):
+            chunks.append(c)
+
+        assert [c.data for c in chunks] == [b"f1", b"last"]
+
+    @pytest.mark.asyncio
+    async def test_decoupled_stream_end_without_is_final_tolerated(self):
+        """Server cut the stream without is_final — target just ends."""
+        from lite_server.analyzer.grpc_target import grpc_stream_target
+        from lite_server.proto import liteserver_pb2
+
+        responses = [liteserver_pb2.DecoupledResponse(data=b"f1", is_final=False)]
+        channel, _ = self._fake_channel(responses)
+        target_fn = grpc_stream_target(channel, "m", decoupled=True)
+
+        chunks = []
+        async for c in target_fn({}):
+            chunks.append(c)
+
+        assert [c.data for c in chunks] == [b"f1"]
+
+    # ── Error mapping (四分桶) ────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_unavailable_maps_to_connect_error(self):
+        import grpc
+        from lite_server.analyzer.grpc_target import grpc_stream_target
+        from lite_server.analyzer.benchmark import RequestConnectError
+
+        channel, _ = self._fake_channel(
+            [], error=self._rpc_error(grpc.StatusCode.UNAVAILABLE),
+        )
+        target_fn = grpc_stream_target(channel, "m")
+        with pytest.raises(RequestConnectError):
+            async for _ in target_fn({}):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_deadline_exceeded_maps_to_timeout_error(self):
+        import grpc
+        from lite_server.analyzer.grpc_target import grpc_stream_target
+        from lite_server.analyzer.benchmark import RequestTimeoutError
+
+        channel, _ = self._fake_channel(
+            [], error=self._rpc_error(grpc.StatusCode.DEADLINE_EXCEEDED),
+        )
+        target_fn = grpc_stream_target(channel, "m")
+        with pytest.raises(RequestTimeoutError):
+            async for _ in target_fn({}):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_internal_maps_to_grpc_error_status_kind(self):
+        import grpc
+        from lite_server.analyzer.grpc_target import grpc_stream_target
+        from lite_server.analyzer.benchmark import RequestGrpcError
+
+        channel, _ = self._fake_channel(
+            [], error=self._rpc_error(grpc.StatusCode.INTERNAL, "model boom"),
+        )
+        target_fn = grpc_stream_target(channel, "m")
+        with pytest.raises(RequestGrpcError) as exc_info:
+            async for _ in target_fn({}):
+                pass
+        assert exc_info.value.kind == "status"
+        assert "INTERNAL" in str(exc_info.value)
+        assert "model boom" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_not_found_maps_to_grpc_error(self):
+        import grpc
+        from lite_server.analyzer.grpc_target import grpc_stream_target
+        from lite_server.analyzer.benchmark import RequestGrpcError
+
+        channel, _ = self._fake_channel(
+            [], error=self._rpc_error(grpc.StatusCode.NOT_FOUND),
+        )
+        target_fn = grpc_stream_target(channel, "m")
+        with pytest.raises(RequestGrpcError):
+            async for _ in target_fn({}):
+                pass
+
+
 # ── Phase 5: CLI ─────────────────────────────────────────────────────────────
 
 class TestStreamingCLI:
