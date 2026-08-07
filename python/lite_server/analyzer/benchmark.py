@@ -116,6 +116,60 @@ def _round_percentiles(p: dict) -> dict:
     return {k: round(v, 2) for k, v in p.items()}
 
 
+# ── Bidi session datatypes (批次 2, plan §4.4/§4.8) ─────────────────────────
+
+
+@dataclass
+class BidiSessionRecord:
+    """Per-session raw measurements (one per completed bidi session).
+
+    Failed sessions raise through the adapter and are counted by ``run()``;
+    only successful sessions produce records (parity with streaming).
+    """
+
+    open_latency_ms: float | None = None  # open sent → first S→C frame
+    chunk_roundtrips_ms: list[float] = field(default_factory=list)  # lock-step only
+    consumer_chunks: int = 0  # S→C data frames received
+    producer_chunks: int = 0  # data chunks sent (open frame excluded)
+    close_to_final_ms: float | None = None  # close sent → done received
+    session_duration_ms: float | None = None  # open sent → done received
+    total_bytes_sent: int = 0
+    total_bytes_recv: int = 0
+
+
+@dataclass
+class BidiSessionMetrics:
+    """Aggregated bidi session metrics for one benchmark run."""
+
+    transport: str  # "ws" | "h2" | "grpc"
+    pacing_mode: str  # "lock_step" | "real_time" | "speedup"
+    sessions: int
+    failed_sessions: int
+    open_latency_ms: dict  # percentiles
+    close_to_final_ms: dict  # percentiles
+    session_duration_ms: dict  # percentiles
+    chunks_per_session: dict  # percentiles, consumer side
+    chunk_roundtrip_ms: dict | None = None  # lock-step only
+    sessions_per_sec: float | None = None  # sessions / window
+
+    def to_dict(self) -> dict:
+        d: dict = {
+            "transport": self.transport,
+            "pacing_mode": self.pacing_mode,
+            "sessions": self.sessions,
+            "failed_sessions": self.failed_sessions,
+            "open_latency_ms": _round_percentiles(self.open_latency_ms),
+            "close_to_final_ms": _round_percentiles(self.close_to_final_ms),
+            "session_duration_ms": _round_percentiles(self.session_duration_ms),
+            "chunks_per_session": _round_percentiles(self.chunks_per_session),
+        }
+        if self.chunk_roundtrip_ms is not None:
+            d["chunk_roundtrip_ms"] = _round_percentiles(self.chunk_roundtrip_ms)
+        if self.sessions_per_sec is not None:
+            d["sessions_per_sec"] = round(self.sessions_per_sec, 2)
+        return d
+
+
 Payload = Union[dict, Callable[[], dict]]
 
 #: Below this many completed requests, percentile conclusions (esp. p99) are
@@ -190,6 +244,7 @@ class BenchmarkResult:
     load_mode: str = "closed-loop"
     target_rate: float | None = None
     stream_metrics: StreamMetrics | None = None
+    bidi_metrics: BidiSessionMetrics | None = None
 
     @property
     def throughput(self) -> float:
@@ -299,6 +354,7 @@ class BenchmarkResult:
             "warnings": list(self.warnings),
             "errors": self.errors,
             "stream": self.stream_metrics.to_dict() if self.stream_metrics else None,
+            "bidi": self.bidi_metrics.to_dict() if self.bidi_metrics else None,
         }
         if self.target_rate is not None:
             d["target_rate"] = self.target_rate
@@ -318,6 +374,7 @@ class BenchmarkEngine:
         warmup_requests: int = 0,
         grace_period: float = 30.0,
         rate: float | None = None,
+        min_samples: int | None = None,
     ) -> BenchmarkResult:
         """Run benchmark and return results.
 
@@ -337,6 +394,10 @@ class BenchmarkEngine:
                 requests are dispatched on a fixed-interval schedule
                 independent of response times, eliminating coordinated
                 omission at the load generator.
+            min_samples: Override the sample-size warning threshold
+                (default ``max(300, 10*concurrency)``).  Used by bidi
+                sessions whose per-unit cost makes 300 samples impractical
+                (plan §4.5 MIN_SESSIONS).
 
         Either ``duration`` or ``total_requests`` must be provided.
         """
@@ -380,11 +441,20 @@ class BenchmarkEngine:
         result.duration = time.perf_counter() - start_time
         result.warmup_requests = warmup_requests
 
-        min_samples = max(MIN_SAMPLES_BASE, 10 * concurrency)
-        if result.successful < min_samples:
+        min_samples_threshold = (
+            min_samples
+            if min_samples is not None
+            else max(MIN_SAMPLES_BASE, 10 * concurrency)
+        )
+        if result.successful < min_samples_threshold:
+            basis = (
+                f"min_samples={min_samples}"
+                if min_samples is not None
+                else "max(300, 10*concurrency)"
+            )
             result.warnings.append(
-                f"Sample size {result.successful} < {min_samples} "
-                f"(max(300, 10*concurrency)); latency percentiles (esp. p99) "
+                f"Sample size {result.successful} < {min_samples_threshold} "
+                f"({basis}); latency percentiles (esp. p99) "
                 f"may be unreliable — increase duration/requests"
             )
 
@@ -526,6 +596,65 @@ class BenchmarkEngine:
                 "estimation — token metrics are partially estimated"
             )
 
+        return result
+
+    async def run_bidi(
+        self,
+        session_runner: Callable[[list], Awaitable[BidiSessionRecord]],
+        payload: Payload,
+        concurrency: int = 1,
+        duration: float | None = None,
+        total_requests: int | None = None,
+        warmup_requests: int = 0,
+        grace_period: float = 30.0,
+        transport: str = "ws",
+        pacing_mode: str = "lock_step",
+        min_sessions: int = 30,
+    ) -> BenchmarkResult:
+        """Run bidi session benchmark — adapter over unmodified ``run()``
+        (批次 2, plan §4.8 D1: same D4 pattern as ``run_stream``).
+
+        Wraps *session_runner* (one full bidi session per call) as a unary
+        callable; the adapter's latency is the session e2e duration.  Only
+        successful sessions produce records — failures raise through to
+        ``run()``'s error buckets.  ``min_sessions`` replaces the default
+        300-based sample warning threshold (§4.5).
+        """
+        from lite_server.analyzer.bidi_metrics import compute_bidi_metrics
+
+        payload_factory = payload if callable(payload) else (lambda: payload)
+
+        records: list[BidiSessionRecord] = []
+        warmup_left = warmup_requests
+
+        async def adapter(script: list) -> dict:
+            nonlocal warmup_left
+            is_warmup = warmup_left > 0
+            if is_warmup:
+                warmup_left -= 1
+            rec = await session_runner(script)
+            if not is_warmup:
+                records.append(rec)
+            return {"ok": True}
+
+        result = await self.run(
+            target=adapter,
+            payload=payload_factory,
+            concurrency=concurrency,
+            duration=duration,
+            total_requests=total_requests,
+            warmup_requests=warmup_requests,
+            grace_period=grace_period,
+            min_samples=min_sessions,
+        )
+
+        result.bidi_metrics = compute_bidi_metrics(
+            records,
+            transport=transport,
+            pacing_mode=pacing_mode,
+            failed_sessions=result.failed,
+            window_secs=result.window or None,
+        )
         return result
 
     @staticmethod

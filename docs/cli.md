@@ -148,10 +148,14 @@ lite-server benchmark --model <MODEL> [OPTIONS]
 | `--export` | path | — | Write authoritative JSON record to PATH (stdout table unchanged) |
 | `--max-error-rate` | float | — | Exit 99 if failed/total exceeds R (e.g. 0.01) |
 | `--max-p99` | float | — | Exit 99 if p99 latency exceeds MS milliseconds |
-| `--stream` | flag | off | Use SSE streaming endpoint `/v2/models/{m}/events` |
+| `--stream` | flag | off | Use SSE streaming endpoint `/v2/models/{m}/events` (mutually exclusive with `--bidi`) |
+| `--bidi` | flag | off | Bidi session benchmark over WS `/stream` bidi mode; payload must be a JSON array `[open, chunk1, ...]` |
 | `--model-type` | llm\|tts\|stt\|generic | llm | Streaming metric interpretation semantics (`generic`: common section only) |
 | `--endpoint` | events\|decoupled | events | Streaming endpoint variant (`decoupled` → `/v2/models/{m}/decoupled`, requires `--stream`) |
-| `--transport` | sse\|ws\|grpc | sse | Streaming transport (requires `--stream` for ws/grpc). `ws` → `/stream`\|`/decoupled-stream`; `grpc` → StreamInfer\|DecoupledInfer over an insecure channel to the `--url` host:port |
+| `--transport` | sse\|ws\|grpc | sse (ws for `--bidi`) | Streaming transport (requires `--stream` for ws/grpc). `ws` → `/stream`\|`/decoupled-stream`; `grpc` → StreamInfer\|DecoupledInfer over an insecure channel to the `--url` host:port |
+| `--pace` | float | — | Bidi real-time pacing: seconds between chunks (requires `--bidi`; default: lock-step) |
+| `--rt-factor` | float | — | Bidi speedup pacing: divide `--pace` by N (requires `--pace`) |
+| `--min-sessions` | int | 30 | Bidi: minimum completed sessions before the sample-size warning fires |
 | `--stream-read-timeout` | float | 300.0 | Seconds between stream chunks before timeout |
 | `--max-ttft-ms` | float | — | Exit 99 if TTFT p99 exceeds MS (requires `--stream`) |
 | `--max-rtf` | float | — | Exit 99 if RTF p99 exceeds VAL (requires `--stream` + `--model-type tts/stt`) |
@@ -176,6 +180,27 @@ lite-server benchmark --model <MODEL> [OPTIONS]
 - **Transports** (`--transport`): `sse` (default, httpx) · `ws` (websockets; Binary frames = chunks, Text = `{"done":true}`/`{"error":...}` control) · `grpc` (StreamInfer/DecoupledInfer, insecure channel, payload as JSON bytes). `--endpoint` selects the endpoint variant per transport (`events` ↔ `/stream` ↔ StreamInfer). Note: for `grpc`, `--stream-read-timeout` is a whole-RPC deadline (gRPC semantics), not a per-chunk idle budget.
 - **Sweep + rate + version**: `--stream` composes with `--concurrency start:end:step`, `--rate`, and `--version` — no extra flags needed.
 - **Thresholds**: `--max-ttft-ms` and `--max-rtf` gate on p99; fail-closed (exit 2 when used without `--stream`).
+
+**Bidi session contract** (`--bidi`, WS transport only for now):
+
+- The benchmark unit is a **session**: open → paced chunks → close. The payload is a JSON array — element 0 is the open payload (sent as the Text first frame → `on_open`), the rest are data chunks (each JSON-serialized into a Binary frame → `on_chunk`).
+- Session metrics (JSON `"bidi"` section): open latency, close→final latency, session e2e duration, chunks/session, sessions/sec; per-chunk roundtrip percentiles in **lock-step** mode only.
+- **Lock-step** (default) requires the model to return a response from every `on_chunk` **and** an `on_open` ready response — sparse-response models must use `--pace` (real-time) or `--pace` + `--rt-factor` (speedup), which do not pair chunks with responses.
+- `--stream-read-timeout` is the per-frame idle budget; a session failing it counts as failed. `--max-p99` gates on session e2e duration. Sample-size warning threshold is `--min-sessions` (default 30), not the 300 used for requests.
+
+```bash
+# Bidi lock-step: per-chunk roundtrip latency (echo-style models)
+lite-server benchmark --model asr --bidi --duration 300 --concurrency 4 \
+  --payload-file tests/fixtures/asr_session.json   # ["open", chunk1, chunk2, ...]
+
+# Bidi real-time pacing at 25 fps ASR rhythm (320ms per chunk)
+lite-server benchmark --model asr --bidi --pace 0.32 --duration 300 \
+  --payload-file tests/fixtures/asr_session.json
+
+# Bidi 2x speedup: find the overload knee
+lite-server benchmark --model asr --bidi --pace 0.32 --rt-factor 2 --duration 300 \
+  --payload-file tests/fixtures/asr_session.json
+```
 
 **Exit codes**: `0` pass · `1` execution error (e.g. no requests completed) · `2` argument/payload error · `99` threshold violation.
 

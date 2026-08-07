@@ -101,8 +101,12 @@ def main(argv=None):
                               help="Exit 99 if failed/total exceeds R (e.g. 0.01)")
     bench_parser.add_argument("--max-p99", type=float, default=None,
                               help="Exit 99 if p99 latency exceeds MS milliseconds")
-    bench_parser.add_argument("--stream", action="store_true", default=False,
+    stream_mode_group = bench_parser.add_mutually_exclusive_group()
+    stream_mode_group.add_argument("--stream", action="store_true", default=False,
                               help="Use SSE streaming endpoint /v2/models/{m}/events")
+    stream_mode_group.add_argument("--bidi", action="store_true", default=False,
+                              help="Run bidi session benchmark (WS /stream bidi mode; "
+                                   "payload must be a JSON array [open, chunk1, ...])")
     bench_parser.add_argument("--model-type", choices=["llm", "tts", "stt", "generic"],
                               default="llm",
                               help="Streaming metric interpretation (default: llm); "
@@ -112,11 +116,20 @@ def main(argv=None):
                               help="Streaming endpoint variant (default: events; "
                                    "decoupled → /v2/models/{m}/decoupled, requires --stream)")
     bench_parser.add_argument("--transport", choices=["sse", "ws", "grpc"],
-                              default="sse",
-                              help="Streaming transport (default: sse, requires --stream "
-                                   "for ws/grpc). ws → /stream|/decoupled-stream; "
-                                   "grpc → StreamInfer|DecoupledInfer over an insecure "
+                              default=None,
+                              help="Streaming transport (default: sse; ws for --bidi). "
+                                   "ws → /stream|/decoupled-stream; grpc → "
+                                   "StreamInfer|DecoupledInfer over an insecure "
                                    "channel to the --url host:port")
+    bench_parser.add_argument("--pace", type=float, default=None,
+                              help="Bidi real-time pacing: seconds between chunks "
+                                   "(requires --bidi; default: lock-step)")
+    bench_parser.add_argument("--rt-factor", type=float, default=None,
+                              help="Bidi speedup pacing: divide --pace by N "
+                                   "(requires --pace)")
+    bench_parser.add_argument("--min-sessions", type=int, default=30,
+                              help="Bidi: minimum completed sessions before the "
+                                   "sample-size warning fires (default: 30)")
     bench_parser.add_argument("--stream-read-timeout", type=float, default=300.0,
                               help="Seconds between stream chunks before timeout "
                                    "(default: 300)")
@@ -380,6 +393,8 @@ def _run_concurrency_sweep(args, levels: list[int], duration, run_one) -> int:
         _print_benchmark_summary(result, args, duration, c)
         if result.stream_metrics is not None:
             _print_stream_section(result)
+        if result.bidi_metrics is not None:
+            _print_bidi_section(result)
         results.append((c, result))
 
         # Per-level threshold gate (A4)
@@ -455,19 +470,12 @@ def _export_sweep_results(args, results: list[tuple[int, "BenchmarkResult"]]) ->
     from pathlib import Path
 
     is_stream = getattr(args, "stream", False)
-    if is_stream:
-        url = f"{args.url}/v2/models/{args.model}/events"
-        if args.version:
-            url = f"{args.url}/v2/models/{args.model}/versions/{args.version}/events"
-    else:
-        url = f"{args.url}/v2/models/{args.model}/infer"
-        if args.version:
-            url = f"{args.url}/v2/models/{args.model}/versions/{args.version}/infer"
+    is_bidi = getattr(args, "bidi", False)
 
     export_data = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "config": {
-            "url": url,
+            "url": _benchmark_request_url(args),
             "model": args.model,
             "version": args.version,
             "concurrency": args.concurrency,
@@ -478,6 +486,11 @@ def _export_sweep_results(args, results: list[tuple[int, "BenchmarkResult"]]) ->
             "payload": _payload_source(args),
             "stream": is_stream,
             "model_type": getattr(args, "model_type", "llm"),
+            "endpoint": getattr(args, "endpoint", "events") if is_stream else None,
+            "transport": getattr(args, "transport", None) if (is_stream or is_bidi) else None,
+            "bidi": is_bidi,
+            "pacing_mode": _bidi_pacing_label(args) if is_bidi else None,
+            "min_sessions": getattr(args, "min_sessions", 30) if is_bidi else None,
         },
         "mode": "sweep",
         "levels": [
@@ -526,6 +539,65 @@ def _print_stream_section(result: "BenchmarkResult") -> None:
     elif sm.model_type in ("tts", "stt") and sm.rtf is not None:
         print(f"    RTF             [mean/p50/p90/p95/p99]: "
               f"{_p(sm.rtf)}")
+
+
+def _print_bidi_section(result: "BenchmarkResult") -> None:
+    """Print bidi session metrics section (批次 2)."""
+    bm = result.bidi_metrics
+    if bm is None:
+        return
+
+    def _p(d: dict) -> str:
+        return f"{d.get('mean', 0):.1f}/{d.get('p50', 0):.1f}/{d.get('p90', 0):.1f}/{d.get('p95', 0):.1f}/{d.get('p99', 0):.1f}"
+
+    print(f"\n  Bidi Session Metrics (transport={bm.transport}, "
+          f"pacing={bm.pacing_mode}):")
+    print(f"    Sessions:         {bm.sessions}  (failed: {bm.failed_sessions})")
+    print(f"    Open latency (ms) [mean/p50/p90/p95/p99]: "
+          f"{_p(bm.open_latency_ms)}")
+    if bm.chunk_roundtrip_ms is not None:
+        print(f"    Chunk RTT (ms)    [mean/p50/p90/p95/p99]: "
+              f"{_p(bm.chunk_roundtrip_ms)}")
+    print(f"    Close→final (ms)  [mean/p50/p90/p95/p99]: "
+          f"{_p(bm.close_to_final_ms)}")
+    print(f"    Session e2e (ms)  [mean/p50/p90/p95/p99]: "
+          f"{_p(bm.session_duration_ms)}")
+    print(f"    Chunks/session (consumer mean): "
+          f"{bm.chunks_per_session.get('mean', 0):.1f}")
+    if bm.sessions_per_sec is not None:
+        print(f"    Sessions/sec:     {bm.sessions_per_sec:.2f}")
+
+
+def _bidi_pacing_label(args) -> str:
+    """Pacing mode label from CLI args (single source for Pacing + exports)."""
+    if getattr(args, "pace", None) is None:
+        return "lock_step"
+    if getattr(args, "rt_factor", None) is None:
+        return "real_time"
+    return "speedup"
+
+
+def _benchmark_request_url(args) -> str:
+    """Request URL for benchmark runs — shared by single-run and sweep export.
+
+    grpc bypasses the URL (channel address comes from the --url host:port);
+    ws converts the scheme and maps endpoint → /stream|/decoupled-stream.
+    """
+    transport = getattr(args, "transport", None) or "sse"
+    endpoint = getattr(args, "endpoint", "events")
+    streamish = getattr(args, "stream", False) or getattr(args, "bidi", False)
+    if streamish:
+        if transport == "ws":
+            base = args.url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+            path = "stream" if endpoint == "events" else "decoupled-stream"
+        else:
+            base, path = args.url, endpoint
+        if args.version:
+            return f"{base}/v2/models/{args.model}/versions/{args.version}/{path}"
+        return f"{base}/v2/models/{args.model}/{path}"
+    if args.version:
+        return f"{args.url}/v2/models/{args.model}/versions/{args.version}/infer"
+    return f"{args.url}/v2/models/{args.model}/infer"
 
 
 def _payload_source(args) -> str:
@@ -577,7 +649,44 @@ def _cmd_benchmark(args):
     if not hasattr(args, "endpoint"):
         args.endpoint = "events"
     if not hasattr(args, "transport"):
-        args.transport = "sse"
+        args.transport = None
+    if not hasattr(args, "bidi"):
+        args.bidi = False
+    if not hasattr(args, "pace"):
+        args.pace = None
+    if not hasattr(args, "rt_factor"):
+        args.rt_factor = None
+    if not hasattr(args, "min_sessions"):
+        args.min_sessions = 30
+    if args.transport is None:
+        args.transport = "ws" if args.bidi else "sse"
+
+    if args.bidi:
+        if args.stream:
+            _logger.error("--bidi and --stream are mutually exclusive")
+            return 2
+        if args.transport == "sse":
+            _logger.error("--bidi requires --transport ws (sse has no bidi mode)")
+            return 2
+        if args.transport == "grpc":
+            _logger.error("--bidi --transport grpc is not supported yet")
+            return 2
+        if args.endpoint != "events":
+            _logger.error("--endpoint does not apply to --bidi")
+            return 2
+        if args.rt_factor is not None and args.pace is None:
+            _logger.error("--rt-factor requires --pace")
+            return 2
+        if args.payload_random is not None:
+            _logger.error("--payload-random does not apply to --bidi "
+                          "(bidi payload must be a JSON array)")
+            return 2
+        if args.min_sessions < 1:
+            _logger.error("--min-sessions must be >= 1")
+            return 2
+    elif args.pace is not None or args.rt_factor is not None:
+        _logger.error("--pace/--rt-factor require --bidi")
+        return 2
 
     if args.max_ttft_ms is not None and not args.stream:
         _logger.error("--max-ttft-ms requires --stream")
@@ -590,10 +699,10 @@ def _cmd_benchmark(args):
             _logger.error("--max-rtf requires --model-type tts or stt, got %s",
                           args.model_type)
             return 2
-    if args.endpoint != "events" and not args.stream:
+    if args.endpoint != "events" and not args.stream and not args.bidi:
         _logger.error("--endpoint requires --stream")
         return 2
-    if args.transport != "sse" and not args.stream:
+    if args.transport != "sse" and not args.stream and not args.bidi:
         _logger.error("--transport requires --stream")
         return 2
 
@@ -619,6 +728,25 @@ def _cmd_benchmark(args):
         _logger.error("payload error: %s", e)
         return 2
 
+    if args.bidi:
+        for p in payloads:
+            if not isinstance(p, list):
+                _logger.error("--bidi payload must be a JSON array: "
+                              "[open_payload, chunk1, chunk2, ...]")
+                return 2
+
+    pacing = None
+    if args.bidi:
+        from lite_server.analyzer.bidi_session import Pacing
+
+        pacing_mode_label = _bidi_pacing_label(args)
+        if pacing_mode_label == "lock_step":
+            pacing = Pacing(mode="lock_step")
+        elif pacing_mode_label == "real_time":
+            pacing = Pacing(mode="real_time", pace_secs=args.pace)
+        else:
+            pacing = Pacing(mode="speedup", pace_secs=args.pace / args.rt_factor)
+
     if args.payload_random is not None:
         try:
             template = json.loads(args.payload_random)
@@ -633,29 +761,19 @@ def _cmd_benchmark(args):
     if duration is None and args.requests is None:
         duration = 30.0
 
-    # URL: streaming path depends on transport; grpc bypasses URL (uses
+    # URL: streaming/bidi path depends on transport; grpc bypasses URL (uses
     # the --url host:port as channel address)
-    if args.stream:
-        if args.transport == "ws":
-            base = args.url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
-            path = "stream" if args.endpoint == "events" else "decoupled-stream"
-        else:
-            base = args.url
-            path = args.endpoint
-        url = f"{base}/v2/models/{args.model}/{path}"
-        if args.version:
-            url = f"{base}/v2/models/{args.model}/versions/{args.version}/{path}"
-    else:
-        url = f"{args.url}/v2/models/{args.model}/infer"
-        if args.version:
-            url = f"{args.url}/v2/models/{args.model}/versions/{args.version}/infer"
+    url = _benchmark_request_url(args)
 
     async def run_benchmark(c: int | None = None):
         import httpx
 
         concurrency = c if c is not None else concurrency_levels[0]
         mode = f"duration={duration}s" if duration is not None else f"requests={args.requests}"
-        stream_label = ", streaming" if args.stream else ""
+        if args.bidi:
+            stream_label = f", bidi/{pacing.mode}"
+        else:
+            stream_label = ", streaming" if args.stream else ""
         print(f"Benchmarking {args.model} (concurrency={concurrency}, "
               f"{mode}{stream_label}, warmup={args.warmup_requests})")
 
@@ -677,6 +795,29 @@ def _cmd_benchmark(args):
         )
         async with httpx.AsyncClient(limits=limits) as client:
             engine = BenchmarkEngine()
+
+            if args.bidi:
+                # Bidi session path: WS transport → run_bidi()
+                from websockets.asyncio.client import connect as _ws_connect
+
+                from lite_server.analyzer.ws_bidi_target import ws_bidi_session
+
+                session = ws_bidi_session(
+                    _ws_connect, url, pacing=pacing,
+                    idle_timeout=args.stream_read_timeout,
+                )
+                return await engine.run_bidi(
+                    session_runner=session,
+                    payload=final_payload,
+                    concurrency=concurrency,
+                    duration=duration,
+                    total_requests=args.requests,
+                    warmup_requests=args.warmup_requests,
+                    grace_period=args.grace_period,
+                    transport="ws",
+                    pacing_mode=pacing.mode,
+                    min_sessions=args.min_sessions,
+                )
 
             if args.stream:
                 # Streaming path: transport target → run_stream()
@@ -828,6 +969,8 @@ def _cmd_benchmark(args):
     # ── Stream section ──────────────────────────────────────────────────
     if result.stream_metrics is not None:
         _print_stream_section(result)
+    if result.bidi_metrics is not None:
+        _print_bidi_section(result)
 
     if args.export:
         from datetime import datetime, timezone
@@ -846,7 +989,10 @@ def _cmd_benchmark(args):
                 "stream": args.stream,
                 "model_type": args.model_type,
                 "endpoint": args.endpoint if args.stream else None,
-                "transport": args.transport if args.stream else None,
+                "transport": args.transport if (args.stream or args.bidi) else None,
+                "bidi": args.bidi,
+                "pacing_mode": pacing.mode if args.bidi else None,
+                "min_sessions": args.min_sessions if args.bidi else None,
             },
             **result.to_dict(),
         }

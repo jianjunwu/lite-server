@@ -148,10 +148,14 @@ lite-server benchmark --model <模型名> [选项]
 | `--export` | path | — | 将权威 JSON 记录写入 PATH（stdout 表格不变） |
 | `--max-error-rate` | float | — | 错误率超过 R 时退出码 99（如 0.01） |
 | `--max-p99` | float | — | p99 延迟超过 MS 毫秒时退出码 99 |
-| `--stream` | flag | off | 使用 SSE 流式端点 `/v2/models/{m}/events` |
+| `--stream` | flag | off | 使用 SSE 流式端点 `/v2/models/{m}/events`（与 `--bidi` 互斥） |
+| `--bidi` | flag | off | WS `/stream` bidi 模式的会话压测；payload 必须是 JSON 数组 `[open, chunk1, ...]` |
 | `--model-type` | llm\|tts\|stt\|generic | llm | 流式指标的语义解释（`generic`：仅通用节） |
 | `--endpoint` | events\|decoupled | events | 流式端点变体（`decoupled` → `/v2/models/{m}/decoupled`，需配合 `--stream`） |
-| `--transport` | sse\|ws\|grpc | sse | 流式传输（ws/grpc 需配合 `--stream`）。`ws` → `/stream`\|`/decoupled-stream`；`grpc` → StreamInfer\|DecoupledInfer（向 `--url` 的 host:port 建 insecure channel） |
+| `--transport` | sse\|ws\|grpc | sse（`--bidi` 时为 ws） | 流式传输（ws/grpc 需配合 `--stream`）。`ws` → `/stream`\|`/decoupled-stream`；`grpc` → StreamInfer\|DecoupledInfer（向 `--url` 的 host:port 建 insecure channel） |
+| `--pace` | float | — | bidi 实时节奏：chunk 间隔秒数（需配合 `--bidi`；默认 lock-step） |
+| `--rt-factor` | float | — | bidi 倍速：`--pace` 除以 N（需配合 `--pace`） |
+| `--min-sessions` | int | 30 | bidi：样本量告警的最少完成会话数 |
 | `--stream-read-timeout` | float | 300.0 | 流式 chunk 间超时秒数 |
 | `--max-ttft-ms` | float | — | TTFT p99 超过 MS 毫秒时退出码 99（需配合 `--stream`） |
 | `--max-rtf` | float | — | RTF p99 超过 VAL 时退出码 99（需 `--stream` + `--model-type tts/stt`） |
@@ -176,6 +180,27 @@ lite-server benchmark --model <模型名> [选项]
 - **传输**（`--transport`）：`sse`（默认，httpx）· `ws`（websockets；Binary 帧 = chunk，Text 帧仅 `{"done":true}`/`{"error":...}` 控制帧）· `grpc`（StreamInfer/DecoupledInfer，insecure channel，payload 为 JSON bytes）。`--endpoint` 在各传输下选择对应端点变体（`events` ↔ `/stream` ↔ StreamInfer）。注意：`grpc` 下 `--stream-read-timeout` 是整个 RPC 的 deadline（gRPC 语义），不是逐 chunk 空闲预算。
 - **组合矩阵**：`--stream` 与 `--concurrency start:end:step`、`--rate`、`--version` 自由组合，无需额外参数。
 - **阈值**：`--max-ttft-ms` 与 `--max-rtf` 按 p99 门禁；fail-closed（缺少 `--stream` 时 exit 2）。
+
+**Bidi 会话口径**（`--bidi`，暂仅 WS 传输）：
+
+- 压测单元是**会话**：open → 按节奏推 chunk → close。payload 为 JSON 数组——第 0 元素是 open 载荷（作为 Text 首帧发送 → `on_open`），其余为数据 chunk（各自 JSON 序列化为 Binary 帧 → `on_chunk`）。
+- 会话指标（JSON `"bidi"` 段）：open 延迟、close→final 延迟、会话 e2e 时长、每会话 chunk 数、会话/秒；逐 chunk 往返百分位仅 **lock-step** 模式。
+- **lock-step**（默认）要求模型每个 `on_chunk` 都返回响应**且** `on_open` 返回 ready 响应——稀疏响应模型须用 `--pace`（实时）或 `--pace` + `--rt-factor`（倍速），这两种模式不做 chunk↔响应配对。
+- `--stream-read-timeout` 是逐帧空闲预算；超时的会话计为失败。`--max-p99` 门禁会话 e2e 时长。样本量告警阈值是 `--min-sessions`（默认 30），而非请求模型的 300。
+
+```bash
+# bidi lock-step：逐 chunk 往返延迟(echo 型模型)
+lite-server benchmark --model asr --bidi --duration 300 --concurrency 4 \
+  --payload-file tests/fixtures/asr_session.json   # ["open", chunk1, chunk2, ...]
+
+# bidi 实时节奏:25 fps ASR 节奏(每 chunk 320ms)
+lite-server benchmark --model asr --bidi --pace 0.32 --duration 300 \
+  --payload-file tests/fixtures/asr_session.json
+
+# bidi 2 倍速:寻找过载拐点
+lite-server benchmark --model asr --bidi --pace 0.32 --rt-factor 2 --duration 300 \
+  --payload-file tests/fixtures/asr_session.json
+```
 
 **退出码**：`0` 通过 · `1` 执行错误（如无请求完成） · `2` 参数/payload 错误 · `99` 阈值违例。
 
