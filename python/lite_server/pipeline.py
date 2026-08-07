@@ -306,18 +306,21 @@ def extract_response_meta(headers: dict[str, str] | None) -> tuple[int, str, dic
     return sc, mt, clean if clean else None
 
 
-def collect_metrics(lit_api: LitAPI) -> Metrics | None:
+def collect_metrics(lit_api: LitAPI, tokens_generated: int | None = None) -> Metrics | None:
     """Collect pre-registered custom metrics from the LitAPI instance.
 
     The swap (read + reset) is protected by ``_metric_lock`` so concurrent
     ``report_metric`` calls from the executor thread cannot land in the
     window between iteration-end and reset.
+
+    ``tokens_generated`` (S3): per-stream chunk 计数近似口径——仅流式路径
+    (Done/close 处)传入,作为参数直接进 Metrics,``不进`` ``_metric_values``
+    共享通道(该通道是 per-worker、跨并发流共享的,走它会跨流误归)。
+    unary 不传(默认 None → 0):无 chunk 概念,精确计数依赖 tokenizer(D3 后续项)。
     """
     with lit_api._metric_lock:
         values = getattr(lit_api, "_metric_values", None) or []
         lit_api._metric_values = []
-    if not values:
-        return None
     specs = lit_api._metric_specs
     gauges, counters, histograms = [], [], []
     for mid, val in values:
@@ -330,9 +333,10 @@ def collect_metrics(lit_api: LitAPI) -> Metrics | None:
                 counters.append(mv)
             elif spec.metric_type == "histogram":
                 histograms.append(mv)
-    if not gauges and not counters and not histograms:
+    if not gauges and not counters and not histograms and not tokens_generated:
         return None
-    return Metrics(gauges=gauges, counters=counters, histograms=histograms)
+    return Metrics(gauges=gauges, counters=counters, histograms=histograms,
+                   tokens_generated=tokens_generated or 0)
 
 
 # ---------------------------------------------------------------------------

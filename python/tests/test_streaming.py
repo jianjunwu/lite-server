@@ -1830,3 +1830,100 @@ class TestBidiFramingContentType:
             BidiAPI(), chunk_req, sock, active, log
         )
         assert received == [{"chunk": 1}]
+
+# ---------------------------------------------------------------------------
+# S3 (批次 2):tokens_generated 近似口径——per-stream chunk 计数
+# ---------------------------------------------------------------------------
+
+
+class TestStreamTokensGenerated:
+    """S3:流式 Done.metrics 携带 tokens_generated(= chunk 数近似口径,
+    per-stream 计数,不进 _metric_values 共享通道);prefill/decode 不填(S3 收窄)。"""
+
+    @pytest.mark.asyncio
+    async def test_done_metrics_carry_tokens_generated(self):
+        class StreamAPI(EchoAPI):
+            def stream_predict(self, x):
+                for i in range(3):
+                    yield {"chunk": i}
+
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            StreamAPI(), _stream_req("s-tok", b'{"prompt": "go"}'), sock, {}, log
+        )
+        done = await sock.wait_for(lambda r: _is_done(r, "s-tok"))
+        metrics = done[0].stream.done.metrics
+        assert metrics is not None, "done.metrics must be present"
+        assert metrics.tokens_generated == 3
+        assert metrics.prefill_ms == 0.0, "S3 收窄:prefill_ms 不填"
+        assert metrics.decode_ms == 0.0, "S3 收窄:decode_ms 不填"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_streams_tokens_not_mixed(self):
+        """并发两流互不误归——per-stream 计数隔离,不走共享 _metric_values。"""
+
+        class StreamAPI(EchoAPI):
+            def stream_predict(self, x):
+                # preprocess 后 x 已是 dict(JSON body)。
+                n = int(x["n"])
+                for i in range(n):
+                    yield {"chunk": i}
+
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            StreamAPI(), _stream_req("s-tok-a", b'{"n": 2}'), sock, {}, log
+        )
+        await inference._handle_stream_open_async(
+            StreamAPI(), _stream_req("s-tok-b", b'{"n": 5}'), sock, {}, log
+        )
+        da = await sock.wait_for(lambda r: _is_done(r, "s-tok-a"))
+        db = await sock.wait_for(lambda r: _is_done(r, "s-tok-b"))
+        assert da[0].stream.done.metrics.tokens_generated == 2
+        assert db[0].stream.done.metrics.tokens_generated == 5
+
+    @pytest.mark.asyncio
+    async def test_zero_chunk_stream_tokens_zero(self):
+        """零 chunk 流(直接 Done)→ tokens_generated 为 0(或 metrics 缺省,
+        Rust 侧 >0 守卫自然不落盘)。"""
+
+        class EmptyAPI(EchoAPI):
+            def stream_predict(self, x):
+                return
+                yield  # 永不执行:0 chunk
+
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            EmptyAPI(), _stream_req("s-tok-0"), sock, {}, log
+        )
+        done = await sock.wait_for(lambda r: _is_done(r, "s-tok-0"))
+        m = done[0].stream.done.metrics
+        assert m is None or m.tokens_generated == 0
+
+    @pytest.mark.asyncio
+    async def test_unary_path_does_not_fill_tokens(self):
+        """unary 不填 tokens_generated(无 chunk 概念;精确计数依赖 tokenizer,
+        D3 后续项)。collect_metrics 默认参数不带 tokens。"""
+        from lite_server.pipeline import collect_metrics
+
+        m = collect_metrics(EchoAPI())
+        assert m is None or m.tokens_generated == 0
+
+    @pytest.mark.asyncio
+    async def test_decoupled_sender_counts_chunks(self):
+        """decoupled 路径同样计数:DecoupledSender.send 每次 +1,
+        close() 的 Done 携带累计 chunk 数。"""
+
+        class DecoupledAPI(EchoAPI):
+            async def predict_decoupled(self, data, sender):
+                for i in range(4):
+                    await sender.send({"chunk": i})
+                await sender.close()
+
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            DecoupledAPI(), _decoupled_req("s-tok-dc", b'{"prompt": "go"}'), sock, {}, log
+        )
+        done = await sock.wait_for(lambda r: _is_done(r, "s-tok-dc"))
+        metrics = done[0].stream.done.metrics
+        assert metrics is not None
+        assert metrics.tokens_generated == 4

@@ -118,7 +118,9 @@ lazy_static! {
         HistogramOpts::new(
             "liteserver_streaming_ttft_seconds",
             "Time to first token in streaming"
-        ).buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]),
+        // S7:桶追加 5/10/30/60——大模型冷启动 TTFT>2.5s(旧桶顶)不落 +Inf。
+        // 纯增量,既有观测不迁移。
+        ).buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
         &["model", "version", "protocol"]
     ).unwrap();
 
@@ -126,7 +128,8 @@ lazy_static! {
         HistogramOpts::new(
             "liteserver_streaming_tbt_seconds",
             "Time between tokens in streaming"
-        ).buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5]),
+        // S7:桶追加 1/2.5/5——慢解码 chunk 间隔不落 +Inf(旧桶顶 0.5s)。
+        ).buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]),
         &["model", "version", "protocol"]
     ).unwrap();
 
@@ -1362,6 +1365,50 @@ mod tests {
             );
         }
         assert!(found, "histogram series for {model} not found");
+    }
+
+    /// gather 指定 model/version 序列的直方图桶累积计数(不存在/未观测 → 0)。
+    fn histogram_bucket_count(metric_name: &str, model: &str, le: f64) -> u64 {
+        let families = REGISTRY.gather();
+        let family = families
+            .iter()
+            .find(|mf| mf.get_name() == metric_name)
+            .unwrap_or_else(|| panic!("{metric_name} must be registered"));
+        for m in family.get_metric() {
+            if m.get_label()
+                .iter()
+                .any(|l| l.get_name() == "model" && l.get_value() == model)
+            {
+                let hist = m.get_histogram();
+                return hist
+                    .get_bucket()
+                    .iter()
+                    .find(|b| (*b).get_upper_bound() == le)
+                    .map(|b| b.get_cumulative_count())
+                    .unwrap_or(0);
+            }
+        }
+        0
+    }
+
+    /// S7:TTFT 桶追加 5/10/30/60——大模型冷启动 TTFT>2.5s(旧桶顶)不落 +Inf。
+    #[test]
+    fn streaming_ttft_buckets_extend_for_cold_start() {
+        let model = "ttft_bucket_m";
+        let version = "1";
+        record_stream_ttft(model, version, "sse", 5.0);
+        let le5 = histogram_bucket_count("liteserver_streaming_ttft_seconds", model, 5.0);
+        assert!(le5 >= 1, "5.0s TTFT must land in the new le=5 bucket (got {le5})");
+    }
+
+    /// S7:TBT 桶追加 1/2.5/5——慢解码 chunk 间隔不落 +Inf(旧桶顶 0.5s)。
+    #[test]
+    fn streaming_tbt_buckets_extend_for_slow_decode() {
+        let model = "tbt_bucket_m";
+        let version = "1";
+        record_stream_tbt(model, version, "sse", 1.0);
+        let le1 = histogram_bucket_count("liteserver_streaming_tbt_seconds", model, 1.0);
+        assert!(le1 >= 1, "1.0s TBT must land in the new le=1 bucket (got {le1})");
     }
 
     // ===== P6: per-worker inference counter (GetModelStats source) =====

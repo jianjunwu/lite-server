@@ -130,7 +130,7 @@ class _BidiSession:
     sending frames, re-running on_close, or re-firing on_stream_close.
     """
 
-    __slots__ = ("handler", "on_chunk", "on_close", "ctx", "closed")
+    __slots__ = ("handler", "on_chunk", "on_close", "ctx", "closed", "chunk_count")
 
     def __init__(self, handler, on_chunk, on_close, ctx: RequestContext):
         self.handler = handler
@@ -138,6 +138,8 @@ class _BidiSession:
         self.on_close = on_close
         self.ctx = ctx
         self.closed = False
+        # S3:per-stream 输出 chunk 计数(on_chunk 输出 + final chunk,close 时上报)。
+        self.chunk_count = 0
 
 
 class _DecoupledSession:
@@ -177,6 +179,8 @@ class _ResponseSender:
         self._ctx = ctx
         self._active_streams = active_streams
         self.closed = False
+        # S3:per-stream chunk 计数(近似 tokens_generated 口径,close 时上报)。
+        self._chunk_count = 0
 
     async def send(self, obj: Any) -> None:
         if self.closed:
@@ -214,18 +218,21 @@ class _ResponseSender:
         if self.closed:
             return  # cancel/close landed during postprocess: drop the late chunk
         if self._ctx.early is not None:
-            await _send_stream_early(self._socket, self._stream_id, self._ctx.early, self._lit_api)
+            # S3:early 帧也是 1 个 chunk——已发计数 +1 一并上报。
+            await _send_stream_early(self._socket, self._stream_id, self._ctx.early,
+                                     self._lit_api, tokens_generated=self._chunk_count + 1)
             # An early return ends the stream.
             await self.close()
             return
         body, _ = unwrap_response(self._ctx.response)
         await self._socket.send(_make_stream_chunk(self._stream_id, serialize_body(body), is_final=False).SerializeToString())
+        self._chunk_count += 1
 
     async def close(self) -> None:
         if self.closed:
             return
         self.closed = True
-        metrics = collect_metrics(self._lit_api)
+        metrics = collect_metrics(self._lit_api, tokens_generated=self._chunk_count)
         await self._socket.send(_make_stream_done(self._stream_id, metrics).SerializeToString())
         await self._pipe.run_on_stream_close(self._ctx, "done")
         # Model-initiated close: drop the session so the channel is reclaimed.
@@ -278,12 +285,17 @@ async def _send_bidi_final_chunk(
     )
 
 
-async def _send_stream_early(socket, stream_id: str, early_response, lit_api: LitAPI) -> None:
-    """Send an early-return response as a stream chunk + StreamDone."""
+async def _send_stream_early(socket, stream_id: str, early_response, lit_api: LitAPI,
+                             tokens_generated: int | None = None) -> None:
+    """Send an early-return response as a stream chunk + StreamDone.
+
+    ``tokens_generated`` (S3):early 帧计入 1 个 chunk,调用点按上下文提供
+    已发 chunk 数 + 1(本帧);无上下文(open 时 preprocess early)传 1。
+    """
     body, _headers = unwrap_response(early_response)
     resp_bytes = serialize_body(body)
     await socket.send(_make_stream_chunk(stream_id, resp_bytes, is_final=False).SerializeToString())
-    metrics = collect_metrics(lit_api)
+    metrics = collect_metrics(lit_api, tokens_generated=tokens_generated)
     await socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
 
 
@@ -354,11 +366,14 @@ async def _handle_stream_async(
                 # Deliver on_close's return as a final chunk (symmetric with
                 # on_open/on_chunk) before Done.  Encoding failures are
                 # isolated — Done is still sent below.
+                final_chunk = 0
                 if on_close_output is not None:
                     await _send_bidi_final_chunk(
                         lit_api, entry.ctx, on_close_output, stream_id, socket, log
                     )
-                metrics = collect_metrics(lit_api)
+                    final_chunk = 1
+                # S3:per-stream chunk 数 = on_chunk 输出 + final chunk。
+                metrics = collect_metrics(lit_api, tokens_generated=entry.chunk_count + final_chunk)
                 await socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
                 await pipe.run_on_stream_close(entry.ctx, "done")
             else:  # cancel — on_close balanced, no terminal frame sent
@@ -430,7 +445,8 @@ async def _handle_stream_open_async(
                                         detail=str(e))
             return
         if ctx.early is not None:
-            await _send_stream_early(socket, stream_id, ctx.early, lit_api)
+            # S3:open 时 preprocess early——early 是唯一输出,计 1 个 chunk。
+            await _send_stream_early(socket, stream_id, ctx.early, lit_api, tokens_generated=1)
             return
 
         sender = _ResponseSender(lit_api, pipe, stream_id, socket, log, ctx, active_streams)
@@ -696,7 +712,9 @@ async def _handle_stream_chunk_async(
     if session.closed:
         return  # cancel landed during postprocess: drop the late chunk
     if ctx.early is not None:
-        await _send_stream_early(socket, stream_id, ctx.early, lit_api)
+        # S3:early 帧 = 1 个输出 chunk。
+        await _send_stream_early(socket, stream_id, ctx.early, lit_api,
+                                 tokens_generated=session.chunk_count + 1)
         # Symmetric with the on_open early path: release the session now.
         # Pop first so a later client close/cancel can't double-fire on_close.
         active_streams.pop(stream_id, None)
@@ -705,6 +723,7 @@ async def _handle_stream_chunk_async(
         return
     body, _ = unwrap_response(ctx.response)
     await socket.send(_make_stream_chunk(stream_id, serialize_body(body), is_final=False).SerializeToString())
+    session.chunk_count += 1
 
 
 _SENTINEL = object()
@@ -740,7 +759,9 @@ async def _process_stream_chunk(
                                     detail=f"encode failed: {e}")
         return False
     if ctx.early is not None:
-        await _send_stream_early(socket, stream_id, ctx.early, lit_api)
+        # S3:early 帧 = 1 个 chunk(stats 尚未 +1)。
+        await _send_stream_early(socket, stream_id, ctx.early, lit_api,
+                                 tokens_generated=stats["chunks"] + 1 if stats else None)
         await pipe.run_on_stream_close(ctx, "done")
         return False
     body, _ = unwrap_response(ctx.response)
@@ -833,7 +854,7 @@ async def _consume_stream(
             stream_id, "deadline exceeded", error_type="deadline_exceeded").SerializeToString())
         await pipe.run_on_stream_close(ctx, "error")
         return
-    metrics = collect_metrics(lit_api)
+    metrics = collect_metrics(lit_api, tokens_generated=stats["chunks"])
     await socket.send(_make_stream_done(stream_id, metrics).SerializeToString())
     await pipe.run_on_stream_close(ctx, "done")
 
