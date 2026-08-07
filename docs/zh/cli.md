@@ -158,6 +158,10 @@ lite-server benchmark --model <模型名> [选项]
 | `--min-sessions` | int | 30 | bidi：样本量告警的最少完成会话数 |
 | `--cancel-after` | int | — | 每流消费 N chunk 后取消——客户端取消场景（需配合 `--stream`）；取消计入 `error_kinds` 的 `canceled` 桶 |
 | `--read-delay-ms` | float | — | 慢消费者场景：每 chunk 后睡眠 MS 毫秒（需配合 `--stream`） |
+| `--goodput` | string | — | SLO 表达式，如 `ttft:500 tpot:50 e2el:2000`（毫秒；需配合 `--stream`；`tpot` 仅 llm） |
+| `--slo-attainment` | float | 0.95 | SLO 达标率低于 R 时退出码 99（需配合 `--goodput`） |
+| `--tokenizer` | string | — | 客户端精确 token 计数（本地文件或 hub id；需 `--stream` + `--model-type llm`；需 `pip install lite-server[benchmark]`） |
+| `--text-field` | string | text→token | chunk JSON 中待分词文本所在字段（需配合 `--tokenizer`） |
 | `--stream-read-timeout` | float | 300.0 | 流式 chunk 间超时秒数 |
 | `--max-ttft-ms` | float | — | TTFT p99 超过 MS 毫秒时退出码 99（需配合 `--stream`） |
 | `--max-rtf` | float | — | RTF p99 超过 VAL 时退出码 99（需 `--stream` + `--model-type tts/stt`） |
@@ -195,6 +199,29 @@ lite-server benchmark --model <模型名> [选项]
 - **mid-stream error**（E1）：指向注错模型（如 `examples/03_streaming` 的 `stream_errors`，`mode=server_error`），用可重复的 `--payload-file` 混合正常/错误负载；错误帧计入 `error_kinds` 的 `stream` 桶，由 `--max-error-rate` 门禁。
 - **client cancel**（E2）：`--cancel-after N` 在每流 N 个 chunk 后中止（连接拆除 → 服务端 promptly 取消 worker）。取消计入 `canceled` 桶——不与失败混淆。
 - **慢消费者**（E3）：`--read-delay-ms M` 每 chunk 后睡眠 M；ITL 膨胀即服务端发送阻塞信号。注意：内核缓冲区会吸收小 chunk 反压——本场景测"慢排空"行为而非 TCP 级反压。e2e 含一个尾部延迟。
+
+**Goodput / SLO**（`--goodput`，仅 `--stream`）：
+
+- SLO 表达式：空格分隔的 `键:阈值毫秒`——`ttft`（首 token 延迟）、`tpot`（每请求逐 token 时间，仅 llm）、`e2el`（端到端延迟）。请求在**所有**指定指标内即达标（逐请求判定，非百分位）。
+- 输出（JSON `stream.goodput`）：`attainment`（达标数/成功数）、`goodput_req_per_sec`（= attainment × 吞吐，vLLM 语义）、`attainment_target`。
+- 门禁：attainment 低于 `--slo-attainment`（默认 0.95）→ exit 99。
+- 缺失指定指标的记录（如零 chunk 流）计为不达标。
+
+**精确 token 计数**（`--tokenizer`，仅 `--stream --model-type llm`）：
+
+- 从本地文件（`Tokenizer.from_file`）或 HuggingFace hub id（`from_pretrained`，需联网）加载 `tokenizers` 分词器。需 `pip install lite-server[benchmark]`。
+- 逐 chunk 对文本字段（`--text-field`，默认先试 `"text"` 再试 `"token"`）做客户端分词并馈入 token 指标——TPOT / tokens/sec 变为精确值。chunk meta 已带 `token_count` 时保留服务端值（绝不重复计数）；无文本字段的 chunk 计 0 并产生告警。
+- 分词增加客户端 CPU；留意内置的 CPU 饱和告警。
+
+```bash
+# SLO 门禁:低于 95% 达标率则 exit 99
+lite-server benchmark --model llama --stream --duration 60 \
+  --goodput "ttft:500 tpot:50 e2el:2000" --slo-attainment 0.95
+
+# 模型无法上报 token_count 时的客户端精确 token 指标
+lite-server benchmark --model llama --stream --duration 60 \
+  --tokenizer ./tokenizer.json --text-field text
+```
 
 ```bash
 # 客户端取消场景:每流 5 chunk 后取消

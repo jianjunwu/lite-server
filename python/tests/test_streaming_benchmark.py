@@ -2254,3 +2254,383 @@ class TestScenarioWrappers:
             stream=True, read_delay_ms=5.0, requests=2,
         ))
         assert rc == 0
+
+
+# ── Phase 6: goodput/SLO (批次 4 Part A, plan §8.1) ──────────────────────────
+
+class TestGoodputSLO:
+    """parse_goodput + compute_goodput: per-request SLO attainment."""
+
+    def test_parse_valid_expression(self):
+        from lite_server.analyzer.stream_metrics import parse_goodput
+
+        slo = parse_goodput("ttft:500 tpot:50 e2el:2000")
+        assert slo == {"ttft": 500.0, "tpot": 50.0, "e2el": 2000.0}
+
+    def test_parse_single_key(self):
+        from lite_server.analyzer.stream_metrics import parse_goodput
+
+        assert parse_goodput("ttft:250") == {"ttft": 250.0}
+
+    def test_parse_unknown_key_raises(self):
+        from lite_server.analyzer.stream_metrics import parse_goodput
+
+        with pytest.raises(ValueError, match="bogus"):
+            parse_goodput("bogus:100")
+
+    def test_parse_missing_colon_raises(self):
+        from lite_server.analyzer.stream_metrics import parse_goodput
+
+        with pytest.raises(ValueError):
+            parse_goodput("ttft500")
+
+    def test_parse_bad_float_raises(self):
+        from lite_server.analyzer.stream_metrics import parse_goodput
+
+        with pytest.raises(ValueError):
+            parse_goodput("ttft:abc")
+
+    def test_parse_empty_raises(self):
+        from lite_server.analyzer.stream_metrics import parse_goodput
+
+        with pytest.raises(ValueError):
+            parse_goodput("")
+
+    def _record(self, ttft=100.0, total=1000.0, tokens=10.0):
+        return StreamRequestRecord(
+            chunk_count=int(tokens), ttft_ms=ttft, total_ms=total,
+            meta_totals={"token_count": tokens},
+        )
+
+    def test_all_attain(self):
+        from lite_server.analyzer.stream_metrics import compute_goodput
+
+        # total=500 → tpot = (500-100)/9 ≈ 44.4 ≤ 50; ttft 100 ≤ 500; e2e ok
+        records = [self._record(total=500.0) for _ in range(4)]
+        g = compute_goodput(
+            records, {"ttft": 500.0, "tpot": 50.0, "e2el": 2000.0},
+            model_type="llm", throughput=10.0, attainment_target=0.95,
+        )
+        assert g["attainment"] == 1.0
+        assert g["goodput_req_per_sec"] == 10.0
+        assert g["evaluated"] == 4
+        assert g["slo"]["ttft"] == 500.0
+        assert g["attainment_target"] == 0.95
+
+    def test_partial_attainment(self):
+        from lite_server.analyzer.stream_metrics import compute_goodput
+
+        records = [
+            self._record(), self._record(), self._record(),
+            self._record(ttft=900.0),  # violates ttft:500
+        ]
+        g = compute_goodput(
+            records, {"ttft": 500.0}, model_type="llm",
+            throughput=8.0, attainment_target=0.95,
+        )
+        assert g["attainment"] == 0.75
+        assert g["goodput_req_per_sec"] == 6.0
+
+    def test_missing_metric_is_violation(self):
+        """Zero-chunk / missing ttft records do not attain."""
+        from lite_server.analyzer.stream_metrics import compute_goodput
+
+        records = [StreamRequestRecord(chunk_count=0)]  # ttft/total None
+        g = compute_goodput(
+            records, {"ttft": 500.0}, model_type="llm",
+            throughput=1.0, attainment_target=0.95,
+        )
+        assert g["attainment"] == 0.0
+
+    def test_tpot_evaluated_per_request(self):
+        from lite_server.analyzer.stream_metrics import compute_goodput
+
+        # (1000-100)/(10-1) = 100ms tpot > 50 → violation
+        g = compute_goodput(
+            [self._record()], {"tpot": 50.0}, model_type="llm",
+            throughput=1.0, attainment_target=0.95,
+        )
+        assert g["attainment"] == 0.0
+        # tpot:120 → pass
+        g2 = compute_goodput(
+            [self._record()], {"tpot": 120.0}, model_type="llm",
+            throughput=1.0, attainment_target=0.95,
+        )
+        assert g2["attainment"] == 1.0
+
+    def test_empty_records_zero_attainment(self):
+        from lite_server.analyzer.stream_metrics import compute_goodput
+
+        g = compute_goodput(
+            [], {"ttft": 500.0}, model_type="llm",
+            throughput=0.0, attainment_target=0.95,
+        )
+        assert g["attainment"] == 0.0
+        assert g["evaluated"] == 0
+
+    def test_stream_metrics_to_dict_includes_goodput(self):
+        m = StreamMetrics(
+            model_type="llm", requests=1, zero_chunk_requests=0,
+            total_chunks=1, total_bytes=1,
+            chunks_per_request={"mean": 1.0}, ttft_ms={"mean": 1.0},
+            total_ms={"mean": 1.0},
+            goodput={"slo": {"ttft": 500.0}, "attainment": 1.0,
+                     "attainment_target": 0.95, "goodput_req_per_sec": 5.0,
+                     "evaluated": 1},
+        )
+        d = m.to_dict()
+        assert d["goodput"]["attainment"] == 1.0
+
+class TestGoodputCLI:
+    """--goodput / --slo-attainment CLI wiring (批次 4 Part A)."""
+
+    def test_goodput_without_stream_exits_2(self):
+        from lite_server import cli
+
+        rc = cli._cmd_benchmark(TestStreamingCLI._stream_args(
+            stream=False, goodput="ttft:500", requests=3,
+        ))
+        assert rc == 2
+
+    def test_goodput_bad_expr_exits_2(self):
+        from lite_server import cli
+
+        rc = cli._cmd_benchmark(TestStreamingCLI._stream_args(
+            stream=True, goodput="bogus:1", requests=3,
+        ))
+        assert rc == 2
+
+    def test_goodput_tpot_with_tts_exits_2(self):
+        from lite_server import cli
+
+        rc = cli._cmd_benchmark(TestStreamingCLI._stream_args(
+            stream=True, goodput="tpot:50", model_type="tts", requests=3,
+        ))
+        assert rc == 2
+
+    def test_slo_attainment_without_goodput_exits_2(self):
+        from lite_server import cli
+
+        rc = cli._cmd_benchmark(TestStreamingCLI._stream_args(
+            stream=True, slo_attainment=0.9, requests=3,
+        ))
+        assert rc == 2
+
+    def test_attainment_violation_exits_99(self, monkeypatch):
+        """ttft:0 is unattainable (any real ttft > 0) → attainment 0 → 99."""
+        import sys
+        from lite_server import cli
+
+        fake, _, _ = TestStreamingCLI._fake_httpx_stream()
+        monkeypatch.setitem(sys.modules, "httpx", fake)
+
+        rc = cli._cmd_benchmark(TestStreamingCLI._stream_args(
+            stream=True, goodput="ttft:0", requests=3,
+        ))
+        assert rc == 99
+
+    def test_attainment_pass_exits_0(self, monkeypatch):
+        import sys
+        from lite_server import cli
+
+        fake, _, _ = TestStreamingCLI._fake_httpx_stream()
+        monkeypatch.setitem(sys.modules, "httpx", fake)
+
+        rc = cli._cmd_benchmark(TestStreamingCLI._stream_args(
+            stream=True, goodput="ttft:999999", requests=3,
+        ))
+        assert rc == 0
+
+    def test_export_contains_goodput(self, monkeypatch, tmp_path):
+        import sys
+        import json
+        from lite_server import cli
+
+        fake, _, _ = TestStreamingCLI._fake_httpx_stream()
+        monkeypatch.setitem(sys.modules, "httpx", fake)
+        export_path = tmp_path / "r.json"
+
+        rc = cli._cmd_benchmark(TestStreamingCLI._stream_args(
+            stream=True, goodput="ttft:999999", requests=3,
+            export=str(export_path),
+        ))
+        assert rc == 0
+        data = json.loads(export_path.read_text())
+        assert data["stream"]["goodput"]["attainment"] == 1.0
+        assert data["stream"]["goodput"]["attainment_target"] == 0.95
+        assert data["config"]["goodput"] == "ttft:999999"
+
+
+# ── Phase 7: tokenizer 精确计数 (批次 4 Part B, plan §8.2) ────────────────────
+
+class TestTokenizerCounter:
+    """TokenizerCounter: client-side exact token counting (B2-B4)."""
+
+    @staticmethod
+    def _fake_tokenizer():
+        class FakeEnc:
+            def __init__(self, ids):
+                self.ids = ids
+
+        class FakeTokenizer:
+            def encode(self, text):
+                return FakeEnc(text.split())  # 1 word == 1 token
+
+        return FakeTokenizer()
+
+    def test_counts_text_field(self):
+        from lite_server.analyzer.token_counter import TokenizerCounter
+
+        counter = TokenizerCounter(self._fake_tokenizer())
+        n = counter(StreamChunk(data="x", meta={"text": "hello world foo"}))
+        assert n == 3
+
+    def test_default_field_falls_back_to_token_key(self):
+        from lite_server.analyzer.token_counter import TokenizerCounter
+
+        counter = TokenizerCounter(self._fake_tokenizer())
+        assert counter(StreamChunk(data="x", meta={"token": "a b"})) == 2
+
+    def test_explicit_text_field(self):
+        from lite_server.analyzer.token_counter import TokenizerCounter
+
+        counter = TokenizerCounter(self._fake_tokenizer(), text_field="delta")
+        assert counter(StreamChunk(data="x", meta={"delta": "a b c d"})) == 4
+
+    def test_server_token_count_wins(self):
+        """Chunk meta already carrying token_count → None (no double count)."""
+        from lite_server.analyzer.token_counter import TokenizerCounter
+
+        counter = TokenizerCounter(self._fake_tokenizer())
+        assert counter(StreamChunk(
+            data="x", meta={"text": "hello", "token_count": 7},
+        )) is None
+
+    def test_missing_field_counts_zero_and_tracks(self):
+        from lite_server.analyzer.token_counter import TokenizerCounter
+
+        counter = TokenizerCounter(self._fake_tokenizer())
+        assert counter(StreamChunk(data="x", meta={"other": 1})) == 0
+        assert counter(StreamChunk(data="x", meta=None)) is None
+        assert counter.missed_chunks == 1
+
+    @pytest.mark.asyncio
+    async def test_run_stream_token_counter_exact_basis(self):
+        """run_stream(token_counter=...) → meta_totals fed → basis exact."""
+        engine = BenchmarkEngine()
+
+        async def target(payload):
+            yield StreamChunk(data="a", meta={"text": "hello world"})
+            yield StreamChunk(data="b", meta={"text": "foo"})
+
+        def counter(chunk):
+            meta = chunk.meta or {}
+            text = meta.get("text", "")
+            return len(text.split())
+
+        result = await engine.run_stream(
+            target=target, payload={}, concurrency=1, total_requests=2,
+            model_type="llm", token_counter=counter,
+        )
+        sm = result.stream_metrics
+        assert sm.token_count_basis == "exact"
+        assert sm.tokens_per_request["mean"] == pytest.approx(3.0)
+
+
+class TestTokenizerCLI:
+    def test_tokenizer_without_stream_exits_2(self):
+        from lite_server import cli
+
+        rc = cli._cmd_benchmark(TestStreamingCLI._stream_args(
+            stream=False, tokenizer="some/tok", requests=3,
+        ))
+        assert rc == 2
+
+    def test_tokenizer_with_non_llm_exits_2(self):
+        from lite_server import cli
+
+        rc = cli._cmd_benchmark(TestStreamingCLI._stream_args(
+            stream=True, tokenizer="some/tok", model_type="tts", requests=3,
+        ))
+        assert rc == 2
+
+    def test_text_field_without_tokenizer_exits_2(self):
+        from lite_server import cli
+
+        rc = cli._cmd_benchmark(TestStreamingCLI._stream_args(
+            stream=True, text_field="text", requests=3,
+        ))
+        assert rc == 2
+
+    def test_tokenizer_not_installed_exits_2(self, monkeypatch):
+        import sys
+        from lite_server import cli
+
+        monkeypatch.setitem(sys.modules, "tokenizers", None)  # import fails
+        rc = cli._cmd_benchmark(TestStreamingCLI._stream_args(
+            stream=True, tokenizer="some/tok", requests=3,
+        ))
+        assert rc == 2
+
+    def test_tokenizer_load_failure_exits_2(self, monkeypatch, tmp_path):
+        import sys
+        import types
+        from lite_server import cli
+
+        fake_mod = types.ModuleType("tokenizers")
+
+        class FakeTokenizer:
+            @staticmethod
+            def from_pretrained(spec):
+                raise RuntimeError("hub unreachable")
+
+        fake_mod.Tokenizer = FakeTokenizer
+        monkeypatch.setitem(sys.modules, "tokenizers", fake_mod)
+
+        rc = cli._cmd_benchmark(TestStreamingCLI._stream_args(
+            stream=True, tokenizer="nonexistent/tok", requests=3,
+        ))
+        assert rc == 2
+
+    def test_tokenizer_happy_path(self, monkeypatch, tmp_path):
+        """Fake tokenizers + fake httpx stream → exact basis, config recorded."""
+        import sys
+        import types
+        import json
+        from lite_server import cli
+
+        fake_mod = types.ModuleType("tokenizers")
+
+        class FakeEnc:
+            def __init__(self, ids):
+                self.ids = ids
+
+        class FakeTokenizer:
+            @staticmethod
+            def from_file(path):
+                return FakeTokenizer()
+
+            def encode(self, text):
+                return FakeEnc(text.split())
+
+        fake_mod.Tokenizer = FakeTokenizer
+        monkeypatch.setitem(sys.modules, "tokenizers", fake_mod)
+
+        tok_file = tmp_path / "tok.json"
+        tok_file.write_text("{}")
+
+        fake, _, _ = TestStreamingCLI._fake_httpx_stream(
+            ['data: {"text": "hello world"}', "", "data: [DONE]", ""],
+        )
+        monkeypatch.setitem(sys.modules, "httpx", fake)
+        export_path = tmp_path / "r.json"
+
+        rc = cli._cmd_benchmark(TestStreamingCLI._stream_args(
+            stream=True, tokenizer=str(tok_file), requests=3,
+            export=str(export_path),
+        ))
+        assert rc == 0
+        data = json.loads(export_path.read_text())
+        assert data["stream"]["token_count_basis"] == "exact"
+        assert data["stream"]["tokens_per_request"]["mean"] == 2.0
+        assert data["config"]["tokenizer"] == str(tok_file)

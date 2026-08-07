@@ -78,6 +78,9 @@ class StreamMetrics:
     # TTS/STT-specific (None for LLM/generic)
     rtf: dict | None = None  # real-time factor percentiles
 
+    # goodput/SLO (批次 4, plan §8.1 A4; None when --goodput not given)
+    goodput: dict | None = None
+
     def to_dict(self) -> dict:
         d: dict = {
             "mode": self.model_type,
@@ -108,6 +111,8 @@ class StreamMetrics:
         # TTS / STT section
         if self.model_type in ("tts", "stt") and self.rtf is not None:
             d["rtf"] = _round_percentiles(self.rtf)
+        if self.goodput is not None:
+            d["goodput"] = self.goodput
         return d
 
 
@@ -486,6 +491,9 @@ class BenchmarkEngine:
         rate: float | None = None,
         model_type: str = "llm",
         request_meta: Callable[[dict], dict | None] | None = None,
+        goodput_slo: dict | None = None,
+        slo_attainment_target: float = 0.95,
+        token_counter: Callable[[StreamChunk], int | None] | None = None,
     ) -> BenchmarkResult:
         """Run streaming benchmark — adapter over unmodified ``run()``.
 
@@ -559,6 +567,17 @@ class BenchmarkEngine:
                             if isinstance(mv, (int, float)):
                                 rec.meta_totals[mk] = rec.meta_totals.get(mk, 0.0) + mv
 
+                    # Client-side token counting (批次 4, §8.2 B3): fills
+                    # meta_totals["token_count"] when the model does not
+                    # report it (counter returns None when meta already has
+                    # a count — no double counting).
+                    if token_counter is not None:
+                        counted = token_counter(chunk)
+                        if counted is not None:
+                            rec.meta_totals["token_count"] = (
+                                rec.meta_totals.get("token_count", 0.0) + counted
+                            )
+
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -587,6 +606,15 @@ class BenchmarkEngine:
         # Compute stream metrics and attach
         sm = compute_stream_metrics(records, model_type, window_secs=result.window or None)
         result.stream_metrics = sm
+
+        if goodput_slo is not None:
+            from lite_server.analyzer.stream_metrics import compute_goodput
+
+            sm.goodput = compute_goodput(
+                records, goodput_slo, model_type=model_type,
+                throughput=result.throughput,
+                attainment_target=slo_attainment_target,
+            )
 
         if sm.zero_chunk_requests > 0:
             result.warnings.append(

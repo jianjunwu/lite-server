@@ -137,6 +137,20 @@ def main(argv=None):
     bench_parser.add_argument("--read-delay-ms", type=float, default=None,
                               help="Slow-consumer scenario: sleep MS after each "
                                    "chunk (requires --stream)")
+    bench_parser.add_argument("--goodput", default=None, metavar="EXPR",
+                              help="SLO expression, e.g. 'ttft:500 tpot:50 e2el:2000' "
+                                   "(ms; requires --stream; tpot is llm-only)")
+    bench_parser.add_argument("--slo-attainment", type=float, default=None,
+                              help="Exit 99 if SLO attainment is below R "
+                                   "(default: 0.95; requires --goodput)")
+    bench_parser.add_argument("--tokenizer", default=None, metavar="PATH_OR_HUB_ID",
+                              help="Client-side exact token counting with a "
+                                   "tokenizers tokenizer (local file or hub id; "
+                                   "requires --stream and --model-type llm; "
+                                   "pip install lite-server[benchmark])")
+    bench_parser.add_argument("--text-field", default=None, metavar="FIELD",
+                              help="Chunk JSON field holding the text to tokenize "
+                                   "(default: 'text' then 'token'; requires --tokenizer)")
     bench_parser.add_argument("--stream-read-timeout", type=float, default=300.0,
                               help="Seconds between stream chunks before timeout "
                                    "(default: 300)")
@@ -463,6 +477,16 @@ def _check_threshold_gate(result: "BenchmarkResult", args) -> int:
                 violations.append(
                     f"RTF p99 {rtf_p99:.2f} > {max_rtf}"
                 )
+    # goodput/SLO attainment gate (批次 4, plan §8.1 A2)
+    if getattr(args, "goodput", None) is not None \
+            and result.stream_metrics is not None \
+            and result.stream_metrics.goodput is not None:
+        g = result.stream_metrics.goodput
+        if g["attainment"] < g["attainment_target"]:
+            violations.append(
+                f"SLO attainment {g['attainment']:.3f} < "
+                f"{g['attainment_target']:g}"
+            )
     if violations:
         for v in violations:
             print(f"  THRESHOLD VIOLATION: {v}")
@@ -498,6 +522,12 @@ def _export_sweep_results(args, results: list[tuple[int, "BenchmarkResult"]]) ->
             "bidi": is_bidi,
             "pacing_mode": _bidi_pacing_label(args) if is_bidi else None,
             "min_sessions": getattr(args, "min_sessions", 30) if is_bidi else None,
+            "cancel_after": getattr(args, "cancel_after", None) if is_stream else None,
+            "read_delay_ms": getattr(args, "read_delay_ms", None) if is_stream else None,
+            "goodput": getattr(args, "goodput", None),
+            "slo_attainment": getattr(args, "slo_attainment", None),
+            "tokenizer": getattr(args, "tokenizer", None) if is_stream else None,
+            "text_field": getattr(args, "text_field", None) if is_stream else None,
         },
         "mode": "sweep",
         "levels": [
@@ -546,6 +576,13 @@ def _print_stream_section(result: "BenchmarkResult") -> None:
     elif sm.model_type in ("tts", "stt") and sm.rtf is not None:
         print(f"    RTF             [mean/p50/p90/p95/p99]: "
               f"{_p(sm.rtf)}")
+
+    if sm.goodput is not None:
+        g = sm.goodput
+        slo_str = " ".join(f"{k}<={v:g}ms" for k, v in g["slo"].items())
+        print(f"    SLO ({slo_str}): attainment {g['attainment']:.3f} "
+              f"(target {g['attainment_target']:g}) → "
+              f"goodput {g['goodput_req_per_sec']:.2f} req/s")
 
 
 def _print_bidi_section(result: "BenchmarkResult") -> None:
@@ -671,6 +708,14 @@ def _cmd_benchmark(args):
         args.cancel_after = None
     if not hasattr(args, "read_delay_ms"):
         args.read_delay_ms = None
+    if not hasattr(args, "goodput"):
+        args.goodput = None
+    if not hasattr(args, "slo_attainment"):
+        args.slo_attainment = None
+    if not hasattr(args, "tokenizer"):
+        args.tokenizer = None
+    if not hasattr(args, "text_field"):
+        args.text_field = None
     if args.transport is None:
         args.transport = "ws" if args.bidi else "sse"
 
@@ -722,6 +767,57 @@ def _cmd_benchmark(args):
     if (args.cancel_after is not None or args.read_delay_ms is not None) \
             and not args.stream:
         _logger.error("--cancel-after/--read-delay-ms require --stream")
+        return 2
+
+    # goodput/SLO (批次 4, plan §8.1)
+    goodput_slo = None
+    if args.goodput is not None:
+        if not args.stream:
+            _logger.error("--goodput requires --stream")
+            return 2
+        from lite_server.analyzer.stream_metrics import parse_goodput
+
+        try:
+            goodput_slo = parse_goodput(args.goodput)
+        except ValueError as e:
+            _logger.error("--goodput: %s", e)
+            return 2
+        if "tpot" in goodput_slo and args.model_type != "llm":
+            _logger.error("--goodput tpot requires --model-type llm, got %s",
+                          args.model_type)
+            return 2
+    if args.slo_attainment is not None:
+        if goodput_slo is None:
+            _logger.error("--slo-attainment requires --goodput")
+            return 2
+        if not 0.0 < args.slo_attainment <= 1.0:
+            _logger.error("--slo-attainment must be in (0, 1]")
+            return 2
+
+    # tokenizer (批次 4, plan §8.2)
+    token_counter = None
+    if args.tokenizer is not None:
+        if not args.stream:
+            _logger.error("--tokenizer requires --stream")
+            return 2
+        if args.model_type != "llm":
+            _logger.error("--tokenizer requires --model-type llm, got %s",
+                          args.model_type)
+            return 2
+        from lite_server.analyzer.token_counter import (
+            TokenizerCounter,
+            TokenizerLoadError,
+            load_tokenizer,
+        )
+
+        try:
+            _tokenizer = load_tokenizer(args.tokenizer)
+        except TokenizerLoadError as e:
+            _logger.error("%s", e)
+            return 2
+        token_counter = TokenizerCounter(_tokenizer, text_field=args.text_field)
+    elif args.text_field is not None:
+        _logger.error("--text-field requires --tokenizer")
         return 2
 
     # Parse concurrency — single int or sweep range
@@ -927,6 +1023,12 @@ def _cmd_benchmark(args):
                         rate=args.rate,
                         model_type=args.model_type,
                         request_meta=request_meta_fn,
+                        goodput_slo=goodput_slo,
+                        slo_attainment_target=(
+                            args.slo_attainment
+                            if args.slo_attainment is not None else 0.95
+                        ),
+                        token_counter=token_counter,
                     )
                 finally:
                     if grpc_channel is not None:
@@ -979,6 +1081,12 @@ def _cmd_benchmark(args):
     if result.total_requests == 0:
         print("No requests completed — is the server running?")
         return 1
+
+    if token_counter is not None and token_counter.missed_chunks > 0:
+        result.warnings.append(
+            f"{token_counter.missed_chunks} chunks had no text to tokenize "
+            f"(field: {args.text_field or 'text/token'}) — counted as 0 tokens"
+        )
 
     print(f"\nBenchmark Results ({args.model}):")
     mode_label = "open-loop" if args.rate else "closed-loop"
@@ -1053,6 +1161,10 @@ def _cmd_benchmark(args):
                 "min_sessions": args.min_sessions if args.bidi else None,
                 "cancel_after": args.cancel_after if args.stream else None,
                 "read_delay_ms": args.read_delay_ms if args.stream else None,
+                "goodput": args.goodput,
+                "slo_attainment": args.slo_attainment,
+                "tokenizer": args.tokenizer if args.stream else None,
+                "text_field": args.text_field if args.stream else None,
             },
             **result.to_dict(),
         }

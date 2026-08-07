@@ -42,7 +42,7 @@ dev = [
     "websockets>=13",
     "h2>=4.1",
 ]
-benchmark = []
+benchmark = ["tokenizers>=0.20"]
 validation = ["jsonschema>=4"]
 
 [tool.maturin]

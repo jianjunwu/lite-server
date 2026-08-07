@@ -31,6 +31,85 @@ from lite_server.analyzer.benchmark import StreamMetrics, StreamRequestRecord
 
 MODEL_TYPES = ("llm", "tts", "stt", "generic")
 
+#: SLO metric keys for --goodput (vLLM #15881 convention, plan §8.1 A3)
+SLO_KEYS = ("ttft", "tpot", "e2el")
+
+
+def parse_goodput(expr: str) -> dict[str, float]:
+    """Parse a ``--goodput`` expression: ``"ttft:500 tpot:50 e2el:2000"``.
+
+    Space-separated ``key:threshold_ms`` terms; keys must be in
+    ``SLO_KEYS``.  Raises ``ValueError`` on unknown keys or bad values.
+    """
+    out: dict[str, float] = {}
+    for part in expr.split():
+        key, sep, val = part.partition(":")
+        if not sep or key not in SLO_KEYS:
+            raise ValueError(
+                f"bad SLO term {part!r}: expected one of {SLO_KEYS}"
+            )
+        out[key] = float(val)  # ValueError on non-numeric, fine
+    if not out:
+        raise ValueError("empty --goodput expression")
+    return out
+
+
+def compute_goodput(
+    records: list[StreamRequestRecord],
+    slo: dict[str, float],
+    *,
+    model_type: str,
+    throughput: float,
+    attainment_target: float,
+) -> dict:
+    """Per-request SLO attainment → goodput (plan §8.1 A1).
+
+    A request attains when every named metric is within its threshold:
+    ``ttft``/``e2el`` come straight from the record; ``tpot`` is derived
+    per request as ``(total − ttft) / max(tokens − 1, 1)`` (same formula
+    as the LLM metrics).  A record missing a named metric is a violation.
+    ``goodput = attainment × throughput`` (req/s, vLLM semantics).
+    """
+    attained = 0
+    for r in records:
+        if _record_attains(r, slo):
+            attained += 1
+    evaluated = len(records)
+    attainment = attained / evaluated if evaluated else 0.0
+    return {
+        "slo": {k: slo[k] for k in SLO_KEYS if k in slo},
+        "attainment": round(attainment, 4),
+        "attainment_target": attainment_target,
+        "goodput_req_per_sec": round(attainment * throughput, 2),
+        "evaluated": evaluated,
+    }
+
+
+def _record_attains(r: StreamRequestRecord, slo: dict[str, float]) -> bool:
+    if "ttft" in slo:
+        if r.ttft_ms is None or r.ttft_ms > slo["ttft"]:
+            return False
+    if "e2el" in slo:
+        if r.total_ms is None or r.total_ms > slo["e2el"]:
+            return False
+    if "tpot" in slo:
+        tpot = _record_tpot(r)
+        if tpot is None or tpot > slo["tpot"]:
+            return False
+    return True
+
+
+def _record_tpot(r: StreamRequestRecord) -> float | None:
+    """Per-request TPOT (same formula as the LLM section in _compute_llm)."""
+    if r.total_ms is None or r.ttft_ms is None:
+        return None
+    tokens = r.meta_totals.get("token_count")
+    if tokens is None:
+        tokens = float(r.chunk_count)  # chunk == token default
+    if tokens > 1:
+        return (r.total_ms - r.ttft_ms) / (tokens - 1)
+    return r.total_ms - r.ttft_ms  # single token → whole decode = TPOT
+
 _PERCENTILE_KEYS = ("mean", "p50", "p90", "p95", "p99", "min", "max")
 
 

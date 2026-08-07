@@ -158,6 +158,10 @@ lite-server benchmark --model <MODEL> [OPTIONS]
 | `--min-sessions` | int | 30 | Bidi: minimum completed sessions before the sample-size warning fires |
 | `--cancel-after` | int | — | Cancel each stream after N chunks — client-cancel scenario (requires `--stream`); cancels bucket under `canceled` in `error_kinds` |
 | `--read-delay-ms` | float | — | Slow-consumer scenario: sleep MS after each chunk (requires `--stream`) |
+| `--goodput` | string | — | SLO expression, e.g. `ttft:500 tpot:50 e2el:2000` (ms; requires `--stream`; `tpot` is llm-only) |
+| `--slo-attainment` | float | 0.95 | Exit 99 if SLO attainment is below R (requires `--goodput`) |
+| `--tokenizer` | string | — | Client-side exact token counting (local file or hub id; requires `--stream` + `--model-type llm`; needs `pip install lite-server[benchmark]`) |
+| `--text-field` | string | text→token | Chunk JSON field holding the text to tokenize (requires `--tokenizer`) |
 | `--stream-read-timeout` | float | 300.0 | Seconds between stream chunks before timeout |
 | `--max-ttft-ms` | float | — | Exit 99 if TTFT p99 exceeds MS (requires `--stream`) |
 | `--max-rtf` | float | — | Exit 99 if RTF p99 exceeds VAL (requires `--stream` + `--model-type tts/stt`) |
@@ -195,6 +199,29 @@ lite-server benchmark --model <MODEL> [OPTIONS]
 - **Mid-stream error** (E1): point at an error-injecting model (e.g. `examples/03_streaming`'s `stream_errors` with `mode=server_error`) and mix payloads via repeatable `--payload-file`; error frames bucket as `stream` in `error_kinds`, gated by `--max-error-rate`.
 - **Client cancel** (E2): `--cancel-after N` aborts each stream after N chunks (connection teardown → server cancels the worker). Canceled streams bucket under `canceled` — not conflated with failures.
 - **Slow consumer** (E3): `--read-delay-ms M` sleeps M after each chunk; ITL inflation shows server-side send blocking. Note: kernel buffers absorb small-chunk backpressure — this measures slow-drain behavior, not TCP-level backpressure. e2e includes one trailing delay.
+
+**Goodput / SLO** (`--goodput`, `--stream` only):
+
+- SLO expression: space-separated `key:threshold_ms` terms — `ttft` (time to first token), `tpot` (per-request time per output token, llm only), `e2el` (end-to-end latency). A request **attains** when every named metric is within its threshold (per-request evaluation, not percentiles).
+- Output (JSON `stream.goodput`): `attainment` (attained/successful), `goodput_req_per_sec` (= attainment × throughput, vLLM semantics), `attainment_target`.
+- Gate: attainment below `--slo-attainment` (default 0.95) → exit 99.
+- A record missing a named metric (e.g. zero-chunk stream) counts as a violation.
+
+**Exact token counting** (`--tokenizer`, `--stream --model-type llm` only):
+
+- Loads a `tokenizers` tokenizer from a local file (`Tokenizer.from_file`) or a HuggingFace hub id (`from_pretrained`, needs network). Requires `pip install lite-server[benchmark]`.
+- Per chunk, the text field (`--text-field`, default `"text"` then `"token"`) is tokenized client-side and fed into the token metrics — TPOT / tokens-per-sec become exact. Chunks whose meta already carries `token_count` keep the server value (never double-counted); chunks with no text count 0 and produce a warning.
+- Token counting adds client CPU; watch the built-in CPU-saturation warning.
+
+```bash
+# SLO-gated run: exit 99 if <95% of requests meet ttft/tpot/e2e budgets
+lite-server benchmark --model llama --stream --duration 60 \
+  --goodput "ttft:500 tpot:50 e2el:2000" --slo-attainment 0.95
+
+# Exact client-side token metrics for a model that can't report token_count
+lite-server benchmark --model llama --stream --duration 60 \
+  --tokenizer ./tokenizer.json --text-field text
+```
 
 ```bash
 # Client-cancel scenario: cancel every stream after 5 chunks
