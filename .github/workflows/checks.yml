@@ -39,8 +39,8 @@ jobs:
             --ignore RUSTSEC-2026-0177
 
   # 蓝图 §6.3：pb2/proto 漂移检查——proto 改动必须同步重生成签入的
-  # liteserver_pb2.py（regen_proto.sh 固定 grpcio-tools 1.62.x，无
-  # runtime_version guard；脚本内置 guard 检查）。
+  # liteserver_pb2.py + liteserver_pb2_grpc.py（regen_proto.sh 固定
+  # grpcio-tools 1.62.x，无 runtime_version guard；脚本内置 guard 检查）。
   proto-drift:
     name: pb2/proto drift check
     runs-on: ubuntu-latest

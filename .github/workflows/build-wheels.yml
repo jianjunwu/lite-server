@@ -121,18 +121,20 @@ jobs:
 
       - name: Checked-in pb2 must not carry a runtime_version guard
         run: |
-          if grep -q "runtime_version" python/lite_server/proto/liteserver_pb2.py; then
-            echo "::error::checked-in liteserver_pb2.py contains a 'runtime_version' guard."
-            echo "::error::Regenerate with tools/regen_proto.sh (pins grpcio-tools 1.62.3 / protoc 25.x — guard-free gencode)."
-            exit 1
-          fi
-          echo "OK: no runtime_version guard in liteserver_pb2.py"
+          for f in liteserver_pb2.py liteserver_pb2_grpc.py; do
+            if grep -q "runtime_version" "python/lite_server/proto/$f"; then
+              echo "::error::checked-in $f contains a 'runtime_version' guard."
+              echo "::error::Regenerate with tools/regen_proto.sh (pins grpcio-tools 1.62.3 / protoc 25.x — guard-free gencode)."
+              exit 1
+            fi
+          done
+          echo "OK: no runtime_version guard in liteserver_pb2.py / liteserver_pb2_grpc.py"
 
       - name: pb2 imports under protobuf ${{ matrix.pb_major }}.x
         run: |
           python -m venv /tmp/v
           /tmp/v/bin/pip install -q --upgrade pip
-          /tmp/v/bin/pip install -q "protobuf~=${{ matrix.pb_major }}.0"
+          /tmp/v/bin/pip install -q "protobuf~=${{ matrix.pb_major }}.0" "grpcio>=1.62"
           /tmp/v/bin/python - <<'PY'
           import sys
           sys.path.insert(0, "python/lite_server/proto")
@@ -140,7 +142,16 @@ jobs:
           r = liteserver_pb2.Request(uid="smoke")
           assert r.uid == "smoke", "round-trip failed"
           import google.protobuf
-          print("import OK under protobuf", google.protobuf.__version__)
+          print("pb2 import OK under protobuf", google.protobuf.__version__)
+
+          # pb2_grpc stub: package-context import (regen_proto.sh rewrites
+          # the stub's import to package-relative) + stub construction
+          sys.path.insert(0, "python")
+          from lite_server.proto import liteserver_pb2_grpc
+          import grpc
+          stub = liteserver_pb2_grpc.LiteServerStub(grpc.insecure_channel("localhost:1"))
+          assert hasattr(stub, "StreamInfer") and hasattr(stub, "DecoupledInfer")
+          print("pb2_grpc import OK under grpcio", grpc.__version__)
           PY
 
   get-version:
