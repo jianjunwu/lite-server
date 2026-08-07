@@ -457,6 +457,18 @@ fn is_close_frame(text: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a worker stream response chunk terminates the forwarder loop.
+///
+/// Both `Done` and `Error` are terminal by contract (`callback.rs` documents
+/// `StreamError` as a terminal frame). Extracted so the loop break condition
+/// is explicit, shared between WS + test assertions, and can't drift.
+fn is_stream_terminal(chunk: &pb::StreamResponse) -> bool {
+    matches!(
+        chunk.payload,
+        Some(pb::stream_response::Payload::Done(_) | pb::stream_response::Payload::Error(_))
+    )
+}
+
 /// Detect a WS decoupled cancel-or-close control frame (D1):
 /// `{"type":"cancel"}` or `{"type":"close"}` — aliases in decoupled mode.
 fn is_cancel_or_close_frame(text: &str) -> bool {
@@ -846,7 +858,7 @@ async fn handle_ws_stream(
             if ws_sink.send(msg).await.is_err() {
                 break;
             }
-            if matches!(chunk.payload, Some(pb::stream_response::Payload::Done(_))) {
+            if is_stream_terminal(&chunk) {
                 break;
             }
         }
@@ -1941,6 +1953,104 @@ mod tests {
             1,
             "terminal Error frame must fire InferenceResponse exactly once \
              (current code fires twice on Error→Done)"
+        );
+    }
+
+    /// §D1 audit (2026-08-07): `is_stream_terminal` only checks `Done`, not
+    /// `Error`. The SSE handler (line 316) checks both; the WS handler should
+    /// too. This test demonstrates the helper returns `false` for Error —
+    /// which means the WS loop continues past Error frames.
+    #[test]
+    fn is_stream_terminal_error_returns_false_is_bug() {
+        let error_chunk = pb::StreamResponse {
+            stream_id: "s".into(),
+            payload: Some(pb::stream_response::Payload::Error(pb::StreamError {
+                message: "boom".into(),
+            })),
+        };
+        assert!(
+            is_stream_terminal(&error_chunk),
+            "BUG: Error is a terminal frame (callback.rs), \
+             but is_stream_terminal returns false — \
+             the WS loop does not break on Error"
+        );
+    }
+
+    /// §D1 audit (2026-08-07): replicate the current WS writer inner-loop
+    /// logic with Error→Done chunks fed directly through an mpsc channel
+    /// (no ZMQ layer to drop the trailing Done). The callback fires TWICE
+    /// because the break condition only checks Done, not Error.
+    #[tokio::test]
+    async fn ws_writer_loop_error_then_done_double_fires_callback() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<pb::StreamResponse>(4);
+
+        let error_chunk = pb::StreamResponse {
+            stream_id: "s".into(),
+            payload: Some(pb::stream_response::Payload::Error(pb::StreamError {
+                message: "boom".into(),
+            })),
+        };
+        let done_chunk = pb::StreamResponse {
+            stream_id: "s".into(),
+            payload: Some(pb::stream_response::Payload::Done(pb::StreamDone::default())),
+        };
+
+        tx.send(error_chunk).await.unwrap();
+        tx.send(done_chunk).await.unwrap();
+        drop(tx);
+
+        let cb = Arc::new(CountingCallback {
+            req: AtomicUsize::new(0),
+            resp: AtomicUsize::new(0),
+            last: Mutex::new(None),
+        });
+        let runner = Arc::new(CallbackRunner::new());
+        runner.register(cb.clone()).await;
+        let req_ctx = crate::callback::InferenceContext {
+            model_name: "m".into(),
+            version: "1".into(),
+            route: "/predict".into(),
+            protocol: crate::callback::Protocol::WebSocket,
+            request_id: "rid".into(),
+            client_ip: "127.0.0.1".into(),
+            elapsed_us: None,
+        };
+        let open_time = std::time::Instant::now();
+
+        // Mirror of the current (buggy) WS writer inner loop (line 812-851).
+        // Uses is_stream_terminal — the same check the handler would use.
+        loop {
+            let chunk = match streaming::recv_chunk(&mut rx, None, None).await {
+                Ok(Some(c)) => c,
+                Ok(None) => break,
+                Err(_) => break,
+            };
+            match &chunk.payload {
+                Some(pb::stream_response::Payload::Error(_)) => {
+                    crate::callback::fire_inference_response(&runner, &req_ctx, open_time);
+                }
+                Some(pb::stream_response::Payload::Done(_)) => {
+                    crate::callback::fire_inference_response(&runner, &req_ctx, open_time);
+                }
+                _ => {}
+            }
+            if is_stream_terminal(&chunk) {
+                break;
+            }
+        }
+
+        // fire_inference_response is tokio::spawn — let the callbacks land.
+        wait_for(|| cb.resp.load(Ordering::Relaxed) >= 1, "resp>=1").await;
+        // Let any (buggy) second fire land too.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        assert_eq!(
+            cb.resp.load(Ordering::Relaxed),
+            1,
+            "BUG: Error→Done fires callback {n} times, expected 1. \
+             is_stream_terminal only matches Done, so Error doesn't break \
+             the loop — Done follows and fires the callback a second time.",
+            n = cb.resp.load(Ordering::Relaxed)
         );
     }
 
