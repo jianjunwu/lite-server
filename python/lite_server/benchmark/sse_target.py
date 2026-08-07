@@ -10,7 +10,7 @@ from __future__ import annotations
 import json as _stdlib_json
 from typing import AsyncIterator, Callable
 
-from lite_server.analyzer.benchmark import (
+from lite_server.benchmark.benchmark import (
     RequestConnectError,
     RequestError,
     RequestStatusError,

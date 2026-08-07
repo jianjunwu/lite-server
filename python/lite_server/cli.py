@@ -676,7 +676,7 @@ def _cmd_benchmark(args):
 
     CLI responsibilities only: arg validation, httpx target construction,
     output rendering, threshold gate. All measurement logic lives in
-    lite_server.analyzer.benchmark.BenchmarkEngine.
+    lite_server.benchmark.benchmark.BenchmarkEngine.
     """
     import itertools
     import sys
@@ -775,7 +775,7 @@ def _cmd_benchmark(args):
         if not args.stream:
             _logger.error("--goodput requires --stream")
             return 2
-        from lite_server.analyzer.stream_metrics import parse_goodput
+        from lite_server.benchmark.stream_metrics import parse_goodput
 
         try:
             goodput_slo = parse_goodput(args.goodput)
@@ -804,7 +804,7 @@ def _cmd_benchmark(args):
             _logger.error("--tokenizer requires --model-type llm, got %s",
                           args.model_type)
             return 2
-        from lite_server.analyzer.token_counter import (
+        from lite_server.benchmark.token_counter import (
             TokenizerCounter,
             TokenizerLoadError,
             load_tokenizer,
@@ -828,7 +828,7 @@ def _cmd_benchmark(args):
         return 2
     sweep_mode = len(concurrency_levels) > 1
 
-    from lite_server.analyzer.benchmark import (
+    from lite_server.benchmark.benchmark import (
         BenchmarkEngine,
         RequestConnectError,
         RequestStatusError,
@@ -851,7 +851,7 @@ def _cmd_benchmark(args):
 
     pacing = None
     if args.bidi:
-        from lite_server.analyzer.bidi_session import Pacing
+        from lite_server.benchmark.bidi_session import Pacing
 
         pacing_mode_label = _bidi_pacing_label(args)
         if pacing_mode_label == "lock_step":
@@ -916,14 +916,14 @@ def _cmd_benchmark(args):
                 if args.transport == "ws":
                     from websockets.asyncio.client import connect as _ws_connect
 
-                    from lite_server.analyzer.ws_bidi_target import ws_bidi_session
+                    from lite_server.benchmark.ws_bidi_target import ws_bidi_session
 
                     session = ws_bidi_session(
                         _ws_connect, url, pacing=pacing,
                         idle_timeout=args.stream_read_timeout,
                     )
                 elif args.transport == "h2":
-                    from lite_server.analyzer.h2_bidi_target import h2_bidi_session
+                    from lite_server.benchmark.h2_bidi_target import h2_bidi_session
 
                     session = h2_bidi_session(
                         url, pacing=pacing,
@@ -932,7 +932,7 @@ def _cmd_benchmark(args):
                 else:  # grpc
                     import grpc as _grpc
 
-                    from lite_server.analyzer.grpc_bidi_target import (
+                    from lite_server.benchmark.grpc_bidi_target import (
                         grpc_bidi_session,
                     )
 
@@ -963,13 +963,13 @@ def _cmd_benchmark(args):
                 # Streaming path: transport target → run_stream()
                 grpc_channel = None
                 if args.transport == "sse":
-                    from lite_server.analyzer.sse_target import sse_stream_target
+                    from lite_server.benchmark.sse_target import sse_stream_target
 
                     stream_target = sse_stream_target(client, url, timeout=timeout)
                 elif args.transport == "ws":
                     from websockets.asyncio.client import connect as _ws_connect
 
-                    from lite_server.analyzer.ws_target import ws_stream_target
+                    from lite_server.benchmark.ws_target import ws_stream_target
 
                     stream_target = ws_stream_target(
                         _ws_connect, url, timeout=args.stream_read_timeout,
@@ -977,7 +977,7 @@ def _cmd_benchmark(args):
                 else:  # grpc
                     import grpc as _grpc
 
-                    from lite_server.analyzer.grpc_target import grpc_stream_target
+                    from lite_server.benchmark.grpc_target import grpc_stream_target
 
                     grpc_addr = args.url.split("://", 1)[-1].rstrip("/")
                     grpc_channel = _grpc.aio.insecure_channel(grpc_addr)
@@ -989,13 +989,13 @@ def _cmd_benchmark(args):
 
                 # Scenario wrappers (plan §7.2): cancel / slow-consumer injection
                 if args.cancel_after is not None:
-                    from lite_server.analyzer.scenario import with_cancel_after
+                    from lite_server.benchmark.scenario import with_cancel_after
 
                     stream_target = with_cancel_after(
                         stream_target, args.cancel_after,
                     )
                 if args.read_delay_ms is not None:
-                    from lite_server.analyzer.scenario import with_read_delay
+                    from lite_server.benchmark.scenario import with_read_delay
 
                     stream_target = with_read_delay(
                         stream_target, args.read_delay_ms / 1000.0,

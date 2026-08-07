@@ -16,14 +16,14 @@ import sys
 
 import pytest
 
-from lite_server.analyzer.benchmark import (
+from lite_server.benchmark.benchmark import (
     BenchmarkEngine,
     RequestStatusError,
     StreamChunk,
     StreamRequestRecord,
 )
-from lite_server.analyzer.stream_metrics import compute_stream_metrics
-from lite_server.analyzer.sse_target import sse_stream_target
+from lite_server.benchmark.stream_metrics import compute_stream_metrics
+from lite_server.benchmark.sse_target import sse_stream_target
 
 
 # ── Minimal fake httpx (self-contained; mirrors test_streaming_benchmark.py) ──

@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from lite_server.analyzer.benchmark import BenchmarkEngine, BenchmarkResult
+from lite_server.benchmark.benchmark import BenchmarkEngine, BenchmarkResult
 from lite_server.analyzer.report import ReportGenerator
 from lite_server.analyzer.static import StaticAnalyzer
 

@@ -231,7 +231,8 @@ Models can implement `prefill()` / `step()` / `has_finished()` hooks to implemen
 | Exceptions | `exceptions.py` | Python-side exception definitions |
 | Worker | `worker/inference.py` | Worker process that loads and runs models |
 | Proto | `proto/` | Python protobuf generated code |
-| Analyzer | `analyzer/` | Performance analysis tools (benchmark, report, static) |
+| Analyzer | `analyzer/` | Static model analysis (static, report) |
+| Benchmark | `benchmark/` | Load testing & bidi streaming benchmarks |
 | Artifact | `artifact/` | Model packing/unpacking (.lma format) |
 | Init | `init/` | Project scaffolding templates |
 

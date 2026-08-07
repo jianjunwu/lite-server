@@ -15,15 +15,15 @@ from __future__ import annotations
 import json as _stdlib_json
 from typing import Awaitable, Callable
 
-from lite_server.analyzer.bidi_session import (
+from lite_server.benchmark.bidi_session import (
     Data,
     Done,
     Error,
     Pacing,
     run_bidi_session,
 )
-from lite_server.analyzer.benchmark import BidiSessionRecord, RequestConnectError
-from lite_server.analyzer.ws_target import _parse_control
+from lite_server.benchmark.benchmark import BidiSessionRecord, RequestConnectError
+from lite_server.benchmark.ws_target import _parse_control
 
 
 def ws_bidi_session(
@@ -49,7 +49,7 @@ def ws_bidi_session(
     async def session(script: list) -> BidiSessionRecord:
         from websockets.exceptions import InvalidHandshake
 
-        from lite_server.analyzer.ws_target import _map_handshake_error
+        from lite_server.benchmark.ws_target import _map_handshake_error
 
         # The wrap covers connect AND the session body: connect-time failures
         # are the dominant OSError/InvalidHandshake source; a rare mid-session

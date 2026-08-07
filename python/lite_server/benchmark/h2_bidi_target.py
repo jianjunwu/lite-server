@@ -19,14 +19,14 @@ import asyncio
 from typing import Awaitable, Callable
 from urllib.parse import urlparse
 
-from lite_server.analyzer.bidi_session import (
+from lite_server.benchmark.bidi_session import (
     Data,
     Done,
     Error,
     Pacing,
     run_bidi_session,
 )
-from lite_server.analyzer.benchmark import (
+from lite_server.benchmark.benchmark import (
     BidiSessionRecord,
     RequestConnectError,
     RequestError,

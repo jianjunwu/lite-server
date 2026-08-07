@@ -11,7 +11,7 @@ import asyncio
 
 import pytest
 
-from lite_server.analyzer.benchmark import (
+from lite_server.benchmark.benchmark import (
     BenchmarkEngine,
     BenchmarkResult,
     BidiSessionMetrics,
@@ -99,7 +99,7 @@ class TestComputeBidiMetrics:
         return BidiSessionRecord(**base)
 
     def test_basic_percentiles(self):
-        from lite_server.analyzer.bidi_metrics import compute_bidi_metrics
+        from lite_server.benchmark.bidi_metrics import compute_bidi_metrics
 
         records = [self._record(), self._record(session_duration_ms=700.0)]
         m = compute_bidi_metrics(
@@ -114,7 +114,7 @@ class TestComputeBidiMetrics:
         assert m.sessions_per_sec == pytest.approx(0.5)
 
     def test_roundtrip_pooled_across_sessions(self):
-        from lite_server.analyzer.bidi_metrics import compute_bidi_metrics
+        from lite_server.benchmark.bidi_metrics import compute_bidi_metrics
 
         records = [
             self._record(chunk_roundtrips_ms=[10.0, 20.0]),
@@ -129,7 +129,7 @@ class TestComputeBidiMetrics:
 
     def test_roundtrip_none_when_no_samples(self):
         """real_time pacing: no per-chunk pairing → no roundtrip section."""
-        from lite_server.analyzer.bidi_metrics import compute_bidi_metrics
+        from lite_server.benchmark.bidi_metrics import compute_bidi_metrics
 
         records = [self._record(chunk_roundtrips_ms=[])]
         m = compute_bidi_metrics(
@@ -140,7 +140,7 @@ class TestComputeBidiMetrics:
 
     def test_none_open_latency_excluded(self):
         """on_open returned None → no ready frame → open_latency excluded."""
-        from lite_server.analyzer.bidi_metrics import compute_bidi_metrics
+        from lite_server.benchmark.bidi_metrics import compute_bidi_metrics
 
         records = [
             self._record(open_latency_ms=None),
@@ -152,7 +152,7 @@ class TestComputeBidiMetrics:
         assert m.open_latency_ms["mean"] == pytest.approx(100.0)
 
     def test_empty_records_zero_structure(self):
-        from lite_server.analyzer.bidi_metrics import compute_bidi_metrics
+        from lite_server.benchmark.bidi_metrics import compute_bidi_metrics
 
         m = compute_bidi_metrics(
             [], transport="ws", pacing_mode="lock_step",
@@ -163,7 +163,7 @@ class TestComputeBidiMetrics:
         assert m.sessions_per_sec is None
 
     def test_sessions_per_sec_none_without_window(self):
-        from lite_server.analyzer.bidi_metrics import compute_bidi_metrics
+        from lite_server.benchmark.bidi_metrics import compute_bidi_metrics
 
         m = compute_bidi_metrics(
             [self._record()], transport="ws", pacing_mode="lock_step",
@@ -217,12 +217,12 @@ class _FakeIO:
 class TestBidiSession:
     @staticmethod
     def _frames():
-        from lite_server.analyzer.bidi_session import Data, Done, Error
+        from lite_server.benchmark.bidi_session import Data, Done, Error
         return Data, Done, Error
 
     @pytest.mark.asyncio
     async def test_lock_step_happy_path(self):
-        from lite_server.analyzer.bidi_session import Pacing, run_bidi_session
+        from lite_server.benchmark.bidi_session import Pacing, run_bidi_session
 
         Data, Done, _ = self._frames()
         io = _FakeIO(
@@ -251,8 +251,8 @@ class TestBidiSession:
 
     @pytest.mark.asyncio
     async def test_lock_step_requires_open_response(self):
-        from lite_server.analyzer.bidi_session import Pacing, run_bidi_session
-        from lite_server.analyzer.benchmark import RequestStreamError
+        from lite_server.benchmark.bidi_session import Pacing, run_bidi_session
+        from lite_server.benchmark.benchmark import RequestStreamError
 
         io = _FakeIO(open_responses=[])  # on_open returned None
         with pytest.raises(RequestStreamError, match="on_open"):
@@ -263,8 +263,8 @@ class TestBidiSession:
 
     @pytest.mark.asyncio
     async def test_lock_step_chunk_without_response_fails(self):
-        from lite_server.analyzer.bidi_session import Pacing, run_bidi_session
-        from lite_server.analyzer.benchmark import RequestStreamError
+        from lite_server.benchmark.bidi_session import Pacing, run_bidi_session
+        from lite_server.benchmark.benchmark import RequestStreamError
 
         Data, _, _ = self._frames()
         io = _FakeIO(
@@ -279,8 +279,8 @@ class TestBidiSession:
 
     @pytest.mark.asyncio
     async def test_error_frame_aborts_session(self):
-        from lite_server.analyzer.bidi_session import Pacing, run_bidi_session
-        from lite_server.analyzer.benchmark import RequestStreamError
+        from lite_server.benchmark.bidi_session import Pacing, run_bidi_session
+        from lite_server.benchmark.benchmark import RequestStreamError
 
         Data, _, Error = self._frames()
         io = _FakeIO(
@@ -296,7 +296,7 @@ class TestBidiSession:
     @pytest.mark.asyncio
     async def test_real_time_pacing_no_roundtrips(self):
         import time
-        from lite_server.analyzer.bidi_session import Pacing, run_bidi_session
+        from lite_server.benchmark.bidi_session import Pacing, run_bidi_session
 
         Data, Done, _ = self._frames()
         io = _FakeIO(
@@ -320,7 +320,7 @@ class TestBidiSession:
     @pytest.mark.asyncio
     async def test_early_done_stops_production(self):
         """Model closes the session mid-script: producer stops, no close sent."""
-        from lite_server.analyzer.bidi_session import Pacing, run_bidi_session
+        from lite_server.benchmark.bidi_session import Pacing, run_bidi_session
 
         Data, Done, _ = self._frames()
         io = _FakeIO(
@@ -339,7 +339,7 @@ class TestBidiSession:
 
     @pytest.mark.asyncio
     async def test_script_with_only_open(self):
-        from lite_server.analyzer.bidi_session import Pacing, run_bidi_session
+        from lite_server.benchmark.bidi_session import Pacing, run_bidi_session
 
         Data, Done, _ = self._frames()
         io = _FakeIO(open_responses=[Data(b"ready")], close_responses=[Done()])
@@ -352,15 +352,15 @@ class TestBidiSession:
 
     @pytest.mark.asyncio
     async def test_empty_script_raises_value_error(self):
-        from lite_server.analyzer.bidi_session import Pacing, run_bidi_session
+        from lite_server.benchmark.bidi_session import Pacing, run_bidi_session
 
         with pytest.raises(ValueError, match="script"):
             await run_bidi_session(io := _FakeIO(), [], pacing=Pacing())
 
     @pytest.mark.asyncio
     async def test_transport_exception_becomes_stream_error(self):
-        from lite_server.analyzer.bidi_session import Pacing, run_bidi_session
-        from lite_server.analyzer.benchmark import RequestStreamError
+        from lite_server.benchmark.bidi_session import Pacing, run_bidi_session
+        from lite_server.benchmark.benchmark import RequestStreamError
 
         Data, _, _ = self._frames()
         io = _FakeIO(open_responses=[Data(b"ready")],
@@ -430,7 +430,7 @@ class TestRunBidi:
 
     @pytest.mark.asyncio
     async def test_failed_sessions_counted_not_recorded(self):
-        from lite_server.analyzer.benchmark import RequestStreamError
+        from lite_server.benchmark.benchmark import RequestStreamError
 
         engine = BenchmarkEngine()
         calls = [0]
@@ -569,8 +569,8 @@ class TestWsBidiTarget:
     @pytest.mark.asyncio
     async def test_frame_mapping_and_session_record(self):
         import json
-        from lite_server.analyzer.bidi_session import Pacing
-        from lite_server.analyzer.ws_bidi_target import ws_bidi_session
+        from lite_server.benchmark.bidi_session import Pacing
+        from lite_server.benchmark.ws_bidi_target import ws_bidi_session
 
         connect, ws, calls = self._fake_ws([
             b'{"status": "ready"}',       # on_open response (Binary)
@@ -578,7 +578,7 @@ class TestWsBidiTarget:
             b'"echo2"',                   # chunk 2 response
             '{"done": true}',             # terminal
         ])
-        from lite_server.analyzer.bidi_session import Pacing as P
+        from lite_server.benchmark.bidi_session import Pacing as P
         session = ws_bidi_session(
             connect, "ws://x/v2/models/m/stream",
             pacing=P(mode="lock_step"), idle_timeout=1.0,
@@ -602,9 +602,9 @@ class TestWsBidiTarget:
 
     @pytest.mark.asyncio
     async def test_error_frame_fails_session(self):
-        from lite_server.analyzer.bidi_session import Pacing
-        from lite_server.analyzer.benchmark import RequestStreamError
-        from lite_server.analyzer.ws_bidi_target import ws_bidi_session
+        from lite_server.benchmark.bidi_session import Pacing
+        from lite_server.benchmark.benchmark import RequestStreamError
+        from lite_server.benchmark.ws_bidi_target import ws_bidi_session
 
         connect, _, _ = self._fake_ws([
             b"ready",
@@ -619,8 +619,8 @@ class TestWsBidiTarget:
 
     @pytest.mark.asyncio
     async def test_unknown_text_frame_tolerated(self):
-        from lite_server.analyzer.bidi_session import Pacing
-        from lite_server.analyzer.ws_bidi_target import ws_bidi_session
+        from lite_server.benchmark.bidi_session import Pacing
+        from lite_server.benchmark.ws_bidi_target import ws_bidi_session
 
         connect, _, _ = self._fake_ws([
             b"ready",
@@ -637,9 +637,9 @@ class TestWsBidiTarget:
 
     @pytest.mark.asyncio
     async def test_close_without_done_fails_session(self):
-        from lite_server.analyzer.bidi_session import Pacing
-        from lite_server.analyzer.benchmark import RequestStreamError
-        from lite_server.analyzer.ws_bidi_target import ws_bidi_session
+        from lite_server.benchmark.bidi_session import Pacing
+        from lite_server.benchmark.benchmark import RequestStreamError
+        from lite_server.benchmark.ws_bidi_target import ws_bidi_session
 
         connect, _, _ = self._fake_ws([b"ready"])  # then transport error
         session = ws_bidi_session(
@@ -1072,8 +1072,8 @@ class TestGrpcBidiTarget:
 
     @pytest.mark.asyncio
     async def test_happy_path_and_message_mapping(self):
-        from lite_server.analyzer.bidi_session import Pacing
-        from lite_server.analyzer.grpc_bidi_target import grpc_bidi_session
+        from lite_server.benchmark.bidi_session import Pacing
+        from lite_server.benchmark.grpc_bidi_target import grpc_bidi_session
 
         pb = self._pb()
         channel, writes, call = self._fake_channel(
@@ -1108,9 +1108,9 @@ class TestGrpcBidiTarget:
 
     @pytest.mark.asyncio
     async def test_error_frame_fails_session(self):
-        from lite_server.analyzer.bidi_session import Pacing
-        from lite_server.analyzer.benchmark import RequestStreamError
-        from lite_server.analyzer.grpc_bidi_target import grpc_bidi_session
+        from lite_server.benchmark.bidi_session import Pacing
+        from lite_server.benchmark.benchmark import RequestStreamError
+        from lite_server.benchmark.grpc_bidi_target import grpc_bidi_session
 
         pb = self._pb()
         channel, _, _ = self._fake_channel(
@@ -1128,9 +1128,9 @@ class TestGrpcBidiTarget:
 
     @pytest.mark.asyncio
     async def test_eof_without_close_frame_fails(self):
-        from lite_server.analyzer.bidi_session import Pacing
-        from lite_server.analyzer.benchmark import RequestStreamError
-        from lite_server.analyzer.grpc_bidi_target import grpc_bidi_session
+        from lite_server.benchmark.bidi_session import Pacing
+        from lite_server.benchmark.benchmark import RequestStreamError
+        from lite_server.benchmark.grpc_bidi_target import grpc_bidi_session
 
         pb = self._pb()
         channel, _, _ = self._fake_channel(
@@ -1149,8 +1149,8 @@ class TestGrpcBidiTarget:
     @pytest.mark.asyncio
     async def test_server_open_frame_tolerated(self):
         """S→C open payload is not expected — tolerated, keep reading."""
-        from lite_server.analyzer.bidi_session import Pacing
-        from lite_server.analyzer.grpc_bidi_target import grpc_bidi_session
+        from lite_server.benchmark.bidi_session import Pacing
+        from lite_server.benchmark.grpc_bidi_target import grpc_bidi_session
 
         pb = self._pb()
         stray_open = pb.BidiChunk(open=pb.BidiOpen(model_name="m"))
@@ -1175,8 +1175,8 @@ class TestBidiErrorClassification:
 
     @pytest.mark.asyncio
     async def test_orchestrator_forwards_classified_request_error(self):
-        from lite_server.analyzer.bidi_session import Pacing, run_bidi_session
-        from lite_server.analyzer.benchmark import RequestStatusError
+        from lite_server.benchmark.bidi_session import Pacing, run_bidi_session
+        from lite_server.benchmark.benchmark import RequestStatusError
 
         class StatusIO:
             async def send_open(self, data):
@@ -1200,9 +1200,9 @@ class TestBidiErrorClassification:
 
     @pytest.mark.asyncio
     async def test_ws_bidi_connect_oserror_maps_to_connect(self):
-        from lite_server.analyzer.bidi_session import Pacing
-        from lite_server.analyzer.benchmark import RequestConnectError
-        from lite_server.analyzer.ws_bidi_target import ws_bidi_session
+        from lite_server.benchmark.bidi_session import Pacing
+        from lite_server.benchmark.benchmark import RequestConnectError
+        from lite_server.benchmark.ws_bidi_target import ws_bidi_session
 
         class _Ctx:
             async def __aenter__(self):
@@ -1221,9 +1221,9 @@ class TestBidiErrorClassification:
     @pytest.mark.asyncio
     async def test_ws_bidi_handshake_status_maps_to_status(self):
         import types
-        from lite_server.analyzer.bidi_session import Pacing
-        from lite_server.analyzer.benchmark import RequestStatusError
-        from lite_server.analyzer.ws_bidi_target import ws_bidi_session
+        from lite_server.benchmark.bidi_session import Pacing
+        from lite_server.benchmark.benchmark import RequestStatusError
+        from lite_server.benchmark.ws_bidi_target import ws_bidi_session
 
         class FakeInvalidStatus(Exception):
             def __init__(self, status_code):
@@ -1260,9 +1260,9 @@ class TestBidiErrorClassification:
     @pytest.mark.asyncio
     async def test_grpc_bidi_unavailable_maps_to_connect(self):
         import grpc
-        from lite_server.analyzer.bidi_session import Pacing
-        from lite_server.analyzer.benchmark import RequestConnectError
-        from lite_server.analyzer.grpc_bidi_target import grpc_bidi_session
+        from lite_server.benchmark.bidi_session import Pacing
+        from lite_server.benchmark.benchmark import RequestConnectError
+        from lite_server.benchmark.grpc_bidi_target import grpc_bidi_session
 
         class FailCall:
             async def write(self, chunk):
@@ -1299,14 +1299,14 @@ class TestLpmCodec:
     """LPM frame codec: 1B flag(0) + 4B BE length + payload."""
 
     def test_encode_decode_roundtrip(self):
-        from lite_server.analyzer.h2_bidi_target import LpmDecoder, encode_lpm
+        from lite_server.benchmark.h2_bidi_target import LpmDecoder, encode_lpm
 
         dec = LpmDecoder()
         frames = dec.feed(encode_lpm(b"hello") + encode_lpm(b"world"))
         assert frames == [b"hello", b"world"]
 
     def test_partial_frame_buffered(self):
-        from lite_server.analyzer.h2_bidi_target import LpmDecoder, encode_lpm
+        from lite_server.benchmark.h2_bidi_target import LpmDecoder, encode_lpm
 
         dec = LpmDecoder()
         raw = encode_lpm(b"0123456789")
@@ -1314,21 +1314,21 @@ class TestLpmCodec:
         assert dec.feed(raw[7:]) == [b"0123456789"]
 
     def test_nonzero_flag_rejected(self):
-        from lite_server.analyzer.h2_bidi_target import LpmDecoder
+        from lite_server.benchmark.h2_bidi_target import LpmDecoder
 
         dec = LpmDecoder()
         with pytest.raises(ValueError, match="flag"):
             dec.feed(b"\x01\x00\x00\x00\x02ab")
 
     def test_oversize_frame_rejected_before_buffering(self):
-        from lite_server.analyzer.h2_bidi_target import LpmDecoder
+        from lite_server.benchmark.h2_bidi_target import LpmDecoder
 
         dec = LpmDecoder()
         with pytest.raises(ValueError, match="too large"):
             dec.feed(b"\x00" + (17 * 1024 * 1024).to_bytes(4, "big"))
 
     def test_empty_frame_legal(self):
-        from lite_server.analyzer.h2_bidi_target import LpmDecoder, encode_lpm
+        from lite_server.benchmark.h2_bidi_target import LpmDecoder, encode_lpm
 
         dec = LpmDecoder()
         assert dec.feed(encode_lpm(b"")) == [b""]
@@ -1344,7 +1344,7 @@ class TestH2BidiTarget:
         import h2.config
         import h2.connection
         import h2.events
-        from lite_server.analyzer.h2_bidi_target import LpmDecoder, encode_lpm
+        from lite_server.benchmark.h2_bidi_target import LpmDecoder, encode_lpm
         from lite_server.proto import liteserver_pb2
 
         class FakeReader:
@@ -1472,8 +1472,8 @@ class TestH2BidiTarget:
 
     @pytest.mark.asyncio
     async def test_happy_path(self, monkeypatch):
-        from lite_server.analyzer.bidi_session import Pacing
-        from lite_server.analyzer.h2_bidi_target import h2_bidi_session
+        from lite_server.benchmark.bidi_session import Pacing
+        from lite_server.benchmark.h2_bidi_target import h2_bidi_session
 
         harness = self._h2_pair(monkeypatch)
         session = h2_bidi_session(
@@ -1492,9 +1492,9 @@ class TestH2BidiTarget:
 
     @pytest.mark.asyncio
     async def test_non_200_maps_to_status_error(self, monkeypatch):
-        from lite_server.analyzer.bidi_session import Pacing
-        from lite_server.analyzer.benchmark import RequestStatusError
-        from lite_server.analyzer.h2_bidi_target import h2_bidi_session
+        from lite_server.benchmark.bidi_session import Pacing
+        from lite_server.benchmark.benchmark import RequestStatusError
+        from lite_server.benchmark.h2_bidi_target import h2_bidi_session
 
         self._h2_pair(monkeypatch, status="404")
         session = h2_bidi_session(
@@ -1507,9 +1507,9 @@ class TestH2BidiTarget:
 
     @pytest.mark.asyncio
     async def test_error_frame_maps_to_stream_error(self, monkeypatch):
-        from lite_server.analyzer.bidi_session import Pacing
-        from lite_server.analyzer.benchmark import RequestStreamError
-        from lite_server.analyzer.h2_bidi_target import h2_bidi_session
+        from lite_server.benchmark.bidi_session import Pacing
+        from lite_server.benchmark.benchmark import RequestStreamError
+        from lite_server.benchmark.h2_bidi_target import h2_bidi_session
 
         self._h2_pair(monkeypatch, error_message="worker exploded")
         session = h2_bidi_session(
@@ -1521,9 +1521,9 @@ class TestH2BidiTarget:
 
     @pytest.mark.asyncio
     async def test_stream_end_without_close_fails(self, monkeypatch):
-        from lite_server.analyzer.bidi_session import Pacing
-        from lite_server.analyzer.benchmark import RequestStreamError
-        from lite_server.analyzer.h2_bidi_target import h2_bidi_session
+        from lite_server.benchmark.bidi_session import Pacing
+        from lite_server.benchmark.benchmark import RequestStreamError
+        from lite_server.benchmark.h2_bidi_target import h2_bidi_session
 
         self._h2_pair(monkeypatch, end_without_close=True)
         session = h2_bidi_session(

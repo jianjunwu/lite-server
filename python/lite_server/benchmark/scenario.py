@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 from typing import AsyncIterator, Callable
 
-from lite_server.analyzer.benchmark import RequestCanceledError, StreamChunk
+from lite_server.benchmark.benchmark import RequestCanceledError, StreamChunk
 
 
 def with_cancel_after(

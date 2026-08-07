@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from lite_server import cli
-from lite_server.analyzer.benchmark import BenchmarkEngine, BenchmarkResult
+from lite_server.benchmark.benchmark import BenchmarkEngine, BenchmarkResult
 from lite_server.analyzer.static import StaticAnalyzer
 
 REPO_ROOT = Path(__file__).resolve().parents[2]

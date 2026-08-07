@@ -8,8 +8,8 @@ session-metric math.
 
 from __future__ import annotations
 
-from lite_server.analyzer.benchmark import BidiSessionMetrics, BidiSessionRecord
-from lite_server.analyzer.stream_metrics import _percentiles
+from lite_server.benchmark.benchmark import BidiSessionMetrics, BidiSessionRecord
+from lite_server.benchmark.stream_metrics import _percentiles
 
 PACING_MODES = ("lock_step", "real_time", "speedup")
 

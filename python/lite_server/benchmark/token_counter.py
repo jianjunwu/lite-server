@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from lite_server.analyzer.benchmark import StreamChunk
+from lite_server.benchmark.benchmark import StreamChunk
 
 
 class TokenizerLoadError(Exception):

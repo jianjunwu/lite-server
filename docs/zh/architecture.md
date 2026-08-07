@@ -227,7 +227,8 @@ sender.close()  ──►  DecoupledResponse{is_final=true}（终结帧）
 | Exceptions | `exceptions.py` | Python 侧异常定义 |
 | Worker | `worker/inference.py` | 加载和运行模型的 Worker 进程 |
 | Proto | `proto/` | Python protobuf 生成代码 |
-| 分析器 | `analyzer/` | 性能分析工具（benchmark、report、static） |
+| 分析器 | `analyzer/` | 静态模型分析（static、report） |
+| 压测 | `benchmark/` | 负载压测与 bidi 流式基准 |
 | 制品 | `artifact/` | 模型打包/解包（.lma 格式） |
 | 脚手架 | `init/` | 项目初始化模板 |
 

@@ -1,4 +1,4 @@
-"""Tests for lite_server.analyzer.benchmark — benchmark engine."""
+"""Tests for lite_server.benchmark.benchmark — benchmark engine."""
 
 import asyncio
 import time
@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from lite_server.analyzer.benchmark import BenchmarkEngine, BenchmarkResult
+from lite_server.benchmark.benchmark import BenchmarkEngine, BenchmarkResult
 
 
 class TestBenchmarkResult:
@@ -290,7 +290,7 @@ class TestStatsContract:
 
     @pytest.mark.asyncio
     async def test_error_kinds_classified(self):
-        from lite_server.analyzer.benchmark import (
+        from lite_server.benchmark.benchmark import (
             RequestStatusError,
             RequestTimeoutError,
         )
@@ -337,7 +337,7 @@ class TestStatsContract:
         assert seen == [1, 2, 3]
 
     def test_cpu_saturation_warning_helper(self):
-        from lite_server.analyzer.benchmark import BenchmarkEngine as E
+        from lite_server.benchmark.benchmark import BenchmarkEngine as E
 
         assert E._cpu_saturation_warning(cpu_used=0.8, wall=1.0) is not None
         assert E._cpu_saturation_warning(cpu_used=0.5, wall=1.0) is None

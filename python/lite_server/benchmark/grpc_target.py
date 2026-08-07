@@ -14,14 +14,14 @@ from __future__ import annotations
 import json as _stdlib_json
 from typing import AsyncIterator, Callable
 
-from lite_server.analyzer.benchmark import (
+from lite_server.benchmark.benchmark import (
     RequestConnectError,
     RequestError,
     RequestGrpcError,
     RequestTimeoutError,
     StreamChunk,
 )
-from lite_server.analyzer.sse_target import bytes_chunk_meta
+from lite_server.benchmark.sse_target import bytes_chunk_meta
 
 
 def grpc_stream_target(

@@ -11,7 +11,7 @@ from dataclasses import asdict
 
 import pytest
 
-from lite_server.analyzer.benchmark import (
+from lite_server.benchmark.benchmark import (
     BenchmarkEngine,
     BenchmarkResult,
     RequestStreamError,
@@ -76,7 +76,7 @@ class TestRequestStreamError:
         assert e.kind == "stream"
 
     def test_is_request_error_subclass(self):
-        from lite_server.analyzer.benchmark import RequestError
+        from lite_server.benchmark.benchmark import RequestError
 
         e = RequestStreamError("boom")
         assert isinstance(e, RequestError)
@@ -279,7 +279,7 @@ class TestComputeStreamMetricsLLM:
 
     def test_chunk_equals_token_default(self):
         """Without token_count meta, each chunk counts as 1 token."""
-        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+        from lite_server.benchmark.stream_metrics import compute_stream_metrics
 
         records = []
         for i in range(5):
@@ -297,7 +297,7 @@ class TestComputeStreamMetricsLLM:
         assert sm.tokens_per_request["mean"] == pytest.approx(4.0)
 
     def test_token_count_meta_gives_exact_basis(self):
-        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+        from lite_server.benchmark.stream_metrics import compute_stream_metrics
 
         records = self._make_records([3, 5, 7])
         sm = compute_stream_metrics(records, "llm")
@@ -306,7 +306,7 @@ class TestComputeStreamMetricsLLM:
         assert sm.tokens_per_request["mean"] == pytest.approx(5.0)
 
     def test_mixed_basis_when_partial_meta(self):
-        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+        from lite_server.benchmark.stream_metrics import compute_stream_metrics
 
         records = self._make_records([3, 5])
         # third record has no chunk_metas
@@ -322,7 +322,7 @@ class TestComputeStreamMetricsLLM:
         assert sm.tokens_per_sec is not None
 
     def test_itl_pooled_across_requests(self):
-        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+        from lite_server.benchmark.stream_metrics import compute_stream_metrics
 
         records = self._make_records([3, 3, 3], inter_chunk=25.0)
         sm = compute_stream_metrics(records, "llm")
@@ -331,7 +331,7 @@ class TestComputeStreamMetricsLLM:
         assert sm.itl_ms["mean"] == pytest.approx(25.0, abs=1.0)
 
     def test_tpot_per_request_percentiles(self):
-        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+        from lite_server.benchmark.stream_metrics import compute_stream_metrics
 
         records = self._make_records([3, 5, 7], ttft_base=50.0, inter_chunk=25.0)
         sm = compute_stream_metrics(records, "llm")
@@ -340,7 +340,7 @@ class TestComputeStreamMetricsLLM:
         assert sm.tpot_ms["mean"] == pytest.approx(25.0, abs=1.0)
 
     def test_tokens_per_sec_decode_phase(self):
-        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+        from lite_server.benchmark.stream_metrics import compute_stream_metrics
 
         records = self._make_records([5, 5], ttft_base=50.0, inter_chunk=10.0)
         sm = compute_stream_metrics(records, "llm")
@@ -348,7 +348,7 @@ class TestComputeStreamMetricsLLM:
         assert sm.tokens_per_sec > 0
 
     def test_tokens_per_sec_e2e_includes_ttft(self):
-        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+        from lite_server.benchmark.stream_metrics import compute_stream_metrics
 
         records = self._make_records([5, 5], ttft_base=50.0, inter_chunk=10.0)
         sm = compute_stream_metrics(records, "llm")
@@ -357,7 +357,7 @@ class TestComputeStreamMetricsLLM:
         assert sm.tokens_per_sec_e2e < sm.tokens_per_sec
 
     def test_tokens_per_sec_aggregate_requires_window(self):
-        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+        from lite_server.benchmark.stream_metrics import compute_stream_metrics
 
         records = self._make_records([5, 5, 5])
         sm = compute_stream_metrics(records, "llm")
@@ -372,7 +372,7 @@ class TestComputeStreamMetricsTTS:
     """TTS model type: RTF-based metrics."""
 
     def test_rtf_from_meta_totals(self):
-        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+        from lite_server.benchmark.stream_metrics import compute_stream_metrics
 
         records = []
         for audio_ms, total_ms in [(1000.0, 500.0), (2000.0, 800.0), (500.0, 300.0)]:
@@ -391,7 +391,7 @@ class TestComputeStreamMetricsTTS:
         assert sm.tokens_per_sec is None
 
     def test_record_missing_audio_duration_excluded_from_rtf(self):
-        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+        from lite_server.benchmark.stream_metrics import compute_stream_metrics
 
         records = [
             StreamRequestRecord(
@@ -414,7 +414,7 @@ class TestComputeStreamMetricsSTT:
     """STT model type: RTF from request_meta."""
 
     def test_rtf_from_request_meta(self):
-        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+        from lite_server.benchmark.stream_metrics import compute_stream_metrics
 
         records = []
         for audio_ms, total_ms in [(3000.0, 1500.0), (5000.0, 2000.0)]:
@@ -431,7 +431,7 @@ class TestComputeStreamMetricsSTT:
         assert sm.rtf["mean"] == pytest.approx(0.45, abs=0.05)
 
     def test_record_missing_request_meta_excluded_from_rtf(self):
-        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+        from lite_server.benchmark.stream_metrics import compute_stream_metrics
 
         records = [
             StreamRequestRecord(
@@ -453,7 +453,7 @@ class TestComputeStreamMetricsEdgeCases:
     """Empty records, zero-chunk, empty chunk filtering, bad model_type."""
 
     def test_empty_records_returns_zero_structure(self):
-        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+        from lite_server.benchmark.stream_metrics import compute_stream_metrics
 
         sm = compute_stream_metrics([], "llm")
         assert sm.requests == 0
@@ -464,7 +464,7 @@ class TestComputeStreamMetricsEdgeCases:
         assert sm.tokens_per_sec is None
 
     def test_all_zero_chunk_requests(self):
-        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+        from lite_server.benchmark.stream_metrics import compute_stream_metrics
 
         records = [
             StreamRequestRecord(chunk_count=0),
@@ -478,7 +478,7 @@ class TestComputeStreamMetricsEdgeCases:
 
     def test_empty_chunk_not_counted_for_ttft(self):
         """Empty data chunks do not count as first-token."""
-        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+        from lite_server.benchmark.stream_metrics import compute_stream_metrics
 
         records = [
             StreamRequestRecord(
@@ -495,13 +495,13 @@ class TestComputeStreamMetricsEdgeCases:
         assert sm.total_chunks == 3
 
     def test_bad_model_type_raises_value_error(self):
-        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+        from lite_server.benchmark.stream_metrics import compute_stream_metrics
 
         with pytest.raises(ValueError, match="model_type"):
             compute_stream_metrics([], "image")
 
     def test_model_type_case_sensitive(self):
-        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+        from lite_server.benchmark.stream_metrics import compute_stream_metrics
 
         with pytest.raises(ValueError, match="model_type"):
             compute_stream_metrics([], "LLM")
@@ -511,12 +511,12 @@ class TestGenericModelType:
     """--model-type generic: common section only, no LLM/TTS/STT metrics (§3.2)."""
 
     def test_generic_in_model_types(self):
-        from lite_server.analyzer.stream_metrics import MODEL_TYPES
+        from lite_server.benchmark.stream_metrics import MODEL_TYPES
 
         assert "generic" in MODEL_TYPES
 
     def test_generic_computes_common_section_only(self):
-        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+        from lite_server.benchmark.stream_metrics import compute_stream_metrics
 
         records = [
             StreamRequestRecord(
@@ -542,7 +542,7 @@ class TestGenericModelType:
         assert sm.rtf is None
 
     def test_generic_to_dict_has_no_model_specific_keys(self):
-        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+        from lite_server.benchmark.stream_metrics import compute_stream_metrics
 
         records = [
             StreamRequestRecord(
@@ -559,7 +559,7 @@ class TestGenericModelType:
             assert key not in d
 
     def test_generic_empty_records_zero_structure(self):
-        from lite_server.analyzer.stream_metrics import compute_stream_metrics
+        from lite_server.benchmark.stream_metrics import compute_stream_metrics
 
         sm = compute_stream_metrics([], "generic")
         assert sm.model_type == "generic"
@@ -873,7 +873,7 @@ class TestSSETarget:
 
     @pytest.mark.asyncio
     async def test_simple_sse_events(self):
-        from lite_server.analyzer.sse_target import sse_stream_target
+        from lite_server.benchmark.sse_target import sse_stream_target
 
         client = self._fake_response([
             "data: hello",
@@ -894,7 +894,7 @@ class TestSSETarget:
 
     @pytest.mark.asyncio
     async def test_multiline_data_joined(self):
-        from lite_server.analyzer.sse_target import sse_stream_target
+        from lite_server.benchmark.sse_target import sse_stream_target
 
         client = self._fake_response([
             "data: line1",
@@ -914,7 +914,7 @@ class TestSSETarget:
     @pytest.mark.asyncio
     async def test_tolerant_no_trailing_newline(self):
         """Last event without trailing empty line is still processed."""
-        from lite_server.analyzer.sse_target import sse_stream_target
+        from lite_server.benchmark.sse_target import sse_stream_target
 
         client = self._fake_response([
             "data: hello",
@@ -932,7 +932,7 @@ class TestSSETarget:
 
     @pytest.mark.asyncio
     async def test_done_stops_iteration(self):
-        from lite_server.analyzer.sse_target import sse_stream_target
+        from lite_server.benchmark.sse_target import sse_stream_target
 
         client = self._fake_response([
             "data: first",
@@ -952,7 +952,7 @@ class TestSSETarget:
 
     @pytest.mark.asyncio
     async def test_error_event_raises_request_stream_error(self):
-        from lite_server.analyzer.sse_target import sse_stream_target
+        from lite_server.benchmark.sse_target import sse_stream_target
 
         client = self._fake_response([
             "data: {\"error\": \"model overloaded\"}",
@@ -965,7 +965,7 @@ class TestSSETarget:
 
     @pytest.mark.asyncio
     async def test_dict_meta_extraction(self):
-        from lite_server.analyzer.sse_target import sse_stream_target
+        from lite_server.benchmark.sse_target import sse_stream_target
 
         client = self._fake_response([
             "data: {\"token\": \"hello\", \"token_count\": 1}",
@@ -984,7 +984,7 @@ class TestSSETarget:
     @pytest.mark.asyncio
     async def test_non_dict_json_no_meta(self):
         """JSON array or primitive → no meta extracted."""
-        from lite_server.analyzer.sse_target import sse_stream_target
+        from lite_server.benchmark.sse_target import sse_stream_target
 
         client = self._fake_response([
             "data: [1, 2, 3]",
@@ -1003,8 +1003,8 @@ class TestSSETarget:
 
     @pytest.mark.asyncio
     async def test_non_200_raises_status_error(self):
-        from lite_server.analyzer.sse_target import sse_stream_target
-        from lite_server.analyzer.benchmark import RequestStatusError
+        from lite_server.benchmark.sse_target import sse_stream_target
+        from lite_server.benchmark.benchmark import RequestStatusError
 
         client = self._fake_response([], status_code=500)
         target_fn = sse_stream_target(client, "http://example.com/events")
@@ -1014,7 +1014,7 @@ class TestSSETarget:
 
     @pytest.mark.asyncio
     async def test_posts_to_correct_url(self):
-        from lite_server.analyzer.sse_target import sse_stream_target
+        from lite_server.benchmark.sse_target import sse_stream_target
 
         client = self._fake_response(["data: x", "", "data: [DONE]", ""])
         target_fn = sse_stream_target(client, "http://example.com/v2/models/m/events")
@@ -1085,7 +1085,7 @@ class TestGrpcTarget:
 
     @pytest.mark.asyncio
     async def test_stream_infer_yields_chunks_with_meta(self):
-        from lite_server.analyzer.grpc_target import grpc_stream_target
+        from lite_server.benchmark.grpc_target import grpc_stream_target
         from lite_server.proto import liteserver_pb2
 
         responses = [
@@ -1108,7 +1108,7 @@ class TestGrpcTarget:
     async def test_stream_infer_request_fields(self):
         """Request carries model_name/version and payload as JSON bytes."""
         import json
-        from lite_server.analyzer.grpc_target import grpc_stream_target
+        from lite_server.benchmark.grpc_target import grpc_stream_target
 
         channel, calls = self._fake_channel([])
         target_fn = grpc_stream_target(channel, "my_model", version="3")
@@ -1124,7 +1124,7 @@ class TestGrpcTarget:
 
     @pytest.mark.asyncio
     async def test_stream_infer_timeout_passed_to_call(self):
-        from lite_server.analyzer.grpc_target import grpc_stream_target
+        from lite_server.benchmark.grpc_target import grpc_stream_target
 
         channel, calls = self._fake_channel([])
         target_fn = grpc_stream_target(channel, "m", timeout=12.5)
@@ -1137,7 +1137,7 @@ class TestGrpcTarget:
 
     @pytest.mark.asyncio
     async def test_decoupled_stops_at_is_final(self):
-        from lite_server.analyzer.grpc_target import grpc_stream_target
+        from lite_server.benchmark.grpc_target import grpc_stream_target
         from lite_server.proto import liteserver_pb2
 
         responses = [
@@ -1159,7 +1159,7 @@ class TestGrpcTarget:
 
     @pytest.mark.asyncio
     async def test_decoupled_final_frame_with_data_yielded(self):
-        from lite_server.analyzer.grpc_target import grpc_stream_target
+        from lite_server.benchmark.grpc_target import grpc_stream_target
         from lite_server.proto import liteserver_pb2
 
         responses = [
@@ -1178,7 +1178,7 @@ class TestGrpcTarget:
     @pytest.mark.asyncio
     async def test_decoupled_stream_end_without_is_final_tolerated(self):
         """Server cut the stream without is_final — target just ends."""
-        from lite_server.analyzer.grpc_target import grpc_stream_target
+        from lite_server.benchmark.grpc_target import grpc_stream_target
         from lite_server.proto import liteserver_pb2
 
         responses = [liteserver_pb2.DecoupledResponse(data=b"f1", is_final=False)]
@@ -1196,8 +1196,8 @@ class TestGrpcTarget:
     @pytest.mark.asyncio
     async def test_unavailable_maps_to_connect_error(self):
         import grpc
-        from lite_server.analyzer.grpc_target import grpc_stream_target
-        from lite_server.analyzer.benchmark import RequestConnectError
+        from lite_server.benchmark.grpc_target import grpc_stream_target
+        from lite_server.benchmark.benchmark import RequestConnectError
 
         channel, _ = self._fake_channel(
             [], error=self._rpc_error(grpc.StatusCode.UNAVAILABLE),
@@ -1210,8 +1210,8 @@ class TestGrpcTarget:
     @pytest.mark.asyncio
     async def test_deadline_exceeded_maps_to_timeout_error(self):
         import grpc
-        from lite_server.analyzer.grpc_target import grpc_stream_target
-        from lite_server.analyzer.benchmark import RequestTimeoutError
+        from lite_server.benchmark.grpc_target import grpc_stream_target
+        from lite_server.benchmark.benchmark import RequestTimeoutError
 
         channel, _ = self._fake_channel(
             [], error=self._rpc_error(grpc.StatusCode.DEADLINE_EXCEEDED),
@@ -1224,8 +1224,8 @@ class TestGrpcTarget:
     @pytest.mark.asyncio
     async def test_internal_maps_to_grpc_error_status_kind(self):
         import grpc
-        from lite_server.analyzer.grpc_target import grpc_stream_target
-        from lite_server.analyzer.benchmark import RequestGrpcError
+        from lite_server.benchmark.grpc_target import grpc_stream_target
+        from lite_server.benchmark.benchmark import RequestGrpcError
 
         channel, _ = self._fake_channel(
             [], error=self._rpc_error(grpc.StatusCode.INTERNAL, "model boom"),
@@ -1241,8 +1241,8 @@ class TestGrpcTarget:
     @pytest.mark.asyncio
     async def test_not_found_maps_to_grpc_error(self):
         import grpc
-        from lite_server.analyzer.grpc_target import grpc_stream_target
-        from lite_server.analyzer.benchmark import RequestGrpcError
+        from lite_server.benchmark.grpc_target import grpc_stream_target
+        from lite_server.benchmark.benchmark import RequestGrpcError
 
         channel, _ = self._fake_channel(
             [], error=self._rpc_error(grpc.StatusCode.NOT_FOUND),
@@ -1340,7 +1340,7 @@ class TestWsTarget:
 
     @pytest.mark.asyncio
     async def test_binary_frames_become_chunks(self, monkeypatch):
-        from lite_server.analyzer.ws_target import ws_stream_target
+        from lite_server.benchmark.ws_target import ws_stream_target
 
         connect, modules, ws, _ = self._fake_ws_env([
             b'{"token_count": 1}',
@@ -1362,7 +1362,7 @@ class TestWsTarget:
     @pytest.mark.asyncio
     async def test_payload_sent_as_first_text_frame(self, monkeypatch):
         import json
-        from lite_server.analyzer.ws_target import ws_stream_target
+        from lite_server.benchmark.ws_target import ws_stream_target
 
         connect, modules, ws, connect_calls = self._fake_ws_env(
             ['{"done": true}'],
@@ -1378,8 +1378,8 @@ class TestWsTarget:
 
     @pytest.mark.asyncio
     async def test_error_text_frame_raises_stream_error(self, monkeypatch):
-        from lite_server.analyzer.ws_target import ws_stream_target
-        from lite_server.analyzer.benchmark import RequestStreamError
+        from lite_server.benchmark.ws_target import ws_stream_target
+        from lite_server.benchmark.benchmark import RequestStreamError
 
         connect, modules, _, _ = self._fake_ws_env([
             b"f1",
@@ -1396,7 +1396,7 @@ class TestWsTarget:
 
     @pytest.mark.asyncio
     async def test_non_json_text_frame_tolerated(self, monkeypatch):
-        from lite_server.analyzer.ws_target import ws_stream_target
+        from lite_server.benchmark.ws_target import ws_stream_target
 
         connect, modules, _, _ = self._fake_ws_env([
             "garbage text frame",
@@ -1415,7 +1415,7 @@ class TestWsTarget:
 
     @pytest.mark.asyncio
     async def test_clean_close_without_done_tolerated(self, monkeypatch):
-        from lite_server.analyzer.ws_target import ws_stream_target
+        from lite_server.benchmark.ws_target import ws_stream_target
 
         connect, modules, _, _ = self._fake_ws_env([b"f1"])  # then ClosedOK
         self._patch(monkeypatch, modules)
@@ -1428,8 +1428,8 @@ class TestWsTarget:
 
     @pytest.mark.asyncio
     async def test_abnormal_close_raises_stream_error(self, monkeypatch):
-        from lite_server.analyzer.ws_target import ws_stream_target
-        from lite_server.analyzer.benchmark import RequestStreamError
+        from lite_server.benchmark.ws_target import ws_stream_target
+        from lite_server.benchmark.benchmark import RequestStreamError
 
         connect, modules, _, _ = self._fake_ws_env(
             [b"f1"], recv_error=_FakeConnectionClosedError("1006"),
@@ -1446,8 +1446,8 @@ class TestWsTarget:
     @pytest.mark.asyncio
     async def test_recv_timeout_maps_to_timeout_error(self, monkeypatch):
         import asyncio
-        from lite_server.analyzer.ws_target import ws_stream_target
-        from lite_server.analyzer.benchmark import RequestTimeoutError
+        from lite_server.benchmark.ws_target import ws_stream_target
+        from lite_server.benchmark.benchmark import RequestTimeoutError
 
         connect, modules, ws, _ = self._fake_ws_env([])
 
@@ -1464,8 +1464,8 @@ class TestWsTarget:
 
     @pytest.mark.asyncio
     async def test_connect_oserror_maps_to_connect_error(self, monkeypatch):
-        from lite_server.analyzer.ws_target import ws_stream_target
-        from lite_server.analyzer.benchmark import RequestConnectError
+        from lite_server.benchmark.ws_target import ws_stream_target
+        from lite_server.benchmark.benchmark import RequestConnectError
 
         connect, modules, _, _ = self._fake_ws_env(
             [], connect_error=OSError("connection refused"),
@@ -1480,8 +1480,8 @@ class TestWsTarget:
     @pytest.mark.asyncio
     async def test_handshake_with_status_maps_to_status_error(self, monkeypatch):
         """WS upgrade rejected with HTTP status → status bucket (parity w/ SSE)."""
-        from lite_server.analyzer.ws_target import ws_stream_target
-        from lite_server.analyzer.benchmark import RequestStatusError
+        from lite_server.benchmark.ws_target import ws_stream_target
+        from lite_server.benchmark.benchmark import RequestStatusError
 
         class FakeInvalidStatus(_FakeInvalidHandshake):
             def __init__(self, status_code):
@@ -1501,8 +1501,8 @@ class TestWsTarget:
 
     @pytest.mark.asyncio
     async def test_handshake_without_status_maps_to_connect_error(self, monkeypatch):
-        from lite_server.analyzer.ws_target import ws_stream_target
-        from lite_server.analyzer.benchmark import RequestConnectError
+        from lite_server.benchmark.ws_target import ws_stream_target
+        from lite_server.benchmark.benchmark import RequestConnectError
 
         connect, modules, _, _ = self._fake_ws_env(
             [], connect_error=_FakeInvalidHandshake("bad upgrade"),
@@ -2151,8 +2151,8 @@ class TestScenarioWrappers:
 
     @pytest.mark.asyncio
     async def test_cancel_after_yields_n_then_raises(self):
-        from lite_server.analyzer.scenario import with_cancel_after
-        from lite_server.analyzer.benchmark import RequestCanceledError
+        from lite_server.benchmark.scenario import with_cancel_after
+        from lite_server.benchmark.benchmark import RequestCanceledError
 
         target = with_cancel_after(
             self._target_factory([StreamChunk(data="a"), StreamChunk(data="b"),
@@ -2167,7 +2167,7 @@ class TestScenarioWrappers:
 
     @pytest.mark.asyncio
     async def test_cancel_after_ge_total_completes_normally(self):
-        from lite_server.analyzer.scenario import with_cancel_after
+        from lite_server.benchmark.scenario import with_cancel_after
 
         target = with_cancel_after(
             self._target_factory([StreamChunk(data="a")]), 5,
@@ -2178,8 +2178,8 @@ class TestScenarioWrappers:
     @pytest.mark.asyncio
     async def test_cancel_closes_inner_generator(self):
         """aclose on the inner target → connection teardown (server cancel)."""
-        from lite_server.analyzer.scenario import with_cancel_after
-        from lite_server.analyzer.benchmark import RequestCanceledError
+        from lite_server.benchmark.scenario import with_cancel_after
+        from lite_server.benchmark.benchmark import RequestCanceledError
 
         closed = []
         target = with_cancel_after(
@@ -2194,7 +2194,7 @@ class TestScenarioWrappers:
     @pytest.mark.asyncio
     async def test_read_delay_inflates_inter_chunk_gaps(self):
         import time
-        from lite_server.analyzer.scenario import with_read_delay
+        from lite_server.benchmark.scenario import with_read_delay
 
         target = with_read_delay(
             self._target_factory([StreamChunk(data="a"), StreamChunk(data="b"),
@@ -2262,36 +2262,36 @@ class TestGoodputSLO:
     """parse_goodput + compute_goodput: per-request SLO attainment."""
 
     def test_parse_valid_expression(self):
-        from lite_server.analyzer.stream_metrics import parse_goodput
+        from lite_server.benchmark.stream_metrics import parse_goodput
 
         slo = parse_goodput("ttft:500 tpot:50 e2el:2000")
         assert slo == {"ttft": 500.0, "tpot": 50.0, "e2el": 2000.0}
 
     def test_parse_single_key(self):
-        from lite_server.analyzer.stream_metrics import parse_goodput
+        from lite_server.benchmark.stream_metrics import parse_goodput
 
         assert parse_goodput("ttft:250") == {"ttft": 250.0}
 
     def test_parse_unknown_key_raises(self):
-        from lite_server.analyzer.stream_metrics import parse_goodput
+        from lite_server.benchmark.stream_metrics import parse_goodput
 
         with pytest.raises(ValueError, match="bogus"):
             parse_goodput("bogus:100")
 
     def test_parse_missing_colon_raises(self):
-        from lite_server.analyzer.stream_metrics import parse_goodput
+        from lite_server.benchmark.stream_metrics import parse_goodput
 
         with pytest.raises(ValueError):
             parse_goodput("ttft500")
 
     def test_parse_bad_float_raises(self):
-        from lite_server.analyzer.stream_metrics import parse_goodput
+        from lite_server.benchmark.stream_metrics import parse_goodput
 
         with pytest.raises(ValueError):
             parse_goodput("ttft:abc")
 
     def test_parse_empty_raises(self):
-        from lite_server.analyzer.stream_metrics import parse_goodput
+        from lite_server.benchmark.stream_metrics import parse_goodput
 
         with pytest.raises(ValueError):
             parse_goodput("")
@@ -2303,7 +2303,7 @@ class TestGoodputSLO:
         )
 
     def test_all_attain(self):
-        from lite_server.analyzer.stream_metrics import compute_goodput
+        from lite_server.benchmark.stream_metrics import compute_goodput
 
         # total=500 → tpot = (500-100)/9 ≈ 44.4 ≤ 50; ttft 100 ≤ 500; e2e ok
         records = [self._record(total=500.0) for _ in range(4)]
@@ -2318,7 +2318,7 @@ class TestGoodputSLO:
         assert g["attainment_target"] == 0.95
 
     def test_partial_attainment(self):
-        from lite_server.analyzer.stream_metrics import compute_goodput
+        from lite_server.benchmark.stream_metrics import compute_goodput
 
         records = [
             self._record(), self._record(), self._record(),
@@ -2333,7 +2333,7 @@ class TestGoodputSLO:
 
     def test_missing_metric_is_violation(self):
         """Zero-chunk / missing ttft records do not attain."""
-        from lite_server.analyzer.stream_metrics import compute_goodput
+        from lite_server.benchmark.stream_metrics import compute_goodput
 
         records = [StreamRequestRecord(chunk_count=0)]  # ttft/total None
         g = compute_goodput(
@@ -2343,7 +2343,7 @@ class TestGoodputSLO:
         assert g["attainment"] == 0.0
 
     def test_tpot_evaluated_per_request(self):
-        from lite_server.analyzer.stream_metrics import compute_goodput
+        from lite_server.benchmark.stream_metrics import compute_goodput
 
         # (1000-100)/(10-1) = 100ms tpot > 50 → violation
         g = compute_goodput(
@@ -2359,7 +2359,7 @@ class TestGoodputSLO:
         assert g2["attainment"] == 1.0
 
     def test_empty_records_zero_attainment(self):
-        from lite_server.analyzer.stream_metrics import compute_goodput
+        from lite_server.benchmark.stream_metrics import compute_goodput
 
         g = compute_goodput(
             [], {"ttft": 500.0}, model_type="llm",
@@ -2479,27 +2479,27 @@ class TestTokenizerCounter:
         return FakeTokenizer()
 
     def test_counts_text_field(self):
-        from lite_server.analyzer.token_counter import TokenizerCounter
+        from lite_server.benchmark.token_counter import TokenizerCounter
 
         counter = TokenizerCounter(self._fake_tokenizer())
         n = counter(StreamChunk(data="x", meta={"text": "hello world foo"}))
         assert n == 3
 
     def test_default_field_falls_back_to_token_key(self):
-        from lite_server.analyzer.token_counter import TokenizerCounter
+        from lite_server.benchmark.token_counter import TokenizerCounter
 
         counter = TokenizerCounter(self._fake_tokenizer())
         assert counter(StreamChunk(data="x", meta={"token": "a b"})) == 2
 
     def test_explicit_text_field(self):
-        from lite_server.analyzer.token_counter import TokenizerCounter
+        from lite_server.benchmark.token_counter import TokenizerCounter
 
         counter = TokenizerCounter(self._fake_tokenizer(), text_field="delta")
         assert counter(StreamChunk(data="x", meta={"delta": "a b c d"})) == 4
 
     def test_server_token_count_wins(self):
         """Chunk meta already carrying token_count → None (no double count)."""
-        from lite_server.analyzer.token_counter import TokenizerCounter
+        from lite_server.benchmark.token_counter import TokenizerCounter
 
         counter = TokenizerCounter(self._fake_tokenizer())
         assert counter(StreamChunk(
@@ -2507,7 +2507,7 @@ class TestTokenizerCounter:
         )) is None
 
     def test_missing_field_counts_zero_and_tracks(self):
-        from lite_server.analyzer.token_counter import TokenizerCounter
+        from lite_server.benchmark.token_counter import TokenizerCounter
 
         counter = TokenizerCounter(self._fake_tokenizer())
         assert counter(StreamChunk(data="x", meta={"other": 1})) == 0

@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from lite_server.analyzer.benchmark import StreamMetrics, StreamRequestRecord
+from lite_server.benchmark.benchmark import StreamMetrics, StreamRequestRecord
 
 MODEL_TYPES = ("llm", "tts", "stt", "generic")
 

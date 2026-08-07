@@ -15,15 +15,15 @@ from __future__ import annotations
 
 from typing import Awaitable, Callable
 
-from lite_server.analyzer.bidi_session import (
+from lite_server.benchmark.bidi_session import (
     Data,
     Done,
     Error,
     Pacing,
     run_bidi_session,
 )
-from lite_server.analyzer.benchmark import BidiSessionRecord
-from lite_server.analyzer.grpc_target import _map_rpc_error
+from lite_server.benchmark.benchmark import BidiSessionRecord
+from lite_server.benchmark.grpc_target import _map_rpc_error
 from lite_server.proto import liteserver_pb2
 
 

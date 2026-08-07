@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass
 from typing import Union
 
-from lite_server.analyzer.benchmark import (
+from lite_server.benchmark.benchmark import (
     BidiSessionRecord,
     RequestError,
     RequestStreamError,

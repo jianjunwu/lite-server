@@ -422,7 +422,15 @@ dependencies = [
 
 [package.optional-dependencies]
 benchmark = [
+    { name = "grpcio" },
+    { name = "h2" },
+    { name = "httpx" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "tokenizers" },
+    { name = "websockets", version = "16.1.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "websockets", version = "17.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
 dev = [
     { name = "grpcio" },
@@ -445,10 +453,14 @@ validation = [
 
 [package.metadata]
 requires-dist = [
+    { name = "grpcio", marker = "extra == 'benchmark'", specifier = ">=1.62" },
     { name = "grpcio", marker = "extra == 'dev'", specifier = ">=1.62" },
+    { name = "h2", marker = "extra == 'benchmark'", specifier = ">=4.1" },
     { name = "h2", marker = "extra == 'dev'", specifier = ">=4.1" },
+    { name = "httpx", marker = "extra == 'benchmark'", specifier = ">=0.28.1" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.28.1" },
     { name = "jsonschema", marker = "extra == 'validation'", specifier = ">=4" },
+    { name = "numpy", marker = "extra == 'benchmark'", specifier = ">=1.24" },
     { name = "numpy", marker = "extra == 'dev'", specifier = ">=1.24" },
     { name = "orjson", specifier = ">=3.9,<4" },
     { name = "protobuf", specifier = ">=5.0" },
@@ -460,6 +472,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "pyzmq", specifier = ">=25.0" },
     { name = "tokenizers", marker = "extra == 'benchmark'", specifier = ">=0.20" },
+    { name = "websockets", marker = "extra == 'benchmark'", specifier = ">=13" },
     { name = "websockets", marker = "extra == 'dev'", specifier = ">=13" },
 ]
 provides-extras = ["dev", "benchmark", "validation"]

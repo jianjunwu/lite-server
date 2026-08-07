@@ -507,7 +507,7 @@ class BenchmarkEngine:
         After ``run()`` returns, ``compute_stream_metrics`` is called to
         produce model-specific metrics and attached to ``result.stream_metrics``.
         """
-        from lite_server.analyzer.stream_metrics import MODEL_TYPES, compute_stream_metrics
+        from lite_server.benchmark.stream_metrics import MODEL_TYPES, compute_stream_metrics
 
         if model_type not in MODEL_TYPES:
             raise ValueError(
@@ -608,7 +608,7 @@ class BenchmarkEngine:
         result.stream_metrics = sm
 
         if goodput_slo is not None:
-            from lite_server.analyzer.stream_metrics import compute_goodput
+            from lite_server.benchmark.stream_metrics import compute_goodput
 
             sm.goodput = compute_goodput(
                 records, goodput_slo, model_type=model_type,
@@ -654,7 +654,7 @@ class BenchmarkEngine:
         ``run()``'s error buckets.  ``min_sessions`` replaces the default
         300-based sample warning threshold (§4.5).
         """
-        from lite_server.analyzer.bidi_metrics import compute_bidi_metrics
+        from lite_server.benchmark.bidi_metrics import compute_bidi_metrics
 
         payload_factory = payload if callable(payload) else (lambda: payload)
 
