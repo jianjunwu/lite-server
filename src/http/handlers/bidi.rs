@@ -61,6 +61,40 @@ async fn h2_bidi_entry(
     cx: RequestContext,
     request: axum::extract::Request,
 ) -> Result<Response, AppError> {
+    // S1(b)/D7:open 前的早期拒绝也计一次请求(对齐 gRPC wrapper 双点语义)。
+    // label:resolve 成功后用 resolved_version,失败用请求原值(可为空串)。
+    let start = std::time::Instant::now();
+    let mut label_version = version.clone().unwrap_or_default();
+    let result = h2_bidi_entry_impl(
+        state,
+        model_name,
+        version,
+        headers,
+        cx,
+        request,
+        &mut label_version,
+    )
+    .await;
+    if let Err(e) = &result {
+        prometheus::record_stream_rejected(
+            model_name,
+            &label_version,
+            super::status_family(e.http_status().as_u16() as i32),
+            start.elapsed().as_secs_f64(),
+        );
+    }
+    result
+}
+
+async fn h2_bidi_entry_impl(
+    state: Arc<AppState>,
+    model_name: &str,
+    version: Option<String>,
+    headers: HeaderMap,
+    cx: RequestContext,
+    request: axum::extract::Request,
+    label_version: &mut String,
+) -> Result<Response, AppError> {
     // 1. h2 version gate: h1 → 426 Upgrade Required.
     if request.version() != axum::http::Version::HTTP_2 {
         return Response::builder()
@@ -89,6 +123,7 @@ async fn h2_bidi_entry(
         crate::validation::validate_version(v)?;
     }
     let resolved_version = resolve_version(&state, model_name, version, &headers).await?;
+    *label_version = resolved_version.clone();
     if !state.registry.is_ready(model_name, Some(&resolved_version)) {
         return Err(AppError::ModelNotReady(format!(
             "{} version {} is not ready",
@@ -260,6 +295,9 @@ async fn h2_bidi_entry(
             let open_time = std::time::Instant::now();
             let mut first_chunk = true;
             let mut last_chunk_time = open_time;
+            // S1/S2:收口枚举——各 break 点只置 reason,尾部 record_stream_terminal
+            // 统一消费(family/cancelled 单一来源)。
+            let reason;
 
             loop {
                 let chunk =
@@ -267,12 +305,23 @@ async fn h2_bidi_entry(
                         .await
                     {
                         Ok(Some(c)) => c,
-                        Ok(None) => break,
+                        Ok(None) => {
+                            reason = prometheus::StreamCloseReason::WorkerEof;
+                            break;
+                        }
                         Err(elapsed) => {
                             tracing::warn!(
                                 ?elapsed, stream_id = %stream_id_out,
                                 "h2 bidi stream closed: deadline/idle elapsed"
                             );
+                            reason = match elapsed {
+                                crate::streaming::RecvElapsed::Deadline => {
+                                    prometheus::StreamCloseReason::Deadline
+                                }
+                                crate::streaming::RecvElapsed::Idle => {
+                                    prometheus::StreamCloseReason::Idle
+                                }
+                            };
                             break;
                         }
                     };
@@ -309,10 +358,12 @@ async fn h2_bidi_entry(
                             })),
                         });
                         if tx.send(frame).await.is_err() {
+                            reason = prometheus::StreamCloseReason::Cancel;
                             break;
                         }
                     }
                     Some(pb::stream_response::Payload::Error(e)) => {
+                        reason = prometheus::StreamCloseReason::Error;
                         let frame = lpm::encode_frame(&pb::BidiChunk {
                             stream_id: stream_id_out.clone(),
                             payload: Some(pb::bidi_chunk::Payload::Error(pb::BidiError {
@@ -329,6 +380,7 @@ async fn h2_bidi_entry(
                         break;
                     }
                     Some(pb::stream_response::Payload::Done(done)) => {
+                        reason = prometheus::StreamCloseReason::Done;
                         prometheus::record_worker_metrics(
                             &metrics_model,
                             &metrics_version,
@@ -349,13 +401,16 @@ async fn h2_bidi_entry(
                     _ => {}
                 }
             }
-            if stream_metrics {
-                prometheus::record_stream_close(
-                    &metrics_model,
-                    &metrics_version,
-                    "http2",
-                );
-            }
+            // S1/S2 收口:无条件 record_request_end + 门控内 cancelled/close。
+            prometheus::record_stream_terminal(
+                &metrics_model,
+                &metrics_version,
+                "http2",
+                open_time,
+                reason.status_family(),
+                reason,
+                stream_metrics,
+            );
 
             // Targeted cancel.
             let cancel_req = streaming::build_stream_cancel(stream_id_out);
@@ -429,6 +484,9 @@ async fn open_worker_stream_bidi(
     if worker_id >= clients.len() {
         return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
     }
+
+    // S8:per-worker dispatch 计数(gRPC/SSE 同位:pick 成功后立即记)。
+    prometheus::record_worker_inference(model_name, resolved_version, worker_id, 1);
 
     let client = &clients[worker_id];
     let open_req = streaming::build_stream_open(
@@ -558,6 +616,16 @@ mod tests {
         {
             format!("tcp://127.0.0.1:{}", 37000 + std::process::id() % 1000)
         }
+    }
+
+    async fn wait_for<F: Fn() -> bool>(cond: F, label: &str) {
+        for _ in 0..60 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("condition never met within ~1.5s: {}", label);
     }
 
     fn make_state(cb: Arc<CallbackRunner>) -> Arc<AppState> {
@@ -691,6 +759,52 @@ mod tests {
             }
         });
         (handle, action_rx)
+    }
+
+    /// PAIR worker: Open → ONE chunk, then stall (no Done / close) — for the
+    /// client-disconnect (cancel) test: the forwarder reaches tx.send with the
+    /// downstream already dropped → send Err → break(cancel), without waiting
+    /// out the idle reclaim.
+    fn spawn_stall_chunk_worker(endpoint: String) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(5000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                    let _ = s.send(
+                        pb::Response { uid: req.uid, ..Default::default() }.encode_to_vec(),
+                        0,
+                    );
+                    continue;
+                };
+                if !matches!(
+                    st.action,
+                    Some(pb::stream_request::Action::Open(_))
+                ) {
+                    continue;
+                }
+                let chunk = pb::Response {
+                    payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                        stream_id: st.stream_id.clone(),
+                        payload: Some(pb::stream_response::Payload::Chunk(
+                            pb::StreamChunkResponse {
+                                data: Bytes::from_static(b"{}"),
+                                is_final: false,
+                            },
+                        )),
+                    })),
+                    ..Default::default()
+                };
+                let _ = s.send(chunk.encode_to_vec(), 0);
+                // STALL: send no Done / close.
+            }
+        })
     }
 
     /// PAIR worker: Open → Error frame, then nothing.
@@ -1237,5 +1351,139 @@ mod tests {
             matches!(err, AppError::InferenceTimeout(_)),
             "expected InferenceTimeout, got {err:?}"
         );
+    }
+
+    // ===== S1/S2/S8 (批次 1):h2 bidi 请求级计数 + 取消计数 + per-worker dispatch =====
+
+    /// S1:h2 bidi 正常完成(Done → Close 帧)→ REQUESTS_TOTAL{2xx} +1。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn h2_bidi_done_records_requests_total_2xx() {
+        let model = "bidi_req_done";
+        let endpoint = ipc_endpoint(model);
+        let _w = spawn_chunk_done_recording_worker(endpoint.clone());
+        let state = ready_state(model, endpoint).await;
+        state.registry.activate_version(model, "1").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let counter = prometheus::REQUESTS_TOTAL.with_label_values(&[model, "1", "2xx"]);
+        let before = counter.get();
+        let (body_tx, resp) = start_bidi_session(model, state).await;
+        tokio::spawn(async move {
+            let _ = axum::body::to_bytes(resp.into_body(), 1 << 20).await;
+            drop(body_tx);
+        });
+        wait_for(|| counter.get() >= before + 1.0, "bidi requests_total 2xx").await;
+        assert_eq!(counter.get(), before + 1.0, "h2 bidi done must record one 2xx");
+    }
+
+    /// S1:h2 bidi Error 帧 → REQUESTS_TOTAL{5xx} +1。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn h2_bidi_error_records_requests_total_5xx() {
+        let model = "bidi_req_err";
+        let endpoint = ipc_endpoint(model);
+        let _w = spawn_error_worker_bidi(endpoint.clone());
+        let state = ready_state(model, endpoint).await;
+        state.registry.activate_version(model, "1").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let counter = prometheus::REQUESTS_TOTAL.with_label_values(&[model, "1", "5xx"]);
+        let before = counter.get();
+        let (body_tx, resp) = start_bidi_session(model, state).await;
+        tokio::spawn(async move {
+            let _ = axum::body::to_bytes(resp.into_body(), 1 << 20).await;
+            drop(body_tx);
+        });
+        wait_for(|| counter.get() >= before + 1.0, "bidi requests_total 5xx").await;
+        assert_eq!(counter.get(), before + 1.0, "h2 bidi error must record one 5xx");
+    }
+
+    /// D7:h2 bidi 早期拒绝(首帧非 BidiOpen)→ REQUESTS_TOTAL{4xx} +1。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn h2_bidi_first_frame_not_open_records_4xx() {
+        let model = "bidi_early_4xx";
+        let endpoint = ipc_endpoint(model);
+        let _w = spawn_chunk_done_recording_worker(endpoint.clone());
+        let state = ready_state(model, endpoint).await;
+        state.registry.activate_version(model, "1").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let counter = prometheus::REQUESTS_TOTAL.with_label_values(&[model, "1", "4xx"]);
+        let before = counter.get();
+        // 首帧发 Data 而非 Open → InvalidRequestBody(400)。
+        let (body_tx, body_rx) =
+            tokio::sync::mpsc::channel::<Result<Bytes, axum::Error>>(8);
+        let body = Body::from_stream(ReceiverStream::new(body_rx));
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v2/models/{}/bidi", model))
+            .version(axum::http::Version::HTTP_2)
+            .header("content-type", BIDI_CONTENT_TYPE)
+            .body(body)
+            .unwrap();
+        body_tx
+            .send(Ok(lpm::encode_frame(&pb::BidiChunk {
+                stream_id: String::new(),
+                payload: Some(pb::bidi_chunk::Payload::Data(pb::BidiData {
+                    data: Bytes::from_static(b"oops"),
+                })),
+            })))
+            .await
+            .expect("send non-Open first frame");
+        let err = h2_bidi_handler(
+            State(state),
+            Path(model.to_string()),
+            HeaderMap::new(),
+            test_cx(),
+            req,
+        )
+        .await
+        .expect_err("first frame must be rejected");
+        assert!(matches!(err, AppError::InvalidRequestBody(_)));
+        assert_eq!(
+            counter.get(),
+            before + 1.0,
+            "D7: early rejection must record 4xx"
+        );
+    }
+
+    /// S2:客户端断开(响应 body 被 drop → tx.send Err)→ STREAM_CANCELLED_TOTAL +1。
+    /// worker 须先发一个 chunk,forwarder 到 tx.send 时下游已 drop 才会 Err;
+    /// 若 worker 不发任何帧,forwarder 阻塞在 recv_chunk(idle 300s),测试挂死。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn h2_bidi_disconnect_records_cancelled() {
+        let model = "bidi_req_cancel";
+        let endpoint = ipc_endpoint(model);
+        let _w = spawn_stall_chunk_worker(endpoint.clone());
+        let state = ready_state(model, endpoint).await;
+        state.registry.activate_version(model, "1").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let canc = prometheus::STREAM_CANCELLED_TOTAL.with_label_values(&[model, "1", "http2"]);
+        let before = canc.get();
+        let (body_tx, resp) = start_bidi_session(model, state).await;
+        // 立即丢弃响应 body 不 drain:outgoing 循环 tx.send Err → break(cancel)。
+        drop(body_tx);
+        drop(resp);
+        wait_for(|| canc.get() >= before + 1.0, "bidi cancelled").await;
+        assert_eq!(canc.get(), before + 1.0, "S2: h2 bidi disconnect must count");
+    }
+
+    /// S8:h2 bidi open 成功后 per-worker dispatch 计数 +1。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn h2_bidi_open_records_worker_inference() {
+        let model = "bidi_wi";
+        let endpoint = ipc_endpoint(model);
+        let _w = spawn_recording_worker(endpoint.clone());
+        let state = ready_state(model, endpoint).await;
+        state.registry.activate_version(model, "1").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let before = prometheus::worker_inference_count(model, "1", 0);
+        let (body_tx, resp) = start_bidi_session(model, state).await;
+        tokio::spawn(async move {
+            let _ = axum::body::to_bytes(resp.into_body(), 1 << 20).await;
+            drop(body_tx);
+        });
+        wait_for(|| prometheus::worker_inference_count(model, "1", 0) >= before + 1, "bidi worker inference").await;
     }
 }

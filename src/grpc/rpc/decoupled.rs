@@ -206,19 +206,33 @@ impl GrpcService {
             let mut last_chunk_time = open_time;
             // P2-1：流关闭时记一次整体 duration；中途 worker 错误按其状态族记。
             let mut stream_family = "2xx";
+            // S1/S2:收口枚举——各 break 点只置 reason,尾部 record_stream_terminal
+            // 统一消费(family/cancelled 单一来源;Error 帧 family 按 grpc code 覆盖)。
+            let reason;
 
             loop {
                 let chunk = match streaming::recv_chunk(&mut chunk_rx, stream_deadline, stream_idle)
                     .await
                 {
                     Ok(Some(c)) => c,
-                    Ok(None) => break, // actor dropped the route (Done/Error forwarded)
+                    Ok(None) => {
+                        reason = crate::metrics::prometheus::StreamCloseReason::WorkerEof;
+                        break; // actor dropped the route (Done/Error forwarded)
+                    }
                     Err(elapsed) => {
                         tracing::warn!(
                             ?elapsed, stream_id = %stream_id,
                             "decoupled stream closed: deadline/idle elapsed"
                         );
                         stream_family = "5xx";
+                        reason = match elapsed {
+                            streaming::RecvElapsed::Deadline => {
+                                crate::metrics::prometheus::StreamCloseReason::Deadline
+                            }
+                            streaming::RecvElapsed::Idle => {
+                                crate::metrics::prometheus::StreamCloseReason::Idle
+                            }
+                        };
                         break;
                     }
                 };
@@ -236,10 +250,12 @@ impl GrpcService {
                         }
                         let resp = pb::DecoupledResponse { data: c.data.clone(), is_final: false };
                         if tx.send(Ok(resp)).await.is_err() {
+                            reason = crate::metrics::prometheus::StreamCloseReason::Cancel;
                             break; // client disconnect
                         }
                     }
                     Some(pb::stream_response::Payload::Error(ref e)) => {
+                        reason = crate::metrics::prometheus::StreamCloseReason::Error;
                         let grpc_err = match serde_json::from_str::<serde_json::Value>(&e.message) {
                             Ok(val) => {
                                 if let Some(parsed) = try_parse_model_error(&val) {
@@ -259,6 +275,7 @@ impl GrpcService {
                         break;
                     }
                     Some(pb::stream_response::Payload::Done(done)) => {
+                        reason = crate::metrics::prometheus::StreamCloseReason::Done;
                         // Task A: record worker-reported metrics (HTTP parity).
                         crate::metrics::prometheus::record_worker_metrics(
                             &metrics_model,
@@ -277,14 +294,15 @@ impl GrpcService {
                     _ => {}
                 }
             }
-            if stream_metrics {
-                crate::metrics::prometheus::record_stream_close(&metrics_model, &metrics_version, "grpc");
-            }
-            crate::metrics::prometheus::record_request_end(
+            // S1/S2 收口:无条件 record_request_end + 门控内 cancelled/close。
+            crate::metrics::prometheus::record_stream_terminal(
                 &metrics_model,
                 &metrics_version,
+                "grpc",
+                start,
                 stream_family,
-                start.elapsed().as_secs_f64(),
+                reason,
+                stream_metrics,
             );
             // Cleanup: cancel the worker. send_raw = fire-and-forget: a
             // stream-cancel gets no unary reply, so this avoids the phantom

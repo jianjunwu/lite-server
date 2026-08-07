@@ -66,6 +66,10 @@ async fn open_worker_stream(
         return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
     }
 
+    // S8:per-worker dispatch 计数(gRPC 同位先例:pick 成功后立即记;pick/open
+    // 失败不记)。
+    prometheus::record_worker_inference(model_name, resolved_version, worker_id, 1);
+
     let client = &clients[worker_id];
     let stream_id = format!("stream-{}", Uuid::new_v4());
     let open_req = streaming::build_stream_open(stream_id.clone(), payload_bytes, Some(meta), decoupled);
@@ -141,11 +145,48 @@ async fn sse_infer_entry(
     cx: RequestContext,
     decoupled: bool,
 ) -> Result<Response, AppError> {
+    // S1(b)/D7:open 前的早期拒绝也计一次请求(对齐 gRPC wrapper 双点语义)。
+    // label:resolve 成功后用 resolved_version,失败用请求原值(可为空串)。
+    let start = std::time::Instant::now();
+    let mut label_version = version.clone().unwrap_or_default();
+    let result = sse_infer_entry_impl(
+        state,
+        model_name,
+        version,
+        headers,
+        body,
+        cx,
+        decoupled,
+        &mut label_version,
+    )
+    .await;
+    if let Err(e) = &result {
+        prometheus::record_stream_rejected(
+            model_name,
+            &label_version,
+            super::status_family(e.http_status().as_u16() as i32),
+            start.elapsed().as_secs_f64(),
+        );
+    }
+    result
+}
+
+async fn sse_infer_entry_impl(
+    state: &Arc<AppState>,
+    model_name: &str,
+    version: Option<String>,
+    headers: HeaderMap,
+    body: RequestBody,
+    cx: RequestContext,
+    decoupled: bool,
+    label_version: &mut String,
+) -> Result<Response, AppError> {
     crate::validation::validate_identifier(model_name)?;
     if let Some(ref v) = version {
         crate::validation::validate_version(v)?;
     }
     let resolved_version = resolve_version(state, model_name, version, &headers).await?;
+    *label_version = resolved_version.clone();
     if !state.registry.is_ready(model_name, Some(&resolved_version)) {
         return Err(AppError::ModelNotReady(format!(
             "{} version {} is not ready",
@@ -254,19 +295,33 @@ async fn sse_infer_impl(
         let open_time = std::time::Instant::now();
         let mut first_chunk = true;
         let mut last_chunk_time = open_time;
+        // S1/S2:收口枚举——各 break 点只置 reason,尾部 record_stream_terminal
+        // 统一消费(family/cancelled 单一来源,exactly-once 由单一收口保证)。
+        let reason;
 
         loop {
             let chunk = match streaming::recv_chunk(&mut chunk_rx, stream_deadline, stream_idle)
                 .await
             {
                 Ok(Some(c)) => c,
-                Ok(None) => break, // worker closed the stream
+                Ok(None) => {
+                    reason = prometheus::StreamCloseReason::WorkerEof;
+                    break; // worker closed the stream
+                }
                 Err(elapsed) => {
                     // P-DEADLINE (§4.0.4): overall deadline or chunk-idle fired.
                     tracing::warn!(
                         ?elapsed, stream_id = %stream_id,
                         "sse stream closed: deadline/idle elapsed"
                     );
+                    reason = match elapsed {
+                        crate::streaming::RecvElapsed::Deadline => {
+                            prometheus::StreamCloseReason::Deadline
+                        }
+                        crate::streaming::RecvElapsed::Idle => {
+                            prometheus::StreamCloseReason::Idle
+                        }
+                    };
                     break;
                 }
             };
@@ -306,6 +361,7 @@ async fn sse_infer_impl(
                 _ => continue,
             };
             if event_tx.send(Ok(event)).await.is_err() {
+                reason = prometheus::StreamCloseReason::Cancel;
                 break;
             }
             // Terminal frames end the stream. Error is terminal by contract
@@ -313,13 +369,28 @@ async fn sse_infer_impl(
             // InferenceResponse callback fires exactly once even if a worker
             // sends Error followed by Done (the chunk path normally terminates
             // on Error, but the forwarder must not rely on that side effect).
+            // reason 在此统一置位——is_stream_terminal 对编译器是不透明谓词,
+            // 分支内赋值无法被流分析跨 if 识别(无初值声明的构造保证)。
             if is_stream_terminal(&chunk) {
+                reason = match chunk.payload {
+                    Some(pb::stream_response::Payload::Done(_)) => {
+                        prometheus::StreamCloseReason::Done
+                    }
+                    _ => prometheus::StreamCloseReason::Error,
+                };
                 break;
             }
         }
-        if stream_metrics {
-            prometheus::record_stream_close(&model_name, &resolved_version, "sse");
-        }
+        // S1/S2 收口:无条件 record_request_end + 门控内 cancelled/close。
+        prometheus::record_stream_terminal(
+            &model_name,
+            &resolved_version,
+            "sse",
+            open_time,
+            reason.status_family(),
+            reason,
+            stream_metrics,
+        );
         // Ensure stream is cleaned up on worker side.
         // D4: decoupled → targeted cancel (parity with WS/gRPC);
         // coupled → broadcast (existing behavior, unchanged).
@@ -550,15 +621,34 @@ async fn handle_ws_stream(
     cx: RequestContext,
     decoupled: bool,
 ) {
+    // S1(b)/D7:握手后早退也计一次请求(WS 已升级 101 无 HTTP status,family
+    // 按原因归类);ws_start 同时供 writer panic 臂的收口时长使用。
+    let ws_start = std::time::Instant::now();
+    // resolve_version 按值消费 version——先提取请求原值 label 供失败分支使用。
+    let request_version_label = version.as_deref().unwrap_or("").to_string();
     let resolved_version = match resolve_version(&state, &model_name, version, &headers).await {
         Ok(v) => v,
         Err(_) => {
+            // model 解析失败 → 4xx;version 未解析用请求原值(可为空串)。
+            prometheus::record_stream_rejected(
+                &model_name,
+                &request_version_label,
+                "4xx",
+                ws_start.elapsed().as_secs_f64(),
+            );
             let _ = socket.close().await;
             return;
         }
     };
 
     if !state.registry.is_ready(&model_name, Some(&resolved_version)) {
+        // 未就绪 → 5xx。
+        prometheus::record_stream_rejected(
+            &model_name,
+            &resolved_version,
+            "5xx",
+            ws_start.elapsed().as_secs_f64(),
+        );
         let _ = socket.close().await;
         return;
     }
@@ -582,6 +672,13 @@ async fn handle_ws_stream(
             .await
             .is_err();
         if auth_failed || rl_failed {
+            // 鉴权/限流 → 4xx。
+            prometheus::record_stream_rejected(
+                &model_name,
+                &resolved_version,
+                "4xx",
+                ws_start.elapsed().as_secs_f64(),
+            );
             let reason = if auth_failed {
                 "unauthorized"
             } else {
@@ -607,6 +704,13 @@ async fn handle_ws_stream(
             Some(budget) => match tokio::time::timeout(budget, socket.recv()).await {
                 Ok(r) => r,
                 Err(_) => {
+                    // 首帧超时 → 4xx。
+                    prometheus::record_stream_rejected(
+                        &model_name,
+                        &resolved_version,
+                        "4xx",
+                        ws_start.elapsed().as_secs_f64(),
+                    );
                     let _ = socket.close().await;
                     return;
                 }
@@ -617,6 +721,13 @@ async fn handle_ws_stream(
             Some(Ok(Message::Text(text))) => FirstFrame::Json(text),
             Some(Ok(Message::Binary(bin))) => FirstFrame::Raw(bytes::Bytes::from(bin)),
             _ => {
+                // 首帧非法(Close/Err 帧)→ 4xx。
+                prometheus::record_stream_rejected(
+                    &model_name,
+                    &resolved_version,
+                    "4xx",
+                    ws_start.elapsed().as_secs_f64(),
+                );
                 let _ = socket.close().await;
                 return;
             }
@@ -628,6 +739,13 @@ async fn handle_ws_stream(
     match &first_frame {
         FirstFrame::Json(text) => {
             if serde_json::from_slice::<&serde_json::value::RawValue>(text.as_bytes()).is_err() {
+                // 非法 JSON → 4xx。
+                prometheus::record_stream_rejected(
+                    &model_name,
+                    &resolved_version,
+                    "4xx",
+                    ws_start.elapsed().as_secs_f64(),
+                );
                 let _ = socket.send(Message::Text(json!({"error": "invalid JSON"}).to_string())).await;
                 let _ = socket.close().await;
                 return;
@@ -685,6 +803,13 @@ async fn handle_ws_stream(
     let (stream_id, worker_client, mut chunk_rx) = match open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes, decoupled).await {
         Ok(r) => r,
         Err(e) => {
+            // open 失败 → 5xx。
+            prometheus::record_stream_rejected(
+                &model_name,
+                &resolved_version,
+                "5xx",
+                ws_start.elapsed().as_secs_f64(),
+            );
             let _ = socket.send(Message::Text(json!({"error": e.to_string()}).to_string())).await;
             let _ = socket.close().await;
             return;
@@ -780,22 +905,39 @@ async fn handle_ws_stream(
     let stream_id_for_writer = stream_id.clone();
     let cancel_client = Arc::clone(&worker_client);
 
+    // S1(b)/S2:ws_start 同时供 writer 收口与 panic 臂使用(Ok/Err 互斥,
+    // exactly-once 由两条路径各收口一次保证)。writer 闭包(move)会带走
+    // model_name/resolved_version 的所有权——panic 臂需自己的副本。
+    let stream_open_time = std::time::Instant::now();
+    let panic_metrics_model = model_name.clone();
+    let panic_metrics_version = resolved_version.clone();
+
     // Writer task: S→C. Forwards worker chunks to the WebSocket, with early
     // termination via gone_rx when the client disconnects. Closes ws_sink on
     // exit so the main task doesn't need to hold a reference.
     let send_task = tokio::spawn(async move {
-        let open_time = std::time::Instant::now();
+        let open_time = stream_open_time;
         let mut first_chunk = true;
         let mut last_chunk_time = open_time;
+        // S1/S2:收口枚举——各 break 点只置 reason,尾部 record_stream_terminal
+        // 统一消费(family/cancelled 单一来源)。
+        let reason;
 
         loop {
             let chunk = tokio::select! {
                 c = streaming::recv_chunk(&mut chunk_rx, stream_deadline, stream_idle) => c,
                 _ = gone_rx.changed() => {
                     // Reader signalled: send error (if any) to client, then break.
+                    // gone=Some(msg) → protocol 违规;gone=Some("")/None → 客户端
+                    // 断开(cancel)。
                     let err_msg = match &*gone_rx.borrow() {
                         Some(msg) if !msg.is_empty() => Some(msg.clone()),
                         _ => None,
+                    };
+                    reason = if err_msg.is_some() {
+                        prometheus::StreamCloseReason::Protocol
+                    } else {
+                        prometheus::StreamCloseReason::Cancel
                     };
                     drop(gone_rx.borrow());
                     if let Some(msg) = err_msg {
@@ -808,13 +950,24 @@ async fn handle_ws_stream(
             };
             let chunk = match chunk {
                 Ok(Some(c)) => c,
-                Ok(None) => break, // worker closed the stream
+                Ok(None) => {
+                    reason = prometheus::StreamCloseReason::WorkerEof;
+                    break; // worker closed the stream
+                }
                 Err(elapsed) => {
                     // P-DEADLINE (§4.0.4): overall deadline or chunk-idle fired.
                     tracing::warn!(
                         ?elapsed, stream_id = %stream_id_for_writer,
                         "websocket stream closed: deadline/idle elapsed"
                     );
+                    reason = match elapsed {
+                        crate::streaming::RecvElapsed::Deadline => {
+                            prometheus::StreamCloseReason::Deadline
+                        }
+                        crate::streaming::RecvElapsed::Idle => {
+                            prometheus::StreamCloseReason::Idle
+                        }
+                    };
                     break;
                 }
             };
@@ -853,15 +1006,30 @@ async fn handle_ws_stream(
                 _ => continue,
             };
             if ws_sink.send(msg).await.is_err() {
+                reason = prometheus::StreamCloseReason::Cancel;
                 break;
             }
+            // reason 统一在 terminal break 处置位(同 SSE 注释,无初值声明的构造保证)。
             if is_stream_terminal(&chunk) {
+                reason = match chunk.payload {
+                    Some(pb::stream_response::Payload::Done(_)) => {
+                        prometheus::StreamCloseReason::Done
+                    }
+                    _ => prometheus::StreamCloseReason::Error,
+                };
                 break;
             }
         }
-        if stream_metrics {
-            prometheus::record_stream_close(&model_name, &resolved_version, "websocket");
-        }
+        // S1/S2 收口:无条件 record_request_end + 门控内 cancelled/close。
+        prometheus::record_stream_terminal(
+            &model_name,
+            &resolved_version,
+            "websocket",
+            open_time,
+            reason.status_family(),
+            reason,
+            stream_metrics,
+        );
         // Close the sink gracefully (moved here so main doesn't need ws_sink).
         let _ = ws_sink.close().await;
         // drop(gone_rx) is implicit when the closure exits
@@ -873,7 +1041,17 @@ async fn handle_ws_stream(
     let completed_stream_id = match send_task.await {
         Ok(sid) => sid,
         Err(_) => {
-            // Writer panicked — still clean up the reader and worker.
+            // Writer panicked — still clean up the reader and worker. S1/S2:
+            // panic 由外层补记(Ok/Err 互斥,exactly-once 保持)。
+            prometheus::record_stream_terminal(
+                &panic_metrics_model,
+                &panic_metrics_version,
+                "websocket",
+                stream_open_time,
+                prometheus::StreamCloseReason::Panic.status_family(),
+                prometheus::StreamCloseReason::Panic,
+                stream_metrics,
+            );
             drop(gone_tx);
             let cancel_req = streaming::build_stream_cancel(stream_id);
             let _ = worker_client.send_raw(cancel_req).await;
@@ -1673,12 +1851,18 @@ mod tests {
 
     // ===== WS bidi (§5.5): loopback WS server + PAIR recording worker =======
 
-    /// Loopback axum server exposing only the WS stream route.
+    /// Loopback axum server exposing the WS stream routes (incl. versioned —
+    /// used by the not-ready early-rejection test which needs an explicit
+    /// version to pass the resolve step).
     async fn spawn_ws_server(state: Arc<AppState>) -> String {
         let app = axum::Router::new()
             .route(
                 "/v2/models/:model_name/stream",
                 axum::routing::get(ws_stream_handler),
+            )
+            .route(
+                "/v2/models/:model_name/:version/stream",
+                axum::routing::get(ws_stream_version_handler),
             )
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2816,6 +3000,329 @@ mod tests {
             FirstFrame::Raw(bytes::Bytes::from_static(b"\x00")).body_kind(),
             "raw"
         );
+    }
+
+    // ===== S1/S2/S8 (批次 1):HTTP 流式请求级计数 + 取消计数 + per-worker dispatch =====
+
+    /// S1:SSE 正常完成(Done)→ REQUESTS_TOTAL{2xx} +1。
+    #[tokio::test]
+    async fn sse_done_records_requests_total_2xx() {
+        let model = "sse_req_done";
+        let endpoint = ipc_endpoint(model);
+        let _w = spawn_done_worker(endpoint.clone());
+        let state = ready_state(model, endpoint, Arc::new(CallbackRunner::new())).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let counter = prometheus::REQUESTS_TOTAL.with_label_values(&[model, "1", "2xx"]);
+        let before = counter.get();
+        let sse = sse_infer_impl(
+            state,
+            model.to_string(),
+            "1".to_string(),
+            HeaderMap::new(),
+            json_body(json!({})),
+            test_cx(),
+            false,
+        )
+        .await
+        .expect("sse must open");
+        wait_for(|| counter.get() >= before + 1.0, "requests_total 2xx").await;
+        drop(sse);
+        assert_eq!(
+            counter.get(),
+            before + 1.0,
+            "SSE done must record exactly one 2xx request"
+        );
+    }
+
+    /// S1:SSE Error 帧 → REQUESTS_TOTAL{5xx} +1。
+    #[tokio::test]
+    async fn sse_error_frame_records_requests_total_5xx() {
+        let model = "sse_req_err";
+        let endpoint = ipc_endpoint(model);
+        let _w = spawn_error_worker(endpoint.clone());
+        let state = ready_state(model, endpoint, Arc::new(CallbackRunner::new())).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let counter = prometheus::REQUESTS_TOTAL.with_label_values(&[model, "1", "5xx"]);
+        let before = counter.get();
+        let sse = sse_infer_impl(
+            state,
+            model.to_string(),
+            "1".to_string(),
+            HeaderMap::new(),
+            json_body(json!({})),
+            test_cx(),
+            false,
+        )
+        .await
+        .expect("sse must open");
+        wait_for(|| counter.get() >= before + 1.0, "requests_total 5xx").await;
+        drop(sse);
+        assert_eq!(
+            counter.get(),
+            before + 1.0,
+            "SSE Error frame must record exactly one 5xx request"
+        );
+    }
+
+    /// S2/D1:客户端断开(event_rx 关闭 → event_tx.send Err)→ STREAM_CANCELLED_TOTAL +1,
+    /// REQUESTS_TOTAL 仍 2xx(服务器确实处理了,由独立 cancel counter 区分)。
+    #[tokio::test]
+    async fn sse_client_disconnect_records_cancelled_2xx() {
+        let model = "sse_req_cancel";
+        let endpoint = ipc_endpoint(model);
+        let _w = spawn_stall_worker(endpoint.clone());
+        let state = ready_state(model, endpoint, Arc::new(CallbackRunner::new())).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let req = prometheus::REQUESTS_TOTAL.with_label_values(&[model, "1", "2xx"]);
+        let canc = prometheus::STREAM_CANCELLED_TOTAL.with_label_values(&[model, "1", "sse"]);
+        let req_before = req.get();
+        let canc_before = canc.get();
+
+        let sse = sse_infer_impl(
+            state,
+            model.to_string(),
+            "1".to_string(),
+            HeaderMap::new(),
+            json_body(json!({})),
+            test_cx(),
+            false,
+        )
+        .await
+        .expect("sse must open");
+        // 立即 drop:forwarder 从 stall worker 收到 chunk 后 event_tx.send 失败。
+        drop(sse);
+        wait_for(|| canc.get() >= canc_before + 1.0, "cancelled").await;
+        assert_eq!(
+            req.get(),
+            req_before + 1.0,
+            "D1: disconnect keeps 2xx family + separate cancel counter"
+        );
+    }
+
+    /// D7:SSE 早期拒绝(显式版本已解析但未就绪)→ REQUESTS_TOTAL{5xx} +1
+    /// (handler 层)。无版本请求对未 ready 模型在 resolve 阶段即 404(无 active
+    /// version)——5xx 语义对应"已解析未就绪",故走 version handler。
+    #[tokio::test]
+    async fn sse_rejects_not_ready_records_5xx() {
+        let model = "sse_early_5xx";
+        let state = make_state(Arc::new(CallbackRunner::new()));
+        state
+            .registry
+            .register(model, "1", ModelConfig::default(), ModelType::LitAPI, std::path::PathBuf::new())
+            .unwrap();
+        // 未 mark_ready
+        let counter = prometheus::REQUESTS_TOTAL.with_label_values(&[model, "1", "5xx"]);
+        let before = counter.get();
+        let resp = sse_infer_version_handler(
+            State(state),
+            Path((model.to_string(), "1".to_string())),
+            HeaderMap::new(),
+            test_cx(),
+            ApiBody(json_body(json!({}))),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            counter.get(),
+            before + 1.0,
+            "D7: early rejection must record 5xx"
+        );
+    }
+
+    /// D7:模型不存在 + 无版本(resolve_version 失败)→ 4xx,version label 用
+    /// 请求原值(无版本 → 空串)。
+    #[tokio::test]
+    async fn sse_rejects_missing_model_records_4xx() {
+        let model = "sse_early_4xx";
+        let state = make_state(Arc::new(CallbackRunner::new()));
+        let counter = prometheus::REQUESTS_TOTAL.with_label_values(&[model, "", "4xx"]);
+        let before = counter.get();
+        let resp = sse_infer_handler(
+            State(state.clone()),
+            Path(model.to_string()),
+            HeaderMap::new(),
+            test_cx(),
+            ApiBody(json_body(json!({}))),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            counter.get(),
+            before + 1.0,
+            "unresolved-version rejection must record 4xx with the request version label"
+        );
+    }
+
+    /// D7:鉴权失败 → 4xx(handler 层)。
+    #[tokio::test]
+    async fn sse_rejects_unauthorized_records_4xx() {
+        let model = "sse_early_auth";
+        let state = make_state(Arc::new(CallbackRunner::new()));
+        state
+            .registry
+            .register(model, "1", ModelConfig::default(), ModelType::LitAPI, std::path::PathBuf::new())
+            .unwrap();
+        // register 不携带 policies(独立字段)——用 set_policies 配置 auth。
+        state.registry.set_policies(
+            model,
+            "1",
+            Some(crate::config::ModelPolicies {
+                auth: Some(crate::config::AuthPolicy {
+                    header: "x-api-key".to_string(),
+                    keys: vec!["sk-a".to_string()],
+                }),
+                ..Default::default()
+            }),
+        );
+        state.registry.mark_ready(model, "1").unwrap();
+        state.registry.activate_version(model, "1").unwrap();
+        let counter = prometheus::REQUESTS_TOTAL.with_label_values(&[model, "1", "4xx"]);
+        let before = counter.get();
+        // 无 x-api-key 头 → Unauthorized。
+        let resp = sse_infer_handler(
+            State(state.clone()),
+            Path(model.to_string()),
+            HeaderMap::new(),
+            test_cx(),
+            ApiBody(json_body(json!({}))),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(counter.get(), before + 1.0, "auth rejection must record 4xx");
+    }
+
+    /// S8:SSE open 成功后 per-worker dispatch 计数 +1。
+    #[tokio::test]
+    async fn sse_open_records_worker_inference() {
+        let model = "sse_wi";
+        let endpoint = ipc_endpoint(model);
+        let _w = spawn_done_worker(endpoint.clone());
+        let state = ready_state(model, endpoint, Arc::new(CallbackRunner::new())).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let before = prometheus::worker_inference_count(model, "1", 0);
+        let sse = sse_infer_impl(
+            state,
+            model.to_string(),
+            "1".to_string(),
+            HeaderMap::new(),
+            json_body(json!({})),
+            test_cx(),
+            false,
+        )
+        .await
+        .expect("sse must open");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(sse);
+        assert_eq!(
+            prometheus::worker_inference_count(model, "1", 0),
+            before + 1,
+            "S8: pick-success must record per-worker dispatch (gRPC parity)"
+        );
+    }
+
+    // ===== S1/S2 (批次 1):WS 请求级计数 =====
+
+    /// S1:WS 正常完成 → REQUESTS_TOTAL{2xx} +1。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ws_done_records_requests_total_2xx() {
+        let model = "ws_req_done";
+        let endpoint = ipc_endpoint(model);
+        let (_w, _actions) = spawn_recording_worker(endpoint.clone());
+        let state = ready_state(model, endpoint, Arc::new(CallbackRunner::new())).await;
+        state.registry.activate_version(model, "1").unwrap();
+        let base = spawn_ws_server(state).await;
+
+        let counter = prometheus::REQUESTS_TOTAL.with_label_values(&[model, "1", "2xx"]);
+        let before = counter.get();
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{}/{}/stream", base, model))
+            .await
+            .expect("WS connect failed");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(r#"{"input": 1}"#.to_string()))
+            .await
+            .unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(r#"{"type":"close"}"#.to_string()))
+            .await
+            .unwrap();
+        // 等 writer 处理 close → worker 回 Done → 收口记录 2xx。
+        wait_for(|| counter.get() >= before + 1.0, "ws requests_total 2xx").await;
+        let _ = ws.close(None).await;
+    }
+
+    /// S1/D7:WS 未知控制帧(协议违规)→ REQUESTS_TOTAL{4xx} +1。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ws_unknown_control_frame_records_4xx() {
+        let model = "ws_req_proto";
+        let endpoint = ipc_endpoint(model);
+        let (_w, _actions) = spawn_recording_worker(endpoint.clone());
+        let state = ready_state(model, endpoint, Arc::new(CallbackRunner::new())).await;
+        state.registry.activate_version(model, "1").unwrap();
+        let base = spawn_ws_server(state).await;
+
+        let counter = prometheus::REQUESTS_TOTAL.with_label_values(&[model, "1", "4xx"]);
+        let before = counter.get();
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{}/{}/stream", base, model))
+            .await
+            .expect("WS connect failed");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(r#"{"input": 1}"#.to_string()))
+            .await
+            .unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(r#"{"type":"bogus"}"#.to_string()))
+            .await
+            .unwrap();
+        wait_for(|| counter.get() >= before + 1.0, "ws requests_total 4xx").await;
+        let _ = ws.close(None).await;
+    }
+
+    /// S2:WS 客户端硬断开(gone 信号)→ STREAM_CANCELLED_TOTAL +1。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ws_client_disconnect_records_cancelled() {
+        let model = "ws_req_cancel";
+        let endpoint = ipc_endpoint(model);
+        let (_w, _actions) = spawn_recording_worker(endpoint.clone());
+        let state = ready_state(model, endpoint, Arc::new(CallbackRunner::new())).await;
+        state.registry.activate_version(model, "1").unwrap();
+        let base = spawn_ws_server(state).await;
+
+        let canc = prometheus::STREAM_CANCELLED_TOTAL.with_label_values(&[model, "1", "websocket"]);
+        let before = canc.get();
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{}/{}/stream", base, model))
+            .await
+            .expect("WS connect failed");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(r#"{"input": 1}"#.to_string()))
+            .await
+            .unwrap();
+        // 直接断开:writer 的 gone_rx 收到 Some("") → break(cancel)。
+        let _ = ws.close(None).await;
+        wait_for(|| canc.get() >= before + 1.0, "ws cancelled").await;
+    }
+
+    /// D7:WS 握手后未就绪早退(显式版本已解析)→ 5xx。无版本请求对未 ready
+    /// 模型在 resolve 阶段即失败(4xx)——5xx 语义对应"已解析未就绪",走
+    /// version 路由。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ws_rejects_not_ready_records_5xx() {
+        let model = "ws_early_5xx";
+        let state = make_state(Arc::new(CallbackRunner::new()));
+        state
+            .registry
+            .register(model, "1", ModelConfig::default(), ModelType::LitAPI, std::path::PathBuf::new())
+            .unwrap();
+        // 未 mark_ready
+        let base = spawn_ws_server(state).await;
+
+        let counter = prometheus::REQUESTS_TOTAL.with_label_values(&[model, "1", "5xx"]);
+        let before = counter.get();
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("{}/{}/1/stream", base, model))
+            .await
+            .expect("WS connect failed");
+        // 服务器升级 101 后立即 close(未就绪早退)。
+        let _ = ws.send(tokio_tungstenite::tungstenite::Message::Text(r#"{"input": 1}"#.to_string())).await;
+        wait_for(|| counter.get() >= before + 1.0, "ws early 5xx").await;
+        let _ = ws.close(None).await;
     }
 }
 

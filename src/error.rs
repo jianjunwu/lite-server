@@ -221,6 +221,44 @@ impl AppError {
             _ => None,
         }
     }
+
+    /// S1(b)/D7:HTTP status 映射——`IntoResponse` 的 status 单源(流式早期
+    /// 拒绝的 family 判定与响应状态保持一致,两处不会漂移)。
+    pub fn http_status(&self) -> StatusCode {
+        if let AppError::ModelError(d) = self {
+            return StatusCode::from_u16(d.status_code)
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        if matches!(self, AppError::PayloadTooLarge { .. }) {
+            return StatusCode::PAYLOAD_TOO_LARGE;
+        }
+        match self {
+            AppError::ModelNotFound(_) => StatusCode::NOT_FOUND,
+            AppError::ModelNotReady(_) => StatusCode::SERVICE_UNAVAILABLE,
+            AppError::VersionNotFound(_, _) => StatusCode::NOT_FOUND,
+            AppError::VersionAlreadyLoaded(_, _) => StatusCode::CONFLICT,
+            AppError::InferenceTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
+            AppError::QueueFull(_) => StatusCode::SERVICE_UNAVAILABLE,
+            AppError::WorkerCrashed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::Validation(_) => StatusCode::BAD_REQUEST,
+            AppError::Config(_) => StatusCode::BAD_REQUEST,
+            AppError::Transport(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::Python(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::Serialization(_) => StatusCode::BAD_REQUEST,
+            AppError::FrameTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::RouteNotFound => StatusCode::NOT_FOUND,
+            AppError::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
+            AppError::InvalidRequestBody(_) => StatusCode::BAD_REQUEST,
+            AppError::InvalidQueryParam(_) => StatusCode::BAD_REQUEST,
+            AppError::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            AppError::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            AppError::RateLimitExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
+            AppError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            AppError::ModelError(_) => unreachable!(), // 上面早返
+        }
+    }
 }
 
 impl IntoResponse for AppError {
@@ -228,8 +266,7 @@ impl IntoResponse for AppError {
         // Model errors carry a model-author-facing message — return it
         // directly without sanitization.
         if let AppError::ModelError(d) = &self {
-            let status = StatusCode::from_u16(d.status_code)
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status = self.http_status();
             // Log at info level — not a server fault, the model intentionally
             // rejected the request.
             tracing::info!(
@@ -271,30 +308,31 @@ impl IntoResponse for AppError {
             return resp;
         }
 
-        let (status, error_type) = match &self {
-            AppError::ModelNotFound(_) => (StatusCode::NOT_FOUND, "not_found_error"),
-            AppError::ModelNotReady(_) => (StatusCode::SERVICE_UNAVAILABLE, "model_not_ready"),
-            AppError::VersionNotFound(_, _) => (StatusCode::NOT_FOUND, "not_found_error"),
-            AppError::VersionAlreadyLoaded(_, _) => (StatusCode::CONFLICT, "conflict_error"),
-            AppError::InferenceTimeout(_) => (StatusCode::GATEWAY_TIMEOUT, "server_error"),
-            AppError::QueueFull(_) => (StatusCode::SERVICE_UNAVAILABLE, "queue_full"),
-            AppError::WorkerCrashed(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
-            AppError::Validation(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
-            AppError::Config(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
-            AppError::Transport(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
-            AppError::Python(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
-            AppError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
-            AppError::Serialization(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
-            AppError::FrameTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error"),
-            AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
-            AppError::RouteNotFound => (StatusCode::NOT_FOUND, "not_found_error"),
-            AppError::MethodNotAllowed => (StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),
-            AppError::InvalidRequestBody(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
-            AppError::InvalidQueryParam(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
-            AppError::PayloadTooLarge { .. } => (StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error"),
-            AppError::UnsupportedMediaType(_) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "invalid_request_error"),
-            AppError::RateLimitExceeded { .. } => (StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded"),
-            AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "authentication_error"),
+        let status = self.http_status();
+        let error_type = match &self {
+            AppError::ModelNotFound(_) => "not_found_error",
+            AppError::ModelNotReady(_) => "model_not_ready",
+            AppError::VersionNotFound(_, _) => "not_found_error",
+            AppError::VersionAlreadyLoaded(_, _) => "conflict_error",
+            AppError::InferenceTimeout(_) => "server_error",
+            AppError::QueueFull(_) => "queue_full",
+            AppError::WorkerCrashed(_) => "server_error",
+            AppError::Validation(_) => "invalid_request_error",
+            AppError::Config(_) => "invalid_request_error",
+            AppError::Transport(_) => "server_error",
+            AppError::Python(_) => "server_error",
+            AppError::Io(_) => "server_error",
+            AppError::Serialization(_) => "invalid_request_error",
+            AppError::FrameTooLarge => "invalid_request_error",
+            AppError::Internal(_) => "server_error",
+            AppError::RouteNotFound => "not_found_error",
+            AppError::MethodNotAllowed => "method_not_allowed",
+            AppError::InvalidRequestBody(_) => "invalid_request_error",
+            AppError::InvalidQueryParam(_) => "invalid_request_error",
+            AppError::PayloadTooLarge { .. } => "invalid_request_error",
+            AppError::UnsupportedMediaType(_) => "invalid_request_error",
+            AppError::RateLimitExceeded { .. } => "rate_limit_exceeded",
+            AppError::Unauthorized(_) => "authentication_error",
             // Handled above via early return; should never reach here.
             AppError::ModelError(_) => unreachable!(),
         };

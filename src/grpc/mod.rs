@@ -3031,4 +3031,50 @@ mod request_metrics_tests {
             "stalled stream must be reclaimed by the always-on idle → 5xx"
         );
     }
+
+    /// S2:gRPC stream 客户端断开(tx.send Err → 下游不 drain)→
+    /// STREAM_CANCELLED_TOTAL +1,REQUESTS_TOTAL 保持 2xx(D1)。
+    #[tokio::test]
+    async fn should_record_stream_cancelled_on_client_disconnect() {
+        use crate::metrics::prometheus::STREAM_CANCELLED_TOTAL;
+        let model = "met_stream_cancel";
+        let endpoint = metric_test_endpoint(model);
+        // spawn_stall_worker:Open → one chunk, then stall——forwarder 从 recv_chunk
+        // 拿到 chunk 后 tx.send 因下游已 drop 而失败 → break(cancel)。
+        let _worker = spawn_stall_worker(endpoint.clone());
+        let mut service = ready_service_with_worker(model, endpoint).await;
+        // D9:cancelled 随 streaming_metrics 门控——测试默认 service 关,显式开。
+        service.streaming_metrics = true;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let canc = STREAM_CANCELLED_TOTAL.with_label_values(&[model, "1", "grpc"]);
+        let req = REQUESTS_TOTAL.with_label_values(&[model, "1", "2xx"]);
+        let canc_before = canc.get();
+        let req_before = req.get();
+
+        let resp = service
+            .stream_infer(Request::new(pb::StreamInferRequest {
+                model_name: model.to_string(),
+                version: "1".to_string(),
+                data: Bytes::from_static(b"{}"),
+                headers: HashMap::new(),
+                sequence_id: None,
+            }))
+            .await
+            .expect("stream must open");
+
+        // 客户端立即丢弃响应不 drain → tx.send Err。
+        drop(resp.into_inner());
+        wait_for(|| canc.get() >= canc_before + 1.0, "stream cancelled").await;
+        assert_eq!(
+            canc.get(),
+            canc_before + 1.0,
+            "S2: client disconnect must count cancelled (gRPC stream)"
+        );
+        assert_eq!(
+            req.get(),
+            req_before + 1.0,
+            "D1: disconnect keeps 2xx family + separate cancel counter"
+        );
+    }
 }

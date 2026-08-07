@@ -20,7 +20,9 @@ lazy_static! {
         HistogramOpts::new(
             "liteserver_request_duration_seconds",
             "End-to-end request latency"
-        ).buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
+        // S7/D8:桶追加 30/60/120——S1 落地后分钟级流时长经 record_request_end
+        // 进入该 histogram(现桶顶 10s 会让长流全落 +Inf)。纯增量,既有观测不迁移。
+        ).buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0]),
         &["model", "version"]
     ).unwrap();
 
@@ -132,6 +134,16 @@ lazy_static! {
         prometheus::Opts::new(
             "liteserver_streaming_chunks_total",
             "Total streaming output chunks"
+        ),
+        &["model", "version", "protocol"]
+    ).unwrap();
+
+    // S2:客户端中断的流(与 requests_total 2xx 并存——服务器确实处理了,
+    // 由独立 counter 承担区分责任,D1)。门控随 features.streaming_metrics(D9)。
+    pub static ref STREAM_CANCELLED_TOTAL: CounterVec = CounterVec::new(
+        prometheus::Opts::new(
+            "liteserver_stream_cancelled_total",
+            "Client-interrupted streaming connections (S2)"
         ),
         &["model", "version", "protocol"]
     ).unwrap();
@@ -270,6 +282,7 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(STREAMING_TTFT.clone()))?;
     REGISTRY.register(Box::new(STREAMING_TBT.clone()))?;
     REGISTRY.register(Box::new(STREAMING_CHUNKS_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(STREAM_CANCELLED_TOTAL.clone()))?;
     REGISTRY.register(Box::new(INFERENCE_DURATION.clone()))?;
     REGISTRY.register(Box::new(BATCH_SIZE.clone()))?;
     REGISTRY.register(Box::new(HEALTH_CHECK_TOTAL.clone()))?;
@@ -492,6 +505,81 @@ pub fn record_stream_chunk(model: &str, version: &str, protocol: &str) {
 
 pub fn record_stream_close(model: &str, version: &str, protocol: &str) {
     STREAMING_CONNECTIONS.with_label_values(&[model, version, protocol]).dec();
+}
+
+// ===== S1/S2 (批次 1):流收口统一记录 =====
+
+/// 流关闭收口枚举(评审优化):各"静默 break"点**只置 reason**,close 收口统一
+/// 消费。family 映射 + cancelled(S2)/errors(S4,批次 3)/duration/bytes(S6,
+/// 批次 3)单一来源;G5 close 日志的 reason 同源。HTTP 路径 family 由
+/// [`StreamCloseReason::status_family`] 派生;gRPC 的 Error 帧按其 grpc code
+/// 映射覆盖(既有语义,不在此枚举内)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamCloseReason {
+    /// 正常 Done 帧完成。
+    Done,
+    /// Error 帧 / worker 报错。
+    Error,
+    /// 客户端中断(下游 send 失败 / 断开 / decoupled cancel 帧)。
+    Cancel,
+    /// 整体 deadline 超时(RecvElapsed::Deadline)。
+    Deadline,
+    /// chunk idle 超时(RecvElapsed::Idle)。
+    Idle,
+    /// worker 无 Done 直接 EOF。
+    WorkerEof,
+    /// WS 协议违规(decoupled 数据帧 / 未知控制帧)。
+    Protocol,
+    /// writer 任务 panic(仅 WS 可达)。
+    Panic,
+}
+
+impl StreamCloseReason {
+    /// D7 family 映射:done/worker_eof/cancel→2xx;error/deadline/idle/panic→5xx;
+    /// protocol→4xx。gRPC 的 Error 帧除外(按其 grpc code 映射)。
+    pub fn status_family(self) -> &'static str {
+        match self {
+            StreamCloseReason::Done
+            | StreamCloseReason::WorkerEof
+            | StreamCloseReason::Cancel => "2xx",
+            StreamCloseReason::Error
+            | StreamCloseReason::Deadline
+            | StreamCloseReason::Idle
+            | StreamCloseReason::Panic => "5xx",
+            StreamCloseReason::Protocol => "4xx",
+        }
+    }
+}
+
+/// 流 close 收口(S1/S2):无条件 `record_request_end`(不门控);门控内
+/// (streaming_metrics)记 cancelled(S2)与 `record_stream_close`。
+/// `family` 由调用方传:HTTP 用 `reason.status_family()`,gRPC 的 Error 帧
+/// 按 grpc code 映射覆盖(既有语义)。exactly-once 由任务尾部单一收口保证。
+pub fn record_stream_terminal(
+    model: &str,
+    version: &str,
+    protocol: &str,
+    open_time: std::time::Instant,
+    family: &str,
+    reason: StreamCloseReason,
+    streaming_metrics: bool,
+) {
+    record_request_end(model, version, family, open_time.elapsed().as_secs_f64());
+    if streaming_metrics {
+        if reason == StreamCloseReason::Cancel {
+            STREAM_CANCELLED_TOTAL
+                .with_label_values(&[model, version, protocol])
+                .inc();
+        }
+        record_stream_close(model, version, protocol);
+    }
+}
+
+/// S1(b)/D7:open 前的早期拒绝也计一次请求(对齐 gRPC wrapper 双点语义)。
+/// family 由调用方按 `AppError::http_status` 映射;version 未解析时传请求
+/// 原值(可为空串)。与 close 收口互斥——open 失败不会抵达收口点,无重复计数。
+pub fn record_stream_rejected(model: &str, version: &str, family: &str, duration_secs: f64) {
+    record_request_end(model, version, family, duration_secs);
 }
 
 // Pre-defined worker metrics (liteserver compatible)
@@ -1107,6 +1195,173 @@ mod tests {
         assert_eq!(WORKER_SATURATION.with_label_values(&[model, version]).get(), 2.0);
         set_worker_saturation(model, version, 0.0);
         assert_eq!(WORKER_SATURATION.with_label_values(&[model, version]).get(), 0.0);
+    }
+
+    // ===== S1/S2: StreamCloseReason 收口 + record_stream_terminal =====
+
+    #[test]
+    fn stream_close_reason_maps_status_family() {
+        use StreamCloseReason::*;
+        assert_eq!(Done.status_family(), "2xx");
+        assert_eq!(WorkerEof.status_family(), "2xx");
+        assert_eq!(Cancel.status_family(), "2xx");
+        assert_eq!(Error.status_family(), "5xx");
+        assert_eq!(Deadline.status_family(), "5xx");
+        assert_eq!(Idle.status_family(), "5xx");
+        assert_eq!(Panic.status_family(), "5xx");
+        assert_eq!(Protocol.status_family(), "4xx");
+    }
+
+    /// S1 不门控:streaming_metrics=false 时 record_request_end 仍须记录。
+    #[test]
+    fn record_stream_terminal_records_request_end_ungated() {
+        let model = "term_ungated";
+        let version = "1";
+        let before = REQUESTS_TOTAL.with_label_values(&[model, version, "2xx"]).get();
+        record_stream_terminal(
+            model, version, "sse", std::time::Instant::now(),
+            StreamCloseReason::Done.status_family(), StreamCloseReason::Done, false,
+        );
+        let after = REQUESTS_TOTAL.with_label_values(&[model, version, "2xx"]).get();
+        assert_eq!(
+            after, before + 1.0,
+            "S1: record_request_end must NOT be gated by streaming_metrics"
+        );
+    }
+
+    /// S2/D1 门控开:cancel → cancelled +1,requests 保持 2xx,close 递减连接。
+    #[test]
+    fn record_stream_terminal_cancel_counts_when_gated() {
+        let model = "term_cancel_on";
+        let version = "1";
+        record_stream_open(model, version, "sse");
+        let req_before = REQUESTS_TOTAL.with_label_values(&[model, version, "2xx"]).get();
+        let canc_before = STREAM_CANCELLED_TOTAL.with_label_values(&[model, version, "sse"]).get();
+        let conn_before = STREAMING_CONNECTIONS.with_label_values(&[model, version, "sse"]).get();
+        record_stream_terminal(
+            model, version, "sse", std::time::Instant::now(),
+            StreamCloseReason::Cancel.status_family(), StreamCloseReason::Cancel, true,
+        );
+        assert_eq!(
+            STREAM_CANCELLED_TOTAL.with_label_values(&[model, version, "sse"]).get(),
+            canc_before + 1.0,
+            "S2: cancelled must count when gated on"
+        );
+        assert_eq!(
+            REQUESTS_TOTAL.with_label_values(&[model, version, "2xx"]).get(),
+            req_before + 1.0,
+            "D1: disconnected stream keeps 2xx family + separate cancel counter"
+        );
+        assert_eq!(
+            STREAMING_CONNECTIONS.with_label_values(&[model, version, "sse"]).get(),
+            conn_before - 1.0,
+            "close must decrement connections"
+        );
+    }
+
+    /// D9 门控关:cancelled 与 record_stream_close 都不记录,requests_total 仍记录。
+    #[test]
+    fn record_stream_terminal_cancel_not_counted_when_gated_off() {
+        let model = "term_cancel_off";
+        let version = "1";
+        record_stream_open(model, version, "websocket");
+        let req_before = REQUESTS_TOTAL.with_label_values(&[model, version, "2xx"]).get();
+        let canc_before = STREAM_CANCELLED_TOTAL.with_label_values(&[model, version, "websocket"]).get();
+        let conn_before = STREAMING_CONNECTIONS.with_label_values(&[model, version, "websocket"]).get();
+        record_stream_terminal(
+            model, version, "websocket", std::time::Instant::now(),
+            StreamCloseReason::Cancel.status_family(), StreamCloseReason::Cancel, false,
+        );
+        assert_eq!(
+            STREAM_CANCELLED_TOTAL.with_label_values(&[model, version, "websocket"]).get(),
+            canc_before,
+            "D9: cancelled gated by streaming_metrics"
+        );
+        assert_eq!(
+            STREAMING_CONNECTIONS.with_label_values(&[model, version, "websocket"]).get(),
+            conn_before,
+            "record_stream_close stays gated (open was gated too)"
+        );
+        assert_eq!(
+            REQUESTS_TOTAL.with_label_values(&[model, version, "2xx"]).get(),
+            req_before + 1.0,
+            "requests_total must still record with metrics off"
+        );
+    }
+
+    /// D7:WS 协议违规 → 4xx family。
+    #[test]
+    fn record_stream_terminal_protocol_maps_4xx() {
+        let model = "term_proto";
+        let version = "1";
+        let before = REQUESTS_TOTAL.with_label_values(&[model, version, "4xx"]).get();
+        record_stream_terminal(
+            model, version, "websocket", std::time::Instant::now(),
+            StreamCloseReason::Protocol.status_family(), StreamCloseReason::Protocol, false,
+        );
+        assert_eq!(
+            REQUESTS_TOTAL.with_label_values(&[model, version, "4xx"]).get(),
+            before + 1.0,
+            "WS protocol violation maps to 4xx (D7)"
+        );
+    }
+
+    /// WS writer panic(仅 WS 可达)→ 5xx。
+    #[test]
+    fn record_stream_terminal_panic_maps_5xx() {
+        let model = "term_panic";
+        let version = "1";
+        let before = REQUESTS_TOTAL.with_label_values(&[model, version, "5xx"]).get();
+        record_stream_terminal(
+            model, version, "websocket", std::time::Instant::now(),
+            StreamCloseReason::Panic.status_family(), StreamCloseReason::Panic, false,
+        );
+        assert_eq!(
+            REQUESTS_TOTAL.with_label_values(&[model, version, "5xx"]).get(),
+            before + 1.0,
+            "WS writer panic maps to 5xx"
+        );
+    }
+
+    /// S7/D8:REQUEST_DURATION 桶追加 30/60/120——S1 落地后分钟级流时长经
+    /// record_request_end 进入该 histogram,不能全落 +Inf(旧桶顶 10s)。
+    #[test]
+    fn request_duration_buckets_extend_to_minute_streams() {
+        let model = "dur_minute_m";
+        let version = "1";
+        record_request_end(model, version, "2xx", 15.0);
+        let families = REGISTRY.gather();
+        let family = families
+            .iter()
+            .find(|mf| mf.get_name() == "liteserver_request_duration_seconds")
+            .expect("REQUEST_DURATION must be registered");
+        let mut found = false;
+        for m in family.get_metric() {
+            if !m.get_label()
+                .iter()
+                .any(|l| l.get_name() == "model" && l.get_value() == model)
+            {
+                continue;
+            }
+            found = true;
+            let hist = m.get_histogram();
+            let le30 = hist
+                .get_bucket()
+                .iter()
+                .find(|b| (*b).get_upper_bound() == 30.0)
+                .unwrap_or_else(|| panic!("le=30 bucket missing in {model} series"));
+            assert!(
+                le30.get_cumulative_count() >= 1,
+                "15s observation must land in le=30 bucket"
+            );
+            // gather 不输出显式 +Inf 桶——用总样本数对比 le30 累积计数证明无溢出。
+            assert_eq!(
+                hist.get_sample_count(),
+                le30.get_cumulative_count(),
+                "no overflow beyond le=30 for a 15s observation"
+            );
+        }
+        assert!(found, "histogram series for {model} not found");
     }
 
     // ===== P6: per-worker inference counter (GetModelStats source) =====
