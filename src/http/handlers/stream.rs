@@ -313,10 +313,7 @@ async fn sse_infer_impl(
             // InferenceResponse callback fires exactly once even if a worker
             // sends Error followed by Done (the chunk path normally terminates
             // on Error, but the forwarder must not rely on that side effect).
-            if matches!(
-                chunk.payload,
-                Some(pb::stream_response::Payload::Done(_) | pb::stream_response::Payload::Error(_))
-            ) {
+            if is_stream_terminal(&chunk) {
                 break;
             }
         }
@@ -460,8 +457,8 @@ fn is_close_frame(text: &str) -> bool {
 /// Whether a worker stream response chunk terminates the forwarder loop.
 ///
 /// Both `Done` and `Error` are terminal by contract (`callback.rs` documents
-/// `StreamError` as a terminal frame). Extracted so the loop break condition
-/// is explicit, shared between WS + test assertions, and can't drift.
+/// `StreamError` as a terminal frame). Single source for the loop break
+/// condition, shared between SSE + WS + test assertions so they can't drift.
 fn is_stream_terminal(chunk: &pb::StreamResponse) -> bool {
     matches!(
         chunk.payload,
@@ -1956,12 +1953,11 @@ mod tests {
         );
     }
 
-    /// §D1 audit (2026-08-07): `is_stream_terminal` only checks `Done`, not
-    /// `Error`. The SSE handler (line 316) checks both; the WS handler should
-    /// too. This test demonstrates the helper returns `false` for Error —
-    /// which means the WS loop continues past Error frames.
+    /// §D1 audit (2026-08-07): `Error` is a terminal frame by contract
+    /// (callback.rs), same as `Done`. Regression guard: the WS writer loop
+    /// breaks via this helper, so it must keep matching Error.
     #[test]
-    fn is_stream_terminal_error_returns_false_is_bug() {
+    fn is_stream_terminal_error_is_terminal() {
         let error_chunk = pb::StreamResponse {
             stream_id: "s".into(),
             payload: Some(pb::stream_response::Payload::Error(pb::StreamError {
@@ -1970,18 +1966,17 @@ mod tests {
         };
         assert!(
             is_stream_terminal(&error_chunk),
-            "BUG: Error is a terminal frame (callback.rs), \
-             but is_stream_terminal returns false — \
-             the WS loop does not break on Error"
+            "Error is a terminal frame (callback.rs) — \
+             is_stream_terminal must return true so the WS loop breaks on Error"
         );
     }
 
-    /// §D1 audit (2026-08-07): replicate the current WS writer inner-loop
-    /// logic with Error→Done chunks fed directly through an mpsc channel
-    /// (no ZMQ layer to drop the trailing Done). The callback fires TWICE
-    /// because the break condition only checks Done, not Error.
+    /// §D1 audit (2026-08-07): replicate the WS writer inner-loop logic with
+    /// Error→Done chunks fed directly through an mpsc channel (bypassing the
+    /// ZMQ route-removal backstop that would otherwise drop the trailing
+    /// Done). The callback must fire exactly once, on the Error frame.
     #[tokio::test]
-    async fn ws_writer_loop_error_then_done_double_fires_callback() {
+    async fn ws_writer_loop_error_then_done_fires_callback_once() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<pb::StreamResponse>(4);
 
         let error_chunk = pb::StreamResponse {
@@ -2017,8 +2012,8 @@ mod tests {
         };
         let open_time = std::time::Instant::now();
 
-        // Mirror of the current (buggy) WS writer inner loop (line 812-851).
-        // Uses is_stream_terminal — the same check the handler would use.
+        // Mirror of the WS writer inner loop in `handle_ws_stream`.
+        // Uses is_stream_terminal — the same check the handler uses.
         loop {
             let chunk = match streaming::recv_chunk(&mut rx, None, None).await {
                 Ok(Some(c)) => c,
@@ -2041,15 +2036,15 @@ mod tests {
 
         // fire_inference_response is tokio::spawn — let the callbacks land.
         wait_for(|| cb.resp.load(Ordering::Relaxed) >= 1, "resp>=1").await;
-        // Let any (buggy) second fire land too.
+        // Give a regressed second fire time to land before asserting.
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         assert_eq!(
             cb.resp.load(Ordering::Relaxed),
             1,
-            "BUG: Error→Done fires callback {n} times, expected 1. \
-             is_stream_terminal only matches Done, so Error doesn't break \
-             the loop — Done follows and fires the callback a second time.",
+            "Error→Done must fire the callback once: if is_stream_terminal \
+             stops matching Error, the loop falls through to Done and fires \
+             a second time (fired {n})",
             n = cb.resp.load(Ordering::Relaxed)
         );
     }
