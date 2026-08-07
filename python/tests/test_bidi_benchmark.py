@@ -920,6 +920,7 @@ class TestBidiCLI:
 
         class FakeAio:
             EOF = object()
+            AioRpcError = type("AioRpcError", (Exception,), {})
 
             @staticmethod
             def insecure_channel(addr):

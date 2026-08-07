@@ -6,8 +6,11 @@ Maps the HTTP/2 ``/bidi`` endpoint (docs/http-bidi.md) onto the
 negotiation, no TLS — benchmark tooling targets local servers).
 
 One connection per session (parity with the WS transport); h2 stream
-multiplexing is a possible future refinement.  ``h2`` is a dev dependency —
-imported lazily inside the session.
+multiplexing is a possible future refinement.
+
+Import layering: ``liteserver_pb2`` is module-level (protobuf is a runtime
+dependency); ``h2`` stays function-local (dev dependency), imported once
+per session in ``session()``/``_reader_loop``.
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ from lite_server.analyzer.benchmark import (
     RequestError,
     RequestStatusError,
 )
+from lite_server.proto import liteserver_pb2
 
 MAX_LPM_FRAME = 16 * 1024 * 1024  # 16 MiB (docs/http-bidi.md)
 
@@ -134,8 +138,6 @@ async def _reader_loop(reader, writer, conn, queue) -> None:
     """Socket → h2 events → LPM frames → bidi frames into *queue*."""
     import h2.events
 
-    from lite_server.proto import liteserver_pb2
-
     decoder = LpmDecoder()
     try:
         while True:
@@ -205,23 +207,17 @@ class _H2BidiIO:
         self._queue = queue
 
     async def send_open(self, payload: bytes) -> None:
-        from lite_server.proto import liteserver_pb2
-
         # h2: model/version are URL-authoritative; only initial_data matters
         await self._send(liteserver_pb2.BidiChunk(
             open=liteserver_pb2.BidiOpen(initial_data=payload),
         ))
 
     async def send_chunk(self, chunk: bytes) -> None:
-        from lite_server.proto import liteserver_pb2
-
         await self._send(liteserver_pb2.BidiChunk(
             data=liteserver_pb2.BidiData(data=chunk),
         ))
 
     async def send_close(self) -> None:
-        from lite_server.proto import liteserver_pb2
-
         await self._send(liteserver_pb2.BidiChunk(
             close=liteserver_pb2.BidiClose(),
         ), end_stream=True)

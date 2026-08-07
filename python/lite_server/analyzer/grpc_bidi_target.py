@@ -5,8 +5,10 @@ Maps the ``BidiStream`` RPC onto the ``bidi_session`` IO contract:
 ``close`` → ``Done``, ``error`` → ``Error``.  An RPC that ends without a
 ``close`` frame (EOF) is an abnormal session end → ``Error``.
 
-All ``grpc`` / pb2_grpc imports are function-local (grpcio is a dev
-dependency, not a package dependency).
+Import layering: ``liteserver_pb2`` is module-level (protobuf is a runtime
+dependency); ``grpc`` / ``liteserver_pb2_grpc`` stay function-local (grpcio
+is a dev dependency) — the IO binds ``grpc`` once at construction, which
+only happens inside a gRPC session.
 """
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ from lite_server.analyzer.bidi_session import (
     run_bidi_session,
 )
 from lite_server.analyzer.benchmark import BidiSessionRecord
+from lite_server.analyzer.grpc_target import _map_rpc_error
+from lite_server.proto import liteserver_pb2
 
 
 def grpc_bidi_session(
@@ -66,13 +70,15 @@ class _GrpcBidiIO:
     """``bidi_session`` IO over a ``BidiStream`` call (write/read)."""
 
     def __init__(self, call, model: str, version: str | None):
+        import grpc  # lazy; bound once per session (construction is grpc-only)
+
         self._call = call
         self._model = model
         self._version = version or ""
+        self._rpc_error = grpc.aio.AioRpcError
+        self._eof = grpc.aio.EOF
 
     async def send_open(self, payload: bytes) -> None:
-        from lite_server.proto import liteserver_pb2
-
         await self._write(liteserver_pb2.BidiChunk(
             open=liteserver_pb2.BidiOpen(
                 model_name=self._model, version=self._version,
@@ -81,41 +87,29 @@ class _GrpcBidiIO:
         ))
 
     async def send_chunk(self, chunk: bytes) -> None:
-        from lite_server.proto import liteserver_pb2
-
         await self._write(liteserver_pb2.BidiChunk(
             data=liteserver_pb2.BidiData(data=chunk),
         ))
 
     async def send_close(self) -> None:
-        from lite_server.proto import liteserver_pb2
-
         await self._write(liteserver_pb2.BidiChunk(
             close=liteserver_pb2.BidiClose(),
         ))
         await self._call.done_writing()
 
     async def _write(self, chunk) -> None:
-        import grpc
-
-        from lite_server.analyzer.grpc_target import _map_rpc_error
-
         try:
             await self._call.write(chunk)
-        except grpc.aio.AioRpcError as e:
+        except self._rpc_error as e:
             raise _map_rpc_error(e) from e
 
     async def recv(self):
-        import grpc
-
-        from lite_server.analyzer.grpc_target import _map_rpc_error
-
         while True:
             try:
                 resp = await self._call.read()
-            except grpc.aio.AioRpcError as e:
+            except self._rpc_error as e:
                 raise _map_rpc_error(e) from e
-            if resp == grpc.aio.EOF:
+            if resp == self._eof:
                 return Error("RPC ended without close frame")
             kind = resp.WhichOneof("payload")
             if kind == "data":
