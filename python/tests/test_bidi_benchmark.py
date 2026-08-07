@@ -786,13 +786,6 @@ class TestBidiCLI:
         rc = cli._cmd_benchmark(self._bidi_args(transport="sse"))
         assert rc == 2
 
-    def test_bidi_transport_grpc_exits_2(self):
-        """--bidi --transport grpc → exit 2 (批次 3)."""
-        from lite_server import cli
-
-        rc = cli._cmd_benchmark(self._bidi_args(transport="grpc"))
-        assert rc == 2
-
     def test_pace_without_bidi_exits_2(self):
         """--pace without --bidi → exit 2 (fail-closed)."""
         from lite_server import cli
@@ -869,3 +862,673 @@ class TestBidiCLI:
         for level in data["levels"]:
             assert level["bidi"]["transport"] == "ws"
             assert level["bidi"]["sessions"] == 2
+
+
+    # ── CLI: gRPC bidi wiring (批次 3) ───────────────────────────────────
+
+    @staticmethod
+    def _fake_grpc_bidi_env():
+        """Fake grpc module with reactive BidiStream call for CLI tests."""
+        import types
+        from lite_server.proto import liteserver_pb2
+
+        writes = []
+        addrs = []
+
+        class FakeCall:
+            def __init__(self):
+                self._q = asyncio.Queue()
+                self.done_writing_called = False
+
+            async def write(self, chunk):
+                writes.append(chunk)
+                kind = chunk.WhichOneof("payload")
+                if kind == "open":
+                    self._q.put_nowait(liteserver_pb2.BidiChunk(
+                        data=liteserver_pb2.BidiData(data=b"ready")))
+                elif kind == "data":
+                    self._q.put_nowait(liteserver_pb2.BidiChunk(
+                        data=liteserver_pb2.BidiData(data=b'"echo"')))
+                elif kind == "close":
+                    self._q.put_nowait(liteserver_pb2.BidiChunk(
+                        close=liteserver_pb2.BidiClose()))
+
+            async def read(self):
+                return await self._q.get()
+
+            async def done_writing(self):
+                self.done_writing_called = True
+
+            def cancel(self):
+                pass
+
+        class FakeChannel:
+            def stream_stream(self, path, request_serializer=None,
+                              response_deserializer=None):
+                def multi_callable(timeout=None):
+                    return FakeCall()
+                return multi_callable
+
+            def unary_unary(self, *a, **k):
+                return None
+
+            def unary_stream(self, *a, **k):
+                return None
+
+            async def close(self):
+                pass
+
+        class FakeAio:
+            EOF = object()
+
+            @staticmethod
+            def insecure_channel(addr):
+                addrs.append(addr)
+                return FakeChannel()
+
+        fake_grpc = types.ModuleType("grpc")
+        fake_grpc.aio = FakeAio
+        return {"grpc": fake_grpc}, writes, addrs
+
+    def test_bidi_grpc_transport_runs(self, monkeypatch, capsys):
+        """--bidi --transport grpc → BidiStream RPC over insecure channel."""
+        from lite_server import cli
+
+        grpc_modules, writes, addrs = self._fake_grpc_bidi_env()
+        self._patch(monkeypatch, grpc_modules)
+
+        rc = cli._cmd_benchmark(self._bidi_args(
+            transport="grpc", requests=2,
+            url="http://127.0.0.1:8001",
+        ))
+        assert rc == 0
+        assert addrs == ["127.0.0.1:8001"]
+        assert writes[0].WhichOneof("payload") == "open"
+        assert writes[0].open.model_name == "test_model"
+        out = capsys.readouterr().out
+        assert "transport=grpc" in out
+
+    def test_bidi_grpc_export_transport(self, monkeypatch, tmp_path):
+        import json
+        from lite_server import cli
+
+        grpc_modules, _, _ = self._fake_grpc_bidi_env()
+        self._patch(monkeypatch, grpc_modules)
+        export_path = tmp_path / "r.json"
+
+        rc = cli._cmd_benchmark(self._bidi_args(
+            transport="grpc", requests=2, export=str(export_path),
+        ))
+        assert rc == 0
+        data = json.loads(export_path.read_text())
+        assert data["config"]["transport"] == "grpc"
+        assert data["bidi"]["transport"] == "grpc"
+
+
+    # ── CLI: h2 bidi wiring + h2 validation (批次 3) ─────────────────────
+
+    def test_bidi_h2_transport_runs(self, monkeypatch, capsys):
+        """--bidi --transport h2 → h2 /bidi endpoint over paired h2 stack."""
+        from lite_server import cli
+
+        TestH2BidiTarget._h2_pair(monkeypatch)
+
+        rc = cli._cmd_benchmark(self._bidi_args(transport="h2", requests=2))
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "transport=h2" in out
+
+    def test_stream_with_h2_transport_exits_2(self):
+        """--stream --transport h2 → exit 2 (h2 is bidi-only)."""
+        from lite_server import cli
+
+        rc = cli._cmd_benchmark(self._bidi_args(
+            bidi=False, stream=True, transport="h2",
+        ))
+        assert rc == 2
+
+    def test_h2_without_stream_or_bidi_exits_2(self):
+        """--transport h2 alone → exit 2 (fail-closed)."""
+        from lite_server import cli
+
+        rc = cli._cmd_benchmark(self._bidi_args(
+            bidi=False, stream=False, transport="h2",
+        ))
+        assert rc == 2
+
+
+# ── Phase 7: grpc_bidi_target (批次 3 Part A) ───────────────────────────────
+
+class TestGrpcBidiTarget:
+    """gRPC BidiStream transport: BidiChunk mapping onto the bidi IO contract."""
+
+    @staticmethod
+    def _fake_channel(open_responses, chunk_responses, close_responses):
+        """Reactive fake: write() enqueues scripted responses; read() pops."""
+        import grpc
+        from lite_server.proto import liteserver_pb2
+
+        writes = []
+        state = {"chunk_idx": 0}
+
+        class FakeCall:
+            def __init__(self):
+                self._q = asyncio.Queue()
+                self.done_writing_called = False
+
+            async def write(self, chunk):
+                writes.append(chunk)
+                kind = chunk.WhichOneof("payload")
+                if kind == "open":
+                    for r in open_responses:
+                        self._q.put_nowait(r)
+                elif kind == "data":
+                    idx = min(state["chunk_idx"], len(chunk_responses) - 1)
+                    state["chunk_idx"] += 1
+                    if chunk_responses:
+                        for r in chunk_responses[idx]:
+                            self._q.put_nowait(r)
+                elif kind == "close":
+                    for r in close_responses:
+                        self._q.put_nowait(r)
+
+            async def read(self):
+                item = await self._q.get()
+                if item == "EOF":
+                    return grpc.aio.EOF
+                return item
+
+            async def done_writing(self):
+                self.done_writing_called = True
+
+            def cancel(self):
+                pass
+
+        call = FakeCall()
+
+        class FakeChannel:
+            def stream_stream(self, path, request_serializer=None,
+                              response_deserializer=None):
+                def multi_callable(timeout=None):
+                    return call
+                return multi_callable
+
+            def unary_unary(self, *args, **kwargs):
+                return None
+
+            def unary_stream(self, *args, **kwargs):
+                return None
+
+            async def close(self):
+                pass
+
+        return FakeChannel(), writes, call
+
+    @staticmethod
+    def _pb():
+        from lite_server.proto import liteserver_pb2
+        return liteserver_pb2
+
+    @pytest.mark.asyncio
+    async def test_happy_path_and_message_mapping(self):
+        from lite_server.analyzer.bidi_session import Pacing
+        from lite_server.analyzer.grpc_bidi_target import grpc_bidi_session
+
+        pb = self._pb()
+        channel, writes, call = self._fake_channel(
+            open_responses=[pb.BidiChunk(data=pb.BidiData(data=b"ready"))],
+            chunk_responses=[[pb.BidiChunk(data=pb.BidiData(data=b'"e1"'))]],
+            close_responses=[pb.BidiChunk(close=pb.BidiClose())],
+        )
+        session = grpc_bidi_session(
+            channel, "my_model", version="3",
+            pacing=Pacing(mode="lock_step"), idle_timeout=1.0,
+        )
+        rec = await session([{"cfg": 1}, "c1"])
+
+        # open carries model/version + JSON bytes payload
+        open_msg = writes[0]
+        assert open_msg.WhichOneof("payload") == "open"
+        assert open_msg.open.model_name == "my_model"
+        assert open_msg.open.version == "3"
+        import json
+        assert json.loads(open_msg.open.initial_data.decode()) == {"cfg": 1}
+        # chunk is data payload
+        assert writes[1].WhichOneof("payload") == "data"
+        assert writes[1].data.data == b'"c1"'
+        # close written + done_writing called
+        assert writes[2].WhichOneof("payload") == "close"
+        assert call.done_writing_called
+        # record
+        assert rec.producer_chunks == 1
+        assert rec.consumer_chunks == 2  # ready + echo
+        assert len(rec.chunk_roundtrips_ms) == 1
+        assert rec.close_to_final_ms is not None
+
+    @pytest.mark.asyncio
+    async def test_error_frame_fails_session(self):
+        from lite_server.analyzer.bidi_session import Pacing
+        from lite_server.analyzer.benchmark import RequestStreamError
+        from lite_server.analyzer.grpc_bidi_target import grpc_bidi_session
+
+        pb = self._pb()
+        channel, _, _ = self._fake_channel(
+            open_responses=[pb.BidiChunk(data=pb.BidiData(data=b"ready"))],
+            chunk_responses=[[pb.BidiChunk(
+                error=pb.BidiError(message="worker died", error_type="server_error"),
+            )]],
+            close_responses=[],
+        )
+        session = grpc_bidi_session(
+            channel, "m", pacing=Pacing(mode="lock_step"), idle_timeout=1.0,
+        )
+        with pytest.raises(RequestStreamError, match="worker died"):
+            await session(["open", "c1"])
+
+    @pytest.mark.asyncio
+    async def test_eof_without_close_frame_fails(self):
+        from lite_server.analyzer.bidi_session import Pacing
+        from lite_server.analyzer.benchmark import RequestStreamError
+        from lite_server.analyzer.grpc_bidi_target import grpc_bidi_session
+
+        pb = self._pb()
+        channel, _, _ = self._fake_channel(
+            open_responses=[pb.BidiChunk(data=pb.BidiData(data=b"ready")), "EOF"],
+            chunk_responses=[],
+            close_responses=[],
+        )
+        session = grpc_bidi_session(
+            channel, "m", pacing=Pacing(mode="real_time", pace_secs=0.0),
+            idle_timeout=1.0,
+        )
+        # open response consumed; then EOF before any close frame
+        with pytest.raises(RequestStreamError, match="without close"):
+            await session(["open"])
+
+    @pytest.mark.asyncio
+    async def test_server_open_frame_tolerated(self):
+        """S→C open payload is not expected — tolerated, keep reading."""
+        from lite_server.analyzer.bidi_session import Pacing
+        from lite_server.analyzer.grpc_bidi_target import grpc_bidi_session
+
+        pb = self._pb()
+        stray_open = pb.BidiChunk(open=pb.BidiOpen(model_name="m"))
+        channel, _, _ = self._fake_channel(
+            open_responses=[stray_open, pb.BidiChunk(data=pb.BidiData(data=b"ready"))],
+            chunk_responses=[],
+            close_responses=[pb.BidiChunk(close=pb.BidiClose())],
+        )
+        session = grpc_bidi_session(
+            channel, "m", pacing=Pacing(mode="lock_step"), idle_timeout=1.0,
+        )
+        rec = await session(["open"])
+        assert rec.consumer_chunks == 1  # only "ready" (stray open not counted)
+
+
+
+# ── Phase 8: classified error propagation (批次 3 修正) ─────────────────────
+
+class TestBidiErrorClassification:
+    """IO-level RequestError must keep its kind through the orchestrator;
+    connect/handshake failures map to connect/status buckets."""
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_forwards_classified_request_error(self):
+        from lite_server.analyzer.bidi_session import Pacing, run_bidi_session
+        from lite_server.analyzer.benchmark import RequestStatusError
+
+        class StatusIO:
+            async def send_open(self, data):
+                pass
+
+            async def send_chunk(self, data):
+                pass
+
+            async def send_close(self):
+                pass
+
+            async def recv(self):
+                raise RequestStatusError(404)
+
+        with pytest.raises(RequestStatusError) as exc_info:
+            await run_bidi_session(
+                StatusIO(), ["open"],
+                pacing=Pacing(mode="lock_step"), idle_timeout=1.0,
+            )
+        assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_ws_bidi_connect_oserror_maps_to_connect(self):
+        from lite_server.analyzer.bidi_session import Pacing
+        from lite_server.analyzer.benchmark import RequestConnectError
+        from lite_server.analyzer.ws_bidi_target import ws_bidi_session
+
+        class _Ctx:
+            async def __aenter__(self):
+                raise OSError("connection refused")
+
+            async def __aexit__(self, *args):
+                return False
+
+        session = ws_bidi_session(
+            lambda url: _Ctx(), "ws://x/stream",
+            pacing=Pacing(mode="lock_step"), idle_timeout=1.0,
+        )
+        with pytest.raises(RequestConnectError):
+            await session(["open"])
+
+    @pytest.mark.asyncio
+    async def test_ws_bidi_handshake_status_maps_to_status(self):
+        import types
+        from lite_server.analyzer.bidi_session import Pacing
+        from lite_server.analyzer.benchmark import RequestStatusError
+        from lite_server.analyzer.ws_bidi_target import ws_bidi_session
+
+        class FakeInvalidStatus(Exception):
+            def __init__(self, status_code):
+                super().__init__(f"rejected: {status_code}")
+                self.status_code = status_code
+
+        class _Ctx:
+            async def __aenter__(self):
+                raise FakeInvalidStatus(404)
+
+            async def __aexit__(self, *args):
+                return False
+
+        exc_mod = types.ModuleType("websockets.exceptions")
+        exc_mod.InvalidHandshake = FakeInvalidStatus
+        pkg = types.ModuleType("websockets")
+        pkg.exceptions = exc_mod
+        import sys
+        monkey_modules = {"websockets": pkg, "websockets.exceptions": exc_mod}
+        for name, mod in monkey_modules.items():
+            sys.modules[name] = mod
+        try:
+            session = ws_bidi_session(
+                lambda url: _Ctx(), "ws://x/stream",
+                pacing=Pacing(mode="lock_step"), idle_timeout=1.0,
+            )
+            with pytest.raises(RequestStatusError) as exc_info:
+                await session(["open"])
+            assert exc_info.value.status_code == 404
+        finally:
+            for name in monkey_modules:
+                sys.modules.pop(name, None)
+
+    @pytest.mark.asyncio
+    async def test_grpc_bidi_unavailable_maps_to_connect(self):
+        import grpc
+        from lite_server.analyzer.bidi_session import Pacing
+        from lite_server.analyzer.benchmark import RequestConnectError
+        from lite_server.analyzer.grpc_bidi_target import grpc_bidi_session
+
+        class FailCall:
+            async def write(self, chunk):
+                raise grpc.aio.AioRpcError(
+                    grpc.StatusCode.UNAVAILABLE,
+                    grpc.aio.Metadata(), grpc.aio.Metadata(), "gone",
+                )
+
+            def cancel(self):
+                pass
+
+        class FakeChannel:
+            def stream_stream(self, path, request_serializer=None,
+                              response_deserializer=None):
+                return lambda timeout=None: FailCall()
+
+            def unary_unary(self, *a, **k):
+                return None
+
+            def unary_stream(self, *a, **k):
+                return None
+
+        session = grpc_bidi_session(
+            FakeChannel(), "m", pacing=Pacing(mode="lock_step"),
+            idle_timeout=1.0,
+        )
+        with pytest.raises(RequestConnectError):
+            await session(["open"])
+
+
+# ── Phase 9: h2_bidi_target (批次 3 Part A) ──────────────────────────────────
+
+class TestLpmCodec:
+    """LPM frame codec: 1B flag(0) + 4B BE length + payload."""
+
+    def test_encode_decode_roundtrip(self):
+        from lite_server.analyzer.h2_bidi_target import LpmDecoder, encode_lpm
+
+        dec = LpmDecoder()
+        frames = dec.feed(encode_lpm(b"hello") + encode_lpm(b"world"))
+        assert frames == [b"hello", b"world"]
+
+    def test_partial_frame_buffered(self):
+        from lite_server.analyzer.h2_bidi_target import LpmDecoder, encode_lpm
+
+        dec = LpmDecoder()
+        raw = encode_lpm(b"0123456789")
+        assert dec.feed(raw[:7]) == []  # header + 2 payload bytes
+        assert dec.feed(raw[7:]) == [b"0123456789"]
+
+    def test_nonzero_flag_rejected(self):
+        from lite_server.analyzer.h2_bidi_target import LpmDecoder
+
+        dec = LpmDecoder()
+        with pytest.raises(ValueError, match="flag"):
+            dec.feed(b"\x01\x00\x00\x00\x02ab")
+
+    def test_oversize_frame_rejected_before_buffering(self):
+        from lite_server.analyzer.h2_bidi_target import LpmDecoder
+
+        dec = LpmDecoder()
+        with pytest.raises(ValueError, match="too large"):
+            dec.feed(b"\x00" + (17 * 1024 * 1024).to_bytes(4, "big"))
+
+    def test_empty_frame_legal(self):
+        from lite_server.analyzer.h2_bidi_target import LpmDecoder, encode_lpm
+
+        dec = LpmDecoder()
+        assert dec.feed(encode_lpm(b"")) == [b""]
+
+
+class TestH2BidiTarget:
+    """h2 bidi over a paired server-side H2Connection (real h2 stack)."""
+
+    @staticmethod
+    def _h2_pair(monkeypatch, *, status="200", error_message=None,
+                 end_without_close=False):
+        """Wire a fake transport: real h2 client ↔ scripted real h2 server."""
+        import h2.config
+        import h2.connection
+        import h2.events
+        from lite_server.analyzer.h2_bidi_target import LpmDecoder, encode_lpm
+        from lite_server.proto import liteserver_pb2
+
+        class FakeReader:
+            def __init__(self):
+                self._q = asyncio.Queue()
+                self._buf = bytearray()
+
+            def feed(self, data):
+                self._q.put_nowait(data)
+
+            async def read(self, n=-1):
+                while not self._buf:
+                    item = await self._q.get()
+                    self._buf.extend(item)
+                out = bytes(self._buf[:n if n > 0 else len(self._buf)])
+                del self._buf[:len(out)]
+                return out
+
+        class Harness:
+            def __init__(self):
+                self.server = h2.connection.H2Connection(
+                    config=h2.config.H2Configuration(
+                        client_side=False, header_encoding="utf-8",
+                    ),
+                )
+                self.server.initiate_connection()
+                self.reader = FakeReader()
+                self.reader.feed(self.server.data_to_send())
+                self.stream_id = None
+                self.decoder = LpmDecoder()
+                self.headers_sent = False
+                self.client_chunks = []  # decoded client BidiChunks
+
+            def respond_data(self, payload: bytes):
+                chunk = liteserver_pb2.BidiChunk(
+                    data=liteserver_pb2.BidiData(data=payload),
+                )
+                self.server.send_data(
+                    self.stream_id, encode_lpm(chunk.SerializeToString()),
+                )
+
+            def process(self, data: bytes):
+                events = self.server.receive_data(data)
+                for ev in events:
+                    if isinstance(ev, h2.events.RequestReceived):
+                        self.stream_id = ev.stream_id
+                    elif isinstance(ev, h2.events.DataReceived):
+                        self.server.acknowledge_received_data(
+                            ev.flow_controlled_length, ev.stream_id,
+                        )
+                        for payload in self.decoder.feed(ev.data):
+                            chunk = liteserver_pb2.BidiChunk.FromString(payload)
+                            self.client_chunks.append(chunk)
+                            self._react(chunk)
+                    elif isinstance(ev, h2.events.StreamEnded):
+                        pass
+                out = self.server.data_to_send()
+                if out:
+                    self.reader.feed(out)
+
+            def _react(self, chunk):
+                kind = chunk.WhichOneof("payload")
+                if kind == "open" and not self.headers_sent:
+                    self.headers_sent = True
+                    self.server.send_headers(self.stream_id, [
+                        (":status", status),
+                        ("content-type", "application/x-lite-bidi"),
+                    ])
+                    if status != "200":
+                        self.server.end_stream(self.stream_id)
+                        return
+                    if error_message is not None:
+                        err = liteserver_pb2.BidiChunk(error=liteserver_pb2.BidiError(
+                            message=error_message))
+                        self.server.send_data(
+                            self.stream_id, encode_lpm(err.SerializeToString()),
+                            end_stream=True,
+                        )
+                        return
+                    self.respond_data(b"ready")
+                elif kind == "data":
+                    self.respond_data(chunk.data.data)  # echo
+                elif kind == "close":
+                    if end_without_close:
+                        self.server.end_stream(self.stream_id)
+                    else:
+                        resp = liteserver_pb2.BidiChunk(
+                            close=liteserver_pb2.BidiClose())
+                        self.server.send_data(
+                            self.stream_id, encode_lpm(resp.SerializeToString()),
+                            end_stream=True,
+                        )
+
+        harnesses = []
+
+        class FakeWriter:
+            def __init__(self, harness):
+                self._harness = harness
+
+            def write(self, data):
+                self._harness.process(data)
+
+            async def drain(self):
+                pass
+
+            def close(self):
+                pass
+
+        async def fake_open_connection(host, port):
+            # One server-side H2Connection per client connection — a second
+            # preface on an existing connection is a protocol error (hangs).
+            harness = Harness()
+            harnesses.append(harness)
+            return harness.reader, FakeWriter(harness)
+
+        class MultiHarness:
+            """Aggregates per-connection harnesses (one per session)."""
+
+            @property
+            def client_chunks(self):
+                return [c for h in harnesses for c in h.client_chunks]
+
+        monkeypatch.setattr(asyncio, "open_connection", fake_open_connection)
+        return MultiHarness()
+
+    @pytest.mark.asyncio
+    async def test_happy_path(self, monkeypatch):
+        from lite_server.analyzer.bidi_session import Pacing
+        from lite_server.analyzer.h2_bidi_target import h2_bidi_session
+
+        harness = self._h2_pair(monkeypatch)
+        session = h2_bidi_session(
+            "http://127.0.0.1:8000/v2/models/m/bidi",
+            pacing=Pacing(mode="lock_step"), idle_timeout=2.0,
+        )
+        rec = await session([{"cfg": 1}, "c1", "c2"])
+
+        assert rec.producer_chunks == 2
+        assert rec.consumer_chunks == 3  # ready + 2 echoes
+        assert len(rec.chunk_roundtrips_ms) == 2
+        assert rec.close_to_final_ms is not None
+        # client frames decoded by the real server stack
+        kinds = [c.WhichOneof("payload") for c in harness.client_chunks]
+        assert kinds == ["open", "data", "data", "close"]
+
+    @pytest.mark.asyncio
+    async def test_non_200_maps_to_status_error(self, monkeypatch):
+        from lite_server.analyzer.bidi_session import Pacing
+        from lite_server.analyzer.benchmark import RequestStatusError
+        from lite_server.analyzer.h2_bidi_target import h2_bidi_session
+
+        self._h2_pair(monkeypatch, status="404")
+        session = h2_bidi_session(
+            "http://127.0.0.1:8000/v2/models/missing/bidi",
+            pacing=Pacing(mode="lock_step"), idle_timeout=2.0,
+        )
+        with pytest.raises(RequestStatusError) as exc_info:
+            await session(["open"])
+        assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_error_frame_maps_to_stream_error(self, monkeypatch):
+        from lite_server.analyzer.bidi_session import Pacing
+        from lite_server.analyzer.benchmark import RequestStreamError
+        from lite_server.analyzer.h2_bidi_target import h2_bidi_session
+
+        self._h2_pair(monkeypatch, error_message="worker exploded")
+        session = h2_bidi_session(
+            "http://127.0.0.1:8000/v2/models/m/bidi",
+            pacing=Pacing(mode="lock_step"), idle_timeout=2.0,
+        )
+        with pytest.raises(RequestStreamError, match="worker exploded"):
+            await session(["open", "c1"])
+
+    @pytest.mark.asyncio
+    async def test_stream_end_without_close_fails(self, monkeypatch):
+        from lite_server.analyzer.bidi_session import Pacing
+        from lite_server.analyzer.benchmark import RequestStreamError
+        from lite_server.analyzer.h2_bidi_target import h2_bidi_session
+
+        self._h2_pair(monkeypatch, end_without_close=True)
+        session = h2_bidi_session(
+            "http://127.0.0.1:8000/v2/models/m/bidi",
+            pacing=Pacing(mode="lock_step"), idle_timeout=2.0,
+        )
+        with pytest.raises(RequestStreamError, match="without close"):
+            await session(["open", "c1"])
+

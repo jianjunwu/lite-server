@@ -219,6 +219,12 @@ class RequestGrpcError(RequestError):
     kind = "status"
 
 
+class RequestCanceledError(RequestError):
+    """Client-initiated cancel mid-stream (scenario wrapper, plan §7.2 E2)."""
+
+    kind = "canceled"
+
+
 @dataclass
 class BenchmarkResult:
     """Results from a benchmark run."""

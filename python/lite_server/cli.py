@@ -115,12 +115,13 @@ def main(argv=None):
                               default="events",
                               help="Streaming endpoint variant (default: events; "
                                    "decoupled → /v2/models/{m}/decoupled, requires --stream)")
-    bench_parser.add_argument("--transport", choices=["sse", "ws", "grpc"],
+    bench_parser.add_argument("--transport", choices=["sse", "ws", "grpc", "h2"],
                               default=None,
                               help="Streaming transport (default: sse; ws for --bidi). "
                                    "ws → /stream|/decoupled-stream; grpc → "
                                    "StreamInfer|DecoupledInfer over an insecure "
-                                   "channel to the --url host:port")
+                                   "channel to the --url host:port; h2 → /bidi "
+                                   "(bidi only, h2c prior-knowledge)")
     bench_parser.add_argument("--pace", type=float, default=None,
                               help="Bidi real-time pacing: seconds between chunks "
                                    "(requires --bidi; default: lock-step)")
@@ -130,6 +131,12 @@ def main(argv=None):
     bench_parser.add_argument("--min-sessions", type=int, default=30,
                               help="Bidi: minimum completed sessions before the "
                                    "sample-size warning fires (default: 30)")
+    bench_parser.add_argument("--cancel-after", type=int, default=None,
+                              help="Cancel each stream after N chunks "
+                                   "(client-cancel scenario; requires --stream)")
+    bench_parser.add_argument("--read-delay-ms", type=float, default=None,
+                              help="Slow-consumer scenario: sleep MS after each "
+                                   "chunk (requires --stream)")
     bench_parser.add_argument("--stream-read-timeout", type=float, default=300.0,
                               help="Seconds between stream chunks before timeout "
                                    "(default: 300)")
@@ -590,6 +597,8 @@ def _benchmark_request_url(args) -> str:
         if transport == "ws":
             base = args.url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
             path = "stream" if endpoint == "events" else "decoupled-stream"
+        elif transport == "h2":
+            base, path = args.url, "bidi"
         else:
             base, path = args.url, endpoint
         if args.version:
@@ -658,6 +667,10 @@ def _cmd_benchmark(args):
         args.rt_factor = None
     if not hasattr(args, "min_sessions"):
         args.min_sessions = 30
+    if not hasattr(args, "cancel_after"):
+        args.cancel_after = None
+    if not hasattr(args, "read_delay_ms"):
+        args.read_delay_ms = None
     if args.transport is None:
         args.transport = "ws" if args.bidi else "sse"
 
@@ -666,10 +679,8 @@ def _cmd_benchmark(args):
             _logger.error("--bidi and --stream are mutually exclusive")
             return 2
         if args.transport == "sse":
-            _logger.error("--bidi requires --transport ws (sse has no bidi mode)")
-            return 2
-        if args.transport == "grpc":
-            _logger.error("--bidi --transport grpc is not supported yet")
+            _logger.error("--bidi requires --transport ws, grpc or h2 "
+                          "(sse has no bidi mode)")
             return 2
         if args.endpoint != "events":
             _logger.error("--endpoint does not apply to --bidi")
@@ -704,6 +715,13 @@ def _cmd_benchmark(args):
         return 2
     if args.transport != "sse" and not args.stream and not args.bidi:
         _logger.error("--transport requires --stream")
+        return 2
+    if args.transport == "h2" and args.stream:
+        _logger.error("--transport h2 is bidi-only (use --bidi)")
+        return 2
+    if (args.cancel_after is not None or args.read_delay_ms is not None) \
+            and not args.stream:
+        _logger.error("--cancel-after/--read-delay-ms require --stream")
         return 2
 
     # Parse concurrency — single int or sweep range
@@ -797,27 +815,53 @@ def _cmd_benchmark(args):
             engine = BenchmarkEngine()
 
             if args.bidi:
-                # Bidi session path: WS transport → run_bidi()
-                from websockets.asyncio.client import connect as _ws_connect
+                # Bidi session path: ws/grpc transport → run_bidi()
+                grpc_channel = None
+                if args.transport == "ws":
+                    from websockets.asyncio.client import connect as _ws_connect
 
-                from lite_server.analyzer.ws_bidi_target import ws_bidi_session
+                    from lite_server.analyzer.ws_bidi_target import ws_bidi_session
 
-                session = ws_bidi_session(
-                    _ws_connect, url, pacing=pacing,
-                    idle_timeout=args.stream_read_timeout,
-                )
-                return await engine.run_bidi(
-                    session_runner=session,
-                    payload=final_payload,
-                    concurrency=concurrency,
-                    duration=duration,
-                    total_requests=args.requests,
-                    warmup_requests=args.warmup_requests,
-                    grace_period=args.grace_period,
-                    transport="ws",
-                    pacing_mode=pacing.mode,
-                    min_sessions=args.min_sessions,
-                )
+                    session = ws_bidi_session(
+                        _ws_connect, url, pacing=pacing,
+                        idle_timeout=args.stream_read_timeout,
+                    )
+                elif args.transport == "h2":
+                    from lite_server.analyzer.h2_bidi_target import h2_bidi_session
+
+                    session = h2_bidi_session(
+                        url, pacing=pacing,
+                        idle_timeout=args.stream_read_timeout,
+                    )
+                else:  # grpc
+                    import grpc as _grpc
+
+                    from lite_server.analyzer.grpc_bidi_target import (
+                        grpc_bidi_session,
+                    )
+
+                    grpc_addr = args.url.split("://", 1)[-1].rstrip("/")
+                    grpc_channel = _grpc.aio.insecure_channel(grpc_addr)
+                    session = grpc_bidi_session(
+                        grpc_channel, args.model, version=args.version,
+                        pacing=pacing, idle_timeout=args.stream_read_timeout,
+                    )
+                try:
+                    return await engine.run_bidi(
+                        session_runner=session,
+                        payload=final_payload,
+                        concurrency=concurrency,
+                        duration=duration,
+                        total_requests=args.requests,
+                        warmup_requests=args.warmup_requests,
+                        grace_period=args.grace_period,
+                        transport=args.transport,
+                        pacing_mode=pacing.mode,
+                        min_sessions=args.min_sessions,
+                    )
+                finally:
+                    if grpc_channel is not None:
+                        await grpc_channel.close()
 
             if args.stream:
                 # Streaming path: transport target → run_stream()
@@ -845,6 +889,20 @@ def _cmd_benchmark(args):
                         grpc_channel, args.model, version=args.version,
                         decoupled=(args.endpoint == "decoupled"),
                         timeout=args.stream_read_timeout,
+                    )
+
+                # Scenario wrappers (plan §7.2): cancel / slow-consumer injection
+                if args.cancel_after is not None:
+                    from lite_server.analyzer.scenario import with_cancel_after
+
+                    stream_target = with_cancel_after(
+                        stream_target, args.cancel_after,
+                    )
+                if args.read_delay_ms is not None:
+                    from lite_server.analyzer.scenario import with_read_delay
+
+                    stream_target = with_read_delay(
+                        stream_target, args.read_delay_ms / 1000.0,
                     )
 
                 # STT request_meta: extract audio_duration_ms from payload
@@ -993,6 +1051,8 @@ def _cmd_benchmark(args):
                 "bidi": args.bidi,
                 "pacing_mode": pacing.mode if args.bidi else None,
                 "min_sessions": args.min_sessions if args.bidi else None,
+                "cancel_after": args.cancel_after if args.stream else None,
+                "read_delay_ms": args.read_delay_ms if args.stream else None,
             },
             **result.to_dict(),
         }

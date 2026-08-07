@@ -27,6 +27,7 @@ from typing import Union
 
 from lite_server.analyzer.benchmark import (
     BidiSessionRecord,
+    RequestError,
     RequestStreamError,
     RequestTimeoutError,
 )
@@ -108,6 +109,11 @@ async def run_bidi_session(
                     return
         except asyncio.CancelledError:
             raise
+        except RequestError as e:
+            # Already-classified failures (status/connect/timeout) keep their
+            # bucket — forwarded through the queue, re-raised by next_frame.
+            frames.put_nowait((e, time.perf_counter_ns()))
+            terminal.set()
         except Exception as e:  # transport failure → Error frame
             frames.put_nowait((Error(f"transport: {e}"), time.perf_counter_ns()))
             terminal.set()
@@ -121,11 +127,14 @@ async def run_bidi_session(
 
         async def next_frame(lock_step_msg: str | None = None):
             try:
-                return await asyncio.wait_for(frames.get(), idle_timeout)
+                frame, ts = await asyncio.wait_for(frames.get(), idle_timeout)
             except asyncio.TimeoutError:
                 if lock_step_msg is not None:
                     raise RequestStreamError(lock_step_msg) from None
                 raise RequestTimeoutError() from None
+            if isinstance(frame, RequestError):
+                raise frame  # classified IO failure — keep the bucket
+            return frame, ts
 
         # open latency = first S→C frame (ready response, or whatever comes)
         frame, ts = await next_frame(

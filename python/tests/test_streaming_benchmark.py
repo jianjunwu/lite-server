@@ -2131,3 +2131,126 @@ class TestStreamingCLI:
             stream=False, model_type="stt", requests=3,
         ))
         assert rc == 0
+
+
+# ── Phase 4s: scenario wrappers (批次 3 Part B, plan §7.2) ───────────────────
+
+class TestScenarioWrappers:
+    """with_cancel_after / with_read_delay — transport-agnostic target wrappers."""
+
+    @staticmethod
+    def _target_factory(chunks, on_aclose=None):
+        async def target(payload):
+            try:
+                for c in chunks:
+                    yield c
+            finally:
+                if on_aclose:
+                    on_aclose()
+        return target
+
+    @pytest.mark.asyncio
+    async def test_cancel_after_yields_n_then_raises(self):
+        from lite_server.analyzer.scenario import with_cancel_after
+        from lite_server.analyzer.benchmark import RequestCanceledError
+
+        target = with_cancel_after(
+            self._target_factory([StreamChunk(data="a"), StreamChunk(data="b"),
+                                  StreamChunk(data="c")]), 2,
+        )
+        received = []
+        with pytest.raises(RequestCanceledError) as exc_info:
+            async for c in target({}):
+                received.append(c.data)
+        assert received == ["a", "b"]
+        assert exc_info.value.kind == "canceled"
+
+    @pytest.mark.asyncio
+    async def test_cancel_after_ge_total_completes_normally(self):
+        from lite_server.analyzer.scenario import with_cancel_after
+
+        target = with_cancel_after(
+            self._target_factory([StreamChunk(data="a")]), 5,
+        )
+        received = [c.data async for c in target({})]
+        assert received == ["a"]
+
+    @pytest.mark.asyncio
+    async def test_cancel_closes_inner_generator(self):
+        """aclose on the inner target → connection teardown (server cancel)."""
+        from lite_server.analyzer.scenario import with_cancel_after
+        from lite_server.analyzer.benchmark import RequestCanceledError
+
+        closed = []
+        target = with_cancel_after(
+            self._target_factory([StreamChunk(data="a"), StreamChunk(data="b")],
+                                 on_aclose=lambda: closed.append(True)), 1,
+        )
+        with pytest.raises(RequestCanceledError):
+            async for _ in target({}):
+                pass
+        assert closed == [True]
+
+    @pytest.mark.asyncio
+    async def test_read_delay_inflates_inter_chunk_gaps(self):
+        import time
+        from lite_server.analyzer.scenario import with_read_delay
+
+        target = with_read_delay(
+            self._target_factory([StreamChunk(data="a"), StreamChunk(data="b"),
+                                  StreamChunk(data="c")]), 0.02,
+        )
+        ts = []
+        async for c in target({}):
+            ts.append(time.perf_counter())
+        gaps = [b - a for a, b in zip(ts, ts[1:])]
+        assert all(g >= 0.018 for g in gaps)  # ~20ms injected per gap
+
+    # ── CLI wiring ───────────────────────────────────────────────────────
+
+    def test_cli_cancel_after_without_stream_exits_2(self):
+        from lite_server import cli
+
+        rc = cli._cmd_benchmark(TestStreamingCLI._stream_args(
+            stream=False, cancel_after=1, requests=3,
+        ))
+        assert rc == 2
+
+    def test_cli_read_delay_without_stream_exits_2(self):
+        from lite_server import cli
+
+        rc = cli._cmd_benchmark(TestStreamingCLI._stream_args(
+            stream=False, read_delay_ms=10.0, requests=3,
+        ))
+        assert rc == 2
+
+    def test_cli_cancel_after_counts_canceled_kind(self, monkeypatch, tmp_path):
+        import sys
+        import json
+        from lite_server import cli
+
+        fake, _, _ = TestStreamingCLI._fake_httpx_stream(
+            ["data: c1", "", "data: c2", "", "data: [DONE]", ""],
+        )
+        monkeypatch.setitem(sys.modules, "httpx", fake)
+        export_path = tmp_path / "r.json"
+
+        rc = cli._cmd_benchmark(TestStreamingCLI._stream_args(
+            stream=True, cancel_after=1, requests=3, export=str(export_path),
+        ))
+        assert rc == 0
+        data = json.loads(export_path.read_text())
+        assert data["error_kinds"] == {"canceled": 3}
+        assert data["config"]["cancel_after"] == 1
+
+    def test_cli_read_delay_runs(self, monkeypatch):
+        import sys
+        from lite_server import cli
+
+        fake, _, _ = TestStreamingCLI._fake_httpx_stream()
+        monkeypatch.setitem(sys.modules, "httpx", fake)
+
+        rc = cli._cmd_benchmark(TestStreamingCLI._stream_args(
+            stream=True, read_delay_ms=5.0, requests=2,
+        ))
+        assert rc == 0

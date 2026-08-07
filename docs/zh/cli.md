@@ -152,10 +152,12 @@ lite-server benchmark --model <模型名> [选项]
 | `--bidi` | flag | off | WS `/stream` bidi 模式的会话压测；payload 必须是 JSON 数组 `[open, chunk1, ...]` |
 | `--model-type` | llm\|tts\|stt\|generic | llm | 流式指标的语义解释（`generic`：仅通用节） |
 | `--endpoint` | events\|decoupled | events | 流式端点变体（`decoupled` → `/v2/models/{m}/decoupled`，需配合 `--stream`） |
-| `--transport` | sse\|ws\|grpc | sse（`--bidi` 时为 ws） | 流式传输（ws/grpc 需配合 `--stream`）。`ws` → `/stream`\|`/decoupled-stream`；`grpc` → StreamInfer\|DecoupledInfer（向 `--url` 的 host:port 建 insecure channel） |
+| `--transport` | sse\|ws\|grpc\|h2 | sse（`--bidi` 时为 ws） | 流式传输（ws/grpc 需配合 `--stream`）。`ws` → `/stream`\|`/decoupled-stream`；`grpc` → StreamInfer\|DecoupledInfer（向 `--url` 的 host:port 建 insecure channel）；`h2` → `/bidi`（仅 bidi,h2c prior-knowledge） |
 | `--pace` | float | — | bidi 实时节奏：chunk 间隔秒数（需配合 `--bidi`；默认 lock-step） |
 | `--rt-factor` | float | — | bidi 倍速：`--pace` 除以 N（需配合 `--pace`） |
 | `--min-sessions` | int | 30 | bidi：样本量告警的最少完成会话数 |
+| `--cancel-after` | int | — | 每流消费 N chunk 后取消——客户端取消场景（需配合 `--stream`）；取消计入 `error_kinds` 的 `canceled` 桶 |
+| `--read-delay-ms` | float | — | 慢消费者场景：每 chunk 后睡眠 MS 毫秒（需配合 `--stream`） |
 | `--stream-read-timeout` | float | 300.0 | 流式 chunk 间超时秒数 |
 | `--max-ttft-ms` | float | — | TTFT p99 超过 MS 毫秒时退出码 99（需配合 `--stream`） |
 | `--max-rtf` | float | — | RTF p99 超过 VAL 时退出码 99（需 `--stream` + `--model-type tts/stt`） |
@@ -187,6 +189,21 @@ lite-server benchmark --model <模型名> [选项]
 - 会话指标（JSON `"bidi"` 段）：open 延迟、close→final 延迟、会话 e2e 时长、每会话 chunk 数、会话/秒；逐 chunk 往返百分位仅 **lock-step** 模式。
 - **lock-step**（默认）要求模型每个 `on_chunk` 都返回响应**且** `on_open` 返回 ready 响应——稀疏响应模型须用 `--pace`（实时）或 `--pace` + `--rt-factor`（倍速），这两种模式不做 chunk↔响应配对。
 - `--stream-read-timeout` 是逐帧空闲预算；超时的会话计为失败。`--max-p99` 门禁会话 e2e 时长。样本量告警阈值是 `--min-sessions`（默认 30），而非请求模型的 300。
+
+**流式场景**（仅 `--stream`，全传输通用）：
+
+- **mid-stream error**（E1）：指向注错模型（如 `examples/03_streaming` 的 `stream_errors`，`mode=server_error`），用可重复的 `--payload-file` 混合正常/错误负载；错误帧计入 `error_kinds` 的 `stream` 桶，由 `--max-error-rate` 门禁。
+- **client cancel**（E2）：`--cancel-after N` 在每流 N 个 chunk 后中止（连接拆除 → 服务端 promptly 取消 worker）。取消计入 `canceled` 桶——不与失败混淆。
+- **慢消费者**（E3）：`--read-delay-ms M` 每 chunk 后睡眠 M；ITL 膨胀即服务端发送阻塞信号。注意：内核缓冲区会吸收小 chunk 反压——本场景测"慢排空"行为而非 TCP 级反压。e2e 含一个尾部延迟。
+
+```bash
+# 客户端取消场景:每流 5 chunk 后取消
+lite-server benchmark --model llama --stream --cancel-after 5 --requests 100
+
+# 错误混合负载:正常+错误 payload 轮替,错误率门禁
+lite-server benchmark --model stream_errors --stream --requests 200 \
+  --payload-file ok.json --payload-file err.json --max-error-rate 0.6
+```
 
 ```bash
 # bidi lock-step：逐 chunk 往返延迟(echo 型模型)

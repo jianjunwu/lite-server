@@ -152,10 +152,12 @@ lite-server benchmark --model <MODEL> [OPTIONS]
 | `--bidi` | flag | off | Bidi session benchmark over WS `/stream` bidi mode; payload must be a JSON array `[open, chunk1, ...]` |
 | `--model-type` | llm\|tts\|stt\|generic | llm | Streaming metric interpretation semantics (`generic`: common section only) |
 | `--endpoint` | events\|decoupled | events | Streaming endpoint variant (`decoupled` → `/v2/models/{m}/decoupled`, requires `--stream`) |
-| `--transport` | sse\|ws\|grpc | sse (ws for `--bidi`) | Streaming transport (requires `--stream` for ws/grpc). `ws` → `/stream`\|`/decoupled-stream`; `grpc` → StreamInfer\|DecoupledInfer over an insecure channel to the `--url` host:port |
+| `--transport` | sse\|ws\|grpc\|h2 | sse (ws for `--bidi`) | Streaming transport (requires `--stream` for ws/grpc). `ws` → `/stream`\|`/decoupled-stream`; `grpc` → StreamInfer\|DecoupledInfer over an insecure channel to the `--url` host:port; `h2` → `/bidi` (bidi only, h2c prior-knowledge) |
 | `--pace` | float | — | Bidi real-time pacing: seconds between chunks (requires `--bidi`; default: lock-step) |
 | `--rt-factor` | float | — | Bidi speedup pacing: divide `--pace` by N (requires `--pace`) |
 | `--min-sessions` | int | 30 | Bidi: minimum completed sessions before the sample-size warning fires |
+| `--cancel-after` | int | — | Cancel each stream after N chunks — client-cancel scenario (requires `--stream`); cancels bucket under `canceled` in `error_kinds` |
+| `--read-delay-ms` | float | — | Slow-consumer scenario: sleep MS after each chunk (requires `--stream`) |
 | `--stream-read-timeout` | float | 300.0 | Seconds between stream chunks before timeout |
 | `--max-ttft-ms` | float | — | Exit 99 if TTFT p99 exceeds MS (requires `--stream`) |
 | `--max-rtf` | float | — | Exit 99 if RTF p99 exceeds VAL (requires `--stream` + `--model-type tts/stt`) |
@@ -187,6 +189,21 @@ lite-server benchmark --model <MODEL> [OPTIONS]
 - Session metrics (JSON `"bidi"` section): open latency, close→final latency, session e2e duration, chunks/session, sessions/sec; per-chunk roundtrip percentiles in **lock-step** mode only.
 - **Lock-step** (default) requires the model to return a response from every `on_chunk` **and** an `on_open` ready response — sparse-response models must use `--pace` (real-time) or `--pace` + `--rt-factor` (speedup), which do not pair chunks with responses.
 - `--stream-read-timeout` is the per-frame idle budget; a session failing it counts as failed. `--max-p99` gates on session e2e duration. Sample-size warning threshold is `--min-sessions` (default 30), not the 300 used for requests.
+
+**Streaming scenarios** (`--stream` only, all transports):
+
+- **Mid-stream error** (E1): point at an error-injecting model (e.g. `examples/03_streaming`'s `stream_errors` with `mode=server_error`) and mix payloads via repeatable `--payload-file`; error frames bucket as `stream` in `error_kinds`, gated by `--max-error-rate`.
+- **Client cancel** (E2): `--cancel-after N` aborts each stream after N chunks (connection teardown → server cancels the worker). Canceled streams bucket under `canceled` — not conflated with failures.
+- **Slow consumer** (E3): `--read-delay-ms M` sleeps M after each chunk; ITL inflation shows server-side send blocking. Note: kernel buffers absorb small-chunk backpressure — this measures slow-drain behavior, not TCP-level backpressure. e2e includes one trailing delay.
+
+```bash
+# Client-cancel scenario: cancel every stream after 5 chunks
+lite-server benchmark --model llama --stream --cancel-after 5 --requests 100
+
+# Error-mix load: round-robin normal + erroring payloads, gate error rate
+lite-server benchmark --model stream_errors --stream --requests 200 \
+  --payload-file ok.json --payload-file err.json --max-error-rate 0.6
+```
 
 ```bash
 # Bidi lock-step: per-chunk roundtrip latency (echo-style models)
