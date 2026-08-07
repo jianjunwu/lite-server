@@ -7,4 +7,8 @@ model_repository:
 orchestration:
   control_mode: explicit
   load_models:
-    - streaming
+    - sse_tokens
+    - ws_echo
+    - decoupled_push
+    - bidi_session
+    - stream_errors

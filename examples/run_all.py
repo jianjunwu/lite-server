@@ -214,9 +214,237 @@ def check_02():
 
 
 def check_03():
-    n = read_sse("/v2/models/streaming/events",
-                 {"prompt": "hello world test", "max_tokens": 3}, want_lines=4)
-    return n >= 4, f"SSE data-lines={n} (expect >=4: 3 tokens + [DONE])"
+    """Composite check for all 5 streaming models (SSE, WS, decoupled, bidi, errors).
+
+    All models run in one server. Each sub-check returns (ok, detail); the
+    composite passes only when every sub-check passes.
+    """
+    import websockets
+    import asyncio
+
+    results = {}
+
+    # --- helpers for streaming checks -----------------------------------------
+
+    def sse_collect(path, body, deadline_s=8.0):
+        """POST body to path, collect all SSE events until the stream ends."""
+        conn = http.client.HTTPConnection(HOST, PORT, timeout=deadline_s)
+        events = []
+        try:
+            conn.request("POST", path, body=json.dumps(body),
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            end = time.time() + deadline_s
+            while time.time() < end:
+                try:
+                    line = resp.readline()
+                except Exception:
+                    break
+                if not line:
+                    break
+                s = line.decode("utf-8", errors="replace").strip()
+                if s.startswith("data: "):
+                    events.append(s[6:])
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return events
+
+    async def ws_collect(path, first_msg, send_frames=None, deadline_s=8.0):
+        """Connect to ws://localhost:8000/{path}, send first_msg + optional
+        send_frames, collect all text/binary messages. Returns list of parsed
+        text messages (dict) or binary payloads (bytes, prefixed 'bin:')."""
+        uri = f"ws://{HOST}:{PORT}{path}"
+        msgs = []
+        try:
+            async with websockets.connect(uri, close_timeout=3, proxy=None) as ws:
+                # Send first frame (Text or Binary based on type)
+                if isinstance(first_msg, bytes):
+                    await ws.send(first_msg)
+                else:
+                    await ws.send(json.dumps(first_msg))
+                # Send additional frames
+                if send_frames:
+                    for f in send_frames:
+                        if isinstance(f, bytes):
+                            await ws.send(f)
+                        else:
+                            await ws.send(json.dumps(f))
+                # Collect responses until close or deadline
+                end = time.time() + deadline_s
+                while time.time() < end:
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=3.0)
+                    except asyncio.TimeoutError:
+                        break
+                    if isinstance(msg, bytes):
+                        # Try to decode as JSON text fallback
+                        try:
+                            msgs.append(json.loads(msg.decode()))
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            msgs.append(f"bin:{msg!r}")
+                    else:
+                        try:
+                            msgs.append(json.loads(msg))
+                        except json.JSONDecodeError:
+                            msgs.append(msg)
+        except Exception:
+            pass
+        return msgs
+
+    async def ws_bidi_collect(path, first_msg, extra_frames=None, deadline_s=8.0):
+        """Like ws_collect but sends extra_frames concurrently with recv.
+        Extra frames (Binary or Text) are sent with 100ms delays to avoid
+        backpressure — the server needs time to drain chunks between frames."""
+        uri = f"ws://{HOST}:{PORT}{path}"
+        msgs = []
+        try:
+            async with websockets.connect(uri, close_timeout=3, proxy=None) as ws:
+                # Send first frame
+                if isinstance(first_msg, bytes):
+                    await ws.send(first_msg)
+                else:
+                    await ws.send(json.dumps(first_msg))
+                # Start recv in background
+                async def _recv():
+                    end = time.time() + deadline_s
+                    while time.time() < end:
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=3.0)
+                        except asyncio.TimeoutError:
+                            break
+                        if isinstance(msg, bytes):
+                            try:
+                                msgs.append(json.loads(msg.decode()))
+                            except (json.JSONDecodeError, UnicodeDecodeError):
+                                msgs.append(f"bin:{msg!r}")
+                        else:
+                            try:
+                                msgs.append(json.loads(msg))
+                            except json.JSONDecodeError:
+                                msgs.append(msg)
+                recv_task = asyncio.create_task(_recv())
+                # Send extra frames with small delays
+                if extra_frames:
+                    for f in extra_frames:
+                        await asyncio.sleep(0.1)
+                        if isinstance(f, bytes):
+                            await ws.send(f)
+                        else:
+                            await ws.send(json.dumps(f))
+                # Wait for recv to finish
+                await recv_task
+        except Exception:
+            pass
+        return msgs
+
+    # --- 1) sse_tokens: SSE events, 10 tokens + [DONE] ------------------------
+
+    events = sse_collect("/v2/models/sse_tokens/events",
+                         {"prompt": "a b c d e f g h i j", "max_tokens": 10})
+    done_count = sum(1 for e in events if e == "[DONE]")
+    tokens = [e for e in events if e != "[DONE]"]
+    ok1 = len(tokens) >= 10 and done_count == 1
+    results["sse_tokens"] = (ok1, f"tokens={len(tokens)} done={done_count}")
+
+    # --- 2) ws_echo: WS coupled stream, first frame → chunks → Done ---------
+
+    async def _ws_echo():
+        # Simple case: send first frame, read all responses (no C→S frames needed).
+        return await ws_collect("/v2/models/ws_echo/stream", {"count": 3})
+    ws_msgs = asyncio.run(_ws_echo())
+    has_chunks = any(isinstance(m, dict) and m.get("chunk") is not None for m in ws_msgs)
+    has_done = any(isinstance(m, dict) and m.get("done") is True for m in ws_msgs)
+    ok2 = has_chunks and has_done
+    results["ws_echo"] = (ok2, f"chunks={has_chunks} done={has_done} msgs={len(ws_msgs)}")
+
+    # --- 3) decoupled_push (SSE): push 5 chunks + [DONE] ---------------------
+
+    dc_events = sse_collect("/v2/models/decoupled_push/decoupled",
+                            {"message": "hello push", "chunks": 5})
+    dc_done = sum(1 for e in dc_events if e == "[DONE]")
+    dc_chunks = [e for e in dc_events if e != "[DONE]"]
+    ok3 = len(dc_chunks) >= 5 and dc_done == 1
+    results["decoupled_sse"] = (ok3, f"chunks={len(dc_chunks)} done={dc_done}")
+
+    # --- 4) decoupled_push (WS): cancel frame cancels worker ------------------
+
+    async def _ws_decoupled_cancel():
+        # Concurrent send+recv: start recv task, then send first+chunks+cancel.
+        return await ws_bidi_collect(
+            "/v2/models/decoupled_push/decoupled-stream",
+            first_msg={"message": "cancel test", "chunks": 10},
+            extra_frames=[{"type": "cancel"}],
+        )
+    dc_ws_msgs = asyncio.run(_ws_decoupled_cancel())
+    chunk_msgs = [m for m in dc_ws_msgs if isinstance(m, dict) and "chunk_index" in m]
+    ok4 = len(chunk_msgs) >= 1  # at least some chunks arrived before cancel
+    results["decoupled_ws"] = (ok4, f"chunks_before_cancel={len(chunk_msgs)}")
+
+    # --- 5) bidi_session: on_open → on_chunk×2 → on_close --------------------
+
+    async def _bidi_session():
+        return await ws_bidi_collect(
+            "/v2/models/bidi_session/stream",
+            first_msg={"session_id": "test-123"},
+            extra_frames=[
+                bytes(json.dumps({"text": "chunk one"}).encode()),
+                bytes(json.dumps({"text": "chunk two"}).encode()),
+                {"type": "close"},
+            ],
+        )
+    bidi_msgs = asyncio.run(_bidi_session())
+    events_by_type = {}
+    for m in bidi_msgs:
+        if isinstance(m, dict) and "event" in m:
+            events_by_type[m["event"]] = m
+    has_open = "open" in events_by_type
+    has_chunk = "chunk" in events_by_type
+    has_close = "close" in events_by_type
+    close_total = events_by_type.get("close", {}).get("total_chunks", 0)
+    ok5 = has_open and has_chunk and has_close and close_total == 2
+    results["bidi_session"] = (
+        ok5,
+        f"open={has_open} chunk={has_chunk} close={has_close} total={close_total}",
+    )
+
+    # --- 6) stream_errors: normal + 3 error modes -----------------------------
+
+    # normal mode
+    normal_events = sse_collect("/v2/models/stream_errors/events",
+                                {"mode": "normal", "input": "hello"})
+    normal_has_done = any(e == "[DONE]" for e in normal_events)
+    ok6a = normal_has_done
+    if not ok6a:
+        results["stream_errors"] = (False, f"normal mode failed: {normal_events}")
+        return False, _format_results(results)
+
+    # error modes: each should produce an error frame (not [DONE])
+    error_results = {}
+    for mode, expect_status in [("bad_request", 400), ("not_found", 404),
+                                 ("server_error", 500)]:
+        err_events = sse_collect("/v2/models/stream_errors/events",
+                                 {"mode": mode, "input": "test"})
+        has_error = any("error" in e for e in err_events)
+        has_done_err = any(e == "[DONE]" for e in err_events)
+        error_results[mode] = has_error and not has_done_err
+    ok6 = ok6a and all(error_results.values())
+    results["stream_errors"] = (ok6, f"normal={ok6a} errors={error_results}")
+
+    all_ok = all(v[0] for v in results.values())
+    return all_ok, _format_results(results)
+
+
+def _format_results(results):
+    """Format sub-check results: 'OK/FAIL key: detail'."""
+    parts = []
+    for k, (ok, detail) in results.items():
+        parts.append(f"{'✓' if ok else '✗'} {k}: {detail}")
+    return " | ".join(parts)
 
 
 def check_04():
@@ -773,7 +1001,7 @@ def check_24():
 SPECS = {
     "01_basic": ("echo", check_01),
     "02_batching": ("batched", check_02),
-    "03_streaming": ("streaming", check_03),
+    "03_streaming": ("sse_tokens", check_03),
     "04_multi_version": ("multi_version", check_04),
     "05_ensemble": ("pipeline", check_05),
     "06_custom_route": ("pets", check_06),
