@@ -111,6 +111,12 @@ def main(argv=None):
                               default="events",
                               help="Streaming endpoint variant (default: events; "
                                    "decoupled → /v2/models/{m}/decoupled, requires --stream)")
+    bench_parser.add_argument("--transport", choices=["sse", "ws", "grpc"],
+                              default="sse",
+                              help="Streaming transport (default: sse, requires --stream "
+                                   "for ws/grpc). ws → /stream|/decoupled-stream; "
+                                   "grpc → StreamInfer|DecoupledInfer over an insecure "
+                                   "channel to the --url host:port")
     bench_parser.add_argument("--stream-read-timeout", type=float, default=300.0,
                               help="Seconds between stream chunks before timeout "
                                    "(default: 300)")
@@ -570,6 +576,8 @@ def _cmd_benchmark(args):
         args.max_rtf = None
     if not hasattr(args, "endpoint"):
         args.endpoint = "events"
+    if not hasattr(args, "transport"):
+        args.transport = "sse"
 
     if args.max_ttft_ms is not None and not args.stream:
         _logger.error("--max-ttft-ms requires --stream")
@@ -584,6 +592,9 @@ def _cmd_benchmark(args):
             return 2
     if args.endpoint != "events" and not args.stream:
         _logger.error("--endpoint requires --stream")
+        return 2
+    if args.transport != "sse" and not args.stream:
+        _logger.error("--transport requires --stream")
         return 2
 
     # Parse concurrency — single int or sweep range
@@ -622,11 +633,18 @@ def _cmd_benchmark(args):
     if duration is None and args.requests is None:
         duration = 30.0
 
-    # URL: streaming uses /events or /decoupled, non-streaming uses /infer
+    # URL: streaming path depends on transport; grpc bypasses URL (uses
+    # the --url host:port as channel address)
     if args.stream:
-        url = f"{args.url}/v2/models/{args.model}/{args.endpoint}"
+        if args.transport == "ws":
+            base = args.url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+            path = "stream" if args.endpoint == "events" else "decoupled-stream"
+        else:
+            base = args.url
+            path = args.endpoint
+        url = f"{base}/v2/models/{args.model}/{path}"
         if args.version:
-            url = f"{args.url}/v2/models/{args.model}/versions/{args.version}/{args.endpoint}"
+            url = f"{base}/v2/models/{args.model}/versions/{args.version}/{path}"
     else:
         url = f"{args.url}/v2/models/{args.model}/infer"
         if args.version:
@@ -661,10 +679,32 @@ def _cmd_benchmark(args):
             engine = BenchmarkEngine()
 
             if args.stream:
-                # Streaming path: SSE target → run_stream()
-                from lite_server.analyzer.sse_target import sse_stream_target
+                # Streaming path: transport target → run_stream()
+                grpc_channel = None
+                if args.transport == "sse":
+                    from lite_server.analyzer.sse_target import sse_stream_target
 
-                stream_target = sse_stream_target(client, url, timeout=timeout)
+                    stream_target = sse_stream_target(client, url, timeout=timeout)
+                elif args.transport == "ws":
+                    from websockets.asyncio.client import connect as _ws_connect
+
+                    from lite_server.analyzer.ws_target import ws_stream_target
+
+                    stream_target = ws_stream_target(
+                        _ws_connect, url, timeout=args.stream_read_timeout,
+                    )
+                else:  # grpc
+                    import grpc as _grpc
+
+                    from lite_server.analyzer.grpc_target import grpc_stream_target
+
+                    grpc_addr = args.url.split("://", 1)[-1].rstrip("/")
+                    grpc_channel = _grpc.aio.insecure_channel(grpc_addr)
+                    stream_target = grpc_stream_target(
+                        grpc_channel, args.model, version=args.version,
+                        decoupled=(args.endpoint == "decoupled"),
+                        timeout=args.stream_read_timeout,
+                    )
 
                 # STT request_meta: extract audio_duration_ms from payload
                 request_meta_fn = None
@@ -676,18 +716,22 @@ def _cmd_benchmark(args):
                         return None
                     request_meta_fn = _stt_request_meta
 
-                return await engine.run_stream(
-                    target=stream_target,
-                    payload=final_payload,
-                    concurrency=concurrency,
-                    duration=duration,
-                    total_requests=args.requests,
-                    warmup_requests=args.warmup_requests,
-                    grace_period=args.grace_period,
-                    rate=args.rate,
-                    model_type=args.model_type,
-                    request_meta=request_meta_fn,
-                )
+                try:
+                    return await engine.run_stream(
+                        target=stream_target,
+                        payload=final_payload,
+                        concurrency=concurrency,
+                        duration=duration,
+                        total_requests=args.requests,
+                        warmup_requests=args.warmup_requests,
+                        grace_period=args.grace_period,
+                        rate=args.rate,
+                        model_type=args.model_type,
+                        request_meta=request_meta_fn,
+                    )
+                finally:
+                    if grpc_channel is not None:
+                        await grpc_channel.close()
             else:
                 # Non-streaming path (unchanged)
                 async def target(payload: dict) -> dict:
@@ -802,6 +846,7 @@ def _cmd_benchmark(args):
                 "stream": args.stream,
                 "model_type": args.model_type,
                 "endpoint": args.endpoint if args.stream else None,
+                "transport": args.transport if args.stream else None,
             },
             **result.to_dict(),
         }

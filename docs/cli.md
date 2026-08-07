@@ -151,6 +151,7 @@ lite-server benchmark --model <MODEL> [OPTIONS]
 | `--stream` | flag | off | Use SSE streaming endpoint `/v2/models/{m}/events` |
 | `--model-type` | llm\|tts\|stt\|generic | llm | Streaming metric interpretation semantics (`generic`: common section only) |
 | `--endpoint` | events\|decoupled | events | Streaming endpoint variant (`decoupled` → `/v2/models/{m}/decoupled`, requires `--stream`) |
+| `--transport` | sse\|ws\|grpc | sse | Streaming transport (requires `--stream` for ws/grpc). `ws` → `/stream`\|`/decoupled-stream`; `grpc` → StreamInfer\|DecoupledInfer over an insecure channel to the `--url` host:port |
 | `--stream-read-timeout` | float | 300.0 | Seconds between stream chunks before timeout |
 | `--max-ttft-ms` | float | — | Exit 99 if TTFT p99 exceeds MS (requires `--stream`) |
 | `--max-rtf` | float | — | Exit 99 if RTF p99 exceeds VAL (requires `--stream` + `--model-type tts/stt`) |
@@ -172,6 +173,7 @@ lite-server benchmark --model <MODEL> [OPTIONS]
 - **STT** (`--model-type stt`): RTF = `total_ms / audio_duration_ms` from the request payload. **Convention**: include `"audio_duration_ms"` (float, milliseconds) in the JSON payload — the CLI extracts it automatically. Requests without `audio_duration_ms` are excluded from RTF calculation.
 - **Generic** (`--model-type generic`): common section only (chunks_per_request / TTFT / e2e) — no ITL/tokens/RTF. Intended for decoupled and other non-token streams.
 - **Decoupled** (`--endpoint decoupled`): benchmarks `POST /v2/models/{m}/decoupled` (server-push, `is_final` terminated). Same SSE wire format as `/events`; typically paired with `--model-type generic`. Set `decoupled_idle_timeout_secs` large enough that it never fires within the run — idle truncation is client-indistinguishable from a normal close.
+- **Transports** (`--transport`): `sse` (default, httpx) · `ws` (websockets; Binary frames = chunks, Text = `{"done":true}`/`{"error":...}` control) · `grpc` (StreamInfer/DecoupledInfer, insecure channel, payload as JSON bytes). `--endpoint` selects the endpoint variant per transport (`events` ↔ `/stream` ↔ StreamInfer). Note: for `grpc`, `--stream-read-timeout` is a whole-RPC deadline (gRPC semantics), not a per-chunk idle budget.
 - **Sweep + rate + version**: `--stream` composes with `--concurrency start:end:step`, `--rate`, and `--version` — no extra flags needed.
 - **Thresholds**: `--max-ttft-ms` and `--max-rtf` gate on p99; fail-closed (exit 2 when used without `--stream`).
 
@@ -203,6 +205,13 @@ lite-server benchmark --model llama --stream --requests 100 \
 # Decoupled streaming: server-push endpoint with generic metrics
 lite-server benchmark --model detector --stream --endpoint decoupled \
   --model-type generic --duration 60 --concurrency 8
+
+# WS transport streaming (websockets)
+lite-server benchmark --model llama --stream --transport ws --duration 60
+
+# gRPC transport streaming (StreamInfer over insecure channel)
+lite-server benchmark --model llama --stream --transport grpc \
+  --url http://127.0.0.1:8001 --duration 60
 
 # Streaming concurrency sweep
 lite-server benchmark --model llama --stream --concurrency 1:16:2 --duration 30

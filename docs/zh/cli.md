@@ -151,6 +151,7 @@ lite-server benchmark --model <模型名> [选项]
 | `--stream` | flag | off | 使用 SSE 流式端点 `/v2/models/{m}/events` |
 | `--model-type` | llm\|tts\|stt\|generic | llm | 流式指标的语义解释（`generic`：仅通用节） |
 | `--endpoint` | events\|decoupled | events | 流式端点变体（`decoupled` → `/v2/models/{m}/decoupled`，需配合 `--stream`） |
+| `--transport` | sse\|ws\|grpc | sse | 流式传输（ws/grpc 需配合 `--stream`）。`ws` → `/stream`\|`/decoupled-stream`；`grpc` → StreamInfer\|DecoupledInfer（向 `--url` 的 host:port 建 insecure channel） |
 | `--stream-read-timeout` | float | 300.0 | 流式 chunk 间超时秒数 |
 | `--max-ttft-ms` | float | — | TTFT p99 超过 MS 毫秒时退出码 99（需配合 `--stream`） |
 | `--max-rtf` | float | — | RTF p99 超过 VAL 时退出码 99（需 `--stream` + `--model-type tts/stt`） |
@@ -172,6 +173,7 @@ lite-server benchmark --model <模型名> [选项]
 - **STT**（`--model-type stt`）：RTF = `total_ms / audio_duration_ms`，从请求 payload 提取。**约定**：在 JSON payload 中包含 `"audio_duration_ms"`（float，毫秒）——CLI 会自动提取。不含此字段的请求不参与 RTF 计算。
 - **Generic**（`--model-type generic`）：仅通用节（chunks_per_request / TTFT / e2e），不计算 ITL/tokens/RTF。面向 decoupled 及其他非 token 流。
 - **Decoupled**（`--endpoint decoupled`）：压测 `POST /v2/models/{m}/decoupled`（服务端异步推送，`is_final` 终止）。与 `/events` 同一 SSE wire 格式；通常搭配 `--model-type generic`。压测前把 `decoupled_idle_timeout_secs` 设足够大——idle 截断在客户端无法与正常关流区分。
+- **传输**（`--transport`）：`sse`（默认，httpx）· `ws`（websockets；Binary 帧 = chunk，Text 帧仅 `{"done":true}`/`{"error":...}` 控制帧）· `grpc`（StreamInfer/DecoupledInfer，insecure channel，payload 为 JSON bytes）。`--endpoint` 在各传输下选择对应端点变体（`events` ↔ `/stream` ↔ StreamInfer）。注意：`grpc` 下 `--stream-read-timeout` 是整个 RPC 的 deadline（gRPC 语义），不是逐 chunk 空闲预算。
 - **组合矩阵**：`--stream` 与 `--concurrency start:end:step`、`--rate`、`--version` 自由组合，无需额外参数。
 - **阈值**：`--max-ttft-ms` 与 `--max-rtf` 按 p99 门禁；fail-closed（缺少 `--stream` 时 exit 2）。
 
@@ -203,6 +205,13 @@ lite-server benchmark --model llama --stream --requests 100 \
 # Decoupled 流式：服务端推送端点 + generic 指标
 lite-server benchmark --model detector --stream --endpoint decoupled \
   --model-type generic --duration 60 --concurrency 8
+
+# WS 传输流式(websockets)
+lite-server benchmark --model llama --stream --transport ws --duration 60
+
+# gRPC 传输流式(StreamInfer,insecure channel)
+lite-server benchmark --model llama --stream --transport grpc \
+  --url http://127.0.0.1:8001 --duration 60
 
 # 流式并发扫描
 lite-server benchmark --model llama --stream --concurrency 1:16:2 --duration 30

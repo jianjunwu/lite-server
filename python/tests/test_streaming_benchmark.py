@@ -1619,6 +1619,7 @@ class TestStreamingCLI:
             "max_ttft_ms": None,
             "max_rtf": None,
             "endpoint": "events",
+            "transport": "sse",
         }
         base.update(overrides)
         return type("Args", (), base)()
@@ -1749,6 +1750,228 @@ class TestStreamingCLI:
         data = json.loads(export_path.read_text())
         assert data["config"]["endpoint"] == "decoupled"
         assert data["stream"]["mode"] == "generic"
+
+    # ── Transport routing (批次 1e, plan §2.5) ───────────────────────────
+
+    @staticmethod
+    def _fake_ws_cli_env(messages=None):
+        """Fake websockets package tree for CLI --transport ws tests."""
+        import types
+
+        if messages is None:
+            messages = [b"c1", '{"done": true}']
+
+        class FakeWS:
+            def __init__(self):
+                self.sent = []
+
+            async def send(self, data):
+                self.sent.append(data)
+
+            async def recv(self):
+                if messages:
+                    return messages.pop(0)
+                raise _FakeConnectionClosedOK()
+
+        class _ConnectCtx:
+            def __init__(self, ws):
+                self._ws = ws
+
+            async def __aenter__(self):
+                return self._ws
+
+            async def __aexit__(self, *args):
+                return False
+
+        ws = FakeWS()
+        connect_calls = []
+
+        def fake_connect(url):
+            connect_calls.append(url)
+            return _ConnectCtx(ws)
+
+        fake_exceptions = types.ModuleType("websockets.exceptions")
+        fake_exceptions.ConnectionClosedOK = _FakeConnectionClosedOK
+        fake_exceptions.ConnectionClosedError = _FakeConnectionClosedError
+        fake_exceptions.InvalidHandshake = _FakeInvalidHandshake
+
+        fake_client = types.ModuleType("websockets.asyncio.client")
+        fake_client.connect = fake_connect
+
+        fake_asyncio = types.ModuleType("websockets.asyncio")
+        fake_asyncio.client = fake_client
+
+        fake_pkg = types.ModuleType("websockets")
+        fake_pkg.exceptions = fake_exceptions
+        fake_pkg.asyncio = fake_asyncio
+
+        return {
+            "websockets": fake_pkg,
+            "websockets.asyncio": fake_asyncio,
+            "websockets.asyncio.client": fake_client,
+            "websockets.exceptions": fake_exceptions,
+        }, ws, connect_calls
+
+    @staticmethod
+    def _fake_grpc_cli_env(responses=None):
+        """Fake grpc module for CLI --transport grpc tests (channel records RPCs)."""
+        import types
+
+        if responses is None:
+            responses = []
+        calls = []
+
+        class FakeCall:
+            def __aiter__(self):
+                async def gen():
+                    for r in responses:
+                        yield r
+                return gen()
+
+        class FakeChannel:
+            def unary_stream(self, path, request_serializer=None,
+                             response_deserializer=None):
+                def multi_callable(request, timeout=None):
+                    calls.append({"path": path, "request": request,
+                                  "timeout": timeout})
+                    return FakeCall()
+                return multi_callable
+
+            def unary_unary(self, *args, **kwargs):
+                return None
+
+            def stream_stream(self, *args, **kwargs):
+                return None
+
+            async def close(self):
+                pass
+
+        channel_addrs = []
+
+        class FakeAio:
+            @staticmethod
+            def insecure_channel(addr):
+                channel_addrs.append(addr)
+                return FakeChannel()
+
+        fake_grpc = types.ModuleType("grpc")
+        fake_grpc.aio = FakeAio
+        return {"grpc": fake_grpc}, calls, channel_addrs
+
+    def test_transport_ws_uses_stream_url(self, monkeypatch):
+        """--stream --transport ws → ws:// scheme + /stream path."""
+        import sys
+        from lite_server import cli
+
+        ws_modules, ws, connect_calls = self._fake_ws_cli_env()
+        for name, mod in ws_modules.items():
+            monkeypatch.setitem(sys.modules, name, mod)
+
+        rc = cli._cmd_benchmark(self._stream_args(
+            stream=True, transport="ws", requests=3,
+        ))
+        assert rc == 0
+        assert connect_calls[0].endswith("/v2/models/test_model/stream")
+        assert connect_calls[0].startswith("ws://")
+
+    def test_transport_ws_decoupled_url(self, monkeypatch):
+        """--transport ws --endpoint decoupled → /decoupled-stream."""
+        import sys
+        from lite_server import cli
+
+        ws_modules, _, connect_calls = self._fake_ws_cli_env()
+        for name, mod in ws_modules.items():
+            monkeypatch.setitem(sys.modules, name, mod)
+
+        rc = cli._cmd_benchmark(self._stream_args(
+            stream=True, transport="ws", endpoint="decoupled", requests=3,
+        ))
+        assert rc == 0
+        assert connect_calls[0].endswith("/v2/models/test_model/decoupled-stream")
+
+    def test_transport_ws_with_version_url(self, monkeypatch):
+        """--transport ws --version → /versions/{v}/stream."""
+        import sys
+        from lite_server import cli
+
+        ws_modules, _, connect_calls = self._fake_ws_cli_env()
+        for name, mod in ws_modules.items():
+            monkeypatch.setitem(sys.modules, name, mod)
+
+        rc = cli._cmd_benchmark(self._stream_args(
+            stream=True, transport="ws", version="3", requests=3,
+        ))
+        assert rc == 0
+        assert "/versions/3/stream" in connect_calls[0]
+
+    def test_transport_grpc_uses_stream_infer(self, monkeypatch):
+        """--transport grpc → insecure channel + StreamInfer RPC."""
+        import sys
+        from lite_server import cli
+
+        grpc_modules, calls, addrs = self._fake_grpc_cli_env()
+        for name, mod in grpc_modules.items():
+            monkeypatch.setitem(sys.modules, name, mod)
+
+        rc = cli._cmd_benchmark(self._stream_args(
+            stream=True, transport="grpc", requests=3,
+        ))
+        assert rc == 0
+        assert addrs == ["127.0.0.1:8000"]
+        assert calls[0]["path"] == "/liteserver.LiteServer/StreamInfer"
+        assert calls[0]["request"].model_name == "test_model"
+
+    def test_transport_grpc_decoupled_uses_decoupled_infer(self, monkeypatch):
+        """--transport grpc --endpoint decoupled → DecoupledInfer RPC."""
+        import sys
+        from lite_server import cli
+
+        grpc_modules, calls, _ = self._fake_grpc_cli_env()
+        for name, mod in grpc_modules.items():
+            monkeypatch.setitem(sys.modules, name, mod)
+
+        rc = cli._cmd_benchmark(self._stream_args(
+            stream=True, transport="grpc", endpoint="decoupled",
+            model_type="generic", requests=3,
+        ))
+        assert rc == 0
+        assert calls[0]["path"] == "/liteserver.LiteServer/DecoupledInfer"
+
+    def test_transport_ws_without_stream_exits_2(self):
+        """--transport ws without --stream → exit 2 (fail-closed)."""
+        from lite_server import cli
+
+        rc = cli._cmd_benchmark(self._stream_args(
+            stream=False, transport="ws", requests=3,
+        ))
+        assert rc == 2
+
+    def test_transport_grpc_without_stream_exits_2(self):
+        """--transport grpc without --stream → exit 2 (fail-closed)."""
+        from lite_server import cli
+
+        rc = cli._cmd_benchmark(self._stream_args(
+            stream=False, transport="grpc", requests=3,
+        ))
+        assert rc == 2
+
+    def test_export_config_includes_transport(self, monkeypatch, tmp_path):
+        """Export config records the transport used."""
+        import sys
+        import json
+        from lite_server import cli
+
+        ws_modules, _, _ = self._fake_ws_cli_env()
+        for name, mod in ws_modules.items():
+            monkeypatch.setitem(sys.modules, name, mod)
+        export_path = tmp_path / "result.json"
+
+        rc = cli._cmd_benchmark(self._stream_args(
+            stream=True, transport="ws", requests=3, export=str(export_path),
+        ))
+        assert rc == 0
+        data = json.loads(export_path.read_text())
+        assert data["config"]["transport"] == "ws"
 
     # ── Output rendering ─────────────────────────────────────────────────
 
