@@ -312,7 +312,12 @@ jobs:
         run: |
           TAG=${GITHUB_REF#refs/tags/v}
           VERSION="${{ needs.get-version.outputs.version }}"
-          if [ "$TAG" != "$VERSION" ]; then
+          # rc prereleases: pyproject.toml must be PEP 440 (0.8.3rc1) for PyPI,
+          # while tags keep the v0.8.3-rc1 convention — normalize by stripping
+          # hyphens before comparing.
+          NORM_TAG=$(echo "$TAG" | tr -d '-')
+          NORM_VERSION=$(echo "$VERSION" | tr -d '-')
+          if [ "$NORM_TAG" != "$NORM_VERSION" ]; then
             echo "Error: Tag version ($TAG) does not match pyproject.toml version ($VERSION)"
             exit 1
           fi
@@ -323,3 +328,8 @@ jobs:
           tag_name: v${{ needs.get-version.outputs.version }}
           name: lite-server v${{ needs.get-version.outputs.version }}
           files: wheels/*.whl
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_TOKEN }}
