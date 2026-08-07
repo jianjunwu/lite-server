@@ -165,14 +165,14 @@ Pre-built zero-compute models are in `benchmarks/models/`:
 ## Streaming Benchmarks (lite-server CLI)
 
 For high-level streaming metrics (TTFT, ITL, TPOT, tokens/sec, RTF) with LLM/TTS/STT
-semantics, use the built-in `lite-server bench` command instead of the wrk scripts
+semantics, use the built-in `lite-server benchmark` command instead of the wrk scripts
 below. wrk only covers HTTP unary — streaming comparison uses the CLI engine:
 
 ```bash
-lite-server bench --stream --model-type llm --duration 60 --concurrency 8 --url http://127.0.0.1:8000
+lite-server benchmark --stream --model-type llm --duration 60 --concurrency 8 --url http://127.0.0.1:8000
 ```
 
-See `lite-server bench --help` and [docs/cli.md](../docs/cli.md) for flags, model types,
+See `lite-server benchmark --help` and [docs/cli.md](../docs/cli.md) for flags, model types,
 and threshold gates.
 
 ## Manual Run
