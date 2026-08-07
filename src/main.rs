@@ -238,9 +238,7 @@ fn main() {
                     health_check_kill_threshold,
                     worker_kill_timeout,
                     hook_http_timeout,
-                    ..Default::default()
                 },
-                ..Default::default()
             });
 
             // Validate after CLI overrides so a negative --<tunable> fails fast

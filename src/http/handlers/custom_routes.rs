@@ -101,6 +101,9 @@ fn parse_route_tail(tail: &str) -> (Option<String>, String) {
 /// InferenceQueue — route calls are not aggregatable). System leaves
 /// (`infer`/`events`/`stream`/...) are exact-registered and matched by axum, so
 /// they never reach the fallback.
+// allow: 单调用点的 HTTP 请求分解(method/query/headers/body/cx),参数即
+// 请求形状本身,无收编语义。
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch_custom_route(
     state: &AppState,
     model_name: &str,

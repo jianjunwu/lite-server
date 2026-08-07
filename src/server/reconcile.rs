@@ -173,6 +173,9 @@ fn compute_target_versions(
 /// backstop (watch events can be lost, e.g. on network filesystems).
 /// `seen_lma` comes from the startup load so artifacts unpacked there are
 /// not re-unpacked on the first tick.
+// allow: server/mod.rs 单点 spawn 的 reconcile 任务,参数为 registry/
+// worker_manager/tunables/触发通道等异构运行时部件。
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn start_reconcile_task(
     repo_path: PathBuf,
     orch: OrchestrationConfig,

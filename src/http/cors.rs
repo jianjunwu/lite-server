@@ -646,7 +646,7 @@ mod prop_tests {
             pat in "(HTTP|https|Https)://[A-Za-z]{1,8}(\\.[a-z]{1,8}){1,2}(:[0-9]{2,4})?",
         ) {
             let m = matches_specific(&pat, &o);
-            prop_assert_eq!(m, normalize_origin(&pat).map_or(false, |n| n == o));
+            prop_assert_eq!(m, normalize_origin(&pat).is_some_and(|n| n == o));
         }
 
         /// header 列表解析（§6.7）：method 与 Origin 均命中时，附 ACAO ⟺
@@ -671,7 +671,7 @@ mod prop_tests {
             let resp =
                 preflight_response(&policy, acao.as_ref(), Some("POST"), acrh.as_deref());
             let attached = resp.headers().contains_key("access-control-allow-origin");
-            let expected_ok = acrh.as_deref().map_or(true, |h| {
+            let expected_ok = acrh.as_deref().is_none_or(|h| {
                 h.split(',')
                     .map(str::trim)
                     .filter(|h| !h.is_empty())

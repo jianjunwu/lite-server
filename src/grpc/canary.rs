@@ -138,9 +138,8 @@ mod tests {
         assert!(reg.get("m1", Some("1")).unwrap().last_used_at.is_none());
 
         let resolved = resolve_bidi_version(&reg, "m1", None, None).unwrap();
-        assert_eq!(
+        assert!(
             reg.get("m1", Some(&resolved)).unwrap().last_used_at.is_some(),
-            true,
             "bidi version resolution must stamp last_used_at like unary/batch/stream"
         );
     }

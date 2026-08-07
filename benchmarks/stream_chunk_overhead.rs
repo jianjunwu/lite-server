@@ -337,7 +337,7 @@ async fn bench_ws(port: u16) -> Result<serde_json::Value, String> {
             async move {
                 let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.ok()?;
                 ws.send(tokio_tungstenite::tungstenite::Message::Text(
-                    format!("{{\"n\": {WS_CHUNKS}}}").into(),
+                    format!("{{\"n\": {WS_CHUNKS}}}"),
                 ))
                 .await
                 .ok()?;

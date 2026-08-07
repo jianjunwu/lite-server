@@ -34,6 +34,9 @@ pub struct AppState {
 }
 
 impl AppState {
+    // allow: 构造器参数与字段一一对应(共享状态组装),收参数对象等于再定义
+    // 一个同形 struct,无消歧收益。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         registry: Arc<ModelRegistry>,
         worker_manager: Arc<WorkerManager>,

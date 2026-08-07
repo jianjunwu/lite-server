@@ -187,6 +187,9 @@ pub(super) fn emit_stderr_line(level: tracing::Level, msg: &str, worker_id: usiz
 /// exit or kill confirmed). Callers that need orphan-free shutdown must await
 /// it; otherwise the process may outlive the server and steal the re-bound
 /// ZMQ socket after a restart.
+// allow: worker 生命周期监控管道(child/关停通道/hooks/draining 等异构
+// 部件),lifecycle 单点组装,无共享上下文可收。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_worker_monitor(
     mut child: Child,
     model_name: &str,

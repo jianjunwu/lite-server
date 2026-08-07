@@ -52,6 +52,9 @@ impl From<notify::EventKind> for WatchEventKind {
 ///   inside an existing unloaded version dir are ordinary dev churn
 ///   (debug log). A version dir that disappeared is unloaded directly in
 ///   every mode — the files are gone, the worker cannot serve.
+// allow: watcher 循环单点调用的事件处理,参数为事件批/registry/tunables/
+// 触发器等异构运行时部件。
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn process_watch_events(
     events: Vec<(PathBuf, WatchEventKind)>,
     repo_path: PathBuf,

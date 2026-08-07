@@ -1010,7 +1010,6 @@ mod tests {
                     payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
                         stream_id: st.stream_id.clone(),
                         payload: Some(payload),
-                        ..Default::default()
                     })),
                     ..Default::default()
                 };
@@ -1057,7 +1056,6 @@ mod tests {
                         payload: Some(pb::stream_response::Payload::Error(pb::StreamError {
                             message: "boom".to_string(),
                         })),
-                        ..Default::default()
                     })),
                     ..Default::default()
                 };
@@ -1097,7 +1095,6 @@ mod tests {
                     payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
                         stream_id: st.stream_id.clone(),
                         payload: Some(payload),
-                        ..Default::default()
                     })),
                     ..Default::default()
                 };
@@ -1531,7 +1528,6 @@ mod tests {
     /// client deadline is reclaimed by the always-on chunk-idle (方案 C), not
     /// left unbounded. The forwarder breaks on idle-elapsed without emitting
     /// `[DONE]`, so draining the body completes within ~idle (not 300s).
-
     fn make_state_with_idle(cb: Arc<CallbackRunner>, idle_secs: f32) -> Arc<AppState> {
         let mut config = crate::config::Config::default();
         config.server.decoupled_idle_timeout_secs = idle_secs;
@@ -1622,7 +1618,6 @@ mod tests {
                             data: Bytes::from_static(b"{}"),
                             is_final: false,
                         })),
-                        ..Default::default()
                     })),
                     ..Default::default()
                 };
@@ -1727,7 +1722,6 @@ mod tests {
                                 payload: Some(pb::stream_response::Payload::Done(
                                     pb::StreamDone::default(),
                                 )),
-                                ..Default::default()
                             })),
                             ..Default::default()
                         };
@@ -1988,7 +1982,6 @@ mod tests {
                             payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
                                 stream_id: st.stream_id.clone(),
                                 payload: Some(payload),
-                                ..Default::default()
                             })),
                             ..Default::default()
                         };
@@ -2107,8 +2100,10 @@ mod tests {
         features: crate::config::FeaturesConfig,
         cb: Arc<CallbackRunner>,
     ) -> Arc<AppState> {
-        let mut config = crate::config::Config::default();
-        config.features = features;
+        let config = crate::config::Config {
+            features,
+            ..Default::default()
+        };
         let registry = Arc::new(ModelRegistry::new());
         let queue = Arc::new(InferenceQueue::new());
         let wm = Arc::new(WorkerManager::new(
@@ -2349,8 +2344,10 @@ mod tests {
     /// not mounted — POST returns 404.
     #[tokio::test]
     async fn decoupled_routes_unmounted_when_feature_off() {
-        let mut features = crate::config::FeaturesConfig::default();
-        features.decoupled = false;
+        let features = crate::config::FeaturesConfig {
+            decoupled: false,
+            ..Default::default()
+        };
         let state = make_state_with_features(features, Arc::new(CallbackRunner::new()));
         // Register a model so route matching doesn't fail before the
         // feature gate check; the fallback handler needs the registry

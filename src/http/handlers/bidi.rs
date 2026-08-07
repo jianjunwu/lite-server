@@ -657,7 +657,6 @@ mod tests {
                     payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
                         stream_id: st.stream_id.clone(),
                         payload: Some(payload),
-                        ..Default::default()
                     })),
                     ..Default::default()
                 };
@@ -730,7 +729,6 @@ mod tests {
                             payload: Some(pb::stream_response::Payload::Error(
                                 pb::StreamError { message: "boom".to_string() },
                             )),
-                            ..Default::default()
                         })),
                         ..Default::default()
                     }
@@ -992,7 +990,6 @@ mod tests {
                                 payload: Some(pb::stream_response::Payload::Done(
                                     pb::StreamDone::default(),
                                 )),
-                                ..Default::default()
                             })),
                             ..Default::default()
                         };

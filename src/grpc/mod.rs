@@ -97,21 +97,42 @@ pub struct GrpcService {
     trusted: Arc<crate::client_ip::TrustedNetworks>,
 }
 
+/// Dependencies and flags for [`GrpcService::new`], grouped so production
+/// (`start_grpc_server`) and test builders assemble the same named-field
+/// shape instead of a 12-positional-arg list (1.96 too_many_arguments batch).
+/// Field semantics are documented on [`GrpcService`].
+pub struct GrpcServiceDeps {
+    pub registry: Arc<ModelRegistry>,
+    pub worker_manager: Arc<WorkerManager>,
+    pub streaming_metrics: bool,
+    pub canary_override: bool,
+    pub grpc_streaming: bool,
+    pub callback_runner: Arc<CallbackRunner>,
+    pub shutdown_state: Arc<crate::server::ShutdownState>,
+    pub server_timeout: Duration,
+    pub rate_limiter: Arc<crate::rate_limit::RateLimiter>,
+    pub decoupled_idle_timeout: Option<Duration>,
+    pub app_state: Arc<AppState>,
+    pub trusted: Arc<crate::client_ip::TrustedNetworks>,
+}
+
 impl GrpcService {
-    pub fn new(
-        registry: Arc<ModelRegistry>,
-        worker_manager: Arc<WorkerManager>,
-        streaming_metrics: bool,
-        canary_override: bool,
-        grpc_streaming: bool,
-        callback_runner: Arc<CallbackRunner>,
-        shutdown_state: Arc<crate::server::ShutdownState>,
-        server_timeout: Duration,
-        rate_limiter: Arc<crate::rate_limit::RateLimiter>,
-        decoupled_idle_timeout: Option<Duration>,
-        app_state: Arc<AppState>,
-        trusted: Arc<crate::client_ip::TrustedNetworks>,
-    ) -> Self {
+    /// Field semantics are documented on [`GrpcService`] itself.
+    pub fn new(deps: GrpcServiceDeps) -> Self {
+        let GrpcServiceDeps {
+            registry,
+            worker_manager,
+            streaming_metrics,
+            canary_override,
+            grpc_streaming,
+            callback_runner,
+            shutdown_state,
+            server_timeout,
+            rate_limiter,
+            decoupled_idle_timeout,
+            app_state,
+            trusted,
+        } = deps;
         Self {
             registry,
             worker_manager,
@@ -435,24 +456,47 @@ pub(crate) fn resolve_grpc_host(grpc_host: Option<&str>, server_host: &str) -> S
     }
 }
 
+/// Options for [`start_grpc_server`] — named fields instead of a
+/// 15-positional-arg list (1.96 too_many_arguments batch; aligns with the
+/// HTTP side's `ServerOptions` precedent, 85313c5).
+pub struct GrpcServerOptions {
+    pub host: String,
+    pub port: u16,
+    pub registry: Arc<ModelRegistry>,
+    pub worker_manager: Arc<WorkerManager>,
+    pub streaming_metrics: bool,
+    pub canary_override: bool,
+    pub callback_runner: Arc<CallbackRunner>,
+    pub shutdown_state: Arc<crate::server::ShutdownState>,
+    pub server_timeout: Duration,
+    pub grpc_config: crate::config::GrpcConfig,
+    pub rate_limiter: Arc<crate::rate_limit::RateLimiter>,
+    pub tls: Option<Arc<crate::tls::TlsConfigStore>>,
+    pub config: crate::config::Config,
+    pub has_hot_reload: Arc<std::sync::atomic::AtomicBool>,
+}
+
 /// Start the gRPC server.
 pub async fn start_grpc_server(
-    host: String,
-    port: u16,
-    registry: Arc<ModelRegistry>,
-    worker_manager: Arc<WorkerManager>,
-    streaming_metrics: bool,
-    canary_override: bool,
-    callback_runner: Arc<CallbackRunner>,
-    shutdown_state: Arc<crate::server::ShutdownState>,
-    server_timeout: Duration,
-    grpc_config: crate::config::GrpcConfig,
-    rate_limiter: Arc<crate::rate_limit::RateLimiter>,
-    tls: Option<Arc<crate::tls::TlsConfigStore>>,
-    config: crate::config::Config,
-    has_hot_reload: Arc<std::sync::atomic::AtomicBool>,
+    options: GrpcServerOptions,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), AppError> {
+    let GrpcServerOptions {
+        host,
+        port,
+        registry,
+        worker_manager,
+        streaming_metrics,
+        canary_override,
+        callback_runner,
+        shutdown_state,
+        server_timeout,
+        grpc_config,
+        rate_limiter,
+        tls,
+        config,
+        has_hot_reload,
+    } = options;
     // P-ENSEMBLE-GRPC (蓝图 §4.1): build an AppState so the unary infer handler
     // can dispatch ensemble models through execute_ensemble (ensemble models have
     // no workers). Built from the same shared pieces as HTTP's AppState; the
@@ -483,25 +527,25 @@ pub async fn start_grpc_server(
     // by the service interceptors and the handler-side `finalize_context`.
     let trusted = Arc::new(config.server.trusted_networks()?);
 
-    let service = GrpcService::new(
-        registry.clone(),
-        worker_manager.clone(),
+    let service = GrpcService::new(GrpcServiceDeps {
+        registry: registry.clone(),
+        worker_manager: worker_manager.clone(),
         streaming_metrics,
         canary_override,
-        config.features.grpc_streaming,
-        callback_runner.clone(),
+        grpc_streaming: config.features.grpc_streaming,
+        callback_runner: callback_runner.clone(),
         shutdown_state,
         server_timeout,
         rate_limiter,
         // P9-1: decoupled stream idle timeout (0 → disabled / None).
-        if config.server.decoupled_idle_timeout_secs > 0.0 {
+        decoupled_idle_timeout: if config.server.decoupled_idle_timeout_secs > 0.0 {
             Some(Duration::from_secs_f32(config.server.decoupled_idle_timeout_secs))
         } else {
             None
         },
         app_state,
-        trusted.clone(),
-    );
+        trusted: trusted.clone(),
+    });
     let max_request_body_bytes = config.server.max_request_body_bytes;
     let server = LiteServerServer::new(service);
     // P1-3: gzip response compression is opt-in and applies to the
@@ -712,6 +756,9 @@ fn resolve_admin_bind(admin_bind: &str) -> Result<(String, u16, u32), AppError> 
 /// ignored) or a TCP host. `owner_only` (admin UDS) additionally requires the
 /// bound socket be owned by the current process with no group/other permission
 /// bits, so a misconfigured admin socket cannot weaken fail-closed.
+// allow: main/admin 两调用点的异构绑定参数(router/地址/TLS/权限/关停),收
+// struct 只是把列表搬家,无消歧收益。
+#[allow(clippy::too_many_arguments)]
 async fn serve_grpc_router(
     router: tonic::transport::server::Router,
     host: String,
@@ -1156,7 +1203,6 @@ mod request_metrics_tests {
                     payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
                         stream_id: st.stream_id.clone(),
                         payload: Some(payload),
-                        ..Default::default()
                     })),
                     ..Default::default()
                 };
@@ -1225,20 +1271,20 @@ mod request_metrics_tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(crate::rate_limit::RateLimiter::default()),
         ));
-        GrpcService::new(
+        GrpcService::new(GrpcServiceDeps {
             registry,
-            wm,
-            false,
+            worker_manager: wm,
+            streaming_metrics: false,
             canary_override,
-            true,
-            Arc::new(CallbackRunner::new()),
-            Arc::new(crate::server::ShutdownState::new()),
+            grpc_streaming: true,
+            callback_runner: Arc::new(CallbackRunner::new()),
+            shutdown_state: Arc::new(crate::server::ShutdownState::new()),
             server_timeout,
-            Arc::new(crate::rate_limit::RateLimiter::default()),
+            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::default()),
             decoupled_idle_timeout,
             app_state,
-            Arc::new(Vec::new()), // P-XFF trusted — empty (fail-safe) in unit tests.
-        )
+            trusted: Arc::new(Vec::new()), // P-XFF trusted — empty (fail-safe) in unit tests.
+        })
     }
 
     /// Registry (registered + ready) and queue (one worker client) for `model`.
@@ -1563,20 +1609,20 @@ mod request_metrics_tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(crate::rate_limit::RateLimiter::default()),
         ));
-        let service = GrpcService::new(
+        let service = GrpcService::new(GrpcServiceDeps {
             registry,
-            wm,
-            false,
-            false,
-            true,
-            Arc::new(CallbackRunner::new()),
-            Arc::new(crate::server::ShutdownState::new()),
-            Duration::from_secs(5),
-            Arc::new(crate::rate_limit::RateLimiter::default()),
-            None,
+            worker_manager: wm,
+            streaming_metrics: false,
+            canary_override: false,
+            grpc_streaming: true,
+            callback_runner: Arc::new(CallbackRunner::new()),
+            shutdown_state: Arc::new(crate::server::ShutdownState::new()),
+            server_timeout: Duration::from_secs(5),
+            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::default()),
+            decoupled_idle_timeout: None,
             app_state,
-            Arc::new(Vec::new()), // P-XFF trusted — empty (fail-safe) in this test.
-        );
+            trusted: Arc::new(Vec::new()), // P-XFF trusted — empty (fail-safe) in this test.
+        });
 
         // Saturate the single admission slot.
         let _fill = service
@@ -1833,7 +1879,6 @@ mod request_metrics_tests {
                         status: Some(pb::Status { code: "Ok".to_string(), message: String::new() }),
                         ..Default::default()
                     })),
-                    ..Default::default()
                 };
                 if s.send(resp.encode_to_vec(), 0).is_err() {
                     return;
@@ -1872,7 +1917,6 @@ mod request_metrics_tests {
                     payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
                         stream_id: st.stream_id.clone(),
                         payload: Some(payload),
-                        ..Default::default()
                     })),
                     ..Default::default()
                 };
@@ -1922,7 +1966,6 @@ mod request_metrics_tests {
                         items,
                         ..Default::default()
                     })),
-                    ..Default::default()
                 };
                 if s.send(resp.encode_to_vec(), 0).is_err() {
                     return;
@@ -2104,7 +2147,6 @@ mod request_metrics_tests {
                         payload: Some(pb::stream_response::Payload::Error(pb::StreamError {
                             message: "boom".to_string(),
                         })),
-                        ..Default::default()
                     })),
                     ..Default::default()
                 };
@@ -2167,20 +2209,20 @@ mod request_metrics_tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(crate::rate_limit::RateLimiter::default()),
         ));
-        GrpcService::new(
+        GrpcService::new(GrpcServiceDeps {
             registry,
-            wm,
-            false,
-            false,
-            true,
-            cb,
-            Arc::new(crate::server::ShutdownState::new()),
-            Duration::from_secs(5),
-            Arc::new(crate::rate_limit::RateLimiter::default()),
-            None,
+            worker_manager: wm,
+            streaming_metrics: false,
+            canary_override: false,
+            grpc_streaming: true,
+            callback_runner: cb,
+            shutdown_state: Arc::new(crate::server::ShutdownState::new()),
+            server_timeout: Duration::from_secs(5),
+            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::default()),
+            decoupled_idle_timeout: None,
             app_state,
-            Arc::new(Vec::new()),
-        )
+            trusted: Arc::new(Vec::new()),
+        })
     }
 
     async fn ready_service_with_worker_cb(
@@ -2881,7 +2923,6 @@ mod request_metrics_tests {
                             data: Bytes::from_static(b"{}"),
                             is_final: false,
                         })),
-                        ..Default::default()
                     })),
                     ..Default::default()
                 };
@@ -2913,20 +2954,20 @@ mod request_metrics_tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(crate::rate_limit::RateLimiter::default()),
         ));
-        GrpcService::new(
+        GrpcService::new(GrpcServiceDeps {
             registry,
-            wm,
-            false,
-            false,
-            true,
-            Arc::new(CallbackRunner::new()),
-            Arc::new(crate::server::ShutdownState::new()),
-            Duration::from_secs(5),
-            Arc::new(crate::rate_limit::RateLimiter::default()),
-            idle,
+            worker_manager: wm,
+            streaming_metrics: false,
+            canary_override: false,
+            grpc_streaming: true,
+            callback_runner: Arc::new(CallbackRunner::new()),
+            shutdown_state: Arc::new(crate::server::ShutdownState::new()),
+            server_timeout: Duration::from_secs(5),
+            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::default()),
+            decoupled_idle_timeout: idle,
             app_state,
-            Arc::new(Vec::new()),
-        )
+            trusted: Arc::new(Vec::new()),
+        })
     }
 
     async fn ready_service_with_worker_idle(

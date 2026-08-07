@@ -715,7 +715,6 @@ mod tests {
                                 is_final: false,
                             },
                         )),
-                        ..Default::default()
                     })),
                     ..Default::default()
                 };

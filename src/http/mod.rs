@@ -297,19 +297,38 @@ impl tower_http::compression::predicate::Predicate for NotEventStream {
 #[cfg(unix)]
 use tokio::net::UnixListener;
 
+/// Options for [`start_http_server`] — named fields instead of an
+/// 11-positional-arg list (1.96 too_many_arguments batch; gRPC side mirrors
+/// this with `GrpcServerOptions`).
+pub struct HttpServerOptions {
+    pub config: Config,
+    pub registry: Arc<ModelRegistry>,
+    pub worker_manager: Arc<WorkerManager>,
+    pub inference_queue: Arc<InferenceQueue>,
+    pub shutdown_state: Arc<crate::server::ShutdownState>,
+    pub draining: Arc<AtomicBool>,
+    pub callback_runner: Arc<crate::callback::CallbackRunner>,
+    pub has_hot_reload: Arc<AtomicBool>,
+    pub rate_limiter: Arc<crate::rate_limit::RateLimiter>,
+    pub tls: Option<Arc<crate::tls::TlsConfigStore>>,
+}
+
 pub async fn start_http_server(
-    config: Config,
-    registry: Arc<ModelRegistry>,
-    worker_manager: Arc<WorkerManager>,
-    inference_queue: Arc<InferenceQueue>,
+    options: HttpServerOptions,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
-    shutdown_state: Arc<crate::server::ShutdownState>,
-    draining: Arc<AtomicBool>,
-    callback_runner: Arc<crate::callback::CallbackRunner>,
-    has_hot_reload: Arc<AtomicBool>,
-    rate_limiter: Arc<crate::rate_limit::RateLimiter>,
-    tls: Option<Arc<crate::tls::TlsConfigStore>>,
 ) -> Result<(), AppError> {
+    let HttpServerOptions {
+        config,
+        registry,
+        worker_manager,
+        inference_queue,
+        shutdown_state,
+        draining,
+        callback_runner,
+        has_hot_reload,
+        rate_limiter,
+        tls,
+    } = options;
     let repo_path = PathBuf::from(&config.model_repository.path);
     // P3-1：RateLimiter 构造上移到 server/mod.rs（HTTP/gRPC 共享 + 60s cleanup）。
     let mut state = AppState::new(registry, worker_manager, inference_queue, config.clone(), repo_path, callback_runner, has_hot_reload, rate_limiter);

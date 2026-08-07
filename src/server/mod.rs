@@ -284,17 +284,19 @@ impl LiteServer {
         let has_hot_reload_for_http = has_hot_reload.clone();
         let draining_for_http = draining.clone();
         let mut http_handle = tokio::spawn(http::start_http_server(
-            self.config.clone(),
-            self.registry.clone(),
-            self.worker_manager.clone(),
-            self.inference_queue.clone(),
+            http::HttpServerOptions {
+                config: self.config.clone(),
+                registry: self.registry.clone(),
+                worker_manager: self.worker_manager.clone(),
+                inference_queue: self.inference_queue.clone(),
+                shutdown_state: shutdown_state.clone(),
+                draining: draining_for_http,
+                callback_runner: self.callback_runner.clone(),
+                has_hot_reload: has_hot_reload_for_http,
+                rate_limiter: rate_limiter.clone(),
+                tls: http_tls.clone(),
+            },
             http_shutdown_rx,
-            shutdown_state.clone(),
-            draining_for_http,
-            self.callback_runner.clone(),
-            has_hot_reload_for_http,
-            rate_limiter.clone(),
-            http_tls.clone(),
         ));
 
         // metrics always needs a TCP host (UDS not supported); when HTTP uses a
@@ -325,20 +327,22 @@ impl LiteServer {
         let (grpc_shutdown_tx, grpc_shutdown_rx) = tokio::sync::oneshot::channel();
         let mut grpc_handle = if self.config.grpc.enabled {
             Some(tokio::spawn(crate::grpc::start_grpc_server(
-                grpc_host,
-                self.config.server.grpc_port,
-                self.registry.clone(),
-                self.worker_manager.clone(),
-                self.config.features.streaming_metrics,
-                self.config.features.canary_override,
-                self.callback_runner.clone(),
-                shutdown_state.clone(),
-                Duration::from_secs_f64(self.config.server.timeout as f64),
-                self.config.grpc.clone(),
-                rate_limiter.clone(),
-                grpc_tls.clone(),
-                self.config.clone(),
-                has_hot_reload.clone(),
+                crate::grpc::GrpcServerOptions {
+                    host: grpc_host,
+                    port: self.config.server.grpc_port,
+                    registry: self.registry.clone(),
+                    worker_manager: self.worker_manager.clone(),
+                    streaming_metrics: self.config.features.streaming_metrics,
+                    canary_override: self.config.features.canary_override,
+                    callback_runner: self.callback_runner.clone(),
+                    shutdown_state: shutdown_state.clone(),
+                    server_timeout: Duration::from_secs_f64(self.config.server.timeout as f64),
+                    grpc_config: self.config.grpc.clone(),
+                    rate_limiter: rate_limiter.clone(),
+                    tls: grpc_tls.clone(),
+                    config: self.config.clone(),
+                    has_hot_reload: has_hot_reload.clone(),
+                },
                 grpc_shutdown_rx,
             )))
         } else {

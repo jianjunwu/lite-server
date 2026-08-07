@@ -2006,10 +2006,10 @@ async fn test_grpc_shutdown_rejects_new_rpcs() {
 }),
     )
     .await;
-    match infer2 {
-        Ok(Ok(_)) => panic!("new gRPC RPC after SIGTERM must be rejected, got Ok"),
-        _ => {} // Err or timeout — both mean rejected / not served
+    if let Ok(Ok(_)) = infer2 {
+        panic!("new gRPC RPC after SIGTERM must be rejected, got Ok")
     }
+    // Err or timeout — both mean rejected / not served
 
     // In-flight Infer #1 still drains to completion.
     let resp = tokio::time::timeout(Duration::from_secs(20), infer1)
@@ -2186,8 +2186,8 @@ async fn test_http_sse_decoupled_pushes_chunks_then_done() {
     );
 
     // First 3 are chunks with ordered indices.
-    for i in 0..3 {
-        let json_str = data_lines[i].strip_prefix("data: ").unwrap();
+    for (i, line) in data_lines.iter().take(3).enumerate() {
+        let json_str = line.strip_prefix("data: ").unwrap();
         let v: Value = serde_json::from_str(json_str).expect("chunk data is JSON");
         assert_eq!(v["index"], i, "chunks must arrive in order");
     }
@@ -4146,9 +4146,9 @@ async fn test_grpc_decoupled_infer_pushes_chunks_then_final() {
     }
     // 3 data chunks (is_final=false) + 1 terminal (is_final=true).
     assert_eq!(frames.len(), 4, "expected 4 frames: {:?}", frames);
-    for i in 0..3 {
-        assert!(!frames[i].is_final, "chunk {} must be non-final", i);
-        let v: Value = serde_json::from_slice(&frames[i].data).expect("chunk data is JSON");
+    for (i, frame) in frames.iter().take(3).enumerate() {
+        assert!(!frame.is_final, "chunk {} must be non-final", i);
+        let v: Value = serde_json::from_slice(&frame.data).expect("chunk data is JSON");
         assert_eq!(v["index"], i, "chunks must arrive in order");
     }
     assert!(frames[3].is_final, "last frame must be terminal is_final=true");

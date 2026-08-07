@@ -153,9 +153,8 @@ mod tests {
     fn parse_network_accepts_cidr_and_bare_ip() {
         assert!(parse_network("10.0.0.0/8").unwrap().contains(&ip("10.1.2.3")));
         assert!(parse_network("192.168.1.1").unwrap().contains(&ip("192.168.1.1")));
-        assert_eq!(
+        assert!(
             parse_network("::1").unwrap().contains(&ip("::1")),
-            true,
             "bare v6 → /128"
         );
         assert!(parse_network("garbage").is_none());

@@ -860,7 +860,7 @@ mod tests {
         let store = Arc::new(TlsConfigStore::load(&settings(&cert, &key, None), TlsProtocol::Http).unwrap());
 
         // Unchanged files → no-op.
-        assert_eq!(store.reload().unwrap(), false);
+        assert!(!store.reload().unwrap());
 
         let (_, client) = run_handshake(store.clone(), client_config(&pki, None), "localhost").await;
         assert_eq!(
@@ -873,7 +873,7 @@ mod tests {
         let (cert2_pem, key2_pem) = pki.sign_server();
         std::fs::write(&cert, &cert2_pem).unwrap();
         std::fs::write(&key, &key2_pem).unwrap();
-        assert_eq!(store.reload().unwrap(), true, "changed files must rotate");
+        assert!(store.reload().unwrap(), "changed files must rotate");
 
         let (_, client) = run_handshake(store.clone(), client_config(&pki, None), "localhost").await;
         assert_eq!(

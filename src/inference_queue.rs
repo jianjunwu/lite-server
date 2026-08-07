@@ -667,6 +667,9 @@ impl InferenceQueue {
     }
 
     /// Register a model version and start its batch collector task.
+    // allow: 生命周期注册入口,参数为 worker/clients/通道等异构运行时部件,
+    // 由 worker lifecycle 单点组装;批发送链路已收 BatchTunables/BatchDispatch。
+    #[allow(clippy::too_many_arguments)]
     pub fn register_model(
         &self,
         model_name: &str,
@@ -718,24 +721,28 @@ impl InferenceQueue {
         let dispatch_workers = zmq_clients.len();
         let handle = tokio::spawn(batch_collector(
             rx,
-            max_batch,
-            batch_timeout,
-            adaptive,
-            min_timeout,
-            queue_threshold,
-            zmq_clients.clone(),
-            model_name.to_string(),
-            version.to_string(),
-            request_timeout,
-            max_requests,
-            max_requests_jitter,
-            reload_tx,
-            max_retries,
-            queue_timeout,
-            queue_timeout_action,
-            outlier.clone(),
-            self.sequence_registry.clone(),
-            self.balance,
+            BatchTunables {
+                max_batch_size: max_batch,
+                base_timeout: batch_timeout,
+                adaptive,
+                min_timeout,
+                queue_threshold,
+                request_timeout,
+                max_requests,
+                max_requests_jitter,
+                max_retries,
+                queue_timeout,
+                queue_timeout_action,
+            },
+            Arc::new(BatchDispatch {
+                zmq_clients: zmq_clients.clone(),
+                outlier: outlier.clone(),
+                model_name: model_name.to_string(),
+                version: version.to_string(),
+                reload_tx,
+                sequence_registry: self.sequence_registry.clone(),
+                balance: self.balance,
+            }),
         ));
 
         // Spawn health checker if interval > 0
@@ -1197,18 +1204,53 @@ fn update_worker_saturation(model_name: &str, version: &str, inflight: &[Arc<Ato
     prometheus::set_worker_saturation(model_name, version, max as f64);
 }
 
+/// Dispatch-side context for the batch send path (`do_send_batch` /
+/// `send_batch_with_retry`): worker pool + routing identity. Grouped so the
+/// collector's per-dispatch spawns share one `Arc` clone instead of cloning
+/// seven fields (the `Vec<Arc<_>>` client list included) for every batch.
+struct BatchDispatch {
+    zmq_clients: Vec<Arc<WorkerZmqClient>>,
+    outlier: Arc<OutlierState>,
+    model_name: String,
+    version: String,
+    reload_tx: mpsc::Sender<ReloadSignal>,
+    sequence_registry: Arc<SequenceRegistry>,
+    balance: BalanceConfig,
+}
+
+/// Batching/timeout knobs resolved from [`ModelConfig`] at register time —
+/// value types only, passed to `batch_collector` by value.
+struct BatchTunables {
+    max_batch_size: usize,
+    base_timeout: Duration,
+    adaptive: bool,
+    min_timeout: Duration,
+    queue_threshold: usize,
+    request_timeout: Duration,
+    max_requests: usize,
+    max_requests_jitter: usize,
+    max_retries: usize,
+    queue_timeout: Duration,
+    queue_timeout_action: crate::config::QueueTimeoutAction,
+}
+
 async fn do_send_batch(
     batch: &mut Vec<QueueItem>,
-    zmq_clients: &[Arc<WorkerZmqClient>],
+    dispatch: &BatchDispatch,
     inflight: &[Arc<AtomicUsize>],
-    outlier: &OutlierState,
-    model_name: &str,
-    version: &str,
     request_timeout: Duration,
     exclude: &[usize],
-    sequence_registry: &SequenceRegistry,
-    balance: BalanceConfig,
 ) -> Result<(), BatchError> {
+    let BatchDispatch {
+        zmq_clients,
+        outlier,
+        model_name,
+        version,
+        sequence_registry,
+        balance,
+        ..
+    } = dispatch;
+    let balance = *balance;
     if batch.is_empty() {
         return Ok(());
     }
@@ -1450,19 +1492,20 @@ async fn do_send_batch(
 /// Send a batch with retry on failure. Retries on a different worker (if available).
 async fn send_batch_with_retry(
     mut batch: Vec<QueueItem>,
-    zmq_clients: &[Arc<WorkerZmqClient>],
+    dispatch: &BatchDispatch,
     inflight: &[Arc<AtomicUsize>],
-    outlier: &OutlierState,
-    model_name: &str,
-    version: &str,
     request_timeout: Duration,
     request_count: &AtomicUsize,
     max_requests: usize,
-    reload_tx: &mpsc::Sender<ReloadSignal>,
     max_retries: usize,
-    sequence_registry: &SequenceRegistry,
-    balance: BalanceConfig,
 ) {
+    let BatchDispatch {
+        zmq_clients,
+        model_name,
+        version,
+        reload_tx,
+        ..
+    } = dispatch;
     if batch.is_empty() {
         return;
     }
@@ -1480,7 +1523,7 @@ async fn send_batch_with_retry(
 
     // Fast path: single worker, or retries disabled (max_retries == 0)
     if zmq_clients.len() <= 1 || max_retries == 0 {
-        let result = do_send_batch(&mut batch, zmq_clients, inflight, outlier, model_name, version, request_timeout, &[], sequence_registry, balance).await;
+        let result = do_send_batch(&mut batch, dispatch, inflight, request_timeout, &[]).await;
         match result {
             Ok(()) => check_max_requests(request_count, batch_size, max_requests, model_name, version, reload_tx).await,
             Err(e) => fail_batch_items(&mut batch, &e),
@@ -1494,7 +1537,7 @@ async fn send_batch_with_retry(
         if attempt > 0 {
             prometheus::inc_retry(model_name, version);
         }
-        match do_send_batch(&mut batch, zmq_clients, inflight, outlier, model_name, version, request_timeout, &excluded, sequence_registry, balance).await {
+        match do_send_batch(&mut batch, dispatch, inflight, request_timeout, &excluded).await {
             Ok(()) => {
                 check_max_requests(request_count, batch_size, max_requests, model_name, version, reload_tx).await;
                 return;
@@ -1589,26 +1632,23 @@ pub fn compute_adaptive_timeout(
 /// Background task that collects requests into batches and dispatches them.
 async fn batch_collector(
     rx: PriorityReceiver,
-    max_batch_size: usize,
-    base_timeout: Duration,
-    adaptive: bool,
-    min_timeout: Duration,
-    queue_threshold: usize,
-    zmq_clients: Vec<Arc<WorkerZmqClient>>,
-    model_name: String,
-    version: String,
-    request_timeout: Duration,
-    max_requests: usize,
-    max_requests_jitter: usize,
-    reload_tx: mpsc::Sender<ReloadSignal>,
-    max_retries: usize,
-    queue_timeout: Duration,
-    queue_timeout_action: crate::config::QueueTimeoutAction,
-    outlier: Arc<OutlierState>,
-    sequence_registry: Arc<SequenceRegistry>,
-    balance: BalanceConfig,
+    tunables: BatchTunables,
+    dispatch: Arc<BatchDispatch>,
 ) {
-    let worker_inflight: Vec<Arc<AtomicUsize>> = (0..zmq_clients.len())
+    let BatchTunables {
+        max_batch_size,
+        base_timeout,
+        adaptive,
+        min_timeout,
+        queue_threshold,
+        request_timeout,
+        max_requests,
+        max_requests_jitter,
+        max_retries,
+        queue_timeout,
+        queue_timeout_action,
+    } = tunables;
+    let worker_inflight: Vec<Arc<AtomicUsize>> = (0..dispatch.zmq_clients.len())
         .map(|_| Arc::new(AtomicUsize::new(0)))
         .collect();
     let request_count = Arc::new(AtomicUsize::new(0));
@@ -1619,21 +1659,16 @@ async fn batch_collector(
     if max_batch_size <= 1 {
         // Fast path: no batching, send immediately and concurrently
         while let Some(item) = rx.recv().await {
-            prometheus::inc_queue_depth(&model_name, &version);
+            prometheus::inc_queue_depth(&dispatch.model_name, &dispatch.version);
             let Some(item) = check_queue_timeout(item, queue_timeout, queue_timeout_action) else {
                 continue;
             };
             let batch = vec![item];
-            let zmq_clients = zmq_clients.clone();
+            let dispatch = dispatch.clone();
             let worker_inflight = worker_inflight.clone();
-            let outlier = outlier.clone();
-            let sequence_registry = sequence_registry.clone();
-            let model_name = model_name.clone();
-            let version = version.clone();
             let request_count = request_count.clone();
-            let reload_tx = reload_tx.clone();
             tokio::spawn(async move {
-                send_batch_with_retry(batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx, max_retries, &sequence_registry, balance).await;
+                send_batch_with_retry(batch, &dispatch, &worker_inflight, request_timeout, &request_count, max_requests, max_retries).await;
             });
         }
         return;
@@ -1646,23 +1681,18 @@ async fn batch_collector(
         tokio::select! {
             biased;
             Some(item) = rx.recv() => {
-                prometheus::inc_queue_depth(&model_name, &version);
+                prometheus::inc_queue_depth(&dispatch.model_name, &dispatch.version);
                 let Some(item) = check_queue_timeout(item, queue_timeout, queue_timeout_action) else {
                     continue;
                 };
                 batch.push(item);
                 if batch.len() >= max_batch_size {
                     let current_batch = std::mem::take(&mut batch);
-                    let zmq_clients = zmq_clients.clone();
+                    let dispatch = dispatch.clone();
                     let worker_inflight = worker_inflight.clone();
-                    let outlier = outlier.clone();
-                    let sequence_registry = sequence_registry.clone();
-                    let model_name = model_name.clone();
-                    let version = version.clone();
                     let request_count = request_count.clone();
-                    let reload_tx = reload_tx.clone();
                     tokio::spawn(async move {
-                        send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx, max_retries, &sequence_registry, balance).await;
+                        send_batch_with_retry(current_batch, &dispatch, &worker_inflight, request_timeout, &request_count, max_requests, max_retries).await;
                     });
                     deadline = None;
                 } else if deadline.is_none() {
@@ -1690,18 +1720,13 @@ async fn batch_collector(
                 }
             }, if deadline.is_some() => {
                 if !batch.is_empty() {
-                    debug!(model = %model_name, version = %version, batch_size = batch.len(), "batch timeout");
+                    debug!(model = %dispatch.model_name, version = %dispatch.version, batch_size = batch.len(), "batch timeout");
                     let current_batch = std::mem::take(&mut batch);
-                    let zmq_clients = zmq_clients.clone();
+                    let dispatch = dispatch.clone();
                     let worker_inflight = worker_inflight.clone();
-                    let outlier = outlier.clone();
-                    let sequence_registry = sequence_registry.clone();
-                    let model_name = model_name.clone();
-                    let version = version.clone();
                     let request_count = request_count.clone();
-                    let reload_tx = reload_tx.clone();
                     tokio::spawn(async move {
-                        send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx, max_retries, &sequence_registry, balance).await;
+                        send_batch_with_retry(current_batch, &dispatch, &worker_inflight, request_timeout, &request_count, max_requests, max_retries).await;
                     });
                 }
                 deadline = None;
@@ -1713,16 +1738,11 @@ async fn batch_collector(
     // Drain remaining items
     if !batch.is_empty() {
         let current_batch = std::mem::take(&mut batch);
-        let zmq_clients = zmq_clients.clone();
+        let dispatch = dispatch.clone();
         let worker_inflight = worker_inflight.clone();
-        let outlier = outlier.clone();
-        let sequence_registry = sequence_registry.clone();
-        let model_name = model_name.clone();
-        let version = version.clone();
         let request_count = request_count.clone();
-        let reload_tx = reload_tx.clone();
         tokio::spawn(async move {
-            send_batch_with_retry(current_batch, &zmq_clients, &worker_inflight, &outlier, &model_name, &version, request_timeout, &request_count, max_requests, &reload_tx, max_retries, &sequence_registry, balance).await;
+            send_batch_with_retry(current_batch, &dispatch, &worker_inflight, request_timeout, &request_count, max_requests, max_retries).await;
         });
     }
 }
@@ -1734,6 +1754,9 @@ async fn batch_collector(
 /// count: reaching the ejection threshold stops routing to the worker
 /// ([`OutlierState`]); reaching `kill_threshold` (0 = never) kills + respawns
 /// the process via `respawn_tx`.
+// allow: register_model 单点 spawn 的健康探针管道,参数为探针间隔/超时/
+// 阈值等异构部件,无共享上下文可收。
+#[allow(clippy::too_many_arguments)]
 async fn health_checker(
     interval: Duration,
     probe_timeout: Duration,

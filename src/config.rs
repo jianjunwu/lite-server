@@ -2363,8 +2363,10 @@ policies:
         );
 
         // Non-finite values are rejected too (NaN/Inf also panic Duration):
-        let mut cfg = ModelConfig::default();
-        cfg.request_timeout = f32::NAN;
+        let cfg = ModelConfig {
+            request_timeout: f32::NAN,
+            ..Default::default()
+        };
         assert!(cfg.validate().is_err());
 
         // B1 regression: hook_http_timeout is NOT validated — negative/NaN

@@ -1113,20 +1113,22 @@ mod tests {
         ));
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(crate::grpc::start_grpc_server(
-            "127.0.0.1".to_string(),
-            port,
-            registry,
-            wm,
-            false,                              // streaming_metrics
-            false,                              // canary_override
-            Arc::new(CallbackRunner::new()),
-            Arc::new(crate::server::ShutdownState::new()),
-            std::time::Duration::from_secs(5),  // server_timeout
-            crate::config::GrpcConfig::default(),
-            Arc::new(crate::rate_limit::RateLimiter::default()),
-            None,                               // tls
-            Config::default(),
-            Arc::new(AtomicBool::new(false)),
+            crate::grpc::GrpcServerOptions {
+                host: "127.0.0.1".to_string(),
+                port,
+                registry,
+                worker_manager: wm,
+                streaming_metrics: false,
+                canary_override: false,
+                callback_runner: Arc::new(CallbackRunner::new()),
+                shutdown_state: Arc::new(crate::server::ShutdownState::new()),
+                server_timeout: std::time::Duration::from_secs(5),
+                grpc_config: crate::config::GrpcConfig::default(),
+                rate_limiter: Arc::new(crate::rate_limit::RateLimiter::default()),
+                tls: None,
+                config: Config::default(),
+                has_hot_reload: Arc::new(AtomicBool::new(false)),
+            },
             shutdown_rx,
         ));
         (port, shutdown_tx, handle)

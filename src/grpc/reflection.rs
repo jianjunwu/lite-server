@@ -89,20 +89,22 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
             let _ = start_grpc_server(
-                "127.0.0.1".to_string(),
-                port,
-                registry,
-                wm,
-                false,
-                false,
-                Arc::new(CallbackRunner::new()),
-                Arc::new(crate::server::ShutdownState::new()),
-                Duration::from_secs(5),
-                grpc_config,
-                Arc::new(crate::rate_limit::RateLimiter::default()),
-                None,
-                config,
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                crate::grpc::GrpcServerOptions {
+                    host: "127.0.0.1".to_string(),
+                    port,
+                    registry,
+                    worker_manager: wm,
+                    streaming_metrics: false,
+                    canary_override: false,
+                    callback_runner: Arc::new(CallbackRunner::new()),
+                    shutdown_state: Arc::new(crate::server::ShutdownState::new()),
+                    server_timeout: Duration::from_secs(5),
+                    grpc_config,
+                    rate_limiter: Arc::new(crate::rate_limit::RateLimiter::default()),
+                    tls: None,
+                    config,
+                    has_hot_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                },
                 rx,
             )
             .await;

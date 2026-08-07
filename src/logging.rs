@@ -36,6 +36,9 @@ fn normalize_log_level(level: &str) -> String {
     }
 }
 
+// allow: 启动一次性初始化,参数即日志配置各字段(level/输出/轮转/OTel
+// layer),两调用点(lib/main)直读配置装配,无收编语义。
+#[allow(clippy::too_many_arguments)]
 pub fn init(
     level: &str,
     info_output: Option<&str>,
