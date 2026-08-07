@@ -298,6 +298,8 @@ async fn h2_bidi_entry_impl(
             // S1/S2:收口枚举——各 break 点只置 reason,尾部 record_stream_terminal
             // 统一消费(family/cancelled 单一来源)。
             let reason;
+            // S6:per-stream 输出字节(Σ chunk.data.len(),收口统一上报)。
+            let mut output_bytes: u64 = 0;
 
             loop {
                 let chunk =
@@ -327,6 +329,7 @@ async fn h2_bidi_entry_impl(
                     };
                 match chunk.payload {
                     Some(pb::stream_response::Payload::Chunk(c)) => {
+                        output_bytes += c.data.len() as u64;
                         if stream_metrics {
                             if first_chunk {
                                 prometheus::record_stream_ttft(
@@ -401,15 +404,17 @@ async fn h2_bidi_entry_impl(
                     _ => {}
                 }
             }
-            // S1/S2 收口:无条件 record_request_end + 门控内 cancelled/close。
+            // S1/S2/S4/S6 收口:无条件 record_request_end + 门控内 cancelled/errors/duration/bytes/close。
             prometheus::record_stream_terminal(
                 &metrics_model,
                 &metrics_version,
+                "http2",
                 "http2",
                 open_time,
                 reason.status_family(),
                 reason,
                 stream_metrics,
+                output_bytes,
             );
 
             // Targeted cancel.
@@ -1388,6 +1393,11 @@ mod tests {
 
         let counter = prometheus::REQUESTS_TOTAL.with_label_values(&[model, "1", "5xx"]);
         let before = counter.get();
+        // S4/S5:Error 帧 → kind=worker_error,stream_kind=http2。before 须在
+        // 流开始前取——errors 与 5xx 在同一次收口原子记录,晚取会漏计数。
+        let errs = prometheus::STREAM_ERRORS_TOTAL
+            .with_label_values(&[model, "1", "http2", "worker_error"]);
+        let e_before = errs.get();
         let (body_tx, resp) = start_bidi_session(model, state).await;
         tokio::spawn(async move {
             let _ = axum::body::to_bytes(resp.into_body(), 1 << 20).await;
@@ -1395,6 +1405,7 @@ mod tests {
         });
         wait_for(|| counter.get() >= before + 1.0, "bidi requests_total 5xx").await;
         assert_eq!(counter.get(), before + 1.0, "h2 bidi error must record one 5xx");
+        assert_eq!(errs.get(), e_before + 1.0, "S4: Error frame must count kind=worker_error");
     }
 
     /// D7:h2 bidi 早期拒绝(首帧非 BidiOpen)→ REQUESTS_TOTAL{4xx} +1。

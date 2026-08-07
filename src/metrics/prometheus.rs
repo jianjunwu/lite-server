@@ -151,6 +151,37 @@ lazy_static! {
         &["model", "version", "protocol"]
     ).unwrap();
 
+    // S4:流错误/停滞计数(S4)。kind 是封闭枚举(worker_error|deadline|idle|
+    // protocol|panic),由 StreamCloseReason::error_kind 映射;cancel/done/
+    // worker_eof 不进。stream_kind 是 S5 的 6 值封闭枚举(sse|ws|http2|
+    // grpc_stream|grpc_bidi|grpc_decoupled)——仅新增指标带,既有 protocol
+    // label 值不改(D2)。门控随 streaming_metrics(D9)。
+    pub static ref STREAM_ERRORS_TOTAL: CounterVec = CounterVec::new(
+        prometheus::Opts::new(
+            "liteserver_stream_errors_total",
+            "Stream errors by kind (S4)"
+        ),
+        &["model", "version", "stream_kind", "kind"]
+    ).unwrap();
+
+    // S6:流时长(open→close)直方图;桶覆盖秒~分钟级流时长。
+    pub static ref STREAM_DURATION_SECONDS: HistogramVec = HistogramVec::new(
+        HistogramOpts::new(
+            "liteserver_stream_duration_seconds",
+            "Stream open-to-close duration (S6)"
+        ).buckets(vec![0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0]),
+        &["model", "version", "stream_kind"]
+    ).unwrap();
+
+    // S6:流输出字节(Σ chunk.data.len())。
+    pub static ref STREAM_OUTPUT_BYTES_TOTAL: CounterVec = CounterVec::new(
+        prometheus::Opts::new(
+            "liteserver_stream_output_bytes_total",
+            "Total stream output bytes (S6)"
+        ),
+        &["model", "version", "stream_kind"]
+    ).unwrap();
+
     // Health check metrics
     pub static ref HEALTH_CHECK_TOTAL: CounterVec = CounterVec::new(
         prometheus::Opts::new(
@@ -286,6 +317,9 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(STREAMING_TBT.clone()))?;
     REGISTRY.register(Box::new(STREAMING_CHUNKS_TOTAL.clone()))?;
     REGISTRY.register(Box::new(STREAM_CANCELLED_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(STREAM_ERRORS_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(STREAM_DURATION_SECONDS.clone()))?;
+    REGISTRY.register(Box::new(STREAM_OUTPUT_BYTES_TOTAL.clone()))?;
     REGISTRY.register(Box::new(INFERENCE_DURATION.clone()))?;
     REGISTRY.register(Box::new(BATCH_SIZE.clone()))?;
     REGISTRY.register(Box::new(HEALTH_CHECK_TOTAL.clone()))?;
@@ -552,20 +586,40 @@ impl StreamCloseReason {
             StreamCloseReason::Protocol => "4xx",
         }
     }
+
+    /// S4:errors kind 映射——error→worker_error、deadline→deadline、
+    /// idle→idle、protocol→protocol、panic→panic(仅 WS 可达);
+    /// cancel/done/worker_eof 不进 errors(None)。
+    pub fn error_kind(self) -> Option<&'static str> {
+        match self {
+            StreamCloseReason::Error => Some("worker_error"),
+            StreamCloseReason::Deadline => Some("deadline"),
+            StreamCloseReason::Idle => Some("idle"),
+            StreamCloseReason::Protocol => Some("protocol"),
+            StreamCloseReason::Panic => Some("panic"),
+            _ => None,
+        }
+    }
 }
 
-/// 流 close 收口(S1/S2):无条件 `record_request_end`(不门控);门控内
-/// (streaming_metrics)记 cancelled(S2)与 `record_stream_close`。
+/// 流 close 收口(S1/S2/S4/S6):无条件 `record_request_end`(不门控);门控内
+/// (streaming_metrics)记 cancelled(S2)、errors(S4)、duration/bytes(S6)与
+/// `record_stream_close`。
+/// `protocol` 是 cancelled 的 label(批次 1,既有 protocol 值);`stream_kind`
+/// 是 S5 的 6 值封闭枚举,供 errors/duration/bytes 使用(D2:既有 protocol
+/// label 值不改)。`output_bytes` 是流内 Σ chunk.data.len()(chunk 处累加)。
 /// `family` 由调用方传:HTTP 用 `reason.status_family()`,gRPC 的 Error 帧
 /// 按 grpc code 映射覆盖(既有语义)。exactly-once 由任务尾部单一收口保证。
 pub fn record_stream_terminal(
     model: &str,
     version: &str,
     protocol: &str,
+    stream_kind: &str,
     open_time: std::time::Instant,
     family: &str,
     reason: StreamCloseReason,
     streaming_metrics: bool,
+    output_bytes: u64,
 ) {
     record_request_end(model, version, family, open_time.elapsed().as_secs_f64());
     if streaming_metrics {
@@ -573,6 +627,19 @@ pub fn record_stream_terminal(
             STREAM_CANCELLED_TOTAL
                 .with_label_values(&[model, version, protocol])
                 .inc();
+        }
+        if let Some(kind) = reason.error_kind() {
+            STREAM_ERRORS_TOTAL
+                .with_label_values(&[model, version, stream_kind, kind])
+                .inc();
+        }
+        STREAM_DURATION_SECONDS
+            .with_label_values(&[model, version, stream_kind])
+            .observe(open_time.elapsed().as_secs_f64());
+        if output_bytes > 0 {
+            STREAM_OUTPUT_BYTES_TOTAL
+                .with_label_values(&[model, version, stream_kind])
+                .inc_by(output_bytes as f64);
         }
         record_stream_close(model, version, protocol);
     }
@@ -1222,8 +1289,8 @@ mod tests {
         let version = "1";
         let before = REQUESTS_TOTAL.with_label_values(&[model, version, "2xx"]).get();
         record_stream_terminal(
-            model, version, "sse", std::time::Instant::now(),
-            StreamCloseReason::Done.status_family(), StreamCloseReason::Done, false,
+            model, version, "sse", "sse", std::time::Instant::now(),
+            StreamCloseReason::Done.status_family(), StreamCloseReason::Done, false, 0,
         );
         let after = REQUESTS_TOTAL.with_label_values(&[model, version, "2xx"]).get();
         assert_eq!(
@@ -1242,8 +1309,8 @@ mod tests {
         let canc_before = STREAM_CANCELLED_TOTAL.with_label_values(&[model, version, "sse"]).get();
         let conn_before = STREAMING_CONNECTIONS.with_label_values(&[model, version, "sse"]).get();
         record_stream_terminal(
-            model, version, "sse", std::time::Instant::now(),
-            StreamCloseReason::Cancel.status_family(), StreamCloseReason::Cancel, true,
+            model, version, "sse", "sse", std::time::Instant::now(),
+            StreamCloseReason::Cancel.status_family(), StreamCloseReason::Cancel, true, 0,
         );
         assert_eq!(
             STREAM_CANCELLED_TOTAL.with_label_values(&[model, version, "sse"]).get(),
@@ -1272,8 +1339,8 @@ mod tests {
         let canc_before = STREAM_CANCELLED_TOTAL.with_label_values(&[model, version, "websocket"]).get();
         let conn_before = STREAMING_CONNECTIONS.with_label_values(&[model, version, "websocket"]).get();
         record_stream_terminal(
-            model, version, "websocket", std::time::Instant::now(),
-            StreamCloseReason::Cancel.status_family(), StreamCloseReason::Cancel, false,
+            model, version, "websocket", "ws", std::time::Instant::now(),
+            StreamCloseReason::Cancel.status_family(), StreamCloseReason::Cancel, false, 0,
         );
         assert_eq!(
             STREAM_CANCELLED_TOTAL.with_label_values(&[model, version, "websocket"]).get(),
@@ -1299,8 +1366,8 @@ mod tests {
         let version = "1";
         let before = REQUESTS_TOTAL.with_label_values(&[model, version, "4xx"]).get();
         record_stream_terminal(
-            model, version, "websocket", std::time::Instant::now(),
-            StreamCloseReason::Protocol.status_family(), StreamCloseReason::Protocol, false,
+            model, version, "websocket", "ws", std::time::Instant::now(),
+            StreamCloseReason::Protocol.status_family(), StreamCloseReason::Protocol, false, 0,
         );
         assert_eq!(
             REQUESTS_TOTAL.with_label_values(&[model, version, "4xx"]).get(),
@@ -1316,8 +1383,8 @@ mod tests {
         let version = "1";
         let before = REQUESTS_TOTAL.with_label_values(&[model, version, "5xx"]).get();
         record_stream_terminal(
-            model, version, "websocket", std::time::Instant::now(),
-            StreamCloseReason::Panic.status_family(), StreamCloseReason::Panic, false,
+            model, version, "websocket", "ws", std::time::Instant::now(),
+            StreamCloseReason::Panic.status_family(), StreamCloseReason::Panic, false, 0,
         );
         assert_eq!(
             REQUESTS_TOTAL.with_label_values(&[model, version, "5xx"]).get(),
@@ -1409,6 +1476,134 @@ mod tests {
         record_stream_tbt(model, version, "sse", 1.0);
         let le1 = histogram_bucket_count("liteserver_streaming_tbt_seconds", model, 1.0);
         assert!(le1 >= 1, "1.0s TBT must land in the new le=1 bucket (got {le1})");
+    }
+
+    // ===== S4/S5/S6 (批次 3):errors 计数 + stream_kind label + duration/bytes =====
+
+    #[test]
+    fn stream_close_reason_maps_error_kind() {
+        use StreamCloseReason::*;
+        assert_eq!(Error.error_kind(), Some("worker_error"));
+        assert_eq!(Deadline.error_kind(), Some("deadline"));
+        assert_eq!(Idle.error_kind(), Some("idle"));
+        assert_eq!(Protocol.error_kind(), Some("protocol"));
+        assert_eq!(Panic.error_kind(), Some("panic"));
+        assert_eq!(Done.error_kind(), None);
+        assert_eq!(WorkerEof.error_kind(), None);
+        assert_eq!(Cancel.error_kind(), None);
+    }
+
+    /// S4:Error reason → STREAM_ERRORS_TOTAL{kind=worker_error} +1(门控开)。
+    #[test]
+    fn record_stream_terminal_error_kind_counts_when_gated() {
+        let model = "term_err_on";
+        let version = "1";
+        let before = STREAM_ERRORS_TOTAL
+            .with_label_values(&[model, version, "sse", "worker_error"])
+            .get();
+        record_stream_terminal(
+            model, version, "sse", "sse", std::time::Instant::now(),
+            "5xx", StreamCloseReason::Error, true, 0,
+        );
+        assert_eq!(
+            STREAM_ERRORS_TOTAL.with_label_values(&[model, version, "sse", "worker_error"]).get(),
+            before + 1.0,
+            "S4: Error frame must count kind=worker_error"
+        );
+    }
+
+    /// S4:cancel/done/worker_eof 不进 errors。
+    #[test]
+    fn record_stream_terminal_cancel_does_not_count_error_kind() {
+        let model = "term_err_cancel";
+        let version = "1";
+        for reason in [
+            StreamCloseReason::Cancel,
+            StreamCloseReason::Done,
+            StreamCloseReason::WorkerEof,
+        ] {
+            let family = reason.status_family();
+            let before = STREAM_ERRORS_TOTAL
+                .with_label_values(&[model, version, "sse", "x"])
+                .get();
+            record_stream_terminal(
+                model, version, "sse", "sse", std::time::Instant::now(),
+                family, reason, true, 0,
+            );
+            assert_eq!(
+                STREAM_ERRORS_TOTAL.with_label_values(&[model, version, "sse", "x"]).get(),
+                before,
+                "{reason:?} must not count as a stream error"
+            );
+        }
+    }
+
+    /// S6:duration 有观测、bytes 累加(门控开)。
+    #[test]
+    fn record_stream_terminal_records_duration_and_bytes_when_gated() {
+        let model = "term_s6_on";
+        let version = "1";
+        let before_dur = STREAM_DURATION_SECONDS
+            .with_label_values(&[model, version, "sse"])
+            .get_sample_count();
+        let before_bytes = STREAM_OUTPUT_BYTES_TOTAL
+            .with_label_values(&[model, version, "sse"])
+            .get();
+        record_stream_terminal(
+            model, version, "sse", "sse", std::time::Instant::now(),
+            "2xx", StreamCloseReason::Done, true, 42,
+        );
+        assert_eq!(
+            STREAM_DURATION_SECONDS.with_label_values(&[model, version, "sse"]).get_sample_count(),
+            before_dur + 1,
+            "S6: close must observe stream duration"
+        );
+        assert_eq!(
+            STREAM_OUTPUT_BYTES_TOTAL.with_label_values(&[model, version, "sse"]).get(),
+            before_bytes + 42.0,
+            "S6: chunk bytes must accumulate"
+        );
+    }
+
+    /// D9 门控矩阵:cancelled/errors/duration/bytes 零记录,requests_total 仍记录。
+    #[test]
+    fn record_stream_terminal_gated_off_skips_errors_duration_bytes() {
+        let model = "term_all_off";
+        let version = "1";
+        let e_before = STREAM_ERRORS_TOTAL
+            .with_label_values(&[model, version, "websocket", "protocol"])
+            .get();
+        let d_before = STREAM_DURATION_SECONDS
+            .with_label_values(&[model, version, "websocket"])
+            .get_sample_count();
+        let b_before = STREAM_OUTPUT_BYTES_TOTAL
+            .with_label_values(&[model, version, "websocket"])
+            .get();
+        let r_before = REQUESTS_TOTAL.with_label_values(&[model, version, "4xx"]).get();
+        record_stream_terminal(
+            model, version, "websocket", "ws", std::time::Instant::now(),
+            "4xx", StreamCloseReason::Protocol, false, 7,
+        );
+        assert_eq!(
+            STREAM_ERRORS_TOTAL.with_label_values(&[model, version, "websocket", "protocol"]).get(),
+            e_before,
+            "D9: errors gated by streaming_metrics"
+        );
+        assert_eq!(
+            STREAM_DURATION_SECONDS.with_label_values(&[model, version, "websocket"]).get_sample_count(),
+            d_before,
+            "D9: duration gated by streaming_metrics"
+        );
+        assert_eq!(
+            STREAM_OUTPUT_BYTES_TOTAL.with_label_values(&[model, version, "websocket"]).get(),
+            b_before,
+            "D9: bytes gated by streaming_metrics"
+        );
+        assert_eq!(
+            REQUESTS_TOTAL.with_label_values(&[model, version, "4xx"]).get(),
+            r_before + 1.0,
+            "S1: requests_total must NOT be gated"
+        );
     }
 
     // ===== P6: per-worker inference counter (GetModelStats source) =====

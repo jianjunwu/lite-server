@@ -298,6 +298,8 @@ async fn sse_infer_impl(
         // S1/S2:收口枚举——各 break 点只置 reason,尾部 record_stream_terminal
         // 统一消费(family/cancelled 单一来源,exactly-once 由单一收口保证)。
         let reason;
+        // S6:per-stream 输出字节(Σ chunk.data.len(),收口统一上报)。
+        let mut output_bytes: u64 = 0;
 
         loop {
             let chunk = match streaming::recv_chunk(&mut chunk_rx, stream_deadline, stream_idle)
@@ -327,6 +329,7 @@ async fn sse_infer_impl(
             };
             let event = match &chunk.payload {
                 Some(pb::stream_response::Payload::Chunk(c)) => {
+                    output_bytes += c.data.len() as u64;
                     if stream_metrics {
                         if first_chunk {
                             prometheus::record_stream_ttft(&model_name, &resolved_version, "sse", open_time.elapsed().as_secs_f64());
@@ -381,15 +384,17 @@ async fn sse_infer_impl(
                 break;
             }
         }
-        // S1/S2 收口:无条件 record_request_end + 门控内 cancelled/close。
+        // S1/S2/S4/S6 收口:无条件 record_request_end + 门控内 cancelled/errors/duration/bytes/close。
         prometheus::record_stream_terminal(
             &model_name,
             &resolved_version,
+            "sse",
             "sse",
             open_time,
             reason.status_family(),
             reason,
             stream_metrics,
+            output_bytes,
         );
         // Ensure stream is cleaned up on worker side.
         // D4: decoupled → targeted cancel (parity with WS/gRPC);
@@ -922,6 +927,8 @@ async fn handle_ws_stream(
         // S1/S2:收口枚举——各 break 点只置 reason,尾部 record_stream_terminal
         // 统一消费(family/cancelled 单一来源)。
         let reason;
+        // S6:per-stream 输出字节(Σ chunk.data.len(),收口统一上报)。
+        let mut output_bytes: u64 = 0;
 
         loop {
             let chunk = tokio::select! {
@@ -973,6 +980,7 @@ async fn handle_ws_stream(
             };
             let msg = match &chunk.payload {
                 Some(pb::stream_response::Payload::Chunk(c)) => {
+                    output_bytes += c.data.len() as u64;
                     if stream_metrics {
                         if first_chunk {
                             prometheus::record_stream_ttft(&model_name, &resolved_version, "websocket", open_time.elapsed().as_secs_f64());
@@ -1020,15 +1028,17 @@ async fn handle_ws_stream(
                 break;
             }
         }
-        // S1/S2 收口:无条件 record_request_end + 门控内 cancelled/close。
+        // S1/S2/S4/S6 收口:无条件 record_request_end + 门控内 cancelled/errors/duration/bytes/close。
         prometheus::record_stream_terminal(
             &model_name,
             &resolved_version,
             "websocket",
+            "ws",
             open_time,
             reason.status_family(),
             reason,
             stream_metrics,
+            output_bytes,
         );
         // Close the sink gracefully (moved here so main doesn't need ws_sink).
         let _ = ws_sink.close().await;
@@ -1047,10 +1057,12 @@ async fn handle_ws_stream(
                 &panic_metrics_model,
                 &panic_metrics_version,
                 "websocket",
+                "ws",
                 stream_open_time,
                 prometheus::StreamCloseReason::Panic.status_family(),
                 prometheus::StreamCloseReason::Panic,
                 stream_metrics,
+                0,
             );
             drop(gone_tx);
             let cancel_req = streaming::build_stream_cancel(stream_id);
@@ -3224,6 +3236,100 @@ mod tests {
         );
     }
 
+    // ===== S4/S5/S6 (批次 3):流错误计数 + stream_kind label + duration/bytes =====
+
+    /// S4/S5:SSE Error 帧 → STREAM_ERRORS_TOTAL{stream_kind=sse, kind=worker_error} +1。
+    #[tokio::test]
+    async fn sse_error_frame_records_stream_error_kind() {
+        let model = "sse_err_kind";
+        let endpoint = ipc_endpoint(model);
+        let _w = spawn_error_worker(endpoint.clone());
+        let state = ready_state(model, endpoint, Arc::new(CallbackRunner::new())).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let errs = prometheus::STREAM_ERRORS_TOTAL
+            .with_label_values(&[model, "1", "sse", "worker_error"]);
+        let before = errs.get();
+        let sse = sse_infer_impl(
+            state,
+            model.to_string(),
+            "1".to_string(),
+            HeaderMap::new(),
+            json_body(json!({})),
+            test_cx(),
+            false,
+        )
+        .await
+        .expect("sse must open");
+        wait_for(|| errs.get() >= before + 1.0, "sse errors kind=worker_error").await;
+        drop(sse);
+    }
+
+    /// S4:SSE idle 回收 → STREAM_ERRORS_TOTAL{kind=idle} +1。
+    #[tokio::test]
+    async fn sse_idle_records_stream_error_idle() {
+        let model = "sse_idle_kind";
+        let endpoint = ipc_endpoint(model);
+        let _w = spawn_stall_worker(endpoint.clone());
+        let state =
+            ready_state_with_idle(model, endpoint, Arc::new(CallbackRunner::new()), 0.2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let errs = prometheus::STREAM_ERRORS_TOTAL
+            .with_label_values(&[model, "1", "sse", "idle"]);
+        let before = errs.get();
+        let sse = sse_infer_impl(
+            state,
+            model.to_string(),
+            "1".to_string(),
+            HeaderMap::new(),
+            json_body(json!({})),
+            test_cx(),
+            false,
+        )
+        .await
+        .expect("sse must open");
+        // 不 drain:forwarder 收到 stall 后 idle(0.2s)回收 → kind=idle。
+        wait_for(|| errs.get() >= before + 1.0, "sse errors kind=idle").await;
+        drop(sse);
+    }
+
+    /// S6:SSE 正常完成 → STREAM_DURATION_SECONDS 有观测、bytes 累加
+    /// (spawn_done_worker 的 chunk 是 b"{}" = 2 字节)。
+    #[tokio::test]
+    async fn sse_done_records_duration_and_output_bytes() {
+        let model = "sse_s6";
+        let endpoint = ipc_endpoint(model);
+        let _w = spawn_done_worker(endpoint.clone());
+        let state = ready_state(model, endpoint, Arc::new(CallbackRunner::new())).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let dur = prometheus::STREAM_DURATION_SECONDS
+            .with_label_values(&[model, "1", "sse"]);
+        let bytes = prometheus::STREAM_OUTPUT_BYTES_TOTAL
+            .with_label_values(&[model, "1", "sse"]);
+        let dur_before = dur.get_sample_count();
+        let bytes_before = bytes.get();
+        let sse = sse_infer_impl(
+            state,
+            model.to_string(),
+            "1".to_string(),
+            HeaderMap::new(),
+            json_body(json!({})),
+            test_cx(),
+            false,
+        )
+        .await
+        .expect("sse must open");
+        wait_for(|| dur.get_sample_count() >= dur_before + 1, "sse duration").await;
+        drop(sse);
+        assert_eq!(
+            bytes.get(),
+            bytes_before + 2.0,
+            "S6: chunk bytes must accumulate (b\"{{}}\" = 2 bytes)"
+        );
+    }
+
     // ===== S1/S2 (批次 1):WS 请求级计数 =====
 
     /// S1:WS 正常完成 → REQUESTS_TOTAL{2xx} +1。
@@ -3264,6 +3370,11 @@ mod tests {
 
         let counter = prometheus::REQUESTS_TOTAL.with_label_values(&[model, "1", "4xx"]);
         let before = counter.get();
+        // S4:协议违规 → kind=protocol(stream_kind=ws)。before 在流开始前取
+        // (errors 与 4xx 同一次收口原子记录)。
+        let errs = prometheus::STREAM_ERRORS_TOTAL
+            .with_label_values(&[model, "1", "ws", "protocol"]);
+        let e_before = errs.get();
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("{}/{}/stream", base, model))
             .await
             .expect("WS connect failed");
@@ -3274,6 +3385,7 @@ mod tests {
             .await
             .unwrap();
         wait_for(|| counter.get() >= before + 1.0, "ws requests_total 4xx").await;
+        assert_eq!(errs.get(), e_before + 1.0, "S4: protocol violation must count kind=protocol");
         let _ = ws.close(None).await;
     }
 

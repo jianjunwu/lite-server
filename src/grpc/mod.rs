@@ -3030,6 +3030,12 @@ mod request_metrics_tests {
             c5xx.get() > before,
             "stalled stream must be reclaimed by the always-on idle → 5xx"
         );
+        // S4/S5:idle 回收 → kind=idle,stream_kind=grpc_stream。
+        // (测试 service streaming_metrics=false —— errors 随门控,此处断言
+        // 零记录,门控矩阵由 prometheus 单测覆盖;门控开的行为见 SSE idle 用例。)
+        let errs = crate::metrics::prometheus::STREAM_ERRORS_TOTAL
+            .with_label_values(&[model, "1", "grpc_stream", "idle"]);
+        assert_eq!(errs.get(), 0.0, "D9: errors gated off in this test service");
     }
 
     /// S2:gRPC stream 客户端断开(tx.send Err → 下游不 drain)→

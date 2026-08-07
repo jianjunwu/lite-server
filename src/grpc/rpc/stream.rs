@@ -205,6 +205,8 @@ impl GrpcService {
             // S1/S2:收口枚举——各 break 点只置 reason,尾部 record_stream_terminal
             // 统一消费(family/cancelled 单一来源;Error 帧 family 按 grpc code 覆盖)。
             let reason;
+            // S6:per-stream 输出字节(Σ chunk.data.len(),收口统一上报)。
+            let mut output_bytes: u64 = 0;
 
             loop {
                 let chunk = match streaming::recv_chunk(&mut chunk_rx, stream_deadline, stream_idle)
@@ -235,6 +237,7 @@ impl GrpcService {
                 };
                 match chunk.payload {
                     Some(pb::stream_response::Payload::Chunk(ref c)) => {
+                        output_bytes += c.data.len() as u64;
                         if stream_metrics {
                             if first_chunk {
                                 crate::metrics::prometheus::record_stream_ttft(&metrics_model, &metrics_version, "grpc", open_time.elapsed().as_secs_f64());
@@ -288,15 +291,17 @@ impl GrpcService {
                     _ => {}
                 }
             }
-            // S1/S2 收口:无条件 record_request_end + 门控内 cancelled/close。
+            // S1/S2/S4/S6 收口:无条件 record_request_end + 门控内 cancelled/errors/duration/bytes/close。
             crate::metrics::prometheus::record_stream_terminal(
                 &metrics_model,
                 &metrics_version,
                 "grpc",
+                "grpc_stream",
                 start,
                 stream_family,
                 reason,
                 stream_metrics,
+                output_bytes,
             );
             // Cleanup: send cancel to worker. `send_raw` (fire-and-forget) —
             // the worker signals the generator to stop and sends NO unary reply
