@@ -649,7 +649,10 @@ class TestBidiStreaming:
         assert len(chunks) == 1, f"expected on_close output as 1 chunk, got {len(chunks)}"
         assert json.loads(chunks[0].stream.chunk.data) == {"final": "hello world"}
         # ...and Done is still sent after the final chunk
-        assert any(_is_done(r, "s-cl") for r in sock.sent)
+        dones = [r for r in sock.sent if _is_done(r, "s-cl")]
+        assert dones
+        # S3:成功发送的 final chunk 计入 tokens_generated(0 on_chunk 输出 + 1 final)。
+        assert dones[0].stream.done.metrics.tokens_generated == 1
 
     @pytest.mark.asyncio
     async def test_chunk_for_unknown_stream_sends_error(self):
@@ -1927,3 +1930,46 @@ class TestStreamTokensGenerated:
         metrics = done[0].stream.done.metrics
         assert metrics is not None
         assert metrics.tokens_generated == 4
+
+    @pytest.mark.asyncio
+    async def test_on_close_encode_failure_does_not_inflate_tokens_generated(self):
+        """S3 回归:bidi on_close 的 final chunk 编码失败被
+        _send_bidi_final_chunk 隔离(帧未实际发送)时,tokens_generated 不得
+        虚报该 chunk——只计实际发出的 chunk。"""
+        class H(BidiStreamHandler):
+            def on_open(self, initial_data):
+                return None  # no open chunk
+
+            def on_close(self):
+                return {"final": "boom"}
+
+        class CB(Callback):
+            def after_predict(self, ctx):
+                raise RuntimeError("encode failed")
+
+        class BidiAPI(EchoAPI):
+            def bidi_stream(self):
+                return H()
+
+        sock = AsyncSocket()
+        active = {}
+        api = BidiAPI()
+        api._pipeline = Pipeline.build(api, [CB()])
+        await inference._handle_stream_open_async(
+            api, _stream_req("s-clf", b"{}"), sock, active, log
+        )
+        close_req = Request(
+            uid="clf1",
+            stream=StreamRequest(stream_id="s-clf", close=StreamClose()),
+        )
+        await inference._handle_stream_async(api, close_req, sock, active, log)
+
+        chunks = [r for r in sock.stream_responses("s-clf") if r.stream.HasField("chunk")]
+        assert not chunks, "encode failure must skip the final chunk (isolated)"
+        done = await sock.wait_for(lambda r: _is_done(r, "s-clf"))
+        metrics = done[0].stream.done.metrics
+        got = 0 if metrics is None else metrics.tokens_generated
+        assert got == 0, (
+            f"final chunk was never sent and must not count toward "
+            f"tokens_generated, got {got}"
+        )

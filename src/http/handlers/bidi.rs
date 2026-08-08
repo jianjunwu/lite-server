@@ -300,6 +300,8 @@ async fn h2_bidi_entry_impl(
             let reason;
             // S6:per-stream 输出字节(Σ chunk.data.len(),收口统一上报)。
             let mut output_bytes: u64 = 0;
+            // G5:per-stream chunk 数(close 日志字段,收口统一上报,非 metric)。
+            let mut chunks: u64 = 0;
 
             loop {
                 let chunk =
@@ -330,6 +332,7 @@ async fn h2_bidi_entry_impl(
                 match chunk.payload {
                     Some(pb::stream_response::Payload::Chunk(c)) => {
                         output_bytes += c.data.len() as u64;
+                        chunks += 1;
                         if stream_metrics {
                             if first_chunk {
                                 prometheus::record_stream_ttft(
@@ -415,6 +418,7 @@ async fn h2_bidi_entry_impl(
                 reason,
                 stream_metrics,
                 output_bytes,
+                chunks,
             );
 
             // Targeted cancel.

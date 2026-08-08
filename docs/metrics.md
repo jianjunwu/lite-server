@@ -63,7 +63,8 @@ inherit the former; the OTel meter is a no-op when the latter is off).
 streams that is **first-byte time** (headers), not stream duration. Stream
 durations are visible via `liteserver_stream_duration_seconds` and the
 structured stream lifecycle logs (`stream opened` / `stream closed` with
-`reason` from the `StreamCloseReason` enum, `stream ended with error`,
+`reason` from the `StreamCloseReason` enum plus per-stream
+`chunks`/`output_bytes`/`duration_secs`, `stream ended with error`,
 `stream cancelled by client`). Access-log latency for streaming should be
 read as first-byte time.
 

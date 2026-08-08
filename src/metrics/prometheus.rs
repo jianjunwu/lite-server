@@ -612,6 +612,8 @@ impl StreamCloseReason {
 /// `protocol` 是 cancelled 的 label(批次 1,既有 protocol 值);`stream_kind`
 /// 是 S5 的 6 值封闭枚举,供 errors/duration/bytes 使用(D2:既有 protocol
 /// label 值不改)。`output_bytes` 是流内 Σ chunk.data.len()(chunk 处累加)。
+/// `chunks` 是流内 chunk 数(同处累加,仅 G5 close 日志字段,非 metric label;
+/// WS writer panic 臂传 0——panic 时不可知,与 output_bytes 同)。
 /// `family` 由调用方传:HTTP 用 `reason.status_family()`,gRPC 的 Error 帧
 /// 按 grpc code 映射覆盖(既有语义)。exactly-once 由任务尾部单一收口保证。
 pub fn record_stream_terminal(
@@ -624,6 +626,7 @@ pub fn record_stream_terminal(
     reason: StreamCloseReason,
     streaming_metrics: bool,
     output_bytes: u64,
+    chunks: u64,
 ) {
     let duration_secs = open_time.elapsed().as_secs_f64();
     record_request_end(model, version, family, duration_secs);
@@ -636,6 +639,7 @@ pub fn record_stream_terminal(
         stream_kind,
         reason = ?reason,
         duration_secs,
+        chunks,
         output_bytes,
         "stream closed"
     );
@@ -1324,7 +1328,7 @@ mod tests {
         let before = REQUESTS_TOTAL.with_label_values(&[model, version, "2xx"]).get();
         record_stream_terminal(
             model, version, "sse", "sse", std::time::Instant::now(),
-            StreamCloseReason::Done.status_family(), StreamCloseReason::Done, false, 0,
+            StreamCloseReason::Done.status_family(), StreamCloseReason::Done, false, 0, 0,
         );
         let after = REQUESTS_TOTAL.with_label_values(&[model, version, "2xx"]).get();
         assert_eq!(
@@ -1344,7 +1348,7 @@ mod tests {
         let conn_before = STREAMING_CONNECTIONS.with_label_values(&[model, version, "sse"]).get();
         record_stream_terminal(
             model, version, "sse", "sse", std::time::Instant::now(),
-            StreamCloseReason::Cancel.status_family(), StreamCloseReason::Cancel, true, 0,
+            StreamCloseReason::Cancel.status_family(), StreamCloseReason::Cancel, true, 0, 0,
         );
         assert_eq!(
             STREAM_CANCELLED_TOTAL.with_label_values(&[model, version, "sse"]).get(),
@@ -1374,7 +1378,7 @@ mod tests {
         let conn_before = STREAMING_CONNECTIONS.with_label_values(&[model, version, "websocket"]).get();
         record_stream_terminal(
             model, version, "websocket", "ws", std::time::Instant::now(),
-            StreamCloseReason::Cancel.status_family(), StreamCloseReason::Cancel, false, 0,
+            StreamCloseReason::Cancel.status_family(), StreamCloseReason::Cancel, false, 0, 0,
         );
         assert_eq!(
             STREAM_CANCELLED_TOTAL.with_label_values(&[model, version, "websocket"]).get(),
@@ -1401,7 +1405,7 @@ mod tests {
         let before = REQUESTS_TOTAL.with_label_values(&[model, version, "4xx"]).get();
         record_stream_terminal(
             model, version, "websocket", "ws", std::time::Instant::now(),
-            StreamCloseReason::Protocol.status_family(), StreamCloseReason::Protocol, false, 0,
+            StreamCloseReason::Protocol.status_family(), StreamCloseReason::Protocol, false, 0, 0,
         );
         assert_eq!(
             REQUESTS_TOTAL.with_label_values(&[model, version, "4xx"]).get(),
@@ -1418,7 +1422,7 @@ mod tests {
         let before = REQUESTS_TOTAL.with_label_values(&[model, version, "5xx"]).get();
         record_stream_terminal(
             model, version, "websocket", "ws", std::time::Instant::now(),
-            StreamCloseReason::Panic.status_family(), StreamCloseReason::Panic, false, 0,
+            StreamCloseReason::Panic.status_family(), StreamCloseReason::Panic, false, 0, 0,
         );
         assert_eq!(
             REQUESTS_TOTAL.with_label_values(&[model, version, "5xx"]).get(),
@@ -1431,6 +1435,9 @@ mod tests {
     /// record_request_end 进入该 histogram,不能全落 +Inf(旧桶顶 10s)。
     #[test]
     fn request_duration_buckets_extend_to_minute_streams() {
+        // gather 走 REGISTRY——先注册(AlreadyReg 忽略,aggregator 测试同款
+        // 先例);否则单独/子集运行时 family 缺失(B4 修复)。
+        let _ = register_metrics();
         let model = "dur_minute_m";
         let version = "1";
         record_request_end(model, version, "2xx", 15.0);
@@ -1495,6 +1502,8 @@ mod tests {
     /// S7:TTFT 桶追加 5/10/30/60——大模型冷启动 TTFT>2.5s(旧桶顶)不落 +Inf。
     #[test]
     fn streaming_ttft_buckets_extend_for_cold_start() {
+        // 同上:先注册,单独/子集运行不依赖其他测试的注册副作用(B4 修复)。
+        let _ = register_metrics();
         let model = "ttft_bucket_m";
         let version = "1";
         record_stream_ttft(model, version, "sse", 5.0);
@@ -1505,6 +1514,8 @@ mod tests {
     /// S7:TBT 桶追加 1/2.5/5——慢解码 chunk 间隔不落 +Inf(旧桶顶 0.5s)。
     #[test]
     fn streaming_tbt_buckets_extend_for_slow_decode() {
+        // 同上:先注册(B4 修复)。
+        let _ = register_metrics();
         let model = "tbt_bucket_m";
         let version = "1";
         record_stream_tbt(model, version, "sse", 1.0);
@@ -1517,6 +1528,8 @@ mod tests {
     /// G1:删除后 gather 不再暴露 open_connections(编译级 + 输出级双重保证)。
     #[test]
     fn open_connections_removed_from_gather() {
+        // 先注册——否则空注册表下断言恒真(子集运行空转,B4 修复)。
+        let _ = register_metrics();
         let output = gather_metrics();
         assert!(
             !output.contains("open_connections"),
@@ -1550,7 +1563,7 @@ mod tests {
             .get();
         record_stream_terminal(
             model, version, "sse", "sse", std::time::Instant::now(),
-            "5xx", StreamCloseReason::Error, true, 0,
+            "5xx", StreamCloseReason::Error, true, 0, 0,
         );
         assert_eq!(
             STREAM_ERRORS_TOTAL.with_label_values(&[model, version, "sse", "worker_error"]).get(),
@@ -1575,7 +1588,7 @@ mod tests {
                 .get();
             record_stream_terminal(
                 model, version, "sse", "sse", std::time::Instant::now(),
-                family, reason, true, 0,
+                family, reason, true, 0, 0,
             );
             assert_eq!(
                 STREAM_ERRORS_TOTAL.with_label_values(&[model, version, "sse", "x"]).get(),
@@ -1598,7 +1611,7 @@ mod tests {
             .get();
         record_stream_terminal(
             model, version, "sse", "sse", std::time::Instant::now(),
-            "2xx", StreamCloseReason::Done, true, 42,
+            "2xx", StreamCloseReason::Done, true, 42, 3,
         );
         assert_eq!(
             STREAM_DURATION_SECONDS.with_label_values(&[model, version, "sse"]).get_sample_count(),
@@ -1629,7 +1642,7 @@ mod tests {
         let r_before = REQUESTS_TOTAL.with_label_values(&[model, version, "4xx"]).get();
         record_stream_terminal(
             model, version, "websocket", "ws", std::time::Instant::now(),
-            "4xx", StreamCloseReason::Protocol, false, 7,
+            "4xx", StreamCloseReason::Protocol, false, 7, 1,
         );
         assert_eq!(
             STREAM_ERRORS_TOTAL.with_label_values(&[model, version, "websocket", "protocol"]).get(),
@@ -1677,5 +1690,90 @@ mod tests {
         );
         // Unseen worker/label reads as 0 (counter lazily instantiated).
         assert_eq!(worker_inference_count(model, version, 99), 0);
+    }
+
+    // ===== G5 (批次 4 审计修复):close 日志携带 chunks 字段 =====
+
+    /// 方案 .claude/observability-gaps.md §2.12:close 事件须携带
+    /// `时长/chunks/bytes + reason`。断言 "stream closed" 事件的字段清单含
+    /// chunks 且值即收口传入的 per-stream chunk 数。
+    #[test]
+    fn g5_close_log_carries_chunks_field() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Default)]
+        struct CloseEvents(Vec<(String, Vec<(String, String)>)>);
+        struct CaptureLayer(std::sync::Arc<std::sync::Mutex<CloseEvents>>);
+        struct FieldPairs {
+            fields: Vec<(String, String)>,
+            message: Option<String>,
+        }
+        impl tracing::field::Visit for FieldPairs {
+            // record_str/record_i64/... 的默认实现均转发 record_debug。
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.fields
+                    .push((field.name().to_string(), format!("{value:?}")));
+                if field.name() == "message" {
+                    self.message = Some(format!("{value:?}"));
+                }
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut v = FieldPairs { fields: Vec::new(), message: None };
+                event.record(&mut v);
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0
+                    .push((v.message.unwrap_or_default(), v.fields));
+            }
+        }
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(CloseEvents::default()));
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(CaptureLayer(captured.clone())),
+        );
+        tracing::dispatcher::with_default(&dispatch, || {
+            // 确定性:并行套件中其他测试可能先把同一 callsite 的 interest 缓存
+            // 成 NEVER(此后宏短路,scoped dispatch 不再被咨询)。在 scoped
+            // default 生效期间 rebuild——DISPATCHERS 含本 scoped dispatch,
+            // interest 被重算为 sometimes/always,事件必然可达本 layer。
+            tracing::callsite::rebuild_interest_cache();
+            record_stream_terminal(
+                "g5_chunks_model",
+                "1",
+                "sse",
+                "sse",
+                std::time::Instant::now(),
+                "2xx",
+                StreamCloseReason::Done,
+                true,
+                7,
+                3,
+            );
+        });
+
+        let events = captured.lock().unwrap_or_else(|e| e.into_inner());
+        let close: Vec<_> = events
+            .0
+            .iter()
+            .filter(|(msg, _)| msg.contains("stream closed"))
+            .collect();
+        assert_eq!(
+            close.len(),
+            1,
+            "expected exactly one stream-closed event; all events: {:?}",
+            events.0
+        );
+        assert!(
+            close[0].1.iter().any(|(k, v)| k == "chunks" && v == "3"),
+            "G5 (plan §2.12): close log must carry the per-stream chunks value; got fields {:?}",
+            close[0].1
+        );
     }
 }

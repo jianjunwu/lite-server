@@ -273,6 +273,7 @@ See [examples/README.md](examples/README.md) for learning path and usage details
 | [HTTP Bidirectional Streaming](docs/http-bidi.md) ([中文](docs/zh/http-bidi.md)) | WS `/stream` bidi frames, h2 `/bidi` endpoint (LPM, client requirements) |
 | [HTTP Decoupled Streaming](docs/http-decoupled.md) ([中文](docs/zh/http-decoupled.md)) | SSE `/decoupled` + WS `/decoupled-stream` (model-driven streams, control frames) |
 | [Observability / OpenTelemetry](docs/otel-observability.md) | OTLP traces + metrics, sampling, baggage allowlist |
+| [Metrics Reference](docs/metrics.md) ([中文](docs/zh/metrics.md)) | Streaming request-level metrics, label semantics, bucket changes, gating matrix (0.8.3) |
 | [CORS Security Checklist](docs/cors-security-checklist.md) | CORS resolution rules and why each exists |
 | [Graceful Shutdown](docs/graceful-shutdown.md) | Drain semantics, signal handling, telemetry flush |
 | [KEDA Autoscaling](docs/keda.md) | vLLM-compatible metrics + ScaledObject for LLM autoscalers |

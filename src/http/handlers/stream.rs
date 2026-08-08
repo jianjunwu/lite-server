@@ -300,6 +300,8 @@ async fn sse_infer_impl(
         let reason;
         // S6:per-stream 输出字节(Σ chunk.data.len(),收口统一上报)。
         let mut output_bytes: u64 = 0;
+        // G5:per-stream chunk 数(close 日志字段,收口统一上报,非 metric)。
+        let mut chunks: u64 = 0;
 
         loop {
             let chunk = match streaming::recv_chunk(&mut chunk_rx, stream_deadline, stream_idle)
@@ -330,6 +332,7 @@ async fn sse_infer_impl(
             let event = match &chunk.payload {
                 Some(pb::stream_response::Payload::Chunk(c)) => {
                     output_bytes += c.data.len() as u64;
+                    chunks += 1;
                     if stream_metrics {
                         if first_chunk {
                             prometheus::record_stream_ttft(&model_name, &resolved_version, "sse", open_time.elapsed().as_secs_f64());
@@ -395,6 +398,7 @@ async fn sse_infer_impl(
             reason,
             stream_metrics,
             output_bytes,
+            chunks,
         );
         // Ensure stream is cleaned up on worker side.
         // D4: decoupled → targeted cancel (parity with WS/gRPC);
@@ -929,6 +933,8 @@ async fn handle_ws_stream(
         let reason;
         // S6:per-stream 输出字节(Σ chunk.data.len(),收口统一上报)。
         let mut output_bytes: u64 = 0;
+        // G5:per-stream chunk 数(close 日志字段,收口统一上报,非 metric)。
+        let mut chunks: u64 = 0;
 
         loop {
             let chunk = tokio::select! {
@@ -981,6 +987,7 @@ async fn handle_ws_stream(
             let msg = match &chunk.payload {
                 Some(pb::stream_response::Payload::Chunk(c)) => {
                     output_bytes += c.data.len() as u64;
+                    chunks += 1;
                     if stream_metrics {
                         if first_chunk {
                             prometheus::record_stream_ttft(&model_name, &resolved_version, "websocket", open_time.elapsed().as_secs_f64());
@@ -1039,6 +1046,7 @@ async fn handle_ws_stream(
             reason,
             stream_metrics,
             output_bytes,
+            chunks,
         );
         // Close the sink gracefully (moved here so main doesn't need ws_sink).
         let _ = ws_sink.close().await;
@@ -1062,6 +1070,7 @@ async fn handle_ws_stream(
                 prometheus::StreamCloseReason::Panic.status_family(),
                 prometheus::StreamCloseReason::Panic,
                 stream_metrics,
+                0,
                 0,
             );
             drop(gone_tx);

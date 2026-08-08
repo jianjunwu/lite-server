@@ -211,6 +211,8 @@ impl GrpcService {
             let reason;
             // S6:per-stream 输出字节(Σ chunk.data.len(),收口统一上报)。
             let mut output_bytes: u64 = 0;
+            // G5:per-stream chunk 数(close 日志字段,收口统一上报,非 metric)。
+            let mut chunks: u64 = 0;
 
             loop {
                 let chunk = match streaming::recv_chunk(&mut chunk_rx, stream_deadline, stream_idle)
@@ -242,6 +244,7 @@ impl GrpcService {
                 match chunk.payload {
                     Some(pb::stream_response::Payload::Chunk(ref c)) => {
                         output_bytes += c.data.len() as u64;
+                        chunks += 1;
                         if stream_metrics {
                             if first_chunk {
                                 crate::metrics::prometheus::record_stream_ttft(&metrics_model, &metrics_version, "grpc", open_time.elapsed().as_secs_f64());
@@ -306,6 +309,7 @@ impl GrpcService {
                 reason,
                 stream_metrics,
                 output_bytes,
+                chunks,
             );
             // Cleanup: send cancel to worker. `send_raw` (fire-and-forget) —
             // the worker signals the generator to stop and sends NO unary reply

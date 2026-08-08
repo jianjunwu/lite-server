@@ -264,12 +264,15 @@ async def _close_bidi_quietly(on_close, ctx, stream_id, log) -> Any:
 
 async def _send_bidi_final_chunk(
     lit_api, ctx: RequestContext, output: Any, stream_id: str, socket, log
-) -> None:
+) -> bool:
     """Encode ``on_close``'s output and send it as a bidi chunk (best-effort).
 
     Mirrors the ``on_open`` / ``on_chunk`` encode path (postprocess → encode
     → chunk).  Exception-isolated: a failure skips the chunk but the caller
     still sends ``StreamDone``.
+
+    Returns True iff the chunk was actually sent — the caller counts it
+    toward ``tokens_generated`` (S3) only for emitted chunks.
     """
     ctx.output = output
     ctx.early = None
@@ -278,11 +281,12 @@ async def _send_bidi_final_chunk(
         await pipe.postprocess(ctx)
     except Exception as e:
         log.warning("bidi on_close encode failed for %s: %s", stream_id, _format_exc_brief(e))
-        return
+        return False
     body, _headers = unwrap_response(ctx.response)
     await socket.send(
         _make_stream_chunk(stream_id, serialize_body(body), is_final=False).SerializeToString()
     )
+    return True
 
 
 async def _send_stream_early(socket, stream_id: str, early_response, lit_api: LitAPI,
@@ -365,12 +369,12 @@ async def _handle_stream_async(
             if action == "close":
                 # Deliver on_close's return as a final chunk (symmetric with
                 # on_open/on_chunk) before Done.  Encoding failures are
-                # isolated — Done is still sent below.
+                # isolated — Done is still sent below; tokens_generated counts
+                # only chunks actually emitted (encode failure → not counted).
                 final_chunk = 0
-                if on_close_output is not None:
-                    await _send_bidi_final_chunk(
-                        lit_api, entry.ctx, on_close_output, stream_id, socket, log
-                    )
+                if on_close_output is not None and await _send_bidi_final_chunk(
+                    lit_api, entry.ctx, on_close_output, stream_id, socket, log
+                ):
                     final_chunk = 1
                 # S3:per-stream chunk 数 = on_chunk 输出 + final chunk。
                 metrics = collect_metrics(lit_api, tokens_generated=entry.chunk_count + final_chunk)
