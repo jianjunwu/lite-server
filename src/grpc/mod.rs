@@ -3182,6 +3182,12 @@ mod request_metrics_tests {
         );
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&recording);
+            // 与 g5_close_log_carries_chunks_field 同法:scoped default 生效
+            // 期间 rebuild——其他测试可能已把 inference span callsite 的
+            // interest 缓存成 NEVER(宏短路,scoped dispatch 不再被咨询),
+            // rebuild 时 DISPATCHERS 含本 scoped dispatch,interest 重算为
+            // sometimes/always,span 必然可达本 layer。
+            tracing::callsite::rebuild_interest_cache();
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -3220,6 +3226,12 @@ mod request_metrics_tests {
         );
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&recording);
+            // 与 g5_close_log_carries_chunks_field 同法:scoped default 生效
+            // 期间 rebuild——其他测试可能已把 inference span callsite 的
+            // interest 缓存成 NEVER(宏短路,scoped dispatch 不再被咨询),
+            // rebuild 时 DISPATCHERS 含本 scoped dispatch,interest 重算为
+            // sometimes/always,span 必然可达本 layer。
+            tracing::callsite::rebuild_interest_cache();
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -3258,6 +3270,12 @@ mod request_metrics_tests {
         );
         let handle = std::thread::spawn(move || {
             let _guard = tracing::dispatcher::set_default(&recording);
+            // 与 g5_close_log_carries_chunks_field 同法:scoped default 生效
+            // 期间 rebuild——其他测试可能已把 inference span callsite 的
+            // interest 缓存成 NEVER(宏短路,scoped dispatch 不再被咨询),
+            // rebuild 时 DISPATCHERS 含本 scoped dispatch,interest 重算为
+            // sometimes/always,span 必然可达本 layer。
+            tracing::callsite::rebuild_interest_cache();
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
