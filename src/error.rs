@@ -1,7 +1,7 @@
+use crate::protocol::CanonicalError;
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -261,53 +261,44 @@ impl AppError {
     }
 }
 
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
-        // Model errors carry a model-author-facing message — return it
-        // directly without sanitization.
+impl AppError {
+    /// 迁移为与协议无关的错误值表(D11)。字段值按现状 `IntoResponse` 的
+    /// 映射**原样搬移**(P2.0 零行为变化,字节快照门禁),只移动 JSON 拼装
+    /// 不移动映射逻辑;wire 拼装全部迁入 `protocol::render` 分派。
+    pub(crate) fn into_canonical(self) -> CanonicalError {
+        // ModelError:模型作者显式暴露的状态/消息/header(不 sanitize),
+        // 日志级别 info(模型主动拒绝,非服务器故障)。
         if let AppError::ModelError(d) = &self {
-            let status = self.http_status();
-            // Log at info level — not a server fault, the model intentionally
-            // rejected the request.
-            tracing::info!(
-                status = %d.status_code,
-                error_type = %d.error_type,
-                code = ?d.code,
-                detail = %d.detail,
-                "model error"
-            );
-            let error_obj = json!({
-                "type": d.error_type,
-                "message": d.detail,
-                "code": d.code,
-                "param": d.param,
-            });
-            let body = Json(json!({ "error": error_obj }));
-            let mut resp = (status, body).into_response();
-            // Forward model-authored headers (e.g. Retry-After) to the client.
-            if let Some(hdrs) = &d.headers {
-                crate::http::handlers::inject_response_headers_into(resp.headers_mut(), hdrs);
-            }
-            return resp;
+            return CanonicalError {
+                status: StatusCode::from_u16(d.status_code)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                error_type: d.error_type.clone(),
+                // Option 保留:模型未提供 code 时 wire 输出 "code": null
+                // (现状字节,快照门禁)。
+                code: d.code.clone(),
+                message: d.detail.clone(),
+                param: d.param.clone(),
+                extra: None,
+                headers: d.headers.clone(),
+                from_model: true,
+                log_detail: d.detail.clone(),
+            };
         }
-
-        // PayloadTooLarge carries size info in the error body so clients can
-        // adjust their requests programmatically.
+        // PayloadTooLarge:413 + extra{max_size, actual_size}——各协议
+        // renderer 决定是否合入(Legacy 合入;Kserve 按规范丢弃)。
         if let AppError::PayloadTooLarge { max_size, actual_size } = &self {
-            let status = StatusCode::PAYLOAD_TOO_LARGE;
-            let error_obj = json!({
-                "type": "invalid_request_error",
-                "message": self.client_message(),
-                "code": self.error_code(),
-                "param": null,
-                "max_size": max_size,
-                "actual_size": actual_size,
-            });
-            let body = Json(json!({ "error": error_obj }));
-            let resp = (status, body).into_response();
-            return resp;
+            return CanonicalError {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                error_type: "invalid_request_error".to_string(),
+                code: Some(self.error_code().to_string()),
+                message: self.client_message(),
+                param: None,
+                extra: Some(json!({ "max_size": max_size, "actual_size": actual_size })),
+                headers: None,
+                from_model: false,
+                log_detail: self.to_string(),
+            };
         }
-
         let status = self.http_status();
         let error_type = match &self {
             AppError::ModelNotFound(_) => "not_found_error",
@@ -333,60 +324,59 @@ impl IntoResponse for AppError {
             AppError::UnsupportedMediaType(_) => "invalid_request_error",
             AppError::RateLimitExceeded { .. } => "rate_limit_exceeded",
             AppError::Unauthorized(_) => "authentication_error",
-            // Handled above via early return; should never reach here.
+            // 上面早返,应不可达。
             AppError::ModelError(_) => unreachable!(),
         };
-
-        // Log full internal details for operational debugging.
-        // The sanitized message is what goes to the client.
-        // C7: client errors (4xx, including 429 rate-limit) log at info so a
-        // saturated rate limiter doesn't flood the logs at error level; only
-        // server faults (5xx) are treated as operational errors.
-        if status.is_server_error() {
-            tracing::error!(
-                error_type = %error_type,
-                code = %self.error_code(),
-                detail = %self.to_string(),
-                "request error"
-            );
+        // Retry-After:QueueFull 恒 1 秒;RateLimitExceeded 取配置秒数。
+        let headers = if matches!(self, AppError::QueueFull(_)) {
+            Some(HashMap::from([("retry-after".to_string(), "1".to_string())]))
+        } else if let AppError::RateLimitExceeded { retry_after_secs } = &self {
+            Some(HashMap::from([(
+                "retry-after".to_string(),
+                retry_after_secs.to_string(),
+            )]))
         } else {
-            tracing::info!(
-                error_type = %error_type,
-                code = %self.error_code(),
-                detail = %self.to_string(),
-                "request error"
-            );
+            None
+        };
+        CanonicalError {
+            status,
+            error_type: error_type.to_string(),
+            code: Some(self.error_code().to_string()),
+            message: self.client_message(),
+            param: self.param().map(String::from),
+            extra: None,
+            headers,
+            from_model: false,
+            log_detail: self.to_string(),
         }
+    }
+}
 
-        let body = Json(json!({
-            "error": {
-                "type": error_type,
-                "message": self.client_message(),
-                "code": self.error_code(),
-                "param": self.param(),
-            }
-        }));
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        // Legacy shim(P2.0):全部既有调用点(测试、gRPC admin、fallback、单测
+        // 构造的 router)零改动、byte-identical。协议感知路径走 ProtocolError
+        // (axum IntoResponse 无请求上下文,协议须挂在错误上携带——D11)。
+        crate::protocol::render(self.into_canonical(), crate::protocol::ApiProtocol::Legacy)
+    }
+}
 
-        let mut response = (status, body).into_response();
+/// 协议感知的错误边界(D11):错误自身携带语义协议,render 分派在
+/// `src/protocol/`(protocol/ 不反向依赖核心)。
+pub struct ProtocolError {
+    pub error: AppError,
+    pub protocol: crate::protocol::ApiProtocol,
+}
 
-        // Add Retry-After header for 503 responses (queue full)
-        if matches!(self, AppError::QueueFull(_)) {
-            response.headers_mut().insert(
-                "retry-after",
-                axum::http::HeaderValue::from_static("1"),
-            );
-        }
+impl From<AppError> for ProtocolError {
+    fn from(error: AppError) -> Self {
+        ProtocolError { error, protocol: crate::protocol::ApiProtocol::Legacy }
+    }
+}
 
-        // Add Retry-After header for 429 responses (rate limit)
-        if let AppError::RateLimitExceeded { retry_after_secs } = &self {
-            if let Ok(val) = axum::http::HeaderValue::from_str(
-                &retry_after_secs.to_string(),
-            ) {
-                response.headers_mut().insert("retry-after", val);
-            }
-        }
-
-        response
+impl IntoResponse for ProtocolError {
+    fn into_response(self) -> Response {
+        crate::protocol::render(self.error.into_canonical(), self.protocol)
     }
 }
 

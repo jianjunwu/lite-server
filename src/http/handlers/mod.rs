@@ -317,56 +317,10 @@ async fn enforce_rate_limit(
     }
 }
 
-/// Headers that must NOT be overridden by user code — managed by the HTTP
-/// library or carry hop-by-hop semantics (RFC 7230 §6.1).
-const BLOCKED_RESPONSE_HEADERS: &[&str] = &[
-    "content-type",
-    "content-length",
-    "transfer-encoding",
-    "content-encoding",
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "upgrade",
-];
-
-fn inject_response_headers(
-    builder: axum::http::response::Builder,
-    headers: &std::collections::HashMap<String, String>,
-) -> axum::http::response::Builder {
-    let mut builder = builder;
-    for (k, v) in headers {
-        let lower = k.to_ascii_lowercase();
-        if !BLOCKED_RESPONSE_HEADERS.contains(&lower.as_str()) {
-            builder = builder.header(k.as_str(), v.as_str());
-        }
-    }
-    builder
-}
-
-/// Inject response headers into an existing `HeaderMap` in place — the
-/// error-response path builds via `into_response()` (no Builder), so it needs
-/// this mutating variant. Skips hop-by-hop / library-managed headers and
-/// silently drops headers with invalid names/values.
-pub(crate) fn inject_response_headers_into(
-    map: &mut HeaderMap,
-    headers: &std::collections::HashMap<String, String>,
-) {
-    for (k, v) in headers {
-        if BLOCKED_RESPONSE_HEADERS.contains(&k.to_ascii_lowercase().as_str()) {
-            continue;
-        }
-        if let (Ok(name), Ok(val)) = (
-            k.parse::<axum::http::HeaderName>(),
-            axum::http::HeaderValue::from_str(v),
-        ) {
-            map.insert(name, val);
-        }
-    }
-}
+// Header injection helpers moved to the protocol seam (P2.0) so error
+// rendering lives in one place; re-exported here so existing call sites
+// (inference.rs / custom_routes.rs) are unchanged.
+pub(crate) use crate::protocol::inject_response_headers;
 
 
 
