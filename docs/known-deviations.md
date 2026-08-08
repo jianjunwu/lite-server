@@ -33,6 +33,7 @@
 | # | Deviation | Note |
 |---|---|---|
 | ⑧ | **own SSE format vs `generate_stream`** | `/events` uses the own format (`data: chunk-N` + terminating `data: [DONE]`); `generate_stream` is the Triton-compatible channel (`data: <full JSON>` per chunk, errors carried inside events, connection closes at the end — no `[DONE]`). Both coexist; `generate_stream` rides the `streaming+sse` gate family, `/generate` (unary) is ungated. **Caveat (D9):** the HTTP status is fixed by the first SSE response; mid-stream errors arrive in later `data:` events and clients must check per-event. |
+| ⑧a | **built-in `generate`/`generate_stream` shadow same-named custom `@route`** | Since batch 4 these paths are built-in routes; a model declaring a custom `@route` named `generate` / `generate_stream` no longer reaches the fallback dispatcher on those paths (G17 behavior change). Rename the custom route if you relied on it. |
 
 ## Batch 5 (openai-compact)
 

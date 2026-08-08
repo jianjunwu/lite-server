@@ -260,5 +260,7 @@ limit for your instance size and expected concurrency.
 |--------|-----------------------------|----------------------------------------------|
 | 400    | `invalid_request_body`      | Invalid JSON syntax                          |
 | 400    | `invalid_request_body`      | Ensemble: field access on binary data, binary step output referenced downstream, or mixed JSON+binary step inputs |
+| 400    | `invalid_triton_binary_head` | Triton Binary: size-sum mismatch / duplicate name / missing name / invalid `binary_data_size` / malformed head structure (worker-side double-check, Python) |
+| 400    | `invalid_json`              | Worker-side JSON parse failure of the request payload |
 | 413    | `payload_too_large`         | Body exceeds `max_request_body_bytes`        |
 | 415    | `unsupported_media_type`    | `Content-Encoding` header present            |

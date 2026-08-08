@@ -17,7 +17,8 @@ label 语义、桶变更与语义说明(D8/S3)——label 白名单的权威评�
 
 ## 流式指标
 
-下列所有 `liteserver_stream_*` 指标均随 `features.streaming_metrics` 门控(D9)。
+下列所有 `liteserver_stream_*` 指标均随 `features.streaming_metrics` 门控(D9,
+`liteserver_requests_total` 除外)。
 
 | 指标 | Labels | 说明 |
 |---|---|---|

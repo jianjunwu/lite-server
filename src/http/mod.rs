@@ -236,7 +236,8 @@ async fn admission_middleware(
 
 /// C3 (P4-2): once draining, reject new non-probe requests with 503 so
 /// keep-alive clients (and LBs that miss readyz) add no new work during the
-/// drain window. Health probes (/livez, /readyz, /startupz, /health) bypass the
+/// drain window. Health probes (/livez, /readyz, /startupz, /health and the
+/// /v2/health/* aliases) bypass the
 /// gate so they can report draining themselves. Placed inside observability so
 /// the 503 is logged with a request-id.
 async fn draining_gate(
@@ -247,7 +248,12 @@ async fn draining_gate(
     use std::sync::atomic::Ordering;
     if state.load(Ordering::Relaxed) {
         let path = request.uri().path();
-        let is_probe = matches!(path, "/livez" | "/readyz" | "/startupz" | "/health");
+        // /v2/health/* 是探针别名路由(批次 3),与本体同豁免(审计修复 B6:
+        // 排水期 liveness 别名 503 会诱发 k8s 误杀)。
+        let is_probe = matches!(
+            path,
+            "/livez" | "/readyz" | "/startupz" | "/health" | "/v2/health/live" | "/v2/health/ready"
+        );
         if !is_probe {
             return (StatusCode::SERVICE_UNAVAILABLE, "server draining").into_response();
         }

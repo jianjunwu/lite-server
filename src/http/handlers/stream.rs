@@ -23,7 +23,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::Instrument;
 use uuid::Uuid;
 
-pub(crate) async fn open_worker_stream(
+async fn open_worker_stream(
     state: &Arc<AppState>,
     model_name: &str,
     resolved_version: &str,
@@ -140,11 +140,14 @@ pub async fn sse_decoupled_version_handler(
 
 /// SSE 帧风格(批次 4,D9):Legacy = /events 自有格式(`data: <chunk>` +
 /// `data: [DONE]`);Generate = Triton Generate extension(`data: <完整 JSON>`
-/// 逐 chunk,错误携带在事件内,结束即连接关闭——无 [DONE] 标记)。
+/// 逐 chunk,错误携带在事件内,结束即连接关闭——无 [DONE] 标记);Openai =
+/// openai-compact(批次 5):`data: <json>` 逐 chunk + `data: [DONE]`,错误帧
+/// 为对象形状 `{"error": {...}}`(OpenAI SSE 惯例,审计修复 B10)。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SseFrameStyle {
     Legacy,
     Generate,
+    Openai,
 }
 
 /// generate_stream 入口(批次 4,D9):与 [`sse_infer_entry`] 同包裹(早期拒绝
@@ -209,6 +212,42 @@ pub async fn generate_stream_version_handler(
     generate_stream_entry(&state, &model_name, Some(version), headers, body, cx)
         .await
         .map_err(|error| ProtocolError { error, protocol })
+}
+
+/// openai-compact 流式入口(批次 5 审计修复 B1/B2/B7/B8):/v1 流式与 /events
+/// 同一管线——validate/auth/限流/binary-flag 400/worker 流 cancel/指标/回调
+/// 全部随管线继承,帧封装 = Openai 风格。早期拒绝同样计数(同 /events 的
+/// S1(b)/D7 语义)。
+pub(crate) async fn openai_stream_entry(
+    state: &Arc<AppState>,
+    model_name: &str,
+    headers: HeaderMap,
+    body: RequestBody,
+    cx: RequestContext,
+) -> Result<Response, AppError> {
+    let start = std::time::Instant::now();
+    let mut label_version = String::new();
+    let result = sse_infer_entry_impl(
+        state,
+        model_name,
+        None,
+        headers,
+        body,
+        cx,
+        false,
+        &mut label_version,
+        SseFrameStyle::Openai,
+    )
+    .await;
+    if let Err(e) = &result {
+        prometheus::record_stream_rejected(
+            model_name,
+            &label_version,
+            super::status_family(e.http_status().as_u16() as i32),
+            start.elapsed().as_secs_f64(),
+        );
+    }
+    result
 }
 
 /// Shared entry for SSE inference: validation, ready check, rate limiting,
@@ -445,6 +484,11 @@ async fn sse_infer_impl(
                         Ok(val) if val.get("error").and_then(|err| err.get("type")).is_some() => {
                             json!({"error": val["error"]}).to_string()
                         }
+                        // Openai 风格(批次 5 审计修复 B10):OpenAI SSE 惯例
+                        // error 是对象,非结构化消息包装为 {"error": {"message"}}。
+                        _ if matches!(frame, SseFrameStyle::Openai) => {
+                            json!({"error": {"message": e.message}}).to_string()
+                        }
                         _ => json!({"error": e.message}).to_string(),
                     };
                     // Task D: terminal Error frame → InferenceResponse.
@@ -456,9 +500,12 @@ async fn sse_infer_impl(
                     // Task D: terminal Done frame → InferenceResponse.
                     crate::callback::fire_inference_response(&cb_runner, &req_ctx, open_time);
                     // 帧封装差异(批次 4):Legacy 发 `data: [DONE]`;Generate
-                    // 风格结束即连接关闭,无终止标记(D9/Triton 行为)。
+                    // 风格结束即连接关闭,无终止标记(D9/Triton 行为);
+                    // Openai 风格(OpenAI SSE 惯例)发 `data: [DONE]`。
                     match frame {
-                        SseFrameStyle::Legacy => Some(Event::default().data("[DONE]")),
+                        SseFrameStyle::Legacy | SseFrameStyle::Openai => {
+                            Some(Event::default().data("[DONE]"))
+                        }
                         SseFrameStyle::Generate => None,
                     }
                 }

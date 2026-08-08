@@ -182,10 +182,11 @@ def main(argv=None):
                                      "(EXECUTES MODEL CODE — opt-in)")
     analyze_parser.add_argument("--deep-timeout", type=float, default=30.0,
                                 help="Seconds before --deep import is killed (default: 30)")
-    analyze_parser.add_argument("--interop", choices=["kserve-v2"], default=None,
+    analyze_parser.add_argument("--interop", "--profile", choices=["kserve-v2"], default=None,
                                 help="Run an optional interop profile check "
                                      "(kserve-v2: KServe V2 inference protocol; "
-                                     "renamed from --profile by protocol-compat 批次 3)")
+                                     "renamed from --profile by protocol-compat 批次 3; "
+                                     "--profile is kept as a deprecated alias)")
 
     # pack
     pack_parser = subparsers.add_parser("pack", help="Pack model into artifact")

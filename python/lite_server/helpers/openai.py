@@ -14,7 +14,7 @@ SSE chunk + embeddings)。纯函数,与 [`kserve.py`](../kserve.py) 同族。
         def decode_request(self, request):
             return parse_chat_request(request)      # {messages, model, stream, ...}
 
-        def predict(self, x):                        # stream: false
+        def predict(self, x, ctx):                   # stream: false
             reply = generate(x["messages"])
             return build_chat_response(reply, model=x["model"],
                                        request_id=ctx.meta.request_id)

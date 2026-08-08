@@ -86,8 +86,21 @@ def _split_binary_inputs(request: dict, tail: memoryview) -> dict[str, memoryvie
     bytes 切片产生第二份拷贝;需要 bytes 时用 ``bytes(mv)`` 显式转换)。
     混合输入合法:未声明 size 的 input 走 JSON ``data``,Σ 只加声明者。
     Σ 不匹配 / 重名 / size 非法 → HTTPException(400)(与 Rust 侧双保险)。
+    结构垃圾(非 dict 的头 / 非 list 的 inputs / 非 dict 的 parameters)
+    同样 400——gRPC/自定义路径可携带该 header 直达此处,无 Rust 边缘校验
+    (审计修复 B12)。
     """
+    if not isinstance(request, dict):
+        raise HTTPException(
+            400, "Triton Binary request head must be a JSON object",
+            error_type="invalid_request_error", code="invalid_triton_binary_head",
+        )
     inputs = request.get("inputs") or []
+    if not isinstance(inputs, list):
+        raise HTTPException(
+            400, "inputs must be a JSON array",
+            error_type="invalid_request_error", code="invalid_triton_binary_head",
+        )
     sizes: list[tuple[str, int]] = []
     names: set[str] = set()
     for inp in inputs:
@@ -97,6 +110,11 @@ def _split_binary_inputs(request: dict, tail: memoryview) -> dict[str, memoryvie
                 error_type="invalid_request_error", code="invalid_triton_binary_head",
             )
         params = inp.get("parameters") or {}
+        if not isinstance(params, dict):
+            raise HTTPException(
+                400, "input parameters must be a JSON object",
+                error_type="invalid_request_error", code="invalid_triton_binary_head",
+            )
         size = params.get("binary_data_size")
         if size is None:
             continue  # 混合输入:未声明者走 JSON data

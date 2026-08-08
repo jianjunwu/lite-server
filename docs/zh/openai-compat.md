@@ -33,7 +33,7 @@ class ChatModel(LitAPI):
     def decode_request(self, request, ctx):
         return parse_chat_request(request)   # {messages, model, stream, ...}
 
-    def predict(self, x):                    # stream: false → unary JSON
+    def predict(self, x, ctx):               # stream: false → unary JSON
         reply = my_generate(x["messages"])
         return build_chat_response(reply, model=x["model"],
                                    request_id=ctx.meta.request_id)

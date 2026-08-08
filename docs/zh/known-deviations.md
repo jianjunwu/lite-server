@@ -31,6 +31,7 @@
 | # | 偏差 | 说明 |
 |---|---|---|
 | ⑧ | **SSE 自有格式 vs `generate_stream`** | `/events` 是自有格式（`data: chunk-N` + `data: [DONE]` 终止）；`generate_stream` 是 Triton 兼容通道（`data: <完整 JSON>` 逐 chunk，错误携带在事件内，结束即连接关闭——无 `[DONE]`）。两者并存不冲突；`/generate_stream` 随 `streaming+sse` 开关族，`/generate`（unary）无 gate。**Caveat（D9）**：HTTP 状态码由首个 SSE 响应固定，流中途错误出现在后续 `data:` 事件内，客户端须逐事件检查。 |
+| ⑧a | **内置 `generate`/`generate_stream` 遮蔽同名自定义 `@route`** | 批次 4 起这两个路径是内置路由；声明了同名自定义 `@route` 的模型在这些路径上不再落到 fallback 分发（G17 行为变化）。如有依赖请改名自定义路由。 |
 
 ## 批次 5（openai-compact）
 

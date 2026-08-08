@@ -305,7 +305,7 @@ lite-server analyze --model <MODEL> [OPTIONS]
 | `--strict` | flag | false | Shortcut for `--fail-severity warning` |
 | `--deep` | flag | false | Resolve statically-unresolvable classes by importing model.py in an isolated subprocess (**executes model code** — opt-in) |
 | `--deep-timeout` | float | 30.0 | Seconds before `--deep` import is killed |
-| `--interop` | kserve-v2 | — | Run an optional interop profile check (kserve-v2: KServe V2 inference protocol; renamed from `--profile` by protocol-compat batch 3) |
+| `--interop` | kserve-v2 | — | Run an optional interop profile check (kserve-v2: KServe V2 inference protocol; renamed from `--profile` by protocol-compat batch 3 — `--profile` remains a deprecated alias) |
 
 **Pure static analysis — user code is never executed.** model.py is parsed as
 AST (no import side effects), paths are confined to the repository root

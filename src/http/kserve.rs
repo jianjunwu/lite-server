@@ -161,9 +161,14 @@ pub(crate) async fn convert_response(
         if let Value::Object(m) = &mut new_out {
             m.remove("data");
             let params = m.entry("parameters").or_insert_with(|| json!({}));
-            if let Value::Object(p) = params {
-                p.insert("binary_data_size".into(), json!(block.len()));
-            }
+            // 审计修复(B9):parameters 已存在但非对象时 binary_data_size
+            // 写不进去——删了 data 又不给 size 等于产出损坏响应 → 400(不猜)。
+            let Value::Object(p) = params else {
+                return Err(AppError::InvalidRequestBody(format!(
+                    "binary_data_output: output {name} has a non-object parameters field"
+                )));
+            };
+            p.insert("binary_data_size".into(), json!(block.len()));
         }
         new_outputs.push(new_out);
     }
@@ -269,6 +274,18 @@ fn int_le<const N: usize>(v: &Value) -> Result<Vec<u8>, AppError> {
             "binary_data_output: data element is not a JSON integer".to_string(),
         )
     })?;
+    // 审计修复(B4):越界 → 400(numpy/KServe parity:np.array(300, int8)
+    // 抛 OverflowError),不得静默截断为低 N 字节。N=8 时 i64 全域合法。
+    if N < 8 {
+        let bits = N * 8;
+        let min = -(1i64 << (bits - 1));
+        let max = (1i64 << (bits - 1)) - 1;
+        if i < min || i > max {
+            return Err(AppError::InvalidRequestBody(format!(
+                "binary_data_output: value {i} out of range for {bits}-bit signed integer"
+            )));
+        }
+    }
     Ok(i.to_le_bytes()[..N].to_vec())
 }
 
@@ -278,6 +295,16 @@ fn uint_le<const N: usize>(v: &Value) -> Result<Vec<u8>, AppError> {
             "binary_data_output: data element is not a JSON unsigned integer".to_string(),
         )
     })?;
+    // 审计修复(B4):同上有符号——越界 → 400。N=8 时 u64 全域合法。
+    if N < 8 {
+        let bits = N * 8;
+        let max = (1u64 << bits) - 1;
+        if u > max {
+            return Err(AppError::InvalidRequestBody(format!(
+                "binary_data_output: value {u} out of range for {bits}-bit unsigned integer"
+            )));
+        }
+    }
     Ok(u.to_le_bytes()[..N].to_vec())
 }
 
@@ -304,8 +331,16 @@ fn f64_to_f16_bits(v: f64) -> u16 {
     if new_exp <= 0 {
         // half denormal:RNE 于 2^-24 粒度。实际指数 = new_exp - 15,
         // fraction = m × 2^(new_exp - 15 + 24) / 2^52 = m >> (43 - new_exp)。
+        let shift = 43 - new_exp;
+        // 审计修复(B3):|v| < 2^-25(tie 以下)时 RNE 必归零——且 shift ≥ 128
+        // 会 u128 移位溢出(f32 denormal 输入最低 2^-149 → shift 高达 177,
+        // debug panic / release 掩码错值)。shift ≥ 54 即 new_exp ≤ -11,
+        // 值 < 2^-26,远低于 tie 点。
+        if shift >= 54 {
+            return sign;
+        }
         let m = (mant | 0x10_0000_0000_0000) as u128; // 隐式 1
-        let shift = (43 - new_exp) as u32;
+        let shift = shift as u32;
         let round = (m >> (shift - 1)) & 1;
         let sticky = if shift >= 2 { m & ((1u128 << (shift - 1)) - 1) } else { 0 };
         let mut hm = (m >> shift) as u32;
@@ -633,5 +668,78 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         let head: Value = serde_json::from_slice(&body[..head_len]).unwrap();
         assert!(head.get("id").is_none(), "无请求 id 则省略");
+    }
+
+    // ===== /audit protocol-compat 举证(2026-08-08,当前代码上 FAIL) =====
+
+    /// 数据假设:FP16 denormal 分支移位溢出。|v| < ~2^-100(如 1e-31,f32
+    /// 可表示)时 new_exp ≤ -85 → shift = 43 - new_exp > 128 → u128 移位
+    /// 溢出(debug panic / release 位掩码垃圾值)。RNE 正确结果 = +0。
+    #[test]
+    fn test_audit_fp16_tiny_magnitude_shift_overflow() {
+        let enc = encode_value("FP16", &json!(1e-31_f64))
+            .expect("tiny FP16 input must encode, not panic");
+        assert_eq!(enc, vec![0u8, 0u8], "1e-31 must round to +0 in FP16 (RNE)");
+    }
+
+    /// 数据假设:INT/UINT 超范围静默截断为低 N 字节(INT8 300 → 44),
+    /// wire 数据损坏。KServe/numpy 对账:numpy 2.5.1 `np.array(300,
+    /// dtype=np.int8)` 抛 OverflowError;「不猜」原则(缺 datatype/shape
+    /// → 400)同样适用于越界值 → 必须 400。
+    #[test]
+    fn test_audit_int_out_of_range_silent_truncation() {
+        assert!(
+            encode_value("INT8", &json!(300)).is_err(),
+            "INT8 value 300 must be rejected, not truncated to 44"
+        );
+        assert!(
+            encode_value("UINT8", &json!(256)).is_err(),
+            "UINT8 value 256 must be rejected, not truncated to 0"
+        );
+        assert!(encode_value("INT16", &json!(70_000)).is_err());
+        assert!(encode_value("UINT32", &json!(5_000_000_000u64)).is_err());
+        assert!(encode_value("INT8", &json!(-200)).is_err());
+    }
+
+    /// 数据假设:命中输出的 `parameters` 已存在但非对象时,`data` 被删除而
+    /// `binary_data_size` 写入被静默跳过(entry 命中非 Object)→ 客户端
+    /// 拿不到切分长度,wire 响应损坏。必须 400(不猜)。
+    #[tokio::test]
+    async fn test_audit_convert_non_object_parameters_loses_binary_size() {
+        let r = req(r#"{"inputs":[{"name":"a","shape":[1],"datatype":"FP32","data":[1]}],"parameters":{"binary_data_output":true}}"#);
+        let resp = convert_response(
+            envelope_response(
+                r#"{"outputs":[{"name":"o","shape":[1],"datatype":"FP32","data":[1.0],"parameters":"bogus"}]}"#,
+                "application/json",
+            ),
+            &r,
+        )
+        .await;
+        match resp {
+            Err(AppError::InvalidRequestBody(_)) => {}
+            Err(other) => panic!("expected InvalidRequestBody 400, got {other:?}"),
+            Ok(resp) => {
+                let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+                let head_len: usize = resp_header_len(&body);
+                let head: Value = serde_json::from_slice(&body[..head_len]).unwrap();
+                panic!(
+                    "unwritable binary_data_size must 400; got 200 with head missing size: {head}"
+                );
+            }
+        }
+    }
+
+    /// 测试辅助:从响应 body 读 inference-header-content-length(仅上面的
+    /// panic 分支用,正常路径到不了)。
+    fn resp_header_len(body: &[u8]) -> usize {
+        // body = head || tail;head 是 JSON,找到 outputs 即够——直接解析到
+        // 第一个非 JSON 字节不可行,改为:本测试的 head 必含 "outputs"。
+        // 简化:扫描 { 起点后逐字节尝试解析前缀。
+        for i in 1..=body.len() {
+            if serde_json::from_slice::<Value>(&body[..i]).is_ok() {
+                return i;
+            }
+        }
+        0
     }
 }

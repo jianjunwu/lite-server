@@ -255,7 +255,12 @@ pub(crate) fn ct_contains(keys: &[String], value: &str) -> bool {
 /// probes are an exact allowlist; inference = anything `access_log_target`
 /// treats as a model inference/custom-route path; everything else is admin.
 pub fn classify_http_path(path: &str) -> EndpointClass {
-    if matches!(path, "/health" | "/livez" | "/readyz" | "/startupz") {
+    // /v2/health/live|ready 是 livez/readyz 的别名路由(routes.rs,批次 3)
+    // ——k8s 探针/KServe SDK 远程探活的目标路径,与本体同类(审计修复 B6)。
+    if matches!(
+        path,
+        "/health" | "/livez" | "/readyz" | "/startupz" | "/v2/health/live" | "/v2/health/ready"
+    ) {
         return EndpointClass::Health;
     }
     if crate::http::routes::access_log_target(path).is_some() {
@@ -305,6 +310,18 @@ mod tests {
         assert_eq!(classify_http_path("/v1/models/foo"), EndpointClass::Inference);
         assert_eq!(classify_http_path("/health"), EndpointClass::Health);
         assert_eq!(classify_http_path("/v2/models/m/infer"), EndpointClass::Inference);
+    }
+
+    /// /audit protocol-compat 举证(2026-08-08,当前 FAIL):
+    /// /v2/health/live|ready 是 livez/readyz 的别名路由(routes.rs:117-118,
+    /// 批次 3 为 k8s 探针/KServe 生态而加),但分类落 Admin——默认
+    /// fail-closed 下非 loopback 探针被 401 拒绝,draining_gate 的探针
+    /// 豁免表(http/mod.rs draining_gate)同样不含这两个路径,排水期
+    /// liveness 别名 503 会诱发 k8s 误杀。别名应与本体同类(Health)。
+    #[test]
+    fn test_audit_v2_health_aliases_classify_as_health() {
+        assert_eq!(classify_http_path("/v2/health/live"), EndpointClass::Health);
+        assert_eq!(classify_http_path("/v2/health/ready"), EndpointClass::Health);
     }
 
     #[test]

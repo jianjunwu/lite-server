@@ -245,5 +245,7 @@ Content-Type，与 unary 透传完全一致。gRPC 侧字节经 `InferResponse.d
 |--------|----------------------------|----------------------------------------------|
 | 400    | `invalid_request_body`     | JSON 语法错误                                |
 | 400    | `invalid_request_body`     | Ensemble：对 binary 数据取字段、binary step 输出被下游引用、或 JSON+binary 混合 step 输入 |
+| 400    | `invalid_triton_binary_head` | Triton Binary：size 求和不匹配 / 重名 / 缺 name / `binary_data_size` 非法 / 头结构畸形（Python worker 侧双保险） |
+| 400    | `invalid_json`             | worker 侧请求 payload JSON 解析失败          |
 | 413    | `payload_too_large`         | Body 超过 `max_request_body_bytes`           |
 | 415    | `unsupported_media_type`    | 请求携带 `Content-Encoding` 头               |

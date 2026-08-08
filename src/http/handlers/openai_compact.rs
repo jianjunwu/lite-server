@@ -5,14 +5,16 @@
 //! (`data: {json}` + `data: [DONE]`),v2 infer 为内部底座。
 //!
 //! **翻译层在 worker 侧**(J6):server 薄透传——body 最小解析仅
-//! `model`/`stream` 两字段用于路由与分流 + SSE 帧编码;chat 请求解析 /
+//! `model`/`stream` 两字段用于路由与分流;chat 请求解析 /
 //! completion·chunk·embeddings 构造全部进 Python helper
-//! `lite_server/helpers/openai.py`(worker 作者集成)。经协议层 seam 接入:
-//! 1 handler 模块 + routes.rs 一行挂载 + `ApiProtocol::OpenaiCompact`
+//! `lite_server/helpers/openai.py`(worker 作者集成)。流式臂复用 SSE 管线
+//! (`stream::openai_stream_entry`,帧封装 = `SseFrameStyle::Openai`:鉴权/
+//! 限流/cancel/指标/回调随管线继承);unary 臂复用 `run_infer`。经协议层
+//! seam 接入:1 handler 模块 + routes.rs 一行挂载 + `ApiProtocol::OpenaiCompact`
 //! 一个 arm(复用 openai.rs renderer),核心逻辑 / error.rs / inference.rs /
 //! stream.rs / worker 零改动。
 
-use super::inference::{build_request_meta, resolve_version, run_infer};
+use super::inference::run_infer;
 use super::{ApiBody, RequestBody};
 use crate::error::{AppError, ProtocolError};
 use crate::http::state::AppState;
@@ -20,14 +22,10 @@ use crate::request_context::RequestContext;
 use axum::{
     extract::{Path, State},
     http::HeaderMap,
-    response::{IntoResponse, Json, Response},
+    response::{Json, Response},
 };
-use axum::response::sse::{Event, Sse};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tracing::Instrument;
 
 /// 挂载 5 条 /v1 路由。handler 经 `State<Arc<AppState>>` extractor 取状态,
 /// route 注册时 S 由 handler 推断为 `Arc<AppState>`(与既有 infer/admin
@@ -84,7 +82,10 @@ pub async fn openai_infer_handler(
     let protocol = crate::protocol::ApiProtocol::OpenaiCompact;
     let route = parse_route(&body).map_err(|error| ProtocolError { error, protocol })?;
     if route.stream {
-        openai_stream(&state, &route.model, headers, body, cx)
+        // 批次 5 审计修复(B1/B2/B7/B8/B10):流式并入 SSE 管线——鉴权/限流/
+        // validate/binary-flag 400/worker 流 cancel/指标/回调全随
+        // sse_infer_entry_impl 继承,帧封装 = SseFrameStyle::Openai。
+        crate::http::handlers::stream::openai_stream_entry(&state, &route.model, headers, body, cx)
             .await
             .map_err(|error| ProtocolError { error, protocol })
     } else {
@@ -141,95 +142,326 @@ pub async fn v1_model_retrieve_handler(
     })))
 }
 
-/// SSE 流式(stream: true):复用 `open_worker_stream` + `streaming::recv_chunk`
-/// 流消费(核心零改动),帧编码 = OpenAI SSE 风格:
-/// - Chunk → `data: <worker chunk JSON>`(worker 经 openai.py 构造 chunk);
-/// - Error → `data: {"error": {...}}`(OpenAI SSE 惯例,HTTP 状态码由首个
-///   响应固定);
-/// - Done → `data: [DONE]`。
-async fn openai_stream(
-    state: &Arc<AppState>,
-    model: &str,
-    headers: HeaderMap,
-    body: RequestBody,
-    cx: RequestContext,
-) -> Result<Response, AppError> {
-    let span = tracing::info_span!(
-        "inference",
-        model = %model,
-        version = "auto",
-        request_id = %cx.request_id,
-        body_kind = "openai_sse",
-    );
-        let resolved_version =
-            resolve_version(state, model, None, &headers).await?;
-        if !state.registry.is_ready(model, Some(&resolved_version)) {
-            return Err(AppError::ModelNotReady(format!(
-                "{} version {} is not ready",
-                model, resolved_version
-            )));
+#[cfg(test)]
+mod audit_tests {
+    //! /audit protocol-compat 举证测试(2026-08-08):每个测试在当前代码上
+    //! FAIL,证明对应缺陷存在;修复后转绿即回归锁。只含测试,不改实现。
+    use super::*;
+    use crate::callback::CallbackRunner;
+    use crate::config::{AuthPolicy, Config, ModelConfig};
+    use crate::inference_queue::InferenceQueue;
+    use crate::proto::liteserver as pb;
+    use crate::registry::types::{ModelType, WorkerInfo, WorkerStatus};
+    use crate::registry::ModelRegistry;
+    use crate::worker::WorkerManager;
+    use axum::body::Body;
+    use axum::http::Request;
+    use prost::Message;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn make_state() -> Arc<AppState> {
+        let registry = Arc::new(ModelRegistry::new());
+        let queue = Arc::new(InferenceQueue::new());
+        let cb = Arc::new(CallbackRunner::new());
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            std::path::PathBuf::new(),
+            queue.clone(),
+            "warn".to_string(),
+            cb.clone(),
+        ));
+        Arc::new(AppState::new(
+            registry,
+            wm,
+            queue,
+            Config::default(),
+            std::path::PathBuf::new(),
+            cb,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+        ))
+    }
+
+    /// 注册 ready + active + 1 worker 的模型(不含 ZMQ client——鉴权/校验
+    /// 类测试应在触及 worker 层之前被拒绝)。
+    fn register_ready(state: &AppState, model: &str, cfg: ModelConfig) {
+        state
+            .registry
+            .register(model, "1", cfg, ModelType::LitAPI, std::path::PathBuf::new())
+            .unwrap();
+        state.registry.mark_ready(model, "1").unwrap();
+        // open_worker_stream 检查 mv.workers.len() > 0。
+        state
+            .registry
+            .set_workers(
+                model,
+                "1",
+                vec![WorkerInfo {
+                    worker_id: 0,
+                    device: "cpu:0".to_string(),
+                    endpoint: String::new(),
+                    pid: None,
+                    status: WorkerStatus::Ready,
+                    capacity: None,
+                }],
+            )
+            .unwrap();
+        assert!(state.registry.activate_version(model, "1").unwrap());
+    }
+
+    fn v1_router(state: Arc<AppState>) -> axum::Router {
+        mount(axum::Router::new()).with_state(state)
+    }
+
+    /// oneshot 按值消耗 router(内含唯一 state 引用)——流式测试必须保留
+    /// 一个 AppState 引用到测试结束,否则 ZMQ client 随 state 提前 drop、
+    /// actor 关停、帧永远到不了(调试实录)。
+    fn v1_router_keep(state: &Arc<AppState>) -> axum::Router {
+        v1_router(state.clone())
+    }
+
+    fn chat_req(model: &str, stream: bool) -> Request<Body> {
+        Request::builder()
+            .uri("/v1/chat/completions")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"stream":{stream}}}"#
+            )))
+            .unwrap()
+    }
+
+    fn ipc_endpoint(tag: &str) -> String {
+        #[cfg(unix)]
+        {
+            format!(
+                "ipc://{}",
+                std::env::temp_dir()
+                    .join(format!("audit-oai-{}-{}.sock", tag, std::process::id()))
+                    .display()
+            )
         }
-        let deadline =
-            crate::deadline::resolve_from_http(&headers, state.config.server.timeout);
-        let payload_bytes = body.bytes();
-        let meta = build_request_meta(
-            &headers,
-            payload_bytes.clone(),
-            "/predict",
-            &cx,
-            deadline.unix_ns,
+        #[cfg(not(unix))]
+        {
+            format!("tcp://127.0.0.1:{}", 38000 + std::process::id() % 1000)
+        }
+    }
+
+    /// B1(范围/安全):/v1 流式臂跳过 per-model enforce_auth。unary 同端点
+    /// 经 run_infer → do_infer → enforce_auth(inference.rs:172)401;
+    /// stream:true 直落 open_worker_stream(无 ZMQ client → 500)。
+    #[tokio::test]
+    async fn test_audit_v1_stream_bypasses_per_model_auth() {
+        let state = make_state();
+        register_ready(&state, "m", ModelConfig::default());
+        // register 不携带 policies(独立字段)——用 set_policies 配置 auth
+        // (stream.rs 既有测试先例)。
+        state.registry.set_policies(
+            "m",
+            "1",
+            Some(crate::config::ModelPolicies {
+                auth: Some(AuthPolicy {
+                    header: "x-api-key".to_string(),
+                    keys: vec!["secret".to_string()],
+                }),
+                ..Default::default()
+            }),
         );
-        let (_stream_id, _worker_client, mut chunk_rx) = crate::http::handlers::stream::open_worker_stream(
-            state, model, &resolved_version, meta, payload_bytes, false,
+        let app = v1_router(state);
+        let resp = app.oneshot(chat_req("m", true)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "stream:true must enforce policies.auth like unary (missing key → 401)"
+        );
+    }
+
+    /// B6(控制流):流式臂缺 validate_identifier(unary 在 run_infer 有)。
+    /// 非法模型名 unary → 400,stream:true → 404(校验缺失)。
+    #[tokio::test]
+    async fn test_audit_v1_stream_validates_model_identifier() {
+        let state = make_state();
+        register_ready(&state, "m", ModelConfig::default());
+        let app = v1_router(state);
+        let resp = app.oneshot(chat_req("bad name!", true)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid model identifier must 400 (unary parity), not fall through to 404"
+        );
+    }
+
+    /// B8(观测缺失):/events 早期拒绝经 record_stream_rejected →
+    /// record_request_end 计数(stream.rs:242-249);/v1 流式臂零计数,
+    /// 拒绝在 liteserver_requests_total 中完全隐形。
+    #[tokio::test]
+    async fn test_audit_v1_stream_rejection_recorded() {
+        let state = make_state();
+        let app = v1_router(state);
+        let counter = crate::metrics::prometheus::REQUESTS_TOTAL
+            .with_label_values(&["audit-v1-rej", "", "4xx"]);
+        let before = counter.get();
+        let resp = app.oneshot(chat_req("audit-v1-rej", true)).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        assert!(
+            counter.get() > before,
+            "SSE parity: early rejection must be counted via record_stream_rejected"
+        );
+    }
+
+    /// PAIR worker:Open → Error("boom") + Done。
+    fn spawn_error_worker(endpoint: String) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(4000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let Ok(req) = pb::Request::decode(bytes.as_slice()) else { continue };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                if !matches!(st.action, Some(pb::stream_request::Action::Open(_))) {
+                    continue;
+                }
+                let mk = |payload| pb::Response {
+                    payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                        stream_id: st.stream_id.clone(),
+                        payload: Some(payload),
+                    })),
+                    ..Default::default()
+                };
+                let _ = s.send(
+                    mk(pb::stream_response::Payload::Error(pb::StreamError {
+                        message: "boom".to_string(),
+                    }))
+                    .encode_to_vec(),
+                    0,
+                );
+                let _ = s.send(
+                    mk(pb::stream_response::Payload::Done(pb::StreamDone::default()))
+                        .encode_to_vec(),
+                    0,
+                );
+            }
+        })
+    }
+
+    /// B13(协议一致性):模块文档(openai_compact.rs:147-149)与方案阶段 6
+    /// 均声明流中途错误帧 = `data: {"error": {...}}`(OpenAI SSE 惯例,对象);
+    /// 实现发扁平字符串 `{"error": "<msg>"}`,且不像 /events 管线
+    /// (stream.rs:444-448)那样先尝试解析 worker 的结构化错误。
+    #[tokio::test]
+    async fn test_audit_v1_stream_error_frame_is_object() {
+        let endpoint = ipc_endpoint("err-shape");
+        let _w = spawn_error_worker(endpoint.clone());
+        let state = make_state();
+        register_ready(&state, "m", ModelConfig::default());
+        let client = Arc::new(crate::transport::zmq::WorkerZmqClient::new(endpoint));
+        state
+            .worker_manager
+            .insert_zmq_clients_for_test("m", "1", vec![client])
+            .await;
+        // 等 PAIR 握手(既有 stream.rs 测试的 200ms 先例)。
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let app = v1_router_keep(&state);
+        let resp = app.oneshot(chat_req("m", true)).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            axum::body::to_bytes(resp.into_body(), 1 << 20),
         )
-        .await?;
+        .await
+        .expect("SSE body must close within timeout")
+        .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        let err_json = text
+            .lines()
+            .find(|l| l.starts_with("data: {"))
+            .map(|l| &l["data: ".len()..])
+            .unwrap_or_else(|| panic!("must carry an error data frame, body = {text:?}"));
+        let v: serde_json::Value = serde_json::from_str(err_json).unwrap();
+        assert!(
+            v.get("error").is_some_and(|e| e.is_object()),
+            "mid-stream error frame must be an object per module doc/plan, got: {text}"
+        );
+    }
 
-        let stream_deadline = if deadline.client_specified {
-            crate::deadline::to_instant(deadline.unix_ns)
-        } else {
-            None
-        };
-        let stream_idle =
-            crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
-        let (event_tx, event_rx) =
-            mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
-
-        tokio::spawn(async move {
-            loop {
-                let chunk = match crate::streaming::recv_chunk(
-                    &mut chunk_rx,
-                    stream_deadline,
-                    stream_idle,
-                )
-                .await
-                {
-                    Ok(Some(c)) => c,
-                    Ok(None) => break,
-                    Err(_) => break,
-                };
-                let event = match &chunk.payload {
-                    Some(crate::proto::liteserver::stream_response::Payload::Chunk(c)) => {
-                        // worker chunk = openai.py 构造的 chunk JSON(透传)
-                        Some(Event::default().data(String::from_utf8_lossy(&c.data)))
+    /// PAIR worker:Open → Chunk("c1"),150ms 后 Chunk("c2"),随后等
+    /// StreamCancel(见到即置 flag)。
+    fn spawn_two_chunk_worker(
+        endpoint: String,
+        cancel_seen: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(4000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let Ok(req) = pb::Request::decode(bytes.as_slice()) else { continue };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else { continue };
+                match st.action {
+                    Some(pb::stream_request::Action::Open(_)) => {
+                        let mk = |data: &str| pb::Response {
+                            payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                                stream_id: st.stream_id.clone(),
+                                payload: Some(pb::stream_response::Payload::Chunk(
+                                    pb::StreamChunkResponse {
+                                        data: bytes::Bytes::copy_from_slice(data.as_bytes()),
+                                        is_final: false,
+                                    },
+                                )),
+                            })),
+                            ..Default::default()
+                        };
+                        let _ = s.send(mk("c1").encode_to_vec(), 0);
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        let _ = s.send(mk("c2").encode_to_vec(), 0);
                     }
-                    Some(crate::proto::liteserver::stream_response::Payload::Error(e)) => {
-                        // 流中途错误:OpenAI SSE 惯例,错误在后续事件内
-                        Some(Event::default().data(json!({"error": e.message}).to_string()))
+                    Some(pb::stream_request::Action::Cancel(_)) => {
+                        cancel_seen.store(true, Ordering::Relaxed);
+                        return;
                     }
-                    Some(crate::proto::liteserver::stream_response::Payload::Done(_)) => {
-                        // OpenAI SSE 以 [DONE] 终止
-                        Some(Event::default().data("[DONE]"))
-                    }
-                    _ => None,
-                };
-                if let Some(event) = event {
-                    if event_tx.send(Ok(event)).await.is_err() {
-                        break;
-                    }
+                    _ => {}
                 }
             }
-        }
-        .instrument(span.clone()));
+        })
+    }
 
-    Ok(Sse::new(ReceiverStream::new(event_rx)).into_response())
+    /// B2(资源泄露):客户端断开(event_tx.send 失败 → break)后从不向
+    /// worker 发 StreamCancel——worker 继续生成直到自然完成。SSE 管线恒
+    /// cancel(stream.rs:506-511),方案阶段 6 复用清单也列了
+    /// build_stream_cancel(未落地)。
+    #[tokio::test]
+    async fn test_audit_v1_stream_cancels_worker_on_client_disconnect() {
+        use tokio_stream::StreamExt;
+        let cancel_seen = Arc::new(AtomicBool::new(false));
+        let endpoint = ipc_endpoint("cancel");
+        let _w = spawn_two_chunk_worker(endpoint.clone(), cancel_seen.clone());
+        let state = make_state();
+        register_ready(&state, "m", ModelConfig::default());
+        let client = Arc::new(crate::transport::zmq::WorkerZmqClient::new(endpoint));
+        state
+            .worker_manager
+            .insert_zmq_clients_for_test("m", "1", vec![client])
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let app = v1_router_keep(&state);
+        let resp = app.oneshot(chat_req("m", true)).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        // 读首帧后断开(客户端取消)。
+        let mut frames = resp.into_body().into_data_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(3), frames.next()).await;
+        assert!(matches!(first, Ok(Some(_))), "first chunk must arrive");
+        drop(frames);
+        // 服务器转发第二帧失败 → 应发现客户端断开并 cancel worker。
+        for _ in 0..90 {
+            if cancel_seen.load(Ordering::Relaxed) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("worker never received StreamCancel after client disconnect (SSE parity)");
+    }
 }
