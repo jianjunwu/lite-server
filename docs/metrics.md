@@ -14,6 +14,7 @@ record for the label whitelist (蓝图 §6.5 约束 10).
 |---|---|---|
 | `liteserver_requests_total` | `model, version, status` | **Not** gated by `features.streaming_metrics`. HTTP streaming (SSE/WS/h2-bidi) now records close-point and early-rejection (D7). Disconnected streams keep `2xx` + a separate cancel counter (D1). |
 | `liteserver_request_duration_seconds` | `model, version` | Buckets extended with `30/60/120` (S7/D8) — minute-scale stream durations no longer fall into `+Inf`. **Semantics (D8):** with streaming counted, this histogram mixes unary and stream e2e durations; long streams dominate the tail. Same for `/metrics/timeline` p99 and Admin `GetModelStats.avg_duration_ms`. |
+| `lite_server_http_request_body_bytes` | `content_type, route` | HTTP request body size histogram. `content_type` = `json` \| `raw` \| `triton_binary` — `triton_binary` covers Triton Binary Tensor Data Extension requests (`Inference-Header-Content-Length` > 0, batch 1). `route` = matched-path pattern. Buckets 1 KB–256 MB. |
 
 ## Streaming metrics
 

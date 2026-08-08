@@ -114,6 +114,9 @@ class RequestContext:
 
     meta: RequestMeta
     request: Any = None  # raw payload (pre-decode)
+    # Triton Binary Tensor Data Extension(阶段 1,D4):输入名 → 二进制尾
+    # memoryview 视图(np.frombuffer 直接接受,零拷贝);非 Triton 请求为 None。
+    binary_data: dict[str, memoryview] | None = None
     input: Any = None  # decode_request output
     output: Any = None  # predict output
     response: Any = None  # encode_response output

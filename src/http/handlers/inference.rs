@@ -116,6 +116,16 @@ async fn do_infer(
             RequestBody::Raw(bytes, ct) => {
                 crate::ensemble::EnsembleValue::Binary(bytes.clone(), ct.clone())
             }
+            // C4 (阶段 1):ensemble 显式拒绝 TritonBinary——「JSON 头+二进制
+            // 尾」是容器格式,DAG 消费它须等 §9.6 Option B 的命名槽位容器
+            // 落地(不同于 D7 的 Raw 400:B3/E6 已把 Raw 透传进首层)。
+            RequestBody::TritonBinary { .. } => {
+                return Err(AppError::InvalidRequestBody(
+                    "ensemble does not support Triton Binary Tensor Data Extension \
+                     requests (JSON head + binary tail container) yet"
+                        .to_string(),
+                ));
+            }
         };
         let result = crate::ensemble::execute_ensemble(
             state, &model_name, &resolved_version, ensemble_input,

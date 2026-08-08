@@ -14,6 +14,76 @@ JSON 路径实现零拷贝：原始字节直接转发，不再经历 `Value` 物
 | `application/octet-stream`  | `RequestBody::Raw`       | `ctx.request` = 原始 `bytes`  |
 | 其他值（含畸形值）          | `RequestBody::Raw`       | `ctx.request` = 原始 `bytes`  |
 | 带 `Content-Encoding`       | **415 Unsupported Media**| —                          |
+| `Inference-Header-Content-Length` > 0 | `RequestBody::TritonBinary` | `ctx.request` = 解析后 JSON 头;`ctx.binary_data` = 二进制尾视图 |
+
+## Triton Binary Tensor Data Extension（0.8.4，批次 1）
+
+多 tensor 二进制传输，兼容 KServe V2 dataplane（Triton HTTP 协议）。body =
+**JSON 头 + 拼接二进制尾**，由 `Inference-Header-Content-Length` 切分：
+
+```http
+POST /v2/models/:m/infer
+Content-Type: application/octet-stream
+Inference-Header-Content-Length: 546      ← JSON 头字节数
+
+{"id": "req-1", "inputs": [{"name": "a", "shape": [2], "datatype": "FP32",
+  "parameters": {"binary_data_size": 8}}, ...]}   ← 0..N 字节
+<输入 a 的二进制块:8 字节>                        ← N..N+Σ 字节
+```
+
+规则（对齐 Triton / KServe）：
+
+- 每个输入用 `parameters.binary_data_size` 声明块大小（该 tensor 总字节数，
+  小端 row-major）。tail 按**声明顺序**切分。
+- **混合输入合法**：JSON `data` 数组与 `binary_data_size` 可并存；Σ 只加
+  二进制者。
+- Σ `binary_data_size` 必须等于 tail 长度——不匹配 **400**。
+- 重名 input、负数/非整数 size、size 溢出、header 超 body 长度、JSON 头
+  畸形——均 **400**。
+- `Inference-Header-Content-Length: 0` 落回普通 `Content-Type` 分流
+  （原始字节，行为不变）。
+- ensemble 模型拒绝 Triton Binary 请求（**400**——JSON 头+二进制尾容器
+  须等 §9.6 Option B 的命名槽位容器）。
+- FP16 / BF16 在 dataplane 中无 JSON 表示——二进制是唯一通道
+  （`datatype: "FP16"` + `binary_data_size`）。
+- batch 请求不解析该 header（batch item 共享首 item 元数据，wire 无
+  per-item headers）。
+
+### Worker 范式
+
+```python
+import numpy as np
+
+class MyModel(LitAPI):
+    def decode_request(self, request, ctx):
+        # ctx.request = 解析后的 JSON 头 dict（信封原样）
+        # ctx.binary_data = {输入名: memoryview}——声明顺序
+        # memoryview 是零拷贝视图;np.frombuffer 直接接受。
+        a = np.frombuffer(ctx.binary_data["a"], dtype=np.float32)  # 视图,无拷贝
+        return {"a": a, "head": ctx.request}
+
+    def predict(self, x):
+        return x["a"].sum()
+
+    def encode_response(self, output):
+        return {"sum": float(output)}
+```
+
+BYTES datatype 的每个元素 = 4 字节小端长度前缀 + 内容（前缀是 *tensor
+语义*——server 只按声明 size 切分，解析归 worker）：
+
+```python
+def parse_bytes_tensor(mv):
+    out = []
+    while mv:
+        (n,) = struct.unpack("<I", mv[:4])
+        out.append(bytes(mv[4 : 4 + n]))
+        mv = mv[4 + n :]
+    return out
+```
+
+非 Triton Binary 请求时 `ctx.binary_data` 为 `None`，`ctx.request` 保持
+既有 JSON / 原始字节行为不变。
 
 ## 客户端示例
 

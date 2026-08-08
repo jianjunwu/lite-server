@@ -79,6 +79,60 @@ def _parse_request_json(data: bytes | None) -> dict:
         ) from e
 
 
+def _split_binary_inputs(request: dict, tail: memoryview) -> dict[str, memoryview]:
+    """按声明 ``binary_data_size`` 的 ``inputs[]`` 顺序切分二进制尾(D4/G19)。
+
+    返回值是 memoryview **视图**(np.frombuffer 直接接受,零拷贝——避免
+    bytes 切片产生第二份拷贝;需要 bytes 时用 ``bytes(mv)`` 显式转换)。
+    混合输入合法:未声明 size 的 input 走 JSON ``data``,Σ 只加声明者。
+    Σ 不匹配 / 重名 / size 非法 → HTTPException(400)(与 Rust 侧双保险)。
+    """
+    inputs = request.get("inputs") or []
+    sizes: list[tuple[str, int]] = []
+    names: set[str] = set()
+    for inp in inputs:
+        if not isinstance(inp, dict):
+            raise HTTPException(
+                400, "invalid input entry in Triton Binary request head",
+                error_type="invalid_request_error", code="invalid_triton_binary_head",
+            )
+        params = inp.get("parameters") or {}
+        size = params.get("binary_data_size")
+        if size is None:
+            continue  # 混合输入:未声明者走 JSON data
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise HTTPException(
+                400, f"invalid binary_data_size: {size!r}",
+                error_type="invalid_request_error", code="invalid_triton_binary_head",
+            )
+        name = inp.get("name")
+        if not isinstance(name, str) or not name:
+            raise HTTPException(
+                400, "input with binary_data_size must declare a name",
+                error_type="invalid_request_error", code="invalid_triton_binary_head",
+            )
+        if name in names:
+            raise HTTPException(
+                400, f"duplicate input name: {name}",
+                error_type="invalid_request_error", code="invalid_triton_binary_head",
+            )
+        names.add(name)
+        sizes.append((name, size))
+    total = sum(s for _, s in sizes)
+    if total != len(tail):
+        raise HTTPException(
+            400,
+            f"binary_data_size sum {total} does not match binary tail length {len(tail)}",
+            error_type="invalid_request_error", code="invalid_triton_binary_head",
+        )
+    result: dict[str, memoryview] = {}
+    offset = 0
+    for name, size in sizes:
+        result[name] = tail[offset:offset + size]
+        offset += size
+    return result
+
+
 def _is_json_content_type(content_type: str) -> bool:
     """Mirror the Rust-side ``is_json_content_type`` (D1/D9):
     ``application/json`` and ``application/*+json``, case-insensitive,
@@ -740,15 +794,31 @@ class Pipeline:
         if ctx is None:
             ctx = RequestContext(meta=meta, request={}, mode=mode)
         try:
-            # D9: missing Content-Type defaults to JSON (the Rust extractor
-            # applies the same default). meta.headers is the read-only
-            # Headers class — .get's default carries the fallback, no
-            # mutation needed (or possible).
-            content_type = meta.headers.get("content-type", "application/json")
-            if _is_json_content_type(content_type):
-                ctx.request = _parse_request_json(data)
+            # D4 (阶段 1, Triton Binary Tensor Data Extension):header > 0 →
+            # JSON 头 + 拼接二进制尾(Rust 边缘已校验 N>0 才走此分支,此处
+            # 防御性 try/except 处理 gRPC/自定义路径的垃圾值,降级到既有分流)。
+            raw_header = meta.headers.get("inference-header-content-length")
+            header_len = 0
+            if raw_header is not None:
+                try:
+                    header_len = int(raw_header)
+                except ValueError:
+                    header_len = 0  # 垃圾值 → 既有分流,不 500
+            if header_len > 0:
+                json_head, tail = data[:header_len], memoryview(data)[header_len:]
+                ctx.request = _parse_request_json(json_head)
+                ctx.binary_data = _split_binary_inputs(ctx.request, tail)
             else:
-                ctx.request = data  # raw bytes — user's decode_request handles it
+                # D9: missing Content-Type defaults to JSON (the Rust extractor
+                # applies the same default). meta.headers is the read-only
+                # Headers class — .get's default carries the fallback, no
+                # mutation needed (or possible). header=0 / 无 header / 垃圾值
+                # 全部落此(C3)。
+                content_type = meta.headers.get("content-type", "application/json")
+                if _is_json_content_type(content_type):
+                    ctx.request = _parse_request_json(data)
+                else:
+                    ctx.request = data  # raw bytes — user's decode_request handles it
             await self.preprocess(ctx)
             if ctx.early is None:
                 await self.predict_value(ctx)

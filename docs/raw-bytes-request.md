@@ -15,6 +15,80 @@ byte-identical, without a `Value` → `to_vec` round-trip.
 | `application/octet-stream`  | `RequestBody::Raw`       | `ctx.request` = raw `bytes` |
 | Any other value (or garbage)| `RequestBody::Raw`       | `ctx.request` = raw `bytes` |
 | `Content-Encoding` present  | **415 Unsupported Media**| —                          |
+| `Inference-Header-Content-Length` > 0 | `RequestBody::TritonBinary` | `ctx.request` = parsed JSON head; `ctx.binary_data` = tail views |
+
+## Triton Binary Tensor Data Extension (0.8.4, batch 1)
+
+Multi-tensor binary transport, compatible with the KServe V2 dataplane
+(Triton HTTP protocol). The body is a **JSON head + concatenated binary
+tail**, split by the `Inference-Header-Content-Length` header:
+
+```http
+POST /v2/models/:m/infer
+Content-Type: application/octet-stream
+Inference-Header-Content-Length: 546      ← JSON head byte count
+
+{"id": "req-1", "inputs": [{"name": "a", "shape": [2], "datatype": "FP32",
+  "parameters": {"binary_data_size": 8}}, ...]}   ← 0..N bytes
+<binary block for input a: 8 bytes>                  ← N..N+Σ bytes
+```
+
+Rules (mirroring Triton / KServe):
+
+- Each input declares its block size via `parameters.binary_data_size`
+  (total bytes for that tensor, little-endian row-major). The tail is split
+  in **declaration order**.
+- **Mixed inputs are legal**: inputs with a JSON `data` array and inputs
+  with `binary_data_size` may coexist; Σ counts only the binary ones.
+- Σ `binary_data_size` must equal the tail length — mismatch is a **400**.
+- Duplicate input names, negative / non-integer sizes, size overflow, a
+  header exceeding the body length, or a malformed JSON head are **400**.
+- `Inference-Header-Content-Length: 0` falls back to the plain
+  `Content-Type` dispatch (raw bytes, unchanged behavior).
+- Ensemble models reject Triton Binary requests with a **400** (the
+  JSON-head + binary-tail container needs the §9.6 Option-B named-slot
+  container first).
+- FP16 / BF16 have no JSON representation in the dataplane — binary is
+  their only channel (`datatype: "FP16"` + `binary_data_size`).
+- Batch requests do not parse this header (batch items share the first
+  item's metadata; no per-item headers on the wire).
+
+### Worker paradigm
+
+```python
+import numpy as np
+
+class MyModel(LitAPI):
+    def decode_request(self, request, ctx):
+        # ctx.request = parsed JSON head dict (the envelope, unmodified)
+        # ctx.binary_data = {input name: memoryview} — declaration order
+        # memoryview is a zero-copy view; np.frombuffer accepts it directly.
+        a = np.frombuffer(ctx.binary_data["a"], dtype=np.float32)  # view, no copy
+        return {"a": a, "head": ctx.request}
+
+    def predict(self, x):
+        return x["a"].sum()
+
+    def encode_response(self, output):
+        return {"sum": float(output)}
+```
+
+For BYTES datatype tensors, each element is a 4-byte little-endian length
+prefix followed by the content (the prefix is *tensor semantics* — the
+server only splits by the declared size; parsing is the worker's job):
+
+```python
+def parse_bytes_tensor(mv):
+    out = []
+    while mv:
+        (n,) = struct.unpack("<I", mv[:4])
+        out.append(bytes(mv[4 : 4 + n]))
+        mv = mv[4 + n :]
+    return out
+```
+
+When the request is not Triton Binary, `ctx.binary_data` is `None` and
+`ctx.request` keeps the existing JSON / raw-bytes behavior unchanged.
 
 ## Client Examples
 

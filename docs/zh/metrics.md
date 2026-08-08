@@ -13,6 +13,7 @@ label 语义、桶变更与语义说明(D8/S3)——label 白名单的权威评�
 |---|---|---|
 | `liteserver_requests_total` | `model, version, status` | **不**受 `features.streaming_metrics` 门控。HTTP 流式(SSE/WS/h2-bidi)现记录 close 点与早期拒绝(D7)。客户端断开的流保持 `2xx`,另由独立 cancel counter 区分(D1)。 |
 | `liteserver_request_duration_seconds` | `model, version` | 桶追加 `30/60/120`(S7/D8)——分钟级流时长不再落 `+Inf`。**语义(D8):** 流式计入后,该直方图混合 unary 与流式 e2e 时长,长流主导尾部;`/metrics/timeline` p99 与 Admin `GetModelStats.avg_duration_ms` 同样混入。 |
+| `lite_server_http_request_body_bytes` | `content_type, route` | HTTP 请求体大小直方图。`content_type` = `json` \| `raw` \| `triton_binary`——`triton_binary` 覆盖 Triton Binary Tensor Data Extension 请求(`Inference-Header-Content-Length` > 0,批次 1)。`route` = 匹配路径模式。桶 1 KB–256 MB。 |
 
 ## 流式指标
 

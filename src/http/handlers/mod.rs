@@ -76,7 +76,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// HTTP request body, dispatched on Content-Type.
-/// Both variants hold the **original request bytes** — no JSON round-trip,
+/// All variants hold the **original request bytes** — no JSON round-trip,
 /// no re-serialization anywhere on the wire path.
 #[derive(Debug, Clone)]
 pub enum RequestBody {
@@ -85,6 +85,11 @@ pub enum RequestBody {
     Json(Bytes),
     /// Non-JSON content-type → raw bytes + normalized media type string.
     Raw(Bytes, String),
+    /// Triton Binary Tensor Data Extension(KServe V2 dataplane,阶段 1):
+    /// body = JSON 头 + 拼接二进制尾;`json_head_len` 为切分点。持有**完整
+    /// 原始 body**(不拼接不拷贝),需要哪段就 `Bytes::slice`(O(1) 视图)。
+    /// 仅 N>0 时构造;N=0 落回 Raw(v2 C3)。
+    TritonBinary { body: Bytes, json_head_len: usize },
 }
 
 impl RequestBody {
@@ -93,6 +98,7 @@ impl RequestBody {
         match self {
             RequestBody::Json(_) => "json",
             RequestBody::Raw(_, _) => "raw",
+            RequestBody::TritonBinary { .. } => "triton_binary",
         }
     }
 
@@ -101,6 +107,15 @@ impl RequestBody {
         match self {
             RequestBody::Json(b) => b.clone(),
             RequestBody::Raw(b, _) => b.clone(),
+            RequestBody::TritonBinary { body, .. } => body.clone(),
+        }
+    }
+
+    /// Triton Binary 切分点(仅 TritonBinary 变体有)。
+    pub fn json_head_len(&self) -> Option<usize> {
+        match self {
+            RequestBody::TritonBinary { json_head_len, .. } => Some(*json_head_len),
+            _ => None,
         }
     }
 }
@@ -123,7 +138,7 @@ where
 
     async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
         // Materialize header decisions before moving the request into parts.
-        let (is_json, content_type, has_content_encoding, content_length) = {
+        let (is_json, content_type, has_content_encoding, content_length, ihcl) = {
             let headers = req.headers();
             let ct_header = headers.get(axum::http::header::CONTENT_TYPE);
             let is_json = match ct_header {
@@ -139,7 +154,13 @@ where
                 .get(axum::http::header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok());
-            (is_json, content_type, has_encoding, content_length)
+            // C9 (阶段 1): `Inference-Header-Content-Length` 存在即 T1 强信号,
+            // 优先于 Content-Type 分流(Triton 客户端恒发 octet-stream)。
+            let ihcl: Option<String> = headers
+                .get(INFERENCE_HEADER_CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            (is_json, content_type, has_encoding, content_length, ihcl)
         };
 
         // D6: no decompression layer — any Content-Encoding → 415.
@@ -160,6 +181,37 @@ where
         .await
         .map_err(|rejection| crate::error::map_body_rejection(rejection, max_size, content_length))?;
 
+        // Triton Binary Tensor Data Extension(D2/C3):header 存在即优先于
+        // Content-Type 分流。N>0 → TritonBinary(JSON 头 &RawValue 校验 +
+        // Σ binary_data_size 结构校验);N==0 → 落回既有分流(byte-identical)。
+        if let Some(raw) = ihcl {
+            let n = raw.parse::<usize>().map_err(|_| {
+                AppError::InvalidRequestBody(format!(
+                    "invalid inference-header-content-length: {raw}"
+                ))
+            })?;
+            if n > 0 {
+                if n > bytes.len() {
+                    return Err(AppError::InvalidRequestBody(format!(
+                        "inference-header-content-length {n} exceeds body length {}",
+                        bytes.len()
+                    )));
+                }
+                let total = triton_binary_tail_sum(&bytes[..n])?;
+                let tail_len = bytes.len() - n;
+                if total as usize != tail_len {
+                    return Err(AppError::InvalidRequestBody(format!(
+                        "binary_data_size sum {total} does not match binary tail length {tail_len}"
+                    )));
+                }
+                return Ok(ApiBody(RequestBody::TritonBinary {
+                    body: bytes,
+                    json_head_len: n,
+                }));
+            }
+            // N == 0 → 落回既有 Content-Type 分流(C3)
+        }
+
         if is_json {
             // D3: zero-allocation syntax validation via `&RawValue` —
             // a full parse (not just first-byte sniffing), no DOM materialized.
@@ -171,6 +223,71 @@ where
             Ok(ApiBody(RequestBody::Raw(bytes, ct)))
         }
     }
+}
+
+/// Triton Binary Tensor Data Extension 的切分 header(KServe V2 dataplane,
+/// constants.py:108 实证,键名小写)。
+pub(crate) const INFERENCE_HEADER_CONTENT_LENGTH: &str = "inference-header-content-length";
+
+/// Triton Binary JSON 头(0..N)的部分反序列化:仅取 `inputs[].name /
+/// data / parameters.binary_data_size`,借用 head 引用,近零分配(D3/C11)。
+#[derive(serde::Deserialize)]
+struct TritonBinaryHead<'a> {
+    #[serde(borrow, default)]
+    inputs: Vec<TritonBinaryInput<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct TritonBinaryInput<'a> {
+    #[serde(borrow, default)]
+    name: Option<&'a str>,
+    /// 是否存在 JSON data(混合输入合法:未声明 size 者走 JSON data)。
+    #[serde(default)]
+    data: Option<&'a serde_json::value::RawValue>,
+    #[serde(default)]
+    parameters: Option<TritonBinaryParams>,
+}
+
+#[derive(serde::Deserialize)]
+struct TritonBinaryParams {
+    #[serde(rename = "binary_data_size", default)]
+    binary_data_size: Option<u64>,
+}
+
+/// Σ `inputs[].parameters.binary_data_size` 的结构校验(D2/G19):
+/// - 混合输入合法:只加声明了 size 的 input;tail 切分顺序 = 声明顺序
+/// - 负数/浮点/非数字 size → serde u64 解析失败 → 400(不 wrap 不 panic)
+/// - `checked_add` 溢出 → 400
+/// - 重名 input → 400(Python 侧按 name 建 dict,静默覆盖是隐患)
+/// - 声明 size 的 input 缺 name → 400;每个 input 必须有 data 或 size → 400
+fn triton_binary_tail_sum(json_head: &[u8]) -> Result<u64, AppError> {
+    let head: TritonBinaryHead = serde_json::from_slice(json_head)
+        .map_err(|e| AppError::InvalidRequestBody(format!("invalid JSON head: {e}")))?;
+    let mut seen = std::collections::HashSet::new();
+    let mut total: u64 = 0;
+    for input in &head.inputs {
+        let size = input.parameters.as_ref().and_then(|p| p.binary_data_size);
+        if input.data.is_none() && size.is_none() {
+            return Err(AppError::InvalidRequestBody(
+                "input must declare data or binary_data_size".to_string(),
+            ));
+        }
+        let Some(size) = size else { continue };
+        let Some(name) = input.name else {
+            return Err(AppError::InvalidRequestBody(
+                "input with binary_data_size must declare name".to_string(),
+            ));
+        };
+        if !seen.insert(name) {
+            return Err(AppError::InvalidRequestBody(format!(
+                "duplicate input name: {name}"
+            )));
+        }
+        total = total.checked_add(size).ok_or_else(|| {
+            AppError::InvalidRequestBody("binary_data_size sum overflow".to_string())
+        })?;
+    }
+    Ok(total)
 }
 
 /// axum `Json` extractor's own JSON content-type predicate (D1):
@@ -206,6 +323,8 @@ pub use files::*;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod triton_binary_tests;
 
 
 /// Pure decision for the peer-IP fallback layer: return the IP string to inject

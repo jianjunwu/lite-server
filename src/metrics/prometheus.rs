@@ -246,9 +246,9 @@ lazy_static! {
     ).unwrap();
 
     /// HTTP request body size histogram (D11: Content-Type dispatch
-    /// observability). `content_type` = "json" | "raw"; `route` =
-    /// matched-path pattern. Buckets cover 1 KB to 256 MB so the
-    /// distribution is visible for small JSON payloads through large
+    /// observability). `content_type` = "json" | "raw" | "triton_binary"
+    /// (阶段 1);`route` = matched-path pattern. Buckets cover 1 KB to 256 MB
+    /// so the distribution is visible for small JSON payloads through large
     /// tensor bodies.
     pub static ref HTTP_REQUEST_BODY_BYTES: HistogramVec = HistogramVec::new(
         HistogramOpts::new(

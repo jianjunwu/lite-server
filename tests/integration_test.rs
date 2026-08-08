@@ -8374,3 +8374,346 @@ async fn test_unary_413_body_too_large() {
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+// ---------------------------------------------------------------------------
+// Triton Binary Tensor Data Extension(阶段 1,批次 1)
+// ---------------------------------------------------------------------------
+
+/// kserve-master `test_infer_type.py:262` wire 夹具移植(与
+/// src/http/handlers/triton_binary_tests.rs 同一常量):546B JSON 头 +
+/// 14B 二进制尾,Σ binary_data_size = 8 + 6 = 14。
+const KSERVE_E2E_HEAD: &str = r#"{"id":"4be4e82f-5500-420a-a5c5-ac86841e271b","model_name":"test_model","inputs":[{"name":"input1","shape":[3],"datatype":"INT32","parameters":{"test-str":"dummy"},"data":[1,2,3]},{"name":"input2","shape":[1],"datatype":"BYTES","parameters":{"test-int":2,"binary_data_size":8}},{"name":"input3","shape":[3],"datatype":"FP16","parameters":{"binary_data_size":6}}],"outputs":[{"name":"output-0","parameters":{"test-str":"dummy","test-bool":true,"test-int":100}},{"name":"output-1","parameters":{"test-str":"dummy","test-bool":true,"test-int":100}}]}"#;
+const KSERVE_E2E_TAIL: &[u8] = b"\x04\x00\x00\x00test\xcd<f@fB";
+
+/// 阶段 1:暴露 ctx.binary_data 切分结果的 worker(Python 侧切分验收)。
+fn write_triton_binary_split_model(repo: &std::path::Path, name: &str) {
+    let dir = repo.join(format!("{name}/1"));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("model.py"),
+        r#"from lite_server import LitAPI
+
+
+class TritonSplitAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request, ctx):
+        return {"binary_data": {k: list(v) for k, v in (ctx.binary_data or {}).items()}}
+
+    def predict(self, x):
+        return x
+
+    def encode_response(self, output):
+        return output
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+}
+
+/// 阶段 1:按声明顺序拼接二进制尾并直通(byte-identical 验收,§7 验收 1)。
+/// worker 契约(D4)下 ctx.request = 解析后的 JSON 头 dict,头部字节保真由
+/// extractor 单测 /echo-bytes 锁定;本 worker 锁定**二进制尾**端到端逐字节。
+fn write_triton_binary_echo_model(repo: &std::path::Path, name: &str) {
+    let dir = repo.join(format!("{name}/1"));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("model.py"),
+        r#"from lite_server import LitAPI
+from lite_server.response import Response
+
+
+class TritonEchoAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request, ctx):
+        return ctx.binary_data  # {name: memoryview},dict 保序 = 声明顺序
+
+    def predict(self, x):
+        return b"".join(bytes(v) for v in x.values())
+
+    def encode_response(self, output):
+        return Response(content=output, media_type="application/octet-stream")
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+}
+
+/// §6.1 test_unary_triton_binary_e2e (P0):多 tensor 二进制请求 → worker
+/// 侧 ctx.binary_data 按声明顺序切分正确(JSON 头 dict 进 ctx.request)。
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_unary_triton_binary_e2e() {
+    let http_port = next_test_port();
+    kill_stale_on_port(http_port);
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-triton-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    write_triton_binary_split_model(&repo, "triton_split");
+
+    let _server = ServerGuard::start(&[
+        "--port", &http_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-grpc", "--no-metrics", "--log-level", "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{http_port}");
+    load_model(&base, "triton_split", "1").await;
+
+    let mut body = KSERVE_E2E_HEAD.as_bytes().to_vec();
+    body.extend_from_slice(KSERVE_E2E_TAIL);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/v2/models/triton_split/infer"))
+        .header("content-type", "application/octet-stream")
+        .header("inference-header-content-length", "546")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "e2e 多 tensor 二进制必须成功");
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(
+        v["binary_data"]["input2"],
+        json!([4, 0, 0, 0, 116, 101, 115, 116]),
+        "input2 = 4B 长度前缀 + \"test\""
+    );
+    assert_eq!(
+        v["binary_data"]["input3"],
+        json!([205, 60, 102, 64, 102, 66]),
+        "input3 = 3×FP16 LE"
+    );
+    assert!(v["binary_data"].get("input1").is_none(), "JSON data 的 input 不进 binary_data");
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// §6.1 test_unary_triton_binary_byte_identical (P0):端到端字节不变——
+/// 二进制尾按声明顺序拼接后逐字节等于原 wire tail(头部字节保真由
+/// extractor 单测 /echo-bytes 锁定)。
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_unary_triton_binary_byte_identical() {
+    let http_port = next_test_port();
+    kill_stale_on_port(http_port);
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-triton-bytes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    write_triton_binary_echo_model(&repo, "triton_echo");
+
+    let _server = ServerGuard::start(&[
+        "--port", &http_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-grpc", "--no-metrics", "--log-level", "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{http_port}");
+    load_model(&base, "triton_echo", "1").await;
+
+    let mut body = KSERVE_E2E_HEAD.as_bytes().to_vec();
+    body.extend_from_slice(KSERVE_E2E_TAIL);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/v2/models/triton_echo/infer"))
+        .header("content-type", "application/octet-stream")
+        .header("inference-header-content-length", "546")
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let echoed = resp.bytes().await.unwrap();
+    assert_eq!(
+        echoed.as_ref(),
+        KSERVE_E2E_TAIL,
+        "二进制尾(input2=8B + input3=6B,声明顺序)端到端逐字节不变"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// §6.1 test_unary_triton_binary_metrics (P1):content_type="triton_binary"
+/// count +1。
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_unary_triton_binary_metrics() {
+    let http_port = next_test_port();
+    let metrics_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(metrics_port);
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-triton-metrics-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    write_triton_binary_echo_model(&repo, "triton_echo");
+
+    let _server = ServerGuard::start(&[
+        "--port", &http_port.to_string(),
+        "--metrics-port", &metrics_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-grpc", "--log-level", "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{http_port}");
+    load_model(&base, "triton_echo", "1").await;
+
+    let mut body = KSERVE_E2E_HEAD.as_bytes().to_vec();
+    body.extend_from_slice(KSERVE_E2E_TAIL);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/v2/models/triton_echo/infer"))
+        .header("content-type", "application/octet-stream")
+        .header("inference-header-content-length", "546")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let scrape = client
+        .get(format!("http://127.0.0.1:{metrics_port}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let count = body_bytes_count(&scrape, "triton_binary");
+    assert_eq!(count, 1, "triton_binary count 必须 +1,metrics:\n{scrape}");
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// §6.1 test_unary_triton_binary_400_mismatch (P1):Σ 不匹配 e2e → 400 +
+/// 结构化错误体。
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_unary_triton_binary_400_mismatch() {
+    let http_port = next_test_port();
+    kill_stale_on_port(http_port);
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-triton-400-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    write_triton_binary_echo_model(&repo, "triton_echo");
+
+    let _server = ServerGuard::start(&[
+        "--port", &http_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-grpc", "--no-metrics", "--log-level", "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{http_port}");
+    load_model(&base, "triton_echo", "1").await;
+
+    // Σ = 14,但 tail 只给 10 字节
+    let mut body = KSERVE_E2E_HEAD.as_bytes().to_vec();
+    body.extend_from_slice(&[0u8; 10]);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/v2/models/triton_echo/infer"))
+        .header("content-type", "application/octet-stream")
+        .header("inference-header-content-length", "546")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "Σ 不匹配必须 400");
+    let v: Value = resp.json().await.unwrap();
+    assert!(
+        v["error"].is_object(),
+        "结构化错误体必须存在(批次 2 起 Triton 客户端变扁平): {v}"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// §6.1 test_triton_binary_ensemble_rejects (P0,C4):ensemble + TritonBinary
+/// → 400,信息明确(容器格式须等 §9.6 Option B)。
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_triton_binary_ensemble_rejects() {
+    let http_port = next_test_port();
+    kill_stale_on_port(http_port);
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-triton-ensemble-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    write_submodel(&repo, "echo", r#"        return {"out": x}"#);
+    let ens_dir = repo.join("ensemble_model/1");
+    std::fs::create_dir_all(&ens_dir).unwrap();
+    std::fs::write(
+        ens_dir.join("config.yaml"),
+        r#"
+ensemble:
+  steps:
+    - name: only
+      model: echo
+      version: "1"
+      inputs:
+        x: "$request.x"
+"#,
+    )
+    .unwrap();
+
+    let _server = ServerGuard::start(&[
+        "--port", &http_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-grpc", "--no-metrics", "--log-level", "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{http_port}");
+    load_model(&base, "echo", "1").await;
+    load_model(&base, "ensemble_model", "1").await;
+
+    let mut body = KSERVE_E2E_HEAD.as_bytes().to_vec();
+    body.extend_from_slice(KSERVE_E2E_TAIL);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/v2/models/ensemble_model/infer"))
+        .header("content-type", "application/octet-stream")
+        .header("inference-header-content-length", "546")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "ensemble 必须显式拒绝 TritonBinary(C4)");
+    let v: Value = resp.json().await.unwrap();
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("Triton Binary"),
+        "拒绝信息必须明确容器格式,got: {msg}"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// 从 /metrics 抓取 `lite_server_http_request_body_bytes_count{content_type=...}`
+/// 的计数值;系列缺失时返回 0。
+fn body_bytes_count(body: &str, content_type: &str) -> u64 {
+    let needle = format!("content_type=\"{content_type}\"");
+    for line in body.lines() {
+        if line.starts_with("lite_server_http_request_body_bytes_count{")
+            && line.contains(&needle)
+        {
+            return line
+                .rsplit_once(' ')
+                .map(|(_, v)| v.trim().parse().unwrap_or(0))
+                .unwrap_or(0);
+        }
+    }
+    0
+}
