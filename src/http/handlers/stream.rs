@@ -1,6 +1,6 @@
 use super::*;
 use super::inference::{build_request_meta, resolve_version};
-use crate::error::AppError;
+use crate::error::{AppError, ProtocolError};
 use crate::http::state::AppState;
 use crate::metrics::prometheus;
 use crate::proto::liteserver as pb;
@@ -86,11 +86,13 @@ pub async fn sse_infer_handler(
     headers: HeaderMap,
     cx: RequestContext,
     ApiBody(body): ApiBody,
-) -> Response {
+) -> Result<Response, ProtocolError> {
     // P-CORS: CORS headers are attached by `cors_middleware` (no longer per-handler).
+    // D11 P2.1:错误按 T1 预筛协议渲染(SSE 客户端不发 IHCL → Legacy,byte-identical)。
+    let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
     sse_infer_entry(&state, &model_name, None, headers, body, cx, false)
         .await
-        .into_response()
+        .map_err(|error| ProtocolError { error, protocol })
 }
 
 pub async fn sse_infer_version_handler(
@@ -99,12 +101,13 @@ pub async fn sse_infer_version_handler(
     headers: HeaderMap,
     cx: RequestContext,
     ApiBody(body): ApiBody,
-) -> Response {
+) -> Result<Response, ProtocolError> {
+    let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
     sse_infer_entry(
         &state, &model_name, Some(version), headers, body, cx, false,
     )
     .await
-    .into_response()
+    .map_err(|error| ProtocolError { error, protocol })
 }
 
 // ===== SSE Decoupled =====
@@ -115,10 +118,11 @@ pub async fn sse_decoupled_handler(
     headers: HeaderMap,
     cx: RequestContext,
     ApiBody(body): ApiBody,
-) -> Response {
+) -> Result<Response, ProtocolError> {
+    let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
     sse_infer_entry(&state, &model_name, None, headers, body, cx, true)
         .await
-        .into_response()
+        .map_err(|error| ProtocolError { error, protocol })
 }
 
 pub async fn sse_decoupled_version_handler(
@@ -127,10 +131,11 @@ pub async fn sse_decoupled_version_handler(
     headers: HeaderMap,
     cx: RequestContext,
     ApiBody(body): ApiBody,
-) -> Response {
+) -> Result<Response, ProtocolError> {
+    let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
     sse_infer_entry(&state, &model_name, Some(version), headers, body, cx, true)
         .await
-        .into_response()
+        .map_err(|error| ProtocolError { error, protocol })
 }
 
 /// Shared entry for SSE inference: validation, ready check, rate limiting,
@@ -185,6 +190,15 @@ async fn sse_infer_entry_impl(
     crate::validation::validate_identifier(model_name)?;
     if let Some(ref v) = version {
         crate::validation::validate_version(v)?;
+    }
+    // 阶段 2(D10):SSE 是文本通道,不能携带二进制输出——KServe 信封请求
+    // 带 binary_data_output flag → 400(双条件,防自有格式撞名);二进制
+    // 流式维持 WS/h2 bidi 自有协议。
+    if crate::http::kserve::request_binary_output_flag(&body) {
+        return Err(AppError::Validation(
+            "SSE streaming cannot return binary_data_output; binary streaming uses WS/h2 bidi"
+                .to_string(),
+        ));
     }
     let resolved_version = resolve_version(state, model_name, version, &headers).await?;
     *label_version = resolved_version.clone();
@@ -1360,6 +1374,7 @@ mod tests {
             trace_cx: opentelemetry::Context::new(),
             protocol: Protocol::Http,
             principal: None,
+            api_protocol: None,
         }
     }
 
@@ -3146,7 +3161,7 @@ mod tests {
             ApiBody(json_body(json!({}))),
         )
         .await;
-        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.into_response().status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             counter.get(),
             before + 1.0,
@@ -3170,7 +3185,7 @@ mod tests {
             ApiBody(json_body(json!({}))),
         )
         .await;
-        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(resp.into_response().status(), axum::http::StatusCode::NOT_FOUND);
         assert_eq!(
             counter.get(),
             before + 1.0,
@@ -3212,7 +3227,7 @@ mod tests {
             ApiBody(json_body(json!({}))),
         )
         .await;
-        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.into_response().status(), axum::http::StatusCode::UNAUTHORIZED);
         assert_eq!(counter.get(), before + 1.0, "auth rejection must record 4xx");
     }
 

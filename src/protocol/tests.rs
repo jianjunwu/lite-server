@@ -1,9 +1,11 @@
-//! 协议层 seam 测试(P2.0 纯迁移门禁,批次 0)。
+//! 协议层 seam 测试(P2.0 纯迁移门禁,批次 0;P2.1 检测,P2.2 路由 seam,
+//! 批次 2)。
 //!
-//! 门禁 = 既有全套测试不改一行全绿 + 本文件三个快照基准:
+//! 门禁 = 既有全套测试不改一行全绿 + 快照基准:
 //! `test_protocol_openai_renderer_byte_identical*`(精确字节快照)、
 //! `test_canonical_error_values_preserved`、`test_protocol_openai_renderer_log_levels_c7`。
 
+use super::detect;
 use super::{ApiProtocol, render};
 use crate::error::{AppError, ModelErrorData, ProtocolError};
 use axum::http::{HeaderMap, StatusCode};
@@ -539,4 +541,105 @@ fn test_canonical_error_fields_are_stable() {
     assert_eq!(c.headers, None);
     assert!(!c.from_model);
     assert!(c.log_detail.contains("invalid request body"));
+}
+
+// ===== P2.1 检测(detect) =====
+
+#[test]
+fn test_t1_prefilter_ihcl_header() {
+    // header 存在(含 "0")→ Kserve;缺失 → None(C9:header 是强信号)
+    use axum::http::HeaderMap;
+    let mut h = HeaderMap::new();
+    h.insert("inference-header-content-length", "546".parse().unwrap());
+    assert_eq!(detect::t1_prefilter("/v2/models/m/infer", &h), Some(ApiProtocol::Kserve));
+
+    let mut h = HeaderMap::new();
+    h.insert("inference-header-content-length", "0".parse().unwrap());
+    assert_eq!(detect::t1_prefilter("/v2/models/m/infer", &h), Some(ApiProtocol::Kserve));
+
+    assert_eq!(detect::t1_prefilter("/v2/models/m/infer", &HeaderMap::new()), None);
+}
+
+#[test]
+fn test_t1_prefilter_other_paths() {
+    // 无 IHCL header 的其他路径 → None(信封主判在 T2)
+    assert_eq!(detect::t1_prefilter("/health", &axum::http::HeaderMap::new()), None);
+}
+
+#[test]
+fn test_t2_envelope_double_condition() {
+    // 命中:完整信封
+    let body = br#"{"id":"r1","inputs":[{"name":"a","shape":[2],"datatype":"FP32","data":[1,2]}]}"#;
+    assert!(detect::t2_kserve_envelope(body));
+
+    // 不命中:缺 inputs / 空 inputs / 缺 name/shape/datatype / 非对象 input / 非 JSON
+    assert!(!detect::t2_kserve_envelope(br#"{"id":"r1"}"#));
+    assert!(!detect::t2_kserve_envelope(br#"{"id":"r1","inputs":[]}"#));
+    assert!(!detect::t2_kserve_envelope(
+        br#"{"id":"r1","inputs":[{"name":"a","shape":[2]}]}"#,
+    ));
+    assert!(!detect::t2_kserve_envelope(
+        br#"{"id":"r1","inputs":[{"name":"a","datatype":"FP32"}]}"#,
+    ));
+    assert!(!detect::t2_kserve_envelope(
+        br#"{"id":"r1","inputs":[{"shape":[2],"datatype":"FP32"}]}"#,
+    ));
+    assert!(!detect::t2_kserve_envelope(br#"{"id":"r1","inputs":[42]}"#));
+    assert!(!detect::t2_kserve_envelope(b"not-json"));
+}
+
+#[test]
+fn test_detect_resolve_precedence() {
+    use axum::http::HeaderMap;
+    // T1 有 → T1(强信号,不等 T2;Triton 二进制/Raw 路径零 T2 成本)
+    let envelope = br#"{"inputs":[{"name":"a","shape":[2],"datatype":"FP32","data":[1,2]}]}"#;
+    assert_eq!(detect::resolve(None, envelope), ApiProtocol::Kserve);
+    // T1 无 + 信封 → Kserve
+    let mut h = HeaderMap::new();
+    h.insert("inference-header-content-length", "10".parse().unwrap());
+    assert_eq!(detect::resolve(Some(ApiProtocol::Kserve), b"not-envelope"), ApiProtocol::Kserve);
+    // 否则 Legacy
+    assert_eq!(detect::resolve(None, br#"{"x":1}"#), ApiProtocol::Legacy);
+    assert_eq!(detect::resolve(None, b"not-json"), ApiProtocol::Legacy);
+}
+
+// ===== P2.2 路由 seam(mount no-op,G17) =====
+
+/// mount 后既有路由零变化(阶段 2 ROUTE_MODULES 为空表);未匹配路径
+/// 仍走 router 级 fallback(404)。
+#[tokio::test]
+async fn test_protocol_mount_noop() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let app = axum::Router::new().route(
+        "/health",
+        axum::routing::get(|| async { "ok" }),
+    );
+    let mounted = super::mount(app.clone());
+
+    let resp = mounted
+        .clone()
+        .oneshot(
+            Request::builder().uri("/health").body(Body::empty()).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    assert_eq!(body, "ok", "既有路由行为必须零变化");
+
+    let resp = mounted
+        .oneshot(Request::builder().uri("/nope").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "未匹配路径仍 404");
+
+    // 未挂载的对照:行为一致(no-op 语义)
+    let resp = app
+        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

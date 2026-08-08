@@ -9,6 +9,7 @@
 //! `CanonicalError` 边界,尚无 Kserve 产出(detect 在 P2.1)。门禁 = 字节快照 +
 //! 既有全套测试不改一行全绿。
 
+pub mod detect;
 pub mod kserve;
 pub mod openai;
 #[cfg(test)]
@@ -25,9 +26,7 @@ pub enum ApiProtocol {
     /// 现状 OpenAI 风格错误体(byte-identical 基准)。
     Legacy,
     /// KServe V2 dataplane 扁平错误体 `{"error": "<message>"}`。
-    /// P2.1 检测(detect::t1_prefilter / t2_kserve_envelope)落地后构造,
-    /// 届时移除本 allow。
-    #[allow(dead_code)]
+    /// 由 detect::t1_prefilter / t2_kserve_envelope 产出(P2.1,批次 2)。
     Kserve,
 }
 
@@ -53,6 +52,14 @@ pub struct CanonicalError {
     pub from_model: bool,
     /// 日志用内部 detail(含内部信息,绝不进 wire)。
     pub log_detail: String,
+}
+
+/// 协议路由挂载 seam(D11 P2.2):create_routes 在 fallback 前一行调用。
+/// 阶段 2 为空表——no-op(G17 回归锁定)。openai-compact(批次 5)= 1 handler
+/// 模块 + 挂载表一行;挂载形状(状态类型/fold)届时按 handler 需要定
+/// (D11:将来要 gate 则条目改 `fn(&FeaturesConfig, Router)`)。
+pub(crate) fn mount<S: Clone + Send + Sync + 'static>(router: axum::Router<S>) -> axum::Router<S> {
+    router
 }
 
 /// 按协议渲染错误响应:C7 日志 + 状态 + 协议体 + header 透传。

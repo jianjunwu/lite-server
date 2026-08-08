@@ -90,6 +90,48 @@ fn triton_binary_split(body: &Bytes, head_len: usize) -> (Bytes, Bytes) {
     (black_box(head), black_box(tail))
 }
 
+/// 信封形状 body(阶段 2,P2.1):`{"inputs":[{"name","shape","datatype","data"}]}`
+/// ——T2 判定命中路径的成本形态。
+fn envelope_payload(target: usize) -> Bytes {
+    let inner = json_payload(target); // {"data":[0,1,...]}
+    let inner_str = String::from_utf8(inner).unwrap();
+    // 去掉外层 {} 后作为 input 对象的成员嵌入
+    let inner_members = &inner_str[1..inner_str.len() - 1];
+    Bytes::from(format!(
+        r#"{{"inputs":[{{"name":"a","shape":[1],"datatype":"FP32",{inner_members}}}]}}"#
+    ))
+}
+
+/// T2 信封双条件探针(复刻 src/protocol/detect.rs 的部分反序列化结构;
+/// bench 为独立 crate,无法引用 pub(crate) 项)。门禁:< 2× 既有 &RawValue
+/// 校验(全 DOM 物化是新成本;部分反序列化近零分配)。
+#[derive(serde::Deserialize)]
+struct BenchEnvelopeProbe<'a> {
+    #[serde(borrow, default)]
+    inputs: Vec<BenchEnvelopeInput<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct BenchEnvelopeInput<'a> {
+    #[serde(borrow, default)]
+    name: Option<&'a serde_json::value::RawValue>,
+    #[serde(default)]
+    shape: Option<&'a serde_json::value::RawValue>,
+    #[serde(default)]
+    datatype: Option<&'a serde_json::value::RawValue>,
+}
+
+fn t2_envelope_check(body: &Bytes) -> bool {
+    let Ok(head) = serde_json::from_slice::<BenchEnvelopeProbe>(body) else {
+        return false;
+    };
+    !head.inputs.is_empty()
+        && head
+            .inputs
+            .iter()
+            .all(|i| i.name.is_some() && i.shape.is_some() && i.datatype.is_some())
+}
+
 fn bench_extractor(c: &mut Criterion) {
     let sizes = [
         ("1KiB", 1usize << 10),
@@ -132,6 +174,35 @@ fn bench_extractor(c: &mut Criterion) {
         );
     }
     triton.finish();
+
+    // 阶段 2(批次 2):T2 信封判定成本门禁——< 2× 既有 &RawValue 校验。
+    let mut t2 = c.benchmark_group("t2_envelope");
+    t2
+        .sample_size(20)
+        .warm_up_time(std::time::Duration::from_secs(1))
+        .measurement_time(std::time::Duration::from_secs(4));
+    for (label, size) in sizes {
+        let body = envelope_payload(size);
+        t2.throughput(Throughput::Bytes(body.len() as u64));
+        t2.bench_with_input(
+            BenchmarkId::new("rawvalue_validate", label),
+            &body,
+            |b, body| {
+                b.iter(|| {
+                    serde_json::from_slice::<&serde_json::value::RawValue>(black_box(body))
+                        .unwrap();
+                });
+            },
+        );
+        t2.bench_with_input(
+            BenchmarkId::new("t2_envelope_check", label),
+            &body,
+            |b, body| {
+                b.iter(|| black_box(t2_envelope_check(body)));
+            },
+        );
+    }
+    t2.finish();
 
     // 零拷贝断言(结构性,一次):8MB 档切片视图必须与原始缓冲同一指针。
     {

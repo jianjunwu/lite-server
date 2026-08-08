@@ -8634,9 +8634,184 @@ async fn test_unary_triton_binary_400_mismatch() {
     assert_eq!(resp.status(), 400, "Σ 不匹配必须 400");
     let v: Value = resp.json().await.unwrap();
     assert!(
-        v["error"].is_object(),
-        "结构化错误体必须存在(批次 2 起 Triton 客户端变扁平): {v}"
+        v["error"].is_string(),
+        "Triton 客户端(IHCL header → T1 Kserve)的错误体必须扁平(C9,批次 2): {v}"
     );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// §6.6 test_kserve_flat_worker_error_e2e:信封 JSON + worker 错误 → 扁平
+/// 错误体(经协议层分派)。
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_kserve_flat_worker_error_e2e() {
+    let http_port = next_test_port();
+    kill_stale_on_port(http_port);
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-kserve-flat-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    let dir = repo.join("boom/1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("model.py"),
+        r#"from lite_server import LitAPI
+from lite_server.exceptions import BadRequestError
+
+
+class BoomAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request
+
+    def predict(self, x):
+        raise BadRequestError("invalid input value")
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+
+    let _server = ServerGuard::start(&[
+        "--port", &http_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-grpc", "--no-metrics", "--log-level", "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{http_port}");
+    load_model(&base, "boom", "1").await;
+
+    let client = reqwest::Client::new();
+    // 信封请求(T2 命中)→ Kserve 模式 → worker 错误扁平
+    let resp = client
+        .post(format!("{base}/v2/models/boom/infer"))
+        .json(&json!({"inputs": [{"name": "a", "shape": [1], "datatype": "FP32", "data": [1.0]}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "worker 错误必须 400");
+    let v: Value = resp.json().await.unwrap();
+    assert!(v["error"].is_string(), "信封请求的错误体必须扁平,got: {v}");
+
+    // 非信封自由 JSON(同 worker)→ OpenAI 形状(回归)
+    let resp = client
+        .post(format!("{base}/v2/models/boom/infer"))
+        .json(&json!({"prompt": "hello"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let v: Value = resp.json().await.unwrap();
+    assert!(v["error"].is_object(), "非信封请求保持 OpenAI 形状,got: {v}");
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// §6.2 test_binary_data_output_e2e:请求带 binary_data_output flag →
+/// 响应 JSON 头 + 二进制尾 + Inference-Header-Content-Length;客户端重组
+/// 数值一致。
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_binary_data_output_e2e() {
+    let http_port = next_test_port();
+    kill_stale_on_port(http_port);
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-bdo-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    // worker 返回 KServe 信封(FP32 输出)
+    let dir = repo.join("env_model/1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("model.py"),
+        r#"from lite_server import LitAPI
+
+
+class EnvAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request
+
+    def predict(self, x):
+        return {"outputs": [{"name": "out", "shape": [2], "datatype": "FP32", "data": [1.0, 2.0]}]}
+
+    def encode_response(self, output):
+        return output
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+
+    let _server = ServerGuard::start(&[
+        "--port", &http_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-grpc", "--no-metrics", "--log-level", "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{http_port}");
+    load_model(&base, "env_model", "1").await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/v2/models/env_model/infer"))
+        .json(&json!({
+            "id": "r1",
+            "inputs": [{"name": "a", "shape": [1], "datatype": "FP32", "data": [1.0]}],
+            "parameters": {"binary_data_output": true},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/octet-stream"
+    );
+    let head_len: usize = resp
+        .headers()
+        .get("inference-header-content-length")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.len() - head_len, 8, "二进制尾 = 2 × FP32(4B)");
+    // 客户端重组:JSON 头 + 二进制尾 → 数值一致
+    let head: Value = serde_json::from_slice(&body[..head_len]).unwrap();
+    assert_eq!(head["id"], "r1", "id 回显");
+    assert_eq!(head["outputs"][0]["parameters"]["binary_data_size"], 8);
+    let mut vals = Vec::new();
+    for chunk in body[head_len..].chunks_exact(4) {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(chunk);
+        vals.push(f32::from_le_bytes(b));
+    }
+    assert_eq!(vals, vec![1.0, 2.0], "客户端重组数值一致");
+
+    // 无 flag → 既有 passthrough(JSON 信封原样)
+    let resp = client
+        .post(format!("{base}/v2/models/env_model/infer"))
+        .json(&json!({
+            "inputs": [{"name": "a", "shape": [1], "datatype": "FP32", "data": [1.0]}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get("content-type").unwrap().to_str().unwrap().contains("json"));
 
     let _ = std::fs::remove_dir_all(&repo);
 }
@@ -8692,7 +8867,8 @@ ensemble:
         .unwrap();
     assert_eq!(resp.status(), 400, "ensemble 必须显式拒绝 TritonBinary(C4)");
     let v: Value = resp.json().await.unwrap();
-    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    // C9(批次 2):Triton 客户端(IHCL → T1 Kserve)错误体扁平
+    let msg = v["error"].as_str().unwrap_or_default();
     assert!(
         msg.contains("Triton Binary"),
         "拒绝信息必须明确容器格式,got: {msg}"

@@ -85,6 +85,31 @@ def parse_bytes_tensor(mv):
 非 Triton Binary 请求时 `ctx.binary_data` 为 `None`，`ctx.request` 保持
 既有 JSON / 原始字节行为不变。
 
+### tritonclient 全链路（阶段 2，G10）
+
+`binary_data_output` 协商 + 响应重组（请求侧 flag → 二进制响应 →
+客户端 `as_numpy` 数值一致）：
+
+```python
+import tritonclient.http as httpclient
+
+client = httpclient.InferenceServerClient(url="localhost:8000")
+inp = httpclient.InferInput("input0", [2, 2], "FP32")
+inp.set_data_from_numpy(arr)  # 自动走二进制通道(JSON 头 + 尾)
+out = httpclient.InferRequestedOutput("output0", binary_data=True)
+resp = client.infer("my-model", [inp], outputs=[out])
+result = resp.as_numpy("output0")  # 重组 ndarray,数值一致
+```
+
+worker 侧用 `lite_server.kserve` helper 构造信封输出：
+
+```python
+from lite_server.kserve import build_response
+
+def encode_response(self, output, ctx):
+    return build_response({"output0": output}, request_id=ctx.meta.request_id)
+```
+
 ## 客户端示例
 
 ### JSON（不变）

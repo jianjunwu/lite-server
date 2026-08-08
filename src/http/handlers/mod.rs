@@ -1,5 +1,6 @@
-use crate::error::AppError;
+use crate::error::{AppError, ProtocolError};
 use crate::http::state::AppState;
+use crate::protocol::ApiProtocol;
 use axum::{extract::Query, response::Json};
 use axum::http::header::HeaderMap;
 use bytes::Bytes;
@@ -37,12 +38,17 @@ where
     S: Send + Sync,
     Json<T>: axum::extract::FromRequest<S, Rejection = axum::extract::rejection::JsonRejection>,
 {
-    type Rejection = AppError;
+    type Rejection = ProtocolError;
 
     async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        // C9 (P2.1):拒绝按 T1 预筛协议渲染(extractor 期无 T2,header 强信号)。
+        let protocol = rejection_protocol(&req);
         match Json::<T>::from_request(req, state).await {
             Ok(Json(value)) => Ok(ApiJson(value)),
-            Err(rejection) => Err(AppError::InvalidRequestBody(rejection.body_text())),
+            Err(rejection) => Err(ProtocolError {
+                error: AppError::InvalidRequestBody(rejection.body_text()),
+                protocol,
+            }),
         }
     }
 }
@@ -57,15 +63,23 @@ where
     S: Send + Sync,
     Query<T>: axum::extract::FromRequestParts<S, Rejection = axum::extract::rejection::QueryRejection>,
 {
-    type Rejection = AppError;
+    type Rejection = ProtocolError;
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
         state: &S,
     ) -> Result<Self, Self::Rejection> {
+        let protocol = parts
+            .extensions
+            .get::<crate::request_context::RequestContext>()
+            .and_then(|cx| cx.api_protocol)
+            .unwrap_or(ApiProtocol::Legacy);
         match Query::<T>::from_request_parts(parts, state).await {
             Ok(Query(value)) => Ok(ApiQuery(value)),
-            Err(rejection) => Err(AppError::InvalidQueryParam(rejection.body_text())),
+            Err(rejection) => Err(ProtocolError {
+                error: AppError::InvalidQueryParam(rejection.body_text()),
+                protocol,
+            }),
         }
     }
 }
@@ -134,9 +148,11 @@ impl<S> axum::extract::FromRequest<S> for ApiBody
 where
     S: Send + Sync + HasBodyLimit,
 {
-    type Rejection = AppError;
+    type Rejection = ProtocolError;
 
     async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        // C9 (P2.1):拒绝按 T1 预筛协议渲染(extractor 期无 T2,header 强信号)。
+        let protocol = rejection_protocol(&req);
         // Materialize header decisions before moving the request into parts.
         let (is_json, content_type, has_content_encoding, content_length, ihcl) = {
             let headers = req.headers();
@@ -165,11 +181,11 @@ where
 
         // D6: no decompression layer — any Content-Encoding → 415.
         if has_content_encoding {
-            return Err(AppError::UnsupportedMediaType(
+            return Err(pe(protocol, AppError::UnsupportedMediaType(
                 "Content-Encoding (compressed request body) is not supported; \
                  send the request body uncompressed"
                     .into(),
-            ));
+            )));
         }
 
         let (parts, body) = req.into_parts();
@@ -179,30 +195,33 @@ where
             state,
         )
         .await
-        .map_err(|rejection| crate::error::map_body_rejection(rejection, max_size, content_length))?;
+        .map_err(|rejection| {
+            pe(protocol, crate::error::map_body_rejection(rejection, max_size, content_length))
+        })?;
 
         // Triton Binary Tensor Data Extension(D2/C3):header 存在即优先于
         // Content-Type 分流。N>0 → TritonBinary(JSON 头 &RawValue 校验 +
         // Σ binary_data_size 结构校验);N==0 → 落回既有分流(byte-identical)。
         if let Some(raw) = ihcl {
             let n = raw.parse::<usize>().map_err(|_| {
-                AppError::InvalidRequestBody(format!(
+                pe(protocol, AppError::InvalidRequestBody(format!(
                     "invalid inference-header-content-length: {raw}"
-                ))
+                )))
             })?;
             if n > 0 {
                 if n > bytes.len() {
-                    return Err(AppError::InvalidRequestBody(format!(
+                    return Err(pe(protocol, AppError::InvalidRequestBody(format!(
                         "inference-header-content-length {n} exceeds body length {}",
                         bytes.len()
-                    )));
+                    ))));
                 }
-                let total = triton_binary_tail_sum(&bytes[..n])?;
+                let total = triton_binary_tail_sum(&bytes[..n])
+                    .map_err(|e| pe(protocol, e))?;
                 let tail_len = bytes.len() - n;
                 if total as usize != tail_len {
-                    return Err(AppError::InvalidRequestBody(format!(
+                    return Err(pe(protocol, AppError::InvalidRequestBody(format!(
                         "binary_data_size sum {total} does not match binary tail length {tail_len}"
-                    )));
+                    ))));
                 }
                 return Ok(ApiBody(RequestBody::TritonBinary {
                     body: bytes,
@@ -216,13 +235,29 @@ where
             // D3: zero-allocation syntax validation via `&RawValue` —
             // a full parse (not just first-byte sniffing), no DOM materialized.
             serde_json::from_slice::<&serde_json::value::RawValue>(&bytes)
-                .map_err(|e| AppError::InvalidRequestBody(format!("invalid JSON body: {e}")))?;
+                .map_err(|e| {
+                    pe(protocol, AppError::InvalidRequestBody(format!("invalid JSON body: {e}")))
+                })?;
             Ok(ApiBody(RequestBody::Json(bytes)))
         } else {
             let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
             Ok(ApiBody(RequestBody::Raw(bytes, ct)))
         }
     }
+}
+
+/// C9 (P2.1):拒绝路径的协议 = T1 预筛值(middleware 填充;无 middleware
+/// 的直挂单测 → Legacy,byte-identical)。
+fn rejection_protocol(req: &axum::extract::Request) -> ApiProtocol {
+    req.extensions()
+        .get::<crate::request_context::RequestContext>()
+        .and_then(|cx| cx.api_protocol)
+        .unwrap_or(ApiProtocol::Legacy)
+}
+
+/// 带协议的错误边界构造(C9)。
+fn pe(protocol: ApiProtocol, error: AppError) -> ProtocolError {
+    ProtocolError { error, protocol }
 }
 
 /// Triton Binary Tensor Data Extension 的切分 header(KServe V2 dataplane,

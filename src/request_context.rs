@@ -46,6 +46,10 @@ pub struct RequestContext {
     /// mTLS 客户端身份（P5-1：TLS acceptor 经 extension 注入；未启用 TLS 或
     /// 单向 TLS 时为 None）。本期仅供访问日志/审计，access_control 不消费。
     pub principal: Option<String>,
+    /// 语义协议 T1 预筛值(D11 P2.1,批次 2):middleware 填充,extractor 期
+    /// 拒绝与 handler 错误按此渲染错误体。区别于 `protocol`(http/grpc/sse
+    /// **传输**协议)——本字段是**语义**协议。gRPC interceptor 置 None。
+    pub api_protocol: Option<crate::protocol::ApiProtocol>,
 }
 
 /// observability 提取的 OTel parent context 的 stash 槽位（D21 单一提取
@@ -119,12 +123,15 @@ impl RequestContext {
             .extensions
             .get::<crate::tls::TlsClientPrincipal>()
             .and_then(|p| p.0.clone());
+        // D11 P2.1:语义协议 T1 预筛(header 强信号,零成本)。
+        let api_protocol = crate::protocol::detect::t1_prefilter(parts.uri.path(), &parts.headers);
         Self {
             request_id,
             client_ip,
             trace_cx,
             protocol: Protocol::Http,
             principal,
+            api_protocol,
         }
     }
 }

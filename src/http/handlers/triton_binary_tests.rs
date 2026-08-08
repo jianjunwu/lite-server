@@ -373,3 +373,65 @@ async fn test_triton_binary_body_limit() {
     let resp = post(&app, body, Some(head.len())).await;
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
+
+// ===== P2.1(批次 2):C9 extractor 拒绝协议感知 =====
+
+/// 生产栈 router:context_middleware 填充 RequestContext(T1 预筛),
+/// extractor 拒绝时按 cx.api_protocol 渲染错误体。
+fn prod_test_app(max_body: usize) -> axum::Router {
+    let state = Arc::new(TestState { max_body });
+    axum::Router::new()
+        .route("/echo-kind", axum::routing::post(
+            |ApiBody(body): ApiBody| async move { body.kind().to_string() },
+        ))
+        .layer(axum::extract::DefaultBodyLimit::max(max_body))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(crate::client_ip::TrustedNetworks::new()),
+            crate::request_context::context_middleware,
+        ))
+        .with_state(state)
+}
+
+/// C9:同请求 ± IHCL header——畸形 body + header → 扁平 400;无 header →
+/// OpenAI 形状字节不变。
+#[tokio::test]
+async fn test_api_body_rejection_protocol_aware_flat() {
+    let app = prod_test_app(64 * 1024 * 1024);
+
+    // IHCL header 存在 → T1 定 Kserve → extractor 拒绝渲染扁平错误体
+    let resp = app.clone().oneshot(
+        Request::builder().uri("/echo-kind").method("POST")
+            .header("content-type", "application/octet-stream")
+            .header("inference-header-content-length", "5")
+            .body(Body::from(b"not-json!!!tail".to_vec())).unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v: serde_json::Value = serde_json::from_slice(&read_body(resp).await).unwrap();
+    assert!(v["error"].is_string(), "KServe-mode 拒绝必须是扁平错误体,got: {v}");
+
+    // 同请求无 header → Legacy → OpenAI 形状(字节不变);用 JSON
+    // content-type 的畸形 body 触发 extractor 拒绝
+    let resp = app.oneshot(
+        Request::builder().uri("/echo-kind").method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(b"not-json!!!tail".to_vec())).unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v: serde_json::Value = serde_json::from_slice(&read_body(resp).await).unwrap();
+    assert!(v["error"].is_object(), "非 KServe 保持 OpenAI 形状,got: {v}");
+}
+
+/// C9:413(超 body 上限)+ IHCL header → 扁平。
+#[tokio::test]
+async fn test_api_body_413_kserve_flat() {
+    let app = prod_test_app(100);
+    let resp = app.oneshot(
+        Request::builder().uri("/echo-kind").method("POST")
+            .header("content-type", "application/octet-stream")
+            .header("inference-header-content-length", "5")
+            .body(Body::from(vec![0u8; 200])).unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let v: serde_json::Value = serde_json::from_slice(&read_body(resp).await).unwrap();
+    assert!(v["error"].is_string(), "KServe-mode 413 必须扁平,got: {v}");
+}

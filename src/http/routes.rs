@@ -206,6 +206,11 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
     // `/{*tail}` route is rejected by matchit because `:model_name` already
     // has deeper registered children.)
 
+    // D11 P2.2:协议路由模块经 mount 注册(阶段 2 空表,no-op;openai-compact
+    // 批次 5 在此挂载)。须在 with_state 之前 merge——Router 此时无状态,
+    // 挂载路由与既有系统路由共享 fallback。
+    router = crate::protocol::mount(router);
+
     // Standardized error bodies for unmatched routes (404) and
     // unmatched methods (405) — axum defaults are empty/plain-text.
     router = router

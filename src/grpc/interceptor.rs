@@ -56,6 +56,7 @@ impl RequestContext {
             trace_cx: crate::telemetry::extract_grpc(metadata), // P-TRACE: W3C parent
             protocol: Protocol::Grpc,
             principal: None, // P5-1: context_interceptor 随后按 TlsConnectInfo 填充
+            api_protocol: None, // D11 P2.1:gRPC 无语义协议检测(自有 LiteServer 协议)
         }
     }
 }

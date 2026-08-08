@@ -7,7 +7,7 @@
 
 use super::inference::{build_request_meta, resolve_version};
 use super::{enforce_auth, enforce_rate_limit, is_json_content_type};
-use crate::error::AppError;
+use crate::error::{AppError, ProtocolError};
 use crate::http::state::AppState;
 use crate::metrics::prometheus;
 use crate::proto::liteserver as pb;
@@ -37,9 +37,12 @@ pub async fn h2_bidi_handler(
     headers: HeaderMap,
     cx: RequestContext,
     request: axum::extract::Request,
-) -> Result<Response, AppError> {
+) -> Result<Response, ProtocolError> {
     let model_name = path.0;
-    h2_bidi_entry(state, &model_name, None, headers, cx, request).await
+    let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
+    h2_bidi_entry(state, &model_name, None, headers, cx, request)
+        .await
+        .map_err(|error| ProtocolError { error, protocol })
 }
 
 pub async fn h2_bidi_version_handler(
@@ -48,9 +51,12 @@ pub async fn h2_bidi_version_handler(
     headers: HeaderMap,
     cx: RequestContext,
     request: axum::extract::Request,
-) -> Result<Response, AppError> {
+) -> Result<Response, ProtocolError> {
     let (model_name, version) = path.0;
-    h2_bidi_entry(state, &model_name, Some(version), headers, cx, request).await
+    let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
+    h2_bidi_entry(state, &model_name, Some(version), headers, cx, request)
+        .await
+        .map_err(|error| ProtocolError { error, protocol })
 }
 
 async fn h2_bidi_entry(
@@ -879,6 +885,7 @@ mod tests {
             trace_cx: opentelemetry::Context::new(),
             protocol: crate::callback::Protocol::Http2,
             principal: None,
+            api_protocol: None,
         }
     }
 
@@ -992,7 +999,7 @@ mod tests {
         .await
         .expect_err("first frame not Open must be rejected");
         assert!(
-            matches!(err, AppError::InvalidRequestBody(_)),
+            matches!(err.error, AppError::InvalidRequestBody(_)),
             "expected InvalidRequestBody (400), got {err:?}"
         );
     }
@@ -1357,7 +1364,7 @@ mod tests {
             .expect("handler must return within the idle backstop")
             .expect_err("first-frame wait must be reclaimed");
         assert!(
-            matches!(err, AppError::InferenceTimeout(_)),
+            matches!(err.error, AppError::InferenceTimeout(_)),
             "expected InferenceTimeout, got {err:?}"
         );
     }
@@ -1453,7 +1460,7 @@ mod tests {
         )
         .await
         .expect_err("first frame must be rejected");
-        assert!(matches!(err, AppError::InvalidRequestBody(_)));
+        assert!(matches!(err.error, AppError::InvalidRequestBody(_)));
         assert_eq!(
             counter.get(),
             before + 1.0,

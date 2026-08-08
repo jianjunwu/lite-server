@@ -1,10 +1,11 @@
 pub mod cors;
 pub mod handlers;
+pub mod kserve;
 pub mod routes;
 pub mod state;
 
 use crate::config::{unix_socket_path, Config};
-use crate::error::AppError;
+use crate::error::{AppError, ProtocolError};
 use crate::http::routes::create_routes;
 use crate::http::state::AppState;
 use crate::inference_queue::InferenceQueue;
@@ -56,14 +57,16 @@ pub(crate) async fn route_fallback(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Response {
+    // D11 P2.1:fallback 无请求上下文,协议恒 Legacy(byte-identical)。
+    let fallback_err = |e: AppError| ProtocolError::from(e).into_response();
     // Only `/v2/models/<model>/<tail>` paths are candidates for custom routes.
     let path = request.uri().path();
     let Some(rest) = path.strip_prefix("/v2/models/") else {
-        return AppError::RouteNotFound.into_response();
+        return fallback_err(AppError::RouteNotFound);
     };
     let (model, tail) = match rest.split_once('/') {
         Some((m, t)) if !m.is_empty() => (m.to_string(), t.to_string()),
-        _ => return AppError::RouteNotFound.into_response(), // bare /v2/models/<model>
+        _ => return fallback_err(AppError::RouteNotFound), // bare /v2/models/<model>
     };
 
     // Split parts/body so the query extractor can run before the body is read.
@@ -84,7 +87,7 @@ pub(crate) async fn route_fallback(
     let body = match axum::body::to_bytes(body, ROUTE_BODY_LIMIT).await {
         Ok(b) => b,
         Err(_) => {
-            return AppError::Internal("failed to read request body".into()).into_response()
+            return fallback_err(AppError::Internal("failed to read request body".into()))
         }
     };
 
@@ -94,7 +97,7 @@ pub(crate) async fn route_fallback(
     .await
     {
         Ok(resp) => resp,
-        Err(e) => e.into_response(),
+        Err(e) => fallback_err(e),
     }
 }
 
@@ -103,8 +106,8 @@ pub(crate) async fn route_fallback(
 const ROUTE_BODY_LIMIT: usize = 10 * 1024 * 1024;
 
 /// Fallback for unmatched methods on matched routes — standardized 405 body.
-pub(crate) async fn method_not_allowed_fallback() -> AppError {
-    AppError::MethodNotAllowed
+pub(crate) async fn method_not_allowed_fallback() -> ProtocolError {
+    ProtocolError::from(AppError::MethodNotAllowed)
 }
 
 /// Middleware that injects `x-request-id` and `x-processing-time-ms` into

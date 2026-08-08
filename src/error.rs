@@ -363,6 +363,7 @@ impl IntoResponse for AppError {
 
 /// 协议感知的错误边界(D11):错误自身携带语义协议,render 分派在
 /// `src/protocol/`(protocol/ 不反向依赖核心)。
+#[derive(Debug)]
 pub struct ProtocolError {
     pub error: AppError,
     pub protocol: crate::protocol::ApiProtocol,

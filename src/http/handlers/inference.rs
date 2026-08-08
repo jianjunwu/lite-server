@@ -1,5 +1,5 @@
 use super::*;
-use crate::error::AppError;
+use crate::error::{AppError, ProtocolError};
 use crate::http::state::AppState;
 use crate::metrics::prometheus;
 use crate::proto::liteserver as pb;
@@ -27,14 +27,12 @@ pub async fn infer_handler(
     headers: HeaderMap,
     cx: RequestContext,
     ApiBody(body): ApiBody,
-) -> Result<Response, AppError> {
-    crate::validation::validate_identifier(&model_name)?;
-    let result = do_infer(
-        state.clone(), model_name.clone(), None,
-        "/predict".to_string(), headers, body, cx,
-    ).await;
+) -> Result<Response, ProtocolError> {
     // P-CORS: CORS headers are attached by `cors_middleware` (no longer per-handler).
-    result
+    run_infer(
+        state, model_name, None,
+        "/predict".to_string(), headers, body, cx,
+    ).await
 }
 
 pub async fn infer_version_handler(
@@ -43,14 +41,55 @@ pub async fn infer_version_handler(
     headers: HeaderMap,
     cx: RequestContext,
     ApiBody(body): ApiBody,
-) -> Result<Response, AppError> {
-    crate::validation::validate_identifier(&model_name)?;
-    crate::validation::validate_version(&version)?;
-    let result = do_infer(
-        state.clone(), model_name.clone(), Some(version),
+) -> Result<Response, ProtocolError> {
+    run_infer(
+        state, model_name, Some(version),
         "/predict".to_string(), headers, body, cx,
-    ).await;
-    result
+    ).await
+}
+
+/// 协议感知的 infer 入口(D11 P2.1):T1(预筛)+ T2(信封主判)→ 语义协议,
+/// 错误挂 [`ProtocolError`](crate::error::ProtocolError) 边界渲染。
+/// 阶段 2 的 `binary_data_output` 响应转换在此边界后处理。
+pub async fn run_infer(
+    state: Arc<AppState>,
+    model_name: String,
+    version: Option<String>,
+    route: String,
+    headers: HeaderMap,
+    body: RequestBody,
+    cx: RequestContext,
+) -> Result<Response, ProtocolError> {
+    // 早期错误(validate,发生在 T2 判定前)按 T1 预筛值渲染(C9)。
+    crate::validation::validate_identifier(&model_name)
+        .map_err(|e| ProtocolError {
+            error: e,
+            protocol: cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy),
+        })?;
+    if let Some(ref v) = version {
+        crate::validation::validate_version(v).map_err(|e| ProtocolError {
+            error: e,
+            protocol: cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy),
+        })?;
+    }
+    // T2 信封主判:仅 T1 缺失时计算(T1 强信号短路,二进制/Raw 路径零成本)。
+    let protocol = crate::protocol::detect::resolve(cx.api_protocol, &body.bytes());
+    // 阶段 2(D5/D6):KServe-mode 请求带 binary_data_output flag → 响应
+    // 转换开关。默认关(非 KServe 请求零成本);双条件防御防自有 schema 撞名。
+    let binary_output = if protocol == crate::protocol::ApiProtocol::Kserve {
+        crate::http::kserve::parse_binary_output_request(&body, &model_name, version.clone())
+    } else {
+        None
+    };
+    let resp = do_infer(state, model_name, version, route, headers, body, cx)
+        .await
+        .map_err(|error| ProtocolError { error, protocol })?;
+    if let Some(req) = binary_output {
+        return crate::http::kserve::convert_response(resp, &req)
+            .await
+            .map_err(|error| ProtocolError { error, protocol });
+    }
+    Ok(resp)
 }
 async fn do_infer(
     state: Arc<AppState>,
@@ -513,6 +552,7 @@ mod streaming_tests {
             trace_cx: opentelemetry::Context::new(),
             protocol: crate::callback::Protocol::Http,
             principal: None,
+            api_protocol: None,
         }
     }
 
