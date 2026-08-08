@@ -8893,3 +8893,161 @@ fn body_bytes_count(body: &str, content_type: &str) -> u64 {
     }
     0
 }
+
+// ---------------------------------------------------------------------------
+// KServe V2 管理面(阶段 3,批次 3):/v2 元数据 / health / 模型元数据 / bare load
+// ---------------------------------------------------------------------------
+
+/// §6.3 test_v2_server_metadata (P0):/v2 → name/version/extensions 含
+/// binary_tensor_data。
+#[tokio::test]
+#[serial]
+async fn test_v2_server_metadata() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+    let resp = client.get(format!("{base}/v2")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["name"], "lite-server");
+    assert!(v["version"].as_str().is_some_and(|s| !s.is_empty()));
+    let exts = v["extensions"].as_array().unwrap();
+    assert!(
+        exts.iter().any(|e| e == "binary_tensor_data"),
+        "extensions 必须声明 binary_tensor_data: {v}"
+    );
+}
+
+async fn fetch_json(
+    client: &reqwest::Client,
+    base: &str,
+    path: &str,
+) -> (reqwest::StatusCode, Value) {
+    let resp = client.get(format!("{base}{path}")).send().await.unwrap();
+    (resp.status(), resp.json().await.unwrap())
+}
+
+/// §6.3 test_v2_health_paths (P0):/v2/health/live、/v2/health/ready 与
+/// /livez /readyz **语义一致**(同一 handler 别名路由)——livez 恒 200;
+/// readyz 的 status 与 body 与 /readyz 逐项相同(无模型加载时同为 503)。
+#[tokio::test]
+#[serial]
+async fn test_v2_health_paths() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+    for path in ["/livez", "/v2/health/live"] {
+        let resp = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "{path} must be 200");
+        let v: Value = resp.json().await.unwrap();
+        assert_eq!(v["status"], "alive", "{path} semantics == livez");
+    }
+    // 别名语义一致:状态码与 body 均相同(共享同一 handler)
+    let (s1, b1) = fetch_json(&client, &base, "/readyz").await;
+    let (s2, b2) = fetch_json(&client, &base, "/v2/health/ready").await;
+    assert_eq!(s1, s2, "/readyz 与 /v2/health/ready 状态码必须一致");
+    assert_eq!(b1, b2, "/readyz 与 /v2/health/ready body 必须一致");
+}
+
+/// §6.3 test_v2_model_metadata_spec_shape + versioned (P0/P1):规范形状
+/// name/platform/inputs/outputs 必填,无 state 字段。
+#[tokio::test]
+#[serial]
+async fn test_v2_model_metadata_spec_shape() {
+    let base = shared_base().await;
+    load_model(&base, MODEL, "1").await;
+    let client = reqwest::Client::new();
+
+    for path in [
+        format!("/v2/models/{MODEL}"),
+        format!("/v2/models/{MODEL}/versions/1"),
+    ] {
+        let resp = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "{path} must be 200");
+        let v: Value = resp.json().await.unwrap();
+        assert_eq!(v["name"], MODEL);
+        assert!(
+            v["platform"].as_str().is_some_and(|p| !p.is_empty()),
+            "platform 必填(J1 兜底 custom 不空串): {v}"
+        );
+        assert!(v["inputs"].is_array(), "inputs 必填(可空数组): {v}");
+        assert!(v["outputs"].is_array(), "outputs 必填(可空数组): {v}");
+        assert!(
+            v.get("state").is_none(),
+            "state 不是 KServe 规范字段(C2),不得返回: {v}"
+        );
+    }
+    // 不存在的模型 → 404
+    let resp = client
+        .get(format!("{base}/v2/models/definitely-not-a-model"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    unload_model(&base, MODEL, "1").await;
+}
+
+/// §6.3 test_v2_bare_load_alias (P0,G14):bare load → 加载 active 版本,
+/// 幂等 200;无 active → 明确错误;响应 KServe 形状 {"name","load":true}(J2)。
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_v2_bare_load_alias() {
+    let http_port = next_test_port();
+    kill_stale_on_port(http_port);
+    let repo = test_model_repo();
+    let _server = ServerGuard::start(&[
+        "--port", &http_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-grpc", "--no-metrics", "--log-level", "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{http_port}");
+    let client = reqwest::Client::new();
+
+    // 无 active → 明确错误(404)
+    let resp = client
+        .post(format!("{base}/v2/repository/models/{MODEL}/load"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "无 active 版本必须明确报错");
+
+    // 加载 + 激活后 → 幂等 200(重复调用仍 200,KServe load 语义 C10)
+    load_model(&base, MODEL, "1").await;
+    for _ in 0..2 {
+        let resp = client
+            .post(format!("{base}/v2/repository/models/{MODEL}/load"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "bare load 必须幂等 200");
+        let v: Value = resp.json().await.unwrap();
+        assert_eq!(v["name"], MODEL);
+        assert_eq!(v["load"], true, "KServe 响应形状(J2): {v}");
+    }
+}
+
+/// §6.3 test_new_routes_fallback_regression (P1,G17):新路由注册后原
+/// fallback 路径行为锁定——/v2/models/:m 现为 200(原 404)。
+#[tokio::test]
+#[serial]
+async fn test_new_routes_fallback_regression() {
+    let base = shared_base().await;
+    load_model(&base, MODEL, "1").await;
+    let client = reqwest::Client::new();
+    // 裸模型路径不再是 404(G17:注册前落 route_fallback)
+    let resp = client
+        .get(format!("{base}/v2/models/{MODEL}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "模型元数据路径必须已注册(G17)");
+    // 不存在模型的裸路径 → 404(路由注册了,但模型不存在)
+    let resp = client
+        .get(format!("{base}/v2/models/no-such-model"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    unload_model(&base, MODEL, "1").await;
+}

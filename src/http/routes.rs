@@ -110,6 +110,14 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
         .route("/info", get(info_handler))
         // Metrics
         .route("/metrics", get(metrics_handler))
+        // KServe V2 管理面(阶段 3,批次 3,D8):server metadata / health 别名 /
+        // 规范形状模型元数据 / bare load alias(G14)。注册前这些路径落
+        // route_fallback(404),注册后行为变化——G17 回归测试锁定。
+        .route("/v2", get(v2_server_metadata_handler))
+        .route("/v2/health/live", get(livez_handler))
+        .route("/v2/health/ready", get(readyz_handler))
+        .route("/v2/models/:model_name", get(model_metadata_handler))
+        .route("/v2/models/:model_name/versions/:version", get(model_metadata_version_handler))
         // Admin: list models
         .route("/v2/models", get(list_models_handler))
         // Admin: list versions
@@ -122,8 +130,10 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
         .route("/v2/models/:model_name/versions/:version/health", get(model_health_version_handler))
         // Admin: repository index
         .route("/v2/repository/index", post(repository_index_handler))
-        // Admin: load (versioned-only since §4.4 — the bare endpoint
-        // silently defaulted to version "1")
+        // Admin: load (bare aliases the active version since G14/批次 3;
+        // §4.4 删除理由——静默默认 version 1——由 alias 解析 active 取代,
+        // 不恢复静默默认)
+        .route("/v2/repository/models/:model_name/load", post(bare_load_model_handler))
         .route("/v2/repository/models/:model_name/versions/:version/load", post(load_model_handler))
         // Admin: unload (bare = active version; versioned = explicit)
         .route("/v2/repository/models/:model_name/unload", post(unload_model_handler))
@@ -269,6 +279,13 @@ mod tests {
         assert_eq!(access_log_target("/v2/repository/index"), None);
         assert_eq!(access_log_target("/health"), None);
         assert_eq!(access_log_target("/v2/models/"), None);
+        // 批次 3 新增路由:全部 admin 类,不落 inference 日志
+        assert_eq!(access_log_target("/v2"), None);
+        assert_eq!(access_log_target("/v2/health/live"), None);
+        assert_eq!(access_log_target("/v2/health/ready"), None);
+        assert_eq!(access_log_target("/v2/models/m"), None); // 模型元数据
+        assert_eq!(access_log_target("/v2/models/m/versions/2"), None); // versioned 元数据
+        assert_eq!(access_log_target("/v2/repository/models/m/load"), None); // bare load
     }
 
     #[test]

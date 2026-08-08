@@ -585,7 +585,7 @@ class TestKserveV2Profile:
         )
         _make_model(tmp_path, model_py=src, config="name: my_model\n")
         report = StaticAnalyzer(tmp_path).analyze_model(
-            "test_model", profile="kserve-v2"
+            "test_model", interop="kserve-v2"
         )
         assert "kserve-v2-health" in report.checks_passed
         assert "kserve-v2-infer-ready" in report.checks_passed
@@ -602,7 +602,7 @@ class TestKserveV2Profile:
         )
         _make_model(tmp_path, model_py=src)
         report = StaticAnalyzer(tmp_path).analyze_model(
-            "test_model", profile="kserve-v2"
+            "test_model", interop="kserve-v2"
         )
         assert "LS401" in _rule_ids(report)
 
@@ -615,7 +615,7 @@ class TestKserveV2Profile:
         )
         _make_model(tmp_path, model_py=src)
         report = StaticAnalyzer(tmp_path).analyze_model(
-            "test_model", profile="kserve-v2"
+            "test_model", interop="kserve-v2"
         )
         assert "LS402" in _rule_ids(report)
 
@@ -628,7 +628,7 @@ class TestKserveV2Profile:
         )
         _make_model(tmp_path, model_py=src, config="stream: true\n")
         report = StaticAnalyzer(tmp_path).analyze_model(
-            "test_model", profile="kserve-v2"
+            "test_model", interop="kserve-v2"
         )
         assert "LS403" in _rule_ids(report)
 
@@ -643,7 +643,7 @@ class TestKserveV2Profile:
         )
         _make_model(tmp_path, model_py=src, config="stream: true\n")
         report = StaticAnalyzer(tmp_path).analyze_model(
-            "test_model", profile="kserve-v2"
+            "test_model", interop="kserve-v2"
         )
         assert "LS403" not in _rule_ids(report)
         assert "kserve-v2-stream-ready" in report.checks_passed

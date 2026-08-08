@@ -3,6 +3,7 @@ use super::inference::resolve_version;
 use crate::error::AppError;
 use crate::http::state::AppState;
 use crate::metrics::prometheus;
+use crate::registry::types::ModelType;
 use axum::{
     extract::{Path, State},
     http::HeaderMap,
@@ -13,6 +14,83 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::info;
+
+// ===== KServe V2 管理面(阶段 3,批次 3) =====
+
+/// G13/J1:model_type → KServe platform 映射。Ensemble → `ensemble`;
+/// LitAPI 无 KServe 标准枚举(`<project>_<format>`)对应 → 兜底 `custom`
+/// (J1 裁定:KServe 自身填空串,我们按规范填 = 超集,不学空串)。
+pub(crate) fn model_type_to_platform(model_type: &ModelType) -> &'static str {
+    match model_type {
+        ModelType::Ensemble => "ensemble",
+        ModelType::LitAPI => "custom",
+    }
+}
+
+/// D8:/v2 server metadata——能力发现(G11)。extensions 随能力落地增删。
+pub async fn v2_server_metadata_handler() -> Json<Value> {
+    Json(json!({
+        "name": "lite-server",
+        "version": env!("CARGO_PKG_VERSION"),
+        "extensions": ["binary_tensor_data"],
+    }))
+}
+
+/// D8:/v2/models/:m 规范形状模型元数据(G13/G16):name/versions/platform/
+/// inputs/outputs 必填;state 不是规范字段(C2)不返回。inputs/outputs
+/// 缺省空数组(合法降级,tritonclient 不校验非空);worker get_metadata()
+/// 回调是后续可选增强。
+async fn model_metadata_impl(
+    state: &AppState,
+    model_name: &str,
+) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(model_name)?;
+    let versions = state.registry.list_versions(model_name);
+    if versions.is_empty() {
+        return Err(AppError::ModelNotFound(model_name.to_string()));
+    }
+    // platform 取 active 版本优先(admin ops 不跟加权路由),无 active 取首个。
+    let model_type = state
+        .registry
+        .get_active_version(model_name)
+        .and_then(|v| state.registry.get(model_name, Some(&v)))
+        .map(|mv| mv.model_type.clone())
+        .or_else(|| versions.first().map(|mv| mv.model_type.clone()))
+        .unwrap_or(ModelType::LitAPI);
+    Ok(Json(json!({
+        "name": model_name,
+        "versions": versions.iter().map(|mv| mv.version.clone()).collect::<Vec<_>>(),
+        "platform": model_type_to_platform(&model_type),
+        "inputs": [],
+        "outputs": [],
+    })))
+}
+
+pub async fn model_metadata_handler(
+    State(state): State<Arc<AppState>>,
+    Path(model_name): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    model_metadata_impl(&state, &model_name).await
+}
+
+/// G16:versioned 模型元数据(规范路径含可选 versions 段)。
+pub async fn model_metadata_version_handler(
+    State(state): State<Arc<AppState>>,
+    Path((model_name, version)): Path<(String, String)>,
+) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
+    crate::validation::validate_version(&version)?;
+    if state.registry.get(&model_name, Some(&version)).is_none() {
+        return Err(AppError::ModelNotFound(format!("{model_name}/{version}")));
+    }
+    let json = model_metadata_impl(&state, &model_name).await?;
+    // 请求的版本必须存在于 versions 列表(versioned 路径语义)
+    let versions = json["versions"].as_array().cloned().unwrap_or_default();
+    if !versions.iter().any(|v| v == &json!(version)) {
+        return Err(AppError::ModelNotFound(format!("{model_name}/{version}")));
+    }
+    Ok(json)
+}
 
 // ===== List Models =====
 
@@ -262,6 +340,22 @@ async fn scan_repository(repo_path: &std::path::Path) -> Vec<Value> {
 
 // ===== Load Model =====
 
+/// G14 (批次 3):bare load aliases 到 active 版本——admin ops 不跟加权路由。
+/// 幂等(C10):active 存在即 200(KServe load 语义,重复调用不报错);无
+/// active → 明确错误。响应 KServe 形状 {"name","load":true}(J2)。
+/// 「上传后 bare load」流程(上传不 load 须先 versioned load/activate)写入
+/// 已知偏差文档(D8)。
+pub async fn bare_load_model_handler(
+    State(state): State<Arc<AppState>>,
+    Path(model_name): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
+    state.registry.get_active_version(&model_name).ok_or_else(|| {
+        AppError::ModelNotFound(format!("{} has no active version", model_name))
+    })?;
+    Ok(Json(json!({"name": model_name, "load": true})))
+}
+
 /// Load is versioned-only (§4.4): the old bare endpoint silently defaulted
 /// to version "1".
 pub async fn load_model_handler(
@@ -304,7 +398,7 @@ async fn unload_model_impl(
     state: &AppState,
     model_name: &str,
     version: &str,
-) -> Result<Json<Value>, AppError> {
+) -> Result<(), AppError> {
     info!(model = %model_name, version = %version, "unload model requested");
     let success = state.worker_manager.unload_model(model_name, Some(version)).await?;
     if !success {
@@ -318,14 +412,12 @@ async fn unload_model_impl(
     let any_hot_reload = state.registry.list_loaded().iter().any(|(_, _, mv)| mv.config.hot_reload);
     state.has_hot_reload.store(any_hot_reload, Ordering::Relaxed);
 
-    Ok(Json(json!({
-        "success": true,
-        "message": format!("Model {} version {} unloaded", model_name, version),
-    })))
+    Ok(())
 }
 
 /// Bare unload targets the **active** version (§4.4): admin ops never follow
-/// the weighted routing pick.
+/// the weighted routing pick. 响应 KServe 形状 {"name","unload":true}(J2,
+/// v2_endpoints.py:196-215 实证;bare 消费者是 KServe SDK)。
 pub async fn unload_model_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
@@ -334,7 +426,8 @@ pub async fn unload_model_handler(
     let active = state.registry.get_active_version(&model_name).ok_or_else(|| {
         AppError::ModelNotFound(format!("{} has no active version", model_name))
     })?;
-    unload_model_impl(&state, &model_name, &active).await
+    unload_model_impl(&state, &model_name, &active).await?;
+    Ok(Json(json!({"name": model_name, "unload": true})))
 }
 
 /// Versioned unload targets the explicit version (§4.4).
@@ -344,7 +437,11 @@ pub async fn unload_version_handler(
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
-    unload_model_impl(&state, &model_name, &version).await
+    unload_model_impl(&state, &model_name, &version).await?;
+    Ok(Json(json!({
+        "success": true,
+        "message": format!("Model {} version {} unloaded", model_name, version),
+    })))
 }
 
 // ===== Reload Model =====

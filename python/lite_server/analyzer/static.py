@@ -230,7 +230,7 @@ class StaticAnalyzer:
 
     def analyze_model(self, model_name: str, version: str | None = None,
                       deep: bool = False, deep_timeout: float = 30.0,
-                      profile: str | None = None) -> AnalysisReport:
+                      interop: str | None = None) -> AnalysisReport:
         """Return the schema v1 analysis report for a model.
 
         Raises (→ CLI exit code 2, "analysis failed"):
@@ -335,9 +335,9 @@ class StaticAnalyzer:
                 version_dir, resolved_model_dir, config, report, deep_timeout
             )
 
-        # --- profile checks (optional interop profiles) ---
-        if profile is not None:
-            self._check_profile(profile, config, report)
+        # --- interop profile checks (optional) ---
+        if interop is not None:
+            self._check_profile(interop, config, report)
 
         return report
 
@@ -778,14 +778,14 @@ class StaticAnalyzer:
 
     # ------------------------------------------------------------ profile checks
 
-    def _check_profile(self, profile: str, config: dict,
+    def _check_profile(self, interop: str, config: dict,
                        report: AnalysisReport) -> None:
-        """Dispatch to a named profile check."""
-        if profile == "kserve-v2":
+        """Dispatch to a named interop profile check."""
+        if interop == "kserve-v2":
             self._check_kserve_v2_profile(config, report)
         else:
             raise ValueError(
-                f"Unknown analyze profile: {profile!r} (available: kserve-v2)"
+                f"Unknown analyze interop profile: {interop!r} (available: kserve-v2)"
             )
 
     def _check_kserve_v2_profile(self, config: dict,
@@ -793,8 +793,10 @@ class StaticAnalyzer:
         """KServe V2 inference protocol interop checks (LS401-LS404).
 
         Optional interop target — all findings are info (LS404 is warning).
-        /v2/health/live and /v2/health/ready are served at the server level
-        and always available regardless of model implementation.
+        G18 对账(protocol-compat 批次 3):/v2/health/live 与 /v2/health/ready
+        自阶段 3 起是 server 内置路由(livez/readyz 的别名,见 routes.rs),
+        恒可用且与模型实现无关——kserve-v2-health 的 pass 是**事实**而非
+        预设(0.8.3 前该描述是预设性,路由并不存在)。
         """
         methods = report.methods or _empty_method_groups()
         impl = set()

@@ -45,7 +45,7 @@ class TestAnalyze:
             "strict": False,
             "deep": False,
             "deep_timeout": 30.0,
-            "profile": None,
+            "interop": None,
         }
         base.update(overrides)
         return type("Args", (), base)()

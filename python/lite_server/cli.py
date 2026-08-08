@@ -182,9 +182,10 @@ def main(argv=None):
                                      "(EXECUTES MODEL CODE — opt-in)")
     analyze_parser.add_argument("--deep-timeout", type=float, default=30.0,
                                 help="Seconds before --deep import is killed (default: 30)")
-    analyze_parser.add_argument("--profile", choices=["kserve-v2"], default=None,
+    analyze_parser.add_argument("--interop", choices=["kserve-v2"], default=None,
                                 help="Run an optional interop profile check "
-                                     "(kserve-v2: KServe V2 inference protocol)")
+                                     "(kserve-v2: KServe V2 inference protocol; "
+                                     "renamed from --profile by protocol-compat 批次 3)")
 
     # pack
     pack_parser = subparsers.add_parser("pack", help="Pack model into artifact")
@@ -1188,7 +1189,7 @@ def _cmd_analyze(args):
         report = analyzer.analyze_model(
             args.model, version=args.version,
             deep=args.deep, deep_timeout=args.deep_timeout,
-            profile=args.profile,
+            interop=args.interop,
         )
     except (ValueError, FileNotFoundError) as e:
         _logger.error("%s", e)
@@ -1199,8 +1200,8 @@ def _cmd_analyze(args):
         command += f" --version {args.version}"
     if args.deep:
         command += " --deep"
-    if args.profile:
-        command += f" --profile {args.profile}"
+    if args.interop:
+        command += f" --interop {args.interop}"
     report_dict = report.to_dict(tool_version=f"lite-server {_pkg_version}",
                                  command=command)
 
