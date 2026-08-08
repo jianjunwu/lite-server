@@ -642,7 +642,7 @@ class LLMModel(LitAPI):
         """Run one generation step for all active sequences."""
         new_tokens = []
         for seq in active_sequences:
-            token = self.model.generate_step(seq["uid"])
+            token = self.model.generate_step(seq.uid)
             new_tokens.append(token)
         return new_tokens
 
@@ -1038,7 +1038,7 @@ from lite_server.exceptions import (
 class MyModel(LitAPI):
     def predict(self, x):
         if x.get("value") < 0:
-            raise BadRequestError("input must be non-negative", "INVALID_INPUT")
+            raise BadRequestError("input must be non-negative", "invalid_input")
         if self.model is None:
             raise ServiceUnavailableError("model not loaded yet")
         return self.model(x)
@@ -1067,7 +1067,7 @@ raise BadRequestError("input must be non-negative", code="invalid_input", param=
 The client always receives a four-field structured response:
 
 ```json
-{"error": {"type": "INVALID_INPUT", "message": "input must be non-negative", "code": "invalid_input", "param": "value"}}
+{"error": {"type": "invalid_input", "message": "input must be non-negative", "code": "invalid_input", "param": "value"}}
 ```
 
 - `code` — machine-readable error code (snake_case), `null` when not set. Server-generated errors always carry one (e.g. `model_not_found`, `queue_full`, `invalid_request_body`).
