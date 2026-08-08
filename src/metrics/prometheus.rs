@@ -616,6 +616,7 @@ impl StreamCloseReason {
 /// WS writer panic 臂传 0——panic 时不可知,与 output_bytes 同)。
 /// `family` 由调用方传:HTTP 用 `reason.status_family()`,gRPC 的 Error 帧
 /// 按 grpc code 映射覆盖(既有语义)。exactly-once 由任务尾部单一收口保证。
+#[allow(clippy::too_many_arguments)] // metrics 收口 API:参数即 label/事件字段,struct 化改全部调用点
 pub fn record_stream_terminal(
     model: &str,
     version: &str,

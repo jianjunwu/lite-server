@@ -1499,6 +1499,6 @@ mod tests {
             let _ = axum::body::to_bytes(resp.into_body(), 1 << 20).await;
             drop(body_tx);
         });
-        wait_for(|| prometheus::worker_inference_count(model, "1", 0) >= before + 1, "bidi worker inference").await;
+        wait_for(|| prometheus::worker_inference_count(model, "1", 0) > before, "bidi worker inference").await;
     }
 }

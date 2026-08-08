@@ -3,7 +3,11 @@
 try:
     from importlib.metadata import version
 
-    __version__ = version("lite-server")
+    # 0.8.3 起 PyPI 包名改为 miraserver;lite-server 是老安装名,兼容保留。
+    try:
+        __version__ = version("miraserver")
+    except Exception:
+        __version__ = version("lite-server")
 except Exception:
     __version__ = "0.0.0"
 

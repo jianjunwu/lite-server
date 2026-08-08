@@ -171,6 +171,7 @@ async fn sse_infer_entry(
     result
 }
 
+#[allow(clippy::too_many_arguments)] // 内部入口:状态/请求/上下文组合参数,struct 化收益低(同 watcher.rs 先例)
 async fn sse_infer_entry_impl(
     state: &Arc<AppState>,
     model_name: &str,
@@ -3330,7 +3331,7 @@ mod tests {
         )
         .await
         .expect("sse must open");
-        wait_for(|| dur.get_sample_count() >= dur_before + 1, "sse duration").await;
+        wait_for(|| dur.get_sample_count() > dur_before, "sse duration").await;
         drop(sse);
         assert_eq!(
             bytes.get(),
