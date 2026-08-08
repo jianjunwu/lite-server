@@ -23,7 +23,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::Instrument;
 use uuid::Uuid;
 
-async fn open_worker_stream(
+pub(crate) async fn open_worker_stream(
     state: &Arc<AppState>,
     model_name: &str,
     resolved_version: &str,

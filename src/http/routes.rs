@@ -233,6 +233,10 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
         .fallback(crate::http::route_fallback)
         .method_not_allowed_fallback(crate::http::method_not_allowed_fallback);
 
+    // 批次 5(openai-compact):/v1 路由注册(with_state 之前,与协议 seam
+    // mount 同点;handler 的 State 由外层 with_state 统一绑定)。
+    router = crate::http::handlers::openai_compact::mount(router);
+
     router
         .layer(axum::middleware::from_fn_with_state(
             shared.clone(),

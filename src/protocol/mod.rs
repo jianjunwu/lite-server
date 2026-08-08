@@ -28,6 +28,9 @@ pub enum ApiProtocol {
     /// KServe V2 dataplane 扁平错误体 `{"error": "<message>"}`。
     /// 由 detect::t1_prefilter / t2_kserve_envelope 产出(P2.1,批次 2)。
     Kserve,
+    /// openai-compact(阶段 6,批次 5):/v1 路径的语义协议。错误体与
+    /// Legacy 同形状(复用 openai.rs renderer,无新 renderer)。
+    OpenaiCompact,
 }
 
 /// 与协议无关的错误值表——wire 输出的唯一来源。值由
@@ -99,6 +102,7 @@ pub fn render(err: CanonicalError, protocol: ApiProtocol) -> Response {
     let body = match protocol {
         ApiProtocol::Legacy => openai::render_body(&err),
         ApiProtocol::Kserve => kserve::render_body(&err),
+        ApiProtocol::OpenaiCompact => openai::render_body(&err),
     };
     let mut response = (err.status, body).into_response();
 

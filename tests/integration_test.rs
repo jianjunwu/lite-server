@@ -9304,3 +9304,330 @@ class GenErrAPI(LitAPI):
 
     let _ = std::fs::remove_dir_all(&repo);
 }
+
+// ---------------------------------------------------------------------------
+// openai-compact(阶段 6,批次 5,J5/J6/C19):/v1 5 端点
+// ---------------------------------------------------------------------------
+
+/// worker:OpenAI 兼容翻译层(helpers/openai.py)——chat/completions/
+/// embeddings 按请求体特征分支;stream_predict 逐 chunk。
+fn write_openai_compat_model(repo: &std::path::Path, name: &str, stream: bool) {
+    let dir = repo.join(format!("{name}/1"));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("model.py"),
+        r#"from lite_server import LitAPI
+
+
+class OpenAICompatAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request
+
+    def predict(self, x):
+        from lite_server.helpers.openai import (
+            build_chat_response, build_completions_response,
+            build_embeddings_response,
+        )
+        if "messages" in x:
+            return build_chat_response(
+                "echo:" + x["messages"][-1]["content"],
+                model=x.get("model", "m"),
+            )
+        if "prompt" in x:
+            return build_completions_response(
+                "echo:" + str(x["prompt"]), model=x.get("model", "m"),
+            )
+        return build_embeddings_response([0.1, 0.2], model=x.get("model", "m"))
+
+    async def stream_predict(self, x, ctx):
+        from lite_server.helpers.openai import build_chat_chunk
+        for tok in ["hel", "lo"]:
+            yield build_chat_chunk(tok, model=x.get("model", "m"))
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        format!(
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: {stream}\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// §6.7 test_chat_completions_unary (P0):/v1/chat/completions 非流式 →
+/// chat 形状 JSON(choices/message)。
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_chat_completions_unary() {
+    let http_port = next_test_port();
+    kill_stale_on_port(http_port);
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-oai-unary-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    write_openai_compat_model(&repo, "chat", false);
+
+    let _server = ServerGuard::start(&[
+        "--port", &http_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-grpc", "--no-metrics", "--log-level", "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{http_port}");
+    load_model(&base, "chat", "1").await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "chat",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["object"], "chat.completion");
+    assert_eq!(v["model"], "chat");
+    assert_eq!(v["choices"][0]["message"]["content"], "echo:hi");
+    assert_eq!(v["choices"][0]["message"]["role"], "assistant");
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// §6.7 test_chat_completions_sse (P0):stream: true → data: {json} 逐 chunk
+/// + data: [DONE];连接正常终止。
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_chat_completions_sse() {
+    let http_port = next_test_port();
+    kill_stale_on_port(http_port);
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-oai-sse-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    write_openai_compat_model(&repo, "chat", true);
+
+    let _server = ServerGuard::start(&[
+        "--port", &http_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-grpc", "--no-metrics", "--log-level", "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{http_port}");
+    load_model(&base, "chat", "1").await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "chat",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap().to_string();
+    assert!(ct.contains("text/event-stream"), "expected SSE, got {ct}");
+    let body = tokio::time::timeout(Duration::from_secs(15), resp.text())
+        .await
+        .expect("SSE 响应必须在超时内关闭")
+        .unwrap();
+    assert!(body.contains("data: {\"id\""), "逐 chunk 帧必须存在: {body}");
+    assert!(body.contains("\"chat.completion.chunk\""), "chunk 对象形状: {body}");
+    assert!(body.contains("data: [DONE]"), "OpenAI SSE 以 [DONE] 终止: {body}");
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// §6.7 test_completions_echo + test_embeddings (P1):/v1/completions 与
+/// /v1/embeddings 透传 worker(翻译层在 worker 侧,J6)。
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_completions_and_embeddings() {
+    let http_port = next_test_port();
+    kill_stale_on_port(http_port);
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-oai-others-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    write_openai_compat_model(&repo, "chat", false);
+
+    let _server = ServerGuard::start(&[
+        "--port", &http_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-grpc", "--no-metrics", "--log-level", "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{http_port}");
+    load_model(&base, "chat", "1").await;
+
+    let client = reqwest::Client::new();
+    // completions
+    let resp = client
+        .post(format!("{base}/v1/completions"))
+        .json(&json!({"model": "chat", "prompt": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["object"], "text_completion");
+    assert_eq!(v["choices"][0]["text"], "echo:hi");
+    // embeddings
+    let resp = client
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({"model": "chat", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["object"], "list");
+    assert_eq!(v["data"][0]["embedding"], json!([0.1, 0.2]));
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// §6.7 test_v1_models_list + test_v1_models_retrieve (P1):/v1/models 列表 =
+/// 注册模型名;/v1/models/{model} 单模型对象;不存在 → 404 OpenAI 形状。
+#[tokio::test]
+#[serial]
+async fn test_v1_models_list_and_retrieve() {
+    let base = shared_base().await;
+    load_model(&base, MODEL, "1").await;
+    let client = reqwest::Client::new();
+
+    let resp = client.get(format!("{base}/v1/models")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["object"], "list");
+    let ids: Vec<&str> = v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert!(ids.contains(&MODEL), "/v1/models 必须含 {MODEL}: {v}");
+
+    let resp = client
+        .get(format!("{base}/v1/models/{MODEL}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["id"], MODEL);
+    assert_eq!(v["object"], "model");
+
+    // 不存在 → 404 OpenAI 形状(经协议层分派)
+    let resp = client
+        .get(format!("{base}/v1/models/no-such-model"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let v: Value = resp.json().await.unwrap();
+    assert!(v["error"].is_object(), "OpenAI 错误形状: {v}");
+
+    unload_model(&base, MODEL, "1").await;
+}
+
+/// §6.7 test_v1_404_model_not_found (P0):不存在模型 → 404 + OpenAI 错误形状。
+#[tokio::test]
+#[serial]
+async fn test_v1_404_model_not_found() {
+    let base = shared_base().await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "definitely-not-a-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "不存在的模型必须 404");
+    let v: Value = resp.json().await.unwrap();
+    assert!(v["error"].is_object(), "OpenAI 错误形状: {v}");
+}
+
+/// §6.7 test_v1_mid_stream_error (P1):流中途错误 → 后续 data: 携带 error
+/// JSON(OpenAI SSE 惯例)。
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_v1_mid_stream_error() {
+    let http_port = next_test_port();
+    kill_stale_on_port(http_port);
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-oai-err-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    let dir = repo.join("chat/1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("model.py"),
+        r#"from lite_server import LitAPI
+from lite_server.helpers.openai import build_chat_chunk
+
+
+class ErrAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request
+
+    async def stream_predict(self, x, ctx):
+        yield build_chat_chunk("hel", model="chat")
+        raise ValueError("mid-stream boom")
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: true\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+
+    let _server = ServerGuard::start(&[
+        "--port", &http_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-grpc", "--no-metrics", "--log-level", "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{http_port}");
+    load_model(&base, "chat", "1").await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "chat",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "HTTP 状态码由首个 SSE 响应固定");
+    let body = tokio::time::timeout(Duration::from_secs(15), resp.text())
+        .await
+        .expect("SSE 响应必须在超时内关闭")
+        .unwrap();
+    assert!(body.contains("data: {\"id\""), "首个 chunk 正常: {body}");
+    assert!(
+        body.contains("\"error\""),
+        "流中途错误必须携带在后续 data: 事件内(OpenAI SSE 惯例): {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}

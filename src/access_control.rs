@@ -261,6 +261,11 @@ pub fn classify_http_path(path: &str) -> EndpointClass {
     if crate::http::routes::access_log_target(path).is_some() {
         return EndpointClass::Inference;
     }
+    // 批次 5(openai-compact):/v1/* 归 inference 族——否则 fail-closed
+    // 默认把 /v1 当 Admin,拒绝公共访问。
+    if path.starts_with("/v1/") {
+        return EndpointClass::Inference;
+    }
     EndpointClass::Admin
 }
 
@@ -290,6 +295,17 @@ mod tests {
     }
 
     // ===== default semantics (D14 fail-closed admin) =====
+
+    #[test]
+    fn classify_http_path_v1_is_inference() {
+        // 批次 5(openai-compact):/v1/* 归 inference 族——否则 fail-closed
+        // 默认把 /v1 当 Admin,拒绝公共访问。
+        assert_eq!(classify_http_path("/v1/chat/completions"), EndpointClass::Inference);
+        assert_eq!(classify_http_path("/v1/models"), EndpointClass::Inference);
+        assert_eq!(classify_http_path("/v1/models/foo"), EndpointClass::Inference);
+        assert_eq!(classify_http_path("/health"), EndpointClass::Health);
+        assert_eq!(classify_http_path("/v2/models/m/infer"), EndpointClass::Inference);
+    }
 
     #[test]
     fn default_admin_loopback_passes_non_loopback_denies() {

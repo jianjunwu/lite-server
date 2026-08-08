@@ -10,12 +10,17 @@ use axum::http::HeaderMap;
 
 /// T1 预筛:强信号立即定协议。
 /// - `Inference-Header-Content-Length` 存在(含 "0")→ Kserve(C9);
-/// - 未来批次 5:/v1/ 前缀 → OpenaiCompact(openai-compact 立项时加);
+/// - `/v1/` 前缀 → OpenaiCompact(批次 5:openai-compact 路径的 extractor
+///   期错误按 OpenAI 形状渲染——与 Legacy 同 renderer,协议上下文区分);
 /// - 其他 → None(T2 主判在 run_infer 边界)。
 pub(crate) fn t1_prefilter(path: &str, headers: &HeaderMap) -> Option<ApiProtocol> {
-    let _ = path; // 批次 5 /v1/ 前缀用
     if headers.contains_key(crate::http::handlers::INFERENCE_HEADER_CONTENT_LENGTH) {
         return Some(ApiProtocol::Kserve);
+    }
+    // 批次 5:/v1/ 前缀 → OpenaiCompact(/v1 路径的 extractor 期错误按
+    // OpenAI 形状渲染——与 Legacy 同 renderer,但协议上下文区分)。
+    if path.starts_with("/v1/") {
+        return Some(ApiProtocol::OpenaiCompact);
     }
     None
 }

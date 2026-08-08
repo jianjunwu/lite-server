@@ -345,6 +345,8 @@ pub mod health;
 pub use health::*;
 pub mod admin;
 pub use admin::*;
+pub mod openai_compact;
+pub use openai_compact::*;
 pub mod inference;
 pub use inference::*;
 pub mod custom_routes;

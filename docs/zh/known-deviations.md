@@ -32,6 +32,13 @@
 |---|---|---|
 | ⑧ | **SSE 自有格式 vs `generate_stream`** | `/events` 是自有格式（`data: chunk-N` + `data: [DONE]` 终止）；`generate_stream` 是 Triton 兼容通道（`data: <完整 JSON>` 逐 chunk，错误携带在事件内，结束即连接关闭——无 `[DONE]`）。两者并存不冲突；`/generate_stream` 随 `streaming+sse` 开关族，`/generate`（unary）无 gate。 |
 
-## 待追加（后续批次）
+## 批次 5（openai-compact）
 
-- 批次 6：`/v1/rerank` 不做（非 OpenAI API，KServe 自家扩展）。
+| # | 偏差 | 说明 |
+|---|---|---|
+| ⑨ | **`/v1/rerank` 不做** | 非 OpenAI API（KServe 自家扩展），openai-compact 仅 5 端点（chat/completions/embeddings/models/models/{model}）。 |
+| ⑩ | **翻译层在 worker 侧** | server 对 /v1 薄透传（仅解析 `model`/`stream` 用于路由与分流 + SSE 帧编码）；chat 请求解析 / completion·chunk·embeddings 构造在 worker 侧 helper `lite_server/helpers/openai.py`（chat→tensor 是模型语义，server 无法通用翻译）。 |
+
+## 后续批次
+
+- （无——批次 0-5 全部完成，本方案收尾。）
