@@ -1,4 +1,4 @@
-# KEDA ScaledObject for lite-server (see docs/keda.md / docs/zh/keda.md).
+# KEDA ScaledObject for lite-server (see docs/deployment.md).
 # Signal: liteserver_queue_depth (dispatch-queue backlog, per model/version).
 # Constraints (D35): minReplicaCount >= 1 (no scale-to-zero); slow scale-down
 # so long-lived streaming/bidi connections drain gracefully.

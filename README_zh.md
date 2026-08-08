@@ -10,22 +10,22 @@
   - [目录](#目录)
   - [为什么选 lite-server？](#为什么选-lite-server)
   - [快速开始](#快速开始)
-  - [架构](#架构)
-  - [与其他框架对比](#与其他框架对比)
-  - [性能基准](#性能基准)
   - [功能特性](#功能特性)
     - [推理模式](#推理模式)
     - [模型管理](#模型管理)
     - [自定义路由](#自定义路由)
     - [Worker 韧性](#worker-韧性)
+    - [流量与可靠性](#流量与可靠性)
+    - [安全](#安全)
     - [可观测性](#可观测性)
+    - [运维](#运维)
   - [安装](#安装)
     - [预编译 Wheel（推荐）](#预编译-wheel推荐)
     - [从源码编译](#从源码编译)
-  - [CLI 命令](#cli-命令)
   - [示例](#示例)
   - [API 端点](#api-端点)
   - [配置](#配置)
+  - [文档](#文档)
   - [常见问题](#常见问题)
   - [多平台支持](#多平台支持)
   - [开发](#开发)
@@ -67,61 +67,6 @@ curl -X POST http://localhost:8000/v2/models/my_model/infer \
 
 目前仅提供 `empty` 模板。使用 `--wizard` 进入交互式项目设置。
 
-## 架构
-
-```
-  HTTP/gRPC 请求
-        │
-        ▼
-  ┌─────────────────┐     ┌──────────────────┐
-  │   Rust 内核      │     │  Python Workers   │
-  │  (axum/tokio)    │────►│  (子进程)          │
-  │                  │ZMQ/ │                   │
-  │  ┌────────────┐  │Protobuf ┌─────────────┐│
-  │  │ 推理队列    │  │     │  │  model.py   │  │
-  │  │ (per model)│  │     │  │  (LitAPI)   │  │
-  │  └────────────┘  │     │  └─────────────┘  │
-  │  ┌────────────┐  │     └──────────────────┘
-  │  │ 指标 & 告警 │  │
-  │  └────────────┘  │
-  └─────────────────┘
-```
-
-Rust 内核处理所有 I/O（HTTP、gRPC、IPC、指标、文件监听），Python worker 负责模型推理。这种分离让你拥有 Rust 级别的吞吐和 Python 级别的简洁。
-
-详见 [docs/zh/architecture.md](docs/zh/architecture.md)。
-
-## 与其他框架对比
-
-| 维度 | lite-server | Triton | TorchServe | BentoML | Ray Serve |
-|------|------------|--------|------------|---------|-----------|
-| 语言 | Rust + Python | C++ | Java + Python | Python | Python |
-| 安装 | `pip install` | Docker | `pip install` / Docker | `pip install` | `pip install` |
-| 热重载 | 文件监听自动重载 | API 模型切换（不支持代码热重载） | 有限支持 | 不支持 | 不支持 |
-| 多版本 | 支持（激活/停用切换） | 支持 | 支持 | 手动管理 | 手动管理 |
-| Ensemble | DAG 并行分层执行 | 支持 | 不支持 | Pipeline | Deployment graph |
-| 异常检测 | Envoy 风格自动剔除 | 不支持 | 不支持 | 不支持 | 不支持 |
-| 心跳 + 自动重启 | ZMQ 探测，自动重启卡死 worker | 不支持 | 不支持 | 不支持 | 支持（Replica 健康检查 + 自动重启） |
-| 生命周期钩子 | Shell + HTTP 回调 | 不支持 | 不支持 | 支持（`on_startup`/`on_shutdown`） | 支持（`__init__`/`reconfigure`/`on_shutdown`） |
-| 流式输出 | SSE + WebSocket + gRPC | 支持（gRPC streaming） | 支持（HTTP streaming） | 支持 | 支持 |
-| 最小开销 | ~15MB | ~2GB+ | ~1.5GB+ | ~500MB+ | ~100MB+ |
-
-详见 [docs/zh/comparison.md](docs/zh/comparison.md)。
-
-## 性能基准
-
-> **注意：** 本机实测（macOS x86_64，i9-9980HK，16 核），零计算 echo 模型，HTTP 层对齐为单事件循环线程（`--threads 1`），2 workers / 64 并发，每配置 15s。完整矩阵与方法见 [docs/zh/benchmark.md](docs/zh/benchmark.md)。
-
-2 worker、64 并发，零计算 echo，HTTP 层对齐 `--threads 1`（lite-server 0.8.0rc2 vs LitServe 0.2.17，三侧同构）：
-
-| 服务器 | 吞吐量 | p99 延迟 |
-|--------|--------|---------|
-| lite-server | 6,788 req/s | 14.9 ms |
-| lite-server-core | 6,949 req/s | 12.0 ms |
-| LitServe | 2,978 req/s | 28.2 ms |
-
-lite-server（PyO3 嵌入）与原生 Rust 二进制持平（嵌入层零热路径开销），且约为 LitServe 的 2.3×（c≥16 区间 2.0–2.4×，同构零计算 echo）。完整矩阵与方法见 [docs/zh/benchmark.md](docs/zh/benchmark.md)。
-
 ## 功能特性
 
 ### 推理模式
@@ -129,14 +74,17 @@ lite-server（PyO3 嵌入）与原生 Rust 二进制持平（嵌入层零热路�
 - **标准 batching** — 请求聚合批量处理，提升 GPU 利用率
 - **Continuous batching** — LLM 专用，支持 prefill/step/has_finished 钩子
 - **流式输出** — 逐 token 输出，支持 SSE、WebSocket、gRPC
-- **Ensemble** — DAG 编排，多模型流水线并行执行
+- **Decoupled 流式** — gRPC `DecoupledInfer` 1:N 推送流，生命周期由模型控制（`predict_decoupled`）
+- **Ensemble** — DAG 编排，多模型流水线并行执行（HTTP 与 gRPC 一致）
 
 ### 模型管理
 
 - **Triton 风格仓库** — `model_name/version/model.py` 目录结构
 - **热重载** — 修改 model.py，服务器自动感知并重载
 - **多版本** — 独立加载、卸载、激活、停用
+- **金丝雀路由** — 按版本流量权重 + `x-lite-version` 请求固定（`canary_override`）
 - **加载策略** — `explicit`（手动指定）、`latest`（最新版本）、`all`（全部加载）
+- **模型预热** — 版本 Ready 前先跑虚拟推理（`policies.warmup`），带 `WarmingUp` 状态机
 - **模型打包** — `.lma` 格式，SHA256 + HMAC 签名验证
 - **模型上传/下载** — 通过 HTTP API 上传 `.lma` 包或原始文件，支持自动加载
 
@@ -157,13 +105,36 @@ lite-server（PyO3 嵌入）与原生 Rust 二进制持平（嵌入层零热路�
 - **生命周期钩子** — worker 就绪/退出/异常时触发 shell 命令或 HTTP 回调，便于告警和可观测
 - **单请求超时** — 硬超时防止卡死请求阻塞队列
 
+### 流量与可靠性
+
+- **过载保护** — 全局 `max_inflight` 上限以 `503 + Retry-After` 拒绝超量推理（健康检查与管理面保持可达）
+- **优先级队列** — `x-lite-priority` 请求头（数值越高越先调度）与 per-model `queue_timeout` + `reject` 动作
+- **请求截止时间** — `x-lite-timeout`（HTTP）/ `grpc-timeout` 约束等待；超时返回 `504`，并跨 ensemble DAG 传播
+- **序列粘性路由** — `x-sequence-id` 将客户端序列固定到单个 worker（`sequence_ttl_secs` / `max_sequences`；带负载均衡阈值的软固定）
+
+### 安全
+
+- **TLS / mTLS** — HTTP 与 gRPC 均支持 rustls TLS、客户端证书 mTLS、证书热轮换（文件轮询 + SIGHUP）
+- **端点访问控制** — 按类（admin / inference / health × http / grpc）配置 API key 或仅回环策略；admin 默认 fail-closed；常量时间密钥比较
+- **可信代理客户端 IP** — `trusted_proxies` 清洗 `X-Forwarded-For` / `X-Real-IP`；fail-safe 默认（忽略请求头）防止伪造 IP 绕过限流
+- **CORS + WebSocket Origin 门禁** — 全局或 per-model CORS（精确 Origin 匹配、`Vary: Origin`）；WS 握手时校验 Origin（不匹配返回 403）
+- **Admin API 认证** — 独立 admin 绑定（`grpc.admin_bind`，如 UDS）、API key 门禁、每个控制面变更的结构化审计日志
+
 ### 可观测性
 
 - **Prometheus 指标** — QPS、P50/P90/P99 延迟、队列深度、TTFT、batch 大小、worker 剔除数
 - **自定义指标** — 通过 `register_metric()` / `report_metric()` 从模型代码采集 Gauge、Counter、Histogram
+- **OpenTelemetry** — opt-in OTLP/gRPC 链路与指标 SDK（cargo `telemetry` feature + `telemetry.enabled`），W3C traceparent 桥接 worker
 - **时间线** — 每个模型的历史指标采样
 - **告警** — 内置异常检测告警规则
-- **结构化日志** — 基于 tracing 的日志，包含 model/worker 上下文
+- **结构化日志** — 基于 tracing 的日志，包含 model/worker 上下文；`lite_server::audit` 目标覆盖控制面变更
+
+### 运维
+
+- **Admin gRPC 服务** — 独立绑定上的 11 个 RPC（GetInfo、ListModels、Load/Unload/Reload、ActivateVersion、SetRouting、GetModelStats 等）
+- **Unix 域套接字** — HTTP（`server.host: unix:...`）与 gRPC（`grpc.host` / `grpc.admin_bind`），支持 `socket_mode` 控制
+- **KEDA / 自动扩缩容集成** — vLLM 兼容指标命名空间（`{ns}:total_queued_requests`、`kv_cache_utilization`）+ ScaledObject 配方
+- **优雅停机** — 排空在途请求、503 排空门禁、限窗强制刷出的遥测
 
 ## 安装
 
@@ -172,7 +143,7 @@ lite-server（PyO3 嵌入）与原生 Rust 二进制持平（嵌入层零热路�
 支持 Linux、macOS、Windows（x86_64 + aarch64），Python 3.10-3.14：
 
 ```bash
-pip install miraserver-<version>-py3-none-<platform>.whl
+pip install miraserver-<version>-cp310-abi3-<platform>.whl
 ```
 
 ### 从源码编译
@@ -184,22 +155,6 @@ pip install maturin
 maturin develop          # 开发构建
 maturin build --release  # 发布 wheel
 ```
-
-## CLI 命令
-
-```bash
-lite-server serve                     # 启动推理服务器
-lite-server serve --config server.yaml
-lite-server serve --port 9000 --max-requests 1000 --max-requests-jitter 100
-lite-server config-check server.yaml  # 校验配置
-lite-server benchmark --model my_model
-lite-server analyze --model my_model
-lite-server pack ./my_model --version 1
-lite-server unpack my_model_v1.lma
-lite-server init my_project           # 脚手架创建项目
-```
-
-详见 [docs/zh/cli.md](docs/zh/cli.md) 获取完整 CLI 参考手册。
 
 ## 示例
 
@@ -224,6 +179,13 @@ lite-server init my_project           # 脚手架创建项目
 | 15 | [callbacks](examples/15_callbacks/) | Python 回调管线（鉴权、缓存、校验、错误指标） |
 | 16 | [grpc](examples/16_grpc/) | gRPC 推理端点 |
 | 17 | [config_templates](examples/17_config_templates/) | 配置模板、环境变量、多环境 server.yaml |
+| 18 | [tls_mtls](examples/18_tls_mtls/) | TLS/mTLS + 证书热轮换 |
+| 19 | [canary](examples/19_canary/) | 金丝雀流量权重 + `x-lite-version` 固定 |
+| 20 | [overload_control](examples/20_overload_control/) | max_inflight、队列超时、优先级、截止时间 |
+| 21 | [admin_security](examples/21_admin_security/) | Admin gRPC 独立 UDS、访问控制、审计日志 |
+| 22 | [warmup](examples/22_warmup/) | 模型预热 + 就绪状态机 |
+| 23 | [advanced_routing](examples/23_advanced_routing/) | sequence_id 粘性 + DecoupledInfer 1:N |
+| 24 | [proxy_security](examples/24_proxy_security/) | 可信代理客户端 IP、CORS、WebSocket Origin 门禁 |
 
 详见 [examples/README.md](examples/README.md) 获取学习路径和使用说明。
 
@@ -288,40 +250,33 @@ model_repository:
   path: ./model_repo
 ```
 
-单模型配置（`model_repo/my_model/1/config.yaml`）：
+完整配置参考（服务器、模型、编排、CLI 参数）见
+[docs/zh/configuration.md](docs/zh/configuration.md)。单模型配置位于
+`model_repo/my_model/1/config.yaml`；模型开发指南见
+[docs/zh/model-authoring.md](docs/zh/model-authoring.md)。
 
-```yaml
-max_batch_size: 8
-batch_timeout: 0.01
-stream: false
-accelerator: cpu
-workers_per_device: 1
-request_timeout: 30.0
+## 文档
 
-# Worker 生命周期 — 自动重启 + 抖动 + 心跳 + 钩子
-max_requests: 500
-max_requests_jitter: 50
+完整文档集入口：[docs/index.md](docs/index.md)（英文权威版）。核心文档提供中文版：
 
-heartbeat_interval: 10.0
-heartbeat_timeout: 5.0
-heartbeat_max_failures: 3
-
-hooks:
-  on_ready: 'echo "Worker $WORKER_ID ready"'
-  on_error: 'curl -s -X POST http://alerts.internal/worker-error \
-    -d "{\"model\":\"$MODEL\",\"reason\":\"$REASON\"}"'
-```
-
-详见 [docs/zh/configuration.md](docs/zh/configuration.md) 获取完整配置参考（服务器、模型、编排、CLI 参数）。
-
-详见 [docs/zh/cli.md](docs/zh/cli.md) 获取完整 CLI 参考手册。
-
-详见 [docs/zh/model-authoring.md](docs/zh/model-authoring.md) 获取模型开发指南（LitAPI 接口、流式输出、continuous batching、最佳实践）。
+| 文档 | 内容 |
+|------|------|
+| [架构](docs/zh/architecture.md) | 系统设计、请求流程、Worker 模型 |
+| [配置参考](docs/zh/configuration.md) | 服务器 / 模型 / 编排配置、TLS、访问控制、CORS |
+| [模型开发指南](docs/zh/model-authoring.md) | LitAPI 接口、流式输出、continuous batching、最佳实践 |
+| [CLI 参考](docs/zh/cli.md) | 全部 CLI 命令与参数 |
+| [迁移指南](docs/zh/migration.md) | 破坏性变更与升级路径 |
+| [流式](docs/streaming.md) | 双向流式（WS `/stream`、h2 `/bidi`）、decoupled 流式（SSE `/decoupled`、WS `/decoupled-stream`） |
+| [协议兼容](docs/protocol.md) | Raw Bytes / Tensor 请求、Triton Binary 扩展、openai-compact、与 KServe V2 / Triton 的已知偏差 |
+| [可观测性](docs/observability.md) | Prometheus 指标参考、OpenTelemetry |
+| [部署](docs/deployment.md) | 优雅停机、滚动更新、KEDA 自动扩缩容 |
+| [基准](docs/benchmark.md) | 基准测试方法与结果 |
+| [对比](docs/comparison.md) | lite-server 与其他推理框架对比 |
 
 ## 常见问题
 
 **Q: lite-server 和 LitServe 有什么区别？**
-lite-server 用 Rust HTTP 内核（axum/tokio）替代了 Python 的 uvicorn，模型代码写法一样（兼容 LitAPI）。零计算 echo（纯框架开销、三侧同构）下，lite-server 与原生 Rust 二进制持平（PyO3 嵌入零开销），且约为 LitServe 的 2.0–2.4×（c≥16，单事件循环对齐）；1ms sleep 同负载下三方吞吐持平——见[性能基准](#性能基准)。
+lite-server 用 Rust HTTP 内核（axum/tokio）替代了 Python 的 uvicorn，模型代码写法一样（兼容 LitAPI）。零计算 echo（纯框架开销、三侧同构）下，lite-server 与原生 Rust 二进制持平（PyO3 嵌入零开销），且约为 LitServe 的 2.0–2.4×（c≥16，单事件循环对齐）；1ms sleep 同负载下三方吞吐持平——见 [docs/benchmark.md](docs/benchmark.md)。
 
 **Q: 需要 Docker 吗？**
 不需要。`pip install` 后直接运行。支持 Linux、macOS、Windows。
@@ -330,7 +285,7 @@ lite-server 用 Rust HTTP 内核（axum/tokio）替代了 Python 的 uvicorn，�
 `from lite_server import LitAPI` 适用于所有有 `setup` + `predict` 的模型。0.7.0 起为独立基类（不依赖 litserve），原生支持异步方法——把 `predict` 写成 `async def` 即可。
 
 **Q: 怎么部署多个模型？**
-每个模型放在 `model_repo/` 下独立目录，在 `server.yaml` 的 `orchestration` 段落中声明。详见 [examples/05_ensemble](examples/05_ensemble/)。
+每个模型放在 `model_repo/` 下独立目录，在 `server.yaml` 中声明。详见 [examples/05_ensemble](examples/05_ensemble/)。
 
 **Q: 怎么切换模型版本？**
 使用激活/停用 API：`POST /v2/models/{name}/versions/{v}/activate`。详见 [examples/04_multi_version](examples/04_multi_version/)。
@@ -342,12 +297,10 @@ Worker 会自动重启。正在处理的请求会自动重试到其他 worker（
 
 | 平台 | 架构 | Wheel Tag |
 |------|------|-----------|
-| Linux | x86_64 | manylinux2014_x86_64 |
-| Linux | aarch64 | manylinux2014_aarch64 |
-| macOS | x86_64 | macosx_10_12_x86_64 |
+| Linux | x86_64 | manylinux_2_28_x86_64 |
+| Linux | aarch64 | manylinux_2_28_aarch64 |
 | macOS | aarch64 (Apple Silicon) | macosx_11_0_arm64 |
 | Windows | x86_64 | win_amd64 |
-| Windows | aarch64 | win_arm64 |
 
 ## 开发
 
@@ -366,19 +319,20 @@ cd python && python -m pytest tests/
 ├── tests/            # Rust 集成测试
 ├── examples/         # 示例模型仓库
 ├── benchmarks/       # 性能基准测试
-├── docs/             # 文档
+├── docs/             # 文档（从 docs/index.md 开始）
+│   ├── index.md
 │   ├── architecture.md
-│   ├── benchmark.md
-│   ├── cli.md              # CLI 参考
-│   ├── comparison.md
 │   ├── configuration.md
-│   ├── cors-security-checklist.md
-│   ├── graceful-shutdown.md
-│   ├── keda.md
-│   ├── migration.md
+│   ├── cli.md
 │   ├── model-authoring.md
-│   ├── otel-observability.md
-│   └── zh/                 # 中文文档（同套）
+│   ├── migration.md
+│   ├── streaming.md
+│   ├── protocol.md
+│   ├── observability.md
+│   ├── deployment.md
+│   ├── benchmark.md
+│   ├── comparison.md
+│   └── zh/                 # 中文文档（核心集）
 └── Cargo.toml        # Rust 清单
 └── pyproject.toml    # Python 打包（maturin）
 ```

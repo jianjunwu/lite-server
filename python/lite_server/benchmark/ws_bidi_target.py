@@ -1,6 +1,6 @@
 """WS bidi transport target for benchmark engine (批次 2, plan §4.6 Phase 2).
 
-Maps the WS ``/stream`` bidi frame protocol (docs/http-bidi.md) onto the
+Maps the WS ``/stream`` bidi frame protocol (docs/streaming.md) onto the
 ``bidi_session`` IO contract: open = Text JSON first frame, chunks = Binary
 frames, close = Text ``{"type": "close"}``; S→C Binary = ``Data``, Text
 ``{"done": true}`` = ``Done``, ``{"error": ...}`` = ``Error``.

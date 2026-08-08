@@ -1,6 +1,6 @@
 """h2 bidi transport target for benchmark engine (批次 3 Part A, plan §7.1).
 
-Maps the HTTP/2 ``/bidi`` endpoint (docs/http-bidi.md) onto the
+Maps the HTTP/2 ``/bidi`` endpoint (docs/streaming.md) onto the
 ``bidi_session`` IO contract.  Framing is LPM (1B flag=0 + 4B BE length +
 ``BidiChunk`` protobuf); the client speaks prior-knowledge h2c (no upgrade
 negotiation, no TLS — benchmark tooling targets local servers).
@@ -34,7 +34,7 @@ from lite_server.benchmark.benchmark import (
 )
 from lite_server.proto import liteserver_pb2
 
-MAX_LPM_FRAME = 16 * 1024 * 1024  # 16 MiB (docs/http-bidi.md)
+MAX_LPM_FRAME = 16 * 1024 * 1024  # 16 MiB (docs/streaming.md)
 
 
 def encode_lpm(payload: bytes) -> bytes:

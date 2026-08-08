@@ -10,22 +10,22 @@ High-performance model inference server — Rust core for I/O, Python for infere
   - [Table of Contents](#table-of-contents)
   - [Why lite-server?](#why-lite-server)
   - [Quick Start](#quick-start)
-  - [Architecture](#architecture)
-  - [Comparison with Other Frameworks](#comparison-with-other-frameworks)
-  - [Benchmarks](#benchmarks)
   - [Features](#features)
     - [Inference Modes](#inference-modes)
     - [Model Management](#model-management)
     - [Custom Routes](#custom-routes)
     - [Worker Resilience](#worker-resilience)
+    - [Traffic & Reliability](#traffic--reliability)
+    - [Security](#security)
     - [Observability](#observability)
+    - [Operations](#operations)
   - [Installation](#installation)
     - [From Wheel (Recommended)](#from-wheel-recommended)
     - [From Source](#from-source)
-  - [CLI Commands](#cli-commands)
   - [Examples](#examples)
   - [API Endpoints](#api-endpoints)
   - [Configuration](#configuration)
+  - [Documentation](#documentation)
   - [FAQ](#faq)
   - [Multi-Platform](#multi-platform)
   - [Development](#development)
@@ -67,62 +67,6 @@ curl -X POST http://localhost:8000/v2/models/my_model/infer \
 ```
 
 Currently only the `empty` template is available. Use `--wizard` for interactive project setup.
-
-## Architecture
-
-```
-  HTTP/gRPC Request
-        │
-        ▼
-  ┌─────────────────┐     ┌──────────────────┐
-  │   Rust Core      │     │  Python Workers   │
-  │  (axum/tokio)    │────►│  (subprocesses)   │
-  │                  │ZMQ/ │                   │
-  │  ┌────────────┐  │Protobuf ┌─────────────┐│
-  │  │ Inference  │  │     │  │  model.py   │  │
-  │  │ Queue      │  │     │  │  (LitAPI)   │  │
-  │  └────────────┘  │     │  └─────────────┘  │
-  │  ┌────────────┐  │     └──────────────────┘
-  │  │ Metrics &  │  │
-  │  │ Alerts     │  │
-  │  └────────────┘  │
-  └─────────────────┘
-```
-
-The Rust core handles all I/O (HTTP, gRPC, IPC, metrics, file watching), while Python workers handle model inference. This separation gives you Rust-level throughput with Python-level simplicity.
-
-See [docs/architecture.md](docs/architecture.md) for details.
-
-## Comparison with Other Frameworks
-
-| Aspect | lite-server | Triton | TorchServe | BentoML | Ray Serve |
-|--------|------------|--------|------------|---------|-----------|
-| Language | Rust + Python | C++ | Java + Python | Python | Python |
-| Install | `pip install` | Docker | `pip install` / Docker | `pip install` | `pip install` |
-| Hot Reload | File watcher auto-reload | Model-swap via API (no code hot-reload) | Limited | No | No |
-| Multi-Version | Yes (activate/deactivate) | Yes | Yes | Manual | Manual |
-| Ensemble | DAG with parallel layers | Yes | No | Pipeline | Deployment graph |
-| Outlier Detection | Envoy-style auto-eject | No | No | No | No |
-| Heartbeat + Respawn | ZMQ probe, auto-restart hung workers | No | No | No | Yes (replica health check + auto-restart) |
-| Lifecycle Hooks | Shell + HTTP callbacks | No | No | Yes (`on_startup`/`on_shutdown`) | Yes (`__init__`/`reconfigure`/`on_shutdown`) |
-| Streaming | SSE + WebSocket + gRPC | Yes (gRPC streaming) | Yes (HTTP streaming) | Yes | Yes |
-| Min. Overhead | ~15MB | ~2GB+ | ~1.5GB+ | ~500MB+ | ~100MB+ |
-
-See [docs/comparison.md](docs/comparison.md) for detailed analysis.
-
-## Benchmarks
-
-> **Note:** Measured on a single workstation (macOS x86_64, i9-9980HK, 16 cores), zero-compute echo model, HTTP layers aligned to a single event-loop thread (`--threads 1`), 2 workers / 64 concurrency, 15s per config. See [docs/benchmark.md](docs/benchmark.md) for the full matrix and methodology.
-
-2-worker, 64-concurrency, zero-compute echo, HTTP layer aligned `--threads 1` (lite-server 0.8.0rc2 vs LitServe 0.2.17, three sides isomorphic):
-
-| Server | Throughput | p99 Latency |
-|--------|-----------|-------------|
-| lite-server | 6,788 req/s | 14.9 ms |
-| lite-server-core | 6,949 req/s | 12.0 ms |
-| LitServe | 2,978 req/s | 28.2 ms |
-
-lite-server (PyO3 embedding) matches the native Rust binary (the embedding layer adds zero hot-path overhead) and sustains ~2.3× LitServe (2.0–2.4× at c≥16, isomorphic zero-compute echo). Full matrix and methodology in [docs/benchmark.md](docs/benchmark.md).
 
 ## Features
 
@@ -213,22 +157,6 @@ maturin develop          # dev build
 maturin build --release  # release wheel
 ```
 
-## CLI Commands
-
-```bash
-lite-server serve                     # Start inference server
-lite-server serve --config server.yaml
-lite-server serve --port 9000 --max-requests 1000 --max-requests-jitter 100
-lite-server config-check server.yaml  # Validate config
-lite-server benchmark --model my_model
-lite-server analyze --model my_model
-lite-server pack ./my_model --version 1
-lite-server unpack my_model_v1.lma
-lite-server init my_project           # Scaffold new project
-```
-
-See [docs/cli.md](docs/cli.md) for the full CLI reference.
-
 ## Examples
 
 See [examples/](examples/) for runnable model repositories:
@@ -261,25 +189,6 @@ See [examples/](examples/) for runnable model repositories:
 | 24 | [proxy_security](examples/24_proxy_security/) | Trusted-proxy client IP, CORS, WebSocket Origin gate |
 
 See [examples/README.md](examples/README.md) for learning path and usage details.
-
-## Documentation
-
-| Doc | Covers |
-|-----|--------|
-| [Configuration](docs/configuration.md) ([中文](docs/zh/configuration.md)) | Full server / model / orchestration config reference |
-| [Model Authoring](docs/model-authoring.md) ([中文](docs/zh/model-authoring.md)) | LitAPI interface, streaming, continuous batching, best practices |
-| [CLI Reference](docs/cli.md) ([中文](docs/zh/cli.md)) | All CLI commands and flags |
-| [Architecture](docs/architecture.md) ([中文](docs/zh/architecture.md)) | System design, request flow, worker model |
-| [HTTP Bidirectional Streaming](docs/http-bidi.md) ([中文](docs/zh/http-bidi.md)) | WS `/stream` bidi frames, h2 `/bidi` endpoint (LPM, client requirements) |
-| [HTTP Decoupled Streaming](docs/http-decoupled.md) ([中文](docs/zh/http-decoupled.md)) | SSE `/decoupled` + WS `/decoupled-stream` (model-driven streams, control frames) |
-| [Observability / OpenTelemetry](docs/otel-observability.md) | OTLP traces + metrics, sampling, baggage allowlist |
-| [Metrics Reference](docs/metrics.md) ([中文](docs/zh/metrics.md)) | Streaming request-level metrics, label semantics, bucket changes, gating matrix (0.8.3) |
-| [CORS Security Checklist](docs/cors-security-checklist.md) | CORS resolution rules and why each exists |
-| [Graceful Shutdown](docs/graceful-shutdown.md) | Drain semantics, signal handling, telemetry flush |
-| [KEDA Autoscaling](docs/keda.md) | vLLM-compatible metrics + ScaledObject for LLM autoscalers |
-| [Migration Guide](docs/migration.md) | 0.6.x → 0.7.x breaking changes, item by item |
-| [Benchmarks](docs/benchmark.md) | Benchmark methodology and results |
-| [Comparison](docs/comparison.md) | lite-server vs other serving frameworks |
 
 ## API Endpoints
 
@@ -342,40 +251,33 @@ model_repository:
   path: ./model_repo
 ```
 
-Per-model config (`model_repo/my_model/1/config.yaml`):
+The full configuration reference (server, model, orchestration, CLI flags) is in
+[docs/configuration.md](docs/configuration.md). Per-model config lives in
+`model_repo/my_model/1/config.yaml`; the model authoring guide is in
+[docs/model-authoring.md](docs/model-authoring.md).
 
-```yaml
-max_batch_size: 8
-batch_timeout: 0.01
-stream: false
-accelerator: cpu
-workers_per_device: 1
-request_timeout: 30.0
+## Documentation
 
-# Worker lifecycle — auto-restart + jitter + heartbeat + hooks
-max_requests: 500
-max_requests_jitter: 50
+Full documentation set, indexed in [docs/index.md](docs/index.md):
 
-heartbeat_interval: 10.0
-heartbeat_timeout: 5.0
-heartbeat_max_failures: 3
-
-hooks:
-  on_ready: 'echo "Worker $WORKER_ID ready"'
-  on_error: 'curl -s -X POST http://alerts.internal/worker-error \
-    -d "{\"model\":\"$MODEL\",\"reason\":\"$REASON\"}"'
-```
-
-See [docs/configuration.md](docs/configuration.md) for the full configuration reference (server, model, orchestration, CLI flags).
-
-See [docs/cli.md](docs/cli.md) for the complete CLI reference.
-
-See [docs/model-authoring.md](docs/model-authoring.md) for the complete model authoring guide (LitAPI interface, streaming, continuous batching, best practices).
+| Doc | Covers |
+|-----|--------|
+| [Architecture](docs/architecture.md) ([中文](docs/zh/architecture.md)) | System design, request flow, worker model |
+| [Configuration](docs/configuration.md) ([中文](docs/zh/configuration.md)) | server / model / orchestration config, TLS, access control, CORS |
+| [Model Authoring](docs/model-authoring.md) ([中文](docs/zh/model-authoring.md)) | LitAPI interface, streaming, continuous batching, best practices |
+| [CLI Reference](docs/cli.md) ([中文](docs/zh/cli.md)) | All CLI commands and flags |
+| [Streaming](docs/streaming.md) | Bidirectional streaming (WS `/stream`, h2 `/bidi`), decoupled streaming (SSE `/decoupled`, WS `/decoupled-stream`) |
+| [Protocol Compatibility](docs/protocol.md) | Raw bytes / tensor requests, Triton Binary extension, openai-compact, known deviations from KServe V2 / Triton |
+| [Observability](docs/observability.md) | Prometheus metrics reference, OpenTelemetry |
+| [Deployment](docs/deployment.md) | Graceful shutdown, rolling updates, KEDA autoscaling |
+| [Migration Guide](docs/migration.md) ([中文](docs/zh/migration.md)) | Breaking changes and upgrade paths |
+| [Benchmarks](docs/benchmark.md) | Benchmark methodology and results |
+| [Comparison](docs/comparison.md) | lite-server vs other serving frameworks |
 
 ## FAQ
 
 **Q: How is lite-server different from LitServe?**
-lite-server uses a Rust HTTP core (axum/tokio) instead of Python's uvicorn, with the same LitAPI-compatible model code. Under zero-compute echo (pure framework overhead, three sides isomorphic), lite-server matches the native lite-server-core binary (PyO3 embedding adds zero overhead) and sustains ~2.0–2.4× LitServe at c≥16 (single event loop, aligned); under a 1ms-sleep workload all three converge — see [Benchmarks](#benchmarks).
+lite-server uses a Rust HTTP core (axum/tokio) instead of Python's uvicorn, with the same LitAPI-compatible model code. Under zero-compute echo (pure framework overhead, three sides isomorphic), lite-server matches the native lite-server-core binary (PyO3 embedding adds zero overhead) and sustains ~2.0–2.4× LitServe at c≥16 (single event loop, aligned); under a 1ms-sleep workload all three converge — see [docs/benchmark.md](docs/benchmark.md).
 
 **Q: Do I need Docker?**
 No. `pip install` and run directly. Works on Linux, macOS, and Windows.
@@ -422,19 +324,20 @@ cd python && python -m pytest tests/
 ├── tests/            # Rust integration tests
 ├── examples/         # Example model repositories
 ├── benchmarks/       # Performance benchmarks
-├── docs/             # Documentation
+├── docs/             # Documentation (start at docs/index.md)
+│   ├── index.md
 │   ├── architecture.md
-│   ├── benchmark.md
-│   ├── cli.md              # CLI reference
-│   ├── comparison.md
 │   ├── configuration.md
-│   ├── cors-security-checklist.md
-│   ├── graceful-shutdown.md
-│   ├── keda.md
-│   ├── migration.md
+│   ├── cli.md
 │   ├── model-authoring.md
-│   ├── otel-observability.md
-│   └── zh/                 # Chinese docs (same set)
+│   ├── migration.md
+│   ├── streaming.md
+│   ├── protocol.md
+│   ├── observability.md
+│   ├── deployment.md
+│   ├── benchmark.md
+│   ├── comparison.md
+│   └── zh/                 # Chinese docs (core set)
 └── Cargo.toml        # Rust manifest
 └── pyproject.toml    # Python packaging (maturin)
 ```

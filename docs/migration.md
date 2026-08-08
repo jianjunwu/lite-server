@@ -285,5 +285,5 @@ switch to a Text frame (`ws.send(JSON.stringify(payload))` in browsers,
 Related 0.8.3 additions (non-breaking): h2 bidi validates `open.initial_data`
 JSON at the edge (400 instead of a worker-side failure — raw content types
 skip validation), and ensemble models accept a raw-bytes root input (see
-[Raw Bytes / Tensor Request](raw-bytes-request.md) → *Ensemble Models*).
+[Raw Bytes / Tensor Request](protocol.md) → *Ensemble Models*).
 

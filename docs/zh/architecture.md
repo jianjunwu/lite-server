@@ -491,7 +491,7 @@ lite-server 通过 `orchestration.control_mode` 控制模型版本的生命周�
   头）。admin 端点跳过（不面向浏览器）。
 - **Origin 匹配**为精确匹配（规范化后：scheme/host 小写、去默认端口），子域通配
   （`*.example.com`）为显式 opt-in。禁反射、禁 `null`、禁后缀混淆——见
-  [安全清单](./cors-security-checklist.md)。
+  [CORS 安全规则](./configuration.md#cors)。
 - **预检**（`OPTIONS` + `Access-Control-Request-Method`）仅当 Origin 命中时短路返回
   `204` + CORS 头。中间件挂在 **access_control 外**（D21），故预检不触发鉴权（预检不带
   凭证），且在 observability 内，故 `204` 带 `x-request-id`。

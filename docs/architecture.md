@@ -506,7 +506,7 @@ request path at runtime, which a statically-mounted `CorsLayer` cannot do.
 - **Origin matching** is exact (after normalization: lowercase scheme/host,
   default port stripped), with opt-in subdomain wildcards (`*.example.com`).
   No reflection, no `null`, no suffix confusion — see the
-  [security checklist](./cors-security-checklist.md).
+  [CORS security rules](./configuration.md#cors).
 - **Preflight** (`OPTIONS` + `Access-Control-Request-Method`) short-circuits with
   `204` + CORS headers only when the Origin is allowed. The middleware is mounted
   **outside** `access_control` (D21), so a preflight never triggers

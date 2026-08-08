@@ -240,6 +240,6 @@ Text 帧（浏览器用 `ws.send(JSON.stringify(payload))`,tungstenite 用
 
 0.8.3 的相关新增（非破坏）:h2 bidi 在边界校验 `open.initial_data` 的
 JSON（400 取代 worker 侧报错——原始字节类 content type 跳过校验）;
-ensemble 模型接受原始字节根输入（见[原始字节 / Tensor 请求](raw-bytes-request.md)
+ensemble 模型接受原始字节根输入（见[原始字节 / Tensor 请求](../protocol.md)
 的 *Ensemble 模型* 一节）。
 

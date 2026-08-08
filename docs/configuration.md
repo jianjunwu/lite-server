@@ -23,38 +23,38 @@ server:
                                # startup. Corrupt-file tolerant; delete the file to reset.
   graceful_timeout: 30.0       # Max seconds to wait for in-flight requests during shutdown
   keepalive_timeout: 5.0       # HTTP keep-alive timeout (seconds), 0 = disable
-  compression: false           # gzip HTTP responses (P1-4); SSE excluded, WS unaffected
-  socket_mode: 0o666           # chmod for a unix: UDS host (P4-1). The HTTP UDS also serves
+  compression: false           # gzip HTTP responses; SSE excluded, WS unaffected
+  socket_mode: 0o666           # chmod for a unix: UDS host. The HTTP UDS also serves
                                # admin, so on multi-tenant hosts set 0o600 (owner-only).
   # TLS/mTLS (see "TLS / mTLS" section below) — all optional, off by default
   tls_cert_path: null          # Server certificate chain PEM; requires tls_key_path
   tls_key_path: null           # Server private key PEM; requires tls_cert_path
   mtls_ca_path: null           # Client CA bundle PEM; when set, client certs are REQUIRED (mTLS)
   tls_min_version: null        # "1.2" (default) or "1.3"
-  # sequence_id sticky routing (P8-1) — opt-in per request via x-sequence-id /
+  # sequence_id sticky routing — opt-in per request via x-sequence-id /
   # the gRPC sequence_id field; absence leaves routing exactly as before.
   sequence_ttl_secs: 3600.0    # Seconds a sequence_id→worker mapping is kept after last use
   max_sequences: 65536         # Upper bound on tracked sequence_id entries (approx LRU)
-  balance_abs_threshold: 2     # B2: abandon a sticky worker once its in-flight exceeds the
+  balance_abs_threshold: 2     # Abandon a sticky worker once its in-flight exceeds the
                                # least-loaded by this many (SGLang --balance-abs-threshold; 0 = off)
-  balance_rel_threshold: 1.5   # B2: relative complement (...* multiplier; 0.0 = off)
-  decoupled_idle_timeout_secs: 300.0  # P9-1: idle timeout (s) for a DecoupledInfer stream — no
+  balance_rel_threshold: 1.5   # Relative complement (...* multiplier; 0.0 = off)
+  decoupled_idle_timeout_secs: 300.0  # Idle timeout (s) for a DecoupledInfer stream — no
                                # chunk within this window → server closes + cancels the worker.
                                # 0 = disabled (stream lives until model close / client cancel)
-  # P-FLOW overload protection (§4.0.9) — all default-off, behaviour unchanged
+  # Overload protection — all default-off, behaviour unchanged
   max_inflight: 0             # Global in-flight inference cap. >0 → inference beyond this concurrent
                                # count is rejected 503 / gRPC Unavailable + Retry-After. Health/admin
                                # endpoints are exempt (probes stay reachable). 0 = unlimited.
   max_request_body_bytes: 67108864 # Per-request body cap (bytes). Oversized → HTTP 413 / gRPC
                                # ResourceExhausted. Default 64 MiB; null = platform default
                                # (axum 2MB / tonic 4MB). Memory budget: value × in-flight requests.
-  # P-XFF trusted-proxy client-IP cleansing — fail-safe by default.
+  # Trusted-proxy client-IP cleansing — fail-safe by default.
   trusted_proxies: []          # CIDRs/IPs of fronting proxies whose X-Forwarded-For /
                                # X-Real-IP are honored. Empty (default) = the direct TCP peer is
                                # always used and client proxy headers are IGNORED (prevents forged-
                                # IP rate-limit bypass). List your gateway/proxy here for its
                                # forwarded client IPs to reach key=ip rate-limiting.
-  # P-CORS global CORS policy (applied when no per-model policies.cors matches, and
+  # Global CORS policy (applied when no per-model policies.cors matches, and
   # to non-model routes). null (default) = CORS pass-through (no headers attached).
   # Same shape as the per-model policies.cors (allow_origins/methods/headers,
   # expose_headers, allow_credentials, max_age_secs).
@@ -72,16 +72,16 @@ logging:
 grpc:
   enabled: true                # Enable gRPC server
   host: null                   # gRPC bind host; null = follow server.host ("unix:/path" = UDS)
-  # P7-2: separate bind for the LiteAdmin service only. UDS recommended — a UDS
+  # Separate bind for the LiteAdmin service only. UDS recommended — a UDS
   # admin socket is created owner-only (0o600) by default.
   admin_bind: null             # e.g. unix:/var/run/lite-admin.sock or 127.0.0.1:9001
   http2_keepalive_interval_secs: null  # HTTP/2 PING interval; null = disabled
   http2_keepalive_timeout_secs: null   # PING ack timeout (needs the interval set)
   http2_adaptive_window: false         # BDP-adaptive HTTP/2 flow-control window
   http2_max_frame_size: null           # Max HTTP/2 frame payload (bytes); null = tonic default
-  response_compression: false          # gzip gRPC responses (P1-3); inference service only
+  response_compression: false          # gzip gRPC responses; inference service only
   reflection: false                    # gRPC server reflection (opt-in): grpcurl/grpcui service discovery; carries the Admin access class (fail-closed to loopback unless access_control admin is configured)
-  socket_mode: 0o666                   # chmod for a unix: gRPC UDS (P4-1)
+  socket_mode: 0o666                   # chmod for a unix: gRPC UDS
   # TLS/mTLS — same semantics as the server.* TLS keys, applied to the gRPC listener
   tls_cert_path: null          # Server certificate chain PEM; requires tls_key_path
   tls_key_path: null           # Server private key PEM; requires tls_cert_path
@@ -90,7 +90,7 @@ grpc:
 
 metrics:
   enabled: true                # Enable Prometheus metrics endpoint
-  # GIE/EPP-compatible metric namespace (P2-1, D32): exposes
+  # GIE/EPP-compatible metric namespace: exposes
   # {namespace}:total_queued_requests / {namespace}:kv_cache_utilization on /metrics
   # (vllm-compatible naming for the Kubernetes LLM-autoscaler ecosystem).
   # Invalid namespaces fail fast at startup.
@@ -105,7 +105,7 @@ model_repository:
   path: ./model_repo           # Path to the model repository directory
 
 features:
-  # P5-2 breaking (migration M3): honor the x-lite-version canary-pin request
+  # Breaking (migration M3): honor the x-lite-version canary-pin request
   # header. Default false = the header is IGNORED (clients cannot pin themselves
   # onto canary versions). Enable only in gray/debug environments.
   canary_override: false
@@ -183,11 +183,11 @@ Rules enforced at startup:
 - The `metrics_port` listener stays **plaintext and unauthenticated** — bind it to an internal network or loopback. With TLS enabled, the main port's Prometheus/probe/internal clients must use HTTPS (ALPN includes `http/1.1` for simple clients).
 - The server warns at startup if the private key file is group/world-readable (`chmod 600` recommended); this is a warning, not a failure, to allow group-based deployments.
 
-## Access Control (P7-1)
+## Access Control
 
 Endpoint classes: `admin` (HTTP `/admin/*` + gRPC LiteAdmin service), `inference`, `health`. `admin` / `inference` are configured per protocol (`http` / `grpc`); `health` takes a single shorthand applied to both.
 
-- **Defaults (fail-closed admin)**: unconfigured `admin` → **loopback only** (UDS counts as loopback); unconfigured `inference` / `health` → public. P7-1 breaking — see [migration.md](migration.md) M4.
+- **Defaults (fail-closed admin)**: unconfigured `admin` → **loopback only** (UDS counts as loopback); unconfigured `inference` / `health` → public. Breaking change — see [migration.md](migration.md) M4.
 - **Modes** (`mode` tag): `public` (explicitly open — the escape hatch) or `key` (API key: `key` = header name; secret from `value` / `value_env` / `value_file`, first present wins, resolved at startup — a missing source fails fast).
 - Key comparison is constant-time. Denials: HTTP 401 / gRPC Unauthenticated. The `metrics_port` listener is not covered — scrape Prometheus there.
 
@@ -203,9 +203,77 @@ access_control:
 
 Per-model `policies.auth` is independent and stacks after this endpoint-level control.
 
-## Telemetry / OpenTelemetry (P-TRACE)
+## CORS
 
-Full OpenTelemetry tracing + metrics SDK, exported over **OTLP/gRPC**. Two-level opt-in: a build-time cargo feature (`--features telemetry`) and a runtime switch (`telemetry.enabled`, default `false` → zero overhead). Both off ⇒ no OTel layer, no propagator, no exporter; the server behaves exactly as without OTel. Trace context reaches the Python worker via the existing `RequestMeta.headers` map (W3C `traceparent`/`tracestate`/`baggage`) — the worker reads it to correlate but creates no span (Rust-only; see [docs/otel-observability.md](otel-observability.md)).
+Configured globally via `server.cors` or per model via `policies.cors` (per-model
+overrides the global policy; omitting it falls back to `server.cors`, and `null`
+defaults to pass-through — no headers attached). CORS is **not**
+`tower-http::cors`: per-model policy override requires resolving the model from
+the path at request time, which a statically-mounted `CorsLayer` cannot do. The
+middleware resolves the effective policy (per-model → global) and applies the
+rules below.
+
+```yaml
+server:
+  cors:
+    allow_origins: ["https://example.com"]  # exact match; "*" = any; "*.example.com" = subdomain wildcard
+    allow_methods: ["GET", "POST"]
+    allow_headers: ["Content-Type", "Authorization"]
+    expose_headers: ["x-request-id", "x-processing-time-ms"]  # response headers visible to JS
+    allow_credentials: false     # true → ACAC: true; forbidden with "*"
+    max_age_secs: 7200           # preflight cache (s); Chrome caps at 7200
+```
+
+Eight security properties are enforced:
+
+1. **Exact Origin match** — `Origin` is matched exactly against the configured
+   `allow_origins` after normalization (lowercase scheme/host, default port
+   stripped). No fuzzy matching.
+2. **No reflection** — `Access-Control-Allow-Origin` is never set to the
+   request's raw `Origin` as an echo. It is set only to (a) a configured origin
+   that the request matched, or (b) the literal `*`. An unconfigured origin
+   gets **no** ACAO.
+3. **Reject `null`** — An `Origin: null` header (sandboxed iframes, `file://`,
+   data URIs) is treated as no origin — no CORS headers are attached.
+4. **No suffix confusion** — `https://evil-example.com` does not match
+   `https://example.com`, and `https://a.notexample.com` does not match
+   `https://*.example.com`. Subdomain wildcards (`*.example.com`) require a
+   leading label (`a.example.com`) and never match the apex (`example.com`).
+5. **Credentials + `*` rejected** — When `allow_credentials: true`, a wildcard
+   `*` origin is **not** reflected — no ACAO is emitted (browsers forbid
+   `Access-Control-Allow-Origin: *` together with
+   `Access-Control-Allow-Credentials: true`). Configure explicit origins.
+6. **`Vary: Origin` always** — Every CORS-relevant response carries
+   `Vary: Origin` (preflight additionally carries
+   `Vary: Access-Control-Request-Method` / `-Headers`) so a shared cache does
+   not serve a response obtained for one Origin to a different Origin.
+7. **Preflight validates method + headers** — A preflight (`OPTIONS` +
+   `Access-Control-Request-Method`) attaches CORS headers **only** when the
+   Origin is allowed; the allowed methods/headers are advertised from the
+   policy (the browser enforces the request method/headers against them). A
+   non-qualifying preflight returns 204 with no CORS headers.
+8. **`max_age` ≤ 7200** — `max_age_secs` defaults to 7200 — Chrome's cap on
+   the preflight cache. Values above it are clamped by the browser anyway;
+   configure ≤ 7200.
+
+**Layering** — the CORS middleware is mounted **outside** access control: a
+preflight `OPTIONS` short-circuits with 204 before authentication runs
+(preflight carries no credentials). It is inside observability so the 204
+carries `x-request-id`.
+
+**WebSocket** — Browsers send no preflight and do not enforce ACAO on a
+WebSocket handshake, so the CORS middleware cannot stop cross-site WebSocket
+hijacking (CSWSH). The WS upgrade handler independently checks `Origin` against
+the same engine (`ws_origin_allowed`). When no CORS policy is configured, WS
+security relies entirely on access-control key authentication.
+
+**Admin endpoints** — Admin-class endpoints are not browser-facing; the CORS
+middleware skips them (no ACAO attached). Configure a global `server.cors`
+policy only if you need cross-origin admin access.
+
+## Telemetry / OpenTelemetry
+
+Full OpenTelemetry tracing + metrics SDK, exported over **OTLP/gRPC**. Two-level opt-in: a build-time cargo feature (`--features telemetry`) and a runtime switch (`telemetry.enabled`, default `false` → zero overhead). Both off ⇒ no OTel layer, no propagator, no exporter; the server behaves exactly as without OTel. Trace context reaches the Python worker via the existing `RequestMeta.headers` map (W3C `traceparent`/`tracestate`/`baggage`) — the worker reads it to correlate but creates no span (Rust-only; see [observability.md](observability.md)).
 
 ```yaml
 telemetry:
@@ -220,7 +288,7 @@ telemetry:
   export_interval_millis: 5000
   max_queue_size: 2048
   metrics_enabled: false               # OTel metrics SDK overlay (C4 exemplars).
-  exemplars_enabled: false             # (reserved) exemplar filter — see otel-observability.md.
+  exemplars_enabled: false             # (reserved) exemplar filter — see observability.md.
   # Inbound W3C baggage is untrusted (M6): only allowlisted keys are kept and
   # forwarded to workers. Default [] = drop ALL inbound baggage.
   baggage_allowlist: []                # e.g. ["tenant", "experiment"]
@@ -259,7 +327,7 @@ devices: null                  # Device assignment (null = auto, or integer like
 workers_per_device: null       # Workers per device (null = 1)
 max_queue_size: 1000           # Max pending requests per worker
 request_timeout: 0.0           # Per-request hard timeout in seconds (0 = disabled)
-# P-FLOW B1 (§4.0.9) — overload queue control. Per request, set the
+# Overload queue control. Per request, set the
 # `x-lite-priority` header (integer; higher = dispatched first, default 0).
 queue_timeout_secs: 0.0        # Max seconds a request may wait in the queue before
                                # queue_timeout_action applies (0 = disabled, default).
@@ -309,7 +377,7 @@ hot_reload_patterns:           # Glob patterns to watch
 policies:
   auth: { header: "X-API-Key", keys: ["${API_KEYS}"] }  # ${VAR} = env var; empty keys = any non-empty value
   rate_limit: { requests_per_minute: 60, key: ip, burst: 100 }  # key: "route" | "ip"
-  cors:                          # P-CORS per-model policy (overrides server.cors). Omit = fall back to global.
+  cors:                          # Per-model policy (overrides server.cors). Omit = fall back to global.
     allow_origins: ["https://example.com"]  # exact match; "*" = any; "*.example.com" = subdomain wildcard
     allow_methods: ["GET", "POST"]
     allow_headers: ["Content-Type", "Authorization"]
@@ -317,7 +385,7 @@ policies:
     allow_credentials: false     # true → ACAC: true; forbidden with "*"
     max_age_secs: 7200           # preflight cache (s); Chrome caps at 7200
   request_log: {}                # Access log: method, path, status, elapsed
-  warmup:                        # P-WARM: warm the engine before serving (default off)
+  warmup:                        # Warm the engine before serving (default off)
     enabled: true                #   false = version goes straight to Ready (no behavior change)
     samples:                     #   dummy inputs, consumed in order — one file per input
                                  #   shape/batch (M7; legacy dummy_input_ref/iterations removed)

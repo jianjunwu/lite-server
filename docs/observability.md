@@ -1,0 +1,171 @@
+# Observability
+
+Prometheus endpoint: `GET /metrics` (with an optional OpenTelemetry overlay
+when `telemetry.metrics_enabled` is on). This document covers the metrics
+reference and the OpenTelemetry integration.
+
+- [Metrics Reference](#metrics-reference)
+- [OpenTelemetry](#opentelemetry)
+
+## Metrics Reference
+
+Streaming request-level metrics were added in 0.8.3. This section records
+the metrics, the label semantics, the bucket changes, and the semantic notes
+— the authoritative review record for the label whitelist.
+
+### Request-level metrics
+
+| Metric | Labels | Notes |
+|---|---|---|
+| `liteserver_requests_total` | `model, version, status` | **Not** gated by `features.streaming_metrics`. HTTP streaming (SSE/WS/h2-bidi) now records close-point and early-rejection. Disconnected streams keep `2xx` + a separate cancel counter. |
+| `liteserver_request_duration_seconds` | `model, version` | Buckets extended with `30/60/120` — minute-scale stream durations no longer fall into `+Inf`. **Semantics:** with streaming counted, this histogram mixes unary and stream e2e durations; long streams dominate the tail. Same for `/metrics/timeline` p99 and Admin `GetModelStats.avg_duration_ms`. |
+| `lite_server_http_request_body_bytes` | `content_type, route` | HTTP request body size histogram. `content_type` = `json` \| `raw` \| `triton_binary` — `triton_binary` covers Triton Binary Tensor Data Extension requests (`Inference-Header-Content-Length` > 0). `route` = matched-path pattern. Buckets 1 KB–256 MB. |
+
+### Streaming metrics
+
+All `liteserver_stream_*` metrics below are gated by
+`features.streaming_metrics`, except `liteserver_requests_total`.
+
+| Metric | Labels | Notes |
+|---|---|---|
+| `liteserver_streaming_connections` | `model, version, protocol` | Existing gauge (`protocol`: `sse`/`websocket`/`http2`/`grpc`). |
+| `liteserver_streaming_ttft_seconds` | `model, version, protocol` | Buckets extended with `5/10/30/60` — cold-start TTFT > 2.5 s no longer lands in `+Inf`. |
+| `liteserver_streaming_tbt_seconds` | `model, version, protocol` | Buckets extended with `1/2.5/5` — slow decode gaps no longer land in `+Inf`. |
+| `liteserver_streaming_chunks_total` | `model, version, protocol` | Existing counter. |
+| `liteserver_stream_cancelled_total` | `model, version, protocol` | Client-interrupted streams. Disconnect keeps `requests_total{2xx}`; this counter carries the distinction. |
+| `liteserver_stream_errors_total` | `model, version, stream_kind, kind` | Stream errors. `kind` is a closed enum: `worker_error`/`deadline`/`idle`/`protocol`/`panic` (panic reachable via WS writer only). `cancel`/`done`/`worker_eof` do not count. |
+| `liteserver_stream_duration_seconds` | `model, version, stream_kind` | Stream open→close duration. Buckets `0.1/0.5/1/2.5/5/10/30/60/120/300`. |
+| `liteserver_stream_output_bytes_total` | `model, version, stream_kind` | Σ output chunk bytes, accumulated per chunk, reported at close. |
+
+#### `protocol` vs `stream_kind`
+
+New streaming metrics carry the `stream_kind` label — a closed 6-value enum:
+`sse` / `ws` / `http2` / `grpc_stream` / `grpc_bidi` / `grpc_decoupled`.
+Existing `protocol` label values are **unchanged** — existing queries
+preserve their meaning. The `stream_kind` and `kind` labels are closed
+enums, reviewed together with the `worker_id` label on
+`liteserver_worker_inference_total`. The close-log `reason` field is a
+**log field, not a metric label**.
+
+### OTel mirror
+
+`liteserver.request.duration` existed already; streaming mirrors are added:
+
+| OTel metric | Attribute | Mirrors |
+|---|---|---|
+| `liteserver.stream.ttft` | `protocol` | `streaming_ttft_seconds` |
+| `liteserver.stream.tbt` | `protocol` | `streaming_tbt_seconds` |
+| `liteserver.stream.duration` | `stream_kind` | `stream_duration_seconds` |
+| `liteserver.stream.chunks` | `protocol` | `streaming_chunks_total` |
+
+Double gating: an OTel streaming mirror is emitted only when
+`features.streaming_metrics` **and** `telemetry.metrics_enabled` are both on
+(the call sites live inside the Prometheus `record_stream_*` functions, which
+inherit the former; the OTel meter is a no-op when the latter is off).
+
+### Access log semantics
+
+`access_log_middleware` measures time to the handler response — for SSE/WS
+streams that is **first-byte time** (headers), not stream duration. Stream
+durations are visible via `liteserver_stream_duration_seconds` and the
+structured stream lifecycle logs (`stream opened` / `stream closed` with
+`reason` from the `StreamCloseReason` enum plus per-stream
+`chunks`/`output_bytes`/`duration_secs`, `stream ended with error`,
+`stream cancelled by client`). Access-log latency for streaming should be
+read as first-byte time.
+
+### `tokens_generated` semantics
+
+Python workers report `tokens_generated` in the Done-frame `Metrics` —
+an **approximation** equal to the per-stream output chunk count (no worker-side
+tokenizer; exact counting is a follow-up item). It is carried as a parameter
+to `collect_metrics`, **not** through the shared per-worker `_metric_values`
+channel, so concurrent streams cannot cross-contaminate. Unary paths do not
+fill it (no chunk concept). Zero-chunk streams report 0 and the Rust
+`> 0` guard keeps `lite_server_tokens_generated_total` unexposed.
+
+`prefill_ms` / `decode_ms` are **not** filled by the worker in this release:
+prefill's TTFT口径 differs from the Rust-side TTFT (two conflicting numbers),
+and decode includes downstream backpressure (ZMQ HWM blocking inflates the
+worker-side window). Both move to the tokenizer follow-up item together with
+exact token counting.
+
+## OpenTelemetry
+
+Full OpenTelemetry tracing + metrics SDK, exported over **OTLP/gRPC**, for
+the Rust core of lite-server. W3C traceparent propagates across the
+gateway→server→worker boundary, tracing spans are bridged to OTel, and an
+exemplar-ready metrics overlay is provided.
+
+### Rust-only boundary
+
+Trace context reaches the Python worker via the existing `RequestMeta.headers`
+map (`traceparent` / `tracestate` / `baggage`). The worker **reads** the
+header to correlate logs/trace_id but **creates no span**. Distributed tracing
+therefore stops at the Rust boundary; end-to-end tracing into the worker is a
+follow-up (requires Python-side instrumentation). No protobuf change is
+needed — propagation rides the existing headers map.
+
+### Two-level opt-in
+
+1. **Build-time**: the cargo feature `telemetry` gates the OTel SDK/exporter/bridge crates (`opentelemetry_sdk`, `opentelemetry-otlp`, `tracing-opentelemetry`). The default build does **not** compile them.
+   ```sh
+   cargo build --features telemetry
+   cargo test  --features telemetry   # runs the telemetry tests
+   ```
+2. **Runtime**: `telemetry.enabled: false` (default). When `false`, no OTel layer is attached to the subscriber, no global propagator is set, and `extract`/`inject` are no-ops — the server behaves byte-for-byte as without OTel. Set `telemetry.enabled: true` and point `otlp_endpoint` at a collector to enable.
+
+### Propagation model
+
+- **HTTP**: the outermost `observability_middleware` extracts the inbound parent context once, stashes it (`OtelParentContext`), and creates an `http.server` span (fields: `http.request.method`, `url.path`, `http.response.status_code`) linked to that parent. `context_middleware` reads the stash into `RequestContext.trace_cx`. No other layer re-extracts.
+- **gRPC**: the pre-call interceptor extracts the parent into `RequestContext.trace_cx`; each handler's `inference` span links to it.
+- **Rust→worker**: at every `RequestMeta` construction site the active span's context is injected into `headers`, so the worker's request is a child of the server/step span (overwriting any client-supplied `traceparent`).
+- **ensemble (anti-breakage)**: `execute_step` builds a child `ensemble.step` span linked to the current trace and injects into the sub-step `headers` — without this, every ensemble step span would be orphaned from the parent request trace.
+
+### W3C invariants
+
+- An invalid `traceparent` (all-zero trace id / bad hex) is discarded — the request restarts its own trace (W3C rule). See `extract_discards_invalid_traceparent`.
+- `tracestate` is passed through; `baggage` is sanitized per the inbound-allowlist guidance (`telemetry.baggage_allowlist`).
+
+### Sampling & shutdown
+
+- Sampling: `ParentBased(TraceIdRatioBased(sample_ratio))` — roots sampled at `sample_ratio`, child spans honour the inbound sampled flag. (Per-class health/admin down-sampling via `health_admin_sample_ratio` is parsed but not yet wired.)
+- Shutdown: on graceful shutdown, traces and metrics are `force_flush`ed + shut down on a blocking thread with a **5s cap**, so a slow/unreachable collector cannot stall the drain window. The 0.30 `BatchSpanProcessor`/`PeriodicReader` run on dedicated threads, decoupling them from the tokio runtime (avoids the `force_flush` deadlock in opentelemetry-rust #2715).
+
+### Metrics SDK & exemplars
+
+With `telemetry.metrics_enabled: true`, an OTel metrics SDK (MeterProvider + OTLP/gRPC MetricExporter + PeriodicReader) overlays the existing Prometheus `/metrics` pipeline. A `liteserver.request.duration` histogram (status-family attribute) is recorded at each request's end.
+
+> **Exemplar caveat (2026-08-01)**: `opentelemetry_sdk 0.30.0` stubs exemplar reservoirs (`exemplars: vec![]`) — real trace-linked exemplars are **not** emitted on this version. The recording-within-span plumbing is correct and exemplar-ready; emitting exemplars requires upgrading the OTel SDK (tracked follow-up). The metrics→trace link is completed on the collector side via Prometheus exemplar-storage + Grafana. `exemplars_enabled` is reserved for that future SDK.
+
+### GenAI semantic conventions
+
+`gen_ai.*` span-attribute names are centralized in `src/telemetry/genai_attrs.rs` (one file). The OTel GenAI semconv is still **Development** as of 2026-07 (moved to a separate repo 2026-06, no versioned release, large rename 2025-08), so we do **not** pin specific fields — a future stable release is a one-file edit. Re-evaluate in 6–12 months.
+
+### Versions (research-verified, 2026-08-01)
+
+| crate | version | note |
+|---|---|---|
+| `opentelemetry` (core) | 0.30 | `trace` + `metrics` features; constant dependency (no SDK/exporter). |
+| `opentelemetry_sdk` | 0.30 | `rt-tokio`/`trace`/`metrics`; feature-gated. |
+| `opentelemetry-otlp` | 0.30 | `grpc-tonic`; pulls `tonic ^0.13`. |
+| `tracing-opentelemetry` | 0.31 | targets `opentelemetry 0.30` (the 0.30 release pins 0.29). |
+| `tonic` family | 0.13 | upgraded 0.12→0.13 to unify a single tonic version with `opentelemetry-otlp`. |
+
+### Quick start
+
+```sh
+# 1. Run a collector + backend (e.g. otel-collector → Jaeger/Tempo) listening on :4317.
+
+# 2. Build with the feature.
+cargo build --release --features telemetry
+
+# 3. Configure (server.yaml).
+#    telemetry:
+#      enabled: true
+#      otlp_endpoint: "http://collector:4317"
+#      metrics_enabled: true   # optional OTLP/metrics overlay
+
+# 4. Send a request with a traceparent; observe the `http.server` → `inference`
+#    span chain in Jaeger/Tempo, correlated by trace_id with server logs.
+```

@@ -1,7 +1,5 @@
 # Framework Comparison: lite-server vs Other Inference Servers
 
-[中文版](zh/comparison.md)
-
 ## TL;DR
 
 - **lite-server** — High-performance, lightweight, Rust+Python hybrid. Best for teams wanting production-grade features without infrastructure overhead.

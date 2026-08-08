@@ -1,7 +1,5 @@
 # Benchmarks
 
-[中文版](zh/benchmark.md)
-
 Three-side `wrk` comparison: **lite-server** (PyO3 `serve()` entry) /
 **lite-server-core** (standalone Rust binary) / **LitServe** (FastAPI + uvicorn).
 Measures **HTTP + IPC framework overhead**, not model compute time.

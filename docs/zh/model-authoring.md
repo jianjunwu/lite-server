@@ -42,7 +42,7 @@ model_repo/
 - `model_name`：字母、数字、下划线、连字符，最长 64 字符（如 `my_model`、`resnet-v2`）。点号 `.` 不允许。
 - `version`：字母、数字、点号、下划线、连字符，最长 64 字符。必须以字母或数字开头，不能以点号开头或结尾，不能含 `..`（如 `1`、`v2`、`latest`、`1.0.0`）
 
-对于 **ensemble 模型**，`model.py` 可以省略——只需在 `config.yaml` 中定义顶层 `ensemble` 字段即可，模型完全由配置描述。ensemble 也接受原始字节根请求（字节直送第一层，binary 值的引用方式有限制）——见[原始字节 / Tensor 请求](raw-bytes-request.md)的 *Ensemble 模型* 一节。
+对于 **ensemble 模型**，`model.py` 可以省略——只需在 `config.yaml` 中定义顶层 `ensemble` 字段即可，模型完全由配置描述。ensemble 也接受原始字节根请求（字节直送第一层，binary 值的引用方式有限制）——见[原始字节 / Tensor 请求](../protocol.md)的 *Ensemble 模型* 一节。
 
 模型根目录（`{model_name}/`）下还可以放置 `requirements.txt`（Python 依赖）和 `README.md`，打包为 `.lma` 时会自动包含。
 
@@ -100,7 +100,7 @@ def decode_request(self, request, ctx):
     return {"prompt": request["prompt"]}
 ```
 
-详见 [原始字节 / Tensor 请求](raw-bytes-request.md)。
+详见 [原始字节 / Tensor 请求](../protocol.md)。
 
 #### `predict(self, x)`
 
@@ -519,7 +519,7 @@ callbacks:
 定义 hook 是加载期错误，报错信息会指向 `Callback` 迁移。Callback 通过
 config.yaml 的 `callbacks:` 字段或 `LitAPI.callbacks` 类属性注册。
 
-参见 [examples/14_lifecycle_hooks](../examples/14_lifecycle_hooks/) 获取可运行示例。
+参见 [examples/14_lifecycle_hooks](../../examples/14_lifecycle_hooks/) 获取可运行示例。
 
 ## 自定义路由（`@route`）
 
@@ -614,7 +614,7 @@ def ticks(self, ctx):
 - 流式中途抛出 `HTTPException` 会发送一个终止性的结构化错误事件（SSE
   模式）或直接截断响应体（其他 media type）— 此时状态行已经发出。
 
-参见 [examples/06_custom_route](../examples/06_custom_route/) 获取可运行示例。
+参见 [examples/06_custom_route](../../examples/06_custom_route/) 获取可运行示例。
 
 ## 异步模型
 
@@ -650,7 +650,7 @@ class AsyncModel(LitAPI):
 - 批处理、流式、双向流式、连续批处理都同时支持同步和异步方法。
 - ``enable_async`` 构造参数自 0.7.0 起接受但**忽略**——所有模型统一运行在 async event loop 上，不再需要显式开启。
 
-参见 [examples/10_async](../examples/10_async/) 获取可运行的示例。
+参见 [examples/10_async](../../examples/10_async/) 获取可运行的示例。
 
 ## 连续批处理（LLM）
 
@@ -776,7 +776,7 @@ class CustomBatchModel(LitAPI):
         return output
 ```
 
-参见 [examples/02_batching](../examples/02_batching/) 获取可运行的示例。
+参见 [examples/02_batching](../../examples/02_batching/) 获取可运行的示例。
 
 ## 双向流式
 
@@ -859,7 +859,7 @@ class MyModel(LitAPI):
 | HTTP WebSocket | `GET /v2/models/{m}/decoupled-stream`（含 `/versions/{v}/decoupled-stream`） |
 
 空闲流在 `server.decoupled_idle_timeout_secs`（默认 300s）后回收。帧约定和传输
-细节见 [HTTP Decoupled 流式](http-decoupled.md)。
+细节见 [Decoupled 流式](../streaming.md)。
 
 ## 自定义指标
 
@@ -965,7 +965,7 @@ def stream_predict(self, request):
 - ID 按 LitAPI 实例隔离 — 不同模型可注册相同指标名（值通过 `model` 标签区分）
 - 默认 Histogram 桶：`[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]`
 
-参见 [examples/09_custom_metrics](../examples/09_custom_metrics/) 获取可运行的示例。
+参见 [examples/09_custom_metrics](../../examples/09_custom_metrics/) 获取可运行的示例。
 
 ## 自定义参数
 
@@ -1011,7 +1011,7 @@ class MyModel(LitAPI):
 - **特性开关**：按模型版本启用/禁用行为
 - **A/B 测试**：不同版本使用不同配置
 
-参见 [examples/07_custom_params](../examples/07_custom_params/) 获取可运行的示例。
+参见 [examples/07_custom_params](../../examples/07_custom_params/) 获取可运行的示例。
 
 ## 日志
 
@@ -1079,7 +1079,7 @@ def after_encode_response(self, ctx):
 
 ``ctx.meta`` 是一个 `RequestMeta` 对象，包含：`route`、`headers`、`client_ip`、`request_id`、`timestamp_ns`。
 
-参见 [examples/11_logging](../examples/11_logging/) 获取可运行的示例。
+参见 [examples/11_logging](../../examples/11_logging/) 获取可运行的示例。
 
 ## 最佳实践
 

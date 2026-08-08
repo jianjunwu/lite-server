@@ -23,36 +23,36 @@ server:
                                # 容忍损坏文件；删除该文件即重置。
   graceful_timeout: 30.0       # 优雅关闭时等待进行中请求的最大秒数
   keepalive_timeout: 5.0       # HTTP keep-alive 超时（秒），0 = 禁用
-  compression: false           # gzip HTTP 响应（P1-4）；排除 SSE，不影响 WS
-  socket_mode: 0o666           # unix: UDS host 的 chmod（P4-1）。HTTP UDS 同时服务 admin，
+  compression: false           # gzip HTTP 响应；排除 SSE，不影响 WS
+  socket_mode: 0o666           # unix: UDS host 的 chmod。HTTP UDS 同时服务 admin，
                                # 多租户主机建议 0o600（仅 owner）
   # TLS/mTLS（见下文「TLS / mTLS」一节）——均可选，默认关闭
   tls_cert_path: null          # 服务器证书链 PEM；须与 tls_key_path 同设
   tls_key_path: null           # 服务器私钥 PEM；须与 tls_cert_path 同设
   mtls_ca_path: null           # 客户端 CA  bundle PEM；设置后强制客户端证书（mTLS）
   tls_min_version: null        # "1.2"（默认）或 "1.3"
-  # sequence_id 粘性路由（P8-1）——按请求经 x-sequence-id / gRPC sequence_id 字段
+  # sequence_id 粘性路由——按请求经 x-sequence-id / gRPC sequence_id 字段
   # 显式开启；缺省时调度与现状完全一致。
   sequence_ttl_secs: 3600.0    # sequence_id→worker 映射在末次使用后保留的秒数
   max_sequences: 65536         # 追踪的 sequence_id 条目上限（近似 LRU）
-  balance_abs_threshold: 2     # B2：粘性 worker 在途数超过最少负载 worker 多少即回退
+  balance_abs_threshold: 2     # 粘性 worker 在途数超过最少负载 worker 多少即回退
                                # （SGLang --balance-abs-threshold 语义；0 = 关闭）
-  balance_rel_threshold: 1.5   # B2：相对阈值（…× 倍数；0.0 = 关闭）
-  decoupled_idle_timeout_secs: 300.0  # P9-1：DecoupledInfer 流的 idle 超时（秒）——窗口内无
+  balance_rel_threshold: 1.5   # 相对阈值（…× 倍数；0.0 = 关闭）
+  decoupled_idle_timeout_secs: 300.0  # DecoupledInfer 流的 idle 超时（秒）——窗口内无
                                # chunk 到达 → 服务端关闭并取消 worker。0 = 关闭
                                # （流存活至模型 close / 客户端取消）
-  # P-FLOW 过载保护（§4.0.9）——全部默认关闭，行为不变
+  # 过载保护——全部默认关闭，行为不变
   max_inflight: 0             # 全局在途推理上限。>0 → 超过此并发数的推理请求被拒（503 /
                                # gRPC Unavailable + Retry-After）。health/admin 端点豁免（探活
                                # 不能挂）。0 = 无限。
   max_request_body_bytes: 67108864 # 单请求体上限（字节）。超限 → HTTP 413 / gRPC
                                # ResourceExhausted。默认 64 MiB；null = 平台默认
                                #（axum 2MB / tonic 4MB）。内存预算：该值 × 在途请求数。
-  # P-XFF 受信代理 client-IP 清洗——默认 fail-safe。
+  # 受信代理 client-IP 清洗——默认 fail-safe。
   trusted_proxies: []          # 前置代理的 CIDR/IP，其 X-Forwarded-For / X-Real-IP 才被信任。
                                # 空（默认）= 一律用直连 TCP peer、忽略客户端代理头（防伪造 IP 绕过
                                # key=ip 限流）。网关/代理需在此列出，其转发的客户端 IP 才能参与限流。
-  # P-CORS 全局 CORS 策略（无 per-model policies.cors 覆盖时生效，且覆盖非模型路由）。
+  # 全局 CORS 策略（无 per-model policies.cors 覆盖时生效，且覆盖非模型路由）。
   # null（默认）= CORS 直通（不附任何头）。字段同 per-model policies.cors。
   cors: null
 
@@ -68,15 +68,15 @@ logging:
 grpc:
   enabled: true                # 启用 gRPC 服务
   host: null                   # gRPC 绑定地址；null = 跟随 server.host（"unix:/路径" = UDS）
-  # P7-2：LiteAdmin 服务独立绑定。推荐 UDS——UDS admin socket 默认属主独占（0o600）创建
+  # LiteAdmin 服务独立绑定。推荐 UDS——UDS admin socket 默认属主独占（0o600）创建
   admin_bind: null             # 如 unix:/var/run/lite-admin.sock 或 127.0.0.1:9001
   http2_keepalive_interval_secs: null  # HTTP/2 PING 间隔；null = 关闭
   http2_keepalive_timeout_secs: null   # PING ACK 超时（须先设间隔）
   http2_adaptive_window: false         # BDP 自适应 HTTP/2 流控窗口
   http2_max_frame_size: null           # HTTP/2 帧载荷上限（字节）；null = tonic 默认
-  response_compression: false          # gzip gRPC 响应（P1-3）；仅推理服务
+  response_compression: false          # gzip gRPC 响应；仅推理服务
   reflection: false                    # gRPC server reflection（opt-in）：grpcurl/grpcui 服务发现；挂 Admin 访问类（未配置 access_control admin 时 fail-closed 仅 loopback）
-  socket_mode: 0o666                   # unix: gRPC UDS 的 chmod（P4-1）
+  socket_mode: 0o666                   # unix: gRPC UDS 的 chmod
   # TLS/mTLS——与 server.* 的 TLS 键语义相同，作用于 gRPC 监听器
   tls_cert_path: null          # 服务器证书链 PEM；须与 tls_key_path 同设
   tls_key_path: null           # 服务器私钥 PEM；须与 tls_cert_path 同设
@@ -85,7 +85,7 @@ grpc:
 
 metrics:
   enabled: true                # 启用 Prometheus 指标端点
-  # GIE/EPP 兼容指标命名空间（P2-1，D32）：在 /metrics 暴露
+  # GIE/EPP 兼容指标命名空间：在 /metrics 暴露
   # {namespace}:total_queued_requests / {namespace}:kv_cache_utilization
   # （vllm 兼容命名，对接 K8s LLM 自动扩缩生态）。非法命名空间启动 fail-fast。
   metric_namespace: liteserver
@@ -99,7 +99,7 @@ model_repository:
   path: ./model_repo           # 模型仓库目录
 
 features:
-  # P5-2 breaking（迁移 M3）：是否响应 x-lite-version canary pin 请求头。
+  # Breaking（迁移 M3）：是否响应 x-lite-version canary pin 请求头。
   # 默认 false = 该头被忽略（客户端无法自行 pin 到 canary 版本）。仅灰度/调试环境开启
   canary_override: false
   timeline: false              # 挂载 /metrics/timeline* 并运行后台采样任务
@@ -176,11 +176,11 @@ grpc:
 - `metrics_port` 监听器保持**明文且无鉴权**——请绑定内网或 loopback。启用 TLS 后，主端口的 Prometheus 抓取/探活/内部客户端须走 HTTPS（ALPN 含 `http/1.1`，简单客户端可用）。
 - 私钥文件为组/全员可读时启动仅告警（建议 `chmod 600`），不阻断基于用户组的部署。
 
-## 访问控制（P7-1）
+## 访问控制
 
 端点类别：`admin`（HTTP `/admin/*` + gRPC LiteAdmin 服务）、`inference`、`health`。`admin` / `inference` 按协议（`http` / `grpc`）分别配置；`health` 为单条简写、双协议同生效。
 
-- **默认（admin fail-closed）**：未配置 `admin` → **仅 loopback 可达**（UDS 视为 loopback）；未配置 `inference` / `health` → 公开。P7-1 breaking——见[迁移指南](migration.md) M4。
+- **默认（admin fail-closed）**：未配置 `admin` → **仅 loopback 可达**（UDS 视为 loopback）；未配置 `inference` / `health` → 公开。breaking 变更——见[迁移指南](migration.md) M4。
 - **模式**（`mode` 标签）：`public`（显式开放——逃生门）或 `key`（API key：`key` = header 名；密钥取 `value` / `value_env` / `value_file` 首个存在者，启动期解析，缺源 fail-fast）。
 - key 比较为恒定时间。拒绝返回 HTTP 401 / gRPC Unauthenticated。`metrics_port` 监听器不受此约束——Prometheus 抓取走该端口。
 
@@ -196,9 +196,41 @@ access_control:
 
 per-model `policies.auth` 独立于此端点级控制，叠加在其后。
 
-## 遥测 / OpenTelemetry（P-TRACE）
+## CORS
 
-全量 OpenTelemetry 追踪 + metrics SDK，经 **OTLP/gRPC** 导出。两级 opt-in：编译期 cargo feature（`--features telemetry`）+ 运行时开关（`telemetry.enabled`，默认 `false`→零开销）。两者皆关 ⇒ 无 OTel layer、无 propagator、无 exporter，行为与无 OTel 逐字节一致。trace context 经既有 `RequestMeta.headers` map（W3C `traceparent`/`tracestate`/`baggage`）到达 Python worker——worker 读 header 关联但不创 span（Rust-only，见 [docs/otel-observability.md](../otel-observability.md)）。
+通过 `server.cors` 全局配置，或通过 `policies.cors` 按模型配置（per-model 覆盖全局策略；省略则回退到 `server.cors`；`null` 默认为透传——不附加任何头）。CORS **不是** `tower-http::cors`：per-model 策略覆盖需要在请求时按路径解析模型，静态挂载的 `CorsLayer` 做不到。中间件按有效策略（per-model → 全局）应用下述规则。
+
+```yaml
+server:
+  cors:
+    allow_origins: ["https://example.com"]  # 精确匹配；"*" = 任意；"*.example.com" = 子域通配
+    allow_methods: ["GET", "POST"]
+    allow_headers: ["Content-Type", "Authorization"]
+    expose_headers: ["x-request-id", "x-processing-time-ms"]  # JS 可见的响应头
+    allow_credentials: false     # true → ACAC: true；与 "*" 互斥
+    max_age_secs: 7200           # preflight 缓存（秒）；Chrome 上限 7200
+```
+
+强制 8 条安全属性：
+
+1. **精确 Origin 匹配** — `Origin` 经规范化（scheme/host 小写、默认端口剥离）后与配置的 `allow_origins` 精确匹配。无模糊匹配。
+2. **不回显** — `Access-Control-Allow-Origin` 永不为请求原始 `Origin` 的 echo。仅当 (a) 请求匹配到某个已配置 origin，或 (b) 字面量 `*` 时设置；未配置的 origin 得不到**任何** ACAO。
+3. **拒绝 `null`** — `Origin: null`（沙箱 iframe、`file://`、data URI）视为无 origin——不附加任何 CORS 头。
+4. **无后缀混淆** — `https://evil-example.com` 不匹配 `https://example.com`，`https://a.notexample.com` 不匹配 `https://*.example.com`。子域通配（`*.example.com`）要求前置标签（`a.example.com`），永不含顶域（`example.com`）。
+5. **Credentials + `*` 拒绝** — `allow_credentials: true` 时不回显通配 `*`——不发 ACAO（浏览器禁止 `Access-Control-Allow-Origin: *` 与 `Access-Control-Allow-Credentials: true` 共存）。请配置显式 origins。
+6. **`Vary: Origin` 恒有** — 所有 CORS 相关响应携带 `Vary: Origin`（preflight 额外携带 `Vary: Access-Control-Request-Method` / `-Headers`），共享缓存不会把某个 Origin 的响应发给另一个 Origin。
+7. **Preflight 校验方法与请求头** — preflight（`OPTIONS` + `Access-Control-Request-Method`）仅在 Origin 被允许时附加 CORS 头；允许的方法/请求头由策略通告（浏览器据此强制请求）。不合格的 preflight 返回 204、无 CORS 头。
+8. **`max_age` ≤ 7200** — `max_age_secs` 默认 7200——Chrome 的 preflight 缓存上限。超出值反正会被浏览器截断；配置 ≤ 7200。
+
+**分层** — CORS 中间件挂载在访问控制**外侧**：preflight `OPTIONS` 在鉴权之前以 204 短路（preflight 不带凭证）。位于 observability 内侧，故 204 携带 `x-request-id`。
+
+**WebSocket** — 浏览器对 WS 握手不发 preflight 也不强制 ACAO，因此 CORS 中间件无法阻止跨站 WebSocket 劫持（CSWSH）。WS upgrade handler 用同一引擎独立校验 `Origin`（`ws_origin_allowed`）。未配置 CORS 策略时，WS 安全完全依赖访问控制 key 鉴权。
+
+**Admin 端点** — admin 类端点非浏览器面向；CORS 中间件跳过它们（不附加 ACAO）。仅在需要跨域 admin 访问时才配置全局 `server.cors` 策略。
+
+## 遥测 / OpenTelemetry
+
+全量 OpenTelemetry 追踪 + metrics SDK，经 **OTLP/gRPC** 导出。两级 opt-in：编译期 cargo feature（`--features telemetry`）+ 运行时开关（`telemetry.enabled`，默认 `false`→零开销）。两者皆关 ⇒ 无 OTel layer、无 propagator、无 exporter，行为与无 OTel 逐字节一致。trace context 经既有 `RequestMeta.headers` map（W3C `traceparent`/`tracestate`/`baggage`）到达 Python worker——worker 读 header 关联但不创 span（Rust-only，见 [observability.md](../observability.md)）。
 
 ```yaml
 telemetry:
@@ -213,7 +245,7 @@ telemetry:
   export_interval_millis: 5000
   max_queue_size: 2048
   metrics_enabled: false               # OTel metrics SDK 叠加（C4 exemplars）
-  exemplars_enabled: false             # （预留）exemplar filter，见 otel-observability.md
+  exemplars_enabled: false             # （预留）exemplar filter，见 observability.md
   # 入站 W3C baggage 不受信（M6）：仅白名单键被保留并透传到 worker。
   # 默认 [] = 入站 baggage 全丢弃
   baggage_allowlist: []                # 如 ["tenant", "experiment"]
@@ -252,7 +284,7 @@ devices: null                  # 设备分配（null = 自动，或整数如 1�
 workers_per_device: null       # 每设备 worker 数（null = 1）
 max_queue_size: 1000           # 每个 worker 的最大待处理请求数
 request_timeout: 0.0           # 单请求硬超时（秒），0 = 禁用
-# P-FLOW B1（§4.0.9）——过载队列控制。每请求用 `x-lite-priority` header
+# 过载队列控制。每请求用 `x-lite-priority` header
 # （整数；越大越先派发，默认 0）指定优先级。
 queue_timeout_secs: 0.0        # 请求在队列中最长等待秒数，超过则按 queue_timeout_action
                                # 处理（0 = 禁用，默认）。
@@ -300,7 +332,7 @@ hot_reload_patterns:           # 监听的 glob 模式
 policies:
   auth: { header: "X-API-Key", keys: ["${API_KEYS}"] }  # ${VAR} = 环境变量；keys 为空 = 任意非空值通过
   rate_limit: { requests_per_minute: 60, key: ip, burst: 100 }  # key: "route" | "ip"
-  cors:                          # P-CORS per-model 策略（覆盖 server.cors）。省略 = 回退全局。
+  cors:                          # Per-model 策略（覆盖 server.cors）。省略 = 回退全局。
     allow_origins: ["https://example.com"]  # 精确匹配；"*" = 任意；"*.example.com" = 子域通配
     allow_methods: ["GET", "POST"]
     allow_headers: ["Content-Type", "Authorization"]
@@ -308,7 +340,7 @@ policies:
     allow_credentials: false     # true → ACAC: true；与 "*" 互斥
     max_age_secs: 7200           # 预检缓存（秒）；Chrome 上限 7200
   request_log: {}                # 访问日志：方法、路径、状态码、耗时
-  warmup:                        # P-WARM：服务前预热引擎（默认关闭）
+  warmup:                        # 服务前预热引擎（默认关闭）
     enabled: true                #   false = 版本直接置 Ready（行为不变）
     samples:                     #   dummy 输入列表，按序消费——每样本一个文件覆盖一种
                                  #   输入形状/batch（M7；旧 dummy_input_ref/iterations 已移除）
