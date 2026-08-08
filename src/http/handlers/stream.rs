@@ -138,6 +138,79 @@ pub async fn sse_decoupled_version_handler(
         .map_err(|error| ProtocolError { error, protocol })
 }
 
+/// SSE 帧风格(批次 4,D9):Legacy = /events 自有格式(`data: <chunk>` +
+/// `data: [DONE]`);Generate = Triton Generate extension(`data: <完整 JSON>`
+/// 逐 chunk,错误携带在事件内,结束即连接关闭——无 [DONE] 标记)。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SseFrameStyle {
+    Legacy,
+    Generate,
+}
+
+/// generate_stream 入口(批次 4,D9):与 [`sse_infer_entry`] 同包裹(早期拒绝
+/// 计数),帧封装 = Generate 风格。非流式 worker 行为与 /events 完全一致
+/// (J4:同路径同管线,唯一差异是帧封装)。
+async fn generate_stream_entry(
+    state: &Arc<AppState>,
+    model_name: &str,
+    version: Option<String>,
+    headers: HeaderMap,
+    body: RequestBody,
+    cx: RequestContext,
+) -> Result<Response, AppError> {
+    let start = std::time::Instant::now();
+    let mut label_version = version.clone().unwrap_or_default();
+    let result = sse_infer_entry_impl(
+        state,
+        model_name,
+        version,
+        headers,
+        body,
+        cx,
+        false,
+        &mut label_version,
+        SseFrameStyle::Generate,
+    )
+    .await;
+    if let Err(e) = &result {
+        prometheus::record_stream_rejected(
+            model_name,
+            &label_version,
+            super::status_family(e.http_status().as_u16() as i32),
+            start.elapsed().as_secs_f64(),
+        );
+    }
+    result
+}
+
+/// D9:/generate_stream(SSE,每 `data:` 一个 JSON 响应)。随 `streaming+sse`
+/// 开关族挂载(J3,与 /events 同批)。
+pub async fn generate_stream_handler(
+    State(state): State<Arc<AppState>>,
+    Path(model_name): Path<String>,
+    headers: HeaderMap,
+    cx: RequestContext,
+    ApiBody(body): ApiBody,
+) -> Result<Response, ProtocolError> {
+    let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
+    generate_stream_entry(&state, &model_name, None, headers, body, cx)
+        .await
+        .map_err(|error| ProtocolError { error, protocol })
+}
+
+pub async fn generate_stream_version_handler(
+    State(state): State<Arc<AppState>>,
+    Path((model_name, version)): Path<(String, String)>,
+    headers: HeaderMap,
+    cx: RequestContext,
+    ApiBody(body): ApiBody,
+) -> Result<Response, ProtocolError> {
+    let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
+    generate_stream_entry(&state, &model_name, Some(version), headers, body, cx)
+        .await
+        .map_err(|error| ProtocolError { error, protocol })
+}
+
 /// Shared entry for SSE inference: validation, ready check, rate limiting,
 /// and stream setup. Returns a `Response` so the caller can uniformly wrap
 /// CORS around both the success stream-start and any early error.
@@ -163,6 +236,7 @@ async fn sse_infer_entry(
         cx,
         decoupled,
         &mut label_version,
+        SseFrameStyle::Legacy,
     )
     .await;
     if let Err(e) = &result {
@@ -186,6 +260,7 @@ async fn sse_infer_entry_impl(
     cx: RequestContext,
     decoupled: bool,
     label_version: &mut String,
+    frame: SseFrameStyle,
 ) -> Result<Response, AppError> {
     crate::validation::validate_identifier(model_name)?;
     if let Some(ref v) = version {
@@ -221,11 +296,13 @@ async fn sse_infer_entry_impl(
         body,
         cx,
         decoupled,
+        frame,
     )
     .await?;
     Ok(sse.into_response())
 }
 
+#[allow(clippy::too_many_arguments)] // 内部管线:状态/请求/上下文组合参数(同 sse_infer_entry_impl 先例)
 async fn sse_infer_impl(
     state: Arc<AppState>,
     model_name: String,
@@ -234,6 +311,7 @@ async fn sse_infer_impl(
     body: RequestBody,
     cx: RequestContext,
     decoupled: bool,
+    frame: SseFrameStyle,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, AppError> {
 
     // Task B: inference span (parity with gRPC + unary HTTP). Created before
@@ -359,7 +437,7 @@ async fn sse_infer_impl(
                         prometheus::record_stream_chunk(&model_name, &resolved_version, "sse");
                     }
                     let data = String::from_utf8_lossy(&c.data);
-                    Event::default().data(&data)
+                    Some(Event::default().data(&data))
                 }
                 Some(pb::stream_response::Payload::Error(e)) => {
                     // Try to parse as structured error from HTTPException
@@ -371,19 +449,26 @@ async fn sse_infer_impl(
                     };
                     // Task D: terminal Error frame → InferenceResponse.
                     crate::callback::fire_inference_response(&cb_runner, &req_ctx, open_time);
-                    Event::default().data(event_data)
+                    Some(Event::default().data(event_data))
                 }
                 Some(pb::stream_response::Payload::Done(done)) => {
                     prometheus::record_worker_metrics(&model_name, &resolved_version, done.metrics.as_ref());
                     // Task D: terminal Done frame → InferenceResponse.
                     crate::callback::fire_inference_response(&cb_runner, &req_ctx, open_time);
-                    Event::default().data("[DONE]")
+                    // 帧封装差异(批次 4):Legacy 发 `data: [DONE]`;Generate
+                    // 风格结束即连接关闭,无终止标记(D9/Triton 行为)。
+                    match frame {
+                        SseFrameStyle::Legacy => Some(Event::default().data("[DONE]")),
+                        SseFrameStyle::Generate => None,
+                    }
                 }
-                _ => continue,
+                _ => None,
             };
-            if event_tx.send(Ok(event)).await.is_err() {
-                reason = prometheus::StreamCloseReason::Cancel;
-                break;
+            if let Some(event) = event {
+                if event_tx.send(Ok(event)).await.is_err() {
+                    reason = prometheus::StreamCloseReason::Cancel;
+                    break;
+                }
             }
             // Terminal frames end the stream. Error is terminal by contract
             // (callback.rs) — breaking here also guarantees the
@@ -1401,6 +1486,7 @@ mod tests {
             json_body(json!({})),
             test_cx(),
             false,
+            SseFrameStyle::Legacy,
         )
         .await
         .expect("sse must open");
@@ -1447,6 +1533,7 @@ mod tests {
             json_body(json!({})),
             test_cx(),
             false,
+            SseFrameStyle::Legacy,
         )
         .await
         .expect("sse must open");
@@ -1486,6 +1573,7 @@ mod tests {
             json_body(json!({})),
             test_cx(),
             false,
+            SseFrameStyle::Legacy,
         )
         .await
         .expect("sse must open");
@@ -1529,6 +1617,7 @@ mod tests {
             json_body(json!({})),
             test_cx(),
             false,
+            SseFrameStyle::Legacy,
         )
         .await
         .expect("sse must open");
@@ -1869,6 +1958,7 @@ mod tests {
             json_body(json!({})),
             test_cx(),
             false,
+            SseFrameStyle::Legacy,
         )
         .await
         .expect("sse must open");
@@ -2470,6 +2560,7 @@ mod tests {
             json_body(json!({})),
             test_cx(),
             true, // decoupled
+            SseFrameStyle::Legacy,
         )
         .await
         .expect("sse must open");
@@ -2511,6 +2602,7 @@ mod tests {
             json_body(json!({})),
             test_cx(),
             true, // decoupled
+            SseFrameStyle::Legacy,
         )
         .await
         .expect("sse must open");
@@ -2584,6 +2676,7 @@ mod tests {
             json_body(json!({})),
             test_cx(),
             true, // decoupled
+            SseFrameStyle::Legacy,
         )
         .await
         .expect("sse must open");
@@ -2646,6 +2739,7 @@ mod tests {
             json_body(json!({})),
             test_cx(),
             true, // decoupled
+            SseFrameStyle::Legacy,
         )
         .await
         .expect("sse must open");
@@ -3060,6 +3154,7 @@ mod tests {
             json_body(json!({})),
             test_cx(),
             false,
+            SseFrameStyle::Legacy,
         )
         .await
         .expect("sse must open");
@@ -3091,6 +3186,7 @@ mod tests {
             json_body(json!({})),
             test_cx(),
             false,
+            SseFrameStyle::Legacy,
         )
         .await
         .expect("sse must open");
@@ -3126,6 +3222,7 @@ mod tests {
             json_body(json!({})),
             test_cx(),
             false,
+            SseFrameStyle::Legacy,
         )
         .await
         .expect("sse must open");
@@ -3249,6 +3346,7 @@ mod tests {
             json_body(json!({})),
             test_cx(),
             false,
+            SseFrameStyle::Legacy,
         )
         .await
         .expect("sse must open");
@@ -3283,6 +3381,7 @@ mod tests {
             json_body(json!({})),
             test_cx(),
             false,
+            SseFrameStyle::Legacy,
         )
         .await
         .expect("sse must open");
@@ -3311,6 +3410,7 @@ mod tests {
             json_body(json!({})),
             test_cx(),
             false,
+            SseFrameStyle::Legacy,
         )
         .await
         .expect("sse must open");
@@ -3343,6 +3443,7 @@ mod tests {
             json_body(json!({})),
             test_cx(),
             false,
+            SseFrameStyle::Legacy,
         )
         .await
         .expect("sse must open");

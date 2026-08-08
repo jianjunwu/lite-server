@@ -48,6 +48,38 @@ pub async fn infer_version_handler(
     ).await
 }
 
+// ===== Triton Generate extension(阶段 4,批次 4,D9) =====
+
+/// D9:/generate = /infer 的 JSON 别名(unary 单响应,复用 run_infer)。
+/// 端点本身即信号,无请求级 opt-in;无 feature gate(J3:unary 即 infer
+/// 别名)。请求侧复用 ApiBody(含 TritonBinary——generate + 多 tensor
+/// 二进制组合裁定允许,透传哲学,worker 语义归 worker)。
+pub async fn generate_handler(
+    State(state): State<Arc<AppState>>,
+    Path(model_name): Path<String>,
+    headers: HeaderMap,
+    cx: RequestContext,
+    ApiBody(body): ApiBody,
+) -> Result<Response, ProtocolError> {
+    run_infer(
+        state, model_name, None,
+        "/predict".to_string(), headers, body, cx,
+    ).await
+}
+
+pub async fn generate_version_handler(
+    State(state): State<Arc<AppState>>,
+    Path((model_name, version)): Path<(String, String)>,
+    headers: HeaderMap,
+    cx: RequestContext,
+    ApiBody(body): ApiBody,
+) -> Result<Response, ProtocolError> {
+    run_infer(
+        state, model_name, Some(version),
+        "/predict".to_string(), headers, body, cx,
+    ).await
+}
+
 /// 协议感知的 infer 入口(D11 P2.1):T1(预筛)+ T2(信封主判)→ 语义协议,
 /// 错误挂 [`ProtocolError`](crate::error::ProtocolError) 边界渲染。
 /// 阶段 2 的 `binary_data_output` 响应转换在此边界后处理。

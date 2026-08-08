@@ -9051,3 +9051,256 @@ async fn test_new_routes_fallback_regression() {
     assert_eq!(resp.status(), 404);
     unload_model(&base, MODEL, "1").await;
 }
+
+// ---------------------------------------------------------------------------
+// Triton Generate extension(阶段 4,批次 4,D9)
+// ---------------------------------------------------------------------------
+
+/// §6.4 test_generate_unary_passthrough (P0):/generate 与 /infer 同请求 →
+/// 响应 byte-identical(别名语义,J3:unary 即 infer 别名,无 gate)。
+#[tokio::test]
+#[serial]
+async fn test_generate_unary_passthrough() {
+    let base = shared_base().await;
+    load_model(&base, MODEL, "1").await;
+    let client = reqwest::Client::new();
+    let body = json!({"input": 5});
+
+    let infer = client
+        .post(format!("{base}/v2/models/{MODEL}/infer"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let generate = client
+        .post(format!("{base}/v2/models/{MODEL}/generate"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(generate.status(), 200);
+    assert_eq!(
+        generate.bytes().await.unwrap(),
+        infer.bytes().await.unwrap(),
+        "/generate 必须与 /infer 响应 byte-identical(别名语义)"
+    );
+
+    unload_model(&base, MODEL, "1").await;
+}
+
+/// §6.4 test_generate_stream_sse_envelope (P0):每 SSE 事件 = data: <JSON>;
+/// 结束即连接关闭(Generate 风格无 [DONE]——D9/Triton 行为)。
+#[tokio::test]
+#[serial]
+async fn test_generate_stream_sse_envelope() {
+    let base = shared_base().await;
+    load_model(&base, MODEL, "1").await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/v2/models/{MODEL}/generate_stream"))
+        .json(&json!({"input": 5}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "generate_stream 必须可开流");
+    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap().to_string();
+    assert!(ct.contains("text/event-stream"), "expected SSE, got {ct}");
+    let body = tokio::time::timeout(Duration::from_secs(15), resp.text())
+        .await
+        .expect("generate_stream 响应必须在超时内关闭")
+        .unwrap();
+    assert!(body.contains("data:"), "SSE 事件必须存在: {body}");
+    assert!(
+        !body.contains("[DONE]"),
+        "Generate 风格结束即连接关闭,无 [DONE] 标记: {body}"
+    );
+
+    unload_model(&base, MODEL, "1").await;
+}
+
+/// §6.4 test_generate_stream_binary_flag_400 (P1):generate_stream + binary
+/// flag → 400(SSE 文本不能携带二进制,D10;与 /events 同一检查)。
+#[tokio::test]
+#[serial]
+async fn test_generate_stream_binary_flag_400() {
+    let base = shared_base().await;
+    load_model(&base, MODEL, "1").await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/v2/models/{MODEL}/generate_stream"))
+        .json(&json!({
+            "inputs": [{"name": "a", "shape": [1], "datatype": "FP32", "data": [1.0]}],
+            "parameters": {"binary_data_output": true},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "SSE 不能携带二进制输出(D10)");
+    let v: Value = resp.json().await.unwrap();
+    assert!(
+        v["error"].is_object() || v["error"].is_string(),
+        "结构化错误体必须存在: {v}"
+    );
+
+    unload_model(&base, MODEL, "1").await;
+}
+
+/// §6.4 test_generate_stream_nonstream_worker + test_generate_stream_unary_untouched
+/// (P1/P0):非流式 worker 的 generate_stream 与 /events 同路径同行为(J4);
+/// 非流式 /infer 响应 byte-identical 回归。
+#[tokio::test]
+#[serial]
+async fn test_generate_stream_nonstream_worker_and_unary_untouched() {
+    let base = shared_base().await;
+    load_model(&base, MODEL, "1").await;
+    let client = reqwest::Client::new();
+    let body = json!({"input": 3});
+
+    // 非流式 worker:generate_stream 与 /events 行为一致(都 200 + SSE 帧)
+    let ev = client
+        .post(format!("{base}/v2/models/{MODEL}/events"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let gen = client
+        .post(format!("{base}/v2/models/{MODEL}/generate_stream"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ev.status(), 200, "/events 基线");
+    assert_eq!(gen.status(), 200, "非流式 worker 的 generate_stream 与 /events 同路径");
+
+    // 非流式 /infer 回归
+    let infer = client
+        .post(format!("{base}/v2/models/{MODEL}/infer"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(infer.status(), 200);
+    let v: Value = infer.json().await.unwrap();
+    assert_eq!(v["output"], 6, "非流式 /infer 必须不受 generate 影响");
+
+    unload_model(&base, MODEL, "1").await;
+}
+
+/// §6.4 test_generate_stream_legacy_events_untouched (P0):/events 自有格式
+/// 回归——data: chunk + data: [DONE](与 generate_stream 并存,帧格式不同)。
+#[tokio::test]
+#[serial]
+async fn test_generate_stream_legacy_events_untouched() {
+    let base = shared_base().await;
+    load_model(&base, MODEL, "1").await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/v2/models/{MODEL}/events"))
+        .json(&json!({"input": 3}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = tokio::time::timeout(Duration::from_secs(15), resp.text())
+        .await
+        .expect("events 响应必须在超时内关闭")
+        .unwrap();
+    assert!(body.contains("data:"), "/events 帧必须存在: {body}");
+    assert!(body.contains("[DONE]"), "/events 自有格式保持 [DONE] 终止: {body}");
+
+    unload_model(&base, MODEL, "1").await;
+}
+
+/// §6.4 test_generate_stream_triton_binary_request (P1):流式 + 多 tensor
+/// 二进制请求组合——规范核对裁定:允许(Triton generate 请求 schema 模型
+/// 自定义,server 维持透传哲学,worker 语义归 worker)。
+#[tokio::test]
+#[serial]
+async fn test_generate_stream_triton_binary_request() {
+    let base = shared_base().await;
+    load_model(&base, MODEL, "1").await;
+    let client = reqwest::Client::new();
+    let head = r#"{"id":"g1","inputs":[{"name":"a","shape":[2],"datatype":"FP32","parameters":{"binary_data_size":8}}]}"#;
+    let mut body_bytes = head.as_bytes().to_vec();
+    body_bytes.extend_from_slice(&[0u8, 1, 2, 3, 4, 5, 6, 7]);
+    let resp = client
+        .post(format!("{base}/v2/models/{MODEL}/generate_stream"))
+        .header("content-type", "application/octet-stream")
+        .header("inference-header-content-length", head.len().to_string())
+        .body(body_bytes)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "TritonBinary 请求组合必须透传(透传哲学)");
+
+    unload_model(&base, MODEL, "1").await;
+}
+
+/// §6.4 test_generate_stream_mid_stream_error (P1):流中途错误 → 后续
+/// data: 携带 error JSON(Triton 行为:HTTP 状态码由首个 SSE 响应固定,
+/// 客户端须逐事件检查——该 caveat 已写入文档)。
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_generate_stream_mid_stream_error() {
+    let http_port = next_test_port();
+    kill_stale_on_port(http_port);
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-gen-err-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    let dir = repo.join("gen_err/1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("model.py"),
+        r#"from lite_server import LitAPI
+
+
+class GenErrAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request
+
+    async def stream_predict(self, request, ctx):
+        yield {"token": "hello"}
+        raise ValueError("mid-stream boom")
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: true\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+
+    let _server = ServerGuard::start(&[
+        "--port", &http_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-grpc", "--no-metrics", "--log-level", "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{http_port}");
+    load_model(&base, "gen_err", "1").await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/v2/models/gen_err/generate_stream"))
+        .json(&json!({"prompt": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    // HTTP 状态码由首个 SSE 响应固定(200);错误在后续事件内(Triton 行为)
+    assert_eq!(resp.status(), 200, "流中途错误不改变已固定的 HTTP 状态码");
+    let body = tokio::time::timeout(Duration::from_secs(15), resp.text())
+        .await
+        .expect("generate_stream 响应必须在超时内关闭")
+        .unwrap();
+    assert!(body.contains("data: {\"token\":\"hello\"}"), "首个 chunk 正常: {body}");
+    assert!(
+        body.contains("\"error\""),
+        "流中途错误必须携带在后续 data: 事件内(Triton 行为): {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}

@@ -25,8 +25,8 @@ pub(crate) fn access_log_target(path: &str) -> Option<(&str, Option<&str>)> {
     let segs: Vec<&str> = segs.collect();
     match segs.as_slice() {
         [] => None,
-        ["infer" | "events" | "stream" | "bidi" | "decoupled" | "decoupled-stream"] => Some((model, None)),
-        ["versions", v, "infer" | "events" | "stream" | "bidi" | "decoupled" | "decoupled-stream"] if !v.is_empty() => Some((model, Some(v))),
+        ["infer" | "events" | "stream" | "bidi" | "decoupled" | "decoupled-stream" | "generate" | "generate_stream"] => Some((model, None)),
+        ["versions", v, "infer" | "events" | "stream" | "bidi" | "decoupled" | "decoupled-stream" | "generate" | "generate_stream"] if !v.is_empty() => Some((model, Some(v))),
         ["versions", ..] => None,
         // B1 audit fix: bare `reload` is a registered state-changing ADMIN route
         // (POST /v2/models/:m/reload → reload_model_handler, no enforce_auth).
@@ -153,7 +153,10 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
         .route("/v2/models/:model_name/routing", put(set_routing_handler))
         // Inference (P-CORS: preflight handled by cors_middleware, no per-route .options())
         .route("/v2/models/:model_name/infer", post(infer_handler))
-        .route("/v2/models/:model_name/versions/:version/infer", post(infer_version_handler));
+        .route("/v2/models/:model_name/versions/:version/infer", post(infer_version_handler))
+        // 批次 4:/generate unary 别名,无 gate(J3:unary 即 infer 别名)
+        .route("/v2/models/:model_name/generate", post(generate_handler))
+        .route("/v2/models/:model_name/versions/:version/generate", post(generate_version_handler));
 
     // Feature-gated routes: mounted only when their toggle is on, so a disabled
     // feature 404s at the router. Handlers are untouched — tests that build
@@ -177,7 +180,10 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
     if features.streaming && features.sse {
         router = router
             .route("/v2/models/:model_name/events", post(sse_infer_handler))
-            .route("/v2/models/:model_name/versions/:version/events", post(sse_infer_version_handler));
+            .route("/v2/models/:model_name/versions/:version/events", post(sse_infer_version_handler))
+            // 批次 4:/generate_stream 随同一开关族(J3,与 /events 同批挂载)
+            .route("/v2/models/:model_name/generate_stream", post(generate_stream_handler))
+            .route("/v2/models/:model_name/versions/:version/generate_stream", post(generate_stream_version_handler));
     }
     if features.streaming && features.sse && features.decoupled {
         router = router
@@ -286,6 +292,13 @@ mod tests {
         assert_eq!(access_log_target("/v2/models/m"), None); // 模型元数据
         assert_eq!(access_log_target("/v2/models/m/versions/2"), None); // versioned 元数据
         assert_eq!(access_log_target("/v2/repository/models/m/load"), None); // bare load
+        // 批次 4:generate 归 inference 族(同 /events 流式日志)
+        assert_eq!(access_log_target("/v2/models/m/generate"), Some(("m", None)));
+        assert_eq!(access_log_target("/v2/models/m/generate_stream"), Some(("m", None)));
+        assert_eq!(
+            access_log_target("/v2/models/m/versions/2/generate_stream"),
+            Some(("m", Some("2")))
+        );
     }
 
     #[test]

@@ -26,7 +26,12 @@
 | ⑥ | **bare load 不触发上传后加载** | `POST /v2/repository/models/:m/load` alias 到 active 版本（幂等 200）；「上传后 bare load」流程须先 versioned load/activate。 |
 | ⑦ | **worker `get_metadata()` 回调未落地** | `/v2/models/:m` 元数据的 `inputs`/`outputs` 暂为空数组（合法降级，tritonclient 不校验非空）；worker 声明回调是后续可选增强。 |
 
+## 批次 4（Triton Generate extension）
+
+| # | 偏差 | 说明 |
+|---|---|---|
+| ⑧ | **SSE 自有格式 vs `generate_stream`** | `/events` 是自有格式（`data: chunk-N` + `data: [DONE]` 终止）；`generate_stream` 是 Triton 兼容通道（`data: <完整 JSON>` 逐 chunk，错误携带在事件内，结束即连接关闭——无 `[DONE]`）。两者并存不冲突；`/generate_stream` 随 `streaming+sse` 开关族，`/generate`（unary）无 gate。 |
+
 ## 待追加（后续批次）
 
-- 批次 4：SSE 自有格式与 Triton `generate_stream` 的区别。
 - 批次 6：`/v1/rerank` 不做（非 OpenAI API，KServe 自家扩展）。

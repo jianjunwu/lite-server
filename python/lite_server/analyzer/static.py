@@ -832,7 +832,9 @@ class StaticAnalyzer:
                 hint="add name and version to config.yaml for complete metadata",
             ))
 
-        # LS403 (info): V2 generate (streaming) endpoint
+        # LS403 (info): V2 generate (streaming) endpoint。对账(protocol-compat
+        # 批次 4):/generate_stream 已随 streaming+sse 落地,未实现 generator
+        # 的模型在该端点走 pick_streaming_worker/fallback 路径(J4)。
         stream_required = config.get("stream") is True
         ls103_emitted = any(f.rule_id == "LS103" for f in report.findings)
         if has_stream_predict and not ls103_emitted:
@@ -841,7 +843,7 @@ class StaticAnalyzer:
             report.findings.append(Finding(
                 "LS403", "info",
                 "stream=true but stream_predict is not implemented as a generator; "
-                "V2 generate endpoint will not be available",
+                "generate_stream endpoint cannot produce per-token events",
                 hint="implement a generator stream_predict(self, request) for V2 streaming",
             ))
 
