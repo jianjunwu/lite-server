@@ -30,7 +30,7 @@
 
 | # | 偏差 | 说明 |
 |---|---|---|
-| ⑧ | **SSE 自有格式 vs `generate_stream`** | `/events` 是自有格式（`data: chunk-N` + `data: [DONE]` 终止）；`generate_stream` 是 Triton 兼容通道（`data: <完整 JSON>` 逐 chunk，错误携带在事件内，结束即连接关闭——无 `[DONE]`）。两者并存不冲突；`/generate_stream` 随 `streaming+sse` 开关族，`/generate`（unary）无 gate。 |
+| ⑧ | **SSE 自有格式 vs `generate_stream`** | `/events` 是自有格式（`data: chunk-N` + `data: [DONE]` 终止）；`generate_stream` 是 Triton 兼容通道（`data: <完整 JSON>` 逐 chunk，错误携带在事件内，结束即连接关闭——无 `[DONE]`）。两者并存不冲突；`/generate_stream` 随 `streaming+sse` 开关族，`/generate`（unary）无 gate。**Caveat（D9）**：HTTP 状态码由首个 SSE 响应固定，流中途错误出现在后续 `data:` 事件内，客户端须逐事件检查。 |
 
 ## 批次 5（openai-compact）
 

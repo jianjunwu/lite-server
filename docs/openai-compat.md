@@ -1,23 +1,25 @@
-# openai-compact(0.9.x,批次 5)
+# openai-compact (0.9.x, batch 5)
 
-OpenAI API 兼容紧凑子集,5 端点(根 `/v1`,v5 J5 裁定):
+OpenAI API-compatible compact subset, 5 endpoints (root `/v1`, v5 J5 ruling):
 
-| 端点 | 说明 |
+| Endpoint | Description |
 |---|---|
-| `POST /v1/chat/completions` | chat 补全(unary JSON 或 `stream: true` SSE) |
-| `POST /v1/completions` | 文本补全(透传 worker) |
-| `POST /v1/embeddings` | 嵌入(透传 worker) |
-| `GET /v1/models` | 注册模型名列表 |
-| `GET /v1/models/{model}` | 单模型对象;不存在 → 404(OpenAI 形状) |
+| `POST /v1/chat/completions` | Chat completion (unary JSON or `stream: true` SSE) |
+| `POST /v1/completions` | Text completion (thin-forwarded to the worker) |
+| `POST /v1/embeddings` | Embeddings (thin-forwarded to the worker) |
+| `GET /v1/models` | Registered model names |
+| `GET /v1/models/{model}` | Single model object; missing → 404 (OpenAI shape) |
 
-**翻译层在 worker 侧**(J6/C19):server 对 /v1 薄透传——body 最小解析仅
-`model`/`stream` 两字段用于路由与分流 + SSE 帧编码(`data: {json}` +
-`data: [DONE]`);chat 请求解析 / completion·chunk·embeddings 构造全部在
-worker 侧 helper [`lite_server/helpers/openai.py`](../python/lite_server/helpers/openai.py)
-(chat→tensor 是模型语义,server 无法通用翻译)。`/v1/rerank` 不做(非
-OpenAI API,见 [known-deviations.md](known-deviations.md))。
+**The translation layer lives on the worker side** (J6/C19): the server
+thin-forwards /v1 — the body is parsed only for the `model`/`stream` fields
+(routing + demux) plus SSE frame encoding (`data: {json}` + `data: [DONE]`);
+chat request parsing / completion·chunk·embeddings construction live in the
+worker-side helper [`lite_server/helpers/openai.py`](../python/lite_server/helpers/openai.py)
+(chat→tensor is model semantics; the server cannot translate generically).
+`/v1/rerank` is not implemented (not an OpenAI API — see
+[known-deviations.md](known-deviations.md)).
 
-## Worker 集成范式
+## Worker integration paradigm
 
 ```python
 from lite_server import LitAPI
@@ -38,17 +40,18 @@ class ChatModel(LitAPI):
         return build_chat_response(reply, model=x["model"],
                                    request_id=ctx.meta.request_id)
 
-    async def stream_predict(self, x, ctx):  # stream: true → SSE 逐 chunk
+    async def stream_predict(self, x, ctx):  # stream: true → SSE per chunk
         for token in my_generate_stream(x["messages"]):
             yield build_chat_chunk(token, model=x["model"])
 ```
 
-- **`stream: true`** → SSE(`data: {json}` 逐 chunk + `data: [DONE]`);HTTP
-  状态码由首个 SSE 响应固定,流中途错误携带在后续 `data: {"error": {...}}`
-  事件内(OpenAI SSE 惯例)。
-- **`stream: false`** → unary JSON(`chat.completion` 形状)。
-- 错误码映射(OpenAI 语义):400 invalid_request_error(缺 `model`/畸形
-  body)、404 model_not_found(模型不存在)、429/503 沿用既有语义。
-- 二进制(WS/h2 bidi 自有通道)与 OpenAI SSE 互不干扰。
-- `model` 字段在 body(非路径)→ access log 归 inference 族、target 用路径、
-  无 per-model access log(v5 裁定)。
+- **`stream: true`** → SSE (`data: {json}` per chunk + `data: [DONE]`); the
+  HTTP status is fixed by the first SSE response and mid-stream errors arrive
+  in later `data: {"error": {...}}` events (OpenAI SSE convention).
+- **`stream: false`** → unary JSON (`chat.completion` shape).
+- Error mapping (OpenAI semantics): 400 invalid_request_error (missing
+  `model` / malformed body), 404 model_not_found (model does not exist),
+  429/503 follow existing semantics.
+- Binary (the WS/h2 bidi own channels) and OpenAI SSE do not interfere.
+- `model` lives in the body (not the path) → access log classifies /v1 as
+  inference with the path as target; no per-model access log (v5 ruling).

@@ -1,4 +1,4 @@
-# Raw Bytes / Tensor Request (0.8.3)
+# Raw Bytes / Tensor Request (0.8.4)
 
 lite-server HTTP inference endpoints accept **raw bytes** requests when the
 `Content-Type` is *not* `application/json` (or its `+json` suffix variants).
@@ -90,23 +90,23 @@ def parse_bytes_tensor(mv):
 When the request is not Triton Binary, `ctx.binary_data` is `None` and
 `ctx.request` keeps the existing JSON / raw-bytes behavior unchanged.
 
-### tritonclient 全链路(阶段 2, G10)
+### tritonclient end-to-end (batch 2, G10)
 
-`binary_data_output` 协商 + 响应重组(请求侧 flag → 二进制响应 →
-客户端 `as_numpy` 数值一致):
+`binary_data_output` negotiation + response reassembly (request flag →
+binary response → client `as_numpy` values match):
 
 ```python
 import tritonclient.http as httpclient
 
 client = httpclient.InferenceServerClient(url="localhost:8000")
 inp = httpclient.InferInput("input0", [2, 2], "FP32")
-inp.set_data_from_numpy(arr)  # 自动走二进制通道(JSON 头 + 尾)
+inp.set_data_from_numpy(arr)  # binary channel automatically (JSON head + tail)
 out = httpclient.InferRequestedOutput("output0", binary_data=True)
 resp = client.infer("my-model", [inp], outputs=[out])
-result = resp.as_numpy("output0")  # 重组 ndarray,数值一致
+result = resp.as_numpy("output0")  # reassembled ndarray, values match
 ```
 
-worker 侧用 `lite_server.kserve` helper 构造信封输出:
+Workers build the envelope output with the `lite_server.kserve` helper:
 
 ```python
 from lite_server.kserve import build_response

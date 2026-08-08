@@ -1,4 +1,4 @@
-# 原始字节 / Tensor 请求（0.8.3）
+# 原始字节 / Tensor 请求（0.8.4）
 
 lite-server HTTP 推理端点支持**原始字节**请求。当 `Content-Type` 不是
 `application/json`（及其 `+json` 后缀变体）时，body 以原始 `bytes` 直传 worker。

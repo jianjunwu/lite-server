@@ -1,44 +1,46 @@
 # Known Deviations from KServe V2 / Triton (protocol-compat)
 
-> 创建于批次 1(protocol-compat-plan.md C18:文档债随批清零——首批 C17 四条,
-> 每批追加)。记录与 KServe V2 dataplane / Triton HTTP 协议的**有意偏差**,
-> 供生态客户端对接时对照。对应方案:[.claude/protocol-compat-plan.md](../.claude/protocol-compat-plan.md)。
+> Created in batch 1 (protocol-compat-plan.md C18: documentation debt is cleared
+> per batch — first four items are C17, appended every batch). Records the
+> **intentional deviations** from the KServe V2 dataplane / Triton HTTP
+> protocols, for ecosystem clients to compare against. Plan:
+> [.claude/protocol-compat-plan.md](../.claude/protocol-compat-plan.md).
 
-## 批次 1(阶段 1 Triton Binary Tensor Data Extension,首批 C17)
+## Batch 1 (stage 1 Triton Binary Tensor Data Extension, first C17 set)
 
-| # | 偏差 | 说明 |
+| # | Deviation | Note |
 |---|---|---|
-| ① | **KServe 二进制响应无 Content-Type** | KServe `encode()` 只写 `Inference-Header-Content-Length` header、不设 Content-Type;我们保留 `application/octet-stream`(Triton 惯例)——见 [raw-bytes-request.md](raw-bytes-request.md)。 |
-| ② | **KServe CloudEvents 信封不做** | structured/binary 两种 CloudEvents 包装均不实现;Triton 的「JSON 头 + 二进制尾」是目标通道(G10 面向 tritonclient)。 |
-| ③ | **KServe model not ready → 503(可选对齐)** | KServe 在 infer 前置 ready 检查、未就绪返回 503;我们 ready gate 语义既有,未做强制对齐。 |
-| ④ | **Triton `/statistics`、`/config` 端点不做** | `GET /v2/models/:m/statistics`、`/v2/models/:m/config` 非目标(G20);tritonclient `get_inference_statistics` 会 404。 |
+| ① | **KServe binary responses carry no Content-Type** | KServe `encode()` writes only the `Inference-Header-Content-Length` header; we keep `application/octet-stream` (Triton convention) — see [raw-bytes-request.md](raw-bytes-request.md). |
+| ② | **KServe CloudEvents envelope not implemented** | Neither structured nor binary CloudEvents wrapping; the Triton JSON-head + binary-tail channel is the target (G10 targets tritonclient). |
+| ③ | **KServe model not ready → 503 (optional alignment)** | KServe checks ready before infer and returns 503; our ready-gate semantics already exist and are not force-aligned. |
+| ④ | **Triton `/statistics` and `/config` endpoints not implemented** | `GET /v2/models/:m/statistics` and `/v2/models/:m/config` are non-goals (G20); tritonclient `get_inference_statistics` will 404. |
 
-## 批次 2(错误体双形状,协议层 seam 分派)
+## Batch 2 (error body duality, protocol-seam dispatch)
 
-| # | 偏差 | 说明 |
+| # | Deviation | Note |
 |---|---|---|
-| ⑤ | **错误体双形状** | KServe-mode 请求(`Inference-Header-Content-Length` 存在,或请求体为 KServe 信封)的 4xx/5xx 返回扁平 `{"error": "<message>"}`;非 KServe 请求维持 OpenAI 风格 `{"error":{type,message,code,param}}`——经 `src/protocol/` 的 render 分派。 |
+| ⑤ | **Error body duality** | KServe-mode requests (`Inference-Header-Content-Length` present, or a KServe envelope body) get the flat `{"error": "<message>"}` shape for 4xx/5xx; non-KServe requests keep the OpenAI style `{"error":{type,message,code,param}}` — dispatched via `src/protocol/` render. |
 
-## 批次 3(管理面)
+## Batch 3 (management surface)
 
-| # | 偏差 | 说明 |
+| # | Deviation | Note |
 |---|---|---|
-| ⑥ | **bare load 不触发上传后加载** | `POST /v2/repository/models/:m/load` alias 到 active 版本(幂等 200);「上传后 bare load」流程须先 versioned load/activate。 |
-| ⑦ | **worker `get_metadata()` 回调未落地** | `/v2/models/:m` 元数据的 `inputs`/`outputs` 暂为空数组(合法降级,tritonclient 不校验非空);worker 声明回调是后续可选增强。 |
+| ⑥ | **bare load does not trigger post-upload loading** | `POST /v2/repository/models/:m/load` aliases the active version (idempotent 200); the post-upload flow must versioned load/activate first. |
+| ⑦ | **worker `get_metadata()` callback not landed** | `/v2/models/:m` metadata returns empty `inputs`/`outputs` (legal degradation; tritonclient does not require non-empty); a worker callback is a later optional enhancement. |
 
-## 批次 4(Triton Generate extension)
+## Batch 4 (Triton Generate extension)
 
-| # | 偏差 | 说明 |
+| # | Deviation | Note |
 |---|---|---|
-| ⑧ | **SSE 自有格式 vs `generate_stream`** | `/events` 是自有格式(`data: chunk-N` + `data: [DONE]` 终止);`generate_stream` 是 Triton 兼容通道(`data: <完整 JSON>` 逐 chunk,错误携带在事件内,结束即连接关闭——无 `[DONE]`)。两者并存不冲突;`/generate_stream` 随 `streaming+sse` 开关族,`/generate`(unary)无 gate。 |
+| ⑧ | **own SSE format vs `generate_stream`** | `/events` uses the own format (`data: chunk-N` + terminating `data: [DONE]`); `generate_stream` is the Triton-compatible channel (`data: <full JSON>` per chunk, errors carried inside events, connection closes at the end — no `[DONE]`). Both coexist; `generate_stream` rides the `streaming+sse` gate family, `/generate` (unary) is ungated. **Caveat (D9):** the HTTP status is fixed by the first SSE response; mid-stream errors arrive in later `data:` events and clients must check per-event. |
 
-## 批次 5（openai-compact）
+## Batch 5 (openai-compact)
 
-| # | 偏差 | 说明 |
+| # | Deviation | Note |
 |---|---|---|
-| ⑨ | **`/v1/rerank` 不做** | 非 OpenAI API（KServe 自家扩展），openai-compact 仅 5 端点（chat/completions/embeddings/models/models/{model}）。 |
-| ⑩ | **翻译层在 worker 侧** | server 对 /v1 薄透传（仅解析 `model`/`stream` 用于路由与分流 + SSE 帧编码）；chat 请求解析 / completion·chunk·embeddings 构造在 worker 侧 helper `lite_server/helpers/openai.py`（chat→tensor 是模型语义，server 无法通用翻译）。 |
+| ⑨ | **`/v1/rerank` not implemented** | Not an OpenAI API (KServe's own extension); openai-compact is exactly 5 endpoints (chat/completions/embeddings/models/models/{model}). |
+| ⑩ | **translation layer lives on the worker side** | The server thin-forwards /v1 (body parsed only for `model`/`stream` routing+demux and SSE frame encoding); chat request parsing / completion·chunk·embeddings construction live in the worker-side helper `lite_server/helpers/openai.py` (chat→tensor is model semantics; the server cannot translate generically). |
 
-## 后续批次
+## Follow-ups
 
-- （无——批次 0-5 全部完成，本方案收尾。）
+- (none — batches 0–5 complete, this plan is wrapped up.)

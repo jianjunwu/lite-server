@@ -305,7 +305,7 @@ lite-server analyze --model <模型名> [选项]
 | `--strict` | flag | false | `--fail-severity warning` 的简写 |
 | `--deep` | flag | false | 在隔离子进程中 import model.py 以解析静态无法确定的类（**会执行模型代码**——需显式启用） |
 | `--deep-timeout` | float | 30.0 | `--deep` 导入的超时秒数 |
-| `--profile` | kserve-v2 | — | 运行可选的互操作 profile 检查（kserve-v2：KServe V2 推理协议） |
+| `--interop` | kserve-v2 | — | 运行可选的互操作 profile 检查（kserve-v2：KServe V2 推理协议；protocol-compat 批次 3 由 `--profile` 改名） |
 
 **纯静态分析——用户代码绝不执行。** model.py 以 AST 解析（无 import 副
 作用）；路径限定在仓库根内（`..`/符号链接逃逸以退出码 2 拒绝）；
