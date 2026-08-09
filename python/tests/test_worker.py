@@ -2197,6 +2197,44 @@ class TestCBLoop:
         assert len(seen) == 1
         assert isinstance(seen[0], HTTPException)
 
+    def test_step_loop_never_sleeps_while_holding_lock(self, monkeypatch):
+        """Regression: the step loop's 1ms idle tick must run OUTSIDE the
+        dispatch lock — a lock-held nap made every add wait out the step
+        thread's sleep cycle (threading.Lock is not fair, so the main
+        thread could miss several cycles per message)."""
+        from lite_server.worker import cb_loop as cb_module
+
+        class IdleCBModel(LitAPI):
+            def prefill(self, uid, decoded_input):
+                pass
+
+            def step(self, active_sequences):
+                return []
+
+            def has_finished(self, uid, token, generated_sequence):
+                return True
+
+        cb = cb_module.CBLoop(IdleCBModel(), SyncMockSocket(), log)
+        held = []
+        real_sleep = time.sleep
+
+        def spy_sleep(dt):
+            held.append(cb.lock.locked())
+            real_sleep(dt)
+
+        # NOTE: patches the shared time module's sleep (cb_loop references it
+        # as time.sleep); the spy delegates to the real sleep so timing is
+        # unchanged. xdist isolates tests per process.
+        monkeypatch.setattr("lite_server.worker.cb_loop.time.sleep", spy_sleep)
+        t = threading.Thread(target=cb._step_loop, daemon=True)
+        t.start()
+        deadline = time.time() + 2
+        while len(held) < 10 and time.time() < deadline:
+            time.sleep(0.001)
+
+        assert held, "step loop never called time.sleep"
+        assert not any(held), "time.sleep called while holding the CB dispatch lock"
+
 
 # ---------------------------------------------------------------------------
 # CB ctx injection (0.7.0 context unification)

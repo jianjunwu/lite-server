@@ -107,15 +107,16 @@ class CBLoop:
         asyncio.set_event_loop(self.loop)
         while True:
             with self.lock:
-                if not self.active:
-                    time.sleep(0.001)
-                    continue
-
+                # Snapshot under the lock; the idle sleep stays OUTSIDE it.
+                # A prefilled sequence cannot vanish before the work block
+                # re-acquires: prefill-failure deletes only un-prefilled uids,
+                # and cb_remove has no server-side producer.
                 ready = [s for s in self.active.values() if s.prefilled]
-                if not ready:
-                    time.sleep(0.001)
-                    continue
+            if not ready:
+                time.sleep(0.001)
+                continue
 
+            with self.lock:
                 try:
                     outputs = self._drive(self.step_fn(ready))
                 except HTTPException as e:
