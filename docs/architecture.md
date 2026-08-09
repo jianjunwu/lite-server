@@ -492,6 +492,10 @@ Token-bucket-based rate limiting (`rate_limit.rs`), supporting:
 > cleansed `client_ip` and the raw (truncated) `X-Forwarded-For` for
 > attribution.
 
+> **Per-instance semantics (P3-1).** Buckets live in an in-process DashMap —
+> with N replicas the effective limit is N× the configured value. Fleet-wide
+> limiting belongs to the upstream gateway.
+
 See [configuration.md](./configuration.md) for configuration examples.
 
 ## CORS (P-CORS)

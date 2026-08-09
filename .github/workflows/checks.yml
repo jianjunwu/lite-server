@@ -38,6 +38,65 @@ jobs:
             --ignore RUSTSEC-2026-0176 \
             --ignore RUSTSEC-2026-0177
 
+  # 蓝图 §6.7 评审 2.4：rustls 唯一版本 + ring 唯一 provider——多版本共存致
+  # mTLS ServerConfig 类型不匹配；aws-lc-rs 混入致 rustls builder() 歧义 panic。
+  rustls-guard:
+    name: rustls single-version + ring-only provider
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Exactly one rustls version (all features)
+        run: |
+          N=$(cargo tree -i rustls --all-features --prefix none | grep -oE '^rustls v[0-9.]+' | sort -u | wc -l)
+          if [ "$N" -ne 1 ]; then
+            cargo tree -i rustls --all-features
+            echo "::error::expected exactly one rustls version, found $N"
+            exit 1
+          fi
+      - name: aws-lc-rs must stay out of the tree
+        run: |
+          if cargo tree -i aws-lc-rs --all-features --prefix none >/dev/null 2>&1; then
+            cargo tree -i aws-lc-rs --all-features
+            echo "::error::aws-lc-rs entered the dependency tree (ring-only provider violated)"
+            exit 1
+          fi
+
+  # 对账 A5（蓝图 §4.3 P-TRACE）：telemetry feature 测试此前仅靠本地——纳入
+  # CI(--features telemetry，环境对齐 build-wheels.yml 的 cargo-test job)。
+  telemetry-tests:
+    name: Rust tests with telemetry feature (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libzmq3-dev protobuf-compiler
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install zeromq
+      - name: Install Miniconda and protoc (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          curl -fsSL -o /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-arm64.sh
+          bash /tmp/miniconda.sh -b -p "$HOME/miniconda"
+          "$HOME/miniconda/bin/conda" install -y -c conda-forge libprotobuf
+          echo "PROTOC=$HOME/miniconda/bin/protoc" >> $GITHUB_ENV
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install Python dependencies
+        run: pip install -e ".[dev]"
+      - name: Run lib tests with telemetry feature
+        run: cargo test --features telemetry --lib -- --test-threads=1
+
   # 蓝图 §6.3：pb2/proto 漂移检查——proto 改动必须同步重生成签入的
   # liteserver_pb2.py + liteserver_pb2_grpc.py（regen_proto.sh 固定
   # grpcio-tools 1.62.x，无 runtime_version guard；脚本内置 guard 检查）。

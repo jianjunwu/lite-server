@@ -94,6 +94,8 @@ rate_limit:
   max_buckets: 65536           # 限流桶数量上限（按 IP/路由 key），
                                # 防 IP 伪造洪泛导致内存无限增长。
                                # 0 = 无限制。
+                               # 进程内 per-instance：N 副本时实际限额 =
+                               # N×配置值；全局限流由上游网关负责。
 
 model_repository:
   path: ./model_repo           # 模型仓库目录
@@ -183,6 +185,8 @@ grpc:
 - **默认（admin fail-closed）**：未配置 `admin` → **仅 loopback 可达**（UDS 视为 loopback）；未配置 `inference` / `health` → 公开。breaking 变更——见[迁移指南](migration.md) M4。
 - **模式**（`mode` 标签）：`public`（显式开放——逃生门）或 `key`（API key：`key` = header 名；密钥取 `value` / `value_env` / `value_file` 首个存在者，启动期解析，缺源 fail-fast）。
 - key 比较为恒定时间。拒绝返回 HTTP 401 / gRPC Unauthenticated。`metrics_port` 监听器不受此约束——Prometheus 抓取走该端口。
+- **`key` 模式务必与 TLS 联合启用**（P5-1）——否则 API key 明文传输，可被链路直接截获。
+- **key 轮换**：密钥在启动期一次性解析。轮换=更新密钥来源（`value_env` / `value_file`）后滚动重启；建议用密钥来源而非内联 `value`——轮换只动密钥库，不动配置文件。
 
 ```yaml
 access_control:
@@ -219,7 +223,7 @@ server:
 4. **无后缀混淆** — `https://evil-example.com` 不匹配 `https://example.com`，`https://a.notexample.com` 不匹配 `https://*.example.com`。子域通配（`*.example.com`）要求前置标签（`a.example.com`），永不含顶域（`example.com`）。
 5. **Credentials + `*` 拒绝** — `allow_credentials: true` 时不回显通配 `*`——不发 ACAO（浏览器禁止 `Access-Control-Allow-Origin: *` 与 `Access-Control-Allow-Credentials: true` 共存）。请配置显式 origins。
 6. **`Vary: Origin` 恒有** — 所有 CORS 相关响应携带 `Vary: Origin`（preflight 额外携带 `Vary: Access-Control-Request-Method` / `-Headers`），共享缓存不会把某个 Origin 的响应发给另一个 Origin。
-7. **Preflight 校验方法与请求头** — preflight（`OPTIONS` + `Access-Control-Request-Method`）仅在 Origin 被允许时附加 CORS 头；允许的方法/请求头由策略通告（浏览器据此强制请求）。不合格的 preflight 返回 204、无 CORS 头。
+7. **Preflight 校验方法与请求头** — preflight（`OPTIONS` + `Access-Control-Request-Method`）仅当 Origin 被允许**且**请求的方法（`ACRM`）与全部请求头（`ACRH`）都在 `allow_methods` / `allow_headers` 清单内时才附加 CORS 头。不合格的 preflight 返回 204、**无** CORS 头。
 8. **`max_age` ≤ 7200** — `max_age_secs` 默认 7200——Chrome 的 preflight 缓存上限。超出值反正会被浏览器截断；配置 ≤ 7200。
 
 **分层** — CORS 中间件挂载在访问控制**外侧**：preflight `OPTIONS` 在鉴权之前以 204 短路（preflight 不带凭证）。位于 observability 内侧，故 204 携带 `x-request-id`。

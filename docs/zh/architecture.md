@@ -480,6 +480,9 @@ lite-server 通过 `orchestration.control_mode` 控制模型版本的生命周�
 > 走到首个非受信 hop。gRPC 路径同款清洗。访问日志并列记录清洗后的 `client_ip`
 > 与原始（截断）`X-Forwarded-For`，便于回溯归因。
 
+> **per-instance 语义（P3-1）。** 桶存在于进程内 DashMap——N 副本时实际限额 =
+> N×配置值；全局限流属上游网关职责。
+
 配置示例见 [configuration.md](./configuration.md)。
 
 ## CORS（P-CORS）

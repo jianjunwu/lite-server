@@ -100,6 +100,9 @@ rate_limit:
   max_buckets: 65536           # Max distinct rate-limit buckets (per IP/route key).
                                # Bounds memory under spoofed-source floods.
                                # 0 = unlimited.
+                               # In-process (per-instance): N replicas → effective
+                               # limit = N× configured value; use the upstream
+                               # gateway for fleet-wide limits.
 
 model_repository:
   path: ./model_repo           # Path to the model repository directory
@@ -190,6 +193,8 @@ Endpoint classes: `admin` (HTTP `/admin/*` + gRPC LiteAdmin service), `inference
 - **Defaults (fail-closed admin)**: unconfigured `admin` → **loopback only** (UDS counts as loopback); unconfigured `inference` / `health` → public. Breaking change — see [migration.md](migration.md) M4.
 - **Modes** (`mode` tag): `public` (explicitly open — the escape hatch) or `key` (API key: `key` = header name; secret from `value` / `value_env` / `value_file`, first present wins, resolved at startup — a missing source fails fast).
 - Key comparison is constant-time. Denials: HTTP 401 / gRPC Unauthenticated. The `metrics_port` listener is not covered — scrape Prometheus there.
+- **Always combine `key` mode with TLS** (P5-1) — without TLS the API key travels in cleartext and can be intercepted off the wire.
+- **Key rotation**: secrets are resolved once at startup. Rotate by updating the secret source (`value_env` / `value_file`) and performing a rolling restart; prefer a secret source over inline `value` so rotation touches the secret store, not the config file.
 
 ```yaml
 access_control:
@@ -249,9 +254,9 @@ Eight security properties are enforced:
    not serve a response obtained for one Origin to a different Origin.
 7. **Preflight validates method + headers** — A preflight (`OPTIONS` +
    `Access-Control-Request-Method`) attaches CORS headers **only** when the
-   Origin is allowed; the allowed methods/headers are advertised from the
-   policy (the browser enforces the request method/headers against them). A
-   non-qualifying preflight returns 204 with no CORS headers.
+   Origin is allowed **and** the requested method (`ACRM`) and every requested
+   header (`ACRH`) are in the configured `allow_methods` / `allow_headers`. A
+   non-qualifying preflight returns 204 with **no** CORS headers.
 8. **`max_age` ≤ 7200** — `max_age_secs` defaults to 7200 — Chrome's cap on
    the preflight cache. Values above it are clamped by the browser anyway;
    configure ≤ 7200.

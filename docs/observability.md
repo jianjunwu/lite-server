@@ -63,6 +63,22 @@ Double gating: an OTel streaming mirror is emitted only when
 (the call sites live inside the Prometheus `record_stream_*` functions, which
 inherit the former; the OTel meter is a no-op when the latter is off).
 
+### OTel export health (Prometheus)
+
+The telemetry pipeline observes itself via three Prometheus counters (always
+registered; stay at 0 when `telemetry.enabled` is false):
+
+| Metric | Meaning |
+|---|---|
+| `liteserver_otel_spans_ended_total` | Spans that entered the export pipeline (processor `on_end`). |
+| `liteserver_otel_spans_exported_total` | Spans successfully exported to the collector (per-batch). |
+| `liteserver_otel_export_failures_total` | Failed OTLP export batches. |
+
+`ended − exported` approximates dropped spans (the BatchSpanProcessor's
+full-queue drop is not directly observable). All request spans also carry
+`trace_id`/`span_id` fields when telemetry is enabled, so plain-text logs
+inside a span scope correlate with traces automatically.
+
 ### Access log semantics
 
 `access_log_middleware` measures time to the handler response — for SSE/WS
