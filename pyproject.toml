@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "miraserver"
-version = "0.8.3"
+version = "0.8.4-rc0"
 description = "High-performance inference server (Rust core + Python workers)"
 readme = "README.md"
 license = {text = "MIT"}
