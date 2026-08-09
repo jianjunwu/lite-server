@@ -124,8 +124,9 @@ def parse_inputs(ctx) -> dict[str, np.ndarray | list[bytes]]:
 def build_response(outputs: dict[str, np.ndarray], request_id: str | None = None) -> dict:
     """构造 KServe 信封 dict:`{id?, outputs: [{name, shape, datatype, data}]}`。
 
-    `data` = `arr.tolist()`(JSON data 数组);客户端需要二进制时在请求侧
-    加 `binary_data_output` flag,由 server 响应转换层二进制化。
+    `data` = row-major **扁平**数组(KServe 规范:JSON data 为 1-D,维数由
+    `shape` 描述——多维嵌套会被 Rust 响应转换层拒绝);客户端需要二进制
+    时在请求侧加 `binary_data_output` flag,由 server 响应转换层二进制化。
     """
     out = []
     for name, arr in outputs.items():
@@ -141,7 +142,7 @@ def build_response(outputs: dict[str, np.ndarray], request_id: str | None = None
             "name": name,
             "shape": list(arr.shape),
             "datatype": datatype,
-            "data": arr.tolist(),
+            "data": arr.flatten().tolist(),  # 1-D row-major;嵌套会 400
         })
     resp: dict = {"outputs": out}
     if request_id:

@@ -90,6 +90,18 @@ class TestBuildResponse:
         assert "id" not in resp
         assert resp["outputs"][0]["datatype"] == "INT64"
 
+    def test_build_response_multidim_data_is_flat(self):
+        """KServe 规范:JSON data 为 row-major 1-D 数组(shape 决定维数)。
+
+        多维输出若 data 嵌套(``arr.tolist()``),Rust 响应转换层
+        ``encode_value`` 逐元素编码时对非标量元素 400
+        (binary_data_output 请求 → "data element is not a JSON number")。
+        """
+        arr = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+        resp = build_response({"o": arr})
+        assert resp["outputs"][0]["shape"] == [2, 2]
+        assert resp["outputs"][0]["data"] == [1.0, 2.0, 3.0, 4.0]
+
     def test_build_response_roundtrip_with_parse(self):
         """parse → build 数值一致(analyzer LS401 codec 对称的正解)。"""
         arr = np.array([[1.5, -2.5]], dtype=np.float32)
