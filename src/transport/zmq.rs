@@ -167,16 +167,23 @@ impl WorkerZmqClient {
                                 Ok(bytes) => {
                                 match pb::Response::decode(bytes.as_slice()) {
                                     Ok(resp) => {
-                                        if let Some(pb::response::Payload::Stream(ref stream_resp)) = resp.payload {
-                                            let sid = &stream_resp.stream_id;
+                                        if let Some(pb::response::Payload::Stream(stream_resp)) = resp.payload {
+                                            // Move the frame into the channel
+                                            // (try_send returns the value on
+                                            // Full) instead of cloning it per
+                                            // chunk. sid / is_terminal are
+                                            // computed up front for post-move
+                                            // cleanup.
+                                            let sid = stream_resp.stream_id.clone();
+                                            let is_terminal = matches!(stream_resp.payload,
+                                                Some(pb::stream_response::Payload::Done(_))
+                                                | Some(pb::stream_response::Payload::Error(_)));
                                             let mut overflowed = false;
-                                            if let Some(tx) = stream_routes.get(sid) {
-                                                let is_done = matches!(stream_resp.payload, Some(pb::stream_response::Payload::Done(_)));
-                                                let is_error = matches!(stream_resp.payload, Some(pb::stream_response::Payload::Error(_)));
-                                                match tx.try_send(stream_resp.clone()) {
+                                            if let Some(tx) = stream_routes.get(&sid) {
+                                                match tx.try_send(stream_resp) {
                                                     Ok(()) => {
-                                                        if is_done || is_error {
-                                                            stream_routes.remove(sid);
+                                                        if is_terminal {
+                                                            stream_routes.remove(&sid);
                                                         }
                                                     }
                                                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -203,21 +210,18 @@ impl WorkerZmqClient {
                                                         });
                                                     }
                                                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                                        stream_routes.remove(sid);
+                                                        stream_routes.remove(&sid);
                                                     }
                                                 }
                                             }
                                             if overflowed {
-                                                stream_routes.remove(sid);
+                                                stream_routes.remove(&sid);
                                             }
                                             // A streaming route reply leaves its
                                             // unused unary slot behind — free it
                                             // once the stream terminates.
-                                            if matches!(stream_resp.payload,
-                                                Some(pb::stream_response::Payload::Done(_))
-                                                | Some(pb::stream_response::Payload::Error(_)))
-                                            {
-                                                pending.remove(sid);
+                                            if is_terminal {
+                                                pending.remove(&sid);
                                             }
                                         } else if let Some(tx) = pending.remove(&resp.uid) {
                                             // A unary route reply leaves its
