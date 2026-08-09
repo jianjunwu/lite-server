@@ -167,29 +167,7 @@ impl WorkerZmqClient {
                                 Ok(bytes) => {
                                 match pb::Response::decode(bytes.as_slice()) {
                                     Ok(resp) => {
-                                        if let Some(pb::response::Payload::CbCompleted(ref cb)) = resp.payload {
-                                            for seq in &cb.sequences {
-                                                if let Some(tx) = pending.remove(&seq.uid) {
-                                                    let single_resp = pb::Response {
-                                                        uid: seq.uid.clone(),
-                                                        payload: Some(pb::response::Payload::Single(
-                                                            pb::SingleResponse {
-                                                                data: seq.data.clone(),
-                                                                headers: HashMap::new(),
-                                                                status: Some(pb::Status {
-                                                                    code: "Ok".to_string(),
-                                                                    message: "".to_string(),
-                                                                }),
-
-                                                                ..Default::default()
-                                                            },
-                                                        )),
-                                                        metrics: resp.metrics.clone(),
-                                                    };
-                                                    let _ = tx.send(single_resp);
-                                                }
-                                            }
-                                        } else if let Some(pb::response::Payload::Stream(ref stream_resp)) = resp.payload {
+                                        if let Some(pb::response::Payload::Stream(ref stream_resp)) = resp.payload {
                                             let sid = &stream_resp.stream_id;
                                             let mut overflowed = false;
                                             if let Some(tx) = stream_routes.get(sid) {

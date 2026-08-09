@@ -17,7 +17,7 @@ from lite_server.api import LitAPI
 from lite_server.context import CBSequence, Headers, RequestContext, RequestMeta
 from lite_server.exceptions import HTTPException
 from lite_server.pipeline import _adapt, _wrap_ctx_method
-from lite_server.proto import CBAddRequest, CBRemoveRequest, Request
+from lite_server.proto import CBAddRequest, Request
 from lite_server.worker.common import (
     _build_single_response,
     _format_exc_brief,
@@ -99,9 +99,6 @@ class CBLoop:
             self._drive(self.pipe.run_on_error(ctx, e))
             err_resp = _make_error_response(cb_add.uid, f"prefill failed: {e}", headers=_merge_err_headers(ctx, e))
             self.socket.send(err_resp.SerializeToString())
-
-    def _handle_remove(self, cb_remove: CBRemoveRequest):
-        self.active.pop(cb_remove.uid, None)
 
     def _step_loop(self):
         asyncio.set_event_loop(self.loop)
@@ -203,11 +200,7 @@ class CBLoop:
                     break
 
                 with self.lock:
-                    if request.HasField("cb_add"):
-                        self._handle_add(request.cb_add)
-                    elif request.HasField("cb_remove"):
-                        self._handle_remove(request.cb_remove)
-                    elif request.HasField("single"):
+                    if request.HasField("single"):
                         # Route standard SingleRequest through CB pipeline
                         cb_add = CBAddRequest()
                         cb_add.uid = request.uid
