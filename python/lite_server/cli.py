@@ -188,6 +188,104 @@ def main(argv=None):
                                      "renamed from --profile by protocol-compat 批次 3; "
                                      "--profile is kept as a deprecated alias)")
 
+    # profile (config search; plan .claude/tune-config-search-plan.md)
+    profile_parser = subparsers.add_parser(
+        "profile",
+        help="Search configuration space against a running server "
+             "(config points × concurrency; Admin ReloadModel swap, "
+             "no server-process restart)",
+    )
+    profile_parser.add_argument("--model", required=True)
+    profile_parser.add_argument("--version", default=None,
+                                help="Model version (default: resolved by the server)")
+    profile_parser.add_argument("--repo", default="./model_repo",
+                                help="Model repository path (preflight batching detection)")
+    profile_parser.add_argument("--admin-url", default="http://127.0.0.1:8000",
+                                help="Admin endpoint (loopback by default; also the "
+                                     "inference URL for trials)")
+    profile_parser.add_argument("--server-pid", type=int, default=None,
+                                help="Server PID for local resource sampling "
+                                     "(default: looked up by listening port)")
+    profile_parser.add_argument("--metrics-url", default=None,
+                                help="Prometheus /metrics endpoint (default: Admin "
+                                     "host on the default metrics port; plan "
+                                     "decision point 4)")
+    profile_parser.add_argument("--sweep-knob", action="append", default=None,
+                                metavar="KEY=v1,v2,v3",
+                                help="Swept config key (repeatable). Batch keys "
+                                     "(max_batch_size/batch_timeout) require the model "
+                                     "to declare batch/unbatch; workers_per_device is "
+                                     "dropped under continuous_batching")
+    profile_parser.add_argument("--concurrency", default="1,2,4,8,16",
+                                help="Comma-separated concurrency levels (inner grid; "
+                                     "zero reloads between levels)")
+    profile_parser.add_argument("--max-trials", type=int, default=64,
+                                help="Cross-product cap: config points × concurrency")
+    profile_parser.add_argument("--objective",
+                                choices=["throughput", "goodput", "sessions_per_sec"],
+                                default="throughput",
+                                help="Ranking objective (batch 2; default: throughput)")
+    profile_parser.add_argument("--top-n", type=int, default=3,
+                                help="Top-N recommendations (batch 2; default: 3)")
+    profile_parser.add_argument("--max-p99", type=float, default=None,
+                                help="Constraint: p99 latency budget in ms (batch 2)")
+    profile_parser.add_argument("--min-throughput", type=float, default=None,
+                                help="Constraint: minimum req/s (batch 2)")
+    profile_parser.add_argument("--max-error-rate", type=float, default=None,
+                                help="Constraint: max failed/total (batch 2)")
+    profile_parser.add_argument("--duration", type=float, default=30.0,
+                                help="Trial duration in seconds (default: 30)")
+    profile_parser.add_argument("--requests", type=int, default=None,
+                                help="Run exactly N requests per trial "
+                                     "(mutually exclusive with --duration)")
+    profile_parser.add_argument("--export", default=None,
+                                help="Write per-trial JSON checkpoints + summary to DIR")
+    profile_parser.add_argument("--search-mode", choices=["grid", "quick"], default="grid",
+                                help="Search strategy (default: grid; quick = hill climb, "
+                                     "batch 3)")
+    profile_parser.add_argument("--reload-timeout", type=float, default=120.0,
+                                help="Seconds to wait for a version to become Ready "
+                                     "after ReloadModel")
+    profile_parser.add_argument("--max-trial-failures", type=int, default=3,
+                                help="Consecutive config-point failures before the "
+                                     "circuit breaker aborts")
+    profile_parser.add_argument("--dry-run", action="store_true",
+                                help="Print preflight conclusions + effective grid + "
+                                     "estimated wall clock; zero side effects")
+    profile_parser.add_argument("--apply-recommendation", action="store_true",
+                                help="Leave the top-1 config applied (batch 2; default: "
+                                     "restore the original config.yaml after the run)")
+    profile_parser.add_argument("--force", action="store_true",
+                                help="Override the exclusivity guard (foreign traffic "
+                                     "pollutes results — use with care)")
+    profile_parser.add_argument("--recover", action="store_true",
+                                help="Restore config.yaml byte-exact from a stale "
+                                     ".profile.backup, then exit")
+    # Benchmark passthrough (stream/bidi/LLM/TTS/STT scenarios, plan §2.11)
+    profile_parser.add_argument("--stream", action="store_true", default=False)
+    profile_parser.add_argument("--bidi", action="store_true", default=False)
+    profile_parser.add_argument("--model-type", choices=["llm", "tts", "stt", "generic"],
+                                default="llm")
+    profile_parser.add_argument("--endpoint", choices=["events", "decoupled"], default="events")
+    profile_parser.add_argument("--transport", choices=["sse", "ws", "grpc", "h2"], default=None)
+    profile_parser.add_argument("--payload", default=None)
+    profile_parser.add_argument("--payload-file", action="append", default=None)
+    profile_parser.add_argument("--payload-random", default=None, metavar="TEMPLATE")
+    profile_parser.add_argument("--rate", type=float, default=None,
+                                help="Constant arrival rate in req/s (open-loop)")
+    profile_parser.add_argument("--warmup-requests", type=int, default=0)
+    profile_parser.add_argument("--grace-period", type=float, default=30.0)
+    profile_parser.add_argument("--goodput", default=None, metavar="EXPR",
+                                help="SLO expression, e.g. 'ttft:500 tpot:50 e2el:2000'")
+    profile_parser.add_argument("--slo-attainment", type=float, default=None)
+    profile_parser.add_argument("--tokenizer", default=None, metavar="PATH_OR_HUB_ID")
+    profile_parser.add_argument("--text-field", default=None, metavar="FIELD")
+    profile_parser.add_argument("--pace", type=float, default=None)
+    profile_parser.add_argument("--rt-factor", type=float, default=None)
+    profile_parser.add_argument("--min-sessions", type=int, default=30)
+    profile_parser.add_argument("--cancel-after", type=int, default=None)
+    profile_parser.add_argument("--read-delay-ms", type=float, default=None)
+
     # pack
     pack_parser = subparsers.add_parser("pack", help="Pack model into artifact")
     pack_parser.add_argument("model_dir", help="Model directory")
@@ -222,6 +320,8 @@ def main(argv=None):
         return _cmd_benchmark(args)
     elif args.command == "analyze":
         return _cmd_analyze(args)
+    elif args.command == "profile":
+        return _cmd_profile(args)
     elif args.command == "pack":
         return _cmd_pack(args)
     elif args.command == "unpack":
@@ -882,184 +982,17 @@ def _cmd_benchmark(args):
     url = _benchmark_request_url(args)
 
     async def run_benchmark(c: int | None = None):
-        import httpx
-
-        concurrency = c if c is not None else concurrency_levels[0]
-        mode = f"duration={duration}s" if duration is not None else f"requests={args.requests}"
-        if args.bidi:
-            stream_label = f", bidi/{pacing.mode}"
-        else:
-            stream_label = ", streaming" if args.stream else ""
-        print(f"Benchmarking {args.model} (concurrency={concurrency}, "
-              f"{mode}{stream_label}, warmup={args.warmup_requests})")
-
-        if payload_factory is not None:
-            final_payload = payload_factory
-        else:
-            payload_cycle = itertools.cycle(payloads)
-            final_payload = lambda: next(payload_cycle)
-
-        if args.stream:
-            read_timeout = args.stream_read_timeout
-        else:
-            read_timeout = 30.0
-        timeout = httpx.Timeout(read_timeout, connect=5.0, pool=5.0)
-        limits = httpx.Limits(
-            max_connections=max(concurrency, 1),
-            max_keepalive_connections=max(concurrency, 1),
-            keepalive_expiry=15.0,
+        return await _run_benchmark_level(
+            args,
+            c if c is not None else concurrency_levels[0],
+            url=url,
+            payload_factory=payload_factory,
+            payloads=payloads,
+            pacing=pacing,
+            duration=duration,
+            goodput_slo=goodput_slo,
+            token_counter=token_counter,
         )
-        async with httpx.AsyncClient(limits=limits) as client:
-            engine = BenchmarkEngine()
-
-            if args.bidi:
-                # Bidi session path: ws/grpc transport → run_bidi()
-                grpc_channel = None
-                if args.transport == "ws":
-                    from websockets.asyncio.client import connect as _ws_connect
-
-                    from lite_server.benchmark.ws_bidi_target import ws_bidi_session
-
-                    session = ws_bidi_session(
-                        _ws_connect, url, pacing=pacing,
-                        idle_timeout=args.stream_read_timeout,
-                    )
-                elif args.transport == "h2":
-                    from lite_server.benchmark.h2_bidi_target import h2_bidi_session
-
-                    session = h2_bidi_session(
-                        url, pacing=pacing,
-                        idle_timeout=args.stream_read_timeout,
-                    )
-                else:  # grpc
-                    import grpc as _grpc
-
-                    from lite_server.benchmark.grpc_bidi_target import (
-                        grpc_bidi_session,
-                    )
-
-                    grpc_addr = args.url.split("://", 1)[-1].rstrip("/")
-                    grpc_channel = _grpc.aio.insecure_channel(grpc_addr)
-                    session = grpc_bidi_session(
-                        grpc_channel, args.model, version=args.version,
-                        pacing=pacing, idle_timeout=args.stream_read_timeout,
-                    )
-                try:
-                    return await engine.run_bidi(
-                        session_runner=session,
-                        payload=final_payload,
-                        concurrency=concurrency,
-                        duration=duration,
-                        total_requests=args.requests,
-                        warmup_requests=args.warmup_requests,
-                        grace_period=args.grace_period,
-                        transport=args.transport,
-                        pacing_mode=pacing.mode,
-                        min_sessions=args.min_sessions,
-                    )
-                finally:
-                    if grpc_channel is not None:
-                        await grpc_channel.close()
-
-            if args.stream:
-                # Streaming path: transport target → run_stream()
-                grpc_channel = None
-                if args.transport == "sse":
-                    from lite_server.benchmark.sse_target import sse_stream_target
-
-                    stream_target = sse_stream_target(client, url, timeout=timeout)
-                elif args.transport == "ws":
-                    from websockets.asyncio.client import connect as _ws_connect
-
-                    from lite_server.benchmark.ws_target import ws_stream_target
-
-                    stream_target = ws_stream_target(
-                        _ws_connect, url, timeout=args.stream_read_timeout,
-                    )
-                else:  # grpc
-                    import grpc as _grpc
-
-                    from lite_server.benchmark.grpc_target import grpc_stream_target
-
-                    grpc_addr = args.url.split("://", 1)[-1].rstrip("/")
-                    grpc_channel = _grpc.aio.insecure_channel(grpc_addr)
-                    stream_target = grpc_stream_target(
-                        grpc_channel, args.model, version=args.version,
-                        decoupled=(args.endpoint == "decoupled"),
-                        timeout=args.stream_read_timeout,
-                    )
-
-                # Scenario wrappers (plan §7.2): cancel / slow-consumer injection
-                if args.cancel_after is not None:
-                    from lite_server.benchmark.scenario import with_cancel_after
-
-                    stream_target = with_cancel_after(
-                        stream_target, args.cancel_after,
-                    )
-                if args.read_delay_ms is not None:
-                    from lite_server.benchmark.scenario import with_read_delay
-
-                    stream_target = with_read_delay(
-                        stream_target, args.read_delay_ms / 1000.0,
-                    )
-
-                # STT request_meta: extract audio_duration_ms from payload
-                request_meta_fn = None
-                if args.model_type == "stt":
-                    def _stt_request_meta(p: dict) -> dict | None:
-                        val = p.get("audio_duration_ms")
-                        if isinstance(val, (int, float)):
-                            return {"audio_duration_ms": float(val)}
-                        return None
-                    request_meta_fn = _stt_request_meta
-
-                try:
-                    return await engine.run_stream(
-                        target=stream_target,
-                        payload=final_payload,
-                        concurrency=concurrency,
-                        duration=duration,
-                        total_requests=args.requests,
-                        warmup_requests=args.warmup_requests,
-                        grace_period=args.grace_period,
-                        rate=args.rate,
-                        model_type=args.model_type,
-                        request_meta=request_meta_fn,
-                        goodput_slo=goodput_slo,
-                        slo_attainment_target=(
-                            args.slo_attainment
-                            if args.slo_attainment is not None else 0.95
-                        ),
-                        token_counter=token_counter,
-                    )
-                finally:
-                    if grpc_channel is not None:
-                        await grpc_channel.close()
-            else:
-                # Non-streaming path (unchanged)
-                async def target(payload: dict) -> dict:
-                    try:
-                        resp = await client.post(url, json=payload, timeout=timeout)
-                    except httpx.TimeoutException as e:
-                        raise RequestTimeoutError() from e
-                    except httpx.ConnectError as e:
-                        raise RequestConnectError() from e
-                    except httpx.TransportError as e:
-                        raise RequestTransportError() from e
-                    if resp.status_code != 200:
-                        raise RequestStatusError(resp.status_code)
-                    return {"ok": True}
-
-                return await engine.run(
-                    target=target,
-                    payload=final_payload,
-                    concurrency=concurrency,
-                    duration=duration,
-                    total_requests=args.requests,
-                    warmup_requests=args.warmup_requests,
-                    grace_period=args.grace_period,
-                    rate=args.rate,
-                )
 
     # Windows: use SelectorEventLoop for subprocess compat
     if sys.platform == "win32":
@@ -1176,6 +1109,202 @@ def _cmd_benchmark(args):
     return _check_threshold_gate(result, args)
 
 
+async def _run_benchmark_level(args, concurrency, *, url, payload_factory, payloads,
+                             pacing, duration, goodput_slo, token_counter):
+    """Run one benchmark level (concurrency) — extracted from _cmd_benchmark
+    so profile can drive the exact same measurement machinery. All
+    preprocessing (payloads, pacing, URL, SLO, tokenizer) is done by the
+    caller; this function owns the httpx client + target construction and the
+    engine invocation for unary / stream / bidi."""
+    import itertools
+
+    import httpx
+
+    from lite_server.benchmark.benchmark import (
+        BenchmarkEngine,
+        RequestConnectError,
+        RequestStatusError,
+        RequestTimeoutError,
+        RequestTransportError,
+    )
+
+    mode = f"duration={duration}s" if duration is not None else f"requests={args.requests}"
+    if args.bidi:
+        stream_label = f", bidi/{pacing.mode}"
+    else:
+        stream_label = ", streaming" if args.stream else ""
+    print(f"Benchmarking {args.model} (concurrency={concurrency}, "
+          f"{mode}{stream_label}, warmup={args.warmup_requests})")
+
+    if payload_factory is not None:
+        final_payload = payload_factory
+    else:
+        payload_cycle = itertools.cycle(payloads)
+        final_payload = lambda: next(payload_cycle)
+
+    if args.stream:
+        read_timeout = args.stream_read_timeout
+    else:
+        read_timeout = 30.0
+    timeout = httpx.Timeout(read_timeout, connect=5.0, pool=5.0)
+    limits = httpx.Limits(
+        max_connections=max(concurrency, 1),
+        max_keepalive_connections=max(concurrency, 1),
+        keepalive_expiry=15.0,
+    )
+    async with httpx.AsyncClient(limits=limits) as client:
+        engine = BenchmarkEngine()
+
+        if args.bidi:
+            # Bidi session path: ws/grpc transport → run_bidi()
+            grpc_channel = None
+            if args.transport == "ws":
+                from websockets.asyncio.client import connect as _ws_connect
+
+                from lite_server.benchmark.ws_bidi_target import ws_bidi_session
+
+                session = ws_bidi_session(
+                    _ws_connect, url, pacing=pacing,
+                    idle_timeout=args.stream_read_timeout,
+                )
+            elif args.transport == "h2":
+                from lite_server.benchmark.h2_bidi_target import h2_bidi_session
+
+                session = h2_bidi_session(
+                    url, pacing=pacing,
+                    idle_timeout=args.stream_read_timeout,
+                )
+            else:  # grpc
+                import grpc as _grpc
+
+                from lite_server.benchmark.grpc_bidi_target import (
+                    grpc_bidi_session,
+                )
+
+                grpc_addr = args.url.split("://", 1)[-1].rstrip("/")
+                grpc_channel = _grpc.aio.insecure_channel(grpc_addr)
+                session = grpc_bidi_session(
+                    grpc_channel, args.model, version=args.version,
+                    pacing=pacing, idle_timeout=args.stream_read_timeout,
+                )
+            try:
+                return await engine.run_bidi(
+                    session_runner=session,
+                    payload=final_payload,
+                    concurrency=concurrency,
+                    duration=duration,
+                    total_requests=args.requests,
+                    warmup_requests=args.warmup_requests,
+                    grace_period=args.grace_period,
+                    transport=args.transport,
+                    pacing_mode=pacing.mode,
+                    min_sessions=args.min_sessions,
+                )
+            finally:
+                if grpc_channel is not None:
+                    await grpc_channel.close()
+
+        if args.stream:
+            # Streaming path: transport target → run_stream()
+            grpc_channel = None
+            if args.transport == "sse":
+                from lite_server.benchmark.sse_target import sse_stream_target
+
+                stream_target = sse_stream_target(client, url, timeout=timeout)
+            elif args.transport == "ws":
+                from websockets.asyncio.client import connect as _ws_connect
+
+                from lite_server.benchmark.ws_target import ws_stream_target
+
+                stream_target = ws_stream_target(
+                    _ws_connect, url, timeout=args.stream_read_timeout,
+                )
+            else:  # grpc
+                import grpc as _grpc
+
+                from lite_server.benchmark.grpc_target import grpc_stream_target
+
+                grpc_addr = args.url.split("://", 1)[-1].rstrip("/")
+                grpc_channel = _grpc.aio.insecure_channel(grpc_addr)
+                stream_target = grpc_stream_target(
+                    grpc_channel, args.model, version=args.version,
+                    decoupled=(args.endpoint == "decoupled"),
+                    timeout=args.stream_read_timeout,
+                )
+
+            # Scenario wrappers (plan §7.2): cancel / slow-consumer injection
+            if args.cancel_after is not None:
+                from lite_server.benchmark.scenario import with_cancel_after
+
+                stream_target = with_cancel_after(
+                    stream_target, args.cancel_after,
+                )
+            if args.read_delay_ms is not None:
+                from lite_server.benchmark.scenario import with_read_delay
+
+                stream_target = with_read_delay(
+                    stream_target, args.read_delay_ms / 1000.0,
+                )
+
+            # Streaming request_meta for STT model types
+            request_meta_fn = None
+            if args.model_type == "stt":
+                def _stt_request_meta(p: dict) -> dict | None:
+                    val = p.get("audio_duration_ms")
+                    if isinstance(val, (int, float)):
+                        return {"audio_duration_ms": float(val)}
+                    return None
+                request_meta_fn = _stt_request_meta
+
+            try:
+                return await engine.run_stream(
+                    target=stream_target,
+                    payload=final_payload,
+                    concurrency=concurrency,
+                    duration=duration,
+                    total_requests=args.requests,
+                    warmup_requests=args.warmup_requests,
+                    grace_period=args.grace_period,
+                    rate=args.rate,
+                    model_type=args.model_type,
+                    request_meta=request_meta_fn,
+                    goodput_slo=goodput_slo,
+                    slo_attainment_target=(
+                        args.slo_attainment
+                        if args.slo_attainment is not None else 0.95
+                    ),
+                    token_counter=token_counter,
+                )
+            finally:
+                if grpc_channel is not None:
+                    await grpc_channel.close()
+        else:
+            # Non-streaming path (unchanged)
+            async def target(payload: dict) -> dict:
+                try:
+                    resp = await client.post(url, json=payload, timeout=timeout)
+                except httpx.TimeoutException as e:
+                    raise RequestTimeoutError() from e
+                except httpx.ConnectError as e:
+                    raise RequestConnectError() from e
+                except httpx.TransportError as e:
+                    raise RequestTransportError() from e
+                if resp.status_code != 200:
+                    raise RequestStatusError(resp.status_code)
+                return {"ok": True}
+
+            return await engine.run(
+                target=target,
+                payload=final_payload,
+                concurrency=concurrency,
+                duration=duration,
+                total_requests=args.requests,
+                warmup_requests=args.warmup_requests,
+                grace_period=args.grace_period,
+                rate=args.rate,
+            )
+
+
 def _cmd_analyze(args):
     """Analyze a model: thin shell over StaticAnalyzer (pure AST, zero execution).
 
@@ -1217,6 +1346,301 @@ def _cmd_analyze(args):
 
     fail_severity = "warning" if args.strict else args.fail_severity
     return report.exit_code(fail_severity)
+
+
+def _cmd_profile(args):
+    """Profile config search (plan tune-config-search-plan.md): thin shell over
+    ProfileEngine. CLI responsibilities: arg mapping, preflight, grid
+    construction, benchmark-runner assembly, checkpoint export, exit codes
+    (0 success / 2 failure incl. preflight refusal, restore failure, breaker)."""
+    import asyncio
+    import json
+    from pathlib import Path
+
+    import httpx
+
+    from lite_server.profile.checkpoint import campaign_hash
+    from lite_server.profile.engine import (
+        EstimateInputs,
+        ProfileAbort,
+        ProfileEngine,
+        ProfileFailure,
+    )
+    from lite_server.profile.grid import GridError, GridSpec, default_knobs
+    from lite_server.profile.preflight import PreflightError, run_preflight
+
+    # --recover: byte-exact restore from a stale backup, then exit (plan §2.6.1)
+    if args.recover:
+        from lite_server.profile.config_writer import (
+            ConfigEditError,
+            has_stale_backup,
+            restore_backup,
+        )
+
+        config_path = Path(args.repo) / args.model / (args.version or "1") / "config.yaml"
+        if not has_stale_backup(config_path):
+            _logger.error("no stale .profile.backup for %s", config_path)
+            return 2
+        try:
+            restore_backup(config_path)
+        except ConfigEditError as e:
+            _logger.error("%s", e)
+            return 2
+        print(f"Restored {config_path} byte-exact from backup. Reload the model "
+              f"via Admin to re-apply the original config.")
+        return 0
+
+    if args.search_mode != "grid":
+        _logger.error("--search-mode quick lands in a later milestone; use grid")
+        return 2
+
+    # Scenario params (plan §2.11): fixed per scenario, not swept
+    scenario = {
+        "stream": bool(args.stream),
+        "bidi": bool(args.bidi),
+        "model_type": args.model_type,
+        "endpoint": args.endpoint if args.stream else None,
+        "transport": args.transport,
+        "goodput": args.goodput,
+        "objective": args.objective,
+    }
+
+    async def main() -> int:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # 1. Preflight (hard gates, §2.4)
+            try:
+                preflight = await run_preflight(
+                    admin_url=args.admin_url,
+                    model=args.model,
+                    version=args.version or "1",
+                    repo_path=Path(args.repo),
+                    client=client,
+                    force=args.force,
+                    server_pid=args.server_pid,
+                    metrics_url=args.metrics_url,
+                )
+            except PreflightError as e:
+                _logger.error("preflight failed: %s", e)
+                return 2
+
+            # 2. Grid: declaration-state defaults + explicit --sweep-knob
+            knobs = default_knobs(
+                preflight.batching_declared,
+                preflight.continuous_batching,
+            )
+            if args.sweep_knob:
+                for spec in args.sweep_knob:
+                    key, _, raw = spec.partition("=")
+                    if not raw:
+                        _logger.error("--sweep-knob must be KEY=v1,v2,v3, got %r", spec)
+                        return 2
+                    try:
+                        values = [int(v) if v.lstrip("-").isdigit() else float(v)
+                                  for v in raw.split(",")]
+                    except ValueError:
+                        _logger.error("--sweep-knob %s: values must be numeric", spec)
+                        return 2
+                    knobs[key] = values
+            try:
+                concurrency = [int(c) for c in args.concurrency.split(",")]
+            except ValueError:
+                _logger.error("--concurrency must be comma-separated integers")
+                return 2
+            try:
+                grid = GridSpec(
+                    batching_declared=preflight.batching_declared,
+                    continuous_batching=preflight.continuous_batching,
+                    knobs=knobs,
+                    concurrency=concurrency,
+                    max_trials=args.max_trials,
+                )
+                grid.check_cap()
+            except GridError as e:
+                _logger.error("%s", e)
+                return 2
+
+            campaign = campaign_hash(
+                args.model, preflight.resolved_version, grid.knobs, scenario,
+            )
+
+            engine = ProfileEngine(
+                config_path=Path(args.repo) / args.model
+                / preflight.resolved_version / "config.yaml",
+                model=args.model,
+                version=preflight.resolved_version,
+                admin_url=args.admin_url,
+                grid=grid,
+                preflight=preflight,
+                measure=_profile_measure_fn(args, client),
+                client=client,
+                reload_timeout=args.reload_timeout,
+                max_trial_failures=args.max_trial_failures,
+                campaign=campaign,
+                metrics_url=args.metrics_url,
+            )
+
+            if args.dry_run:
+                report = engine.dry_run_report(EstimateInputs(duration_secs=args.duration))
+                print(json.dumps(report, indent=2, ensure_ascii=False))
+                return 0
+
+            try:
+                result = await engine.run()
+            except (ProfileAbort, ProfileFailure) as e:
+                _logger.error("profile failed: %s", e)
+                return 2
+
+            if result.aborted:
+                _logger.error("profile aborted (interrupted) — original config restored")
+                return 2
+
+            # 3. Checkpoint export: per-trial JSON + summary (plan §2.8)
+            export_dir = Path(args.export) if args.export else None
+            summary = {
+                "schema_version": 1,
+                "campaign_hash": result.campaign,
+                "model": args.model,
+                "version": preflight.resolved_version,
+                "grid": {
+                    "config_points": [p.to_dict() for p in grid.config_points()],
+                    "concurrency": concurrency,
+                },
+                "scenario": scenario,
+                "constraints": {
+                    "max_p99": args.max_p99,
+                    "min_throughput": args.min_throughput,
+                    "max_error_rate": args.max_error_rate,
+                    "objective": args.objective,
+                },
+                "trials": [t.to_dict() for t in result.trials],
+            }
+            if export_dir is not None:
+                export_dir.mkdir(parents=True, exist_ok=True)
+                for t in result.trials:
+                    trial_file = export_dir / f"trial-{t.index:03d}.json"
+                    trial_file.write_text(
+                        json.dumps(t.to_dict(), indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                summary_path = export_dir / "summary.json"
+                summary_path.write_text(
+                    json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+                print(f"Checkpoint exported: {export_dir}")
+
+            ok = [t for t in result.trials if t.status == "ok"]
+            print(f"\nProfile complete: {len(ok)} ok / {len(result.trials)} trials "
+                  f"(campaign {result.campaign})")
+            if not ok:
+                return 1  # no usable trials (constraint filtering lands in batch 2)
+            return 0
+
+    try:
+        return asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nProfile interrupted.")
+        return 130
+
+
+def _profile_measure_fn(args, client):
+    """Build the per-trial measure runner: benchmark preprocessing reused from
+    the benchmark CLI, then one _run_benchmark_level per concurrency level."""
+    import itertools
+
+    from lite_server.benchmark.benchmark import BenchmarkResult
+
+    # Mirror _cmd_benchmark preprocessing on a benchmark-shaped namespace.
+    ns = argparse.Namespace(
+        url=args.admin_url,
+        model=args.model,
+        version=args.version,
+        requests=args.requests,
+        warmup_requests=args.warmup_requests,
+        grace_period=args.grace_period,
+        rate=args.rate,
+        payload=args.payload,
+        payload_file=args.payload_file,
+        payload_random=args.payload_random,
+        stream=args.stream,
+        bidi=args.bidi,
+        endpoint=args.endpoint,
+        transport=args.transport or ("ws" if args.bidi else "sse"),
+        model_type=args.model_type,
+        stream_read_timeout=300.0,
+        max_ttft_ms=None,
+        max_rtf=None,
+        pace=args.pace,
+        rt_factor=args.rt_factor,
+        min_sessions=args.min_sessions,
+        cancel_after=args.cancel_after,
+        read_delay_ms=args.read_delay_ms,
+        goodput=args.goodput,
+        slo_attainment=args.slo_attainment,
+        tokenizer=args.tokenizer,
+        text_field=args.text_field,
+    )
+
+    try:
+        payloads = _resolve_benchmark_payloads(ns)
+    except (OSError, ValueError) as e:
+        def _raise_payload(_c):
+            raise ProfileFailure(f"payload error: {e}")
+        return _raise_payload
+
+    payload_factory = None
+    if ns.payload_random is not None:
+        import json as _json
+
+        template = _json.loads(ns.payload_random)
+        payload_factory = _random_payload_factory(template)
+
+    pacing = None
+    if ns.bidi:
+        from lite_server.benchmark.bidi_session import Pacing
+
+        label = _bidi_pacing_label(ns)
+        if label == "lock_step":
+            pacing = Pacing(mode="lock_step")
+        elif label == "real_time":
+            pacing = Pacing(mode="real_time", pace_secs=ns.pace)
+        else:
+            pacing = Pacing(mode="speedup", pace_secs=ns.pace / ns.rt_factor)
+
+    goodput_slo = None
+    if ns.goodput is not None:
+        from lite_server.benchmark.stream_metrics import parse_goodput
+
+        goodput_slo = parse_goodput(ns.goodput)
+
+    token_counter = None
+    if ns.tokenizer is not None:
+        from lite_server.benchmark.token_counter import (
+            TokenizerCounter,
+            load_tokenizer,
+        )
+
+        token_counter = TokenizerCounter(load_tokenizer(ns.tokenizer), text_field=ns.text_field)
+
+    duration = args.duration if args.requests is None else None
+    url = _benchmark_request_url(ns)
+
+    async def measure(concurrency: int) -> dict:
+        result = await _run_benchmark_level(
+            ns,
+            concurrency,
+            url=url,
+            payload_factory=payload_factory,
+            payloads=payloads,
+            pacing=pacing,
+            duration=duration,
+            goodput_slo=goodput_slo,
+            token_counter=token_counter,
+        )
+        if isinstance(result, BenchmarkResult):
+            return result.to_dict()
+        return result.to_dict()
+
+    return measure
 
 
 def _cmd_pack(args):

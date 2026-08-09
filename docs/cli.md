@@ -346,6 +346,69 @@ it (via stdout or `--output-dir`), not the markdown rendering.
 
 ---
 
+### `profile` — Configuration Space Search
+
+```bash
+lite-server profile --model <MODEL> [OPTIONS]
+```
+
+Search the configuration space (config points × concurrency) against a
+**running** server. Config changes are applied through Admin ReloadModel —
+the server re-reads the on-disk config.yaml (validate-then-swap), so the
+server process is never restarted; workers are rebuilt per config point.
+Resource metrics are generic (CPU/RAM, non-GPU) via the Prometheus
+`/metrics` endpoint and local psutil sampling.
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--model` | string | (required) | Model name |
+| `--version` | string | (resolved) | Model version |
+| `--repo` | path | ./model_repo | Model repository path (preflight batching detection) |
+| `--admin-url` | url | http://127.0.0.1:8000 | Admin endpoint (also the inference URL for trials) |
+| `--metrics-url` | url | admin host:8002 | Prometheus /metrics endpoint |
+| `--server-pid` | int | — | Server PID for local resource sampling (default: listener lookup by port) |
+| `--sweep-knob` | KEY=v1,v2,v3 | — | Swept config key (repeatable). Batch keys require declared batch/unbatch; `workers_per_device` is dropped under `continuous_batching` |
+| `--concurrency` | list | 1,2,4,8,16 | Inner-grid concurrency levels (zero reloads between levels) |
+| `--max-trials` | int | 64 | Cross-product cap: config points × concurrency |
+| `--search-mode` | grid\|quick | grid | Search strategy (quick = hill climb, later milestone) |
+| `--duration` | float | 30.0 | Trial duration in seconds |
+| `--requests` | int | — | Run exactly N requests per trial (mutually exclusive with `--duration`) |
+| `--export` | dir | — | Write per-trial JSON checkpoints + summary.json to DIR |
+| `--reload-timeout` | float | 120.0 | Seconds to wait for Ready after ReloadModel |
+| `--max-trial-failures` | int | 3 | Consecutive config-point failures before the circuit breaker aborts |
+| `--objective` | throughput\|goodput\|sessions_per_sec | throughput | Ranking objective (constraint filtering, later milestone) |
+| `--top-n` | int | 3 | Top-N recommendations (later milestone) |
+| `--max-p99` / `--min-throughput` / `--max-error-rate` | float | — | Constraint filters (later milestone) |
+| `--dry-run` | flag | false | Print preflight conclusions + effective grid + estimated wall clock; zero side effects |
+| `--force` | flag | false | Override the exclusivity guard (foreign traffic pollutes results) |
+| `--recover` | flag | false | Restore config.yaml byte-exact from a stale `.profile.backup`, then exit |
+
+**Benchmark passthrough** (streaming/bidi scenarios, plan §2.11):
+`--stream`, `--bidi`, `--model-type`, `--endpoint`, `--transport`,
+`--payload` / `--payload-file` / `--payload-random`, `--rate`,
+`--warmup-requests`, `--grace-period`, `--goodput`, `--slo-attainment`,
+`--tokenizer`, `--text-field`, `--pace`, `--rt-factor`, `--min-sessions`,
+`--cancel-after`, `--read-delay-ms`.
+
+**Preflight gates (any failure → exit 2):** server reachable + model loaded +
+`/metrics` readable; server version ≥ 0.8.4 (the reload_model disk re-read
+fix); exclusivity (`liteserver_queue_depth` == 0, `--force` overrides);
+batching declaration state from StaticAnalyzer (AST, zero execution) decides
+the swept key set (undeclared/unknown → batch keys dropped; declared → batch
+grid from 2, never 1; `continuous_batching` → `workers_per_device` dropped).
+
+**Mechanism:** per config point — atomically rewrite config.yaml (ruamel
+round-trip, comments preserved; pyyaml validation net fail-closed; tmp +
+os.replace) → Admin ReloadModel → poll Ready (+ ACTIVE_WORKERS == expected)
+→ inner concurrency sweep (zero reloads) → next point. On completion the
+original config.yaml is restored **byte-exact** and the server reloaded back
+to baseline; a failed restore is a profile failure (exit 2). SIGINT →
+best-effort restore. A stale `.profile.backup` (SIGKILL residue) blocks the
+run until `--recover` or manual cleanup.
+
+**Exit codes**: `0` trials recorded · `1` no usable trials · `2` failure
+(preflight refusal, grid conflict, restore failure, circuit breaker).
+
 ### `pack` — Pack Model into Artifact
 
 ```bash

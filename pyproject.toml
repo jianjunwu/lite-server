@@ -36,7 +36,6 @@ dev = [
     "pytest-xdist>=3.0",
     "httpx>=0.28.1",
     "pytest-timeout>=2.0",
-    "psutil>=5.9",
     "grpcio>=1.62",
     "numpy>=1.24",
     "websockets>=13",
@@ -49,6 +48,10 @@ benchmark = [
     "websockets>=13",
     "h2>=4.1",
     "tokenizers>=0.20",
+    # profile(方案决策点 1/7):psutil 自 dev 移入(非全新供应链),ruamel.yaml
+    # 新增——config.yaml round-trip 保真重写 + 进程级 RSS/CPU 采样。
+    "psutil>=5.9",
+    "ruamel.yaml>=0.18",
 ]
 validation = ["jsonschema>=4"]
 
