@@ -685,3 +685,170 @@ mod prop_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod gap_tests {
+    //! 对账 C（P-CORS 测试缺口）：WS Origin 校验 / admin 豁免 / @route 落全局 /
+    //! per-model 覆盖全局。
+    use super::*;
+    use crate::callback::CallbackRunner;
+    use crate::config::{Config, CorsPolicy, ModelConfig, ModelPolicies};
+    use crate::inference_queue::InferenceQueue;
+    use crate::rate_limit::RateLimiter;
+    use crate::registry::types::ModelType;
+    use crate::registry::ModelRegistry;
+    use crate::worker::WorkerManager;
+    use axum::Router;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    fn policy(origins: &[&str]) -> CorsPolicy {
+        CorsPolicy {
+            allow_origins: origins.iter().map(|s| s.to_string()).collect(),
+            allow_methods: vec!["*".to_string()],
+            ..Default::default()
+        }
+    }
+
+    fn state_with(global: Option<CorsPolicy>, per_model: Option<CorsPolicy>) -> Arc<AppState> {
+        let mut config = Config::default();
+        config.server.cors = global;
+        let registry = Arc::new(ModelRegistry::new());
+        let dir = std::env::temp_dir().join(format!("lite-server-cors-gap-{}", std::process::id()));
+        registry
+            .register(
+                "m",
+                "1",
+                ModelConfig { max_batch_size: 1, ..Default::default() },
+                ModelType::LitAPI,
+                dir,
+            )
+            .unwrap();
+        if let Some(pm) = per_model {
+            registry.set_policies("m", "1", Some(ModelPolicies { cors: Some(pm), ..Default::default() }));
+        }
+        let queue = Arc::new(InferenceQueue::new());
+        let cb = Arc::new(CallbackRunner::new());
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            PathBuf::new(),
+            queue.clone(),
+            "error".to_string(),
+            cb.clone(),
+        ));
+        Arc::new(AppState::new(
+            registry,
+            wm,
+            queue,
+            config,
+            PathBuf::new(),
+            cb,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(RateLimiter::default()),
+        ))
+    }
+
+    fn headers_with_origin(origin: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(o) = origin {
+            h.insert("origin", HeaderValue::from_str(o).unwrap());
+        }
+        h
+    }
+
+    // ===== WS 握手 Origin 校验（ws_origin_allowed）=====
+
+    #[test]
+    fn ws_origin_no_cors_config_allows() {
+        let state = state_with(None, None);
+        assert!(ws_origin_allowed(&state, "m", Some("1"), &headers_with_origin(Some("https://anything.example"))));
+    }
+
+    #[test]
+    fn ws_origin_absent_origin_allows() {
+        // 非浏览器客户端无 Origin → 放行（WS 安全靠 access_control）。
+        let state = state_with(Some(policy(&["https://ok.example"])), None);
+        assert!(ws_origin_allowed(&state, "m", Some("1"), &HeaderMap::new()));
+    }
+
+    #[test]
+    fn ws_origin_allow_and_deny_and_null() {
+        let state = state_with(Some(policy(&["https://ok.example"])), None);
+        assert!(ws_origin_allowed(&state, "m", Some("1"), &headers_with_origin(Some("https://ok.example"))));
+        assert!(!ws_origin_allowed(&state, "m", Some("1"), &headers_with_origin(Some("https://evil.example"))));
+        // 非法/null Origin → 拒绝（CSWSH 防护）。
+        assert!(!ws_origin_allowed(&state, "m", Some("1"), &headers_with_origin(Some("null"))));
+    }
+
+    #[test]
+    fn ws_origin_per_model_overrides_global() {
+        let state = state_with(
+            Some(policy(&["https://global.example"])),
+            Some(policy(&["https://model.example"])),
+        );
+        // per-model 胜出:model.example 放行,global.example 不再命中。
+        assert!(ws_origin_allowed(&state, "m", Some("1"), &headers_with_origin(Some("https://model.example"))));
+        assert!(!ws_origin_allowed(&state, "m", Some("1"), &headers_with_origin(Some("https://global.example"))));
+    }
+
+    // ===== 中间件级:admin 豁免 / @route 落全局 / per-model 覆盖全局 =====
+
+    async fn roundtrip(state: Arc<AppState>, path: &str, origin: &str) -> Response {
+        let app = Router::new()
+            .route(path, axum::routing::post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(state, cors_middleware));
+        tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("origin", origin)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn admin_endpoints_get_no_acao() {
+        let state = state_with(Some(policy(&["https://ok.example"])), None);
+        // /admin/* 归 Admin 类（classify_http_path）→ CORS 中间件跳过。
+        let resp = roundtrip(state, "/admin/models", "https://ok.example").await;
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin"),
+            None,
+            "admin 端点不面向浏览器,不得附 ACAO(评审 2.2/低#16)"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_route_falls_back_to_global_policy() {
+        let state = state_with(Some(policy(&["https://ok.example"])), None);
+        // @route 自定义尾路径(/v2/models/m/<tail>):无 per-model 策略 → 全局生效。
+        let resp = roundtrip(state, "/v2/models/m/my-custom-route", "https://ok.example").await;
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin"),
+            Some(&HeaderValue::from_static("https://ok.example")),
+            "@route 无 per-model 策略时应落全局策略"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_model_overrides_global_policy() {
+        let state = state_with(
+            Some(policy(&["https://global.example"])),
+            Some(policy(&["https://model.example"])),
+        );
+        let resp = roundtrip(state.clone(), "/v2/models/m/versions/1/infer", "https://model.example").await;
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin"),
+            Some(&HeaderValue::from_static("https://model.example")),
+            "per-model 策略须覆盖全局"
+        );
+        // 全局 origin 在 per-model 策略生效时不命中。
+        let resp = roundtrip(state, "/v2/models/m/versions/1/infer", "https://global.example").await;
+        assert_eq!(resp.headers().get("access-control-allow-origin"), None);
+    }
+}

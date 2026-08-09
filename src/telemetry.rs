@@ -75,8 +75,11 @@ impl<'a> opentelemetry::propagation::Extractor for MetadataExtractor<'a> {
 }
 
 /// Carrier adapter over a `RequestMeta.headers` map (Rust→worker injection).
+/// 仅 feature 开启的 `inject` 使用（无 feature 时 inject 为 no-op）。
+#[cfg(feature = "telemetry")]
 struct HeadersInjector<'a>(&'a mut HashMap<String, String>);
 
+#[cfg(feature = "telemetry")]
 impl<'a> opentelemetry::propagation::Injector for HeadersInjector<'a> {
     fn set(&mut self, key: &str, value: String) {
         self.0.insert(key.to_string(), value);
@@ -159,8 +162,24 @@ fn scrub_baggage_with(cx: Context, policy: &BaggagePolicy) -> Context {
 /// worker can correlate (it reads `traceparent`, creates no span — D8). Overwrites
 /// any client-supplied propagation headers with the active server/step span, giving
 /// the worker the correct parent. No-op when telemetry is off (no propagator).
+///
+/// 对账修复（e2e 举证）：优先取**当前 tracing span** 的 OTel context——生产
+/// 路径中 instrumented inference span 的 context；仅在其无效时回退线程 attach
+/// 的 `Context::current()`（单元测试/特殊场景）。原实现只用后者，而生产从不
+/// attach → 注入静默空转（HTTP 仅因原始 header 透传而"碰巧正确"）。
+#[cfg(not(feature = "telemetry"))]
+pub fn inject(_headers: &mut HashMap<String, String>) {}
+
+#[cfg(feature = "telemetry")]
 pub fn inject(headers: &mut HashMap<String, String>) {
-    let cx = Context::current();
+    use opentelemetry::trace::TraceContextExt;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    let span_cx = tracing::Span::current().context();
+    let cx = if span_cx.span().span_context().is_valid() {
+        span_cx
+    } else {
+        Context::current()
+    };
     opentelemetry::global::get_text_map_propagator(|p| {
         p.inject_context(&cx, &mut HeadersInjector(headers));
     });
@@ -830,8 +849,6 @@ mod tests {
     }
 }
 
-/// §6.7 解析面 property 测试（proptest）：入站 baggage 清洗的安全不变式——
-/// 白名单外零泄漏、条数/字节上限、值不篡改、幂等。不依赖 SDK（纯函数）。
 #[cfg(all(test, feature = "telemetry"))]
 mod otel_health_tests {
     //! 对账 A5：导出健康计数（CountingExporter/CountingProcessor）+ span
@@ -847,18 +864,11 @@ mod otel_health_tests {
     }
 
     impl SpanExporter for FakeExporter {
-        fn export(
-            &self,
-            batch: Vec<SpanData>,
-        ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
-            let fail = self.fail;
-            let n = batch.len();
-            async move {
-                if fail {
-                    Err(OTelSdkError::InternalFailure(format!("boom ({n})")))
-                } else {
-                    Ok(())
-                }
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            if self.fail {
+                Err(OTelSdkError::InternalFailure(format!("boom ({})", batch.len())))
+            } else {
+                Ok(())
             }
         }
     }
@@ -927,11 +937,8 @@ mod otel_health_tests {
         #[derive(Debug)]
         struct NoopExporter;
         impl SpanExporter for NoopExporter {
-            fn export(
-                &self,
-                _batch: Vec<SpanData>,
-            ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
-                async { Ok(()) }
+            async fn export(&self, _batch: Vec<SpanData>) -> OTelSdkResult {
+                Ok(())
             }
         }
 
@@ -1006,6 +1013,8 @@ mod otel_health_tests {
     }
 }
 
+/// §6.7 解析面 property 测试（proptest）：入站 baggage 清洗的安全不变式——
+/// 白名单外零泄漏、条数/字节上限、值不篡改、幂等。不依赖 SDK（纯函数）。
 #[cfg(test)]
 mod prop_tests {
     use super::*;

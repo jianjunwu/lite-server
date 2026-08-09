@@ -96,6 +96,8 @@ jobs:
         run: pip install -e ".[dev]"
       - name: Run lib tests with telemetry feature
         run: cargo test --features telemetry --lib -- --test-threads=1
+      - name: Run telemetry e2e integration tests
+        run: cargo test --features telemetry --test integration_test -- telemetry --test-threads=1
 
   # 蓝图 §6.3：pb2/proto 漂移检查——proto 改动必须同步重生成签入的
   # liteserver_pb2.py + liteserver_pb2_grpc.py（regen_proto.sh 固定

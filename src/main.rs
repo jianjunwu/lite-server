@@ -252,7 +252,14 @@ fn main() {
             // P-TRACE: build the OTel layer first (no-op unless telemetry.enabled +
             // feature) so it rides the same subscriber; the 0.30 BatchSpanProcessor
             // uses its own dedicated thread (no runtime context required).
-            let otel_layer = lite_server::telemetry::init(&cfg.telemetry);
+            // 对账修复：OTLP exporter 构造会经 tonic connect_lazy 向当前 reactor
+            // spawn 后台任务——init 必须在 runtime 上下文中执行（enter 借用，
+            // 不 block_on；spawn 的任务随后面 block_on 泵动）。
+            let rt = build_runtime(cfg.server.threads);
+            let otel_layer = {
+                let _rt_guard = rt.enter();
+                lite_server::telemetry::init(&cfg.telemetry)
+            };
             let _log_guard = lite_server::logging::init(
                 &cfg.logging.level,
                 cfg.logging.info_output.as_deref(),
@@ -275,8 +282,8 @@ fn main() {
             info!("Metrics port: {}", cfg.server.metrics_port);
             info!("Model repo: {}", cfg.model_repository.path);
 
-            // Build tokio runtime with configured thread count
-            let rt = build_runtime(cfg.server.threads);
+            // Build tokio runtime with configured thread count（已在上方
+            // telemetry init 前构建——OTLP exporter 构造需要 reactor 上下文）。
             let server = LiteServer::new(cfg);
             if let Err(e) = rt.block_on(server.run(None)) {
                 error!("Server error: {}", e);

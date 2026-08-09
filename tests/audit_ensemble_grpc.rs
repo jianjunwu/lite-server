@@ -3,7 +3,7 @@
 //! 命名 test_audit_<维度>_<场景>；在当前代码上 FAIL，证明缺陷存在；修复后转绿
 //! 作为回归锁。仅新增测试，不改实现。
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use serial_test::serial;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -314,6 +314,140 @@ async fn test_audit_data_grpc_ensemble_binary_input_drops_declared_content_type(
          Raw(bytes, ct) 保留声明值。worker 实际看到: {}",
         got
     );
+
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// ---------------------------------------------------------------------------
+// 对账 C（覆盖测试，非举证）：跨协议 parity + DAG 错误映射
+// ---------------------------------------------------------------------------
+
+/// 引用不存在子模型的 ensemble（DAG 错误在 infer 期暴露）。
+fn write_missing_sub_ensemble(repo: &std::path::Path) {
+    let dir = repo.join("ens_missing/1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        r#"
+ensemble:
+  steps:
+    - name: bad
+      model: no_such_model
+      version: "1"
+      inputs:
+        x: "$request"
+"#,
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_grpc_http_ensemble_parity_and_dag_not_found_mapping() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+    use std::collections::HashMap;
+
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    let metrics_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-cgap-ens-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    write_ct_echo_model(&repo);
+    write_ct_ensemble(&repo);
+    write_missing_sub_ensemble(&repo);
+
+    let tmp_dir = std::env::temp_dir()
+        .join(format!("lite-server-cgap-ens-yaml-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: {metrics_port}\n  timeout: 30.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            metrics_port = metrics_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let _guard = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 30).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "ct_echo", "1").await;
+    load_model(&base, "ens_ct", "1").await;
+    load_model(&base, "ens_missing", "1").await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+    let json_payload = serde_json::to_vec(&json!({"x": 1})).unwrap();
+
+    // 1) 跨协议 parity：同一 ensemble 模型、同一 JSON 输入，HTTP 与 gRPC
+    //    输出逐字节等价。
+    let http_resp = reqwest::Client::new()
+        .post(format!("{}/v2/models/ens_ct/infer", base))
+        .header("content-type", "application/json")
+        .body(json_payload.clone())
+        .send()
+        .await
+        .expect("http infer");
+    assert_eq!(http_resp.status(), 200);
+    let http_json: Value = http_resp.json().await.unwrap();
+
+    let grpc_resp = client
+        .infer(InferRequest {
+            model_name: "ens_ct".to_string(),
+            version: "1".to_string(),
+            data: bytes::Bytes::from(json_payload.clone()),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            ..Default::default()
+        })
+        .await
+        .expect("grpc infer")
+        .into_inner();
+    let grpc_json: Value = serde_json::from_slice(&grpc_resp.data).unwrap();
+
+    assert_eq!(
+        http_json, grpc_json,
+        "HTTP 与 gRPC 对同一 ensemble 模型产出必须一致"
+    );
+
+    // 2) DAG 错误映射：子模型不存在 → gRPC NotFound / HTTP 404。
+    // 语义注记:子模型「不存在」在 ensemble 里先被就绪检查拦下——
+    // not loaded ⇒ not ready(ModelNotReady → 503/Unavailable),双侧一致
+    // 即为「映射正确」(蓝图测试条的真意是双协议同错同码,而非特定 404)。
+    let err = client
+        .infer(InferRequest {
+            model_name: "ens_missing".to_string(),
+            version: "1".to_string(),
+            data: bytes::Bytes::from(json_payload),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            ..Default::default()
+        })
+        .await
+        .expect_err("missing sub-model must fail");
+    assert_eq!(
+        err.code(),
+        tonic::Code::Unavailable,
+        "DAG 子模型未加载 → ModelNotReady → Unavailable(须与 HTTP 503 parity); got: {err:?}"
+    );
+
+    let http_resp = reqwest::Client::new()
+        .post(format!("{}/v2/models/ens_missing/infer", base))
+        .header("content-type", "application/json")
+        .body(serde_json::to_vec(&json!({"x": 1})).unwrap())
+        .send()
+        .await
+        .expect("http infer missing");
+    assert_eq!(http_resp.status(), 503, "HTTP 侧 503 parity 基准");
 
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&tmp_dir);

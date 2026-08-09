@@ -1934,6 +1934,103 @@ async fn test_grpc_graceful_shutdown_drains_inflight() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
+/// P4-2（对账 C）超时→abort（HTTP + gRPC 双侧）：graceful_timeout(2s) <
+/// RPC 时长(30s) 时 drain 窗口耗尽即强制 abort——server 远早于 30s 退出，
+/// 不会傻等慢 RPC 完成。
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_graceful_shutdown_aborts_inflight_after_timeout() {
+    for use_grpc in [false, true] {
+        let http_port = next_test_port();
+        let grpc_port = next_test_port();
+        kill_stale_on_port(http_port);
+        kill_stale_on_port(grpc_port);
+        let repo = create_slow_model_repo(30);
+        // 端到端退出时间 = server abort(graceful_timeout=2s) + 队列 drain
+        // 兜底(unload_grace 沿用 server.timeout=5s) + worker SIGKILL 升级
+        // (worker_kill_timeout)——把模型的 kill 超时收窄到 3s,全程 ≪ 30s。
+        let model_cfg = repo.join("slow_model/1/config.yaml");
+        let mut cfg_text = std::fs::read_to_string(&model_cfg).unwrap();
+        cfg_text.push_str("worker_kill_timeout: 3\n");
+        std::fs::write(&model_cfg, cfg_text).unwrap();
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "lite-server-p42-abort-{}-{}",
+            std::process::id(),
+            use_grpc
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let server_yaml = tmp_dir.join("server.yaml");
+        std::fs::write(
+            &server_yaml,
+            format!(
+                "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18213\n  graceful_timeout: 2.0\n  timeout: 5.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+                http_port = http_port,
+                grpc_port = grpc_port,
+                repo = repo.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let mut child = start_server(&["--config", &server_yaml.to_string_lossy()]);
+        wait_for_server(http_port, 20).await;
+        let base = format!("http://127.0.0.1:{}", http_port);
+        load_model(&base, "slow_model", "1").await;
+
+        // 30s 慢推理在途（结果不重要——abort 后必然失败/被断）。
+        let inflight = if use_grpc {
+            let channel = grpc_tcp_channel(grpc_port).await;
+            tokio::spawn(async move {
+                use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+                use lite_server::proto::liteserver::InferRequest;
+                use std::collections::HashMap;
+                let mut client = LiteServerClient::new(channel);
+                let _ = client
+                    .infer(InferRequest {
+                        model_name: "slow_model".to_string(),
+                        version: "1".to_string(),
+                        data: br#"{"input":1}"#.to_vec().into(),
+                        headers: HashMap::new(),
+                        ..Default::default()
+                    })
+                    .await;
+            })
+        } else {
+            let url = format!("{}/v2/models/slow_model/infer", base);
+            tokio::spawn(async move {
+                let _ = reqwest::Client::new()
+                    .post(url)
+                    .body(r#"{"input":1}"#)
+                    .send()
+                    .await;
+            })
+        };
+        sleep(Duration::from_secs(1)).await; // RPC 已在 worker 内执行
+
+        let sigterm_at = std::time::Instant::now();
+        send_sigterm(&child);
+        let exited = wait_for_exit(&mut child, 15).await;
+        let elapsed = sigterm_at.elapsed();
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = inflight.await;
+        assert!(
+            exited,
+            "{}: graceful_timeout=2s 时 server 必须 abort 退出(30s 慢 RPC 在途)",
+            if use_grpc { "gRPC" } else { "HTTP" }
+        );
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "{}: abort 须远早于 30s RPC 完成点退出,实际 {elapsed:?}",
+            if use_grpc { "gRPC" } else { "HTTP" }
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+}
+
 /// Once SIGTERM starts graceful shutdown, the gRPC server stops accepting NEW
 /// RPCs (tonic `serve_with_shutdown` sends GOAWAY / stops the listener): an
 /// in-flight Infer still drains to completion, but a NEW Infer fired after the
@@ -4221,6 +4318,237 @@ async fn test_grpc_decoupled_infer_not_implemented_is_failed_precondition() {
 }
 
 // ---------------------------------------------------------------------------
+// P9-1（对账 C）：Rust 侧断连回收 + idle 超时 e2e
+// ---------------------------------------------------------------------------
+
+/// 慢速 decoupled 模型 fixture：每 chunk 间隔 100ms，共 50 个（约 5s）。
+fn write_slow_decoupled_repo(repo: &std::path::Path) {
+    let dir = repo.join("slow_decoupled/1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("model.py"),
+        r#"from lite_server import LitAPI
+import asyncio
+
+
+class SlowDecoupledAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 50)
+
+    async def predict_decoupled(self, data, sender):
+        for i in range(data):
+            await asyncio.sleep(0.1)
+            await sender.send({"index": i})
+        await sender.close()
+
+    def encode_response(self, output):
+        return output
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+}
+
+/// Rust client 中途断开 → worker sender 失效 + 通道回收（对账 C）。可观察
+/// 断言：断连后 worker 不被孤儿推送卡死——同一模型的后续 decoupled 请求
+/// 正常完成。
+#[tokio::test]
+#[serial]
+async fn test_grpc_decoupled_client_disconnect_reclaims_stream() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::DecoupledInferRequest;
+    use std::collections::HashMap;
+
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-p9disc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    write_slow_decoupled_repo(&repo);
+
+    let _server = ServerGuard::start(&[
+        "--port", &http_port.to_string(),
+        "--grpc-port", &grpc_port.to_string(),
+        "--model-repo", &repo.to_string_lossy(),
+        "--no-metrics",
+        "--log-level", "warn",
+    ]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "slow_decoupled", "1").await;
+
+    let mut client = LiteServerClient::connect(format!("http://127.0.0.1:{}", grpc_port))
+        .await
+        .expect("gRPC client must connect");
+
+    // 第一条流：读 2 帧后断开（drop stream = client disconnect）。
+    let resp = client
+        .decoupled_infer(DecoupledInferRequest {
+            model_name: "slow_decoupled".to_string(),
+            version: "1".to_string(),
+            data: bytes::Bytes::from(serde_json::to_vec(&json!({"input": 50})).unwrap()),
+            headers: HashMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("open first stream");
+    let mut stream = resp.into_inner();
+    for _ in 0..2 {
+        tokio::time::timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("frame")
+            .expect("ok")
+            .expect("some");
+    }
+    drop(stream);
+    // 给断连→cancel→回收留传播时间。
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 第二条流（input=3）：worker 未被断连流的孤儿推送卡死 → 正常完成。
+    let resp = client
+        .decoupled_infer(DecoupledInferRequest {
+            model_name: "slow_decoupled".to_string(),
+            version: "1".to_string(),
+            data: bytes::Bytes::from(serde_json::to_vec(&json!({"input": 3})).unwrap()),
+            headers: HashMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("open second stream");
+    let mut stream = resp.into_inner();
+    let mut frames = 0;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(15), stream.message()).await {
+            Ok(Ok(Some(frame))) => {
+                frames += 1;
+                if frame.is_final {
+                    break;
+                }
+            }
+            Ok(Ok(None)) => break,
+            other => panic!("second stream after disconnect poisoned: {other:?}"),
+        }
+    }
+    assert_eq!(frames, 4, "second stream must complete 3 chunks + final");
+
+    unload_model(&base, "slow_decoupled", "1").await;
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// idle 超时 → 服务端关闭（对账 C）：模型 30s 不推送任何 chunk，
+/// decoupled_idle_timeout_secs=1 → 流在远小于 30s 内被回收结束。
+#[tokio::test]
+#[serial]
+async fn test_grpc_decoupled_idle_timeout_closes_stream() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::DecoupledInferRequest;
+    use std::collections::HashMap;
+
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-p9idle-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    // 永不推送的模型：sleep 30s 后才 close。
+    let dir = repo.join("never_push/1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("model.py"),
+        r#"from lite_server import LitAPI
+import asyncio
+
+
+class NeverPushAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    async def predict_decoupled(self, data, sender):
+        await asyncio.sleep(30)
+        await sender.close()
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+
+    let tmp_dir = std::env::temp_dir()
+        .join(format!("lite-server-p9idle-yaml-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18374\n  timeout: 30.0\n  decoupled_idle_timeout_secs: 1.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "never_push", "1").await;
+
+    let mut client = LiteServerClient::connect(format!("http://127.0.0.1:{}", grpc_port))
+        .await
+        .expect("gRPC client must connect");
+
+    let start = std::time::Instant::now();
+    let resp = client
+        .decoupled_infer(DecoupledInferRequest {
+            model_name: "never_push".to_string(),
+            version: "1".to_string(),
+            data: bytes::Bytes::from(serde_json::to_vec(&json!({})).unwrap()),
+            headers: HashMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("open stream");
+    let mut stream = resp.into_inner();
+    let mut saw_final = false;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(15), stream.message()).await {
+            Ok(Ok(Some(frame))) => {
+                if frame.is_final {
+                    saw_final = true;
+                }
+            }
+            Ok(Ok(None)) => break,
+            Ok(Err(_)) => break, // idle 回收可表现为错误终态或流结束
+            Err(_) => panic!("stream not reclaimed within 15s (idle=1s)"),
+        }
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "idle timeout must reclaim the stuck stream promptly, took {elapsed:?}"
+    );
+    assert!(!saw_final, "idle-reclaimed stream must not report a normal final frame");
+
+    unload_model(&base, "never_push", "1").await;
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// ---------------------------------------------------------------------------
 // P2-1: gRPC 请求指标 + GIE 指标语义
 // ---------------------------------------------------------------------------
 
@@ -4651,8 +4979,69 @@ async fn test_grpc_response_compression_gzip() {
 }
 
 // ---------------------------------------------------------------------------
-// Ensemble total timeout bounds serial layers (#3)
+// P1-2 keepalive 装配冒烟(对账 C):配置→builder→serve 全链真实生效
 // ---------------------------------------------------------------------------
+
+/// 装配冒烟:配 http2_keepalive_interval/timeout 后 server 正常装配并服务,
+/// 且空闲超过一个 ping 周期后连接仍健康(keepalive 帧路径真实走过)。
+#[tokio::test]
+async fn test_grpc_http2_keepalive_assembly_smoke() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+    use std::collections::HashMap;
+
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = test_model_repo();
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-grpc-keepalive-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 0.0.0.0\n  http_port: {}\n  grpc_port: {}\n  metrics_port: 18083\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\n  http2_keepalive_interval_secs: 1\n  http2_keepalive_timeout_secs: 2\nmodel_repository:\n  path: {}\n",
+            http_port,
+            grpc_port,
+            repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, MODEL, "1").await;
+
+    let channel = tonic::transport::Endpoint::new(format!("http://127.0.0.1:{}", grpc_port))
+        .expect("valid gRPC address")
+        .connect()
+        .await
+        .expect("gRPC channel must connect with keepalive configured");
+    let mut client = LiteServerClient::new(channel);
+
+    // 空闲超过一个 ping 周期(1s),让 server 的 keepalive PING 真实发出。
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    let resp = client
+        .infer(InferRequest {
+            model_name: MODEL.to_string(),
+            version: "1".to_string(),
+            data: bytes::Bytes::from(serde_json::to_vec(&json!({"input": 1})).unwrap()),
+            headers: HashMap::new(),
+            ..Default::default()
+        })
+        .await;
+    assert!(
+        resp.is_ok(),
+        "keepalive 装配后 infer 必须正常(空闲>1 个 ping 周期后): {:?}",
+        resp.err()
+    );
+
+    unload_model(&base, MODEL, "1").await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
 
 /// Write a sub-model whose predict() sleeps 1.5s, returning {"out": x}.
 fn write_slow_submodel(repo: &std::path::Path, name: &str) {
@@ -5112,6 +5501,93 @@ async fn test_access_control_admin_key_mode_both_protocols() {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// P6-2(对账 C):gRPC Admin Load/Unload happy-path 状态流转(真实 worker)
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_grpc_admin_load_unload_happy_path() {
+    use lite_server::proto::liteserver::admin_client::AdminClient;
+    use lite_server::proto::liteserver::{
+        ListModelsRequest, LoadModelRequest, ModelReadyRequest, UnloadModelRequest,
+    };
+
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = test_model_repo();
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-p62-yaml-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18373\n  timeout: 30.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let _guard = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 30).await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut admin = AdminClient::new(channel);
+
+    // Load(真实 Python worker 拉起)→ ModelReady 轮询转就绪。
+    let load = admin
+        .load_model(LoadModelRequest { model_name: MODEL.to_string(), version: "1".to_string() })
+        .await
+        .expect("LoadModel happy path");
+    assert!(load.into_inner().success);
+
+    let mut ready = false;
+    for _ in 0..100 {
+        let r = admin
+            .model_ready(ModelReadyRequest { model_name: MODEL.to_string(), version: Some("1".to_string()) })
+            .await
+            .expect("ModelReady")
+            .into_inner();
+        if r.ready {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    assert!(ready, "model did not become ready after LoadModel");
+
+    let models = admin
+        .list_models(ListModelsRequest {})
+        .await
+        .expect("ListModels")
+        .into_inner();
+    assert!(
+        models.models.iter().any(|m| m.name == MODEL && m.version == "1"),
+        "loaded model must appear in ListModels: {:?}",
+        models.models
+    );
+
+    // Unload → ListModels 不再含该模型。
+    let unload = admin
+        .unload_model(UnloadModelRequest { model_name: MODEL.to_string(), version: Some("1".to_string()) })
+        .await
+        .expect("UnloadModel happy path");
+    assert!(unload.into_inner().success);
+    let models = admin
+        .list_models(ListModelsRequest {})
+        .await
+        .expect("ListModels after unload")
+        .into_inner();
+    assert!(
+        !models.models.iter().any(|m| m.name == MODEL),
+        "unloaded model must disappear from ListModels"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
 // P7-2: grpc.admin_bind splits Admin onto a second server. With admin_bind set
 // to a UDS, Admin RPCs are reachable ONLY via the UDS (and the socket is
 // owner-only 0o600); the main TCP port returns UNIMPLEMENTED for Admin (the
@@ -9630,4 +10106,174 @@ class ErrAPI(LitAPI):
     );
 
     let _ = std::fs::remove_dir_all(&repo);
+}
+
+// ---------------------------------------------------------------------------
+// P-TRACE（对账 C，feature=telemetry）：traceparent 端到端传播 + SIGTERM flush
+// ---------------------------------------------------------------------------
+
+/// traceparent 回显模型：把 worker 收到的 RequestMeta.headers["traceparent"]
+/// 回传给客户端。
+#[cfg(all(unix, feature = "telemetry"))]
+fn write_tp_echo_repo(repo: &std::path::Path) {
+    let dir = repo.join("tp_echo/1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("model.py"),
+        r#"from lite_server import LitAPI
+
+
+class TpEchoAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def predict(self, x, ctx=None):
+        tp = ""
+        if ctx is not None and getattr(ctx, "meta", None) is not None:
+            tp = ctx.meta.headers.get("traceparent", "")
+        return {"tp": tp}
+
+    def encode_response(self, output):
+        return output
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+}
+
+#[cfg(all(unix, feature = "telemetry"))]
+const TP_TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+#[cfg(all(unix, feature = "telemetry"))]
+const TP_VALUE: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+/// HTTP：带 traceparent 的请求，worker 收到的 RequestMeta.headers 必须含
+/// 同 trace-id 的 traceparent（propagator 提取→注入链路的端到端证据）。
+/// SIGTERM：telemetry 开启时进程须在窗口内干净退出（force_flush 有界，
+/// 无 #2715 死锁）。
+#[cfg(all(unix, feature = "telemetry"))]
+#[tokio::test]
+#[serial]
+async fn test_telemetry_traceparent_e2e_and_sigterm_flush_http() {
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+
+    let repo = std::env::temp_dir().join(format!("lite-server-ptrace-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    write_tp_echo_repo(&repo);
+
+    let tmp_dir = std::env::temp_dir()
+        .join(format!("lite-server-ptrace-yaml-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18214\n  timeout: 10.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\ntelemetry:\n  enabled: true\n  otlp_endpoint: \"http://127.0.0.1:4319\"\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let mut child = start_server(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "tp_echo", "1").await;
+
+    // HTTP: traceparent 头 → worker 回显的 trace-id 必须一致。
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v2/models/tp_echo/infer", base))
+        .header("content-type", "application/json")
+        .header("traceparent", TP_VALUE)
+        .body(r#"{"x":1}"#)
+        .send()
+        .await
+        .expect("http infer");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let echoed = body["tp"].as_str().unwrap_or("");
+    assert!(
+        echoed.contains(TP_TRACE_ID),
+        "worker 收到的 traceparent 须含入站 trace-id {TP_TRACE_ID}; got: {echoed:?}"
+    );
+
+    // SIGTERM:telemetry 开启时优雅退出(force_flush 有界,不死锁)。
+    send_sigterm(&child);
+    let exited = wait_for_exit(&mut child, 15).await;
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(exited, "telemetry 开启时 SIGTERM 须有界退出(flush 不死锁)");
+
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// gRPC:metadata traceparent → 同款传播断言。
+#[cfg(all(unix, feature = "telemetry"))]
+#[tokio::test]
+#[serial]
+async fn test_telemetry_traceparent_e2e_grpc() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+    use std::collections::HashMap;
+
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+
+    let repo = std::env::temp_dir().join(format!("lite-server-ptraceg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    write_tp_echo_repo(&repo);
+
+    let tmp_dir = std::env::temp_dir()
+        .join(format!("lite-server-ptraceg-yaml-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18215\n  timeout: 10.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\ntelemetry:\n  enabled: true\n  otlp_endpoint: \"http://127.0.0.1:4319\"\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let _guard = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{}", http_port);
+    load_model(&base, "tp_echo", "1").await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+    let mut req = tonic::Request::new(InferRequest {
+        model_name: "tp_echo".to_string(),
+        version: "1".to_string(),
+        data: bytes::Bytes::from(serde_json::to_vec(&json!({"x": 1})).unwrap()),
+        headers: HashMap::new(),
+        ..Default::default()
+    });
+    req.metadata_mut()
+        .insert("traceparent", tonic::metadata::MetadataValue::from_static(TP_VALUE));
+    let resp = client.infer(req).await.expect("grpc infer").into_inner();
+    let body: Value = serde_json::from_slice(&resp.data).unwrap();
+    let echoed = body["tp"].as_str().unwrap_or("");
+    assert!(
+        echoed.contains(TP_TRACE_ID),
+        "gRPC:worker 收到的 traceparent 须含入站 trace-id; got: {echoed:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }

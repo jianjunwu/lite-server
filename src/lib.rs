@@ -162,7 +162,13 @@ pub fn run_server(
     // it is attached in the same subscriber. No runtime context needed — the 0.30
     // BatchSpanProcessor runs on its own dedicated thread (opentelemetry-rust #2715
     // decoupled). Returns None (zero overhead) when telemetry is off.
-    let otel_layer = telemetry::init(&cfg.telemetry);
+    // 对账修复：OTLP exporter 构造经 tonic connect_lazy 向当前 reactor spawn
+    // 后台任务——先建 runtime 并在其上下文中 init(enter 借用,非 block_on)。
+    let rt = build_runtime(cfg.server.threads);
+    let otel_layer = {
+        let _rt_guard = rt.enter();
+        telemetry::init(&cfg.telemetry)
+    };
     let _log_guard = logging::init(
         &cfg.logging.level,
         cfg.logging.info_output.as_deref(),
@@ -178,10 +184,8 @@ pub fn run_server(
     info!("Metrics port: {}", cfg.server.metrics_port);
     info!("Model repo: {}", cfg.model_repository.path);
 
-    let threads = cfg.server.threads;
     let server = server::LiteServer::new(cfg);
 
-    let rt = build_runtime(threads);
     rt.block_on(async {
         server.run(shutdown_rx).await.map_err(|e| {
             Box::<dyn std::error::Error + Send + Sync>::from(format!("Server error: {}", e))
