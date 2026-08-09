@@ -9,11 +9,16 @@ use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 use tonic::{Response, Status};
 
 /// P2-3：从入站 metadata 取 request_id（span 字段用；与 interceptor 同源）。
+/// 提取入站 `x-client-request-id`（空→空串）。**套用与 interceptor 相同的
+/// `is_valid_request_id` 校验**（P-MW 审计修复：非法值——超长/非 ASCII——
+/// 返回空串，由下游 UUID 兜底；否则 span 上的 request_id 会与校验后回显/
+/// RequestMeta 的值分叉）。优先消费 RequestContext.request_id，本函数仅为
+/// 无 interceptor 场景的回退。
 pub(super) fn metadata_request_id(metadata: &MetadataMap) -> String {
     metadata
         .get("x-client-request-id")
         .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty())
+        .filter(|s| crate::validation::is_valid_request_id(s))
         .map(String::from)
         .unwrap_or_default()
 }
@@ -37,6 +42,21 @@ pub(super) fn echo_grpc_response_headers<T>(
             Err(status)
         }
     }
+}
+
+/// P2-2 parity（对账修复）：admission 等 guard 的早期拒绝发生在 handler 出口
+/// 的 echo 包装之前——把回显前移到 guard 处，拒绝响应同样携带
+/// `x-request-id`/`x-processing-time-ms`（对齐 HTTP observability 最外层恒回显）。
+/// request_id 优先取 interceptor 校验填充的 RequestContext（含 UUID 兜底）。
+pub(super) fn echo_early_rejection<T>(mut status: Status, request: &tonic::Request<T>) -> Status {
+    let rid = request
+        .extensions()
+        .get::<crate::request_context::RequestContext>()
+        .map(|rc| rc.request_id.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| metadata_request_id(request.metadata()));
+    inject_echo_headers(status.metadata_mut(), &rid, std::time::Duration::from_millis(0));
+    status
 }
 
 /// 注入回显 header（request_id 缺省/非法则跳过该项；processing-time 恒定注入）。
@@ -97,5 +117,42 @@ pub(super) fn inject_grpc_metadata(
                 metadata.insert(mk, mv);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    //! /audit 举证（P-MW 面，蓝图 §4.0.5）：span 的 request_id 来源
+    //! `metadata_request_id` 是对入站 metadata 的重复提取，且不套用
+    //! `is_valid_request_id` 校验——与 interceptor→finalize 链路（回显
+    //! x-request-id / RequestMeta.request_id 的来源）读到的值不一致。
+    use super::metadata_request_id;
+    use crate::grpc::interceptor::finalize_context;
+    use std::collections::HashMap;
+    use tonic::metadata::{MetadataKey, MetadataMap};
+
+    #[test]
+    fn test_audit_data_span_request_id_diverges_from_validated_context() {
+        // 513 字符的 x-client-request-id：is_valid_request_id 拒收（>512）。
+        // interceptor 校验 → 空 → finalize 生成 UUID（回显/RequestMeta 读到 UUID）；
+        // metadata_request_id 只滤空串 → span 读到 513 字符的非法原值。
+        let oversized = "x".repeat(513);
+        let mut md = MetadataMap::new();
+        md.insert(
+            MetadataKey::from_bytes(b"x-client-request-id").unwrap(),
+            oversized.parse().unwrap(),
+        );
+        let finalized = finalize_context(None, &md, &HashMap::new(), None, &[]);
+        // 前提确认：finalize 链路确实拒绝了非法值（生成 UUID）。
+        assert!(uuid::Uuid::parse_str(&finalized.request_id).is_ok());
+        assert_ne!(finalized.request_id, oversized);
+
+        let span_rid = metadata_request_id(&md);
+        assert!(
+            span_rid.is_empty() || crate::validation::is_valid_request_id(&span_rid),
+            "P-MW §4.0.5（observability 读到同一 request_id / 无重复提取）：span 的 \
+             request_id 来源必须与 interceptor 同源同校验；当前 span 读到被拒收的 \
+             513 字符非法值，与回显的 UUID 不一致（HTTP 侧 span 读 context，无此分叉）"
+        );
     }
 }

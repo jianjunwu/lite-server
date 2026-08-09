@@ -235,6 +235,8 @@ async fn h2_bidi_entry_impl(
         version = %resolved_version,
         request_id = %cx.request_id,
         pinned_version = tracing::field::Empty,
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
         body_bytes = tracing::field::Empty,
         body_kind = tracing::field::Empty,
     );

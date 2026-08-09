@@ -160,6 +160,8 @@ impl GrpcService {
             version = %resolved_version,
             request_id = %request_id,
             pinned_version = tracing::field::Empty,
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
             body_bytes = initial_data.len() as i64,
             body_kind = crate::grpc::payload::body_kind_label(&headers),
         );

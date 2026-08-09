@@ -149,6 +149,8 @@ async fn observability_middleware(mut request: Request, next: Next) -> Response 
         "url.path" = %path,
         "endpoint.class" = crate::access_control::classify_http_path(&path).as_str(),
         "http.response.status_code" = tracing::field::Empty,
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
     );
     crate::telemetry::link_parent(&span, &parent);
     let span_for_status = span.clone();
@@ -350,6 +352,8 @@ pub async fn start_http_server(
     let access_control = std::sync::Arc::new(
         crate::access_control::AccessControl::build(&config.access_control)?,
     );
+    // D27: admin handlers 的审计 key 指纹经 AppState 消费（Arc 包装前注入）。
+    state.access_control = access_control.clone();
 
     // P-XFF: parse trusted-proxy CIDRs once (fail-fast on a bad entry). Empty
     // → fail-safe (direct peer used, client proxy headers ignored).
@@ -410,15 +414,6 @@ pub async fn start_http_server(
         access_control_middleware,
     ));
 
-    // P-CORS (蓝图 §4.3): hybrid CORS middleware — per-model > global policy,
-    // exact Origin match, preflight short-circuit. Mounted OUTSIDE access_control
-    // (preflight must not trigger auth; D21) and inside observability (204
-    // carries x-request-id). Admin endpoints are skipped (not browser-facing).
-    let app = app.layer(axum::middleware::from_fn_with_state(
-        shared.clone(),
-        crate::http::cors::cors_middleware,
-    ));
-
     // C3 (P4-2): draining gate — inside observability (so 503s carry a
     // request-id) but outside context/compression so new work is rejected
     // before any handler runs. Respects D21: it neither consumes RequestContext
@@ -432,6 +427,18 @@ pub async fn start_http_server(
     let app = app.layer(axum::middleware::from_fn_with_state(
         state_admission.clone(),
         admission_middleware,
+    ));
+
+    // P-CORS (蓝图 §4.3): hybrid CORS middleware — per-model > global policy,
+    // exact Origin match, preflight short-circuit. Mounted OUTSIDE access_control
+    // (preflight must not trigger auth; D21) and inside observability (204
+    // carries x-request-id). Admin endpoints are skipped (not browser-facing).
+    // 对账修复：移至 admission/draining **外侧**——§4.0.4 不变式「CORS 在错误
+    // 响应上也附 ACAO」要求 503 短路响应也过 CORS，否则浏览器读不到错误体。
+    // preflight 204 在 CORS 内短路，不再占用 admission 槽位。
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        shared.clone(),
+        crate::http::cors::cors_middleware,
     ));
 
     // Observability middleware (captures total wall-clock duration and sets
@@ -927,5 +934,123 @@ mod tests {
         let body = String::from_utf8(body_bytes.to_vec()).unwrap();
         assert_eq!(body, format!("{}|10.1.2.3", echoed),
             "handler context must read the same request_id observability echoes");
+    }
+}
+
+/// /audit 举证（P-MW 面，蓝图 §4.0.2/§4.0.4 顺序不变式）：生产栈挂载顺序
+/// （外→内）为 admission → draining_gate → cors（见上方装配），故
+/// admission/draining 的 503 短路响应**不经过 cors_middleware**——§4.0.4
+/// 要求「CORS 在错误响应上也附 ACAO（浏览器需要）」，当前被违反：浏览器在
+/// 过载/排水的 503 上收到不透明 CORS 错误，读不到状态与 Retry-After。
+/// 以下测试按生产同序复刻最小栈，FAIL 证明缺陷；修复后转绿作回归锁。
+#[cfg(test)]
+mod audit_mw_order_tests {
+    use super::*;
+    use crate::config::CorsPolicy;
+
+    fn cors_state(max_inflight: usize) -> Arc<AppState> {
+        use crate::callback::CallbackRunner;
+        use crate::inference_queue::InferenceQueue;
+        use crate::rate_limit::RateLimiter;
+        use crate::registry::ModelRegistry;
+        use crate::worker::WorkerManager;
+        let mut config = Config::default();
+        config.server.max_inflight = max_inflight;
+        config.server.cors = Some(CorsPolicy {
+            allow_origins: vec!["https://ok.example".to_string()],
+            allow_methods: vec!["*".to_string()],
+            ..Default::default()
+        });
+        let registry = Arc::new(ModelRegistry::new());
+        let inference_queue = Arc::new(InferenceQueue::new());
+        let callback_runner = Arc::new(CallbackRunner::new());
+        let worker_manager = Arc::new(WorkerManager::new(
+            registry.clone(),
+            PathBuf::new(),
+            inference_queue.clone(),
+            "error".to_string(),
+            callback_runner.clone(),
+        ));
+        Arc::new(AppState::new(
+            registry,
+            worker_manager,
+            inference_queue,
+            config,
+            PathBuf::new(),
+            callback_runner,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(RateLimiter::new(1024)),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_audit_order_admission_503_carries_cors_acao() {
+        let state = cors_state(1);
+        let admission = state.admission.clone();
+        // 生产同序（外→内，修复后）：cors → admission → route。
+        let app = Router::new()
+            .route("/v2/models/foo/infer", axum::routing::post(|| async { "unreached" }))
+            .layer(axum::middleware::from_fn_with_state(
+                admission.clone(),
+                admission_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                crate::http::cors::cors_middleware,
+            ));
+        // 占满唯一 admission 槽位 → 下一个 inference 请求 503。
+        let _held = admission.try_acquire().expect("cap=1 admits one");
+
+        let response = tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/v2/models/foo/infer")
+                .header("origin", "https://ok.example")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get("access-control-allow-origin"),
+            Some(&HeaderValue::from_static("https://ok.example")),
+            "§4.0.4: CORS 在错误响应上也附 ACAO——admission 503 在 cors 外侧短路,浏览器读不到"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_audit_order_draining_503_carries_cors_acao() {
+        let state = cors_state(0);
+        let draining = Arc::new(AtomicBool::new(true));
+        // 生产同序（外→内，修复后）：cors → draining_gate → route。
+        let app = Router::new()
+            .route("/v2/models/foo/infer", axum::routing::post(|| async { "unreached" }))
+            .layer(axum::middleware::from_fn_with_state(draining, draining_gate))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                crate::http::cors::cors_middleware,
+            ));
+
+        let response = tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/v2/models/foo/infer")
+                .header("origin", "https://ok.example")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get("access-control-allow-origin"),
+            Some(&HeaderValue::from_static("https://ok.example")),
+            "§4.0.4: CORS 在错误响应上也附 ACAO——draining 503 在 cors 外侧短路,浏览器读不到"
+        );
     }
 }

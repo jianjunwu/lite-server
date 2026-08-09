@@ -196,8 +196,19 @@ pub fn link_parent(_span: &tracing::Span, _parent: &Context) {}
 
 #[cfg(feature = "telemetry")]
 pub fn link_parent(span: &tracing::Span, parent: &Context) {
+    use opentelemetry::trace::TraceContextExt;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
     span.set_parent(parent.clone());
+    // 对账 A5（蓝图 §4.3「日志关联」）：OTel layer 活跃时把 trace_id/span_id
+    // 落成 span 字段——纯文本 fmt 日志在 span 作用域内自动带出。未启用/未
+    // 采样时 span_context 非法，跳过（字段保持 Empty）。
+    let cx = span.context();
+    let otel_span = cx.span();
+    let sc = otel_span.span_context();
+    if sc.is_valid() {
+        span.record("trace_id", sc.trace_id().to_string().as_str());
+        span.record("span_id", sc.span_id().to_string().as_str());
+    }
 }
 
 // ===========================================================================
@@ -300,6 +311,70 @@ mod otel {
         }
     }
 
+    /// 对账 A5（蓝图 §4.3 评审 2.2「dropped-spans 计数 + 导出失败计数桥接
+    /// /metrics」）：装饰 OTLP exporter——成功按 batch 大小计 exported、失败
+    /// 计 failures。BSP 队列满丢弃不可直接观测，以 ended−exported 差值逼近。
+    /// 泛型化 inner 以便测试注入 fake。
+    #[derive(Debug)]
+    pub struct CountingExporter<E> {
+        pub inner: E,
+    }
+
+    impl<E: opentelemetry_sdk::trace::SpanExporter> opentelemetry_sdk::trace::SpanExporter
+        for CountingExporter<E>
+    {
+        fn export(
+            &self,
+            batch: Vec<opentelemetry_sdk::trace::SpanData>,
+        ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send {
+            let n = batch.len() as u64;
+            let fut = self.inner.export(batch);
+            async move {
+                let result = fut.await;
+                match &result {
+                    Ok(()) => crate::metrics::prometheus::OTEL_SPANS_EXPORTED_TOTAL.inc_by(n),
+                    Err(_) => crate::metrics::prometheus::OTEL_EXPORT_FAILURES_TOTAL.inc(),
+                }
+                result
+            }
+        }
+
+        fn shutdown(&mut self) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.inner.shutdown()
+        }
+
+        fn set_resource(&mut self, resource: &Resource) {
+            self.inner.set_resource(resource);
+        }
+    }
+
+    /// 配对的 processor 装饰：on_end 计 spans_ended（进入导出管线的总量）。
+    #[derive(Debug)]
+    pub struct CountingProcessor<P> {
+        pub inner: P,
+    }
+
+    impl<P: opentelemetry_sdk::trace::SpanProcessor> opentelemetry_sdk::trace::SpanProcessor
+        for CountingProcessor<P>
+    {
+        fn on_start(&self, span: &mut opentelemetry_sdk::trace::Span, cx: &Context) {
+            self.inner.on_start(span, cx);
+        }
+        fn on_end(&self, span: opentelemetry_sdk::trace::SpanData) {
+            crate::metrics::prometheus::OTEL_SPANS_ENDED_TOTAL.inc();
+            self.inner.on_end(span);
+        }
+        fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.inner.force_flush()
+        }
+        fn shutdown_with_timeout(&self, timeout: Duration) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.inner.shutdown_with_timeout(timeout)
+        }
+        fn shutdown(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.inner.shutdown()
+        }
+    }
+
     pub fn init(cfg: &TelemetryConfig) -> Option<BoxedLayer> {
         if !cfg.enabled {
             return None;
@@ -338,7 +413,7 @@ mod otel {
             .with_max_queue_size(cfg.max_queue_size)
             .with_scheduled_delay(Duration::from_millis(cfg.export_interval_millis))
             .build();
-        let bsp = BatchSpanProcessor::builder(exporter)
+        let bsp = BatchSpanProcessor::builder(CountingExporter { inner: exporter })
             .with_batch_config(batch_config)
             .build();
 
@@ -351,7 +426,7 @@ mod otel {
         }));
 
         let provider = SdkTracerProvider::builder()
-            .with_span_processor(bsp)
+            .with_span_processor(CountingProcessor { inner: bsp })
             .with_sampler(sampler)
             .with_resource(resource.clone())
             .build();
@@ -757,6 +832,180 @@ mod tests {
 
 /// §6.7 解析面 property 测试（proptest）：入站 baggage 清洗的安全不变式——
 /// 白名单外零泄漏、条数/字节上限、值不篡改、幂等。不依赖 SDK（纯函数）。
+#[cfg(all(test, feature = "telemetry"))]
+mod otel_health_tests {
+    //! 对账 A5：导出健康计数（CountingExporter/CountingProcessor）+ span
+    //! trace_id/span_id 字段（日志关联）。
+    use super::otel::{CountingExporter, CountingProcessor};
+    use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
+    use opentelemetry_sdk::trace::{SpanData, SpanExporter, SpanProcessor};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug)]
+    struct FakeExporter {
+        fail: bool,
+    }
+
+    impl SpanExporter for FakeExporter {
+        fn export(
+            &self,
+            batch: Vec<SpanData>,
+        ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+            let fail = self.fail;
+            let n = batch.len();
+            async move {
+                if fail {
+                    Err(OTelSdkError::InternalFailure(format!("boom ({n})")))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoopProcessor;
+    impl SpanProcessor for NoopProcessor {
+        fn on_start(&self, _span: &mut opentelemetry_sdk::trace::Span, _cx: &opentelemetry::Context) {}
+        fn on_end(&self, _span: SpanData) {}
+        fn force_flush(&self) -> OTelSdkResult {
+            Ok(())
+        }
+        fn shutdown_with_timeout(&self, _timeout: std::time::Duration) -> OTelSdkResult {
+            Ok(())
+        }
+    }
+
+    fn fake_span_data(name: &'static str) -> SpanData {
+        SpanData {
+            span_context: opentelemetry::trace::SpanContext::empty_context(),
+            parent_span_id: opentelemetry::trace::SpanId::INVALID,
+            span_kind: opentelemetry::trace::SpanKind::Server,
+            name: name.into(),
+            start_time: std::time::SystemTime::now(),
+            end_time: std::time::SystemTime::now(),
+            attributes: vec![],
+            dropped_attributes_count: 0,
+            events: Default::default(),
+            links: Default::default(),
+            status: opentelemetry::trace::Status::Unset,
+            instrumentation_scope: opentelemetry::InstrumentationScope::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn counting_exporter_counts_success_by_batch_and_failures() {
+        let fails0 = crate::metrics::prometheus::OTEL_EXPORT_FAILURES_TOTAL.get();
+        let ok0 = crate::metrics::prometheus::OTEL_SPANS_EXPORTED_TOTAL.get();
+
+        let good = CountingExporter { inner: FakeExporter { fail: false } };
+        SpanExporter::export(&good, vec![fake_span_data("a"), fake_span_data("b")])
+            .await
+            .expect("ok exporter");
+        let bad = CountingExporter { inner: FakeExporter { fail: true } };
+        let _ = SpanExporter::export(&bad, vec![fake_span_data("c")]).await;
+
+        assert_eq!(crate::metrics::prometheus::OTEL_SPANS_EXPORTED_TOTAL.get(), ok0 + 2, "成功按 batch 大小计数");
+        assert_eq!(crate::metrics::prometheus::OTEL_EXPORT_FAILURES_TOTAL.get(), fails0 + 1, "失败按批次计数");
+    }
+
+    #[test]
+    fn counting_processor_counts_ended_spans() {
+        let ended0 = crate::metrics::prometheus::OTEL_SPANS_ENDED_TOTAL.get();
+        let p = CountingProcessor { inner: NoopProcessor };
+        p.on_end(fake_span_data("x"));
+        p.on_end(fake_span_data("y"));
+        assert_eq!(crate::metrics::prometheus::OTEL_SPANS_ENDED_TOTAL.get(), ended0 + 2);
+    }
+
+    /// link_parent 在 OTel layer 活跃时把 trace_id/span_id record 到 span
+    /// 字段上（fmt 日志据此自动带出）。
+    #[test]
+    fn link_parent_records_trace_ids_when_layer_active() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Debug)]
+        struct NoopExporter;
+        impl SpanExporter for NoopExporter {
+            fn export(
+                &self,
+                _batch: Vec<SpanData>,
+            ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+                async { Ok(()) }
+            }
+        }
+
+        #[derive(Default)]
+        struct Rec {
+            recorded: Vec<(String, String)>,
+        }
+        struct RecLayer(Arc<Mutex<Rec>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RecLayer {
+            fn on_record(
+                &self,
+                _span: &tracing::span::Id,
+                values: &tracing::span::Record<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct V<'a>(&'a mut Vec<(String, String)>);
+                impl tracing::field::Visit for V<'_> {
+                    fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                        self.0.push((f.name().to_string(), format!("{v:?}")));
+                    }
+                    fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                        self.0.push((f.name().to_string(), v.to_string()));
+                    }
+                }
+                let mut v = V(&mut self.0.lock().unwrap().recorded);
+                values.record(&mut v);
+            }
+        }
+
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(NoopExporter)
+            .build();
+        use opentelemetry::trace::TracerProvider;
+        let tracer = provider.tracer("test");
+        let rec: Arc<Mutex<Rec>> = Default::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry()
+                .with(tracing_opentelemetry::layer().with_tracer(tracer))
+                .with(RecLayer(rec.clone())),
+        );
+        let handle = std::thread::spawn(move || {
+            let _guard = tracing::dispatcher::set_default(&dispatch);
+            tracing::callsite::rebuild_interest_cache();
+            let span = tracing::info_span!(
+                "a5_test_span",
+                trace_id = tracing::field::Empty,
+                span_id = tracing::field::Empty,
+            );
+            super::link_parent(&span, &opentelemetry::Context::new());
+            let _enter = span.enter();
+        });
+        handle.join().unwrap();
+
+        let rec = rec.lock().unwrap();
+        let get = |n: &str| rec.recorded.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+        let trace_id = get("trace_id").expect("link_parent 须 record trace_id");
+        assert_eq!(trace_id.trim_matches('"').len(), 32, "trace_id 为 32 hex: {trace_id}");
+        let span_id = get("span_id").expect("link_parent 须 record span_id");
+        assert_eq!(span_id.trim_matches('"').len(), 16, "span_id 为 16 hex: {span_id}");
+    }
+
+    /// 无 OTel layer 时 link_parent 不 record（字段保持 Empty，不 panic）。
+    #[test]
+    fn link_parent_without_layer_is_noop() {
+        let span = tracing::info_span!(
+            "a5_noop_span",
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
+        );
+        super::link_parent(&span, &opentelemetry::Context::new());
+        // 无断言——不 panic 即通过（invalid span_context 跳过 record）。
+    }
+}
+
 #[cfg(test)]
 mod prop_tests {
     use super::*;

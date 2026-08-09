@@ -514,6 +514,8 @@ async fn execute_step(
             "ensemble.step",
             step = %step.name,
             model = %step.model,
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
         );
         crate::telemetry::link_parent(&step_span, &opentelemetry::Context::current());
         let _guard = step_span.enter();

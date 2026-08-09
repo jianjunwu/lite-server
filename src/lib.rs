@@ -4,6 +4,7 @@ pub mod config;
 pub mod deadline;
 pub mod access_control;
 pub mod admission;
+pub mod audit;
 pub mod rate_limit;
 pub mod ensemble;
 pub mod error;

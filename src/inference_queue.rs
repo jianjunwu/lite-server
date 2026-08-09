@@ -954,7 +954,8 @@ fn batch_affinity(
     let mut disagree = false;
     for item in batch {
         let meta = item.meta.as_ref();
-        let seq = meta.and_then(|m| m.sequence_id.as_deref());
+        // P8-1 审计 B1：空串零值归一化为未携带（见 sequence::normalize_sequence_id）。
+        let seq = crate::sequence::normalize_sequence_id(meta.and_then(|m| m.sequence_id.as_deref()));
         let key = seq.or_else(|| {
             meta.and_then(|m| m.headers.get("x-lite-affinity-key"))
                 .map(|s| s.as_str())
@@ -1299,7 +1300,9 @@ async fn do_send_batch(
     // next same-sequence request biases here (last-writer-wins; a retry to a
     // different worker updates the mapping to the actual handler).
     for item in batch.iter() {
-        if let Some(seq) = item.meta.as_ref().and_then(|m| m.sequence_id.as_deref()) {
+        if let Some(seq) = crate::sequence::normalize_sequence_id(
+            item.meta.as_ref().and_then(|m| m.sequence_id.as_deref()),
+        ) {
             sequence_registry.record(seq, model_name, version, worker_idx);
         }
     }
@@ -3816,5 +3819,72 @@ mod tests {
             crate::config::QueueTimeoutAction::Reject,
         );
         assert!(opt.is_some(), "queue_timeout=0 must not reject");
+    }
+
+    // ===== /audit P8-1 举证测试（2026-08-09）=====
+
+    /// 数据维度：proto3 零值 `sequence_id = Some("")` 必须视同 ABSENT。
+    /// HTTP 侧在提取时丢弃空 `x-sequence-id`（inference.rs `.filter(!empty)`），
+    /// gRPC 侧 `req.sequence_id.clone()` 直传——空串在此处被当成真实 key：
+    /// 所有显式置空字段的 gRPC 客户端被静默归入同一条粘性映射（热点），
+    /// 违反 proto 注释 "Absent = no affinity (behavior unchanged)" 与双侧 parity。
+    /// 同站点的 affinity_key 分支恰恰有空串过滤（`.filter(|s| !s.is_empty())`）。
+    #[test]
+    fn test_audit_data_empty_sequence_id_treated_as_absent_in_batch_affinity() {
+        let reg = SequenceRegistry::new(Duration::from_secs(60), 16);
+        let meta = pb::RequestMeta {
+            sequence_id: Some(String::new()),
+            ..Default::default()
+        };
+        let batch = vec![hint_item("a", Arc::new(meta))];
+        assert!(
+            batch_affinity(&batch, &reg, "m", "1").is_none(),
+            "empty sequence_id must mean 'no affinity' (HTTP parity: empty x-sequence-id is dropped)"
+        );
+    }
+
+    /// 偏离复核锁（蓝图裁定 rendezvous 取代 least-loaded 回退）：HRW 最小扰动——
+    /// worker 下线时只有落在它身上的 sequence 迁移，其余必须原地不动。
+    /// 纯函数性质（SipHash 定键），无统计波动。
+    #[test]
+    fn test_audit_pure_rendezvous_minimal_perturbation_on_worker_loss() {
+        let outlier = OutlierState::new(4);
+        let seqs: Vec<String> = (0..500).map(|i| format!("seq-{i}")).collect();
+        let before: Vec<usize> = seqs
+            .iter()
+            .map(|s| rendezvous_pick(s, 4, &outlier, &[]).unwrap())
+            .collect();
+        let victim = 2usize;
+        eject(&outlier, victim);
+        for (s, &w0) in seqs.iter().zip(&before) {
+            let w1 = rendezvous_pick(s, 4, &outlier, &[]).unwrap();
+            if w0 == victim {
+                assert_ne!(w1, victim, "sequence on the dead worker must move");
+            } else {
+                assert_eq!(
+                    w1, w0,
+                    "sequence on a live worker must NOT move (minimal perturbation)"
+                );
+            }
+        }
+    }
+
+    /// 偏离复核锁：rendezvous 分布均匀性。4000 个 sequence 在 4 worker 上
+    /// 期望 ~1000/worker；DefaultHasher 定键使计数为固定值，±30% 宽带不会抖动。
+    #[test]
+    fn test_audit_pure_rendezvous_distribution_uniform() {
+        let outlier = OutlierState::new(4);
+        let mut counts = [0usize; 4];
+        let total = 4000;
+        for i in 0..total {
+            let w = rendezvous_pick(&format!("seq-{i}"), 4, &outlier, &[]).unwrap();
+            counts[w] += 1;
+        }
+        for (w, &c) in counts.iter().enumerate() {
+            assert!(
+                (700..=1300).contains(&c),
+                "worker {w} got {c}/{total} picks — rendezvous distribution skewed"
+            );
+        }
     }
 }

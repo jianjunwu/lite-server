@@ -134,7 +134,10 @@ pub(crate) fn pick_streaming_worker(
 
     // 2. sequence_id stickiness (best-effort) → 3. affinity_key rendezvous →
     //    skip-ejected/random.
-    let preferred = meta.sequence_id.as_deref().and_then(|seq| {
+    // P8-1 审计 B1：proto3 零值（空串）归一化为「未携带」，否则零值客户端
+    // 被归组到同一粘性 key。
+    let seq_normalized = crate::sequence::normalize_sequence_id(meta.sequence_id.as_deref());
+    let preferred = seq_normalized.and_then(|seq| {
         let w = seq_registry.lookup(seq, model, version)?;
         let ejected = outlier.map(|o| o.is_ejected(w)).unwrap_or(false);
         (w < num_workers && !ejected).then_some(w)
@@ -152,7 +155,7 @@ pub(crate) fn pick_streaming_worker(
 
     // Record the sticky mapping so the next request with this sequence_id lands
     // on the same worker (matches the prior inline behavior).
-    if let Some(seq) = meta.sequence_id.as_deref() {
+    if let Some(seq) = seq_normalized {
         seq_registry.record(seq, model, version, worker_id);
     }
     Ok(worker_id)
@@ -365,5 +368,22 @@ mod tests {
         let meta = hint_meta(&[], Some("seq-rec"));
         let w = pick_streaming_worker(&meta, 2, Some(&outlier), &reg, "m", "1").unwrap();
         assert_eq!(reg.lookup("seq-rec", "m", "1"), Some(w), "chosen worker must be recorded");
+    }
+
+    // ===== /audit P8-1 举证测试（2026-08-09）=====
+
+    /// 数据维度：流式直连路径同样不得把 proto3 零值 `Some("")` 当真实 sequence。
+    /// 当前 `record("", ...)` 会在注册表建空串条目，把后续所有显式置空的
+    /// 客户端粘性归组到同一 worker（HTTP 侧空 x-sequence-id 被丢弃，无此问题）。
+    #[test]
+    fn test_audit_data_empty_sequence_id_not_recorded_by_streaming_pick() {
+        let outlier = OutlierState::new(2);
+        let reg = SequenceRegistry::new(Duration::from_secs(60), 16);
+        let meta = hint_meta(&[], Some("")); // proto3 zero value, explicitly set
+        let _ = pick_streaming_worker(&meta, 2, Some(&outlier), &reg, "m", "1").unwrap();
+        assert!(
+            reg.is_empty(),
+            "empty sequence_id must be treated as absent — no registry entry may be created"
+        );
     }
 }

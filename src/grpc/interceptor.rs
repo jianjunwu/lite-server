@@ -39,6 +39,9 @@ impl RequestContext {
             .and_then(|v| v.to_str().ok())
             .filter(|s| crate::validation::is_valid_request_id(s))
             .map(String::from)
+            // 留空是有意设计:proto headers 回退只在字段留空时生效
+            // (post-decode finalize 的职责);UUID 兜底由 finalize_context
+            // (inference)或 service_interceptor(Admin/health)按职责完成。
             .unwrap_or_default();
         let xff = metadata_xff(metadata, "x-forwarded-for");
         let x_real_ip = metadata_first(metadata, "x-real-ip");
@@ -89,6 +92,12 @@ pub fn service_interceptor(
         let remote = request.remote_addr();
         let mut cx = RequestContext::from_grpc_metadata(request.metadata(), remote, &trusted);
         cx.principal = tls_principal(request.extensions());
+        // D27（对账修复）:Admin/health 的 handler 无 post-decode finalize
+        // 步骤——request_id 在此兜底 UUID v4(否则审计记录恒空串)。Inference
+        // 保持留空:proto headers 回退优先级由 finalize_context 维持。
+        if cx.request_id.is_empty() && !matches!(class, EndpointClass::Inference) {
+            cx.request_id = Uuid::new_v4().to_string();
+        }
         let is_loopback = remote.map(|a| a.ip().is_loopback()).unwrap_or(true);
         if !access_control.check(class, Protocol::Grpc, request.metadata(), is_loopback) {
             return Err(Status::unauthenticated("access denied"));
@@ -384,45 +393,66 @@ mod tests {
 
     // ===== 护栏：gRPC handler 不再各自 inline 提取 request_id/client_ip =====
 
+    /// b37ddb8 拆分后 handler 生产代码在 rpc/*.rs——护栏必须扫描这些文件，
+    /// 只扫 mod.rs 会空转（2026-08-09 对账发现）。
+    const HANDLER_SOURCES: [(&str, &str); 6] = [
+        ("mod.rs", include_str!("mod.rs")),
+        ("rpc/infer.rs", include_str!("rpc/infer.rs")),
+        ("rpc/batch.rs", include_str!("rpc/batch.rs")),
+        ("rpc/stream.rs", include_str!("rpc/stream.rs")),
+        ("rpc/bidi.rs", include_str!("rpc/bidi.rs")),
+        ("rpc/decoupled.rs", include_str!("rpc/decoupled.rs")),
+    ];
+
     #[test]
     fn grpc_handlers_do_not_extract_inline() {
-        let src = include_str!("mod.rs");
-        let boundary = src.find("#[cfg(test)]").unwrap_or(src.len());
-        let prod = &src[..boundary];
-        assert!(
-            !prod.contains("extract_request_id"),
-            "P-MW: grpc/mod.rs handlers must read RequestContext (interceptor::finalize_context), not extract_request_id inline"
-        );
-        assert!(
-            !prod.contains("extract_client_ip"),
-            "P-MW: grpc/mod.rs handlers must read RequestContext (interceptor::finalize_context), not extract_client_ip inline"
-        );
+        for (name, src) in HANDLER_SOURCES {
+            let boundary = src.find("#[cfg(test)]").unwrap_or(src.len());
+            let prod = &src[..boundary];
+            assert!(
+                !prod.contains("extract_request_id"),
+                "P-MW: {name} handlers must read RequestContext (interceptor::finalize_context), not extract_request_id inline"
+            );
+            assert!(
+                !prod.contains("extract_client_ip"),
+                "P-MW: {name} handlers must read RequestContext (interceptor::finalize_context), not extract_client_ip inline"
+            );
+        }
     }
 
     /// P1-1 文本护栏（蓝图 §4.1）：gRPC 错误返回一律走 `err()` 分级日志助手
-    /// （客户端类→info!、其余→error!），流式路径与 unary（mod.rs:363）同式。
+    /// （客户端类→info!、其余→error!），流式路径与 unary 同式。
     /// 本测试断言每一处 `model_error_status(` 调用都带 `err(` 包裹。
+    /// error.rs 内的调用是 Status 构造器内部使用，不属于本护栏范围。
     #[test]
     fn streaming_model_errors_go_through_graded_logging() {
-        let src = include_str!("mod.rs");
-        let boundary = src.find("#[cfg(test)]").unwrap_or(src.len());
-        let prod = &src[..boundary];
-        let unguarded: Vec<String> = prod
-            .lines()
-            .enumerate()
-            .filter(|(_, l)| {
-                // 调用点必须同行带 `err(model_error_status(`（unary 363 范本）；
-                // 定义行（fn model_error_status）与测试用例不计。
-                l.contains("model_error_status(")
-                    && !l.contains("err(model_error_status")
-                    && !l.trim_start().starts_with("fn model_error_status")
-            })
-            .map(|(i, l)| format!("{}: {}", i + 1, l.trim()))
-            .collect();
+        let mut total_calls = 0usize;
+        for (name, src) in HANDLER_SOURCES {
+            let boundary = src.find("#[cfg(test)]").unwrap_or(src.len());
+            let prod = &src[..boundary];
+            let unguarded: Vec<String> = prod
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| {
+                    // 调用点必须同行带 `err(model_error_status(`；
+                    // 定义行（fn model_error_status）与测试用例不计。
+                    l.contains("model_error_status(")
+                        && !l.contains("err(model_error_status")
+                        && !l.trim_start().starts_with("fn model_error_status")
+                })
+                .map(|(i, l)| format!("{name}:{}: {}", i + 1, l.trim()))
+                .collect();
+            total_calls += prod.matches("model_error_status(").count();
+            assert!(
+                unguarded.is_empty(),
+                "P1-1: 结构化 model error 必须经 err() 分级日志，未包裹: {unguarded:?}"
+            );
+        }
+        // 反空转断言：护栏必须真的扫到调用点（当前 infer/stream/bidi/decoupled
+        // 各 1 处），否则文件迁移后护栏静默失效而无人察觉。
         assert!(
-            unguarded.is_empty(),
-            "P1-1: 结构化 model error 必须经 err() 分级日志（unary 为范本），\
-             流式路径未包裹: {unguarded:?}"
+            total_calls >= 4,
+            "P1-1 护栏空转：仅扫到 {total_calls} 处 model_error_status( 调用，应 >=4"
         );
     }
 }

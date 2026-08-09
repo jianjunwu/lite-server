@@ -191,15 +191,46 @@ impl WorkerZmqClient {
                                             }
                                         } else if let Some(pb::response::Payload::Stream(ref stream_resp)) = resp.payload {
                                             let sid = &stream_resp.stream_id;
+                                            let mut overflowed = false;
                                             if let Some(tx) = stream_routes.get(sid) {
                                                 let is_done = matches!(stream_resp.payload, Some(pb::stream_response::Payload::Done(_)));
                                                 let is_error = matches!(stream_resp.payload, Some(pb::stream_response::Payload::Error(_)));
-                                                if tx.try_send(stream_resp.clone()).is_err() {
-                                                    warn!("Stream channel full or closed for {}", sid);
-                                                    stream_routes.remove(sid);
-                                                } else if is_done || is_error {
-                                                    stream_routes.remove(sid);
+                                                match tx.try_send(stream_resp.clone()) {
+                                                    Ok(()) => {
+                                                        if is_done || is_error {
+                                                            stream_routes.remove(sid);
+                                                        }
+                                                    }
+                                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                                        overflowed = true;
+                                                        // B2(审计 P9-1):背压截断必须对 client 可见——
+                                                        // channel 满意味着后续数据帧(含终态 Done)被丢弃,
+                                                        // 若安静移除路由,consumer 观察到干净 EOF 误当正常
+                                                        // 完成。补一个合成 Error 终态帧:克隆 sender + 有界
+                                                        // 等待投递(不阻塞 actor 主循环),随后移除路由。
+                                                        warn!("Stream channel full for {} — delivering truncation error", sid);
+                                                        let sid_t = sid.clone();
+                                                        let tx2 = tx.clone();
+                                                        tokio::spawn(async move {
+                                                            let term = pb::StreamResponse {
+                                                                stream_id: sid_t,
+                                                                payload: Some(pb::stream_response::Payload::Error(pb::StreamError {
+                                                                    message: "stream truncated: consumer too slow (channel overflow)".to_string(),
+                                                                })),
+                                                            };
+                                                            let _ = tokio::time::timeout(
+                                                                std::time::Duration::from_secs(2),
+                                                                tx2.send(term),
+                                                            ).await;
+                                                        });
+                                                    }
+                                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                                        stream_routes.remove(sid);
+                                                    }
                                                 }
+                                            }
+                                            if overflowed {
+                                                stream_routes.remove(sid);
                                             }
                                             // A streaming route reply leaves its
                                             // unused unary slot behind — free it
@@ -408,6 +439,16 @@ fn drain_commands(
                 }
             }
             Ok(ZmqCommand::Raw { request }) => {
+                // B1(审计 P9-1):cancel 控制消息到达即回收流路由——worker 对
+                // cancel 语义上不回任何终态帧(python _ResponseSender.cancel:
+                // "No StreamDone is sent"),不在此回收则该流的路由
+                // (mpsc::Sender+至多 64 条缓冲 chunk)泄漏到 worker 重启。
+                if let Some(pb::request::Payload::Stream(ref st)) = request.payload {
+                    if matches!(st.action, Some(pb::stream_request::Action::Cancel(_))) {
+                        stream_routes.remove(&st.stream_id);
+                        pending.remove(&st.stream_id);
+                    }
+                }
                 let bytes = request.encode_to_vec();
                 if let Err(e) = socket.send(&bytes, 0) {
                     // B2: stop messages are sent during unload/shutdown; if the

@@ -102,7 +102,13 @@ impl GrpcService {
                         Ok(v) => crate::ensemble::EnsembleValue::Json(v),
                         Err(_) => crate::ensemble::EnsembleValue::Binary(
                             req.data.clone(),
-                            "application/octet-stream".to_string(),
+                            // 审计 E-B1 修复:保留 proto headers 声明的
+                            // content-type(HTTP parity:Raw(bytes, ct) 保留
+                            // 声明值);未声明才回退 octet-stream。
+                            req.headers
+                                .get("content-type")
+                                .cloned()
+                                .unwrap_or_else(|| "application/octet-stream".to_string()),
                         ),
                     };
                 // P-DEADLINE: resolve here (grpc_metadata still in scope) and

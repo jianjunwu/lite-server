@@ -448,6 +448,12 @@ async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.
             # P9-1: signal the decoupled sender so the model's push loop can
             # release resources (cooperative cancel, no StreamDone).
             entry.sender.cancel()
+            # B5(审计):shutdown 回收也须 fire on_stream_close——消息 cancel
+            # 路径对同会话类型 fire "cancel"(streaming.py),uni-stream 任务
+            # 取消也经 CancelledError handler fire。
+            pipe = _get_pipeline(lit_api)
+            if pipe is not None:
+                await pipe.run_on_stream_close(entry.ctx, "cancel")
             active_streams.pop(sid, None)
 
     if cancelled:

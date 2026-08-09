@@ -224,6 +224,22 @@ lazy_static! {
         "Number of in-flight requests during shutdown"
     ).unwrap();
 
+    // ===== P-TRACE 导出健康（对账 A5）：OTel 管线自身的可观测 =====
+    // ended→exported 的差值≈丢弃（BSP 队列满丢弃不可直接观测，以差值逼近）；
+    // export_failures 直接计数导出失败。telemetry 关闭时恒 0。
+    pub static ref OTEL_SPANS_ENDED_TOTAL: prometheus::IntCounter = prometheus::IntCounter::new(
+        "liteserver_otel_spans_ended_total",
+        "Total spans ended (entered the OTel export pipeline)"
+    ).unwrap();
+    pub static ref OTEL_SPANS_EXPORTED_TOTAL: prometheus::IntCounter = prometheus::IntCounter::new(
+        "liteserver_otel_spans_exported_total",
+        "Total spans successfully exported to the OTLP collector"
+    ).unwrap();
+    pub static ref OTEL_EXPORT_FAILURES_TOTAL: prometheus::IntCounter = prometheus::IntCounter::new(
+        "liteserver_otel_export_failures_total",
+        "Total failed OTLP span export batches"
+    ).unwrap();
+
     // ===== P2-1 扩展: 扩缩一等指标（autoscaling 信号）=====
     // label 仅封闭枚举 model/version（§6.5 约束 10）。
 
@@ -318,6 +334,9 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(WORKER_INFERENCE_TOTAL.clone()))?;
     REGISTRY.register(Box::new(WORKER_RESPAWNS_TOTAL.clone()))?;
     REGISTRY.register(Box::new(SHUTDOWN_PENDING_REQUESTS.clone()))?;
+    REGISTRY.register(Box::new(OTEL_SPANS_ENDED_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(OTEL_SPANS_EXPORTED_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(OTEL_EXPORT_FAILURES_TOTAL.clone()))?;
     REGISTRY.register(Box::new(IN_FLIGHT_REQUESTS.clone()))?;
     REGISTRY.register(Box::new(QUEUE_WAIT_SECONDS.clone()))?;
     REGISTRY.register(Box::new(WORKER_SATURATION.clone()))?;

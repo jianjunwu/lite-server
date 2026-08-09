@@ -184,7 +184,9 @@ impl LiteServer for GrpcService {
         // P-FLOW (§4.0.9): global in-flight admission cap (health/admin RPCs
         // are separate services and never reach here). Held for the handler
         // scope; streaming releases on stream-open (header-semantic).
-        let _admission = self.acquire_admission()?;
+        let _admission = self
+            .acquire_admission()
+            .map_err(|s| metadata::echo_early_rejection(s, &request))?;
         // P2-1 请求指标：成功/失败统一在此记一次（version label 取解析后版本，
         // 解析失败保持请求原值；D5 无 protocol label，与 HTTP 共享计数）。
         // P2-2 回显：request_id/processing-time 注入响应或错误 metadata（对齐
@@ -197,7 +199,16 @@ impl LiteServer for GrpcService {
         } else {
             request.get_ref().version.clone()
         };
-        let span_rid = metadata_request_id(request.metadata());
+        // P-MW 审计修复：span 的 request_id 与 interceptor 校验后的
+        // RequestContext 同源——直接重提取会绕过 is_valid_request_id（非法值
+        // 上 span，与回显/RequestMeta 的 UUID 分叉）。无 context（直调单测）
+        // 才回退重提取。
+        let span_rid = request
+            .extensions()
+            .get::<crate::request_context::RequestContext>()
+            .map(|rc| rc.request_id.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| metadata_request_id(request.metadata()));
         // FD-2: D11 body fields on the inference span (HTTP handler parity).
         let body_bytes = request.get_ref().data.len() as i64;
         let body_kind = crate::grpc::payload::body_kind_label(&request.get_ref().headers);
@@ -208,6 +219,8 @@ impl LiteServer for GrpcService {
             request_id = %span_rid,
             // P5-2: canary pin 命中时由 canary_pin record（蓝图 §4.4）。
             pinned_version = tracing::field::Empty,
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
             body_bytes,
             body_kind,
         );
@@ -234,7 +247,9 @@ impl LiteServer for GrpcService {
         // P-FLOW (§4.0.9): global in-flight admission cap (health/admin RPCs
         // are separate services and never reach here). Held for the handler
         // scope; streaming releases on stream-open (header-semantic).
-        let _admission = self.acquire_admission()?;
+        let _admission = self
+            .acquire_admission()
+            .map_err(|s| metadata::echo_early_rejection(s, &request))?;
         // P2-1 请求指标 + P2-2 回显 + P2-3 span（同 infer 包装）。
         let start = Instant::now();
         let model_label = request.get_ref().model_name.clone();
@@ -243,7 +258,16 @@ impl LiteServer for GrpcService {
         } else {
             request.get_ref().version.clone()
         };
-        let span_rid = metadata_request_id(request.metadata());
+        // P-MW 审计修复：span 的 request_id 与 interceptor 校验后的
+        // RequestContext 同源——直接重提取会绕过 is_valid_request_id（非法值
+        // 上 span，与回显/RequestMeta 的 UUID 分叉）。无 context（直调单测）
+        // 才回退重提取。
+        let span_rid = request
+            .extensions()
+            .get::<crate::request_context::RequestContext>()
+            .map(|rc| rc.request_id.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| metadata_request_id(request.metadata()));
         // FD-2: D11 body fields (batch body size = Σ items).
         let body_bytes = request.get_ref().items.iter().map(|i| i.len()).sum::<usize>() as i64;
         let body_kind = crate::grpc::payload::body_kind_label(&request.get_ref().headers);
@@ -254,6 +278,8 @@ impl LiteServer for GrpcService {
             request_id = %span_rid,
             // P5-2: canary pin 命中时由 canary_pin record（蓝图 §4.4）。
             pinned_version = tracing::field::Empty,
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
             body_bytes,
             body_kind,
         );
@@ -287,7 +313,9 @@ impl LiteServer for GrpcService {
         // P-FLOW (§4.0.9): global in-flight admission cap (health/admin RPCs
         // are separate services and never reach here). Held for the handler
         // scope; streaming releases on stream-open (header-semantic).
-        let _admission = self.acquire_admission()?;
+        let _admission = self
+            .acquire_admission()
+            .map_err(|s| metadata::echo_early_rejection(s, &request))?;
         // P2-1 请求指标：open 失败在此记一次；open 成功后由转发 task 在流
         // 关闭处记一次整体 duration（蓝图 §4.3 P2-1 stream/bidi 语义）。
         // P2-2 回显：注入 stream open 的 initial metadata（processing-time 为
@@ -299,7 +327,16 @@ impl LiteServer for GrpcService {
         } else {
             request.get_ref().version.clone()
         };
-        let span_rid = metadata_request_id(request.metadata());
+        // P-MW 审计修复：span 的 request_id 与 interceptor 校验后的
+        // RequestContext 同源——直接重提取会绕过 is_valid_request_id（非法值
+        // 上 span，与回显/RequestMeta 的 UUID 分叉）。无 context（直调单测）
+        // 才回退重提取。
+        let span_rid = request
+            .extensions()
+            .get::<crate::request_context::RequestContext>()
+            .map(|rc| rc.request_id.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| metadata_request_id(request.metadata()));
         // FD-2: D11 body fields on the inference span (HTTP handler parity).
         let body_bytes = request.get_ref().data.len() as i64;
         let body_kind = crate::grpc::payload::body_kind_label(&request.get_ref().headers);
@@ -310,6 +347,8 @@ impl LiteServer for GrpcService {
             request_id = %span_rid,
             // P5-2: canary pin 命中时由 canary_pin record（蓝图 §4.4）。
             pinned_version = tracing::field::Empty,
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
             body_bytes,
             body_kind,
             // G3:转发 task 内补记(单 span 覆盖 open→全流→close)。
@@ -355,7 +394,9 @@ impl LiteServer for GrpcService {
         // P-FLOW (§4.0.9): global in-flight admission cap (health/admin RPCs
         // are separate services and never reach here). Held for the handler
         // scope; streaming releases on stream-open (header-semantic).
-        let _admission = self.acquire_admission()?;
+        let _admission = self
+            .acquire_admission()
+            .map_err(|s| metadata::echo_early_rejection(s, &request))?;
         let start = Instant::now();
         let model_label = request.get_ref().model_name.clone();
         let span_version = if request.get_ref().version.is_empty() {
@@ -363,7 +404,16 @@ impl LiteServer for GrpcService {
         } else {
             request.get_ref().version.clone()
         };
-        let span_rid = metadata_request_id(request.metadata());
+        // P-MW 审计修复：span 的 request_id 与 interceptor 校验后的
+        // RequestContext 同源——直接重提取会绕过 is_valid_request_id（非法值
+        // 上 span，与回显/RequestMeta 的 UUID 分叉）。无 context（直调单测）
+        // 才回退重提取。
+        let span_rid = request
+            .extensions()
+            .get::<crate::request_context::RequestContext>()
+            .map(|rc| rc.request_id.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| metadata_request_id(request.metadata()));
         // FD-2: D11 body fields on the inference span (HTTP handler parity).
         let body_bytes = request.get_ref().data.len() as i64;
         let body_kind = crate::grpc::payload::body_kind_label(&request.get_ref().headers);
@@ -374,6 +424,8 @@ impl LiteServer for GrpcService {
             request_id = %span_rid,
             method = "decoupled_infer",
             pinned_version = tracing::field::Empty,
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
             body_bytes,
             body_kind,
             // G3:转发 task 内补记(单 span 覆盖 open→全流→close)。
@@ -416,7 +468,9 @@ impl LiteServer for GrpcService {
         // P-FLOW (§4.0.9): global in-flight admission cap (health/admin RPCs
         // are separate services and never reach here). Held for the handler
         // scope; streaming releases on stream-open (header-semantic).
-        let _admission = self.acquire_admission()?;
+        let _admission = self
+            .acquire_admission()
+            .map_err(|s| metadata::echo_early_rejection(s, &request))?;
         // P2-1 请求指标 + P2-2 回显（同 stream_infer；model 在 BidiOpen 前未知，
         // 早期失败以空 label 记录；request_id 来自 transport metadata）。
         let start = Instant::now();
@@ -616,6 +670,7 @@ pub async fn start_grpc_server(
         callback_runner.clone(),
         Arc::new(config),
         has_hot_reload,
+        access_control.clone(),
     );
     let admin_server = crate::grpc::admin::AdminServer::new(admin_service);
     // P-FLOW (§4.0.9): same per-request decode cap as inference.

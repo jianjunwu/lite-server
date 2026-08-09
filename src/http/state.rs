@@ -31,6 +31,10 @@ pub struct AppState {
     /// requests. Health/admin traffic is exempt (enforced by the HTTP
     /// middleware / gRPC handler which classify the endpoint).
     pub admission: AdmissionCounter,
+    /// D27 审计的 key 指纹来源。默认全 Unconfigured（admin fail-closed），
+    /// 启动路径以解析后的实例覆盖（http/mod.rs）——直构 AppState 的单测
+    /// 无需注入也能用（指纹字段为 None）。
+    pub access_control: Arc<crate::access_control::AccessControl>,
 }
 
 impl AppState {
@@ -61,6 +65,7 @@ impl AppState {
             has_hot_reload,
             rate_limiter,
             admission,
+            access_control: Arc::new(crate::access_control::AccessControl::default()),
         }
     }
 }

@@ -47,7 +47,15 @@ pub(crate) fn app_error_to_grpc_status(e: &AppError) -> Status {
         AppError::MethodNotAllowed => 405,
         _ => 500,
     };
-    Status::new(http_status_to_grpc_code(http_status), e.pub_error_message())
+    let status = Status::new(http_status_to_grpc_code(http_status), e.pub_error_message());
+    // §4.0.9 收口:queue-full → Unavailable + retry-after(对齐 HTTP 侧
+    // QueueFull 恒挂 Retry-After: 1,以及直连路径的 with_retry_after;
+    // ensemble 子步骤 QueueFull 经此集中映射)。
+    if matches!(e, AppError::QueueFull(_)) {
+        with_retry_after(status, 1)
+    } else {
+        status
+    }
 }
 
 /// Map an error_type string (from a structured stream error) to a gRPC code.
@@ -358,5 +366,34 @@ mod tests {
 
         let data = serde_json::json!({"other": "stuff"});
         assert!(try_parse_model_error(&data).is_none());
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    //! /audit 举证(P-ENSEMBLE-GRPC 面,蓝图 §4.0.9 + §4.1):ensemble 子步骤
+    //! queue-full 的错误映射缺口。子模型队列满 → execute_step 产
+    //! `AppError::QueueFull` → rpc/infer.rs:124 经 `app_error_to_grpc_status`
+    //! 映射。§4.0.9 收口:queue-full/过载 → Unavailable(落 5xx)**+ retry-after**
+    //! (对齐 HTTP `Retry-After`,error.rs HTTP 侧 QueueFull 恒挂 Retry-After: 1;
+    //! gRPC 直连路径 rpc/infer.rs queue-full 也经 `with_retry_after` 兑现)。
+    //! 但此集中映射不挂 retry-after → gRPC ensemble 客户端拿不到退避信号。
+    use super::app_error_to_grpc_status;
+    use crate::error::AppError;
+
+    #[test]
+    fn test_audit_control_ensemble_queue_full_status_carries_retry_after() {
+        let status = app_error_to_grpc_status(&AppError::QueueFull("sub 1".to_string()));
+        assert_eq!(
+            status.code(),
+            tonic::Code::Unavailable,
+            "§4.0.9: queue-full → Unavailable(落 5xx,ResourceExhausted 专给限流)"
+        );
+        assert!(
+            status.metadata().get("retry-after").is_some(),
+            "parity 缺陷:HTTP QueueFull 响应恒挂 Retry-After(error.rs HTTP 侧),gRPC 直连 \
+             queue-full 也经 with_retry_after 挂 retry-after;ensemble 子步骤 QueueFull 经 \
+             app_error_to_grpc_status 丢失该 metadata,gRPC 客户端无法退避"
+        );
     }
 }

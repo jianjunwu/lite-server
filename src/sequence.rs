@@ -16,6 +16,15 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// proto3 零值归一化（P8-1 审计 B1）：空串 `sequence_id` 视为未携带——否则
+/// 所有未设置该字段的客户端被归组到同一粘性 key，互相挤到同一 worker。
+/// 口径与 HTTP 侧一致（空 `x-sequence-id` header 被丢弃）。
+pub fn normalize_sequence_id(seq: Option<&str>) -> Option<&str> {
+    seq.filter(|s| !s.is_empty())
+}
+
+/// Sticky routing registry (P8-1): sequence_id → (model, version, worker) with
+/// TTL + LRU capacity. Per-process (see 蓝图 §4.4 评审 2.2 multi-instance note).
 pub struct SequenceRegistry {
     map: DashMap<Arc<str>, SequenceEntry>,
     ttl: Duration,

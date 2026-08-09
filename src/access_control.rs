@@ -78,7 +78,9 @@ enum ResolvedControl {
     Unconfigured,
     Public,
     /// Require a key: compare the named header to `secret` in constant time.
-    Key { header: String, secret: Vec<u8> },
+    /// `fingerprint` = SHA-256 hex 前缀（12 字符）of `secret`——审计归因用
+    /// （D27），日志不落密钥本体。
+    Key { header: String, secret: Vec<u8>, fingerprint: String },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -131,7 +133,7 @@ impl AccessControl {
         let axis = protocol_axis(protocol);
         match self.cell(class, axis) {
             ResolvedControl::Public => true,
-            ResolvedControl::Key { header, secret } => match headers.header(header) {
+            ResolvedControl::Key { header, secret, .. } => match headers.header(header) {
                 Some(presented) => ct_eq(presented.as_bytes(), secret),
                 None => false,
             },
@@ -154,6 +156,16 @@ impl AccessControl {
             self.cell(EndpointClass::Admin, ProtocolAxis::Grpc),
             ResolvedControl::Unconfigured
         )
+    }
+
+    /// SHA-256 指纹（12 hex）of the configured key for (class, protocol)——
+    /// 审计归因（D27 key 指纹字段）：标识用了哪把 key（轮换前后可区分），
+    /// 日志不落密钥本体。非 key 模式（public/未配置）返回 None。
+    pub fn key_fingerprint(&self, class: EndpointClass, protocol: Protocol) -> Option<&str> {
+        match self.cell(class, protocol_axis(protocol)) {
+            ResolvedControl::Key { fingerprint, .. } => Some(fingerprint),
+            _ => None,
+        }
     }
 }
 
@@ -178,7 +190,7 @@ fn resolve_one(ctrl: Option<&EndpointControl>) -> Result<ResolvedControl, AppErr
                 ));
             }
             let secret = resolve_secret(value.as_deref(), value_env.as_deref(), value_file.as_deref())?;
-            ResolvedControl::Key { header: key.clone(), secret }
+            ResolvedControl::Key { fingerprint: secret_fingerprint(&secret), header: key.clone(), secret }
         }
     })
 }
@@ -276,6 +288,19 @@ pub fn classify_http_path(path: &str) -> EndpointClass {
 
 /// Convenience alias used by callers that already hold the shared policy.
 pub type SharedAccessControl = Arc<AccessControl>;
+
+/// SHA-256 hex 前缀（12 字符）of a secret。高熵 API key 的截断哈希可安全
+/// 入日志做归因；与 tls.rs 证书指纹同族（sha2 直依赖）。
+fn secret_fingerprint(secret: &[u8]) -> String {
+    use sha2::Digest;
+    use std::fmt::Write as _;
+    let digest = sha2::Sha256::digest(secret);
+    let mut out = String::with_capacity(12);
+    for b in &digest[..6] {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
 
 #[cfg(test)]
 mod tests {
@@ -491,5 +516,67 @@ mod tests {
         })
         .unwrap();
         assert!(!ac.admin_denies_non_loopback());
+    }
+
+    // ===== D27 key 指纹（审计归因）=====
+
+    #[test]
+    fn key_fingerprint_is_sha256_prefix_of_configured_secret() {
+        let ac = AccessControl::build(&AccessControlConfig {
+            admin: ProtocolControl { http: Some(key_ctrl("x-admin-key", "secret-token-123")), grpc: None },
+            ..Default::default()
+        })
+        .unwrap();
+        let fp = ac
+            .key_fingerprint(EndpointClass::Admin, Protocol::Http)
+            .expect("key 模式必须有指纹");
+        assert_eq!(fp.len(), 12);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        // 与 secret 的 SHA-256 前缀一致（独立重算，防实现自证）
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(b"secret-token-123");
+        let expected: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(fp, expected);
+        // 不落明文
+        assert!(!fp.contains("secret"));
+    }
+
+    #[test]
+    fn key_fingerprint_none_for_public_and_unconfigured() {
+        // public → None
+        let ac = AccessControl::build(&AccessControlConfig {
+            admin: ProtocolControl { http: Some(EndpointControl::Public), grpc: None },
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(ac.key_fingerprint(EndpointClass::Admin, Protocol::Http), None);
+        // 未配置 → None
+        let ac = AccessControl::default();
+        assert_eq!(ac.key_fingerprint(EndpointClass::Admin, Protocol::Http), None);
+        // key 只配在 http 轴时 grpc 轴 → None
+        let ac = AccessControl::build(&AccessControlConfig {
+            admin: ProtocolControl { http: Some(key_ctrl("x-admin-key", "tok")), grpc: None },
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(ac.key_fingerprint(EndpointClass::Admin, Protocol::Grpc), None);
+    }
+
+    #[test]
+    fn key_fingerprint_distinguishes_rotated_keys() {
+        let build = |secret: &str| {
+            AccessControl::build(&AccessControlConfig {
+                admin: ProtocolControl { http: Some(key_ctrl("x-admin-key", secret)), grpc: None },
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let old = build("old-token");
+        let new = build("new-token");
+        assert_ne!(
+            old.key_fingerprint(EndpointClass::Admin, Protocol::Http),
+            new.key_fingerprint(EndpointClass::Admin, Protocol::Http),
+            "轮换前后指纹必须可区分"
+        );
     }
 }

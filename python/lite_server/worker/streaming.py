@@ -232,12 +232,14 @@ class _ResponseSender:
         if self.closed:
             return
         self.closed = True
+        # B3(审计):terminal-first——先摘会话再 await;否则 cancel 在 close
+        # 挂起期间落地会对同一流再 fire 一次 on_stream_close(与 send() 错误
+        # 路径同模式;server cancel 路径先 pop 再 fire,此处先 pop 则其找不到
+        # 会话)。
+        self._active_streams.pop(self._stream_id, None)
         metrics = collect_metrics(self._lit_api, tokens_generated=self._chunk_count)
         await self._socket.send(_make_stream_done(self._stream_id, metrics).SerializeToString())
         await self._pipe.run_on_stream_close(self._ctx, "done")
-        # Model-initiated close: drop the session so the channel is reclaimed.
-        # (Server-initiated cancel pops active_streams before calling cancel().)
-        self._active_streams.pop(self._stream_id, None)
 
     def cancel(self) -> None:
         """Cooperative cancel (client disconnect / shutdown). Subsequent
@@ -451,6 +453,9 @@ async def _handle_stream_open_async(
         if ctx.early is not None:
             # S3:open 时 preprocess early——early 是唯一输出,计 1 个 chunk。
             await _send_stream_early(socket, stream_id, ctx.early, lit_api, tokens_generated=1)
+            # B4(审计):early 终止同样 fire on_stream_close(uni-stream/bidi
+            # early 路径均 fire "done",decoupled 不得例外)。
+            await pipe.run_on_stream_close(ctx, "done")
             return
 
         sender = _ResponseSender(lit_api, pipe, stream_id, socket, log, ctx, active_streams)

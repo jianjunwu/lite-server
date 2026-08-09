@@ -14,7 +14,8 @@
 //! P7-1; until then Admin is reachable wherever the gRPC server binds (parity
 //! with the current HTTP admin surface, which is open to the bind address).
 
-use crate::callback::{CallbackRunner, ModelLifecycleContext};
+use crate::access_control::AccessControl;
+use crate::callback::{CallbackRunner, ModelLifecycleContext, Protocol};
 use crate::config::Config;
 use crate::error::AppError;
 use crate::metrics::prometheus;
@@ -37,6 +38,8 @@ pub struct GrpcAdminService {
     config: Arc<Config>,
     /// File-watcher enable flag; load/unload recompute it (mirrors HTTP).
     has_hot_reload: Arc<AtomicBool>,
+    /// D27 审计的 key 指纹来源（配置在 build 期解析，fail-fast 已在启动路径）。
+    access_control: Arc<AccessControl>,
 }
 
 impl GrpcAdminService {
@@ -46,6 +49,7 @@ impl GrpcAdminService {
         callback_runner: Arc<CallbackRunner>,
         config: Arc<Config>,
         has_hot_reload: Arc<AtomicBool>,
+        access_control: Arc<AccessControl>,
     ) -> Self {
         Self {
             registry,
@@ -53,7 +57,14 @@ impl GrpcAdminService {
             callback_runner,
             config,
             has_hot_reload,
+            access_control,
         }
+    }
+
+    /// D27 控制面审计——委托共享助手（`src/audit.rs`），与 HTTP admin 同
+    /// 记录形状（含 key 指纹）。
+    fn audit(&self, cx: &Option<RequestContext>, action: &str, model: &str, version: Option<&str>, details: &str) {
+        crate::audit::control_plane(cx.as_ref(), &self.access_control, Protocol::Grpc, action, model, version, details);
     }
 }
 
@@ -76,27 +87,6 @@ fn version_status_str(s: &VersionStatus) -> &'static str {
         Failed => "failed",
         Unloading => "unloading",
     }
-}
-
-/// Structured audit record for a control-plane mutation (D27). `cx` carries
-/// the request_id / peer / mTLS principal from the interceptor (absent when
-/// the call did not go through it, e.g. direct unit tests).
-fn audit(cx: &Option<RequestContext>, action: &str, model: &str, version: Option<&str>, details: &str) {
-    let (rid, ip, principal) = match cx {
-        Some(c) => (c.request_id.as_str(), c.client_ip.as_str(), c.principal.as_deref()),
-        None => ("", "", None),
-    };
-    tracing::info!(
-        target: "lite_server::audit",
-        action = action,
-        model = %model,
-        version = ?version,
-        request_id = %rid,
-        client_ip = %ip,
-        principal = ?principal,
-        details = %details,
-        "admin control-plane mutation",
-    );
 }
 
 #[tonic::async_trait]
@@ -319,7 +309,7 @@ impl Admin for GrpcAdminService {
                 .activate_version(&model_name, &version)
                 .map_err(to_status)?;
         }
-        audit(
+        self.audit(
             &cx,
             "load",
             &model_name,
@@ -372,7 +362,7 @@ impl Admin for GrpcAdminService {
             .iter()
             .any(|(_, _, mv)| mv.config.hot_reload);
         self.has_hot_reload.store(any_hot_reload, Ordering::Relaxed);
-        audit(&cx, "unload", &model_name, Some(&version), "unloaded");
+        self.audit(&cx, "unload", &model_name, Some(&version), "unloaded");
         Ok(Response::new(pb::UnloadModelResponse {
             success: true,
             message: format!("Model {} version {} unloaded", model_name, version),
@@ -412,7 +402,7 @@ impl Admin for GrpcAdminService {
                 model_name, version
             ))));
         }
-        audit(&cx, "reload", &model_name, Some(&version), "reloaded");
+        self.audit(&cx, "reload", &model_name, Some(&version), "reloaded");
         Ok(Response::new(pb::ReloadModelResponse {
             success: true,
             message: format!("Model {} version {} reloaded", model_name, version),
@@ -435,7 +425,7 @@ impl Admin for GrpcAdminService {
             .activate_version(&model_name, &version)
             .map_err(to_status)?;
         if !success {
-            audit(
+            self.audit(
                 &cx,
                 "activate",
                 &model_name,
@@ -468,7 +458,7 @@ impl Admin for GrpcAdminService {
                 device: None,
             })
             .await;
-        audit(
+        self.audit(
             &cx,
             "activate",
             &model_name,
@@ -560,7 +550,7 @@ impl Admin for GrpcAdminService {
         for mv in self.registry.list_versions(&model_name) {
             prometheus::set_version_weight(&model_name, &mv.version, mv.weight as f64);
         }
-        audit(
+        self.audit(
             &cx,
             "set_routing",
             &model_name,
@@ -695,6 +685,7 @@ mod tests {
             Arc::new(CallbackRunner::new()),
             Arc::new(Config::default()),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AccessControl::default()),
         )
     }
 
