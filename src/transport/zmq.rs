@@ -413,6 +413,17 @@ fn drain_commands(
                     }
                     Err(e) => {
                         error!("ZMQ stream send error: {}", e);
+                        // Dropping chunk_tx silently would read as a clean EOF
+                        // (WorkerEof) to consumers; deliver a terminal Error
+                        // frame instead (parity with the Unary/RouteOrStream
+                        // error paths). Fresh channel — try_send can't fill.
+                        let term = pb::StreamResponse {
+                            stream_id,
+                            payload: Some(pb::stream_response::Payload::Error(pb::StreamError {
+                                message: format!("ZMQ send: {}", e),
+                            })),
+                        };
+                        let _ = chunk_tx.try_send(term);
                     }
                 }
             }
@@ -606,6 +617,57 @@ mod tests {
         } else {
             panic!("Expected Single response with error status");
         }
+    }
+
+    // Regression: a Stream command whose socket send fails used to drop
+    // `chunk_tx` silently — the consumer observed a clean EOF (WorkerEof)
+    // with no terminal frame, indistinguishable from normal completion.
+    // The send-failure path must deliver a terminal Error frame, matching
+    // the Unary/RouteOrStream error paths.
+    #[tokio::test]
+    async fn stream_send_failure_delivers_error_frame_not_clean_eof() {
+        #[cfg(unix)]
+        let endpoint = {
+            let sock = std::env::temp_dir().join(format!(
+                "lite-server-zmq-stream-sendfail-{}.sock",
+                std::process::id()
+            ));
+            format!("ipc://{}", sock.display())
+        };
+        #[cfg(windows)]
+        let endpoint = format!("tcp://127.0.0.1:{}", 35000 + std::process::id() % 1000);
+
+        let client = WorkerZmqClient::new(endpoint);
+
+        let open_req = pb::Request {
+            uid: "s-open".to_string(),
+            meta: None,
+            payload: Some(pb::request::Payload::Stream(pb::StreamRequest {
+                stream_id: "sid-1".to_string(),
+                action: Some(pb::stream_request::Action::Open(pb::StreamOpen {
+                    data: bytes::Bytes::from_static(b"{}"),
+                    meta: None,
+                    decoupled: None,
+                })),
+            })),
+        };
+        let mut chunk_rx = client
+            .send_stream(open_req, "sid-1".to_string())
+            .await
+            .expect("send_stream");
+
+        // No peer: the actor's blocking send errors after sndtimeo (1s).
+        // The consumer must receive a terminal Error frame, not a silent EOF.
+        let frame = tokio::time::timeout(Duration::from_secs(5), chunk_rx.recv())
+            .await
+            .expect("no frame within 5s")
+            .expect("channel closed without any frame (silent EOF)");
+        assert!(
+            matches!(frame.payload, Some(pb::stream_response::Payload::Error(_))),
+            "expected terminal Error frame, got {:?}",
+            frame.payload
+        );
+        drop(client);
     }
 
     // 回归防护: actor 曾以 try_recv + poll(100ms)/rcvtimeo(100ms) 交替轮询,
