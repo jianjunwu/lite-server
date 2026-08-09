@@ -263,6 +263,71 @@ pub(crate) fn ct_contains(keys: &[String], value: &str) -> bool {
     found
 }
 
+/// OpenAI-compact 专属鉴权门(openai-compact 方案 2026-08-09):只锁 /v1
+/// 5 端点,不影响其他协议。与 access-control Key 模式共享 EndpointControl
+/// 形状与常量时间比对,差异:header 为 `authorization` 时接受 `Bearer <key>`
+/// (RFC 6750 剥前缀后比对,官方 openai SDK 的标准形式),无 loopback 豁免
+/// (配了就要 key,本地开发不配即可)。由 openai_compact::mount 独家挂载
+/// 为 /v1 路由的 route_layer;解析在启动期完成(缺 secret 源 fail-fast)。
+///
+/// 常量时间性质:header 缺失/scheme 存在性在线上本就可见,提前返回不泄漏
+/// secret;secret 字节始终经 `ct_eq` 全量比对。
+#[derive(Debug, Clone)]
+pub struct OpenaiAuthGate {
+    header: String,
+    secret: Vec<u8>,
+}
+
+impl OpenaiAuthGate {
+    /// Resolve the /v1 gate from config. `None`/`Public` → no gate (explicitly
+    /// open); `Key` → fail-fast resolution of the secret source.
+    pub fn build(ctrl: Option<&EndpointControl>) -> Result<Option<Self>, AppError> {
+        match ctrl {
+            None | Some(EndpointControl::Public) => Ok(None),
+            Some(EndpointControl::Key { key, value, value_env, value_file }) => {
+                if key.trim().is_empty() {
+                    return Err(AppError::Config(
+                        "openai_compact.auth key mode requires a non-empty header name (`key`)".into(),
+                    ));
+                }
+                let secret = resolve_secret(value.as_deref(), value_env.as_deref(), value_file.as_deref())?;
+                Ok(Some(Self { header: key.clone(), secret }))
+            }
+        }
+    }
+
+    /// Authorize a /v1 request: `authorization` header → accept `Bearer <key>`
+    /// (scheme case-insensitive) or the bare value; any other configured header
+    /// → full-value comparison (access-control semantics).
+    pub fn check(&self, headers: &dyn HeaderLookup) -> bool {
+        let Some(presented) = headers.header(&self.header) else {
+            return false;
+        };
+        if self.header.eq_ignore_ascii_case("authorization") {
+            if let Some(token) = strip_bearer(&presented) {
+                if ct_eq(token.as_bytes(), &self.secret) {
+                    return true;
+                }
+            }
+        }
+        ct_eq(presented.as_bytes(), &self.secret)
+    }
+
+    /// 401 归因消息用(不落密钥本体)。
+    pub(crate) fn header_name(&self) -> &str {
+        &self.header
+    }
+}
+
+/// Strip an RFC 6750 `Bearer ` prefix (scheme is case-insensitive); any other
+/// form → None (falls through to the full-value comparison).
+fn strip_bearer(value: &str) -> Option<&str> {
+    if let Some(rest) = value.strip_prefix("Bearer ") {
+        return Some(rest);
+    }
+    value.strip_prefix("bearer ")
+}
+
 /// Classify an HTTP request path into an endpoint class (蓝图 §4.2). Health
 /// probes are an exact allowlist; inference = anything `access_log_target`
 /// treats as a model inference/custom-route path; everything else is admin.
@@ -578,5 +643,101 @@ mod tests {
             new.key_fingerprint(EndpointClass::Admin, Protocol::Http),
             "轮换前后指纹必须可区分"
         );
+    }
+
+    // ===== OpenaiAuthGate(openai-compact 专属门,只锁 /v1 5 端点)=====
+    //
+    // 与 access-control Key 模式共享 EndpointControl 形状与常量时间比对,
+    // 差异:header 为 authorization 时接受 `Bearer <key>`(RFC 6750 剥前缀),
+    // 无 loopback 豁免(配了就要 key),由 openai_compact::mount 独家挂载。
+
+    fn gate_ctrl(header: &str, secret: &str) -> EndpointControl {
+        EndpointControl::Key { key: header.to_string(), value: Some(secret.to_string()), value_env: None, value_file: None }
+    }
+
+    #[test]
+    fn openai_gate_unconfigured_and_public_build_to_none() {
+        assert!(OpenaiAuthGate::build(None).unwrap().is_none());
+        assert!(OpenaiAuthGate::build(Some(&EndpointControl::Public)).unwrap().is_none());
+    }
+
+    #[test]
+    fn openai_gate_bearer_prefix_stripped_accepts() {
+        let gate = OpenaiAuthGate::build(Some(&gate_ctrl("authorization", "sk-secret")))
+            .unwrap()
+            .expect("key 模式必须产出 gate");
+        // 官方 openai SDK 的标准形式:Authorization: Bearer <key>。
+        assert!(gate.check(&hdrs(&[("authorization", "Bearer sk-secret")])));
+        // RFC 6750 scheme 大小写不敏感。
+        assert!(gate.check(&hdrs(&[("authorization", "bearer sk-secret")])));
+        // 裸值等值保留(直接配完整 "Bearer xxx" 的兼容)。
+        assert!(gate.check(&hdrs(&[("authorization", "sk-secret")])));
+    }
+
+    #[test]
+    fn openai_gate_bearer_rejects_wrong_missing_empty() {
+        let gate = OpenaiAuthGate::build(Some(&gate_ctrl("authorization", "sk-secret")))
+            .unwrap()
+            .unwrap();
+        assert!(!gate.check(&hdrs(&[("authorization", "Bearer wrong")])));
+        assert!(!gate.check(&hdrs(&[("authorization", "Bearer ")])));
+        assert!(!gate.check(&hdrs(&[])), "缺 header 必须拒绝");
+        assert!(!gate.check(&hdrs(&[("authorization", "")])));
+    }
+
+    #[test]
+    fn openai_gate_non_authorization_header_raw_only() {
+        // 自定义 header(如 x-api-key)保持 access-control 语义:全值比对,
+        // 不剥 Bearer。
+        let gate = OpenaiAuthGate::build(Some(&gate_ctrl("x-api-key", "k")))
+            .unwrap()
+            .unwrap();
+        assert!(gate.check(&hdrs(&[("x-api-key", "k")])));
+        assert!(!gate.check(&hdrs(&[("x-api-key", "Bearer k")])));
+    }
+
+    #[test]
+    fn openai_gate_configured_header_case_insensitive_for_scheme() {
+        // 配置写 "Authorization" 时同样启用 Bearer 语义(eq_ignore_ascii_case)。
+        // header 查找本身的大小写不敏感由生产 HeaderMap 提供(HashMap 测试
+        // impl 是大小写敏感的),这里只验证 gate 的 scheme 判定。
+        let gate = OpenaiAuthGate::build(Some(&gate_ctrl("Authorization", "sk-x")))
+            .unwrap()
+            .unwrap();
+        assert!(gate.check(&hdrs(&[("Authorization", "Bearer sk-x")])));
+        assert!(gate.check(&hdrs(&[("Authorization", "bearer sk-x")])));
+    }
+
+    #[test]
+    fn openai_gate_fail_fast_on_missing_secret() {
+        let ctrl = EndpointControl::Key {
+            key: "authorization".to_string(),
+            value: None,
+            value_env: None,
+            value_file: None,
+        };
+        assert!(OpenaiAuthGate::build(Some(&ctrl)).is_err(), "无 secret 源必须 fail-fast");
+    }
+
+    #[test]
+    fn openai_gate_fail_fast_on_unset_env() {
+        let ctrl = EndpointControl::Key {
+            key: "authorization".to_string(),
+            value: None,
+            value_env: Some("OAI_GATE_DEFINITELY_UNSET".to_string()),
+            value_file: None,
+        };
+        assert!(OpenaiAuthGate::build(Some(&ctrl)).is_err(), "value_env 未设必须 fail-fast");
+    }
+
+    #[test]
+    fn openai_gate_fail_fast_on_empty_header_name() {
+        let ctrl = EndpointControl::Key {
+            key: String::new(),
+            value: Some("sk-x".to_string()),
+            value_env: None,
+            value_file: None,
+        };
+        assert!(OpenaiAuthGate::build(Some(&ctrl)).is_err(), "空 header 名必须 fail-fast");
     }
 }

@@ -200,6 +200,23 @@ access_control:
 
 per-model `policies.auth` 独立于此端点级控制，叠加在其后。
 
+### OpenAI-Compact（`/v1`）专属鉴权
+
+`openai_compact.auth` 门（openai-compact 协议，阶段 6）**只锁 /v1 5 个端点**（`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`/v1/models`、`/v1/models/{model}`）。KServe `/v2`、gRPC、自定义路由、admin 均不受影响；**无 loopback 豁免**（配了之后每个 /v1 请求都必须带 key）。
+
+- 与 `access_control` 相同的 `mode` 标签与 secret 来源（`value` / `value_env` / `value_file`，首个生效，启动期解析——缺源 fail-fast）。单 key，轮换改 secret 源 + 滚动重启。
+- header 为默认的 `authorization` 时，`Authorization: Bearer <key>`（RFC 6750，官方 `openai` SDK 只发这种形式）与裸值均接受，常量时间比对；自定义 header（如 `x-api-key`）仅全值比对。
+- 拒绝：401 + OpenAI 形状错误体（`{"error": {message, type, param, code}}`）。未配置 → 现状公开，零行为变化。
+- 与 `access_control`、per-model `policies.auth` 相互独立，同时配置时叠加。
+
+```yaml
+openai_compact:
+  auth:
+    mode: key
+    key: authorization            # OpenAI 标准:Authorization: Bearer <key>
+    value_env: OPENAI_API_KEY     # 或 value: "sk-..." / value_file: <路径>
+```
+
 ### 控制面审计（D27）
 
 所有控制面**变更**操作（HTTP admin 与 gRPC Admin，双侧同形状）都输出一条结构化审计记录；只读端点（`ListModels`/`GetInfo`/健康探活）不审计。字段：`action`（`load`/`unload`/`reload`/`delete`/`activate`/`set_routing`）、`model`/`version`、`request_id`、`client_ip`、`principal`（mTLS）、`key_fingerprint`、`details`（含前后值，如 `weights {"1": 70} -> {"2": 100}`；`activate` 失败也留痕）。

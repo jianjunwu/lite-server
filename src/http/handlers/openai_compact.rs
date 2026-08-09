@@ -13,6 +13,15 @@
 //! seam 接入:1 handler 模块 + routes.rs 一行挂载 + `ApiProtocol::OpenaiCompact`
 //! 一个 arm(复用 openai.rs renderer),核心逻辑 / error.rs / inference.rs /
 //! stream.rs / worker 零改动。
+//!
+//! **专属鉴权门**(2026-08-09 方案):`openai_compact.auth` 配置的
+//! `Authorization: Bearer <key>` 校验在 3 个 handler 入口各调一次
+//! (`check_openai_gate`)——/v1 5 端点全数覆盖,v2/gRPC/自定义路由/admin
+//! 零影响,无 loopback 豁免。与 per-model `policies.auth` 独立,同时配置
+//! 时 AND 叠加。选用 handler 内检查而非 route_layer:axum 的 route_layer
+//! 对**调用时 router 已注册的全部路由 + fallback** 生效,在 create_routes
+//! 链式组装中途挂载会泄漏到 /v2 与 /health(实测 401),handler 检查作用域
+//! 天然精确(与 per-model enforce_auth 同风格)。
 
 use super::inference::run_infer;
 use super::{ApiBody, RequestBody};
@@ -38,6 +47,29 @@ pub fn mount(router: axum::Router<Arc<AppState>>) -> axum::Router<Arc<AppState>>
         .route("/v1/embeddings", axum::routing::post(openai_infer_handler))
         .route("/v1/models", axum::routing::get(v1_models_handler))
         .route("/v1/models/:model", axum::routing::get(v1_model_retrieve_handler))
+}
+
+/// /v1 专属鉴权门(openai_compact.auth):handler 入口调用。未配置 → 直通
+/// (现状公开,零行为变化);未过 → 401 经协议层渲染(OpenAI 形状,与
+/// per-model enforce_auth 的 401 同形状同风格)。缺 header 与错 key 区分
+/// 文案,不落密钥本体。
+fn check_openai_gate(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
+    let Some(gate) = state.openai_auth.as_ref() else {
+        return Ok(());
+    };
+    if gate.check(headers) {
+        return Ok(());
+    }
+    let missing = headers
+        .get(gate.header_name())
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true);
+    Err(AppError::Unauthorized(if missing {
+        format!("missing API key (header: {})", gate.header_name())
+    } else {
+        format!("invalid API key (header: {})", gate.header_name())
+    }))
 }
 
 /// body 最小解析(C19):仅 `model`/`stream` 两字段用于路由与分流。
@@ -80,6 +112,7 @@ pub async fn openai_infer_handler(
     ApiBody(body): ApiBody,
 ) -> Result<Response, ProtocolError> {
     let protocol = crate::protocol::ApiProtocol::OpenaiCompact;
+    check_openai_gate(&state, &headers).map_err(|error| ProtocolError { error, protocol })?;
     let route = parse_route(&body).map_err(|error| ProtocolError { error, protocol })?;
     if route.stream {
         // 批次 5 审计修复(B1/B2/B7/B8/B10):流式并入 SSE 管线——鉴权/限流/
@@ -100,7 +133,10 @@ pub async fn openai_infer_handler(
 /// /v1/models 列表 = 注册模型名列表(OpenAI `{"object":"list","data":[...]}`)。
 pub async fn v1_models_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, ProtocolError> {
+    let protocol = crate::protocol::ApiProtocol::OpenaiCompact;
+    check_openai_gate(&state, &headers).map_err(|error| ProtocolError { error, protocol })?;
     let models: Vec<Value> = state
         .registry
         .list_loaded()
@@ -121,9 +157,11 @@ pub async fn v1_models_handler(
 /// /v1/models/{model} 单模型对象;不存在 → 404(OpenAI 形状,经协议层分派)。
 pub async fn v1_model_retrieve_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(model): Path<String>,
 ) -> Result<Json<Value>, ProtocolError> {
     let protocol = crate::protocol::ApiProtocol::OpenaiCompact;
+    check_openai_gate(&state, &headers).map_err(|error| ProtocolError { error, protocol })?;
     crate::validation::validate_identifier(&model)
         .map_err(|error| ProtocolError { error, protocol })?;
     let versions = state.registry.list_versions(&model);
@@ -147,6 +185,7 @@ mod audit_tests {
     //! /audit protocol-compat 举证测试(2026-08-08):每个测试在当前代码上
     //! FAIL,证明对应缺陷存在;修复后转绿即回归锁。只含测试,不改实现。
     use super::*;
+    use crate::access_control::OpenaiAuthGate;
     use crate::callback::CallbackRunner;
     use crate::config::{AuthPolicy, Config, ModelConfig};
     use crate::inference_queue::InferenceQueue;
@@ -463,5 +502,115 @@ mod audit_tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("worker never received StreamCancel after client disconnect (SSE parity)");
+    }
+
+    // ===== openai_compact.auth 专属鉴权门(2026-08-09 方案)=====
+
+    fn with_gate(state: &mut Arc<AppState>, secret: &str) {
+        // make_state 刚返回的 Arc 唯一 → get_mut 成功(注入门后由
+        // v1_router 捕获)。
+        let state = Arc::get_mut(state).expect("state Arc must be unique");
+        state.openai_auth = OpenaiAuthGate::build(Some(&crate::config::EndpointControl::Key {
+            key: "authorization".to_string(),
+            value: Some(secret.to_string()),
+            value_env: None,
+            value_file: None,
+        }))
+        .unwrap()
+        .map(std::sync::Arc::new);
+    }
+
+    fn models_req() -> Request<Body> {
+        Request::builder().uri("/v1/models").method("GET").body(Body::empty()).unwrap()
+    }
+
+    fn models_req_with(key: &str) -> Request<Body> {
+        Request::builder()
+            .uri("/v1/models")
+            .method("GET")
+            .header("authorization", format!("Bearer {key}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// 门配置后:/v1 缺 key → 401;带 Bearer → 过门落到 handler(未注册
+    /// 模型 → 404 model_not_found,而非门的 401)。
+    #[tokio::test]
+    async fn test_v1_gate_rejects_without_key_accepts_bearer() {
+        let mut state = make_state();
+        with_gate(&mut state, "sk-secret");
+        let app = v1_router(state);
+
+        let resp = app.clone().oneshot(chat_req("m", false)).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let req = Request::builder()
+            .uri("/v1/chat/completions")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer sk-secret")
+            .body(Body::from(
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "过门后应落到 handler(404 model_not_found),不是门的 401"
+        );
+
+        let req = Request::builder()
+            .uri("/v1/chat/completions")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer wrong")
+            .body(Body::from(
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED, "错 key 必须拒绝");
+    }
+
+    /// 401 响应体为 OpenAI 形状(官方 SDK 解析 message/type 出可读错误)。
+    #[tokio::test]
+    async fn test_v1_gate_401_body_is_openai_shape() {
+        let mut state = make_state();
+        with_gate(&mut state, "sk-secret");
+        let app = v1_router(state);
+        let resp = app.oneshot(chat_req("m", false)).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "authentication_error");
+        assert!(
+            v["error"]["message"].as_str().unwrap().contains("missing API key"),
+            "缺 header 文案:{}",
+            v["error"]["message"]
+        );
+        assert!(v["error"]["param"].is_null());
+    }
+
+    /// /v1/models 列表同样要 key(OpenAI SDK 会先打它;列表端点无 model
+    /// 上下文,per-model policies.auth 覆盖不到——正是专属门的职责)。
+    #[tokio::test]
+    async fn test_v1_gate_models_endpoints_require_key() {
+        let mut state = make_state();
+        with_gate(&mut state, "sk-secret");
+        let app = v1_router(state);
+        let resp = app.clone().oneshot(models_req()).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+        let resp = app.oneshot(models_req_with("sk-secret")).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    /// 未配置 auth → 中间件直通,/v1 维持现状公开(零行为变化)。
+    #[tokio::test]
+    async fn test_v1_gate_unconfigured_is_passthrough() {
+        let state = make_state();
+        let app = v1_router(state);
+        let resp = app.oneshot(models_req()).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
     }
 }

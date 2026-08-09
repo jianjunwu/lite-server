@@ -234,7 +234,9 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
         .method_not_allowed_fallback(crate::http::method_not_allowed_fallback);
 
     // 批次 5(openai-compact):/v1 路由注册(with_state 之前,与协议 seam
-    // mount 同点;handler 的 State 由外层 with_state 统一绑定)。
+    // mount 同点;handler 的 State 由外层 with_state 统一绑定)。专属鉴权门
+    // 在 handler 入口检查(check_openai_gate),不经 route_layer——route_layer
+    // 会套住调用时已注册的全部路由(含 /health、/v2 与 fallback),实测泄漏。
     router = crate::http::handlers::openai_compact::mount(router);
 
     router

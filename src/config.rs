@@ -22,6 +22,8 @@ pub struct Config {
     /// public. Per-model `policies.auth` (enforce_auth) is a separate, finer
     /// gate that stacks on top of this coarse class gate.
     pub access_control: AccessControlConfig,
+    /// openai-compact(/v1) 专属配置:鉴权门只锁 /v1 5 端点,不影响其他协议。
+    pub openai_compact: OpenaiCompactConfig,
     /// P-TRACE (蓝图 §4.3): 全量 OTel——traces + metrics SDK（exemplars）经
     /// OTLP/gRPC 导出。默认 `enabled=false`（opt-in，零开销）；SDK/exporter 本身
     /// 经 cargo `telemetry` feature 门控。
@@ -78,6 +80,17 @@ pub enum EndpointControl {
         #[serde(default)]
         value_file: Option<String>,
     },
+}
+
+/// openai-compact(/v1) 专属配置(server.yaml `openai_compact:` 节)。
+/// 与 access-control 同形状的 EndpointControl:`auth` 未配 = /v1 维持
+/// 现状公开;`{mode: public}` = 显式公开;`{mode: key}` = 要求 header 携带
+/// key(默认 `authorization`,接受 OpenAI 标准 `Bearer <key>` 形式),无
+/// loopback 豁免。门只挂载于 /v1 5 端点——v2/gRPC/自定义路由/admin 零影响。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OpenaiCompactConfig {
+    pub auth: Option<EndpointControl>,
 }
 
 /// Server-level tunables (server.yaml `tunables:` section). Defaults preserve

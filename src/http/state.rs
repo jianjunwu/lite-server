@@ -35,6 +35,11 @@ pub struct AppState {
     /// 启动路径以解析后的实例覆盖（http/mod.rs）——直构 AppState 的单测
     /// 无需注入也能用（指纹字段为 None）。
     pub access_control: Arc<crate::access_control::AccessControl>,
+    /// openai-compact(/v1) 专属鉴权门。默认 None（不启用，/v1 现状公开）；
+    /// 启动路径经 OpenaiAuthGate::build 解析后覆盖（http/mod.rs）——单测
+    /// 直构 AppState 后自行注入。只被 openai_compact::mount 的 route_layer
+    /// 消费，其他路由不读。
+    pub openai_auth: Option<Arc<crate::access_control::OpenaiAuthGate>>,
 }
 
 impl AppState {
@@ -66,6 +71,7 @@ impl AppState {
             rate_limiter,
             admission,
             access_control: Arc::new(crate::access_control::AccessControl::default()),
+            openai_auth: None,
         }
     }
 }

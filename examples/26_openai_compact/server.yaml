@@ -9,3 +9,12 @@ orchestration:
   load_models:
     - chat
     - embed
+
+# openai-compact(/v1) 专属鉴权(可选,默认不启用):
+# 只锁 /v1 5 端点,不影响 /v2、gRPC、自定义路由与 admin;无 loopback 豁免。
+# 单 key 支持;轮换改环境变量即可。与 per-model policies.auth 独立叠加。
+# openai_compact:
+#   auth:
+#     mode: key
+#     key: authorization          # OpenAI 标准:Authorization: Bearer <key>
+#     value_env: OPENAI_API_KEY   # 或 value: "sk-..." / value_file: <路径>

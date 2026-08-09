@@ -90,3 +90,23 @@ resp = client.chat.completions.create(
 )
 print(resp.choices[0].message.content)  # chat echo: hi there
 ```
+
+### API-key auth (optional, /v1 only)
+
+By default `/v1` needs no auth — `api_key` above can be anything. To lock down
+**only the 5 `/v1` endpoints** (KServe `/v2`, gRPC, custom routes and admin are
+untouched, no loopback exemption), set `openai_compact.auth` in `server.yaml`
+(see the commented block there):
+
+```yaml
+openai_compact:
+  auth:
+    mode: key
+    key: authorization            # OpenAI standard: Authorization: Bearer <key>
+    value_env: OPENAI_API_KEY     # or value: "sk-..." / value_file: <path>
+```
+
+Once configured, the official client just uses the real key (`api_key="sk-..."`);
+requests without it get a `401` with an OpenAI-shaped error body. A single key
+is supported — rotate by changing the env var. This gate is independent of the
+per-model `policies.auth` gate; when both are set they both apply.

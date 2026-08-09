@@ -88,3 +88,22 @@ resp = client.chat.completions.create(
 )
 print(resp.choices[0].message.content)  # chat echo: hi there
 ```
+
+### API key 鉴权(可选,只锁 /v1)
+
+默认 `/v1` 无鉴权——上面的 `api_key` 随便填。若想**只锁 /v1 这 5 个端点**
+(KServe `/v2`、gRPC、自定义路由、admin 均不受影响,无 loopback 豁免),
+在 `server.yaml` 配置 `openai_compact.auth`(示例见 server.yaml 注释块):
+
+```yaml
+openai_compact:
+  auth:
+    mode: key
+    key: authorization            # OpenAI 标准:Authorization: Bearer <key>
+    value_env: OPENAI_API_KEY     # 或 value: "sk-..." / value_file: <路径>
+```
+
+配置后官方客户端直接填真实 key(`api_key="sk-..."`)即可——SDK 只发
+`Authorization: Bearer`,server 剥前缀后校验;不带 key 的请求返回 401,
+错误体为 OpenAI 形状。单 key 支持,轮换改环境变量即可。此门与 per-model
+`policies.auth` 相互独立,同时配置时 AND 叠加。

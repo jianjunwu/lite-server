@@ -355,6 +355,14 @@ pub async fn start_http_server(
     // D27: admin handlers 的审计 key 指纹经 AppState 消费（Arc 包装前注入）。
     state.access_control = access_control.clone();
 
+    // openai-compact(/v1) 专属鉴权门:与 access_control 同模式,启动期解析
+    // (value_env/value_file 缺源 fail-fast);None = 不启用(/v1 维持公开)。
+    // 只被 openai_compact::mount 的 route_layer 消费。
+    state.openai_auth = crate::access_control::OpenaiAuthGate::build(
+        config.openai_compact.auth.as_ref(),
+    )?
+    .map(std::sync::Arc::new);
+
     // P-XFF: parse trusted-proxy CIDRs once (fail-fast on a bad entry). Empty
     // → fail-safe (direct peer used, client proxy headers ignored).
     let trusted = std::sync::Arc::new(config.server.trusted_networks()?);

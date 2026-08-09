@@ -208,6 +208,23 @@ access_control:
 
 Per-model `policies.auth` is independent and stacks after this endpoint-level control.
 
+## OpenAI-Compact (`/v1`) Auth
+
+The `openai_compact.auth` gate (openai-compact protocol, stage 6) locks **only the 5 `/v1` endpoints** (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/models/{model}`). KServe `/v2`, gRPC, custom routes and admin are untouched; **no loopback exemption** (once configured, every `/v1` request must carry the key).
+
+- Same `mode` tag and secret sources as `access_control` (`value` / `value_env` / `value_file`, first present wins, resolved at startup — a missing source fails fast). Single key; rotate via the secret source + rolling restart.
+- With the default header `authorization`, both `Authorization: Bearer <key>` (RFC 6750, what the official `openai` SDK sends) and the bare value are accepted, compared in constant time. A custom header name (e.g. `x-api-key`) is full-value comparison only.
+- Denials: 401 with an OpenAI-shaped error body (`{"error": {message, type, param, code}}`). Unconfigured → current behavior (public, zero change).
+- Independent of, and stacking with, both `access_control` and per-model `policies.auth`.
+
+```yaml
+openai_compact:
+  auth:
+    mode: key
+    key: authorization            # OpenAI standard: Authorization: Bearer <key>
+    value_env: OPENAI_API_KEY     # or value: "sk-..." / value_file: <path>
+```
+
 ## CORS
 
 Configured globally via `server.cors` or per model via `policies.cors` (per-model

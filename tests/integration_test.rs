@@ -9876,6 +9876,129 @@ async fn test_chat_completions_unary() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
+/// openai-compact 专属鉴权门(2026-08-09 方案):`openai_compact.auth` 只锁
+/// /v1 5 端点——缺 key → 401(OpenAI 形状),Bearer 通过;错 key 拒绝;
+/// SSE 臂同样过门;v2 infer 与 /health 不带 key 照常 200(侧效为零)。
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_v1_gate_scoped_to_openai_compact() {
+    let http_port = next_test_port();
+    kill_stale_on_port(http_port);
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-oai-gate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    write_openai_compat_model(&repo, "chat", false);
+
+    let tmp_dir = std::env::temp_dir()
+        .join(format!("lite-server-oai-gate-cfg-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 0.0.0.0\n  http_port: {}\n  grpc_port: {}\n  metrics_port: 18094\n  log_level: warn\ngrpc:\n  enabled: false\nmetrics:\n  enabled: false\nmodel_repository:\n  path: {}\nopenai_compact:\n  auth:\n    mode: key\n    key: authorization\n    value: sk-integration-secret\n",
+            http_port,
+            next_test_port(),
+            repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 20).await;
+    let base = format!("http://127.0.0.1:{http_port}");
+    load_model(&base, "chat", "1").await;
+
+    let client = reqwest::Client::new();
+
+    // 1. /v1/chat/completions:缺 key → 401 OpenAI 形状;Bearer → 200 echo。
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "chat",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["error"]["type"], "authentication_error");
+    assert!(
+        v["error"]["message"].as_str().unwrap().contains("missing API key"),
+        "缺 header 文案:{}",
+        v["error"]["message"]
+    );
+
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("authorization", "Bearer sk-integration-secret")
+        .json(&json!({
+            "model": "chat",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], "echo:hi");
+
+    // 2. 错 key → 401;stream:true 同样被门拦截(worker 之前)。
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("authorization", "Bearer wrong")
+        .json(&json!({
+            "model": "chat",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "错 key 必须拒绝");
+
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "chat",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "SSE 臂同样过门(worker 前拦截)");
+
+    // 3. /v1/models 缺 key → 401(OpenAI SDK 会先打它;列表端点无 model
+    // 上下文,per-model policies.auth 覆盖不到);带 key → 200 列表。
+    let resp = client.get(format!("{base}/v1/models")).send().await.unwrap();
+    assert_eq!(resp.status(), 401, "/v1/models 也要 key");
+    let resp = client
+        .get(format!("{base}/v1/models"))
+        .header("authorization", "Bearer sk-integration-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["object"], "list");
+
+    // 4. 边界:非 /v1 端点零影响——v2 infer 与 /health 不带 key 照常 200。
+    let resp = client
+        .post(format!("{base}/v2/models/chat/infer"))
+        .json(&json!({"input": 5}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "v2 infer 不受 openai_compact.auth 影响");
+    let resp = client.get(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "health 不受影响");
+
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
 /// §6.7 test_chat_completions_sse (P0):stream: true → data: {json} 逐 chunk
 /// + data: [DONE];连接正常终止。
 #[cfg(unix)]
