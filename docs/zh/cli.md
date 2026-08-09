@@ -345,6 +345,79 @@ JSON 报告为 schema v1（`schema_version: 1`），是唯一权威表示——C
 
 ---
 
+### `profile` — 配置空间搜索
+
+```bash
+lite-server profile --model <MODEL> [OPTIONS]
+```
+
+对**运行中**的服务器搜索配置空间（config 点 × concurrency）。配置变更
+经 Admin ReloadModel 应用——服务端从磁盘重读 config.yaml
+（validate-then-swap），服务器进程不重启；worker 按 config 点重建。
+资源指标为通用口径（CPU/RAM，非 GPU），经 Prometheus `/metrics` 端点
+与本机 psutil 采样获取。
+
+| Flag | 类型 | 默认值 | 说明 |
+|------|------|---------|-------------|
+| `--model` | string | （必填） | 模型名 |
+| `--version` | string | （解析） | 模型版本 |
+| `--repo` | path | ./model_repo | 模型仓库路径（预检 batching 检测） |
+| `--admin-url` | url | http://127.0.0.1:8000 | Admin 端点（兼作 trial 的推理 URL） |
+| `--metrics-url` | url | admin 主机:8002 | Prometheus /metrics 端点 |
+| `--server-pid` | int | — | 本机资源采样的服务器 PID（缺省按端口反查监听进程） |
+| `--sweep-knob` | KEY=v1,v2,v3 | — | 被扫配置键（可重复）。batch 键要求已声明 batch/unbatch；`continuous_batching` 下剔除 `workers_per_device` |
+| `--concurrency` | list | 1,2,4,8,16 | 内层网格 concurrency 档（档间零 reload） |
+| `--search-mode` | grid\|quick | grid | 搜索策略：全网格，或 quick（单键爬山，约 <40% 点数） |
+| `--max-trials` | int | 64 | 跨积上限（grid）/ 测点上限（quick） |
+| `--duration` | float | 30.0 | 单 trial 时长（秒） |
+| `--requests` | int | — | 单 trial 固定 N 个请求（与 `--duration` 互斥） |
+| `--export` | dir | — | 写出逐 trial JSON checkpoint + summary.json + report.md 到 DIR |
+| `--resume` | dir | — | 换约束重分析完整 checkpoint，或续跑中断的运行（campaign 哈希须匹配） |
+| `--reload-timeout` | float | 120.0 | ReloadModel 后等待 Ready 的秒数 |
+| `--max-trial-failures` | int | 3 | 熔断前允许的连续 config 点失败数 |
+| `--objective` | throughput\|goodput\|sessions_per_sec | throughput | 排名目标（goodput 需 `--goodput`；sessions_per_sec 仅 bidi） |
+| `--top-n` | int | 3 | top-N 推荐 |
+| `--max-p99` | float | — | 约束：p99 延迟预算（ms） |
+| `--min-throughput` | float | — | 约束：最低 req/s |
+| `--max-error-rate` | float | — | 约束：最大 failed/total |
+| `--max-ttft-ms` | float | — | 约束：TTFT p99 预算（ms，流式） |
+| `--max-rtf` | float | — | 约束：RTF p99 预算（TTS/STT） |
+| `--max-session-ms` / `--max-chunk-roundtrip-ms` | float | — | 约束：bidi 会话时长 / chunk roundtrip p99 预算 |
+| `--max-rss-mb` | float | — | 约束：进程树 RSS（仅本机服务器） |
+| `--apply-recommendation` | flag | false | 跑完后保留 top-1 配置并 reload 生效 |
+| `--dry-run` | flag | false | 只打印预检结论 + 有效网格 + 预估墙钟；零副作用 |
+| `--force` | flag | false | 覆盖独占使用守卫（他方流量会污染结果） |
+| `--recover` | flag | false | 从残留 `.profile.backup` 逐字节恢复 config.yaml 后退出 |
+
+**benchmark 透传**（流式/bidi 场景，方案 §2.11）：
+`--stream`、`--bidi`、`--model-type`、`--endpoint`、`--transport`、
+`--payload` / `--payload-file` / `--payload-random`、`--rate`、
+`--warmup-requests`、`--grace-period`、`--goodput`、`--slo-attainment`、
+`--tokenizer`、`--text-field`、`--pace`、`--rt-factor`、`--min-sessions`、
+`--cancel-after`、`--read-delay-ms`。
+
+**预检门禁（任一失败 → exit 2）**：服务器可达 + 模型已加载 +
+`/metrics` 可读；服务器版本 ≥ 0.8.4（reload_model 磁盘重读修复——已
+发布的 v0.8.4-rc0 tag 早于该修复，被拒绝；rc1+ 与正式版放行）；独占
+（所有模型的 `liteserver_queue_depth` == 0 且
+`liteserver_in_flight_requests` == 0，`--force` 可覆盖）；StaticAnalyzer
+AST 检测（零执行）的 batching 声明状态决定扫描键集（未声明/不确定 →
+剔除 batch 键；已声明 → batch 网格从 2 起、禁 1；
+`continuous_batching` → 剔除 `workers_per_device`）。
+
+**机制**：每个 config 点——原子重写 config.yaml（ruamel round-trip，
+注释保留；pyyaml 校验网 fail-closed；tmp + os.replace）→ Admin
+ReloadModel → 轮询 Ready（+ ACTIVE_WORKERS == 期望值）→ 内层
+concurrency 扫描（零 reload）→ 下一点。全部结束后原始 config.yaml
+**逐字节**恢复并把服务器 reload 回基线；恢复失败即 profile 失败
+（exit 2）。SIGINT → best-effort 恢复。残留 `.profile.backup`
+（SIGKILL 遗留）会阻塞运行，直至 `--recover` 或手动清理。
+
+**退出码**：`0` 有推荐 · `1` 无满足约束的 trial · `2` 失败（预检拒绝、
+网格冲突、恢复失败、熔断、campaign 不匹配）。
+
+---
+
 ### `pack` — 打包模型为制品
 
 ```bash

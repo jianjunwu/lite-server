@@ -29,8 +29,8 @@ def render_top_n_markdown(ranking: Ranking) -> str:
 
     lines.append(f"## Top-{len(ranking.recommendations())} recommendations")
     lines.append("")
-    lines.append("| config | tp | p50 | p95 | p99 | max | imp% | rssMB |")
-    lines.append("|---|---|---|---|---|---|---|---|")
+    lines.append("| config | tp | p50 | p95 | p99 | max | imp% | rssMB | cpu% |")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
     for t in ranking.recommendations():
         m = t.metrics or {}
         lat = m.get("latency_ms") or {}
@@ -39,11 +39,13 @@ def render_top_n_markdown(ranking: Ranking) -> str:
         imp_str = f"{imp:+.1f}" if imp is not None else "n/a"
         rss = resources.get("rss_max_mb")
         rss_str = f"{rss:.0f}" if rss is not None else "n/a"
+        cpu = resources.get("cpu_mean")
+        cpu_str = f"{cpu:.0f}" if cpu is not None else "n/a"
         lines.append(
             f"| `{t.config_point}` | {m.get('throughput', 0):.2f} "
             f"| {lat.get('p50', 0):.1f} | {lat.get('p95', 0):.1f} "
             f"| {lat.get('p99', 0):.1f} | {lat.get('max', 0):.1f} "
-            f"| {imp_str} | {rss_str} |"
+            f"| {imp_str} | {rss_str} | {cpu_str} |"
         )
     lines.append("")
     lines.append(

@@ -10,31 +10,47 @@ from __future__ import annotations
 import asyncio
 import time
 
+# psutil.Process instances cached by pid: cpu_percent(interval=None) measures
+# the delta since the instance's PREVIOUS call and returns a meaningless 0.0
+# on an instance's first call — a fresh instance per sample makes every sample
+# 0.0 (silent fake data). Instances are evicted when the process goes away.
+_PROCESSES: dict[int, object] = {}
+
+
+def _process_for(pid: int):
+    import psutil
+
+    proc = _PROCESSES.get(pid)
+    if proc is None:
+        proc = psutil.Process(pid)
+        _PROCESSES[pid] = proc
+    return proc
+
 
 def sample_process_rss_mb(pid: int) -> float | None:
     """RSS of the process tree (server + workers) in MB. None on psutil errors."""
     try:
-        import psutil
-
-        p = psutil.Process(pid)
+        p = _process_for(pid)
         total = p.memory_info().rss
         for child in p.children(recursive=True):
             total += child.memory_info().rss
         return total / (1024.0 * 1024.0)
     except Exception:  # noqa: BLE001 — psutil.Error, NoSuchProcess, AccessDenied...
+        _PROCESSES.pop(pid, None)
         return None
 
 
 def sample_process_cpu_percent(pid: int) -> float | None:
     try:
-        import psutil
-
-        p = psutil.Process(pid)
+        p = _process_for(pid)
         total = p.cpu_percent(interval=None)
         for child in p.children(recursive=True):
-            total += child.cpu_percent(interval=None)
+            # Cache children by pid too — a fresh child instance per sample
+            # would report 0.0 forever (same first-call semantics).
+            total += _process_for(child.pid).cpu_percent(interval=None)
         return total
     except Exception:  # noqa: BLE001
+        _PROCESSES.pop(pid, None)
         return None
 
 

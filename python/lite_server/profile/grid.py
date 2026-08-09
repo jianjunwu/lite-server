@@ -61,7 +61,18 @@ class GridSpec:
 
     def __post_init__(self) -> None:
         _validate_knob_values(self.knobs)
+        self._validate_concurrency()
         self._enforce_declaration_rules()
+
+    def _validate_concurrency(self) -> None:
+        """Concurrency levels are benchmark worker counts — 0/negative builds
+        zero workers (an empty trial with throughput 0, fake data that burns a
+        reload cycle instead of failing fast)."""
+        for c in self.concurrency:
+            if not isinstance(c, int) or isinstance(c, bool) or c < 1:
+                raise GridError(
+                    f"--concurrency values must be integers >= 1, got {c!r}"
+                )
 
     # ---- declaration-state constraints (§2.4) --------------------------------
 

@@ -388,3 +388,40 @@ class TestQuickSearchSmoke:
         assert (export / "report.md").exists(), "top-N markdown report expected"
         assert not (live_server["repo"] / "m" / "1" /
                     "config.yaml.profile.backup").exists()
+
+    def test_quick_mode_interrupt_restores_original_config(self, live_server, monkeypatch):
+        # AUDIT B4 (resource assumption): plan §2.6.1 requires
+        # SIGINT/SIGTERM → best-effort restore of the original config. The
+        # quick path bypasses engine.run() — no signal handlers, no
+        # try/finally — so a KeyboardInterrupt mid-search leaves config.yaml
+        # on a swept point AND the .profile.backup behind (which then blocks
+        # every future run via the stale-backup gate).
+        from lite_server.cli import main
+        from lite_server.profile.grid import ConfigPoint
+
+        config_path = live_server["repo"] / "m" / "1" / "config.yaml"
+        before = config_path.read_bytes()
+
+        async def interrupting_quick_search(runner, grid, objective, max_trials):
+            # Apply a real swept point (config edited + model reloaded),
+            # then the user hits Ctrl-C.
+            await runner.measure_point(ConfigPoint(values={"workers_per_device": 2}))
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(
+            "lite_server.profile.search.quick_search", interrupting_quick_search
+        )
+        rc = main([
+            "profile", "--model", "m", "--repo", str(live_server["repo"]),
+            "--admin-url", live_server["admin_url"],
+            "--metrics-url", live_server["metrics_url"],
+            "--search-mode", "quick",
+            "--sweep-knob", "workers_per_device=1,2",
+            "--concurrency", "1", "--duration", "1",
+        ])
+        assert rc == 130
+        assert config_path.read_bytes() == before, (
+            "interrupted quick search must best-effort restore the original "
+            "config.yaml (plan §2.6.1) — the repo must not be left on a "
+            "swept point"
+        )

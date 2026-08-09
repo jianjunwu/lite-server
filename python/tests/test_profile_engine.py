@@ -69,7 +69,7 @@ class AdminFake(httpx.AsyncBaseTransport):
         if request.url.path == "/metrics":
             return httpx.Response(
                 200,
-                text=f'ACTIVE_WORKERS{{model="m",version="1"}} {self._served_workers()}\n'
+                text=f'liteserver_active_workers{{model="m",version="1"}} {self._served_workers()}\n'
                      "liteserver_queue_depth 0\n",
             )
         return httpx.Response(404, text="{}")
@@ -228,6 +228,37 @@ class TestRunSequence:
         assert not has_stale_backup(tmp_path / "config.yaml")
 
     @pytest.mark.asyncio
+    async def test_circuit_breaker_covers_consecutive_benchmark_failures(self, tmp_path):
+        # AUDIT B3 (control-flow assumption): plan §2.6.3 lists "压测异常"
+        # (benchmark failure) under the single-trial failure policy with the
+        # consecutive-failure circuit breaker (≥ --max-trial-failures) as the
+        # runaway guard. The implementation only counts CONFIG-POINT apply
+        # failures — a measure that always raises (e.g. a payload error, or
+        # inference broken after reload) sails through the whole grid with
+        # every trial failed and no abort.
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text(CONFIG_TEMPLATE, encoding="utf-8")
+        grid = GridSpec(batching_declared=False, knobs={"workers_per_device": [1, 2, 3]}, concurrency=[1])
+
+        async def always_failing_measure(c: int) -> dict:
+            raise RuntimeError("payload error: payload file not found")
+
+        engine = ProfileEngine(
+            config_path=cfg, model="m", version="1", admin_url="http://127.0.0.1:8000",
+            grid=grid, preflight=_preflight(), measure=always_failing_measure,
+            client=httpx.AsyncClient(
+                # config_path: ACTIVE_WORKERS mirrors the on-disk config, so
+                # every point APPLIES successfully — only the benchmark fails.
+                transport=AdminFake(config_path=cfg),
+                base_url="http://admin.local",
+            ),
+            reload_timeout=5.0, max_trial_failures=2,
+            campaign=campaign_hash("m", "1", grid.knobs, {}),
+        )
+        with pytest.raises(ProfileAbort, match="circuit breaker"):
+            await engine.run()
+
+    @pytest.mark.asyncio
     async def test_ready_timeout_marks_point_failed(self, tmp_path):
         cfg = tmp_path / "config.yaml"
         cfg.write_text(CONFIG_TEMPLATE, encoding="utf-8")
@@ -350,3 +381,56 @@ def engine_after(tmp_path: Path, name: str) -> Path | None:
 
 def cfg_bytes(tmp_path: Path) -> str:
     return (tmp_path / "config.yaml").read_bytes().decode("utf-8")
+
+
+class TestRetestRestore:
+    @pytest.mark.asyncio
+    async def test_restore_without_backup_anchor_fails_closed(self, tmp_path):
+        # AUDIT B11 (resource assumption): engine.run()'s finally removes the
+        # .profile.backup anchor. The winner-retest path then applies the
+        # top-1 point via measure_point — with NO anchor on disk — and calls
+        # engine.restore(), whose has_stale_backup branch silently skipped
+        # the byte restore: the server reloaded onto the SWEPT config and the
+        # repo was left modified (violating plan §2.6 "the user's repo is
+        # never left on a modified config"). restore() must fail closed when
+        # the anchor is missing.
+        engine = _engine(tmp_path, AdminFake(config_path=tmp_path / "config.yaml"))
+        await engine.run()  # completes and removes the backup in its finally
+        cfg = tmp_path / "config.yaml"
+        assert not has_stale_backup(cfg), "sanity: run() removed the anchor"
+        with pytest.raises(ProfileFailure, match="anchor"):
+            await engine.restore()
+
+
+class TestServerMetricsSnapshot:
+    @pytest.mark.asyncio
+    async def test_snapshot_covers_plan_metric_fields(self, tmp_path):
+        # AUDIT B7 (missing feature): plan §2.7 specifies the per-trial
+        # server-side metrics as ACTIVE_WORKERS, WORKER_SATURATION,
+        # TotalQueuedRequests and the BATCH_SIZE histogram median. The
+        # snapshot captures only active_workers + queue_depth — saturation
+        # (the primary overload signal when ranking points) and the real
+        # server-side batch size are silently dropped from every trial.
+        class FullMetrics(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                if request.url.path == "/metrics":
+                    return httpx.Response(200, text=(
+                        'liteserver_active_workers{model="m",version="1"} 2\n'
+                        'liteserver_queue_depth{model="m",version="1"} 0\n'
+                        'liteserver_worker_saturation{model="m",version="1"} 0.73\n'
+                        'liteserver_batch_size_bucket{model="m",version="1",le="1"} 0\n'
+                        'liteserver_batch_size_bucket{model="m",version="1",le="2"} 0\n'
+                        'liteserver_batch_size_bucket{model="m",version="1",le="4"} 20\n'
+                        'liteserver_batch_size_bucket{model="m",version="1",le="+Inf"} 25\n'
+                    ))
+                return httpx.Response(404, text="{}")
+
+        engine = _engine(tmp_path, FullMetrics())
+        snapshot = await engine._snapshot_server_metrics()
+        assert snapshot is not None
+        assert snapshot == {
+            "active_workers": 2,
+            "queue_depth": 0.0,
+            "worker_saturation": 0.73,
+            "batch_size_median": 4.0,  # le=4 is the first bucket past half of 25
+        }

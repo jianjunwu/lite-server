@@ -369,7 +369,6 @@ Resource metrics are generic (CPU/RAM, non-GPU) via the Prometheus
 | `--server-pid` | int | — | Server PID for local resource sampling (default: listener lookup by port) |
 | `--sweep-knob` | KEY=v1,v2,v3 | — | Swept config key (repeatable). Batch keys require declared batch/unbatch; `workers_per_device` is dropped under `continuous_batching` |
 | `--concurrency` | list | 1,2,4,8,16 | Inner-grid concurrency levels (zero reloads between levels) |
-| `--max-trials` | int | 64 | Cross-product cap: config points × concurrency |
 | `--search-mode` | grid\|quick | grid | Search strategy: full grid, or quick (single-key hill climb, ~<40% of the points) |
 | `--max-trials` | int | 64 | Cross-product cap (grid) / point-measurement cap (quick) |
 | `--duration` | float | 30.0 | Trial duration in seconds |
@@ -401,7 +400,9 @@ Resource metrics are generic (CPU/RAM, non-GPU) via the Prometheus
 
 **Preflight gates (any failure → exit 2):** server reachable + model loaded +
 `/metrics` readable; server version ≥ 0.8.4 (the reload_model disk re-read
-fix); exclusivity (`liteserver_queue_depth` == 0, `--force` overrides);
+fix — the tagged v0.8.4-rc0 predates it and is refused; rc1+ and the final
+release pass); exclusivity (`liteserver_queue_depth` == 0 AND
+`liteserver_in_flight_requests` == 0 across all models, `--force` overrides);
 batching declaration state from StaticAnalyzer (AST, zero execution) decides
 the swept key set (undeclared/unknown → batch keys dropped; declared → batch
 grid from 2, never 1; `continuous_batching` → `workers_per_device` dropped).

@@ -43,7 +43,9 @@ from lite_server.profile.preflight import (
     PreflightResult,
     default_metrics_url,
     parse_active_workers,
+    parse_batch_size_median,
     parse_queue_depth,
+    parse_worker_saturation,
 )
 
 READY_POLL_SECS = 0.5
@@ -154,8 +156,25 @@ class ProfileEngine:
                             f"{self.max_trial_failures}), circuit breaker"
                         )
                     continue
+                records = await self._sweep_concurrency(point)
+                result.trials.extend(records)
+                if records and all(r.status != "ok" for r in records):
+                    # §2.6.3: benchmark failures count toward the breaker too —
+                    # a deterministically broken measure (bad payload file,
+                    # inference broken after reload) must not churn through
+                    # the whole grid. A point only counts when EVERY level
+                    # failed (a single flaky level does not trip it).
+                    consecutive_failures += 1
+                    if point.values:
+                        await self._restore_baseline()
+                    if consecutive_failures >= self.max_trial_failures:
+                        raise ProfileAbort(
+                            f"{consecutive_failures} consecutive config points "
+                            f"failed (≥ --max-trial-failures "
+                            f"{self.max_trial_failures}), circuit breaker"
+                        )
+                    continue
                 consecutive_failures = 0
-                result.trials.extend(await self._sweep_concurrency(point))
         except ProfileAbort as e:
             result.aborted = True
             raise
@@ -248,7 +267,7 @@ class ProfileEngine:
             text = (await self.client.get(f"{self.metrics_base}/metrics", timeout=10.0)).text
         except httpx.HTTPError:
             return None
-        workers = parse_active_workers(text)
+        workers = parse_active_workers(text, self.model, self.version)
         if workers is None:
             return None
         return workers == (expected_workers if expected_workers is not None
@@ -296,8 +315,10 @@ class ProfileEngine:
         except httpx.HTTPError:
             return None
         return {
-            "active_workers": parse_active_workers(text),
+            "active_workers": parse_active_workers(text, self.model, self.version),
             "queue_depth": parse_queue_depth(text),
+            "worker_saturation": parse_worker_saturation(text, self.model, self.version),
+            "batch_size_median": parse_batch_size_median(text, self.model, self.version),
         }
 
     async def restore(self) -> None:
@@ -318,17 +339,26 @@ class ProfileEngine:
     # ---- restore & interrupt -------------------------------------------------
 
     async def _restore_baseline(self) -> None:
-        """Restore the original config.yaml (byte-exact) → ReloadModel → wait Ready."""
-        if has_stale_backup(self.config_path):
-            restore_backup(self.config_path)
-            # Once restored the cluster is back at baseline, so the finally
-            # cleanup skips automatically — avoids a double worker rebuild on
-            # the circuit-breaker abort path.
-            self._edited = False
-            # The restore deleted the backup, but later config points in this
-            # run may still rewrite the file (failure → baseline → continue).
-            # Re-persist the backup so subsequent edits keep an anchor.
-            write_backup(self.config_path, self.campaign)
+        """Restore the original config.yaml (byte-exact) → ReloadModel → wait Ready.
+
+        Fail-closed: without the .profile.backup anchor the original bytes
+        are unknown — silently skipping the restore would reload onto a
+        swept config and leave the user's repo modified (plan §2.6: "the
+        user's repo is never left on a modified config")."""
+        if not has_stale_backup(self.config_path):
+            raise ProfileFailure(
+                "restore anchor (.profile.backup) missing — refusing to "
+                "reload onto an unknown config state"
+            )
+        restore_backup(self.config_path)
+        # Once restored the cluster is back at baseline, so the finally
+        # cleanup skips automatically — avoids a double worker rebuild on
+        # the circuit-breaker abort path.
+        self._edited = False
+        # The restore deleted the backup, but later config points in this
+        # run may still rewrite the file (failure → baseline → continue).
+        # Re-persist the backup so subsequent edits keep an anchor.
+        write_backup(self.config_path, self.campaign)
         try:
             await self.client.post(
                 f"{self.admin_url}/v2/models/{self.model}/versions/{self.version}/reload",

@@ -23,8 +23,6 @@ from typing import Any
 import httpx
 
 # Minimum server version carrying the batch-0 fix (reload_model disk re-read).
-# RC builds carry the same fix (0.8.4-rc0 onward), so an equal version number
-# passes regardless of pre-release suffix.
 PROFILE_MIN_SERVER_VERSION = (0, 8, 4)
 
 # Default Prometheus metrics port (config.rs server.metrics_port default).
@@ -39,10 +37,18 @@ def default_metrics_url(admin_url: str) -> str:
     parts = urlsplit(admin_url)
     return urlunsplit((parts.scheme, f"{parts.hostname}:{DEFAULT_METRICS_PORT}", "", "", ""))
 
-_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
-# GaugeVec export is labeled: liteserver_queue_depth{model="m",version="1"} 0
+_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:([-+]).*)?$")
+# GaugeVec exports are labeled: liteserver_queue_depth{model="m",version="1"} 0
 _QUEUE_DEPTH_RE = re.compile(r"^liteserver_queue_depth(?:\{[^}]*\})?\s+(-?\d+(?:\.\d+)?)\s*$", re.M)
-_ACTIVE_WORKERS_RE = re.compile(r"^ACTIVE_WORKERS\{[^}]*\}\s+(\d+)\s*$", re.M)
+_IN_FLIGHT_RE = re.compile(r"^liteserver_in_flight_requests(?:\{[^}]*\})?\s+(-?\d+(?:\.\d+)?)\s*$", re.M)
+# Export names from src/metrics/prometheus.rs (:57 / :286 / :721).
+_ACTIVE_WORKERS_RE = re.compile(r"^liteserver_active_workers\{([^}]*)\}\s+(\d+)\s*$", re.M)
+_WORKER_SATURATION_RE = re.compile(r"^liteserver_worker_saturation\{([^}]*)\}\s+(-?\d+(?:\.\d+)?)\s*$", re.M)
+_BATCH_SIZE_BUCKET_RE = re.compile(r"^liteserver_batch_size_bucket\{([^}]*)\}\s+(-?\d+(?:\.\d+)?)\s*$", re.M)
+
+
+def _labels(blob: str) -> dict[str, str]:
+    return dict(re.findall(r'(\w+)="([^"]*)"', blob))
 
 
 class PreflightError(RuntimeError):
@@ -57,19 +63,96 @@ def parse_version(version: str) -> tuple[int, int, int]:
 
 
 def version_gate_ok(version: str) -> bool:
-    """Server version ≥ PROFILE_MIN_SERVER_VERSION; equal version number with an
-    rc suffix also passes (carries the fix)."""
-    return parse_version(version) >= PROFILE_MIN_SERVER_VERSION
+    """Server version ≥ PROFILE_MIN_SERVER_VERSION. The tagged v0.8.4-rc0
+    predates the batch-0 fix (c3b5c30) and is refused — profiling it
+    measures fake data (plan §0.1). rc1+ / the final release / build
+    metadata (+) are built on the fixed tree and pass."""
+    parsed = parse_version(version)
+    if parsed != PROFILE_MIN_SERVER_VERSION:
+        return parsed > PROFILE_MIN_SERVER_VERSION
+    suffix = version.strip()[len(".".join(map(str, PROFILE_MIN_SERVER_VERSION))):]
+    if not suffix or suffix.startswith("+"):
+        return True
+    m = re.fullmatch(r"-rc(\d+)", suffix)
+    return m is not None and int(m.group(1)) >= 1
 
 
 def parse_queue_depth(metrics_text: str) -> float | None:
-    m = _QUEUE_DEPTH_RE.search(metrics_text)
-    return float(m.group(1)) if m else None
+    """Max across ALL labeled series — exclusivity means no queued requests
+    anywhere; a foreign model's queue pollutes every trial just the same."""
+    values = [float(m.group(1)) for m in _QUEUE_DEPTH_RE.finditer(metrics_text)]
+    return max(values) if values else None
 
 
-def parse_active_workers(metrics_text: str) -> int | None:
-    m = _ACTIVE_WORKERS_RE.search(metrics_text)
-    return int(m.group(1)) if m else None
+def parse_in_flight(metrics_text: str) -> float | None:
+    """Max in-flight requests across all series (plan §2.4: exclusivity also
+    requires no in-flight requests — a long foreign stream holds zero queue
+    depth but pollutes every trial, and reload would cut it off)."""
+    values = [float(m.group(1)) for m in _IN_FLIGHT_RE.finditer(metrics_text)]
+    return max(values) if values else None
+
+
+def _match_labels(blob: str, model: str | None, version: str | None) -> bool:
+    labels = _labels(blob)
+    if model is not None and labels.get("model") != model:
+        return False
+    if version is not None and labels.get("version") != version:
+        return False
+    return True
+
+
+def parse_active_workers(metrics_text: str, model: str | None = None,
+                         version: str | None = None) -> int | None:
+    """liteserver_active_workers for the TARGET model/version — the readiness
+    gate (§2.7) must not compare against another model's series. Without
+    label arguments: first series (single-model convenience)."""
+    for m in _ACTIVE_WORKERS_RE.finditer(metrics_text):
+        if model is None and version is None:
+            return int(m.group(2))
+        if _match_labels(m.group(1), model, version):
+            return int(m.group(2))
+    return None
+
+
+def parse_worker_saturation(metrics_text: str, model: str | None = None,
+                            version: str | None = None) -> float | None:
+    """liteserver_worker_saturation for the target model/version (plan §2.7)."""
+    for m in _WORKER_SATURATION_RE.finditer(metrics_text):
+        if model is None and version is None:
+            return float(m.group(2))
+        if _match_labels(m.group(1), model, version):
+            return float(m.group(2))
+    return None
+
+
+def parse_batch_size_median(metrics_text: str, model: str | None = None,
+                            version: str | None = None) -> float | None:
+    """Estimated median of the liteserver_batch_size histogram for the target
+    model/version: the first bucket whose cumulative count reaches half of
+    the total (plan §2.7 — the only indirect evidence max_batch_size landed)."""
+    buckets: list[tuple[float, float]] = []
+    for m in _BATCH_SIZE_BUCKET_RE.finditer(metrics_text):
+        labels = _labels(m.group(1))
+        if model is not None and labels.get("model") != model:
+            continue
+        if version is not None and labels.get("version") != version:
+            continue
+        le_raw = labels.get("le")
+        if le_raw is None:
+            continue
+        le = float("inf") if le_raw == "+Inf" else float(le_raw)
+        buckets.append((le, float(m.group(2))))
+    if not buckets:
+        return None
+    buckets.sort(key=lambda b: b[0])
+    total = buckets[-1][1]  # the +Inf (or largest) bucket holds the total
+    if total <= 0:
+        return None
+    half = total / 2.0
+    for le, cum in buckets:
+        if cum >= half:
+            return le
+    return buckets[-1][0]
 
 
 @dataclass
@@ -141,22 +224,26 @@ async def run_preflight(
             f"Load it first: POST {base}/v2/models/{model}/versions/{version}/load"
         )
 
-    # 3. Exclusivity guard: liteserver_queue_depth == 0. The gauge is a
-    #    labeled GaugeVec — it only appears in /metrics after the first queued
-    #    request creates the label set. Absence therefore means "never queued"
-    #    = exclusive; only an unreadable /metrics endpoint is fail-closed.
+    # 3. Exclusivity guard: liteserver_queue_depth == 0 AND no in-flight
+    #    requests (plan §2.4). Both gauges are labeled GaugeVecs — they only
+    #    appear after the first request creates the label set, so absence
+    #    means "never busy" = exclusive; only an unreadable /metrics endpoint
+    #    is fail-closed.
     metrics_base = (metrics_url or default_metrics_url(base)).rstrip("/")
     exclusive = False
     try:
         metrics_text = (await client.get(f"{metrics_base}/metrics", timeout=10.0)).text
         depth = parse_queue_depth(metrics_text)
-        exclusive = depth is None or depth == 0
+        in_flight = parse_in_flight(metrics_text)
+        exclusive = (depth is None or depth == 0) and \
+                    (in_flight is None or in_flight == 0)
     except httpx.HTTPError:
         exclusive = False
     if not exclusive and not force:
         raise PreflightError(
-            "server not exclusive: liteserver_queue_depth is non-zero or "
-            "/metrics is unreadable. Foreign traffic pollutes every trial; "
+            "server not exclusive: liteserver_queue_depth or "
+            "liteserver_in_flight_requests is non-zero (or /metrics is "
+            "unreadable). Foreign traffic pollutes every trial; "
             "drain requests and retry, or --force to accept explicitly"
         )
 

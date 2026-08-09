@@ -74,6 +74,16 @@ class TestDeclarationRules:
         with pytest.raises(GridError, match="empty"):
             GridSpec(batching_declared=True, knobs={"max_batch_size": []})
 
+    def test_concurrency_zero_or_negative_rejected(self):
+        # AUDIT B6 (data assumption): knob values are validated >= 1 but the
+        # concurrency ladder is not. `--concurrency 0` builds zero benchmark
+        # workers (range(0) → no requests → an empty trial with throughput 0),
+        # silently burning a reload cycle on fake data instead of failing fast.
+        with pytest.raises(GridError):
+            GridSpec(batching_declared=False, knobs={}, concurrency=[0])
+        with pytest.raises(GridError):
+            GridSpec(batching_declared=False, knobs={}, concurrency=[1, -2])
+
 
 class TestNestedGrid:
     def test_config_points_cross_product(self):

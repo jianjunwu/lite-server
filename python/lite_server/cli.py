@@ -1539,6 +1539,18 @@ def _cmd_profile(args):
                 return 2
 
             config_path = Path(args.repo) / args.model / preflight.resolved_version / "config.yaml"
+            try:
+                measure_fn = _profile_measure_fn(
+                    args, client,
+                    server_pid=preflight.server_pid,
+                    trust_env=not _loopback,
+                )
+            except ProfileFailure as e:
+                # Payload/preprocessing errors are deterministic — fail fast
+                # (exit 2) instead of letting every trial fail and trip the
+                # breaker after hours of reload churn.
+                _logger.error("%s", e)
+                return 2
             engine = ProfileEngine(
                 config_path=config_path,
                 model=args.model,
@@ -1546,9 +1558,7 @@ def _cmd_profile(args):
                 admin_url=args.admin_url,
                 grid=grid,
                 preflight=preflight,
-                measure=_profile_measure_fn(args, client,
-                                              server_pid=preflight.server_pid,
-                                              trust_env=not _loopback),
+                measure=measure_fn,
                 client=client,
                 reload_timeout=args.reload_timeout,
                 max_trial_failures=args.max_trial_failures,
@@ -1598,10 +1608,21 @@ def _cmd_profile(args):
                     )
                     return 2
                 write_backup(config_path, campaign)
-                qr = await quick_search(
-                    engine, grid, args.objective, max_trials=args.max_trials,
-                )
-                await engine.restore()
+                try:
+                    qr = await quick_search(
+                        engine, grid, args.objective, max_trials=args.max_trials,
+                    )
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    # §2.6.1: interrupted mid-search — best-effort restore so
+                    # the repo is never left on a swept point (the quick path
+                    # bypasses engine.run()'s finally).
+                    await _best_effort_restore(engine, config_path)
+                    raise
+                try:
+                    await engine.restore()
+                except ProfileFailure as e:
+                    _logger.error("restore failed: %s", e)
+                    return 2
                 trials = resumed_trials + qr.trials
                 print(f"Quick search: {len(qr.points_measured)} unique config "
                       f"points of {qr.total_points} (coverage "
@@ -1628,9 +1649,28 @@ def _cmd_profile(args):
             if ranking.recommendations():
                 best = ranking.recommendations()[0]
                 if best.config_point:
-                    retest_trials = await engine.measure_point(
-                        ConfigPoint(values=best.config_point))
-                    await engine.restore()
+                    # engine.run()'s finally removed the .profile.backup
+                    # anchor — re-anchor before measure_point edits the
+                    # config, or restore() has no original bytes to return
+                    # to (B11: the repo would be left on the swept config).
+                    from lite_server.profile.config_writer import (
+                        backup_path_for,
+                        write_backup,
+                    )
+
+                    write_backup(config_path, campaign)
+                    try:
+                        retest_trials = await engine.measure_point(
+                            ConfigPoint(values=best.config_point))
+                        await engine.restore()
+                    except (KeyboardInterrupt, asyncio.CancelledError):
+                        await _best_effort_restore(engine, config_path)
+                        raise
+                    except ProfileFailure as e:
+                        _logger.error("retest restore failed: %s", e)
+                        return 2
+                    finally:
+                        backup_path_for(config_path).unlink(missing_ok=True)
                     from lite_server.profile.rank import objective_value
                     from lite_server.profile.search import _point_value
 
@@ -1664,6 +1704,24 @@ def _cmd_profile(args):
 def _point_key_values(point) -> str:
     """Stable point identity used by resume keys (matches engine's format)."""
     return json.dumps(point.values, sort_keys=True, ensure_ascii=False)
+
+
+async def _best_effort_restore(engine, config_path) -> None:
+    """§2.6.1: interrupted paths (quick search / winner retest bypass
+    engine.run()'s finally) restore the original config best-effort. The
+    backup is kept when the restore itself fails so --recover can still fix
+    the repo; on success the anchor is removed for a clean exit."""
+    from lite_server.profile.config_writer import backup_path_for
+
+    try:
+        await engine.restore()
+    except Exception as e:  # noqa: BLE001
+        _logger.error(
+            "best-effort restore after interruption failed: %s — "
+            ".profile.backup kept for --recover", e,
+        )
+        return
+    backup_path_for(config_path).unlink(missing_ok=True)
 
 
 def trial_key_for_point(point) -> str:
@@ -1722,7 +1780,7 @@ async def _finish_profile(args, trials, grid, campaign, scenario, constraints,
     if ranking.recommendations():
         print(f"\nTop-{len(ranking.recommendations())} by {args.objective}:")
         print(f"  {'config':<40} {'tp':>9} {'p50':>8} {'p95':>8} {'p99':>8} "
-              f"{'imp%':>7} {'rssMB':>7}")
+              f"{'imp%':>7} {'rssMB':>7} {'cpu%':>6}")
         for t in ranking.recommendations():
             m = t.metrics or {}
             lat = m.get("latency_ms") or {}
@@ -1731,9 +1789,12 @@ async def _finish_profile(args, trials, grid, campaign, scenario, constraints,
             imp_str = f"{imp:+.1f}" if imp is not None else "n/a"
             rss = resources.get("rss_max_mb")
             rss_str = f"{rss:.0f}" if rss is not None else "n/a"
+            cpu = resources.get("cpu_mean")
+            cpu_str = f"{cpu:.0f}" if cpu is not None else "n/a"
             print(f"  {str(t.config_point):<40} {m.get('throughput', 0):>9.2f} "
                   f"{lat.get('p50', 0):>8.1f} {lat.get('p95', 0):>8.1f} "
-                  f"{lat.get('p99', 0):>8.1f} {imp_str:>7} {rss_str:>7}")
+                  f"{lat.get('p99', 0):>8.1f} {imp_str:>7} {rss_str:>7} "
+                  f"{cpu_str:>6}")
     else:
         print("\nNo trial satisfies the constraints — nothing to recommend.")
 
@@ -1833,9 +1894,7 @@ def _profile_measure_fn(args, client, server_pid=None, trust_env=True):
     try:
         payloads = _resolve_benchmark_payloads(ns)
     except (OSError, ValueError) as e:
-        def _raise_payload(_c):
-            raise ProfileFailure(f"payload error: {e}")
-        return _raise_payload
+        raise ProfileFailure(f"payload error: {e}") from e
 
     payload_factory = None
     if ns.payload_random is not None:
