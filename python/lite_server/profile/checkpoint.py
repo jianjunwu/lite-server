@@ -12,6 +12,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 
 # Metric-caliber version: bump when the benchmark's CO labeling / percentile
 # conventions / streaming metrics evolve.
@@ -52,19 +53,74 @@ def campaign_hash(
     version: str,
     knobs: dict[str, list],
     scenario: dict[str, object],
+    concurrency: list[int] | None = None,
     caliber: str = METRIC_CALIBER,
 ) -> str:
-    """Campaign fingerprint: changing the grid/scenario/caliber must change the
-    hash so `--resume` rejects stale data."""
-    canonical = json.dumps(
-        {
-            "model": model,
-            "version": version,
-            "knobs": {k: list(v) for k, v in sorted(knobs.items())},
-            "scenario": scenario,
-            "caliber": caliber,
-        },
-        sort_keys=True,
-        ensure_ascii=False,
-    )
+    """Campaign fingerprint: changing the grid (knobs + concurrency) /
+    scenario / caliber must change the hash so `--resume` rejects stale data."""
+    payload: dict = {
+        "model": model,
+        "version": version,
+        "knobs": {k: list(v) for k, v in sorted(knobs.items())},
+        "scenario": scenario,
+        "caliber": caliber,
+    }
+    if concurrency is not None:
+        payload["concurrency"] = list(concurrency)
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+# ---- checkpoint persistence (plan §2.8/§2.10) -------------------------------
+
+
+def trial_key(trial: TrialRecord) -> str:
+    """Stable identity: (config point, concurrency)."""
+    point = json.dumps(trial.config_point, sort_keys=True, ensure_ascii=False)
+    return f"{point}@{trial.concurrency}"
+
+
+def write_trials(export_dir: Path, trials: list[TrialRecord], summary: dict) -> None:
+    """Persist per-trial JSON + summary.json (dedupes by trial identity)."""
+    export_dir = Path(export_dir)
+    export_dir.mkdir(parents=True, exist_ok=True)
+    seen: set[str] = set()
+    for t in trials:
+        key = trial_key(t)
+        if key in seen:
+            continue
+        seen.add(key)
+        (export_dir / f"trial-{t.index:03d}.json").write_text(
+            json.dumps(t.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8",
+        )
+    (export_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8",
+    )
+
+
+def read_trials(export_dir: Path) -> list[TrialRecord]:
+    """Read per-trial JSONs back (order by index)."""
+    export_dir = Path(export_dir)
+    records: list[TrialRecord] = []
+    for path in sorted(export_dir.glob("trial-*.json")):
+        try:
+            records.append(TrialRecord.from_dict(
+                json.loads(path.read_text(encoding="utf-8"))
+            ))
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+    return records
+
+
+def read_summary(export_dir: Path) -> dict | None:
+    summary_path = Path(export_dir) / "summary.json"
+    if not summary_path.exists():
+        return None
+    try:
+        return json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def completed_keys(trials: list[TrialRecord]) -> set[str]:
+    return {trial_key(t) for t in trials}

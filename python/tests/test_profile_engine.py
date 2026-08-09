@@ -16,7 +16,7 @@ from lite_server.profile.engine import (
     ProfileEngine,
     ProfileFailure,
 )
-from lite_server.profile.grid import GridSpec
+from lite_server.profile.grid import ConfigPoint, GridSpec
 from lite_server.profile.preflight import PreflightResult
 
 CONFIG_TEMPLATE = """max_batch_size: 1
@@ -29,15 +29,32 @@ workers_per_device: 1
 
 
 class AdminFake(httpx.AsyncBaseTransport):
-    """In-memory Admin fake: tracks reload calls, configurable ready behavior."""
+    """In-memory Admin fake: tracks reload calls, configurable ready behavior.
 
-    def __init__(self, *, ready=True, fail_reload=False, workers=1, ready_after_reloads=0):
+    config_path: when set, ACTIVE_WORKERS mirrors the on-disk config.yaml
+    (workers_per_device × devices) — like the real server. Otherwise a fixed
+    `workers` value is served.
+    """
+
+    def __init__(self, *, ready=True, fail_reload=False, workers=1,
+                 ready_after_reloads=0, config_path: Path | None = None):
         self.ready = ready
         self.fail_reload = fail_reload
         self.workers = workers
         self.ready_after_reloads = ready_after_reloads
+        self.config_path = config_path
         self.reload_count = 0
         self.reload_requests: list[str] = []
+
+    def _served_workers(self) -> int:
+        if self.config_path is not None and self.config_path.exists():
+            import yaml
+
+            cfg = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
+            devices = cfg.get("devices")
+            d = devices if isinstance(devices, int) else 1
+            return d * int(cfg.get("workers_per_device") or 1)
+        return self.workers
 
     async def handle_async_request(self, request):
         self.reload_requests.append(request.url.path)
@@ -52,7 +69,7 @@ class AdminFake(httpx.AsyncBaseTransport):
         if request.url.path == "/metrics":
             return httpx.Response(
                 200,
-                text=f'ACTIVE_WORKERS{{model="m",version="1"}} {self.workers}\n'
+                text=f'ACTIVE_WORKERS{{model="m",version="1"}} {self._served_workers()}\n'
                      "liteserver_queue_depth 0\n",
             )
         return httpx.Response(404, text="{}")
@@ -113,9 +130,9 @@ class TestRunSequence:
 
     @pytest.mark.asyncio
     async def test_grid_point_edits_config_reloads_and_restores_byte_exact(self, tmp_path):
-        transport = AdminFake(workers=2)
         cfg = tmp_path / "config.yaml"
         cfg.write_text(CONFIG_TEMPLATE, encoding="utf-8")
+        transport = AdminFake(config_path=cfg)
         grid = GridSpec(
             batching_declared=False,
             knobs={"workers_per_device": [1, 2]},
@@ -130,10 +147,12 @@ class TestRunSequence:
             return {"tp": 1.0}
 
         client = httpx.AsyncClient(transport=transport, base_url="http://admin.local")
+        preflight = _preflight(expected_workers=1)
+        preflight.config = {"devices": 1, "workers_per_device": 1}
         engine = ProfileEngine(
             config_path=cfg, model="m", version="1",
             admin_url="http://127.0.0.1:8000", grid=grid,
-            preflight=_preflight(expected_workers=2), measure=measure,
+            preflight=preflight, measure=measure,
             client=client, reload_timeout=30.0,
             campaign=campaign_hash("m", "1", grid.knobs, {}),
         )
@@ -254,6 +273,63 @@ class TestRunSequence:
         with pytest.raises(ProfileFailure, match="waiting for Ready timed out"):
             await engine.run()
         assert cfg.read_bytes().decode("utf-8") == CONFIG_TEMPLATE, "byte restore runs first, repo safe"
+
+
+class TestResume:
+    @pytest.mark.asyncio
+    async def test_resume_done_skips_measured_points(self, tmp_path):
+        """§2.10: config points whose (point, concurrency) trials exist in the
+        checkpoint are skipped; only remaining points run."""
+        import json
+
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text(CONFIG_TEMPLATE, encoding="utf-8")
+        grid = GridSpec(
+            batching_declared=False,
+            knobs={"workers_per_device": [1, 2]},
+            concurrency=[1, 2],
+        )
+        transport = AdminFake()
+        client = httpx.AsyncClient(transport=transport, base_url="http://admin.local")
+
+        async def measure(c: int) -> dict:
+            return {"tp": 1.0}
+
+        # baseline + workers_per_device=1 fully measured; workers_per_device=2 missing
+        done = {
+            f"{json.dumps({}, sort_keys=True)}@1",
+            f"{json.dumps({}, sort_keys=True)}@2",
+            f'{json.dumps({"workers_per_device": 1}, sort_keys=True)}@1',
+            f'{json.dumps({"workers_per_device": 1}, sort_keys=True)}@2',
+        }
+        engine = ProfileEngine(
+            config_path=cfg, model="m", version="1", admin_url="http://127.0.0.1:8000",
+            grid=grid, preflight=_preflight(), measure=measure,
+            client=client, reload_timeout=5.0, resume_done=done,
+            campaign=campaign_hash("m", "1", grid.knobs, {}),
+        )
+        result = await engine.run()
+        points = sorted(t.config_point.get("workers_per_device") for t in result.trials)
+        assert points == [2, 2], f"resume must run only remaining points, got {points}"
+        assert cfg.read_bytes().decode("utf-8") == CONFIG_TEMPLATE
+
+
+class TestExpectedWorkers:
+    def test_expectation_follows_point(self, tmp_path):
+        """Sweeping workers_per_device must move the ACTIVE_WORKERS gate with
+        the point (the whole point of the sweep)."""
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text(CONFIG_TEMPLATE, encoding="utf-8")
+        preflight = _preflight(expected_workers=2)
+        preflight.config = {"devices": 2, "workers_per_device": 1}
+        engine = _engine(tmp_path, AdminFake())
+        engine.preflight = preflight
+        assert engine._expected_workers_for(ConfigPoint(values={})) == 2
+        assert engine._expected_workers_for(
+            ConfigPoint(values={"workers_per_device": 3})) == 6
+        preflight.continuous_batching = True
+        assert engine._expected_workers_for(
+            ConfigPoint(values={"workers_per_device": 3})) == 1
 
 
 class TestDryRun:

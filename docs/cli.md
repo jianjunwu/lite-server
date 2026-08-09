@@ -370,15 +370,24 @@ Resource metrics are generic (CPU/RAM, non-GPU) via the Prometheus
 | `--sweep-knob` | KEY=v1,v2,v3 | — | Swept config key (repeatable). Batch keys require declared batch/unbatch; `workers_per_device` is dropped under `continuous_batching` |
 | `--concurrency` | list | 1,2,4,8,16 | Inner-grid concurrency levels (zero reloads between levels) |
 | `--max-trials` | int | 64 | Cross-product cap: config points × concurrency |
-| `--search-mode` | grid\|quick | grid | Search strategy (quick = hill climb, later milestone) |
+| `--search-mode` | grid\|quick | grid | Search strategy: full grid, or quick (single-key hill climb, ~<40% of the points) |
+| `--max-trials` | int | 64 | Cross-product cap (grid) / point-measurement cap (quick) |
 | `--duration` | float | 30.0 | Trial duration in seconds |
 | `--requests` | int | — | Run exactly N requests per trial (mutually exclusive with `--duration`) |
-| `--export` | dir | — | Write per-trial JSON checkpoints + summary.json to DIR |
+| `--export` | dir | — | Write per-trial JSON checkpoints + summary.json + report.md to DIR |
+| `--resume` | dir | — | Re-analyze a complete checkpoint with new constraints, or continue an interrupted run (campaign hash must match) |
 | `--reload-timeout` | float | 120.0 | Seconds to wait for Ready after ReloadModel |
 | `--max-trial-failures` | int | 3 | Consecutive config-point failures before the circuit breaker aborts |
-| `--objective` | throughput\|goodput\|sessions_per_sec | throughput | Ranking objective (constraint filtering, later milestone) |
-| `--top-n` | int | 3 | Top-N recommendations (later milestone) |
-| `--max-p99` / `--min-throughput` / `--max-error-rate` | float | — | Constraint filters (later milestone) |
+| `--objective` | throughput\|goodput\|sessions_per_sec | throughput | Ranking objective (goodput needs `--goodput`; sessions_per_sec is bidi-only) |
+| `--top-n` | int | 3 | Top-N recommendations |
+| `--max-p99` | float | — | Constraint: p99 latency budget in ms |
+| `--min-throughput` | float | — | Constraint: minimum req/s |
+| `--max-error-rate` | float | — | Constraint: max failed/total |
+| `--max-ttft-ms` | float | — | Constraint: TTFT p99 budget in ms (streaming) |
+| `--max-rtf` | float | — | Constraint: RTF p99 budget (TTS/STT) |
+| `--max-session-ms` / `--max-chunk-roundtrip-ms` | float | — | Constraint: bidi session / chunk-roundtrip p99 budgets |
+| `--max-rss-mb` | float | — | Constraint: process-tree RSS (local servers only) |
+| `--apply-recommendation` | flag | false | Leave the top-1 config applied and reloaded after the run |
 | `--dry-run` | flag | false | Print preflight conclusions + effective grid + estimated wall clock; zero side effects |
 | `--force` | flag | false | Override the exclusivity guard (foreign traffic pollutes results) |
 | `--recover` | flag | false | Restore config.yaml byte-exact from a stale `.profile.backup`, then exit |
@@ -406,8 +415,9 @@ to baseline; a failed restore is a profile failure (exit 2). SIGINT →
 best-effort restore. A stale `.profile.backup` (SIGKILL residue) blocks the
 run until `--recover` or manual cleanup.
 
-**Exit codes**: `0` trials recorded · `1` no usable trials · `2` failure
-(preflight refusal, grid conflict, restore failure, circuit breaker).
+**Exit codes**: `0` recommendation(s) · `1` no trial satisfies the constraints
+· `2` failure (preflight refusal, grid conflict, restore failure, circuit
+breaker, campaign mismatch).
 
 ### `pack` — Pack Model into Artifact
 

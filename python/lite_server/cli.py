@@ -233,6 +233,16 @@ def main(argv=None):
                                 help="Constraint: minimum req/s (batch 2)")
     profile_parser.add_argument("--max-error-rate", type=float, default=None,
                                 help="Constraint: max failed/total (batch 2)")
+    profile_parser.add_argument("--max-ttft-ms", type=float, default=None,
+                                help="Constraint: TTFT p99 budget in ms (streaming)")
+    profile_parser.add_argument("--max-rtf", type=float, default=None,
+                                help="Constraint: RTF p99 budget (TTS/STT)")
+    profile_parser.add_argument("--max-session-ms", type=float, default=None,
+                                help="Constraint: bidi session-duration p99 budget in ms")
+    profile_parser.add_argument("--max-chunk-roundtrip-ms", type=float, default=None,
+                                help="Constraint: bidi chunk-roundtrip p99 budget in ms")
+    profile_parser.add_argument("--max-rss-mb", type=float, default=None,
+                                help="Constraint: max process-tree RSS in MB (local servers only)")
     profile_parser.add_argument("--duration", type=float, default=30.0,
                                 help="Trial duration in seconds (default: 30)")
     profile_parser.add_argument("--requests", type=int, default=None,
@@ -240,6 +250,10 @@ def main(argv=None):
                                      "(mutually exclusive with --duration)")
     profile_parser.add_argument("--export", default=None,
                                 help="Write per-trial JSON checkpoints + summary to DIR")
+    profile_parser.add_argument("--resume", default=None, metavar="DIR",
+                                help="Resume from a checkpoint DIR: re-analyze a complete "
+                                     "checkpoint with new constraints, or continue an "
+                                     "interrupted run (campaign hash must match)")
     profile_parser.add_argument("--search-mode", choices=["grid", "quick"], default="grid",
                                 help="Search strategy (default: grid; quick = hill climb, "
                                      "batch 3)")
@@ -1110,7 +1124,8 @@ def _cmd_benchmark(args):
 
 
 async def _run_benchmark_level(args, concurrency, *, url, payload_factory, payloads,
-                             pacing, duration, goodput_slo, token_counter):
+                             pacing, duration, goodput_slo, token_counter,
+                             trust_env: bool = True):
     """Run one benchmark level (concurrency) — extracted from _cmd_benchmark
     so profile can drive the exact same measurement machinery. All
     preprocessing (payloads, pacing, URL, SLO, tokenizer) is done by the
@@ -1152,7 +1167,7 @@ async def _run_benchmark_level(args, concurrency, *, url, payload_factory, paylo
         max_keepalive_connections=max(concurrency, 1),
         keepalive_expiry=15.0,
     )
-    async with httpx.AsyncClient(limits=limits) as client:
+    async with httpx.AsyncClient(limits=limits, trust_env=trust_env) as client:
         engine = BenchmarkEngine()
 
         if args.bidi:
@@ -1359,15 +1374,29 @@ def _cmd_profile(args):
 
     import httpx
 
-    from lite_server.profile.checkpoint import campaign_hash
+    from lite_server.profile.checkpoint import (
+        campaign_hash,
+        completed_keys,
+        read_summary,
+        read_trials,
+        write_trials,
+    )
     from lite_server.profile.engine import (
         EstimateInputs,
         ProfileAbort,
         ProfileEngine,
         ProfileFailure,
     )
-    from lite_server.profile.grid import GridError, GridSpec, default_knobs
+    from lite_server.profile.grid import ConfigPoint, GridError, GridSpec, default_knobs
     from lite_server.profile.preflight import PreflightError, run_preflight
+    from lite_server.profile.rank import (
+        Constraints,
+        RankError,
+        config_diff,
+        improvement_percent,
+        rank_trials,
+        validate_objective,
+    )
 
     # --recover: byte-exact restore from a stale backup, then exit (plan §2.6.1)
     if args.recover:
@@ -1390,10 +1419,6 @@ def _cmd_profile(args):
               f"via Admin to re-apply the original config.")
         return 0
 
-    if args.search_mode != "grid":
-        _logger.error("--search-mode quick lands in a later milestone; use grid")
-        return 2
-
     # Scenario params (plan §2.11): fixed per scenario, not swept
     scenario = {
         "stream": bool(args.stream),
@@ -1405,8 +1430,39 @@ def _cmd_profile(args):
         "objective": args.objective,
     }
 
+    constraints = Constraints(
+        max_p99=args.max_p99,
+        min_throughput=args.min_throughput,
+        max_error_rate=args.max_error_rate,
+        max_ttft_ms=args.max_ttft_ms,
+        max_rtf=args.max_rtf,
+        slo_attainment=args.slo_attainment,
+        max_session_ms=args.max_session_ms,
+        max_chunk_roundtrip_ms=args.max_chunk_roundtrip_ms,
+        max_rss_mb=args.max_rss_mb,
+    )
+
+    from urllib.parse import urlsplit as _urlsplit
+
+    _loopback = _urlsplit(args.admin_url).hostname in ("127.0.0.1", "localhost", "::1")
+
     async def main() -> int:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        # Loopback admin: bypass proxy env vars (macOS system proxy would
+        # route localhost through the proxy and 502 every check).
+        async with httpx.AsyncClient(timeout=30.0, trust_env=not _loopback) as client:
+            # 0. Resume: read the checkpoint (plan §2.10). Campaign hash must
+            #    match — stale data for a new grid/scenario is refused.
+            resumed_trials: list = []
+            resume_done: set[str] = set()
+            checkpoint_summary: dict | None = None
+            if args.resume:
+                checkpoint_summary = read_summary(args.resume)
+                if checkpoint_summary is None:
+                    _logger.error("--resume: no summary.json in %s", args.resume)
+                    return 2
+                resumed_trials = read_trials(args.resume)
+                resume_done = completed_keys(resumed_trials)
+
             # 1. Preflight (hard gates, §2.4)
             try:
                 preflight = await run_preflight(
@@ -1423,8 +1479,9 @@ def _cmd_profile(args):
                 _logger.error("preflight failed: %s", e)
                 return 2
 
-            # 2. Grid: declaration-state defaults + explicit --sweep-knob
-            knobs = default_knobs(
+            # 2. Grid: declaration-state defaults, or manual mode — explicit
+            #    --sweep-knob REPLACES the defaults entirely (plan §2.3).
+            knobs = {} if args.sweep_knob else default_knobs(
                 preflight.batching_declared,
                 preflight.continuous_batching,
             )
@@ -1461,22 +1518,43 @@ def _cmd_profile(args):
 
             campaign = campaign_hash(
                 args.model, preflight.resolved_version, grid.knobs, scenario,
+                concurrency=concurrency,
             )
+            if args.resume and checkpoint_summary is not None                     and checkpoint_summary.get("campaign_hash") != campaign:
+                _logger.error(
+                    "--resume: campaign hash mismatch (checkpoint %s vs current %s). "
+                    "The grid/scenario changed — refusing stale data",
+                    checkpoint_summary.get("campaign_hash"), campaign,
+                )
+                return 2
 
+            # 3. Objective legality matrix (§2.7): fail-fast before any run
+            try:
+                validate_objective(
+                    args.objective, constraints, scenario,
+                    local=preflight.local, goodput_given=args.goodput is not None,
+                )
+            except RankError as e:
+                _logger.error("%s", e)
+                return 2
+
+            config_path = Path(args.repo) / args.model / preflight.resolved_version / "config.yaml"
             engine = ProfileEngine(
-                config_path=Path(args.repo) / args.model
-                / preflight.resolved_version / "config.yaml",
+                config_path=config_path,
                 model=args.model,
                 version=preflight.resolved_version,
                 admin_url=args.admin_url,
                 grid=grid,
                 preflight=preflight,
-                measure=_profile_measure_fn(args, client),
+                measure=_profile_measure_fn(args, client,
+                                              server_pid=preflight.server_pid,
+                                              trust_env=not _loopback),
                 client=client,
                 reload_timeout=args.reload_timeout,
                 max_trial_failures=args.max_trial_failures,
                 campaign=campaign,
                 metrics_url=args.metrics_url,
+                resume_done=resume_done,
             )
 
             if args.dry_run:
@@ -1484,56 +1562,96 @@ def _cmd_profile(args):
                 print(json.dumps(report, indent=2, ensure_ascii=False))
                 return 0
 
-            try:
-                result = await engine.run()
-            except (ProfileAbort, ProfileFailure) as e:
-                _logger.error("profile failed: %s", e)
+            if args.search_mode == "quick" and args.resume:
+                _logger.error("--search-mode quick does not support --resume")
                 return 2
 
-            if result.aborted:
-                _logger.error("profile aborted (interrupted) — original config restored")
-                return 2
-
-            # 3. Checkpoint export: per-trial JSON + summary (plan §2.8)
-            export_dir = Path(args.export) if args.export else None
-            summary = {
-                "schema_version": 1,
-                "campaign_hash": result.campaign,
-                "model": args.model,
-                "version": preflight.resolved_version,
-                "grid": {
-                    "config_points": [p.to_dict() for p in grid.config_points()],
-                    "concurrency": concurrency,
-                },
-                "scenario": scenario,
-                "constraints": {
-                    "max_p99": args.max_p99,
-                    "min_throughput": args.min_throughput,
-                    "max_error_rate": args.max_error_rate,
-                    "objective": args.objective,
-                },
-                "trials": [t.to_dict() for t in result.trials],
-            }
-            if export_dir is not None:
-                export_dir.mkdir(parents=True, exist_ok=True)
-                for t in result.trials:
-                    trial_file = export_dir / f"trial-{t.index:03d}.json"
-                    trial_file.write_text(
-                        json.dumps(t.to_dict(), indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                summary_path = export_dir / "summary.json"
-                summary_path.write_text(
-                    json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+            # Stage 2 (plan §2.10): a complete checkpoint with new constraints
+            # re-analyzes without re-running the load.
+            all_points = [ConfigPoint(values={}), *grid.config_points()]
+            all_keys = {f"{trial_key_for_point(p)}@{c}" for p in all_points
+                        for c in concurrency}
+            if args.resume and all_keys <= resume_done:
+                print(f"Checkpoint complete ({len(resumed_trials)} trials) — "
+                      f"re-analyzing with the given constraints, no load run")
+                return await _finish_profile(
+                    args, resumed_trials, grid, campaign, scenario, constraints,
+                    preflight, config_path, client,
                 )
-                print(f"Checkpoint exported: {export_dir}")
 
-            ok = [t for t in result.trials if t.status == "ok"]
-            print(f"\nProfile complete: {len(ok)} ok / {len(result.trials)} trials "
-                  f"(campaign {result.campaign})")
-            if not ok:
-                return 1  # no usable trials (constraint filtering lands in batch 2)
-            return 0
+            if args.search_mode == "quick":
+                # Hill climb (plan §2.5): single-key steps, bounded by
+                # --max-trials; the engine restores the baseline afterwards.
+                # The quick path bypasses engine.run(), so the backup anchor
+                # and the stale-backup gate are managed here.
+                from lite_server.profile.config_writer import (
+                    backup_path_for,
+                    has_stale_backup,
+                    write_backup,
+                )
+                from lite_server.profile.search import quick_search
+
+                if has_stale_backup(config_path):
+                    _logger.error(
+                        "stale .profile.backup found — run --recover or clean "
+                        "it up before another profile run"
+                    )
+                    return 2
+                write_backup(config_path, campaign)
+                qr = await quick_search(
+                    engine, grid, args.objective, max_trials=args.max_trials,
+                )
+                await engine.restore()
+                trials = resumed_trials + qr.trials
+                print(f"Quick search: {len(qr.points_measured)} unique config "
+                      f"points of {qr.total_points} (coverage "
+                      f"{qr.coverage_ratio:.0%}), best {qr.best_value}")
+            else:
+                try:
+                    result = await engine.run()
+                except (ProfileAbort, ProfileFailure) as e:
+                    _logger.error("profile failed: %s", e)
+                    return 2
+
+                if result.aborted:
+                    _logger.error("profile aborted (interrupted) — original config restored")
+                    return 2
+                trials = resumed_trials + result.trials
+
+            # Winner retest (plan decision point 9): measure top-1 once more;
+            # a deviation beyond the threshold is flagged in the report.
+            from lite_server.profile.rank import rank_trials
+
+            retest_note: str | None = None
+            ranking = rank_trials(trials, args.objective, constraints, scenario,
+                                  top_n=args.top_n)
+            if ranking.recommendations():
+                best = ranking.recommendations()[0]
+                if best.config_point:
+                    retest_trials = await engine.measure_point(
+                        ConfigPoint(values=best.config_point))
+                    await engine.restore()
+                    from lite_server.profile.rank import objective_value
+                    from lite_server.profile.search import _point_value
+
+                    retest_value = _point_value(retest_trials, args.objective)
+                    orig_value = objective_value(best, args.objective)
+                    if retest_value is not None and orig_value:
+                        deviation = abs(retest_value - orig_value) / orig_value
+                        if deviation > 0.10:
+                            retest_note = (
+                                f"top-1 retest deviated {deviation:.0%} "
+                                f"({orig_value:.2f} → {retest_value:.2f}) — "
+                                f"result may be noise-sensitive"
+                            )
+            # The quick path is done: _restore_baseline re-persists the backup
+            # anchor for later edits (engine.run semantics) — remove it now.
+            if args.search_mode == "quick":
+                backup_path_for(config_path).unlink(missing_ok=True)
+            return await _finish_profile(
+                args, trials, grid, campaign, scenario, constraints,
+                preflight, config_path, client, retest_note=retest_note,
+            )
 
     try:
         return asyncio.run(main())
@@ -1542,7 +1660,139 @@ def _cmd_profile(args):
         return 130
 
 
-def _profile_measure_fn(args, client):
+
+def _point_key_values(point) -> str:
+    """Stable point identity used by resume keys (matches engine's format)."""
+    return json.dumps(point.values, sort_keys=True, ensure_ascii=False)
+
+
+def trial_key_for_point(point) -> str:
+    return _point_key_values(point)
+
+
+async def _finish_profile(args, trials, grid, campaign, scenario, constraints,
+                          preflight, config_path, client, retest_note=None):
+    """Rank → top-N table + recommendation diff → export → exit code.
+    0 = recommendation(s) · 1 = no trial satisfies the constraints ·
+    2 = application failure."""
+    from lite_server.profile.checkpoint import write_trials
+    from lite_server.profile.rank import (
+        config_diff,
+        improvement_percent,
+        rank_trials,
+    )
+
+    ranking = rank_trials(
+        trials, args.objective, constraints, scenario, top_n=args.top_n,
+    )
+    summary = {
+        "schema_version": 1,
+        "campaign_hash": campaign,
+        "model": args.model,
+        "version": preflight.resolved_version,
+        "grid": {
+            "config_points": [p.to_dict() for p in grid.config_points()],
+            "concurrency": list(grid.concurrency),
+        },
+        "scenario": scenario,
+        "constraints": {
+            "max_p99": constraints.max_p99,
+            "min_throughput": constraints.min_throughput,
+            "max_error_rate": constraints.max_error_rate,
+            "max_ttft_ms": constraints.max_ttft_ms,
+            "max_rtf": constraints.max_rtf,
+            "slo_attainment": constraints.slo_attainment,
+            "max_session_ms": constraints.max_session_ms,
+            "max_chunk_roundtrip_ms": constraints.max_chunk_roundtrip_ms,
+            "max_rss_mb": constraints.max_rss_mb,
+            "objective": args.objective,
+        },
+        "ranking": {
+            "objective": args.objective,
+            "recommendations": [t.to_dict() for t in ranking.recommendations()],
+        },
+        "trials": [t.to_dict() for t in trials],
+    }
+
+    ok_count = sum(1 for t in trials if t.status == "ok")
+    print(f"\nProfile complete: {ok_count} ok / {len(trials)} trials "
+          f"(campaign {campaign})")
+
+    # Top-N table (per config: tp / p50/p95/p99/max + improvement + resources)
+    if ranking.recommendations():
+        print(f"\nTop-{len(ranking.recommendations())} by {args.objective}:")
+        print(f"  {'config':<40} {'tp':>9} {'p50':>8} {'p95':>8} {'p99':>8} "
+              f"{'imp%':>7} {'rssMB':>7}")
+        for t in ranking.recommendations():
+            m = t.metrics or {}
+            lat = m.get("latency_ms") or {}
+            resources = m.get("resources") or {}
+            imp = improvement_percent(t, ranking.baseline, args.objective)
+            imp_str = f"{imp:+.1f}" if imp is not None else "n/a"
+            rss = resources.get("rss_max_mb")
+            rss_str = f"{rss:.0f}" if rss is not None else "n/a"
+            print(f"  {str(t.config_point):<40} {m.get('throughput', 0):>9.2f} "
+                  f"{lat.get('p50', 0):>8.1f} {lat.get('p95', 0):>8.1f} "
+                  f"{lat.get('p99', 0):>8.1f} {imp_str:>7} {rss_str:>7}")
+    else:
+        print("\nNo trial satisfies the constraints — nothing to recommend.")
+
+    # Recommendation config diff (§2.8): original text → recommended text
+    if ranking.recommendations():
+        try:
+            from lite_server.profile.config_writer import (
+                ConfigEditError,
+                render_config,
+            )
+
+            best = ranking.recommendations()[0]
+            original_text = config_path.read_text(encoding="utf-8")
+            recommended_text = render_config(config_path, best.config_point)
+            diff = config_diff(original_text, recommended_text)
+            print(f"\nRecommended config (top-1: {best.config_point}):")
+            print(diff if diff else "  (identical to the original)")
+        except ConfigEditError as e:
+            _logger.warning("cannot render recommendation diff: %s", e)
+
+    # --apply-recommendation (plan decision point 8): leave top-1 applied
+    if args.apply_recommendation and ranking.recommendations():
+        best = ranking.recommendations()[0]
+        from lite_server.profile.config_writer import edit_config
+
+        try:
+            edit_config(config_path, best.config_point)
+            resp = await client.post(
+                f"{args.admin_url.rstrip('/')}/v2/models/{args.model}/"
+                f"versions/{preflight.resolved_version}/reload",
+                timeout=30.0,
+            )
+            if resp.status_code != 200:
+                _logger.error("apply-recommendation: ReloadModel HTTP %s",
+                              resp.status_code)
+                return 2
+            print(f"\nApplied top-1 config ({best.config_point}) and reloaded — "
+                  f"the server now serves the recommendation")
+        except Exception as e:  # noqa: BLE001
+            _logger.error("apply-recommendation failed: %s", e)
+            return 2
+
+    if retest_note:
+        print(f"\nRetest note: {retest_note}")
+
+    # Checkpoint export (deduped by trial identity) + top-N markdown report
+    export_dir = Path(args.export) if args.export else None
+    if export_dir is not None:
+        write_trials(export_dir, trials, summary)
+        from lite_server.profile.report import render_top_n_markdown
+
+        (export_dir / "report.md").write_text(
+            render_top_n_markdown(ranking), encoding="utf-8",
+        )
+        print(f"\nCheckpoint exported: {export_dir}")
+
+    return 0 if ranking.recommendations() else 1
+
+def _profile_measure_fn(args, client, server_pid=None, trust_env=True):
     """Build the per-trial measure runner: benchmark preprocessing reused from
     the benchmark CLI, then one _run_benchmark_level per concurrency level."""
     import itertools
@@ -1625,20 +1875,38 @@ def _profile_measure_fn(args, client):
     url = _benchmark_request_url(ns)
 
     async def measure(concurrency: int) -> dict:
-        result = await _run_benchmark_level(
-            ns,
-            concurrency,
-            url=url,
-            payload_factory=payload_factory,
-            payloads=payloads,
-            pacing=pacing,
-            duration=duration,
-            goodput_slo=goodput_slo,
-            token_counter=token_counter,
-        )
-        if isinstance(result, BenchmarkResult):
-            return result.to_dict()
-        return result.to_dict()
+        # Local server: sample the process tree (RSS/CPU) concurrently — the
+        # sampling window equals the measurement window (plan §2.7).
+        sampler = None
+        if server_pid is not None:
+            from lite_server.profile.process import sample_until_cancelled
+
+            sampler = asyncio.create_task(sample_until_cancelled(server_pid))
+        try:
+            result = await _run_benchmark_level(
+                ns,
+                concurrency,
+                url=url,
+                payload_factory=payload_factory,
+                payloads=payloads,
+                pacing=pacing,
+                duration=duration,
+                goodput_slo=goodput_slo,
+                token_counter=token_counter,
+                trust_env=trust_env,
+            )
+        finally:
+            if sampler is not None:
+                sampler.cancel()
+        metrics = result.to_dict()
+        if sampler is not None:
+            try:
+                resources = await sampler
+            except Exception:  # noqa: BLE001
+                resources = {}
+            if resources:
+                metrics["resources"] = resources
+        return metrics
 
     return measure
 

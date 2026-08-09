@@ -49,16 +49,12 @@ def _set_nested(mapping: Any, key_path: list[str], value: Any) -> None:
     cur[key_path[-1]] = value
 
 
-def edit_config(config_path: Path, updates: dict[str, Any]) -> None:
-    """Atomically rewrite the swept keys in config.yaml; on failure the
-    original file is kept/restored and ConfigEditError is raised.
-
-    updates: dotted key → value, e.g. {"max_batch_size": 4} or
-    {"worker.max_batch_size": 4}.
-    """
+def render_config(config_path: Path, updates: dict[str, Any]) -> str:
+    """Render the would-be config.yaml text for `updates` (round-trip +
+    validation net, fail-closed), without touching the file. Used for the
+    recommendation diff and by edit_config."""
     config_path = Path(config_path)
-    original_bytes = config_path.read_bytes()
-    original_text = original_bytes.decode("utf-8")
+    original_text = config_path.read_bytes().decode("utf-8")
 
     y = _roundtrip_yaml()
     try:
@@ -73,24 +69,39 @@ def edit_config(config_path: Path, updates: dict[str, Any]) -> None:
         _set_nested(data, dotted.split("."), value)
         _set_nested(expected, dotted.split("."), value)
 
+    import io
+
+    buf = io.StringIO()
+    y.dump(data, buf)
+    dumped = buf.getvalue()
+
+    # Validation net (fail-closed): pyyaml re-parse + full-dict comparison.
+    parsed = _parse_with_pyyaml(dumped)
+    if parsed is None:
+        raise ConfigEditError("post-write pyyaml re-parse failed — refusing to persist")
+    if parsed != expected:
+        drift = _diff_keys(parsed, expected)
+        raise ConfigEditError(f"post-write full-dict comparison drifted: {drift}")
+    return dumped
+
+
+def edit_config(config_path: Path, updates: dict[str, Any]) -> None:
+    """Atomically rewrite the swept keys in config.yaml; on failure the
+    original file is kept/restored and ConfigEditError is raised.
+
+    updates: dotted key → value, e.g. {"max_batch_size": 4} or
+    {"worker.max_batch_size": 4}.
+    """
+    config_path = Path(config_path)
+    rendered = render_config(config_path, updates)
+
     tmp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
             "w", dir=config_path.parent, suffix=".tmp", delete=False, encoding="utf-8"
         ) as tf:
-            y.dump(data, tf)
+            tf.write(rendered)
             tmp_path = Path(tf.name)
-
-        # Validation net (fail-closed): pyyaml re-parse + swept-key assertion
-        # + full-dict comparison against expectation.
-        dumped = tmp_path.read_bytes()
-        parsed = _parse_with_pyyaml(dumped.decode("utf-8"))
-        if parsed is None:
-            raise ConfigEditError("post-write pyyaml re-parse failed — refusing to persist")
-        if parsed != expected:
-            drift = _diff_keys(parsed, expected)
-            raise ConfigEditError(f"post-write full-dict comparison drifted: {drift}")
-
         os.replace(tmp_path, config_path)
         tmp_path = None
     except Exception as e:

@@ -91,6 +91,7 @@ class ProfileEngine:
         max_trial_failures: int = 3,
         campaign: str | None = None,
         metrics_url: str | None = None,
+        resume_done: set[str] | None = None,
     ) -> None:
         self.config_path = Path(config_path)
         self.model = model
@@ -104,6 +105,7 @@ class ProfileEngine:
         self.max_trial_failures = max_trial_failures
         self.campaign = campaign
         self.metrics_base = (metrics_url or default_metrics_url(admin_url)).rstrip("/")
+        self.resume_done = resume_done or set()
         self._abort = False
         self._orig_sigint: Any = None
         self._orig_sigterm: Any = None
@@ -114,7 +116,7 @@ class ProfileEngine:
     # ---- entry point ---------------------------------------------------------
 
     async def run(self) -> ProfileResult:
-        points = self._points_with_baseline()
+        points = self._points_to_run()
         result = ProfileResult(campaign=self.campaign)
         if has_stale_backup(self.config_path):
             raise ProfileFailure(
@@ -174,6 +176,21 @@ class ProfileEngine:
         rest = [p for p in self.grid.config_points() if p.values]
         return [baseline, *rest]
 
+    def _points_to_run(self) -> list[ConfigPoint]:
+        """Resume: drop config points whose (point, concurrency) trials are
+        already recorded in the checkpoint (§2.10)."""
+        if not self.resume_done:
+            return self._points_with_baseline()
+        import json as _json
+
+        out = []
+        for point in self._points_with_baseline():
+            key = _json.dumps(point.values, sort_keys=True)
+            done = all(f"{key}@{c}" in self.resume_done for c in self.grid.concurrency)
+            if not done:
+                out.append(point)
+        return out
+
     async def _apply_config_point(self, point: ConfigPoint) -> bool:
         """Steps 1-3: write config → ReloadModel → wait Ready. True on success."""
         try:
@@ -195,13 +212,15 @@ class ProfileEngine:
         except httpx.HTTPError as e:
             self._log_point_failure(point, f"ReloadModel request failed: {e}")
             return False
-        if not await self._wait_ready():
+        if not await self._wait_ready(self._expected_workers_for(point)):
             self._log_point_failure(point, f"Ready timeout ({self.reload_timeout}s)")
             return False
         return True
 
-    async def _wait_ready(self) -> bool:
+    async def _wait_ready(self, expected_workers: int | None = None) -> bool:
         """Poll version ready + ACTIVE_WORKERS == expected (§2.7 indirect check)."""
+        expected_workers = expected_workers if expected_workers is not None \
+            else self.preflight.expected_workers
         deadline = asyncio.get_running_loop().time() + self.reload_timeout
         while asyncio.get_running_loop().time() < deadline:
             if self._abort:
@@ -216,13 +235,13 @@ class ProfileEngine:
             except httpx.HTTPError:
                 ready = False
             if ready:
-                workers_ok = await self._check_active_workers()
+                workers_ok = await self._check_active_workers(expected_workers)
                 if workers_ok is not False:  # True, or metrics unreadable (skip)
                     return True
             await asyncio.sleep(READY_POLL_SECS)
         return False
 
-    async def _check_active_workers(self) -> bool | None:
+    async def _check_active_workers(self, expected_workers: int | None = None) -> bool | None:
         """None = /metrics unreadable (cannot verify; mechanism is guaranteed
         by the version gate, treat as pass)."""
         try:
@@ -232,7 +251,20 @@ class ProfileEngine:
         workers = parse_active_workers(text)
         if workers is None:
             return None
-        return workers == self.preflight.expected_workers
+        return workers == (expected_workers if expected_workers is not None
+                           else self.preflight.expected_workers)
+
+    def _expected_workers_for(self, point: ConfigPoint) -> int:
+        """ACTIVE_WORKERS expectation for a config point (§2.7): the point's
+        own workers_per_device × devices — sweeping workers_per_device is the
+        whole point, the readiness gate must follow it."""
+        if self.preflight.continuous_batching:
+            return 1
+        wpd = point.values.get("workers_per_device")
+        if wpd is None:
+            return self.preflight.expected_workers
+        devices = self.preflight.config.get("devices")
+        return (devices if isinstance(devices, int) else 1) * int(wpd)
 
     async def _sweep_concurrency(self, point: ConfigPoint) -> list[TrialRecord]:
         records: list[TrialRecord] = []
@@ -267,6 +299,21 @@ class ProfileEngine:
             "active_workers": parse_active_workers(text),
             "queue_depth": parse_queue_depth(text),
         }
+
+    async def restore(self) -> None:
+        """Public restore-to-baseline (used by quick search / winner retest)."""
+        await self._restore_baseline()
+
+    async def measure_point(self, point: ConfigPoint) -> list[TrialRecord]:
+        """Apply one config point + run its concurrency sweep, leaving the
+        config applied (caller controls restore — used by quick search)."""
+        if point.values:
+            ok = await self._apply_config_point(point)
+            if not ok:
+                reason = self._last_point_failure or "config point apply failed"
+                return [self._failed_trial(point, c, reason)
+                        for c in self.grid.concurrency]
+        return await self._sweep_concurrency(point)
 
     # ---- restore & interrupt -------------------------------------------------
 

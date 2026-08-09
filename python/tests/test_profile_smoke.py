@@ -255,3 +255,136 @@ class TestProfileSmoke:
         assert preflight.exclusive is True
         assert preflight.continuous_batching is False
         assert preflight.expected_workers == 1
+
+
+class TestProfileCliIntegration:
+    """End-to-end CLI: stage-2 re-analysis from a checkpoint, campaign-hash
+    mismatch refusal, and interrupted-run continuation (plan §2.10)."""
+
+    def test_stage2_reanalyze_with_new_constraints(self, live_server, tmp_path):
+        """A complete checkpoint + --resume re-analyzes without re-running load."""
+        from lite_server.cli import main
+
+        export = tmp_path / "checkpoint"
+        # First pass: real run, tiny grid
+        rc = main([
+            "profile", "--model", "m", "--repo", str(live_server["repo"]),
+            "--admin-url", live_server["admin_url"],
+            "--metrics-url", live_server["metrics_url"],
+            "--sweep-knob", "workers_per_device=1,2",
+            "--concurrency", "1", "--duration", "1",
+            "--export", str(export),
+        ])
+        assert rc == 0, f"first pass failed rc={rc}"
+        assert (export / "summary.json").exists()
+
+        # Stage 2: same grid/scenario, new constraint → re-analyze only
+        rc = main([
+            "profile", "--model", "m", "--repo", str(live_server["repo"]),
+            "--admin-url", live_server["admin_url"],
+            "--metrics-url", live_server["metrics_url"],
+            "--resume", str(export),
+            "--sweep-knob", "workers_per_device=1,2",
+            "--concurrency", "1",
+            "--max-p99", "100000",
+        ])
+        assert rc == 0, f"stage-2 re-analysis failed rc={rc}"
+
+    def test_resume_hash_mismatch_refused(self, live_server, tmp_path):
+        from lite_server.cli import main
+
+        export = tmp_path / "checkpoint"
+        rc = main([
+            "profile", "--model", "m", "--repo", str(live_server["repo"]),
+            "--admin-url", live_server["admin_url"],
+            "--metrics-url", live_server["metrics_url"],
+            "--sweep-knob", "workers_per_device=1,2",
+            "--concurrency", "1", "--duration", "1",
+            "--export", str(export),
+        ])
+        assert rc == 0
+        # Same --resume dir but a DIFFERENT grid (concurrency changed) → refused
+        rc = main([
+            "profile", "--model", "m", "--repo", str(live_server["repo"]),
+            "--admin-url", live_server["admin_url"],
+            "--metrics-url", live_server["metrics_url"],
+            "--resume", str(export),
+            "--sweep-knob", "workers_per_device=1,2",
+            "--concurrency", "1,2",
+        ])
+        assert rc == 2, "campaign mismatch must refuse stale data"
+
+    def test_resume_continuation_runs_only_remaining(self, live_server, tmp_path):
+        """Interrupted run: only the missing (point, concurrency) trials run."""
+        import json as _json
+
+        from lite_server.cli import main
+        from lite_server.profile.checkpoint import TrialRecord, write_trials
+
+        export = tmp_path / "checkpoint"
+        # Pre-seed the checkpoint with baseline + workers_per_device=1 trials
+        # (as if the run was interrupted); campaign hash must match what the
+        # CLI computes for this grid.
+        from lite_server.profile.checkpoint import campaign_hash
+
+        scenario = {
+            "stream": False, "bidi": False, "model_type": "llm",
+            "endpoint": None, "transport": None, "goodput": None,
+            "objective": "throughput",
+        }
+        knobs = {"workers_per_device": [1, 2]}
+        campaign = campaign_hash("m", "1", knobs, scenario, concurrency=[1])
+        seeded = [
+            TrialRecord(index=0, config_point={}, concurrency=1, status="ok",
+                        metrics={"throughput": 5.0, "total_requests": 3,
+                                 "failed": 0, "latency_ms": {"p50": 1, "p95": 1, "p99": 1}}),
+            TrialRecord(index=1, config_point={"workers_per_device": 1},
+                        concurrency=1, status="ok",
+                        metrics={"throughput": 6.0, "total_requests": 3,
+                                 "failed": 0, "latency_ms": {"p50": 1, "p95": 1, "p99": 1}}),
+        ]
+        write_trials(export, seeded, {"campaign_hash": campaign})
+
+        rc = main([
+            "profile", "--model", "m", "--repo", str(live_server["repo"]),
+            "--admin-url", live_server["admin_url"],
+            "--metrics-url", live_server["metrics_url"],
+            "--resume", str(export),
+            "--sweep-knob", "workers_per_device=1,2",
+            "--concurrency", "1", "--duration", "1",
+            "--export", str(export),
+        ])
+        assert rc == 0, f"continuation failed rc={rc}"
+        summary = _json.loads((export / "summary.json").read_text())
+        trials = summary["trials"]
+        points = sorted(t["config_point"].get("workers_per_device") for t in trials
+                        if t["config_point"].get("workers_per_device") is not None)
+        assert points == [1, 2], (
+            "continuation must merge seeded + remaining trials, got %s" % points
+        )
+
+
+class TestQuickSearchSmoke:
+    def test_quick_search_runs_and_restores(self, live_server, tmp_path):
+        """--search-mode quick: hill climb over a live server; the config is
+        restored byte-exact afterwards."""
+        from lite_server.cli import main
+
+        config_path = live_server["repo"] / "m" / "1" / "config.yaml"
+        before = config_path.read_bytes()
+        export = tmp_path / "ckpt-quick"
+        rc = main([
+            "profile", "--model", "m", "--repo", str(live_server["repo"]),
+            "--admin-url", live_server["admin_url"],
+            "--metrics-url", live_server["metrics_url"],
+            "--search-mode", "quick",
+            "--sweep-knob", "workers_per_device=1,2",
+            "--concurrency", "1", "--duration", "1",
+            "--max-trials", "6",
+            "--export", str(export),
+        ])
+        assert rc in (0, 1), f"quick search failed rc={rc}"
+        assert config_path.read_bytes() == before, "config must be restored"
+        assert (export / "report.md").exists(), "top-N markdown report expected"
+        assert not (live_server["repo"] / "m" / "1" /
+                    "config.yaml.profile.backup").exists()

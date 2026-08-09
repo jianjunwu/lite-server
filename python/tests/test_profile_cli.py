@@ -73,10 +73,24 @@ class TestProfileCli:
         ])
         assert rc == 2
 
-    def test_quick_search_exits_2_until_batch_3(self, repo):
+    def test_quick_search_dry_run_reports_grid(self, repo):
+        # Quick search with --dry-run: preflight gate fails first against a
+        # dead admin port — exit 2 from the gate, not the mode.
+        dead_port = _free_port()
         rc = main([
             "profile", "--model", "m", "--repo", str(repo),
+            "--admin-url", f"http://127.0.0.1:{dead_port}",
             "--search-mode", "quick", "--dry-run",
+        ])
+        assert rc == 2
+
+    def test_quick_search_with_resume_refused(self, repo, tmp_path):
+        export = tmp_path / "ckpt"
+        export.mkdir()
+        (export / "summary.json").write_text("{}")
+        rc = main([
+            "profile", "--model", "m", "--repo", str(repo),
+            "--search-mode", "quick", "--resume", str(export),
         ])
         assert rc == 2
 
