@@ -236,7 +236,9 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
     // 批次 5(openai-compact):/v1 路由注册(with_state 之前,与协议 seam
     // mount 同点;handler 的 State 由外层 with_state 统一绑定)。专属鉴权门
     // 在 handler 入口检查(check_openai_gate),不经 route_layer——route_layer
-    // 会套住调用时已注册的全部路由(含 /health、/v2 与 fallback),实测泄漏。
+    // 套住调用时已注册的全部显式路由(/health、/v2 系统路由此刻均已注册),
+    // 实测泄漏到 /v2 与 /health;fallback 不受影响(axum 0.7.9 源码
+    // routing/mod.rs:307)。
     router = crate::http::handlers::openai_compact::mount(router);
 
     router

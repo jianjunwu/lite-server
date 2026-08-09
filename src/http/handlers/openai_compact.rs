@@ -18,10 +18,13 @@
 //! `Authorization: Bearer <key>` 校验在 3 个 handler 入口各调一次
 //! (`check_openai_gate`)——/v1 5 端点全数覆盖,v2/gRPC/自定义路由/admin
 //! 零影响,无 loopback 豁免。与 per-model `policies.auth` 独立,同时配置
-//! 时 AND 叠加。选用 handler 内检查而非 route_layer:axum 的 route_layer
-//! 对**调用时 router 已注册的全部路由 + fallback** 生效,在 create_routes
-//! 链式组装中途挂载会泄漏到 /v2 与 /health(实测 401),handler 检查作用域
-//! 天然精确(与 per-model enforce_auth 同风格)。
+//! 时 AND 叠加。选用 handler 内检查而非 route_layer:axum 0.7.9 的
+//! route_layer 只遍历 **调用时 path_router 已注册的显式路由**逐个套 layer
+//! (源码 routing/mod.rs:307 + path_router.rs:277;fallback_router 不受
+//! 影响),而 mount 在 create_routes 链式组装中途被调用——/health、
+//! /livez、/v2 全套系统路由均已注册,门被套上全部路径,泄漏到 /v2 与
+//! /health(实测 401)。handler 检查作用域天然精确(与 per-model
+//! enforce_auth 同风格)。
 
 use super::inference::run_infer;
 use super::{ApiBody, RequestBody};
