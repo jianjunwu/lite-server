@@ -179,7 +179,15 @@ pub(super) async fn process_watch_events(
                 .get(&key)
                 .map(|fs| fs.iter().map(|f| f.to_string_lossy().into_owned()).collect())
                 .unwrap_or_default();
-            if worker_manager.notify_file_changed(&name, &version, &changed).await {
+            // Batch 0: a config.yaml change bypasses the FILE_CHANGED hook —
+            // max_batch_size & co. are __init__ constructor parameters that an
+            // in-process refresh cannot change; a hook claiming handled would
+            // silently swallow the change (§0.1). config.yaml goes straight to
+            // reload_model (which re-reads disk, validate-then-swap).
+            let config_changed = changed.iter().any(|f| {
+                std::path::Path::new(f).file_name().and_then(|n| n.to_str()) == Some("config.yaml")
+            });
+            if !config_changed && worker_manager.notify_file_changed(&name, &version, &changed).await {
                 info!(
                     "Hot reload: {} version {} refreshed in-process via on_file_changed (no restart)",
                     name, version
@@ -589,6 +597,97 @@ mod tests {
             "file change on a live version must go down the hot-reload path, not trigger reconcile"
         );
 
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// Batch 0 (profile prerequisite): a config.yaml change must BYPASS the
+    /// FILE_CHANGED hook and reload directly — max_batch_size & co. are
+    /// constructor parameters that an in-process refresh cannot change; if the
+    /// model overrides on_file_changed (returns handled=true) and config.yaml
+    /// took the hook path, the change would be silently swallowed (plan §0.1).
+    /// The model code deliberately overrides on_file_changed to return handled,
+    /// proving the bypass: old behavior = hook wins, config unchanged; new
+    /// behavior = direct reload, the on-disk value lands.
+    #[tokio::test]
+    async fn config_yaml_change_bypasses_hook_and_reloads_from_disk() {
+        let tmp = test_repo_dir("cfg-reload");
+        let version_dir = tmp.join("m").join("1");
+        tokio::fs::create_dir_all(&version_dir).await.unwrap();
+        // hot_reload_patterns defaults to ["*.py"], which would gate out a
+        // config.yaml event; clear it explicitly (the pattern gate is explicit
+        // user semantics, out of scope for this bypass).
+        tokio::fs::write(
+            version_dir.join("config.yaml"),
+            "hot_reload: true\nhot_reload_patterns: []\nmax_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            version_dir.join("model.py"),
+            r#"from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+
+    def on_file_changed(self, changed_files):
+        return {"handled": True}
+"#,
+        )
+        .await
+        .unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let wm = build_test_worker_manager(tmp.clone(), registry.clone());
+        let config = crate::config::load_model_config(&version_dir.join("config.yaml")).unwrap();
+        wm.load_model("m", "1", &config).await.unwrap();
+        assert_eq!(
+            registry.get("m", Some("1")).unwrap().config.max_batch_size,
+            1,
+            "sanity: loaded from disk config"
+        );
+
+        // Edit config.yaml on disk. The model's on_file_changed claims
+        // handled — without the bypass this would swallow the change.
+        tokio::fs::write(
+            version_dir.join("config.yaml"),
+            "hot_reload: true\nhot_reload_patterns: []\nmax_batch_size: 4\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+        )
+        .await
+        .unwrap();
+
+        let mut last_reload = std::collections::HashMap::new();
+        let flag = AtomicBool::new(true);
+        process_watch_events(
+            vec![(version_dir.join("config.yaml"), WatchEventKind::Modify)],
+            tmp.clone(),
+            wm.clone(),
+            registry.clone(),
+            &mut last_reload,
+            &crate::config::ServerTunables::default(),
+            &flag,
+            &None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            registry.get("m", Some("1")).unwrap().config.max_batch_size,
+            4,
+            "config.yaml change must bypass the FILE_CHANGED hook and reload from disk"
+        );
+
+        let _ = wm.unload_model("m", Some("1")).await;
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 

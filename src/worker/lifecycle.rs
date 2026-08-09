@@ -831,10 +831,29 @@ impl WorkerManager {
             },
         };
 
-        let config = match self.registry.get(model_name, Some(&v)) {
-            Some(mv) => mv.config,
-            None => return Ok(false),
-        };
+        if self.registry.get(model_name, Some(&v)).is_none() {
+            return Ok(false);
+        }
+
+        // Batch 0 (profile prerequisite): validate-then-swap — re-read
+        // config.yaml from disk and apply model_defaults; any failure returns
+        // early, old workers keep serving. Previously reload reused the
+        // registry's stale config (§0.1), so "edit config.yaml → reload"
+        // silently measured the old config 100% of the time.
+        let model_dir = crate::validation::resolve_model_dir(&self.repo_path, model_name, &v)?;
+        if !model_dir.exists() {
+            return Err(AppError::ModelNotFound(format!(
+                "{} version {} not found",
+                model_name, v
+            )));
+        }
+        let config_path = model_dir.join("config.yaml");
+        let mut config = crate::config::load_model_config(&config_path)
+            .map_err(|e| AppError::Config(format!("invalid config.yaml: {}", e)))?;
+        self.model_defaults.apply_to(&mut config);
+        config
+            .validate()
+            .map_err(|e| AppError::Config(e.to_string()))?;
 
         let was_active = self.registry.get_active_version(model_name).as_deref() == Some(v.as_str());
 
@@ -1505,19 +1524,24 @@ class TestAPI(LitAPI):
         .unwrap();
 
         let registry = Arc::new(ModelRegistry::new());
+        let defaults = crate::config::ModelTunables {
+            max_queue_size: Some(500),
+            ..Default::default()
+        };
+        // Batch 0: reload_model now re-reads config from disk and applies the
+        // model_defaults held by WorkerManager (no longer the registry's stale
+        // config). The defaults must live on the WorkerManager or the disk
+        // path cannot see them.
         let wm = WorkerManager::new(
             registry.clone(),
             repo.clone(),
             Arc::new(InferenceQueue::new()),
             "warn".to_string(),
             Arc::new(CallbackRunner::new()),
-        );
+        )
+        .with_model_defaults(defaults.clone());
 
         let mut config = ModelConfig::default();
-        let defaults = crate::config::ModelTunables {
-            max_queue_size: Some(500),
-            ..Default::default()
-        };
         defaults.apply_to(&mut config);
         wm.load_model("m", "1", &config).await.unwrap();
 
@@ -1528,6 +1552,141 @@ class TestAPI(LitAPI):
             mv.config.max_queue_size, 500,
             "reload_model must preserve model_defaults (got {})",
             mv.config.max_queue_size
+        );
+
+        let _ = wm.unload_model("m", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Batch 0 (profile prerequisite): `reload_model` must re-read
+    /// config.yaml from disk instead of reusing the registry's stale config —
+    /// otherwise the "edit config.yaml → reload" swap mechanism silently
+    /// measures the old config (plan §0.1).
+    #[tokio::test]
+    async fn test_reload_model_rereads_config_from_disk() {
+        let repo = std::env::temp_dir()
+            .join(format!("lite-server-reload-disk-{}", std::process::id()));
+        let model_dir = repo.join("m").join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+
+        std::fs::write(
+            model_dir.join("model.py"),
+            r#"from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+        )
+        .unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let wm = WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            Arc::new(InferenceQueue::new()),
+            "warn".to_string(),
+            Arc::new(CallbackRunner::new()),
+        );
+
+        let config = crate::config::load_model_config(&model_dir.join("config.yaml")).unwrap();
+        wm.load_model("m", "1", &config).await.unwrap();
+        assert_eq!(registry.get("m", Some("1")).unwrap().config.max_batch_size, 1);
+
+        // Change config.yaml on disk, then reload — the new value must land.
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: 4\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+        )
+        .unwrap();
+
+        assert!(wm.reload_model("m", Some("1")).await.unwrap());
+
+        let mv = registry.get("m", Some("1")).unwrap();
+        assert_eq!(
+            mv.config.max_batch_size, 4,
+            "reload_model must re-read config.yaml from disk (got {})",
+            mv.config.max_batch_size
+        );
+
+        let _ = wm.unload_model("m", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Batch 0 validate-then-swap: a bad config.yaml → reload returns Err
+    /// early, **old workers keep serving** (no unload happens).
+    #[tokio::test]
+    async fn test_reload_model_bad_config_keeps_old_version() {
+        let repo = std::env::temp_dir()
+            .join(format!("lite-server-reload-badcfg-{}", std::process::id()));
+        let model_dir = repo.join("m").join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+
+        std::fs::write(
+            model_dir.join("model.py"),
+            r#"from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+        )
+        .unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let wm = WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            Arc::new(InferenceQueue::new()),
+            "warn".to_string(),
+            Arc::new(CallbackRunner::new()),
+        );
+
+        let config = crate::config::load_model_config(&model_dir.join("config.yaml")).unwrap();
+        wm.load_model("m", "1", &config).await.unwrap();
+
+        // Corrupt the config: unclosed flow sequence is a YAML parse error.
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: [unclosed\n",
+        )
+        .unwrap();
+
+        let err = wm.reload_model("m", Some("1")).await.unwrap_err();
+        assert!(
+            registry.get("m", Some("1")).is_some(),
+            "bad config must be refused BEFORE unload (validate-then-swap); got: {}",
+            err
         );
 
         let _ = wm.unload_model("m", Some("1")).await;

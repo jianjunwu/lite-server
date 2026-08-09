@@ -142,7 +142,8 @@ impl LiteServer {
         ).with_server_http(Self::loopback_http_base(&config))
          .with_unload_grace(Duration::from_secs_f32(config.server.timeout))
          .with_server_tunables(config.tunables.clone())
-         .with_custom_metrics(config.features.custom_metrics));
+         .with_custom_metrics(config.features.custom_metrics)
+         .with_model_defaults(config.model_defaults.clone()));
 
         Self {
             config,

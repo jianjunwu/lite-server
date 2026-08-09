@@ -390,7 +390,10 @@ callbacks:                     # Worker 启动时加载的 callback 类路径列
 ```
 
 > **关于 `hot_reload` 的作用范围**：它对**已加载**版本做 worker 重启
-> （或经 `on_file_changed` 钩子进程内刷新）。`control_mode: "auto"` 时，
+> （或经 `on_file_changed` 钩子进程内刷新）。`config.yaml` 自身的变更
+> **绕过 `on_file_changed` 钩子**、总是按磁盘配置重启 worker
+> （`max_batch_size` 等构造参数无法进程内刷新）；校验失败的 reload 在
+> **unload 之前**被拒绝,旧 worker 继续服务。`control_mode: "auto"` 时，
 > 版本目录的新增/删除完全由 reconcile 任务负责。在非 auto 的
 > `control_mode` 下 `hot_reload: true` 自动**加载**新版本目录的旧行为已
 > 于 **0.7.7 移除**——仅**目录创建事件**会以 WARN 提示新版本出现（不会

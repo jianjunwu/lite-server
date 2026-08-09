@@ -423,7 +423,12 @@ callbacks:                     # Callback class paths loaded at worker startup
 
 > **Note on `hot_reload` scope:** it restarts (or, with an
 > `on_file_changed` hook, refreshes in-process) workers of
-> **already-loaded** versions when their files change. With
+> **already-loaded** versions when their files change. A change to
+> `config.yaml` itself bypasses the `on_file_changed` hook and always
+> restarts the workers from the on-disk config (`max_batch_size` and other
+> constructor parameters cannot be refreshed in-process); a reload that
+> fails validation is refused **before** unloading, so the previous workers
+> keep serving. With
 > `control_mode: "auto"`, adding/removing version directories is handled
 > exclusively by the reconcile task. The legacy behavior of auto-**loading**
 > brand-new versions under `hot_reload: true` with a non-auto
