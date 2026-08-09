@@ -21,6 +21,7 @@ Verify every example starts and matches its README output — sequentially
 
 ```bash
 pip install grpcio          # required: example 13 uses gRPC bidi
+pip install tritonclient numpy   # required: example 25 uses the Triton Binary channel
 python run_all.py           # from the examples/ directory
 # (or: python examples/run_all.py from the project root)
 ```
@@ -80,6 +81,13 @@ Start from example 01 and work your way up. Each example builds on concepts from
 | 22 | [warmup](22_warmup/) | Model warmup | `policies.warmup`, `WarmingUp` → `Ready` state machine, dummy inputs |
 | 23 | [advanced_routing](23_advanced_routing/) | Sticky + decoupled routing | `x-sequence-id` worker pinning, `predict_decoupled()` 1:N push streams |
 | 24 | [proxy_security](24_proxy_security/) | Proxy & browser security | `trusted_proxies` IP cleansing, per-model CORS, WS Origin gate |
+
+### Protocol Compatibility
+
+| # | Example | Description | Key Concept |
+|---|---------|-------------|-------------|
+| 25 | [kserve_v2](25_kserve_v2/) | KServe V2 dataplane | Raw tensor bytes (`x-tensor-*` headers), Triton Binary Tensor Data Extension (`ctx.binary_data`, `binary_data_output`), tritonclient e2e |
+| 26 | [openai_compact](26_openai_compact/) | OpenAI-compatible subset | `/v1/chat/completions` unary + SSE, `/v1/embeddings`, `/v1/models`; worker-side translation via `lite_server.helpers.openai` |
 
 ## Running Any Example
 
@@ -369,6 +377,47 @@ curl -s -X POST http://127.0.0.1:8000/v2/models/env_demo/infer \
 # Prod config (port 8080 + gRPC):
 DEMO_API_KEY=prod-secret DEMO_BACKEND=gpu \
   python -m lite_server serve --config server.prod.yaml
+```
+
+### 25 KServe V2 Dataplane
+
+```bash
+# From the example directory, with the server running:
+python test_kserve.py
+# raw tensor : sum=10.0 shape=[4] dtype=<f4 PASS
+# triton bin : output0=[[11.0, 22.0], [33.0, 44.0]] PASS
+```
+
+The raw-bytes path works from any HTTP client (octet-stream body +
+`x-tensor-dtype`/`x-tensor-shape` headers); the Triton Binary path uses the
+official `tritonclient` (JSON head + binary tail, `binary_data_output`
+negotiation). See the example README for the Python snippets.
+
+### 26 openai-compact
+
+```bash
+# Unary chat completion
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "chat", "messages": [{"role": "user", "content": "hi there"}]}'
+# => {"object": "chat.completion", ..., "content": "chat echo: hi there"}
+
+# Streaming (SSE) — one data: chunk per token + data: [DONE]
+curl -N -X POST http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "chat", "stream": true, "messages": [{"role": "user", "content": "a b c"}]}'
+# => data: {... "delta": {"content": "a"} ...}
+# => data: {... "delta": {"content": "b"} ...}
+# => data: {... "delta": {"content": "c"} ...}
+# => data: {... "finish_reason": "stop"}
+# => data: [DONE]
+
+# Embeddings + model listing
+curl -X POST http://localhost:8000/v1/embeddings \
+  -H 'Content-Type: application/json' -d '{"model": "embed", "input": "hey"}'
+# => {"object": "list", "data": [{"embedding": [104.0, 101.0, 121.0], ...}]}
+curl http://localhost:8000/v1/models
+# => {"object": "list", "data": [{"id": "chat", ...}, {"id": "embed", ...}]}
 ```
 
 ## More Documentation

@@ -11,6 +11,8 @@ so they run one at a time — never in parallel.
 Requirements (in the Python that runs this script):
   * ``lite-server``        — the server itself (``python -m lite_server``)
   * ``grpcio``             — example 13's bidirectional gRPC handshake
+  * ``tritonclient``       — example 25's Triton Binary client channel
+  * ``numpy``              — example 25's tensor construction
 
 Usage:
     python run_all.py                 # run every example
@@ -997,6 +999,119 @@ def check_24():
     return True, f"xff {ip0}/{ip1}/{ip2} + preflight ok/evil + ws 101/403"
 
 
+def check_25():
+    """KServe V2 dataplane: raw tensor bytes + Triton Binary e2e
+    (tritonclient, binary response via binary_data_output)."""
+    import numpy as np
+    import tritonclient.http as httpclient
+
+    # 1) Raw tensor bytes (octet-stream + x-tensor-* headers) -> JSON summary
+    body = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32).tobytes()
+    req = urllib.request.Request(
+        BASE + "/v2/models/raw_tensor/infer", data=body, method="POST",
+        headers={"Content-Type": "application/octet-stream",
+                 "x-tensor-dtype": np.dtype("<f4").str, "x-tensor-shape": "4"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            r1 = json.loads(r.read().decode())
+    except Exception as e:  # noqa: BLE001 — report any transport failure
+        return False, f"raw tensor request failed: {e}"
+    if r1.get("sum") != 10.0 or r1.get("shape") != [4]:
+        return False, f"raw tensor: {r1}"
+
+    # 2) Triton Binary: two FP32 inputs, binary output negotiated
+    try:
+        client = httpclient.InferenceServerClient(url="localhost:8000")
+        a = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+        b = np.array([[10.0, 20.0], [30.0, 40.0]], dtype=np.float32)
+        ia = httpclient.InferInput("a", [2, 2], "FP32")
+        ia.set_data_from_numpy(a)
+        ib = httpclient.InferInput("b", [2, 2], "FP32")
+        ib.set_data_from_numpy(b)
+        out = httpclient.InferRequestedOutput("output0", binary_data=True)
+        got = client.infer("binary_sum", [ia, ib], outputs=[out]).as_numpy("output0")
+    except Exception as e:  # noqa: BLE001
+        return False, f"triton binary failed: {e}"
+    if not np.array_equal(got, a + b):
+        return False, f"triton binary sum mismatch: {got.tolist()}"
+    return True, "raw tensor sum=10.0 + triton binary sum OK"
+
+
+def check_26():
+    """openai-compact: unary chat, SSE stream, embeddings, /v1/models (+404)."""
+    # 1) Unary chat completion
+    st, r = http_json("POST", "/v1/chat/completions",
+                      {"model": "chat",
+                       "messages": [{"role": "user", "content": "hi there"}]})
+    if st != 200 or not isinstance(r, dict) or r.get("object") != "chat.completion":
+        return False, f"unary chat: HTTP {st} -> {r}"
+    content = r["choices"][0]["message"]["content"]
+    if content != "chat echo: hi there":
+        return False, f"unary chat content: {content!r}"
+
+    # 2) Streaming chat -> SSE data: chunks + finish + [DONE]
+    def sse_collect(path, body, deadline_s=8.0):
+        conn = http.client.HTTPConnection(HOST, PORT, timeout=deadline_s)
+        events, status = [], None
+        try:
+            conn.request("POST", path, body=json.dumps(body),
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            status = resp.status
+            end = time.time() + deadline_s
+            while time.time() < end:
+                try:
+                    line = resp.readline()
+                except Exception:  # socket timeout / closed
+                    break
+                if not line:
+                    break
+                s = line.decode("utf-8", errors="replace").strip()
+                if s.startswith("data: "):
+                    events.append(s[6:])
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return status, events
+
+    st, events = sse_collect(
+        "/v1/chat/completions",
+        {"model": "chat", "stream": True,
+         "messages": [{"role": "user", "content": "a b c"}]})
+    if st != 200 or len(events) < 5 or events[-1] != "[DONE]":
+        return False, f"stream: HTTP {st} events={events}"
+    try:
+        deltas = [json.loads(e)["choices"][0]["delta"].get("content", "")
+                  for e in events[:4]]
+    except Exception as e:  # noqa: BLE001
+        return False, f"stream parse: {e}"
+    if deltas[:3] != ["a", "b", "c"]:
+        return False, f"stream deltas: {deltas}"
+
+    # 3) Embeddings
+    st, r = http_json("POST", "/v1/embeddings", {"model": "embed", "input": "hey"})
+    if st != 200 or not isinstance(r, dict) or r.get("object") != "list":
+        return False, f"embeddings: HTTP {st} -> {r}"
+    if r["data"][0]["embedding"] != [104.0, 101.0, 121.0]:
+        return False, f"embedding: {r['data'][0]['embedding']}"
+
+    # 4) Model listing + unknown-model 404
+    st, r = http_json("GET", "/v1/models")
+    ids = [m["id"] for m in r.get("data", [])] if isinstance(r, dict) else []
+    if st != 200 or "chat" not in ids or "embed" not in ids:
+        return False, f"/v1/models: HTTP {st} -> {r}"
+    st, r = http_json("POST", "/v1/chat/completions",
+                      {"model": "nope",
+                       "messages": [{"role": "user", "content": "x"}]})
+    if st != 404:
+        return False, f"unknown model: expected 404, got HTTP {st} -> {r}"
+    return True, "unary+stream chat + embeddings + /v1/models OK"
+
+
 # example dir -> (primary model for readiness, check fn)
 SPECS = {
     "01_basic": ("echo", check_01),
@@ -1024,6 +1139,8 @@ SPECS = {
     "22_warmup": ("warmup_echo", check_22),
     "23_advanced_routing": ("sticky_echo", check_23),
     "24_proxy_security": ("proxy_echo", check_24),
+    "25_kserve_v2": ("raw_tensor", check_25),
+    "26_openai_compact": ("chat", check_26),
 }
 
 
