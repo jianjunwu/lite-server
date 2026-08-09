@@ -200,6 +200,20 @@ access_control:
 
 per-model `policies.auth` 独立于此端点级控制，叠加在其后。
 
+### 控制面审计（D27）
+
+所有控制面**变更**操作（HTTP admin 与 gRPC Admin，双侧同形状）都输出一条结构化审计记录；只读端点（`ListModels`/`GetInfo`/健康探活）不审计。字段：`action`（`load`/`unload`/`reload`/`delete`/`activate`/`set_routing`）、`model`/`version`、`request_id`、`client_ip`、`principal`（mTLS）、`key_fingerprint`、`details`（含前后值，如 `weights {"1": 70} -> {"2": 100}`；`activate` 失败也留痕）。
+
+`key_fingerprint` = 配置 key 的 SHA-256 前 6 字节 hex（12 字符）——日志可区分轮换前后的 key，不落密钥明文；public / loopback / 未配置为 `None`。
+
+记录走独立 log target `lite_server::audit`，`info` 级别即出，无需额外配置。EnvFilter 用**下划线**形式：
+
+```sh
+RUST_LOG=lite_server::audit=info
+```
+
+完整字段表见 [observability.md](../../observability.md)（en，无 zh 镜像）。
+
 ## CORS
 
 通过 `server.cors` 全局配置，或通过 `policies.cors` 按模型配置（per-model 覆盖全局策略；省略则回退到 `server.cors`；`null` 默认为透传——不附加任何头）。CORS **不是** `tower-http::cors`：per-model 策略覆盖需要在请求时按路径解析模型，静态挂载的 `CorsLayer` 做不到。中间件按有效策略（per-model → 全局）应用下述规则。

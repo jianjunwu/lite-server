@@ -937,12 +937,12 @@ mod tests {
     }
 }
 
-/// /audit 举证（P-MW 面，蓝图 §4.0.2/§4.0.4 顺序不变式）：生产栈挂载顺序
-/// （外→内）为 admission → draining_gate → cors（见上方装配），故
-/// admission/draining 的 503 短路响应**不经过 cors_middleware**——§4.0.4
-/// 要求「CORS 在错误响应上也附 ACAO（浏览器需要）」，当前被违反：浏览器在
-/// 过载/排水的 503 上收到不透明 CORS 错误，读不到状态与 Retry-After。
-/// 以下测试按生产同序复刻最小栈，FAIL 证明缺陷；修复后转绿作回归锁。
+/// /audit 回归锁（P-MW 面，蓝图 §4.0.2/§4.0.4 顺序不变式）：生产栈挂载顺序
+/// （外→内）为 cors → admission → draining_gate（见上方装配），故
+/// admission/draining 的 503 短路响应**经过 cors_middleware**——§4.0.4
+/// 要求「CORS 在错误响应上也附 ACAO（浏览器需要）」，浏览器在过载/排水的
+/// 503 上能读到状态与 Retry-After；preflight 204 在 CORS 内短路，不占
+/// admission 槽位。以下测试按生产同序复刻最小栈，验证该不变式。
 #[cfg(test)]
 mod audit_mw_order_tests {
     use super::*;

@@ -90,6 +90,29 @@ structured stream lifecycle logs (`stream opened` / `stream closed` with
 `stream cancelled by client`). Access-log latency for streaming should be
 read as first-byte time.
 
+### Control-plane audit (D27)
+
+Every control-plane **mutation** emits a structured audit record (HTTP admin
+handlers and gRPC Admin, same record shape). Read-only endpoints
+(`ListModels`, `GetInfo`, health) do not audit.
+
+| Field | Meaning |
+|---|---|
+| `action` | `load` / `unload` / `reload` / `delete` / `activate` / `set_routing` |
+| `model`, `version` | The target model (version `None` for `set_routing`) |
+| `request_id` | Correlated request id (UUID-v4 fallback on the gRPC Admin side) |
+| `client_ip` | Peer address (XFF-cleansed when behind trusted proxies) |
+| `principal` | mTLS client principal, when TLS mutual auth is configured |
+| `key_fingerprint` | SHA-256 hex prefix (12 chars) of the configured API key — distinguishes pre-/post-rotation keys in the log **without** writing the secret; `None` for public / loopback / unconfigured policies |
+| `details` | Before/after values where applicable, e.g. `weights {"1": 70} -> {"2": 100}`, `previous_active=Some("1") -> 2`; failures are audited too (`activate` not-ready) |
+
+Records go to the dedicated log target `lite_server::audit` at `info` level
+(no extra configuration). EnvFilter uses the **underscore** form:
+
+```sh
+RUST_LOG=lite_server::audit=info
+```
+
 ### `tokens_generated` semantics
 
 Python workers report `tokens_generated` in the Done-frame `Metrics` —
@@ -145,7 +168,7 @@ needed — propagation rides the existing headers map.
 
 ### Sampling & shutdown
 
-- Sampling: `ParentBased(TraceIdRatioBased(sample_ratio))` — roots sampled at `sample_ratio`, child spans honour the inbound sampled flag. (Per-class health/admin down-sampling via `health_admin_sample_ratio` is parsed but not yet wired.)
+- Sampling: `ParentBased(TraceIdRatioBased(sample_ratio))` — roots sampled at `sample_ratio`, child spans honour the inbound sampled flag. Health/admin roots use the independent `health_admin_sample_ratio` (default `0.0`) so high-frequency probes do not burn collector quota (see configuration.md §Telemetry).
 - Shutdown: on graceful shutdown, traces and metrics are `force_flush`ed + shut down on a blocking thread with a **5s cap**, so a slow/unreachable collector cannot stall the drain window. The 0.30 `BatchSpanProcessor`/`PeriodicReader` run on dedicated threads, decoupling them from the tokio runtime (avoids the `force_flush` deadlock in opentelemetry-rust #2715).
 
 ### Metrics SDK & exemplars
