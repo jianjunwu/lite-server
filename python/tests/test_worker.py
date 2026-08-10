@@ -1326,6 +1326,125 @@ class TestAsyncLoop:
         assert resp.batch.items[2].status.code == "Ok"
 
 
+class TestTaskTracking:
+    """run_async_loop reaps completed handler tasks via their done callback
+    (audit 2026-08-10 #6) — not by scanning the whole pending map on every
+    received message (O(in-flight) per message, and a completed task used to
+    linger until the NEXT message arrived)."""
+
+    def test_track_task_reaps_on_completion(self):
+        async def runner():
+            pending, active = {}, {}
+
+            async def noop():
+                return None
+
+            t = asyncio.create_task(noop())
+            inference._track_task(pending, active, "uid-1", t, log)
+            assert "uid-1" in pending
+            await asyncio.sleep(0.02)  # let the loop run the done callback
+            assert pending == {}, "done callback must reap the entry without a new message"
+            assert t.exception() is None  # retrieved, not lost
+
+        asyncio.run(runner())
+
+    def test_track_task_retrieves_exception(self, caplog):
+        async def runner():
+            pending, active = {}, {}
+
+            async def boom():
+                raise RuntimeError("kaboom")
+
+            t = asyncio.create_task(boom())
+            inference._track_task(pending, active, "uid-err", t, log)
+            with caplog.at_level(logging.ERROR):
+                await asyncio.sleep(0.02)
+            assert pending == {}
+            assert any("kaboom" in r.getMessage() and "uid-err" in r.getMessage()
+                       for r in caplog.records), \
+                "task exception must be retrieved and logged by the done callback"
+
+        asyncio.run(runner())
+
+    def test_track_task_cancelled_does_not_raise(self, caplog):
+        async def runner():
+            pending, active = {}, {}
+
+            async def wait_forever():
+                await asyncio.sleep(60)
+
+            t = asyncio.create_task(wait_forever())
+            inference._track_task(pending, active, "uid-cancel", t, log)
+            t.cancel()
+            with caplog.at_level(logging.ERROR):
+                await asyncio.sleep(0.02)
+            assert pending == {}
+            # t.exception() raises CancelledError on a cancelled task — the
+            # callback must skip retrieval, not blow up the loop.
+            assert not caplog.records, f"callback errored: {caplog.records}"
+
+        asyncio.run(runner())
+
+    def test_track_task_cleans_stream_alias(self):
+        """A uni-stream consume task is aliased in both pending_tasks (keyed
+        stream-consume-<sid>) and active_streams (keyed sid); completing it
+        must clean both."""
+        async def runner():
+            pending, active = {}, {}
+
+            async def noop():
+                return None
+
+            t = asyncio.create_task(noop())
+            active["sid-1"] = t
+            inference._track_task(pending, active, "stream-consume-sid-1", t, log)
+            await asyncio.sleep(0.02)
+            assert pending == {}
+            assert active == {}, "stream alias must be reaped with the pending entry"
+
+        asyncio.run(runner())
+
+    def test_loop_reaps_completed_task_without_next_message(self):
+        """Integration: with no follow-up message arriving, the completed
+        handler task must still disappear from the loop's pending map (old
+        per-message scan only reaped on the NEXT received message)."""
+
+        class AsyncModel(LitAPI):
+            async def predict(self, x):
+                return {"ok": True}
+
+        pending: dict = {}
+        socket = AsyncMockSocket()
+        req = Request(uid="req-reap", single=SingleRequest(data=json.dumps({"input": 1}).encode()))
+        socket.inject(req.SerializeToString())
+
+        async def runner():
+            task = asyncio.create_task(
+                inference.run_async_loop(AsyncModel(), socket, "test", log, _pending=pending)
+            )
+            try:
+                # Wait for the handler response.
+                deadline = asyncio.get_running_loop().time() + 5
+                while not socket._msgs and asyncio.get_running_loop().time() < deadline:
+                    await asyncio.sleep(0.001)
+                assert socket._msgs, "no response"
+                # Yield to the loop WITHOUT injecting another message: the
+                # done callback (not a next-message scan) must reap the task.
+                for _ in range(30):
+                    if not pending:
+                        break
+                    await asyncio.sleep(0.001)
+                assert pending == {}, "completed task lingered without a follow-up message"
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        asyncio.run(runner())
+
+
 class TestAsyncLoopEdgeCases:
     def test_async_loop_cancels_pending_on_shutdown(self):
         class SlowModel(LitAPI):

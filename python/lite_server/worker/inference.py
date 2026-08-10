@@ -353,9 +353,42 @@ def _start_parent_watchpoint_sync(log: logging.Logger, server_pid=None, stop_eve
     return t
 
 
-async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.Logger, server_pid=None):
-    """Handle single + batch + stream requests asynchronously."""
-    pending_tasks: dict[str, asyncio.Task] = {}
+def _track_task(pending_tasks: dict, active_streams: dict, uid: str, task: asyncio.Task, log: logging.Logger) -> None:
+    """Register *task* for shutdown-cancel and exception retrieval.
+
+    Completion cleanup runs in the task's done callback — NOT in a
+    per-message scan of the pending map (which cost O(in-flight) on every
+    received message and only reaped a finished task when the NEXT message
+    arrived). The callback pops the pending entry, clears the stream alias
+    for uni-stream consume tasks, and retrieves the exception so asyncio
+    never reports "Task exception was never retrieved".
+    """
+    pending_tasks[uid] = task
+
+    def _on_done(t: asyncio.Task) -> None:
+        pending_tasks.pop(uid, None)
+        # A uni-stream consume task is also aliased in active_streams.
+        for sid, stream_task in list(active_streams.items()):
+            if stream_task is t:
+                active_streams.pop(sid, None)
+                break
+        if t.cancelled():
+            return  # t.exception() raises CancelledError on cancelled tasks
+        exc = t.exception()
+        if exc is not None:
+            log.error("async task %s failed: %s", uid, exc)
+
+    task.add_done_callback(_on_done)
+
+
+async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.Logger, server_pid=None, _pending=None):
+    """Handle single + batch + stream requests asynchronously.
+
+    *_pending* is a test hook: when given, it replaces the loop's internal
+    pending-task map so tests can observe reaping. Production never passes
+    it (mirrors the ``stop_event`` hook on ``_start_parent_watchpoint_sync``).
+    """
+    pending_tasks: dict[str, asyncio.Task] = _pending if _pending is not None else {}
     active_streams: dict[str, asyncio.Task] = {}
 
     # Self-terminate if the server (our parent) dies — including SIGKILL, which
@@ -403,27 +436,12 @@ async def run_async_loop(lit_api: LitAPI, socket, model_name: str, log: logging.
                     # Track the consume task for exception retrieval / shutdown
                     entry = active_streams.get(stream_id)
                     if isinstance(entry, asyncio.Task):
-                        pending_tasks[f"stream-consume-{stream_id}"] = entry
+                        _track_task(pending_tasks, active_streams, f"stream-consume-{stream_id}", entry, log)
             else:
                 task = asyncio.create_task(
                     _handle_request_async(lit_api, request, socket, log)
                 )
-                pending_tasks[request.uid] = task
-
-            # Clean up completed tasks and retrieve exceptions to avoid warnings
-            done = [uid for uid, t in pending_tasks.items() if t.done()]
-            for uid in done:
-                t = pending_tasks.pop(uid)
-                # Also clean up active_streams if this was a stream task
-                for sid, stream_task in list(active_streams.items()):
-                    if stream_task is t:
-                        active_streams.pop(sid, None)
-                        break
-                if t.cancelled():
-                    continue  # t.exception() raises CancelledError on cancelled tasks
-                exc = t.exception()
-                if exc is not None:
-                    log.error("async task %s failed: %s", uid, exc)
+                _track_task(pending_tasks, active_streams, request.uid, task, log)
     except asyncio.CancelledError:
         # Task cancelled (e.g. asyncio.run SIGINT shutdown): fall through to
         # the shutdown cleanup below instead of skipping it, then re-raise.
