@@ -4,7 +4,7 @@
 use super::hooks::{execute_hook, policies_from_config};
 use super::process::{
     classify_stderr_line, drain_worker_stderr, emit_stderr_line, new_worker_command,
-    spawn_worker_monitor, strip_level_prefix, worker_endpoint,
+    spawn_worker_monitor, strip_level_prefix, worker_endpoint, WorkerExitKind,
 };
 use super::{WorkerManager, WorkerProcess};
 use crate::callback::ModelLifecycleContext;
@@ -417,12 +417,24 @@ impl WorkerManager {
             // Spawn monitor task — owns the Child, detects exits and handles
             // cleanup. The ZMQ client is reused across a worker's kill+respawn
             // (the bound PAIR socket outlives any single worker process), so
-            // there is no `.sock` to clean on exit — `on_exit` is empty here;
-            // it stays a parameter because tests use it to observe the monitor ran.
+            // there is no `.sock` to clean on exit. `on_exit` fails in-flight
+            // requests fast when the worker is gone: ZMQ PAIR has no
+            // peer-disconnect event, so waiters would otherwise hang until
+            // their caller-side timeouts (request_timeout, else 300s).
             let hooks_arc = Arc::new(model_config.hooks.clone());
+            let fail_client = zmq_client.clone();
             let done_rx = spawn_worker_monitor(
                 child, model_name, version, worker_id as u32, shutdown_rx,
-                || {},
+                move |kind| {
+                    let reason = match kind {
+                        WorkerExitKind::Crash => "worker process exited unexpectedly",
+                        WorkerExitKind::Killed => "worker terminated by supervisor",
+                        // Clean exit: the unload path's client drop handles
+                        // in-flight requests — no spurious fail on stops.
+                        WorkerExitKind::Clean => return,
+                    };
+                    fail_client.fail_all(reason);
+                },
                 Some(hooks_arc),
                 self.hook_tasks.clone(),
                 self.draining.clone(),

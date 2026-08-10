@@ -175,6 +175,23 @@ pub(super) fn emit_stderr_line(level: tracing::Level, msg: &str, worker_id: usiz
 
 // ===== spawn / monitor helpers =====
 
+/// How a monitored worker process terminated. Passed to the `on_exit`
+/// callback of [`spawn_worker_monitor`]: `Clean` skips in-flight cleanup
+/// (the unload path's client drop handles it), while `Crash`/`Killed` must
+/// fail in-flight requests fast — ZMQ PAIR has no peer-disconnect event,
+/// so waiters would otherwise hang until their caller-side timeouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerExitKind {
+    /// Zero exit status (graceful stop / intentional exit).
+    Clean,
+    /// Non-zero exit, or the wait itself failed. An exit during drain also
+    /// maps here — its in-flight requests are dead either way.
+    Crash,
+    /// Supervisor-initiated kill via the shutdown channel (health-check
+    /// kill escalation, or an unload's kill grace expiring).
+    Killed,
+}
+
 /// Spawn a background task that monitors a worker child process.
 /// - If the process exits on its own (crash, OOM kill), logs the event and runs cleanup.
 /// - If a shutdown signal is sent via `shutdown_rx`, kills the process and runs cleanup.
@@ -196,7 +213,7 @@ pub(super) fn spawn_worker_monitor(
     version: &str,
     worker_id: u32,
     mut shutdown_rx: oneshot::Receiver<()>,
-    on_exit: impl FnOnce() + Send + 'static,
+    on_exit: impl FnOnce(WorkerExitKind) + Send + 'static,
     hooks: Option<Arc<crate::config::WorkerHooksConfig>>,
     hook_tasks: HookTasks,
     draining: Arc<AtomicBool>,
@@ -210,7 +227,7 @@ pub(super) fn spawn_worker_monitor(
         ("$WORKER_ID".to_string(), worker_id.to_string()),
     ];
     tokio::spawn(async move {
-        tokio::select! {
+        let kind = tokio::select! {
             result = child.wait() => {
                 match result {
                     Ok(status) => {
@@ -222,6 +239,7 @@ pub(super) fn spawn_worker_monitor(
                             if let Some(ref h) = hooks {
                                 execute_hook("exit", h, hook_vars.clone(), &hook_tasks);
                             }
+                            WorkerExitKind::Clean
                         } else {
                             let exit_code = status.code().unwrap_or(-1);
                             // B1: during draining/shutdown, a worker exit (including via
@@ -248,6 +266,7 @@ pub(super) fn spawn_worker_monitor(
                                     execute_hook("error", h, vars, &hook_tasks);
                                 }
                             }
+                            WorkerExitKind::Crash
                         }
                     }
                     Err(e) => {
@@ -256,6 +275,9 @@ pub(super) fn spawn_worker_monitor(
                             error = %e,
                             "Failed to wait on worker process"
                         );
+                        // The wait failed, not the child necessarily — but
+                        // failing in-flight requests beats hanging them.
+                        WorkerExitKind::Crash
                     }
                 }
             }
@@ -265,9 +287,10 @@ pub(super) fn spawn_worker_monitor(
                     "Shutting down worker process"
                 );
                 let _ = child.kill().await;
+                WorkerExitKind::Killed
             }
-        }
-        on_exit();
+        };
+        on_exit(kind);
 
         // Signal that the child has been reaped (kill confirmed or natural
         // exit observed). Receivers that already dropped are fine.
@@ -618,12 +641,26 @@ impl WorkerManager {
         // Spawn monitor for the new worker. The ZMQ client is reused (not
         // recreated) — the bound PAIR socket outlives this worker process and
         // accepts the replacement's reconnect — so there is no `.sock` to clean
-        // on exit. `on_exit` stays a parameter: tests use it to observe that the
-        // monitor ran.
+        // on exit. `on_exit` fails in-flight requests fast when this worker
+        // later dies: ZMQ PAIR has no peer-disconnect event, so waiters would
+        // otherwise hang until their caller-side timeouts.
+        let fail_client = {
+            let clients = self.zmq_clients.read().await;
+            clients.get(&key).and_then(|cs| cs.get(worker_id as usize).cloned())
+        };
         let hooks_arc = Arc::new(model_config.hooks.clone());
         let done_rx = spawn_worker_monitor(
             child, model_name, version, worker_id, shutdown_rx,
-            || {},
+            move |kind| {
+                let reason = match kind {
+                    WorkerExitKind::Crash => "worker process exited unexpectedly",
+                    WorkerExitKind::Killed => "worker terminated by supervisor",
+                    WorkerExitKind::Clean => return,
+                };
+                if let Some(c) = &fail_client {
+                    c.fail_all(reason);
+                }
+            },
             Some(hooks_arc),
             self.hook_tasks.clone(),
             self.draining.clone(),
@@ -758,7 +795,7 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         spawn_worker_monitor(
             child, "test_model", "1", 0, shutdown_rx,
-            move || { cleaned_up_clone.store(true, Ordering::SeqCst); },
+            move |_kind| { cleaned_up_clone.store(true, Ordering::SeqCst); },
             None,
             Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             Arc::new(AtomicBool::new(false)),
@@ -770,6 +807,178 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(cleaned_up.load(Ordering::SeqCst), "monitor should have triggered cleanup");
+    }
+
+    /// Audit 2026-08-10 #8: a crash must fail the worker's in-flight requests
+    /// immediately (monitor → on_exit(Crash) → fail_all) — ZMQ PAIR has no
+    /// peer-disconnect event, so without this they hang until their
+    /// caller-side timeouts (up to the 300s backstop).
+    #[tokio::test]
+    async fn test_monitor_crash_fails_inflight_requests() {
+        use crate::proto::liteserver as pb;
+        use crate::transport::zmq::WorkerZmqClient;
+
+        // Fake worker peer: connects and stays silent so in-flight entries
+        // stay registered. rcvtimeo-bounded so the thread exits at teardown.
+        #[cfg(unix)]
+        let endpoint = {
+            let sock = std::env::temp_dir()
+                .join(format!("lite-monitor-failall-{}.sock", std::process::id()));
+            let _ = std::fs::remove_file(&sock);
+            format!("ipc://{}", sock.display())
+        };
+        #[cfg(windows)]
+        let endpoint = format!("tcp://127.0.0.1:{}", 37000 + std::process::id() % 1000);
+        let ep = endpoint.clone();
+        let worker = std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).unwrap();
+            s.connect(&ep).unwrap();
+            let _ = s.set_rcvtimeo(5000);
+            loop {
+                match s.recv_bytes(0) {
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let client = std::sync::Arc::new(WorkerZmqClient::new(endpoint));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // One in-flight unary with a 30s timeout — fail_all, not the
+        // timeout, must resolve it.
+        let req = pb::Request {
+            uid: "crash-inflight".to_string(),
+            meta: None,
+            payload: Some(pb::request::Payload::Single(pb::SingleRequest {
+                data: bytes::Bytes::from_static(b"{}"),
+            })),
+        };
+        let inflight = tokio::spawn({
+            let c = client.clone();
+            async move { c.send_with_timeout(req, Duration::from_secs(30)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Child that crashes (exit 1) right away.
+        #[cfg(unix)]
+        let child = tokio::process::Command::new("false")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        #[cfg(windows)]
+        let child = tokio::process::Command::new("cmd")
+            .args(["/c", "exit", "1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observed_c = observed.clone();
+        let fail_client = client.clone();
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let done_rx = spawn_worker_monitor(
+            child, "test_model", "1", 0, shutdown_rx,
+            move |kind| {
+                *observed_c.lock().unwrap() = Some(kind);
+                // Mirrors the production closures (lifecycle spawn + respawn):
+                // anything but a clean exit fails in-flight requests fast.
+                if !matches!(kind, WorkerExitKind::Clean) {
+                    fail_client.fail_all("worker process exited unexpectedly");
+                }
+            },
+            None,
+            Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        timeout(Duration::from_secs(5), done_rx)
+            .await
+            .expect("monitor did not observe the crash")
+            .expect("completion channel dropped");
+
+        let resp = timeout(Duration::from_secs(3), inflight)
+            .await
+            .expect("in-flight request was not released after the crash")
+            .expect("inflight task panicked")
+            .expect("send failed");
+        match resp.payload {
+            Some(pb::response::Payload::Single(single)) => {
+                assert_eq!(single.status.unwrap().code, "Error");
+            }
+            other => panic!("expected Single error, got {:?}", other),
+        }
+        assert_eq!(*observed.lock().unwrap(), Some(WorkerExitKind::Crash));
+
+        drop(client);
+        let _ = worker.join();
+    }
+
+    /// A zero-status exit reports Clean (in-flight cleanup is left to the
+    /// unload path's client drop — no spurious fail_all on graceful stops).
+    #[tokio::test]
+    async fn test_monitor_reports_clean_exit_kind() {
+        #[cfg(unix)]
+        let child = tokio::process::Command::new("true")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        #[cfg(windows)]
+        let child = tokio::process::Command::new("cmd")
+            .args(["/c", "exit", "0"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observed_c = observed.clone();
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let done_rx = spawn_worker_monitor(
+            child, "test_model", "1", 0, shutdown_rx,
+            move |kind| { *observed_c.lock().unwrap() = Some(kind); },
+            None,
+            Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        timeout(Duration::from_secs(5), done_rx)
+            .await
+            .expect("monitor should signal completion")
+            .expect("completion channel dropped");
+        assert_eq!(*observed.lock().unwrap(), Some(WorkerExitKind::Clean));
+    }
+
+    /// A supervisor-initiated kill (shutdown channel) reports Killed — the
+    /// health-check kill escalation and the unload kill grace both take this
+    /// path, and their in-flight requests must fail fast too.
+    #[tokio::test]
+    async fn test_monitor_reports_killed_kind() {
+        let mut cmd = Command::new("python");
+        cmd.arg("-c").arg("import time; time.sleep(60)");
+        let child = cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observed_c = observed.clone();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let done_rx = spawn_worker_monitor(
+            child, "test_model", "1", 0, shutdown_rx,
+            move |kind| { *observed_c.lock().unwrap() = Some(kind); },
+            None,
+            Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        shutdown_tx.send(()).unwrap();
+        timeout(Duration::from_secs(5), done_rx)
+            .await
+            .expect("monitor should signal completion after kill")
+            .expect("completion channel dropped");
+        assert_eq!(*observed.lock().unwrap(), Some(WorkerExitKind::Killed));
     }
 
     /// B1: when draining is set, a worker exit (even non-zero) must NOT trigger
@@ -807,7 +1016,7 @@ mod tests {
 
         let done_rx = spawn_worker_monitor(
             child, "test_model", "1", 0, shutdown_rx,
-            move || { cleaned_up_clone.store(true, Ordering::SeqCst); },
+            move |_kind| { cleaned_up_clone.store(true, Ordering::SeqCst); },
             Some(Arc::new(hooks)),
             hook_tasks_clone,
             Arc::new(AtomicBool::new(true)), // draining=true
@@ -858,7 +1067,7 @@ mod tests {
 
         let done_rx = spawn_worker_monitor(
             child, "test_model", "1", 0, shutdown_rx,
-            || {},
+            |_kind| {},
             Some(Arc::new(hooks)),
             hook_tasks_clone,
             Arc::new(AtomicBool::new(false)), // draining=false — real crash
@@ -902,7 +1111,7 @@ mod tests {
 
         spawn_worker_monitor(
             child, "test", "1", 0, shutdown_rx,
-            move || { done_c.store(true, Ordering::SeqCst); },
+            move |_kind| { done_c.store(true, Ordering::SeqCst); },
             None,
             Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             Arc::new(AtomicBool::new(false)),
@@ -930,7 +1139,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let done_rx = spawn_worker_monitor(
             child, "test", "1", 0, shutdown_rx,
-            || {},
+            |_kind| {},
             None,
             Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             Arc::new(AtomicBool::new(false)),
@@ -973,7 +1182,7 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let done_rx = spawn_worker_monitor(
             child, "test", "1", 0, shutdown_rx,
-            || {},
+            |_kind| {},
             None,
             Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             Arc::new(AtomicBool::new(false)),

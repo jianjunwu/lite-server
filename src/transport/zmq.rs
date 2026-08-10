@@ -46,6 +46,11 @@ enum ZmqCommand {
         response_tx: oneshot::Sender<pb::Response>,
         chunk_tx: mpsc::Sender<pb::StreamResponse>,
     },
+    /// Fail every in-flight request: the worker process is gone (crash or
+    /// supervisor kill). Pending unary slots get an error response, stream
+    /// routes get a terminal Error frame. The transport itself stays up —
+    /// the bound socket outlives the worker and a respawned peer reconnects.
+    FailAll { reason: String },
 }
 
 pub struct WorkerZmqClient {
@@ -354,6 +359,27 @@ impl WorkerZmqClient {
         Ok(())
     }
 
+    /// Fail every in-flight request immediately (worker process gone).
+    ///
+    /// ZMQ PAIR has no peer-disconnect event, so without this the entries
+    /// linger until their caller-side timeouts (request_timeout, else the
+    /// [`ZMQ_RESPONSE_TIMEOUT`] backstop). The transport stays usable: the
+    /// bound socket outlives the worker and a respawned peer reconnects to
+    /// it. Best-effort: a full/closed command channel (flood or teardown)
+    /// falls back to the timeout path with a warn.
+    pub fn fail_all(&self, reason: &str) {
+        match self.cmd_tx.try_send(ZmqCommand::FailAll { reason: reason.to_string() }) {
+            Ok(()) => self.wake_actor(),
+            Err(e) => warn!(
+                "ZMQ fail_all dropped ({}); in-flight requests fall back to timeouts",
+                match e {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => "command channel full",
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => "command channel closed",
+                }
+            ),
+        }
+    }
+
     /// Interrupt the actor's blocking poll so it drains the command channel
     /// now instead of at the next backstop tick. Best-effort: a full wake
     /// pipe means the actor is already awake.
@@ -469,6 +495,31 @@ fn drain_commands(
                         error!("ZMQ send error: {}", e);
                         let _ = response_tx.send(error_response(&uid, &format!("ZMQ send: {}", e)));
                     }
+                }
+            }
+            Ok(ZmqCommand::FailAll { reason }) => {
+                // ZMQ PAIR has no peer-disconnect event: without this the
+                // entries would hang until their caller-side timeouts.
+                let (n_pending, n_streams) = (pending.len(), stream_routes.len());
+                for (uid, tx) in pending.drain() {
+                    let _ = tx.send(error_response(&uid, &reason));
+                }
+                for (sid, tx) in stream_routes.drain() {
+                    let term = pb::StreamResponse {
+                        stream_id: sid,
+                        payload: Some(pb::stream_response::Payload::Error(pb::StreamError {
+                            message: reason.clone(),
+                        })),
+                    };
+                    // A full stream channel means the consumer is already
+                    // behind — it will observe the sender drop as EOF.
+                    let _ = tx.try_send(term);
+                }
+                if n_pending > 0 || n_streams > 0 {
+                    warn!(
+                        "ZMQ fail_all ({}): released {} pending + {} stream(s)",
+                        reason, n_pending, n_streams
+                    );
                 }
             }
             Err(mpsc::error::TryRecvError::Empty) => return DrainOutcome::Continue,
@@ -672,6 +723,140 @@ mod tests {
             frame.payload
         );
         drop(client);
+    }
+
+    // Regression (audit 2026-08-10 #8): ZMQ PAIR has no peer-disconnect
+    // event — when the worker process died, in-flight requests hung until
+    // their caller-side timeouts (request_timeout, else the 300s backstop).
+    // fail_all must release every pending waiter and stream route
+    // immediately, while keeping the transport usable for a respawned peer.
+    #[tokio::test]
+    async fn fail_all_releases_pending_and_stream_routes_fast() {
+        #[cfg(unix)]
+        let endpoint = {
+            let sock = std::env::temp_dir().join(format!(
+                "lite-server-zmq-failall-{}.sock",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&sock);
+            format!("ipc://{}", sock.display())
+        };
+        #[cfg(windows)]
+        let endpoint = format!("tcp://127.0.0.1:{}", 36000 + std::process::id() % 1000);
+
+        // Silent peer: receives everything, never replies — in-flight
+        // entries stay registered until fail_all. rcvtimeo-bounded so the
+        // thread exits after the test drops the client.
+        let ep_for_worker = endpoint.clone();
+        let worker = std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&ep_for_worker).expect("worker connect");
+            let _ = s.set_rcvtimeo(5000);
+            loop {
+                match s.recv_bytes(0) {
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let client = std::sync::Arc::new(WorkerZmqClient::new(endpoint));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // 1. Pending unary with a 30s timeout — fail_all, not the timeout,
+        //    must be what resolves it.
+        let unary_req = pb::Request {
+            uid: "inflight-unary".to_string(),
+            meta: None,
+            payload: Some(pb::request::Payload::Single(pb::SingleRequest {
+                data: bytes::Bytes::from_static(b"{}"),
+            })),
+        };
+        let unary_task = tokio::spawn({
+            let c = client.clone();
+            async move { c.send_with_timeout(unary_req, Duration::from_secs(30)).await }
+        });
+
+        // 2. Stream route with no terminal frame in sight.
+        let open_req = pb::Request {
+            uid: "s-open".to_string(),
+            meta: None,
+            payload: Some(pb::request::Payload::Stream(pb::StreamRequest {
+                stream_id: "inflight-stream".to_string(),
+                action: Some(pb::stream_request::Action::Open(pb::StreamOpen {
+                    data: bytes::Bytes::from_static(b"{}"),
+                    meta: None,
+                    decoupled: None,
+                })),
+            })),
+        };
+        let mut chunk_rx = client
+            .send_stream(open_req, "inflight-stream".to_string())
+            .await
+            .expect("send_stream");
+
+        // Let the actor register both entries.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        client.fail_all("worker process exited unexpectedly");
+
+        // The pending unary resolves immediately with an Error payload.
+        let resp = tokio::time::timeout(Duration::from_secs(3), unary_task)
+            .await
+            .expect("pending unary not released by fail_all")
+            .expect("unary task panicked")
+            .expect("unary send failed");
+        match resp.payload {
+            Some(pb::response::Payload::Single(single)) => {
+                let st = single.status.expect("status");
+                assert_eq!(st.code, "Error");
+                assert!(
+                    st.message.contains("exited unexpectedly"),
+                    "fail reason lost: {}",
+                    st.message
+                );
+            }
+            other => panic!("expected Single error, got {:?}", other),
+        }
+
+        // The stream route gets a terminal Error frame (not a silent EOF).
+        let frame = tokio::time::timeout(Duration::from_secs(3), chunk_rx.recv())
+            .await
+            .expect("stream route not released by fail_all")
+            .expect("stream closed without a frame");
+        match frame.payload {
+            Some(pb::stream_response::Payload::Error(e)) => {
+                assert!(
+                    e.message.contains("exited unexpectedly"),
+                    "fail reason lost: {}",
+                    e.message
+                );
+            }
+            other => panic!("expected Error frame, got {:?}", other),
+        }
+
+        // The transport stays usable for a respawned peer: a fresh send
+        // reaches the actor and times out normally — it must NOT fail with
+        // "command channel closed".
+        let probe_req = pb::Request {
+            uid: "post-failall-probe".to_string(),
+            meta: None,
+            payload: Some(pb::request::Payload::Single(pb::SingleRequest {
+                data: bytes::Bytes::from_static(b"{}"),
+            })),
+        };
+        let err = client
+            .send_with_timeout(probe_req, Duration::from_millis(300))
+            .await
+            .expect_err("silent peer must time out");
+        assert!(
+            matches!(err, AppError::InferenceTimeout(_)),
+            "actor died after fail_all: {err}"
+        );
+
+        drop(client);
+        let _ = worker.join();
     }
 
     // 回归防护: actor 曾以 try_recv + poll(100ms)/rcvtimeo(100ms) 交替轮询,
