@@ -225,6 +225,15 @@ impl WorkerManager {
         if model_config.continuous_batching && workers_per_device != 1 {
             warn!("continuous_batching enabled; forcing workers_per_device=1");
         }
+        if model_config.continuous_batching && model_config.stream {
+            // B5: CB workers answer stream opens with an explicit terminal
+            // not_implemented error frame — surface the mismatch at load
+            // time instead of letting clients discover it per request.
+            warn!(
+                "continuous_batching + streaming: CB workers do not serve streams; \
+                 streaming endpoints reply with a not_implemented error"
+            );
+        }
 
         let computed = if model_config.continuous_batching {
             devices
@@ -407,8 +416,13 @@ impl WorkerManager {
                 }
             });
 
-            // Create ZMQ client (binds the socket, worker connects)
-            let zmq_client = Arc::new(WorkerZmqClient::new(endpoint.clone()));
+            // Create ZMQ client (binds the socket, worker connects). CB
+            // workers get cb_remove notifications when a reply slot dies
+            // (B2: stops wasted generation on client disconnect/timeout).
+            let zmq_client = Arc::new(WorkerZmqClient::new_with_cb(
+                endpoint.clone(),
+                model_config.continuous_batching,
+            ));
             zmq_clients_for_model.push(zmq_client.clone());
 
             let pid = child.id();

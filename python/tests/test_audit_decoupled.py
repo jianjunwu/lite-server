@@ -229,3 +229,37 @@ class TestAuditDecoupledStreamCloseContract:
             "reason='cancel' for the same session type. Hook calls: "
             + str(calls)
         )
+
+    @pytest.mark.asyncio
+    async def test_audit_decoupled_early_send_emits_two_stream_done_frames(self):
+        """_ResponseSender.send() early path emits TWO StreamDone frames.
+
+        streaming.py:220-226: when postprocess sets ctx.early, send() calls
+        ``_send_stream_early`` (which sends an early chunk + StreamDone) and
+        then ``self.close()`` — close() is not gated on the early branch and
+        sends a SECOND StreamDone. The terminal frame must be emitted exactly
+        once per stream; the duplicate is dropped by the Rust actor with a
+        "Received response for unknown uid" warn per stream.
+        """
+        class EarlyCB(Callback):
+            def after_encode_response(self, ctx):
+                ctx.respond({"early": True})
+
+        class DecoupledAPI(EchoAPI):
+            async def predict_decoupled(self, data, sender):
+                await sender.send({"token": 1})
+
+        api = DecoupledAPI()
+        api._pipeline = Pipeline.build(api, [EarlyCB()])
+        sock = AsyncSocket()
+        active: dict = {}
+        await inference._handle_stream_open_async(
+            api, _decoupled_req("s-dbl-done", b'{"x": 1}'), sock, active, log
+        )
+        responses = sock.stream_responses("s-dbl-done")
+        done_frames = [r for r in responses if r.stream.HasField("done")]
+        assert len(done_frames) == 1, (
+            f"expected exactly one StreamDone, got {len(done_frames)}: "
+            "send()'s early path calls _send_stream_early (sends Done) and "
+            "then close() (sends Done again)"
+        )

@@ -55,7 +55,11 @@ fn now_unix_ns() -> i64 {
 
 /// `now + secs` as an absolute UNIX-ns deadline.
 fn from_relative_secs(secs: f64) -> i64 {
-    now_unix_ns() + ((secs * 1_000_000_000.0) as i64)
+    // B1: a huge-but-finite client timeout (e.g. 1e10 s ≈ 317 years) saturates
+    // the f64→i64 cast to i64::MAX; a plain `+` then overflows (debug panic,
+    // release wrap to a negative deadline = every wait expires instantly).
+    // Saturate instead: an effectively-infinite deadline stays in the future.
+    now_unix_ns().saturating_add((secs * 1_000_000_000.0) as i64)
 }
 
 /// `server.timeout` fallback when the client specified nothing.
@@ -287,5 +291,26 @@ mod tests {
     #[test]
     fn to_instant_none_when_no_deadline() {
         assert_eq!(to_instant(None), None);
+    }
+
+    #[test]
+    fn huge_client_timeout_must_not_overflow_to_instant_expiry() {
+        // `x-lite-timeout` is parsed as f64 with only finite>0 validation;
+        // a huge-but-finite value (e.g. 1e10 s ≈ 317 years) saturates to
+        // i64::MAX in `(secs * 1e9) as i64`, and `now_unix_ns() + i64::MAX`
+        // overflows: debug panics, release wraps to a negative deadline that
+        // makes `remaining()` return Duration::ZERO — every wait for this
+        // client expires immediately (504). The invalid-timeout fallback
+        // semantics ("bad header falls back to server.timeout") require this
+        // to be handled, not overflow.
+        let d = resolve_from_http(&hmap(&[("x-lite-timeout", "10000000000")]), 30.0);
+        assert!(d.client_specified);
+        let rem = remaining(d.unix_ns).expect("deadline present");
+        assert!(!rem.is_zero(), "huge timeout must not resolve to already-expired");
+        // grpc-timeout with a huge hour count hits the same arithmetic.
+        let d = resolve_from_grpc(&grpc(&[("grpc-timeout", "10000000000H")]), 30.0);
+        assert!(d.client_specified);
+        let rem = remaining(d.unix_ns).expect("deadline present");
+        assert!(!rem.is_zero(), "huge grpc-timeout must not resolve to already-expired");
     }
 }

@@ -73,6 +73,12 @@ pub struct WorkerZmqClient {
 
 impl WorkerZmqClient {
     pub fn new(endpoint: String) -> Self {
+        Self::new_with_cb(endpoint, false)
+    }
+
+    /// `is_cb` marks the peer as a continuous-batching worker: the pending
+    /// sweep then notifies it via `CbRemove` when a reply slot dies (B2).
+    pub fn new_with_cb(endpoint: String, is_cb: bool) -> Self {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ZmqCommand>(128);
 
         // inproc wake pair sharing the actor's context: senders poke it
@@ -289,9 +295,9 @@ impl WorkerZmqClient {
                 // tick keeps this running when idle; gating on elapsed time
                 // bounds sweep cost.
                 if last_pending_sweep.elapsed() >= Duration::from_secs(5) {
-                    let removed = sweep_dead_pending(&mut pending);
-                    if removed > 0 {
-                        warn!("Swept {} orphaned pending ZMQ response(s)", removed);
+                    let evicted = sweep_dead_pending(&mut pending, &socket, is_cb);
+                    if !evicted.is_empty() {
+                        warn!("Swept {} orphaned pending ZMQ response(s)", evicted.len());
                     }
                     last_pending_sweep = Instant::now();
                 }
@@ -542,9 +548,15 @@ fn drain_commands(
                             message: reason.clone(),
                         })),
                     };
-                    // A full stream channel means the consumer is already
-                    // behind — it will observe the sender drop as EOF.
-                    let _ = tx.try_send(term);
+                    // S2: a full stream channel must not silently swallow the
+                    // crash frame — a dropped terminal reads as a clean EOF
+                    // and the crash gets counted as a successful stream. Same
+                    // delivery contract as the overflow path above: spawn an
+                    // unbounded send; a live consumer always observes the
+                    // frame, a dead one ends the send with Closed.
+                    tokio::spawn(async move {
+                        let _ = tx.send(term).await;
+                    });
                 }
                 if n_pending > 0 || n_streams > 0 {
                     warn!(
@@ -579,11 +591,42 @@ fn error_response(uid: &str, message: &str) -> pb::Response {
 /// Drop pending-response senders whose receiver has gone away — i.e. the
 /// caller already timed out and dropped `response_rx`. Such entries otherwise
 /// linger in the map until the worker finally replies or the whole client is
-/// dropped (#5). Returns the number evicted.
-fn sweep_dead_pending(pending: &mut HashMap<String, oneshot::Sender<pb::Response>>) -> usize {
-    let before = pending.len();
-    pending.retain(|_, tx| !tx.is_closed());
-    before - pending.len()
+/// dropped (#5). Returns the evicted uids.
+///
+/// B2: when the peer is a continuous-batching worker (`is_cb`), eviction
+/// also sends a fire-and-forget `CbRemove` per uid — a CB sequence keeps
+/// generating after its reply slot dies (client disconnect / timeout), and
+/// the worker-side cb_remove branch stops that wasted compute. Non-CB
+/// workers have no generation to cancel, so eviction stays silent for them.
+fn sweep_dead_pending(
+    pending: &mut HashMap<String, oneshot::Sender<pb::Response>>,
+    socket: &zmq::Socket,
+    is_cb: bool,
+) -> Vec<String> {
+    let mut evicted = Vec::new();
+    pending.retain(|uid, tx| {
+        if tx.is_closed() {
+            evicted.push(uid.clone());
+            false
+        } else {
+            true
+        }
+    });
+    if is_cb {
+        for uid in &evicted {
+            let req = pb::Request {
+                uid: uid.clone(),
+                meta: None,
+                payload: Some(pb::request::Payload::CbRemove(pb::CbRemoveRequest {
+                    uid: uid.clone(),
+                })),
+            };
+            if let Err(e) = socket.send(req.encode_to_vec(), 0) {
+                warn!("cb_remove send failed for {}: {}", uid, e);
+            }
+        }
+    }
+    evicted
 }
 
 #[cfg(test)]
@@ -595,6 +638,8 @@ mod tests {
         // #5: a request whose caller timed out (response_rx dropped) leaves a
         // dead oneshot::Sender in the pending map. Its is_closed() is true, so
         // a periodic sweep must evict it while keeping live senders intact.
+        let ctx = zmq::Context::new();
+        let socket = ctx.socket(zmq::PAIR).unwrap();
         let mut pending: HashMap<String, oneshot::Sender<pb::Response>> = HashMap::new();
         let (live_tx, _live_rx) = oneshot::channel();
         let (dead_tx, dead_rx) = oneshot::channel();
@@ -602,23 +647,132 @@ mod tests {
         pending.insert("live".to_string(), live_tx);
         pending.insert("dead".to_string(), dead_tx);
 
-        let removed = sweep_dead_pending(&mut pending);
-        assert_eq!(removed, 1);
+        let evicted = sweep_dead_pending(&mut pending, &socket, false);
+        assert_eq!(evicted, vec!["dead".to_string()]);
         assert!(pending.contains_key("live"));
         assert!(!pending.contains_key("dead"));
     }
 
     #[test]
     fn sweep_dead_pending_keeps_all_when_all_live() {
+        let ctx = zmq::Context::new();
+        let socket = ctx.socket(zmq::PAIR).unwrap();
         let mut pending: HashMap<String, oneshot::Sender<pb::Response>> = HashMap::new();
         let (tx1, _rx1) = oneshot::channel();
         let (tx2, _rx2) = oneshot::channel();
         pending.insert("a".to_string(), tx1);
         pending.insert("b".to_string(), tx2);
 
-        let removed = sweep_dead_pending(&mut pending);
-        assert_eq!(removed, 0);
+        let evicted = sweep_dead_pending(&mut pending, &socket, false);
+        assert!(evicted.is_empty());
         assert_eq!(pending.len(), 2);
+    }
+
+    #[test]
+    fn sweep_dead_pending_cb_worker_receives_cb_remove_for_evicted() {
+        // B2: evicting a dead pending entry on a continuous-batching worker
+        // must tell the worker to stop generating that uid — the reply slot
+        // is gone (client disconnect / timeout), so the response would be
+        // dropped on arrival while generation keeps burning compute.
+        let ctx = zmq::Context::new();
+        let endpoint = format!("inproc://sweep-cb-{}", std::process::id());
+        let actor = ctx.socket(zmq::PAIR).unwrap();
+        actor.bind(&endpoint).unwrap();
+        let peer = ctx.socket(zmq::PAIR).unwrap();
+        peer.connect(&endpoint).unwrap();
+        peer.set_rcvtimeo(2000).unwrap();
+
+        let mut pending: HashMap<String, oneshot::Sender<pb::Response>> = HashMap::new();
+        let (live_tx, _live_rx) = oneshot::channel();
+        let (dead_tx, dead_rx) = oneshot::channel();
+        drop(dead_rx);
+        pending.insert("live".to_string(), live_tx);
+        pending.insert("cb-dead".to_string(), dead_tx);
+
+        let evicted = sweep_dead_pending(&mut pending, &actor, true);
+        assert_eq!(evicted, vec!["cb-dead".to_string()]);
+
+        let bytes = peer.recv_bytes(0).expect("cb_remove frame for evicted uid");
+        let req = pb::Request::decode(bytes.as_slice()).unwrap();
+        assert_eq!(req.uid, "cb-dead");
+        match req.payload {
+            Some(pb::request::Payload::CbRemove(rm)) => assert_eq!(rm.uid, "cb-dead"),
+            other => panic!("expected CbRemove payload, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sweep_dead_pending_non_cb_worker_receives_nothing() {
+        // Non-CB workers have no generation to cancel: eviction must stay
+        // silent (a spurious cb_remove would be noise on the dispatch loop).
+        let ctx = zmq::Context::new();
+        let endpoint = format!("inproc://sweep-noncb-{}", std::process::id());
+        let actor = ctx.socket(zmq::PAIR).unwrap();
+        actor.bind(&endpoint).unwrap();
+        let peer = ctx.socket(zmq::PAIR).unwrap();
+        peer.connect(&endpoint).unwrap();
+
+        let mut pending: HashMap<String, oneshot::Sender<pb::Response>> = HashMap::new();
+        let (dead_tx, dead_rx) = oneshot::channel();
+        drop(dead_rx);
+        pending.insert("dead".to_string(), dead_tx);
+
+        let evicted = sweep_dead_pending(&mut pending, &actor, false);
+        assert_eq!(evicted, vec!["dead".to_string()]);
+        assert!(
+            peer.recv_bytes(zmq::DONTWAIT).is_err(),
+            "non-CB worker must not receive cb_remove"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_all_full_stream_channel_still_delivers_terminal_error() {
+        // S2: worker crash while a stream's channel is FULL must not silently
+        // drop the terminal error frame (try_send fails → client sees a clean
+        // EOF → the crash is recorded as a successful stream). Delivery must
+        // follow the overflow path's contract (0dd5fde): pend until the
+        // consumer drains, so the truncation/crash is always visible.
+        let ctx = zmq::Context::new();
+        let socket = ctx.socket(zmq::PAIR).unwrap(); // FailAll never sends
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<ZmqCommand>(8);
+        let mut pending: HashMap<String, oneshot::Sender<pb::Response>> = HashMap::new();
+        let mut stream_routes: HashMap<String, mpsc::Sender<pb::StreamResponse>> = HashMap::new();
+
+        let (chunk_tx, mut chunk_rx) = mpsc::channel::<pb::StreamResponse>(STREAM_CHANNEL_SIZE);
+        for _ in 0..STREAM_CHANNEL_SIZE {
+            chunk_tx
+                .try_send(pb::StreamResponse {
+                    stream_id: "s-full".to_string(),
+                    payload: Some(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
+                        data: bytes::Bytes::from_static(b"x"),
+                        is_final: false,
+                    })),
+                })
+                .unwrap();
+        }
+        stream_routes.insert("s-full".to_string(), chunk_tx);
+
+        cmd_tx
+            .send(ZmqCommand::FailAll { reason: "worker exited unexpectedly".to_string() })
+            .await
+            .unwrap();
+        drain_commands(&mut cmd_rx, &socket, &mut pending, &mut stream_routes);
+
+        // Drain the buffered chunks; the terminal Error must follow — a
+        // silent EOF (dropped frame) is the bug.
+        for _ in 0..STREAM_CHANNEL_SIZE {
+            chunk_rx.recv().await.expect("buffered chunk");
+        }
+        let term = tokio::time::timeout(Duration::from_secs(2), chunk_rx.recv())
+            .await
+            .expect("terminal error frame never arrived: crash looks like clean EOF")
+            .expect("channel closed without terminal frame");
+        match term.payload {
+            Some(pb::stream_response::Payload::Error(e)) => {
+                assert!(e.message.contains("worker exited unexpectedly"), "reason lost: {}", e.message);
+            }
+            other => panic!("expected terminal Error frame, got {:?}", other),
+        }
     }
 
     #[tokio::test]

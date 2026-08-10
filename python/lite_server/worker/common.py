@@ -48,6 +48,18 @@ def _make_status(ok: bool, message: str = "") -> Status:
     return Status(code="Ok" if ok else "Error", message=message)
 
 
+# N5: health probes are identified by this explicit meta marker (set by the
+# Rust health checker), NOT inferred from an empty body — an empty-body real
+# request (e.g. gRPC Infer with no data) runs the pipeline like any other.
+PROBE_HEADER = "x-lite-probe"
+PROBE_VALUE = "health-check"
+
+
+def _is_health_probe(meta: RequestMeta) -> bool:
+    """True iff the request is a server health probe (explicit marker)."""
+    return meta.headers.get(PROBE_HEADER) == PROBE_VALUE
+
+
 def _make_error_response(uid: str, message: str,
                          status_code: int | None = None,
                          error_type: str | None = None,

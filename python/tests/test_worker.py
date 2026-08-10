@@ -647,6 +647,325 @@ class TestOuterHandlerErrorTraceback:
         assert resp.single.status.code == "Error"
 
 
+class TestCBLoopRemove:
+    """Client-disconnect cancellation for continuous-batching sequences."""
+
+    def test_deadline_cb_sequence_expiring_mid_generation_stops_stepping(self):
+        """A CB sequence whose deadline passes mid-generation must stop.
+
+        The add-entry check only covers already-expired requests; the step
+        loop must re-check per round (mirroring streaming's cooperative
+        ``_deadline_passed`` between chunks) so a sequence that outlives its
+        deadline is dropped instead of generating until ``has_finished``.
+        """
+        steps = []
+
+        class GenModel(LitAPI):
+            def decode_request(self, req):
+                return req
+
+            def prefill(self, uid, decoded_input):
+                pass
+
+            def step(self, active_sequences):
+                steps.append(len(active_sequences))
+                return [1 for _ in active_sequences]
+
+            def has_finished(self, uid, token, generated_sequence):
+                return False  # never finishes
+
+            def encode_response(self, output):
+                return output
+
+        socket = SyncMockSocket()
+        add = Request()
+        add.uid = "cb-mid-dead-1"
+        add.single.data = json.dumps({"input": 1}).encode()
+        add.meta.deadline_unix_ns = time.time_ns() + 200_000_000  # +200ms
+        socket.inject(add.SerializeToString())
+
+        start_cb_loop(GenModel(), socket)
+        deadline = time.time() + 5
+        while time.time() < deadline and not steps:
+            time.sleep(0.01)
+        assert steps, "generation never started"
+
+        time.sleep(0.5)  # well past the +200ms deadline
+        steps_at_deadline = len(steps)
+        time.sleep(0.3)
+        assert len(steps) == steps_at_deadline, (
+            "CB sequence kept stepping past its deadline: "
+            f"{steps_at_deadline} -> {len(steps)} steps"
+        )
+
+    def test_controlflow_cb_remove_ignored_keeps_stepping(self):
+        """A cb_remove control message must stop the sequence's generation.
+
+        The proto contract (CBRemoveRequest) exists and the stream paths
+        cancel the worker on client disconnect — but the CB recv loop only
+        matches ``stop`` and ``single``, so a ``cb_remove`` is silently
+        dropped and the sequence keeps stepping to completion, burning
+        compute on a response nobody will read.
+        """
+        steps = []
+
+        class GenModel(LitAPI):
+            def decode_request(self, req):
+                return req
+
+            def prefill(self, uid, decoded_input):
+                pass
+
+            def step(self, active_sequences):
+                steps.append(len(active_sequences))
+                return [1 for _ in active_sequences]
+
+            def has_finished(self, uid, token, generated_sequence):
+                return False  # never finishes: generation runs until removed
+
+            def encode_response(self, output):
+                return output
+
+        socket = SyncMockSocket()
+        add = Request()
+        add.uid = "cb-rm-1"
+        add.single.data = json.dumps({"input": 1}).encode()
+        socket.inject(add.SerializeToString())
+
+        start_cb_loop(GenModel(), socket)
+        deadline = time.time() + 5
+        while time.time() < deadline and not steps:
+            time.sleep(0.01)
+        assert steps, "generation never started"
+
+        steps_at_remove = len(steps)
+
+        rm = Request()
+        rm.uid = "cb-rm-1"
+        rm.cb_remove.uid = "cb-rm-1"
+        socket.inject(rm.SerializeToString())
+
+        time.sleep(0.3)  # let any in-flight step drain after the removal
+        settled = len(steps)
+        time.sleep(0.3)  # plenty of step-loop cycles to observe continued stepping
+        assert len(steps) == settled, (
+            "cb_remove did not stop generation: steps kept increasing after "
+            f"removal settled ({steps_at_remove} -> {settled} -> {len(steps)}). "
+            "At most the one step already in flight may complete after "
+            "removal; the sequence must then never step again."
+        )
+
+    def test_controlflow_stream_open_to_cb_worker_swallowed_no_response(self):
+        """A stream-open routed to a CB worker must not be silently dropped.
+
+        ``continuous_batching`` is a per-model config the server never
+        checks, and the CB recv loop ignores ``stream`` payloads entirely —
+        the client hangs until its deadline instead of receiving an error
+        (the docs pair ``stream: true`` with ``continuous_batching: true``).
+        """
+        class CBStreamModel(LitAPI):
+            def decode_request(self, req):
+                return req
+
+            def prefill(self, uid, decoded_input):
+                pass
+
+            def step(self, active_sequences):
+                return [1 for _ in active_sequences]
+
+            def has_finished(self, uid, token, generated_sequence):
+                return True
+
+            def encode_response(self, output):
+                return output
+
+        socket = SyncMockSocket()
+        open_req = Request()
+        open_req.uid = "cb-stream-1"
+        open_req.stream.stream_id = "cb-stream-1"
+        open_req.stream.open.data = json.dumps({"input": 1}).encode()
+        socket.inject(open_req.SerializeToString())
+
+        start_cb_loop(CBStreamModel(), socket)
+        time.sleep(0.5)
+        assert socket._msgs, (
+            "stream-open to a CB worker was swallowed: no error frame, no start "
+            "frame — the client hangs until its own deadline"
+        )
+
+    def test_controlflow_file_changed_to_cb_worker_swallowed_forces_restart(self):
+        """FILE_CHANGED to a CB worker must get a reply (handled=true/false).
+
+        The server waits ``file_changed_timeout`` (default 60s) for each
+        worker's reply and restarts the whole version when any worker fails
+        to answer — the CB recv loop ignores ``file_changed``, so a CB
+        model's hot reload always stalls 60s and then force-restarts,
+        killing in-flight requests.
+        """
+        class CBModel(LitAPI):
+            def decode_request(self, req):
+                return req
+
+            def prefill(self, uid, decoded_input):
+                pass
+
+            def step(self, active_sequences):
+                return [1 for _ in active_sequences]
+
+            def has_finished(self, uid, token, generated_sequence):
+                return True
+
+            def encode_response(self, output):
+                return output
+
+        socket = SyncMockSocket()
+        fc = Request()
+        fc.uid = "cb-fc-1"
+        fc.file_changed.paths.append("config.yaml")
+        socket.inject(fc.SerializeToString())
+
+        start_cb_loop(CBModel(), socket)
+        time.sleep(0.5)
+        assert socket._msgs, (
+            "FILE_CHANGED to a CB worker was swallowed: the server times out "
+            "after file_changed_timeout and force-restarts the version"
+        )
+
+    def test_deadline_cb_sequence_expired_deadline_still_prefills(self):
+        """A CB sequence whose deadline already passed must not start work.
+
+        ``deadline_unix_ns`` flows in request meta (x-lite-timeout) and the
+        streaming path stops via ``_deadline_passed`` — the CB loop never
+        checks it, so a request that already exceeded its deadline still
+        runs a full prefill + generation, wasting compute the server-side
+        timeout has already given up on.
+        """
+        steps = []
+
+        class GenModel(LitAPI):
+            def decode_request(self, req):
+                return req
+
+            def prefill(self, uid, decoded_input):
+                pass
+
+            def step(self, active_sequences):
+                steps.append(len(active_sequences))
+                return [1 for _ in active_sequences]
+
+            def has_finished(self, uid, token, generated_sequence):
+                return False
+
+            def encode_response(self, output):
+                return output
+
+        socket = SyncMockSocket()
+        add = Request()
+        add.uid = "cb-dead-1"
+        add.single.data = json.dumps({"input": 1}).encode()
+        add.meta.deadline_unix_ns = time.time_ns() - 10_000_000_000  # already expired
+        socket.inject(add.SerializeToString())
+
+        start_cb_loop(GenModel(), socket)
+        time.sleep(0.5)
+        assert not steps, (
+            "expired-deadline CB sequence still ran: "
+            f"{len(steps)} steps of wasted generation"
+        )
+
+
+class TestHealthProbeMarker:
+    """N5: health probes are identified by an explicit ``x-lite-probe``
+    marker, not inferred from an empty body — an empty-body real request
+    (e.g. gRPC Infer with no data) must run the pipeline instead of being
+    short-circuited into a fabricated 200."""
+
+    def test_probe_marker_short_circuits_predict(self):
+        calls = []
+
+        class RecModel(LitAPI):
+            def decode_request(self, req):
+                return req
+
+            def predict(self, x):
+                calls.append(x)
+                return {"ok": True}
+
+        socket = AsyncMockSocket()
+        req = Request(uid="health-m-1-0")
+        req.meta.headers["x-lite-probe"] = "health-check"
+        req.single.data = b""  # empty body — same shape the Rust checker sends
+        socket.inject(req.SerializeToString())
+        drive_loop(RecModel(), socket)
+
+        assert calls == [], f"probe must not run the model, predict calls: {calls}"
+        assert len(socket._msgs) == 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.single.status.code == "Ok"
+        assert resp.single.data == b"{}"
+
+    def test_empty_body_without_marker_runs_pipeline(self):
+        calls = []
+
+        class RecModel(LitAPI):
+            def decode_request(self, req):
+                return req
+
+            def predict(self, x):
+                calls.append(x)
+                return {"ok": True}
+
+        socket = AsyncMockSocket()
+        req = Request(uid="real-empty-1")  # empty data, NO marker
+        req.single.data = b""
+        socket.inject(req.SerializeToString())
+        drive_loop(RecModel(), socket)
+
+        assert calls == [{}], (
+            "empty-body real request must run the pipeline (empty JSON {}), "
+            f"not be mistaken for a health probe; predict calls: {calls}"
+        )
+
+    def test_cb_worker_probe_replies_without_prefill(self):
+        prefills = []
+
+        class CBProbeModel(LitAPI):
+            def decode_request(self, req):
+                return req
+
+            def prefill(self, uid, decoded_input):
+                prefills.append(uid)
+
+            def step(self, active_sequences):
+                return [1 for _ in active_sequences]
+
+            def has_finished(self, uid, token, generated_sequence):
+                return True
+
+            def encode_response(self, output):
+                return output
+
+        socket = SyncMockSocket()
+        req = Request(uid="health-m-1-0")
+        req.meta.headers["x-lite-probe"] = "health-check"
+        req.single.data = b""
+        socket.inject(req.SerializeToString())
+        start_cb_loop(CBProbeModel(), socket)
+
+        deadline = time.time() + 5
+        while time.time() < deadline and not socket._msgs:
+            time.sleep(0.01)
+        assert socket._msgs, "probe to a CB worker got no reply"
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        assert resp.single.status.code == "Ok"
+        assert not prefills, (
+            "probe must not prefill a fake CB sequence (today every health "
+            f"probe burns a full generation); prefills: {prefills}"
+        )
+
+
 class TestMakeErrorResponse:
     def test_error_response_structure(self):
         resp = inference._make_error_response("uid-1", "something broke")
@@ -836,6 +1155,8 @@ class TestAsyncLoop:
 
         socket = AsyncMockSocket()
         req = Request(uid="health-1", single=SingleRequest(data=b""))
+        # N5: probes are identified by the explicit marker, not the empty body.
+        req.meta.headers["x-lite-probe"] = "health-check"
         socket.inject(req.SerializeToString())
         drive_loop(AsyncModel(), socket)
 
@@ -869,6 +1190,47 @@ class TestAsyncLoop:
         assert len(resp.batch.items) == 2
         assert json.loads(resp.batch.items[0].data) == {"result": 2}
         assert json.loads(resp.batch.items[1].data) == {"result": 3}
+
+    def test_async_batch_item_error_loses_http_status_code(self):
+        """A failed batch item must carry the numeric HTTP status code.
+
+        The unary error path encodes the status code into
+        ``Status.message`` (common._make_error_response) and the Rust side
+        restores it via ``msg.parse::<u16>()`` — the batch failure path
+        (dispatch.py) sets ``Status.message`` to the exception text instead,
+        so the Rust side falls into the sanitized-500 branch and the
+        client's structured 4xx error becomes a generic 500.
+        """
+        from lite_server.exceptions import HTTPException
+
+        class BatchRejectModel(LitAPI):
+            async def predict(self, x):
+                raise HTTPException(400, "bad parameter")
+
+        socket = AsyncMockSocket()
+        req = Request(
+            uid="batch-err",
+            batch=BatchRequest(items=[
+                BatchItem(uid="ok", data=json.dumps({"input": 1}).encode()),
+                BatchItem(uid="bad", data=json.dumps({"input": 2}).encode()),
+            ]),
+        )
+        socket.inject(req.SerializeToString())
+        drive_loop(BatchRejectModel(), socket)
+
+        assert len(socket._msgs) == 1
+        resp = Response()
+        resp.ParseFromString(socket._msgs[0])
+        failed = next(i for i in resp.batch.items if i.uid == "bad")
+        assert failed.status_code == 400, (
+            f"failed batch item lost its HTTP status code (got "
+            f"status_code={failed.status_code}); Rust side then maps the "
+            "non-numeric Status.message to a sanitized 500"
+        )
+        assert failed.status.message == "400", (
+            "failed batch item Status.message must carry the numeric status "
+            "code (unary parity); got " + repr(failed.status.message)
+        )
 
     def test_async_error_in_predict(self):
         class BrokenModel(LitAPI):
@@ -1321,7 +1683,13 @@ class TestAsyncLoop:
         assert json.loads(resp.batch.items[0].data) == {"result": 2}
         assert resp.batch.items[0].status.code == "Ok"
         assert resp.batch.items[1].status.code == "Error"
-        assert "item 2 fails" in resp.batch.items[1].status.message
+        # B3: failed items carry the numeric status code in Status.message
+        # (unary parity); the exception text lives in the structured body.
+        assert resp.batch.items[1].status.message == "500"
+        assert resp.batch.items[1].status_code == 500
+        err_body = json.loads(resp.batch.items[1].data)
+        assert "item 2 fails" in err_body["error"]["message"]
+        assert err_body["error"]["type"] == "server_error"
         assert json.loads(resp.batch.items[2].data) == {"result": 6}
         assert resp.batch.items[2].status.code == "Ok"
 
@@ -1603,7 +1971,9 @@ class TestBatchPredict:
         assert len(resp.batch.items) == 2
         for item in resp.batch.items:
             assert item.status.code == "Error"
-            assert "batch predict boom" in item.status.message
+            # B3: numeric code in Status.message; exception text in the body.
+            assert item.status.message == "500"
+            assert "batch predict boom" in json.loads(item.data)["error"]["message"]
 
     def test_whole_batch_predict_failure_drives_on_error_per_item(self):
         """A5: when batched predict fails, every item's on_error must fire."""
@@ -3273,10 +3643,10 @@ class TestAsyncLoopNonStreaming:
                 return {"output": x["required_field"]}
 
         socket = AsyncMockSocket()
-        socket.inject(Request(
-            uid="ahc1",
-            single=SingleRequest(data=b""),
-        ).SerializeToString())
+        # N5: probes are identified by the explicit marker, not the empty body.
+        probe = Request(uid="ahc1", single=SingleRequest(data=b""))
+        probe.meta.headers["x-lite-probe"] = "health-check"
+        socket.inject(probe.SerializeToString())
         drive_loop(StrictAPI(), socket)
 
         assert len(socket._msgs) >= 1

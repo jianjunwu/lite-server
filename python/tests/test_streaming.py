@@ -655,6 +655,48 @@ class TestBidiStreaming:
         assert dones[0].stream.done.metrics.tokens_generated == 1
 
     @pytest.mark.asyncio
+    async def test_audit_bidi_preprocess_early_missing_on_stream_close(self):
+        """bidi preprocess early-return terminates the stream without firing
+        on_stream_close.
+
+        streaming.py:502-504 sends the early chunk + StreamDone and returns
+        without run_on_stream_close — the only early path with that gap: the
+        decoupled preprocess early (streaming.py:453-459) and the bidi
+        on_open-early (streaming.py:556-560) paths both fire reason="done".
+        """
+        calls: list[str] = []
+
+        class CacheCB(Callback):
+            def before_decode_request(self, ctx):
+                ctx.respond({"cached": True})
+
+        class CloseHook(Callback):
+            def on_stream_close(self, ctx, reason):
+                calls.append(reason)
+
+        class BidiEarlyAPI(EchoAPI):
+            def bidi_stream(self):
+                return _UpperHandler()
+
+        api = BidiEarlyAPI()
+        api._pipeline = Pipeline.build(api, [CacheCB(), CloseHook()])
+        sock = AsyncSocket()
+        await inference._handle_stream_open_async(
+            api, _stream_req("s-bidi-early", b'{"x": 1}'), sock, {}, log
+        )
+
+        responses = sock.stream_responses("s-bidi-early")
+        # The stream DID terminate: early chunk + StreamDone on the wire.
+        assert len(responses) == 2
+        assert json.loads(responses[0].stream.chunk.data) == {"cached": True}
+        assert responses[1].stream.HasField("done")
+        assert calls == ["done"], (
+            "bidi preprocess early-return terminated the stream without "
+            "firing on_stream_close; decoupled/bidi-on_open early paths fire "
+            "reason='done'. Hook calls: " + str(calls)
+        )
+
+    @pytest.mark.asyncio
     async def test_chunk_for_unknown_stream_sends_error(self):
         from lite_server.proto import StreamChunk
 

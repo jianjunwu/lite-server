@@ -17,16 +17,20 @@ from lite_server.api import LitAPI
 from lite_server.context import CBSequence, Headers, RequestContext, RequestMeta
 from lite_server.exceptions import HTTPException
 from lite_server.pipeline import _adapt, _wrap_ctx_method
-from lite_server.proto import CBAddRequest, Request
+from lite_server.proto import CBAddRequest, Request, Response, SingleResponse
 from lite_server.worker.common import (
     _build_single_response,
     _format_exc_brief,
     _get_pipeline,
+    _is_health_probe,
     _make_error_response,
+    _make_status,
+    _make_stream_error,
     _merge_err_headers,
     _meta_from_proto,
     _parse_json_payload,
 )
+from lite_server.worker.dispatch import _handle_file_changed
 
 
 class CBLoop:
@@ -64,6 +68,13 @@ class CBLoop:
             route="", headers=Headers(), client_ip="", request_id="", timestamp_ns=0,
         )
         ctx = RequestContext(meta=meta, request={}, mode="cb")
+        # B8: deadline already passed → skip the add entirely. Cooperative
+        # stop (no synthetic frame): the server's own deadline wait produces
+        # the client-facing 504 — mirrors streaming's _deadline_passed.
+        remaining_ms = ctx.deadline_remaining_ms()
+        if remaining_ms is not None and remaining_ms <= 0:
+            self.log.info("cb add %s skipped: deadline already passed", cb_add.uid)
+            return
         try:
             ctx.request = _parse_json_payload(cb_add.data)
             self._drive(self.pipe.preprocess(ctx))
@@ -105,15 +116,32 @@ class CBLoop:
         while True:
             with self.lock:
                 # Snapshot under the lock; the idle sleep stays OUTSIDE it.
-                # A prefilled sequence cannot vanish before the work block
-                # re-acquires: prefill-failure deletes only un-prefilled uids,
-                # and cb_remove has no server-side producer.
+                # Sequences CAN vanish before the work block re-acquires
+                # (cb_remove / deadline expiry / prefill failure) — the work
+                # block therefore re-filters `ready` against live membership
+                # and the completion path pops with a default.
+                # B8: drop sequences whose deadline passed mid-generation —
+                # cooperative stop, mirrors streaming's per-chunk check.
+                expired = []
+                for uid, s in self.active.items():
+                    rem = s.ctx.deadline_remaining_ms()
+                    if rem is not None and rem <= 0:
+                        expired.append(uid)
+                for uid in expired:
+                    self.active.pop(uid, None)
+                    self.log.info("cb sequence %s dropped: deadline reached", uid)
                 ready = [s for s in self.active.values() if s.prefilled]
             if not ready:
                 time.sleep(0.001)
                 continue
 
             with self.lock:
+                # Re-filter against live membership: a cb_remove/expiry that
+                # landed between the snapshot and this re-acquire must not
+                # burn one more step of compute on a removed sequence.
+                ready = [s for s in ready if s.uid in self.active]
+                if not ready:
+                    continue
                 try:
                     outputs = self._drive(self.step_fn(ready))
                 except HTTPException as e:
@@ -154,7 +182,13 @@ class CBLoop:
                         completed.append(state.uid)
 
                 for uid in completed:
-                    state = self.active.pop(uid)
+                    # cb_remove / deadline expiry may have popped the sequence
+                    # between the ready snapshot and now — skip instead of
+                    # KeyError (an uncaught exception would kill this daemon
+                    # step thread and hang every subsequent CB request).
+                    state = self.active.pop(uid, None)
+                    if state is None:
+                        continue
                     state.ctx.output = state.output
                     state.ctx.early = None
                     try:
@@ -201,6 +235,20 @@ class CBLoop:
 
                 with self.lock:
                     if request.HasField("single"):
+                        # N5: health probe — reply Ok directly; a probe must
+                        # not prefill a fake CB sequence (each one otherwise
+                        # burns a full prefill + generation).
+                        if request.HasField("meta") and _is_health_probe(
+                            _meta_from_proto(request.meta)
+                        ):
+                            probe_resp = Response(
+                                uid=request.uid,
+                                single=SingleResponse(
+                                    data=b"{}", status=_make_status(True),
+                                ),
+                            )
+                            self.socket.send(probe_resp.SerializeToString())
+                            continue
                         # Route standard SingleRequest through CB pipeline
                         cb_add = CBAddRequest()
                         cb_add.uid = request.uid
@@ -208,6 +256,36 @@ class CBLoop:
                         if request.HasField("meta"):
                             cb_add.meta.CopyFrom(request.meta)
                         self._handle_add(cb_add)
+                    elif request.HasField("cb_remove"):
+                        # B2: client disconnect / server-side timeout evicted
+                        # the pending reply — stop generating for this uid.
+                        # Idempotent: an unknown uid (already completed /
+                        # never added) is a no-op.
+                        rm_uid = request.cb_remove.uid
+                        if self.active.pop(rm_uid, None) is not None:
+                            self.log.info("cb sequence %s removed by server", rm_uid)
+                    elif request.HasField("stream"):
+                        # B5: CB workers do not serve streams — answer stream
+                        # opens with an explicit terminal error instead of
+                        # swallowing (the client otherwise hangs until its
+                        # own deadline). Late chunk/close/cancel frames for a
+                        # stream that never opened are ignored: the server
+                        # drops the route on the terminal error.
+                        if request.stream.HasField("open"):
+                            self.socket.send(_make_stream_error(
+                                request.stream.stream_id,
+                                "continuous_batching model does not support streaming",
+                                error_type="not_implemented",
+                            ).SerializeToString())
+                    elif request.HasField("file_changed"):
+                        # B6: same hot-reload contract as dispatch workers —
+                        # run on_file_changed and reply handled=true/false so
+                        # the server does not stall for file_changed_timeout
+                        # (default 60s) and then force-restart the version.
+                        resp = _handle_file_changed(
+                            self.lit_api, request.uid, request.file_changed, self.log,
+                        )
+                        self.socket.send(resp.SerializeToString())
         finally:
             self.loop.close()
 

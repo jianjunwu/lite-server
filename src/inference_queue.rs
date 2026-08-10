@@ -1757,6 +1757,25 @@ async fn batch_collector(
 /// count: reaching the ejection threshold stops routing to the worker
 /// ([`OutlierState`]); reaching `kill_threshold` (0 = never) kills + respawns
 /// the process via `respawn_tx`.
+/// Health-check probe: a Single with empty data (pre-marker workers
+/// short-circuit on empty data) AND an explicit `x-lite-probe` meta header
+/// (N5) so post-marker workers identify probes by marker — an empty-body
+/// real request then runs the pipeline instead of getting a fake 200.
+fn health_probe_request(uid: String) -> pb::Request {
+    let mut headers = std::collections::HashMap::new();
+    headers.insert("x-lite-probe".to_string(), "health-check".to_string());
+    pb::Request {
+        uid,
+        meta: Some(pb::RequestMeta {
+            headers,
+            ..Default::default()
+        }),
+        payload: Some(pb::request::Payload::Single(pb::SingleRequest {
+            data: Default::default(),
+        })),
+    }
+}
+
 // allow: register_model 单点 spawn 的健康探针管道,参数为探针间隔/超时/
 // 阈值等异构部件,无共享上下文可收。
 #[allow(clippy::too_many_arguments)]
@@ -1783,13 +1802,7 @@ async fn health_checker(
             let uid = format!("{}-{}", uid_prefix, idx);
             async move {
                 let was_ejected = outlier.is_ejected(idx);
-                let request = pb::Request {
-                    uid,
-                    meta: None,
-                    payload: Some(pb::request::Payload::Single(pb::SingleRequest {
-                        data: Default::default(),
-                    })),
-                };
+                let request = health_probe_request(uid);
                 let result = tokio::time::timeout(probe_timeout, client.send(request)).await;
                 match result {
                     Ok(Ok(resp)) => {
@@ -2073,6 +2086,25 @@ mod tests {
             hint_item("b", meta_with_headers(&[])),
         ];
         assert_eq!(batch_direct_pin(&mixed), Some(1), "部分携带 pin → 按携带项");
+    }
+
+    #[test]
+    fn health_probe_carries_explicit_marker() {
+        // N5: the health probe must be identifiable by an explicit marker,
+        // not by its empty body — an empty-body real request (e.g. gRPC Infer
+        // with no data) must run the model instead of being short-circuited
+        // into a fake 200.
+        let req = health_probe_request("health-m-1-0".to_string());
+        let meta = req.meta.as_ref().expect("probe must carry meta");
+        assert_eq!(
+            meta.headers.get("x-lite-probe").map(|s| s.as_str()),
+            Some("health-check"),
+        );
+        // Empty data retained: pre-marker workers still short-circuit on it.
+        match req.payload {
+            Some(pb::request::Payload::Single(s)) => assert!(s.data.is_empty()),
+            other => panic!("probe must be a Single request, got {:?}", other),
+        }
     }
 
     /// 注册一个 2-worker 版本（echo worker 以各自 tag 回应，可分辨落点）。

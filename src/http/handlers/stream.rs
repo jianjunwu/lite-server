@@ -850,15 +850,18 @@ async fn handle_ws_stream(
         }
     }
 
-    // Wait for first message from client (the request payload). Bound the wait
-    // by server.timeout when one is configured; with server.timeout <= 0 the
-    // wait is unbounded (a client that upgrades but never sends keeps the
-    // handler open indefinitely).
+    // Wait for first message from client (the request payload). Bound:
+    // server.timeout when configured; otherwise the decoupled idle budget
+    // (S5, h2 bidi FD-5 parity) — a client that upgrades but never sends is
+    // reclaimed instead of pinning the handler indefinitely. Only with BOTH
+    // disabled does the wait stay unbounded (explicit operator choice).
     //
     // B2 (E3): Text → JSON (RawValue validation, legacy path); Binary →
     // opaque bytes (skip validation). See FirstFrame / E4 normalization.
     let first_frame = {
-        let recv = match crate::deadline::idle_budget(state.config.server.timeout) {
+        let first_frame_budget = crate::deadline::idle_budget(state.config.server.timeout)
+            .or_else(|| crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs));
+        let recv = match first_frame_budget {
             Some(budget) => match tokio::time::timeout(budget, socket.recv()).await {
                 Ok(r) => r,
                 Err(_) => {
@@ -1892,8 +1895,13 @@ mod tests {
     /// client deadline is reclaimed by the always-on chunk-idle (方案 C), not
     /// left unbounded. The forwarder breaks on idle-elapsed without emitting
     /// `[DONE]`, so draining the body completes within ~idle (not 300s).
-    fn make_state_with_idle(cb: Arc<CallbackRunner>, idle_secs: f32) -> Arc<AppState> {
+    fn make_state_with_idle_and_server_timeout(
+        cb: Arc<CallbackRunner>,
+        idle_secs: f32,
+        server_timeout: f32,
+    ) -> Arc<AppState> {
         let mut config = crate::config::Config::default();
+        config.server.timeout = server_timeout;
         config.server.decoupled_idle_timeout_secs = idle_secs;
         let registry = Arc::new(ModelRegistry::new());
         let queue = Arc::new(InferenceQueue::new());
@@ -1922,7 +1930,24 @@ mod tests {
         cb: Arc<CallbackRunner>,
         idle_secs: f32,
     ) -> Arc<AppState> {
-        let state = make_state_with_idle(cb, idle_secs);
+        ready_state_with_idle_and_server_timeout(
+            model,
+            endpoint,
+            cb,
+            idle_secs,
+            crate::config::Config::default().server.timeout,
+        )
+        .await
+    }
+
+    async fn ready_state_with_idle_and_server_timeout(
+        model: &str,
+        endpoint: String,
+        cb: Arc<CallbackRunner>,
+        idle_secs: f32,
+        server_timeout: f32,
+    ) -> Arc<AppState> {
+        let state = make_state_with_idle_and_server_timeout(cb, idle_secs, server_timeout);
         state
             .registry
             .register(model, "1", ModelConfig::default(), ModelType::LitAPI, std::path::PathBuf::new())
@@ -3612,6 +3637,47 @@ mod tests {
         let _ = ws.send(tokio_tungstenite::tungstenite::Message::Text(r#"{"input": 1}"#.to_string())).await;
         wait_for(|| counter.get() >= before + 1.0, "ws early 5xx").await;
         let _ = ws.close(None).await;
+    }
+
+    /// S5: server.timeout<=0 must not leave the WS first-frame wait unbounded
+    /// (h2 bidi FD-5 parity): fall back to decoupled_idle_timeout_secs — a
+    /// client that upgrades but never sends a first frame is reclaimed within
+    /// ~idle instead of pinning the handler forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ws_first_frame_wait_bounded_when_server_timeout_disabled() {
+        use futures::StreamExt;
+        let model = "ws_first_frame_idle";
+        let endpoint = ipc_endpoint(model);
+        let (_w, _actions) = spawn_recording_worker(endpoint.clone());
+        let state = ready_state_with_idle_and_server_timeout(
+            model,
+            endpoint,
+            Arc::new(CallbackRunner::new()),
+            0.3,
+            0.0,
+        )
+        .await;
+        state.registry.activate_version(model, "1").unwrap();
+        let base = spawn_ws_server(state).await;
+
+        let counter = prometheus::REQUESTS_TOTAL.with_label_values(&[model, "1", "4xx"]);
+        let before = counter.get();
+        let (ws, _) = tokio_tungstenite::connect_async(format!("{}/{}/stream", base, model))
+            .await
+            .expect("WS connect failed");
+        // Never send a first frame: the server must close within ~idle (0.3s),
+        // not hold the upgrade open indefinitely.
+        let (_write, mut read) = ws.split();
+        let terminated = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(_msg) = read.next().await {}
+        })
+        .await;
+        assert!(
+            terminated.is_ok(),
+            "WS first-frame wait unbounded with server.timeout=0 — must fall \
+             back to decoupled_idle_timeout_secs (FD-5 parity)"
+        );
+        wait_for(|| counter.get() >= before + 1.0, "ws first-frame idle 4xx").await;
     }
 }
 

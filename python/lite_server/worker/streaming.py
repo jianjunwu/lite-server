@@ -221,8 +221,14 @@ class _ResponseSender:
             # S3:early 帧也是 1 个 chunk——已发计数 +1 一并上报。
             await _send_stream_early(self._socket, self._stream_id, self._ctx.early,
                                      self._lit_api, tokens_generated=self._chunk_count + 1)
-            # An early return ends the stream.
-            await self.close()
+            # An early return ends the stream. B7(审计): _send_stream_early
+            # already emitted the terminal Done — close() would send a SECOND
+            # one (dropped by the Rust actor with an "unknown uid" warn and
+            # inconsistent metrics). Reclaim the session + fire the close
+            # hook only, keeping close()'s terminal-first order.
+            self.closed = True
+            self._active_streams.pop(self._stream_id, None)
+            await self._pipe.run_on_stream_close(self._ctx, "done")
             return
         body, _ = unwrap_response(self._ctx.response)
         await self._socket.send(_make_stream_chunk(self._stream_id, serialize_body(body), is_final=False).SerializeToString())
@@ -501,6 +507,10 @@ async def _handle_stream_open_async(
             return
         if ctx.early is not None:
             await _send_stream_early(socket, stream_id, ctx.early, lit_api)
+            # B4(审计): preprocess early 终止同样 fire on_stream_close——
+            # decoupled preprocess early 与 bidi on_open-early 均 fire "done",
+            # 唯独此分支曾漏发(清理/计费钩子静默丢失)。
+            await pipe.run_on_stream_close(ctx, "done")
             return
 
         try:

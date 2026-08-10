@@ -35,6 +35,7 @@ from lite_server.worker.common import (
     _build_single_response,
     _format_exc_brief,
     _get_pipeline,
+    _is_health_probe,
     _make_error_response,
     _make_status,
     _merge_err_headers,
@@ -139,8 +140,11 @@ async def _handle_request_async(lit_api: LitAPI, request: Request, socket, log: 
                 return  # streaming route already replied inline over socket
 
         elif request.HasField("single"):
-            # Health check: empty data → skip predict pipeline
-            if not request.single.data:
+            # Health check: explicit probe marker (N5) → skip predict
+            # pipeline. An empty body alone is NOT a probe signal — real
+            # empty-body requests (e.g. gRPC Infer with no data) run the
+            # pipeline and get the model's actual answer/error.
+            if _is_health_probe(meta):
                 response = Response(
                     uid=uid,
                     single=SingleResponse(data=b"{}", status=_make_status(True)),
@@ -208,6 +212,41 @@ def _handle_file_changed(lit_api: LitAPI, uid: str, fc, log: logging.Logger) -> 
             status=_make_status(True),
         ),
     )
+
+
+def _make_batch_item_error(item_uid: str, err: Exception,
+                           headers: dict[str, str] | None) -> BatchItemResponse:
+    """Failed batch item, unary parity (B3): carry the numeric HTTP status
+    code in BOTH the ``status_code`` field and ``Status.message`` — the Rust
+    side restores it via ``msg.parse::<u16>()``, and a non-numeric message
+    (the raw exception text) falls into the sanitized-500 branch. Body shape
+    matches ``_make_error_response`` (code/param always present, null when
+    unset)."""
+    if isinstance(err, HTTPException):
+        status_code = err.status_code
+        error_type = err.error_type
+        message = err.detail
+        code, param = err.code, err.param
+    else:
+        status_code = 500
+        error_type = "server_error"
+        message = str(err)
+        code = param = None
+    error_dict = {
+        "type": error_type or "model_error",
+        "message": message,
+        "code": code,
+        "param": param,
+    }
+    bir = BatchItemResponse(
+        uid=item_uid,
+        data=_json.dumps({"error": error_dict}),
+        status=_make_status(False, str(status_code)),
+        status_code=status_code,
+    )
+    if headers:
+        bir.headers.update(headers)
+    return bir
 
 
 async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
@@ -318,16 +357,7 @@ async def _handle_batch(pipe: Pipeline, uid: str, batch: BatchRequest,
             items.append(bir)
         else:
             err = error_map.get(item_uid, Exception("unknown error"))
-            err_bytes = _json.dumps({"error": str(err)})
-            bir = BatchItemResponse(
-                uid=item_uid,
-                data=err_bytes,
-                status=_make_status(False, str(err)),
-            )
-            hdrs = err_headers_map.get(item_uid)
-            if hdrs:
-                bir.headers.update(hdrs)
-            items.append(bir)
+            items.append(_make_batch_item_error(item_uid, err, err_headers_map.get(item_uid)))
 
     metrics = collect_metrics(lit_api)
     # BatchResponse.headers is retained for wire compatibility but no
