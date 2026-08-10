@@ -1,6 +1,6 @@
 [package]
 name = "lite-server"
-version = "0.8.4-rc2"
+version = "0.8.4-rc3"
 edition = "2021"
 
 [[bin]]
