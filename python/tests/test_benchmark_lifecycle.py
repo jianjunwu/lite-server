@@ -55,6 +55,29 @@ def _drain_stream(stream, collector: list):
         collector.append(line.decode(errors="replace"))
 
 
+def _spawn_tree(cmd: list[str], **kwargs) -> subprocess.Popen:
+    """Popen in its own process group so teardown can kill the whole tree
+    (run_liteserver + serve + workers), not just the direct child."""
+    return subprocess.Popen(cmd, start_new_session=True, **kwargs)
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Hard-kill proc's entire process group; safe on every exit path.
+
+    A process group outlives its leader, so this also reaps grandchildren
+    that survived a leader exit — the failure mode that used to leak orphan
+    serve/worker processes whose workers steal sockets and poison every
+    later run."""
+    if hasattr(os, "killpg"):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    if proc.poll() is None:
+        proc.kill()  # Windows fallback + group-less stragglers
+    proc.wait()
+
+
 class TestBenchmarkLifecycle:
     def test_sigterm_cleans_up_child_process(self, tmp_path):
         """SIGTERM to run_liteserver.py should also terminate lite-server serve."""
@@ -66,7 +89,7 @@ class TestBenchmarkLifecycle:
         tmp_repo = tmp_path / "models"
         shutil.copytree(MODEL_REPO, tmp_repo, ignore=shutil.ignore_patterns("__pycache__"))
 
-        proc = subprocess.Popen(
+        proc = _spawn_tree(
             [
                 sys.executable,
                 str(RUN_SCRIPT),
@@ -123,10 +146,9 @@ class TestBenchmarkLifecycle:
                 f"lite-server still responding on port {port} after SIGTERM"
             )
         finally:
-            # Hard kill any remaining processes from this test
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
+            # Kill the whole tree: a startup hang or failed assert must not
+            # leak orphan servers into later runs.
+            _kill_tree(proc)
 
 
 class TestPortConflictStartup:
@@ -173,37 +195,40 @@ class TestPortConflictStartup:
             f"model_repository:\n  path: {tmp_repo}\n"
         )
 
-        proc = subprocess.Popen(
+        proc = _spawn_tree(
             [sys.executable, "-m", "lite_server.cli", "serve", "--config", str(cfg)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             env=_clean_env(),
         )
         try:
-            proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-            # The wedged server leaves its python worker orphaned (no parent
-            # to watch it); reap processes of THIS test's repo only, so
-            # parallel tests' workers are never touched.
-            import psutil
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                # The wedged server leaves its python worker orphaned (no parent
+                # to watch it); reap processes of THIS test's repo only, so
+                # parallel tests' workers are never touched.
+                import psutil
 
-            for p in psutil.process_iter(["cmdline"]):
-                try:
-                    cmd = " ".join(p.info["cmdline"] or [])
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-                if str(tmp_repo) in cmd:
-                    p.kill()
+                for p in psutil.process_iter(["cmdline"]):
+                    try:
+                        cmd = " ".join(p.info["cmdline"] or [])
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+                    if str(tmp_repo) in cmd:
+                        p.kill()
+                hog.close()
+                pytest.fail(
+                    "server wedged on a gRPC port conflict (Python CLI): the tokio "
+                    "Runtime drop deadlocks on the in-flight ZMQ worker actor; it "
+                    "must fail fast with a startup error"
+                )
+
             hog.close()
-            pytest.fail(
-                "server wedged on a gRPC port conflict (Python CLI): the tokio "
-                "Runtime drop deadlocks on the in-flight ZMQ worker actor; it "
-                "must fail fast with a startup error"
-            )
-
-        hog.close()
-        assert proc.returncode != 0, "server must exit non-zero on a port conflict"
-        stderr = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
-        assert "Server error" in stderr, f"expected a startup error; got: {stderr[-500:]}"
+            assert proc.returncode != 0, "server must exit non-zero on a port conflict"
+            stderr = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+            assert "Server error" in stderr, f"expected a startup error; got: {stderr[-500:]}"
+        finally:
+            _kill_tree(proc)
