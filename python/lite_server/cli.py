@@ -1378,6 +1378,7 @@ async def _run_benchmark_level_multiproc(args, concurrency, *, url, payloads, pa
     requests_splits = (
         split_work(args.requests, processes) if args.requests is not None else None
     )
+    warmup_splits = split_work(args.warmup_requests, processes)
     specs = []
     for i, ci in enumerate(concurrency_splits):
         if ci < 1:
@@ -1385,6 +1386,7 @@ async def _run_benchmark_level_multiproc(args, concurrency, *, url, payloads, pa
         kwargs = dict(
             concurrency=ci, url=url, payloads=payloads, pacing=pacing,
             duration=duration, goodput_slo=goodput_slo, trust_env=trust_env,
+            child_warmup=warmup_splits[i],
         )
         if requests_splits is not None:
             if requests_splits[i] < 1:
@@ -1399,7 +1401,19 @@ async def _run_benchmark_level_multiproc(args, concurrency, *, url, payloads, pa
 
         return BenchmarkResult()
 
-    timeout = (duration or 0.0) + args.grace_period + 360.0
+    # The batch deadline must cover the workload: duration mode is bounded
+    # by the clock; rate mode by the dispatch schedule (requests / rate);
+    # closed-loop requests mode is unbounded — no deadline (a hung child is
+    # still surfaced by run_benchmark_children's dead-child reap).
+    if duration is not None:
+        budget_secs = duration
+    elif args.requests is not None and args.rate:
+        budget_secs = args.requests / args.rate
+    else:
+        budget_secs = None
+    timeout = (
+        None if budget_secs is None else budget_secs + args.grace_period + 360.0
+    )
     if pool is not None:
         outcomes = pool.run(specs, timeout)
     else:
@@ -1413,12 +1427,13 @@ async def _run_benchmark_level_multiproc(args, concurrency, *, url, payloads, pa
 
 
 def _benchmark_child_process(args, *, concurrency, url, payloads, pacing, duration,
-                             goodput_slo, trust_env, child_requests=None, child_rate=None):
+                             goodput_slo, trust_env, child_requests=None,
+                             child_rate=None, child_warmup=None):
     """Multiprocessing-spawn entry for one benchmark level (方案 A).
 
     Module-level (spawn pickles by reference).  Rebuilds the non-picklable
     closures (payload_factory, token_counter) from ``args``, applies the
-    per-child overrides (requests/rate split), and runs the same
+    per-child overrides (requests/rate/warmup split), and runs the same
     ``_run_benchmark_level`` the parent would.  Returns a picklable
     BenchmarkResult; exceptions surface as a crash outcome via the wrapper.
     """
@@ -1431,6 +1446,8 @@ def _benchmark_child_process(args, *, concurrency, url, payloads, pacing, durati
         args.requests = child_requests
     if child_rate is not None:
         args.rate = child_rate
+    if child_warmup is not None:
+        args.warmup_requests = child_warmup
 
     payload_factory = None
     if args.payload_random is not None:

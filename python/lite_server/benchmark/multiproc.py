@@ -18,10 +18,15 @@ from __future__ import annotations
 import atexit
 import multiprocessing
 import queue
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from lite_server.benchmark.benchmark import MIN_SAMPLES_BASE, BenchmarkResult
+
+# Collection poll tick for run_benchmark_children: bounds both the
+# hard-crash detection latency and the deadline overshoot.
+_POLL_SECS = 0.2
 
 
 @dataclass
@@ -49,17 +54,19 @@ def split_work(total: int, processes: int) -> list[int]:
     return [base + (1 if i < extra else 0) for i in range(processes)]
 
 
-def _child_wrapper(entry: Callable, result_q: Any, arg: Any, kwargs: dict) -> None:
+def _child_wrapper(
+    entry: Callable, result_q: Any, task_id: int, arg: Any, kwargs: dict
+) -> None:
     """Spawn target: run ``entry(arg, **kwargs)`` and always put exactly one
-    ChildOutcome.
+    ``(task_id, ChildOutcome)`` — the same wire protocol as ``_pool_worker``.
 
     ``entry`` is pickled by reference (must be a module-level function), so
     closures stay in the parent and children rebuild them from args.
     """
     try:
-        result_q.put(ChildOutcome(entry(arg, **kwargs), None))
+        result_q.put((task_id, ChildOutcome(entry(arg, **kwargs), None)))
     except BaseException as e:  # noqa: BLE001 — child must not die silently
-        result_q.put(ChildOutcome(None, f"{type(e).__name__}: {e}"))
+        result_q.put((task_id, ChildOutcome(None, f"{type(e).__name__}: {e}")))
 
 
 def _pool_worker(entry: Callable, task_q: Any, result_q: Any) -> None:
@@ -108,8 +115,10 @@ class ChildPool:
         self._closed = False
         atexit.register(self.close)
 
-    def run(self, specs: list[tuple[Any, dict]], timeout_secs: float) -> list[ChildOutcome]:
-        """Dispatch one batch of tasks and collect results in spec order."""
+    def run(self, specs: list[tuple[Any, dict]], timeout_secs: float | None) -> list[ChildOutcome]:
+        """Dispatch one batch of tasks and collect results in spec order.
+
+        ``timeout_secs=None`` waits indefinitely (unbounded workloads)."""
         if self._closed:
             raise RuntimeError("ChildPool is closed")
         ids = []
@@ -169,38 +178,73 @@ class ChildPool:
 def run_benchmark_children(
     entry: Callable,
     specs: list[tuple[Any, dict]],
-    timeout_secs: float,
+    timeout_secs: float | None,
 ) -> list[ChildOutcome]:
     """Spawn ``entry`` once per spec (unified spawn context), collect results.
 
     ``specs`` is a list of ``(arg, kwargs)`` tuples, each invoking
-    ``entry(arg, **kwargs)``.  A child that does not finish within
-    ``timeout_secs`` is terminated and reported as a crash.  Returns one
-    ChildOutcome per spec, in spec order.
+    ``entry(arg, **kwargs)``.  Outcomes carry their spec index (same wire
+    protocol as :class:`ChildPool`), so the batch is returned in spec order
+    regardless of completion order.
+
+    Outcomes are collected *while* children run: a child cannot exit until
+    its queue buffer flushes, and the buffer only drains when the parent
+    reads — joining before reading deadlocks once an outcome exceeds the
+    OS pipe buffer.  ``timeout_secs`` is one deadline for the whole batch
+    (children run concurrently); ``None`` waits indefinitely for unbounded
+    workloads (closed-loop requests mode).  A child that dies without
+    queueing (hard crash — the wrapper queues on every catchable path) is
+    reaped on the next poll tick; children still alive at the deadline are
+    terminated and reported as crashes.
     """
     ctx = multiprocessing.get_context("spawn")
     result_q = ctx.Queue()
     procs = []
-    for arg, kwargs in specs:
-        p = ctx.Process(target=_child_wrapper, args=(entry, result_q, arg, kwargs))
+    for task_id, (arg, kwargs) in enumerate(specs):
+        p = ctx.Process(
+            target=_child_wrapper, args=(entry, result_q, task_id, arg, kwargs)
+        )
         p.start()
         procs.append(p)
 
-    for p in procs:
-        p.join(timeout_secs)
+    outcomes: dict[int, ChildOutcome] = {}
+    deadline = None if timeout_secs is None else time.monotonic() + timeout_secs
+    while len(outcomes) < len(procs):
+        timeout = _POLL_SECS
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            timeout = min(timeout, remaining)
+        try:
+            got_id, outcome = result_q.get(timeout=timeout)
+            outcomes[got_id] = outcome
+            continue
+        except queue.Empty:
+            pass
+        # Poll tick: reap children that died without queueing an outcome.
+        # A just-exited child's outcome may still be in the pipe, so drain
+        # once before declaring a crash.
+        for task_id, p in enumerate(procs):
+            if task_id in outcomes or p.is_alive():
+                continue
+            try:
+                got_id, outcome = result_q.get(timeout=_POLL_SECS)
+                outcomes[got_id] = outcome
+            except queue.Empty:
+                outcomes[task_id] = ChildOutcome(
+                    None, f"child {task_id} produced no result")
 
-    outcomes: list[ChildOutcome] = []
-    for i, p in enumerate(procs):
+    for task_id, p in enumerate(procs):
+        if task_id not in outcomes:
+            p.terminate()
+            outcomes[task_id] = ChildOutcome(
+                None, f"child {task_id} timed out after {timeout_secs}s")
+        p.join(5)
         if p.is_alive():
             p.terminate()
-            p.join(5)
-            outcomes.append(ChildOutcome(None, f"child {i} timed out after {timeout_secs}s"))
-            continue
-        try:
-            outcomes.append(result_q.get(timeout=5))
-        except Exception:  # noqa: BLE001 — hard crash before the wrapper queued
-            outcomes.append(ChildOutcome(None, f"child {i} produced no result"))
-    return outcomes
+            p.join(1)
+    return [outcomes[i] for i in range(len(procs))]
 
 
 def merge_child_results(
@@ -239,9 +283,12 @@ def merge_child_results(
         for kind, count in r.error_kinds.items():
             merged.error_kinds[kind] = merged.error_kinds.get(kind, 0) + count
     merged.duration = max(r.duration for r in results)
-    merged.warmup_requests = results[0].warmup_requests
+    # Scalar fields are per-child *shares* of the user's request (each child
+    # ran rate/processes and its warmup slice) — sum them back to the whole.
+    merged.warmup_requests = sum(r.warmup_requests for r in results)
     merged.load_mode = results[0].load_mode
-    merged.target_rate = results[0].target_rate
+    rates = [r.target_rate for r in results if r.target_rate is not None]
+    merged.target_rate = sum(rates) if rates else None
 
     first_t0s = [r.first_t0_ns for r in results if r.first_t0_ns is not None]
     last_t1s = [r.last_t1_ns for r in results if r.last_t1_ns is not None]
