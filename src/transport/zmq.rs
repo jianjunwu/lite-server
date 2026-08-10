@@ -61,6 +61,14 @@ pub struct WorkerZmqClient {
     /// only if inproc pair creation failed — the actor then relies on the
     /// backstop tick (correct, just slower).
     wake_tx: Option<std::sync::Arc<std::sync::Mutex<zmq::Socket>>>,
+    /// True while the actor is parked in its blocking poll. Senders read it
+    /// to skip the wake lock+syscall when the actor is busy draining (the
+    /// command is seen on the current pass); the actor re-checks the command
+    /// channel right after setting it, closing the lost-wakeup window.
+    actor_asleep: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Test instrumentation: how many wake bytes were actually sent (the
+    /// gating regression test asserts this stays near zero under load).
+    wake_send_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl WorkerZmqClient {
@@ -95,6 +103,9 @@ impl WorkerZmqClient {
                 (None, None)
             }
         };
+        let actor_asleep = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let actor_asleep_in_loop = actor_asleep.clone();
+        let wake_send_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         tokio::task::spawn_blocking(move || {
             let socket = match ctx.socket(zmq::PAIR) {
@@ -140,6 +151,17 @@ impl WorkerZmqClient {
                     return;
                 }
 
+                // Advertise "going to sleep", then re-check the command
+                // channel: a producer that queued between the drain above and
+                // this store sees asleep==false and skips its wake — this
+                // second drain keeps its command from waiting out the
+                // backstop tick (lost wakeup).
+                actor_asleep_in_loop.store(true, std::sync::atomic::Ordering::SeqCst);
+                if !cmd_rx.is_empty() {
+                    actor_asleep_in_loop.store(false, std::sync::atomic::Ordering::SeqCst);
+                    continue;
+                }
+
                 // Block until the worker has data or a sender wakes us for
                 // newly queued commands. The timeout is only a backstop for
                 // a lost wake byte and for shutdown detection — the wake
@@ -164,6 +186,7 @@ impl WorkerZmqClient {
                         (r, items[0].get_revents().contains(zmq::POLLIN))
                     }
                 };
+                actor_asleep_in_loop.store(false, std::sync::atomic::Ordering::SeqCst);
 
                 match poll_result {
                     Ok(_) => {
@@ -274,7 +297,7 @@ impl WorkerZmqClient {
             }
         });
 
-        Self { cmd_tx, wake_tx }
+        Self { cmd_tx, wake_tx, actor_asleep, wake_send_count }
     }
 
     pub async fn send(&self, request: pb::Request) -> Result<pb::Response, AppError> {
@@ -382,13 +405,20 @@ impl WorkerZmqClient {
 
     /// Interrupt the actor's blocking poll so it drains the command channel
     /// now instead of at the next backstop tick. Best-effort: a full wake
-    /// pipe means the actor is already awake.
+    /// pipe means the actor is already awake. Skipped entirely when the
+    /// actor is busy draining (its current pass sees the command) — that
+    /// saves a mutex acquisition + syscall per command under load.
     fn wake_actor(&self) {
+        if !self.actor_asleep.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         if let Some(wake) = &self.wake_tx {
             // Poison recovery: a panic while holding the lock must not
             // disable waking — matches ShutdownState's precedent.
             let guard = wake.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = guard.send(b"\0".as_ref(), zmq::DONTWAIT);
+            if guard.send(b"\0".as_ref(), zmq::DONTWAIT).is_ok() {
+                self.wake_send_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 }
@@ -934,6 +964,140 @@ mod tests {
             worst < Duration::from_millis(150),
             "idle round trip took {worst:?} — actor poll tick is gating requests"
         );
+    }
+
+    // The wake socket must fire ONLY when the actor is actually parked in its
+    // poll (audit 2026-08-10 #7): under a command flood the actor is draining
+    // continuously, so per-command wakes are pure overhead (a mutex + a
+    // syscall each). A non-reading peer backpressures the actor's sends, so
+    // it never reaches the poll — and wake_send_count must stay near zero
+    // instead of equalling the command count.
+    #[tokio::test]
+    async fn wake_is_skipped_while_actor_is_busy() {
+        #[cfg(unix)]
+        let endpoint = {
+            let sock = std::env::temp_dir().join(format!(
+                "lite-server-zmq-wakegate-{}.sock",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&sock);
+            format!("ipc://{}", sock.display())
+        };
+        #[cfg(windows)]
+        let endpoint = format!("tcp://127.0.0.1:{}", 38000 + std::process::id() % 1000);
+
+        // Peer that connects but never reads: the outbound pipe fills, the
+        // actor's send blocks (sndtimeo), it never parks in the poll.
+        let ep_for_worker = endpoint.clone();
+        let worker = std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&ep_for_worker).expect("worker connect");
+            std::thread::sleep(Duration::from_secs(3));
+        });
+
+        let client = WorkerZmqClient::new(endpoint);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        const N: usize = 1200;
+        let req = pb::Request {
+            uid: "flood".to_string(),
+            meta: None,
+            payload: Some(pb::request::Payload::Single(pb::SingleRequest {
+                data: bytes::Bytes::from_static(b"{}"),
+            })),
+        };
+        for _ in 0..N {
+            client.send_raw(req.clone()).await.expect("send_raw");
+        }
+
+        let wakes = client.wake_send_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            wakes < N / 10,
+            "actor never idled under the flood, yet {wakes}/{N} commands paid a wake"
+        );
+
+        drop(client);
+        let _ = worker.join();
+    }
+
+    // The gate must never lose a wakeup: with the actor idling between
+    // bursts, concurrent round trips must all complete promptly (a lost wake
+    // would strand a command until the 200ms backstop tick).
+    #[tokio::test]
+    async fn wake_gate_loses_no_wakeup_under_concurrency() {
+        #[cfg(unix)]
+        let endpoint = {
+            let sock = std::env::temp_dir().join(format!(
+                "lite-server-zmq-wakeconc-{}.sock",
+                std::process::id()
+            ));
+            format!("ipc://{}", sock.display())
+        };
+        #[cfg(windows)]
+        let endpoint = format!("tcp://127.0.0.1:{}", 39000 + std::process::id() % 1000);
+
+        let ep_for_worker = endpoint.clone();
+        let worker = std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&ep_for_worker).expect("worker connect");
+            let _ = s.set_rcvtimeo(3000);
+            loop {
+                let bytes = match s.recv_bytes(0) {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let resp = pb::Response {
+                    uid: req.uid.clone(),
+                    payload: Some(pb::response::Payload::Single(pb::SingleResponse {
+                        data: bytes::Bytes::from_static(b"{}"),
+                        headers: HashMap::new(),
+                        status: Some(pb::Status {
+                            code: "Ok".to_string(),
+                            message: "".to_string(),
+                        }),
+                        ..Default::default()
+                    })),
+                    metrics: None,
+                };
+                let _ = s.send(resp.encode_to_vec(), 0);
+            }
+        });
+
+        let client = std::sync::Arc::new(WorkerZmqClient::new(endpoint));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let start = Instant::now();
+        let mut handles = Vec::new();
+        for i in 0..32 {
+            let c = client.clone();
+            handles.push(tokio::spawn(async move {
+                let req = pb::Request {
+                    uid: format!("conc-{i}"),
+                    meta: None,
+                    payload: Some(pb::request::Payload::Single(pb::SingleRequest {
+                        data: bytes::Bytes::from_static(b"{}"),
+                    })),
+                };
+                c.send(req).await.expect("send")
+            }));
+        }
+        for h in handles {
+            h.await.expect("task panicked");
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "32 concurrent round trips took {:?} — wakeups are being lost",
+            start.elapsed()
+        );
+
+        drop(client);
+        let _ = worker.join();
     }
 
     // Bidirectional stream chunks must be sent fire-and-forget: the worker's
