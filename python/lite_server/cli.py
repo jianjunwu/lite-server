@@ -83,6 +83,11 @@ def main(argv=None):
                               help="Constant arrival rate in req/s (open-loop); "
                                    "dispatch requests on a fixed-interval schedule "
                                    "independent of response times")
+    bench_parser.add_argument("--processes", type=int, default=1,
+                              help="Split the client across N OS processes (each its "
+                                   "own event loop + connection pool, one core per "
+                                   "process); raw samples are merged exactly in the "
+                                   "parent")
     bench_parser.add_argument("--latency-threshold", type=float, default=None,
                               help="During concurrency sweep, stop early when p99 "
                                    "exceeds MS milliseconds (perf_analyzer convention)")
@@ -288,6 +293,9 @@ def main(argv=None):
     profile_parser.add_argument("--rate", type=float, default=None,
                                 help="Constant arrival rate in req/s (open-loop)")
     profile_parser.add_argument("--warmup-requests", type=int, default=0)
+    profile_parser.add_argument("--processes", type=int, default=1,
+                                help="Split each trial's client across N OS processes "
+                                     "(benchmark passthrough)")
     profile_parser.add_argument("--grace-period", type=float, default=30.0)
     profile_parser.add_argument("--goodput", default=None, metavar="EXPR",
                                 help="SLO expression, e.g. 'ttft:500 tpot:50 e2el:2000'")
@@ -832,8 +840,14 @@ def _cmd_benchmark(args):
         args.tokenizer = None
     if not hasattr(args, "text_field"):
         args.text_field = None
+    if not hasattr(args, "processes"):
+        args.processes = 1
     if args.transport is None:
         args.transport = "ws" if args.bidi else "sse"
+
+    if args.processes < 1:
+        _logger.error("--processes must be >= 1")
+        return 2
 
     if args.bidi:
         if args.stream:
@@ -1006,6 +1020,7 @@ def _cmd_benchmark(args):
             duration=duration,
             goodput_slo=goodput_slo,
             token_counter=token_counter,
+            processes=args.processes,
         )
 
     # Windows: use SelectorEventLoop for subprocess compat
@@ -1041,6 +1056,8 @@ def _cmd_benchmark(args):
     mode_label = "open-loop" if args.rate else "closed-loop"
     latency_label = "open-loop (realistic)" if args.rate else "closed-loop (service-time latencies)"
     print(f"  Mode:            {mode_label} ({latency_label})")
+    if args.processes > 1:
+        print(f"  Processes:       {args.processes}")
     if args.rate:
         print(f"  Target rate:     {args.rate} req/s")
     if duration is not None:
@@ -1100,6 +1117,7 @@ def _cmd_benchmark(args):
                 "requests": args.requests,
                 "warmup_requests": args.warmup_requests,
                 "grace_period": args.grace_period,
+                "processes": args.processes,
                 "payload": _payload_source(args),
                 "stream": args.stream,
                 "model_type": args.model_type,
@@ -1125,12 +1143,20 @@ def _cmd_benchmark(args):
 
 async def _run_benchmark_level(args, concurrency, *, url, payload_factory, payloads,
                              pacing, duration, goodput_slo, token_counter,
-                             trust_env: bool = True):
+                             trust_env: bool = True, processes: int = 1,
+                             min_samples: int | None = None, pool=None):
     """Run one benchmark level (concurrency) — extracted from _cmd_benchmark
     so profile can drive the exact same measurement machinery. All
     preprocessing (payloads, pacing, URL, SLO, tokenizer) is done by the
     caller; this function owns the httpx client + target construction and the
-    engine invocation for unary / stream / bidi."""
+    engine invocation for unary / stream / bidi.
+
+    With ``processes > 1`` the level runs across that many OS processes
+    (each with its own event loop + client); raw samples are merged exactly
+    in the parent (方案 A). ``pool`` reuses a ChildPool across levels (profile
+    trials); None spawns fresh children per level. ``min_samples`` overrides
+    the engine's sample-size warning threshold (children pass 1 so only the
+    merged check fires)."""
     import itertools
 
     import httpx
@@ -1142,6 +1168,13 @@ async def _run_benchmark_level(args, concurrency, *, url, payload_factory, paylo
         RequestTimeoutError,
         RequestTransportError,
     )
+
+    if processes > 1:
+        return await _run_benchmark_level_multiproc(
+            args, concurrency, url=url, payloads=payloads, pacing=pacing,
+            duration=duration, goodput_slo=goodput_slo, trust_env=trust_env,
+            processes=processes, pool=pool,
+        )
 
     mode = f"duration={duration}s" if duration is not None else f"requests={args.requests}"
     if args.bidi:
@@ -1214,6 +1247,7 @@ async def _run_benchmark_level(args, concurrency, *, url, payload_factory, paylo
                     transport=args.transport,
                     pacing_mode=pacing.mode,
                     min_sessions=args.min_sessions,
+                    min_samples=min_samples,
                 )
             finally:
                 if grpc_channel is not None:
@@ -1289,6 +1323,7 @@ async def _run_benchmark_level(args, concurrency, *, url, payload_factory, paylo
                         if args.slo_attainment is not None else 0.95
                     ),
                     token_counter=token_counter,
+                    min_samples=min_samples,
                 )
             finally:
                 if grpc_channel is not None:
@@ -1317,7 +1352,112 @@ async def _run_benchmark_level(args, concurrency, *, url, payload_factory, paylo
                 warmup_requests=args.warmup_requests,
                 grace_period=args.grace_period,
                 rate=args.rate,
+                min_samples=min_samples,
             )
+
+
+async def _run_benchmark_level_multiproc(args, concurrency, *, url, payloads, pacing,
+                                         duration, goodput_slo, trust_env, processes,
+                                         pool=None):
+    """Run one level across ``processes`` OS processes (unified spawn).
+
+    Each child gets a slice of the concurrency (and, in requests mode, of
+    ``--requests``; in rate mode, ``rate / processes``) and runs the full
+    transport stack in its own process + event loop.  Children return raw
+    samples; ``merge_child_results`` recomputes every aggregate on the
+    union (方案 A).  ``pool`` (a ChildPool) reuses worker processes across
+    levels — profile pays the spawn cost once for all trials.
+    """
+    from lite_server.benchmark.multiproc import (
+        merge_child_results,
+        run_benchmark_children,
+        split_work,
+    )
+
+    concurrency_splits = split_work(concurrency, processes)
+    requests_splits = (
+        split_work(args.requests, processes) if args.requests is not None else None
+    )
+    specs = []
+    for i, ci in enumerate(concurrency_splits):
+        if ci < 1:
+            continue  # tail child with no work (processes > work)
+        kwargs = dict(
+            concurrency=ci, url=url, payloads=payloads, pacing=pacing,
+            duration=duration, goodput_slo=goodput_slo, trust_env=trust_env,
+        )
+        if requests_splits is not None:
+            if requests_splits[i] < 1:
+                continue
+            kwargs["child_requests"] = requests_splits[i]
+        if args.rate is not None:
+            kwargs["child_rate"] = args.rate / processes
+        specs.append((args, kwargs))
+
+    if not specs:
+        from lite_server.benchmark.benchmark import BenchmarkResult
+
+        return BenchmarkResult()
+
+    timeout = (duration or 0.0) + args.grace_period + 360.0
+    if pool is not None:
+        outcomes = pool.run(specs, timeout)
+    else:
+        outcomes = run_benchmark_children(_benchmark_child_process, specs, timeout)
+    return merge_child_results(
+        outcomes, concurrency=concurrency, model_type=args.model_type,
+        goodput_slo=goodput_slo,
+        slo_attainment=args.slo_attainment if args.slo_attainment is not None else 0.95,
+        bidi=args.bidi, min_sessions=args.min_sessions,
+    )
+
+
+def _benchmark_child_process(args, *, concurrency, url, payloads, pacing, duration,
+                             goodput_slo, trust_env, child_requests=None, child_rate=None):
+    """Multiprocessing-spawn entry for one benchmark level (方案 A).
+
+    Module-level (spawn pickles by reference).  Rebuilds the non-picklable
+    closures (payload_factory, token_counter) from ``args``, applies the
+    per-child overrides (requests/rate split), and runs the same
+    ``_run_benchmark_level`` the parent would.  Returns a picklable
+    BenchmarkResult; exceptions surface as a crash outcome via the wrapper.
+    """
+    import asyncio
+    import copy
+    import sys
+
+    args = copy.copy(args)
+    if child_requests is not None:
+        args.requests = child_requests
+    if child_rate is not None:
+        args.rate = child_rate
+
+    payload_factory = None
+    if args.payload_random is not None:
+        payload_factory = _random_payload_factory(json.loads(args.payload_random))
+    token_counter = None
+    if args.tokenizer is not None:
+        from lite_server.benchmark.token_counter import (
+            TokenizerCounter,
+            load_tokenizer,
+        )
+
+        token_counter = TokenizerCounter(
+            load_tokenizer(args.tokenizer), text_field=args.text_field
+        )
+
+    # Mirrors _cmd_benchmark: Windows needs the Selector event loop for
+    # subprocess/pipe compatibility.
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    return asyncio.run(_run_benchmark_level(
+        args, concurrency,
+        url=url, payload_factory=payload_factory, payloads=payloads,
+        pacing=pacing, duration=duration,
+        goodput_slo=goodput_slo, token_counter=token_counter,
+        trust_env=trust_env, min_samples=1,
+    ))
 
 
 def _cmd_analyze(args):
@@ -1853,9 +1993,15 @@ async def _finish_profile(args, trials, grid, campaign, scenario, constraints,
 
     return 0 if ranking.recommendations() else 1
 
-def _profile_measure_fn(args, client, server_pid=None, trust_env=True):
+def _profile_measure_fn(args, client, server_pid=None, trust_env=True, pool=None):
     """Build the per-trial measure runner: benchmark preprocessing reused from
-    the benchmark CLI, then one _run_benchmark_level per concurrency level."""
+    the benchmark CLI, then one _run_benchmark_level per concurrency level.
+
+    With ``--processes > 1`` a ChildPool is created here (unless one is
+    passed in) and reused across every trial of the campaign — coordinate
+    descent runs dozens of trials, so the ~0.5s/process spawn cost is paid
+    once.  The pool closes via atexit (idempotent), so no profile exit path
+    (early returns, interruptions) can leave orphan workers."""
     import itertools
 
     from lite_server.benchmark.benchmark import BenchmarkResult
@@ -1889,6 +2035,7 @@ def _profile_measure_fn(args, client, server_pid=None, trust_env=True):
         slo_attainment=args.slo_attainment,
         tokenizer=args.tokenizer,
         text_field=args.text_field,
+        processes=args.processes,
     )
 
     try:
@@ -1933,6 +2080,11 @@ def _profile_measure_fn(args, client, server_pid=None, trust_env=True):
     duration = args.duration if args.requests is None else None
     url = _benchmark_request_url(ns)
 
+    if pool is None and args.processes > 1:
+        from lite_server.benchmark.multiproc import ChildPool
+
+        pool = ChildPool(_benchmark_child_process, args.processes)
+
     async def measure(concurrency: int) -> dict:
         # Local server: sample the process tree (RSS/CPU) concurrently — the
         # sampling window equals the measurement window (plan §2.7).
@@ -1953,6 +2105,8 @@ def _profile_measure_fn(args, client, server_pid=None, trust_env=True):
                 goodput_slo=goodput_slo,
                 token_counter=token_counter,
                 trust_env=trust_env,
+                processes=args.processes,
+                pool=pool,
             )
         finally:
             if sampler is not None:

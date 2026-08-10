@@ -141,6 +141,7 @@ lite-server benchmark --model <MODEL> [OPTIONS]
 | `--warmup-requests` | int | 0 | Warmup requests before measurement; samples discarded (recommended: ~= concurrency) |
 | `--grace-period` | float | 30.0 | After the deadline, wait at most N seconds for in-flight requests to drain |
 | `--rate` | float | — | Constant arrival rate in req/s (open-loop); eliminates coordinated omission at the load generator |
+| `--processes` | int | 1 | Split the client across N OS processes (each its own event loop + connection pool, one core per process). Concurrency/requests are split evenly; `--rate` is divided by N. Raw samples are merged exactly in the parent |
 | `--latency-threshold` | float | — | During concurrency sweep, stop early when p99 exceeds MS |
 | `--payload` | string | `{"input": 1.0}` | Inline JSON request body |
 | `--payload-file` | path | — | JSON file with request body; repeatable, round-robin |
@@ -173,6 +174,7 @@ lite-server benchmark --model <MODEL> [OPTIONS]
 - Warmup samples are discarded; in-flight requests at the deadline are drained up to `--grace-period` (completions kept, the rest reported as `dropped_inflight`).
 - Throughput = `successful / (last response − first request)` (measured window), percentiles use numpy `linear` interpolation (p50/p90/p95/p99/max reported).
 - Insufficient samples (`< max(300, 10 × concurrency)`) and client CPU saturation (>70% of one core) produce explicit warnings in stdout and JSON.
+- **Multi-process client** (`--processes N`, default 1): the Python (httpx) client holds the GIL, so a single event loop is limited to one core — beyond its capacity, client CPU saturation inflates recorded latency (the `>70%` warning fires) and caps achieved throughput. `--processes N` splits concurrency (and `--requests`/`--rate`) across N OS processes via unified `spawn`, scaling client capacity by N cores. Raw samples are merged exactly in the parent: percentiles and stream/bidi metrics are recomputed on the union of samples, the window is the union of first/last timestamps, and the sample-size warning is re-checked on the merged count (children suppress their own). The CPU-saturation warning stays per process. Export JSON records `config.processes`.
 
 **Streaming measurement contract** (`--stream`):
 
@@ -373,6 +375,7 @@ Resource metrics are generic (CPU/RAM, non-GPU) via the Prometheus
 | `--max-trials` | int | 64 | Cross-product cap (grid) / point-measurement cap (quick) |
 | `--duration` | float | 30.0 | Trial duration in seconds |
 | `--requests` | int | — | Run exactly N requests per trial (mutually exclusive with `--duration`) |
+| `--processes` | int | 1 | Split each trial's client across N OS processes; the worker pool is created once and reused across every trial (benchmark passthrough; see `benchmark --processes`) |
 | `--export` | dir | — | Write per-trial JSON checkpoints + summary.json + report.md to DIR |
 | `--resume` | dir | — | Re-analyze a complete checkpoint with new constraints, or continue an interrupted run (campaign hash must match) |
 | `--reload-timeout` | float | 120.0 | Seconds to wait for Ready after ReloadModel |
@@ -394,7 +397,7 @@ Resource metrics are generic (CPU/RAM, non-GPU) via the Prometheus
 **Benchmark passthrough** (streaming/bidi scenarios, plan §2.11):
 `--stream`, `--bidi`, `--model-type`, `--endpoint`, `--transport`,
 `--payload` / `--payload-file` / `--payload-random`, `--rate`,
-`--warmup-requests`, `--grace-period`, `--goodput`, `--slo-attainment`,
+`--warmup-requests`, `--processes`, `--grace-period`, `--goodput`, `--slo-attainment`,
 `--tokenizer`, `--text-field`, `--pace`, `--rt-factor`, `--min-sessions`,
 `--cancel-after`, `--read-delay-ms`.
 

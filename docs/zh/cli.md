@@ -141,6 +141,7 @@ lite-server benchmark --model <模型名> [选项]
 | `--warmup-requests` | int | 0 | 预热请求数，样本丢弃（推荐 ≈ 并发数） |
 | `--grace-period` | float | 30.0 | 到期后等待在途请求完成的上限（秒） |
 | `--rate` | float | — | 固定到达速率 req/s（开环）；消除负载发生器侧的 coordinated omission |
+| `--processes` | int | 1 | 将客户端拆到 N 个 OS 进程（各自独立事件循环 + 连接池，每进程占一个核）。并发/请求数均分，`--rate` 除以 N；父进程对原始样本做精确合并 |
 | `--latency-threshold` | float | — | sweep 模式下 p99 超过 MS 毫秒时提前停止 |
 | `--payload` | string | `{"input": 1.0}` | 内联 JSON 请求体 |
 | `--payload-file` | path | — | JSON 请求体文件；可重复指定，轮询发送 |
@@ -173,6 +174,7 @@ lite-server benchmark --model <模型名> [选项]
 - 预热样本丢弃；到期在途请求按 `--grace-period` 有界 drain（grace 内完成计入统计，其余记为 `dropped_inflight`）。
 - 吞吐 = `成功数 / (末响应 − 首请求)`（实测窗口）；百分位统一 numpy `linear` 插值（报告 p50/p90/p95/p99/max）。
 - 样本不足（`< max(300, 10 × 并发数)`）与客户端 CPU 饱和（单核 >70%）会在 stdout 与 JSON 中显式告警。
+- **多进程客户端**（`--processes N`，默认 1）：Python（httpx）客户端持有 GIL，单事件循环只能吃一个核——超出其容量时，客户端 CPU 饱和会虚高记录的延迟（触发 `>70%` 告警）并封顶实测吞吐。`--processes N` 通过统一 `spawn` 把并发（及 `--requests`/`--rate`）拆到 N 个 OS 进程，客户端容量随核数线性扩展。原始样本在父进程精确合并：百分位与流式/bidi 指标基于样本并集重算，窗口取首末时间戳并集，样本量告警按合并后的总数重查（子进程自行抑制各自的告警）。CPU 饱和告警仍按进程各自判断。导出 JSON 记录 `config.processes`。
 
 **流式测量口径**（`--stream`）：
 
@@ -371,6 +373,7 @@ lite-server profile --model <MODEL> [OPTIONS]
 | `--max-trials` | int | 64 | 跨积上限（grid）/ 测点上限（quick） |
 | `--duration` | float | 30.0 | 单 trial 时长（秒） |
 | `--requests` | int | — | 单 trial 固定 N 个请求（与 `--duration` 互斥） |
+| `--processes` | int | 1 | 每个 trial 的客户端拆到 N 个 OS 进程；worker 池创建一次、跨所有 trial 复用（benchmark 透传；见 `benchmark --processes`） |
 | `--export` | dir | — | 写出逐 trial JSON checkpoint + summary.json + report.md 到 DIR |
 | `--resume` | dir | — | 换约束重分析完整 checkpoint，或续跑中断的运行（campaign 哈希须匹配） |
 | `--reload-timeout` | float | 120.0 | ReloadModel 后等待 Ready 的秒数 |
@@ -392,7 +395,7 @@ lite-server profile --model <MODEL> [OPTIONS]
 **benchmark 透传**（流式/bidi 场景，方案 §2.11）：
 `--stream`、`--bidi`、`--model-type`、`--endpoint`、`--transport`、
 `--payload` / `--payload-file` / `--payload-random`、`--rate`、
-`--warmup-requests`、`--grace-period`、`--goodput`、`--slo-attainment`、
+`--warmup-requests`、`--processes`、`--grace-period`、`--goodput`、`--slo-attainment`、
 `--tokenizer`、`--text-field`、`--pace`、`--rt-factor`、`--min-sessions`、
 `--cancel-after`、`--read-delay-ms`。
 

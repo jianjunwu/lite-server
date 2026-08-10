@@ -247,6 +247,10 @@ class BenchmarkResult:
     # response received. Throughput is computed over this window so trailing
     # idle time and failed fast-paths do not distort the rate.
     window: float = 0.0
+    # Window endpoints (perf_counter_ns); the multi-process parent merges
+    # children into a union window = max(last_t1) - min(first_t0).
+    first_t0_ns: int | None = None
+    last_t1_ns: int | None = None
     warmup_requests: int = 0
     drained_in_grace: int = 0
     dropped_inflight: int = 0
@@ -256,6 +260,10 @@ class BenchmarkResult:
     target_rate: float | None = None
     stream_metrics: StreamMetrics | None = None
     bidi_metrics: BidiSessionMetrics | None = None
+    # Raw per-request records, attached by run_stream/run_bidi for exact
+    # cross-process merging; intentionally absent from to_dict().
+    stream_records: list[StreamRequestRecord] | None = None
+    bidi_records: list[BidiSessionRecord] | None = None
 
     @property
     def throughput(self) -> float:
@@ -494,6 +502,7 @@ class BenchmarkEngine:
         goodput_slo: dict | None = None,
         slo_attainment_target: float = 0.95,
         token_counter: Callable[[StreamChunk], int | None] | None = None,
+        min_samples: int | None = None,
     ) -> BenchmarkResult:
         """Run streaming benchmark — adapter over unmodified ``run()``.
 
@@ -601,9 +610,12 @@ class BenchmarkEngine:
             warmup_requests=warmup_requests,
             grace_period=grace_period,
             rate=rate,
+            min_samples=min_samples,
         )
 
-        # Compute stream metrics and attach
+        # Compute stream metrics and attach; raw records ride along so the
+        # multi-process parent can re-aggregate exactly (方案 A).
+        result.stream_records = records
         sm = compute_stream_metrics(records, model_type, window_secs=result.window or None)
         result.stream_metrics = sm
 
@@ -644,6 +656,7 @@ class BenchmarkEngine:
         transport: str = "ws",
         pacing_mode: str = "lock_step",
         min_sessions: int = 30,
+        min_samples: int | None = None,
     ) -> BenchmarkResult:
         """Run bidi session benchmark — adapter over unmodified ``run()``
         (批次 2, plan §4.8 D1: same D4 pattern as ``run_stream``).
@@ -679,9 +692,10 @@ class BenchmarkEngine:
             total_requests=total_requests,
             warmup_requests=warmup_requests,
             grace_period=grace_period,
-            min_samples=min_sessions,
+            min_samples=min_samples if min_samples is not None else min_sessions,
         )
 
+        result.bidi_records = records
         result.bidi_metrics = compute_bidi_metrics(
             records,
             transport=transport,
@@ -741,8 +755,10 @@ class BenchmarkEngine:
                 result.drained_in_grace += 1
 
     def _finish_window(self, result: BenchmarkResult, state: dict) -> None:
-        if state["first_t0_ns"] is not None and state["last_t1_ns"] is not None:
-            result.window = (state["last_t1_ns"] - state["first_t0_ns"]) / 1e9
+        result.first_t0_ns = state.get("first_t0_ns")
+        result.last_t1_ns = state.get("last_t1_ns")
+        if result.first_t0_ns is not None and result.last_t1_ns is not None:
+            result.window = (result.last_t1_ns - result.first_t0_ns) / 1e9
 
     async def _run_fixed_duration(
         self,
