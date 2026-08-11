@@ -66,6 +66,47 @@ class TestCliFailFast:
         assert rc == 2
 
 
+class TestParseHeaderArgsControlChars:
+    """Audit findings: control characters must be rejected at parse time.
+
+    The CLI promises fail-fast (exit 2) for bad --header values, but today
+    only the *name* is checked for whitespace.  A value containing CR/LF
+    (or a name containing NUL) sails through and fails LATE at send time:
+    httpx raises LocalProtocolError per request (every request lands in the
+    transport-error bucket), h2 HPACK-encodes the malformed value onto the
+    wire, and websockets formats it raw into the handshake.  The benchmark
+    then runs to completion with 100% failures instead of exiting 2.
+    """
+
+    def test_parse_rejects_crlf_in_value(self):
+        with pytest.raises(ValueError):
+            cli._parse_header_args(["X-Test: a\r\nHost: evil"])
+
+    def test_parse_rejects_lf_in_value(self):
+        with pytest.raises(ValueError):
+            cli._parse_header_args(["X-Test: a\nb"])
+
+    def test_parse_rejects_control_char_in_name(self):
+        with pytest.raises(ValueError):
+            cli._parse_header_args(["Bad\x00Name: v"])
+
+    def test_parse_rejects_non_token_char_in_name(self):
+        # RFC 7230 tchar only: '(' is not valid in a header name; h11/h2/gRPC
+        # all reject it at send time, so parse must reject it first.
+        with pytest.raises(ValueError):
+            cli._parse_header_args(["X(Bad): v"])
+
+    def test_parse_rejects_non_ascii_value(self):
+        # gRPC metadata values are ASCII-only; obs-text would fail late there,
+        # so the parse gate rejects it uniformly for every transport.
+        with pytest.raises(ValueError):
+            cli._parse_header_args(["X-Test: 中文"])
+
+    def test_parse_allows_htab_in_value(self):
+        # HTAB is legal in an RFC 7230 field value; only CTLs are rejected.
+        assert cli._parse_header_args(["X-Test: a\tb"]) == {"x-test": "a\tb"}
+
+
 # ── Unary + SSE: httpx client default headers ────────────────────────────
 
 class _HeaderRecordingServer:

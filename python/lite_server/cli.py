@@ -481,13 +481,24 @@ def _parse_concurrency(raw: str) -> list[int]:
     return [int(raw)]
 
 
+# RFC 7230 tchar set, lowercase form (names are lowercased before validation).
+# Every transport (h11/h2/gRPC) rejects names outside this set at send time,
+# so the parse gate must reject them first to keep the fail-fast contract.
+_HEADER_NAME_CHARS = frozenset("!#$%&'*+-.^_`|~") | frozenset(
+    "abcdefghijklmnopqrstuvwxyz0123456789"
+)
+
+
 def _parse_header_args(raw: list[str] | None) -> dict[str, str]:
     """Parse repeated --header args (curl -H style, 'Name: value').
 
     Names are lowercased (HTTP/2 requirement — h2 and gRPC transports reject
     uppercase; HTTP/1.1 and websockets are case-insensitive anyway) and the
     value is stripped of surrounding whitespace.  ``None`` (no --header)
-    yields an empty dict.  Raises ``ValueError`` on malformed entries.
+    yields an empty dict.  Raises ``ValueError`` on malformed entries:
+    missing ':', a name outside the RFC 7230 token set, or a value with
+    control / non-ASCII characters (printable ASCII + HTAB only — gRPC
+    metadata values are ASCII-only, so obs-text would fail late there).
     """
     headers: dict[str, str] = {}
     for entry in raw or ():
@@ -498,10 +509,15 @@ def _parse_header_args(raw: list[str] | None) -> dict[str, str]:
         name, _, value = entry.partition(":")
         name = name.strip().lower()
         value = value.strip()
-        if not name or any(c.isspace() for c in name):
+        if not name or any(c not in _HEADER_NAME_CHARS for c in name):
             raise ValueError(
-                f"header {entry!r} is not 'Name: value' (name must be "
-                f"non-empty without whitespace)"
+                f"header {entry!r} is not 'Name: value' (name must be an "
+                f"RFC 7230 token: letters, digits, !#$%&'*+-.^_`|~)"
+            )
+        if any((ord(c) < 0x20 and c != "\t") or ord(c) > 0x7E for c in value):
+            raise ValueError(
+                f"header {entry!r} value contains control or non-ASCII "
+                f"characters (printable ASCII + HTAB only)"
             )
         headers[name] = value
     return headers
