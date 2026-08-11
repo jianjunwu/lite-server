@@ -441,8 +441,14 @@ class TestOpenLoop:
             p99 = result.p99
             co_p99 = result._co_corrected_percentile(0.99)
             # In open-loop the gap is minimal (no queueing at generator);
-            # allow slack for CI/xdist scheduling jitter.
-            assert abs(co_p99 - p99) < 50.0
+            # allow slack for CI/xdist scheduling jitter. The failure
+            # message carries the measured gap so a rare xdist-scheduling
+            # flake is diagnosable without a rerun.
+            gap_ms = abs(co_p99 - p99)
+            assert gap_ms < 50.0, (
+                f"open-loop CO gap {gap_ms:.1f}ms (p99={p99:.1f}, "
+                f"co_p99={co_p99:.1f}, successful={result.successful})"
+            )
 
     @pytest.mark.asyncio
     async def test_rate_mode_concurrency_caps_inflight(self):
