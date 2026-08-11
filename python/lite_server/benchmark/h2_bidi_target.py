@@ -70,6 +70,7 @@ def h2_bidi_session(
     *,
     pacing: Pacing,
     idle_timeout: float | None = None,
+    headers: dict[str, str] | None = None,
 ) -> Callable[[list], Awaitable[BidiSessionRecord]]:
     """Build a bidi session runner for the h2 ``/bidi`` endpoint.
 
@@ -77,6 +78,8 @@ def h2_bidi_session(
         url: Full URL (``http://host:port/v2/models/{m}/bidi``); h2c only.
         pacing: Producer pacing (lock_step / real_time / speedup).
         idle_timeout: Per-frame idle budget in seconds (orchestrator-side).
+        headers: Extra request headers appended to the POST header block
+            (h2 requires lowercase names; the CLI normalizes them).
 
     Returns:
         ``session(script) -> BidiSessionRecord`` for
@@ -86,6 +89,7 @@ def h2_bidi_session(
     host = parsed.hostname or "127.0.0.1"
     port = parsed.port or 80
     path = parsed.path
+    extra_headers = [(k, v) for k, v in (headers or {}).items()]
 
     async def session(script: list) -> BidiSessionRecord:
         import h2.config
@@ -113,6 +117,7 @@ def h2_bidi_session(
             (":authority", f"{host}:{port}"),
             (":path", path),
             ("content-type", "application/x-lite-bidi"),
+            *extra_headers,
         ], end_stream=False)
         writer.write(conn.data_to_send())
         await writer.drain()

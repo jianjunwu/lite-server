@@ -31,6 +31,7 @@ def grpc_stream_target(
     version: str | None = None,
     decoupled: bool = False,
     timeout: float | None = None,
+    metadata: tuple[tuple[str, str], ...] | None = None,
 ) -> Callable[[dict], AsyncIterator[StreamChunk]]:
     """Build a streaming benchmark target for a gRPC endpoint.
 
@@ -42,12 +43,16 @@ def grpc_stream_target(
             ``StreamInfer`` and stop after the ``is_final`` frame.
         timeout: Whole-RPC timeout in seconds (gRPC deadline semantics —
             unlike httpx read timeout this does NOT re-arm per chunk).
+        metadata: Per-call gRPC metadata (header passthrough).  ``None`` →
+            the call is made without a ``metadata`` kwarg (backward compat).
 
     Returns:
         A callable ``target(payload) -> AsyncIterator[StreamChunk]``
         compatible with ``BenchmarkEngine.run_stream()``.  The payload is
         sent as JSON bytes, aligned with the HTTP targets.
     """
+
+    call_kwargs = {"metadata": metadata} if metadata is not None else {}
 
     async def target(payload: dict) -> AsyncIterator[StreamChunk]:
         import grpc
@@ -59,12 +64,12 @@ def grpc_stream_target(
             request: object = liteserver_pb2.DecoupledInferRequest(
                 model_name=model, version=version or "", data=data,
             )
-            call = stub.DecoupledInfer(request, timeout=timeout)
+            call = stub.DecoupledInfer(request, timeout=timeout, **call_kwargs)
         else:
             request = liteserver_pb2.StreamInferRequest(
                 model_name=model, version=version or "", data=data,
             )
-            call = stub.StreamInfer(request, timeout=timeout)
+            call = stub.StreamInfer(request, timeout=timeout, **call_kwargs)
 
         try:
             async for resp in call:

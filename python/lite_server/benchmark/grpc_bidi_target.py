@@ -34,6 +34,7 @@ def grpc_bidi_session(
     version: str | None = None,
     pacing: Pacing,
     idle_timeout: float | None = None,
+    metadata: tuple[tuple[str, str], ...] | None = None,
 ) -> Callable[[list], Awaitable[BidiSessionRecord]]:
     """Build a bidi session runner for the gRPC ``BidiStream`` RPC.
 
@@ -43,6 +44,8 @@ def grpc_bidi_session(
         version: Optional model version (empty string = server default).
         pacing: Producer pacing (lock_step / real_time / speedup).
         idle_timeout: Per-frame idle budget in seconds (orchestrator-side).
+        metadata: Per-call gRPC metadata (header passthrough).  ``None`` →
+            the call is made without a ``metadata`` kwarg (backward compat).
 
     Returns:
         ``session(script) -> BidiSessionRecord`` for
@@ -54,7 +57,10 @@ def grpc_bidi_session(
         from lite_server.proto import liteserver_pb2_grpc
 
         stub = liteserver_pb2_grpc.LiteServerStub(channel)
-        call = stub.BidiStream()
+        if metadata is not None:
+            call = stub.BidiStream(metadata=metadata)
+        else:
+            call = stub.BidiStream()
         try:
             return await run_bidi_session(
                 _GrpcBidiIO(call, model, version), script,

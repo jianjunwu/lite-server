@@ -164,6 +164,11 @@ def main(argv=None):
     bench_parser.add_argument("--max-rtf", type=float, default=None,
                               help="Exit 99 if RTF p99 exceeds VAL "
                                    "(requires --stream and --model-type tts/stt)")
+    bench_parser.add_argument("--header", "-H", action="append", default=None,
+                              metavar='"NAME: VALUE"',
+                              help="Extra request header, repeatable (curl -H "
+                                   "style; sent on every request of every "
+                                   "transport: HTTP/SSE/WS/gRPC/h2)")
 
     # analyze
     analyze_parser = subparsers.add_parser("analyze", help="Run model analyzer")
@@ -293,6 +298,10 @@ def main(argv=None):
     profile_parser.add_argument("--rate", type=float, default=None,
                                 help="Constant arrival rate in req/s (open-loop)")
     profile_parser.add_argument("--warmup-requests", type=int, default=0)
+    profile_parser.add_argument("--header", "-H", action="append", default=None,
+                                metavar='"NAME: VALUE"',
+                                help="Extra request header, repeatable "
+                                     "(benchmark passthrough)")
     profile_parser.add_argument("--processes", type=int, default=1,
                                 help="Split each trial's client across N OS processes "
                                      "(benchmark passthrough)")
@@ -470,6 +479,32 @@ def _parse_concurrency(raw: str) -> list[int]:
             raise ValueError(f"Concurrency sweep {raw!r} produces no levels")
         return levels
     return [int(raw)]
+
+
+def _parse_header_args(raw: list[str] | None) -> dict[str, str]:
+    """Parse repeated --header args (curl -H style, 'Name: value').
+
+    Names are lowercased (HTTP/2 requirement — h2 and gRPC transports reject
+    uppercase; HTTP/1.1 and websockets are case-insensitive anyway) and the
+    value is stripped of surrounding whitespace.  ``None`` (no --header)
+    yields an empty dict.  Raises ``ValueError`` on malformed entries.
+    """
+    headers: dict[str, str] = {}
+    for entry in raw or ():
+        if ":" not in entry:
+            raise ValueError(
+                f"header {entry!r} is not 'Name: value' (missing ':')"
+            )
+        name, _, value = entry.partition(":")
+        name = name.strip().lower()
+        value = value.strip()
+        if not name or any(c.isspace() for c in name):
+            raise ValueError(
+                f"header {entry!r} is not 'Name: value' (name must be "
+                f"non-empty without whitespace)"
+            )
+        headers[name] = value
+    return headers
 
 
 def _resolve_benchmark_payloads(args) -> list[dict]:
@@ -844,6 +879,15 @@ def _cmd_benchmark(args):
         args.processes = 1
     if args.transport is None:
         args.transport = "ws" if args.bidi else "sse"
+    if not hasattr(args, "header"):
+        args.header = None
+
+    # --header: parse + validate once, fail-fast before any network contact.
+    try:
+        args.headers = _parse_header_args(args.header)
+    except ValueError as e:
+        _logger.error("--header: %s", e)
+        return 2
 
     if args.processes < 1:
         _logger.error("--processes must be >= 1")
@@ -1184,6 +1228,13 @@ async def _run_benchmark_level(args, concurrency, *, url, payload_factory, paylo
     print(f"Benchmarking {args.model} (concurrency={concurrency}, "
           f"{mode}{stream_label}, warmup={args.warmup_requests})")
 
+    # --header: the parsed dict rides the args namespace (multiproc children
+    # pickled with the parent's args). Empty dict = no custom headers.
+    headers = getattr(args, "headers", None) or {}
+    # gRPC transport: headers become call metadata (tuple of (key, value));
+    # None when empty so the targets keep their no-kwarg call shape.
+    grpc_metadata = tuple((k, v) for k, v in headers.items()) or None
+
     if payload_factory is not None:
         final_payload = payload_factory
     else:
@@ -1200,7 +1251,11 @@ async def _run_benchmark_level(args, concurrency, *, url, payload_factory, paylo
         max_keepalive_connections=max(concurrency, 1),
         keepalive_expiry=15.0,
     )
-    async with httpx.AsyncClient(limits=limits, trust_env=trust_env) as client:
+    # Client default headers cover BOTH unary (client.post) and SSE
+    # (client.stream) — httpx applies them to every request.
+    async with httpx.AsyncClient(
+        limits=limits, trust_env=trust_env, headers=headers,
+    ) as client:
         engine = BenchmarkEngine()
 
         if args.bidi:
@@ -1214,6 +1269,7 @@ async def _run_benchmark_level(args, concurrency, *, url, payload_factory, paylo
                 session = ws_bidi_session(
                     _ws_connect, url, pacing=pacing,
                     idle_timeout=args.stream_read_timeout,
+                    headers=headers,
                 )
             elif args.transport == "h2":
                 from lite_server.benchmark.h2_bidi_target import h2_bidi_session
@@ -1221,6 +1277,7 @@ async def _run_benchmark_level(args, concurrency, *, url, payload_factory, paylo
                 session = h2_bidi_session(
                     url, pacing=pacing,
                     idle_timeout=args.stream_read_timeout,
+                    headers=headers,
                 )
             else:  # grpc
                 import grpc as _grpc
@@ -1234,6 +1291,7 @@ async def _run_benchmark_level(args, concurrency, *, url, payload_factory, paylo
                 session = grpc_bidi_session(
                     grpc_channel, args.model, version=args.version,
                     pacing=pacing, idle_timeout=args.stream_read_timeout,
+                    metadata=grpc_metadata,
                 )
             try:
                 return await engine.run_bidi(
@@ -1267,6 +1325,7 @@ async def _run_benchmark_level(args, concurrency, *, url, payload_factory, paylo
 
                 stream_target = ws_stream_target(
                     _ws_connect, url, timeout=args.stream_read_timeout,
+                    headers=headers,
                 )
             else:  # grpc
                 import grpc as _grpc
@@ -1279,6 +1338,7 @@ async def _run_benchmark_level(args, concurrency, *, url, payload_factory, paylo
                     grpc_channel, args.model, version=args.version,
                     decoupled=(args.endpoint == "decoupled"),
                     timeout=args.stream_read_timeout,
+                    metadata=grpc_metadata,
                 )
 
             # Scenario wrappers (plan §7.2): cancel / slow-consumer injection
@@ -1586,6 +1646,13 @@ def _cmd_profile(args):
         "goodput": args.goodput,
         "objective": args.objective,
     }
+
+    # --header: parse + validate once (fail-fast; rides the trial namespace)
+    try:
+        args.headers = _parse_header_args(args.header)
+    except ValueError as e:
+        _logger.error("--header: %s", e)
+        return 2
 
     constraints = Constraints(
         max_p99=args.max_p99,
@@ -2053,6 +2120,8 @@ def _profile_measure_fn(args, client, server_pid=None, trust_env=True, pool=None
         tokenizer=args.tokenizer,
         text_field=args.text_field,
         processes=args.processes,
+        header=args.header,
+        headers=args.headers,
     )
 
     try:

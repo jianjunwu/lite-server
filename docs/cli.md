@@ -166,6 +166,7 @@ lite-server benchmark --model <MODEL> [OPTIONS]
 | `--stream-read-timeout` | float | 300.0 | Seconds between stream chunks before timeout |
 | `--max-ttft-ms` | float | — | Exit 99 if TTFT p99 exceeds MS (requires `--stream`) |
 | `--max-rtf` | float | — | Exit 99 if RTF p99 exceeds VAL (requires `--stream` + `--model-type tts/stt`) |
+| `--header` / `-H` | string | — | Extra request header, repeatable (`-H "Authorization: Bearer x"`); sent on every request of every transport. Names are lowercased (HTTP/2 requirement) — for `--transport grpc` headers become per-call gRPC metadata, for `ws` they become handshake `additional_headers`, for `h2` they are appended to the POST header block |
 
 **Measurement contract** (closed-loop: service-time; open-loop: `--rate`):
 
@@ -397,7 +398,7 @@ Resource metrics are generic (CPU/RAM, non-GPU) via the Prometheus
 **Benchmark passthrough** (streaming/bidi scenarios, plan §2.11):
 `--stream`, `--bidi`, `--model-type`, `--endpoint`, `--transport`,
 `--payload` / `--payload-file` / `--payload-random`, `--rate`,
-`--warmup-requests`, `--processes`, `--grace-period`, `--goodput`, `--slo-attainment`,
+`--warmup-requests`, `--header`, `--processes`, `--grace-period`, `--goodput`, `--slo-attainment`,
 `--tokenizer`, `--text-field`, `--pace`, `--rt-factor`, `--min-sessions`,
 `--cancel-after`, `--read-delay-ms`.
 

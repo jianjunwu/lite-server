@@ -32,6 +32,7 @@ def ws_stream_target(
     url: str,
     *,
     timeout: float | None = None,
+    headers: dict[str, str] | None = None,
 ) -> Callable[[dict], AsyncIterator[StreamChunk]]:
     """Build a streaming benchmark target for a WS endpoint.
 
@@ -40,11 +41,16 @@ def ws_stream_target(
         url: Full WS endpoint URL (``ws://`` / ``wss://``).
         timeout: Inter-chunk idle budget in seconds; re-arms per frame,
             matching the SSE read-timeout semantics.  ``None`` = no limit.
+        headers: Extra handshake headers, forwarded to *connect* as
+            ``additional_headers`` (websockets).  ``None``/empty → the
+            connect call is unchanged (backward compat).
 
     Returns:
         A callable ``target(payload) -> AsyncIterator[StreamChunk]``
         compatible with ``BenchmarkEngine.run_stream()``.
     """
+
+    connect_kwargs = {"additional_headers": headers} if headers else {}
 
     async def target(payload: dict) -> AsyncIterator[StreamChunk]:
         from websockets.exceptions import (
@@ -54,7 +60,7 @@ def ws_stream_target(
         )
 
         try:
-            async with connect(url) as ws:
+            async with connect(url, **connect_kwargs) as ws:
                 await ws.send(_stdlib_json.dumps(payload))
                 while True:
                     try:

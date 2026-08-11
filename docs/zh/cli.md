@@ -166,6 +166,7 @@ lite-server benchmark --model <模型名> [选项]
 | `--stream-read-timeout` | float | 300.0 | 流式 chunk 间超时秒数 |
 | `--max-ttft-ms` | float | — | TTFT p99 超过 MS 毫秒时退出码 99（需配合 `--stream`） |
 | `--max-rtf` | float | — | RTF p99 超过 VAL 时退出码 99（需 `--stream` + `--model-type tts/stt`） |
+| `--header` / `-H` | string | — | 附加请求头，可重复（`-H "Authorization: Bearer x"`）；每个请求都会带上，覆盖所有传输。名字统一转小写（HTTP/2 要求）——`--transport grpc` 时变为 per-call gRPC metadata，`ws` 时变为握手 `additional_headers`，`h2` 时追加进 POST header 块 |
 
 **测量口径**（闭环：service-time；开环：`--rate`）：
 
@@ -395,7 +396,7 @@ lite-server profile --model <MODEL> [OPTIONS]
 **benchmark 透传**（流式/bidi 场景，方案 §2.11）：
 `--stream`、`--bidi`、`--model-type`、`--endpoint`、`--transport`、
 `--payload` / `--payload-file` / `--payload-random`、`--rate`、
-`--warmup-requests`、`--processes`、`--grace-period`、`--goodput`、`--slo-attainment`、
+`--warmup-requests`、`--header`、`--processes`、`--grace-period`、`--goodput`、`--slo-attainment`、
 `--tokenizer`、`--text-field`、`--pace`、`--rt-factor`、`--min-sessions`、
 `--cancel-after`、`--read-delay-ms`。
 
