@@ -406,6 +406,9 @@ async fn sse_infer_impl(
     // forward task — it is captured by the spawn below and released when the
     // task ends (terminal frame / idle / disconnect), the D18 teardown path.
     let mut ensemble_permit = None;
+    // §4.1 指标行: the streaming step's latency is recorded at stream close
+    // (record_ensemble_step_latency); the tail labels ride the forward task.
+    let mut ensemble_tail: Option<(String, String, String)> = None;
     let (stream_id, worker_client, mut chunk_rx) = if is_ensemble {
         let ensemble_input = super::inference::ensemble_input_from_body(&body)?;
         let opts = crate::ensemble::EnsembleExecOpts {
@@ -418,6 +421,7 @@ async fn sse_infer_impl(
         ).await? {
             crate::ensemble::EnsembleOutcome::Stream(mut s) => {
                 ensemble_permit = s.permit.take();
+                ensemble_tail = Some((s.tail_step.clone(), s.tail_model.clone(), s.tail_version.clone()));
                 (s.stream_id, s.cancel_client, s.chunk_rx)
             }
             crate::ensemble::EnsembleOutcome::Unary(_) => {
@@ -479,6 +483,10 @@ async fn sse_infer_impl(
         let mut output_bytes: u64 = 0;
         // G5:per-stream chunk 数(close 日志字段,收口统一上报,非 metric)。
         let mut chunks: u64 = 0;
+        // m7: ensemble text streams are validated as ONE logical UTF-8
+        // sequence — a multi-byte codepoint split across chunk boundaries is
+        // buffered here (≤3 bytes) instead of being misread as binary.
+        let mut utf8_pending: Vec<u8> = Vec::new();
 
         loop {
             let chunk = match streaming::recv_chunk(&mut chunk_rx, stream_deadline, stream_idle)
@@ -525,11 +533,16 @@ async fn sse_infer_impl(
                     // UTF-8 — a binary chunk that slipped past the static D7
                     // 400 (model flag unset) closes with an Error frame +
                     // type_mismatch (the stream is open; the status code is
-                    // already committed). Non-ensemble keeps the lossy path.
+                    // already committed). Validation is stream-level: a
+                    // multi-byte codepoint split across chunk boundaries is
+                    // text, not binary (direct path tolerates it lossily;
+                    // here it is reassembled exactly). Non-ensemble keeps the
+                    // lossy path.
                     if is_ensemble {
-                        match std::str::from_utf8(&c.data) {
-                            Ok(s) => Some(Event::default().data(s)),
-                            Err(_) => {
+                        match ensemble_chunk_utf8(&mut utf8_pending, &c.data) {
+                            Ok(Some(s)) => Some(Event::default().data(s)),
+                            Ok(None) => None, // incomplete tail held for the next chunk
+                            Err(()) => {
                                 type_mismatch = true;
                                 let msg = "ensemble streaming step produced a binary chunk on a text endpoint";
                                 match frame {
@@ -566,6 +579,15 @@ async fn sse_infer_impl(
                     prometheus::record_worker_metrics(&model_name, &resolved_version, done.metrics.as_ref());
                     // Task D: terminal Done frame → InferenceResponse.
                     crate::callback::fire_inference_response(&cb_runner, &req_ctx, open_time);
+                    // A non-empty pending tail here means the worker truncated
+                    // a multi-byte codepoint at stream end (protocol bug) —
+                    // the held bytes are dropped; surface it for debugging.
+                    if !utf8_pending.is_empty() {
+                        tracing::warn!(
+                            stream_id = %stream_id,
+                            "ensemble stream ended with an incomplete UTF-8 tail; bytes dropped"
+                        );
+                    }
                     // 帧封装差异(批次 4):Legacy 发 `data: [DONE]`;Generate
                     // 风格结束即连接关闭,无终止标记(D9/Triton 行为);
                     // Openai 风格(OpenAI SSE 惯例)发 `data: [DONE]`。
@@ -620,6 +642,16 @@ async fn sse_infer_impl(
             output_bytes,
             chunks,
         );
+        // §4.1 指标行: the streaming step's latency, measured at stream close.
+        if let Some((tail_step, tail_model, tail_version)) = ensemble_tail {
+            prometheus::record_ensemble_step_latency(
+                &model_name,
+                &tail_step,
+                &tail_model,
+                &tail_version,
+                open_time.elapsed().as_secs_f64(),
+            );
+        }
         // Ensure stream is cleaned up on worker side.
         // D4: decoupled → targeted cancel (parity with WS/gRPC);
         // coupled → broadcast (existing behavior, unchanged).
@@ -743,15 +775,78 @@ pub async fn ws_decoupled_version_handler(
 }
 
 /// §4.4: WS error frame + close (the connection already upgraded — there is
-/// no HTTP status code; the error JSON is the client contract).
+/// no HTTP status code; the error JSON is the client contract). Contractual
+/// close codes (D21): unsupported-combination/protocol 1003, over-limit 1009,
+/// server-side 1011; the error JSON is `{error:{code,message}}`.
 async fn ws_send_error(
     sink: &mut futures::stream::SplitSink<WebSocket, Message>,
     e: &AppError,
 ) {
+    let code: u16 = match e {
+        AppError::PayloadTooLarge { .. } => 1009,
+        AppError::InvalidRequestBody(_)
+        | AppError::Validation(_)
+        | AppError::InvalidQueryParam(_)
+        | AppError::UnsupportedMediaType(_) => 1003,
+        _ => 1011,
+    };
     let _ = sink
-        .send(Message::Text(json!({"error": e.to_string()}).to_string()))
+        .send(Message::Text(
+            json!({"error": {"code": e.error_code(), "message": e.to_string()}}).to_string(),
+        ))
         .await;
-    let _ = sink.close().await;
+    let _ = sink
+        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+            code,
+            reason: e.error_code().to_string().into(),
+        })))
+        .await;
+}
+
+/// m7: validate an ensemble text stream as ONE logical UTF-8 sequence —
+/// chunk boundaries may split a multi-byte codepoint (byte-oriented chunking
+/// is legal, §1.4 chunk = opaque Bytes), so per-chunk validation would kill
+/// legitimate text streams. Only a genuine invalid sequence is binary
+/// evidence (type_mismatch). Incomplete tails are buffered in `pending`
+/// (≤3 bytes by construction) and prepended to the next chunk.
+/// Ok(Some(text)) = emit; Ok(None) = hold (nothing complete to emit);
+/// Err(()) = genuine binary.
+fn ensemble_chunk_utf8(pending: &mut Vec<u8>, chunk: &[u8]) -> Result<Option<String>, ()> {
+    if pending.is_empty() {
+        return match std::str::from_utf8(chunk) {
+            Ok(s) => Ok(Some(s.to_string())),
+            Err(e) if e.error_len().is_none() => {
+                let valid = e.valid_up_to();
+                // Hold the incomplete tail; emit the complete prefix.
+                pending.extend_from_slice(&chunk[valid..]);
+                if valid == 0 {
+                    Ok(None)
+                } else {
+                    Ok(Some(std::str::from_utf8(&chunk[..valid]).unwrap().to_string()))
+                }
+            }
+            Err(_) => Err(()),
+        };
+    }
+    pending.extend_from_slice(chunk);
+    match std::str::from_utf8(pending) {
+        Ok(s) => {
+            let out = s.to_string();
+            pending.clear();
+            Ok(Some(out))
+        }
+        Err(e) if e.error_len().is_none() => {
+            let valid = e.valid_up_to();
+            if valid == 0 {
+                Ok(None)
+            } else {
+                let out = std::str::from_utf8(&pending[..valid]).unwrap().to_string();
+                pending.drain(..valid);
+                Ok(Some(out))
+            }
+        }
+        Err(_) => Err(()),
+    }
 }
 
 /// Detect a WS bidi app-level close control frame: `{"type":"close"}`.
@@ -1064,6 +1159,8 @@ async fn handle_ws_stream(
 
     // P10 (D40): semaphore permit held for the writer task's lifetime.
     let mut ensemble_permit = None;
+    // §4.1 指标行: streaming-step latency is recorded at stream close.
+    let mut ensemble_tail: Option<(String, String, String)> = None;
     let (stream_id, worker_client, mut chunk_rx) = if is_ensemble {
         let max_body = state
             .config
@@ -1101,14 +1198,20 @@ async fn handle_ws_stream(
                 // Two-stage bound (D17): chunk-idle ALWAYS on (reclaims an
                 // abandoned aggregating client), overall deadline since the
                 // first frame. The recv itself is timeout-wrapped — an idle
-                // check between blocking recvs would never fire.
-                let next = match (agg_deadline, agg_idle) {
-                    (Some(d), _) => {
-                        let remain = d.saturating_duration_since(std::time::Instant::now());
-                        tokio::time::timeout(remain, ws_stream.next()).await
-                    }
-                    (None, Some(idle)) => tokio::time::timeout(idle, ws_stream.next()).await,
-                    (None, None) => Ok(ws_stream.next().await),
+                // check between blocking recvs would never fire. Per-recv
+                // bound = min(overall remaining, idle) — recv_chunk's
+                // semantics; a client-specified deadline must NOT disable
+                // the always-on idle reclaim.
+                let now = std::time::Instant::now();
+                let bound = match (agg_deadline, agg_idle) {
+                    (Some(d), Some(idle)) => Some(d.saturating_duration_since(now).min(idle)),
+                    (Some(d), None) => Some(d.saturating_duration_since(now)),
+                    (None, Some(idle)) => Some(idle),
+                    (None, None) => None,
+                };
+                let next = match bound {
+                    Some(b) => tokio::time::timeout(b, ws_stream.next()).await,
+                    None => Ok(ws_stream.next().await),
                 };
                 match next {
                     Ok(Some(Ok(Message::Text(t)))) if is_close_frame(&t) => break,
@@ -1134,7 +1237,15 @@ async fn handle_ws_stream(
                     // Idle/deadline fired with no close trigger.
                     Err(_) => {
                         prometheus::record_stream_rejected(&model_name, &resolved_version, "5xx", ws_start.elapsed().as_secs_f64());
-                        let _ = ws_sink.send(Message::Text(json!({"error": "bidi aggregation idle timeout"}).to_string())).await;
+                        let deadline_fired = agg_deadline
+                            .map(|d| d <= std::time::Instant::now())
+                            .unwrap_or(false);
+                        let msg = if deadline_fired {
+                            "bidi aggregation exceeded the overall deadline"
+                        } else {
+                            "bidi aggregation idle timeout"
+                        };
+                        let _ = ws_sink.send(Message::Text(json!({"error": msg}).to_string())).await;
                         let _ = ws_sink.close().await;
                         return;
                     }
@@ -1165,6 +1276,7 @@ async fn handle_ws_stream(
         {
             Ok(crate::ensemble::EnsembleOutcome::Stream(mut s)) => {
                 ensemble_permit = s.permit.take();
+                ensemble_tail = Some((s.tail_step.clone(), s.tail_model.clone(), s.tail_version.clone()));
                 (s.stream_id, s.cancel_client, s.chunk_rx)
             }
             Ok(crate::ensemble::EnsembleOutcome::Unary(_)) => {
@@ -1241,9 +1353,22 @@ async fn handle_ws_stream(
         // decoupled first frame) already ran the DAG — any further DATA frame
         // is a session-multi-round violation (WS has no half-close). The
         // client's normal tail-off close frame is idempotently ignored (D33).
+        // D33: decoupled close/cancel keep their cancel-alias meaning (the
+        // single-frame trigger is what makes them unambiguous) — cancel the
+        // sub-model worker stream and stop the writer, exactly like the
+        // non-ensemble decoupled path.
+        let reader_stream_id = stream_id.clone();
+        let reader_client = Arc::clone(&worker_client);
         tokio::spawn(async move {
             while let Some(msg) = ws_stream.next().await {
                 match msg {
+                    Ok(Message::Text(t)) if decoupled && is_cancel_or_close_frame(&t) => {
+                        let cancel_req =
+                            streaming::build_stream_cancel(reader_stream_id.clone());
+                        let _ = reader_client.send_raw(cancel_req).await;
+                        let _ = gone_tx_reader.send(Some(String::new()));
+                        break;
+                    }
                     Ok(Message::Text(t)) if is_close_frame(&t) => return,
                     Ok(Message::Text(_)) | Ok(Message::Binary(_)) => {
                         let _ = gone_tx_reader.send(Some(
@@ -1453,6 +1578,16 @@ async fn handle_ws_stream(
             output_bytes,
             chunks,
         );
+        // §4.1 指标行: the streaming step's latency, measured at stream close.
+        if let Some((tail_step, tail_model, tail_version)) = ensemble_tail {
+            prometheus::record_ensemble_step_latency(
+                &model_name,
+                &tail_step,
+                &tail_model,
+                &tail_version,
+                open_time.elapsed().as_secs_f64(),
+            );
+        }
         // Close the sink gracefully (moved here so main doesn't need ws_sink).
         let _ = ws_sink.close().await;
         // drop(gone_rx) is implicit when the closure exits

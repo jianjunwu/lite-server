@@ -209,6 +209,8 @@ impl GrpcService {
 
         // P10 (D40): semaphore permit held for the forward task's lifetime.
         let mut ensemble_permit = None;
+        // §4.1 指标行: streaming-step latency is recorded at stream close.
+        let mut ensemble_tail: Option<(String, String, String)> = None;
         // Non-ensemble only: the client→worker chunk forwarder's client
         // (ensemble aggregates upstream instead, D17).
         let mut worker_client: Option<Arc<crate::transport::zmq::WorkerZmqClient>> = None;
@@ -238,10 +240,15 @@ impl GrpcService {
                 None
             };
             loop {
+                // Per-recv bound = min(overall remaining, idle) — recv_chunk's
+                // two-stage semantics; a client-specified deadline must NOT
+                // disable the always-on idle reclaim (D17).
+                let now = std::time::Instant::now();
                 let next = match (agg_deadline, self.decoupled_idle_timeout) {
-                    (Some(d), _) => {
-                        let remain = d.saturating_duration_since(std::time::Instant::now());
-                        tokio::time::timeout(remain, stream.message()).await
+                    (Some(d), idle) => {
+                        let remain = d.saturating_duration_since(now);
+                        let bound = idle.map(|i| remain.min(i)).unwrap_or(remain);
+                        tokio::time::timeout(bound, stream.message()).await
                     }
                     (None, Some(idle)) => tokio::time::timeout(idle, stream.message()).await,
                     (None, None) => {
@@ -295,6 +302,7 @@ impl GrpcService {
             {
                 crate::ensemble::EnsembleOutcome::Stream(mut s) => {
                     ensemble_permit = s.permit.take();
+                    ensemble_tail = Some((s.tail_step.clone(), s.tail_model.clone(), s.tail_version.clone()));
                     (s.stream_id, s.chunk_rx, s.cancel_client)
                 }
                 crate::ensemble::EnsembleOutcome::Unary(_) => {
@@ -566,6 +574,16 @@ impl GrpcService {
                 output_bytes,
                 chunks,
             );
+            // §4.1 指标行: the streaming step's latency, measured at stream close.
+            if let Some((tail_step, tail_model, tail_version)) = ensemble_tail {
+                crate::metrics::prometheus::record_ensemble_step_latency(
+                    &metrics_model,
+                    &tail_step,
+                    &tail_model,
+                    &tail_version,
+                    start.elapsed().as_secs_f64(),
+                );
+            }
 
             // B3 audit fix: cancel the worker on forwarder exit, aligned with
             // stream_infer (grpc/mod.rs:791) and decoupled (:1038). bidi was

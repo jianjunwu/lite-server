@@ -201,6 +201,8 @@ async fn h2_bidi_entry_impl(
 
     // P10 (D40): semaphore permit held for the outgoing task's lifetime.
     let mut ensemble_permit = None;
+    // §4.1 指标行: streaming-step latency is recorded at stream close.
+    let mut ensemble_tail: Option<(String, String, String)> = None;
 
     // 5. Open worker stream (or run the DAG for ensemble). The incoming task
     // (client→worker chunk forwarding) is spawned ONLY on the non-ensemble
@@ -234,7 +236,8 @@ async fn h2_bidi_entry_impl(
         } else {
             None
         };
-        let mut last_activity = std::time::Instant::now();
+        let aggregate_start = std::time::Instant::now();
+        let mut last_activity = aggregate_start;
         loop {
             if let Some(idle) = agg_idle {
                 if last_activity.elapsed() > idle {
@@ -260,11 +263,52 @@ async fn h2_bidi_entry_impl(
                     Some(pb::bidi_chunk::Payload::Close(_)) => break,
                     _ => {}
                 },
-                Ok(None) => match body_stream.next().await {
-                    Some(Ok(bytes)) => buf.extend_from_slice(&bytes),
-                    // Body EOF (or transport error) → half-close → trigger (D33).
-                    Some(Err(_)) | None => break,
-                },
+                Ok(None) => {
+                    // D17: the recv itself must be bounded — a loop-top idle
+                    // check between blocking recvs would never fire for a
+                    // silent client (it would pin the aggregation buffer
+                    // forever; N connections = N× max_request_body_bytes).
+                    // Bound = min(overall remaining, idle remaining), the
+                    // recv_chunk two-stage semantics.
+                    let now = std::time::Instant::now();
+                    let idle_rem = agg_idle.map(|i| i.saturating_sub(last_activity.elapsed()));
+                    let overall_rem = agg_deadline.map(|d| d.saturating_duration_since(now));
+                    let bound = match (overall_rem, idle_rem) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (Some(a), None) => Some(a),
+                        (None, Some(b)) => Some(b),
+                        (None, None) => None,
+                    };
+                    let next = match bound {
+                        Some(b) => match tokio::time::timeout(b, body_stream.next()).await {
+                            Ok(v) => v,
+                            Err(_) => {
+                                let deadline_fired = agg_deadline
+                                    .map(|d| d <= std::time::Instant::now())
+                                    .unwrap_or(false);
+                                return Err(AppError::InferenceTimeout(if deadline_fired {
+                                    "bidi aggregation exceeded the overall deadline".to_string()
+                                } else {
+                                    format!("bidi aggregation idle timeout for {}", model_name)
+                                }));
+                            }
+                        },
+                        None => body_stream.next().await,
+                    };
+                    match next {
+                        Some(Ok(bytes)) => buf.extend_from_slice(&bytes),
+                        // Body EOF → half-close → trigger (D33).
+                        None => break,
+                        // Transport error mid-aggregation is NOT a clean
+                        // half-close: abandon the execution (§4.4), never run
+                        // the DAG on possibly-truncated input.
+                        Some(Err(e)) => {
+                            return Err(AppError::Internal(format!(
+                                "bidi body stream error during aggregation: {e}"
+                            )));
+                        }
+                    }
+                }
                 Err(_) => {
                     return Err(AppError::InvalidRequestBody(
                         "bidi LPM frame error during aggregation".to_string(),
@@ -274,7 +318,7 @@ async fn h2_bidi_entry_impl(
         }
         crate::metrics::prometheus::record_ensemble_bidi_aggregate(
             aggregator.total_bytes(),
-            last_activity.elapsed().as_secs_f64(),
+            aggregate_start.elapsed().as_secs_f64(),
         );
         let value = aggregator.finish()?;
         let opts = crate::ensemble::EnsembleExecOpts {
@@ -294,6 +338,7 @@ async fn h2_bidi_entry_impl(
         {
             crate::ensemble::EnsembleOutcome::Stream(mut s) => {
                 ensemble_permit = s.permit.take();
+                ensemble_tail = Some((s.tail_step.clone(), s.tail_model.clone(), s.tail_version.clone()));
                 (s.cancel_client, s.chunk_rx, None)
             }
             crate::ensemble::EnsembleOutcome::Unary(_) => {
@@ -546,6 +591,16 @@ async fn h2_bidi_entry_impl(
                 output_bytes,
                 chunks,
             );
+            // §4.1 指标行: the streaming step's latency, measured at stream close.
+            if let Some((tail_step, tail_model, tail_version)) = ensemble_tail {
+                prometheus::record_ensemble_step_latency(
+                    &metrics_model,
+                    &tail_step,
+                    &tail_model,
+                    &tail_version,
+                    open_time.elapsed().as_secs_f64(),
+                );
+            }
 
             // Targeted cancel.
             let cancel_req = streaming::build_stream_cancel(stream_id_out);

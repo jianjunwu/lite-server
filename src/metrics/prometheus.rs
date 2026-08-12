@@ -365,6 +365,12 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(WORKER_INFERENCE_TOTAL.clone()))?;
     REGISTRY.register(Box::new(WORKER_RESPAWNS_TOTAL.clone()))?;
     REGISTRY.register(Box::new(SHUTDOWN_PENDING_REQUESTS.clone()))?;
+    // P10 (D40) + m4: ensemble streaming capacity gauge and batch-0/1
+    // histograms — unregistered collectors never reach /metrics.
+    REGISTRY.register(Box::new(ENSEMBLE_STREAMING_ACTIVE.clone()))?;
+    REGISTRY.register(Box::new(ENSEMBLE_AUTOLOAD_WAIT.clone()))?;
+    REGISTRY.register(Box::new(ENSEMBLE_BIDI_AGGREGATE_BYTES.clone()))?;
+    REGISTRY.register(Box::new(ENSEMBLE_BIDI_AGGREGATE_SECONDS.clone()))?;
     REGISTRY.register(Box::new(OTEL_SPANS_ENDED_TOTAL.clone()))?;
     REGISTRY.register(Box::new(OTEL_SPANS_EXPORTED_TOTAL.clone()))?;
     REGISTRY.register(Box::new(OTEL_EXPORT_FAILURES_TOTAL.clone()))?;
@@ -1849,5 +1855,32 @@ mod tests {
             "G5 (plan §2.12): close log must carry the per-stream chunks value; got fields {:?}",
             close[0].1
         );
+    }
+
+    // ===== /audit 2026-08-12: ensemble batch-0/1 metric registration =====
+
+    /// Resource/observability assumption: a lazily-defined collector that is
+    /// never registered is silently absent from /metrics gather() output.
+    /// The P10 gauge and m4 histograms must be exported (plan §4.1/§4.3/§6
+    /// D40: `ensemble_streaming_active` observes the semaphore in-use count).
+    #[test]
+    fn ensemble_batch01_metrics_are_registered() {
+        let _ = register_metrics(); // AlreadyReg on repeat runs is fine
+        let registered: std::collections::HashSet<String> = REGISTRY
+            .gather()
+            .iter()
+            .map(|f| f.get_name().to_string())
+            .collect();
+        for name in [
+            "ensemble_streaming_active",
+            "ensemble_autoload_wait_seconds",
+            "ensemble_bidi_aggregate_bytes",
+            "ensemble_bidi_aggregate_seconds",
+        ] {
+            assert!(
+                registered.contains(name),
+                "metric {name} is set/observe()d but never registered — absent from /metrics"
+            );
+        }
     }
 }

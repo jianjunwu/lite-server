@@ -416,6 +416,71 @@ class PreAggAPI(LitAPI):
     );
 }
 
+/// Decoupled-capable slow streaming tail (0.5s/chunk via the decoupled
+/// sender contract) — ensemble decoupled cancel tests need a worker that
+/// implements predict_decoupled (stream_predict-only workers report
+/// not_implemented on a decoupled open).
+fn write_tail_dslow(repo: &std::path::Path) {
+    write_model_py(
+        repo,
+        "tail_dslow",
+        r#"import asyncio
+from lite_server import LitAPI
+
+
+class TailDecoupledAPI(LitAPI):
+    def setup(self, device):
+        self.device = device
+
+    async def decode_request(self, request, ctx=None):
+        return request.get("pre", "")
+
+    async def predict(self, x, ctx=None):
+        return {"tokens": x.split()}
+
+    async def predict_decoupled(self, data, sender, ctx=None):
+        for w in data.split():
+            await asyncio.sleep(0.5)
+            await sender.send({"token": w})
+        await sender.close()
+
+    async def encode_response(self, output, ctx=None):
+        return output
+"#,
+    );
+}
+
+/// Split-UTF-8 streaming tail: a single multi-byte codepoint ("你" = E4 BD A0)
+/// split across two chunk yields — byte-oriented chunking is legal for a text
+/// stream (the direct SSE path tolerates it via from_utf8_lossy).
+fn write_tail_split(repo: &std::path::Path) {
+    write_model_py(
+        repo,
+        "tail_split",
+        r#"from lite_server import LitAPI
+
+
+class TailSplitAPI(LitAPI):
+    def setup(self, device):
+        self.device = device
+
+    async def decode_request(self, request, ctx=None):
+        return request.get("pre", "")
+
+    async def predict(self, x, ctx=None):
+        return {"tokens": [x]}
+
+    def stream_predict(self, request, ctx=None):
+        b = "你".encode("utf-8")
+        yield b[:1]
+        yield b[1:]
+
+    async def encode_response(self, output, ctx=None):
+        return output
+"#,
+    );
+}
+
 /// echo unary tail (ens_unary: full-unary DAG hit via a streaming endpoint).
 fn write_echo(repo: &std::path::Path) {
     write_model_py(
@@ -593,13 +658,47 @@ const ENS_AGG_YAML: &str = r#"ensemble:
         pre: "$pre.pre"
 "#;
 
+/// Decoupled slow DAG (WS decoupled cancel contract tests).
+const ENS_DSLOW_YAML: &str = r#"ensemble:
+  steps:
+    - name: pre
+      model: pre
+      version: "1"
+      inputs:
+        text: "$request.text"
+    - name: tail
+      model: tail_dslow
+      version: "1"
+      stream: true
+      inputs:
+        pre: "$pre.pre"
+"#;
+
+/// Split-UTF-8 DAG (m7 boundary: byte-split text chunks must not kill the stream).
+const ENS_SPLIT_YAML: &str = r#"ensemble:
+  steps:
+    - name: pre
+      model: pre
+      version: "1"
+      inputs:
+        text: "$request.text"
+    - name: tail
+      model: tail_split
+      version: "1"
+      stream: true
+      inputs:
+        pre: "$pre.pre"
+"#;
+
 fn write_all_fixtures(repo: &std::path::Path) {
     write_pre(repo);
     write_tail(repo, "tail", "");
     write_tail(repo, "tail_v2", "_v2");
     write_tail_slow(repo);
+    write_tail_dslow(repo);
     write_tail_fail(repo);
     write_tail_binary(repo);
+    write_tail_split(repo);
     write_pre_bad(repo);
     write_pre_5xx(repo);
     write_missing_model(repo);
@@ -607,6 +706,8 @@ fn write_all_fixtures(repo: &std::path::Path) {
     write_pre_agg(repo);
     write_ensemble(repo, "ens_stream", ENS_STREAM_YAML);
     write_ensemble(repo, "ens_agg", ENS_AGG_YAML);
+    write_ensemble(repo, "ens_split", ENS_SPLIT_YAML);
+    write_ensemble(repo, "ens_dslow", ENS_DSLOW_YAML);
     write_ensemble(repo, "ens_binary", ENS_BINARY_YAML);
     write_ensemble(repo, "ens_unary", ENS_UNARY_YAML);
     write_ensemble(repo, "ens_pipeline", ENS_PIPELINE_YAML);
@@ -631,7 +732,7 @@ fn write_server_yaml(repo: &std::path::Path, http_port: u16, extra: &str) -> std
         format!(
             "server:\n  http_port: {http_port}\n  timeout: 30.0\n{extra}\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n",
             repo.display()
         ),
     )
@@ -996,7 +1097,7 @@ async fn boot_server_grpc(extra: &str) -> (String, u16, ServerGuard, std::path::
             "server:\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  timeout: 30.0\n{extra}\n\n\
              grpc:\n  enabled: true\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n",
             repo.display()
         ),
     )
@@ -1376,7 +1477,7 @@ async fn test_audit_stream_ws_bidi_mixed_frames_rejected() {
     ))
     .await
     .unwrap();
-    ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![0u8, 1, 2].into()))
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![0u8, 1, 2]))
         .await
         .unwrap();
 
@@ -1438,5 +1539,309 @@ async fn test_audit_stream_ws_bidi_aggregation_idle_timeout() {
     assert!(
         saw_error,
         "aggregation without a close trigger must hit the idle timeout"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// /audit 2026-08-12: batch-0/1 defect repros (read-only; no impl changes)
+// ---------------------------------------------------------------------------
+
+/// D33/现有 decoupled 契约:WS decoupled 的 close/cancel 帧是 cancel 别名
+/// (is_cancel_or_close_frame)。ensemble 分支把 cancel 帧误判为「多轮违规」,
+/// 客户端收到子虚乌有的协议错误。
+#[tokio::test]
+#[serial]
+async fn test_audit_stream_ws_decoupled_cancel_frame_is_not_multi_round() {
+    use futures::{SinkExt, StreamExt};
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_dslow"]).await;
+    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_dslow/decoupled-stream", http_port);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"text":"one two three four"}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    // Wait for the first downstream chunk (DAG is streaming).
+    let mut got_chunk = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline && !got_chunk {
+        if let Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(b)))) =
+            tokio::time::timeout(Duration::from_secs(5), ws.next()).await
+        {
+            if b.windows(5).any(|w| w == b"token") {
+                got_chunk = true;
+            }
+        }
+    }
+    assert!(got_chunk, "must receive a downstream chunk before cancel");
+
+    // decoupled contract: a cancel frame cancels the worker stream + closes.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"type":"cancel"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    let mut multi_round_error = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(2), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
+                if t.contains("multi-round") {
+                    multi_round_error = true;
+                }
+            }
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(b)))) => {
+                if b.windows(11).any(|w| w == b"multi-round") {
+                    multi_round_error = true;
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(
+        !multi_round_error,
+        "decoupled cancel frame must cancel the stream (existing contract), \
+         not be rejected as a multi-round violation"
+    );
+}
+
+/// D33:decoupled 的 close 帧同为 cancel 别名。ensemble 分支静默忽略它——
+/// worker 继续生成、客户端继续收 chunk,cancel 语义丢失。
+#[tokio::test]
+#[serial]
+async fn test_audit_stream_ws_decoupled_close_frame_cancels_stream() {
+    use futures::{SinkExt, StreamExt};
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_dslow"]).await;
+    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_dslow/decoupled-stream", http_port);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"text":"one two three four five six"}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    // Wait for the first downstream chunk.
+    let mut got_chunk = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline && !got_chunk {
+        if let Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(b)))) =
+            tokio::time::timeout(Duration::from_secs(5), ws.next()).await
+        {
+            if b.windows(5).any(|w| w == b"token") {
+                got_chunk = true;
+            }
+        }
+    }
+    assert!(got_chunk, "must receive a downstream chunk before close");
+
+    // decoupled contract: close frame = cancel alias → stream stops promptly.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"type":"close"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    let mut further_chunks = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(1500), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(b)))) => {
+                if b.windows(5).any(|w| w == b"token") {
+                    further_chunks += 1;
+                }
+            }
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
+                if t.contains("token") {
+                    further_chunks += 1;
+                }
+            }
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) | Ok(None) => break,
+            _ => break,
+        }
+    }
+    assert_eq!(
+        further_chunks, 0,
+        "decoupled close frame must cancel the ensemble stream; chunks kept flowing"
+    );
+}
+
+/// D17 硬要求(方案原文「禁止新写不接 idle 超时的聚合循环」):h2 聚合循环在
+/// body_stream.next() 上无超时阻塞,静默客户端可无限期钉住聚合缓冲。
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_audit_stream_h2_bidi_aggregation_stall_reclaimed() {
+    use lite_server::proto::liteserver as pb;
+    use lite_server::streaming::lpm;
+
+    let (base, _guard, _repo) = boot_server("  decoupled_idle_timeout_secs: 1.0").await;
+    wait_ready_all(&base, &["ens_agg"]).await;
+
+    // Body yields the Open frame, then never yields and never EOFs.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, reqwest::Error>>(16);
+    tx.send(Ok(lpm::encode_frame(&pb::BidiChunk {
+        stream_id: "t".into(),
+        payload: Some(pb::bidi_chunk::Payload::Open(pb::BidiOpen {
+            initial_data: bytes::Bytes::from(r#"{"text":"h2"}"#),
+            ..Default::default()
+        })),
+    })))
+    .await
+    .unwrap();
+    let _hold_tx = tx; // held open: no more frames, no EOF
+    let body = reqwest::Body::wrap_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
+
+    let send = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap()
+        .post(format!("{}/v2/models/ens_agg/bidi", base))
+        .header("content-type", "application/x-lite-bidi")
+        .body(body)
+        .send();
+    // Fixed behavior: the always-on idle budget (~1s) reclaims the stalled
+    // aggregation and the server responds/closes. Today the recv is not
+    // timeout-wrapped, so the handler hangs forever.
+    let answered = tokio::time::timeout(Duration::from_secs(6), send).await;
+    assert!(
+        answered.is_ok(),
+        "h2 aggregation of a stalled client must be reclaimed by the idle budget (D17), \
+         not hang forever holding the aggregation buffer"
+    );
+}
+
+/// §4.4 (D21):WS 错误一律落 close frame + 契约 close code(组合不支持 =
+/// 1003)。当前 ws_send_error 发的是无 code 的普通 close。
+#[tokio::test]
+#[serial]
+async fn test_audit_stream_ws_bidi_error_close_code_is_contractual() {
+    use futures::{SinkExt, StreamExt};
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_stream"]).await;
+    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_stream/stream", http_port);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"text":"hello"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    // Mixed frames (JSON then Binary) → 400 semantics: close 1003 (D17/§4.4).
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![0u8, 1, 2]))
+        .await
+        .unwrap();
+
+    let mut close_code = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(frame)))) => {
+                close_code = frame.map(|f| f.code);
+                break;
+            }
+            Ok(Some(Err(_))) | Ok(None) => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        close_code,
+        Some(tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Unsupported),
+        "mixed-frame rejection must close with the contractual 1003 (§4.4)"
+    );
+}
+
+/// D17 两段式:per-chunk idle 常开。客户端指定了 overall deadline 时,
+/// 聚合循环丢掉 idle 约束((Some(d), _) 分支),静默连接可挂到 deadline
+/// 才被回收——recv_chunk 的语义是 min(overall, idle)。
+#[tokio::test]
+#[serial]
+async fn test_audit_stream_ws_bidi_aggregation_idle_despite_client_deadline() {
+    use futures::{SinkExt, StreamExt};
+    let (base, _guard, _repo) = boot_server("  decoupled_idle_timeout_secs: 1.0").await;
+    wait_ready_all(&base, &["ens_stream"]).await;
+    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_stream/stream", http_port);
+    let req = tokio_tungstenite::tungstenite::client::ClientRequestBuilder::new(
+        ws_url.parse::<tokio_tungstenite::tungstenite::http::Uri>().unwrap(),
+    )
+    .with_header("x-lite-timeout", "30");
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.expect("WS connect");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"text":"stuck"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    // Never send the close trigger. idle=1s must fire well before the 30s
+    // overall deadline.
+    let mut saw_error = false;
+    let answered = tokio::time::timeout(Duration::from_secs(6), async {
+        while let Some(msg) = ws.next().await {
+            match msg {
+                Ok(tokio_tungstenite::tungstenite::Message::Text(t)) => {
+                    if t.contains("idle") || t.contains("error") {
+                        saw_error = true;
+                        break;
+                    }
+                }
+                Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
+                    saw_error = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        answered.is_ok() && saw_error,
+        "aggregation idle timeout must fire even when the client set an overall deadline (D17 two-stage)"
+    );
+}
+
+/// m7 边界:字节级切分的文本 chunk(多字节 UTF-8 字符跨 chunk)不是 Binary。
+/// 直连 SSE 容忍(from_utf8_lossy),ensemble 不得误判 type_mismatch 杀流。
+#[tokio::test]
+#[serial]
+async fn test_audit_stream_split_utf8_chunks_not_type_mismatch() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_split"]).await;
+
+    let body = sse_post(&base, "/v2/models/ens_split/events", json!({"text": "x"}))
+        .await
+        .expect("split-UTF8 text stream must open");
+    assert!(
+        body.contains("[DONE]") && !body.contains("type_mismatch") && !body.contains("binary chunk"),
+        "byte-split UTF-8 text chunks must stream to completion (direct-path parity), \
+         not be killed as type_mismatch: {body}"
+    );
+}
+
+/// §4.1 指标行:record_ensemble_step_latency 对流式 step 以流 close 时刻计
+/// (EnsembleStream.tail_model/tail_version 即为此携带)。当前没有任何记录点。
+#[tokio::test]
+#[serial]
+async fn test_audit_stream_step_latency_covers_streaming_step() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_stream"]).await;
+
+    let _ = sse_post(&base, "/v2/models/ens_stream/events", json!({"text": "a b"}))
+        .await
+        .expect("SSE happy path");
+    let metrics = reqwest::Client::new()
+        .get(format!("{}/metrics", base))
+        .send()
+        .await
+        .expect("/metrics")
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains(r#"step="tail""#),
+        "ensemble_step_latency must include the streaming step (recorded at stream close, §4.1); \
+         only pre-layer steps are recorded today"
     );
 }

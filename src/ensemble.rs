@@ -34,17 +34,25 @@ pub enum EnsembleValue {
 
 // ===== Config parsing =====
 
+// D24: the ensemble schema denies unknown fields — keys from a newer release
+// (params/when/outputs/dags/inputs/step.outputs, 0.9.0) or plain typos must
+// fail fast at load, never be silently ignored (a swallowed `stream:` typo
+// would silently disable streaming). NOTE: only the ensemble section denies —
+// the top-level file shares space with model-config keys (max_batch_size …),
+// so EnsembleConfig itself must stay open.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EnsembleConfig {
     pub ensemble: EnsembleBlock,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnsembleBlock {
     pub steps: Vec<EnsembleStepRaw>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnsembleStepRaw {
     pub name: String,
     pub model: String,
@@ -75,7 +83,7 @@ lazy_static::lazy_static! {
 /// streaming/MIMO validation stacks on top of it (no parse logic double
 /// write). The caller owns the file read — the cache re-parses only on
 /// miss/eviction.
-pub fn parse_ensemble_plan(content: &str, config_path: &PathBuf) -> Result<EnsemblePlan, AppError> {
+pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Result<EnsemblePlan, AppError> {
     let config: EnsembleConfig = serde_yaml::from_str(content)
         .map_err(|e| AppError::Config(format!("failed to parse ensemble config: {}", e)))?;
 
@@ -103,7 +111,10 @@ pub fn parse_ensemble_plan(content: &str, config_path: &PathBuf) -> Result<Ensem
         output_step: steps.len() - 1,
         steps,
         layers,
-        config_path: config_path.clone(),
+        config_path: config_path.to_path_buf(),
+        // Set by the production loader (stat-before-read); None for the
+        // load-time direct-parse path (insert_ready stats on its own).
+        source_mtime: None,
     })
 }
 
@@ -116,10 +127,19 @@ async fn load_ensemble_plan(
 ) -> Result<Arc<EnsemblePlan>, AppError> {
     let model_dir = crate::validation::resolve_model_dir(repo_path, model, version)?;
     let config_path = model_dir.join("config.yaml");
+    // Stat BEFORE the read: a write landing between stat and read leaves the
+    // stored mtime OLDER than the file's, so the interval re-check re-parses
+    // (safe). The reverse order could pin a fresh mtime onto stale content
+    // and serve it indefinitely (the watcher-miss fallback's whole point).
+    let source_mtime = std::fs::metadata(&config_path)
+        .and_then(|m| m.modified())
+        .ok();
     let content = tokio::fs::read_to_string(&config_path)
         .await
         .map_err(|e| AppError::Config(format!("failed to read ensemble config: {}", e)))?;
-    parse_ensemble_plan(&content, &config_path).map(Arc::new)
+    let mut plan = parse_ensemble_plan(&content, &config_path)?;
+    plan.source_mtime = source_mtime;
+    Ok(Arc::new(plan))
 }
 
 /// P6 (batch 0 scope): background plan warm, spawned from the lifecycle
@@ -190,6 +210,12 @@ pub async fn get_ensemble_plan(
 }
 
 fn validate_dag(steps: &[EnsembleStep]) -> Result<(), AppError> {
+    // An empty DAG has no output step — reject at parse instead of panicking
+    // on `steps.len() - 1` (pre-batch-0 this degenerated into a request-time
+    // 500; with the plan cache it must be a load-time config error).
+    if steps.is_empty() {
+        return Err(AppError::Config("ensemble declares no steps".to_string()));
+    }
     let step_names: HashSet<&str> = steps.iter().map(|s| s.name.as_str()).collect();
 
     // Check for duplicate names
@@ -262,25 +288,11 @@ fn validate_dag(steps: &[EnsembleStep]) -> Result<(), AppError> {
 /// dispatch point opens pipeline form in batch 2 (no validator rework).
 ///
 /// Rules (non-pipeline form):
-/// 1. streaming step must be in the last topological layer — implied by
-///    "output not referenced" (topological last layer = no dependents), so
-///    the form split above covers it.
-/// 3. at most one streaming step per DAG.
-/// 4. output-step semantics unified (E2 base, batch 0): with `output`
-///    omitted the DAG output is `steps.last()`, which MUST be the streaming
-///    step — otherwise a streaming DAG would silently produce nothing
-///    streamable (B-m4: explicit `output` lands with E2 in batch 3).
-/// §4.0/D16 form-dispatching validation for `stream: true` steps (batch 0:
-/// only the non-pipeline form is open). Rule 2 (streaming output not
-/// referenced) is the definition of the form split — a referenced streaming
-/// output IS the pipeline form, rejected here with an explicit batch-2
-/// message instead of being mis-killed by rules 1-3. The same dispatch
-/// point opens pipeline form in batch 2 (no validator rework).
-///
-/// Rules (non-pipeline form):
-/// 1. streaming step must be in the last topological layer — implied by
-///    "output not referenced" (topological last layer = no dependents), so
-///    the form split above covers it.
+/// 1. streaming step must be in the last topological layer — checked
+///    explicitly below: "output not referenced" does NOT imply it (Kahn
+///    layering puts a no-dependency sink in layer 0 even when later layers
+///    exist), and accepting such a DAG would truncate execution at the
+///    tail's layer, silently never running the steps in later layers.
 /// 3. at most one streaming step per DAG.
 /// 4. output-step semantics unified (E2 base, batch 0): with `output`
 ///    omitted the DAG output is `steps.last()`, which MUST be the streaming
@@ -314,6 +326,25 @@ fn validate_stream_rules(steps: &[EnsembleStep]) -> Result<(), AppError> {
             "pipeline streaming (streaming step '{}' output consumed by a \
              downstream step) opens in 0.9.0 (batch 2); this server accepts \
              only tail streaming (streaming step = final step, output to client)",
+            tail.name
+        )));
+    }
+
+    // Rule 1: the streaming step must be in the LAST topological layer.
+    // "Output not referenced" only proves it has no dependents — Kahn
+    // layering puts a no-dependency sink in layer 0 even when later layers
+    // exist, so without this check a streaming step in an early layer would
+    // truncate execution (run_layers stops at the tail's layer) and steps in
+    // later layers would silently never run. Load-time cost only (parse path).
+    let layers = topological_layers(steps);
+    let in_last_layer = layers
+        .last()
+        .map(|l| l.iter().any(|s| s.name == tail.name))
+        .unwrap_or(false);
+    if !in_last_layer {
+        return Err(AppError::Config(format!(
+            "streaming step '{}' must be in the last topological layer (rule 1); \
+             steps in later layers would silently never execute",
             tail.name
         )));
     }
@@ -455,6 +486,13 @@ pub struct EnsemblePlan {
     pub output_step: usize,
     /// Source config file — mtime re-check (review ②) stats this path.
     pub config_path: PathBuf,
+    /// mtime of `config_path` captured BEFORE the file read (stat-before-read):
+    /// a write landing mid-load leaves this mtime OLDER than the file's, so
+    /// the interval re-check re-parses (safe) — the reverse order could pin a
+    /// fresh mtime onto stale content and serve it indefinitely. Set by the
+    /// production loader; None for the load-time direct-parse path
+    /// (`insert_ready` stats on its own there).
+    pub source_mtime: Option<std::time::SystemTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -464,8 +502,14 @@ pub struct PlanKey {
 }
 
 enum PlanCell {
-    /// Single-flight in progress: the holder parses; waiters park here.
-    Loading(Vec<oneshot::Sender<Result<Arc<EnsemblePlan>, AppError>>>),
+    /// Single-flight in progress: the holder parses; waiters park here. The
+    /// generation id disambiguates ownership after an invalidation removed
+    /// the holder's cell mid-load (D23 race) — without it the stale holder
+    /// could clobber a NEW holder's cell or a load-time `insert_ready`.
+    Loading {
+        id: u64,
+        waiters: Vec<oneshot::Sender<Result<Arc<EnsemblePlan>, AppError>>>,
+    },
     Ready {
         plan: Arc<EnsemblePlan>,
         mtime: Option<std::time::SystemTime>,
@@ -482,6 +526,14 @@ enum PlanCell {
 pub struct EnsemblePlanCache {
     plans: DashMap<PlanKey, PlanCell>,
     stat_interval: Duration,
+    /// Single-flight cell generation counter (ownership after invalidation).
+    epoch: std::sync::atomic::AtomicU64,
+}
+
+impl Default for EnsemblePlanCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EnsemblePlanCache {
@@ -489,9 +541,9 @@ impl EnsemblePlanCache {
         Self {
             plans: DashMap::new(),
             stat_interval: Duration::from_secs(1),
+            epoch: std::sync::atomic::AtomicU64::new(0),
         }
     }
-
     /// Get-or-load with single-flight: concurrent first requests share one
     /// parse; a failed load is NOT cached (next call re-parses — a fixed
     /// config heals without reload). Ready entries within `stat_interval`
@@ -519,7 +571,7 @@ impl EnsemblePlanCache {
         loop {
             match self.plans.entry(key.clone()) {
                 MapEntry::Occupied(mut occ) => match occ.get_mut() {
-                    PlanCell::Loading(waiters) => {
+                    PlanCell::Loading { waiters, .. } => {
                         // Not the holder: park on the holder's result.
                         let (tx, rx) = oneshot::channel();
                         waiters.push(tx);
@@ -549,30 +601,42 @@ impl EnsemblePlanCache {
                 MapEntry::Vacant(vacant) => {
                     // We are the single-flight holder (review ④). Insert the
                     // Loading placeholder, drop the shard lock, then parse.
-                    vacant.insert(PlanCell::Loading(Vec::new()));
+                    let my_id = self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    vacant.insert(PlanCell::Loading { id: my_id, waiters: Vec::new() });
                     match load().await {
                         Ok(plan) => {
-                            let mtime = std::fs::metadata(&plan.config_path)
-                                .and_then(|m| m.modified())
-                                .ok();
+                            // B2: the mtime comes from the loader's
+                            // stat-before-read (a mid-load write can only make
+                            // it older → safe re-parse), never a post-load
+                            // stat (which could pin a fresh mtime onto stale
+                            // content and serve it indefinitely).
+                            let mtime = plan.source_mtime;
+                            // The cell may be gone (invalidate raced the load,
+                            // D23) or replaced (load-time insert_ready / a new
+                            // holder): only write back while WE still own it.
+                            // No panic paths — unload/reload racing a cold
+                            // first load is normal operation.
                             let waiters = match self.plans.get_mut(&key) {
                                 Some(mut cell) => match cell.value_mut() {
-                                    PlanCell::Loading(w) => std::mem::take(w),
-                                    PlanCell::Ready { .. } => {
-                                        unreachable!("holder owns the Loading cell")
+                                    PlanCell::Loading { id, waiters } if *id == my_id => {
+                                        std::mem::take(waiters)
                                     }
+                                    _ => Vec::new(),
                                 },
-                                None => unreachable!("holder owns the entry"),
+                                None => Vec::new(),
                             };
                             for w in waiters {
                                 let _ = w.send(Ok(plan.clone()));
                             }
-                            let mut cell = self.plans.get_mut(&key).unwrap();
-                            *cell.value_mut() = PlanCell::Ready {
-                                plan: plan.clone(),
-                                mtime,
-                                last_stat: tokio::time::Instant::now(),
-                            };
+                            if let Some(mut cell) = self.plans.get_mut(&key) {
+                                if matches!(&*cell, PlanCell::Loading { id, .. } if *id == my_id) {
+                                    *cell.value_mut() = PlanCell::Ready {
+                                        plan: plan.clone(),
+                                        mtime,
+                                        last_stat: tokio::time::Instant::now(),
+                                    };
+                                }
+                            }
                             return Ok(plan);
                         }
                         Err(e) => {
@@ -580,20 +644,24 @@ impl EnsemblePlanCache {
                             // placeholder so the next call re-parses (a fixed
                             // config heals without reload — behaviour parity
                             // with the uncached path). Waiters share the failure.
+                            // Same ownership rule as the Ok path: only evict
+                            // our own cell (an invalidate may have beaten us).
                             let waiters = match self.plans.get_mut(&key) {
                                 Some(mut cell) => match cell.value_mut() {
-                                    PlanCell::Loading(w) => std::mem::take(w),
-                                    PlanCell::Ready { .. } => {
-                                        unreachable!("holder owns the Loading cell")
+                                    PlanCell::Loading { id, waiters } if *id == my_id => {
+                                        Some(std::mem::take(waiters))
                                     }
+                                    _ => None,
                                 },
-                                None => unreachable!("holder owns the entry"),
+                                None => None,
                             };
-                            self.plans.remove(&key);
-                            for w in waiters {
-                                let _ = w.send(Err(AppError::Internal(
-                                    "ensemble plan load failed".to_string(),
-                                )));
+                            if let Some(waiters) = waiters {
+                                self.plans.remove(&key);
+                                for w in waiters {
+                                    let _ = w.send(Err(AppError::Internal(format!(
+                                        "ensemble plan load failed: {e}"
+                                    ))));
+                                }
                             }
                             return Err(e);
                         }
@@ -804,6 +872,10 @@ pub struct EnsembleStream {
     pub cancel_client: Arc<crate::transport::zmq::WorkerZmqClient>,
     pub tail_model: String,
     pub tail_version: String,
+    /// Step-level metric label (§4.1): the adapters record
+    /// `record_ensemble_step_latency(ensemble, tail_step, tail_model,
+    /// tail_version, …)` at stream close.
+    pub tail_step: String,
     /// D35 (batch 3): E5 `timeout_secs` converted to a step wall-clock cap —
     /// the adapter's recv_chunk overall takes min(client overall, this).
     /// None = inactive.
@@ -960,6 +1032,7 @@ pub async fn execute_ensemble(
 /// `context`. Step errors propagate directly (B3). The whole run is bounded
 /// by a single shared deadline (P-DEADLINE §4.0.10): an N-layer ensemble can
 /// never exceed the parent; the per-step timeout in execute_step is the
+#[allow(clippy::too_many_arguments)] // layer-engine plumbing: state+plan+ctx+ids ride together by design
 /// inner safety net, this outer deadline bounds the total.
 async fn run_layers(
     state: &Arc<AppState>,
@@ -992,7 +1065,6 @@ async fn run_layers(
                 let ensemble_name = model_name.to_string();
                 let request_id = request_id.to_string();
                 let client_ip = opts.client_ip.clone();
-                let deadline_unix_ns = deadline_unix_ns;
                 set.spawn(async move {
                     let start = Instant::now();
                     let result =
@@ -1047,6 +1119,7 @@ async fn run_layers(
 /// D25: open the tail stream — build/route the stream-open and return the
 /// stream handle. Batch 0: the tail's same-layer sibling unary steps run in
 /// parallel with the stream (rule 3: they produce no DAG output — results
+#[allow(clippy::too_many_arguments)] // layer-engine plumbing: state+plan+ctx+ids ride together by design
 /// dropped, failures warn only); batch 2 replaces this function's body with
 /// the chain spawn without touching the caller seam.
 async fn open_tail_stream(
@@ -1250,6 +1323,7 @@ async fn ensure_sub_model_loaded(
 }
 
 /// Execute the streaming tail step: resolve inputs, assemble payload (same
+#[allow(clippy::too_many_arguments)] // layer-engine plumbing: state+plan+ctx+ids ride together by design
 /// rules as unary), D19 readiness poll (skipped when a P7 preflight is
 /// provided), build meta, route and open the stream. Returns the stream
 /// handle consumed by the adapter layers.
@@ -1389,6 +1463,7 @@ async fn execute_stream_step(
         cancel_client: Arc::clone(client),
         tail_model: step.model.clone(),
         tail_version: step.version.clone(),
+        tail_step: step.name.clone(),
         // D35 (batch 3): E5 timeout_secs → step wall-clock cap; adapter
         // recv_chunk overall takes min(client overall, this). Inactive until
         // E5 lands.
@@ -2179,6 +2254,7 @@ mod tests {
             layers: Vec::new(),
             output_step: 0,
             config_path: PathBuf::from(path),
+            source_mtime: None,
         })
     }
 
@@ -2329,6 +2405,7 @@ mod tests {
                     layers: Vec::new(),
                     output_step: 0,
                     config_path,
+                    source_mtime: None,
                 }))
             }
         };
@@ -2348,5 +2425,178 @@ mod tests {
         cache.get_or_load(key.clone(), || load(count.clone())).await.unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 2, "mtime change after the interval must re-parse");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // === /audit 2026-08-12: batch-0/1 defect repros (read-only; no impl changes) ===
+
+    /// Concurrency assumption (D23): unload_version fires cache invalidation
+    /// BEFORE registry changes, so an invalidate can race an in-flight
+    /// single-flight load (cold cache + concurrent unload/reload). The holder
+    /// must still resolve — not panic on its vanished Loading cell.
+    #[tokio::test]
+    async fn p0_cache_invalidate_during_inflight_load_must_not_panic() {
+        let cache = Arc::new(EnsemblePlanCache::new());
+        let key = PlanKey { model: "m".to_string(), version: "1".to_string() };
+        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+        let c2 = cache.clone();
+        let k2 = key.clone();
+        let holder = tokio::spawn(async move {
+            c2.get_or_load(k2, || async move {
+                // Hold the single-flight load open (a slow disk read/parse).
+                let _ = gate_rx.await;
+                Ok::<_, AppError>(test_plan("/nonexistent"))
+            })
+            .await
+        });
+        // Wait until the holder has published the Loading cell.
+        for _ in 0..1000 {
+            if matches!(cache.plans.get(&key).as_deref(), Some(PlanCell::Loading { .. })) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // D23: unload invalidates before registry changes — this races loads.
+        cache.invalidate_model("m");
+        let _ = gate_tx.send(());
+        let joined = holder.await;
+        assert!(
+            joined.is_ok(),
+            "invalidate racing an in-flight load panicked the holder: {joined:?}"
+        );
+        assert!(
+            joined.unwrap().is_ok(),
+            "the racing load must still resolve its plan"
+        );
+    }
+
+    /// Order assumption (review ②): the loader stats BEFORE the read, so a
+    /// write landing between stat and read leaves the stored mtime OLDER than
+    /// the file's — the interval re-check must then re-parse (safe). The
+    /// reverse order (stat after read) could pin a fresh mtime onto stale
+    /// content and serve it indefinitely.
+    #[tokio::test(start_paused = true)]
+    async fn p0_cache_stat_after_read_must_not_pin_stale_plan() {
+        let dir = std::env::temp_dir().join(format!("liteserver-ens-p0-toctou-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.yaml");
+        std::fs::write(&config_path, b"v1").unwrap();
+        // The production loader's stat-before-read mtime.
+        let v1_mtime = std::fs::metadata(&config_path).and_then(|m| m.modified()).ok();
+        // Real clock: force a distinct mtime for the interleaved write.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let cache = EnsemblePlanCache::new();
+        let key = PlanKey { model: "m".to_string(), version: "1".to_string() };
+        // First load: returns the v1 plan (output_step=1) with the
+        // stat-before-read mtime, but the file becomes v2 before the cache
+        // stores the entry — exactly the stat→write→store interleaving the
+        // mtime re-check must catch at the next interval.
+        let first = cache
+            .get_or_load(key.clone(), || {
+                let cp = config_path.clone();
+                async move {
+                    std::fs::write(&cp, b"v2").unwrap(); // interleaved write
+                    Ok::<_, AppError>(Arc::new(EnsemblePlan {
+                        steps: Vec::new(),
+                        layers: Vec::new(),
+                        output_step: 1,
+                        config_path: cp,
+                        source_mtime: v1_mtime,
+                    }))
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.output_step, 1);
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        // Interval elapsed: the re-check must notice v2 (stored mtime is
+        // v1's, older than the file's) and re-parse.
+        let second = cache
+            .get_or_load(key.clone(), || {
+                let cp = config_path.clone();
+                async move {
+                    Ok::<_, AppError>(Arc::new(EnsemblePlan {
+                        steps: Vec::new(),
+                        layers: Vec::new(),
+                        output_step: 2,
+                        config_path: cp,
+                        source_mtime: None,
+                    }))
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            second.output_step, 2,
+            "a mid-load write must be caught at the next interval re-check"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Control-flow assumption (§4.1 rule 1): a streaming step must be in the
+    /// LAST topological layer. "Output not referenced" does NOT imply that —
+    /// Kahn layering puts a no-dependency sink in layer 0 even when later
+    /// layers exist. Accepting this config truncates execution at the tail's
+    /// layer: steps in later layers silently never run.
+    #[test]
+    fn stream_rules_streaming_step_must_be_in_last_topological_layer() {
+        // a (layer 0) ← c (layer 1); b (stream, no deps → layer 0, config-last).
+        let yaml = r#"
+ensemble:
+  steps:
+    - name: a
+      model: m1
+      version: "1"
+      inputs: {x: "$request.x"}
+    - name: c
+      model: m2
+      version: "1"
+      inputs: {y: "$a"}
+    - name: b
+      model: m3
+      version: "1"
+      stream: true
+      inputs: {z: "$request.z"}
+"#;
+        let res = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"));
+        assert!(
+            res.is_err(),
+            "streaming step not in the last topological layer must be rejected (rule 1); \
+             accepting it silently drops step c from execution"
+        );
+    }
+
+    /// Data assumption: an empty steps list is malformed config. It must be a
+    /// Config error at parse — not a `steps.len() - 1` underflow panic
+    /// (regression: the pre-cache code returned a request-time 500).
+    #[test]
+    fn parse_ensemble_plan_empty_steps_is_config_error_not_panic() {
+        let yaml = "ensemble:\n  steps: []\n";
+        let res = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"));
+        assert!(
+            res.is_err(),
+            "empty steps must be a config error, not an arithmetic panic"
+        );
+    }
+
+    /// Config contract (D24): the ensemble schema must deny unknown fields so
+    /// 0.9.0 keys (params/when/outputs/…) — or plain typos — fail fast at
+    /// load instead of being silently ignored.
+    #[test]
+    fn ensemble_schema_rejects_unknown_fields_d24() {
+        let yaml = r#"
+ensemble:
+  steps:
+    - name: s1
+      model: m1
+      version: "1"
+      inputs: {x: "$request"}
+      strem: true
+"#;
+        let res = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"));
+        assert!(
+            res.is_err(),
+            "unknown step field `strem` must be rejected (D24 deny_unknown_fields); \
+             silently ignoring it disables streaming without any error"
+        );
     }
 }

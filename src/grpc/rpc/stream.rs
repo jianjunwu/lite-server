@@ -141,6 +141,8 @@ impl GrpcService {
 
         // P10 (D40): semaphore permit held for the forward task's lifetime.
         let mut ensemble_permit = None;
+        // §4.1 指标行: streaming-step latency is recorded at stream close.
+        let mut ensemble_tail: Option<(String, String, String)> = None;
         let (stream_id, mut chunk_rx, cancel_client) = if is_ensemble {
             let ensemble_input = match serde_json::from_slice::<serde_json::Value>(&req.data) {
                 Ok(v) => crate::ensemble::EnsembleValue::Json(v),
@@ -170,6 +172,7 @@ impl GrpcService {
             {
                 crate::ensemble::EnsembleOutcome::Stream(mut s) => {
                     ensemble_permit = s.permit.take();
+                    ensemble_tail = Some((s.tail_step.clone(), s.tail_model.clone(), s.tail_version.clone()));
                     (s.stream_id, s.chunk_rx, s.cancel_client)
                 }
                 crate::ensemble::EnsembleOutcome::Unary(_) => {
@@ -371,6 +374,16 @@ impl GrpcService {
                 output_bytes,
                 chunks,
             );
+            // §4.1 指标行: the streaming step's latency, measured at stream close.
+            if let Some((tail_step, tail_model, tail_version)) = ensemble_tail {
+                crate::metrics::prometheus::record_ensemble_step_latency(
+                    &metrics_model,
+                    &tail_step,
+                    &tail_model,
+                    &tail_version,
+                    start.elapsed().as_secs_f64(),
+                );
+            }
             // Cleanup: send cancel to worker. `send_raw` (fire-and-forget) —
             // the worker signals the generator to stop and sends NO unary reply
             // to a Cancel, so `.send()` would await the full ZMQ_RESPONSE_TIMEOUT
