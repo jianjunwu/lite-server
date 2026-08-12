@@ -43,6 +43,7 @@ pub(crate) fn app_error_to_grpc_status(e: &AppError) -> Status {
         | AppError::InvalidQueryParam(_) => 400,
         AppError::FrameTooLarge => 413,
         AppError::RateLimitExceeded { .. } => 429,
+        AppError::StreamingCapacityExceeded(_) => 429,
         AppError::Unauthorized(_) => 401,
         AppError::MethodNotAllowed => 405,
         _ => 500,

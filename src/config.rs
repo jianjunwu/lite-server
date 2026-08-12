@@ -183,6 +183,13 @@ pub struct ServerConfig {
     /// stream and cancels the worker (reclaims a channel the model left open).
     /// 0 disables the idle timeout (stream lives until model close / cancel).
     pub decoupled_idle_timeout_secs: f32,
+    /// P10 (D40): global cap on concurrent streaming ensemble DAGs. Streaming
+    /// bypasses the queue (no backpressure), so an ensemble fan-out has no
+    /// global memory bound — this semaphore is the knob (§6.3.1: default 128
+    /// bounds worst-case streaming residency ≈ 128 × 64 × c_max). Exceeding
+    /// it rejects immediately with 429/ResourceExhausted (no queueing — the
+    /// pre-layers already waited in the queue once). 0 = unlimited.
+    pub max_concurrent_streaming_dags: usize,
     /// P-FLOW (§4.0.9): global in-flight admission cap for *inference*
     /// requests. When > 0, inference requests beyond this concurrent count are
     /// rejected with 503 / gRPC Unavailable (+ Retry-After). Health/admin
@@ -234,6 +241,7 @@ impl Default for ServerConfig {
             balance_rel_threshold: 1.5,
             decoupled_idle_timeout_secs: 300.0,
             max_inflight: 0,
+            max_concurrent_streaming_dags: 128,
             max_request_body_bytes: Some(64 * 1024 * 1024), // 64 MiB
             trusted_proxies: Vec::new(),
             cors: None,

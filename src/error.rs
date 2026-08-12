@@ -86,6 +86,11 @@ pub enum AppError {
     #[error("rate limit exceeded")]
     RateLimitExceeded { retry_after_secs: u64 },
 
+    /// P10 (D40): streaming ensemble DAG concurrency cap reached — HTTP 429
+    /// / gRPC ResourceExhausted, immediate rejection (no queueing).
+    #[error("{0}")]
+    StreamingCapacityExceeded(String),
+
     /// Missing or invalid API key — HTTP 401. The detail names the header
     /// that was checked; it is client-facing (mirrors the old Python-side
     /// RequireApiKey messages).
@@ -149,6 +154,7 @@ impl AppError {
             AppError::PayloadTooLarge { .. } => "payload too large",
             AppError::UnsupportedMediaType(_) => "unsupported media type",
             AppError::RateLimitExceeded { .. } => "rate limit exceeded",
+            AppError::StreamingCapacityExceeded(_) => "streaming capacity exceeded",
             AppError::Unauthorized(_) => "unauthorized",
             // ModelError is handled specially in IntoResponse
             // and never reaches this point, but provide a fallback.
@@ -208,6 +214,7 @@ impl AppError {
             AppError::PayloadTooLarge { .. } => "payload_too_large",
             AppError::UnsupportedMediaType(_) => "unsupported_media_type",
             AppError::RateLimitExceeded { .. } => "rate_limit_exceeded",
+            AppError::StreamingCapacityExceeded(_) => "streaming_capacity_exceeded",
             AppError::Unauthorized(_) => "unauthorized",
             // ModelError code comes from the Python worker; fallback to its error_type
             AppError::ModelError(d) => d.code.as_deref().unwrap_or(d.error_type.as_str()),
@@ -255,6 +262,7 @@ impl AppError {
             AppError::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             AppError::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             AppError::RateLimitExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
+            AppError::StreamingCapacityExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             AppError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             AppError::ModelError(_) => unreachable!(), // 上面早返
         }
@@ -307,6 +315,7 @@ impl AppError {
             AppError::VersionAlreadyLoaded(_, _) => "conflict_error",
             AppError::InferenceTimeout(_) => "server_error",
             AppError::QueueFull(_) => "queue_full",
+            AppError::StreamingCapacityExceeded(_) => "streaming_capacity_exceeded",
             AppError::WorkerCrashed(_) => "server_error",
             AppError::Validation(_) => "invalid_request_error",
             AppError::Config(_) => "invalid_request_error",

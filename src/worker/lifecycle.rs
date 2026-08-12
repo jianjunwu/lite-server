@@ -203,6 +203,17 @@ impl WorkerManager {
             // Ensemble: no workers, just mark ready
             self.registry
                 .mark_ready(model_name, version)?;
+            // P6 (batch 0): background warm — prime the plan cache and
+            // pre-check sub-model readiness without blocking the load
+            // (sub-model preloading + the E4 resolved-version side-table
+            // land with batch 3).
+            crate::ensemble::spawn_ensemble_warm(
+                self.repo_path.clone(),
+                self.ensemble_plans.clone(),
+                self.registry.clone(),
+                model_name.to_string(),
+                version.to_string(),
+            );
             crate::metrics::prometheus::record_model_load(model_name, version, true);
             self.sync_grpc_health().await;
             info!("Ensemble {} version {} loaded", model_name, version);

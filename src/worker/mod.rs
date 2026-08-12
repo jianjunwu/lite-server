@@ -94,6 +94,9 @@ pub struct WorkerManager {
     // P0 (D6): ensemble plan cache, invalidated from the lifecycle single
     // collection point (unload_version / reload_model, D23).
     ensemble_plans: Option<Arc<crate::ensemble::EnsemblePlanCache>>,
+    // P10 (D40): global streaming-DAG semaphore (server.max_concurrent_streaming_dags).
+    // None = unlimited (0) or bare unit-test WorkerManager.
+    streaming_capacity: Option<Arc<crate::ensemble::StreamingCapacityState>>,
 }
 
 struct WorkerProcess {
@@ -145,6 +148,9 @@ impl WorkerManager {
             // install one (unit-test WorkerManager::new) — execute_ensemble
             // then loads plans uncached (behaviour parity).
             ensemble_plans: None,
+            // P10 (D40): installed on the production path (server/mod.rs)
+            // from server.max_concurrent_streaming_dags; 0/None = unlimited.
+            streaming_capacity: None,
         }
     }
 
@@ -160,6 +166,17 @@ impl WorkerManager {
     /// bare WorkerManager).
     pub fn ensemble_plans(&self) -> Option<Arc<crate::ensemble::EnsemblePlanCache>> {
         self.ensemble_plans.clone()
+    }
+
+    /// P10 (D40): install the global streaming-DAG semaphore.
+    pub fn with_streaming_capacity(mut self, capacity: Arc<crate::ensemble::StreamingCapacityState>) -> Self {
+        self.streaming_capacity = Some(capacity);
+        self
+    }
+
+    /// P10 (D40): accessor for the streaming-DAG semaphore (None = unlimited).
+    pub fn streaming_capacity(&self) -> Option<Arc<crate::ensemble::StreamingCapacityState>> {
+        self.streaming_capacity.clone()
     }
 
     /// Set the loopback HTTP base URL workers receive as --server-http

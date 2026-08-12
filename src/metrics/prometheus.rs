@@ -224,6 +224,23 @@ lazy_static! {
         "Number of in-flight requests during shutdown"
     ).unwrap();
 
+    // P10 (D40): concurrent streaming ensemble DAGs (global, no model label —
+    // same口径 as the semaphore; per-model visibility comes from the existing
+    // record_stream_open/terminal model labels, aligning with the m4 label
+    // cardinality constraint).
+    pub static ref ENSEMBLE_STREAMING_ACTIVE: prometheus::IntGauge = prometheus::IntGauge::new(
+        "ensemble_streaming_active",
+        "Number of concurrent streaming ensemble DAGs (P10 semaphore in use)"
+    ).unwrap();
+
+    // m4: sub-model autoload wait (P6 cold-start tracking).
+    pub static ref ENSEMBLE_AUTOLOAD_WAIT: prometheus::Histogram = prometheus::Histogram::with_opts(
+        prometheus::HistogramOpts::new(
+            "ensemble_autoload_wait_seconds",
+            "Sub-model autoload wait duration for ensemble DAG steps"
+        )
+    ).unwrap();
+
     // ===== P-TRACE 导出健康（对账 A5）：OTel 管线自身的可观测 =====
     // ended→exported 的差值≈丢弃（BSP 队列满丢弃不可直接观测，以差值逼近）；
     // export_failures 直接计数导出失败。telemetry 关闭时恒 0。
@@ -505,6 +522,17 @@ pub fn record_model_unload(model: &str, version: &str) {
 
 pub fn set_active_workers(model: &str, version: &str, count: f64) {
     ACTIVE_WORKERS.with_label_values(&[model, version]).set(count);
+}
+
+/// P10 (D40): reflect the global streaming-DAG semaphore's in-use count.
+pub fn set_ensemble_streaming_active(count: usize) {
+    ENSEMBLE_STREAMING_ACTIVE.set(count as i64);
+}
+
+/// m4: sub-model autoload wait duration (histogram) — the dominant cold-TTFT
+/// term for ensemble DAGs (P6 tracks it).
+pub fn record_ensemble_autoload_wait_seconds(secs: f64) {
+    ENSEMBLE_AUTOLOAD_WAIT.observe(secs);
 }
 
 pub fn set_version_weight(model: &str, version: &str, weight: f64) {

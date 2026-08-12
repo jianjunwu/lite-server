@@ -122,6 +122,53 @@ async fn load_ensemble_plan(
     parse_ensemble_plan(&content, &config_path).map(Arc::new)
 }
 
+/// P6 (batch 0 scope): background plan warm, spawned from the lifecycle
+/// load_model ensemble branch — prime the P0 cache so the first request
+/// never pays the config parse, and pre-check sub-model readiness.
+/// Non-blocking (load_model returns immediately; the warm runs detached).
+/// The resolved-version side-table and sub-model preloading land with E4
+/// (batch 3) — warm here only parses + checks.
+pub fn spawn_ensemble_warm(
+    repo_path: PathBuf,
+    plans: Option<Arc<EnsemblePlanCache>>,
+    registry: Arc<crate::registry::ModelRegistry>,
+    model_name: String,
+    version: String,
+) {
+    tokio::spawn(async move {
+        let Some(plans) = plans else { return; };
+        let key = PlanKey {
+            model: model_name.clone(),
+            version: version.clone(),
+        };
+        let plan = match plans
+            .get_or_load(key, || load_ensemble_plan(&repo_path, &model_name, &version))
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    model = %model_name,
+                    error = %e,
+                    "ensemble warm: plan parse failed (first request retries)"
+                );
+                return;
+            }
+        };
+        for step in &plan.steps {
+            if !registry.is_ready(&step.model, Some(&step.version)) {
+                // P6: sub-model preload + resolved-version side-table land
+                // with E4 (batch 3) — log-only for now.
+                warn!(
+                    model = %step.model,
+                    version = %step.version,
+                    "ensemble warm: sub-model not ready (preload deferred to batch 3)"
+                );
+            }
+        }
+    });
+}
+
 /// P0 entry: cached plan lookup with single-flight + mtime re-check; falls
 /// back to a direct load when no cache is installed (tests construct
 /// WorkerManager without one).
@@ -623,6 +670,79 @@ pub struct EnsembleStream {
     /// D18: chain task tree unified teardown. Batch 0 = the tail stream
     /// itself (inert placeholder); batch 2 roots the whole chain here.
     pub abort: tokio::task::AbortHandle,
+    /// P10 (D40): owned semaphore permit — released when the stream is
+    /// dropped (terminal frame / adapter task end), the same single path as
+    /// D18's teardown. None = capacity not configured (0/unlimited).
+    pub permit: Option<StreamingPermit>,
+}
+
+/// P10 (D40): global streaming-DAG capacity — the semaphore that bounds
+/// streaming residency (§6.3.1: streaming bypasses the queue, so a fan-out
+/// has no other memory bound). Global scope (the derivation M = N × D_stream
+/// is a global memory model; per-model caps make the bound unprovable).
+/// Configuration: `server.max_concurrent_streaming_dags` (default 128;
+/// 0 = unlimited, capacity not installed).
+pub struct StreamingCapacityState {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    in_use: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// RAII permit handed to [`EnsembleStream`]. The Arc inner decouples the
+/// release from the stream struct's own Drop (the adapter moves fields out
+/// of EnsembleStream, which forbids a Drop impl on it): when the last
+/// reference goes away, the semaphore permit is returned and the gauge is
+/// synced (D40: owned permit, released via the D18 teardown path).
+#[derive(Clone)]
+pub struct StreamingPermit {
+    // Held (not read) for RAII lifetime semantics; the inner's Drop returns
+    // the semaphore slot and syncs the gauge.
+    _inner: Arc<StreamingPermitInner>,
+}
+
+struct StreamingPermitInner {
+    // Held (not read): owning the permit is the point — dropping it releases
+    // the semaphore slot.
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    in_use: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for StreamingPermitInner {
+    fn drop(&mut self) {
+        let prev = self.in_use.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        crate::metrics::prometheus::set_ensemble_streaming_active(prev.saturating_sub(1));
+    }
+}
+
+impl StreamingCapacityState {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(limit)),
+            in_use: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// Acquire one streaming-DAG slot. Immediate rejection on exhaustion —
+    /// no queueing (queueing turns an unbounded-stream memory problem into a
+    /// latency one, and the pre-layers already waited in the queue once).
+    pub fn try_acquire(&self) -> Result<StreamingPermit, AppError> {
+        match self.semaphore.clone().try_acquire_owned() {
+            Ok(permit) => {
+                let prev = self.in_use.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                crate::metrics::prometheus::set_ensemble_streaming_active(prev + 1);
+                Ok(StreamingPermit {
+                    _inner: Arc::new(StreamingPermitInner {
+                        _permit: permit,
+                        in_use: self.in_use.clone(),
+                    }),
+                })
+            }
+            Err(_) => Err(AppError::StreamingCapacityExceeded(
+                "concurrent streaming ensemble DAG limit reached (429); \
+                 reduce concurrency or raise server.max_concurrent_streaming_dags"
+                    .to_string(),
+            )),
+        }
+    }
 }
 
 pub async fn execute_ensemble(
@@ -659,14 +779,37 @@ pub async fn execute_ensemble(
     // extends the split into a chain without rewriting the main flow).
     let tail_layer = plan.layers.iter().position(|l| l.contains(&tail_idx))
         .ok_or_else(|| AppError::Internal("output step missing from layers".to_string()))?;
-    run_layers(
-        &state, &plan, &plan.layers[..tail_layer], &mut context,
-        model_name, version, request_id, &opts, deadline_unix_ns,
-    ).await?;
-    let stream = open_tail_stream(
+    // P7: the stream-open preflight (route pick + meta build — nothing that
+    // depends on the pre-layer results) runs IN PARALLEL with the pre-layers,
+    // so the TTFT critical path after the layers is just assemble + send.
+    // The autoload path stays serial (preflight only when already ready).
+    let preflight_fut = async {
+        tail_stream_preflight(
+            &state, &plan.steps[tail_idx], request_id, &opts, deadline_unix_ns,
+        )
+        .await
+    };
+    let layers_fut = async {
+        run_layers(
+            &state, &plan, &plan.layers[..tail_layer], &mut context,
+            model_name, version, request_id, &opts, deadline_unix_ns,
+        )
+        .await
+    };
+    let (preflight, layers_res) = tokio::join!(preflight_fut, layers_fut);
+    layers_res?;
+
+    // P10 (D40): acquire a streaming-DAG slot BEFORE opening the stream —
+    // immediate 429 rejection on exhaustion (no queueing; the pre-layers
+    // already waited in the queue once). The owned permit rides the stream
+    // and releases when the adapter's forward task ends (D18 teardown path).
+    let mut stream = open_tail_stream(
         &state, &plan, tail_idx, tail_layer, &context,
-        request_id, &opts, deadline_unix_ns,
+        request_id, &opts, deadline_unix_ns, preflight?,
     ).await?;
+    if let Some(capacity) = state.worker_manager.streaming_capacity() {
+        stream.permit = Some(capacity.try_acquire()?);
+    }
     Ok(EnsembleOutcome::Stream(stream))
 }
 
@@ -773,6 +916,7 @@ async fn open_tail_stream(
     request_id: &str,
     opts: &EnsembleExecOpts,
     deadline_unix_ns: Option<i64>,
+    preflight: Option<TailPreflight>,
 ) -> Result<EnsembleStream, AppError> {
     // §4.1 rule 3: same-layer sibling unary steps still run in parallel with
     // the streaming step. They never enter `context` (output semantics belong
@@ -785,7 +929,7 @@ async fn open_tail_stream(
         .filter(|&i| i != tail_idx)
         .collect();
 
-    let run_stream = execute_stream_step(state, plan, tail_idx, context, request_id, opts, deadline_unix_ns);
+    let run_stream = execute_stream_step(state, plan, tail_idx, context, request_id, opts, deadline_unix_ns, preflight);
     tokio::pin!(run_stream);
 
     if siblings.is_empty() {
@@ -830,6 +974,68 @@ async fn open_tail_stream(
     }
 }
 
+/// P7: stream-open preflight — everything that does NOT depend on the
+/// pre-layer results (route pick + meta build; autoload readiness check) is
+/// done in parallel with the pre-layers, so the TTFT critical path only
+/// waits for the assembled payload before send_stream. Returns None when the
+/// sub-model was not ready at preflight time — the autoload path stays
+/// serial after the pre-layers (P7 constraint: never preflight a stream for
+/// a model still loading).
+struct TailPreflight {
+    meta: pb::RequestMeta,
+    worker_id: usize,
+    clients: Vec<Arc<crate::transport::zmq::WorkerZmqClient>>,
+}
+
+async fn tail_stream_preflight(
+    state: &Arc<AppState>,
+    step: &EnsembleStep,
+    request_id: &str,
+    opts: &EnsembleExecOpts,
+    deadline_unix_ns: Option<i64>,
+) -> Result<Option<TailPreflight>, AppError> {
+    // P7 constraint: only preflight an already-ready sub-model. Not ready →
+    // fall back to the serial path (which runs the autoload + poll).
+    if !state.registry.is_ready(&step.model, Some(&step.version)) {
+        return Ok(None);
+    }
+    if !streaming_worker_ready(state, &step.model, &step.version, &pb::RequestMeta::default()).await {
+        return Ok(None);
+    }
+    let mv = state.registry.get(&step.model, Some(&step.version))
+        .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", step.model, step.version)))?;
+    let clients = state.worker_manager.get_zmq_clients(&step.model, &step.version).await
+        .ok_or_else(|| AppError::WorkerCrashed(format!("{} {} has no ZMQ clients", step.model, step.version)))?;
+
+    // P-TRACE: step-level span + trace injection (content-type is patched in
+    // after assembly — it depends on the payload shape).
+    let mut step_headers = HashMap::new();
+    {
+        let step_span = tracing::info_span!(
+            "ensemble.step",
+            step = %step.name,
+            model = %step.model,
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
+        );
+        crate::telemetry::link_parent(&step_span, &opentelemetry::Context::current());
+        let _guard = step_span.enter();
+        crate::telemetry::inject(&mut step_headers);
+    }
+    let meta = build_step_meta(
+        step, request_id, &opts.client_ip, deadline_unix_ns, step_headers, bytes::Bytes::new(),
+    );
+    let outlier = state.worker_manager.get_outlier_state(&step.model, &step.version).await;
+    let seq_registry = state.inference_queue.sequence_registry();
+    let worker_id = crate::worker::pick_streaming_worker(
+        &meta, mv.workers.len(), outlier.as_deref(), seq_registry, &step.model, &step.version,
+    ).map_err(|e| AppError::Validation(e.0))?;
+    if worker_id >= clients.len() {
+        return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
+    }
+    Ok(Some(TailPreflight { meta, worker_id, clients }))
+}
+
 /// D19: streaming readiness predicate — the sub-model must be reachable via
 /// routing (pick_streaming_worker returns a valid worker), NOT merely
 /// registry-ready: mark_ready and the streaming route table registration have
@@ -870,6 +1076,7 @@ async fn ensure_sub_model_loaded(
     if state.registry.is_ready(&step.model, Some(&step.version)) {
         return Ok(());
     }
+    let load_start = Instant::now();
     info!("Auto-loading sub-model {} v{} for ensemble", step.model, step.version);
     let sub_model_dir = crate::validation::resolve_model_dir(
         &state.repo_path, &step.model, &step.version,
@@ -893,12 +1100,17 @@ async fn ensure_sub_model_loaded(
             "sub-model {} v{} not ready: {}", step.model, step.version, e
         )));
     }
+    // m4: autoload wait (the dominant cold-TTFT term for ensemble DAGs).
+    crate::metrics::prometheus::record_ensemble_autoload_wait_seconds(
+        load_start.elapsed().as_secs_f64(),
+    );
     Ok(())
 }
 
 /// Execute the streaming tail step: resolve inputs, assemble payload (same
-/// rules as unary), D19 readiness poll, build meta, route and open the
-/// stream. Returns the stream handle consumed by the adapter layers.
+/// rules as unary), D19 readiness poll (skipped when a P7 preflight is
+/// provided), build meta, route and open the stream. Returns the stream
+/// handle consumed by the adapter layers.
 async fn execute_stream_step(
     state: &Arc<AppState>,
     plan: &EnsemblePlan,
@@ -907,6 +1119,7 @@ async fn execute_stream_step(
     request_id: &str,
     opts: &EnsembleExecOpts,
     deadline_unix_ns: Option<i64>,
+    preflight: Option<TailPreflight>,
 ) -> Result<EnsembleStream, AppError> {
     let step = &plan.steps[step_idx];
 
@@ -918,31 +1131,87 @@ async fn execute_stream_step(
     }
     let (payload_bytes, content_type_for_step) = assemble_step_payload(&step.name, &resolved)?;
 
-    // D19: ensure the sub-model is loaded, then poll STREAMING readiness
-    // (pick non-empty) with backoff. A pick failure is a retryable state.
-    ensure_sub_model_loaded(state, step).await?;
-    let mut retries = 0;
-    let max_retries = 30;
-    let mut delay = Duration::from_millis(50);
-    while !streaming_worker_ready(state, &step.model, &step.version, &pb::RequestMeta::default()).await {
-        if retries >= max_retries {
-            return Err(AppError::ModelNotReady(format!(
-                "sub-model {} v{} streaming not ready", step.model, step.version
-            )));
-        }
-        // D19: quick-fail when the remaining budget cannot cover one more
-        // poll — never spin to timeout.
-        if let Some(rem) = crate::deadline::remaining(deadline_unix_ns) {
-            if rem < delay {
-                return Err(AppError::InferenceTimeout(format!(
-                    "ensemble step {}: deadline exhausted while waiting for sub-model {} v{}",
-                    step.name, step.model, step.version
-                )));
+    // P7: when the preflight already routed/built meta in parallel with the
+    // pre-layers, skip the serial readiness/meta/pick block.
+    let (mut meta, worker_id, clients) = match preflight {
+        Some(pf) => (pf.meta, pf.worker_id, pf.clients),
+        None => {
+            // D19: ensure the sub-model is loaded, then poll STREAMING
+            // readiness (pick non-empty) with backoff. A pick failure is a
+            // retryable state.
+            ensure_sub_model_loaded(state, step).await?;
+            let mut retries = 0;
+            let max_retries = 30;
+            let mut delay = Duration::from_millis(50);
+            while !streaming_worker_ready(state, &step.model, &step.version, &pb::RequestMeta::default()).await {
+                if retries >= max_retries {
+                    return Err(AppError::ModelNotReady(format!(
+                        "sub-model {} v{} streaming not ready", step.model, step.version
+                    )));
+                }
+                // D19: quick-fail when the remaining budget cannot cover one
+                // more poll — never spin to timeout.
+                if let Some(rem) = crate::deadline::remaining(deadline_unix_ns) {
+                    if rem < delay {
+                        return Err(AppError::InferenceTimeout(format!(
+                            "ensemble step {}: deadline exhausted while waiting for sub-model {} v{}",
+                            step.name, step.model, step.version
+                        )));
+                    }
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_millis(500));
+                retries += 1;
             }
+
+            let mv = state.registry.get(&step.model, Some(&step.version))
+                .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", step.model, step.version)))?;
+            let clients = state.worker_manager.get_zmq_clients(&step.model, &step.version).await
+                .ok_or_else(|| AppError::WorkerCrashed(format!("{} {} has no ZMQ clients", step.model, step.version)))?;
+
+            // P-TRACE (同 execute_step): step-level span links to the parent
+            // trace and injects its context into the step headers so the
+            // worker spans land as children of the step.
+            let mut step_headers = HashMap::new();
+            if let Some(ct) = &content_type_for_step {
+                step_headers.insert("content-type".to_string(), ct.clone());
+            }
+            {
+                let step_span = tracing::info_span!(
+                    "ensemble.step",
+                    step = %step.name,
+                    model = %step.model,
+                    trace_id = tracing::field::Empty,
+                    span_id = tracing::field::Empty,
+                );
+                crate::telemetry::link_parent(&step_span, &opentelemetry::Context::current());
+                let _guard = step_span.enter();
+                crate::telemetry::inject(&mut step_headers);
+            }
+
+            // Streaming meta carries no payload — the body rides StreamOpen.data.
+            let meta = build_step_meta(
+                step, request_id, &opts.client_ip, deadline_unix_ns, step_headers, bytes::Bytes::new(),
+            );
+
+            let outlier = state.worker_manager.get_outlier_state(&step.model, &step.version).await;
+            let seq_registry = state.inference_queue.sequence_registry();
+            let worker_id = crate::worker::pick_streaming_worker(
+                &meta, mv.workers.len(), outlier.as_deref(), seq_registry, &step.model, &step.version,
+            ).map_err(|e| AppError::Validation(e.0))?;
+            if worker_id >= clients.len() {
+                return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
+            }
+            (meta, worker_id, clients)
         }
-        tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(Duration::from_millis(500));
-        retries += 1;
+    };
+
+    // The preflight built meta before the payload was assembled — patch in
+    // the content-type for binary passthrough (B3/E7).
+    if let Some(ct) = &content_type_for_step {
+        meta.headers
+            .entry("content-type".to_string())
+            .or_insert_with(|| ct.clone());
     }
 
     // D19: final deadline check before opening the stream — an expired
@@ -954,51 +1223,12 @@ async fn execute_stream_step(
             )));
         }
     }
-
-    let mv = state.registry.get(&step.model, Some(&step.version))
-        .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", step.model, step.version)))?;
-    let clients = state.worker_manager.get_zmq_clients(&step.model, &step.version).await
-        .ok_or_else(|| AppError::WorkerCrashed(format!("{} {} has no ZMQ clients", step.model, step.version)))?;
-
-    // P-TRACE (同 execute_step): step-level span links to the parent trace and
-    // injects its context into the step headers so the worker spans land as
-    // children of the step (request_id is already `{parent}:{step}`).
-    let mut step_headers = HashMap::new();
-    if let Some(ct) = &content_type_for_step {
-        step_headers.insert("content-type".to_string(), ct.clone());
-    }
-    {
-        let step_span = tracing::info_span!(
-            "ensemble.step",
-            step = %step.name,
-            model = %step.model,
-            trace_id = tracing::field::Empty,
-            span_id = tracing::field::Empty,
-        );
-        crate::telemetry::link_parent(&step_span, &opentelemetry::Context::current());
-        let _guard = step_span.enter();
-        crate::telemetry::inject(&mut step_headers);
-    }
-
-    // Streaming meta carries no payload — the body rides StreamOpen.data.
-    let meta = build_step_meta(
-        step, request_id, &opts.client_ip, deadline_unix_ns, step_headers, bytes::Bytes::new(),
-    );
-
-    let outlier = state.worker_manager.get_outlier_state(&step.model, &step.version).await;
-    let seq_registry = state.inference_queue.sequence_registry();
-    let worker_id = crate::worker::pick_streaming_worker(
-        &meta, mv.workers.len(), outlier.as_deref(), seq_registry, &step.model, &step.version,
-    ).map_err(|e| AppError::Validation(e.0))?;
-    if worker_id >= clients.len() {
-        return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
-    }
     crate::metrics::prometheus::record_worker_inference(&step.model, &step.version, worker_id, 1);
 
     let client = &clients[worker_id];
     let stream_id = format!("stream-{}", Uuid::new_v4());
     let open_req = crate::streaming::build_stream_open(
-        stream_id.clone(), bytes::Bytes::from(payload_bytes), Some(meta), opts.decoupled,
+        stream_id.clone(), payload_bytes, Some(meta), opts.decoupled,
     );
     let chunk_rx = client.send_stream(open_req, stream_id.clone()).await?;
 
@@ -1023,6 +1253,8 @@ async fn execute_stream_step(
         step_deadline: None,
         chain,
         abort,
+        // P10: filled by execute_ensemble after open_tail_stream returns.
+        permit: None,
     })
 }
 
@@ -1057,14 +1289,47 @@ fn build_step_meta(
     }
 }
 
+/// P9: cheap size estimate for with_capacity — recursive walk, no allocation
+/// (numbers fall back to a fixed f64-bound; the estimate only needs to be
+/// within a constant factor of the serialized size to eliminate the realloc
+/// chain in assemble_step_payload).
+fn json_value_len_estimate(v: &serde_json::Value) -> usize {
+    match v {
+        Value::Null => 4,
+        Value::Bool(b) => {
+            if *b {
+                4
+            } else {
+                5
+            }
+        }
+        Value::Number(_) => 16,
+        Value::String(s) => s.len() + 2,
+        Value::Array(a) => {
+            a.iter().map(json_value_len_estimate).sum::<usize>() + a.len() + 2
+        }
+        Value::Object(o) => o
+            .iter()
+            .map(|(k, v)| k.len() + 3 + json_value_len_estimate(v))
+            .sum::<usize>()
+            + 2,
+    }
+}
+
 /// B3 (E7): step input assembly — three branches.
 ///   all Json                                → build a JSON object (historical path)
 ///   exactly one input, a whole Binary       → raw bytes passthrough + content-type
 ///   any other combination involving Binary  → 400 (Option B scope)
+///
+/// P9: the Json branch pre-sizes its buffer from a cheap estimate (no
+/// realloc chain) and hands the Vec straight to `Bytes` (ownership transfer,
+/// zero copy — the queue payload stays Bytes end-to-end, §1.4); the Binary
+/// branch passes the Bytes through by refcount (P2: the old `to_vec` copy is
+/// gone).
 fn assemble_step_payload(
     step_name: &str,
     resolved: &HashMap<String, EnsembleValue>,
-) -> Result<(Vec<u8>, Option<String>), AppError> {
+) -> Result<(bytes::Bytes, Option<String>), AppError> {
     let binary_count = resolved
         .values()
         .filter(|v| matches!(v, EnsembleValue::Binary(_, _)))
@@ -1081,17 +1346,24 @@ fn assemble_step_payload(
                 EnsembleValue::Binary(_, _) => unreachable!(),
             }
         }
-        let payload_value = Value::Object(obj);
-        // serde_json::to_vec on a Value is infallible (E8 cleanup note).
-        let bytes = serde_json::to_vec(&payload_value).expect("Value serialization is infallible");
-        Ok((bytes, None))
+        let estimate: usize = obj
+            .iter()
+            .map(|(k, v)| k.len() + 3 + json_value_len_estimate(v))
+            .sum::<usize>()
+            + 2;
+        let mut buf = Vec::with_capacity(estimate);
+        let mut ser = serde_json::Serializer::new(&mut buf);
+        // Value serialization is infallible (E8 cleanup note).
+        serde::Serialize::serialize(&Value::Object(obj), &mut ser)
+            .expect("Value serialization is infallible");
+        Ok((bytes::Bytes::from(buf), None))
     } else if resolved.len() == 1 && binary_count == 1 {
         // Exactly one input and it is Binary → raw bytes passthrough.
         let (data, ct) = match resolved.values().next().unwrap() {
             EnsembleValue::Binary(data, ct) => (data.clone(), ct.clone()),
             EnsembleValue::Json(_) => unreachable!(),
         };
-        Ok((data.to_vec(), Some(ct)))
+        Ok((data, Some(ct)))
     } else {
         // Mixed or multiple inputs with any Binary → 400 (Option B scope).
         Err(AppError::InvalidRequestBody(format!(
@@ -1203,13 +1475,13 @@ async fn execute_step(
 
     let meta = build_step_meta(
         step, request_id, client_ip, deadline_unix_ns, step_headers,
-        bytes::Bytes::from(payload_bytes.clone()),
+        payload_bytes.clone(),
     );
 
     let (response_tx, response_rx) = oneshot::channel();
     let item = crate::inference_queue::QueueItem {
         uid: uid.clone(),
-        data: bytes::Bytes::from(payload_bytes),
+        data: payload_bytes,
         meta: Some(std::sync::Arc::new(meta)),
         response_tx,
         inflight_guard: None,
@@ -1503,7 +1775,7 @@ mod tests {
         let mut resolved = HashMap::new();
         resolved.insert("img".to_string(), bin(b"\x00\x01\x02", "image/png"));
         let (bytes, ct) = assemble_step_payload("s", &resolved).unwrap();
-        assert_eq!(bytes, b"\x00\x01\x02", "binary payload must pass verbatim");
+        assert_eq!(bytes.as_ref(), b"\x00\x01\x02", "binary payload must pass verbatim");
         assert_eq!(ct.as_deref(), Some("image/png"), "CT must be forwarded");
     }
 
@@ -1674,6 +1946,42 @@ mod tests {
             sstep("s2", &[("data", "$s1")], false),
         ];
         assert!(validate_stream_rules(&steps).is_ok());
+    }
+
+    // === P10: streaming-DAG capacity (D40) ===
+
+    #[test]
+    fn p10_capacity_rejects_when_exhausted_and_releases_on_drop() {
+        let cap = StreamingCapacityState::new(2);
+        let p1 = cap.try_acquire().unwrap();
+        let p2 = cap.try_acquire().unwrap();
+        let err = cap.try_acquire().err().unwrap();
+        assert!(
+            matches!(err, AppError::StreamingCapacityExceeded(_)),
+            "exhausted capacity must reject immediately (429), got {err:?}"
+        );
+        // Dropping a permit returns its slot — no queueing, no leak.
+        drop(p1);
+        let _p3 = cap.try_acquire().expect("slot must be released on permit drop");
+        // Clones share the same permit: slot stays held until ALL clones drop.
+        let p2_clone = p2.clone();
+        drop(p2);
+        let err = cap.try_acquire().err().unwrap();
+        assert!(
+            matches!(err, AppError::StreamingCapacityExceeded(_)),
+            "cloned permit must hold the slot until the last reference drops"
+        );
+        drop(p2_clone);
+        let _p4 = cap.try_acquire().expect("last clone drop must release the slot");
+    }
+
+    #[test]
+    fn p10_capacity_zero_permits_is_immediately_exhausted() {
+        // A 0-limit installation rejects everything (misconfiguration guard);
+        // production never installs one for 0 (server/mod.rs skips it).
+        let cap = StreamingCapacityState::new(0);
+        let err = cap.try_acquire().err().unwrap();
+        assert!(matches!(err, AppError::StreamingCapacityExceeded(_)));
     }
 
     // === P0: EnsemblePlan cache (D6 + review ①-④) ===

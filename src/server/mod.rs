@@ -136,7 +136,13 @@ impl LiteServer {
         // P0 (D6): install the ensemble plan cache on the production path;
         // lifecycle unload/reload invalidates it (D23 single collection point).
         let ensemble_plans = Arc::new(crate::ensemble::EnsemblePlanCache::new());
-        let worker_manager = Arc::new(WorkerManager::new(
+        // P10 (D40): global streaming-DAG semaphore; 0 = unlimited (no cap).
+        let streaming_capacity = (config.server.max_concurrent_streaming_dags > 0).then(|| {
+            Arc::new(crate::ensemble::StreamingCapacityState::new(
+                config.server.max_concurrent_streaming_dags,
+            ))
+        });
+        let mut wm = WorkerManager::new(
             registry.clone(),
             repo_path,
             inference_queue.clone(),
@@ -147,7 +153,11 @@ impl LiteServer {
          .with_server_tunables(config.tunables.clone())
          .with_custom_metrics(config.features.custom_metrics)
          .with_model_defaults(config.model_defaults.clone())
-         .with_ensemble_plans(ensemble_plans));
+         .with_ensemble_plans(ensemble_plans);
+        if let Some(capacity) = streaming_capacity {
+            wm = wm.with_streaming_capacity(capacity);
+        }
+        let worker_manager = Arc::new(wm);
 
         Self {
             config,
