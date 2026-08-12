@@ -96,7 +96,12 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
     }).collect();
 
     validate_dag(&steps)?;
-    validate_stream_rules(&steps)?;
+    // Pipeline-form validation + chain construction (P-R1..R5/D26, batch 2);
+    // non-pipeline streaming rules apply only when no chain exists.
+    let chains = build_chains(&steps, steps.len() - 1)?;
+    if chains.is_empty() {
+        validate_stream_rules(&steps)?;
+    }
     let index_of: HashMap<&str, usize> = steps
         .iter()
         .enumerate()
@@ -111,6 +116,7 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
         output_step: steps.len() - 1,
         steps,
         layers,
+        chains,
         config_path: config_path.to_path_buf(),
         // Set by the production loader (stat-before-read); None for the
         // load-time direct-parse path (insert_ready stats on its own).
@@ -298,6 +304,149 @@ fn validate_dag(steps: &[EnsembleStep]) -> Result<(), AppError> {
 ///    omitted the DAG output is `steps.last()`, which MUST be the streaming
 ///    step — otherwise a streaming DAG would silently produce nothing
 ///    streamable (B-m4: explicit `output` lands with E2 in batch 3).
+/// A linear pipeline chain (§4.2): consecutive STREAMING steps where each
+/// step's output is consumed whole by the next (P-R1/P-R2), ending at the
+/// DAG output step (P-R3/D26). Steps are indices into `EnsemblePlan.steps`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chain {
+    pub nodes: Vec<usize>,
+}
+
+/// §4.0/D16 pipeline-form validation + chain construction (batch 2 opens the
+/// form the batch-0 validator rejected). Rules P-R1..P-R5 + D26:
+///   P-R1  a streaming output has exactly ONE consumer (0 → non-pipeline;
+///         ≥2 → error)
+///   P-R2  streaming outputs are referenced WHOLE only ($s0; $s0.field → error)
+///   P-R3  the chain tail must be the DAG output step (and streaming — the
+///         unary-tail shape is rejected here, D26's "pipeline chain tail
+///         must be a streaming step")
+///   P-R4  chains never share steps (Kahn covers cycles; the linear walk
+///         below marks every node visited — a shared step fails)
+///   P-R5  the DAG's streaming set is exactly one chain OR one tail streaming
+///         step — a chain plus an orphan streaming step is an error
+///   D26   a chain's unary consumer has no clean chunk→unary→chunk semantics
+///         → the whole form is rejected at parse time
+fn build_chains(steps: &[EnsembleStep], output_step: usize) -> Result<Vec<Chain>, AppError> {
+    let is_stream: Vec<bool> = steps.iter().map(|s| s.stream).collect();
+    let stream_count = is_stream.iter().filter(|b| **b).count();
+    if stream_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Consumer edges: streaming step index → (consumer index, field-ref?).
+    let mut consumers: HashMap<usize, Vec<(usize, bool)>> = HashMap::new();
+    for (i, step) in steps.iter().enumerate() {
+        for ref_str in step.inputs.values() {
+            let Some(caps) = REF_RE.captures(ref_str) else { continue };
+            let source = caps.get(1).unwrap().as_str();
+            let Some(src_idx) = steps.iter().position(|s| s.name == source) else { continue };
+            if is_stream[src_idx] {
+                consumers
+                    .entry(src_idx)
+                    .or_default()
+                    .push((i, caps.get(2).is_some()));
+            }
+        }
+    }
+
+    let mut chains: Vec<Chain> = Vec::new();
+    let mut visited: HashSet<usize> = HashSet::new();
+    for s in 0..steps.len() {
+        if !is_stream[s] || visited.contains(&s) {
+            continue;
+        }
+        match consumers.get(&s).map(|v| v.as_slice()) {
+            None => {
+                // Zero consumers = non-pipeline (tail-streaming) form. An
+                // orphan that is NOT the output step breaks the output
+                // semantics (§4.1-4 / P-R5).
+                if s != output_step {
+                    return Err(AppError::Config(format!(
+                        "streaming step '{}' has no consumer and is not the DAG \
+                         output step — the DAG mixes a pipeline chain with an \
+                         orphan streaming step (P-R5)",
+                        steps[s].name
+                    )));
+                }
+            }
+            Some([(c, field_ref)]) => {
+                // Chain start (P-R1: exactly one consumer).
+                if *field_ref {
+                    return Err(AppError::Config(format!(
+                        "streaming step '{}' output must be referenced whole \
+                         ($step), not field-projected (P-R2)",
+                        steps[s].name
+                    )));
+                }
+                // Walk the consumer chain. Every node must be streaming —
+                // a unary consumer is the D26-rejected chunk→unary→chunk form
+                // (P-R3's "pipeline chain tail must be a streaming step").
+                let mut nodes = vec![s];
+                let mut cur = s;
+                let mut next_consumer = *c;
+                loop {
+                    let c = next_consumer;
+                    if !is_stream[c] {
+                        return Err(AppError::Config(format!(
+                            "pipeline chain step '{}' consumes streaming step \
+                             '{}' but is not streaming — the pipeline chain \
+                             tail must be a streaming step; unary consumers \
+                             on a chain are not defined (D26)",
+                            steps[c].name, steps[cur].name
+                        )));
+                    }
+                    if visited.contains(&c) {
+                        return Err(AppError::Config(format!(
+                            "pipeline chains share step '{}' (P-R4)",
+                            steps[c].name
+                        )));
+                    }
+                    nodes.push(c);
+                    visited.insert(c);
+                    match consumers.get(&c).map(|v| v.as_slice()) {
+                        None => break, // chain tail
+                        Some([(c2, field_ref2)]) => {
+                            if *field_ref2 {
+                                return Err(AppError::Config(format!(
+                                    "streaming step '{}' output must be referenced \
+                                     whole ($step), not field-projected (P-R2)",
+                                    steps[c].name
+                                )));
+                            }
+                            cur = c;
+                            next_consumer = *c2;
+                        }
+                        Some(_) => {
+                            return Err(AppError::Config(format!(
+                                "streaming step '{}' output has multiple \
+                                 consumers (P-R1)",
+                                steps[c].name
+                            )));
+                        }
+                    }
+                }
+                let tail = *nodes.last().unwrap();
+                if tail != output_step {
+                    return Err(AppError::Config(format!(
+                        "pipeline chain tail '{}' must be the DAG output step \
+                         (config last step); explicit `output:` lands in 0.9.0 \
+                         (batch 3) (P-R3)",
+                        steps[tail].name
+                    )));
+                }
+                chains.push(Chain { nodes });
+            }
+            Some(_) => {
+                return Err(AppError::Config(format!(
+                    "streaming step '{}' output has multiple consumers (P-R1)",
+                    steps[s].name
+                )));
+            }
+        }
+    }
+    Ok(chains)
+}
+
 fn validate_stream_rules(steps: &[EnsembleStep]) -> Result<(), AppError> {
     let stream_steps: Vec<&EnsembleStep> = steps.iter().filter(|s| s.stream).collect();
     if stream_steps.is_empty() {
@@ -484,6 +633,10 @@ pub struct EnsemblePlan {
     /// explicit `output` (batch 3) this is `steps.last()`; validation ensures
     /// a streaming DAG's output step is its streaming step.
     pub output_step: usize,
+    /// Pipeline chains (§4.2, batch 2): each chain is a linear consumer path
+    /// of STREAMING steps (all nodes stream), tail = output step. Empty for
+    /// non-pipeline DAGs (tail-streaming only).
+    pub chains: Vec<Chain>,
     /// Source config file — mtime re-check (review ②) stats this path.
     pub config_path: PathBuf,
     /// mtime of `config_path` captured BEFORE the file read (stat-before-read):
@@ -2131,6 +2284,121 @@ mod tests {
         }
     }
 
+    // === §4.0/D16: pipeline-form validation (batch 2) ===
+
+    fn pstep(name: &str, inputs: &[(&str, &str)], stream: bool) -> EnsembleStep {
+        sstep(name, inputs, stream)
+    }
+
+    #[test]
+    fn pipeline_chain_two_streaming_steps_valid() {
+        // s0 (streaming) → s1 (streaming, consumes s0 whole) = a valid chain;
+        // the chain tail is the config last step (output semantics, §4.1-4).
+        let steps = vec![
+            pstep("s0", &[("input", "$request")], true),
+            pstep("s1", &[("data", "$s0")], true),
+        ];
+        let chains = build_chains(&steps, 1).expect("valid chain must build");
+        assert_eq!(chains.len(), 1, "one chain expected");
+        assert_eq!(chains[0].nodes, vec![0, 1], "chain order: s0 → s1");
+    }
+
+    #[test]
+    fn pipeline_r1_two_consumers_rejected() {
+        // P-R1: a streaming step's output must have EXACTLY one consumer.
+        let steps = vec![
+            pstep("s0", &[("input", "$request")], true),
+            pstep("s1", &[("data", "$s0")], true),
+            pstep("s2", &[("data", "$s0")], true),
+        ];
+        let err = build_chains(&steps, 2).unwrap_err();
+        assert!(
+            err.to_string().contains("consumer"),
+            "P-R1 must name the consumer rule, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pipeline_r2_whole_ref_only_rejected() {
+        // P-R2: streaming outputs can only be referenced whole ($s0), never
+        // field-projected ($s0.field).
+        let steps = vec![
+            pstep("s0", &[("input", "$request")], true),
+            pstep("s1", &[("data", "$s0.token")], true),
+        ];
+        let err = build_chains(&steps, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("whole"),
+            "P-R2 must reject field references, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pipeline_d26_unary_consumer_rejected() {
+        // D26: a chain's unary consumer has no clean chunk→unary→chunk
+        // semantics — the form is rejected at parse time ("pipeline chain
+        // tail must be a streaming step" covers the unary-tail shape).
+        let steps = vec![
+            pstep("s0", &[("input", "$request")], true),
+            pstep("u1", &[("data", "$s0")], false),
+        ];
+        let err = build_chains(&steps, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("streaming") || err.to_string().contains("tail"),
+            "D26 must reject the unary-consumer chain form, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pipeline_r5_mixed_forms_rejected() {
+        // P-R5: the DAG's streaming set is exactly ONE chain OR one tail
+        // streaming step — a chain plus an orphan streaming step is an error.
+        let steps = vec![
+            pstep("s0", &[("input", "$request")], true),
+            pstep("s1", &[("data", "$s0")], true),
+            pstep("s2", &[("input", "$request")], true),
+        ];
+        // Chain s0→s1 (tail = s1 = config last); s2 is an orphan streaming
+        // step that is NOT the output step.
+        let err = build_chains(&steps, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("streaming step"),
+            "P-R5 must reject chain + orphan streaming step, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pipeline_chain_tail_must_be_output_step() {
+        // P-R3: the chain tail must be the DAG output step. Chain s0→s1 but
+        // the config last step is s2 (unary) → the chain tail is not the
+        // output → rejected (§4.1-4 output semantics).
+        let steps = vec![
+            pstep("s0", &[("input", "$request")], true),
+            pstep("s1", &[("data", "$s0")], true),
+            pstep("s2", &[("data", "$request")], false),
+        ];
+        let err = build_chains(&steps, 2).unwrap_err();
+        assert!(
+            err.to_string().contains("output step"),
+            "chain tail must be the output step, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pipeline_orphan_streaming_step_not_output_rejected() {
+        // A zero-consumer streaming step that is NOT the output step is an
+        // orphan (§4.1-4: the config last step must be the streaming step).
+        let steps = vec![
+            pstep("s0", &[("input", "$request")], true),
+            pstep("u1", &[("data", "$request")], false),
+        ];
+        let err = build_chains(&steps, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("streaming"),
+            "orphan streaming step must be rejected, got: {err}"
+        );
+    }
+
     // === §4.0/D16: streaming validation (form dispatch, batch 0) ===
 
     fn sstep(name: &str, inputs: &[(&str, &str)], stream: bool) -> EnsembleStep {
@@ -2253,6 +2521,7 @@ mod tests {
             steps: Vec::new(),
             layers: Vec::new(),
             output_step: 0,
+            chains: Vec::new(),
             config_path: PathBuf::from(path),
             source_mtime: None,
         })
@@ -2404,6 +2673,7 @@ mod tests {
                     steps: Vec::new(),
                     layers: Vec::new(),
                     output_step: 0,
+                    chains: Vec::new(),
                     config_path,
                     source_mtime: None,
                 }))
@@ -2499,6 +2769,7 @@ mod tests {
                         steps: Vec::new(),
                         layers: Vec::new(),
                         output_step: 1,
+                        chains: Vec::new(),
                         config_path: cp,
                         source_mtime: v1_mtime,
                     }))
@@ -2518,6 +2789,7 @@ mod tests {
                         steps: Vec::new(),
                         layers: Vec::new(),
                         output_step: 2,
+                        chains: Vec::new(),
                         config_path: cp,
                         source_mtime: None,
                     }))
