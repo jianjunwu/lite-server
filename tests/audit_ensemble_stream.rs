@@ -704,8 +704,12 @@ fn write_all_fixtures(repo: &std::path::Path) {
     write_missing_model(repo);
     write_echo(repo);
     write_pre_agg(repo);
+    write_tail_upper(repo);
+    write_tail_fail_chain(repo);
     write_ensemble(repo, "ens_stream", ENS_STREAM_YAML);
     write_ensemble(repo, "ens_agg", ENS_AGG_YAML);
+    write_ensemble(repo, "ens_chain", ENS_CHAIN_YAML);
+    write_ensemble(repo, "ens_chain_fail", ENS_CHAIN_FAIL_YAML);
     write_ensemble(repo, "ens_split", ENS_SPLIT_YAML);
     write_ensemble(repo, "ens_dslow", ENS_DSLOW_YAML);
     write_ensemble(repo, "ens_binary", ENS_BINARY_YAML);
@@ -732,7 +736,7 @@ fn write_server_yaml(repo: &std::path::Path, http_port: u16, extra: &str) -> std
         format!(
             "server:\n  http_port: {http_port}\n  timeout: 30.0\n{extra}\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n",
             repo.display()
         ),
     )
@@ -828,9 +832,10 @@ async fn test_audit_stream_unary_endpoint_on_stream_dag_400() {
     );
 }
 
-/// D16: pipeline form (streaming output consumed downstream) is NOT silently
-/// accepted in batch 0 — the config fails validation, the model never
-/// becomes ready, and requests see not-ready (never a fake 200 stream).
+/// D16/D26: the pipeline form is OPEN in batch 2, but this fixture's chain
+/// has a UNARY consumer (s2 = pre consumes s1's streaming output) — the
+/// chunk→unary→chunk shape is rejected at load (D26), so the model never
+/// becomes ready and requests see not-ready (never a fake 200 stream).
 #[serial]
 #[tokio::test]
 async fn test_audit_stream_pipeline_form_rejected_batch0() {
@@ -838,7 +843,7 @@ async fn test_audit_stream_pipeline_form_rejected_batch0() {
     // ens_pipeline must NOT be ready (config validation failed at load).
     assert!(
         !wait_model_ready(&base, "ens_pipeline", 5).await,
-        "pipeline form must be rejected at load time in batch 0 (D16)"
+        "unary-consumer chain must be rejected at load time (D26)"
     );
     let err = sse_post(&base, "/v2/models/ens_pipeline/events", json!({"text": "x"}))
         .await
@@ -1097,7 +1102,7 @@ async fn boot_server_grpc(extra: &str) -> (String, u16, ServerGuard, std::path::
             "server:\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  timeout: 30.0\n{extra}\n\n\
              grpc:\n  enabled: true\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n",
             repo.display()
         ),
     )
@@ -1843,5 +1848,147 @@ async fn test_audit_stream_step_latency_covers_streaming_step() {
         metrics.contains(r#"step="tail""#),
         "ensemble_step_latency must include the streaming step (recorded at stream close, §4.1); \
          only pre-layer steps are recorded today"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Batch 2: pipeline chain (§4.2/D2/D18/D20/D26)
+// ---------------------------------------------------------------------------
+
+/// Second chain hop: consumes the previous step's chunk (per-chunk sub-call),
+/// yields the token uppercased.
+fn write_tail_upper(repo: &std::path::Path) {
+    write_model_py(
+        repo,
+        "tail_upper",
+        r#"import time
+from lite_server import LitAPI
+
+
+class TailUpperAPI(LitAPI):
+    def setup(self, device):
+        self.device = device
+
+    async def decode_request(self, request, ctx=None):
+        return request.get("prev", {})
+
+    async def predict(self, x, ctx=None):
+        return {"final": str(x)}
+
+    def stream_predict(self, request, ctx=None):
+        w = request.get("token", "?") if isinstance(request, dict) else str(request)
+        time.sleep(0.02)
+        yield {"final": w.upper()}
+
+    async def encode_response(self, output, ctx=None):
+        return output
+"#,
+    );
+}
+
+/// Second chain hop that fails on the 2nd chunk (mid-chain failure, m8).
+fn write_tail_fail_chain(repo: &std::path::Path) {
+    write_model_py(
+        repo,
+        "tail_fail_chain",
+        r#"import time
+from lite_server import LitAPI
+
+
+class TailFailChainAPI(LitAPI):
+    def setup(self, device):
+        self.device = device
+
+    async def decode_request(self, request, ctx=None):
+        return request.get("prev", {})
+
+    async def predict(self, x, ctx=None):
+        return {"final": str(x)}
+
+    def stream_predict(self, request, ctx=None):
+        w = request.get("token", "?") if isinstance(request, dict) else str(request)
+        time.sleep(0.02)
+        if w == "chain":
+            raise RuntimeError("mid-chain boom")
+        yield {"final": w.upper()}
+
+    async def encode_response(self, output, ctx=None):
+        return output
+"#,
+    );
+}
+
+/// Two-level streaming chain: t1 (stream) → t2 (stream, whole $t1).
+const ENS_CHAIN_YAML: &str = r#"ensemble:
+  steps:
+    - name: t1
+      model: tail
+      version: "1"
+      stream: true
+      inputs:
+        pre: "$request.text"
+    - name: t2
+      model: tail_upper
+      version: "1"
+      stream: true
+      inputs:
+        prev: "$t1"
+"#;
+
+const ENS_CHAIN_FAIL_YAML: &str = r#"ensemble:
+  steps:
+    - name: t1
+      model: tail
+      version: "1"
+      stream: true
+      inputs:
+        pre: "$request.text"
+    - name: t2
+      model: tail_fail_chain
+      version: "1"
+      stream: true
+      inputs:
+        prev: "$t1"
+"#;
+
+/// §4.2 e2e: a two-level streaming chain drives the tail per upstream chunk
+/// — each t1 token opens a t2 sub-stream (D20), all chunks flow, [DONE].
+#[serial]
+#[tokio::test]
+async fn test_audit_stream_pipeline_chain_sse() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_chain"]).await;
+
+    let body = sse_post(&base, "/v2/models/ens_chain/events", json!({"text": "hello chain world"}))
+        .await
+        .expect("chain SSE must open");
+    assert!(
+        body.contains(r#""final":"HELLO""#)
+            && body.contains(r#""final":"CHAIN""#)
+            && body.contains(r#""final":"WORLD""#),
+        "chain must drive the tail per upstream chunk: {body}"
+    );
+    assert!(body.contains("[DONE]"), "chain must terminate with [DONE]: {body}");
+    assert!(!body.contains("error"), "no error expected: {body}");
+}
+
+/// §4.2/m8: a mid-chain sub-stream failure delivers the partial output, then
+/// an Error frame (no fake [DONE]) — the failure propagates downstream.
+#[serial]
+#[tokio::test]
+async fn test_audit_stream_pipeline_midchain_failure() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_chain_fail"]).await;
+
+    let body = sse_post(&base, "/v2/models/ens_chain_fail/events", json!({"text": "hello chain world"}))
+        .await
+        .expect("chain must open (200)");
+    assert!(
+        body.contains(r#""final":"HELLO""#),
+        "chunks before the failure must stream: {body}"
+    );
+    assert!(
+        body.contains("error") && !body.contains("[DONE]"),
+        "mid-chain failure must close with an Error frame, no [DONE]: {body}"
     );
 }

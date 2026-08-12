@@ -459,26 +459,6 @@ fn validate_stream_rules(steps: &[EnsembleStep]) -> Result<(), AppError> {
     }
     let tail = stream_steps[0];
 
-    // Form split (D16): streaming output referenced by a downstream step =
-    // pipeline form. Not open before 0.9.0 batch 2 — explicit error rather
-    // than a misleading rule-1/2 rejection.
-    let consumed = steps.iter().any(|s| {
-        s.inputs.values().any(|r| {
-            REF_RE
-                .captures(r)
-                .map(|c| c.get(1).map(|m| m.as_str()) == Some(tail.name.as_str()))
-                .unwrap_or(false)
-        })
-    });
-    if consumed {
-        return Err(AppError::Config(format!(
-            "pipeline streaming (streaming step '{}' output consumed by a \
-             downstream step) opens in 0.9.0 (batch 2); this server accepts \
-             only tail streaming (streaming step = final step, output to client)",
-            tail.name
-        )));
-    }
-
     // Rule 1: the streaming step must be in the LAST topological layer.
     // "Output not referenced" only proves it has no dependents — Kahn
     // layering puts a no-dependency sink in layer 0 even when later layers
@@ -2786,23 +2766,6 @@ mod tests {
         assert!(
             err.to_string().contains("output") && err.to_string().contains("s1"),
             "must reject streaming step not at config tail, got: {err}"
-        );
-    }
-
-    #[test]
-    fn stream_rules_pipeline_form_rejected_with_batch2_message() {
-        // D16: a streaming step whose output is consumed downstream IS the
-        // pipeline form — batch 0 must reject it with an explicit batch-2
-        // message, not a misleading rule-1/2 rejection (and not accept it).
-        let steps = vec![
-            sstep("s1", &[("input", "$request")], true),
-            sstep("s2", &[("data", "$s1")], false),
-        ];
-        let err = validate_stream_rules(&steps).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.to_lowercase().contains("pipeline") && msg.contains("0.9.0"),
-            "pipeline form must be rejected with an explicit batch-2 message, got: {msg}"
         );
     }
 
