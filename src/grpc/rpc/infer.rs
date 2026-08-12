@@ -3,6 +3,7 @@
 //! ejection / retry / max_requests recycling), plus the P-ENSEMBLE-GRPC
 //! DAG-executor dispatch for ensemble models.
 
+use crate::error::AppError;
 use crate::grpc::auth::{enforce_auth_grpc, enforce_grpc_rate_limit};
 use crate::grpc::canary::canary_pin;
 use crate::grpc::error::{
@@ -117,14 +118,19 @@ impl GrpcService {
                     &grpc_metadata,
                     self.server_timeout.as_secs_f32(),
                 );
+                // D37 (batch 0): signature converged — execution-face opts.
+                let opts = crate::ensemble::EnsembleExecOpts {
+                    client_ip: client_ip.clone(),
+                    deadline_unix_ns: ensemble_deadline.unix_ns,
+                    decoupled: false,
+                };
                 let result = crate::ensemble::execute_ensemble(
                     self.app_state.clone(),
                     model_name,
                     &resolved_version,
                     ensemble_input,
                     &request_id,
-                    &client_ip,
-                    ensemble_deadline.unix_ns,
+                    opts,
                 )
                 .await
                 .map_err(|e| err(app_error_to_grpc_status(&e)))?;
@@ -133,10 +139,20 @@ impl GrpcService {
                 // client must know the model contract, consistent with gRPC
                 // unary semantics).
                 let data = match result {
-                    crate::ensemble::EnsembleValue::Json(v) => {
+                    crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Json(v)) => {
                         bytes::Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
                     }
-                    crate::ensemble::EnsembleValue::Binary(b, _ct) => b,
+                    crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Binary(b, _ct)) => b,
+                    crate::ensemble::EnsembleOutcome::Stream(_) => {
+                        // D1: a unary endpoint calling a streaming DAG is a
+                        // client contract violation — InvalidArgument (parity
+                        // with the HTTP 400).
+                        return Err(err(app_error_to_grpc_status(
+                            &AppError::InvalidRequestBody(
+                                "DAG contains a streaming step; use a streaming endpoint".to_string(),
+                            ),
+                        )));
+                    }
                 };
                 return Ok(Response::new(pb::InferResponse {
                     data,

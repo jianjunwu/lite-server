@@ -198,16 +198,22 @@ async fn do_infer(
                 ));
             }
         };
+        // D37 (batch 0): signature converged — execution-face opts; later
+        // batches add fields (dag_selector) without touching call sites.
+        let opts = crate::ensemble::EnsembleExecOpts {
+            client_ip: cx.client_ip.clone(),
+            deadline_unix_ns: deadline.unix_ns,
+            decoupled: false,
+        };
         let result = crate::ensemble::execute_ensemble(
-            state, &model_name, &resolved_version, ensemble_input,
-            &request_id, &cx.client_ip, deadline.unix_ns,
+            state, &model_name, &resolved_version, ensemble_input, &request_id, opts,
         ).await?;
         // B3 (E6) egress: Json → historical Json(response).into_response();
         // Binary → body bytes + content-type header (mirror unary passthrough,
         // inference.rs:266-283).
         return match result {
-            crate::ensemble::EnsembleValue::Json(v) => Ok(Json(v).into_response()),
-            crate::ensemble::EnsembleValue::Binary(data, ct) => {
+            crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Json(v)) => Ok(Json(v).into_response()),
+            crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Binary(data, ct)) => {
                 // Same builder-error handling as the unary passthrough
                 // (inference.rs:291-302): a worker-supplied media_type that is
                 // not a valid header value must become a 500, never a panic.
@@ -216,6 +222,14 @@ async fn do_infer(
                     .header(axum::http::header::CONTENT_TYPE, &ct)
                     .body(axum::body::Body::from(data))
                     .map_err(|e| AppError::Internal(format!("build response: {e}")))
+            }
+            crate::ensemble::EnsembleOutcome::Stream(_) => {
+                // D1: a unary endpoint calling a streaming DAG is a client
+                // contract violation — 400 (aggregating chunks would fake
+                // unary semantics and hide backpressure/memory risk).
+                Err(AppError::InvalidRequestBody(
+                    "DAG contains a streaming step; use a streaming endpoint".to_string(),
+                ))
             }
         };
     }

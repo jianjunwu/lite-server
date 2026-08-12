@@ -12,7 +12,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{timeout, Duration};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -50,6 +50,10 @@ pub struct EnsembleStepRaw {
     pub model: String,
     pub version: String,
     pub inputs: HashMap<String, String>,
+    /// §4.1: tail streaming. The streaming step must be the DAG output
+    /// (config `steps.last()` — explicit `output` lands with E2, batch 3).
+    #[serde(default)]
+    pub stream: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +62,7 @@ pub struct EnsembleStep {
     pub model: String,
     pub version: String,
     pub inputs: HashMap<String, String>,
+    pub stream: bool,
 }
 
 lazy_static::lazy_static! {
@@ -79,9 +84,11 @@ pub fn parse_ensemble_plan(content: &str, config_path: &PathBuf) -> Result<Ensem
         model: s.model,
         version: s.version,
         inputs: s.inputs,
+        stream: s.stream,
     }).collect();
 
     validate_dag(&steps)?;
+    validate_stream_rules(&steps)?;
     let index_of: HashMap<&str, usize> = steps
         .iter()
         .enumerate()
@@ -92,7 +99,12 @@ pub fn parse_ensemble_plan(content: &str, config_path: &PathBuf) -> Result<Ensem
         .map(|layer| layer.into_iter().map(|s| index_of[s.name.as_str()]).collect())
         .collect();
 
-    Ok(EnsemblePlan { steps, layers, config_path: config_path.clone() })
+    Ok(EnsemblePlan {
+        output_step: steps.len() - 1,
+        steps,
+        layers,
+        config_path: config_path.clone(),
+    })
 }
 
 /// Production plan loader: resolve the model dir, read config.yaml and parse
@@ -190,6 +202,84 @@ fn validate_dag(steps: &[EnsembleStep]) -> Result<(), AppError> {
 
     if visited != steps.len() {
         return Err(AppError::Config("cycle detected in ensemble DAG".to_string()));
+    }
+
+    Ok(())
+}
+
+/// §4.0/D16 form-dispatching validation for `stream: true` steps (batch 0:
+/// only the non-pipeline form is open). Rule 2 (streaming output not
+/// referenced) is the definition of the form split — a referenced streaming
+/// output IS the pipeline form, rejected here with an explicit
+/// batch-2 message instead of being mis-killed by rules 1-3. The same
+/// dispatch point opens pipeline form in batch 2 (no validator rework).
+///
+/// Rules (non-pipeline form):
+/// 1. streaming step must be in the last topological layer — implied by
+///    "output not referenced" (topological last layer = no dependents), so
+///    the form split above covers it.
+/// 3. at most one streaming step per DAG.
+/// 4. output-step semantics unified (E2 base, batch 0): with `output`
+///    omitted the DAG output is `steps.last()`, which MUST be the streaming
+///    step — otherwise a streaming DAG would silently produce nothing
+///    streamable (B-m4: explicit `output` lands with E2 in batch 3).
+/// §4.0/D16 form-dispatching validation for `stream: true` steps (batch 0:
+/// only the non-pipeline form is open). Rule 2 (streaming output not
+/// referenced) is the definition of the form split — a referenced streaming
+/// output IS the pipeline form, rejected here with an explicit batch-2
+/// message instead of being mis-killed by rules 1-3. The same dispatch
+/// point opens pipeline form in batch 2 (no validator rework).
+///
+/// Rules (non-pipeline form):
+/// 1. streaming step must be in the last topological layer — implied by
+///    "output not referenced" (topological last layer = no dependents), so
+///    the form split above covers it.
+/// 3. at most one streaming step per DAG.
+/// 4. output-step semantics unified (E2 base, batch 0): with `output`
+///    omitted the DAG output is `steps.last()`, which MUST be the streaming
+///    step — otherwise a streaming DAG would silently produce nothing
+///    streamable (B-m4: explicit `output` lands with E2 in batch 3).
+fn validate_stream_rules(steps: &[EnsembleStep]) -> Result<(), AppError> {
+    let stream_steps: Vec<&EnsembleStep> = steps.iter().filter(|s| s.stream).collect();
+    if stream_steps.is_empty() {
+        return Ok(());
+    }
+    if stream_steps.len() > 1 {
+        return Err(AppError::Config(
+            "at most one streaming step per ensemble DAG (rule 3)".to_string(),
+        ));
+    }
+    let tail = stream_steps[0];
+
+    // Form split (D16): streaming output referenced by a downstream step =
+    // pipeline form. Not open before 0.9.0 batch 2 — explicit error rather
+    // than a misleading rule-1/2 rejection.
+    let consumed = steps.iter().any(|s| {
+        s.inputs.values().any(|r| {
+            REF_RE
+                .captures(r)
+                .map(|c| c.get(1).map(|m| m.as_str()) == Some(tail.name.as_str()))
+                .unwrap_or(false)
+        })
+    });
+    if consumed {
+        return Err(AppError::Config(format!(
+            "pipeline streaming (streaming step '{}' output consumed by a \
+             downstream step) opens in 0.9.0 (batch 2); this server accepts \
+             only tail streaming (streaming step = final step, output to client)",
+            tail.name
+        )));
+    }
+
+    // Rule 4 (B-m4): output-step semantics unified — with `output` omitted
+    // the DAG output is `steps.last()`, which must be the streaming step.
+    if steps.last().map(|s| s.name.as_str()) != Some(tail.name.as_str()) {
+        return Err(AppError::Config(format!(
+            "streaming step '{}' must be the DAG output step (config last \
+             step), or the DAG output is ambiguous; explicit `output:` lands \
+             in 0.9.0 (batch 3)",
+            tail.name
+        )));
     }
 
     Ok(())
@@ -312,6 +402,10 @@ pub struct EnsemblePlan {
     pub steps: Vec<EnsembleStep>,
     /// Topological layers as indices into `steps` (self-owning, no refs).
     pub layers: Vec<Vec<usize>>,
+    /// DAG output step (E2 semantics unified at batch 0, §4.1 rule 4): with no
+    /// explicit `output` (batch 3) this is `steps.last()`; validation ensures
+    /// a streaming DAG's output step is its streaming step.
+    pub output_step: usize,
     /// Source config file — mtime re-check (review ②) stats this path.
     pub config_path: PathBuf,
 }
@@ -479,35 +573,124 @@ impl EnsemblePlanCache {
 
 // ===== Execution =====
 
+/// Execution-face parameters (D37, fixed once at batch 0 — later batches add
+/// fields without touching the signature, e.g. `dag_selector` in batch 5;
+/// D36's snapshot/depth ride the internal `execute_ensemble_inner`, not the
+/// public opts).
+#[derive(Debug, Clone)]
+pub struct EnsembleExecOpts {
+    pub client_ip: String,
+    pub deadline_unix_ns: Option<i64>,
+    /// StreamOpen.decoupled passthrough (batch 0).
+    pub decoupled: bool,
+}
+
+/// D25: batch-0 result — Unary keeps the historical byte-identical path;
+/// Stream carries the tail stream (and, from batch 2, the whole chain).
+pub enum EnsembleOutcome {
+    Unary(EnsembleValue),
+    Stream(EnsembleStream),
+}
+
+/// Chain-handle element (D25): batch 0 always holds exactly the tail stream;
+/// batch 2 pushes the chain as "tail first, then upstream". Adapter layers
+/// read only the top-level quick-access fields — the seam stays fixed.
+#[derive(Clone)]
+pub struct StreamHandle {
+    pub stream_id: String,
+    pub cancel_client: Arc<crate::transport::zmq::WorkerZmqClient>,
+    pub abort: tokio::task::AbortHandle,
+}
+
+/// The streaming result handed to the adapter layers. `chain` is the single
+/// source of truth (tail included) once filled; top-level fields are the
+/// tail quick-access the adapters already consume (same type as
+/// `open_worker_stream`'s return — the SSE/WS/gRPC forward loops change
+/// zero lines).
+pub struct EnsembleStream {
+    /// Tail stream — same type as `send_stream`'s receiver; the existing
+    /// adapter forward loops consume it as-is.
+    pub chunk_rx: mpsc::Receiver<pb::StreamResponse>,
+    pub stream_id: String,
+    pub cancel_client: Arc<crate::transport::zmq::WorkerZmqClient>,
+    pub tail_model: String,
+    pub tail_version: String,
+    /// D35 (batch 3): E5 `timeout_secs` converted to a step wall-clock cap —
+    /// the adapter's recv_chunk overall takes min(client overall, this).
+    /// None = inactive.
+    pub step_deadline: Option<std::time::Instant>,
+    pub chain: Vec<StreamHandle>,
+    /// D18: chain task tree unified teardown. Batch 0 = the tail stream
+    /// itself (inert placeholder); batch 2 roots the whole chain here.
+    pub abort: tokio::task::AbortHandle,
+}
+
 pub async fn execute_ensemble(
     state: Arc<AppState>,
     model_name: &str,
     version: &str,
     payload: EnsembleValue,
     request_id: &str,
-    client_ip: &str,
-    deadline_unix_ns: Option<i64>,
-) -> Result<EnsembleValue, AppError> {
+    opts: EnsembleExecOpts,
+) -> Result<EnsembleOutcome, AppError> {
     // P0 (D6): plan comes from the cache — parse/validate/layers run once per
     // config version, not per request. In-flight requests hold their Arc and
     // finish on the old plan even across a reload (D23).
     let plan = get_ensemble_plan(&state, model_name, version).await?;
+    let deadline_unix_ns = opts.deadline_unix_ns;
+    let tail_idx = plan.output_step;
 
     let mut context: HashMap<String, EnsembleValue> = HashMap::new();
     context.insert("request".to_string(), payload);
 
-    // #3: bound the WHOLE ensemble by a single shared deadline (P-DEADLINE
-    // §4.0.10): the parent request's deadline cascades across the whole DAG, so
-    // an N-layer ensemble can never exceed the parent. Layers run serially, so
-    // without this each layer could spend up to its own budget and amplify to
-    // N×. The per-step timeout in execute_step (parent − elapsed) is the inner
-    // safety net; this outer deadline is what actually bounds the total.
+    if !plan.steps[tail_idx].stream {
+        // Historical unary path — byte-identical behaviour.
+        run_layers(
+            &state, &plan, &plan.layers, &mut context,
+            model_name, version, request_id, &opts, deadline_unix_ns,
+        ).await?;
+        let value = plan.steps[tail_idx].name.as_str();
+        let value = context.get(value).cloned()
+            .ok_or_else(|| AppError::Internal("ensemble produced no output".to_string()))?;
+        return Ok(EnsembleOutcome::Unary(value));
+    }
+
+    // Streaming DAG (D25: run_pre_layers / open_tail_stream split — batch 2
+    // extends the split into a chain without rewriting the main flow).
+    let tail_layer = plan.layers.iter().position(|l| l.contains(&tail_idx))
+        .ok_or_else(|| AppError::Internal("output step missing from layers".to_string()))?;
+    run_layers(
+        &state, &plan, &plan.layers[..tail_layer], &mut context,
+        model_name, version, request_id, &opts, deadline_unix_ns,
+    ).await?;
+    let stream = open_tail_stream(
+        &state, &plan, tail_idx, tail_layer, &context,
+        request_id, &opts, deadline_unix_ns,
+    ).await?;
+    Ok(EnsembleOutcome::Stream(stream))
+}
+
+/// Layer-barrier executor (historical engine): runs `layers` serially, each
+/// layer in a JoinSet (P-FLOW shared cancel), writing step outputs into
+/// `context`. Step errors propagate directly (B3). The whole run is bounded
+/// by a single shared deadline (P-DEADLINE §4.0.10): an N-layer ensemble can
+/// never exceed the parent; the per-step timeout in execute_step is the
+/// inner safety net, this outer deadline bounds the total.
+async fn run_layers(
+    state: &Arc<AppState>,
+    plan: &EnsemblePlan,
+    layers: &[Vec<usize>],
+    context: &mut HashMap<String, EnsembleValue>,
+    model_name: &str,
+    version: &str,
+    request_id: &str,
+    opts: &EnsembleExecOpts,
+    deadline_unix_ns: Option<i64>,
+) -> Result<(), AppError> {
     let total_budget = crate::deadline::remaining(deadline_unix_ns);
     let plan_run = plan.clone();
-    // Borrows `context` mutably for the DAG run (step results land here);
-    // the caller reads the output below once the run finishes.
     let ensemble_run = async {
-        for layer in &plan_run.layers {
+        for layer in layers {
             // P-FLOW (§4.0.9): a JoinSet per layer is the ensemble's shared
             // cancel. On any early exit — a step error, the outer total-budget
             // timeout, or the parent request being dropped (client disconnect) —
@@ -523,7 +706,8 @@ pub async fn execute_ensemble(
                 let step = plan_run.steps[step_idx].clone();
                 let ensemble_name = model_name.to_string();
                 let request_id = request_id.to_string();
-                let client_ip = client_ip.to_string();
+                let client_ip = opts.client_ip.clone();
+                let deadline_unix_ns = deadline_unix_ns;
                 set.spawn(async move {
                     let start = Instant::now();
                     let result =
@@ -572,12 +756,305 @@ pub async fn execute_ensemble(
             ensemble_run.await?;
         }
     }
+    Ok(())
+}
 
-    // Return last step's output
-    plan.steps.last()
-        .and_then(|s| context.get(&s.name))
-        .cloned()
-        .ok_or_else(|| AppError::Internal("ensemble produced no output".to_string()))
+/// D25: open the tail stream — build/route the stream-open and return the
+/// stream handle. Batch 0: the tail's same-layer sibling unary steps run in
+/// parallel with the stream (rule 3: they produce no DAG output — results
+/// dropped, failures warn only); batch 2 replaces this function's body with
+/// the chain spawn without touching the caller seam.
+async fn open_tail_stream(
+    state: &Arc<AppState>,
+    plan: &EnsemblePlan,
+    tail_idx: usize,
+    tail_layer: usize,
+    context: &HashMap<String, EnsembleValue>,
+    request_id: &str,
+    opts: &EnsembleExecOpts,
+    deadline_unix_ns: Option<i64>,
+) -> Result<EnsembleStream, AppError> {
+    // §4.1 rule 3: same-layer sibling unary steps still run in parallel with
+    // the streaming step. They never enter `context` (output semantics belong
+    // to the streaming step) and cannot affect the stream contract, so their
+    // results are dropped; the JoinSet gives them the same P-FLOW drop-abort
+    // cancellation as every other layer.
+    let siblings: Vec<usize> = plan.layers[tail_layer]
+        .iter()
+        .copied()
+        .filter(|&i| i != tail_idx)
+        .collect();
+
+    let run_stream = execute_stream_step(state, plan, tail_idx, context, request_id, opts, deadline_unix_ns);
+    tokio::pin!(run_stream);
+
+    if siblings.is_empty() {
+        return run_stream.await;
+    }
+
+    let run_siblings = async {
+        let mut set: tokio::task::JoinSet<(String, Result<EnsembleValue, AppError>)> =
+            tokio::task::JoinSet::new();
+        for idx in siblings {
+            let state = state.clone();
+            let ctx = context.clone();
+            let step = plan.steps[idx].clone();
+            let request_id = request_id.to_string();
+            let client_ip = opts.client_ip.clone();
+            set.spawn(async move {
+                let name = step.name.clone();
+                execute_step(state, &step, &ctx, &request_id, &client_ip, deadline_unix_ns).await
+                    .map(|v| (name.clone(), Ok(v)))
+                    .unwrap_or_else(|e| (name.clone(), Err(e)))
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            if let Ok((name, Err(e))) = joined {
+                warn!(step = %name, error = %e, "tail-layer sibling step failed (result dropped)");
+            }
+        }
+    };
+    tokio::pin!(run_siblings);
+
+    // Whichever finishes first wins: if the stream opens first, the siblings
+    // future is dropped — its JoinSet drop-aborts in-flight steps (P-FLOW),
+    // exactly like a cancelled layer. If the siblings finish first, we await
+    // the stream (their failures were already logged).
+    let stream_result = tokio::select! {
+        _ = &mut run_siblings => None,
+        r = &mut run_stream => Some(r),
+    };
+    match stream_result {
+        Some(r) => r,
+        None => run_stream.await,
+    }
+}
+
+/// D19: streaming readiness predicate — the sub-model must be reachable via
+/// routing (pick_streaming_worker returns a valid worker), NOT merely
+/// registry-ready: mark_ready and the streaming route table registration have
+/// a window between them, so a pick failure is a retryable state, never an
+/// instant 500.
+async fn streaming_worker_ready(
+    state: &Arc<AppState>,
+    model: &str,
+    version: &str,
+    meta: &pb::RequestMeta,
+) -> bool {
+    let Some(mv) = state.registry.get(model, Some(version)) else { return false; };
+    if mv.workers.is_empty() {
+        return false;
+    }
+    let Some(clients) = state.worker_manager.get_zmq_clients(model, version).await else {
+        return false;
+    };
+    if clients.is_empty() {
+        return false;
+    }
+    let outlier = state.worker_manager.get_outlier_state(model, version).await;
+    let seq = state.inference_queue.sequence_registry();
+    match crate::worker::pick_streaming_worker(meta, mv.workers.len(), outlier.as_deref(), seq, model, version) {
+        Ok(w) => w < clients.len(),
+        Err(_) => false,
+    }
+}
+
+/// Shared sub-model autoload (unary + streaming execution faces): config
+/// parse/validation errors surface as ModelNotReady; load failures surface
+/// directly. The caller polls its own readiness predicate afterwards (unary =
+/// registry ready, streaming = `streaming_worker_ready`).
+async fn ensure_sub_model_loaded(
+    state: &Arc<AppState>,
+    step: &EnsembleStep,
+) -> Result<(), AppError> {
+    if state.registry.is_ready(&step.model, Some(&step.version)) {
+        return Ok(());
+    }
+    info!("Auto-loading sub-model {} v{} for ensemble", step.model, step.version);
+    let sub_model_dir = crate::validation::resolve_model_dir(
+        &state.repo_path, &step.model, &step.version,
+    )?;
+    // 配置解析/校验失败必须可见(同 reconcile:不再 unwrap_or_default
+    // 静默回退默认配置;M7 迁移哨兵依赖此错误上浮)。
+    let mut config = match crate::config::load_model_config(
+        &sub_model_dir.join("config.yaml")
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(AppError::ModelNotReady(format!(
+                "sub-model {} v{} has invalid config.yaml: {}", step.model, step.version, e
+            )));
+        }
+    };
+    state.config.apply_model_defaults(&mut config);
+    if let Err(e) = state.worker_manager.load_model(&step.model, &step.version, &config).await {
+        warn!("Failed to auto-load sub-model {} v{}: {}", step.model, step.version, e);
+        return Err(AppError::ModelNotReady(format!(
+            "sub-model {} v{} not ready: {}", step.model, step.version, e
+        )));
+    }
+    Ok(())
+}
+
+/// Execute the streaming tail step: resolve inputs, assemble payload (same
+/// rules as unary), D19 readiness poll, build meta, route and open the
+/// stream. Returns the stream handle consumed by the adapter layers.
+async fn execute_stream_step(
+    state: &Arc<AppState>,
+    plan: &EnsemblePlan,
+    step_idx: usize,
+    context: &HashMap<String, EnsembleValue>,
+    request_id: &str,
+    opts: &EnsembleExecOpts,
+    deadline_unix_ns: Option<i64>,
+) -> Result<EnsembleStream, AppError> {
+    let step = &plan.steps[step_idx];
+
+    // Resolve inputs into EnsembleValues (identical to the unary path).
+    let mut resolved: HashMap<String, EnsembleValue> = HashMap::new();
+    for (key, ref_str) in &step.inputs {
+        let value = resolve_ref(ref_str, context)?;
+        resolved.insert(key.clone(), value);
+    }
+    let (payload_bytes, content_type_for_step) = assemble_step_payload(&step.name, &resolved)?;
+
+    // D19: ensure the sub-model is loaded, then poll STREAMING readiness
+    // (pick non-empty) with backoff. A pick failure is a retryable state.
+    ensure_sub_model_loaded(state, step).await?;
+    let mut retries = 0;
+    let max_retries = 30;
+    let mut delay = Duration::from_millis(50);
+    while !streaming_worker_ready(state, &step.model, &step.version, &pb::RequestMeta::default()).await {
+        if retries >= max_retries {
+            return Err(AppError::ModelNotReady(format!(
+                "sub-model {} v{} streaming not ready", step.model, step.version
+            )));
+        }
+        // D19: quick-fail when the remaining budget cannot cover one more
+        // poll — never spin to timeout.
+        if let Some(rem) = crate::deadline::remaining(deadline_unix_ns) {
+            if rem < delay {
+                return Err(AppError::InferenceTimeout(format!(
+                    "ensemble step {}: deadline exhausted while waiting for sub-model {} v{}",
+                    step.name, step.model, step.version
+                )));
+            }
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_millis(500));
+        retries += 1;
+    }
+
+    // D19: final deadline check before opening the stream — an expired
+    // budget must not open one (deadline-exhausted mapping, §4.4).
+    if let Some(rem) = crate::deadline::remaining(deadline_unix_ns) {
+        if rem.is_zero() {
+            return Err(AppError::InferenceTimeout(format!(
+                "ensemble step {}: deadline exhausted before stream open", step.name
+            )));
+        }
+    }
+
+    let mv = state.registry.get(&step.model, Some(&step.version))
+        .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", step.model, step.version)))?;
+    let clients = state.worker_manager.get_zmq_clients(&step.model, &step.version).await
+        .ok_or_else(|| AppError::WorkerCrashed(format!("{} {} has no ZMQ clients", step.model, step.version)))?;
+
+    // P-TRACE (同 execute_step): step-level span links to the parent trace and
+    // injects its context into the step headers so the worker spans land as
+    // children of the step (request_id is already `{parent}:{step}`).
+    let mut step_headers = HashMap::new();
+    if let Some(ct) = &content_type_for_step {
+        step_headers.insert("content-type".to_string(), ct.clone());
+    }
+    {
+        let step_span = tracing::info_span!(
+            "ensemble.step",
+            step = %step.name,
+            model = %step.model,
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
+        );
+        crate::telemetry::link_parent(&step_span, &opentelemetry::Context::current());
+        let _guard = step_span.enter();
+        crate::telemetry::inject(&mut step_headers);
+    }
+
+    // Streaming meta carries no payload — the body rides StreamOpen.data.
+    let meta = build_step_meta(
+        step, request_id, &opts.client_ip, deadline_unix_ns, step_headers, bytes::Bytes::new(),
+    );
+
+    let outlier = state.worker_manager.get_outlier_state(&step.model, &step.version).await;
+    let seq_registry = state.inference_queue.sequence_registry();
+    let worker_id = crate::worker::pick_streaming_worker(
+        &meta, mv.workers.len(), outlier.as_deref(), seq_registry, &step.model, &step.version,
+    ).map_err(|e| AppError::Validation(e.0))?;
+    if worker_id >= clients.len() {
+        return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
+    }
+    crate::metrics::prometheus::record_worker_inference(&step.model, &step.version, worker_id, 1);
+
+    let client = &clients[worker_id];
+    let stream_id = format!("stream-{}", Uuid::new_v4());
+    let open_req = crate::streaming::build_stream_open(
+        stream_id.clone(), bytes::Bytes::from(payload_bytes), Some(meta), opts.decoupled,
+    );
+    let chunk_rx = client.send_stream(open_req, stream_id.clone()).await?;
+
+    // D25: chain handles — batch 0 = the tail stream itself as the single
+    // element (chain[0] === the top-level fields; adapters never read chain).
+    let abort = tokio::spawn(async {}).abort_handle();
+    let chain = vec![StreamHandle {
+        stream_id: stream_id.clone(),
+        cancel_client: Arc::clone(client),
+        abort: abort.clone(),
+    }];
+
+    Ok(EnsembleStream {
+        chunk_rx,
+        stream_id,
+        cancel_client: Arc::clone(client),
+        tail_model: step.model.clone(),
+        tail_version: step.version.clone(),
+        // D35 (batch 3): E5 timeout_secs → step wall-clock cap; adapter
+        // recv_chunk overall takes min(client overall, this). Inactive until
+        // E5 lands.
+        step_deadline: None,
+        chain,
+        abort,
+    })
+}
+
+/// Shared step RequestMeta (unary + streaming): request_id `{parent}:{step}`
+/// suffix, trace-injected headers, deadline cascade, content-type passthrough
+/// (B3/E7). `payload` is the serialized body — empty for streaming, where the
+/// body rides StreamOpen.data.
+fn build_step_meta(
+    step: &EnsembleStep,
+    request_id: &str,
+    client_ip: &str,
+    deadline_unix_ns: Option<i64>,
+    step_headers: HashMap<String, String>,
+    payload: bytes::Bytes,
+) -> pb::RequestMeta {
+    pb::RequestMeta {
+        route: "/predict".to_string(),
+        headers: step_headers,
+        client_ip: client_ip.to_string(),
+        // Correlate sub-step requests with the client-facing request ID;
+        // the step-name suffix keeps each step uniquely identifiable.
+        request_id: format!("{}:{}", request_id, step.name),
+        timestamp_ns: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64,
+        payload,
+        // P-DEADLINE cascade: child step shares the parent deadline so a single
+        // step cannot exceed it (budget = parent − already elapsed).
+        deadline_unix_ns,
+        ..Default::default()
+    }
 }
 
 /// B3 (E7): step input assembly — three branches.
@@ -666,40 +1143,16 @@ async fn execute_step(
     // B3 (E7): input assembly — three branches (see assemble_step_payload).
     let (payload_bytes, content_type_for_step) = assemble_step_payload(&step.name, &resolved)?;
 
-    // Ensure sub-model is ready
-    if !state.registry.is_ready(&step.model, Some(&step.version)) {
-        info!("Auto-loading sub-model {} v{} for ensemble", step.model, step.version);
-        let sub_model_dir = crate::validation::resolve_model_dir(
-            &state.repo_path, &step.model, &step.version,
-        )?;
-        // 配置解析/校验失败必须可见（同 reconcile：不再 unwrap_or_default
-        // 静默回退默认配置；M7 迁移哨兵依赖此错误上浮）。
-        let mut config = match crate::config::load_model_config(
-            &sub_model_dir.join("config.yaml")
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                return Err(AppError::ModelNotReady(format!(
-                    "sub-model {} v{} has invalid config.yaml: {}", step.model, step.version, e
-                )));
-            }
-        };
-        state.config.apply_model_defaults(&mut config);
-        if let Err(e) = state.worker_manager.load_model(&step.model, &step.version, &config).await {
-            warn!("Failed to auto-load sub-model {} v{}: {}", step.model, step.version, e);
-            return Err(AppError::ModelNotReady(format!(
-                "sub-model {} v{} not ready: {}", step.model, step.version, e
-            )));
-        }
-        // Poll with exponential backoff for worker readiness
-        let mut retries = 0;
-        let max_retries = 30;
-        let mut delay = Duration::from_millis(50);
-        while !state.registry.is_ready(&step.model, Some(&step.version)) && retries < max_retries {
-            tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(Duration::from_millis(500));
-            retries += 1;
-        }
+    // Ensure sub-model is ready (shared autoload; unary readiness predicate)
+    ensure_sub_model_loaded(&state, step).await?;
+    // Poll with exponential backoff for worker readiness
+    let mut retries = 0;
+    let max_retries = 30;
+    let mut delay = Duration::from_millis(50);
+    while !state.registry.is_ready(&step.model, Some(&step.version)) && retries < max_retries {
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_millis(500));
+        retries += 1;
     }
 
     if !state.registry.is_ready(&step.model, Some(&step.version)) {
@@ -748,23 +1201,10 @@ async fn execute_step(
         crate::telemetry::inject(&mut step_headers);
     }
 
-    let meta = pb::RequestMeta {
-        route: "/predict".to_string(),
-        headers: step_headers,
-        client_ip: client_ip.to_string(),
-        // Correlate sub-step requests with the client-facing request ID;
-        // the step-name suffix keeps each step uniquely identifiable.
-        request_id: format!("{}:{}", request_id, step.name),
-        timestamp_ns: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as i64,
-        payload: bytes::Bytes::from(payload_bytes.clone()),
-        // P-DEADLINE cascade: child step shares the parent deadline so a single
-        // step cannot exceed it (budget = parent − already elapsed).
-        deadline_unix_ns,
-        ..Default::default()
-    };
+    let meta = build_step_meta(
+        step, request_id, client_ip, deadline_unix_ns, step_headers,
+        bytes::Bytes::from(payload_bytes.clone()),
+    );
 
     let (response_tx, response_rx) = oneshot::channel();
     let item = crate::inference_queue::QueueItem {
@@ -847,12 +1287,14 @@ mod tests {
                 name: "step1".to_string(),
                 model: "m1".to_string(),
                 version: "1".to_string(),
+                stream: false,
                 inputs: [("input".to_string(), "$request".to_string())].into(),
             },
             EnsembleStep {
                 name: "step2".to_string(),
                 model: "m2".to_string(),
                 version: "1".to_string(),
+                stream: false,
                 inputs: [("data".to_string(), "$step1".to_string())].into(),
             },
         ];
@@ -866,12 +1308,14 @@ mod tests {
                 name: "step1".to_string(),
                 model: "m1".to_string(),
                 version: "1".to_string(),
+                stream: false,
                 inputs: [("input".to_string(), "$step2".to_string())].into(),
             },
             EnsembleStep {
                 name: "step2".to_string(),
                 model: "m2".to_string(),
                 version: "1".to_string(),
+                stream: false,
                 inputs: [("input".to_string(), "$step1".to_string())].into(),
             },
         ];
@@ -885,6 +1329,7 @@ mod tests {
                 name: "step1".to_string(),
                 model: "m1".to_string(),
                 version: "1".to_string(),
+                stream: false,
                 inputs: [("input".to_string(), "$unknown".to_string())].into(),
             },
         ];
@@ -898,18 +1343,21 @@ mod tests {
                 name: "a".to_string(),
                 model: "m1".to_string(),
                 version: "1".to_string(),
+                stream: false,
                 inputs: [("x".to_string(), "$request".to_string())].into(),
             },
             EnsembleStep {
                 name: "b".to_string(),
                 model: "m2".to_string(),
                 version: "1".to_string(),
+                stream: false,
                 inputs: [("x".to_string(), "$request".to_string())].into(),
             },
             EnsembleStep {
                 name: "c".to_string(),
                 model: "m3".to_string(),
                 version: "1".to_string(),
+                stream: false,
                 inputs: [("x".to_string(), "$a".to_string())].into(),
             },
         ];
@@ -1149,12 +1597,92 @@ mod tests {
         }
     }
 
+    // === §4.0/D16: streaming validation (form dispatch, batch 0) ===
+
+    fn sstep(name: &str, inputs: &[(&str, &str)], stream: bool) -> EnsembleStep {
+        EnsembleStep {
+            name: name.to_string(),
+            model: format!("m_{}", name),
+            version: "1".to_string(),
+            inputs: inputs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            stream,
+        }
+    }
+
+    #[test]
+    fn stream_rules_tail_stream_dag_valid() {
+        // s1 (unary) → s2 (streaming tail): the only open form in batch 0.
+        let steps = vec![
+            sstep("s1", &[("input", "$request")], false),
+            sstep("s2", &[("data", "$s1")], true),
+        ];
+        assert!(validate_stream_rules(&steps).is_ok(), "tail-streaming DAG must validate");
+    }
+
+    #[test]
+    fn stream_rules_two_stream_steps_rejected() {
+        // Rule 3: at most one streaming step per DAG.
+        let steps = vec![
+            sstep("s1", &[("input", "$request")], true),
+            sstep("s2", &[("data", "$request")], true),
+        ];
+        let err = validate_stream_rules(&steps).unwrap_err();
+        assert!(
+            err.to_string().contains("one streaming step"),
+            "must reject two streaming steps, got: {err}"
+        );
+    }
+
+    #[test]
+    fn stream_rules_tail_stream_not_config_last_rejected() {
+        // Rule 4 (B-m4): with `output` omitted the DAG output is steps.last(),
+        // which must be the streaming step — a streaming step that is not the
+        // config last step would silently produce nothing streamable.
+        let steps = vec![
+            sstep("s1", &[("input", "$request")], true),
+            sstep("s2", &[("data", "$request")], false),
+        ];
+        let err = validate_stream_rules(&steps).unwrap_err();
+        assert!(
+            err.to_string().contains("output") && err.to_string().contains("s1"),
+            "must reject streaming step not at config tail, got: {err}"
+        );
+    }
+
+    #[test]
+    fn stream_rules_pipeline_form_rejected_with_batch2_message() {
+        // D16: a streaming step whose output is consumed downstream IS the
+        // pipeline form — batch 0 must reject it with an explicit batch-2
+        // message, not a misleading rule-1/2 rejection (and not accept it).
+        let steps = vec![
+            sstep("s1", &[("input", "$request")], true),
+            sstep("s2", &[("data", "$s1")], false),
+        ];
+        let err = validate_stream_rules(&steps).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("pipeline") && msg.contains("0.9.0"),
+            "pipeline form must be rejected with an explicit batch-2 message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn stream_rules_plain_dag_unchanged() {
+        // No stream: false — behaviour parity with the historical validator.
+        let steps = vec![
+            sstep("s1", &[("input", "$request")], false),
+            sstep("s2", &[("data", "$s1")], false),
+        ];
+        assert!(validate_stream_rules(&steps).is_ok());
+    }
+
     // === P0: EnsemblePlan cache (D6 + review ①-④) ===
 
     fn test_plan(path: &str) -> Arc<EnsemblePlan> {
         Arc::new(EnsemblePlan {
             steps: Vec::new(),
             layers: Vec::new(),
+            output_step: 0,
             config_path: PathBuf::from(path),
         })
     }
@@ -1304,6 +1832,7 @@ mod tests {
                 Ok::<_, AppError>(Arc::new(EnsemblePlan {
                     steps: Vec::new(),
                     layers: Vec::new(),
+                    output_step: 0,
                     config_path,
                 }))
             }
