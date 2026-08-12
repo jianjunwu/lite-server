@@ -1438,25 +1438,45 @@ async fn forward_stream(
     cancel_client: Arc<crate::transport::zmq::WorkerZmqClient>,
     stream_id: String,
 ) -> bool {
+    // m4: cumulative time this hop's downstream channel was FULL (the 64-slot
+    // bound is backpressure, not a drop — saturation measures how long it held).
+    let mut saturation_secs: f64 = 0.0;
     while let Some(chunk) = rx.recv().await {
         match chunk.payload {
             Some(pb::stream_response::Payload::Chunk(_)) => {
-                if tx.send(chunk).await.is_err() {
+                let send_start = Instant::now();
+                let send_res = tx.send(chunk).await;
+                saturation_secs += send_start.elapsed().as_secs_f64();
+                if send_res.is_err() {
                     let _ = cancel_client
                         .send_raw(crate::streaming::build_stream_cancel(stream_id))
                         .await;
+                    crate::metrics::prometheus::record_ensemble_pipeline_channel_saturation_seconds(
+                        saturation_secs,
+                    );
                     return false;
                 }
             }
             Some(pb::stream_response::Payload::Error(_)) => {
                 // Propagate the failure downstream, then stop the chain.
                 let _ = tx.send(chunk).await;
+                crate::metrics::prometheus::record_ensemble_pipeline_channel_saturation_seconds(
+                    saturation_secs,
+                );
                 return true;
             }
-            Some(pb::stream_response::Payload::Done(_)) => return false,
+            Some(pb::stream_response::Payload::Done(_)) => {
+                crate::metrics::prometheus::record_ensemble_pipeline_channel_saturation_seconds(
+                    saturation_secs,
+                );
+                return false;
+            }
             _ => {}
         }
     }
+    crate::metrics::prometheus::record_ensemble_pipeline_channel_saturation_seconds(
+        saturation_secs,
+    );
     false
 }
 

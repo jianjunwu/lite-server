@@ -241,6 +241,14 @@ lazy_static! {
         )
     ).unwrap();
 
+    // m4 (§4.2): cumulative backpressure time on chain inter-hop channels.
+    pub static ref ENSEMBLE_PIPELINE_CHANNEL_SATURATION: prometheus::Histogram = prometheus::Histogram::with_opts(
+        prometheus::HistogramOpts::new(
+            "ensemble_pipeline_channel_saturation_seconds",
+            "Cumulative time a pipeline chain inter-hop channel was full"
+        )
+    ).unwrap();
+
     // m4 (§4.2): pipeline chain depth (streaming steps on the chain).
     pub static ref ENSEMBLE_PIPELINE_CHAIN_DEPTH: prometheus::Histogram = prometheus::Histogram::with_opts(
         prometheus::HistogramOpts::new(
@@ -572,6 +580,11 @@ pub fn record_ensemble_bidi_aggregate(bytes: usize, seconds: f64) {
 /// m4 (§4.2): pipeline chain depth — streaming steps on the chain.
 pub fn record_ensemble_pipeline_chain_depth(depth: usize) {
     ENSEMBLE_PIPELINE_CHAIN_DEPTH.observe(depth as f64);
+}
+
+/// m4 (§4.2): cumulative time a chain hop's channel was FULL (backpressure).
+pub fn record_ensemble_pipeline_channel_saturation_seconds(secs: f64) {
+    ENSEMBLE_PIPELINE_CHANNEL_SATURATION.observe(secs);
 }
 
 pub fn set_version_weight(model: &str, version: &str, weight: f64) {
