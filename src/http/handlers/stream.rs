@@ -1382,13 +1382,23 @@ async fn handle_ws_stream(
         // non-ensemble decoupled path.
         let reader_stream_id = stream_id.clone();
         let reader_client = Arc::clone(&worker_client);
+        // D18: decoupled cancel/close cancels the WHOLE chain (broadcast over
+        // every streaming step's worker + abort the chain task tree) — the
+        // quick-access client/id alone target only the head, and a chain's
+        // top-level stream_id is synthetic.
+        let reader_chain = ensemble_chain.clone();
+        let reader_abort = ensemble_abort.clone();
         tokio::spawn(async move {
             while let Some(msg) = ws_stream.next().await {
                 match msg {
                     Ok(Message::Text(t)) if decoupled && is_cancel_or_close_frame(&t) => {
-                        let cancel_req =
-                            streaming::build_stream_cancel(reader_stream_id.clone());
-                        let _ = reader_client.send_raw(cancel_req).await;
+                        crate::ensemble::cancel_chain(
+                            reader_chain.as_ref(),
+                            reader_abort.as_ref(),
+                            &reader_stream_id,
+                            &reader_client,
+                        )
+                        .await;
                         let _ = gone_tx_reader.send(Some(String::new()));
                         break;
                     }
@@ -1637,8 +1647,20 @@ async fn handle_ws_stream(
                 0,
             );
             drop(gone_tx);
-            let cancel_req = streaming::build_stream_cancel(stream_id);
-            let _ = worker_client.send_raw(cancel_req).await;
+            if is_ensemble {
+                // D18: chain teardown broadcasts over every streaming step's
+                // worker (the top-level stream_id is synthetic for chains).
+                crate::ensemble::cancel_chain(
+                    ensemble_chain.as_ref(),
+                    ensemble_abort.as_ref(),
+                    &stream_id,
+                    &worker_client,
+                )
+                .await;
+            } else {
+                let cancel_req = streaming::build_stream_cancel(stream_id);
+                let _ = worker_client.send_raw(cancel_req).await;
+            }
             streaming::observe_or_abort(reader).await;
             return;
         }
@@ -1647,8 +1669,21 @@ async fn handle_ws_stream(
     drop(gone_tx);
 
     // Targeted cancel (replaces broadcast open_worker_stream_cancel).
-    let cancel_req = streaming::build_stream_cancel(completed_stream_id);
-    let _ = cancel_client.send_raw(cancel_req).await;
+    // Ensemble streams (incl. pipeline chains) cancel via the D18 chain
+    // broadcast — a chain's top-level stream_id is synthetic and every
+    // streaming step's worker holds a real sub-stream id in `chain`.
+    if is_ensemble {
+        crate::ensemble::cancel_chain(
+            ensemble_chain.as_ref(),
+            ensemble_abort.as_ref(),
+            &stream_id,
+            &cancel_client,
+        )
+        .await;
+    } else {
+        let cancel_req = streaming::build_stream_cancel(completed_stream_id);
+        let _ = cancel_client.send_raw(cancel_req).await;
+    }
 
     // Observe reader task for panics.
     streaming::observe_or_abort(reader).await;

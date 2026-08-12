@@ -304,6 +304,7 @@ fn validate_dag(steps: &[EnsembleStep]) -> Result<(), AppError> {
 ///    omitted the DAG output is `steps.last()`, which MUST be the streaming
 ///    step — otherwise a streaming DAG would silently produce nothing
 ///    streamable (B-m4: explicit `output` lands with E2 in batch 3).
+///
 /// A linear pipeline chain (§4.2): consecutive STREAMING steps where each
 /// step's output is consumed whole by the next (P-R1/P-R2), ending at the
 /// DAG output step (P-R3/D26). Steps are indices into `EnsemblePlan.steps`.
@@ -1141,11 +1142,24 @@ pub async fn execute_ensemble(
     // branch; the tail-stream branch below remains for non-pipeline DAGs).
     if !plan.chains.is_empty() {
         let chain = &plan.chains[0];
-        let head = chain.nodes[0];
-        let head_layer = plan.layers.iter().position(|l| l.contains(&head))
-            .ok_or_else(|| AppError::Internal("chain head missing from layers".to_string()))?;
+        // §4.2: non-chain parts advance by layer — every non-chain step up
+        // to the chain tail still runs (chain nodes excluded). The historical
+        // executor runs whole layers, so pass layers filtered to non-chain
+        // indices; they never depend on chain streaming outputs (P-R1/D26),
+        // so running them before the chain is always valid.
+        let mut pre_layers: Vec<Vec<usize>> = Vec::new();
+        for layer in &plan.layers {
+            let non_chain: Vec<usize> = layer
+                .iter()
+                .copied()
+                .filter(|&i| !chain.nodes.contains(&i))
+                .collect();
+            if !non_chain.is_empty() {
+                pre_layers.push(non_chain);
+            }
+        }
         run_layers(
-            &state, &plan, &plan.layers[..head_layer], &mut context,
+            &state, &plan, &pre_layers, &mut context,
             model_name, version, request_id, &opts, deadline_unix_ns,
         )
         .await?;
@@ -1485,6 +1499,7 @@ async fn forward_stream(
 /// carries request_id `{parent}:{step}:{chunk_seq}`. D18: a failed
 /// downstream send cancels this step's worker; the chain-handle list is
 /// updated per sub-stream (tail inserted at index 0, others appended).
+#[allow(clippy::too_many_arguments)] // chain-hop plumbing: state+plan+ctx+ids ride together by design
 async fn consume_stream_consumer(
     state: &Arc<AppState>,
     plan: &EnsemblePlan,
@@ -1503,7 +1518,7 @@ async fn consume_stream_consumer(
     let mut seq: u64 = 0;
     let mut error_terminated = false;
     while let Some(chunk) = upstream.recv().await {
-        match chunk.payload {
+        match &chunk.payload {
             Some(pb::stream_response::Payload::Chunk(c)) => {
                 // Chunk → the previous step's value in a per-chunk context.
                 let chunk_value: Value = serde_json::from_slice(&c.data).map_err(|e| {
@@ -1555,9 +1570,14 @@ async fn consume_stream_consumer(
                 seq += 1;
             }
             Some(pb::stream_response::Payload::Done(_)) => break,
-            // An upstream Error frame was already forwarded downstream by the
-            // forwarding hop — terminal; do not synthesize a Done after it.
+            // An upstream Error frame is terminal (§4.4: every mid-stream
+            // failure must reach the client as an Error frame). A hop's own
+            // sub-stream Error is forwarded by forward_stream; a frame
+            // arriving HERE comes from the head hop (which has no forwarding
+            // hop) or an upstream hop's channel — forward it once, then stop.
+            // Do not synthesize a Done after it.
             Some(pb::stream_response::Payload::Error(_)) => {
+                let _ = downstream.send(chunk).await;
                 error_terminated = true;
                 break;
             }

@@ -706,10 +706,15 @@ fn write_all_fixtures(repo: &std::path::Path) {
     write_pre_agg(repo);
     write_tail_upper(repo);
     write_tail_fail_chain(repo);
+    write_chain_slow_head(repo);
+    write_chain_head_fail(repo);
     write_ensemble(repo, "ens_stream", ENS_STREAM_YAML);
     write_ensemble(repo, "ens_agg", ENS_AGG_YAML);
     write_ensemble(repo, "ens_chain", ENS_CHAIN_YAML);
     write_ensemble(repo, "ens_chain_fail", ENS_CHAIN_FAIL_YAML);
+    write_ensemble(repo, "ens_chain_slow", ENS_CHAIN_SLOW_YAML);
+    write_ensemble(repo, "ens_chain_head_fail", ENS_CHAIN_HEAD_FAIL_YAML);
+    write_ensemble(repo, "ens_chain_sibling", ENS_CHAIN_SIBLING_YAML);
     write_ensemble(repo, "ens_split", ENS_SPLIT_YAML);
     write_ensemble(repo, "ens_dslow", ENS_DSLOW_YAML);
     write_ensemble(repo, "ens_binary", ENS_BINARY_YAML);
@@ -736,7 +741,7 @@ fn write_server_yaml(repo: &std::path::Path, http_port: u16, extra: &str) -> std
         format!(
             "server:\n  http_port: {http_port}\n  timeout: 30.0\n{extra}\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n",
             repo.display()
         ),
     )
@@ -1102,7 +1107,7 @@ async fn boot_server_grpc(extra: &str) -> (String, u16, ServerGuard, std::path::
             "server:\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  timeout: 30.0\n{extra}\n\n\
              grpc:\n  enabled: true\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n",
             repo.display()
         ),
     )
@@ -1918,6 +1923,80 @@ class TailFailChainAPI(LitAPI):
     );
 }
 
+/// Chain head that streams slowly and marks generator cancellation — the
+/// D18 fixture: chain teardown must cancel EVERY streaming step's worker
+/// (GeneratorExit fires iff the worker receives a StreamCancel with the
+/// correct stream id).
+fn write_chain_slow_head(repo: &std::path::Path) {
+    write_model_py(
+        repo,
+        "chain_slow_head",
+        r#"import os
+import time
+from lite_server import LitAPI
+
+
+class ChainSlowHeadAPI(LitAPI):
+    def setup(self, device):
+        self.device = device
+
+    async def decode_request(self, request, ctx=None):
+        return request.get("pre", "")
+
+    async def predict(self, x, ctx=None):
+        return {"tokens": [x]}
+
+    def stream_predict(self, request, ctx=None):
+        marker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gen_cancelled")
+        try:
+            for i in range(15):
+                time.sleep(0.3)
+                yield {"token": f"t{i}"}
+        except GeneratorExit:
+            with open(marker, "w") as f:
+                f.write("cancelled")
+            raise
+
+    async def encode_response(self, output, ctx=None):
+        return output
+"#,
+    );
+}
+
+/// Chain head that fails on its 2nd chunk (head mid-stream failure — §4.4
+/// requires the failure to surface as an Error frame, not a silent EOF).
+fn write_chain_head_fail(repo: &std::path::Path) {
+    write_model_py(
+        repo,
+        "chain_head_fail",
+        r#"import time
+from lite_server import LitAPI
+
+
+class ChainHeadFailAPI(LitAPI):
+    def setup(self, device):
+        self.device = device
+
+    async def decode_request(self, request, ctx=None):
+        return request.get("pre", "")
+
+    async def predict(self, x, ctx=None):
+        return {"tokens": [x]}
+
+    def stream_predict(self, request, ctx=None):
+        words = (request.get("pre", "") if isinstance(request, dict) else str(request)).split()
+        for i, w in enumerate(words):
+            time.sleep(0.02)
+            if i == 1:
+                raise RuntimeError("head boom")
+            yield {"token": w}
+
+    async def encode_response(self, output, ctx=None):
+        return output
+"#,
+    );
+}
+
 /// Two-level streaming chain: t1 (stream) → t2 (stream, whole $t1).
 const ENS_CHAIN_YAML: &str = r#"ensemble:
   steps:
@@ -1945,6 +2024,63 @@ const ENS_CHAIN_FAIL_YAML: &str = r#"ensemble:
         pre: "$request.text"
     - name: t2
       model: tail_fail_chain
+      version: "1"
+      stream: true
+      inputs:
+        prev: "$t1"
+"#;
+
+/// Slow-head chain (WS D18 cancel-contract fixture).
+const ENS_CHAIN_SLOW_YAML: &str = r#"ensemble:
+  steps:
+    - name: t1
+      model: chain_slow_head
+      version: "1"
+      stream: true
+      inputs:
+        pre: "$request.text"
+    - name: t2
+      model: tail_upper
+      version: "1"
+      stream: true
+      inputs:
+        prev: "$t1"
+"#;
+
+/// Head-fail chain: the HEAD worker errors on its 2nd chunk.
+const ENS_CHAIN_HEAD_FAIL_YAML: &str = r#"ensemble:
+  steps:
+    - name: t1
+      model: chain_head_fail
+      version: "1"
+      stream: true
+      inputs:
+        pre: "$request.text"
+    - name: t2
+      model: tail_upper
+      version: "1"
+      stream: true
+      inputs:
+        prev: "$t1"
+"#;
+
+/// Chain + a unary sibling in the head's layer (§4.2: non-chain steps still
+/// run by layer — the sibling must not be silently skipped).
+const ENS_CHAIN_SIBLING_YAML: &str = r#"ensemble:
+  steps:
+    - name: t1
+      model: tail
+      version: "1"
+      stream: true
+      inputs:
+        pre: "$request.text"
+    - name: u
+      model: echo
+      version: "1"
+      inputs:
+        data: "$request.text"
+    - name: t2
+      model: tail_upper
       version: "1"
       stream: true
       inputs:
@@ -1990,5 +2126,121 @@ async fn test_audit_stream_pipeline_midchain_failure() {
     assert!(
         body.contains("error") && !body.contains("[DONE]"),
         "mid-chain failure must close with an Error frame, no [DONE]: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// /audit 2026-08-13: batch-2 defect repros (read-only; no impl changes)
+// ---------------------------------------------------------------------------
+
+/// §4.2/D18:WS 适配器未接线 cancel_chain(ensemble_chain/ensemble_abort
+/// 赋值后从未读取,clippy unused_variables 已告警)。客户端断连后主任务只
+/// 向 head client 发携带合成 "chain-*" id 的 StreamCancel,head worker 的
+/// 真实流 id 收不到 cancel → 生成器跑完全部 token,无 GeneratorExit。
+#[tokio::test]
+#[serial]
+async fn test_audit_stream_ws_chain_disconnect_cancels_head_worker() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (base, _guard, repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_chain_slow"]).await;
+    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_chain_slow/stream", http_port);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    ws.send(Message::Text(r#"{"text":"a b c"}"#.into())).await.unwrap();
+    ws.send(Message::Text(r#"{"type":"close"}"#.into())).await.unwrap();
+
+    // Two downstream chunks, then abrupt disconnect (no close frame).
+    let mut chunks = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline && chunks < 2 {
+        if let Ok(Some(Ok(Message::Binary(b)))) =
+            tokio::time::timeout(Duration::from_secs(5), ws.next()).await
+        {
+            if b.windows(5).any(|w| w == b"final") {
+                chunks += 1;
+            }
+        }
+    }
+    assert_eq!(chunks, 2, "chain must deliver downstream chunks before disconnect");
+    drop(ws);
+
+    // D18: chain teardown must cancel EVERY streaming step's worker — the
+    // head receives StreamCancel → generator.close() → GeneratorExit marker.
+    let marker = repo.join("chain_slow_head").join("1").join("gen_cancelled");
+    let mut cancelled = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+    while tokio::time::Instant::now() < deadline && !cancelled {
+        if marker.exists() {
+            cancelled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        cancelled,
+        "client disconnect must cancel the chain head worker (D18 broadcast); \
+         the head generator ran without receiving a StreamCancel"
+    );
+}
+
+/// §4.4:开流后的一切失败 → Error 帧 + close 收口。链头 worker 中途失败
+/// 时,首个消费者的 Error 分支吞帧(注释声称「已由前跳转发」,但链头没有
+/// 前跳),下游静默 EOF——客户端看到 200 流干净结束,无 Error 帧无 [DONE]。
+#[tokio::test]
+#[serial]
+async fn test_audit_stream_pipeline_head_failure_emits_error_frame() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_chain_head_fail"]).await;
+
+    let body = sse_post(
+        &base,
+        "/v2/models/ens_chain_head_fail/events",
+        json!({"text": "hello chain world"}),
+    )
+    .await
+    .expect("chain must open (200)");
+    assert!(
+        body.contains(r#""final":"HELLO""#),
+        "chunks before the head failure must stream: {body}"
+    );
+    assert!(
+        body.contains("error"),
+        "head mid-stream failure must close with an Error frame (§4.4), \
+         got a silent EOF: {body}"
+    );
+}
+
+/// §4.2:非链部分仍按层 JoinSet 推进。与链头同层的 unary step(无依赖)
+/// 落在 layers[..head_layer] 之外 → 永远不执行且无任何报错。对照 §4.1
+/// 规则 3(末步流式的同层兄弟并行执行)与规则 1 的拒止精神,属静默截断。
+#[tokio::test]
+#[serial]
+async fn test_audit_stream_pipeline_same_layer_unary_sibling_runs() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_chain_sibling"]).await;
+
+    let _ = sse_post(&base, "/v2/models/ens_chain_sibling/events", json!({"text": "hello"}))
+        .await
+        .expect("chain SSE must open");
+    let metrics = reqwest::Client::new()
+        .get(format!("{}/metrics", base))
+        .send()
+        .await
+        .expect("/metrics")
+        .text()
+        .await
+        .unwrap();
+    let count = metrics
+        .lines()
+        .find(|l| l.starts_with(r#"liteserver_worker_inference_total{model="echo""#))
+        .and_then(|l| l.rsplit(' ').next())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    assert!(
+        count > 0,
+        "non-chain unary step in the head's layer must still execute (§4.2); \
+         the sibling worker saw {count} inferences"
     );
 }
