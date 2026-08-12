@@ -91,6 +91,9 @@ pub struct WorkerManager {
     /// B1: set true at shutdown start so worker monitors know to suppress
     /// ERROR-level "exited unexpectedly" for workers killed during drain.
     draining: Arc<std::sync::atomic::AtomicBool>,
+    // P0 (D6): ensemble plan cache, invalidated from the lifecycle single
+    // collection point (unload_version / reload_model, D23).
+    ensemble_plans: Option<Arc<crate::ensemble::EnsemblePlanCache>>,
 }
 
 struct WorkerProcess {
@@ -138,7 +141,25 @@ impl WorkerManager {
             hook_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_defaults: crate::config::ModelTunables::default(),
+            // P0 (D6): ensemble plan cache. None when the caller did not
+            // install one (unit-test WorkerManager::new) — execute_ensemble
+            // then loads plans uncached (behaviour parity).
+            ensemble_plans: None,
         }
+    }
+
+    /// P0 (D6): install the ensemble plan cache. Invalidated from the
+    /// lifecycle single collection point (unload_version / reload_model,
+    /// D23) — see `ensemble_plans` accessor.
+    pub fn with_ensemble_plans(mut self, cache: Arc<crate::ensemble::EnsemblePlanCache>) -> Self {
+        self.ensemble_plans = Some(cache);
+        self
+    }
+
+    /// P0: accessor for the ensemble plan cache (None in tests that build a
+    /// bare WorkerManager).
+    pub fn ensemble_plans(&self) -> Option<Arc<crate::ensemble::EnsemblePlanCache>> {
+        self.ensemble_plans.clone()
     }
 
     /// Set the loopback HTTP base URL workers receive as --server-http

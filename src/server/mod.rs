@@ -133,6 +133,9 @@ impl LiteServer {
             balance,
         ));
         let callback_runner = Arc::new(CallbackRunner::new());
+        // P0 (D6): install the ensemble plan cache on the production path;
+        // lifecycle unload/reload invalidates it (D23 single collection point).
+        let ensemble_plans = Arc::new(crate::ensemble::EnsemblePlanCache::new());
         let worker_manager = Arc::new(WorkerManager::new(
             registry.clone(),
             repo_path,
@@ -143,7 +146,8 @@ impl LiteServer {
          .with_unload_grace(Duration::from_secs_f32(config.server.timeout))
          .with_server_tunables(config.tunables.clone())
          .with_custom_metrics(config.features.custom_metrics)
-         .with_model_defaults(config.model_defaults.clone()));
+         .with_model_defaults(config.model_defaults.clone())
+         .with_ensemble_plans(ensemble_plans));
 
         Self {
             config,

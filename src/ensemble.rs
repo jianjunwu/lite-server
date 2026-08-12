@@ -3,10 +3,12 @@ use crate::http::state::AppState;
 use crate::proto::liteserver as pb;
 use crate::registry::types::ModelType;
 use bytes::Bytes;
+use dashmap::DashMap;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -63,11 +65,13 @@ lazy_static::lazy_static! {
         .expect("invalid ensemble ref regex");
 }
 
-pub async fn parse_ensemble_config(config_path: &PathBuf) -> Result<Vec<EnsembleStep>, AppError> {
-    let content = tokio::fs::read_to_string(config_path)
-        .await
-        .map_err(|e| AppError::Config(format!("failed to read ensemble config: {}", e)))?;
-    let config: EnsembleConfig = serde_yaml::from_str(&content)
+/// Parse + validate + topologically sort a config file into the cached
+/// [`EnsemblePlan`] (P0, D6): the plan is structured once at load time,
+/// streaming/MIMO validation stacks on top of it (no parse logic double
+/// write). The caller owns the file read — the cache re-parses only on
+/// miss/eviction.
+pub fn parse_ensemble_plan(content: &str, config_path: &PathBuf) -> Result<EnsemblePlan, AppError> {
+    let config: EnsembleConfig = serde_yaml::from_str(content)
         .map_err(|e| AppError::Config(format!("failed to parse ensemble config: {}", e)))?;
 
     let steps: Vec<EnsembleStep> = config.ensemble.steps.into_iter().map(|s| EnsembleStep {
@@ -78,7 +82,52 @@ pub async fn parse_ensemble_config(config_path: &PathBuf) -> Result<Vec<Ensemble
     }).collect();
 
     validate_dag(&steps)?;
-    Ok(steps)
+    let index_of: HashMap<&str, usize> = steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.name.as_str(), i))
+        .collect();
+    let layers = topological_layers(&steps)
+        .into_iter()
+        .map(|layer| layer.into_iter().map(|s| index_of[s.name.as_str()]).collect())
+        .collect();
+
+    Ok(EnsemblePlan { steps, layers, config_path: config_path.clone() })
+}
+
+/// Production plan loader: resolve the model dir, read config.yaml and parse
+/// into a cached plan (P0). Wrapped by [`get_ensemble_plan`].
+async fn load_ensemble_plan(
+    repo_path: &std::path::Path,
+    model: &str,
+    version: &str,
+) -> Result<Arc<EnsemblePlan>, AppError> {
+    let model_dir = crate::validation::resolve_model_dir(repo_path, model, version)?;
+    let config_path = model_dir.join("config.yaml");
+    let content = tokio::fs::read_to_string(&config_path)
+        .await
+        .map_err(|e| AppError::Config(format!("failed to read ensemble config: {}", e)))?;
+    parse_ensemble_plan(&content, &config_path).map(Arc::new)
+}
+
+/// P0 entry: cached plan lookup with single-flight + mtime re-check; falls
+/// back to a direct load when no cache is installed (tests construct
+/// WorkerManager without one).
+pub async fn get_ensemble_plan(
+    state: &AppState,
+    model_name: &str,
+    version: &str,
+) -> Result<Arc<EnsemblePlan>, AppError> {
+    let key = PlanKey {
+        model: model_name.to_string(),
+        version: version.to_string(),
+    };
+    match state.worker_manager.ensemble_plans() {
+        Some(cache) => cache
+            .get_or_load(key, || load_ensemble_plan(&state.repo_path, model_name, version))
+            .await,
+        None => load_ensemble_plan(&state.repo_path, model_name, version).await,
+    }
 }
 
 fn validate_dag(steps: &[EnsembleStep]) -> Result<(), AppError> {
@@ -251,6 +300,183 @@ fn resolve_ref(ref_str: &str, context: &HashMap<String, EnsembleValue>) -> Resul
     }
 }
 
+// ===== P0: EnsemblePlan cache (D6 + review ①-④) =====
+
+/// Parsed, validated, layer-sorted ensemble DAG — the object cached by
+/// [`EnsemblePlanCache`] so a request never re-reads/parses/validates the
+/// config.yaml. Batch 0 starts with the historical parse result; streaming
+/// fields (stream/output semantics) land on this struct in batch 0 step 2
+/// (D6: parse structured once, stream/MIMO validation stacks on top).
+#[derive(Debug, Clone)]
+pub struct EnsemblePlan {
+    pub steps: Vec<EnsembleStep>,
+    /// Topological layers as indices into `steps` (self-owning, no refs).
+    pub layers: Vec<Vec<usize>>,
+    /// Source config file — mtime re-check (review ②) stats this path.
+    pub config_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PlanKey {
+    pub model: String,
+    pub version: String,
+}
+
+enum PlanCell {
+    /// Single-flight in progress: the holder parses; waiters park here.
+    Loading(Vec<oneshot::Sender<Result<Arc<EnsemblePlan>, AppError>>>),
+    Ready {
+        plan: Arc<EnsemblePlan>,
+        mtime: Option<std::time::SystemTime>,
+        last_stat: tokio::time::Instant,
+    },
+}
+
+/// P0: `DashMap<(model, version), Arc<EnsemblePlan>>` with single-flight
+/// loads (review ④), mtime interval re-check (review ②, coarse tokio clock,
+/// no syscall on the hot path) and model-prefix invalidation (review ③ —
+/// `(m,"latest")` and `(m,"1")` are distinct keys, both must clear).
+/// Invalidation hooks: lifecycle `unload_version` (via reload_model too) —
+/// single collection point, fired BEFORE registry changes (D23).
+pub struct EnsemblePlanCache {
+    plans: DashMap<PlanKey, PlanCell>,
+    stat_interval: Duration,
+}
+
+impl EnsemblePlanCache {
+    pub fn new() -> Self {
+        Self {
+            plans: DashMap::new(),
+            stat_interval: Duration::from_secs(1),
+        }
+    }
+
+    /// Get-or-load with single-flight: concurrent first requests share one
+    /// parse; a failed load is NOT cached (next call re-parses — a fixed
+    /// config heals without reload). Ready entries within `stat_interval`
+    /// are returned without touching the filesystem.
+    pub async fn get_or_load<F, Fut>(
+        &self,
+        key: PlanKey,
+        load: F,
+    ) -> Result<Arc<EnsemblePlan>, AppError>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = Result<Arc<EnsemblePlan>, AppError>> + Send,
+    {
+        use dashmap::mapref::entry::Entry as MapEntry;
+
+        // Fast path: a fresh Ready entry returns without any filesystem work.
+        if let Some(cell) = self.plans.get(&key) {
+            if let PlanCell::Ready { plan, last_stat, .. } = &*cell {
+                if last_stat.elapsed() < self.stat_interval {
+                    return Ok(plan.clone());
+                }
+            }
+        }
+
+        loop {
+            match self.plans.entry(key.clone()) {
+                MapEntry::Occupied(mut occ) => match occ.get_mut() {
+                    PlanCell::Loading(waiters) => {
+                        // Not the holder: park on the holder's result.
+                        let (tx, rx) = oneshot::channel();
+                        waiters.push(tx);
+                        drop(occ);
+                        return rx.await.map_err(|_| {
+                            AppError::Internal("ensemble plan load task dropped".to_string())
+                        })?;
+                    }
+                    PlanCell::Ready { plan, mtime, last_stat } => {
+                        if last_stat.elapsed() < self.stat_interval {
+                            return Ok(plan.clone());
+                        }
+                        // Interval elapsed (review ②): re-stat the source file.
+                        // Coarse check amortised to once per interval, never on
+                        // the hot path; a change evicts and re-loads in-flight.
+                        let current_mtime = std::fs::metadata(&plan.config_path)
+                            .and_then(|m| m.modified())
+                            .ok();
+                        if current_mtime == *mtime {
+                            *last_stat = tokio::time::Instant::now();
+                            return Ok(plan.clone());
+                        }
+                        occ.remove();
+                        continue;
+                    }
+                },
+                MapEntry::Vacant(vacant) => {
+                    // We are the single-flight holder (review ④). Insert the
+                    // Loading placeholder, drop the shard lock, then parse.
+                    vacant.insert(PlanCell::Loading(Vec::new()));
+                    match load().await {
+                        Ok(plan) => {
+                            let mtime = std::fs::metadata(&plan.config_path)
+                                .and_then(|m| m.modified())
+                                .ok();
+                            let waiters = match self.plans.get_mut(&key) {
+                                Some(mut cell) => match cell.value_mut() {
+                                    PlanCell::Loading(w) => std::mem::take(w),
+                                    PlanCell::Ready { .. } => {
+                                        unreachable!("holder owns the Loading cell")
+                                    }
+                                },
+                                None => unreachable!("holder owns the entry"),
+                            };
+                            for w in waiters {
+                                let _ = w.send(Ok(plan.clone()));
+                            }
+                            let mut cell = self.plans.get_mut(&key).unwrap();
+                            *cell.value_mut() = PlanCell::Ready {
+                                plan: plan.clone(),
+                                mtime,
+                                last_stat: tokio::time::Instant::now(),
+                            };
+                            return Ok(plan);
+                        }
+                        Err(e) => {
+                            // Failed loads must NOT be cached: evict the
+                            // placeholder so the next call re-parses (a fixed
+                            // config heals without reload — behaviour parity
+                            // with the uncached path). Waiters share the failure.
+                            let waiters = match self.plans.get_mut(&key) {
+                                Some(mut cell) => match cell.value_mut() {
+                                    PlanCell::Loading(w) => std::mem::take(w),
+                                    PlanCell::Ready { .. } => {
+                                        unreachable!("holder owns the Loading cell")
+                                    }
+                                },
+                                None => unreachable!("holder owns the entry"),
+                            };
+                            self.plans.remove(&key);
+                            for w in waiters {
+                                let _ = w.send(Err(AppError::Internal(
+                                    "ensemble plan load failed".to_string(),
+                                )));
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Invalidate every version of a model (review ③: latest + pinned
+    /// versions are separate keys). Called on unload BEFORE registry
+    /// changes (D23).
+    pub fn invalidate_model(&self, model: &str) {
+        self.plans.retain(|key, _| key.model != model);
+    }
+
+    pub fn invalidate_version(&self, model: &str, version: &str) {
+        self.plans.remove(&PlanKey {
+            model: model.to_string(),
+            version: version.to_string(),
+        });
+    }
+}
+
 // ===== Execution =====
 
 pub async fn execute_ensemble(
@@ -262,13 +488,10 @@ pub async fn execute_ensemble(
     client_ip: &str,
     deadline_unix_ns: Option<i64>,
 ) -> Result<EnsembleValue, AppError> {
-    let model_dir = crate::validation::resolve_model_dir(
-        &state.repo_path, model_name, version,
-    )?;
-    let config_path = model_dir.join("config.yaml");
-
-    let steps = parse_ensemble_config(&config_path).await?;
-    let layers = topological_layers(&steps);
+    // P0 (D6): plan comes from the cache — parse/validate/layers run once per
+    // config version, not per request. In-flight requests hold their Arc and
+    // finish on the old plan even across a reload (D23).
+    let plan = get_ensemble_plan(&state, model_name, version).await?;
 
     let mut context: HashMap<String, EnsembleValue> = HashMap::new();
     context.insert("request".to_string(), payload);
@@ -280,8 +503,11 @@ pub async fn execute_ensemble(
     // N×. The per-step timeout in execute_step (parent − elapsed) is the inner
     // safety net; this outer deadline is what actually bounds the total.
     let total_budget = crate::deadline::remaining(deadline_unix_ns);
+    let plan_run = plan.clone();
+    // Borrows `context` mutably for the DAG run (step results land here);
+    // the caller reads the output below once the run finishes.
     let ensemble_run = async {
-        for layer in layers {
+        for layer in &plan_run.layers {
             // P-FLOW (§4.0.9): a JoinSet per layer is the ensemble's shared
             // cancel. On any early exit — a step error, the outer total-budget
             // timeout, or the parent request being dropped (client disconnect) —
@@ -291,10 +517,10 @@ pub async fn execute_ensemble(
             // parent). Completed tasks are no-ops to abort.
             let mut set: tokio::task::JoinSet<(String, Result<EnsembleValue, AppError>)> =
                 tokio::task::JoinSet::new();
-            for step in layer {
+            for &step_idx in layer {
                 let state = state.clone();
                 let ctx = context.clone();
-                let step = step.clone();
+                let step = plan_run.steps[step_idx].clone();
                 let ensemble_name = model_name.to_string();
                 let request_id = request_id.to_string();
                 let client_ip = client_ip.to_string();
@@ -348,7 +574,7 @@ pub async fn execute_ensemble(
     }
 
     // Return last step's output
-    steps.last()
+    plan.steps.last()
         .and_then(|s| context.get(&s.name))
         .cloned()
         .ok_or_else(|| AppError::Internal("ensemble produced no output".to_string()))
@@ -921,5 +1147,182 @@ mod tests {
             EnsembleValue::Json(v) => assert_eq!(v, json!({})),
             _ => panic!("expected Json empty object"),
         }
+    }
+
+    // === P0: EnsemblePlan cache (D6 + review ①-④) ===
+
+    fn test_plan(path: &str) -> Arc<EnsemblePlan> {
+        Arc::new(EnsemblePlan {
+            steps: Vec::new(),
+            layers: Vec::new(),
+            config_path: PathBuf::from(path),
+        })
+    }
+
+    #[tokio::test]
+    async fn p0_cache_hit_returns_same_arc() {
+        let cache = EnsemblePlanCache::new();
+        let key = PlanKey { model: "m".to_string(), version: "1".to_string() };
+        let plan = test_plan("/nonexistent");
+        let first = cache.get_or_load(key.clone(), || {
+            let plan = plan.clone();
+            async move { Ok::<_, AppError>(plan) }
+        }).await.unwrap();
+        assert!(Arc::ptr_eq(&plan, &first), "first load returns the parsed plan");
+        let hit = cache.get_or_load(key, || async { panic!("cache hit must not parse again") })
+            .await.unwrap();
+        assert!(Arc::ptr_eq(&plan, &hit), "hit must return the cached Arc");
+    }
+
+    #[tokio::test]
+    async fn p0_cache_single_flight_only_one_parse() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = Arc::new(EnsemblePlanCache::new());
+        let key = PlanKey { model: "m".to_string(), version: "1".to_string() };
+        let parse_count = Arc::new(AtomicUsize::new(0));
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..10 {
+            let cache = cache.clone();
+            let key = key.clone();
+            let parse_count = parse_count.clone();
+            set.spawn(async move {
+                cache.get_or_load(key, || {
+                    let parse_count = parse_count.clone();
+                    async move {
+                        parse_count.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Ok::<_, AppError>(test_plan("/nonexistent"))
+                    }
+                }).await.unwrap()
+            });
+        }
+        let mut plans = Vec::new();
+        while let Some(r) = set.join_next().await {
+            plans.push(r.unwrap());
+        }
+        assert_eq!(
+            parse_count.load(Ordering::SeqCst),
+            1,
+            "concurrent first requests must parse exactly once (single-flight, review ④)"
+        );
+        for p in &plans {
+            assert!(Arc::ptr_eq(&plans[0], p), "all waiters must receive the holder's plan");
+        }
+    }
+
+    #[tokio::test]
+    async fn p0_cache_failed_load_not_cached() {
+        let cache = EnsemblePlanCache::new();
+        let key = PlanKey { model: "m".to_string(), version: "1".to_string() };
+        let err = cache.get_or_load(key.clone(), || async {
+            Err::<Arc<EnsemblePlan>, _>(AppError::Config("boom".to_string()))
+        }).await.unwrap_err();
+        assert!(err.to_string().contains("boom"));
+        // A failed load must not be cached: the next call re-parses (a fixed
+        // config heals without reload — behaviour parity with no cache).
+        let ok = cache.get_or_load(key, || async {
+            Ok::<_, AppError>(test_plan("/nonexistent"))
+        }).await;
+        assert!(ok.is_ok(), "failed load must not be cached; next call re-parses");
+    }
+
+    #[tokio::test]
+    async fn p0_cache_invalidate_model_clears_all_versions() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = EnsemblePlanCache::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let k_latest = PlanKey { model: "m".to_string(), version: "latest".to_string() };
+        let k_pinned = PlanKey { model: "m".to_string(), version: "1".to_string() };
+        let k_other = PlanKey { model: "other".to_string(), version: "1".to_string() };
+        for key in [&k_latest, &k_pinned, &k_other] {
+            cache.get_or_load(key.clone(), || {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, AppError>(test_plan("/nonexistent"))
+                }
+            }).await.unwrap();
+        }
+        cache.invalidate_model("m");
+        // Review ③: both "latest" and the pinned version are separate keys
+        // and must ALL clear on a model-prefix invalidation.
+        for key in [&k_latest, &k_pinned] {
+            cache.get_or_load(key.clone(), || {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, AppError>(test_plan("/nonexistent"))
+                }
+            }).await.unwrap();
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 5, "invalidate_model must clear every version of the model");
+    }
+
+    #[tokio::test]
+    async fn p0_cache_invalidate_version_clears_one() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = EnsemblePlanCache::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let k1 = PlanKey { model: "m".to_string(), version: "1".to_string() };
+        let k2 = PlanKey { model: "m".to_string(), version: "2".to_string() };
+        for key in [&k1, &k2] {
+            cache.get_or_load(key.clone(), || {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, AppError>(test_plan("/nonexistent"))
+                }
+            }).await.unwrap();
+        }
+        cache.invalidate_version("m", "1");
+        cache.get_or_load(k1, || {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, AppError>(test_plan("/nonexistent"))
+            }
+        }).await.unwrap();
+        // v2 untouched → no new parse.
+        cache.get_or_load(k2, || async { panic!("v2 must stay cached") }).await.unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 3, "only version 1 must re-parse");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn p0_cache_mtime_recheck_after_interval() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = std::env::temp_dir().join(format!("liteserver-ens-p0-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.yaml");
+        std::fs::write(&config_path, b"v1").unwrap();
+        let cache = EnsemblePlanCache::new();
+        let key = PlanKey { model: "m".to_string(), version: "1".to_string() };
+        let count = Arc::new(AtomicUsize::new(0));
+        let load = |count: Arc<AtomicUsize>| {
+            let config_path = config_path.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, AppError>(Arc::new(EnsemblePlan {
+                    steps: Vec::new(),
+                    layers: Vec::new(),
+                    config_path,
+                }))
+            }
+        };
+        cache.get_or_load(key.clone(), || load(count.clone())).await.unwrap();
+        // Within the stat interval: no syscall, same Arc (review ②).
+        let within = cache.get_or_load(key.clone(), || load(count.clone())).await.unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1, "hot path must not stat within the interval");
+        // Rewrite the file; still within interval → still served from cache.
+        std::fs::write(&config_path, b"v2").unwrap();
+        let stale = cache.get_or_load(key.clone(), || load(count.clone())).await.unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1, "file change inside the interval is not seen");
+        drop(within);
+        drop(stale);
+        // Advance past the interval: next get must stat, see the mtime change,
+        // evict and re-parse (single-flight).
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        cache.get_or_load(key.clone(), || load(count.clone())).await.unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 2, "mtime change after the interval must re-parse");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

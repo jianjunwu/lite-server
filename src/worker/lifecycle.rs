@@ -754,6 +754,14 @@ impl WorkerManager {
     ) -> Result<(), AppError> {
         info!("Unloading {} version {}", model_name, version);
 
+        // P0 (D23): invalidate the ensemble plan cache BEFORE any registry
+        // change — a fresh request must never hit a stale plan for a version
+        // that is being unloaded. reload_model funnels through here, so this
+        // single point covers both paths.
+        if let Some(cache) = &self.ensemble_plans {
+            cache.invalidate_model(model_name);
+        }
+
         // Stop the status coordinator first so it can't tick against a
         // half-torn-down version.
         self.stop_status_coordinator(model_name, version).await;
