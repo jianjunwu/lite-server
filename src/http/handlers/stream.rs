@@ -402,6 +402,10 @@ async fn sse_infer_impl(
         Some(mv) => mv.model_type == crate::registry::types::ModelType::Ensemble,
         None => false,
     };
+    // P10 (D40): the stream's semaphore permit must live as long as the
+    // forward task — it is captured by the spawn below and released when the
+    // task ends (terminal frame / idle / disconnect), the D18 teardown path.
+    let mut ensemble_permit = None;
     let (stream_id, worker_client, mut chunk_rx) = if is_ensemble {
         let ensemble_input = super::inference::ensemble_input_from_body(&body)?;
         let opts = crate::ensemble::EnsembleExecOpts {
@@ -412,7 +416,8 @@ async fn sse_infer_impl(
         match crate::ensemble::execute_ensemble(
             state.clone(), &model_name, &resolved_version, ensemble_input, &cx.request_id, opts,
         ).await? {
-            crate::ensemble::EnsembleOutcome::Stream(s) => {
+            crate::ensemble::EnsembleOutcome::Stream(mut s) => {
+                ensemble_permit = s.permit.take();
                 (s.stream_id, s.cancel_client, s.chunk_rx)
             }
             crate::ensemble::EnsembleOutcome::Unary(_) => {
@@ -461,6 +466,9 @@ async fn sse_infer_impl(
     };
 
     tokio::spawn(async move {
+        // P10 (D40): held for the forward task's lifetime — released on drop
+        // (terminal frame / idle / disconnect; same path as D18 teardown).
+        let _ensemble_permit = ensemble_permit;
         let open_time = std::time::Instant::now();
         let mut first_chunk = true;
         let mut last_chunk_time = open_time;
@@ -498,6 +506,7 @@ async fn sse_infer_impl(
                     break;
                 }
             };
+            let mut type_mismatch = false;
             let event = match &chunk.payload {
                 Some(pb::stream_response::Payload::Chunk(c)) => {
                     output_bytes += c.data.len() as u64;
@@ -512,8 +521,29 @@ async fn sse_infer_impl(
                         last_chunk_time = std::time::Instant::now();
                         prometheus::record_stream_chunk(&model_name, &resolved_version, "sse");
                     }
-                    let data = String::from_utf8_lossy(&c.data);
-                    Some(Event::default().data(&data))
+                    // m7 (D20): ensemble streams on text endpoints must be
+                    // UTF-8 — a binary chunk that slipped past the static D7
+                    // 400 (model flag unset) closes with an Error frame +
+                    // type_mismatch (the stream is open; the status code is
+                    // already committed). Non-ensemble keeps the lossy path.
+                    if is_ensemble {
+                        match std::str::from_utf8(&c.data) {
+                            Ok(s) => Some(Event::default().data(s)),
+                            Err(_) => {
+                                type_mismatch = true;
+                                let msg = "ensemble streaming step produced a binary chunk on a text endpoint";
+                                match frame {
+                                    SseFrameStyle::Openai => {
+                                        Some(Event::default().data(json!({"error": {"message": msg}}).to_string()))
+                                    }
+                                    _ => Some(Event::default().data(json!({"error": msg}).to_string())),
+                                }
+                            }
+                        }
+                    } else {
+                        let data = String::from_utf8_lossy(&c.data);
+                        Some(Event::default().data(&data))
+                    }
                 }
                 Some(pb::stream_response::Payload::Error(e)) => {
                     // Try to parse as structured error from HTTPException
@@ -553,6 +583,12 @@ async fn sse_infer_impl(
                     reason = prometheus::StreamCloseReason::Cancel;
                     break;
                 }
+            }
+            // m7: the type-mismatch error event was already sent — close the
+            // stream with the dedicated terminal reason.
+            if type_mismatch {
+                reason = prometheus::StreamCloseReason::TypeMismatch;
+                break;
             }
             // Terminal frames end the stream. Error is terminal by contract
             // (callback.rs) — breaking here also guarantees the

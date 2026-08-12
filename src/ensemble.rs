@@ -1,4 +1,4 @@
-use crate::error::AppError;
+use crate::error::{AppError, ModelErrorData};
 use crate::http::state::AppState;
 use crate::proto::liteserver as pb;
 use crate::registry::types::ModelType;
@@ -601,6 +601,23 @@ impl EnsemblePlanCache {
                 }
             }
         }
+    }
+
+    /// Direct insert from the lifecycle load path (P0/P6): the plan was
+    /// parsed at load time, so the first request hits the cache without
+    /// paying the parse. mtime is stat'ed here (once, at load).
+    pub fn insert_ready(&self, key: PlanKey, plan: Arc<EnsemblePlan>) {
+        let mtime = std::fs::metadata(&plan.config_path)
+            .and_then(|m| m.modified())
+            .ok();
+        self.plans.insert(
+            key,
+            PlanCell::Ready {
+                plan,
+                mtime,
+                last_stat: tokio::time::Instant::now(),
+            },
+        );
     }
 
     /// Invalidate every version of a model (review ③: latest + pinned
@@ -1536,6 +1553,51 @@ async fn execute_step(
                 "Ok" => {
                     // B3 (E8): typed output (see parse_step_output).
                     parse_step_output(&step.name, single)
+                }
+                "Error" => {
+                    let msg = single.status.as_ref().and_then(|s| {
+                        if s.message.is_empty() { None } else { Some(s.message.clone()) }
+                    }).unwrap_or_else(|| "unknown worker error".to_string());
+                    // §4.4: the worker carries the numeric HTTP status in
+                    // Status.message (common._make_error_response). Parity
+                    // with the unary queue path (inference.rs:425-465): a
+                    // numeric status → ModelError (4xx passes through, 5xx
+                    // maps 500 — B3, never sanitized to 503); a non-numeric
+                    // message means the worker itself is broken →
+                    // WorkerCrashed.
+                    match msg.parse::<u16>() {
+                        Ok(http_status) => {
+                            let data: Value = if single.data.is_empty() {
+                                json!({})
+                            } else {
+                                serde_json::from_slice(&single.data).unwrap_or(json!({}))
+                            };
+                            let err_obj = data.get("error");
+                            Err(AppError::ModelError(Box::new(ModelErrorData {
+                                status_code: http_status,
+                                error_type: err_obj.and_then(|e| e.get("type"))
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("model_error")
+                                    .to_string(),
+                                detail: err_obj.and_then(|e| e.get("message"))
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("model error")
+                                    .to_string(),
+                                code: err_obj.and_then(|e| e.get("code"))
+                                    .and_then(|c| c.as_str())
+                                    .map(|s| s.to_string()),
+                                param: err_obj.and_then(|e| e.get("param"))
+                                    .and_then(|p| p.as_str())
+                                    .map(|s| s.to_string()),
+                                headers: if single.headers.is_empty() {
+                                    None
+                                } else {
+                                    Some(single.headers.clone())
+                                },
+                            })))
+                        }
+                        Err(_) => Err(AppError::WorkerCrashed(msg)),
+                    }
                 }
                 _ => Err(AppError::WorkerCrashed(
                     single.status.as_ref().and_then(|s| {

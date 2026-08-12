@@ -620,6 +620,10 @@ pub enum StreamCloseReason {
     Protocol,
     /// writer 任务 panic(仅 WS 可达)。
     Panic,
+    /// m7 (D20): ensemble streaming step produced a binary chunk on a text
+    /// endpoint (SSE/OpenAI) after the stream opened — closed with an Error
+    /// frame; the static D7 binary-flag 400 was not set for this model.
+    TypeMismatch,
 }
 
 impl StreamCloseReason {
@@ -633,7 +637,8 @@ impl StreamCloseReason {
             StreamCloseReason::Error
             | StreamCloseReason::Deadline
             | StreamCloseReason::Idle
-            | StreamCloseReason::Panic => "5xx",
+            | StreamCloseReason::Panic
+            | StreamCloseReason::TypeMismatch => "5xx",
             StreamCloseReason::Protocol => "4xx",
         }
     }
@@ -648,6 +653,7 @@ impl StreamCloseReason {
             StreamCloseReason::Idle => Some("idle"),
             StreamCloseReason::Protocol => Some("protocol"),
             StreamCloseReason::Panic => Some("panic"),
+            StreamCloseReason::TypeMismatch => Some("type_mismatch"),
             _ => None,
         }
     }

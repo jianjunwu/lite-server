@@ -154,10 +154,12 @@ impl WorkerManager {
         // Check for ensemble (structural YAML parse — string-contains would
         // false-positive on comments mentioning "ensemble:")
         let mut is_ensemble = false;
+        let mut ensemble_content: Option<String> = None;
         if config_yaml.exists() {
             if let Ok(content) = tokio::fs::read_to_string(&config_yaml).await {
                 if crate::config::config_content_is_ensemble(&content) {
                     is_ensemble = true;
+                    ensemble_content = Some(content);
                 }
             }
         }
@@ -200,13 +202,34 @@ impl WorkerManager {
             .register(model_name, version, model_config.clone(), model_type, model_dir.clone())?;
 
         if is_ensemble {
+            // P0/P6: parse the plan NOW — config validation surfaces at
+            // load time (a bad DAG keeps the model unready, §4.4 note ③:
+            // config errors never appear per-request), and the parsed plan
+            // primes the P0 cache so the first request pays nothing.
+            if let Some(plans) = &self.ensemble_plans {
+                let content = ensemble_content.as_deref().unwrap_or_default();
+                let config_path = config_yaml.clone();
+                match crate::ensemble::parse_ensemble_plan(content, &config_path) {
+                    Ok(plan) => {
+                        plans.insert_ready(
+                            crate::ensemble::PlanKey {
+                                model: model_name.to_string(),
+                                version: version.to_string(),
+                            },
+                            std::sync::Arc::new(plan),
+                        );
+                    }
+                    Err(e) => {
+                        return Err(e);
+                    }
+                }
+            }
             // Ensemble: no workers, just mark ready
             self.registry
                 .mark_ready(model_name, version)?;
-            // P6 (batch 0): background warm — prime the plan cache and
-            // pre-check sub-model readiness without blocking the load
-            // (sub-model preloading + the E4 resolved-version side-table
-            // land with batch 3).
+            // P6 (batch 0): background warm — pre-check sub-model readiness
+            // without blocking the load (sub-model preloading + the E4
+            // resolved-version side-table land with batch 3).
             crate::ensemble::spawn_ensemble_warm(
                 self.repo_path.clone(),
                 self.ensemble_plans.clone(),

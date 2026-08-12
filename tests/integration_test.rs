@@ -5381,9 +5381,24 @@ ensemble:
     let _guard = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
     wait_for_server(http_port, 30).await;
     let base = format!("http://127.0.0.1:{}", http_port);
-    // Load succeeds — the cycle is only detected when the config is parsed at
-    // infer time, so the model registers and becomes ready.
-    load_model(&base, "ensemble_cycle", "1").await;
+    // §4.4 note ③ (batch 0): config validation fires at LOAD time — a cyclic
+    // DAG fails load (invalid_configuration 400), the model never registers.
+    // (Previously the cycle was only detected when the config was parsed at
+    // infer time; batch 0 moves DAG validation onto the load path, P0/P6.)
+    let client = reqwest::Client::new();
+    let load_resp = client
+        .post(format!(
+            "{}/v2/repository/models/ensemble_cycle/versions/1/load",
+            base
+        ))
+        .send()
+        .await
+        .expect("load request");
+    assert_eq!(
+        load_resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "cyclic DAG must fail at load time (§4.4 note ③)"
+    );
 
     let channel = grpc_tcp_channel(grpc_port).await;
     let mut client = LiteServerClient::new(channel);
@@ -5400,7 +5415,7 @@ ensemble:
 
     assert!(
         result.is_err(),
-        "cyclic ensemble DAG must surface as a gRPC error, not OK; got: {:?}",
+        "an unloaded cyclic ensemble must surface as a gRPC error, not OK; got: {:?}",
         result.map(|r| String::from_utf8_lossy(&r.into_inner().data).to_string())
     );
 
