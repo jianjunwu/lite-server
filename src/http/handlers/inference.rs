@@ -21,6 +21,34 @@ use uuid::Uuid;
 
 // ===== Inference =====
 
+/// Shared RequestBody → EnsembleValue translation for the ensemble dispatch
+/// (unary + SSE/OpenAI/decoupled endpoints — thin wire adaptation, the DAG
+/// orchestration itself stays in ensemble.rs).
+pub(crate) fn ensemble_input_from_body(
+    body: &RequestBody,
+) -> Result<crate::ensemble::EnsembleValue, AppError> {
+    match body {
+        RequestBody::Json(b) => {
+            let v = serde_json::from_slice::<Value>(b).map_err(|e| {
+                AppError::InvalidRequestBody(format!("ensemble requires valid JSON input: {e}"))
+            })?;
+            Ok(crate::ensemble::EnsembleValue::Json(v))
+        }
+        // B3 (E6): binary root input — Raw bytes go straight to the first layer.
+        RequestBody::Raw(bytes, ct) => {
+            Ok(crate::ensemble::EnsembleValue::Binary(bytes.clone(), ct.clone()))
+        }
+        // C4 (阶段 1):ensemble 显式拒绝 TritonBinary——「JSON 头+二进制
+        // 尾」是容器格式,DAG 消费它须等 §9.6 Option B 的命名槽位容器
+        // 落地(不同于 D7 的 Raw 400:B3/E6 已把 Raw 透传进首层)。
+        RequestBody::TritonBinary { .. } => Err(AppError::InvalidRequestBody(
+            "ensemble does not support Triton Binary Tensor Data Extension \
+             requests (JSON head + binary tail container) yet"
+                .to_string(),
+        )),
+    }
+}
+
 pub async fn infer_handler(
     State(state): State<Arc<AppState>>,
     Path(model_name): Path<String>,
@@ -174,30 +202,7 @@ async fn do_infer(
 
     // Handle ensemble
     if mv.model_type == ModelType::Ensemble {
-        let ensemble_input = match &body {
-            RequestBody::Json(b) => {
-                let v = serde_json::from_slice::<Value>(b)
-                    .map_err(|e| AppError::InvalidRequestBody(format!(
-                        "ensemble requires valid JSON input: {e}"
-                    )))?;
-                crate::ensemble::EnsembleValue::Json(v)
-            }
-            // B3 (E6): binary root input — D7 400 is replaced by passthrough
-            // (parent plan §9.6). Raw bytes go straight to the first layer.
-            RequestBody::Raw(bytes, ct) => {
-                crate::ensemble::EnsembleValue::Binary(bytes.clone(), ct.clone())
-            }
-            // C4 (阶段 1):ensemble 显式拒绝 TritonBinary——「JSON 头+二进制
-            // 尾」是容器格式,DAG 消费它须等 §9.6 Option B 的命名槽位容器
-            // 落地(不同于 D7 的 Raw 400:B3/E6 已把 Raw 透传进首层)。
-            RequestBody::TritonBinary { .. } => {
-                return Err(AppError::InvalidRequestBody(
-                    "ensemble does not support Triton Binary Tensor Data Extension \
-                     requests (JSON head + binary tail container) yet"
-                        .to_string(),
-                ));
-            }
-        };
+        let ensemble_input = ensemble_input_from_body(&body)?;
         // D37 (batch 0): signature converged — execution-face opts; later
         // batches add fields (dag_selector) without touching call sites.
         let opts = crate::ensemble::EnsembleExecOpts {

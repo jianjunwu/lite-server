@@ -392,7 +392,38 @@ async fn sse_infer_impl(
         None
     };
     let stream_idle = crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
-    let (stream_id, worker_client, mut chunk_rx) = open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes, decoupled).await?;
+    // §4.1 endpoint adaptation: ensemble models have no workers — dispatch
+    // through the DAG executor. The returned Stream plugs the SAME variables
+    // the forward loop below consumes (zero changes past this point); a Unary
+    // outcome here means the DAG has no streaming step (§4.4 "unsupported
+    // combination" row → 400). This call site sits before any 200/headers are
+    // emitted (M1: pre-layer failures still map to real HTTP status codes).
+    let is_ensemble = match state.registry.get(&model_name, Some(&resolved_version)) {
+        Some(mv) => mv.model_type == crate::registry::types::ModelType::Ensemble,
+        None => false,
+    };
+    let (stream_id, worker_client, mut chunk_rx) = if is_ensemble {
+        let ensemble_input = super::inference::ensemble_input_from_body(&body)?;
+        let opts = crate::ensemble::EnsembleExecOpts {
+            client_ip: cx.client_ip.clone(),
+            deadline_unix_ns: deadline.unix_ns,
+            decoupled,
+        };
+        match crate::ensemble::execute_ensemble(
+            state.clone(), &model_name, &resolved_version, ensemble_input, &cx.request_id, opts,
+        ).await? {
+            crate::ensemble::EnsembleOutcome::Stream(s) => {
+                (s.stream_id, s.cancel_client, s.chunk_rx)
+            }
+            crate::ensemble::EnsembleOutcome::Unary(_) => {
+                return Err(AppError::InvalidRequestBody(
+                    "ensemble DAG has no streaming step; use a unary endpoint".to_string(),
+                ));
+            }
+        }
+    } else {
+        open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes, decoupled).await?
+    };
 
     // Task D: fire InferenceRequest once the worker stream opened and arm the
     // response callback. cx is not captured by the spawn, so request_id /
@@ -418,8 +449,12 @@ async fn sse_infer_impl(
     let (event_tx, event_rx) = mpsc::channel(64);
 
     // D4: decoupled path keeps the client for targeted cancel (vs coupled
-    // broadcast). Clone before the spawn so the Arc stays alive.
-    let cancel_client = if decoupled {
+    // broadcast). Clone before the spawn so the Arc stays alive. Ensemble
+    // streams ALWAYS use targeted cancel: the stream lives on a sub-model
+    // worker, and broadcasting to the (worker-less) ensemble model name
+    // would be a no-op — the sub-model worker would orphan until idle
+    // reclaim (D18).
+    let cancel_client = if decoupled || is_ensemble {
         Some(Arc::clone(&worker_client))
     } else {
         None
