@@ -380,6 +380,42 @@ fn write_missing_model(repo: &std::path::Path) {
     std::fs::write(dir.join("config.yaml"), "not: [valid yaml\n").unwrap();
 }
 
+/// Array-aware pre-layer: joins aggregated JSON arrays back into a string
+/// (batch-1 bidi aggregation tests send multi-frame arrays).
+fn write_pre_agg(repo: &std::path::Path) {
+    write_model_py(
+        repo,
+        "pre_agg",
+        r#"from lite_server import LitAPI
+
+
+class PreAggAPI(LitAPI):
+    def setup(self, device):
+        self.device = device
+
+    async def decode_request(self, request, ctx=None):
+        t = request.get("data", request)
+        if isinstance(t, list):
+            parts = []
+            for x in t:
+                if isinstance(x, dict):
+                    parts.append(str(x.get("text", x)))
+                else:
+                    parts.append(str(x))
+            return " ".join(parts)
+        if isinstance(t, dict):
+            return t.get("text", "")
+        return t
+
+    async def predict(self, x, ctx=None):
+        return {"pre": x}
+
+    async def encode_response(self, output, ctx=None):
+        return output
+"#,
+    );
+}
+
 /// echo unary tail (ens_unary: full-unary DAG hit via a streaming endpoint).
 fn write_echo(repo: &std::path::Path) {
     write_model_py(
@@ -541,6 +577,22 @@ const ENS_SLOW_YAML: &str = r#"ensemble:
         pre: "$pre.pre"
 "#;
 
+/// Array-aware DAG for bidi multi-frame aggregation tests (batch 1).
+const ENS_AGG_YAML: &str = r#"ensemble:
+  steps:
+    - name: pre
+      model: pre_agg
+      version: "1"
+      inputs:
+        data: "$request"
+    - name: tail
+      model: tail
+      version: "1"
+      stream: true
+      inputs:
+        pre: "$pre.pre"
+"#;
+
 fn write_all_fixtures(repo: &std::path::Path) {
     write_pre(repo);
     write_tail(repo, "tail", "");
@@ -552,7 +604,9 @@ fn write_all_fixtures(repo: &std::path::Path) {
     write_pre_5xx(repo);
     write_missing_model(repo);
     write_echo(repo);
+    write_pre_agg(repo);
     write_ensemble(repo, "ens_stream", ENS_STREAM_YAML);
+    write_ensemble(repo, "ens_agg", ENS_AGG_YAML);
     write_ensemble(repo, "ens_binary", ENS_BINARY_YAML);
     write_ensemble(repo, "ens_unary", ENS_UNARY_YAML);
     write_ensemble(repo, "ens_pipeline", ENS_PIPELINE_YAML);
@@ -577,7 +631,7 @@ fn write_server_yaml(repo: &std::path::Path, http_port: u16, extra: &str) -> std
         format!(
             "server:\n  http_port: {http_port}\n  timeout: 30.0\n{extra}\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - tail\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n",
             repo.display()
         ),
     )
@@ -912,5 +966,477 @@ async fn test_audit_stream_p0_reload_uses_new_plan() {
     assert!(
         after.contains(r#""token":"hello_v2""#),
         "post-reload request must use the new plan (tail_v2): {after}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Batch 1: gRPC server-streaming + bidi aggregation (§4.3/D17/D33/D3)
+// ---------------------------------------------------------------------------
+
+/// Boot a server with gRPC enabled (batch-1 gRPC tests).
+async fn boot_server_grpc(extra: &str) -> (String, u16, ServerGuard, std::path::PathBuf) {
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-ens-stream-{}-{}", std::process::id(), http_port));
+    let _ = std::fs::remove_dir_all(&repo);
+    write_all_fixtures(&repo);
+    let dir = std::env::temp_dir().join(format!(
+        "lite-server-ens-stream-yaml-{}-{}",
+        std::process::id(),
+        http_port
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let server_yaml = dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  timeout: 30.0\n{extra}\n\n\
+             grpc:\n  enabled: true\n\n\
+             model_repository:\n  path: {}\n\n\
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+    let guard = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 30).await;
+    (
+        format!("http://127.0.0.1:{}", http_port),
+        grpc_port,
+        guard,
+        repo,
+    )
+}
+
+#[cfg(unix)]
+async fn grpc_tcp_channel(grpc_port: u16) -> tonic::transport::Channel {
+    tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{}", grpc_port))
+        .expect("grpc endpoint")
+        .connect()
+        .await
+        .expect("grpc connect")
+}
+
+/// gRPC server-streaming parity (e8430dd precedent): the SAME ensemble DAG
+/// produces the SAME chunk sequence over gRPC StreamInfer and HTTP SSE.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_audit_stream_grpc_server_streaming_parity() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::StreamInferRequest;
+    use std::collections::HashMap;
+
+    let (base, grpc_port, _guard, _repo) = boot_server_grpc("").await;
+    wait_ready_all(&base, &["ens_stream"]).await;
+
+    // SSE reference sequence.
+    let sse = sse_post(&base, "/v2/models/ens_stream/events", json!({"text": "parity check"}))
+        .await
+        .expect("SSE must open");
+    let sse_tokens: Vec<String> = sse
+        .lines()
+        .filter_map(|l| {
+            let l = l.strip_prefix("data: ")?;
+            let v: Value = serde_json::from_str(l).ok()?;
+            v.get("token")?.as_str().map(|s| s.to_string())
+        })
+        .collect();
+    assert_eq!(sse_tokens, vec!["parity", "check"], "SSE reference: {sse}");
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+    let resp = client
+        .stream_infer(StreamInferRequest {
+            model_name: "ens_stream".to_string(),
+            version: "1".to_string(),
+            data: bytes::Bytes::from(r#"{"text":"parity check"}"#),
+            headers: HashMap::new(),
+            sequence_id: None,
+        })
+        .await
+        .expect("StreamInfer must open");
+    let mut stream = resp.into_inner();
+    let mut grpc_tokens: Vec<String> = Vec::new();
+    while let Ok(Some(chunk)) = stream.message().await {
+        if let Ok(v) = serde_json::from_slice::<Value>(&chunk.data) {
+            if let Some(t) = v.get("token").and_then(|t| t.as_str()) {
+                grpc_tokens.push(t.to_string());
+            }
+        }
+    }
+    assert_eq!(
+        sse_tokens, grpc_tokens,
+        "gRPC server-streaming must produce the same chunk sequence as SSE (parity)"
+    );
+}
+
+/// gRPC bidi aggregation: Open + multiple JSON Data frames → half-close →
+/// the DAG runs on the aggregated JSON array → tail stream flows down.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_audit_stream_grpc_bidi_json_aggregation() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::{bidi_chunk, BidiChunk, BidiData, BidiOpen};
+
+    let (base, grpc_port, _guard, _repo) = boot_server_grpc("").await;
+    wait_ready_all(&base, &["ens_agg"]).await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+    let (tx, rx) = tokio::sync::mpsc::channel::<BidiChunk>(16);
+    tx.send(BidiChunk {
+        stream_id: "t".into(),
+        payload: Some(bidi_chunk::Payload::Open(BidiOpen {
+            model_name: "ens_agg".into(),
+            version: "1".into(),
+            initial_data: bytes::Bytes::from(r#"{"text":"hello"}"#),
+            ..Default::default()
+        })),
+    })
+    .await
+    .unwrap();
+    tx.send(BidiChunk {
+        stream_id: "t".into(),
+        payload: Some(bidi_chunk::Payload::Data(BidiData {
+            data: bytes::Bytes::from(r#"{"text":"world"}"#),
+        })),
+    })
+    .await
+    .unwrap();
+    // Half-close → trigger (D33).
+    drop(tx);
+
+    let resp = client
+        .bidi_stream(tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        .await
+        .expect("bidi must open");
+    let mut out = resp.into_inner();
+    let mut tokens: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), out.message()).await {
+            Ok(Ok(Some(chunk))) => {
+                match chunk.payload {
+                    Some(bidi_chunk::Payload::Data(d)) => {
+                        if let Ok(v) = serde_json::from_slice::<Value>(&d.data) {
+                            if let Some(t) = v.get("token").and_then(|t| t.as_str()) {
+                                tokens.push(t.to_string());
+                            }
+                        }
+                    }
+                    Some(bidi_chunk::Payload::Close(_)) => break,
+                    _ => {}
+                }
+            }
+            Ok(Ok(None)) | Ok(Err(_)) => break,
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        tokens,
+        vec!["hello", "world"],
+        "gRPC bidi must aggregate JSON frames into an array and stream the DAG output: {tokens:?}"
+    );
+}
+
+/// WS bidi aggregation: multi-frame JSON + app-level close frame → trigger →
+/// tail stream flows down. (D33: the close frame is the WS trigger.)
+#[tokio::test]
+#[serial]
+async fn test_audit_stream_ws_bidi_aggregation() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_agg"]).await;
+    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_agg/stream", http_port);
+    use futures::{SinkExt, StreamExt};
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"text":"via"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"text":"ws"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    // App-level close frame → aggregation trigger (D33).
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"type":"close"}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let mut tokens: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            // WS writer emits chunks as Binary frames (existing behaviour).
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
+                if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                    if let Some(tok) = v.get("token").and_then(|x| x.as_str()) {
+                        tokens.push(tok.to_string());
+                    }
+                    if v.get("done").and_then(|x| x.as_bool()) == Some(true) {
+                        break;
+                    }
+                }
+            }
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(b)))) => {
+                if let Ok(v) = serde_json::from_slice::<Value>(&b) {
+                    if let Some(tok) = v.get("token").and_then(|x| x.as_str()) {
+                        tokens.push(tok.to_string());
+                    }
+                }
+            }
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) => break,
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        tokens,
+        vec!["via", "ws"],
+        "WS bidi must aggregate JSON frames and stream the DAG output: {tokens:?}"
+    );
+}
+
+/// h2 bidi aggregation: LPM Open + Data frames → body EOF (half-close) →
+/// trigger → tail stream flows down in LPM frames.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_audit_stream_h2_bidi_aggregation() {
+    use lite_server::proto::liteserver as pb;
+    use lite_server::streaming::lpm;
+    use futures::StreamExt;
+
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_agg"]).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, reqwest::Error>>(16);
+    tx.send(Ok(lpm::encode_frame(&pb::BidiChunk {
+        stream_id: "t".into(),
+        payload: Some(pb::bidi_chunk::Payload::Open(pb::BidiOpen {
+            initial_data: bytes::Bytes::from(r#"{"text":"h2"}"#),
+            ..Default::default()
+        })),
+    })))
+    .await
+    .unwrap();
+    tx.send(Ok(lpm::encode_frame(&pb::BidiChunk {
+        stream_id: "t".into(),
+        payload: Some(pb::bidi_chunk::Payload::Data(pb::BidiData {
+            data: bytes::Bytes::from(r#"{"text":"works"}"#),
+        })),
+    })))
+    .await
+    .unwrap();
+    drop(tx); // body EOF → half-close → trigger (D33)
+    let body_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let body = reqwest::Body::wrap_stream(body_stream);
+
+    let resp = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap()
+        .post(format!("{}/v2/models/ens_agg/bidi", base))
+        .header("content-type", "application/x-lite-bidi")
+        .body(body)
+        .send()
+        .await
+        .expect("h2 bidi POST");
+    assert_eq!(resp.status(), 200, "h2 bidi must open");
+
+    let mut tokens: Vec<String> = Vec::new();
+    let mut buf = bytes::BytesMut::new();
+    let mut body = resp.bytes_stream();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    'outer: while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), body.next()).await {
+            Ok(Some(Ok(bytes))) => {
+                buf.extend_from_slice(&bytes);
+                while let Ok(Some(chunk)) = lpm::try_decode_frame(&mut buf) {
+                    match chunk.payload {
+                        Some(pb::bidi_chunk::Payload::Data(d)) => {
+                            if let Ok(v) = serde_json::from_slice::<Value>(&d.data) {
+                                if let Some(t) = v.get("token").and_then(|x| x.as_str()) {
+                                    tokens.push(t.to_string());
+                                }
+                            }
+                        }
+                        Some(pb::bidi_chunk::Payload::Close(_)) => break 'outer,
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        tokens,
+        vec!["h2", "works"],
+        "h2 bidi must aggregate LPM frames and stream the DAG output: {tokens:?}"
+    );
+}
+
+/// WS multi-round rejection: frames after the aggregation trigger are a
+/// session violation → error frame + close (§4.3).
+#[tokio::test]
+#[serial]
+async fn test_audit_stream_ws_bidi_multi_round_rejected() {
+    use futures::{SinkExt, StreamExt};
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_stream"]).await;
+    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_stream/stream", http_port);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"text":"hello"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"type":"close"}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    // Wait for the first downstream chunk (aggregation triggered + DAG ran).
+    // WS writer emits chunks as Binary frames (existing behaviour).
+    let mut got_chunk = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(b)))) => {
+                if b.windows(5).any(|w| w == b"token") {
+                    got_chunk = true;
+                    break;
+                }
+            }
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
+                if t.contains("token") {
+                    got_chunk = true;
+                    break;
+                }
+            }
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) => break,
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+    assert!(got_chunk, "must receive a downstream chunk before multi-round check");
+
+    // A data frame after the trigger → error + close (multi-round rejected).
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"text":"late"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    let mut saw_error = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
+                if t.contains("multi-round") {
+                    saw_error = true;
+                    break;
+                }
+            }
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) => {
+                saw_error = true;
+                break;
+            }
+            _ => break,
+        }
+    }
+    assert!(saw_error, "multi-round frame must be rejected with an error/close");
+}
+
+/// WS mixed frames: JSON + Binary → 400 semantics (error frame + close, D17).
+#[tokio::test]
+#[serial]
+async fn test_audit_stream_ws_bidi_mixed_frames_rejected() {
+    use futures::{SinkExt, StreamExt};
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_stream"]).await;
+    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_stream/stream", http_port);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"text":"hello"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(vec![0u8, 1, 2].into()))
+        .await
+        .unwrap();
+
+    let mut saw_error = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
+                if t.contains("error") {
+                    saw_error = true;
+                    break;
+                }
+            }
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) => {
+                saw_error = true;
+                break;
+            }
+            _ => break,
+        }
+    }
+    assert!(saw_error, "mixed JSON/Binary frames must be rejected (D17)");
+}
+
+/// WS aggregation idle timeout: no close frame within the idle budget →
+/// error + close (§4.3 D17: aggregation reuses the two-stage bound).
+#[tokio::test]
+#[serial]
+async fn test_audit_stream_ws_bidi_aggregation_idle_timeout() {
+    use futures::{SinkExt, StreamExt};
+    let (base, _guard, _repo) = boot_server("  decoupled_idle_timeout_secs: 1.0").await;
+    wait_ready_all(&base, &["ens_stream"]).await;
+    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_stream/stream", http_port);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    // Send a first frame but never the close trigger.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"text":"stuck"}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let mut saw_error = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
+                if t.contains("idle") || t.contains("error") {
+                    saw_error = true;
+                    break;
+                }
+            }
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) => {
+                saw_error = true;
+                break;
+            }
+            _ => break,
+        }
+    }
+    assert!(
+        saw_error,
+        "aggregation without a close trigger must hit the idle timeout"
     );
 }

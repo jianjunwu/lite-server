@@ -6,11 +6,13 @@
 use crate::grpc::auth::{enforce_auth_grpc, enforce_grpc_rate_limit};
 use crate::grpc::canary::{canary_pin, resolve_bidi_version};
 use crate::grpc::error::{
-    err, error_type_to_grpc_code, grpc_code_to_status_family, model_error_status,
-    try_parse_model_error,
+    app_error_to_grpc_status, err, error_type_to_grpc_code, grpc_code_to_status_family,
+    model_error_status, try_parse_model_error,
 };
 use crate::grpc::interceptor;
 use crate::grpc::GrpcService;
+use crate::registry::types::ModelType;
+use std::sync::Arc;
 use crate::proto::liteserver as pb;
 use crate::request_context::RequestContext;
 use crate::streaming;
@@ -195,15 +197,122 @@ impl GrpcService {
             ..Default::default()
         };
 
-        let clients = self
-            .worker_manager
-            .get_zmq_clients(&model_name, &resolved_version)
-            .await
-            .ok_or_else(|| err(Status::unavailable("no workers available")))?;
+        // §4.3 endpoint adaptation: ensemble models have no workers — the
+        // upstream is AGGREGATED into one root input (D17), the trigger is
+        // half-close (BidiClose or transport EOF, D33), and the DAG's tail
+        // stream replaces the worker stream below (same forward variables).
+        let is_ensemble = self
+            .registry
+            .get(&model_name, Some(&resolved_version))
+            .map(|mv| mv.model_type == ModelType::Ensemble)
+            .unwrap_or(false);
 
-        if clients.is_empty() {
-            return Err(err(Status::unavailable("no workers available")));
-        }
+        // P10 (D40): semaphore permit held for the forward task's lifetime.
+        let mut ensemble_permit = None;
+        // Non-ensemble only: the client→worker chunk forwarder's client
+        // (ensemble aggregates upstream instead, D17).
+        let mut worker_client: Option<Arc<crate::transport::zmq::WorkerZmqClient>> = None;
+        let (stream_id, mut chunk_rx, cancel_client) = if is_ensemble {
+            let max_body = self
+                .app_state
+                .config
+                .server
+                .max_request_body_bytes
+                .unwrap_or(64 * 1024 * 1024);
+            let mut aggregator = crate::ensemble::BidiAggregator::new(max_body);
+            // First frame kind: content-type declares JSON vs opaque bytes
+            // (WS frame-type parity). Mixed kinds → 400 inside push.
+            let is_json = crate::grpc::payload::body_kind_label(&meta.headers) == "json";
+            let ct = meta.headers.get("content-type").cloned();
+            let aggregate_start = std::time::Instant::now();
+            aggregator
+                .push(initial_data, is_json, ct.as_deref())
+                .map_err(|e| err(app_error_to_grpc_status(&e)))?;
+            // §4.3 (D17): the aggregation loop reuses the two-stage bound —
+            // chunk-idle ALWAYS on (reclaims an abandoned aggregating client),
+            // overall deadline since the FIRST frame (aggregation eats the DAG
+            // budget — the client is effectively streaming its body).
+            let agg_deadline = if deadline.client_specified {
+                crate::deadline::to_instant(deadline.unix_ns)
+            } else {
+                None
+            };
+            loop {
+                let next = match (agg_deadline, self.decoupled_idle_timeout) {
+                    (Some(d), _) => {
+                        let remain = d.saturating_duration_since(std::time::Instant::now());
+                        tokio::time::timeout(remain, stream.message()).await
+                    }
+                    (None, Some(idle)) => tokio::time::timeout(idle, stream.message()).await,
+                    (None, None) => {
+                        Ok::<_, tokio::time::error::Elapsed>(stream.message().await)
+                    }
+                };
+                match next {
+                    Ok(Ok(Some(chunk))) => match chunk.payload {
+                        Some(pb::bidi_chunk::Payload::Data(d)) => {
+                            aggregator.push(d.data, is_json, ct.as_deref()).map_err(|e| err(app_error_to_grpc_status(&e)))?;
+                        }
+                        Some(pb::bidi_chunk::Payload::Close(_)) => break,
+                        _ => {}
+                    },
+                    // §4.4 aggregation-disconnect row: transport failed mid-
+                    // aggregation — abandon the execution (no response object).
+                    Ok(Err(_)) => {
+                        return Err(err(Status::cancelled(
+                            "bidi stream aborted during aggregation",
+                        )));
+                    }
+                    // Half-close (transport input end) → trigger (D33).
+                    Ok(Ok(None)) => break,
+                    Err(_) => {
+                        return Err(err(Status::deadline_exceeded(
+                            "bidi aggregation timed out waiting for close",
+                        )));
+                    }
+                }
+            }
+            crate::metrics::prometheus::record_ensemble_bidi_aggregate(
+                aggregator.total_bytes(),
+                aggregate_start.elapsed().as_secs_f64(),
+            );
+            let value = aggregator.finish().map_err(|e| err(app_error_to_grpc_status(&e)))?;
+            let opts = crate::ensemble::EnsembleExecOpts {
+                client_ip: client_ip.clone(),
+                deadline_unix_ns: deadline.unix_ns,
+                decoupled: false,
+            };
+            match crate::ensemble::execute_ensemble(
+                self.app_state.clone(),
+                &model_name,
+                &resolved_version,
+                value,
+                &request_id,
+                opts,
+            )
+            .await
+            .map_err(|e| err(app_error_to_grpc_status(&e)))?
+            {
+                crate::ensemble::EnsembleOutcome::Stream(mut s) => {
+                    ensemble_permit = s.permit.take();
+                    (s.stream_id, s.chunk_rx, s.cancel_client)
+                }
+                crate::ensemble::EnsembleOutcome::Unary(_) => {
+                    return Err(err(Status::invalid_argument(
+                        "ensemble DAG has no streaming step; use a unary endpoint",
+                    )));
+                }
+            }
+        } else {
+            let clients = self
+                .worker_manager
+                .get_zmq_clients(&model_name, &resolved_version)
+                .await
+                .ok_or_else(|| err(Status::unavailable("no workers available")))?;
+
+            if clients.is_empty() {
+                return Err(err(Status::unavailable("no workers available")));
+            }
 
         // Task F: shared streaming worker pick (B3 hints: x-lite-worker-id pin >
         // sequence_id stickiness > x-lite-affinity-key rendezvous >
@@ -230,13 +339,16 @@ impl GrpcService {
             worker_id,
             1,
         );
+        worker_client = Some(client.clone());
 
         let open_req = streaming::build_stream_open(stream_id.clone(), initial_data, Some(meta), false);
 
-        let mut chunk_rx = client
+        let chunk_rx = client
             .send_stream(open_req, stream_id.clone())
             .await
             .map_err(|e| err(Status::internal(format!("worker stream error: {}", e))))?;
+        (stream_id, chunk_rx, client.clone())
+        };
 
         // Task D: fire InferenceRequest once the worker stream opened and arm
         // the response callback. The inner forwarder spawn below does not
@@ -255,11 +367,6 @@ impl GrpcService {
         crate::callback::fire_inference_request(&cb_runner, &req_ctx);
 
         let (tx, rx) = mpsc::channel(64);
-        let worker_client = client.clone();
-        // B3: worker_client is moved into the incoming (client→worker) task below,
-        // so keep a separate clone for the cleanup cancel (aligned with stream_infer
-        // :722 / decoupled :960 `cancel_client`).
-        let cancel_client = client.clone();
 
         let stream_metrics = self.streaming_metrics;
         let metrics_model = model_name.clone();
@@ -281,13 +388,19 @@ impl GrpcService {
         };
         let stream_idle = self.decoupled_idle_timeout;
         tokio::spawn(async move {
-            // Forward incoming bidi chunks to worker as StreamRequest::Chunk.
-            // These are fire-and-forget: the worker's response to each chunk
-            // comes back as a StreamResponse routed through the stream's
-            // channel (registered at open), so we must NOT use send() — that
-            // would await a unary reply that never matches and stall for
-            // ZMQ_RESPONSE_TIMEOUT between chunks.
-            let incoming_task = tokio::spawn(async move {
+            // P10 (D40): held for the forward task's lifetime — released on
+            // drop (terminal frame / idle / disconnect; D18 teardown path).
+            let _ensemble_permit = ensemble_permit;
+            // Non-ensemble: forward incoming bidi chunks to the worker as
+            // StreamRequest::Chunk (fire-and-forget — each chunk's response
+            // comes back through the stream channel registered at open, so
+            // send() would stall for ZMQ_RESPONSE_TIMEOUT).
+            // Ensemble (§4.3): multi-round guard — frames after the
+            // aggregation trigger are a protocol violation (half-close
+            // already ended input); log + ignore.
+            let incoming_task = if let Some(worker_client) = &worker_client {
+                let worker_client = worker_client.clone();
+                tokio::spawn(async move {
                 let mut close_sent = false;
                 while let Some(Ok(chunk)) = stream.message().await.transpose() {
                     match chunk.payload {
@@ -314,7 +427,21 @@ impl GrpcService {
                 if !close_sent {
                     let _ = worker_client.send_raw(streaming::build_stream_close(stream_id_for_incoming)).await;
                 }
-            });
+                })
+            } else {
+                // Ensemble: no worker stream — frames after the aggregation
+                // trigger are rejected (multi-round), §4.3.
+                tokio::spawn(async move {
+                    while let Some(Ok(chunk)) = stream.message().await.transpose() {
+                        if matches!(chunk.payload, Some(pb::bidi_chunk::Payload::Data(_))) {
+                            tracing::warn!(
+                                stream_id = %stream_id_for_incoming,
+                                "bidi frame after aggregation trigger ignored (multi-round rejected)"
+                            );
+                        }
+                    }
+                })
+            };
 
             // Forward worker chunks -> gRPC
             let open_time = std::time::Instant::now();

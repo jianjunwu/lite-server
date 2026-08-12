@@ -241,6 +241,20 @@ lazy_static! {
         )
     ).unwrap();
 
+    // m4 (§4.3): bidi upstream aggregation observability.
+    pub static ref ENSEMBLE_BIDI_AGGREGATE_BYTES: prometheus::Histogram = prometheus::Histogram::with_opts(
+        prometheus::HistogramOpts::new(
+            "ensemble_bidi_aggregate_bytes",
+            "Bytes aggregated for a bidi ensemble request"
+        )
+    ).unwrap();
+    pub static ref ENSEMBLE_BIDI_AGGREGATE_SECONDS: prometheus::Histogram = prometheus::Histogram::with_opts(
+        prometheus::HistogramOpts::new(
+            "ensemble_bidi_aggregate_seconds",
+            "Elapsed time aggregating a bidi ensemble request"
+        )
+    ).unwrap();
+
     // ===== P-TRACE 导出健康（对账 A5）：OTel 管线自身的可观测 =====
     // ended→exported 的差值≈丢弃（BSP 队列满丢弃不可直接观测，以差值逼近）；
     // export_failures 直接计数导出失败。telemetry 关闭时恒 0。
@@ -533,6 +547,12 @@ pub fn set_ensemble_streaming_active(count: usize) {
 /// term for ensemble DAGs (P6 tracks it).
 pub fn record_ensemble_autoload_wait_seconds(secs: f64) {
     ENSEMBLE_AUTOLOAD_WAIT.observe(secs);
+}
+
+/// m4 (§4.3): bidi upstream aggregation — bytes aggregated + elapsed time.
+pub fn record_ensemble_bidi_aggregate(bytes: usize, seconds: f64) {
+    ENSEMBLE_BIDI_AGGREGATE_BYTES.observe(bytes as f64);
+    ENSEMBLE_BIDI_AGGREGATE_SECONDS.observe(seconds);
 }
 
 pub fn set_version_weight(model: &str, version: &str, weight: f64) {

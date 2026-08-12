@@ -742,6 +742,18 @@ pub async fn ws_decoupled_version_handler(
     ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), headers, socket, cx, true))
 }
 
+/// §4.4: WS error frame + close (the connection already upgraded — there is
+/// no HTTP status code; the error JSON is the client contract).
+async fn ws_send_error(
+    sink: &mut futures::stream::SplitSink<WebSocket, Message>,
+    e: &AppError,
+) {
+    let _ = sink
+        .send(Message::Text(json!({"error": e.to_string()}).to_string()))
+        .await;
+    let _ = sink.close().await;
+}
+
 /// Detect a WS bidi app-level close control frame: `{"type":"close"}`.
 fn is_close_frame(text: &str) -> bool {
     serde_json::from_str::<Value>(text)
@@ -1008,17 +1020,18 @@ async fn handle_ws_stream(
     // B2 (E4): payload_bytes from frame type; body_kind from frame type
     // (Text → json, Binary → raw). CT normalization for Binary frames writes
     // the effective content-type into meta.headers so the Python side's D9
-    // dispatch receives a single-source-of-truth header. Matched by value so
-    // the legacy Text path stays zero-copy (String::into_bytes).
+    // dispatch receives a single-source-of-truth header. Cloned (not moved):
+    // the ensemble dispatch below aggregates the first frame into the DAG
+    // root input (D17).
     let body_kind = first_frame.body_kind();
-    let payload_bytes = match first_frame {
+    let payload_bytes = match &first_frame {
         FirstFrame::Json(text) => {
             // Text first frame → JSON (legacy path, no CT normalization).
-            bytes::Bytes::from(text.into_bytes())
+            bytes::Bytes::from(text.clone().into_bytes())
         }
         FirstFrame::Raw(bin) => {
             normalize_binary_first_frame_ct(&mut headers, &model_name);
-            bin
+            bin.clone()
         }
     };
     span.record("body_bytes", payload_bytes.len() as i64);
@@ -1034,19 +1047,159 @@ async fn handle_ws_stream(
     };
     let stream_idle = crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
 
-    let (stream_id, worker_client, mut chunk_rx) = match open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes, decoupled).await {
-        Ok(r) => r,
-        Err(e) => {
-            // open 失败 → 5xx。
-            prometheus::record_stream_rejected(
-                &model_name,
-                &resolved_version,
-                "5xx",
-                ws_start.elapsed().as_secs_f64(),
-            );
-            let _ = socket.send(Message::Text(json!({"error": e.to_string()}).to_string())).await;
-            let _ = socket.close().await;
+    // Split socket for independent read/write halves (bidi). Done before the
+    // ensemble dispatch — aggregation reads the upstream half.
+    let (mut ws_sink, mut ws_stream) = socket.split();
+
+    // §4.3 endpoint adaptation: ensemble models have no workers — the
+    // upstream is AGGREGATED into one root input (D17), the trigger is the
+    // app-level close frame (coupled; D33) or the single first frame
+    // (decoupled), and the DAG's tail stream replaces the worker stream
+    // below (same writer loop).
+    let is_ensemble = state
+        .registry
+        .get(&model_name, Some(&resolved_version))
+        .map(|mv| mv.model_type == crate::registry::types::ModelType::Ensemble)
+        .unwrap_or(false);
+
+    // P10 (D40): semaphore permit held for the writer task's lifetime.
+    let mut ensemble_permit = None;
+    let (stream_id, worker_client, mut chunk_rx) = if is_ensemble {
+        let max_body = state
+            .config
+            .server
+            .max_request_body_bytes
+            .unwrap_or(64 * 1024 * 1024);
+        let mut aggregator = crate::ensemble::BidiAggregator::new(max_body);
+        let ct = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let push_first = match &first_frame {
+            FirstFrame::Json(text) => {
+                aggregator.push(bytes::Bytes::from(text.clone().into_bytes()), true, None)
+            }
+            FirstFrame::Raw(bin) => aggregator.push(bin.clone(), false, ct.as_deref()),
+        };
+        if let Err(e) = push_first {
+            prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64());
+            ws_send_error(&mut ws_sink, &e).await;
             return;
+        }
+        if !decoupled {
+            // D33: aggregate until the app-level close frame. The loop reuses
+            // the two-stage bound — chunk-idle ALWAYS on (reclaims an
+            // abandoned aggregating client), overall deadline since the FIRST
+            // frame (aggregation eats the DAG budget).
+            let agg_idle = crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
+            let agg_deadline = if deadline.client_specified {
+                crate::deadline::to_instant(deadline.unix_ns)
+            } else {
+                None
+            };
+            loop {
+                // Two-stage bound (D17): chunk-idle ALWAYS on (reclaims an
+                // abandoned aggregating client), overall deadline since the
+                // first frame. The recv itself is timeout-wrapped — an idle
+                // check between blocking recvs would never fire.
+                let next = match (agg_deadline, agg_idle) {
+                    (Some(d), _) => {
+                        let remain = d.saturating_duration_since(std::time::Instant::now());
+                        tokio::time::timeout(remain, ws_stream.next()).await
+                    }
+                    (None, Some(idle)) => tokio::time::timeout(idle, ws_stream.next()).await,
+                    (None, None) => Ok(ws_stream.next().await),
+                };
+                match next {
+                    Ok(Some(Ok(Message::Text(t)))) if is_close_frame(&t) => break,
+                    Ok(Some(Ok(Message::Text(t)))) => {
+                        if let Err(e) = aggregator.push(bytes::Bytes::from(t.into_bytes()), true, None) {
+                            prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64());
+                            ws_send_error(&mut ws_sink, &e).await;
+                            return;
+                        }
+                    }
+                    Ok(Some(Ok(Message::Binary(b)))) => {
+                        if let Err(e) = aggregator.push(bytes::Bytes::from(b), false, ct.as_deref()) {
+                            prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64());
+                            ws_send_error(&mut ws_sink, &e).await;
+                            return;
+                        }
+                    }
+                    // WS transport close / disconnect mid-aggregation →
+                    // abandon the execution (§4.4: connection gone, no
+                    // response object).
+                    Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => return,
+                    Ok(_) => {} // Ping/Pong ignored
+                    // Idle/deadline fired with no close trigger.
+                    Err(_) => {
+                        prometheus::record_stream_rejected(&model_name, &resolved_version, "5xx", ws_start.elapsed().as_secs_f64());
+                        let _ = ws_sink.send(Message::Text(json!({"error": "bidi aggregation idle timeout"}).to_string())).await;
+                        let _ = ws_sink.close().await;
+                        return;
+                    }
+                }
+            }
+        }
+        crate::metrics::prometheus::record_ensemble_bidi_aggregate(
+            aggregator.total_bytes(),
+            ws_start.elapsed().as_secs_f64(),
+        );
+        let value = match aggregator.finish() {
+            Ok(v) => v,
+            Err(e) => {
+                prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64());
+                ws_send_error(&mut ws_sink, &e).await;
+                return;
+            }
+        };
+        let opts = crate::ensemble::EnsembleExecOpts {
+            client_ip: cx.client_ip.clone(),
+            deadline_unix_ns: deadline.unix_ns,
+            decoupled,
+        };
+        match crate::ensemble::execute_ensemble(
+            state.clone(), &model_name, &resolved_version, value, &cx.request_id, opts,
+        )
+        .await
+        {
+            Ok(crate::ensemble::EnsembleOutcome::Stream(mut s)) => {
+                ensemble_permit = s.permit.take();
+                (s.stream_id, s.cancel_client, s.chunk_rx)
+            }
+            Ok(crate::ensemble::EnsembleOutcome::Unary(_)) => {
+                prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64());
+                let err = AppError::InvalidRequestBody(
+                    "ensemble DAG has no streaming step; use a unary endpoint".to_string(),
+                );
+                ws_send_error(&mut ws_sink, &err).await;
+                return;
+            }
+            Err(e) => {
+                prometheus::record_stream_rejected(
+                    &model_name,
+                    &resolved_version,
+                    super::status_family(e.http_status().as_u16() as i32),
+                    ws_start.elapsed().as_secs_f64(),
+                );
+                ws_send_error(&mut ws_sink, &e).await;
+                return;
+            }
+        }
+    } else {
+        match open_worker_stream(&state, &model_name, &resolved_version, meta, payload_bytes, decoupled).await {
+            Ok(r) => r,
+            Err(e) => {
+                // open 失败 → 5xx。
+                prometheus::record_stream_rejected(
+                    &model_name,
+                    &resolved_version,
+                    "5xx",
+                    ws_start.elapsed().as_secs_f64(),
+                );
+                ws_send_error(&mut ws_sink, &e).await;
+                return;
+            }
         }
     };
 
@@ -1071,9 +1224,6 @@ async fn handle_ws_stream(
         prometheus::record_stream_open(&model_name, &resolved_version, "websocket", &stream_id, decoupled);
     }
 
-    // Split socket for independent read/write halves (bidi).
-    let (mut ws_sink, mut ws_stream) = socket.split();
-
     // gone_tx: carries an optional error message from the reader to the writer.
     // None = no signal (writer keeps running); Some("") = client disconnect
     // (writer breaks); Some("msg") = protocol error (writer sends msg then breaks).
@@ -1082,58 +1232,85 @@ async fn handle_ws_stream(
     let (gone_tx, mut gone_rx) = tokio::sync::watch::channel::<Option<String>>(None);
     let gone_tx_reader = gone_tx.clone();
 
-    // Reader task: C→S frames. Forwards binary chunks and close to worker.
-    // Exits silently on app-level close (writer keeps going); signals gone on
-    // hard disconnect so the writer can terminate promptly.
-    let reader_stream_id = stream_id.clone();
-    let reader_client = Arc::clone(&worker_client);
-    let reader = tokio::spawn(async move {
-        while let Some(msg) = ws_stream.next().await {
-            match msg {
-                // D1: decoupled stream accepts no data frames after the first.
-                Ok(Message::Binary(_bin)) if decoupled => {
-                    let _ = gone_tx_reader.send(Some(
-                        "decoupled stream accepts no data frames".to_string(),
-                    ));
-                    break;
+    // Reader task: C→S frames. Forwards binary chunks and close to worker
+    // (non-ensemble); ensemble guards against multi-round frames after the
+    // aggregation trigger (§4.3). Exits silently on app-level close (writer
+    // keeps going); signals gone on hard disconnect.
+    let reader = if is_ensemble {
+        // §4.3 multi-round guard: the aggregation trigger (close frame /
+        // decoupled first frame) already ran the DAG — any further DATA frame
+        // is a session-multi-round violation (WS has no half-close). The
+        // client's normal tail-off close frame is idempotently ignored (D33).
+        tokio::spawn(async move {
+            while let Some(msg) = ws_stream.next().await {
+                match msg {
+                    Ok(Message::Text(t)) if is_close_frame(&t) => return,
+                    Ok(Message::Text(_)) | Ok(Message::Binary(_)) => {
+                        let _ = gone_tx_reader.send(Some(
+                            "frames after the aggregation trigger are rejected (multi-round)"
+                                .to_string(),
+                        ));
+                        break;
+                    }
+                    Ok(Message::Close(_)) | Err(_) => {
+                        let _ = gone_tx_reader.send(Some(String::new()));
+                        break;
+                    }
+                    _ => {} // Ping/Pong ignored
                 }
-                // Coupled: forward Binary as stream chunk (existing behavior).
-                Ok(Message::Binary(bin)) => {
-                    let chunk_req = streaming::build_stream_chunk(
-                        reader_stream_id.clone(),
-                        bytes::Bytes::from(bin),
-                    );
-                    let _ = reader_client.send_raw(chunk_req).await;
-                }
-                // D1: decoupled cancel/close are aliases → cancel worker, signal gone.
-                Ok(Message::Text(t)) if decoupled && is_cancel_or_close_frame(&t) => {
-                    let cancel_req =
-                        streaming::build_stream_cancel(reader_stream_id.clone());
-                    let _ = reader_client.send_raw(cancel_req).await;
-                    let _ = gone_tx_reader.send(Some(String::new()));
-                    break;
-                }
-                // Coupled: app-level close → send close to worker (existing).
-                Ok(Message::Text(t)) if !decoupled && is_close_frame(&t) => {
-                    let close_req =
-                        streaming::build_stream_close(reader_stream_id.clone());
-                    let _ = reader_client.send_raw(close_req).await;
-                    return; // graceful: don't signal gone, writer continues
-                }
-                Ok(Message::Close(_)) | Err(_) => {
-                    // Client disconnect → signal writer to terminate.
-                    let _ = gone_tx_reader.send(Some(String::new()));
-                    break;
-                }
-                Ok(Message::Text(_)) => {
-                    // Unknown control frame → protocol error.
-                    let _ = gone_tx_reader.send(Some("unknown control frame".to_string()));
-                    break;
-                }
-                _ => {} // Ping/Pong ignored
             }
-        }
-    });
+        })
+    } else {
+        let reader_stream_id = stream_id.clone();
+        let reader_client = Arc::clone(&worker_client);
+        tokio::spawn(async move {
+            while let Some(msg) = ws_stream.next().await {
+                match msg {
+                    // D1: decoupled stream accepts no data frames after the first.
+                    Ok(Message::Binary(_bin)) if decoupled => {
+                        let _ = gone_tx_reader.send(Some(
+                            "decoupled stream accepts no data frames".to_string(),
+                        ));
+                        break;
+                    }
+                    // Coupled: forward Binary as stream chunk (existing behavior).
+                    Ok(Message::Binary(bin)) => {
+                        let chunk_req = streaming::build_stream_chunk(
+                            reader_stream_id.clone(),
+                            bytes::Bytes::from(bin),
+                        );
+                        let _ = reader_client.send_raw(chunk_req).await;
+                    }
+                    // D1: decoupled cancel/close are aliases → cancel worker, signal gone.
+                    Ok(Message::Text(t)) if decoupled && is_cancel_or_close_frame(&t) => {
+                        let cancel_req =
+                            streaming::build_stream_cancel(reader_stream_id.clone());
+                        let _ = reader_client.send_raw(cancel_req).await;
+                        let _ = gone_tx_reader.send(Some(String::new()));
+                        break;
+                    }
+                    // Coupled: app-level close → send close to worker (existing).
+                    Ok(Message::Text(t)) if !decoupled && is_close_frame(&t) => {
+                        let close_req =
+                            streaming::build_stream_close(reader_stream_id.clone());
+                        let _ = reader_client.send_raw(close_req).await;
+                        return; // graceful: don't signal gone, writer continues
+                    }
+                    Ok(Message::Close(_)) | Err(_) => {
+                        // Client disconnect → signal writer to terminate.
+                        let _ = gone_tx_reader.send(Some(String::new()));
+                        break;
+                    }
+                    Ok(Message::Text(_)) => {
+                        // Unknown control frame → protocol error.
+                        let _ = gone_tx_reader.send(Some("unknown control frame".to_string()));
+                        break;
+                    }
+                    _ => {} // Ping/Pong ignored
+                }
+            }
+        })
+    };
 
     // Clone before move so cancel can reference them after the tasks complete.
     let stream_id_for_writer = stream_id.clone();
@@ -1150,6 +1327,9 @@ async fn handle_ws_stream(
     // termination via gone_rx when the client disconnects. Closes ws_sink on
     // exit so the main task doesn't need to hold a reference.
     let send_task = tokio::spawn(async move {
+        // P10 (D40): held for the writer task's lifetime — released on drop
+        // (terminal frame / idle / disconnect; D18 teardown path).
+        let _ensemble_permit = ensemble_permit;
         let open_time = stream_open_time;
         let mut first_chunk = true;
         let mut last_chunk_time = open_time;

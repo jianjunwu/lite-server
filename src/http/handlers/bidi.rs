@@ -11,6 +11,7 @@ use crate::error::{AppError, ProtocolError};
 use crate::http::state::AppState;
 use crate::metrics::prometheus;
 use crate::proto::liteserver as pb;
+use crate::registry::types::ModelType;
 use crate::request_context::RequestContext;
 use crate::streaming;
 use crate::streaming::lpm;
@@ -188,10 +189,176 @@ async fn h2_bidi_entry_impl(
 
     let stream_id = format!("http-bidi-{}", uuid::Uuid::new_v4());
 
-    // 5. Open worker stream.
-    let (worker_client, mut chunk_rx) =
-        open_worker_stream_bidi(&state, model_name, &resolved_version, meta, &stream_id)
+    // §4.3 endpoint adaptation: ensemble models have no workers — the
+    // upstream is AGGREGATED into one root input (D17), the trigger is
+    // half-close (body EOF, D33), and the DAG's tail stream replaces the
+    // worker stream below (same outgoing forward loop).
+    let is_ensemble = state
+        .registry
+        .get(model_name, Some(&resolved_version))
+        .map(|mv| mv.model_type == ModelType::Ensemble)
+        .unwrap_or(false);
+
+    // P10 (D40): semaphore permit held for the outgoing task's lifetime.
+    let mut ensemble_permit = None;
+
+    // 5. Open worker stream (or run the DAG for ensemble). The incoming task
+    // (client→worker chunk forwarding) is spawned ONLY on the non-ensemble
+    // path — ensemble aggregates the upstream inline and half-close (body
+    // EOF) ends input, so no frames can follow (h2 semantics, D33).
+    let (worker_client, mut chunk_rx, incoming_task) = if is_ensemble {
+        let max_body = state
+            .config
+            .server
+            .max_request_body_bytes
+            .unwrap_or(64 * 1024 * 1024);
+        let mut aggregator = crate::ensemble::BidiAggregator::new(max_body);
+        let ct = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        // initial_data moved into meta above — meta.payload is the same bytes.
+        aggregator.push(meta.payload.clone(), initial_is_json, ct.as_deref())?;
+        // Aggregation loop: decode LPM frames until the body stream EOFs
+        // (half-close → trigger). Chunk-idle budget applies between frames
+        // (an abandoned aggregating client is reclaimed); the overall
+        // deadline runs since the FIRST frame (aggregation eats the DAG
+        // budget — the client is effectively streaming its body).
+        let mut buf = remainder_buf;
+        let mut body_stream = body_stream;
+        let agg_idle = crate::deadline::idle_budget(
+            state.config.server.decoupled_idle_timeout_secs,
+        );
+        let agg_deadline = if deadline.client_specified {
+            crate::deadline::to_instant(deadline.unix_ns)
+        } else {
+            None
+        };
+        let mut last_activity = std::time::Instant::now();
+        loop {
+            if let Some(idle) = agg_idle {
+                if last_activity.elapsed() > idle {
+                    return Err(AppError::InferenceTimeout(format!(
+                        "bidi aggregation idle timeout for {}",
+                        model_name
+                    )));
+                }
+            }
+            if let Some(d) = agg_deadline {
+                if std::time::Instant::now() >= d {
+                    return Err(AppError::InferenceTimeout(
+                        "bidi aggregation exceeded the overall deadline".to_string(),
+                    ));
+                }
+            }
+            match lpm::try_decode_frame(&mut buf) {
+                Ok(Some(chunk)) => match chunk.payload {
+                    Some(pb::bidi_chunk::Payload::Data(data)) => {
+                        aggregator.push(data.data, initial_is_json, ct.as_deref())?;
+                        last_activity = std::time::Instant::now();
+                    }
+                    Some(pb::bidi_chunk::Payload::Close(_)) => break,
+                    _ => {}
+                },
+                Ok(None) => match body_stream.next().await {
+                    Some(Ok(bytes)) => buf.extend_from_slice(&bytes),
+                    // Body EOF (or transport error) → half-close → trigger (D33).
+                    Some(Err(_)) | None => break,
+                },
+                Err(_) => {
+                    return Err(AppError::InvalidRequestBody(
+                        "bidi LPM frame error during aggregation".to_string(),
+                    ));
+                }
+            }
+        }
+        crate::metrics::prometheus::record_ensemble_bidi_aggregate(
+            aggregator.total_bytes(),
+            last_activity.elapsed().as_secs_f64(),
+        );
+        let value = aggregator.finish()?;
+        let opts = crate::ensemble::EnsembleExecOpts {
+            client_ip: cx.client_ip.clone(),
+            deadline_unix_ns: deadline.unix_ns,
+            decoupled: false,
+        };
+        match crate::ensemble::execute_ensemble(
+            state.clone(),
+            model_name,
+            &resolved_version,
+            value,
+            &cx.request_id,
+            opts,
+        )
+        .await?
+        {
+            crate::ensemble::EnsembleOutcome::Stream(mut s) => {
+                ensemble_permit = s.permit.take();
+                (s.cancel_client, s.chunk_rx, None)
+            }
+            crate::ensemble::EnsembleOutcome::Unary(_) => {
+                return Err(AppError::InvalidRequestBody(
+                    "ensemble DAG has no streaming step; use a unary endpoint"
+                        .to_string(),
+                ));
+            }
+        }
+    } else {
+        let (wc, rx) = open_worker_stream_bidi(&state, model_name, &resolved_version, meta, &stream_id)
             .await?;
+        // Incoming task: decode LPM frames from the request body → worker
+        // (fire-and-forget). The body stream is OWNED here for the whole
+        // session — frames may arrive long after Open (full-duplex).
+        let stream_id_inc = stream_id.clone();
+        let incoming_client = Arc::clone(&wc);
+        let incoming_task = tokio::spawn(async move {
+            let mut buf = remainder_buf;
+            let mut body_stream = body_stream;
+            let mut close_sent = false;
+            loop {
+                match lpm::try_decode_frame(&mut buf) {
+                    Ok(Some(chunk)) => {
+                        match chunk.payload {
+                            Some(pb::bidi_chunk::Payload::Data(data)) => {
+                                let req = streaming::build_stream_chunk(
+                                    stream_id_inc.clone(),
+                                    data.data,
+                                );
+                                let _ = incoming_client.send_raw(req).await;
+                            }
+                            Some(pb::bidi_chunk::Payload::Close(_)) => {
+                                let req = streaming::build_stream_close(
+                                    stream_id_inc.clone(),
+                                );
+                                let _ = incoming_client.send_raw(req).await;
+                                close_sent = true;
+                                break; // graceful close
+                            }
+                            _ => {} // Open after first frame → ignore; Error → ignore
+                        }
+                    }
+                    Ok(None) => {
+                        // Need more data — read the next body chunk.
+                        match body_stream.next().await {
+                            Some(Ok(bytes)) => buf.extend_from_slice(&bytes),
+                            // Transport error / body EOF → D4 close below.
+                            Some(Err(_)) | None => break,
+                        }
+                    }
+                    Err(_) => return, // frame error → stop (protocol violation)
+                }
+            }
+            // D4: body EOF (or transport error) without an explicit Close
+            // frame → gracefully end worker input (same half-close
+            // semantics as gRPC bidi, PR-1).
+            if !close_sent {
+                let _ = incoming_client
+                    .send_raw(streaming::build_stream_close(stream_id_inc))
+                    .await;
+            }
+        });
+        (wc, rx, Some(incoming_task))
+    };
 
     // Task D: fire InferenceRequest.
     let cb_runner = state.callback_runner.clone();
@@ -222,9 +389,7 @@ async fn h2_bidi_entry_impl(
 
     // Spawn forwarder: incoming → worker, worker → outgoing → response body.
     let (tx, rx) = mpsc::channel::<Bytes>(64);
-    let stream_id_inc = stream_id.clone();
     let stream_id_out = stream_id.clone();
-    let incoming_client = Arc::clone(&worker_client);
     let cancel_client = Arc::clone(&worker_client);
     let metrics_model = model_name.to_string();
     let metrics_version = resolved_version.clone();
@@ -249,56 +414,9 @@ async fn h2_bidi_entry_impl(
 
     tokio::spawn(
         async move {
-            // Incoming task: decode LPM frames from the request body → worker
-            // (fire-and-forget). The body stream is OWNED here for the whole
-            // session — frames may arrive long after Open (full-duplex).
-            let incoming_task = tokio::spawn(async move {
-                let mut buf = remainder_buf;
-                let mut body_stream = body_stream;
-                let mut close_sent = false;
-                loop {
-                    match lpm::try_decode_frame(&mut buf) {
-                        Ok(Some(chunk)) => {
-                            match chunk.payload {
-                                Some(pb::bidi_chunk::Payload::Data(data)) => {
-                                    let req = streaming::build_stream_chunk(
-                                        stream_id_inc.clone(),
-                                        data.data,
-                                    );
-                                    let _ = incoming_client.send_raw(req).await;
-                                }
-                                Some(pb::bidi_chunk::Payload::Close(_)) => {
-                                    let req = streaming::build_stream_close(
-                                        stream_id_inc.clone(),
-                                    );
-                                    let _ = incoming_client.send_raw(req).await;
-                                    close_sent = true;
-                                    break; // graceful close
-                                }
-                                _ => {} // Open after first frame → ignore; Error → ignore
-                            }
-                        }
-                        Ok(None) => {
-                            // Need more data — read the next body chunk.
-                            match body_stream.next().await {
-                                Some(Ok(bytes)) => buf.extend_from_slice(&bytes),
-                                // Transport error / body EOF → D4 close below.
-                                Some(Err(_)) | None => break,
-                            }
-                        }
-                        Err(_) => return, // frame error → stop (protocol violation)
-                    }
-                }
-                // D4: body EOF (or transport error) without an explicit Close
-                // frame → gracefully end worker input (same half-close
-                // semantics as gRPC bidi, PR-1).
-                if !close_sent {
-                    let _ = incoming_client
-                        .send_raw(streaming::build_stream_close(stream_id_inc))
-                        .await;
-                }
-            });
-
+            // P10 (D40): held for the outgoing task's lifetime — released on
+            // drop (terminal frame / idle / disconnect; D18 teardown path).
+            let _ensemble_permit = ensemble_permit;
             // Outgoing loop: worker chunks → LPM frames → tx.
             let open_time = std::time::Instant::now();
             let mut first_chunk = true;
@@ -433,7 +551,9 @@ async fn h2_bidi_entry_impl(
             let cancel_req = streaming::build_stream_cancel(stream_id_out);
             let _ = cancel_client.send_raw(cancel_req).await;
 
-            streaming::observe_or_abort(incoming_task).await;
+            if let Some(task) = incoming_task {
+                streaming::observe_or_abort(task).await;
+            }
         }
         .instrument(span),
     );

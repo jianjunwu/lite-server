@@ -5,11 +5,12 @@
 use crate::grpc::auth::{enforce_auth_grpc, enforce_grpc_rate_limit};
 use crate::grpc::canary::canary_pin;
 use crate::grpc::error::{
-    err, error_type_to_grpc_code, grpc_code_to_status_family, model_error_status,
-    try_parse_model_error,
+    app_error_to_grpc_status, err, error_type_to_grpc_code, grpc_code_to_status_family,
+    model_error_status, try_parse_model_error,
 };
 use crate::grpc::interceptor;
 use crate::grpc::GrpcService;
+use crate::registry::types::ModelType;
 use crate::proto::liteserver as pb;
 use crate::request_context::RequestContext;
 use crate::streaming;
@@ -127,52 +128,109 @@ impl GrpcService {
         };
         let stream_idle = self.decoupled_idle_timeout;
 
-        let stream_id = format!("grpc-stream-{}", Uuid::new_v4());
+        // §4.1 endpoint adaptation: ensemble models have no workers — dispatch
+        // through the DAG executor; the returned Stream plugs the SAME
+        // variables the forward loop below consumes (zero changes past this
+        // point). Unary outcome here = the DAG has no streaming step (§4.4
+        // unsupported-combination row → InvalidArgument).
+        let is_ensemble = self
+            .registry
+            .get(model_name, Some(&resolved_version))
+            .map(|mv| mv.model_type == ModelType::Ensemble)
+            .unwrap_or(false);
+
+        // P10 (D40): semaphore permit held for the forward task's lifetime.
+        let mut ensemble_permit = None;
+        let (stream_id, mut chunk_rx, cancel_client) = if is_ensemble {
+            let ensemble_input = match serde_json::from_slice::<serde_json::Value>(&req.data) {
+                Ok(v) => crate::ensemble::EnsembleValue::Json(v),
+                Err(_) => crate::ensemble::EnsembleValue::Binary(
+                    req.data.clone(),
+                    req.headers
+                        .get("content-type")
+                        .cloned()
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                ),
+            };
+            let opts = crate::ensemble::EnsembleExecOpts {
+                client_ip: client_ip.clone(),
+                deadline_unix_ns: deadline.unix_ns,
+                decoupled: false,
+            };
+            match crate::ensemble::execute_ensemble(
+                self.app_state.clone(),
+                model_name,
+                &resolved_version,
+                ensemble_input,
+                &request_id,
+                opts,
+            )
+            .await
+            .map_err(|e| err(app_error_to_grpc_status(&e)))?
+            {
+                crate::ensemble::EnsembleOutcome::Stream(mut s) => {
+                    ensemble_permit = s.permit.take();
+                    (s.stream_id, s.chunk_rx, s.cancel_client)
+                }
+                crate::ensemble::EnsembleOutcome::Unary(_) => {
+                    return Err(err(Status::invalid_argument(
+                        "ensemble DAG has no streaming step; use a unary endpoint",
+                    )));
+                }
+            }
+        } else {
+            let stream_id = format!("grpc-stream-{}", Uuid::new_v4());
+            let clients = self
+                .worker_manager
+                .get_zmq_clients(model_name, &resolved_version)
+                .await
+                .ok_or_else(|| err(Status::unavailable("no workers available")))?;
+
+            if clients.is_empty() {
+                return Err(err(Status::unavailable("no workers available")));
+            }
+
+            // Task F: shared streaming worker pick (B3 hints: x-lite-worker-id pin >
+            // sequence_id stickiness > x-lite-affinity-key rendezvous >
+            // skip-ejected/random). A bad pin → InvalidArgument.
+            let outlier = self
+                .worker_manager
+                .get_outlier_state(model_name.as_str(), &resolved_version)
+                .await;
+            let seq_registry = self.app_state.inference_queue.sequence_registry();
+            let worker_id = crate::worker::pick_streaming_worker(
+                &meta,
+                clients.len(),
+                outlier.as_deref(),
+                seq_registry,
+                model_name,
+                &resolved_version,
+            )
+            .map_err(|e| err(Status::invalid_argument(e.0)))?;
+            let client = clients[worker_id].clone();
+            // P6 GetModelStats: one streaming inference dispatched to this worker.
+            crate::metrics::prometheus::record_worker_inference(
+                model_name,
+                &resolved_version,
+                worker_id,
+                1,
+            );
+
+            let open_req = streaming::build_stream_open(
+                stream_id.clone(),
+                req.data,
+                Some(meta),
+                false,
+            );
+
+            let chunk_rx = client
+                .send_stream(open_req, stream_id.clone())
+                .await
+                .map_err(|e| err(Status::internal(format!("worker stream error: {}", e))))?;
+            (stream_id, chunk_rx, client.clone())
+        };
         // G3:补记 stream_id,转发 spawn 在 span 内执行(单 span 覆盖全流)。
         span.record("stream_id", stream_id.as_str());
-
-        let clients = self
-            .worker_manager
-            .get_zmq_clients(model_name, &resolved_version)
-            .await
-            .ok_or_else(|| err(Status::unavailable("no workers available")))?;
-
-        if clients.is_empty() {
-            return Err(err(Status::unavailable("no workers available")));
-        }
-
-        // Task F: shared streaming worker pick (B3 hints: x-lite-worker-id pin >
-        // sequence_id stickiness > x-lite-affinity-key rendezvous >
-        // skip-ejected/random). A bad pin → InvalidArgument.
-        let outlier = self
-            .worker_manager
-            .get_outlier_state(model_name.as_str(), &resolved_version)
-            .await;
-        let seq_registry = self.app_state.inference_queue.sequence_registry();
-        let worker_id = crate::worker::pick_streaming_worker(
-            &meta,
-            clients.len(),
-            outlier.as_deref(),
-            seq_registry,
-            model_name,
-            &resolved_version,
-        )
-        .map_err(|e| err(Status::invalid_argument(e.0)))?;
-        let client = clients[worker_id].clone();
-        // P6 GetModelStats: one streaming inference dispatched to this worker.
-        crate::metrics::prometheus::record_worker_inference(
-            model_name,
-            &resolved_version,
-            worker_id,
-            1,
-        );
-
-        let open_req = streaming::build_stream_open(stream_id.clone(), req.data, Some(meta), false);
-
-        let mut chunk_rx = client
-            .send_stream(open_req, stream_id.clone())
-            .await
-            .map_err(|e| err(Status::internal(format!("worker stream error: {}", e))))?;
 
         // Task D: fire InferenceRequest once the worker stream opened (streaming
         // bypasses the queue, so open-success is the trigger) and arm the
@@ -191,7 +249,6 @@ impl GrpcService {
         crate::callback::fire_inference_request(&cb_runner, &req_ctx);
 
         let (tx, rx) = mpsc::channel(64);
-        let cancel_client = client.clone();
 
         let stream_metrics = self.streaming_metrics;
         let metrics_model = model_name.to_string();
@@ -201,6 +258,9 @@ impl GrpcService {
         }
 
         tokio::spawn(async move {
+            // P10 (D40): held for the forward task's lifetime — released on
+            // drop (terminal frame / idle / disconnect; D18 teardown path).
+            let _ensemble_permit = ensemble_permit;
             let open_time = std::time::Instant::now();
             let mut first_chunk = true;
             let mut last_chunk_time = open_time;
