@@ -11,6 +11,7 @@ use crate::grpc::error::{
 use crate::grpc::interceptor;
 use crate::grpc::GrpcService;
 use crate::registry::types::ModelType;
+use std::sync::Arc;
 use crate::proto::liteserver as pb;
 use crate::request_context::RequestContext;
 use crate::streaming;
@@ -141,6 +142,10 @@ impl GrpcService {
 
         // P10 (D40): semaphore permit held for the forward task's lifetime.
         let mut ensemble_permit = None;
+        // D18: chain handles + chain-tree abort held for the forward task's
+        // cancellation (pipeline chains broadcast over every streaming step).
+        let mut ensemble_chain: Option<Arc<std::sync::Mutex<Vec<crate::ensemble::StreamHandle>>>> = None;
+        let mut ensemble_abort: Option<tokio::task::AbortHandle> = None;
         // §4.1 指标行: streaming-step latency is recorded at stream close.
         let mut ensemble_tail: Option<(String, String, String)> = None;
         let (stream_id, mut chunk_rx, cancel_client) = if is_ensemble {
@@ -172,6 +177,8 @@ impl GrpcService {
             {
                 crate::ensemble::EnsembleOutcome::Stream(mut s) => {
                     ensemble_permit = s.permit.take();
+                    ensemble_chain = Some(s.chain.clone());
+                    ensemble_abort = Some(s.abort.clone());
                     ensemble_tail = Some((s.tail_step.clone(), s.tail_model.clone(), s.tail_version.clone()));
                     (s.stream_id, s.chunk_rx, s.cancel_client)
                 }
@@ -388,8 +395,18 @@ impl GrpcService {
             // the worker signals the generator to stop and sends NO unary reply
             // to a Cancel, so `.send()` would await the full ZMQ_RESPONSE_TIMEOUT
             // (300s). Aligned with bidi/decoupled/HTTP stream (P-FLOW §4.0.9).
-            let cancel_req = streaming::build_stream_cancel(stream_id);
-            let _ = cancel_client.send_raw(cancel_req).await;
+            if is_ensemble {
+                crate::ensemble::cancel_chain(
+                    ensemble_chain.as_ref(),
+                    ensemble_abort.as_ref(),
+                    &stream_id,
+                    &cancel_client,
+                )
+                .await;
+            } else {
+                let cancel_req = streaming::build_stream_cancel(stream_id);
+                let _ = cancel_client.send_raw(cancel_req).await;
+            }
         }
         .instrument(span));
 

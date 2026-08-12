@@ -201,6 +201,10 @@ async fn h2_bidi_entry_impl(
 
     // P10 (D40): semaphore permit held for the outgoing task's lifetime.
     let mut ensemble_permit = None;
+    // D18: chain handles + chain-tree abort held for the outgoing task's
+    // cancellation (pipeline chains broadcast over every streaming step).
+    let mut ensemble_chain: Option<Arc<std::sync::Mutex<Vec<crate::ensemble::StreamHandle>>>> = None;
+    let mut ensemble_abort: Option<tokio::task::AbortHandle> = None;
     // §4.1 指标行: streaming-step latency is recorded at stream close.
     let mut ensemble_tail: Option<(String, String, String)> = None;
 
@@ -338,6 +342,8 @@ async fn h2_bidi_entry_impl(
         {
             crate::ensemble::EnsembleOutcome::Stream(mut s) => {
                 ensemble_permit = s.permit.take();
+                ensemble_chain = Some(s.chain.clone());
+                ensemble_abort = Some(s.abort.clone());
                 ensemble_tail = Some((s.tail_step.clone(), s.tail_model.clone(), s.tail_version.clone()));
                 (s.cancel_client, s.chunk_rx, None)
             }
@@ -603,8 +609,18 @@ async fn h2_bidi_entry_impl(
             }
 
             // Targeted cancel.
-            let cancel_req = streaming::build_stream_cancel(stream_id_out);
-            let _ = cancel_client.send_raw(cancel_req).await;
+            if is_ensemble {
+                crate::ensemble::cancel_chain(
+                    ensemble_chain.as_ref(),
+                    ensemble_abort.as_ref(),
+                    &stream_id_out,
+                    &cancel_client,
+                )
+                .await;
+            } else {
+                let cancel_req = streaming::build_stream_cancel(stream_id_out);
+                let _ = cancel_client.send_raw(cancel_req).await;
+            }
 
             if let Some(task) = incoming_task {
                 streaming::observe_or_abort(task).await;

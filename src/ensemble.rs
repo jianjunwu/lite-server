@@ -1033,7 +1033,13 @@ pub struct EnsembleStream {
     /// the adapter's recv_chunk overall takes min(client overall, this).
     /// None = inactive.
     pub step_deadline: Option<std::time::Instant>,
-    pub chain: Vec<StreamHandle>,
+    /// D18/D25: chain handles — the single source of truth for the chain's
+    /// streams (tail included). Batch 0 = the tail stream alone; batch 2 =
+    /// every streaming step on the pipeline chain, pushed by the chain tasks
+    /// as they open (tail first — chain[0] always mirrors the top-level
+    /// fields, so adapters that only read the quick-access fields stay
+    /// unchanged). Cancellation broadcasts over this list.
+    pub chain: Arc<std::sync::Mutex<Vec<StreamHandle>>>,
     /// D18: chain task tree unified teardown. Batch 0 = the tail stream
     /// itself (inert placeholder); batch 2 roots the whole chain here.
     pub abort: tokio::task::AbortHandle,
@@ -1092,7 +1098,14 @@ impl StreamingCapacityState {
     /// no queueing (queueing turns an unbounded-stream memory problem into a
     /// latency one, and the pre-layers already waited in the queue once).
     pub fn try_acquire(&self) -> Result<StreamingPermit, AppError> {
-        match self.semaphore.clone().try_acquire_owned() {
+        self.try_acquire_many(1)
+    }
+
+    /// Acquire `n` slots — pipeline chains weight by their streaming-step
+    /// count (D40: 末步 = 1, k 链 = k; the residency derivation M = N × D_stream
+    /// scales linearly with the chain length).
+    pub fn try_acquire_many(&self, n: usize) -> Result<StreamingPermit, AppError> {
+        match self.semaphore.clone().try_acquire_many_owned(n as u32) {
             Ok(permit) => {
                 let prev = self.in_use.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 crate::metrics::prometheus::set_ensemble_streaming_active(prev + 1);
@@ -1140,6 +1153,33 @@ pub async fn execute_ensemble(
         let value = context.get(value).cloned()
             .ok_or_else(|| AppError::Internal("ensemble produced no output".to_string()))?;
         return Ok(EnsembleOutcome::Unary(value));
+    }
+
+    // §4.2 pipeline branch (batch 2): the DAG contains a chain — run the
+    // pre-layers before the chain head, then spawn the whole chain and
+    // return the tail stream immediately (D25's split, now the chain
+    // branch; the tail-stream branch below remains for non-pipeline DAGs).
+    if !plan.chains.is_empty() {
+        let chain = &plan.chains[0];
+        let head = chain.nodes[0];
+        let head_layer = plan.layers.iter().position(|l| l.contains(&head))
+            .ok_or_else(|| AppError::Internal("chain head missing from layers".to_string()))?;
+        run_layers(
+            &state, &plan, &plan.layers[..head_layer], &mut context,
+            model_name, version, request_id, &opts, deadline_unix_ns,
+        )
+        .await?;
+        let mut stream = spawn_chain(
+            &state, &plan, chain, &context, request_id, &opts, deadline_unix_ns,
+        )
+        .await?;
+        // P10 (D40): the permit is WEIGHTED by the chain's streaming-step
+        // count (末步 = 1, k 链 = k — residency scales linearly with the
+        // chain length).
+        if let Some(capacity) = state.worker_manager.streaming_capacity() {
+            stream.permit = Some(capacity.try_acquire_many(chain.nodes.len())?);
+        }
+        return Ok(EnsembleOutcome::Stream(stream));
     }
 
     // Streaming DAG (D25: run_pre_layers / open_tail_stream split — batch 2
@@ -1391,7 +1431,7 @@ async fn tail_stream_preflight(
         crate::telemetry::inject(&mut step_headers);
     }
     let meta = build_step_meta(
-        step, request_id, &opts.client_ip, deadline_unix_ns, step_headers, bytes::Bytes::new(),
+        &format!("{}:{}", request_id, step.name), &opts.client_ip, deadline_unix_ns, step_headers, bytes::Bytes::new(),
     );
     let outlier = state.worker_manager.get_outlier_state(&step.model, &step.version).await;
     let seq_registry = state.inference_queue.sequence_registry();
@@ -1402,6 +1442,303 @@ async fn tail_stream_preflight(
         return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
     }
     Ok(Some(TailPreflight { meta, worker_id, clients }))
+}
+
+/// §4.2: forward a worker stream into a downstream channel. Only Chunk
+/// frames pass through — a per-chunk sub-stream's Done is an intermediate
+/// milestone, NOT the chain's end (the tail hop synthesizes the final Done);
+/// an Error frame passes through and terminates the whole chain (a node
+/// failure cancels its worker and propagates upstream, D18). When the
+/// downstream closes (adapter disconnect / next hop exiting), send
+/// StreamCancel to THIS worker and end.
+/// Returns `true` when the stream ended with an Error frame (chain stop).
+async fn forward_stream(
+    mut rx: mpsc::Receiver<pb::StreamResponse>,
+    tx: mpsc::Sender<pb::StreamResponse>,
+    cancel_client: Arc<crate::transport::zmq::WorkerZmqClient>,
+    stream_id: String,
+) -> bool {
+    while let Some(chunk) = rx.recv().await {
+        match chunk.payload {
+            Some(pb::stream_response::Payload::Chunk(_)) => {
+                if tx.send(chunk).await.is_err() {
+                    let _ = cancel_client
+                        .send_raw(crate::streaming::build_stream_cancel(stream_id))
+                        .await;
+                    return false;
+                }
+            }
+            Some(pb::stream_response::Payload::Error(_)) => {
+                // Propagate the failure downstream, then stop the chain.
+                let _ = tx.send(chunk).await;
+                return true;
+            }
+            Some(pb::stream_response::Payload::Done(_)) => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// §4.2: a pipeline chain consumer — one nested send_stream sub-call PER
+/// upstream chunk (chunk → 组包 → sub-stream → forward). D20: each sub-call
+/// carries request_id `{parent}:{step}:{chunk_seq}`. D18: a failed
+/// downstream send cancels this step's worker; the chain-handle list is
+/// updated per sub-stream (tail inserted at index 0, others appended).
+async fn consume_stream_consumer(
+    state: &Arc<AppState>,
+    plan: &EnsemblePlan,
+    step_idx: usize,
+    prev_step_name: &str,
+    mut upstream: mpsc::Receiver<pb::StreamResponse>,
+    downstream: mpsc::Sender<pb::StreamResponse>,
+    context: &HashMap<String, EnsembleValue>,
+    request_id: &str,
+    opts: &EnsembleExecOpts,
+    deadline_unix_ns: Option<i64>,
+    chain_handles: &Arc<std::sync::Mutex<Vec<StreamHandle>>>,
+    is_tail: bool,
+) -> Result<(), AppError> {
+    let step = &plan.steps[step_idx];
+    let mut seq: u64 = 0;
+    let mut error_terminated = false;
+    while let Some(chunk) = upstream.recv().await {
+        match chunk.payload {
+            Some(pb::stream_response::Payload::Chunk(c)) => {
+                // Chunk → the previous step's value in a per-chunk context.
+                let chunk_value: Value = serde_json::from_slice(&c.data).map_err(|e| {
+                    AppError::Internal(format!(
+                        "pipeline chunk from '{}' is not valid JSON: {e}",
+                        prev_step_name
+                    ))
+                })?;
+                let mut ctx = context.clone();
+                ctx.insert(
+                    prev_step_name.to_string(),
+                    EnsembleValue::Json(chunk_value),
+                );
+                let sub_request_id = format!("{}:{}:{}", request_id, step.name, seq);
+                let sub = execute_stream_step(
+                    state, plan, step_idx, &ctx, &sub_request_id, opts, deadline_unix_ns, None,
+                )
+                .await?;
+                {
+                    let mut handles = chain_handles.lock().unwrap();
+                    let handle = StreamHandle {
+                        stream_id: sub.stream_id.clone(),
+                        cancel_client: Arc::clone(&sub.cancel_client),
+                        abort: tokio::spawn(async {}).abort_handle(),
+                    };
+                    if is_tail {
+                        // D25: tail at index 0 — the top-level quick-access
+                        // fields mirror it.
+                        handles.insert(0, handle);
+                    } else {
+                        handles.push(handle);
+                    }
+                }
+                let error_terminated = forward_stream(
+                    sub.chunk_rx,
+                    downstream.clone(),
+                    sub.cancel_client.clone(),
+                    sub.stream_id.clone(),
+                )
+                .await;
+                if error_terminated {
+                    // A node failed: cancel its worker and stop consuming
+                    // upstream — the upstream sender drops with us (D18).
+                    let _ = sub.cancel_client
+                        .send_raw(crate::streaming::build_stream_cancel(sub.stream_id.clone()))
+                        .await;
+                    return Ok(());
+                }
+                seq += 1;
+            }
+            Some(pb::stream_response::Payload::Done(_)) => break,
+            // An upstream Error frame was already forwarded downstream by the
+            // forwarding hop — terminal; do not synthesize a Done after it.
+            Some(pb::stream_response::Payload::Error(_)) => {
+                error_terminated = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    // Tail hop: upstream exhausted = the chain finished normally — synthesize
+    // the final Done so the adapter's close收口 fires with a clean reason
+    // (the per-chunk sub-stream Dones were never forwarded).
+    if is_tail && !error_terminated {
+        let _ = downstream
+            .send(pb::StreamResponse {
+                stream_id: String::new(),
+                payload: Some(pb::stream_response::Payload::Done(pb::StreamDone {
+                    metrics: None,
+                })),
+            })
+            .await;
+    }
+    Ok(())
+}
+
+/// §4.2: spawn the pipeline chain as one task tree and return the tail
+/// stream immediately. The head opens its worker stream synchronously
+/// (build failures surface as real error codes); every consumer hop then
+/// runs as a task: per-chunk nested sub-streams, flows through bounded
+/// mpsc channels (64, D2 — full = backpressure, never dropped). The chain
+/// root's AbortHandle is the D18 teardown point.
+async fn spawn_chain(
+    state: &Arc<AppState>,
+    plan: &EnsemblePlan,
+    chain: &Chain,
+    context: &HashMap<String, EnsembleValue>,
+    request_id: &str,
+    opts: &EnsembleExecOpts,
+    deadline_unix_ns: Option<i64>,
+) -> Result<EnsembleStream, AppError> {
+    let nodes: Vec<usize> = chain.nodes.clone();
+    let tail_idx = *nodes.last().unwrap();
+    let tail = &plan.steps[tail_idx];
+
+    // Inter-hop channels (nodes.len() - 1) + the tail output channel.
+    let mut hop_txs: Vec<mpsc::Sender<pb::StreamResponse>> = Vec::new();
+    let mut hop_rxs: Vec<mpsc::Receiver<pb::StreamResponse>> = Vec::new();
+    for _ in 1..nodes.len() {
+        // D2: inter-hop channel capacity 64, aligned with STREAM_CHANNEL_SIZE.
+        let (tx, rx) = mpsc::channel(64);
+        hop_txs.push(tx);
+        hop_rxs.push(rx);
+    }
+    let (tail_tx, tail_rx) = mpsc::channel(64);
+
+    // D18: chain-handle collection shared with the consumer tasks.
+    let chain_handles: Arc<std::sync::Mutex<Vec<StreamHandle>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // Head: open the first worker stream from the pre-layer context
+    // SYNCHRONOUSLY — build failures surface as real error codes before the
+    // stream is returned (the chain consumers then run detached).
+    let head_stream = execute_stream_step(
+        state, plan, nodes[0], context, request_id, opts, deadline_unix_ns, None,
+    )
+    .await?;
+    {
+        // D18: record the head handle (appended; the tail lands at index 0).
+        let mut h = chain_handles.lock().unwrap();
+        h.push(StreamHandle {
+            stream_id: head_stream.stream_id.clone(),
+            cancel_client: Arc::clone(&head_stream.cancel_client),
+            abort: tokio::spawn(async {}).abort_handle(),
+        });
+    }
+    // The top-level cancel_client is the head stream's client (synchronously
+    // available) — adapters that only read the quick-access fields stay
+    // unchanged; chain cancellation broadcasts over `chain` via
+    // [`cancel_ensemble_stream`].
+    let cancel_client = {
+        let handles = chain_handles.lock().unwrap();
+        Arc::clone(&handles[0].cancel_client)
+    };
+
+    let state_h = state.clone();
+    let plan_h = plan.clone();
+    let context_h = context.clone();
+    let request_id_h = request_id.to_string();
+    let opts_h = opts.clone();
+    let handles_h = chain_handles.clone();
+    let tail_tx_h = tail_tx.clone();
+    let chain_depth = nodes.len();
+    crate::metrics::prometheus::record_ensemble_pipeline_chain_depth(chain_depth);
+    let root = tokio::spawn(async move {
+        // Consumer hops: hop i consumes hop i-1's output and forwards into
+        // hop i's channel (or the tail channel).
+        let mut tasks: Vec<tokio::task::JoinHandle<Result<(), AppError>>> = Vec::new();
+        let mut prev_rx = head_stream.chunk_rx;
+        for (i, &node) in nodes.iter().enumerate().skip(1) {
+            let is_tail = i == nodes.len() - 1;
+            let down_tx = if is_tail {
+                tail_tx_h.clone()
+            } else {
+                hop_txs[i - 1].clone()
+            };
+            let up_rx = std::mem::replace(&mut prev_rx, hop_rxs.remove(0));
+            let state = state_h.clone();
+            let plan = plan_h.clone();
+            let ctx = context_h.clone();
+            let req = request_id_h.clone();
+            let opts = opts_h.clone();
+            let handles = handles_h.clone();
+            let prev_name = plan_h.steps[nodes[i - 1]].name.clone();
+            tasks.push(tokio::spawn(async move {
+                consume_stream_consumer(
+                    &state, &plan, node, &prev_name, up_rx, down_tx, &ctx, &req, &opts,
+                    deadline_unix_ns, &handles, is_tail,
+                )
+                .await
+            }));
+        }
+        for t in tasks {
+            t.await
+                .map_err(|e| AppError::Internal(format!("chain task join error: {e}")))??;
+        }
+        Ok::<(), AppError>(())
+    });
+
+    let stream_id = format!("chain-{}", Uuid::new_v4());
+
+    Ok(EnsembleStream {
+        chunk_rx: tail_rx,
+        stream_id,
+        cancel_client,
+        tail_model: tail.model.clone(),
+        tail_version: tail.version.clone(),
+        tail_step: tail.name.clone(),
+        step_deadline: None,
+        chain: chain_handles,
+        // D18: the chain task tree's root handle — the adapter aborts it on
+        // disconnect as the teardown backstop.
+        abort: root.abort_handle(),
+        permit: None,
+    })
+}
+
+/// D18: cancel an ensemble stream from the adapters. A pipeline chain
+/// broadcasts over every chain handle (each streaming step's worker) and
+/// aborts the chain task tree; the top-level client is the fallback (empty
+/// handles = non-chain, or a chain whose consumers have not opened yet).
+pub async fn cancel_chain(
+    chain: Option<&Arc<std::sync::Mutex<Vec<StreamHandle>>>>,
+    abort: Option<&tokio::task::AbortHandle>,
+    fallback_stream_id: &str,
+    fallback_client: &Arc<crate::transport::zmq::WorkerZmqClient>,
+) {
+    match chain {
+        Some(chain) => {
+            // Collect the cancel targets under the lock, then send outside it
+            // (MutexGuard must not cross an await — the future stays Send).
+            let targets: Vec<(String, Arc<crate::transport::zmq::WorkerZmqClient>)> = {
+                let handles = chain.lock().unwrap();
+                if handles.is_empty() {
+                    vec![(fallback_stream_id.to_string(), fallback_client.clone())]
+                } else {
+                    handles
+                        .iter()
+                        .map(|h| (h.stream_id.clone(), h.cancel_client.clone()))
+                        .collect()
+                }
+            };
+            for (sid, client) in targets {
+                let req = crate::streaming::build_stream_cancel(sid);
+                let _ = client.send_raw(req).await;
+            }
+            if let Some(a) = abort {
+                a.abort();
+            }
+        }
+        None => {
+            let req = crate::streaming::build_stream_cancel(fallback_stream_id.to_string());
+            let _ = fallback_client.send_raw(req).await;
+        }
+    }
 }
 
 /// D19: streaming readiness predicate — the sub-model must be reachable via
@@ -1560,7 +1897,7 @@ async fn execute_stream_step(
 
             // Streaming meta carries no payload — the body rides StreamOpen.data.
             let meta = build_step_meta(
-                step, request_id, &opts.client_ip, deadline_unix_ns, step_headers, bytes::Bytes::new(),
+                &format!("{}:{}", request_id, step.name), &opts.client_ip, deadline_unix_ns, step_headers, bytes::Bytes::new(),
             );
 
             let outlier = state.worker_manager.get_outlier_state(&step.model, &step.version).await;
@@ -1621,7 +1958,7 @@ async fn execute_stream_step(
         // recv_chunk overall takes min(client overall, this). Inactive until
         // E5 lands.
         step_deadline: None,
-        chain,
+        chain: Arc::new(std::sync::Mutex::new(chain)),
         abort,
         // P10: filled by execute_ensemble after open_tail_stream returns.
         permit: None,
@@ -1633,7 +1970,6 @@ async fn execute_stream_step(
 /// (B3/E7). `payload` is the serialized body — empty for streaming, where the
 /// body rides StreamOpen.data.
 fn build_step_meta(
-    step: &EnsembleStep,
     request_id: &str,
     client_ip: &str,
     deadline_unix_ns: Option<i64>,
@@ -1644,9 +1980,11 @@ fn build_step_meta(
         route: "/predict".to_string(),
         headers: step_headers,
         client_ip: client_ip.to_string(),
-        // Correlate sub-step requests with the client-facing request ID;
-        // the step-name suffix keeps each step uniquely identifiable.
-        request_id: format!("{}:{}", request_id, step.name),
+        // The request_id passed in is ALREADY the full step-scoped id
+        // (callers append `:{step}` or `:{step}:{chunk_seq}` for pipeline
+        // sub-calls, D20) — no suffixing here so pipeline chunk calls can
+        // carry their own seq.
+        request_id: request_id.to_string(),
         timestamp_ns: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1844,7 +2182,7 @@ async fn execute_step(
     }
 
     let meta = build_step_meta(
-        step, request_id, client_ip, deadline_unix_ns, step_headers,
+        &format!("{}:{}", request_id, step.name), client_ip, deadline_unix_ns, step_headers,
         payload_bytes.clone(),
     );
 

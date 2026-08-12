@@ -406,6 +406,10 @@ async fn sse_infer_impl(
     // forward task — it is captured by the spawn below and released when the
     // task ends (terminal frame / idle / disconnect), the D18 teardown path.
     let mut ensemble_permit = None;
+    // D18: chain handles + chain-tree abort held for the forward task's
+    // cancellation (pipeline chains broadcast over every streaming step).
+    let mut ensemble_chain: Option<Arc<std::sync::Mutex<Vec<crate::ensemble::StreamHandle>>>> = None;
+    let mut ensemble_abort: Option<tokio::task::AbortHandle> = None;
     // §4.1 指标行: the streaming step's latency is recorded at stream close
     // (record_ensemble_step_latency); the tail labels ride the forward task.
     let mut ensemble_tail: Option<(String, String, String)> = None;
@@ -421,6 +425,8 @@ async fn sse_infer_impl(
         ).await? {
             crate::ensemble::EnsembleOutcome::Stream(mut s) => {
                 ensemble_permit = s.permit.take();
+                ensemble_chain = Some(s.chain.clone());
+                ensemble_abort = Some(s.abort.clone());
                 ensemble_tail = Some((s.tail_step.clone(), s.tail_model.clone(), s.tail_version.clone()));
                 (s.stream_id, s.cancel_client, s.chunk_rx)
             }
@@ -654,12 +660,23 @@ async fn sse_infer_impl(
         }
         // Ensure stream is cleaned up on worker side.
         // D4: decoupled → targeted cancel (parity with WS/gRPC);
-        // coupled → broadcast (existing behavior, unchanged).
-        let cancel_req = streaming::build_stream_cancel(stream_id);
-        if let Some(client) = cancel_client {
-            let _ = client.send_raw(cancel_req).await;
+        // coupled → broadcast (existing behavior, unchanged). Ensemble
+        // streams (incl. pipeline chains) cancel via the D18 chain broadcast.
+        if is_ensemble {
+            crate::ensemble::cancel_chain(
+                ensemble_chain.as_ref(),
+                ensemble_abort.as_ref(),
+                &stream_id,
+                &worker_client,
+            )
+            .await;
         } else {
-            open_worker_stream_cancel(&state, &model_name, &resolved_version, cancel_req).await;
+            let cancel_req = streaming::build_stream_cancel(stream_id);
+            if let Some(client) = cancel_client {
+                let _ = client.send_raw(cancel_req).await;
+            } else {
+                open_worker_stream_cancel(&state, &model_name, &resolved_version, cancel_req).await;
+            }
         }
     }
     .instrument(span.clone()));
@@ -1159,6 +1176,10 @@ async fn handle_ws_stream(
 
     // P10 (D40): semaphore permit held for the writer task's lifetime.
     let mut ensemble_permit = None;
+    // D18: chain handles + chain-tree abort held for the writer task's
+    // cancellation (pipeline chains broadcast over every streaming step).
+    let mut ensemble_chain: Option<Arc<std::sync::Mutex<Vec<crate::ensemble::StreamHandle>>>> = None;
+    let mut ensemble_abort: Option<tokio::task::AbortHandle> = None;
     // §4.1 指标行: streaming-step latency is recorded at stream close.
     let mut ensemble_tail: Option<(String, String, String)> = None;
     let (stream_id, worker_client, mut chunk_rx) = if is_ensemble {
@@ -1276,6 +1297,8 @@ async fn handle_ws_stream(
         {
             Ok(crate::ensemble::EnsembleOutcome::Stream(mut s)) => {
                 ensemble_permit = s.permit.take();
+                ensemble_chain = Some(s.chain.clone());
+                ensemble_abort = Some(s.abort.clone());
                 ensemble_tail = Some((s.tail_step.clone(), s.tail_model.clone(), s.tail_version.clone()));
                 (s.stream_id, s.cancel_client, s.chunk_rx)
             }

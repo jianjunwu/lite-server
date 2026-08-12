@@ -241,6 +241,14 @@ lazy_static! {
         )
     ).unwrap();
 
+    // m4 (§4.2): pipeline chain depth (streaming steps on the chain).
+    pub static ref ENSEMBLE_PIPELINE_CHAIN_DEPTH: prometheus::Histogram = prometheus::Histogram::with_opts(
+        prometheus::HistogramOpts::new(
+            "ensemble_pipeline_chain_depth",
+            "Streaming steps on a pipeline chain"
+        )
+    ).unwrap();
+
     // m4 (§4.3): bidi upstream aggregation observability.
     pub static ref ENSEMBLE_BIDI_AGGREGATE_BYTES: prometheus::Histogram = prometheus::Histogram::with_opts(
         prometheus::HistogramOpts::new(
@@ -559,6 +567,11 @@ pub fn record_ensemble_autoload_wait_seconds(secs: f64) {
 pub fn record_ensemble_bidi_aggregate(bytes: usize, seconds: f64) {
     ENSEMBLE_BIDI_AGGREGATE_BYTES.observe(bytes as f64);
     ENSEMBLE_BIDI_AGGREGATE_SECONDS.observe(seconds);
+}
+
+/// m4 (§4.2): pipeline chain depth — streaming steps on the chain.
+pub fn record_ensemble_pipeline_chain_depth(depth: usize) {
+    ENSEMBLE_PIPELINE_CHAIN_DEPTH.observe(depth as f64);
 }
 
 pub fn set_version_weight(model: &str, version: &str, weight: f64) {

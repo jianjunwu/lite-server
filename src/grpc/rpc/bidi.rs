@@ -209,6 +209,10 @@ impl GrpcService {
 
         // P10 (D40): semaphore permit held for the forward task's lifetime.
         let mut ensemble_permit = None;
+        // D18: chain handles + chain-tree abort held for the forward task's
+        // cancellation (pipeline chains broadcast over every streaming step).
+        let mut ensemble_chain: Option<Arc<std::sync::Mutex<Vec<crate::ensemble::StreamHandle>>>> = None;
+        let mut ensemble_abort: Option<tokio::task::AbortHandle> = None;
         // §4.1 指标行: streaming-step latency is recorded at stream close.
         let mut ensemble_tail: Option<(String, String, String)> = None;
         // Non-ensemble only: the client→worker chunk forwarder's client
@@ -302,6 +306,8 @@ impl GrpcService {
             {
                 crate::ensemble::EnsembleOutcome::Stream(mut s) => {
                     ensemble_permit = s.permit.take();
+                    ensemble_chain = Some(s.chain.clone());
+                    ensemble_abort = Some(s.abort.clone());
                     ensemble_tail = Some((s.tail_step.clone(), s.tail_model.clone(), s.tail_version.clone()));
                     (s.stream_id, s.chunk_rx, s.cancel_client)
                 }
@@ -593,8 +599,18 @@ impl GrpcService {
             // fire-and-forget (a cancel draws no unary reply, so .send() would
             // stall for ZMQ_RESPONSE_TIMEOUT). Harmless when the worker already
             // stopped (Done/Error) — it ignores the cancel.
-            let cancel_req = streaming::build_stream_cancel(stream_id.clone());
-            let _ = cancel_client.send_raw(cancel_req).await;
+            if is_ensemble {
+                crate::ensemble::cancel_chain(
+                    ensemble_chain.as_ref(),
+                    ensemble_abort.as_ref(),
+                    &stream_id,
+                    &cancel_client,
+                )
+                .await;
+            } else {
+                let cancel_req = streaming::build_stream_cancel(stream_id.clone());
+                let _ = cancel_client.send_raw(cancel_req).await;
+            }
 
             // #8: observe the incoming task so a panic is logged, not silently
             // dropped by a bare abort().
