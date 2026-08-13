@@ -2,6 +2,7 @@
 //! already explicit in the request), with the response wait bounded by the
 //! resolved deadline (B2 audit fix).
 
+use crate::error::AppError;
 use crate::grpc::auth::{enforce_auth_grpc, enforce_grpc_rate_limit};
 use crate::grpc::canary::canary_pin;
 use crate::grpc::error::err;
@@ -9,11 +10,68 @@ use crate::grpc::interceptor;
 use crate::grpc::metadata::inject_grpc_metadata;
 use crate::grpc::GrpcService;
 use crate::proto::liteserver as pb;
+use crate::registry::types::ModelType;
 use crate::request_context::RequestContext;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
+
+/// D30 (batch 3): element payload classification — the unary rules
+/// (`grpc_payload_is_json`: JSON content-type, or missing = JSON default)
+/// applied to a single batch element. JSON → parsed Json; anything else →
+/// opaque Binary bytes with the request's content-type.
+fn d30_element_payload(
+    data: &bytes::Bytes,
+    headers: &HashMap<String, String>,
+) -> Result<crate::ensemble::EnsembleValue, String> {
+    if crate::grpc::payload::grpc_payload_is_json(headers) {
+        let v: serde_json::Value = serde_json::from_slice(data)
+            .map_err(|e| format!("element is not valid JSON: {e}"))?;
+        Ok(crate::ensemble::EnsembleValue::Json(v))
+    } else {
+        let ct = headers
+            .get("content-type")
+            .cloned()
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        Ok(crate::ensemble::EnsembleValue::Binary(data.clone(), ct))
+    }
+}
+
+/// D30: element-level error — the mapped §4.4 unary-row HTTP status rides
+/// the status message (numeric-in-message convention, worker parity: 4xx
+/// passthrough / 5xx 500 / queue 503 / deadline 504 / load 503 / validation
+/// 400, via `AppError::http_status`).
+fn d30_element_error(e: &AppError) -> pb::InferResponse {
+    pb::InferResponse {
+        data: bytes::Bytes::new(),
+        status: Some(pb::Status {
+            code: "Error".to_string(),
+            message: format!("{} {}", e.http_status().as_u16(), e),
+        }),
+        metrics: None,
+    }
+}
+
+/// D30: success element — Json serialized back to bytes; Binary passed
+/// through verbatim (InferResponse carries no per-item content-type field).
+fn d30_element_ok(value: crate::ensemble::EnsembleValue) -> pb::InferResponse {
+    let data = match value {
+        crate::ensemble::EnsembleValue::Json(v) => {
+            bytes::Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
+        }
+        crate::ensemble::EnsembleValue::Binary(data, _ct) => data,
+    };
+    pb::InferResponse {
+        data,
+        status: Some(pb::Status {
+            code: "Ok".to_string(),
+            message: String::new(),
+        }),
+        metrics: None,
+    }
+}
 
 impl GrpcService {
     pub(crate) async fn batch_infer_impl(
@@ -74,7 +132,8 @@ impl GrpcService {
             ))));
         }
 
-        if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
+        let mv = self.registry.get(model_name, Some(&resolved_version));
+        if let Some(mv) = &mv {
             enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
             enforce_grpc_rate_limit(&self.rate_limiter, mv.policies.rate_limit.as_ref(), model_name, &client_ip)?;
         }
@@ -93,15 +152,38 @@ impl GrpcService {
         };
         crate::callback::fire_inference_request(&self.callback_runner, &req_ctx);
 
+        // P-DEADLINE (§4.0.10): carried to the worker so it can stop; the batch
+        // response wait below is also bounded server-side by this deadline.
+        // Moved before the D30 ensemble branch — elements share the same bound.
+        let deadline =
+            crate::deadline::resolve_from_grpc(&grpc_metadata, self.server_timeout.as_secs_f32());
+
+        // D30 (batch 3): batch × ensemble — element-wise DAG execution reusing
+        // execute_ensemble (batch = the unary shell). Elements run in parallel,
+        // response order preserved; element errors ride the element's status
+        // (§4.4 unary rows, B3 direct propagation) and never fail the whole
+        // batch. A streaming DAG is an unsupported combination → whole-RPC
+        // InvalidArgument.
+        if mv.as_ref().map(|m| m.model_type == ModelType::Ensemble).unwrap_or(false) {
+            return self
+                .batch_infer_ensemble(
+                    model_name.to_string(),
+                    resolved_version.clone(),
+                    req,
+                    client_ip.clone(),
+                    request_id.clone(),
+                    &deadline,
+                    &req_ctx,
+                    Instant::now(),
+                )
+                .await;
+        }
+
         let mut header_map: HashMap<String, String> = req.headers.clone();
         // P-TRACE: inject the active inference span's trace context into the
         // worker RequestMeta.headers (overwrites any client-supplied traceparent
         // so the worker is a child of THIS span; D8 Rust-only).
         crate::telemetry::inject(&mut header_map);
-        // P-DEADLINE (§4.0.10): carried to the worker so it can stop; the batch
-        // response wait below is also bounded server-side by this deadline.
-        let deadline =
-            crate::deadline::resolve_from_grpc(&grpc_metadata, self.server_timeout.as_secs_f32());
         let meta = pb::RequestMeta {
             route: "/predict".to_string(),
             headers: header_map,
@@ -215,5 +297,171 @@ impl GrpcService {
             }
             _ => Err(err(Status::internal("unexpected response type"))),
         }
+    }
+
+    /// D30 (batch 3): ensemble branch of batch_infer_impl — load the plan
+    /// once, reject streaming DAGs (no element-level streaming), then run
+    /// every element through `execute_ensemble` in parallel and return the
+    /// ordered per-element responses. Element-level failures map per §4.4
+    /// unary rows (B3 direct propagation) into the element's status; only a
+    /// plan-level failure (broken config) fails the whole RPC.
+    #[allow(clippy::too_many_arguments)] // batch plumbing: ids+deadline+ctx ride together by design
+    async fn batch_infer_ensemble(
+        &self,
+        model_name: String,
+        resolved_version: String,
+        req: pb::BatchInferRequest,
+        client_ip: String,
+        request_id: String,
+        deadline: &crate::deadline::ResolvedDeadline,
+        req_ctx: &crate::callback::InferenceContext,
+        start: Instant,
+    ) -> Result<Response<pb::BatchInferResponse>, Status> {
+        let plan = crate::ensemble::get_ensemble_plan(&self.app_state, &model_name, &resolved_version)
+            .await
+            .map_err(|e| err(crate::grpc::error::app_error_to_grpc_status(&e)))?;
+        if plan.steps[plan.output_step].stream || !plan.chains.is_empty() {
+            return Err(err(Status::invalid_argument(
+                "ensemble DAG contains a streaming step; batch has no element-level streaming (D30)",
+            )));
+        }
+
+        let opts = crate::ensemble::EnsembleExecOpts {
+            client_ip,
+            deadline_unix_ns: deadline.unix_ns,
+            decoupled: false,
+        };
+        // D15: ONE request-scope version snapshot shared by every element —
+        // a batch is one logical request, so elements resolve sub-model
+        // versions consistently.
+        let snapshot = Arc::new(crate::ensemble::VersionSnapshot::default());
+
+        let item_count = req.items.len();
+        let mut set: tokio::task::JoinSet<(usize, pb::InferResponse)> =
+            tokio::task::JoinSet::new();
+        for (i, item) in req.items.into_iter().enumerate() {
+            let payload = match d30_element_payload(&item, &req.headers) {
+                Ok(p) => p,
+                Err(msg) => {
+                    // Parse failure is an element-level error (order kept via
+                    // the index slot).
+                    let resp = d30_element_error(&AppError::InvalidRequestBody(msg));
+                    set.spawn(async move { (i, resp) });
+                    continue;
+                }
+            };
+            let state = self.app_state.clone();
+            let model = model_name.clone();
+            let version = resolved_version.clone();
+            let request_id_elem = format!("{}:{}", request_id, i);
+            let opts = opts.clone();
+            let snapshot = Arc::clone(&snapshot);
+            set.spawn(async move {
+                let resp = match crate::ensemble::execute_ensemble_inner(
+                    state, &model, &version, payload, &request_id_elem, opts, &snapshot, 0,
+                )
+                .await
+                {
+                    Ok(crate::ensemble::EnsembleOutcome::Unary(v)) => d30_element_ok(v),
+                    Ok(crate::ensemble::EnsembleOutcome::Stream(_)) => d30_element_error(
+                        &AppError::Internal(
+                            "ensemble returned a stream from batch (D30 violation)".to_string(),
+                        ),
+                    ),
+                    Err(e) => d30_element_error(&e),
+                };
+                (i, resp)
+            });
+        }
+
+        let mut items: Vec<Option<pb::InferResponse>> = vec![None; item_count];
+        while let Some(joined) = set.join_next().await {
+            let (i, resp) = joined.map_err(|e| {
+                err(Status::internal(format!("batch element task join error: {e}")))
+            })?;
+            items[i] = Some(resp);
+        }
+        let items = items
+            .into_iter()
+            .map(|r| r.expect("every spawned element task reports its slot"))
+            .collect();
+
+        crate::callback::fire_inference_response(&self.callback_runner, req_ctx, start);
+        Ok(Response::new(pb::BatchInferResponse { items }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D30: JSON content-type (and the missing-ct default) parses elements
+    /// as Json; any other content-type treats them as opaque Binary.
+    #[test]
+    fn d30_element_payload_classification() {
+        let json_headers: HashMap<String, String> =
+            [("content-type".to_string(), "application/json".to_string())].into();
+        let v = d30_element_payload(&bytes::Bytes::from_static(br#"{"a": 1}"#), &json_headers).unwrap();
+        assert_eq!(
+            v,
+            crate::ensemble::EnsembleValue::Json(serde_json::json!({"a": 1}))
+        );
+
+        // Missing content-type → JSON default (unary parity).
+        let v = d30_element_payload(&bytes::Bytes::from_static(br#"{"a": 1}"#), &HashMap::new()).unwrap();
+        assert!(matches!(v, crate::ensemble::EnsembleValue::Json(_)));
+
+        // Non-JSON content-type → Binary with the declared content-type.
+        let bin_headers: HashMap<String, String> =
+            [("content-type".to_string(), "image/png".to_string())].into();
+        let v = d30_element_payload(&bytes::Bytes::from_static(&[0x00, 0x01]), &bin_headers).unwrap();
+        match v {
+            crate::ensemble::EnsembleValue::Binary(data, ct) => {
+                assert_eq!(data.as_ref(), &[0x00, 0x01]);
+                assert_eq!(ct, "image/png");
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+
+        // JSON content-type + invalid bytes → element error.
+        let res = d30_element_payload(&bytes::Bytes::from_static(b"not json"), &json_headers);
+        assert!(res.is_err(), "invalid JSON element must error");
+    }
+
+    /// D30: element errors carry the mapped §4.4 unary-row HTTP status in
+    /// the status message (numeric-in-message, worker parity).
+    #[test]
+    fn d30_element_error_maps_http_status() {
+        let e = crate::error::AppError::QueueFull("queue full".to_string());
+        let resp = d30_element_error(&e);
+        let status = resp.status.as_ref().unwrap();
+        assert_eq!(status.code, "Error");
+        assert!(
+            status.message.starts_with("503"),
+            "queue full → 503, got {}",
+            status.message
+        );
+
+        let e = crate::error::AppError::InferenceTimeout("t".to_string());
+        assert!(
+            d30_element_error(&e).status.unwrap().message.starts_with("504"),
+            "step timeout → 504"
+        );
+    }
+
+    /// D30: success elements — Json serialized back to bytes, Binary passed
+    /// through verbatim (InferResponse carries no per-item content-type).
+    #[test]
+    fn d30_element_ok_shapes() {
+        let resp = d30_element_ok(crate::ensemble::EnsembleValue::Json(serde_json::json!({"x": 1})));
+        assert_eq!(resp.status.as_ref().unwrap().code, "Ok");
+        assert_eq!(resp.data.as_ref(), &br#"{"x":1}"#[..]);
+
+        let resp = d30_element_ok(crate::ensemble::EnsembleValue::Binary(
+            bytes::Bytes::from_static(b"raw"),
+            "image/png".to_string(),
+        ));
+        assert_eq!(resp.status.as_ref().unwrap().code, "Ok");
+        assert_eq!(resp.data.as_ref(), b"raw");
     }
 }
