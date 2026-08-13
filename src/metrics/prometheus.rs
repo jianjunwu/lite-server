@@ -85,7 +85,9 @@ lazy_static! {
             "liteserver_ensemble_step_latency_seconds",
             "Per-step latency in ensemble DAG"
         ).buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]),
-        &["ensemble", "step", "model", "version"]
+        // depth (m6/E1): nesting depth of the ensemble containing the step —
+        // bounded by the depth limit (8), so cardinality stays contained.
+        &["ensemble", "step", "model", "version", "depth"]
     ).unwrap();
 
     // Outlier detection metrics
@@ -615,8 +617,9 @@ pub fn record_version_switch(model: &str, from: &str, to: &str) {
 
 // ===== Ensemble metrics =====
 
-pub fn record_ensemble_step_latency(ensemble: &str, step: &str, model: &str, version: &str, latency_secs: f64) {
-    ENSEMBLE_STEP_LATENCY.with_label_values(&[ensemble, step, model, version]).observe(latency_secs);
+pub fn record_ensemble_step_latency(ensemble: &str, step: &str, model: &str, version: &str, depth: u32, latency_secs: f64) {
+    let depth_str = depth.to_string();
+    ENSEMBLE_STEP_LATENCY.with_label_values(&[ensemble, step, model, version, &depth_str]).observe(latency_secs);
 }
 
 // ===== Streaming metrics =====

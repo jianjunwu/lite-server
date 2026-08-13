@@ -655,6 +655,7 @@ async fn sse_infer_impl(
                 &tail_step,
                 &tail_model,
                 &tail_version,
+                0, // tail step of a top-level ensemble = depth 0 (nested ensembles cannot stream, D4)
                 open_time.elapsed().as_secs_f64(),
             );
         }
@@ -1618,6 +1619,7 @@ async fn handle_ws_stream(
                 &tail_step,
                 &tail_model,
                 &tail_version,
+                0, // tail step of a top-level ensemble = depth 0 (nested ensembles cannot stream, D4)
                 open_time.elapsed().as_secs_f64(),
             );
         }

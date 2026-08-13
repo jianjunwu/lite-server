@@ -388,6 +388,7 @@ impl GrpcService {
                     &tail_step,
                     &tail_model,
                     &tail_version,
+                    0, // tail step of a top-level ensemble = depth 0 (nested ensembles cannot stream, D4)
                     start.elapsed().as_secs_f64(),
                 );
             }
