@@ -231,7 +231,7 @@ async fn h2_bidi_entry_impl(
         // then the client's normal finish; late data frames die with the
         // transport). Undeclared ensembles keep the D17 aggregation.
         let declared = crate::ensemble::ensemble_declares_inputs(
-            &state, &model_name, &resolved_version,
+            &state, model_name, &resolved_version,
             crate::ensemble::dag_selector_from_http(&headers)?.as_deref(),
         )
         .await?;

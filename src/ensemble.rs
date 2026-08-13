@@ -20,6 +20,10 @@ use uuid::Uuid;
 
 // ===== EnsembleValue: typed step input/output (B3, E6) =====
 
+/// The materialized outputs of one step — `(context key, value)` pairs
+/// (MIMO: `step.alias` keys; undeclared steps yield the single `step` key).
+type StepResults = Vec<(String, EnsembleValue)>;
+
 /// A value flowing through an ensemble DAG edge.
 ///
 /// `Json` is the historical path — all steps participate in field-level
@@ -1017,16 +1021,14 @@ fn resolve_output(
 
 /// MIMO (batch 4①, R1-R5/R9/R11/R12): build the static type environment.
 /// With an `inputs` declaration every ref's type is parse-decidable:
-///  - R1/R2: declaration field validation (names, type gating);
-///  - R3/R5: namespace rules (binary paths, legacy `$request`, undeclared
-///    `$inputs`);
-///  - R11/R12: per-step input-mode dispatch (all-Json → GroupJson, exactly
-///    one whole Binary → BinaryPassThrough, anything else → error);
-///  - R9: params × Binary is a static error once the mode is decided;
-///  - R4: steps referencing optional (no-default) inputs are CONDITIONAL —
-///    recorded for the runtime skip (D13).
-/// Legacy configs (no declaration) return all-None modes (dynamic dispatch,
-/// byte-identical) and reject `$inputs` (R5).
+/// - R1/R2: declaration field validation (names, type gating);
+/// - R3/R5: namespace rules (binary paths, legacy `$request`, undeclared `$inputs`);
+/// - R9: params × Binary is a static error once the mode is decided;
+/// - R4: optional-input refs make the step CONDITIONAL (runtime skip, D13);
+/// - R11/R12: per-step input-mode dispatch (GroupJson / BinaryPassThrough, mixed → error).
+///
+/// Legacy configs (no declaration) return all-None modes (dynamic
+/// dispatch, byte-identical) and reject `$inputs` (R5).
 #[allow(clippy::type_complexity)] // (modes, conditional) is a natural parse pair
 fn analyze_static_types(
     steps: &[EnsembleStep],
@@ -1837,12 +1839,13 @@ pub enum ResolvedRef {
 /// Resolve a `$ref` against the runtime context. The PLAN's static type
 /// environment decides the semantics (parse rules R3/R5/R7/R8 already
 /// rejected ill-typed refs — the runtime only projects/forwards):
-///  - `$request[.field]` — legacy anonymous root (rejected at parse in
-///    declared mode, R5);
-///  - `$inputs.NAME[.a.b]` — named root input; absent optional → Absent;
-///  - `$stepX[.field]` — undeclared step (static json, legacy single-field);
-///  - `$stepX.ALIAS` — declared alias; a binary alias passes through whole
-///    (D8), a json alias projects (MIMO②).
+/// - `$request[.field]` — legacy anonymous root (parse-rejected in
+///   declared mode, R5);
+/// - `$inputs.NAME[.a.b]` — named root input; absent optional → Absent;
+/// - `$stepX[.field]` — undeclared step (static json, legacy single-field);
+/// - `$stepX.ALIAS` — declared alias; a binary alias passes through whole
+///   (D8), a json alias projects (MIMO②).
+///
 /// Runtime type mismatches (declared json but the worker produced binary)
 /// are step errors (I3's runtime failure #1).
 fn resolve_ref(
@@ -3019,10 +3022,10 @@ pub(crate) async fn execute_ensemble_inner(
         // Historical unary path — byte-identical behaviour (E7: multi-sink
         // responses build from the same context via build_response).
         run_layers(
-            &state, &plan, &plan.layers, &mut context, &absent_inputs,
+            &state, plan, &plan.layers, &mut context, &absent_inputs,
             model_name, version, request_id, &opts, deadline_unix_ns, snapshot, depth, &ancestors,
         ).await?;
-        return build_response(&plan, model_name, &context);
+        return build_response(plan, model_name, &context);
     }
 
     // §4.2 pipeline branch (batch 2): the DAG contains a chain — run the
@@ -3048,12 +3051,12 @@ pub(crate) async fn execute_ensemble_inner(
             }
         }
         run_layers(
-            &state, &plan, &pre_layers, &mut context, &absent_inputs,
+            &state, plan, &pre_layers, &mut context, &absent_inputs,
             model_name, version, request_id, &opts, deadline_unix_ns, snapshot, depth, &ancestors,
         )
         .await?;
         let mut stream = spawn_chain(
-            &state, &plan, chain, &context, request_id, &opts, deadline_unix_ns, snapshot,
+            &state, plan, chain, &context, request_id, &opts, deadline_unix_ns, snapshot,
         )
         .await?;
         // P10 (D40): the permit is WEIGHTED by the chain's streaming-step
@@ -3081,7 +3084,7 @@ pub(crate) async fn execute_ensemble_inner(
     };
     let layers_fut = async {
         run_layers(
-            &state, &plan, &plan.layers[..tail_layer], &mut context, &absent_inputs,
+            &state, plan, &plan.layers[..tail_layer], &mut context, &absent_inputs,
             model_name, version, request_id, &opts, deadline_unix_ns, snapshot, depth, &ancestors,
         )
         .await
@@ -3094,7 +3097,7 @@ pub(crate) async fn execute_ensemble_inner(
     // already waited in the queue once). The owned permit rides the stream
     // and releases when the adapter's forward task ends (D18 teardown path).
     let mut stream = open_tail_stream(
-        &state, &plan, tail_idx, tail_layer, &context, &absent_inputs,
+        &state, plan, tail_idx, tail_layer, &context, &absent_inputs,
         request_id, &opts, deadline_unix_ns, preflight?, snapshot, depth, &ancestors,
     ).await?;
     if let Some(capacity) = state.worker_manager.streaming_capacity() {
@@ -3144,7 +3147,7 @@ async fn run_layers(
             // in the layer, so a cancelled ensemble does not leave sub-steps
             // running on workers (detached `tokio::spawn` would outlive the
             // parent). Completed tasks are no-ops to abort.
-            let mut set: tokio::task::JoinSet<(String, Result<Vec<(String, EnsembleValue)>, AppError>)> =
+            let mut set: tokio::task::JoinSet<(String, Result<StepResults, AppError>)> =
                 tokio::task::JoinSet::new();
             for &step_idx in layer {
                 // E8-2 (batch 5): a when-false step is skipped (E6 channel).
@@ -3293,7 +3296,7 @@ async fn open_tail_stream(
     }
 
     let run_siblings = async {
-        let mut set: tokio::task::JoinSet<(String, Result<Vec<(String, EnsembleValue)>, AppError>)> =
+        let mut set: tokio::task::JoinSet<(String, Result<StepResults, AppError>)> =
             tokio::task::JoinSet::new();
         for idx in siblings {
             // E8-2: a when-false sibling is skipped (E6 channel); an eval
@@ -6691,13 +6694,13 @@ ensemble:
             decoupled: false,
             dag_selector: Some("fast".into()),
         };
-        assert!(eval_when(&plan.steps[0].when.as_ref().unwrap(), &opts, &context).unwrap(), "1 == 1");
-        assert!(!eval_when(&plan.steps[1].when.as_ref().unwrap(), &opts, &context).unwrap(), "1 == '1' must be false (strict, no coercion)");
-        assert!(!eval_when(&plan.steps[2].when.as_ref().unwrap(), &opts, &context).unwrap(), "number contains → false");
-        assert!(!eval_when(&plan.steps[3].when.as_ref().unwrap(), &opts, &context).unwrap(), "1 in ['x','y'] must be false");
+        assert!(eval_when(plan.steps[0].when.as_ref().unwrap(), &opts, &context).unwrap(), "1 == 1");
+        assert!(!eval_when(plan.steps[1].when.as_ref().unwrap(), &opts, &context).unwrap(), "1 == '1' must be false (strict, no coercion)");
+        assert!(!eval_when(plan.steps[2].when.as_ref().unwrap(), &opts, &context).unwrap(), "number contains → false");
+        assert!(!eval_when(plan.steps[3].when.as_ref().unwrap(), &opts, &context).unwrap(), "1 in ['x','y'] must be false");
         // absent != null → true (absence = null, R16)
-        assert!(eval_when(&plan.steps[4].when.as_ref().unwrap(), &opts, &context).unwrap(), "absent != null must be true");
-        assert!(eval_when(&plan.steps[5].when.as_ref().unwrap(), &opts, &context).unwrap(), "$request.dag == 'fast'");
+        assert!(eval_when(plan.steps[4].when.as_ref().unwrap(), &opts, &context).unwrap(), "absent != null must be true");
+        assert!(eval_when(plan.steps[5].when.as_ref().unwrap(), &opts, &context).unwrap(), "$request.dag == 'fast'");
     }
 
     // === E8-1 (batch 5): named DAG sets ===
@@ -7185,7 +7188,7 @@ ensemble:
         blob.extend_from_slice(tail);
         let (v, t) = split_envelope(&blob).expect("valid container must split");
         assert_eq!(v, json!({"inputs": [{"name": "text", "data": 1}]}));
-        assert_eq!(t.as_deref(), Some(&tail[..]));
+        assert_eq!(t.as_deref(), Some(tail));
 
         // Magic mismatch → 400.
         let err = split_envelope(b"XXXX................").unwrap_err();
