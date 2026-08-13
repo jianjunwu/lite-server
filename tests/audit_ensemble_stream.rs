@@ -744,6 +744,10 @@ fn write_all_fixtures(repo: &std::path::Path) {
     write_ensemble(repo, "ens_drift_parent", ENS_DRIFT_PARENT_YAML);
     write_ensemble(repo, "ens_e5_stream", ENS_E5_STREAM_YAML);
     write_ensemble(repo, "ens_e5_autoload", ENS_E5_AUTOLOAD_YAML);
+    // ===== audit (batch 3) defect-reproduction fixtures =====
+    write_ensemble(repo, "ens_sibling_race", ENS_SIBLING_RACE_YAML);
+    write_ensemble(repo, "ens_e5_slow_child", ENS_E5_SLOW_CHILD_YAML);
+    write_ensemble(repo, "ens_e5_nested_timeout", ENS_E5_NESTED_TIMEOUT_YAML);
 }
 
 fn write_server_yaml(repo: &std::path::Path, http_port: u16, extra: &str, orch_extra: &str) -> std::path::PathBuf {
@@ -760,7 +764,7 @@ fn write_server_yaml(repo: &std::path::Path, http_port: u16, extra: &str, orch_e
         format!(
             "server:\n  http_port: {http_port}\n  timeout: 30.0\n{extra}\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n",
             repo.display()
         ),
     )
@@ -1143,7 +1147,7 @@ async fn boot_server_grpc(extra: &str) -> (String, u16, ServerGuard, std::path::
             "server:\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  timeout: 30.0\n{extra}\n\n\
              grpc:\n  enabled: true\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n",
             repo.display()
         ),
     )
@@ -2494,6 +2498,45 @@ const ENS_E5_AUTOLOAD_YAML: &str = r#"ensemble:
         pre: "$pre.pre"
 "#;
 
+/// Audit: two SAME-LAYER steps both calling the same child ensemble is legal
+/// fan-out (E3 params make the shape natural) — not recursion. The child
+/// (ens_drift_child → drift v1) runs ~2s, so the first sibling's child run
+/// stays in flight while the second checks the shared ancestor chain.
+const ENS_SIBLING_RACE_YAML: &str = r#"ensemble:
+  steps:
+    - name: s1
+      model: ens_drift_child
+      inputs:
+        x: "$request"
+    - name: s2
+      model: ens_drift_child
+      inputs:
+        x: "$request"
+"#;
+
+/// Audit: child of the nested-timeout parent — a 2s unary sub-model, so the
+/// parent step's 0.3s cap is the only bound that could stop it early.
+const ENS_E5_SLOW_CHILD_YAML: &str = r#"ensemble:
+  steps:
+    - name: c
+      model: drift
+      version: "1"
+      inputs:
+        x: "$request.x"
+"#;
+
+/// Audit: parent step → child ensemble with timeout_secs 0.3 — E5's local
+/// timeout wrap must bound the CHILD run (nested execution is the step's
+/// execution), not just direct worker calls.
+const ENS_E5_NESTED_TIMEOUT_YAML: &str = r#"ensemble:
+  steps:
+    - name: child
+      model: ens_e5_slow_child
+      timeout_secs: 0.3
+      inputs:
+        x: "$request"
+"#;
+
 /// Reflect worker: returns the WHOLE decoded request (params observable).
 fn write_reflect(repo: &std::path::Path) {
     write_model_py(
@@ -2926,4 +2969,303 @@ async fn test_audit_stream_e5_autoload_timeout_504() {
         .await
         .expect_err("a step budget that cannot cover the autoload must fail");
     assert_eq!(err, reqwest::StatusCode::GATEWAY_TIMEOUT, "must be 504 (deadline row)");
+}
+
+/// D35 transport parity (gRPC server-streaming): the tail step's timeout
+/// fires mid-stream — chunks flow first, then the tonic stream ends with
+/// DEADLINE_EXCEEDED (the same terminal shape as a client overall deadline).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_audit_stream_e5_stream_timeout_grpc_deadline_exceeded() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::StreamInferRequest;
+    use std::collections::HashMap;
+
+    let (base, grpc_port, _guard, _repo) = boot_server_grpc("").await;
+    wait_ready_all(&base, &["ens_e5_stream"]).await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+    let resp = client
+        .stream_infer(StreamInferRequest {
+            model_name: "ens_e5_stream".to_string(),
+            version: "1".to_string(),
+            data: bytes::Bytes::from(r#"{"text":"a b c d e f g h"}"#),
+            headers: HashMap::new(),
+            sequence_id: None,
+        })
+        .await
+        .expect("StreamInfer must open");
+    let mut stream = resp.into_inner();
+    let mut saw_token = false;
+    loop {
+        match stream.message().await {
+            Ok(Some(chunk)) => {
+                if let Ok(v) = serde_json::from_slice::<Value>(&chunk.data) {
+                    if v.get("token").is_some() {
+                        saw_token = true;
+                    }
+                }
+            }
+            Ok(None) => panic!("stream must end with a deadline error, not clean EOF"),
+            Err(status) => {
+                assert_eq!(
+                    status.code(),
+                    tonic::Code::DeadlineExceeded,
+                    "mid-stream step timeout must surface as DEADLINE_EXCEEDED: {status}"
+                );
+                break;
+            }
+        }
+    }
+    assert!(saw_token, "chunks must flow before the step cap fires");
+}
+
+/// D35 transport parity (WS): the tail step's timeout fires mid-stream —
+/// chunks flow first, then the error message + close (§4.4: 开流后失败 →
+/// Error 收口; the ws sink drop ends the session).
+#[tokio::test]
+#[serial]
+async fn test_audit_stream_e5_stream_timeout_ws_error_close() {
+    use futures::{SinkExt, StreamExt};
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_e5_stream"]).await;
+    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let ws_url = format!("ws://127.0.0.1:{}/v2/models/ens_e5_stream/stream", http_port);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"text":"a b c d e f g h"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"type":"close"}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let mut saw_token = false;
+    let mut saw_error = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(b)))) => {
+                if b.windows(5).any(|w| w == b"token") {
+                    saw_token = true;
+                }
+            }
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
+                if t.contains("deadline exceeded") {
+                    saw_error = true;
+                    break;
+                }
+            }
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))))
+            | Ok(Some(Err(_)))
+            | Ok(None)
+            | Err(_) => break,
+            _ => {}
+        }
+    }
+    assert!(saw_token, "chunks must flow before the step cap fires");
+    assert!(saw_error, "mid-stream step timeout must close with an error message");
+}
+
+/// D35 transport parity (h2 bidi): the tail step's timeout fires mid-stream
+/// — LPM Data chunks flow first, then an Error frame + close (§4.4).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_audit_stream_e5_stream_timeout_h2_bidi_error_frame() {
+    use lite_server::proto::liteserver as pb;
+    use lite_server::streaming::lpm;
+    use futures::StreamExt;
+
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_e5_stream"]).await;
+
+    // Single Open frame (single frame = the original value, D17) + body EOF
+    // half-close → trigger (D33) → the tail stream flows down.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, reqwest::Error>>(16);
+    tx.send(Ok(lpm::encode_frame(&pb::BidiChunk {
+        stream_id: "t".into(),
+        payload: Some(pb::bidi_chunk::Payload::Open(pb::BidiOpen {
+            initial_data: bytes::Bytes::from(r#"{"text":"a b c d e f g h"}"#),
+            ..Default::default()
+        })),
+    })))
+    .await
+    .unwrap();
+    drop(tx); // body EOF → half-close → trigger (D33)
+    let body_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let body = reqwest::Body::wrap_stream(body_stream);
+
+    let resp = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap()
+        .post(format!("{}/v2/models/ens_e5_stream/bidi", base))
+        .header("content-type", "application/x-lite-bidi")
+        .body(body)
+        .send()
+        .await
+        .expect("h2 bidi POST");
+    assert_eq!(resp.status(), 200, "h2 bidi must open");
+
+    let mut saw_token = false;
+    let mut saw_error = false;
+    let mut buf = bytes::BytesMut::new();
+    let mut body = resp.bytes_stream();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    'outer: while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), body.next()).await {
+            Ok(Some(Ok(bytes))) => {
+                buf.extend_from_slice(&bytes);
+                while let Ok(Some(chunk)) = lpm::try_decode_frame(&mut buf) {
+                    match chunk.payload {
+                        Some(pb::bidi_chunk::Payload::Data(d)) => {
+                            if let Ok(v) = serde_json::from_slice::<Value>(&d.data) {
+                                if v.get("token").is_some() {
+                                    saw_token = true;
+                                }
+                            }
+                        }
+                        Some(pb::bidi_chunk::Payload::Error(e)) => {
+                            assert!(
+                                e.message.contains("deadline exceeded"),
+                                "Error frame must name the deadline: {}",
+                                e.message
+                            );
+                            saw_error = true;
+                            break 'outer;
+                        }
+                        Some(pb::bidi_chunk::Payload::Close(_)) => break 'outer,
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    assert!(saw_token, "chunks must flow before the step cap fires");
+    assert!(saw_error, "mid-stream step timeout must send an Error frame");
+}
+
+// ---------------------------------------------------------------------------
+// Audit (batch 3) defect reproductions — these FAIL on the current code and
+// pin the fixes.
+// ---------------------------------------------------------------------------
+
+/// E1: same-layer sibling steps calling the SAME child ensemble is legal
+/// fan-out, not recursion. The shared flat ancestor chain flags the second
+/// sibling while the first's child run (~2s) is still in flight — a spurious
+/// "recursion detected" 400 on a valid DAG (same shape as D30 batch elements
+/// sharing one snapshot).
+#[serial]
+#[tokio::test]
+async fn test_audit_stream_e1_sibling_same_child_not_recursion() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_sibling_race", "ens_drift_child"]).await;
+
+    let client = reqwest::Client::new();
+    // Several rounds: round 0 cold-loads the child plan (both siblings check
+    // before either pushes); warm rounds race check-vs-push with the child
+    // run held open ~2s — on current code they 400 with "recursion".
+    for round in 0..4 {
+        let resp = client
+            .post(format!("{}/v2/models/ens_sibling_race/infer", base))
+            .header("Content-Type", "application/json")
+            .json(&json!({"text": "hello"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "round {round}: sibling fan-out to the same child must succeed, got {:?}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        );
+    }
+}
+
+/// E5 × E1: a nested-ensemble step's timeout_secs must bound the CHILD run
+/// (the local timeout wrap, §5-E5 — nested execution IS the step's
+/// execution). The child's sub-model sleeps 2s; the 0.3s step cap must fire
+/// 504. Running the full 2s and returning 200 silently drops the cap.
+#[serial]
+#[tokio::test]
+async fn test_audit_stream_e5_nested_step_timeout_enforced() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_e5_nested_timeout"]).await;
+
+    let client = reqwest::Client::new();
+    let start = std::time::Instant::now();
+    let resp = client
+        .post(format!("{}/v2/models/ens_e5_nested_timeout/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"text": "hello"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::GATEWAY_TIMEOUT,
+        "step timeout must bound the nested child run (504), got {:?}",
+        resp.status()
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "the step cap must fire at ~0.3s, not after the 2s child run: {:?}",
+        start.elapsed()
+    );
+}
+
+/// m4: the step-latency metric's version label must normalize UNRESOLVED
+/// versions ("latest"/omitted) to "latest" — recording the resolved active
+/// value makes the label set grow with every active drift (model × step ×
+/// version cardinality explosion, the exact risk m4 exists to prevent).
+#[serial]
+#[tokio::test]
+async fn test_audit_stream_e4_metric_version_label_normalized_to_latest() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_drift"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_drift/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"text": "hello"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let metrics = client
+        .get(format!("{}/metrics", base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    // Scope to ens_drift's version-OMITTED steps (model="drift"; the fin
+    // step pins version "1" explicitly and may legitimately carry "1").
+    let drift_series: Vec<&str> = metrics
+        .lines()
+        .filter(|l| {
+            l.starts_with("liteserver_ensemble_step_latency_seconds")
+                && l.contains(r#"ensemble="ens_drift""#)
+                && l.contains(r#"model="drift""#)
+        })
+        .collect();
+    assert!(!drift_series.is_empty(), "ens_drift drift-step series must exist");
+    for line in &drift_series {
+        assert!(
+            line.contains(r#"version="latest""#),
+            "unresolved step versions must normalize to \"latest\" (m4): {line}"
+        );
+    }
 }

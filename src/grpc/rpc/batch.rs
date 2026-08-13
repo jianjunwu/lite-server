@@ -358,7 +358,7 @@ impl GrpcService {
             let snapshot = Arc::clone(&snapshot);
             set.spawn(async move {
                 let resp = match crate::ensemble::execute_ensemble_inner(
-                    state, &model, &version, payload, &request_id_elem, opts, &snapshot, 0,
+                    state, &model, &version, payload, &request_id_elem, opts, &snapshot, 0, &[],
                 )
                 .await
                 {

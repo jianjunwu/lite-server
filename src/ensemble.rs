@@ -340,7 +340,19 @@ fn validate_dag(steps: &[EnsembleStep]) -> Result<(), AppError> {
         let deps = dependencies.entry(&step.name).or_default();
         for ref_str in step.inputs.values() {
             let caps = REF_RE.captures(ref_str).ok_or_else(|| {
-                AppError::Config(format!("invalid reference format: {}", ref_str))
+                // Single-level field refs only ($step.field). Name the
+                // boundary for nested paths ($step.a.b) — they open with
+                // MIMO multi-level mapping (R17), so a config author hitting
+                // the limit sees the future path instead of a bare error.
+                if ref_str.starts_with('$') && ref_str.contains('.') {
+                    AppError::Config(format!(
+                        "invalid reference '{}': nested field paths (a.b.c) are not \
+                         supported yet — multi-level paths open with MIMO (R17)",
+                        ref_str
+                    ))
+                } else {
+                    AppError::Config(format!("invalid reference format: {}", ref_str))
+                }
             })?;
             let source = caps.get(1).unwrap().as_str();
             if source != "request" && !step_names.contains(source) {
@@ -1112,22 +1124,20 @@ impl BidiAggregator {
 /// produce a DAG where step A hit v1 and step B hit v2. Explicit step
 /// versions bypass the snapshot entirely.
 ///
-/// E1 (batch 3): the struct also carries the request's active nesting chain
-/// (`ancestors`) — every ensemble on the current recursion path, guarded by
-/// `AncestorGuard`. The recursion inside `execute_step` spans spawned tasks,
-/// so the chain lives here (shared state) rather than on the call stack.
+/// E1 (batch 3): the NESTING CHAIN itself is NOT shared — each recursion
+/// level extends its own immutable chain ([`extend_ancestor_chain`]) and
+/// passes it down, so a concurrent sibling's in-flight child run can never
+/// be misread as an ancestor of this branch (B1: the flat shared Vec
+/// conflated sibling fan-out with recursion). Only the version table above
+/// is request-shared (D36).
 pub struct VersionSnapshot {
     resolved: std::sync::Mutex<HashMap<String, String>>,
-    /// (model, resolved version) of every ensemble on the active nesting
-    /// path — pushed on `execute_ensemble_inner` entry, popped on exit.
-    ancestors: std::sync::Mutex<Vec<(String, String)>>,
 }
 
 impl Default for VersionSnapshot {
     fn default() -> Self {
         Self {
             resolved: std::sync::Mutex::new(HashMap::new()),
-            ancestors: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -1158,45 +1168,30 @@ impl VersionSnapshot {
         snapshot.insert(step.model.clone(), resolved.clone());
         Ok(resolved)
     }
-
-    /// E1: is (model, version) already on the active nesting path? Guards
-    /// direct self-loops — and, beyond the plan's m6 depth-only tradeoff,
-    /// cross-model mutual recursion (A→B→A) for free.
-    pub fn contains_ancestor(&self, model: &str, version: &str) -> bool {
-        self.ancestors
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(m, v)| m == model && v == version)
-    }
-
-    /// E1: push an ensemble onto the nesting chain; the returned guard pops
-    /// it on drop (every exit path of `execute_ensemble_inner`).
-    pub fn push_ancestor(self: &Arc<Self>, model: String, version: String) -> AncestorGuard {
-        self.ancestors.lock().unwrap().push((model.clone(), version.clone()));
-        AncestorGuard {
-            snapshot: Arc::clone(self),
-            entry: (model, version),
-        }
-    }
 }
 
-/// E1: RAII pop of a [`VersionSnapshot`] ancestor entry — the nested run
-/// spans spawned step tasks, so the chain can only be cleaned up by the
-/// scope that pushed it.
-pub struct AncestorGuard {
-    snapshot: Arc<VersionSnapshot>,
-    entry: (String, String),
+/// E1: is (model, version) on THIS branch's nesting chain? Guards direct
+/// self-loops — and, beyond the plan's m6 depth-only tradeoff, cross-model
+/// mutual recursion (A→B→A) for free. The chain is immutable per branch:
+/// a concurrent sibling's entries live on a DIFFERENT chain, so legal
+/// same-layer fan-out to one child ensemble is never misread as recursion
+/// (B1).
+fn contains_ancestor(chain: &[(String, String)], model: &str, version: &str) -> bool {
+    chain.iter().any(|(m, v)| m == model && v == version)
 }
 
-impl Drop for AncestorGuard {
-    fn drop(&mut self) {
-        if let Ok(mut ancestors) = self.snapshot.ancestors.lock() {
-            if let Some(pos) = ancestors.iter().rposition(|e| *e == self.entry) {
-                ancestors.remove(pos);
-            }
-        }
-    }
+/// E1: extend this branch's nesting chain with the current ensemble for the
+/// nested run. The parent chain is left untouched — sibling branches built
+/// from the same parent stay independent (B1: per-branch chains replace the
+/// flat request-global Vec; the version table alone remains shared, D36).
+fn extend_ancestor_chain(
+    chain: &[(String, String)],
+    model: &str,
+    version: &str,
+) -> Vec<(String, String)> {
+    let mut child = chain.to_vec();
+    child.push((model.to_string(), version.to_string()));
+    child
 }
 
 /// E1: runtime nesting depth limit (default 8, counted along the call tree
@@ -1230,7 +1225,12 @@ fn step_effective_deadline(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as i64;
-    let step_deadline = now_unix_ns + (timeout_secs * 1e9) as i64;
+    // Saturating: a parse-legal but absurd cap (e.g. 1e18 s) saturates the
+    // f64→i64 cast, and a plain `now +` addition would then overflow — debug
+    // builds panic, release wraps negative (every request on the step then
+    // fails instantly as "expired"). Saturating keeps the config's intent
+    // ("effectively no timeout") without either failure mode.
+    let step_deadline = now_unix_ns.saturating_add((timeout_secs * 1e9) as i64);
     match parent_deadline_unix_ns {
         Some(parent) => Some(parent.min(step_deadline)),
         None => Some(step_deadline),
@@ -1252,9 +1252,10 @@ fn execute_nested_ensemble_boxed(
     opts: EnsembleExecOpts,
     snapshot: Arc<VersionSnapshot>,
     depth: u32,
+    ancestors: Vec<(String, String)>, // E1: this branch's chain (owned — moves into the boxed future)
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<EnsembleOutcome, AppError>> + Send>> {
     Box::pin(async move {
-        execute_ensemble_inner(state, &model, &version, payload, &request_id, opts, &snapshot, depth)
+        execute_ensemble_inner(state, &model, &version, payload, &request_id, opts, &snapshot, depth, &ancestors)
             .await
     })
 }
@@ -1408,14 +1409,16 @@ pub async fn execute_ensemble(
     // D15 (E4): request-scoped version snapshot — shared across every step
     // of this request and (D36) across nested ensemble calls.
     let snapshot = Arc::new(VersionSnapshot::default());
-    execute_ensemble_inner(state, model_name, version, payload, request_id, opts, &snapshot, 0)
+    execute_ensemble_inner(state, model_name, version, payload, request_id, opts, &snapshot, 0, &[])
         .await
 }
 
 /// D36 (E1/E4): the internal execution entry — the D15 version snapshot and
 /// the nesting depth ride here, so the public signature stays fixed. Nested
-/// ensembles recurse into this function with depth+1 and the SAME snapshot:
-/// a parent and child resolving the same model share one version.
+/// ensembles recurse into this function with depth+1, the SAME snapshot (a
+/// parent and child resolving the same model share one version) and a
+/// branch-local ancestors chain (E1: recursion detection checks only THIS
+/// branch's path — concurrent siblings never share it, B1).
 #[allow(clippy::too_many_arguments)] // execution plumbing: state+ids+snapshot ride together by design
 pub(crate) async fn execute_ensemble_inner(
     state: Arc<AppState>,
@@ -1426,13 +1429,15 @@ pub(crate) async fn execute_ensemble_inner(
     opts: EnsembleExecOpts,
     snapshot: &Arc<VersionSnapshot>,
     depth: u32,
+    ancestors: &[(String, String)], // E1: enclosing ensembles (self NOT included)
 ) -> Result<EnsembleOutcome, AppError> {
     // E1: depth limit before anything else (cheapest failure first).
     ensure_nesting_depth(depth)?;
-    // E1: register this ensemble on the nesting chain — the guard pops on
-    // every exit path (the recursion happens inside spawned step tasks, so
-    // the chain cannot live on the call stack).
-    let _ancestor = snapshot.push_ancestor(model_name.to_string(), version.to_string());
+    // E1: this branch's nesting chain — the current ensemble plus every
+    // enclosing one. Each recursion level extends its OWN copy, so a
+    // concurrent sibling branch never sees this entry (B1: the flat shared
+    // Vec misread sibling fan-out as recursion).
+    let ancestors = extend_ancestor_chain(ancestors, model_name, version);
     // P0 (D6): plan comes from the cache — parse/validate/layers run once per
     // config version, not per request. In-flight requests hold their Arc and
     // finish on the old plan even across a reload (D23).
@@ -1447,7 +1452,7 @@ pub(crate) async fn execute_ensemble_inner(
         // Historical unary path — byte-identical behaviour.
         run_layers(
             &state, &plan, &plan.layers, &mut context,
-            model_name, version, request_id, &opts, deadline_unix_ns, snapshot, depth,
+            model_name, version, request_id, &opts, deadline_unix_ns, snapshot, depth, &ancestors,
         ).await?;
         let value = context.get(&plan.steps[tail_idx].name).cloned()
             .ok_or_else(|| AppError::Internal("ensemble produced no output".to_string()))?;
@@ -1481,7 +1486,7 @@ pub(crate) async fn execute_ensemble_inner(
         }
         run_layers(
             &state, &plan, &pre_layers, &mut context,
-            model_name, version, request_id, &opts, deadline_unix_ns, snapshot, depth,
+            model_name, version, request_id, &opts, deadline_unix_ns, snapshot, depth, &ancestors,
         )
         .await?;
         let mut stream = spawn_chain(
@@ -1514,7 +1519,7 @@ pub(crate) async fn execute_ensemble_inner(
     let layers_fut = async {
         run_layers(
             &state, &plan, &plan.layers[..tail_layer], &mut context,
-            model_name, version, request_id, &opts, deadline_unix_ns, snapshot, depth,
+            model_name, version, request_id, &opts, deadline_unix_ns, snapshot, depth, &ancestors,
         )
         .await
     };
@@ -1527,7 +1532,7 @@ pub(crate) async fn execute_ensemble_inner(
     // and releases when the adapter's forward task ends (D18 teardown path).
     let mut stream = open_tail_stream(
         &state, &plan, tail_idx, tail_layer, &context,
-        request_id, &opts, deadline_unix_ns, preflight?, snapshot, depth,
+        request_id, &opts, deadline_unix_ns, preflight?, snapshot, depth, &ancestors,
     ).await?;
     if let Some(capacity) = state.worker_manager.streaming_capacity() {
         stream.permit = Some(capacity.try_acquire()?);
@@ -1554,6 +1559,7 @@ async fn run_layers(
     deadline_unix_ns: Option<i64>,
     snapshot: &Arc<VersionSnapshot>,
     depth: u32, // E1: nesting depth — carried into execute_step for recursion
+    ancestors: &[(String, String)], // E1: this branch's chain (B1: never shared across sibling branches)
 ) -> Result<(), AppError> {
     let total_budget = crate::deadline::remaining(deadline_unix_ns);
     let plan_run = plan.clone();
@@ -1579,12 +1585,22 @@ async fn run_layers(
                 // resolution aborts the layer here — the same error execute_step
                 // would surface for that step). The resolved label is the
                 // truthful version the step will call.
-                let version_label = snapshot.resolve(&state.registry, &step)?;
+                let resolved_label = snapshot.resolve(&state.registry, &step)?;
+                // m4: the metric label records the actual version only for
+                // EXPLICIT versions — unresolved ("latest"/omitted) normalizes
+                // to "latest" so active drift cannot grow the label set
+                // (model × step × version).
+                let version_label = if step.version.is_some() {
+                    resolved_label
+                } else {
+                    "latest".to_string()
+                };
                 let snapshot = snapshot.clone();
+                let ancestors = ancestors.to_vec();
                 set.spawn(async move {
                     let start = Instant::now();
                     let result =
-                        execute_step(state, &step, &ctx, &request_id, &client_ip, deadline_unix_ns, &snapshot, depth)
+                        execute_step(state, &step, &ctx, &request_id, &client_ip, deadline_unix_ns, &snapshot, depth, &ancestors)
                             .await;
                     let latency = start.elapsed().as_secs_f64();
                     crate::metrics::prometheus::record_ensemble_step_latency(
@@ -1650,6 +1666,7 @@ async fn open_tail_stream(
     preflight: Option<TailPreflight>,
     snapshot: &Arc<VersionSnapshot>,
     depth: u32, // E1: carried into sibling unary steps (they can recurse)
+    ancestors: &[(String, String)], // E1: this branch's chain (B1: never shared across sibling branches)
 ) -> Result<EnsembleStream, AppError> {
     // §4.1 rule 3: same-layer sibling unary steps still run in parallel with
     // the streaming step. They never enter `context` (output semantics belong
@@ -1679,9 +1696,10 @@ async fn open_tail_stream(
             let request_id = request_id.to_string();
             let client_ip = opts.client_ip.clone();
             let snapshot = snapshot.clone();
+            let ancestors = ancestors.to_vec();
             set.spawn(async move {
                 let name = step.name.clone();
-                execute_step(state, &step, &ctx, &request_id, &client_ip, deadline_unix_ns, &snapshot, depth).await
+                execute_step(state, &step, &ctx, &request_id, &client_ip, deadline_unix_ns, &snapshot, depth, &ancestors).await
                     .map(|v| (name.clone(), Ok(v)))
                     .unwrap_or_else(|e| (name.clone(), Err(e)))
             });
@@ -1962,7 +1980,14 @@ async fn spawn_chain(
     let tail = &plan.steps[tail_idx];
     // E4/D15: the metric label carries the RESOLVED tail version (the chain
     // nodes resolve via the same snapshot when their streams open).
-    let tail_version = snapshot.resolve(&state.registry, tail)?;
+    let resolved_tail = snapshot.resolve(&state.registry, tail)?;
+    // m4: label normalization — explicit versions only; unresolved
+    // ("latest"/omitted) records "latest" (no cardinality growth on drift).
+    let tail_version = if tail.version.is_some() {
+        resolved_tail
+    } else {
+        "latest".to_string()
+    };
 
     // Inter-hop channels (nodes.len() - 1) + the tail output channel.
     let mut hop_txs: Vec<mpsc::Sender<pb::StreamResponse>> = Vec::new();
@@ -2352,12 +2377,23 @@ async fn execute_stream_step(
         stream_id,
         cancel_client: Arc::clone(client),
         tail_model: step.model.clone(),
-        tail_version: resolved_version.clone(),
+        // m4: label normalization — explicit versions only; unresolved
+        // ("latest"/omitted) records "latest" (no cardinality growth on
+        // active drift).
+        tail_version: if step.version.is_some() {
+            resolved_version.clone()
+        } else {
+            "latest".to_string()
+        },
         tail_step: step.name.clone(),
         // D35 (batch 3): E5 timeout_secs → step wall-clock cap measured from
         // the open instant; the adapters' recv_chunk overall takes min(client
-        // overall, this). None = no step timeout.
-        step_deadline: step.timeout_secs.map(|t| Instant::now() + Duration::from_secs_f64(t)),
+        // overall, this). None = no step timeout. Absurdly large caps are
+        // parse-legal — an unrepresentable Duration degrades to "no cap"
+        // (None) instead of a from_secs_f64 overflow panic.
+        step_deadline: step.timeout_secs.and_then(|t| {
+            Instant::now().checked_add(Duration::try_from_secs_f64(t).ok()?)
+        }),
         chain: Arc::new(std::sync::Mutex::new(chain)),
         abort,
         // P10: filled by execute_ensemble after open_tail_stream returns.
@@ -2534,6 +2570,7 @@ async fn execute_step(
     deadline_unix_ns: Option<i64>,
     snapshot: &Arc<VersionSnapshot>,
     depth: u32, // E1: nesting depth — +1 on recursion into an ensemble step
+    ancestors: &[(String, String)], // E1: THIS branch's nesting chain (B1: never shared across sibling branches)
 ) -> Result<EnsembleValue, AppError> {
     // E4/D15: resolve the sub-model version at execution time — explicit
     // versions as-is, unresolved ("latest"/omitted) via the request-scoped
@@ -2594,7 +2631,7 @@ async fn execute_step(
         // share one resolution) and the shared parent deadline (E1: 递归共享
         // 父 deadline). The child request is the step's assembled payload
         // (params already merged, E3) re-materialized as a value.
-        if snapshot.contains_ancestor(&step.model, &resolved_version) {
+        if contains_ancestor(ancestors, &step.model, &resolved_version) {
             return Err(AppError::InvalidRequestBody(format!(
                 "ensemble recursion detected: {} v{} is already on the active nesting chain",
                 step.model, resolved_version
@@ -2628,7 +2665,7 @@ async fn execute_step(
             deadline_unix_ns,
             decoupled: false, // the child is unary-only (D4)
         };
-        let outcome = execute_nested_ensemble_boxed(
+        let nested = execute_nested_ensemble_boxed(
             state.clone(),
             step.model.clone(),
             resolved_version.clone(),
@@ -2637,8 +2674,24 @@ async fn execute_step(
             child_opts,
             Arc::clone(snapshot),
             depth + 1,
-        )
-        .await?;
+            ancestors.to_vec(),
+        );
+        // E5 (batch 3): the step wall-clock cap bounds the nested run too —
+        // the child execution IS this step's execution, same local timeout
+        // wrap as the unary response wait below. E1's "recursion shares the
+        // PARENT deadline" is preserved: child_opts still carries the parent
+        // deadline; the cap is enforced here at the step boundary.
+        let outcome = match crate::deadline::remaining(step_deadline) {
+            Some(rem) => match tokio::time::timeout(rem, nested).await {
+                Ok(r) => r?,
+                Err(_) => {
+                    return Err(AppError::InferenceTimeout(format!(
+                        "ensemble step {} timed out", step.name
+                    )))
+                }
+            },
+            None => nested.await?,
+        };
         return match outcome {
             EnsembleOutcome::Unary(v) => Ok(v),
             // Unreachable under D4 (child plans with streaming are rejected
@@ -4003,23 +4056,44 @@ ensemble:
     /// on the active nesting path).
     #[test]
     fn e1_ancestor_chain_detects_self_loop() {
-        let snapshot = Arc::new(VersionSnapshot::default());
-        let _guard = snapshot.push_ancestor("m".to_string(), "1".to_string());
-        assert!(snapshot.contains_ancestor("m", "1"));
-        assert!(!snapshot.contains_ancestor("m", "2"));
-        assert!(!snapshot.contains_ancestor("other", "1"));
+        let chain = vec![("a".to_string(), "1".to_string()), ("b".to_string(), "2".to_string())];
+        assert!(contains_ancestor(&chain, "a", "1"));
+        assert!(contains_ancestor(&chain, "b", "2"));
+        assert!(!contains_ancestor(&chain, "a", "2"));
+        assert!(!contains_ancestor(&chain, "other", "1"));
     }
 
-    /// E1: the ancestor guard pops its entry on drop (request-scope cleanup
-    /// on every return path of the nested execution).
+    /// E1: a nested run extends the chain with the child ensemble; the
+    /// PARENT chain stays untouched — each branch owns its copy, the chain
+    /// is not request-global mutable state.
     #[test]
-    fn e1_ancestor_guard_pops_on_drop() {
-        let snapshot = Arc::new(VersionSnapshot::default());
-        {
-            let _guard = snapshot.push_ancestor("m".to_string(), "1".to_string());
-            assert!(snapshot.contains_ancestor("m", "1"));
-        }
-        assert!(!snapshot.contains_ancestor("m", "1"));
+    fn e1_ancestor_chain_extends_per_branch() {
+        let parent = vec![("a".to_string(), "1".to_string())];
+        let child = extend_ancestor_chain(&parent, "b", "2");
+        assert!(contains_ancestor(&child, "a", "1"));
+        assert!(contains_ancestor(&child, "b", "2"));
+        assert_eq!(parent.len(), 1, "the parent chain must stay unchanged");
+        assert!(!contains_ancestor(&parent, "b", "2"));
+    }
+
+    /// E1: `contains_ancestor` answers for the CURRENT branch only — the
+    /// chain is immutable per branch (each recursion level extends its own
+    /// copy via [`extend_ancestor_chain`]), so a concurrent sibling's
+    /// in-flight child run can never appear on this branch's chain. The old
+    /// flat shared Vec conflated the two, turning legal same-layer fan-out
+    /// (two steps calling one child ensemble; D30 batch elements) into a
+    /// spurious "recursion detected" 400 (B1).
+    #[test]
+    fn e1_sibling_in_flight_child_is_not_recursion() {
+        let parent = vec![("p".to_string(), "1".to_string())];
+        // Sibling A recurses into the child ensemble and extends ITS branch...
+        let _chain_a = extend_ancestor_chain(&parent, "child", "1");
+        // ...sibling B checks ITS OWN chain — the sibling's in-flight child
+        // run is not an ancestor of B's branch.
+        assert!(
+            !contains_ancestor(&parent, "child", "1"),
+            "a concurrent sibling's in-flight child call is not recursion"
+        );
     }
 
     /// E1: nesting depth limit — depth counts along the call tree; level 0
@@ -4029,6 +4103,21 @@ ensemble:
         assert!(ensure_nesting_depth(0).is_ok());
         assert!(ensure_nesting_depth(7).is_ok());
         assert!(ensure_nesting_depth(8).is_err());
+    }
+
+    /// E5: `timeout_secs` is parse-legal whenever positive & finite, but the
+    /// unix_ns conversion saturates the f64→i64 cast and the `now +` addition
+    /// then overflows: debug builds panic (arithmetic overflow), release
+    /// wraps negative — every request on that step then fails instantly as
+    /// expired. The conversion must clamp instead of overflowing.
+    #[test]
+    fn e5_huge_timeout_secs_must_not_overflow() {
+        // 1e18 s (~3×10^10 years) is absurd but parse-legal (positive, finite).
+        let d = step_effective_deadline(None, Some(1e18));
+        assert!(
+            d.is_some() && d.unwrap() > 0,
+            "a huge timeout must clamp to a sane deadline, got {d:?}"
+        );
     }
 
     // ===== Batch 3 (E2/E3) output selection + params tests =====
