@@ -329,6 +329,39 @@ def test_step_output_rejects_unknown_type():
         StepOutput(type="tensor")
 
 
+def test_step_rejects_non_positive_timeout_like_rust_schema():
+    # The Rust schema rejects timeout_secs <= 0 at load time (E5: "must be a
+    # positive, finite duration"). The module docstring promises a serialized
+    # config is "always loadable" — a declaration accepting 0 (or NaN/inf)
+    # would serialize a config the server refuses.
+    with pytest.raises(ValueError, match="timeout_secs"):
+        Step(name="a", model="m", inputs={}, timeout_secs=0)
+
+
+def test_step_rejects_nan_timeout_like_rust_schema():
+    with pytest.raises(ValueError, match="timeout_secs"):
+        Step(name="a", model="m", inputs={}, timeout_secs=float("nan"))
+
+
+def test_step_rejects_inf_timeout_like_rust_schema():
+    with pytest.raises(ValueError, match="timeout_secs"):
+        Step(name="a", model="m", inputs={}, timeout_secs=float("inf"))
+
+
+def test_ensemble_dag_rejects_empty_dags():
+    # Rust rejects "ensemble.dags declares no sets (E8-1)" at load time.
+    with pytest.raises(ValueError, match="dags"):
+        EnsembleDAG(dags={})
+
+
+def test_input_decl_rejects_required_with_default_like_rust_schema():
+    # Rust R2: "required: true conflicts with a default" is a load-time
+    # Config error. The declaration must not serialize configs the server
+    # cannot load.
+    with pytest.raises(ValueError, match="required"):
+        InputDecl(type="json", required=True, default="You are helpful.")
+
+
 # ===== canonical form (analyzer drift check foundation) =====
 
 

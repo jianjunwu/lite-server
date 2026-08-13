@@ -5304,7 +5304,18 @@ fn unary_response_to_value(
                     // / declared steps keep the historical parse validation.
                     let is_binary = !single.media_type.is_empty()
                         && !single.media_type.starts_with("application/json");
-                    if raw_eligible && !is_binary {
+                    // B1/B2 (batch 6 audit): an EMPTY body and non-UTF-8
+                    // bytes fall back to parse_step_output — the empty body
+                    // keeps its historical `{}` normalization (splicing
+                    // empty bytes would produce malformed JSON downstream)
+                    // and non-UTF-8 bytes keep the historical parse error
+                    // channel (lossy decoding at the response boundary would
+                    // silently substitute U+FFFD).
+                    if raw_eligible
+                        && !is_binary
+                        && !single.data.is_empty()
+                        && std::str::from_utf8(&single.data).is_ok()
+                    {
                         Ok(EnsembleValue::RawJson(Arc::new(RawJsonValue::new(
                             single.data,
                         ))))
@@ -5870,6 +5881,67 @@ mod tests {
         assert!(
             err.to_string().contains("invalid JSON"),
             "typed/field-referenced steps keep validation, got: {err}"
+        );
+    }
+
+    #[test]
+    fn p2_raw_empty_body_keeps_historical_empty_object() {
+        // Historical behavior: an Ok JSON response with EMPTY data normalized
+        // to Json(json!({})) (parse_step_output's empty-body special case).
+        // P2 raw residency must not change that — splicing empty bytes into a
+        // downstream payload produces malformed JSON ({"a":}).
+        let single = pb::SingleResponse {
+            data: Bytes::new(),
+            media_type: "application/json".to_string(),
+            ..Default::default()
+        };
+        let value = unary_response_to_value(
+            "s",
+            pb::Response {
+                payload: Some(pb::response::Payload::Single(single)),
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap();
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), value);
+        let (out, _) = assemble_group_json("s2", &resolved, &HashMap::new()).unwrap();
+        assert_eq!(
+            out.as_ref(),
+            br#"{"a":{}}"#,
+            "an empty-body output must assemble like the historical parsed path"
+        );
+        serde_json::from_slice::<Value>(&out)
+            .expect("raw splice of an empty body produced invalid JSON");
+    }
+
+    #[test]
+    fn p2_unary_response_raw_rejects_invalid_utf8() {
+        // Historical behavior: a worker's non-UTF-8 bytes under an
+        // application/json media_type errored at parse_step_output (the
+        // step-error channel — skip/retries semantics intact). Raw
+        // residency must not keep them: lossy decoding at the envelope
+        // boundary would silently substitute U+FFFD for the original bytes.
+        let single = pb::SingleResponse {
+            data: Bytes::from(vec![
+                b'{', b'"', b'k', b'"', b':', b'"', 0xFFu8, b'"', b'}',
+            ]),
+            media_type: "application/json".to_string(),
+            ..Default::default()
+        };
+        let err = unary_response_to_value(
+            "s",
+            pb::Response {
+                payload: Some(pb::response::Payload::Single(single)),
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid JSON"),
+            "non-UTF-8 raw bytes must fall back to the historical parse error, got: {err}"
         );
     }
 

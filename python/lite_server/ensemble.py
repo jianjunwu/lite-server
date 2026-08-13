@@ -4,9 +4,11 @@ A `dag.py` next to a model's `config.yaml` can declare the DAG as Python
 objects and serialize it to the equivalent handwritten config the Rust
 orchestrator executes. Nothing here RUNS a DAG — execution stays in the Rust
 core (`src/ensemble.rs`), and DAG-level validation (graph refs, streaming
-rules, R1-R19) is the server's job at load time. This module only checks
-structural/type-level well-formedness so the serialized config is always
-loadable.
+rules, R1-R19) is the server's job at load time. This module checks
+structural/type-level well-formedness only (per-field rules mirrored from
+the Rust schema where statically decidable) — cross-field and graph rules
+stay with the server, and `lite-server analyze` surfaces load problems
+statically.
 
 `lite-server analyze` cross-checks a `dag.py` declaration against the model's
 `config.yaml` via pure AST evaluation (never executing the file) and reports
@@ -15,6 +17,7 @@ drift as a warning finding (see `lite_server/analyzer/static.py`).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -69,6 +72,11 @@ class InputDecl:
         if self.type == "binary" and self.default is not None:
             raise ValueError(
                 "default is not allowed on type='binary' inputs (json only, R2)"
+            )
+        if self.required and self.default is not None:
+            raise ValueError(
+                "required: true conflicts with a default (R2) — set "
+                "required=False when a default is provided"
             )
         if self.type == "json" and any(
             v is not None for v in (self.content_type, self.shape, self.datatype)
@@ -175,11 +183,13 @@ class Step:
         ):
             raise ValueError(f"retries must be a non-negative int, got {self.retries!r}")
         if self.timeout_secs is not None and (
-            not isinstance(self.timeout_secs, (int, float))
-            or self.timeout_secs < 0
+            isinstance(self.timeout_secs, bool)
+            or not isinstance(self.timeout_secs, (int, float))
+            or not math.isfinite(self.timeout_secs)
+            or self.timeout_secs <= 0
         ):
             raise ValueError(
-                f"timeout_secs must be a non-negative number, got {self.timeout_secs!r}"
+                f"timeout_secs must be a positive finite number, got {self.timeout_secs!r}"
             )
         if self.outputs is not None and (
             not isinstance(self.outputs, dict)
@@ -268,6 +278,8 @@ class EnsembleDAG:
         if any(not isinstance(s, Step) for s in self.steps):
             raise ValueError("steps must be a list of Step")
         if self.dags is not None:
+            if not self.dags:
+                raise ValueError("dags must declare at least one set (E8-1)")
             if self.steps:
                 raise ValueError(
                     "steps must be empty in the dags form — everything lives "
