@@ -71,8 +71,10 @@ fn d30_element_ok(value: crate::ensemble::EnsembleValue) -> pb::InferResponse {
             bytes::Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
         }
         crate::ensemble::EnsembleValue::Binary(data, _ct, ..) => data,
-        crate::ensemble::EnsembleValue::Envelope { .. } => {
-            unreachable!("envelope never reaches batch element egress")
+        // E7 (D32): multi-sink element responses ride the LSBE-1 container
+        // (InferResponse has no headers map).
+        crate::ensemble::EnsembleValue::Envelope { head, tail } => {
+            crate::ensemble::encode_lsbe1(&head, &tail)
         }
     };
     pb::InferResponse {

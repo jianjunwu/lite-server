@@ -137,11 +137,11 @@ impl GrpcService {
                         bytes::Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
                     }
                     crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Binary(b, _ct, ..)) => b,
-                    // Internal only — never a DAG output.
-                    crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Envelope { .. }) => {
-                        return Err(err(app_error_to_grpc_status(
-                            &AppError::Internal("envelope reached the egress layer".to_string()),
-                        )));
+                    // E7 (D32): the multi-sink response — InferResponse has
+                    // no headers map, so the LSBE-1 container is the
+                    // self-describing carrier (head + tail).
+                    crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Envelope { head, tail }) => {
+                        crate::ensemble::encode_lsbe1(&head, &tail)
                     }
                     crate::ensemble::EnsembleOutcome::Stream(_) => {
                         // D1: a unary endpoint calling a streaming DAG is a

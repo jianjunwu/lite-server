@@ -989,6 +989,41 @@ const ENS_MIMO_JSON_ALIAS_YAML: &str = r#"ensemble:
         data: "$tok.pre"
 "#;
 
+/// E7 (D31/D5): multi-sink — json alias + binary alias (marker output) +
+/// skip alias (pre_5xx with on_error: skip → null).
+const ENS_MULTISINK_YAML: &str = r#"ensemble:
+  inputs:
+    text:
+      type: json
+    image:
+      type: binary
+  outputs:
+    answer: "$tok"
+    thumb: "$enc.crop"
+    score: "$may"
+  steps:
+    - name: tok
+      model: pre
+      version: "1"
+      inputs:
+        text: "$inputs.text"
+    - name: enc
+      model: vis_enc
+      version: "1"
+      outputs:
+        crop:
+          type: binary
+          path: "$.thumb"
+      inputs:
+        img: "$inputs.image"
+    - name: may
+      model: pre_5xx
+      version: "1"
+      on_error: skip
+      inputs:
+        text: "$inputs.text"
+"#;
+
 /// R4 conditional skip: the optional input absent → `cond` (which would 500
 /// if it ran) is skipped, `main` still produces the output.
 const ENS_MIMO_COND_YAML: &str = r#"ensemble:
@@ -1169,6 +1204,7 @@ fn write_all_fixtures(repo: &std::path::Path) {
     write_classifier(repo);
     write_ensemble(repo, "ens_mimo", ENS_MIMO_YAML);
     write_ensemble(repo, "ens_mimo_json_alias", ENS_MIMO_JSON_ALIAS_YAML);
+    write_ensemble(repo, "ens_multisink", ENS_MULTISINK_YAML);
     write_ensemble(repo, "ens_mimo_bin", ENS_MIMO_BIN_YAML);
     write_ensemble(repo, "ens_mimo_cond", ENS_MIMO_COND_YAML);
     write_ensemble(repo, "ens_mimo_stream", ENS_MIMO_STREAM_YAML);
@@ -1188,7 +1224,7 @@ fn write_server_yaml(repo: &std::path::Path, http_port: u16, extra: &str, orch_e
         format!(
             "server:\n  http_port: {http_port}\n  timeout: 30.0\n{extra}\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n",
             repo.display()
         ),
     )
@@ -1571,7 +1607,7 @@ async fn boot_server_grpc(extra: &str) -> (String, u16, ServerGuard, std::path::
             "server:\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  timeout: 30.0\n{extra}\n\n\
              grpc:\n  enabled: true\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n",
             repo.display()
         ),
     )
@@ -4124,4 +4160,104 @@ async fn test_audit_mimo2_json_alias_projection() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK, "json alias DAG must run");
     let body = resp.text().await.unwrap();
     assert!(body.contains("via alias"), "projected alias must feed the tail: {body}");
+}
+
+/// E7 (D31/D5): multi-sink response — the KServe envelope: JSON head
+/// outputs[] (answer json, thumb binary with binary_data_size, score null
+/// after the skip) + binary tail split via
+/// Inference-Header-Content-Length.
+#[serial]
+#[tokio::test]
+async fn test_audit_e7_multisink_envelope_response() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_multisink"]).await;
+
+    let image_bytes: &[u8] = b"\x00\x01\x02";
+    let head = json!({"id": "r1", "inputs": [
+        {"name": "text", "data": "multi sink"},
+        {"name": "image", "parameters": {"binary_data_size": 3}}
+    ]});
+    let head_bytes = serde_json::to_vec(&head).unwrap();
+    let mut body = head_bytes.clone();
+    body.extend_from_slice(image_bytes);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_multisink/infer", base))
+        .header("content-type", "application/octet-stream")
+        .header("inference-header-content-length", head_bytes.len().to_string())
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "multi-sink must succeed");
+    let head_len: usize = resp
+        .headers()
+        .get("inference-header-content-length")
+        .expect("envelope response must carry the head-length header")
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let full = resp.bytes().await.unwrap();
+    let resp_head: Value = serde_json::from_slice(&full[..head_len]).unwrap();
+    let tail = &full[head_len..];
+    assert_eq!(tail, image_bytes, "binary alias must land in the tail verbatim");
+    assert_eq!(resp_head["model_name"], json!("ens_multisink"));
+    let outs = resp_head["outputs"].as_array().unwrap();
+    assert_eq!(outs.len(), 3, "{outs:?}");
+    assert_eq!(outs[0], json!({"name": "answer", "data": {"pre": "multi sink"}}));
+    assert_eq!(
+        outs[1],
+        json!({"name": "thumb", "parameters": {"binary_data_size": 3}}),
+        "thumb size = the input bytes (marker decode round-trip)"
+    );
+    assert_eq!(outs[2], json!({"name": "score", "data": null}), "skip alias → null (D5)");
+}
+
+/// E7 (D32): gRPC unary multi-sink — the LSBE-1 container carries the
+/// envelope head + binary tail (InferResponse has no headers map).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_audit_e7_multisink_grpc_lsbe1_response() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+
+    let (base, grpc_port, _guard, _repo) = boot_server_grpc("").await;
+    wait_ready_all(&base, &["ens_multisink"]).await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+
+    // Request: LSBE-1 envelope — text (json) + image (binary tail).
+    let head = serde_json::to_vec(&json!({"inputs": [
+        {"name": "text", "data": "grpc sink"},
+        {"name": "image", "parameters": {"binary_data_size": 3}}
+    ]})).unwrap();
+    let mut blob = Vec::new();
+    blob.extend_from_slice(b"LSB1");
+    blob.extend_from_slice(&(head.len() as u64).to_le_bytes());
+    blob.extend_from_slice(&head);
+    blob.extend_from_slice(b"\x01\x02\x03");
+    let resp = client
+        .infer(tonic::Request::new(InferRequest {
+            model_name: "ens_multisink".into(),
+            version: "1".into(),
+            data: bytes::Bytes::from(blob),
+            ..Default::default()
+        }))
+        .await
+        .expect("gRPC multi-sink must succeed");
+    let data = resp.into_inner().data;
+    let (resp_head, tail) = lite_server::ensemble::split_envelope(&data)
+        .expect("response must be an LSBE-1 container");
+    assert_eq!(
+        tail.as_deref(),
+        Some(&b"\x01\x02\x03"[..]),
+        "binary alias must land in the container tail verbatim"
+    );
+    let outs = resp_head["outputs"].as_array().unwrap();
+    assert_eq!(outs[0], json!({"name": "answer", "data": {"pre": "grpc sink"}}));
+    assert_eq!(outs[2], json!({"name": "score", "data": null}), "skip alias → null (D5)");
 }

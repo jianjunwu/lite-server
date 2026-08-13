@@ -73,10 +73,14 @@ pub struct EnsembleBlock {
     /// environment's root. None = the historical single anonymous input
     /// (`$request`); Some = the KServe-envelope wire (D31), `$inputs.NAME`
     /// refs, and no anonymous root (R5).
-    /// (E7 `outputs` and E8-1 `dags` land with their own commits —
-    /// deny_unknown_fields keeps them an explicit failure until then.)
     #[serde(default)]
     pub inputs: Option<IndexMap<String, InputDecl>>,
+    /// E7 (batch 4④): multi-sink outputs `{alias: $ref}` — mutually
+    /// exclusive with `output` (E2); the response is a KServe envelope
+    /// (JSON head outputs[] + binary tail, D31). Absent = the historical
+    /// single-output contract.
+    #[serde(default)]
+    pub outputs: Option<IndexMap<String, String>>,
 }
 
 /// MIMO (D8/D31): a named root input's declaration — the static type of
@@ -212,6 +216,208 @@ lazy_static::lazy_static! {
         Regex::new(r"^\$(\.[A-Za-z_][A-Za-z0-9_]*)+$").expect("invalid json path regex");
 }
 
+/// E7 (batch 4④, R13/D11/R14): multi-sink validation.
+///  - `output` × `outputs` are mutually exclusive (E2 二选一);
+///  - alias names are identifiers; each ref must be a legal sink ref
+///    (`$stepX` / `$stepX.ALIAS[.path]` / `$inputs.NAME[.path]`, R13) —
+///    refs to absentable steps are ALLOWED (the D5 null channel);
+///  - a streaming DAG with outputs must have EXACTLY one alias pointing at
+///    the streaming step (D11/R14) — outputs is then validation-only, the
+///    response stays the stream.
+fn validate_outputs_rules(
+    steps: &[EnsembleStep],
+    outputs: Option<&IndexMap<String, String>>,
+    single_output_omitted: bool,
+    output_step: usize,
+) -> Result<(), AppError> {
+    let Some(outputs) = outputs else {
+        return Ok(());
+    };
+    if !single_output_omitted {
+        return Err(AppError::Config(
+            "ensemble.output and ensemble.outputs are mutually exclusive \
+             (E2 × E7 — pick one)"
+                .to_string(),
+        ));
+    }
+    for (alias, ref_str) in outputs {
+        if !IDENT_RE.is_match(alias) {
+            return Err(AppError::Config(format!(
+                "ensemble.outputs alias '{alias}' is not a valid identifier (R13)"
+            )));
+        }
+        let caps = REF_RE.captures(ref_str).ok_or_else(|| {
+            AppError::Config(format!(
+                "ensemble.outputs alias '{alias}': invalid reference '{}' (R13)",
+                ref_str
+            ))
+        })?;
+        let source = caps.get(1).unwrap().as_str();
+        let rest = caps.get(2).map(|m| m.as_str());
+        match source {
+            "request" => {
+                return Err(AppError::Config(format!(
+                    "ensemble.outputs alias '{alias}': $request is not a sink \
+                     reference (R13)"
+                )));
+            }
+            "inputs" => {
+                // The declared-inputs namespace — validity is checked by the
+                // declared mode's analyze pass for STEP refs only; outputs
+                // refs are checked here (name must exist in the declaration).
+                // (decl=None is rejected by the step-ref analysis path when
+                // no step uses $inputs — keep the error uniform here.)
+                let name = rest.and_then(|r| r.split('.').next()).unwrap_or("");
+                if name.is_empty() {
+                    return Err(AppError::Config(format!(
+                        "ensemble.outputs alias '{alias}': '{}' is missing the \
+                         input name (R13)",
+                        ref_str
+                    )));
+                }
+            }
+            step_name => {
+                let src = steps.iter().find(|s| s.name == step_name).ok_or_else(|| {
+                    AppError::Config(format!(
+                        "ensemble.outputs alias '{alias}' references unknown step \
+                         '{}' (R13)",
+                        ref_str
+                    ))
+                })?;
+                if let Some(decl) = &src.outputs_decl {
+                    let a = rest.and_then(|r| r.split('.').next()).ok_or_else(|| {
+                        AppError::Config(format!(
+                            "ensemble.outputs alias '{alias}': '{}' — step '{}' \
+                             declares outputs and must be referenced by alias (R13)",
+                            ref_str, step_name
+                        ))
+                    })?;
+                    if !decl.contains_key(a) {
+                        return Err(AppError::Config(format!(
+                            "ensemble.outputs alias '{alias}': '{}' is not a \
+                             declared alias of step '{}' (R13)",
+                            ref_str, step_name
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    // D11/R14: streaming DAGs — outputs is validation-only; exactly one
+    // alias, pointing at the streaming (output) step.
+    if steps[output_step].stream {
+        if outputs.len() != 1 {
+            return Err(AppError::Config(format!(
+                "ensemble.outputs on a streaming DAG must have exactly ONE alias \
+                 pointing at the streaming step (D11) — {} found",
+                outputs.len()
+            )));
+        }
+        let (alias, ref_str) = outputs.first().unwrap();
+        let caps = REF_RE.captures(ref_str)
+            .expect("refs validated above");
+        let source = caps.get(1).unwrap().as_str();
+        if source != steps[output_step].name.as_str() {
+            return Err(AppError::Config(format!(
+                "ensemble.outputs alias '{alias}' references '{}' — a streaming \
+                 DAG's outputs must point at the streaming step '{}' (R14)",
+                ref_str, steps[output_step].name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// E7 (batch 4④, D31/D5): build the DAG response — priority
+/// outputs (E7) > output (E2) > steps.last() (historical). Multi-sink
+/// responses are KServe envelopes: JSON head `{model_name, outputs:
+/// [{name, data}]}` + binary tail for Binary aliases (binary_data_size
+/// refilled in header order); absent aliases (skip/absent optional input)
+/// → `data: null` + warn (D5). A tail-less envelope degrades to plain JSON
+/// (Envelope { tail: empty } is never produced).
+fn build_response(
+    plan: &EnsemblePlan,
+    model_name: &str,
+    context: &HashMap<String, EnsembleValue>,
+) -> Result<EnsembleOutcome, AppError> {
+    let Some(outputs) = &plan.outputs else {
+        // Historical single-output path (byte-identical).
+        let value = context.get(&plan.steps[plan.output_step].name).cloned()
+            .ok_or_else(|| AppError::Internal("ensemble produced no output".to_string()))?;
+        let value = select_output_field(
+            &plan.steps[plan.output_step].name, value, plan.output_field.as_deref(),
+        )?;
+        return Ok(EnsembleOutcome::Unary(value));
+    };
+
+    let mut head_outputs = Vec::with_capacity(outputs.len());
+    let mut tail: Vec<u8> = Vec::new();
+    for (alias, ref_str) in outputs {
+        let value = match resolve_ref(plan, ref_str, context) {
+            Ok(ResolvedRef::Value(v)) => Some(v),
+            Ok(ResolvedRef::Absent(_)) => None,
+            Err(e) => {
+                // R13 parse-validated the ref — a runtime error here means
+                // the source is ABSENT (skipped step / missing optional
+                // input): the D5 null channel.
+                warn!(alias = %alias, ref_ = %ref_str, error = %e, "ensemble outputs alias is null (absent source, D5)");
+                None
+            }
+        };
+        match value {
+            None => head_outputs.push(json!({"name": alias, "data": null})),
+            Some(EnsembleValue::Json(v)) => {
+                head_outputs.push(json!({"name": alias, "data": v}));
+            }
+            Some(EnsembleValue::Binary(b, _ct, shape, datatype)) => {
+                // Binary alias → head element + tail slice (header order).
+                let mut el = serde_json::Map::new();
+                el.insert("name".to_string(), json!(alias));
+                el.insert(
+                    "parameters".to_string(),
+                    json!({"binary_data_size": b.len()}),
+                );
+                if let Some(shape) = shape {
+                    el.insert("shape".to_string(), json!(shape));
+                }
+                if let Some(dt) = datatype {
+                    el.insert("datatype".to_string(), json!(dt));
+                }
+                head_outputs.push(Value::Object(el));
+                tail.extend_from_slice(&b);
+            }
+            Some(EnsembleValue::Envelope { .. }) => {
+                return Err(AppError::Internal(
+                    "envelope reached the response builder".to_string(),
+                ));
+            }
+        }
+    }
+    let head = json!({"model_name": model_name, "outputs": head_outputs});
+    if tail.is_empty() {
+        Ok(EnsembleOutcome::Unary(EnsembleValue::Json(head)))
+    } else {
+        Ok(EnsembleOutcome::Unary(EnsembleValue::Envelope {
+            head,
+            tail: Bytes::from(tail),
+        }))
+    }
+}
+
+/// D32: encode the LSBE-1 in-frame container — `"LSB1"` magic ‖ u64 LE head
+/// length ‖ JSON head ‖ binary tail. The gRPC unary multi-sink response
+/// form (InferResponse has no headers map — the container is
+/// self-describing); round-trips through [`split_envelope`].
+pub fn encode_lsbe1(head: &Value, tail: &[u8]) -> Bytes {
+    let head_bytes = serde_json::to_vec(head).expect("Value serialization is infallible");
+    let mut blob = Vec::with_capacity(12 + head_bytes.len() + tail.len());
+    blob.extend_from_slice(b"LSB1");
+    blob.extend_from_slice(&(head_bytes.len() as u64).to_le_bytes());
+    blob.extend_from_slice(&head_bytes);
+    blob.extend_from_slice(tail);
+    Bytes::from(blob)
+}
+
 /// MIMO (R6, batch 4③): step.outputs declaration validation — alias names
 /// are identifiers; projection paths are `$.a.b` dot segments (D29). Runs
 /// for both config modes (declarations are mode-independent).
@@ -298,14 +504,21 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
     let inputs_decl = config.ensemble.inputs;
     validate_step_output_decls(&steps)?;
     let (input_modes, conditional_refs) = analyze_static_types(&steps, inputs_decl.as_ref())?;
+    // E7 (batch 4④): multi-sink validation — R13 ref shape, E2 mutual
+    // exclusion, D11/R14 streaming rules.
+    let outputs = config.ensemble.outputs;
+    // The E2 × E7 exclusion needs the raw `output:` PRESENCE (output_field
+    // is None both when output is omitted and when it names a whole step).
+    let single_output_omitted = config.ensemble.output.is_none();
+    validate_outputs_rules(&steps, outputs.as_ref(), single_output_omitted, output_step)?;
     // E6 (D5/D34) + MIMO R4: an absentable step's absence must be statically
     // provable — no downstream references, no single-output reference,
     // never streaming.
-    validate_skip_rules(&steps, output_step, &conditional_refs)?;
+    validate_skip_rules(&steps, output_step, &conditional_refs, outputs.is_some())?;
     // MIMO (R7/D10): the single-output contract cannot name aliases — a DAG
-    // whose output step declares step.outputs must use ensemble.outputs
-    // (E7, batch 4④) to name the sinks.
-    if steps[output_step].outputs_decl.is_some() {
+    // whose output step declares step.outputs must use ensemble.outputs (E7)
+    // to name the sinks (with outputs present the aliases ARE the contract).
+    if outputs.is_none() && steps[output_step].outputs_decl.is_some() {
         return Err(AppError::Config(format!(
             "output step '{}' declares step.outputs — the single-output contract \
              cannot name aliases; set ensemble.outputs to select the sinks (E7)",
@@ -348,6 +561,8 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
         inputs_decl,
         input_modes,
         conditional_refs,
+        // E7 (batch 4④): multi-sink output mapping (None = single output).
+        outputs,
         config_path: config_path.to_path_buf(),
         // Set by the production loader (stat-before-read); None for the
         // load-time direct-parse path (insert_ready stats on its own).
@@ -641,6 +856,10 @@ fn validate_skip_rules(
     steps: &[EnsembleStep],
     output_step: usize,
     conditional_refs: &[Vec<String>],
+    // E7: with ensemble.outputs present the single-output contract is
+    // REPLACED — an absentable output step is fine (its aliases use the D5
+    // null channel); the rule only binds the implicit single output.
+    outputs_present: bool,
 ) -> Result<(), AppError> {
     let absentable: HashSet<&str> = steps
         .iter()
@@ -696,9 +915,10 @@ fn validate_skip_rules(
         }
     }
 
-    // Rule 2: the single-output contract has no null channel.
+    // Rule 2: the single-output contract has no null channel (E7's
+    // multi-sink outputs DO — D5 — so the rule binds only without them).
     let output_step = &steps[output_step];
-    if absentable.contains(output_step.name.as_str()) {
+    if !outputs_present && absentable.contains(output_step.name.as_str()) {
         return Err(AppError::Config(format!(
             "ensemble.output references potentially-absent step '{}' — the single-output \
              contract has no null channel; use ensemble.outputs (alias = null when \
@@ -1658,6 +1878,10 @@ pub struct EnsemblePlan {
     /// non-empty marks a CONDITIONAL step (absent input → step skipped,
     /// D13/E6-skip channel). Index-aligned with `steps`.
     pub conditional_refs: Vec<Vec<String>>,
+    /// E7 (batch 4④): multi-sink aliases `{alias: $ref}` — the response is
+    /// a KServe envelope (build_response). None = the historical single
+    /// output.
+    pub outputs: Option<IndexMap<String, String>>,
     /// Source config file — mtime re-check (review ②) stats this path.
     pub config_path: PathBuf,
     /// mtime of `config_path` captured BEFORE the file read (stat-before-read):
@@ -2361,17 +2585,13 @@ pub(crate) async fn execute_ensemble_inner(
     };
 
     if !plan.steps[tail_idx].stream {
-        // Historical unary path — byte-identical behaviour.
+        // Historical unary path — byte-identical behaviour (E7: multi-sink
+        // responses build from the same context via build_response).
         run_layers(
             &state, &plan, &plan.layers, &mut context, &absent_inputs,
             model_name, version, request_id, &opts, deadline_unix_ns, snapshot, depth, &ancestors,
         ).await?;
-        let value = context.get(&plan.steps[tail_idx].name).cloned()
-            .ok_or_else(|| AppError::Internal("ensemble produced no output".to_string()))?;
-        // E2 (batch 3): explicit output field projection (whole-value pass
-        // through when `output:` carried no `.field`).
-        let value = select_output_field(&plan.steps[tail_idx].name, value, plan.output_field.as_deref())?;
-        return Ok(EnsembleOutcome::Unary(value));
+        return build_response(&plan, model_name, &context);
     }
 
     // §4.2 pipeline branch (batch 2): the DAG contains a chain — run the
@@ -4821,6 +5041,7 @@ mod tests {
             inputs_decl: None,
             input_modes: Vec::new(),
             conditional_refs: Vec::new(),
+            outputs: None,
             config_path: PathBuf::from(path),
             source_mtime: None,
         })
@@ -4977,6 +5198,7 @@ mod tests {
                     inputs_decl: None,
                     input_modes: Vec::new(),
                     conditional_refs: Vec::new(),
+                    outputs: None,
                     config_path,
                     source_mtime: None,
                 }))
@@ -5077,6 +5299,7 @@ mod tests {
                         inputs_decl: None,
                         input_modes: Vec::new(),
                         conditional_refs: Vec::new(),
+                        outputs: None,
                         config_path: cp,
                         source_mtime: v1_mtime,
                     }))
@@ -5101,6 +5324,7 @@ mod tests {
                         inputs_decl: None,
                         input_modes: Vec::new(),
                         conditional_refs: Vec::new(),
+                        outputs: None,
                         config_path: cp,
                         source_mtime: None,
                     }))
@@ -5928,6 +6152,103 @@ ensemble:
         let err = parse_ensemble_plan(bad_path, &PathBuf::from("/nonexistent/config.yaml"))
             .expect_err("array-subscript paths must be rejected (D29)");
         assert!(err.to_string().contains("path"), "got: {err}");
+    }
+
+    // === E7 (batch 4④): multi-sink outputs ===
+
+    /// E7: `output` and `outputs` are mutually exclusive (二选一).
+    #[test]
+    fn e7_output_x_outputs_mutually_exclusive() {
+        let yaml = "ensemble:\n  output: \"$a\"\n  outputs:\n    answer: \"$a\"\n  steps:\n    - name: a\n      model: m\n      version: \"1\"\n      inputs: {x: \"$request\"}\n";
+        let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("output × outputs must be rejected (E7)");
+        assert!(err.to_string().contains("outputs"), "got: {err}");
+    }
+
+    /// R13: outputs values must be legal refs — unknown sources are
+    /// rejected; refs to absentable steps are ALLOWED (null channel, D5).
+    #[test]
+    fn e7_r13_outputs_ref_validation() {
+        let bad = "ensemble:\n  outputs:\n    answer: \"$nope\"\n  steps:\n    - name: a\n      model: m\n      version: \"1\"\n      inputs: {x: \"$request\"}\n";
+        let err = parse_ensemble_plan(bad, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("unknown outputs ref must be rejected (R13)");
+        assert!(err.to_string().contains("nope"), "got: {err}");
+        // Skip-step alias is the D5 null channel.
+        let ok = "ensemble:\n  outputs:\n    answer: \"$may\"\n  steps:\n    - name: may\n      model: m1\n      version: \"1\"\n      on_error: skip\n      inputs: {x: \"$request\"}\n    - name: main\n      model: m2\n      version: \"1\"\n      inputs: {x: \"$request\"}\n";
+        parse_ensemble_plan(ok, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect("skip-step outputs alias must parse (D5)");
+        // Declared-step alias refs ($stepX.ALIAS) are legal sink refs.
+        let ok = "ensemble:\n  outputs:\n    thumb: \"$a.crop\"\n  steps:\n    - name: a\n      model: m1\n      version: \"1\"\n      outputs:\n        crop:\n          type: binary\n      inputs: {x: \"$request\"}\n    - name: b\n      model: m2\n      version: \"1\"\n      inputs: {x: \"$request\"}\n";
+        parse_ensemble_plan(ok, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect("declared-alias sink refs must parse (R13)");
+    }
+
+    /// R14/D11: outputs × streaming — exactly ONE alias pointing at the
+    /// streaming step; anything else is rejected.
+    #[test]
+    fn e7_r14_streaming_outputs_sole_alias() {
+        let base = "ensemble:\n  outputs:\n{out}  steps:\n    - name: pre\n      model: m1\n      version: \"1\"\n      inputs: {x: \"$request\"}\n    - name: tail\n      model: m2\n      version: \"1\"\n      stream: true\n      inputs: {x: \"$pre\"}\n";
+        // Sole alias pointing at the streaming step → ok.
+        let ok = base.replace("{out}", "    answer: \"$tail\"\n");
+        parse_ensemble_plan(&ok, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect("sole streaming alias must parse (D11)");
+        // Two aliases → rejected.
+        let two = base.replace("{out}", "    a: \"$tail\"\n    b: \"$pre\"\n");
+        let err = parse_ensemble_plan(&two, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("multi-alias outputs on a streaming DAG must be rejected (D11)");
+        assert!(err.to_string().contains("alias"), "got: {err}");
+        // Alias NOT pointing at the streaming step → rejected.
+        let wrong = base.replace("{out}", "    answer: \"$pre\"\n");
+        let err = parse_ensemble_plan(&wrong, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("outputs not referencing the streaming step must be rejected (R14)");
+        assert!(err.to_string().contains("stream"), "got: {err}");
+    }
+
+    /// build_response: the KServe envelope shape — json aliases in outputs[],
+    /// binary aliases into the tail with binary_data_size refilled, absent
+    /// aliases (skip/optional) → data: null + warn (D5), declaration order
+    /// preserved.
+    #[test]
+    fn e7_build_response_envelope() {
+        let plan = parse_ensemble_plan(
+            "ensemble:\n  inputs:\n    a:\n      type: json\n    opt:\n      type: json\n      required: false\n  outputs:\n    answer: \"$main\"\n    thumb: \"$enc.crop\"\n    echo: \"$inputs.a\"\n    maybe: \"$inputs.opt\"\n  steps:\n    - name: enc\n      model: m1\n      version: \"1\"\n      outputs:\n        crop:\n          type: binary\n          path: \"$.crop\"\n      inputs: {x: \"$inputs.a\"}\n    - name: main\n      model: m2\n      version: \"1\"\n      inputs: {x: \"$inputs.a\"}\n",
+            &PathBuf::from("/nonexistent/config.yaml"),
+        )
+        .unwrap();
+        let mut context = HashMap::new();
+        context.insert("main".to_string(), EnsembleValue::Json(json!({"out": 1})));
+        context.insert(
+            "enc.crop".to_string(),
+            EnsembleValue::Binary(Bytes::from_static(b"\x01\x02"), "image/png".into(), Some(vec![2]), None),
+        );
+        context.insert("inputs.a".to_string(), EnsembleValue::Json(json!("in")));
+        // opt absent → maybe → null.
+        let outcome = build_response(&plan, "demo", &context).unwrap();
+        let EnsembleOutcome::Unary(EnsembleValue::Envelope { head, tail }) = outcome else {
+            panic!("multi-sink with a binary alias must be an envelope");
+        };
+        assert_eq!(tail.as_ref(), b"\x01\x02");
+        assert_eq!(head["model_name"], json!("demo"));
+        let outs = head["outputs"].as_array().unwrap();
+        assert_eq!(outs.len(), 4, "{outs:?}");
+        assert_eq!(outs[0], json!({"name": "answer", "data": {"out": 1}}));
+        assert_eq!(
+            outs[1],
+            json!({"name": "thumb", "parameters": {"binary_data_size": 2}, "shape": [2]})
+        );
+        assert_eq!(outs[2], json!({"name": "echo", "data": "in"}));
+        assert_eq!(outs[3], json!({"name": "maybe", "data": null}), "absent alias → null (D5)");
+    }
+
+    /// D32 codec: LSBE-1 encode + split round-trips (the gRPC multi-sink
+    /// response container).
+    #[test]
+    fn e7_lsbe1_encode_split_roundtrip() {
+        let head = json!({"model_name": "demo", "outputs": [{"name": "a", "data": 1}]});
+        let blob = encode_lsbe1(&head, b"\x00\x01");
+        let (h, t) = split_envelope(&blob).unwrap();
+        assert_eq!(h, head);
+        assert_eq!(t.as_deref(), Some(&b"\x00\x01"[..]));
     }
 
     // === MIMO (batch 4①): inputs declaration R1-R5, wire R18/R19, LSBE-1

@@ -243,10 +243,25 @@ async fn do_infer(
                     "DAG contains a streaming step; use a streaming endpoint".to_string(),
                 ))
             }
-            // Internal only (de-framed at the entry, consumed by
-            // parse_root_inputs) — never a DAG output.
-            crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Envelope { .. }) => {
-                Err(AppError::Internal("envelope reached the egress layer".to_string()))
+            // E7 (D31): the multi-sink response — JSON head + binary tail
+            // with the Inference-Header-Content-Length split header
+            // (kserve.rs convention). A tail-less envelope degrades to
+            // plain JSON (build_response never emits one with an empty
+            // tail — the guard is defensive).
+            crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Envelope { head, tail }) => {
+                if tail.is_empty() {
+                    return Ok(Json(head).into_response());
+                }
+                let head_bytes = serde_json::to_vec(&head)
+                    .map_err(|e| AppError::Internal(format!("serialize envelope head: {e}")))?;
+                let mut body = head_bytes.clone();
+                body.extend_from_slice(&tail);
+                Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+                    .header("inference-header-content-length", head_bytes.len())
+                    .body(axum::body::Body::from(body))
+                    .map_err(|e| AppError::Internal(format!("build response: {e}")))
             }
         };
     }
