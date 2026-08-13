@@ -81,6 +81,26 @@ pub struct EnsembleStepRaw {
     /// deadline only.
     #[serde(default)]
     pub timeout_secs: Option<f64>,
+    /// E6 (batch 4): fault tolerance — `fail` (default, historical) or
+    /// `skip` (the step's absence must be parse-provable: no downstream
+    /// references, no ensemble.output, never on a streaming step, D5/D34).
+    #[serde(default)]
+    pub on_error: Option<OnErrorKind>,
+    /// E6 (batch 4): worker-inference retries (5xx/timeouts only, exponential
+    /// backoff; 4xx is a client contract and never retries). For streaming
+    /// steps the window is build-limited (D35: send_stream → first non-Error
+    /// frame). Default 0 = historical single attempt.
+    #[serde(default)]
+    pub retries: Option<u32>,
+}
+
+/// E6 (batch 4): step fault tolerance modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnErrorKind {
+    #[default]
+    Fail,
+    Skip,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +114,10 @@ pub struct EnsembleStep {
     pub stream: bool,
     pub params: HashMap<String, Value>,
     pub timeout_secs: Option<f64>,
+    /// E6 (batch 4): fault tolerance — `fail` (default) or `skip`.
+    pub on_error: OnErrorKind,
+    /// E6 (batch 4): worker-inference retry budget (see the raw field).
+    pub retries: u32,
 }
 
 lazy_static::lazy_static! {
@@ -129,6 +153,8 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
             stream: s.stream,
             params: s.params,
             timeout_secs: s.timeout_secs,
+            on_error: s.on_error.unwrap_or_default(),
+            retries: s.retries.unwrap_or(0),
         })
     }).collect::<Result<_, AppError>>()?;
 
@@ -136,6 +162,9 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
     // E2: resolve the explicit output BEFORE chain construction / streaming
     // validation — both anchor on the output step.
     let (output_step, output_field) = resolve_output(config.ensemble.output.as_deref(), &steps)?;
+    // E6 (D5/D34): a skip step's absence must be statically provable — no
+    // downstream references, no single-output reference, never streaming.
+    validate_skip_rules(&steps, output_step)?;
     // Pipeline-form validation + chain construction (P-R1..R5/D26, batch 2);
     // non-pipeline streaming rules apply only when no chain exists.
     let chains = build_chains(&steps, output_step)?;
@@ -206,6 +235,70 @@ fn resolve_output(
             ))
         })?;
     Ok((idx, caps.get(2).map(|m| m.as_str().to_string())))
+}
+
+/// E6 (batch 4, D5/D34): a `skip` step is absent from the context when its
+/// error fires — every consumer of its output must be statically provable as
+/// safe at parse time:
+///   1. no OTHER step may reference it (`$name` whole or `$name.field` —
+///      both dangle identically at runtime);
+///   2. `ensemble.output` may not point at it (the single-output contract
+///      has no null channel — only E7's multi-sink outputs do, D5);
+///   3. a streaming step may never be absent (D34 rule 6: the streaming
+///      response contract promises a stream unconditionally).
+fn validate_skip_rules(steps: &[EnsembleStep], output_step: usize) -> Result<(), AppError> {
+    let skip_names: HashSet<&str> = steps
+        .iter()
+        .filter(|s| s.on_error == OnErrorKind::Skip)
+        .map(|s| s.name.as_str())
+        .collect();
+    if skip_names.is_empty() {
+        return Ok(());
+    }
+
+    // Rule 3 first (cheapest): stream × skip is a structural contradiction.
+    for s in steps {
+        if s.stream && s.on_error == OnErrorKind::Skip {
+            return Err(AppError::Config(format!(
+                "step '{}': on_error: skip cannot combine with stream: true \
+                 (a streaming response promises a stream unconditionally, D34)",
+                s.name
+            )));
+        }
+    }
+
+    // Rule 1: any input reference whose first segment names a skip step.
+    for s in steps {
+        if s.on_error == OnErrorKind::Skip {
+            continue; // self-references are caught by validate_dag anyway
+        }
+        for ref_str in s.inputs.values() {
+            let Some(caps) = REF_RE.captures(ref_str) else {
+                continue; // malformed refs are reported elsewhere (validate_dag)
+            };
+            let source = caps.get(1).unwrap().as_str();
+            if skip_names.contains(source) {
+                return Err(AppError::Config(format!(
+                    "step '{}' references skip step '{}' via '{}' — a skipped step \
+                     leaves the DAG dangling; on_error: skip steps must be unreferenced \
+                     (use ensemble.outputs for a null-when-skipped alias, D5)",
+                    s.name, source, ref_str
+                )));
+            }
+        }
+    }
+
+    // Rule 2: the single-output contract has no null channel.
+    let output_step = &steps[output_step];
+    if output_step.on_error == OnErrorKind::Skip {
+        return Err(AppError::Config(format!(
+            "ensemble.output references skip step '{}' — the single-output contract \
+             has no null channel; use ensemble.outputs (alias = null when skipped, D5)",
+            output_step.name
+        )));
+    }
+
+    Ok(())
 }
 
 /// Production plan loader: resolve the model dir, read config.yaml and parse
@@ -1563,6 +1656,14 @@ async fn run_layers(
 ) -> Result<(), AppError> {
     let total_budget = crate::deadline::remaining(deadline_unix_ns);
     let plan_run = plan.clone();
+    // E6 (batch 4): steps allowed to be absent on error (parse rules D5/D34
+    // guarantee nothing references them — absence is safe by construction).
+    let skip_set: HashSet<&str> = plan
+        .steps
+        .iter()
+        .filter(|s| s.on_error == OnErrorKind::Skip)
+        .map(|s| s.name.as_str())
+        .collect();
     let ensemble_run = async {
         for layer in layers {
             // P-FLOW (§4.0.9): a JoinSet per layer is the ensemble's shared
@@ -1619,6 +1720,13 @@ async fn run_layers(
                         context.insert(name, value);
                     }
                     Err(e) => {
+                        // E6 (batch 4): a skip step's failure leaves it
+                        // ABSENT from the context and the layer continues
+                        // (parse rules guarantee nothing references it).
+                        if skip_set.contains(name.as_str()) {
+                            warn!(step = %name, error = %e, "ensemble step skipped (on_error: skip)");
+                            continue;
+                        }
                         // B3: propagate step errors directly — client errors
                         // (e.g. InvalidRequestBody from resolve_ref E7 rules)
                         // must reach the HTTP/gRPC layer with their correct
@@ -2356,26 +2464,43 @@ async fn execute_stream_step(
     }
     crate::metrics::prometheus::record_worker_inference(&step.model, &resolved_version, worker_id, 1);
 
-    let client = &clients[worker_id];
-    let stream_id = format!("stream-{}", Uuid::new_v4());
-    let open_req = crate::streaming::build_stream_open(
-        stream_id.clone(), payload_bytes, Some(meta), opts.decoupled,
-    );
-    let chunk_rx = client.send_stream(open_req, stream_id.clone()).await?;
+    // E6 (batch 4, D35): streaming retry is BUILD-WINDOW limited — the
+    // window is send_stream → first non-Error frame; a first-frame Error /
+    // build timeout / pre-frame close rebuilds with backoff and a re-pick
+    // (can land on a healthy instance), each attempt a fresh stream_id.
+    // Chunk/Start/Done commits the stream (no replay — P5/§6.3). retries == 0
+    // keeps the historical no-peek path byte-for-byte.
+    let (chunk_rx, stream_id, cancel_client, wrapper_abort) = if step.retries == 0 {
+        let client = &clients[worker_id];
+        let stream_id = format!("stream-{}", Uuid::new_v4());
+        let open_req = crate::streaming::build_stream_open(
+            stream_id.clone(), payload_bytes.clone(), Some(meta.clone()), opts.decoupled,
+        );
+        let chunk_rx = client.send_stream(open_req, stream_id.clone()).await?;
+        (chunk_rx, stream_id, Arc::clone(client), None)
+    } else {
+        open_stream_with_retry(
+            state, step, &resolved_version, payload_bytes.clone(), &meta, opts,
+            step_deadline, &clients, worker_id, step.retries,
+        )
+        .await?
+    };
 
     // D25: chain handles — batch 0 = the tail stream itself as the single
     // element (chain[0] === the top-level fields; adapters never read chain).
-    let abort = tokio::spawn(async {}).abort_handle();
+    // E6: with retries a first-frame forwarder runs — its AbortHandle is the
+    // teardown point (aborting it drops the receiver, worker idle reclaim).
+    let abort = wrapper_abort.unwrap_or_else(|| tokio::spawn(async {}).abort_handle());
     let chain = vec![StreamHandle {
         stream_id: stream_id.clone(),
-        cancel_client: Arc::clone(client),
+        cancel_client: Arc::clone(&cancel_client),
         abort: abort.clone(),
     }];
 
     Ok(EnsembleStream {
         chunk_rx,
         stream_id,
-        cancel_client: Arc::clone(client),
+        cancel_client,
         tail_model: step.model.clone(),
         // m4: label normalization — explicit versions only; unresolved
         // ("latest"/omitted) records "latest" (no cardinality growth on
@@ -2399,6 +2524,165 @@ async fn execute_stream_step(
         // P10: filled by execute_ensemble after open_tail_stream returns.
         permit: None,
     })
+}
+
+/// E6 (batch 4, D35): open the step's worker stream under the build-window
+/// retry contract. The window closes when a Chunk/Start/Done frame arrives
+/// (committed) — a first-frame Error, a build timeout, a pre-frame channel
+/// close, or a failing `send_stream` call rebuilds with exponential backoff
+/// and a FRESH worker pick (a retry can land on a healthy instance; the old
+/// stream is cancelled so it never leaks). On exhaustion the committed path
+/// still runs — the first Error frame returns in-stream (the adapter emits
+/// the Error frame + close, §4.4) and a build timeout hands the raw receiver
+/// to the adapter (its recv_chunk bounds take over). Because the peek
+/// consumes the first frame, a committed stream is wrapped by a zero-copy
+/// forwarder that re-emits it first — the adapter forward loops stay
+/// unchanged (D25 seam).
+#[allow(clippy::too_many_arguments)] // stream-open plumbing: state+meta+clients ride together by design
+async fn open_stream_with_retry(
+    state: &Arc<AppState>,
+    step: &EnsembleStep,
+    resolved_version: &str,
+    payload_bytes: bytes::Bytes,
+    meta: &pb::RequestMeta,
+    opts: &EnsembleExecOpts,
+    step_deadline: Option<i64>,
+    clients: &[Arc<crate::transport::zmq::WorkerZmqClient>],
+    mut worker_id: usize,
+    retries: u32,
+) -> Result<
+    (
+        mpsc::Receiver<pb::StreamResponse>,
+        String,
+        Arc<crate::transport::zmq::WorkerZmqClient>,
+        Option<tokio::task::AbortHandle>,
+    ),
+    AppError,
+> {
+    // First-frame peek bound: the step budget remaining; with no deadline the
+    // idle budget (same escape hatch as the adapters' recv_chunk: 0 = none).
+    let peek_bound = crate::deadline::remaining(step_deadline).or_else(|| {
+        crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs)
+    });
+    let mut attempt: u32 = 0;
+    let mut backoff = Duration::from_millis(50);
+    loop {
+        let stream_id = format!("stream-{}", Uuid::new_v4());
+        let client = &clients[worker_id];
+        let open_req = crate::streaming::build_stream_open(
+            stream_id.clone(), payload_bytes.clone(), Some(meta.clone()), opts.decoupled,
+        );
+        // E6/D35: the window starts AT send_stream — a build failure is
+        // retryable (worker crash race), no 4xx/5xx distinction on the
+        // streaming wire (there are no status codes).
+        let mut rx = match client.send_stream(open_req, stream_id.clone()).await {
+            Ok(rx) => rx,
+            Err(e) => {
+                if attempt < retries && retry_sleep_budget(step_deadline, backoff).is_some() {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_millis(500));
+                    attempt += 1;
+                    worker_id = repick_streaming_worker(state, step, resolved_version, meta, clients).await?;
+                    continue;
+                }
+                return Err(e);
+            }
+        };
+
+        // Peek the first frame (bounded). Committed frames: Chunk/Start/Done.
+        let first = match peek_bound {
+            Some(b) => match tokio::time::timeout(b, rx.recv()).await {
+                Ok(f) => f,
+                Err(_) => {
+                    // Build timeout — retry; exhausted → hand the raw
+                    // receiver to the adapter (its recv_chunk bounds rule).
+                    if attempt < retries && retry_sleep_budget(step_deadline, backoff).is_some() {
+                        let _ = client
+                            .send_raw(crate::streaming::build_stream_cancel(stream_id))
+                            .await;
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_millis(500));
+                        attempt += 1;
+                        worker_id = repick_streaming_worker(state, step, resolved_version, meta, clients).await?;
+                        continue;
+                    }
+                    return Ok((rx, stream_id, Arc::clone(client), None));
+                }
+            },
+            None => rx.recv().await,
+        };
+
+        let first_is_error = matches!(
+            &first,
+            Some(f) if matches!(&f.payload, Some(pb::stream_response::Payload::Error(_)))
+        );
+        let first_is_none = first.is_none();
+        if (first_is_error || first_is_none) && attempt < retries {
+            // First-frame Error / pre-frame close (worker died) — retryable.
+            if retry_sleep_budget(step_deadline, backoff).is_some() {
+                let _ = client
+                    .send_raw(crate::streaming::build_stream_cancel(stream_id))
+                    .await;
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_millis(500));
+                attempt += 1;
+                worker_id = repick_streaming_worker(state, step, resolved_version, meta, clients).await?;
+                continue;
+            }
+        }
+
+        // Committed (Chunk/Start/Done, or Error/close with retries
+        // exhausted): preserve the consumed first frame behind a zero-copy
+        // forwarder — capacity aligned with STREAM_CHANNEL_SIZE (D2).
+        let (tx, out_rx) = mpsc::channel(64);
+        let task = tokio::spawn(async move {
+            if let Some(f) = first {
+                if tx.send(f).await.is_err() {
+                    return;
+                }
+            }
+            while let Some(f) = rx.recv().await {
+                if tx.send(f).await.is_err() {
+                    return;
+                }
+            }
+        });
+        return Ok((out_rx, stream_id, Arc::clone(client), Some(task.abort_handle())));
+    }
+}
+
+/// E6 (batch 4): re-pick a streaming worker for a retry attempt — the same
+/// pick path as the serial open (fresh pick can land on a healthy instance
+/// after a crash race).
+async fn repick_streaming_worker(
+    state: &Arc<AppState>,
+    step: &EnsembleStep,
+    resolved_version: &str,
+    meta: &pb::RequestMeta,
+    clients: &[Arc<crate::transport::zmq::WorkerZmqClient>],
+) -> Result<usize, AppError> {
+    let mv = state.registry.get(&step.model, Some(resolved_version)).ok_or_else(|| {
+        AppError::ModelNotFound(format!("{} version {}", step.model, resolved_version))
+    })?;
+    let outlier = state.worker_manager.get_outlier_state(&step.model, resolved_version).await;
+    let seq_registry = state.inference_queue.sequence_registry();
+    let worker_id = crate::worker::pick_streaming_worker(
+        meta, mv.workers.len(), outlier.as_deref(), seq_registry, &step.model, resolved_version,
+    )
+    .map_err(|e| AppError::Validation(e.0))?;
+    if worker_id >= clients.len() {
+        return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
+    }
+    Ok(worker_id)
+}
+
+/// E6 (batch 4): the retry sleep — None when the step budget cannot cover
+/// it (fast-fail instead of sleeping into the deadline, §4.4 deadline row).
+fn retry_sleep_budget(step_deadline: Option<i64>, backoff: Duration) -> Option<Duration> {
+    match crate::deadline::remaining(step_deadline) {
+        Some(rem) if rem < backoff => None,
+        _ => Some(backoff),
+    }
 }
 
 /// Shared step RequestMeta (unary + streaming): request_id `{parent}:{step}`
@@ -2560,6 +2844,19 @@ fn parse_step_output(step_name: &str, single: pb::SingleResponse) -> Result<Ense
     }
 }
 
+/// E6 (batch 4): retry classification — only transient worker-side failures
+/// retry. 5xx model errors (upstream overload/crash race) and timeouts are
+/// transient; 4xx is a deterministic client contract (retrying cannot fix
+/// it), queue pressure retrying makes worse, and crashes/readiness belong to
+/// the autoload path, not the retry path.
+fn is_retryable_error(e: &AppError) -> bool {
+    match e {
+        AppError::InferenceTimeout(_) => true,
+        AppError::ModelError(data) => data.status_code >= 500,
+        _ => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // step plumbing: state+ctx+ids+snapshot ride together by design
 async fn execute_step(
     state: Arc<AppState>,
@@ -2707,9 +3004,6 @@ async fn execute_step(
         return Err(AppError::WorkerCrashed(format!("{} has no workers", step.model)));
     }
 
-    // Send inference request through the unified queue
-    let uid = format!("ensemble_{}_{}_{}", step.model, resolved_version, Uuid::new_v4());
-
     // P-TRACE (蓝图 §4.3 ensemble 接线，防 trace 断裂): the sub-step RequestMeta
     // would otherwise carry empty headers, orphaning every step span from the
     // parent request trace. Build a child `ensemble.step` span linked to the
@@ -2741,65 +3035,109 @@ async fn execute_step(
         payload_bytes.clone(),
     );
 
-    let (response_tx, response_rx) = oneshot::channel();
-    let item = crate::inference_queue::QueueItem {
-        uid: uid.clone(),
-        data: payload_bytes,
-        meta: Some(std::sync::Arc::new(meta)),
-        response_tx,
-        inflight_guard: None,
-        enqueued_at: std::time::Instant::now(),
-    };
+    // E6 (batch 4): worker-inference retry loop — submit → bounded wait →
+    // classify. Retryable errors (5xx/timeout, is_retryable_error) re-enter
+    // with exponential backoff and a fresh uid (queue identity) while the
+    // payload (Bytes refcount) and meta (Arc clone) are reused. 4xx, queue
+    // pressure and crashes fall through immediately.
+    let mut attempt: u32 = 0;
+    let mut backoff = Duration::from_millis(50);
+    loop {
+        // Send inference request through the unified queue
+        let uid = format!("ensemble_{}_{}_{}", step.model, resolved_version, Uuid::new_v4());
 
-    match state.inference_queue.try_submit(&step.model, &resolved_version, item) {
-        Ok(()) => {}
-        Err(crate::inference_queue::QueueError::Full) => {
-            return Err(AppError::QueueFull(format!(
-                "Queue full for {} {}", step.model, resolved_version
-            )));
+        let (response_tx, response_rx) = oneshot::channel();
+        let item = crate::inference_queue::QueueItem {
+            uid,
+            data: payload_bytes.clone(),
+            meta: Some(std::sync::Arc::new(meta.clone())),
+            response_tx,
+            inflight_guard: None,
+            enqueued_at: std::time::Instant::now(),
+        };
+
+        match state.inference_queue.try_submit(&step.model, &resolved_version, item) {
+            Ok(()) => {}
+            Err(crate::inference_queue::QueueError::Full) => {
+                // E6: queue pressure is NOT retryable (a retry adds pressure).
+                return Err(AppError::QueueFull(format!(
+                    "Queue full for {} {}", step.model, resolved_version
+                )));
+            }
+            Err(_) => {
+                return Err(AppError::ModelNotReady(format!(
+                    "Queue not available for {} {}", step.model, resolved_version
+                )));
+            }
         }
-        Err(_) => {
-            return Err(AppError::ModelNotReady(format!(
-                "Queue not available for {} {}", step.model, resolved_version
-            )));
+
+        let result = async {
+            // P-DEADLINE cascade (E5): bound this attempt by the STEP
+            // deadline's remaining budget — min(parent, now + timeout_secs).
+            // None = no deadline → unbounded inner wait, outer DAG bound
+            // still applies via execute_ensemble's total_budget.
+            let response = match crate::deadline::remaining(step_deadline) {
+                Some(timeout_duration) => match timeout(timeout_duration, response_rx).await {
+                    Ok(Ok(resp)) => resp,
+                    Ok(Err(_)) => {
+                        return Err(AppError::InferenceTimeout(format!(
+                            "ensemble step {} response channel closed", step.name
+                        )));
+                    }
+                    Err(_) => {
+                        return Err(AppError::InferenceTimeout(format!(
+                            "ensemble step {} timed out", step.name
+                        )));
+                    }
+                },
+                None => match response_rx.await {
+                    Ok(resp) => resp,
+                    Err(_) => {
+                        return Err(AppError::InferenceTimeout(format!(
+                            "ensemble step {} response channel closed", step.name
+                        )));
+                    }
+                },
+            };
+            unary_response_to_value(&step.name, response)
+        }.await;
+
+        match result {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                if attempt < step.retries && is_retryable_error(&e) {
+                    // E6: don't sleep past the step budget — the next attempt
+                    // would fail immediately anyway (fast-fail, §4.4 deadline
+                    // row semantics).
+                    if let Some(rem) = crate::deadline::remaining(step_deadline) {
+                        if rem < backoff {
+                            return Err(e);
+                        }
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_millis(500));
+                    attempt += 1;
+                    continue;
+                }
+                return Err(e);
+            }
         }
     }
+}
 
-    // P-DEADLINE cascade (E5): bound this step by the STEP deadline's
-    // remaining budget — min(parent, now + timeout_secs). None = no deadline
-    // → unbounded inner wait, outer DAG bound still applies via
-    // execute_ensemble's total_budget.
-    let response = match crate::deadline::remaining(step_deadline) {
-        Some(timeout_duration) => match timeout(timeout_duration, response_rx).await {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(_)) => {
-                return Err(AppError::InferenceTimeout(format!(
-                    "ensemble step {} response channel closed", step.name
-                )));
-            }
-            Err(_) => {
-                return Err(AppError::InferenceTimeout(format!(
-                    "ensemble step {} timed out", step.name
-                )));
-            }
-        },
-        None => match response_rx.await {
-            Ok(resp) => resp,
-            Err(_) => {
-                return Err(AppError::InferenceTimeout(format!(
-                    "ensemble step {} response channel closed", step.name
-                )));
-            }
-        },
-    };
-
+/// E6 (batch 4): map a unary queue response to the step value (extracted
+/// from execute_step so the retry loop can classify the error before
+/// deciding). B3: typed output; §4.4 status mapping — a numeric Status.message
+/// → ModelError (4xx passes through, 5xx maps 500), a non-numeric message
+/// means the worker itself is broken → WorkerCrashed.
+fn unary_response_to_value(step_name: &str, response: pb::Response) -> Result<EnsembleValue, AppError> {
     match response.payload {
         Some(pb::response::Payload::Single(single)) => {
             let code = single.status.as_ref().map(|s| s.code.as_str()).unwrap_or("Ok");
             match code {
                 "Ok" => {
                     // B3 (E8): typed output (see parse_step_output).
-                    parse_step_output(&step.name, single)
+                    parse_step_output(step_name, single)
                 }
                 "Error" => {
                     let msg = single.status.as_ref().and_then(|s| {
@@ -2873,6 +3211,8 @@ mod tests {
 
                 timeout_secs: None,
                 stream: false,
+                on_error: OnErrorKind::Fail,
+                retries: 0,
                 inputs: [("input".to_string(), "$request".to_string())].into(),
             },
             EnsembleStep {
@@ -2884,6 +3224,8 @@ mod tests {
 
                 timeout_secs: None,
                 stream: false,
+                on_error: OnErrorKind::Fail,
+                retries: 0,
                 inputs: [("data".to_string(), "$step1".to_string())].into(),
             },
         ];
@@ -2902,6 +3244,8 @@ mod tests {
 
                 timeout_secs: None,
                 stream: false,
+                on_error: OnErrorKind::Fail,
+                retries: 0,
                 inputs: [("input".to_string(), "$step2".to_string())].into(),
             },
             EnsembleStep {
@@ -2913,6 +3257,8 @@ mod tests {
 
                 timeout_secs: None,
                 stream: false,
+                on_error: OnErrorKind::Fail,
+                retries: 0,
                 inputs: [("input".to_string(), "$step1".to_string())].into(),
             },
         ];
@@ -2931,6 +3277,8 @@ mod tests {
 
                 timeout_secs: None,
                 stream: false,
+                on_error: OnErrorKind::Fail,
+                retries: 0,
                 inputs: [("input".to_string(), "$unknown".to_string())].into(),
             },
         ];
@@ -2949,6 +3297,8 @@ mod tests {
 
                 timeout_secs: None,
                 stream: false,
+                on_error: OnErrorKind::Fail,
+                retries: 0,
                 inputs: [("x".to_string(), "$request".to_string())].into(),
             },
             EnsembleStep {
@@ -2960,6 +3310,8 @@ mod tests {
 
                 timeout_secs: None,
                 stream: false,
+                on_error: OnErrorKind::Fail,
+                retries: 0,
                 inputs: [("x".to_string(), "$request".to_string())].into(),
             },
             EnsembleStep {
@@ -2971,6 +3323,8 @@ mod tests {
 
                 timeout_secs: None,
                 stream: false,
+                on_error: OnErrorKind::Fail,
+                retries: 0,
                 inputs: [("x".to_string(), "$a".to_string())].into(),
             },
         ];
@@ -3338,6 +3692,8 @@ mod tests {
             timeout_secs: None,
             inputs: inputs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             stream,
+            on_error: OnErrorKind::Fail,
+            retries: 0,
         }
     }
 
@@ -3987,6 +4343,8 @@ ensemble:
             stream: false,
             params: HashMap::new(),
             timeout_secs: None,
+            on_error: OnErrorKind::Fail,
+            retries: 0,
         }
     }
 
@@ -4243,5 +4601,195 @@ ensemble:
         let parent = unix_ns_now() + 1_000_000_000; // 1s from now
         let deadline = step_effective_deadline(Some(parent), Some(60.0));
         assert_eq!(deadline, Some(parent), "parent deadline must win when earlier");
+    }
+
+    // === E6 (batch 4): on_error/retries ===
+
+    /// E6 (D5): a `skip` step referenced by ANY other step's inputs is a
+    /// parse-time rejection — the DAG must never have a dangling reference
+    /// when the skip fires at runtime.
+    #[test]
+    fn e6_skip_step_referenced_by_another_step_is_config_error() {
+        let yaml = r#"
+ensemble:
+  steps:
+    - name: may_skip
+      model: m1
+      version: "1"
+      on_error: skip
+      inputs: {x: "$request"}
+    - name: consumer
+      model: m2
+      version: "1"
+      inputs: {y: "$may_skip"}
+"#;
+        let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("skip step referenced downstream must be rejected at parse");
+        assert!(
+            err.to_string().contains("skip"),
+            "error must name the skip rule, got: {err}"
+        );
+    }
+
+    /// E6 (D5): a `skip` step referenced (even by field) by another step is
+    /// rejected — the field projection has the same dangling-reference risk.
+    #[test]
+    fn e6_skip_step_field_reference_is_config_error() {
+        let yaml = r#"
+ensemble:
+  steps:
+    - name: may_skip
+      model: m1
+      version: "1"
+      on_error: skip
+      inputs: {x: "$request"}
+    - name: consumer
+      model: m2
+      version: "1"
+      inputs: {y: "$may_skip.field"}
+"#;
+        let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("skip step field reference must be rejected at parse");
+        assert!(
+            err.to_string().contains("skip"),
+            "error must name the skip rule, got: {err}"
+        );
+    }
+
+    /// E6 (D5): `ensemble.output` pointing at a skip step is rejected — the
+    /// single-output contract has no null channel (only E7 outputs do).
+    #[test]
+    fn e6_skip_step_as_output_is_config_error() {
+        let yaml = r#"
+ensemble:
+  output: "$may_skip"
+  steps:
+    - name: may_skip
+      model: m1
+      version: "1"
+      on_error: skip
+      inputs: {x: "$request"}
+"#;
+        let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("skip step as ensemble.output must be rejected at parse");
+        assert!(
+            err.to_string().contains("skip"),
+            "error must name the skip rule, got: {err}"
+        );
+    }
+
+    /// E6 (D34 rule 6): a streaming step must never be absent — `on_error:
+    /// skip` × `stream: true` is a parse-time rejection (the streaming
+    /// response contract promises a stream unconditionally).
+    #[test]
+    fn e6_streaming_step_with_skip_is_config_error() {
+        let yaml = r#"
+ensemble:
+  steps:
+    - name: tail
+      model: m1
+      version: "1"
+      stream: true
+      on_error: skip
+      inputs: {x: "$request"}
+"#;
+        let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("streaming step with on_error: skip must be rejected at parse");
+        assert!(
+            err.to_string().contains("skip"),
+            "error must name the skip rule, got: {err}"
+        );
+    }
+
+    /// E6: an unreferenced skip step is legal — the skip simply drops the
+    /// step from the context and the layer continues.
+    #[test]
+    fn e6_unreferenced_skip_step_is_accepted() {
+        let yaml = r#"
+ensemble:
+  steps:
+    - name: may_skip
+      model: m1
+      version: "1"
+      on_error: skip
+      inputs: {x: "$request"}
+    - name: main
+      model: m2
+      version: "1"
+      inputs: {x: "$request"}
+"#;
+        let plan = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect("unreferenced skip step must parse");
+        assert_eq!(plan.steps[0].on_error, OnErrorKind::Skip);
+        assert_eq!(plan.steps[1].on_error, OnErrorKind::Fail);
+    }
+
+    /// E6: an unknown on_error value fails deserialization (the schema
+    /// denies typos — a swallowed `on_error: skp` would silently disable
+    /// fault tolerance).
+    #[test]
+    fn e6_unknown_on_error_value_is_config_error() {
+        let yaml = r#"
+ensemble:
+  steps:
+    - name: s
+      model: m1
+      version: "1"
+      on_error: skp
+      inputs: {x: "$request"}
+"#;
+        let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("unknown on_error value must be rejected at parse");
+        assert!(err.to_string().contains("on_error"), "got: {err}");
+    }
+
+    /// E6: retry classification — only 5xx worker errors and timeouts
+    /// retry; 4xx (client contract), queue pressure and crashes never do
+    /// (a 4xx is deterministic, a QueueFull retry makes pressure worse).
+    #[test]
+    fn e6_retryable_error_classification() {
+        let err_500 = AppError::ModelError(Box::new(ModelErrorData {
+            status_code: 500,
+            error_type: "model_error".into(),
+            detail: "boom".into(),
+            code: None,
+            param: None,
+            headers: None,
+        }));
+        let err_503 = AppError::ModelError(Box::new(ModelErrorData {
+            status_code: 503,
+            error_type: "model_error".into(),
+            detail: "overloaded".into(),
+            code: None,
+            param: None,
+            headers: None,
+        }));
+        let err_400 = AppError::ModelError(Box::new(ModelErrorData {
+            status_code: 400,
+            error_type: "invalid".into(),
+            detail: "bad input".into(),
+            code: None,
+            param: None,
+            headers: None,
+        }));
+        assert!(is_retryable_error(&err_500), "5xx must retry");
+        assert!(is_retryable_error(&err_503), "5xx must retry");
+        assert!(!is_retryable_error(&err_400), "4xx must NOT retry");
+        assert!(
+            is_retryable_error(&AppError::InferenceTimeout("t".into())),
+            "timeouts must retry"
+        );
+        assert!(
+            !is_retryable_error(&AppError::QueueFull("full".into())),
+            "queue pressure must NOT retry"
+        );
+        assert!(
+            !is_retryable_error(&AppError::WorkerCrashed("crash".into())),
+            "worker crashes must NOT retry"
+        );
+        assert!(
+            !is_retryable_error(&AppError::ModelNotReady("not ready".into())),
+            "readiness must NOT retry"
+        );
     }
 }

@@ -372,6 +372,105 @@ class Pre5xxAPI(LitAPI):
     );
 }
 
+/// E6 (batch 4): flaky unary step — 500 on the FIRST call only, then
+/// succeeds (module counter; one worker per process keeps it deterministic).
+fn write_pre_flaky(repo: &std::path::Path) {
+    write_model_py(
+        repo,
+        "pre_flaky",
+        r#"from lite_server.exceptions import InternalServerError
+from lite_server import LitAPI
+
+
+_ATTEMPTS = 0
+
+
+class PreFlakyAPI(LitAPI):
+    def setup(self, device):
+        self.device = device
+
+    async def decode_request(self, request, ctx=None):
+        return request.get("text", "")
+
+    async def predict(self, x, ctx=None):
+        global _ATTEMPTS
+        _ATTEMPTS += 1
+        if _ATTEMPTS == 1:
+            raise InternalServerError("flaky first call")
+        return {"pre": x}
+
+    async def encode_response(self, output, ctx=None):
+        return output
+"#,
+    );
+}
+
+/// E6 (batch 4): flaky streaming tail — the FIRST stream raises (first-frame
+/// Error), the second streams normally (build-window retry fixture, D35).
+fn write_tail_flaky(repo: &std::path::Path) {
+    write_model_py(
+        repo,
+        "tail_flaky",
+        r#"import time
+from lite_server import LitAPI
+
+
+_ATTEMPTS = 0
+
+
+class TailFlakyAPI(LitAPI):
+    def setup(self, device):
+        self.device = device
+
+    async def decode_request(self, request, ctx=None):
+        return request.get("pre", "")
+
+    async def predict(self, x, ctx=None):
+        return {"tokens": x.split()}
+
+    def stream_predict(self, request, ctx=None):
+        global _ATTEMPTS
+        _ATTEMPTS += 1
+        if _ATTEMPTS == 1:
+            raise RuntimeError("first-frame boom")
+        for w in request.split():
+            time.sleep(0.02)
+            yield {"token": w}
+
+    async def encode_response(self, output, ctx=None):
+        return output
+"#,
+    );
+}
+
+/// E6 (batch 4): streaming tail that ALWAYS raises on the first frame
+/// (build-window retry exhaustion fixture, D35).
+fn write_tail_fail_always(repo: &std::path::Path) {
+    write_model_py(
+        repo,
+        "tail_fail_always",
+        r#"from lite_server import LitAPI
+
+
+class TailFailAlwaysAPI(LitAPI):
+    def setup(self, device):
+        self.device = device
+
+    async def decode_request(self, request, ctx=None):
+        return request.get("pre", "")
+
+    async def predict(self, x, ctx=None):
+        return {"tokens": x.split()}
+
+    def stream_predict(self, request, ctx=None):
+        raise RuntimeError("first-frame boom")
+
+    async def encode_response(self, output, ctx=None):
+        return output
+"#,
+    );
+}
+
 /// Corrupt-config sub-model: exists but load_model fails → ModelNotReady 503.
 fn write_missing_model(repo: &std::path::Path) {
     let dir = repo.join("ghost").join("1");
@@ -627,6 +726,111 @@ const ENS_FAIL_YAML: &str = r#"ensemble:
         pre: "$pre.pre"
 "#;
 
+// ===== E6 (batch 4) fixtures =====
+
+/// Skip step (fails 5xx) + independent sibling — the DAG must still produce
+/// the sibling's output (the skip is parse-guaranteed unreferenced, D5).
+const ENS_SKIP_YAML: &str = r#"ensemble:
+  steps:
+    - name: may_skip
+      model: pre_5xx
+      version: "1"
+      on_error: skip
+      inputs:
+        text: "$request.text"
+    - name: main
+      model: pre
+      version: "1"
+      inputs:
+        text: "$request.text"
+"#;
+
+/// Retry recovery: flaky unary step (500 on first call) with retries: 1.
+const ENS_RETRY_YAML: &str = r#"ensemble:
+  steps:
+    - name: flaky
+      model: pre_flaky
+      version: "1"
+      retries: 1
+      inputs:
+        text: "$request.text"
+"#;
+
+/// Retry default-off pin: same flaky model with retries: 0 must fail 500.
+const ENS_RETRY_OFF_YAML: &str = r#"ensemble:
+  steps:
+    - name: flaky
+      model: pre_flaky
+      version: "1"
+      inputs:
+        text: "$request.text"
+"#;
+
+/// Retry exhaustion: always-500 model with retries: 2 → 500 after 3 attempts.
+const ENS_RETRY_EXHAUST_YAML: &str = r#"ensemble:
+  steps:
+    - name: broken
+      model: pre_5xx
+      version: "1"
+      retries: 2
+      inputs:
+        text: "$request.text"
+"#;
+
+/// Streaming build-window retry recovery (D35): the tail's first stream
+/// opens with a first-frame Error; retries rebuild it and chunks stream.
+const ENS_STREAM_RETRY_YAML: &str = r#"ensemble:
+  steps:
+    - name: pre
+      model: pre
+      version: "1"
+      inputs:
+        text: "$request.text"
+    - name: tail
+      model: tail_flaky
+      version: "1"
+      stream: true
+      retries: 2
+      inputs:
+        pre: "$pre.pre"
+"#;
+
+/// Streaming build-window retry exhaustion: the tail always fails on the
+/// first frame → Error frame + close (no [DONE]).
+const ENS_STREAM_RETRY_EXHAUST_YAML: &str = r#"ensemble:
+  steps:
+    - name: pre
+      model: pre
+      version: "1"
+      inputs:
+        text: "$request.text"
+    - name: tail
+      model: tail_fail_always
+      version: "1"
+      stream: true
+      retries: 1
+      inputs:
+        pre: "$pre.pre"
+"#;
+
+/// Committed-stream pin (D35): a mid-stream failure (3rd chunk) with
+/// retries: 2 must NOT replay — chunks before the Error frame appear once.
+const ENS_STREAM_COMMITTED_YAML: &str = r#"ensemble:
+  steps:
+    - name: pre
+      model: pre
+      version: "1"
+      inputs:
+        text: "$request.text"
+    - name: tail
+      model: tail_fail
+      version: "1"
+      stream: true
+      retries: 2
+      inputs:
+        pre: "$pre.pre"
+"#;
+
 const ENS_SLOW_YAML: &str = r#"ensemble:
   steps:
     - name: pre
@@ -748,6 +952,17 @@ fn write_all_fixtures(repo: &std::path::Path) {
     write_ensemble(repo, "ens_sibling_race", ENS_SIBLING_RACE_YAML);
     write_ensemble(repo, "ens_e5_slow_child", ENS_E5_SLOW_CHILD_YAML);
     write_ensemble(repo, "ens_e5_nested_timeout", ENS_E5_NESTED_TIMEOUT_YAML);
+    // ===== batch 4 (E6) fixtures =====
+    write_pre_flaky(repo);
+    write_tail_flaky(repo);
+    write_tail_fail_always(repo);
+    write_ensemble(repo, "ens_skip", ENS_SKIP_YAML);
+    write_ensemble(repo, "ens_retry", ENS_RETRY_YAML);
+    write_ensemble(repo, "ens_retry_off", ENS_RETRY_OFF_YAML);
+    write_ensemble(repo, "ens_retry_exhaust", ENS_RETRY_EXHAUST_YAML);
+    write_ensemble(repo, "ens_stream_retry", ENS_STREAM_RETRY_YAML);
+    write_ensemble(repo, "ens_stream_retry_exhaust", ENS_STREAM_RETRY_EXHAUST_YAML);
+    write_ensemble(repo, "ens_stream_committed", ENS_STREAM_COMMITTED_YAML);
 }
 
 fn write_server_yaml(repo: &std::path::Path, http_port: u16, extra: &str, orch_extra: &str) -> std::path::PathBuf {
@@ -764,7 +979,7 @@ fn write_server_yaml(repo: &std::path::Path, http_port: u16, extra: &str, orch_e
         format!(
             "server:\n  http_port: {http_port}\n  timeout: 30.0\n{extra}\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n",
             repo.display()
         ),
     )
@@ -1147,7 +1362,7 @@ async fn boot_server_grpc(extra: &str) -> (String, u16, ServerGuard, std::path::
             "server:\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  timeout: 30.0\n{extra}\n\n\
              grpc:\n  enabled: true\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n",
             repo.display()
         ),
     )
@@ -3268,4 +3483,157 @@ async fn test_audit_stream_e4_metric_version_label_normalized_to_latest() {
             "unresolved step versions must normalize to \"latest\" (m4): {line}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Batch 4 (E6): on_error skip + retries
+// ---------------------------------------------------------------------------
+
+/// E6 (D5): a skip step that fails leaves the DAG intact — the sibling
+/// still produces the output (the skip step is absent from the context).
+#[serial]
+#[tokio::test]
+async fn test_audit_e6_skip_step_sibling_continues() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_skip"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_skip/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"text": "still works"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "skip must not fail the DAG");
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("still works"),
+        "sibling step must produce the output despite the skip: {body}"
+    );
+}
+
+/// E6: a flaky unary step (500 on first call) recovers with retries.
+#[serial]
+#[tokio::test]
+async fn test_audit_e6_unary_retry_recovers() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_retry"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_retry/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"text": "recovered"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "retry must recover from the first 500"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("recovered"), "second attempt output: {body}");
+}
+
+/// E6: retries default off — the same flaky model without retries is 500.
+#[serial]
+#[tokio::test]
+async fn test_audit_e6_retry_default_off_is_500() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_retry_off"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_retry_off/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"text": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "retries: 0 (default) must keep the historical single-attempt 500"
+    );
+}
+
+/// E6: retry exhaustion — an always-500 model with retries: 2 still ends 500.
+#[serial]
+#[tokio::test]
+async fn test_audit_e6_retry_exhausted_is_500() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_retry_exhaust"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_retry_exhaust/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"text": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "exhausted retries must surface the final 500"
+    );
+}
+
+/// E6 (D35): a streaming step whose first build attempt errors on the first
+/// frame rebuilds the stream — chunks arrive on the second attempt.
+#[serial]
+#[tokio::test]
+async fn test_audit_e6_stream_build_retry_recovers() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_stream_retry"]).await;
+
+    let body = sse_post(&base, "/v2/models/ens_stream_retry/events", json!({"text": "hello world"}))
+        .await
+        .expect("stream must open (200)");
+    assert!(body.contains(r#""token":"hello""#), "chunks must arrive after rebuild: {body}");
+    assert!(body.contains(r#""token":"world""#), "second chunk: {body}");
+    assert!(body.contains("[DONE]"), "clean [DONE]: {body}");
+    assert!(!body.contains("error"), "no error frame expected: {body}");
+}
+
+/// E6 (D35): build-window retry exhaustion — an always-failing first frame
+/// surfaces as an Error frame + close (no [DONE]).
+#[serial]
+#[tokio::test]
+async fn test_audit_e6_stream_retry_exhausted_error_frame() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_stream_retry_exhaust"]).await;
+
+    let body = sse_post(&base, "/v2/models/ens_stream_retry_exhaust/events", json!({"text": "hello"}))
+        .await
+        .expect("stream must open (200) — first-frame failure is in-stream");
+    assert!(
+        body.contains("error") && !body.contains("[DONE]"),
+        "exhausted build retries must close with an Error frame, no [DONE]: {body}"
+    );
+}
+
+/// E6 (D35): once a chunk commits the stream, retries close — a mid-stream
+/// failure is NOT replayed (no doubled chunks, Error frame after the
+/// committed prefix).
+#[serial]
+#[tokio::test]
+async fn test_audit_e6_stream_committed_no_replay() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_stream_committed"]).await;
+
+    let body = sse_post(&base, "/v2/models/ens_stream_committed/events", json!({"text": "a b c d"}))
+        .await
+        .expect("stream must open (200)");
+    assert_eq!(
+        body.matches(r#""token":"a""#).count(),
+        1,
+        "committed chunks must not replay after a mid-stream failure: {body}"
+    );
+    assert!(
+        body.contains("error") && !body.contains("[DONE]"),
+        "mid-stream failure must close with an Error frame: {body}"
+    );
 }
