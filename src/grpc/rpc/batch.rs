@@ -70,6 +70,8 @@ fn d30_element_ok(value: crate::ensemble::EnsembleValue) -> pb::InferResponse {
         crate::ensemble::EnsembleValue::Json(v) => {
             bytes::Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
         }
+        // P2 (batch 6): raw-resident output → original bytes.
+        crate::ensemble::EnsembleValue::RawJson(raw) => raw.bytes.clone(),
         crate::ensemble::EnsembleValue::Binary(data, _ct, ..) => data,
         // E7 (D32): multi-sink element responses ride the LSBE-1 container
         // (InferResponse has no headers map).

@@ -38,9 +38,14 @@ type StepResults = Vec<(String, EnsembleValue)>;
 /// head plus the binary tail — internal only, produced by the transport
 /// de-framing shims and consumed by [`parse_root_inputs`]; it NEVER flows
 /// on a DAG edge (I1-I3 make every step output Json or Binary).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum EnsembleValue {
     Json(serde_json::Value),
+    /// P2/P8 (batch 6): a raw-resident step output — the worker's JSON bytes
+    /// kept unparsed in the context. Whole references splice the original
+    /// bytes into downstream payloads (zero parse/re-serialize); a field
+    /// access parses ONCE and caches the shared `Arc<Value>`.
+    RawJson(Arc<RawJsonValue>),
     Binary(
         Bytes,
         String,           /* content_type */
@@ -51,6 +56,60 @@ pub enum EnsembleValue {
         head: serde_json::Value,
         tail: Bytes,
     },
+}
+
+/// P2/P8 (batch 6): raw-resident JSON bytes + a lazy once-parsed cache. The
+/// cache holds the shared `Arc<Value>` so field accesses parse once and every
+/// consumer shares one allocation.
+#[derive(Debug)]
+pub struct RawJsonValue {
+    pub bytes: Bytes,
+    parsed: std::sync::OnceLock<Arc<Value>>,
+}
+
+impl PartialEq for RawJsonValue {
+    /// Equality on the BYTES (the parse cache is derived state).
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl RawJsonValue {
+    pub fn new(bytes: Bytes) -> Self {
+        Self {
+            bytes,
+            parsed: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Parse once (racing parses discard the loser — equivalent values).
+    pub fn parse(&self) -> Result<&Arc<Value>, serde_json::Error> {
+        if let Some(v) = self.parsed.get() {
+            return Ok(v);
+        }
+        let v = Arc::new(serde_json::from_slice(&self.bytes)?);
+        let _ = self.parsed.set(v);
+        Ok(self.parsed.get().unwrap())
+    }
+}
+
+impl Clone for EnsembleValue {
+    fn clone(&self) -> Self {
+        match self {
+            EnsembleValue::Json(v) => EnsembleValue::Json(v.clone()),
+            EnsembleValue::RawJson(r) => EnsembleValue::RawJson(Arc::clone(r)),
+            EnsembleValue::Binary(b, ct, shape, dt) => EnsembleValue::Binary(
+                b.clone(),
+                ct.clone(),
+                shape.clone(),
+                dt.clone(),
+            ),
+            EnsembleValue::Envelope { head, tail } => EnsembleValue::Envelope {
+                head: head.clone(),
+                tail: tail.clone(),
+            },
+        }
+    }
 }
 
 // ===== Config parsing =====
@@ -737,6 +796,20 @@ fn build_response(
             Some(EnsembleValue::Json(v)) => {
                 head_outputs.push(json!({"name": alias, "data": v}));
             }
+            // P2 (batch 6): a raw-resident alias embeds its ORIGINAL bytes
+            // into the envelope head (RawValue validates once and writes
+            // verbatim — no re-serialize).
+            Some(EnsembleValue::RawJson(raw)) => {
+                let embedded = serde_json::value::RawValue::from_string(
+                    String::from_utf8_lossy(&raw.bytes).into_owned(),
+                )
+                .map_err(|e| {
+                    AppError::Internal(format!(
+                        "ensemble outputs alias '{alias}' value is not valid JSON: {e}"
+                    ))
+                })?;
+                head_outputs.push(json!({"name": alias, "data": embedded}));
+            }
             Some(EnsembleValue::Binary(b, _ct, shape, datatype)) => {
                 // Binary alias → head element + tail slice (header order).
                 let mut el = serde_json::Map::new();
@@ -879,6 +952,7 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
             input_modes: Vec::new(),
             conditional_refs: Vec::new(),
             step_dep_keys: Vec::new(),
+            step_raw_eligible: Vec::new(),
             outputs: None,
             dag_sets: Some(sets),
             config_path: config_path.to_path_buf(),
@@ -1010,6 +1084,45 @@ fn parse_ensemble_set(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    // P2/P8 (batch 6): raw residency — any ref carrying a path segment onto
+    // an undeclared step forces the parse (field projection needs the Value;
+    // the lazy cache covers the mixed whole+field case). Declared steps
+    // always parse (R6 projection semantics).
+    let mut step_raw_eligible = vec![true; steps.len()];
+    for (i, s) in steps.iter().enumerate() {
+        if s.outputs_decl.is_some() {
+            step_raw_eligible[i] = false;
+        }
+    }
+    let mut mark_field_referenced = |r: &str| {
+        if let Some(caps) = REF_RE.captures(r) {
+            let source = caps.get(1).unwrap().as_str();
+            let rest = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            // A non-empty rest on an UNDECLARED step is a single-segment field
+            // access (legacy multi-segment is parse-rejected, B5) — declared
+            // steps are always ineligible regardless (R6 projections).
+            if !rest.is_empty() {
+                if let Some(&i) = index_of.get(source) {
+                    if steps[i].outputs_decl.is_none() {
+                        step_raw_eligible[i] = false;
+                    }
+                }
+            }
+        }
+    };
+    for s in &steps {
+        for r in s.inputs.values() {
+            mark_field_referenced(r);
+        }
+    }
+    if let Some(o) = &output {
+        mark_field_referenced(o);
+    }
+    if let Some(outs) = &outputs {
+        for r in outs.values() {
+            mark_field_referenced(r);
+        }
+    }
 
     Ok(EnsemblePlan {
         output_step,
@@ -1023,6 +1136,7 @@ fn parse_ensemble_set(
         input_modes,
         conditional_refs,
         step_dep_keys,
+        step_raw_eligible,
         // E7 (batch 4④): multi-sink output mapping (None = single output).
         outputs,
         // E8-1 (batch 5): a single-set plan carries no named sets.
@@ -1865,6 +1979,24 @@ fn select_output_field(
             })?;
             Ok(EnsembleValue::Json(field_val))
         }
+        // P2 (batch 6): a raw-resident output with a field projection parses
+        // once (the explicit output field forces the parse at plan time too —
+        // this arm is the lazy-cache backstop).
+        EnsembleValue::RawJson(raw) => {
+            let v = raw.parse().map_err(|e| {
+                AppError::Internal(format!(
+                    "ensemble step '{}' output is not valid JSON: {}",
+                    step_name, e
+                ))
+            })?;
+            let field_val = v.get(field).cloned().ok_or_else(|| {
+                AppError::Config(format!(
+                    "ensemble.output field '{}' not found in step '{}' output",
+                    field, step_name
+                ))
+            })?;
+            Ok(EnsembleValue::Json(field_val))
+        }
         EnsembleValue::Binary(..) => Err(AppError::InvalidRequestBody(format!(
             "ensemble.output field '{}' cannot be extracted from binary step \
              output '{}' (no field semantics on bytes)",
@@ -2053,6 +2185,24 @@ fn resolve_ref(
                 Ok(ResolvedRef::Value(EnsembleValue::Json(field_val)))
             }
         },
+        // P2/P8 (batch 6): a raw-resident value — whole refs pass the bytes
+        // through by refcount; a field access parses ONCE (cached) and
+        // projects from the shared value.
+        EnsembleValue::RawJson(raw) => match json_path {
+            None => Ok(ResolvedRef::Value(source_data.clone())),
+            Some(f) => {
+                let v = raw.parse().map_err(|e| {
+                    AppError::Internal(format!(
+                        "step output for '{}' is not valid JSON: {}",
+                        ref_str, e
+                    ))
+                })?;
+                let field_val = project_json_path(v, f).map_err(|_| {
+                    AppError::Config(format!("cannot resolve '{}' from {}", ref_str, v))
+                })?;
+                Ok(ResolvedRef::Value(EnsembleValue::Json(field_val)))
+            }
+        },
         EnsembleValue::Envelope { .. } => {
             Err(AppError::Internal("envelope reached a DAG edge".to_string()))
         }
@@ -2141,7 +2291,7 @@ pub fn parse_root_inputs(
     let (head, tail) = match payload {
         EnsembleValue::Json(v) => (v, Bytes::new()),
         EnsembleValue::Envelope { head, tail } => (head, tail),
-        EnsembleValue::Binary(..) => {
+        EnsembleValue::Binary(..) | EnsembleValue::RawJson(..) => {
             return Err(AppError::InvalidRequestBody(
                 "this ensemble declares named inputs — requests must be a KServe \
                  envelope (JSON with inputs[], or JSON head + binary tail); raw \
@@ -2446,6 +2596,12 @@ pub struct EnsemblePlan {
     /// of every sibling output per spawn is eliminated. Index-aligned with
     /// `steps`.
     pub step_dep_keys: Vec<Vec<String>>,
+    /// P2/P8 (batch 6): per-step raw residency — an UNDECLARED step whose
+    /// output is never field-projected stays unparsed Bytes in the context
+    /// (whole refs splice the original bytes; a field access parses lazily
+    /// once). Declared steps (step.outputs projections) and field-referenced
+    /// steps always parse. Index-aligned with `steps`.
+    pub step_raw_eligible: Vec<bool>,
     /// E7 (batch 4④): multi-sink aliases `{alias: $ref}` — the response is
     /// a KServe envelope (build_response). None = the historical single
     /// output.
@@ -3757,16 +3913,13 @@ async fn consume_stream_consumer(
         match &chunk.payload {
             Some(pb::stream_response::Payload::Chunk(c)) => {
                 // Chunk → the previous step's value in a per-chunk context.
-                let chunk_value: Value = serde_json::from_slice(&c.data).map_err(|e| {
-                    AppError::Internal(format!(
-                        "pipeline chunk from '{}' is not valid JSON: {e}",
-                        prev_step_name
-                    ))
-                })?;
+                // P2 (batch 6): the chunk stays unparsed raw bytes (P-R2
+                // guarantees whole-reference-only consumption — the downstream
+                // assembly splices the original bytes, no per-chunk parse).
                 let mut ctx = base_ctx.clone();
                 ctx.insert(
                     prev_step_name.to_string(),
-                    EnsembleValue::Json(chunk_value),
+                    EnsembleValue::RawJson(Arc::new(RawJsonValue::new(c.data.clone()))),
                 );
                 let sub_request_id = format!("{}:{}:{}", request_id, step.name, seq);
                 let sub = execute_stream_step(
@@ -4597,36 +4750,84 @@ fn assemble_step_payload(
 /// MIMO (R12): GroupJson assembly — all-Json inputs build one object (E3
 /// params override after the inputs). Shared by the static dispatch and the
 /// legacy dynamic path (identical bytes).
+///
+/// P2/P8 (batch 6): raw-resident values splice their ORIGINAL bytes into the
+/// assembled payload — no parse, no re-serialize on the hot path. Keys emit
+/// in sorted order (the historical serde_json::Map ordering) so the bytes
+/// are identical to the pre-P2 path.
 fn assemble_group_json(
     _step_name: &str,
     resolved: &HashMap<String, EnsembleValue>,
     params: &HashMap<String, Value>,
 ) -> Result<(bytes::Bytes, Option<String>), AppError> {
-    let mut obj = serde_json::Map::new();
-    for (key, val) in resolved {
-        match val {
-            EnsembleValue::Json(v) => {
-                obj.insert(key.clone(), v.clone());
+    enum ValueSource<'a> {
+        Input(&'a EnsembleValue),
+        Param(&'a Value),
+    }
+    impl ValueSource<'_> {
+        fn len_estimate(&self) -> usize {
+            match self {
+                ValueSource::Input(EnsembleValue::Json(v)) => json_value_len_estimate(v),
+                ValueSource::Param(v) => json_value_len_estimate(v),
+                ValueSource::Input(EnsembleValue::RawJson(raw)) => raw.bytes.len(),
+                // Unreachable: legacy routes here only with binary_count == 0;
+                // static GroupJson is parse-checked (R12).
+                ValueSource::Input(EnsembleValue::Binary(..) | EnsembleValue::Envelope { .. }) => {
+                    unreachable!()
+                }
             }
-            // Unreachable: legacy routes here only with binary_count == 0;
-            // static GroupJson is parse-checked (R12).
-            EnsembleValue::Binary(..) | EnsembleValue::Envelope { .. } => unreachable!(),
         }
     }
-    // E3: constant step params override the assembled inputs.
-    for (key, val) in params {
-        obj.insert(key.clone(), val.clone());
-    }
-    let estimate: usize = obj
+
+    // E3: constant step params override the assembled inputs on key conflict.
+    let mut merged: HashMap<&str, ValueSource> = resolved
         .iter()
-        .map(|(k, v)| k.len() + 3 + json_value_len_estimate(v))
+        .map(|(k, v)| (k.as_str(), ValueSource::Input(v)))
+        .collect();
+    for (key, val) in params {
+        merged.insert(key.as_str(), ValueSource::Param(val));
+    }
+    let mut entries: Vec<(&str, ValueSource)> = merged.into_iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    let estimate: usize = entries
+        .iter()
+        .map(|(k, src)| k.len() + 3 + src.len_estimate())
         .sum::<usize>()
         + 2;
     let mut buf = Vec::with_capacity(estimate);
-    let mut ser = serde_json::Serializer::new(&mut buf);
-    // Value serialization is infallible (E8 cleanup note).
-    serde::Serialize::serialize(&Value::Object(obj), &mut ser)
-        .expect("Value serialization is infallible");
+    buf.push(b'{');
+    for (i, (key, src)) in entries.iter().enumerate() {
+        if i > 0 {
+            buf.push(b',');
+        }
+        serde::Serialize::serialize(key, &mut serde_json::Serializer::new(&mut buf))
+            .expect("key serialization is infallible");
+        buf.push(b':');
+        match src {
+            ValueSource::Param(v) => {
+                serde::Serialize::serialize(
+                    v,
+                    &mut serde_json::Serializer::new(&mut buf),
+                )
+                .expect("Value serialization is infallible");
+            }
+            ValueSource::Input(EnsembleValue::Json(v)) => {
+                serde::Serialize::serialize(
+                    v,
+                    &mut serde_json::Serializer::new(&mut buf),
+                )
+                .expect("Value serialization is infallible");
+            }
+            ValueSource::Input(EnsembleValue::RawJson(raw)) => {
+                buf.extend_from_slice(&raw.bytes);
+            }
+            ValueSource::Input(EnsembleValue::Binary(..) | EnsembleValue::Envelope { .. }) => {
+                unreachable!()
+            }
+        }
+    }
+    buf.push(b'}');
     Ok((bytes::Bytes::from(buf), None))
 }
 
@@ -4691,6 +4892,22 @@ fn materialize_step_outputs(
     let Some(decl) = &step.outputs_decl else {
         return Ok(vec![(step.name.clone(), raw)]);
     };
+    // P2 (batch 6): a declared step over a NESTED child's raw-resident
+    // outcome parses before projection (unary workers never produce raw for
+    // declared steps — unary_response_to_value forces the parse — but the
+    // child's build_response may hand over raw bytes).
+    let raw = match raw {
+        EnsembleValue::RawJson(r) => {
+            let v = r.parse().map_err(|e| {
+                AppError::Internal(format!(
+                    "step '{}' raw output is not valid JSON: {}",
+                    step.name, e
+                ))
+            })?;
+            EnsembleValue::Json((**v).clone())
+        }
+        other => other,
+    };
     let mut out = Vec::with_capacity(decl.len());
     for (alias, d) in decl {
         let key = format!("{}.{}", step.name, alias);
@@ -4753,6 +4970,11 @@ fn materialize_step_outputs(
                 return Err(AppError::Internal(
                     "envelope reached step materialization".to_string(),
                 ));
+            }
+            // P2 (batch 6): declared steps always parse (raw residency only
+            // applies to undeclared steps).
+            (EnsembleValue::RawJson(_), _) => {
+                unreachable!("declared steps never receive raw-resident values")
             }
         }
     }
@@ -5034,7 +5256,7 @@ async fn execute_step(
                     }
                 },
             };
-            unary_response_to_value(&step.name, response)
+            unary_response_to_value(&step.name, response, plan.step_raw_eligible[step_idx])
         }.await;
 
         match result {
@@ -5065,14 +5287,31 @@ async fn execute_step(
 /// deciding). B3: typed output; §4.4 status mapping — a numeric Status.message
 /// → ModelError (4xx passes through, 5xx maps 500), a non-numeric message
 /// means the worker itself is broken → WorkerCrashed.
-fn unary_response_to_value(step_name: &str, response: pb::Response) -> Result<EnsembleValue, AppError> {
+fn unary_response_to_value(
+    step_name: &str,
+    response: pb::Response,
+    raw_eligible: bool,
+) -> Result<EnsembleValue, AppError> {
     match response.payload {
         Some(pb::response::Payload::Single(single)) => {
             let code = single.status.as_ref().map(|s| s.code.as_str()).unwrap_or("Ok");
             match code {
                 "Ok" => {
-                    // B3 (E8): typed output (see parse_step_output).
-                    parse_step_output(step_name, single)
+                    // P2 (batch 6): a raw-eligible (pass-through schema)
+                    // JSON response stays unparsed Bytes in the context —
+                    // validation is skipped by design (whole refs splice
+                    // the bytes; field access parses lazily). Field-projected
+                    // / declared steps keep the historical parse validation.
+                    let is_binary = !single.media_type.is_empty()
+                        && !single.media_type.starts_with("application/json");
+                    if raw_eligible && !is_binary {
+                        Ok(EnsembleValue::RawJson(Arc::new(RawJsonValue::new(
+                            single.data,
+                        ))))
+                    } else {
+                        // B3 (E8): typed output (see parse_step_output).
+                        parse_step_output(step_name, single)
+                    }
                 }
                 "Error" => {
                     let msg = single.status.as_ref().and_then(|s| {
@@ -5440,6 +5679,198 @@ mod tests {
         assert!(subset.contains_key("a"));
         assert!(!subset.contains_key("b"));
         assert!(!subset.contains_key("c"));
+    }
+
+    // === P2 + P8 (batch 6): raw-resident step outputs ===
+
+    #[test]
+    fn p2_raw_eligibility_whole_only_chain() {
+        let plan = parse_ensemble_plan(
+            "ensemble:\n  steps:\n    - name: a\n      model: m1\n      version: \"1\"\n      inputs:\n        x: \"$request\"\n    - name: b\n      model: m2\n      version: \"1\"\n      inputs:\n        a: \"$a\"\n",
+            &PathBuf::from("/nonexistent/config.yaml"),
+        )
+        .unwrap();
+        assert!(
+            plan.step_raw_eligible[0],
+            "a whole-referenced undeclared step stays raw-resident"
+        );
+        assert!(plan.step_raw_eligible[1], "the output step is whole-consumed");
+    }
+
+    #[test]
+    fn p2_raw_eligibility_field_ref_forces_parse() {
+        let plan = parse_ensemble_plan(
+            "ensemble:\n  steps:\n    - name: a\n      model: m1\n      version: \"1\"\n      inputs:\n        x: \"$request\"\n    - name: b\n      model: m2\n      version: \"1\"\n      inputs:\n        a: \"$a.output\"\n",
+            &PathBuf::from("/nonexistent/config.yaml"),
+        )
+        .unwrap();
+        assert!(
+            !plan.step_raw_eligible[0],
+            "a field-referenced step must parse its output"
+        );
+    }
+
+    #[test]
+    fn p2_raw_eligibility_declared_and_output_field_force_parse() {
+        let declared = parse_ensemble_plan(
+            "ensemble:\n  inputs:\n    text:\n      type: json\n  outputs:\n    out: \"$a.out\"\n  steps:\n    - name: a\n      model: m1\n      version: \"1\"\n      outputs:\n        out:\n          type: json\n      inputs:\n        x: \"$inputs.text\"\n",
+            &PathBuf::from("/nonexistent/config.yaml"),
+        )
+        .unwrap();
+        assert!(
+            !declared.step_raw_eligible[0],
+            "declared step.outputs always parse"
+        );
+        let out_field = parse_ensemble_plan(
+            "ensemble:\n  output: \"$a.output\"\n  steps:\n    - name: a\n      model: m1\n      version: \"1\"\n      inputs:\n        x: \"$request\"\n",
+            &PathBuf::from("/nonexistent/config.yaml"),
+        )
+        .unwrap();
+        assert!(
+            !out_field.step_raw_eligible[0],
+            "an explicit output field forces the parse"
+        );
+    }
+
+    #[test]
+    fn p2_assemble_splices_raw_identically_to_parsed() {
+        // The raw fixture is the CANONICAL serialization of the parsed value
+        // (a worker re-emitting received bytes keeps them verbatim).
+        let raw_bytes: Bytes = Bytes::from_static(br#"{"output":42}"#);
+        let mut resolved_raw = HashMap::new();
+        resolved_raw.insert(
+            "a".to_string(),
+            EnsembleValue::RawJson(Arc::new(RawJsonValue::new(raw_bytes))),
+        );
+        let mut resolved_parsed = HashMap::new();
+        resolved_parsed.insert(
+            "a".to_string(),
+            EnsembleValue::Json(json!({"output": 42})),
+        );
+        let (raw_out, _) = assemble_group_json("s", &resolved_raw, &HashMap::new()).unwrap();
+        let (parsed_out, _) =
+            assemble_group_json("s", &resolved_parsed, &HashMap::new()).unwrap();
+        assert_eq!(
+            raw_out, parsed_out,
+            "raw splice must produce byte-identical assembly to the parsed path"
+        );
+    }
+
+    #[test]
+    fn p2_assemble_sorted_keys_and_params_override() {
+        let mut resolved = HashMap::new();
+        resolved.insert("z".to_string(), EnsembleValue::Json(json!(1)));
+        resolved.insert("a".to_string(), EnsembleValue::Json(json!(2)));
+        let params: HashMap<String, Value> =
+            [("z".to_string(), json!(3))].into_iter().collect();
+        let (out, _) = assemble_group_json("s", &resolved, &params).unwrap();
+        assert_eq!(
+            out.as_ref(),
+            br#"{"a":2,"z":3}"#,
+            "keys emit sorted with params winning conflicts"
+        );
+    }
+
+    #[test]
+    fn p2_resolve_ref_raw_field_parses_lazily() {
+        let plan = legacy_plan();
+        let mut context = HashMap::new();
+        context.insert(
+            "step1".to_string(),
+            EnsembleValue::RawJson(Arc::new(RawJsonValue::new(
+                Bytes::from_static(br#"{"output": 42}"#),
+            ))),
+        );
+        let v = match resolve_ref(&plan, "$step1.output", &context).unwrap() {
+            ResolvedRef::Value(EnsembleValue::Json(v)) => v,
+            other => panic!("expected projected Json, got {other:?}"),
+        };
+        assert_eq!(v, json!(42));
+        let whole = match resolve_ref(&plan, "$step1", &context).unwrap() {
+            ResolvedRef::Value(EnsembleValue::RawJson(r)) => r,
+            other => panic!("expected raw passthrough, got {other:?}"),
+        };
+        assert_eq!(whole.bytes.as_ref(), br#"{"output": 42}"#);
+    }
+
+    #[test]
+    fn p2_resolve_ref_raw_malformed_field_errors() {
+        let plan = legacy_plan();
+        let mut context = HashMap::new();
+        context.insert(
+            "step1".to_string(),
+            EnsembleValue::RawJson(Arc::new(RawJsonValue::new(
+                Bytes::from_static(b"{oops"),
+            ))),
+        );
+        let err = resolve_ref(&plan, "$step1.output", &context).unwrap_err();
+        assert!(
+            err.to_string().contains("not valid JSON"),
+            "a field access on malformed raw bytes must error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn p2_declared_step_materializes_nested_raw_outcome() {
+        // A declared parent step over a nested child whose outcome is
+        // raw-resident must parse before projecting (never panic).
+        let step = EnsembleStep {
+            name: "parent".to_string(),
+            model: "child".to_string(),
+            version: Some("1".to_string()),
+            inputs: HashMap::new(),
+            stream: false,
+            params: HashMap::new(),
+            timeout_secs: None,
+            on_error: OnErrorKind::Fail,
+            retries: 0,
+            outputs_decl: Some(
+                [(
+                    "out".to_string(),
+                    StepOutputDecl {
+                        ty: InputType::Json,
+                        path: None,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            when: None,
+        };
+        let raw = EnsembleValue::RawJson(Arc::new(RawJsonValue::new(
+            Bytes::from_static(br#"{"out": 7}"#),
+        )));
+        let out = materialize_step_outputs(&step, raw).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "parent.out");
+        assert_eq!(out[0].1, EnsembleValue::Json(json!(7)));
+    }
+
+    #[test]
+    fn p2_unary_response_raw_eligible_skips_validation() {
+        let single = pb::SingleResponse {
+            data: Bytes::from_static(b"{oops"),
+            media_type: "application/json".to_string(),
+            ..Default::default()
+        };
+        let value =
+            unary_response_to_value("s", pb::Response {
+                payload: Some(pb::response::Payload::Single(single.clone())),
+                ..Default::default()
+            }, true).unwrap();
+        assert!(
+            matches!(value, EnsembleValue::RawJson(r) if r.bytes.as_ref() == b"{oops"),
+            "pass-through schemas skip JSON validation (P2①)"
+        );
+        let err =
+            unary_response_to_value("s", pb::Response {
+                payload: Some(pb::response::Payload::Single(single)),
+                ..Default::default()
+            }, false).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid JSON"),
+            "typed/field-referenced steps keep validation, got: {err}"
+        );
     }
 
     // === P3 + P11 (batch 6): zero-spawn layer executor ===
@@ -5912,6 +6343,7 @@ mod tests {
             input_modes: Vec::new(),
             conditional_refs: Vec::new(),
             step_dep_keys: Vec::new(),
+            step_raw_eligible: Vec::new(),
             outputs: None,
             dag_sets: None,
             config_path: PathBuf::from(path),
@@ -6071,6 +6503,7 @@ mod tests {
                     input_modes: Vec::new(),
                     conditional_refs: Vec::new(),
                     step_dep_keys: Vec::new(),
+                    step_raw_eligible: Vec::new(),
                     outputs: None,
                     dag_sets: None,
                     config_path,
@@ -6174,6 +6607,7 @@ mod tests {
                         input_modes: Vec::new(),
                         conditional_refs: Vec::new(),
                         step_dep_keys: Vec::new(),
+                        step_raw_eligible: Vec::new(),
                         outputs: None,
                         dag_sets: None,
                         config_path: cp,
@@ -6201,6 +6635,7 @@ mod tests {
                         input_modes: Vec::new(),
                         conditional_refs: Vec::new(),
                         step_dep_keys: Vec::new(),
+                        step_raw_eligible: Vec::new(),
                         outputs: None,
                         dag_sets: None,
                         config_path: cp,

@@ -139,6 +139,8 @@ impl GrpcService {
                     crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Json(v)) => {
                         bytes::Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
                     }
+                    // P2 (batch 6): raw-resident output → original bytes.
+                    crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::RawJson(raw)) => raw.bytes.clone(),
                     crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Binary(b, _ct, ..)) => b,
                     // E7 (D32): the multi-sink response — InferResponse has
                     // no headers map, so the LSBE-1 container is the

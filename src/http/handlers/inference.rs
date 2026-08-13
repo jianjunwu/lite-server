@@ -227,6 +227,15 @@ async fn do_infer(
         // inference.rs:266-283).
         return match result {
             crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Json(v)) => Ok(Json(v).into_response()),
+            // P2 (batch 6): a raw-resident whole output emits its ORIGINAL
+            // bytes — zero copy, zero re-serialize at the response boundary.
+            crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::RawJson(raw)) => {
+                Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(raw.bytes.clone()))
+                    .map_err(|e| AppError::Internal(format!("build response: {e}")))
+            }
             crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Binary(data, ct, ..)) => {
                 // Same builder-error handling as the unary passthrough
                 // (inference.rs:291-302): a worker-supplied media_type that is
