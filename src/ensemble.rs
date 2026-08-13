@@ -1213,6 +1213,30 @@ fn ensure_nesting_depth(depth: u32) -> Result<(), AppError> {
     Ok(())
 }
 
+/// E5 (batch 3): a step's effective deadline — `min(parent deadline,
+/// now + timeout_secs)`. None = no step timeout (parent passes through; a
+/// parent of None stays None = unbounded). Both the unary submit/wait and
+/// the streaming open (D35: recv_chunk overall takes min(client overall,
+/// this cap)) use the result. The same formula applies per streaming step on
+/// a pipeline chain (each hop computes its own from its open time).
+fn step_effective_deadline(
+    parent_deadline_unix_ns: Option<i64>,
+    timeout_secs: Option<f64>,
+) -> Option<i64> {
+    let Some(timeout_secs) = timeout_secs else {
+        return parent_deadline_unix_ns;
+    };
+    let now_unix_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64;
+    let step_deadline = now_unix_ns + (timeout_secs * 1e9) as i64;
+    match parent_deadline_unix_ns {
+        Some(parent) => Some(parent.min(step_deadline)),
+        None => Some(step_deadline),
+    }
+}
+
 /// E1: type-erased entry into the nested execution. `execute_step` awaits
 /// this instead of `execute_ensemble_inner` directly — the `dyn Future`
 /// erasure breaks the opaque-type cycle the direct call creates
@@ -1735,8 +1759,11 @@ async fn tail_stream_preflight(
         let _guard = step_span.enter();
         crate::telemetry::inject(&mut step_headers);
     }
+    // E5 (batch 3): the preflight meta carries the STEP deadline — the same
+    // min(parent, now + timeout_secs) formula the serial path would compute.
+    let preflight_deadline = step_effective_deadline(deadline_unix_ns, step.timeout_secs);
     let meta = build_step_meta(
-        &format!("{}:{}", request_id, step.name), &opts.client_ip, deadline_unix_ns, step_headers, bytes::Bytes::new(),
+        &format!("{}:{}", request_id, step.name), &opts.client_ip, preflight_deadline, step_headers, bytes::Bytes::new(),
     );
     let outlier = state.worker_manager.get_outlier_state(&step.model, &resolved_version).await;
     let seq_registry = state.inference_queue.sequence_registry();
@@ -2174,6 +2201,11 @@ async fn execute_stream_step(
     // E4/D15: execution-time version resolution (same source as execute_step;
     // the metric label tail_version below is the resolved version).
     let resolved_version = snapshot.resolve(&state.registry, step)?;
+    // E5/D35 (batch 3): the step's wall-clock cap — the readiness poll, D19
+    // checks and the meta cascade below are bounded by min(parent deadline,
+    // now + timeout_secs). Each chain hop computes its own from its own
+    // open time (the same formula per streaming step).
+    let step_deadline = step_effective_deadline(deadline_unix_ns, step.timeout_secs);
 
     // Resolve inputs into EnsembleValues (identical to the unary path).
     let mut resolved: HashMap<String, EnsembleValue> = HashMap::new();
@@ -2202,8 +2234,8 @@ async fn execute_stream_step(
                     )));
                 }
                 // D19: quick-fail when the remaining budget cannot cover one
-                // more poll — never spin to timeout.
-                if let Some(rem) = crate::deadline::remaining(deadline_unix_ns) {
+                // more poll — never spin to timeout (E5: the STEP budget).
+                if let Some(rem) = crate::deadline::remaining(step_deadline) {
                     if rem < delay {
                         return Err(AppError::InferenceTimeout(format!(
                             "ensemble step {}: deadline exhausted while waiting for sub-model {} v{}",
@@ -2253,7 +2285,7 @@ async fn execute_stream_step(
 
             // Streaming meta carries no payload — the body rides StreamOpen.data.
             let meta = build_step_meta(
-                &format!("{}:{}", request_id, step.name), &opts.client_ip, deadline_unix_ns, step_headers, bytes::Bytes::new(),
+                &format!("{}:{}", request_id, step.name), &opts.client_ip, step_deadline, step_headers, bytes::Bytes::new(),
             );
 
             let outlier = state.worker_manager.get_outlier_state(&step.model, &resolved_version).await;
@@ -2277,8 +2309,9 @@ async fn execute_stream_step(
     }
 
     // D19: final deadline check before opening the stream — an expired
-    // budget must not open one (deadline-exhausted mapping, §4.4).
-    if let Some(rem) = crate::deadline::remaining(deadline_unix_ns) {
+    // budget must not open one (deadline-exhausted mapping, §4.4; E5: the
+    // STEP budget).
+    if let Some(rem) = crate::deadline::remaining(step_deadline) {
         if rem.is_zero() {
             return Err(AppError::InferenceTimeout(format!(
                 "ensemble step {}: deadline exhausted before stream open", step.name
@@ -2310,10 +2343,10 @@ async fn execute_stream_step(
         tail_model: step.model.clone(),
         tail_version: resolved_version.clone(),
         tail_step: step.name.clone(),
-        // D35 (batch 3): E5 timeout_secs → step wall-clock cap; adapter
-        // recv_chunk overall takes min(client overall, this). Inactive until
-        // E5 lands.
-        step_deadline: None,
+        // D35 (batch 3): E5 timeout_secs → step wall-clock cap measured from
+        // the open instant; the adapters' recv_chunk overall takes min(client
+        // overall, this). None = no step timeout.
+        step_deadline: step.timeout_secs.map(|t| Instant::now() + Duration::from_secs_f64(t)),
         chain: Arc::new(std::sync::Mutex::new(chain)),
         abort,
         // P10: filled by execute_ensemble after open_tail_stream returns.
@@ -2498,6 +2531,20 @@ async fn execute_step(
     // resolved version.
     let resolved_version = snapshot.resolve(&state.registry, step)?;
 
+    // E5 (batch 3): the step's wall-clock cap — the meta cascade and the
+    // response wait below are bounded by min(parent deadline, now +
+    // timeout_secs).
+    let step_deadline = step_effective_deadline(deadline_unix_ns, step.timeout_secs);
+    // E5: a cap that expired BEFORE submit fails fast (§4.4 deadline row).
+    if let Some(rem) = crate::deadline::remaining(step_deadline) {
+        if rem.is_zero() {
+            return Err(AppError::InferenceTimeout(format!(
+                "ensemble step {}: step timeout exhausted before submit",
+                step.name
+            )));
+        }
+    }
+
     // Resolve inputs into EnsembleValues.
     let mut resolved: HashMap<String, EnsembleValue> = HashMap::new();
     for (key, ref_str) in &step.inputs {
@@ -2626,7 +2673,7 @@ async fn execute_step(
     }
 
     let meta = build_step_meta(
-        &format!("{}:{}", request_id, step.name), client_ip, deadline_unix_ns, step_headers,
+        &format!("{}:{}", request_id, step.name), client_ip, step_deadline, step_headers,
         payload_bytes.clone(),
     );
 
@@ -2654,10 +2701,11 @@ async fn execute_step(
         }
     }
 
-    // P-DEADLINE cascade: bound this step by the parent deadline's remaining
-    // budget (None = no deadline → unbounded inner wait, outer DAG bound still
-    // applies via execute_ensemble's total_budget).
-    let response = match crate::deadline::remaining(deadline_unix_ns) {
+    // P-DEADLINE cascade (E5): bound this step by the STEP deadline's
+    // remaining budget — min(parent, now + timeout_secs). None = no deadline
+    // → unbounded inner wait, outer DAG bound still applies via
+    // execute_ensemble's total_budget.
+    let response = match crate::deadline::remaining(step_deadline) {
         Some(timeout_duration) => match timeout(timeout_duration, response_rx).await {
             Ok(Ok(resp)) => resp,
             Ok(Err(_)) => {
@@ -4058,5 +4106,42 @@ ensemble:
         let params: HashMap<String, Value> = [("temperature".to_string(), json!(0.7))].into();
         let res = assemble_step_payload("s", &resolved, &params);
         assert!(res.is_err(), "params × Binary input must be rejected (E3)");
+    }
+
+    // ===== Batch 3 (E5) step timeout tests =====
+
+    fn unix_ns_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64
+    }
+
+    /// E5: no step timeout → the parent deadline passes through unchanged
+    /// (historical behaviour).
+    #[test]
+    fn e5_step_effective_deadline_passthrough() {
+        assert_eq!(step_effective_deadline(Some(1_000_000), None), Some(1_000_000));
+        assert_eq!(step_effective_deadline(None, None), None);
+    }
+
+    /// E5: a step timeout produces a wall-clock cap of now + timeout_secs.
+    #[test]
+    fn e5_step_effective_deadline_timeout_cap() {
+        let before = unix_ns_now();
+        let deadline = step_effective_deadline(None, Some(2.0)).unwrap();
+        let after = unix_ns_now() + 2_000_000_000;
+        assert!(
+            deadline >= before + 2_000_000_000 && deadline <= after,
+            "step cap must be ~now + 2s, got {deadline}"
+        );
+    }
+
+    /// E5: the tighter bound wins — an earlier parent deadline caps the step.
+    #[test]
+    fn e5_step_effective_deadline_min_with_parent() {
+        let parent = unix_ns_now() + 1_000_000_000; // 1s from now
+        let deadline = step_effective_deadline(Some(parent), Some(60.0));
+        assert_eq!(deadline, Some(parent), "parent deadline must win when earlier");
     }
 }

@@ -201,6 +201,10 @@ async fn h2_bidi_entry_impl(
 
     // P10 (D40): semaphore permit held for the outgoing task's lifetime.
     let mut ensemble_permit = None;
+    // D35 (E5): the tail step's timeout cap, captured at the ensemble
+    // dispatch (which precedes the stream_deadline computation) and folded
+    // into the recv overall bound below.
+    let mut ensemble_step_deadline: Option<std::time::Instant> = None;
     // D18: chain handles + chain-tree abort held for the outgoing task's
     // cancellation (pipeline chains broadcast over every streaming step).
     let mut ensemble_chain: Option<Arc<std::sync::Mutex<Vec<crate::ensemble::StreamHandle>>>> = None;
@@ -341,6 +345,7 @@ async fn h2_bidi_entry_impl(
         .await?
         {
             crate::ensemble::EnsembleOutcome::Stream(mut s) => {
+                ensemble_step_deadline = s.step_deadline;
                 ensemble_permit = s.permit.take();
                 ensemble_chain = Some(s.chain.clone());
                 ensemble_abort = Some(s.abort.clone());
@@ -430,11 +435,15 @@ async fn h2_bidi_entry_impl(
     }
 
     // P-DEADLINE: overall deadline client-specified only; chunk-idle always on.
-    let stream_deadline = if deadline.client_specified {
-        crate::deadline::to_instant(deadline.unix_ns)
-    } else {
-        None
-    };
+    let stream_deadline = crate::deadline::min_instant(
+        if deadline.client_specified {
+            crate::deadline::to_instant(deadline.unix_ns)
+        } else {
+            None
+        },
+        // D35 (E5): the ensemble tail step's timeout cap.
+        ensemble_step_deadline,
+    );
     let stream_idle =
         crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
 

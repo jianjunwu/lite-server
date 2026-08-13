@@ -218,6 +218,10 @@ impl GrpcService {
         // Non-ensemble only: the client→worker chunk forwarder's client
         // (ensemble aggregates upstream instead, D17).
         let mut worker_client: Option<Arc<crate::transport::zmq::WorkerZmqClient>> = None;
+        // D35 (E5): the tail step's timeout cap, captured here (the ensemble
+        // dispatch precedes the stream_deadline computation) and folded into
+        // the recv overall bound below.
+        let mut ensemble_step_deadline: Option<std::time::Instant> = None;
         let (stream_id, mut chunk_rx, cancel_client) = if is_ensemble {
             let max_body = self
                 .app_state
@@ -305,6 +309,7 @@ impl GrpcService {
             .map_err(|e| err(app_error_to_grpc_status(&e)))?
             {
                 crate::ensemble::EnsembleOutcome::Stream(mut s) => {
+                    ensemble_step_deadline = s.step_deadline;
                     ensemble_permit = s.permit.take();
                     ensemble_chain = Some(s.chain.clone());
                     ensemble_abort = Some(s.abort.clone());
@@ -395,11 +400,15 @@ impl GrpcService {
         let stream_id_for_incoming = stream_id.clone();
         // P-DEADLINE (方案 C): overall deadline client-specified only; chunk-idle
         // reclaim always on (decoupled parity). Captured before spawn.
-        let stream_deadline = if deadline.client_specified {
-            crate::deadline::to_instant(deadline.unix_ns)
-        } else {
-            None
-        };
+        let stream_deadline = crate::deadline::min_instant(
+            if deadline.client_specified {
+                crate::deadline::to_instant(deadline.unix_ns)
+            } else {
+                None
+            },
+            // D35 (E5): the ensemble tail step's timeout cap.
+            ensemble_step_deadline,
+        );
         let stream_idle = self.decoupled_idle_timeout;
         tokio::spawn(async move {
             // P10 (D40): held for the forward task's lifetime — released on

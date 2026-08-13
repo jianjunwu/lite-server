@@ -155,6 +155,17 @@ pub fn to_instant(unix_ns: Option<i64>) -> Option<Instant> {
     Instant::now().checked_add(remaining(unix_ns)?)
 }
 
+/// D35 (E5, ensemble batch 3): fold two optional wall-clock caps — the
+/// tighter one wins. The adapters combine their client-derived overall
+/// deadline with an ensemble step's `timeout_secs` cap before the forward
+/// loop spawns.
+pub fn min_instant(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, y) => x.or(y),
+    }
+}
+
 /// Convert a config idle budget (seconds, 0/neg = disabled) into the
 /// `Option<Duration>` the streaming recv helper consumes.
 pub fn idle_budget(idle_secs: f32) -> Option<Duration> {

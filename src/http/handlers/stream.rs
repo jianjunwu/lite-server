@@ -386,7 +386,7 @@ async fn sse_infer_impl(
     // P-DEADLINE (方案 C): overall deadline only when the CLIENT specified one;
     // chunk-idle reclaim is ALWAYS on (decoupled parity) so a stuck stream is
     // recovered instead of hanging unbounded. Long streams keep flowing untouched.
-    let stream_deadline = if deadline.client_specified {
+    let mut stream_deadline = if deadline.client_specified {
         crate::deadline::to_instant(deadline.unix_ns)
     } else {
         None
@@ -424,6 +424,9 @@ async fn sse_infer_impl(
             state.clone(), &model_name, &resolved_version, ensemble_input, &cx.request_id, opts,
         ).await? {
             crate::ensemble::EnsembleOutcome::Stream(mut s) => {
+                // D35 (E5): fold the tail step's timeout cap into the recv
+                // overall bound (min(client overall, step cap)).
+                stream_deadline = crate::deadline::min_instant(stream_deadline, s.step_deadline);
                 ensemble_permit = s.permit.take();
                 ensemble_chain = Some(s.chain.clone());
                 ensemble_abort = Some(s.abort.clone());
@@ -1153,7 +1156,7 @@ async fn handle_ws_stream(
     // P-DEADLINE (方案 C): overall deadline only when the CLIENT specified one;
     // chunk-idle reclaim is ALWAYS on (decoupled parity) so a stuck stream is
     // recovered instead of hanging unbounded. Long streams keep flowing untouched.
-    let stream_deadline = if deadline.client_specified {
+    let mut stream_deadline = if deadline.client_specified {
         crate::deadline::to_instant(deadline.unix_ns)
     } else {
         None
@@ -1297,6 +1300,9 @@ async fn handle_ws_stream(
         .await
         {
             Ok(crate::ensemble::EnsembleOutcome::Stream(mut s)) => {
+                // D35 (E5): fold the tail step's timeout cap into the recv
+                // overall bound (min(client overall, step cap)).
+                stream_deadline = crate::deadline::min_instant(stream_deadline, s.step_deadline);
                 ensemble_permit = s.permit.take();
                 ensemble_chain = Some(s.chain.clone());
                 ensemble_abort = Some(s.abort.clone());

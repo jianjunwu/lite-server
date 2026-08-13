@@ -122,7 +122,7 @@ impl GrpcService {
         // one; chunk-idle reclaim is ALWAYS on (decoupled parity) so a stuck
         // stream is recovered instead of hanging unbounded. Long streams that
         // keep producing chunks are unaffected. Captured before spawn.
-        let stream_deadline = if deadline.client_specified {
+        let mut stream_deadline = if deadline.client_specified {
             crate::deadline::to_instant(deadline.unix_ns)
         } else {
             None
@@ -176,6 +176,9 @@ impl GrpcService {
             .map_err(|e| err(app_error_to_grpc_status(&e)))?
             {
                 crate::ensemble::EnsembleOutcome::Stream(mut s) => {
+                    // D35 (E5): fold the tail step's timeout cap into the recv
+                    // overall bound (min(client overall, step cap)).
+                    stream_deadline = crate::deadline::min_instant(stream_deadline, s.step_deadline);
                     ensemble_permit = s.permit.take();
                     ensemble_chain = Some(s.chain.clone());
                     ensemble_abort = Some(s.abort.clone());
