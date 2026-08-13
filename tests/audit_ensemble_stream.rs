@@ -1061,6 +1061,7 @@ const ENS_WHEN_YAML: &str = r#"ensemble:
       outputs:
         answer: "$main"
         maybe_score: "$maybe"
+        dag_path_out: "$dag_path"
       steps:
         - name: dag_path
           model: pre
@@ -1277,6 +1278,10 @@ fn write_all_fixtures(repo: &std::path::Path) {
     write_ensemble(repo, "ens_mimo_bin", ENS_MIMO_BIN_YAML);
     write_ensemble(repo, "ens_mimo_cond", ENS_MIMO_COND_YAML);
     write_ensemble(repo, "ens_mimo_stream", ENS_MIMO_STREAM_YAML);
+    // ===== audit (batch 4/5 review) defect-reproduction fixtures =====
+    write_ensemble(repo, "ens_nested_dags_parent", ENS_NESTED_DAGS_PARENT_YAML);
+    write_ensemble(repo, "ens_dags_inputs", ENS_DAGS_INPUTS_YAML);
+    write_ensemble(repo, "ens_when_dag_obs", ENS_WHEN_DAG_OBS_YAML);
 }
 
 fn write_server_yaml(repo: &std::path::Path, http_port: u16, extra: &str, orch_extra: &str) -> std::path::PathBuf {
@@ -1293,7 +1298,7 @@ fn write_server_yaml(repo: &std::path::Path, http_port: u16, extra: &str, orch_e
         format!(
             "server:\n  http_port: {http_port}\n  timeout: 30.0\n{extra}\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_dags\n    - ens_when\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_dags\n    - ens_when\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n    - ens_nested_dags_parent\n    - ens_dags_inputs\n    - ens_when_dag_obs\n",
             repo.display()
         ),
     )
@@ -1676,7 +1681,7 @@ async fn boot_server_grpc(extra: &str) -> (String, u16, ServerGuard, std::path::
             "server:\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  timeout: 30.0\n{extra}\n\n\
              grpc:\n  enabled: true\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_dags\n    - ens_when\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_dags\n    - ens_when\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n    - ens_nested_dags_parent\n    - ens_dags_inputs\n    - ens_when_dag_obs\n",
             repo.display()
         ),
     )
@@ -4427,8 +4432,10 @@ async fn test_audit_e8_when_skip_and_dag_condition() {
     let client = reqwest::Client::new();
     let envelope = json!({"inputs": [{"name": "mode", "data": "hello when"}]});
 
-    // Default set, no opt: dag_path RUNS (dag == 'default'), maybe skipped
-    // (absent != null → false) → answer present, alias null.
+    // Default set, no header: `$request.dag` sees the RESOLVED set name
+    // ("default"), so dag_path RUNS and its alias carries data; maybe is
+    // skipped via the R4 conditional channel (it references the absent
+    // optional input — absence always skips, D13, its when never sees it).
     let resp = client
         .post(format!("{}/v2/models/ens_when/infer", base))
         .header("Content-Type", "application/json")
@@ -4441,6 +4448,11 @@ async fn test_audit_e8_when_skip_and_dag_condition() {
     let outs = v["outputs"].as_array().unwrap();
     assert_eq!(outs[0], json!({"name": "answer", "data": {"echo": "hello when"}}));
     assert_eq!(outs[1], json!({"name": "maybe_score", "data": null}), "when-false alias → null (D5)");
+    assert_eq!(
+        outs[2],
+        json!({"name": "dag_path_out", "data": {"pre": "hello when"}}),
+        "dag_path must RUN — $request.dag == 'default' with no header"
+    );
 
     // x-lite-dag: fast → the fast SET answers (pre, a distinct output).
     let resp = client
@@ -4471,5 +4483,158 @@ async fn test_audit_e8_when_skip_and_dag_condition() {
         resp.status(),
         reqwest::StatusCode::INTERNAL_SERVER_ERROR,
         "a when-true step must RUN (observable 500)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Audit (batch 4/5 review): defect reproduction fixtures + tests
+// ---------------------------------------------------------------------------
+
+/// Audit: a parent whose child is a DAGS-FORM ensemble — the E1/D4
+/// streaming check must consult the child's SELECTED set, not index an
+/// empty outer plan.
+const ENS_NESTED_DAGS_PARENT_YAML: &str = r#"ensemble:
+  steps:
+    - name: child
+      model: ens_dags
+      version: "1"
+      inputs:
+        text: "$request.text"
+"#;
+
+/// Audit: per-set inputs declarations (R15) — a shared client sends the
+/// SUPERSET envelope; the selected set uses its own name and must tolerate
+/// the rest (§5.5.8: ignore + debug log, never 400).
+const ENS_DAGS_INPUTS_YAML: &str = r#"ensemble:
+  dags:
+    default:
+      inputs:
+        a: {type: json}
+      steps:
+        - name: main
+          model: pre
+          version: "1"
+          inputs:
+            text: "$inputs.a"
+    fast:
+      inputs:
+        b: {type: json}
+      steps:
+        - name: main
+          model: echo
+          version: "1"
+          inputs:
+            data: "$inputs.b"
+"#;
+
+/// Audit: an OBSERVABLE `$request.dag` condition in the default set — the
+/// when target must see the RESOLVED set name ("default" with no header),
+/// or the guard step silently never runs for headerless requests.
+const ENS_WHEN_DAG_OBS_YAML: &str = r#"ensemble:
+  dags:
+    default:
+      inputs:
+        mode: {type: json}
+      outputs:
+        answer: "$guard"
+        main_out: "$main"
+      steps:
+        - name: guard
+          model: pre
+          version: "1"
+          when: "$request.dag == 'default'"
+          inputs:
+            text: "$inputs.mode"
+        - name: main
+          model: echo
+          version: "1"
+          inputs:
+            data: "$inputs.mode"
+"#;
+
+/// Audit (batch 4/5 review): E1 nesting × E8-1 dags form — the child's D4
+/// streaming check indexes the OUTER dags plan (empty steps) and panics
+/// inside the step task; the request 500s instead of executing the child's
+/// default set.
+#[serial]
+#[tokio::test]
+async fn test_audit_nested_dags_child_executes_default_set() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_nested_dags_parent"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_nested_dags_parent/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"text": "hi nested"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "a nested dags-form child must execute its default set, not panic"
+    );
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v, json!({"pre": "hi nested"}), "child default set answers: {v}");
+}
+
+/// Audit (batch 4/5 review): §5.5.8 R15 superset tolerance — a shared
+/// client sending the union of the sets' inputs must not 400; the selected
+/// set ignores names it does not declare.
+#[serial]
+#[tokio::test]
+async fn test_audit_dags_superset_envelope_tolerated() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_dags_inputs"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_dags_inputs/infer", base))
+        .header("Content-Type", "application/json")
+        .header("x-lite-dag", "fast")
+        .json(&json!({"inputs": [
+            {"name": "a", "data": "from the default set"},
+            {"name": "b", "data": "superset ok"}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "names not declared by the SELECTED set must be tolerated (superset client, §5.5.8)"
+    );
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v, json!({"echo": "superset ok"}), "fast set answers with its own input: {v}");
+}
+
+/// Audit (batch 4/5 review): `$request.dag` in a when condition must see
+/// the RESOLVED set name — with no header the default set runs, so
+/// `$request.dag == 'default'` must be true (the existing ens_when fixture
+/// documents exactly this); the implementation evaluates the raw header
+/// (None) and silently skips the guard step, its alias degrading to null
+/// through the D5 channel.
+#[serial]
+#[tokio::test]
+async fn test_audit_when_dag_sees_resolved_default() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_when_dag_obs"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_when_dag_obs/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"inputs": [{"name": "mode", "data": "hello"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let v: Value = resp.json().await.unwrap();
+    let outs = v["outputs"].as_array().unwrap();
+    assert_eq!(
+        outs[0],
+        json!({"name": "answer", "data": {"pre": "hello"}}),
+        "guard must run for the headerless default set (dag == 'default')"
     );
 }

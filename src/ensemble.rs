@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{timeout, Duration};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 // ===== EnsembleValue: typed step input/output (B3, E6) =====
@@ -294,6 +294,9 @@ fn validate_outputs_rules(
     outputs: Option<&IndexMap<String, String>>,
     single_output_omitted: bool,
     output_step: usize,
+    // R5/R13: `$inputs` refs in outputs obey the same namespace rules as
+    // step inputs (declaration required; the name must be declared).
+    inputs_decl: Option<&IndexMap<String, InputDecl>>,
 ) -> Result<(), AppError> {
     let Some(outputs) = outputs else {
         return Ok(());
@@ -327,16 +330,38 @@ fn validate_outputs_rules(
                 )));
             }
             "inputs" => {
-                // The declared-inputs namespace — validity is checked by the
-                // declared mode's analyze pass for STEP refs only; outputs
-                // refs are checked here (name must exist in the declaration).
-                // (decl=None is rejected by the step-ref analysis path when
-                // no step uses $inputs — keep the error uniform here.)
+                // R5: the $inputs namespace requires a declaration; R13: the
+                // name must be DECLARED (step inputs enforce the same rule —
+                // outputs must not be the silent-null loophole for typos);
+                // R3: binary inputs are whole-only refs.
                 let name = rest.and_then(|r| r.split('.').next()).unwrap_or("");
                 if name.is_empty() {
                     return Err(AppError::Config(format!(
                         "ensemble.outputs alias '{alias}': '{}' is missing the \
                          input name (R13)",
+                        ref_str
+                    )));
+                }
+                let Some(decl) = inputs_decl else {
+                    return Err(AppError::Config(format!(
+                        "ensemble.outputs alias '{alias}': '{}' requires an \
+                         ensemble.inputs declaration (R5)",
+                        ref_str
+                    )));
+                };
+                let d = decl.get(name).ok_or_else(|| {
+                    AppError::Config(format!(
+                        "ensemble.outputs alias '{alias}': '{}' references \
+                         undeclared input '{}' (R13)",
+                        ref_str, name
+                    ))
+                })?;
+                if d.ty == InputType::Binary
+                    && rest.map(|r| r.contains('.')).unwrap_or(false)
+                {
+                    return Err(AppError::Config(format!(
+                        "ensemble.outputs alias '{alias}': binary input '{}' \
+                         must be referenced whole (R3)",
                         ref_str
                     )));
                 }
@@ -923,7 +948,13 @@ fn parse_ensemble_set(
     // The E2 × E7 exclusion needs the raw `output:` PRESENCE (output_field
     // is None both when output is omitted and when it names a whole step).
     let single_output_omitted = output.is_none();
-    validate_outputs_rules(&steps, outputs.as_ref(), single_output_omitted, output_step)?;
+    validate_outputs_rules(
+        &steps,
+        outputs.as_ref(),
+        single_output_omitted,
+        output_step,
+        inputs_decl.as_ref(),
+    )?;
     // E6 (D5/D34) + MIMO R4: an absentable step's absence must be statically
     // provable — no downstream references, no single-output reference,
     // never streaming.
@@ -1880,10 +1911,20 @@ fn resolve_ref(
                 }
                 None => {
                     // Undeclared step / request: legacy semantics — the key
-                    // is the source name; the field is the FIRST path segment
-                    // (multi-level paths stay MIMO-declaration-only).
+                    // is the source name and the field is a SINGLE path
+                    // segment. Multi-segment paths stay
+                    // MIMO-declaration-only (§5.5.3) — reject them instead
+                    // of silently taking the first segment (wrong data).
                     let key = source.to_string();
-                    let json_path = rest.and_then(|r| r.split('.').next());
+                    let rest = rest.unwrap_or("");
+                    if rest.contains('.') {
+                        return Err(AppError::Config(format!(
+                            "multi-segment path '{}' is not supported on legacy \
+                             steps — declare step.outputs for path projections (R7)",
+                            ref_str
+                        )));
+                    }
+                    let json_path = (!rest.is_empty()).then_some(rest);
                     (key, json_path)
                 }
             }
@@ -2001,6 +2042,11 @@ pub enum RootInputs {
 pub fn parse_root_inputs(
     payload: EnsembleValue,
     decl: Option<&IndexMap<String, InputDecl>>,
+    // §5.5.8 (R15): true only for the dags form — a shared client may send
+    // the SUPERSET of every set's inputs, so names outside the SELECTED set
+    // are ignored with a debug log (never 400). Single-set forms keep the
+    // strict R18 unknown-name rejection.
+    tolerate_unknown: bool,
 ) -> Result<RootInputs, AppError> {
     let Some(decl) = decl else {
         match &payload {
@@ -2056,11 +2102,41 @@ pub fn parse_root_inputs(
         let name = el.get("name").and_then(|n| n.as_str()).ok_or_else(|| {
             AppError::InvalidRequestBody("envelope input element is missing 'name'".to_string())
         })?;
-        let d = decl.get(name).ok_or_else(|| {
-            AppError::InvalidRequestBody(format!(
-                "envelope declares unknown input '{name}' (not in ensemble.inputs, R18)"
-            ))
-        })?;
+        let d = match decl.get(name) {
+            Some(d) => d,
+            None => {
+                if tolerate_unknown {
+                    // A tolerated binary element's declared tail slice must
+                    // still be consumed — header-order slicing means a skip
+                    // that leaves bytes unaccounted misaligns every later
+                    // binary element.
+                    if let Some(size) = el
+                        .get("parameters")
+                        .and_then(|p| p.get("binary_data_size"))
+                        .and_then(|s| s.as_u64())
+                    {
+                        let end = offset.checked_add(size as usize).ok_or_else(|| {
+                            AppError::InvalidRequestBody("binary tail size overflow".to_string())
+                        })?;
+                        let _ = tail.get(offset..end).ok_or_else(|| {
+                            AppError::InvalidRequestBody(format!(
+                                "envelope input '{name}': binary_data_size {size} overruns \
+                                 the binary tail (R18)"
+                            ))
+                        })?;
+                        offset = end;
+                    }
+                    debug!(
+                        input = %name,
+                        "envelope input ignored — not declared by the selected dag set (§5.5.8)"
+                    );
+                    continue;
+                }
+                return Err(AppError::InvalidRequestBody(format!(
+                    "envelope declares unknown input '{name}' (not in ensemble.inputs, R18)"
+                )));
+            }
+        };
         let value = match d.ty {
             InputType::Json => {
                 let data = el.get("data").ok_or_else(|| {
@@ -2211,16 +2287,18 @@ pub fn ensemble_payload_from_bytes(
     data: &Bytes,
     content_type: Option<String>,
 ) -> Result<EnsembleValue, AppError> {
-    if data.starts_with(b"{") {
-        if let Ok(v) = serde_json::from_slice::<Value>(data) {
-            return Ok(EnsembleValue::Json(v));
-        }
-        // Malformed JSON — historical gRPC behaviour falls back to Binary
-        // passthrough (byte-identical for undeclared ensembles).
-    }
+    // D32: the LSBE-1 magic can never be valid JSON (JSON starts with `{`,
+    // `[`, `"`, a digit, `-`, `t`, `f` or `n`) — check it BEFORE any JSON
+    // parsing so a container is never misread as a payload.
     if data.starts_with(b"LSB1") {
         let (head, tail) = split_envelope(data)?;
         return Ok(EnsembleValue::Envelope { head, tail: tail.unwrap_or_default() });
+    }
+    // §5.5.7 legacy byte-compat: ANY valid JSON — objects, arrays, scalars,
+    // whitespace-prefixed — parses as Json (the historical gRPC unary
+    // behaviour); malformed falls back to Binary passthrough.
+    if let Ok(v) = serde_json::from_slice::<Value>(data) {
+        return Ok(EnsembleValue::Json(v));
     }
     Ok(EnsembleValue::Binary(
         data.clone(),
@@ -2996,6 +3074,20 @@ pub(crate) async fn execute_ensemble_inner(
     // config version, not per request. In-flight requests hold their Arc and
     // finish on the old plan even across a reload (D23).
     let plan = get_ensemble_plan(&state, model_name, version).await?;
+    // §5.5.8 (R15): only the dags form tolerates superset envelopes.
+    let is_dags_form = plan.dag_sets.is_some();
+    // E8-2 (B6 fix): `$request.dag` must see the RESOLVED set name — with no
+    // header the dags form selects "default", so when conditions on the
+    // default set must compare against "default", not absence. Normalize
+    // before selection so when-eval and select_dag_set agree.
+    let mut opts = opts;
+    if is_dags_form {
+        opts.dag_selector = Some(
+            opts.dag_selector
+                .take()
+                .unwrap_or_else(|| "default".to_string()),
+        );
+    }
     // E8-1 (D38/D22): resolve the request's DAG set (dags form) — single-
     // form plans pass through; unknown names 400 here.
     let plan = select_dag_set(&plan, opts.dag_selector.as_deref())?;
@@ -3005,7 +3097,7 @@ pub(crate) async fn execute_ensemble_inner(
     // MIMO (D31/R18): the single root-parsing point — the KServe envelope
     // (declared mode) or the legacy payload (byte-identical passthrough).
     let mut context: HashMap<String, EnsembleValue> = HashMap::new();
-    let absent_inputs: HashSet<String> = match parse_root_inputs(payload, plan.inputs_decl.as_ref())? {
+    let absent_inputs: HashSet<String> = match parse_root_inputs(payload, plan.inputs_decl.as_ref(), is_dags_form)? {
         RootInputs::Single(v) => {
             context.insert("request".to_string(), v);
             HashSet::new()
@@ -4619,8 +4711,12 @@ async fn execute_step(
         }
         // D4: a nested ensemble must not contain streaming steps (the
         // combination is out of scope — checked before recursing so the
-        // error names the offending child DAG).
+        // error names the offending child DAG). E8-1: a dags-form child is a
+        // pure container whose outer plan has EMPTY steps — nested calls
+        // carry no selector, so the check inspects the SELECTED default set
+        // (indexing the outer plan would panic).
         let child_plan = get_ensemble_plan(&state, &step.model, &resolved_version).await?;
+        let child_plan = select_dag_set(&child_plan, None)?;
         if child_plan.steps[child_plan.output_step].stream || !child_plan.chains.is_empty() {
             return Err(AppError::InvalidRequestBody(format!(
                 "nested ensemble '{}' contains a streaming step — nested ensembles \
@@ -7083,6 +7179,7 @@ ensemble:
         let root = parse_root_inputs(
             EnsembleValue::Envelope { head, tail: Bytes::from(full).slice(head_bytes.len()..) },
             Some(&decl),
+            false,
         )
         .unwrap();
         let RootInputs::Named { values, absent } = root else { panic!("named expected") };
@@ -7101,7 +7198,7 @@ ensemble:
 
         // Missing required → 400.
         let head = json!({"inputs": [{"name": "text", "data": 1}]});
-        let err = parse_root_inputs(EnsembleValue::Json(head), Some(&decl)).unwrap_err();
+        let err = parse_root_inputs(EnsembleValue::Json(head), Some(&decl), false).unwrap_err();
         assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
 
         // Unknown input name → 400.
@@ -7110,7 +7207,7 @@ ensemble:
             {"name": "nope", "data": 2},
             {"name": "img", "parameters": {"binary_data_size": 0}}
         ]});
-        let err = parse_root_inputs(EnsembleValue::Json(head), Some(&decl)).unwrap_err();
+        let err = parse_root_inputs(EnsembleValue::Json(head), Some(&decl), false).unwrap_err();
         assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
 
         // Tail overrun (binary_data_size beyond the tail) → 400.
@@ -7121,6 +7218,7 @@ ensemble:
         let err = parse_root_inputs(
             EnsembleValue::Envelope { head, tail: Bytes::from_static(b"short") },
             Some(&decl),
+            false,
         )
         .unwrap_err();
         assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
@@ -7133,6 +7231,7 @@ ensemble:
         let err = parse_root_inputs(
             EnsembleValue::Envelope { head, tail: Bytes::from_static(b"xx") },
             Some(&decl),
+            false,
         )
         .unwrap_err();
         assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
@@ -7142,7 +7241,7 @@ ensemble:
             {"name": "text", "data": 1},
             {"name": "img", "data": {"$binary_b64": "AAEC", "content_type": "image/jpeg"}}
         ]});
-        let root = parse_root_inputs(EnsembleValue::Json(head), Some(&decl)).unwrap();
+        let root = parse_root_inputs(EnsembleValue::Json(head), Some(&decl), false).unwrap();
         let RootInputs::Named { values, .. } = root else { panic!("named expected") };
         match &values["img"] {
             EnsembleValue::Binary(b, ct, _, _) => {
@@ -7161,17 +7260,20 @@ ensemble:
         let err = parse_root_inputs(
             EnsembleValue::Json(json!({"$inputs": [{"name": "a"}]})),
             None,
+            false,
         )
         .unwrap_err();
         assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
         let err = parse_root_inputs(
             EnsembleValue::Envelope { head: json!({"inputs": []}), tail: Bytes::new() },
             None,
+            false,
         )
         .unwrap_err();
         assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
         // Ordinary legacy payload passes through untouched.
-        let root = parse_root_inputs(EnsembleValue::Json(json!({"a": 1})), None).unwrap();
+        let root =
+            parse_root_inputs(EnsembleValue::Json(json!({"a": 1})), None, false).unwrap();
         assert!(matches!(root, RootInputs::Single(EnsembleValue::Json(_))));
     }
 
@@ -7340,6 +7442,152 @@ ensemble:
             EnsembleValue::Binary(b, ct, _, _) => {
                 assert_eq!(b.as_ref(), b"\x00\x01\x02");
                 assert_eq!(ct, "image/jpeg");
+            }
+            other => panic!("binary expected, got {other:?}"),
+        }
+    }
+
+    // ===== audit (batch 4/5 review): defect reproduction tests =====
+
+    /// §5.5.7: legacy configs keep byte-identical payload classification.
+    /// The old gRPC unary / server-streaming paths parsed ANY valid JSON
+    /// (arrays, scalars, whitespace-prefixed objects) into Json; the
+    /// `{`-sniff in ensemble_payload_from_bytes re-classifies them as
+    /// Binary (regression, and HTTP/batch keep parsing them as Json —
+    /// cross-transport parity break). Only the LSBE-1 magic may pre-empt
+    /// JSON parsing (it can never be valid JSON).
+    #[test]
+    fn test_audit_legacy_payload_json_array_stays_json() {
+        let payload =
+            ensemble_payload_from_bytes(&Bytes::from_static(b"[1,2]"), None).unwrap();
+        match payload {
+            EnsembleValue::Json(v) => assert_eq!(v, json!([1, 2])),
+            other => panic!("legacy JSON array must stay Json, got {other:?}"),
+        }
+    }
+
+    /// R5/R13: `$inputs.NAME` refs in ensemble.outputs must name a DECLARED
+    /// input — step inputs reject undeclared names at parse, outputs refs
+    /// currently slip through and silently degrade to `data: null` at
+    /// runtime (the D5 channel is for ABSENT sources, not config typos).
+    #[test]
+    fn test_audit_outputs_ref_undeclared_input_name_rejected() {
+        let yaml = r#"ensemble:
+  inputs:
+    text: {type: json}
+  outputs:
+    a: "$inputs.nope"
+  steps:
+    - name: s
+      model: m
+      version: "1"
+      inputs: {x: "$inputs.text"}
+"#;
+        let err =
+            parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml")).unwrap_err();
+        assert!(
+            err.to_string().contains("undeclared input"),
+            "an undeclared $inputs name in outputs must be a config error, got: {err}"
+        );
+    }
+
+    /// R5: a legacy config (no inputs declaration) rejects ANY `$inputs.*`
+    /// ref — step inputs are rejected, outputs refs currently slip through
+    /// and degrade to null at runtime.
+    #[test]
+    fn test_audit_outputs_ref_inputs_namespace_rejected_legacy() {
+        let yaml = r#"ensemble:
+  outputs:
+    a: "$inputs.x"
+  steps:
+    - name: s
+      model: m
+      version: "1"
+      inputs: {x: "$request"}
+"#;
+        let err =
+            parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml")).unwrap_err();
+        assert!(
+            err.to_string().contains("inputs"),
+            "a legacy $inputs namespace ref in outputs must be a config error (R5), got: {err}"
+        );
+    }
+
+    /// §5.5.3: multi-segment paths on UNDECLARED steps stay
+    /// declaration-only. `$stepX.a.b` used to fail as a literal-key lookup;
+    /// the new resolver silently takes the FIRST segment and drops `.b`,
+    /// producing wrong data instead of an error.
+    #[test]
+    fn test_audit_legacy_multisegment_step_ref_not_truncated() {
+        let plan = legacy_plan();
+        let mut context = HashMap::new();
+        context.insert(
+            "s".to_string(),
+            EnsembleValue::Json(json!({"a": {"b": 1}})),
+        );
+        assert!(
+            resolve_ref(&plan, "$s.a.b", &context).is_err(),
+            "multi-segment legacy step refs must be rejected, not silently truncated \
+             to the first segment"
+        );
+    }
+
+    /// Same rule for the legacy anonymous root: `$request.a.b` must not
+    /// silently resolve to `request["a"]`.
+    #[test]
+    fn test_audit_legacy_multisegment_request_ref_not_truncated() {
+        let plan = legacy_plan();
+        let mut context = HashMap::new();
+        context.insert(
+            "request".to_string(),
+            EnsembleValue::Json(json!({"a": {"b": 1}})),
+        );
+        assert!(
+            resolve_ref(&plan, "$request.a.b", &context).is_err(),
+            "multi-segment legacy request refs must be rejected, not silently truncated"
+        );
+    }
+
+    /// B3 fix: a tolerated (unknown) binary element in a dags-form envelope
+    /// must still consume its declared tail slice — header-order slicing
+    /// means a skip that leaves bytes unaccounted misaligns every later
+    /// binary element.
+    #[test]
+    fn test_audit_dags_tolerated_binary_element_consumes_tail() {
+        let decl: IndexMap<String, InputDecl> = [(
+            "img".to_string(),
+            InputDecl {
+                ty: InputType::Binary,
+                required: true,
+                default: None,
+                content_type: Some("image/png".to_string()),
+                shape: None,
+                datatype: None,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let head = json!({"inputs": [
+            {"name": "other_set_img", "parameters": {"binary_data_size": 2}},
+            {"name": "img", "parameters": {"binary_data_size": 3}}
+        ]});
+        let root = parse_root_inputs(
+            EnsembleValue::Envelope {
+                head,
+                tail: Bytes::from_static(b"\x00\x00\x01\x02\x03"),
+            },
+            Some(&decl),
+            true,
+        )
+        .unwrap();
+        let RootInputs::Named { values, .. } = root else { panic!("named expected") };
+        match &values["img"] {
+            EnsembleValue::Binary(b, _, _, _) => {
+                assert_eq!(
+                    b.as_ref(),
+                    b"\x01\x02\x03",
+                    "later elements must slice after the tolerated bytes"
+                );
             }
             other => panic!("binary expected, got {other:?}"),
         }
