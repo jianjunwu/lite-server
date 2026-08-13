@@ -42,7 +42,11 @@ model_repo/
 - `model_name`：字母、数字、下划线、连字符，最长 64 字符（如 `my_model`、`resnet-v2`）。点号 `.` 不允许。
 - `version`：字母、数字、点号、下划线、连字符，最长 64 字符。必须以字母或数字开头，不能以点号开头或结尾，不能含 `..`（如 `1`、`v2`、`latest`、`1.0.0`）
 
-对于 **ensemble 模型**，`model.py` 可以省略——只需在 `config.yaml` 中定义顶层 `ensemble` 字段即可，模型完全由配置描述。ensemble 也接受原始字节根请求（字节直送第一层，binary 值的引用方式有限制）——见[原始字节 / Tensor 请求](../protocol.md)的 *Ensemble 模型* 一节。
+对于 **ensemble 模型**，`model.py` 可以省略——只需在 `config.yaml` 中定义顶层 `ensemble` 字段即可，模型完全由配置描述。DAG 支持 unary 步骤、**末步流式**（输出步骤 `stream: true`）、**管道流式**（流式步骤逐 chunk 级联）、容错（`on_error: skip`、`retries`）、每步 `timeout_secs`/`params`/`when` 条件、嵌套 ensemble、命名 DAG 集合（`dags`，经 `x-lite-dag` 头选择）以及 **MIMO** 命名多输入/多输出（KServe 信封 wire、`inputs` 声明与 `step.outputs` 投影）。ensemble 也接受原始字节根请求（字节直送第一层，binary 值的引用方式有限制）——见[原始字节 / Tensor 请求](../protocol.md)的 *Ensemble 模型* 一节。
+
+执行模型差异：unary 步骤走常规推理队列（受 `max_queue_size` 限制）；**流式步骤绕过队列**（直连流式路径，与其它流式端点语义一致），并发流式 DAG 数由全局旋钮 `server.max_concurrent_streaming_dags` 限制（默认 128，耗尽立即 429）。
+
+DAG 也可用 **Python 声明**（E9-A）：在 `config.yaml` 旁的 `dag.py` 中用 `lite_server.ensemble` 的 `EnsembleDAG` 声明（见 [examples/05_ensemble](../../examples/05_ensemble)），序列化为等价的手写配置；`lite-server analyze` 会对声明与 `config.yaml` 做一致性检查并报告漂移（LS112）。服务端执行的是 `config.yaml`——Python 声明只是编写面，绝不执行。
 
 模型根目录（`{model_name}/`）下还可以放置 `requirements.txt`（Python 依赖）和 `README.md`，打包为 `.lma` 时会自动包含。
 

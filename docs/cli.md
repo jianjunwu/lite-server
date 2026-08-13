@@ -328,6 +328,7 @@ through the same Rust serde path as `config-check`.
 | LS103 | warning | `stream: true` but `stream_predict` not overridden or not a generator |
 | LS104 | warning | requirements.txt line not parseable |
 | LS111 | warning | No `--version` given; resolved latest(1) |
+| LS112 | warning | `dag.py` declares an `EnsembleDAG` (E9-A) that drifted from config.yaml — or the declaration is missing/unevaluable (non-literal args, imports outside `lite_server(.ensemble)`) or config.yaml has no `ensemble` block. Evaluated via pure AST; the file is never executed |
 | LS201 | info | Lifecycle hooks (`teardown`/`on_file_changed`) not overridden |
 | LS202 | info | Possible LitAPI subclass with unresolvable base (no silent false negatives) |
 | LS203 | warning | `--deep` import failed (timeout, non-zero exit, invalid output, or runtime error) |

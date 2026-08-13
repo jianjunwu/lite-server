@@ -21,6 +21,7 @@ config shapes and logs `warn` lines pointing at the M-entries below
 | M8 | 0.8.0 | `features.*` toggles now enforced; 3 reserved fields removed; `custom_metrics` now opt-in |
 | M9 | 0.8.0 | Callback lifecycle hooks renamed (`on_*` → positional `before_*`/`after_*`); duck-typed `pre_setup` removed |
 | M10 | 0.8.3 | WebSocket Binary first frame is now raw bytes (was: lossy UTF-8 decoded as JSON) — send JSON as a Text frame |
+| M11 | 0.9.0 | Ensemble config schema denies unknown fields (new 0.9.0 fields fail to load on older servers — rolling back 0.9.0→0.8.5 requires rolling back the config too); `$inputs` is a reserved request key on legacy configs; streaming-DAG semantics (see M11 below) |
 
 Non-breaking phases (no action needed): P-MW, P-ENSEMBLE-GRPC, P-FLOW, P-DEADLINE,
 P-WARM (pure additions; defaults preserve prior behavior). P-OAI is deferred to 0.9
@@ -286,4 +287,53 @@ Related 0.8.3 additions (non-breaking): h2 bidi validates `open.initial_data`
 JSON at the edge (400 instead of a worker-side failure — raw content types
 skip validation), and ensemble models accept a raw-bytes root input (see
 [Raw Bytes / Tensor Request](protocol.md) → *Ensemble Models*).
+
+## M11 — Ensemble streaming + enhancements (0.9.0)
+
+The 0.9.0 ensemble release adds streaming DAGs (tail streaming, pipeline
+streaming, bidi aggregation), enhancements E1-E9 (nesting, output selection,
+params, version elasticity, step timeouts, fault tolerance, multi-sink
+outputs, named DAG sets, when-conditions, the Python declaration surface)
+and MIMO named multi-input/multi-output. Legacy configs and legacy clients
+are byte-identical; the new surface is opt-in via config fields.
+
+**What changed / to know:**
+
+- **Rollback convention (D24):** the ensemble schema denies unknown fields.
+  A config using 0.9.0 fields (`stream`, `params`, `timeout_secs`,
+  `on_error`, `retries`, `when`, `outputs`, `dags`, `inputs`,
+  `step.outputs`) **fails to load on a 0.8.x server** (fast fail — a
+  swallowed `stream:` would silently disable streaming). Rolling back
+  0.9.0 → 0.8.5 therefore requires rolling back the ensemble configs that
+  use these fields; the reverse direction needs no config change.
+- **`$inputs` reserved key (D14):** a legacy config (no `inputs`
+  declaration) receiving a request body with a top-level `$inputs` key now
+  gets **400** (was: passed through as an opaque JSON field). Declared
+  multi-input configs speak the KServe-envelope wire instead.
+- **Streaming DAGs and endpoints (D1):** a DAG containing a streaming step
+  is rejected with **400** on unary endpoints ("DAG contains a streaming
+  step; use a streaming endpoint") — declare `stream` only when callers use
+  streaming endpoints.
+- **Bidi aggregation contract (D17):** for ensemble models on WS/h2/gRPC
+  bidi endpoints, all client frames are aggregated into a single root
+  input — Binary frames concatenate (Content-Type from the first frame),
+  text/JSON frames aggregate into a JSON array (a single frame stays a
+  plain value), mixed frames are 400. Declared-input models accept a
+  single envelope frame (executes immediately, no close signal needed);
+  legacy models need the WS `{"type":"close"}` frame (or h2/gRPC
+  half-close) to trigger execution. Session-style multi-turn is rejected.
+- **Streaming steps bypass the queue:** unary ensemble steps queue
+  (bounded by `max_queue_size`); streaming steps use the direct streaming
+  path like every other streaming endpoint. Concurrent streaming DAGs are
+  bounded globally by `server.max_concurrent_streaming_dags` (default 128
+  — rejections are immediate 429, not queued).
+- **Deadline expiry mid-stream (D35):** when a streaming step's wall-clock
+  budget (`timeout_secs` or the overall request deadline) expires while
+  chunks are flowing, the client now receives an **Error frame** and a
+  clean close (terminal reason `deadline`) — previously the budget only
+  governed stream opening.
+
+Run `lite-server analyze --model <ensemble-model>` to cross-check config
+and the optional `dag.py` declaration (drift → LS112).
+
 

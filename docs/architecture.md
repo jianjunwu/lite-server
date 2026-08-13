@@ -207,7 +207,7 @@ Models can implement `prefill()` / `step()` / `has_finished()` hooks to implemen
 | Streaming | `streaming/` | Protobuf streaming request builders (open/chunk/close/cancel) |
 | Metrics | `metrics/` | Prometheus metrics, timeline aggregation, alert engine |
 | Rate Limiter | `rate_limit.rs` | Token-bucket rate limiting |
-| Ensemble | `ensemble.rs` | DAG-based multi-model pipeline orchestration |
+| Ensemble | `ensemble.rs` | DAG-based multi-model pipeline orchestration: unary + tail/pipeline streaming + bidi aggregation, nesting, fault tolerance, named DAG sets, MIMO named multi-input/multi-output |
 | Callback | `callback.rs` | Server and inference lifecycle callbacks (Rust trait) |
 | Validation | `validation.rs` | Model name and version identifier format validation |
 | Config | `config.rs` | YAML config loading, CLI override application |
@@ -553,9 +553,13 @@ cascade-fail under pressure (§4.0.9). P-FLOW lands these:
   `request_timeout`.
 - **Cancel propagation**: client disconnect on any stream → a fire-and-forget
   `Cancel` (`send_raw`) tells the worker to stop and release resources. Ensemble
-  sub-steps share one cancel: a per-layer `JoinSet` means a parent cancel (client
-  disconnect, total-budget timeout, or a sibling step error) **aborts every
-  in-flight sub-step** rather than leaving workers computing for a dead request.
+  sub-steps share one cancel: each layer is driven **in-task** (single-step
+  layers awaited directly, multi-step layers via `FuturesUnordered` — no
+  per-step spawn), so a parent cancel (client disconnect, total-budget
+  timeout, or a sibling step error) **drops every in-flight sub-step** rather
+  than leaving workers computing for a dead request; the first failing step
+  drops its siblings immediately. Pipeline chains additionally propagate
+  cancellation hop-by-hop and abort the chain task tree.
   Unary disconnect-cancel is intentionally not implemented (unary has no
   stream_id; the worker may finish an already-received request).
 
@@ -573,14 +577,19 @@ timeouts act independently:
 
 The resolved deadline travels to the worker as an absolute UNIX-ns timestamp
 (`RequestMeta.deadline_unix_ns`) and the worker checks it cooperatively.
-Ensemble DAGs share one parent budget (each sub-step gets parent − elapsed);
-streaming enforces **two stages**: an overall deadline plus a chunk-idle
+Ensemble DAGs share one parent budget (each sub-step gets parent − elapsed;
+a per-step `timeout_secs` takes the min of the parent and its own wall clock).
+Streaming enforces **two stages**: an overall deadline plus a chunk-idle
 timeout. The chunk-idle timeout is **always on** (reusing
 `decoupled_idle_timeout_secs`, default 300s) so a stuck stream is recovered
 instead of hanging unbounded — long streams that keep producing chunks are
 unaffected; the overall deadline activates only when the client specified one
 (default config leaves long streams unbounded by overall deadline). Set
-`decoupled_idle_timeout_secs = 0` to disable idle reclaim.
+`decoupled_idle_timeout_secs = 0` to disable idle reclaim. For ensemble
+streaming steps, a budget (overall or `timeout_secs`) that expires while
+chunks are flowing closes the stream with an **Error frame** (terminal
+reason `deadline`) — the HTTP status code can no longer change once the
+stream has opened.
 
 **Status when the budget expires** — read this before writing retry logic:
 

@@ -327,6 +327,7 @@ config.yaml 走与 `config-check` 相同的 Rust serde 校验路径。
 | LS103 | warning | `stream: true` 但 `stream_predict` 未覆写或非 generator |
 | LS104 | warning | requirements.txt 存在无法解析的行 |
 | LS111 | warning | 未指定 `--version`，按 latest(1) 解析 |
+| LS112 | warning | `dag.py` 声明的 `EnsembleDAG`（E9-A）与 config.yaml 漂移——或声明缺失/无法静态求值（非字面量参数、从 `lite_server(.ensemble)` 之外导入）或 config.yaml 无 `ensemble` 块。纯 AST 求值，绝不执行该文件 |
 | LS201 | info | 生命周期钩子（`teardown`/`on_file_changed`）未覆写 |
 | LS202 | info | 疑似 LitAPI 子类但基类无法静态解析（假阴性不静默） |
 | LS203 | warning | `--deep` 导入失败（超时、非零退出、无效输出或运行时错误） |

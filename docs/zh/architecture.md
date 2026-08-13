@@ -203,7 +203,7 @@ sender.close()  ──►  DecoupledResponse{is_final=true}（终结帧）
 | 流式 | `streaming/` | Protobuf 流式请求构建器（open/chunk/close/cancel） |
 | 指标 | `metrics/` | Prometheus 指标、时间线聚合、告警引擎 |
 | 限流 | `rate_limit.rs` | 令牌桶速率限制 |
-| Ensemble | `ensemble.rs` | DAG 多模型流水线编排 |
+| Ensemble | `ensemble.rs` | DAG 多模型流水线编排：unary + 末步/管道流式 + bidi 聚合、嵌套、容错、命名 DAG 集合、MIMO 命名多输入/多输出 |
 | Callback | `callback.rs` | 服务器和推理生命周期回调（Rust trait） |
 | 校验 | `validation.rs` | 模型名称、版本标识符格式校验 |
 | 配置 | `config.rs` | YAML 配置加载、CLI 参数覆盖 |
@@ -525,9 +525,11 @@ lite-server 通过 `orchestration.control_mode` 控制模型版本的生命周�
   对等待超 deadline 的请求返回 `503` / gRPC `Unavailable`；`delay`（默认）交给
   `request_timeout` 兜底。
 - **取消传播**：任一流上客户端断连 → fire-and-forget `Cancel`（`send_raw`）通知
-  worker 停止并释放资源。ensemble 子 step 共享一个取消：每层 `JoinSet` 意味着 parent
-  取消（客户端断连、总预算超时、或同层兄弟 step 出错）**abort 所有在途子 step**，
-  而非让 worker 为已死请求继续算。unary 断连取消有意不实现（unary 无 stream_id；
+  worker 停止并释放资源。ensemble 子 step 共享一个取消：每层**在当前 task 内驱动**
+  （单步层直接 await，多步层经 `FuturesUnordered`——不再每 step spawn），parent
+  取消（客户端断连、总预算超时、或同层兄弟 step 出错）即 **drop 所有在途子 step**，
+  而非让 worker 为已死请求继续算；首个失败 step 立即 drop 其兄弟。管道链另做
+  逐跳取消传播并 abort 链任务树。unary 断连取消有意不实现（unary 无 stream_id；
   worker 可能跑完已收请求）。
 
 `max_inflight` / `max_request_body_bytes` 详见 [configuration.md](./configuration.md)。
@@ -541,11 +543,14 @@ lite-server 通过 `orchestration.control_mode` 控制模型版本的生命周�
 - 两者皆无，回落 `server.timeout`。
 
 解析出的 deadline 以绝对 UNIX 纳秒时间戳传到 worker（`RequestMeta.deadline_unix_ns`），
-worker 协作式检查。ensemble DAG 共享一份 parent 预算（子 step 得 parent − 已耗）；
+worker 协作式检查。ensemble DAG 共享一份 parent 预算（子 step 得 parent − 已耗；
+每步 `timeout_secs` 取 parent 与自身墙钟的较小值）；
 流式为**两段式**：总时长上限 + chunk 间 idle 超时。chunk-idle 超时**恒开**（复用
 `decoupled_idle_timeout_secs`，默认 300s）——卡死的流会被回收而非无界挂起，持续产
 chunk 的长流不受影响；总时长上限仅在客户端显式指定 deadline 时激活（默认配置下长流
-不被总时长截断）。设 `decoupled_idle_timeout_secs = 0` 可禁用 idle 回收。
+不被总时长截断）。设 `decoupled_idle_timeout_secs = 0` 可禁用 idle 回收。ensemble
+流式 step 的预算（总时长或 `timeout_secs`）在 chunk 流动期间耗尽时，流以
+**Error 帧**关闭（终端 reason=deadline）——流已打开，HTTP 状态码已不可改。
 
 **预算耗尽时的状态码**——写重试逻辑前请先读：
 

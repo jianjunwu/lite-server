@@ -47,6 +47,28 @@ enums, reviewed together with the `worker_id` label on
 `liteserver_worker_inference_total`. The close-log `reason` field is a
 **log field, not a metric label**.
 
+### Ensemble metrics
+
+Ensemble DAG metrics (0.9.0 ensemble streaming/enhancement batch). Entry
+metrics (`stream_open`/`stream_ttft`/`stream_tbt`/`stream_terminal` and
+`requests_total`) report the **ensemble model's name** — the client view,
+identical labels to unary requests.
+
+| Metric | Labels | Notes |
+|---|---|---|
+| `liteserver_ensemble_step_latency_seconds` | `ensemble, step, model, version, depth` | Per-step latency in ensemble DAG. `version` records the actual version only for **explicit** versions; `latest`/omitted normalize to `"latest"` so active-version drift cannot grow the label set (model × step × version). `depth` = nesting depth (E1). For streaming steps the latency spans open→close. |
+| `ensemble_streaming_active` | — | Gauge: concurrent streaming ensemble DAGs (the P10 semaphore in use). **Global, no labels** — same scope as the semaphore; per-model visibility comes from the streaming metrics above. |
+| `ensemble_autoload_wait_seconds` | — | Histogram: sub-model autoload wait duration for ensemble DAG steps (P6 cold-start tracking). |
+| `ensemble_pipeline_chain_depth` | — | Histogram: streaming steps on a pipeline chain (§4.2). |
+| `ensemble_pipeline_channel_saturation_seconds` | — | Histogram: cumulative time a pipeline chain inter-hop channel was full (backpressure). |
+| `ensemble_bidi_aggregate_bytes` | — | Histogram: bytes aggregated for a bidi ensemble request (D17 upstream aggregation). |
+| `ensemble_bidi_aggregate_seconds` | — | Histogram: elapsed time aggregating a bidi ensemble request. |
+
+P10 rejection semantics: when `server.max_concurrent_streaming_dags` is
+exhausted the request is rejected **immediately** (429 — no queueing); the
+rejection surfaces through `liteserver_requests_total` (status label) and
+the `ensemble_streaming_active` gauge, not a dedicated counter.
+
 ### OTel mirror
 
 `liteserver.request.duration` existed already; streaming mirrors are added:

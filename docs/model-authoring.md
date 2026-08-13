@@ -42,7 +42,13 @@ model_repo/
 - `model_name`: alphanumeric, underscores, hyphens, max 64 characters (e.g., `my_model`, `resnet-v2`). Dots `.` are not allowed.
 - `version`: alphanumeric, dots, underscores, hyphens, max 64 characters. Must start with an alphanumeric character, must not start/end with a dot, and must not contain `..` (e.g., `1`, `v2`, `latest`, `1.0.0`)
 
-For **ensemble models**, `model.py` can be omitted — define a top-level `ensemble` key in `config.yaml` instead. The model is then entirely configuration-driven. Ensembles also accept a raw-bytes root request that flows straight to the first layer, with limits on how binary values may be referenced — see [Raw Bytes / Tensor Request](protocol.md) → *Ensemble Models*.
+For **ensemble models**, `model.py` can be omitted — define a top-level `ensemble` key in `config.yaml` instead. The model is then entirely configuration-driven. The DAG supports unary steps, **tail streaming** (`stream: true` on the output step), **pipeline streaming** (streaming steps feeding each other chunk-by-chunk), fault tolerance (`on_error: skip`, `retries`), per-step `timeout_secs`/`params`/`when` conditions, nested ensembles, named DAG sets (`dags`, selected via the `x-lite-dag` header), and **MIMO** named multi-inputs/multi-outputs (KServe-envelope wire, `inputs` declarations and `step.outputs` projections). Ensembles also accept a raw-bytes root request that flows straight to the first layer, with limits on how binary values may be referenced — see [Raw Bytes / Tensor Request](protocol.md) → *Ensemble Models*.
+
+Note the execution-model difference: unary ensemble steps go through the regular inference queue (bounded by `max_queue_size`); **streaming steps bypass the queue** (the direct streaming path, identical to every other streaming endpoint) and concurrent streaming DAGs are bounded globally by `server.max_concurrent_streaming_dags` (default 128, immediate 429 when exhausted).
+
+The DAG can also be **declared in Python** (E9-A): an optional `dag.py` next to `config.yaml` declaring an `EnsembleDAG` from `lite_server.ensemble` (see [examples/05_ensemble](../examples/05_ensemble)). It serializes to the equivalent handwritten config; `lite-server analyze` cross-checks the declaration against `config.yaml` and reports drift (LS112). The server executes `config.yaml` — the Python declaration is an authoring surface only, never executed.
+
+Run `lite-server analyze --model <ensemble-model>` for a static config/declaration check.
 
 The model root directory (`{model_name}/`) may also contain `requirements.txt` (Python dependencies) and `README.md`, which are automatically included when packaging as `.lma`.
 

@@ -19,6 +19,7 @@
 | M8 | 0.8.0 | `features.*` 开关现已生效；移除 3 个预留字段；`custom_metrics` 改为显式开启 |
 | M9 | 0.8.0 | Callback 生命周期钩子改名（`on_*` → 位置化 `before_*`/`after_*`）；鸭子类型 `pre_setup` 已删除 |
 | M10 | 0.8.3 | WebSocket Binary 首帧改为原始字节（原为 lossy UTF-8 解码当 JSON）——JSON 请用 Text 帧发送 |
+| M11 | 0.9.0 | ensemble 配置 schema 拒绝未知字段（0.9.0 新字段在旧版服务端加载即失败——0.9.0→0.8.5 回滚须同步回滚 config）；旧 config 收到 `$inputs` 保留键 → 400；流式 DAG 语义（见下文 M11） |
 
 无 breaking 的阶段（无需动作）：P-MW、P-ENSEMBLE-GRPC、P-FLOW、P-DEADLINE、
 P-WARM（纯新增，默认值保持旧行为）。P-OAI 延后至 0.9（不在本版本范围内）。
@@ -243,3 +244,39 @@ JSON（400 取代 worker 侧报错——原始字节类 content type 跳过校�
 ensemble 模型接受原始字节根输入（见[原始字节 / Tensor 请求](../protocol.md)
 的 *Ensemble 模型* 一节）。
 
+## M11 — Ensemble 流式 + 功能增强（0.9.0）
+
+0.9.0 的 ensemble 版本新增流式 DAG（末步流式、管道流式、bidi 聚合）、
+增强 E1-E9（嵌套、输出选择、params、version 弹性、step 超时、容错、
+多 sink 输出、命名 DAG 集合、when 条件、Python 声明面）与 MIMO 命名
+多输入/多输出。旧 config 与旧客户端字节级不变；新面全部经 config 字段
+显式开启。
+
+**变化与须知：**
+
+- **回滚约定（D24）：** ensemble schema 拒绝未知字段。使用 0.9.0 字段
+  （`stream`、`params`、`timeout_secs`、`on_error`、`retries`、`when`、
+  `outputs`、`dags`、`inputs`、`step.outputs`）的 config 在 0.8.x 服务端
+  **加载即失败**（快失败——静默吞掉 `stream:` 会让流式静默失效）。
+  因此 0.9.0 → 0.8.5 回滚须同步回滚使用这些字段的 ensemble config；
+  反向升级无需改 config。
+- **`$inputs` 保留键（D14）：** 旧 config（无 `inputs` 声明）收到顶层含
+  `$inputs` 键的请求体现在返回 **400**（原为按不透明 JSON 字段透传）。
+  声明多输入的 config 改用 KServe 信封 wire。
+- **流式 DAG 与端点（D1）：** 含流式 step 的 DAG 在 unary 端点被 **400**
+  拒绝（提示改用流式端点）——只有调用方走流式端点时才声明 `stream`。
+- **bidi 聚合契约（D17）：** ensemble 模型在 WS/h2/gRPC bidi 端点将全部
+  客户端帧聚合为单个根输入——Binary 帧字节拼接（Content-Type 取首帧）、
+  text/JSON 帧聚合为 JSON 数组（单帧保持原值）、混合帧 400。声明 inputs
+  的模型只接受单个信封帧（收到即执行，无需结束信号）；旧模型需 WS
+  `{"type":"close"}` 帧（或 h2/gRPC 半关闭）触发执行。会话式多轮被拒绝。
+- **流式 step 绕过队列：** unary step 走队列（受 `max_queue_size` 限制）；
+  流式 step 走直连流式路径（与其它流式端点语义一致）。并发流式 DAG 数
+  由全局旋钮 `server.max_concurrent_streaming_dags` 限制（默认 128，
+  超限立即 429，不排队）。
+- **流中 deadline 到期（D35）：** 流式 step 的墙钟预算（`timeout_secs`
+  或整体请求 deadline）在 chunk 流动期间到期时，客户端现在收到
+  **Error 帧**并干净关闭（终端 reason=deadline）——此前预算只约束开流。
+
+用 `lite-server analyze --model <ensemble-model>` 交叉检查 config 与可选的
+`dag.py` 声明（漂移 → LS112）。
