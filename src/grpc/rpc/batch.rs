@@ -26,6 +26,15 @@ fn d30_element_payload(
     data: &bytes::Bytes,
     headers: &HashMap<String, String>,
 ) -> Result<crate::ensemble::EnsembleValue, String> {
+    // MIMO (D32): the LSBE-1 container splits into the envelope (declared-
+    // inputs ensembles); transport de-framing only.
+    if data.starts_with(b"LSB1") {
+        let (head, tail) = crate::ensemble::split_envelope(data).map_err(|e| e.to_string())?;
+        return Ok(crate::ensemble::EnsembleValue::Envelope {
+            head,
+            tail: tail.unwrap_or_default(),
+        });
+    }
     if crate::grpc::payload::grpc_payload_is_json(headers) {
         let v: serde_json::Value = serde_json::from_slice(data)
             .map_err(|e| format!("element is not valid JSON: {e}"))?;
@@ -35,7 +44,7 @@ fn d30_element_payload(
             .get("content-type")
             .cloned()
             .unwrap_or_else(|| "application/octet-stream".to_string());
-        Ok(crate::ensemble::EnsembleValue::Binary(data.clone(), ct))
+        Ok(crate::ensemble::EnsembleValue::Binary(data.clone(), ct, None, None))
     }
 }
 
@@ -61,7 +70,10 @@ fn d30_element_ok(value: crate::ensemble::EnsembleValue) -> pb::InferResponse {
         crate::ensemble::EnsembleValue::Json(v) => {
             bytes::Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
         }
-        crate::ensemble::EnsembleValue::Binary(data, _ct) => data,
+        crate::ensemble::EnsembleValue::Binary(data, _ct, ..) => data,
+        crate::ensemble::EnsembleValue::Envelope { .. } => {
+            unreachable!("envelope never reaches batch element egress")
+        }
     };
     pb::InferResponse {
         data,
@@ -416,7 +428,7 @@ mod tests {
             [("content-type".to_string(), "image/png".to_string())].into();
         let v = d30_element_payload(&bytes::Bytes::from_static(&[0x00, 0x01]), &bin_headers).unwrap();
         match v {
-            crate::ensemble::EnsembleValue::Binary(data, ct) => {
+            crate::ensemble::EnsembleValue::Binary(data, ct, ..) => {
                 assert_eq!(data.as_ref(), &[0x00, 0x01]);
                 assert_eq!(ct, "image/png");
             }
@@ -460,6 +472,8 @@ mod tests {
         let resp = d30_element_ok(crate::ensemble::EnsembleValue::Binary(
             bytes::Bytes::from_static(b"raw"),
             "image/png".to_string(),
+            None,
+            None,
         ));
         assert_eq!(resp.status.as_ref().unwrap().code, "Ok");
         assert_eq!(resp.data.as_ref(), b"raw");

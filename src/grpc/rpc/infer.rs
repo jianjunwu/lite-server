@@ -97,21 +97,15 @@ impl GrpcService {
                 // B3 (E6): gRPC ensemble — parse JSON into Json variant,
                 // fall back to Binary so malformed JSON is no longer silently
                 // swallowed as Value::Null (the old unwrap_or behaviour).
-                // gRPC `data` is opaque bytes; this is self-consistent.
-                let ensemble_input =
-                    match serde_json::from_slice::<serde_json::Value>(&req.data) {
-                        Ok(v) => crate::ensemble::EnsembleValue::Json(v),
-                        Err(_) => crate::ensemble::EnsembleValue::Binary(
-                            req.data.clone(),
-                            // 审计 E-B1 修复:保留 proto headers 声明的
-                            // content-type(HTTP parity:Raw(bytes, ct) 保留
-                            // 声明值);未声明才回退 octet-stream。
-                            req.headers
-                                .get("content-type")
-                                .cloned()
-                                .unwrap_or_else(|| "application/octet-stream".to_string()),
-                        ),
-                    };
+                // MIMO (D32): the LSBE-1 container splits into the envelope
+                // (declared-inputs ensembles); transport de-framing only.
+                let ensemble_input = crate::ensemble::ensemble_payload_from_bytes(
+                    &req.data,
+                    // 审计 E-B1 修复:保留 proto headers 声明的 content-type
+                    // (HTTP parity:Raw(bytes, ct) 保留声明值);未声明才回退。
+                    req.headers.get("content-type").cloned(),
+                )
+                .map_err(|e| err(app_error_to_grpc_status(&e)))?;
                 // P-DEADLINE: resolve here (grpc_metadata still in scope) and
                 // pass to the ensemble cascade.
                 let ensemble_deadline = crate::deadline::resolve_from_grpc(
@@ -142,7 +136,13 @@ impl GrpcService {
                     crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Json(v)) => {
                         bytes::Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
                     }
-                    crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Binary(b, _ct)) => b,
+                    crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Binary(b, _ct, ..)) => b,
+                    // Internal only — never a DAG output.
+                    crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Envelope { .. }) => {
+                        return Err(err(app_error_to_grpc_status(
+                            &AppError::Internal("envelope reached the egress layer".to_string()),
+                        )));
+                    }
                     crate::ensemble::EnsembleOutcome::Stream(_) => {
                         // D1: a unary endpoint calling a streaming DAG is a
                         // client contract violation — InvalidArgument (parity

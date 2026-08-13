@@ -149,16 +149,11 @@ impl GrpcService {
         // §4.1 指标行: streaming-step latency is recorded at stream close.
         let mut ensemble_tail: Option<(String, String, String)> = None;
         let (stream_id, mut chunk_rx, cancel_client) = if is_ensemble {
-            let ensemble_input = match serde_json::from_slice::<serde_json::Value>(&req.data) {
-                Ok(v) => crate::ensemble::EnsembleValue::Json(v),
-                Err(_) => crate::ensemble::EnsembleValue::Binary(
-                    req.data.clone(),
-                    req.headers
-                        .get("content-type")
-                        .cloned()
-                        .unwrap_or_else(|| "application/octet-stream".to_string()),
-                ),
-            };
+            let ensemble_input = crate::ensemble::ensemble_payload_from_bytes(
+                &req.data,
+                req.headers.get("content-type").cloned(),
+            )
+            .map_err(|e| crate::grpc::error::err(crate::grpc::error::app_error_to_grpc_status(&e)))?;
             let opts = crate::ensemble::EnsembleExecOpts {
                 client_ip: client_ip.clone(),
                 deadline_unix_ns: deadline.unix_ns,

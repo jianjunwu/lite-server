@@ -222,11 +222,24 @@ async fn h2_bidi_entry_impl(
             .server
             .max_request_body_bytes
             .unwrap_or(64 * 1024 * 1024);
-        let mut aggregator = crate::ensemble::BidiAggregator::new(max_body);
         let ct = headers
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
+        // D33: a declared-inputs ensemble executes on the FIRST envelope
+        // frame — the remaining body stream is dropped (h2 half-close is
+        // then the client's normal finish; late data frames die with the
+        // transport). Undeclared ensembles keep the D17 aggregation.
+        let declared = crate::ensemble::ensemble_declares_inputs(
+            &state, &model_name, &resolved_version,
+        )
+        .await?;
+        let value = if declared {
+            // initial_data moved into meta above — meta.payload is the same
+            // bytes.
+            crate::ensemble::bidi_envelope_frame(&meta.payload, initial_is_json, ct.clone())?
+        } else {
+        let mut aggregator = crate::ensemble::BidiAggregator::new(max_body);
         // initial_data moved into meta above — meta.payload is the same bytes.
         aggregator.push(meta.payload.clone(), initial_is_json, ct.as_deref())?;
         // Aggregation loop: decode LPM frames until the body stream EOFs
@@ -324,11 +337,12 @@ async fn h2_bidi_entry_impl(
                 }
             }
         }
-        crate::metrics::prometheus::record_ensemble_bidi_aggregate(
-            aggregator.total_bytes(),
-            aggregate_start.elapsed().as_secs_f64(),
-        );
-        let value = aggregator.finish()?;
+            crate::metrics::prometheus::record_ensemble_bidi_aggregate(
+                aggregator.total_bytes(),
+                aggregate_start.elapsed().as_secs_f64(),
+            );
+            aggregator.finish()?
+        };
         let opts = crate::ensemble::EnsembleExecOpts {
             client_ip: cx.client_ip.clone(),
             deadline_unix_ns: deadline.unix_ns,

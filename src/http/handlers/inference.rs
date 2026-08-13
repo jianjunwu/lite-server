@@ -36,16 +36,23 @@ pub(crate) fn ensemble_input_from_body(
         }
         // B3 (E6): binary root input — Raw bytes go straight to the first layer.
         RequestBody::Raw(bytes, ct) => {
-            Ok(crate::ensemble::EnsembleValue::Binary(bytes.clone(), ct.clone()))
+            Ok(crate::ensemble::EnsembleValue::Binary(bytes.clone(), ct.clone(), None, None))
         }
-        // C4 (阶段 1):ensemble 显式拒绝 TritonBinary——「JSON 头+二进制
-        // 尾」是容器格式,DAG 消费它须等 §9.6 Option B 的命名槽位容器
-        // 落地(不同于 D7 的 Raw 400:B3/E6 已把 Raw 透传进首层)。
-        RequestBody::TritonBinary { .. } => Err(AppError::InvalidRequestBody(
-            "ensemble does not support Triton Binary Tensor Data Extension \
-             requests (JSON head + binary tail container) yet"
-                .to_string(),
-        )),
+        // MIMO (D31/D32): transport de-framing only — the TritonBinary
+        // container splits into the KServe JSON head + binary tail; all
+        // envelope VALIDATION stays single-point in parse_root_inputs (D39).
+        // Undeclared ensembles keep their historical 400 there.
+        RequestBody::TritonBinary { body, json_head_len } => {
+            let head: Value = serde_json::from_slice(&body[..*json_head_len]).map_err(|e| {
+                AppError::InvalidRequestBody(format!(
+                    "ensemble requires valid JSON in the Triton head: {e}"
+                ))
+            })?;
+            Ok(crate::ensemble::EnsembleValue::Envelope {
+                head,
+                tail: body.slice(*json_head_len..),
+            })
+        }
     }
 }
 
@@ -218,7 +225,7 @@ async fn do_infer(
         // inference.rs:266-283).
         return match result {
             crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Json(v)) => Ok(Json(v).into_response()),
-            crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Binary(data, ct)) => {
+            crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Binary(data, ct, ..)) => {
                 // Same builder-error handling as the unary passthrough
                 // (inference.rs:291-302): a worker-supplied media_type that is
                 // not a valid header value must become a 500, never a panic.
@@ -235,6 +242,11 @@ async fn do_infer(
                 Err(AppError::InvalidRequestBody(
                     "DAG contains a streaming step; use a streaming endpoint".to_string(),
                 ))
+            }
+            // Internal only (de-framed at the entry, consumed by
+            // parse_root_inputs) — never a DAG output.
+            crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Envelope { .. }) => {
+                Err(AppError::Internal("envelope reached the egress layer".to_string()))
             }
         };
     }

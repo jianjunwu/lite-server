@@ -443,6 +443,84 @@ class TailFlakyAPI(LitAPI):
     );
 }
 
+/// MIMO (batch 4①, D8): vision encoder — binary in, JSON out carrying a
+/// `$binary_b64` marker field (the step.outputs binary-alias source).
+fn write_vis_enc(repo: &std::path::Path) {
+    write_model_py(
+        repo,
+        "vis_enc",
+        r#"import base64
+from lite_server import LitAPI
+
+
+class VisEncAPI(LitAPI):
+    def setup(self, device):
+        self.device = device
+
+    async def decode_request(self, request, ctx=None):
+        return request  # raw bytes (binary passthrough)
+
+    async def predict(self, x, ctx=None):
+        return {
+            "thumb": {"$binary_b64": base64.b64encode(x).decode(), "content_type": "image/jpeg"},
+            "emb": {"v": 1.0},
+        }
+
+    async def encode_response(self, output, ctx=None):
+        return output
+"#,
+    );
+}
+
+/// MIMO (D8): cropper — binary in, binary marker out (chain hop 2).
+fn write_cropper(repo: &std::path::Path) {
+    write_model_py(
+        repo,
+        "cropper",
+        r#"import base64
+from lite_server import LitAPI
+
+
+class CropperAPI(LitAPI):
+    def setup(self, device):
+        self.device = device
+
+    async def decode_request(self, request, ctx=None):
+        return request  # raw bytes
+
+    async def predict(self, x, ctx=None):
+        return {"crop": {"$binary_b64": base64.b64encode(x).decode(), "content_type": "image/png"}}
+
+    async def encode_response(self, output, ctx=None):
+        return output
+"#,
+    );
+}
+
+/// MIMO (D8): classifier — binary in, plain JSON out (chain tail).
+fn write_classifier(repo: &std::path::Path) {
+    write_model_py(
+        repo,
+        "classifier",
+        r#"from lite_server import LitAPI
+
+
+class ClassifierAPI(LitAPI):
+    def setup(self, device):
+        self.device = device
+
+    async def decode_request(self, request, ctx=None):
+        return request  # raw bytes
+
+    async def predict(self, x, ctx=None):
+        return {"label": "cat", "bytes_in": len(x)}
+
+    async def encode_response(self, output, ctx=None):
+        return output
+"#,
+    );
+}
+
 /// E6 (batch 4): streaming tail that ALWAYS raises on the first frame
 /// (build-window retry exhaustion fixture, D35).
 fn write_tail_fail_always(repo: &std::path::Path) {
@@ -831,6 +909,106 @@ const ENS_STREAM_COMMITTED_YAML: &str = r#"ensemble:
         pre: "$pre.pre"
 "#;
 
+// ===== MIMO (batch 4①) fixtures =====
+
+/// Declared multi-input DAG: text + default-carrying sys.
+const ENS_MIMO_YAML: &str = r#"ensemble:
+  inputs:
+    text:
+      type: json
+    sys:
+      type: json
+      required: false
+      default: "be terse"
+  steps:
+    - name: tok
+      model: pre
+      version: "1"
+      inputs:
+        text: "$inputs.text"
+    - name: out
+      model: echo
+      version: "1"
+      inputs:
+        data: "$tok.pre"
+"#;
+
+/// D8 binary passthrough chain: image → vis_enc (marker output) → cropper
+/// (marker output) → classifier (plain JSON tail). Each binary hop is a
+/// declared alias consumed whole as the step's sole input.
+const ENS_MIMO_BIN_YAML: &str = r#"ensemble:
+  inputs:
+    image:
+      type: binary
+      content_type: image/png
+  steps:
+    - name: enc
+      model: vis_enc
+      version: "1"
+      outputs:
+        thumb:
+          type: binary
+          path: "$.thumb"
+      inputs:
+        img: "$inputs.image"
+    - name: crop
+      model: cropper
+      version: "1"
+      outputs:
+        crop:
+          type: binary
+          path: "$.crop"
+      inputs:
+        img: "$enc.thumb"
+    - name: cls
+      model: classifier
+      version: "1"
+      inputs:
+        img: "$crop.crop"
+"#;
+
+/// R4 conditional skip: the optional input absent → `cond` (which would 500
+/// if it ran) is skipped, `main` still produces the output.
+const ENS_MIMO_COND_YAML: &str = r#"ensemble:
+  inputs:
+    text:
+      type: json
+    opt:
+      type: json
+      required: false
+  steps:
+    - name: cond
+      model: pre_5xx
+      version: "1"
+      inputs:
+        text: "$inputs.opt"
+    - name: main
+      model: pre
+      version: "1"
+      inputs:
+        text: "$inputs.text"
+"#;
+
+/// Declared streaming DAG — the D33 bidi fixture (envelope frame triggers
+/// immediately, no close frame).
+const ENS_MIMO_STREAM_YAML: &str = r#"ensemble:
+  inputs:
+    text:
+      type: json
+  steps:
+    - name: pre
+      model: pre
+      version: "1"
+      inputs:
+        text: "$inputs.text"
+    - name: tail
+      model: tail
+      version: "1"
+      stream: true
+      inputs:
+        pre: "$pre.pre"
+"#;
+
 const ENS_SLOW_YAML: &str = r#"ensemble:
   steps:
     - name: pre
@@ -963,6 +1141,14 @@ fn write_all_fixtures(repo: &std::path::Path) {
     write_ensemble(repo, "ens_stream_retry", ENS_STREAM_RETRY_YAML);
     write_ensemble(repo, "ens_stream_retry_exhaust", ENS_STREAM_RETRY_EXHAUST_YAML);
     write_ensemble(repo, "ens_stream_committed", ENS_STREAM_COMMITTED_YAML);
+    // ===== batch 4 (MIMO①) fixtures =====
+    write_vis_enc(repo);
+    write_cropper(repo);
+    write_classifier(repo);
+    write_ensemble(repo, "ens_mimo", ENS_MIMO_YAML);
+    write_ensemble(repo, "ens_mimo_bin", ENS_MIMO_BIN_YAML);
+    write_ensemble(repo, "ens_mimo_cond", ENS_MIMO_COND_YAML);
+    write_ensemble(repo, "ens_mimo_stream", ENS_MIMO_STREAM_YAML);
 }
 
 fn write_server_yaml(repo: &std::path::Path, http_port: u16, extra: &str, orch_extra: &str) -> std::path::PathBuf {
@@ -979,7 +1165,7 @@ fn write_server_yaml(repo: &std::path::Path, http_port: u16, extra: &str, orch_e
         format!(
             "server:\n  http_port: {http_port}\n  timeout: 30.0\n{extra}\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n",
             repo.display()
         ),
     )
@@ -1362,7 +1548,7 @@ async fn boot_server_grpc(extra: &str) -> (String, u16, ServerGuard, std::path::
             "server:\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  timeout: 30.0\n{extra}\n\n\
              grpc:\n  enabled: true\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n",
             repo.display()
         ),
     )
@@ -3635,5 +3821,263 @@ async fn test_audit_e6_stream_committed_no_replay() {
     assert!(
         body.contains("error") && !body.contains("[DONE]"),
         "mid-stream failure must close with an Error frame: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Batch 4 (MIMO①): KServe envelope wire (D31), LSBE-1 (D32), D8 binary
+// passthrough chain, R18/R19, D33 bidi single-envelope-frame trigger
+// ---------------------------------------------------------------------------
+
+/// MIMO happy path: a KServe envelope with named inputs (defaults filled)
+/// runs the DAG — HTTP unary.
+#[serial]
+#[tokio::test]
+async fn test_audit_mimo_envelope_happy_http_unary() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_mimo"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_mimo/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"inputs": [{"name": "text", "data": {"text": "hello envelope"}}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "envelope request must run the DAG");
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("hello envelope"), "DAG output must reflect the named input: {body}");
+}
+
+/// R18: a missing required input → 400 (named-input contract).
+#[serial]
+#[tokio::test]
+async fn test_audit_mimo_missing_required_400() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_mimo"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_mimo/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"inputs": [{"name": "sys", "data": "x"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "missing required input must be 400 (R18)");
+}
+
+/// R18: an unknown input name → 400.
+#[serial]
+#[tokio::test]
+async fn test_audit_mimo_unknown_input_400() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_mimo"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_mimo/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"inputs": [
+            {"name": "text", "data": {"text": "x"}},
+            {"name": "nope", "data": 1}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "unknown input must be 400 (R18)");
+}
+
+/// D8: the binary passthrough chain — a TritonBinary envelope (JSON head +
+/// binary tail) flows image → vis_enc → cropper → classifier whole-value
+/// along declared binary aliases.
+#[serial]
+#[tokio::test]
+async fn test_audit_mimo_binary_passthrough_chain() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_mimo_bin"]).await;
+
+    let head = json!({"id": "r1", "inputs": [
+        {"name": "image", "parameters": {"binary_data_size": 3}}
+    ]});
+    let head_bytes = serde_json::to_vec(&head).unwrap();
+    let mut body = head_bytes.clone();
+    body.extend_from_slice(b"\x00\x01\x02");
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_mimo_bin/infer", base))
+        .header("content-type", "application/octet-stream")
+        .header("inference-header-content-length", head_bytes.len().to_string())
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "binary passthrough chain must run: {:?}",
+        resp.text().await
+    );
+    // Re-send to read the body (consumed above on failure path only — use a
+    // fresh request to assert the payload).
+    let mut body2 = head_bytes.clone();
+    body2.extend_from_slice(b"\x00\x01\x02");
+    let resp2 = client
+        .post(format!("{}/v2/models/ens_mimo_bin/infer", base))
+        .header("content-type", "application/octet-stream")
+        .header("inference-header-content-length", head_bytes.len().to_string())
+        .body(body2)
+        .send()
+        .await
+        .unwrap();
+    let v: Value = resp2.json().await.unwrap();
+    assert_eq!(v["label"], json!("cat"), "classifier output: {v}");
+    assert_eq!(v["bytes_in"], json!(3), "the original 3 bytes must reach the tail: {v}");
+}
+
+/// R4/D13: the optional input absent → the conditional step (which would
+/// 500) is skipped; the sibling still produces the output.
+#[serial]
+#[tokio::test]
+async fn test_audit_mimo_conditional_skip() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_mimo_cond"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_mimo_cond/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"inputs": [{"name": "text", "data": {"text": "no opt today"}}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "conditional skip must not fail the DAG");
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("no opt today"), "sibling output: {body}");
+}
+
+/// R19/D14: a legacy ensemble receiving a top-level `$inputs` key → 400
+/// (reserved namespace).
+#[serial]
+#[tokio::test]
+async fn test_audit_mimo_r19_reserved_namespace_400() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_unary"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_unary/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"$inputs": [{"name": "a", "data": 1}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "'$inputs' on a legacy ensemble must be 400 (R19/D14)"
+    );
+}
+
+/// D32: gRPC unary with an LSBE-1 container (binary envelope) runs the DAG;
+/// a malformed container is InvalidArgument.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_audit_mimo_grpc_lsbe1_container() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+
+    let (base, grpc_port, _guard, _repo) = boot_server_grpc("").await;
+    wait_ready_all(&base, &["ens_mimo"]).await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+
+    // Happy: LSBE-1 container with a json-only envelope (no tail).
+    let head = serde_json::to_vec(&json!({"inputs": [{"name": "text", "data": "grpc envelope"}]})).unwrap();
+    let mut blob = Vec::new();
+    blob.extend_from_slice(b"LSB1");
+    blob.extend_from_slice(&(head.len() as u64).to_le_bytes());
+    blob.extend_from_slice(&head);
+    let resp = client
+        .infer(tonic::Request::new(InferRequest {
+            model_name: "ens_mimo".into(),
+            version: "1".into(),
+            data: bytes::Bytes::from(blob),
+            ..Default::default()
+        }))
+        .await
+        .expect("LSBE-1 gRPC unary must succeed");
+    let v: Value = serde_json::from_slice(resp.into_inner().data.as_ref()).unwrap();
+    assert_eq!(v["echo"], json!("grpc envelope"), "gRPC envelope output: {v}");
+
+    // Malformed container (magic mismatch) → InvalidArgument.
+    let resp = client
+        .infer(tonic::Request::new(InferRequest {
+            model_name: "ens_mimo".into(),
+            version: "1".into(),
+            data: bytes::Bytes::from_static(b"XXXX-not-a-container"),
+            ..Default::default()
+        }))
+        .await;
+    match resp {
+        Err(status) => assert_eq!(
+            status.code(),
+            tonic::Code::InvalidArgument,
+            "malformed LSBE-1 must be InvalidArgument, got {status:?}"
+        ),
+        Ok(_) => panic!("malformed container must fail"),
+    }
+}
+
+/// D33: a declared-inputs ensemble executes on the FIRST WS envelope frame
+/// — no close frame needed; chunks stream back immediately.
+#[tokio::test]
+#[serial]
+async fn test_audit_mimo_ws_bidi_envelope_frame_immediate() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_mimo_stream"]).await;
+    let http_port = base.trim_start_matches("http://127.0.0.1:").parse::<u16>().unwrap();
+    let ws_url = format!("ws://127.0.0.1:{http_port}/v2/models/ens_mimo_stream/stream");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+
+    // Single envelope text frame — D33: executes immediately, no close frame.
+    let envelope = json!({"inputs": [{"name": "text", "data": "hi ws"}]});
+    ws.send(Message::Text(envelope.to_string())).await.unwrap();
+
+    let mut tokens: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => {
+                let v: Value = serde_json::from_str(&t).ok().unwrap_or(Value::Null);
+                if let Some(tok) = v.get("token").and_then(|t| t.as_str()) {
+                    tokens.push(tok.to_string());
+                }
+            }
+            // The WS writer emits chunks as Binary frames (existing
+            // behaviour — parity with the aggregation tests).
+            Ok(Some(Ok(Message::Binary(b)))) => {
+                if let Ok(v) = serde_json::from_slice::<Value>(&b) {
+                    if let Some(tok) = v.get("token").and_then(|t| t.as_str()) {
+                        tokens.push(tok.to_string());
+                    }
+                }
+            }
+            Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => break,
+            Ok(Some(Ok(_))) => {}
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        tokens,
+        vec!["hi", "ws"],
+        "the envelope frame must trigger execution without a close frame: {tokens:?}"
     );
 }

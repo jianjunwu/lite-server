@@ -229,11 +229,24 @@ impl GrpcService {
                 .server
                 .max_request_body_bytes
                 .unwrap_or(64 * 1024 * 1024);
-            let mut aggregator = crate::ensemble::BidiAggregator::new(max_body);
             // First frame kind: content-type declares JSON vs opaque bytes
             // (WS frame-type parity). Mixed kinds → 400 inside push.
             let is_json = crate::grpc::payload::body_kind_label(&meta.headers) == "json";
             let ct = meta.headers.get("content-type").cloned();
+            // D33: a declared-inputs ensemble executes on the FIRST envelope
+            // frame — the request stream is dropped afterwards (half-close
+            // is then the client's normal finish; late data frames die with
+            // the transport). Undeclared ensembles keep the D17 aggregation.
+            let declared = crate::ensemble::ensemble_declares_inputs(
+                &self.app_state, &model_name, &resolved_version,
+            )
+            .await
+            .map_err(|e| err(app_error_to_grpc_status(&e)))?;
+            let value = if declared {
+                crate::ensemble::bidi_envelope_frame(&initial_data, is_json, ct.clone())
+                    .map_err(|e| err(app_error_to_grpc_status(&e)))?
+            } else {
+            let mut aggregator = crate::ensemble::BidiAggregator::new(max_body);
             let aggregate_start = std::time::Instant::now();
             aggregator
                 .push(initial_data, is_json, ct.as_deref())
@@ -291,7 +304,8 @@ impl GrpcService {
                 aggregator.total_bytes(),
                 aggregate_start.elapsed().as_secs_f64(),
             );
-            let value = aggregator.finish().map_err(|e| err(app_error_to_grpc_status(&e)))?;
+            aggregator.finish().map_err(|e| err(app_error_to_grpc_status(&e)))?
+            };
             let opts = crate::ensemble::EnsembleExecOpts {
                 client_ip: client_ip.clone(),
                 deadline_unix_ns: deadline.unix_ns,

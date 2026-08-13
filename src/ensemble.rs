@@ -4,6 +4,7 @@ use crate::proto::liteserver as pb;
 use crate::registry::types::ModelType;
 use bytes::Bytes;
 use dashmap::DashMap;
+use indexmap::IndexMap;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -23,13 +24,28 @@ use uuid::Uuid;
 ///
 /// `Json` is the historical path — all steps participate in field-level
 /// `$ref` resolution and merge into JSON objects. `Binary` is the
-/// passthrough path — root input or final-step output can be opaque bytes,
-/// but binary values MUST NOT flow between internal DAG steps (Option A
-/// scope; internal binary flow is reserved for Option B).
+/// passthrough path; D8 (MIMO) boundedly opens binary flow between internal
+/// steps: whole-value references only, declared types, sole-input
+/// consumption (§5.5.2 I1-I3). D31 extends Binary with optional
+/// shape/datatype metadata (carried from the KServe envelope head).
+///
+/// `Envelope` is the MIMO request-side wire form (D31/D32): a KServe JSON
+/// head plus the binary tail — internal only, produced by the transport
+/// de-framing shims and consumed by [`parse_root_inputs`]; it NEVER flows
+/// on a DAG edge (I1-I3 make every step output Json or Binary).
 #[derive(Debug, Clone, PartialEq)]
 pub enum EnsembleValue {
     Json(serde_json::Value),
-    Binary(Bytes, String /* content_type */),
+    Binary(
+        Bytes,
+        String,           /* content_type */
+        Option<Vec<i64>>, /* shape (D31) */
+        Option<String>,   /* datatype (D31) */
+    ),
+    Envelope {
+        head: serde_json::Value,
+        tail: Bytes,
+    },
 }
 
 // ===== Config parsing =====
@@ -53,6 +69,61 @@ pub struct EnsembleBlock {
     /// Omitted = `steps.last()` (historical semantics).
     #[serde(default)]
     pub output: Option<String>,
+    /// MIMO (D8/D9, batch 4①): request-level named inputs — the static type
+    /// environment's root. None = the historical single anonymous input
+    /// (`$request`); Some = the KServe-envelope wire (D31), `$inputs.NAME`
+    /// refs, and no anonymous root (R5).
+    /// (E7 `outputs` and E8-1 `dags` land with their own commits —
+    /// deny_unknown_fields keeps them an explicit failure until then.)
+    #[serde(default)]
+    pub inputs: Option<IndexMap<String, InputDecl>>,
+}
+
+/// MIMO (D8/D31): a named root input's declaration — the static type of
+/// `$inputs.NAME`. `type` is mandatory (the static type environment's
+/// foundation); the shape/datatype fields are carried onto the Binary value
+/// (D31, hint-only, never enforced).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputDecl {
+    #[serde(rename = "type")]
+    pub ty: InputType,
+    /// R2: required (default true) means the envelope must carry the input.
+    #[serde(default = "default_true")]
+    pub required: bool,
+    /// json only (R2); a default makes the input never-absent (not
+    /// conditional, R4).
+    pub default: Option<serde_json::Value>,
+    /// binary only (R2): expected MIME — documentation/hint, not enforced.
+    pub content_type: Option<String>,
+    /// binary only (R2, D31): expected shape — hint, carried onto the value.
+    pub shape: Option<Vec<i64>>,
+    /// binary only (R2, D31): expected datatype — hint, carried onto the value.
+    pub datatype: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InputType {
+    Json,
+    Binary,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// MIMO (D10): a step's named output projection against its single worker
+/// response. `type: binary` + no `path` = the whole response (non-JSON
+/// media_type); `type: binary` + `path` = a `$binary_b64` marker object at
+/// that JSON path (secondary in-JSON path); `type: json` = a `$.a.b`-style
+/// projection (MIMO②).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StepOutputDecl {
+    #[serde(rename = "type")]
+    pub ty: InputType,
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -92,6 +163,12 @@ pub struct EnsembleStepRaw {
     /// frame). Default 0 = historical single attempt.
     #[serde(default)]
     pub retries: Option<u32>,
+    /// MIMO (D10, batch 4): step-level named outputs — projections against
+    /// the single worker response. None = the historical single output
+    /// (`$stepX`, static type json). R10: streaming steps must not declare
+    /// outputs (chunks have no named-output semantics, D11).
+    #[serde(default)]
+    pub outputs: Option<IndexMap<String, StepOutputDecl>>,
 }
 
 /// E6 (batch 4): step fault tolerance modes.
@@ -118,11 +195,29 @@ pub struct EnsembleStep {
     pub on_error: OnErrorKind,
     /// E6 (batch 4): worker-inference retry budget (see the raw field).
     pub retries: u32,
+    /// MIMO (D10, batch 4): named output declarations (see the raw field).
+    pub outputs_decl: Option<IndexMap<String, StepOutputDecl>>,
 }
 
 lazy_static::lazy_static! {
-    static ref REF_RE: Regex = Regex::new(r"^\$(\w+)(?:\.(\w+))?$")
+    static ref REF_RE: Regex = Regex::new(r"^\$(\w+)(?:\.(.+))?$")
         .expect("invalid ensemble ref regex");
+    /// R1: input/alias names — `[A-Za-z_][A-Za-z0-9_]*` (the `$inputs.NAME`
+    /// grammar's first segment depends on it).
+    static ref IDENT_RE: Regex = Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$")
+        .expect("invalid ident regex");
+}
+
+/// MIMO (R11/R12, batch 4①): the parse-decided step input assembly — with a
+/// declared type environment every ref's type is known at parse time, so the
+/// runtime has no type branches (§5.5.6). None (legacy configs) keeps the
+/// historical dynamic dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputMode {
+    /// All-Json inputs → object assembly (+ params override, E3).
+    GroupJson,
+    /// Exactly one whole-Binary input → raw bytes passthrough (D8).
+    BinaryPassThrough,
 }
 
 /// Parse + validate + topologically sort a config file into the cached
@@ -155,6 +250,7 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
             timeout_secs: s.timeout_secs,
             on_error: s.on_error.unwrap_or_default(),
             retries: s.retries.unwrap_or(0),
+            outputs_decl: s.outputs,
         })
     }).collect::<Result<_, AppError>>()?;
 
@@ -162,9 +258,25 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
     // E2: resolve the explicit output BEFORE chain construction / streaming
     // validation — both anchor on the output step.
     let (output_step, output_field) = resolve_output(config.ensemble.output.as_deref(), &steps)?;
-    // E6 (D5/D34): a skip step's absence must be statically provable — no
-    // downstream references, no single-output reference, never streaming.
-    validate_skip_rules(&steps, output_step)?;
+    // MIMO (batch 4①): the static type environment — inputs declaration
+    // validation (R1/R2), ref analysis (R3/R5/R9/R12), input-mode dispatch
+    // (R11) and conditional-step discovery (R4).
+    let inputs_decl = config.ensemble.inputs;
+    let (input_modes, conditional_refs) = analyze_static_types(&steps, inputs_decl.as_ref())?;
+    // E6 (D5/D34) + MIMO R4: an absentable step's absence must be statically
+    // provable — no downstream references, no single-output reference,
+    // never streaming.
+    validate_skip_rules(&steps, output_step, &conditional_refs)?;
+    // MIMO (R7/D10): the single-output contract cannot name aliases — a DAG
+    // whose output step declares step.outputs must use ensemble.outputs
+    // (E7, batch 4④) to name the sinks.
+    if steps[output_step].outputs_decl.is_some() {
+        return Err(AppError::Config(format!(
+            "output step '{}' declares step.outputs — the single-output contract \
+             cannot name aliases; set ensemble.outputs to select the sinks (E7)",
+            steps[output_step].name
+        )));
+    }
     // Pipeline-form validation + chain construction (P-R1..R5/D26, batch 2);
     // non-pipeline streaming rules apply only when no chain exists.
     let chains = build_chains(&steps, output_step)?;
@@ -196,6 +308,11 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
         steps,
         layers,
         chains,
+        // MIMO (batch 4①): the static type environment (None = legacy single
+        // anonymous input, byte-identical behaviour).
+        inputs_decl,
+        input_modes,
+        conditional_refs,
         config_path: config_path.to_path_buf(),
         // Set by the production loader (stat-before-read); None for the
         // load-time direct-parse path (insert_ready stats on its own).
@@ -237,39 +354,296 @@ fn resolve_output(
     Ok((idx, caps.get(2).map(|m| m.as_str().to_string())))
 }
 
-/// E6 (batch 4, D5/D34): a `skip` step is absent from the context when its
-/// error fires — every consumer of its output must be statically provable as
-/// safe at parse time:
+/// MIMO (batch 4①, R1-R5/R9/R11/R12): build the static type environment.
+/// With an `inputs` declaration every ref's type is parse-decidable:
+///  - R1/R2: declaration field validation (names, type gating);
+///  - R3/R5: namespace rules (binary paths, legacy `$request`, undeclared
+///    `$inputs`);
+///  - R11/R12: per-step input-mode dispatch (all-Json → GroupJson, exactly
+///    one whole Binary → BinaryPassThrough, anything else → error);
+///  - R9: params × Binary is a static error once the mode is decided;
+///  - R4: steps referencing optional (no-default) inputs are CONDITIONAL —
+///    recorded for the runtime skip (D13).
+/// Legacy configs (no declaration) return all-None modes (dynamic dispatch,
+/// byte-identical) and reject `$inputs` (R5).
+#[allow(clippy::type_complexity)] // (modes, conditional) is a natural parse pair
+fn analyze_static_types(
+    steps: &[EnsembleStep],
+    inputs_decl: Option<&IndexMap<String, InputDecl>>,
+) -> Result<(Vec<Option<InputMode>>, Vec<Vec<String>>), AppError> {
+    let mut modes = Vec::with_capacity(steps.len());
+    let mut conditional = Vec::with_capacity(steps.len());
+
+    if let Some(decl) = inputs_decl {
+        // R1/R2: declaration-level validation (once per plan).
+        for (name, d) in decl {
+            if !IDENT_RE.is_match(name) {
+                return Err(AppError::Config(format!(
+                    "ensemble.inputs name '{name}' is not a valid identifier \
+                     ([A-Za-z_][A-Za-z0-9_]*, R1)"
+                )));
+            }
+            match d.ty {
+                InputType::Json => {
+                    if d.content_type.is_some() || d.shape.is_some() || d.datatype.is_some() {
+                        return Err(AppError::Config(format!(
+                            "ensemble.inputs '{name}': content_type/shape/datatype are \
+                             binary-only fields (R2)"
+                        )));
+                    }
+                }
+                InputType::Binary => {
+                    if d.default.is_some() {
+                        return Err(AppError::Config(format!(
+                            "ensemble.inputs '{name}': default is json-only (R2)"
+                        )));
+                    }
+                }
+            }
+            if d.required && d.default.is_some() {
+                return Err(AppError::Config(format!(
+                    "ensemble.inputs '{name}': required: true conflicts with a default (R2)"
+                )));
+            }
+        }
+    }
+
+    for step in steps {
+        // R10: streaming chunks have no named-output semantics (D11).
+        if step.stream && step.outputs_decl.is_some() {
+            return Err(AppError::Config(format!(
+                "step '{}': stream: true cannot declare step.outputs \
+                 (streaming chunks have no named outputs, R10/D11)",
+                step.name
+            )));
+        }
+        // Ref analysis. The R7/R8 disambiguation of DECLARED step refs
+        // applies in both modes (step.outputs declarations are mode-
+        // independent); the `$inputs`/`$request` namespace rules and the
+        // static input-mode dispatch are declared-mode-only (the legacy
+        // root's type is unknown at parse — Raw binary may arrive).
+        let mut mode: Option<InputMode> = None;
+        let mut cond: Vec<String> = Vec::new();
+        for ref_str in step.inputs.values() {
+            let caps = REF_RE.captures(ref_str).ok_or_else(|| {
+                AppError::Config(format!("invalid reference format: {}", ref_str))
+            })?;
+            let source = caps.get(1).unwrap().as_str();
+            let rest = caps.get(2).map(|m| m.as_str());
+            match source {
+                "request" => {
+                    if inputs_decl.is_some() {
+                        return Err(AppError::Config(format!(
+                            "step '{}' references '{}' — declared-inputs ensembles have no \
+                             anonymous root; use $inputs.NAME (R5)",
+                            step.name, ref_str
+                        )));
+                    }
+                    // Legacy root: dynamic type — no static mode.
+                }
+                "inputs" => {
+                    let Some(decl) = inputs_decl else {
+                        return Err(AppError::Config(format!(
+                            "step '{}' references '{}' — $inputs requires an \
+                             ensemble.inputs declaration (R5)",
+                            step.name, ref_str
+                        )));
+                    };
+                    let name = rest.and_then(|r| r.split('.').next()).unwrap_or("");
+                    let d = decl.get(name).ok_or_else(|| {
+                        AppError::Config(format!(
+                            "step '{}' references undeclared input '{}' (R5)",
+                            step.name, ref_str
+                        ))
+                    })?;
+                    let has_path = rest.map(|r| r.contains('.')).unwrap_or(false);
+                    match d.ty {
+                        InputType::Json => {
+                            if mode == Some(InputMode::BinaryPassThrough) {
+                                return Err(AppError::Config(format!(
+                                    "step '{}': mixed JSON/Binary inputs are forbidden (R12) \
+                                     — a binary input must be the step's sole input",
+                                    step.name
+                                )));
+                            }
+                            mode = Some(InputMode::GroupJson);
+                            if !d.required && d.default.is_none() {
+                                cond.push(name.to_string());
+                            }
+                        }
+                        InputType::Binary => {
+                            if has_path {
+                                return Err(AppError::Config(format!(
+                                    "step '{}': binary input '{}' must be referenced whole \
+                                     (R3 — no field projection on binary)",
+                                    step.name, ref_str
+                                )));
+                            }
+                            if mode.is_some() {
+                                return Err(AppError::Config(format!(
+                                    "step '{}': a binary input must be the step's SOLE whole \
+                                     input (R12); '{}' combines with other inputs",
+                                    step.name, ref_str
+                                )));
+                            }
+                            mode = Some(InputMode::BinaryPassThrough);
+                            if !d.required && d.default.is_none() {
+                                cond.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    // Step ref — the static type comes from the source step's
+                    // declaration (undeclared steps are json, I3).
+                    let src = steps
+                        .iter()
+                        .find(|s| s.name == source)
+                        .ok_or_else(|| {
+                            AppError::Config(format!(
+                                "step '{}' references unknown step '{}'",
+                                step.name, source
+                            ))
+                        })?;
+                    match &src.outputs_decl {
+                        None => {
+                            // Undeclared → static type json (whole or legacy
+                            // field path). Legacy configs stay dynamic
+                            // (mode None) — declared configs get GroupJson.
+                            if inputs_decl.is_some() {
+                                if mode == Some(InputMode::BinaryPassThrough) {
+                                    return Err(AppError::Config(format!(
+                                        "step '{}': mixed JSON/Binary inputs are forbidden (R12)",
+                                        step.name
+                                    )));
+                                }
+                                mode = Some(InputMode::GroupJson);
+                            }
+                        }
+                        Some(alias_decl) => {
+                            // R7: a declared step must be referenced by alias
+                            // (both modes — the whole ref has no type).
+                            let alias = rest.and_then(|r| r.split('.').next()).ok_or_else(|| {
+                                AppError::Config(format!(
+                                    "step '{}': '{}' — step '{}' declares outputs and must be \
+                                     referenced by alias ($stepX.ALIAS, R7)",
+                                    step.name, ref_str, source
+                                ))
+                            })?;
+                            let d = alias_decl.get(alias).ok_or_else(|| {
+                                AppError::Config(format!(
+                                    "step '{}': '{}' — '{}' is not a declared alias of step \
+                                     '{}' (R7)",
+                                    step.name, ref_str, alias, source
+                                ))
+                            })?;
+                            let has_path = rest.map(|r| r.contains('.')).unwrap_or(false);
+                            match d.ty {
+                                InputType::Binary => {
+                                    // R8: binary aliases are whole-only.
+                                    if has_path {
+                                        return Err(AppError::Config(format!(
+                                            "step '{}': binary alias '{}' must be referenced \
+                                             whole (R8)",
+                                            step.name, ref_str
+                                        )));
+                                    }
+                                    if inputs_decl.is_some() {
+                                        if mode.is_some() {
+                                            return Err(AppError::Config(format!(
+                                                "step '{}': a binary input must be the step's \
+                                                 SOLE whole input (R12)",
+                                                step.name
+                                            )));
+                                        }
+                                        mode = Some(InputMode::BinaryPassThrough);
+                                    }
+                                }
+                                InputType::Json => {
+                                    // MIMO② (batch 4③) opens json alias
+                                    // projection; the declaration itself is
+                                    // complete in ①.
+                                    if inputs_decl.is_some() {
+                                        if mode == Some(InputMode::BinaryPassThrough) {
+                                            return Err(AppError::Config(format!(
+                                                "step '{}': mixed JSON/Binary inputs are forbidden (R12)",
+                                                step.name
+                                            )));
+                                        }
+                                        mode = Some(InputMode::GroupJson);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // R9: with the mode parse-decided, params × Binary is static.
+        if mode == Some(InputMode::BinaryPassThrough) && !step.params.is_empty() {
+            return Err(AppError::Config(format!(
+                "step '{}': params cannot combine with a binary input (R9/E3)",
+                step.name
+            )));
+        }
+        modes.push(mode);
+        conditional.push(cond);
+    }
+    Ok((modes, conditional))
+}
+
+/// E6 (batch 4, D5/D34) + MIMO R4 (batch 4①, D13): an ABSENTABLE step
+/// (`on_error: skip`, or conditional — referencing an optional input) is
+/// absent from the context when its error fires / its input is missing —
+/// every consumer of its output must be statically provable as safe at parse
+/// time:
 ///   1. no OTHER step may reference it (`$name` whole or `$name.field` —
 ///      both dangle identically at runtime);
 ///   2. `ensemble.output` may not point at it (the single-output contract
 ///      has no null channel — only E7's multi-sink outputs do, D5);
 ///   3. a streaming step may never be absent (D34 rule 6: the streaming
 ///      response contract promises a stream unconditionally).
-fn validate_skip_rules(steps: &[EnsembleStep], output_step: usize) -> Result<(), AppError> {
-    let skip_names: HashSet<&str> = steps
+fn validate_skip_rules(
+    steps: &[EnsembleStep],
+    output_step: usize,
+    conditional_refs: &[Vec<String>],
+) -> Result<(), AppError> {
+    let absentable: HashSet<&str> = steps
         .iter()
-        .filter(|s| s.on_error == OnErrorKind::Skip)
-        .map(|s| s.name.as_str())
+        .enumerate()
+        .filter(|(i, s)| s.on_error == OnErrorKind::Skip || !conditional_refs[*i].is_empty())
+        .map(|(_, s)| s.name.as_str())
         .collect();
-    if skip_names.is_empty() {
+    if absentable.is_empty() {
         return Ok(());
     }
 
-    // Rule 3 first (cheapest): stream × skip is a structural contradiction.
-    for s in steps {
-        if s.stream && s.on_error == OnErrorKind::Skip {
+    // Rule 3 first (cheapest): stream × absence is a structural
+    // contradiction (skip arm names skip; conditional arm names the input).
+    for (i, s) in steps.iter().enumerate() {
+        if !s.stream {
+            continue;
+        }
+        if s.on_error == OnErrorKind::Skip {
             return Err(AppError::Config(format!(
                 "step '{}': on_error: skip cannot combine with stream: true \
                  (a streaming response promises a stream unconditionally, D34)",
                 s.name
             )));
         }
+        if !conditional_refs[i].is_empty() {
+            return Err(AppError::Config(format!(
+                "step '{}': a streaming step cannot reference optional inputs ({:?}) \
+                 (a streaming response promises a stream unconditionally, D34)",
+                s.name, conditional_refs[i]
+            )));
+        }
     }
 
-    // Rule 1: any input reference whose first segment names a skip step.
+    // Rule 1: any input reference whose first segment names an absentable
+    // step.
     for s in steps {
-        if s.on_error == OnErrorKind::Skip {
+        if absentable.contains(s.name.as_str()) {
             continue; // self-references are caught by validate_dag anyway
         }
         for ref_str in s.inputs.values() {
@@ -277,11 +651,11 @@ fn validate_skip_rules(steps: &[EnsembleStep], output_step: usize) -> Result<(),
                 continue; // malformed refs are reported elsewhere (validate_dag)
             };
             let source = caps.get(1).unwrap().as_str();
-            if skip_names.contains(source) {
+            if absentable.contains(source) {
                 return Err(AppError::Config(format!(
-                    "step '{}' references skip step '{}' via '{}' — a skipped step \
-                     leaves the DAG dangling; on_error: skip steps must be unreferenced \
-                     (use ensemble.outputs for a null-when-skipped alias, D5)",
+                    "step '{}' references potentially-absent step '{}' via '{}' — \
+                     an on_error: skip or optional-input step leaves the DAG dangling \
+                     (D5/R4); use ensemble.outputs for a null-when-absent alias",
                     s.name, source, ref_str
                 )));
             }
@@ -290,10 +664,11 @@ fn validate_skip_rules(steps: &[EnsembleStep], output_step: usize) -> Result<(),
 
     // Rule 2: the single-output contract has no null channel.
     let output_step = &steps[output_step];
-    if output_step.on_error == OnErrorKind::Skip {
+    if absentable.contains(output_step.name.as_str()) {
         return Err(AppError::Config(format!(
-            "ensemble.output references skip step '{}' — the single-output contract \
-             has no null channel; use ensemble.outputs (alias = null when skipped, D5)",
+            "ensemble.output references potentially-absent step '{}' — the single-output \
+             contract has no null channel; use ensemble.outputs (alias = null when \
+             absent, D5)",
             output_step.name
         )));
     }
@@ -433,28 +808,18 @@ fn validate_dag(steps: &[EnsembleStep]) -> Result<(), AppError> {
         let deps = dependencies.entry(&step.name).or_default();
         for ref_str in step.inputs.values() {
             let caps = REF_RE.captures(ref_str).ok_or_else(|| {
-                // Single-level field refs only ($step.field). Name the
-                // boundary for nested paths ($step.a.b) — they open with
-                // MIMO multi-level mapping (R17), so a config author hitting
-                // the limit sees the future path instead of a bare error.
-                if ref_str.starts_with('$') && ref_str.contains('.') {
-                    AppError::Config(format!(
-                        "invalid reference '{}': nested field paths (a.b.c) are not \
-                         supported yet — multi-level paths open with MIMO (R17)",
-                        ref_str
-                    ))
-                } else {
-                    AppError::Config(format!("invalid reference format: {}", ref_str))
-                }
+                AppError::Config(format!("invalid reference format: {}", ref_str))
             })?;
             let source = caps.get(1).unwrap().as_str();
-            if source != "request" && !step_names.contains(source) {
+            // MIMO: `$inputs.NAME` is a named-input ref, not a step dep (its
+            // validity is checked by analyze_static_types).
+            if source != "request" && source != "inputs" && !step_names.contains(source) {
                 return Err(AppError::Config(format!(
                     "step '{}' references unknown step '{}'",
                     step.name, source
                 )));
             }
-            if source != "request" {
+            if source != "request" && source != "inputs" {
                 deps.insert(source);
             }
         }
@@ -708,7 +1073,8 @@ fn topological_layers(steps: &[EnsembleStep]) -> Vec<Vec<&EnsembleStep>> {
         for ref_str in step.inputs.values() {
             if let Some(caps) = REF_RE.captures(ref_str) {
                 let source = caps.get(1).unwrap().as_str();
-                if source != "request" {
+                // MIMO: `$inputs.NAME` is a named-input ref, not a step dep.
+                if source != "request" && source != "inputs" {
                     deps.insert(source);
                 }
             }
@@ -779,62 +1145,448 @@ fn select_output_field(
             })?;
             Ok(EnsembleValue::Json(field_val))
         }
-        EnsembleValue::Binary(_, _) => Err(AppError::InvalidRequestBody(format!(
+        EnsembleValue::Binary(..) => Err(AppError::InvalidRequestBody(format!(
             "ensemble.output field '{}' cannot be extracted from binary step \
              output '{}' (no field semantics on bytes)",
             field, step_name
         ))),
+        EnsembleValue::Envelope { .. } => unreachable!("envelope never reaches output selection"),
     }
 }
 
-fn resolve_ref(ref_str: &str, context: &HashMap<String, EnsembleValue>) -> Result<EnsembleValue, AppError> {
+/// The result of resolving a `$ref` against the runtime context.
+#[derive(Debug)]
+pub enum ResolvedRef {
+    /// The referenced value (Json or Binary).
+    Value(EnsembleValue),
+    /// MIMO R4: the referenced named input was absent this request — only
+    /// reachable for optional inputs (conditional steps are skipped before
+    /// resolution; a step resolving one here is an internal inconsistency).
+    Absent(String),
+}
+
+/// Resolve a `$ref` against the runtime context. The PLAN's static type
+/// environment decides the semantics (parse rules R3/R5/R7/R8 already
+/// rejected ill-typed refs — the runtime only projects/forwards):
+///  - `$request[.field]` — legacy anonymous root (rejected at parse in
+///    declared mode, R5);
+///  - `$inputs.NAME[.a.b]` — named root input; absent optional → Absent;
+///  - `$stepX[.field]` — undeclared step (static json, legacy single-field);
+///  - `$stepX.ALIAS` — declared alias; a binary alias passes through whole
+///    (D8), a json alias projects (MIMO②).
+/// Runtime type mismatches (declared json but the worker produced binary)
+/// are step errors (I3's runtime failure #1).
+fn resolve_ref(
+    plan: &EnsemblePlan,
+    ref_str: &str,
+    context: &HashMap<String, EnsembleValue>,
+) -> Result<ResolvedRef, AppError> {
     let caps = REF_RE.captures(ref_str).ok_or_else(|| {
         AppError::Config(format!("invalid reference: {}", ref_str))
     })?;
     let source = caps.get(1).unwrap().as_str();
-    let field = caps.get(2).map(|m| m.as_str());
+    let rest = caps.get(2).map(|m| m.as_str());
 
-    let source_data = context.get(source).ok_or_else(|| {
-        AppError::Config(format!("reference source not found: {}", source))
-    })?;
+    let (key, json_path) = match source {
+        "inputs" => {
+            let name = rest.and_then(|r| r.split('.').next()).unwrap_or("");
+            let key = format!("inputs.{name}");
+            let json_path = rest.and_then(|r| r.strip_prefix(name))
+                .and_then(|p| p.strip_prefix('.'));
+            (key, json_path)
+        }
+        step_name => {
+            let src = plan.steps.iter().find(|s| s.name == step_name);
+            match src.and_then(|s| s.outputs_decl.as_ref()) {
+                Some(_decl) => {
+                    // Declared step: context key is `step.alias`.
+                    let alias = rest.and_then(|r| r.split('.').next()).unwrap_or("");
+                    let key = format!("{step_name}.{alias}");
+                    let json_path = rest.and_then(|r| r.strip_prefix(alias))
+                        .and_then(|p| p.strip_prefix('.'));
+                    (key, json_path)
+                }
+                None => {
+                    // Undeclared step / request: legacy semantics — the key
+                    // is the source name; the field is the FIRST path segment
+                    // (multi-level paths stay MIMO-declaration-only).
+                    let key = source.to_string();
+                    let json_path = rest.and_then(|r| r.split('.').next());
+                    (key, json_path)
+                }
+            }
+        }
+    };
+
+    let Some(source_data) = context.get(&key) else {
+        if source == "inputs" {
+            // MIMO R4: an absent optional named input — Absent (conditional
+            // steps are pre-skipped; reaching here is an internal bug).
+            return Ok(ResolvedRef::Absent(key));
+        }
+        return Err(AppError::Config(format!(
+            "reference source not found: {}",
+            ref_str
+        )));
+    };
 
     match source_data {
-        EnsembleValue::Binary(_, _) => match field {
-            // E7: $request (whole) on Binary → passthrough (root binary to first layer)
+        EnsembleValue::Binary(..) => match json_path {
             None => {
-                if source == "request" {
-                    Ok(source_data.clone())
+                // D8: binary values flow along DECLARED binary edges — the
+                // legacy root (`$request`), named binary inputs
+                // (`$inputs.NAME`), and declared binary aliases
+                // (`$stepX.ALIAS`). Anything else is the legacy Option-A
+                // boundary (undeclared step outputs — their type is unknown
+                // at parse) or a declared-json mismatch (I3 runtime #1).
+                let declared_binary_edge = match source {
+                    "request" | "inputs" => true,
+                    step_name => plan
+                        .steps
+                        .iter()
+                        .find(|s| s.name == step_name)
+                        .and_then(|s| s.outputs_decl.as_ref())
+                        .and_then(|d| {
+                            rest.and_then(|r| r.split('.').next()).and_then(|a| d.get(a))
+                        })
+                        .map(|dd| dd.ty == InputType::Binary)
+                        .unwrap_or(false),
+                };
+                if declared_binary_edge {
+                    Ok(ResolvedRef::Value(source_data.clone()))
                 } else {
-                    // E7: $stepN (whole) on Binary → 400 (Option A scope boundary:
-                    // binary must not flow between internal DAG steps)
                     Err(AppError::InvalidRequestBody(format!(
                         "cannot reference binary step output '{}' as a whole; \
-                         binary values may only flow from the root input to the first layer \
-                         or from the final layer to the client",
+                         binary values flow only along declared binary inputs/outputs (D8) \
+                         — root input → first layer or final layer → client",
                         ref_str
                     )))
                 }
             }
-            // E7: $request.field on Binary → 400 (no field semantics on bytes)
             Some(_) => Err(AppError::InvalidRequestBody(format!(
                 "cannot extract field '{}' from binary data; \
                  binary values have no field-level semantics",
                 ref_str
             ))),
         },
-        EnsembleValue::Json(v) => match field {
-            None => Ok(EnsembleValue::Json(v.clone())),
+        EnsembleValue::Json(v) => match json_path {
+            None => Ok(ResolvedRef::Value(EnsembleValue::Json(v.clone()))),
             Some(f) => {
-                let field_val = v.get(f).cloned().ok_or_else(|| {
-                    AppError::Config(format!(
-                        "cannot resolve '{}' from {}",
-                        ref_str, v
-                    ))
+                let field_val = project_json_path(v, f).map_err(|_| {
+                    AppError::Config(format!("cannot resolve '{}' from {}", ref_str, v))
                 })?;
-                Ok(EnsembleValue::Json(field_val))
+                Ok(ResolvedRef::Value(EnsembleValue::Json(field_val)))
             }
         },
+        EnsembleValue::Envelope { .. } => {
+            Err(AppError::Internal("envelope reached a DAG edge".to_string()))
+        }
     }
+}
+
+/// MIMO: dot-segment JSON projection (`a.b.c`, an optional leading `$.` is
+/// stripped). No array subscripts or filters (D29: the `$.a.b` subset only).
+fn project_json_path(v: &Value, path: &str) -> Result<Value, AppError> {
+    let path = path.strip_prefix("$.").unwrap_or(path);
+    let mut cur = v;
+    for seg in path.split('.') {
+        if seg.is_empty() {
+            return Err(AppError::Config(format!(
+                "empty segment in JSON path '{path}'"
+            )));
+        }
+        cur = cur.get(seg).ok_or_else(|| {
+            AppError::Config(format!("path segment '{seg}' not found in '{path}'"))
+        })?;
+    }
+    Ok(cur.clone())
+}
+
+/// MIMO (D8/D9): the request root after [`parse_root_inputs`].
+/// `Single` is the legacy path (byte-identical); `Named` is the declared
+/// multi-input path — `absent` lists optional inputs the envelope did not
+/// carry (R4 conditional steps skip on them).
+#[derive(Debug)]
+pub enum RootInputs {
+    Single(EnsembleValue),
+    Named {
+        values: IndexMap<String, EnsembleValue>,
+        absent: Vec<String>,
+    },
+}
+
+/// MIMO (D31/D32, R18/R19): the DAG entry's root parsing — the SINGLE R18
+/// validation point (D39: endpoints de-frame transport only, never validate).
+///  - decl = None (legacy): payload passes through untouched, except the
+///    reserved `$inputs` namespace (400, D14) and the envelope container
+///    form (400 — TritonBinary/LSBE-1 have no legacy semantics);
+///  - decl = Some: the payload must be a KServe envelope — Json head with
+///    `inputs[]` (plus an optional binary tail from [`EnsembleValue::Envelope`]);
+///    elements match by name in header order, binary elements slice the tail
+///    cumulatively (`parameters.binary_data_size`), `$binary_b64` marker data
+///    decodes in-place (secondary path), defaults fill, absent optionals
+///    list.
+pub fn parse_root_inputs(
+    payload: EnsembleValue,
+    decl: Option<&IndexMap<String, InputDecl>>,
+) -> Result<RootInputs, AppError> {
+    let Some(decl) = decl else {
+        match &payload {
+            // R19/D14: `$inputs` is a reserved namespace on legacy payloads.
+            EnsembleValue::Json(v) => {
+                if v.as_object().map(|o| o.contains_key("$inputs")).unwrap_or(false) {
+                    return Err(AppError::InvalidRequestBody(
+                        "'$inputs' is a reserved namespace (D14) — this ensemble has no \
+                         inputs declaration; send a plain JSON body"
+                            .to_string(),
+                    ));
+                }
+            }
+            // The envelope container (TritonBinary / LSBE-1) has no legacy
+            // semantics — undeclared ensembles reject it (historical
+            // TritonBinary 400 kept byte-identical).
+            EnsembleValue::Envelope { .. } => {
+                return Err(AppError::InvalidRequestBody(
+                    "Triton Binary Tensor Data Extension requests (JSON head + binary \
+                     tail container) are only supported by ensembles with an inputs \
+                     declaration"
+                        .to_string(),
+                ));
+            }
+            _ => {}
+        }
+        return Ok(RootInputs::Single(payload));
+    };
+
+    let (head, tail) = match payload {
+        EnsembleValue::Json(v) => (v, Bytes::new()),
+        EnsembleValue::Envelope { head, tail } => (head, tail),
+        EnsembleValue::Binary(..) => {
+            return Err(AppError::InvalidRequestBody(
+                "this ensemble declares named inputs — requests must be a KServe \
+                 envelope (JSON with inputs[], or JSON head + binary tail); raw \
+                 binary bodies have no envelope semantics (R18)"
+                    .to_string(),
+            ));
+        }
+    };
+    let inputs = head.get("inputs").and_then(|i| i.as_array()).ok_or_else(|| {
+        AppError::InvalidRequestBody(
+            "declared-inputs ensemble requires a KServe envelope with an inputs[] \
+             array (R18/D31)"
+                .to_string(),
+        )
+    })?;
+
+    let mut values: IndexMap<String, EnsembleValue> = IndexMap::new();
+    let mut offset = 0usize;
+    for el in inputs {
+        let name = el.get("name").and_then(|n| n.as_str()).ok_or_else(|| {
+            AppError::InvalidRequestBody("envelope input element is missing 'name'".to_string())
+        })?;
+        let d = decl.get(name).ok_or_else(|| {
+            AppError::InvalidRequestBody(format!(
+                "envelope declares unknown input '{name}' (not in ensemble.inputs, R18)"
+            ))
+        })?;
+        let value = match d.ty {
+            InputType::Json => {
+                let data = el.get("data").ok_or_else(|| {
+                    AppError::InvalidRequestBody(format!(
+                        "envelope input '{name}' (type json) is missing 'data'"
+                    ))
+                })?;
+                EnsembleValue::Json(data.clone())
+            }
+            InputType::Binary => {
+                // Primary path: header element + tail slice (header order).
+                if let Some(marker) = el.get("data") {
+                    // Secondary path: `$binary_b64` marker object in-JSON.
+                    let (bytes, ct) = decode_binary_marker(marker)?;
+                    EnsembleValue::Binary(bytes, ct, None, None)
+                } else {
+                    let size = el
+                        .get("parameters")
+                        .and_then(|p| p.get("binary_data_size"))
+                        .and_then(|s| s.as_u64())
+                        .ok_or_else(|| {
+                            AppError::InvalidRequestBody(format!(
+                                "envelope input '{name}' (type binary) needs \
+                                 parameters.binary_data_size or $binary_b64 data (R18)"
+                            ))
+                        })? as usize;
+                    let end = offset.checked_add(size).ok_or_else(|| {
+                        AppError::InvalidRequestBody("binary tail size overflow".to_string())
+                    })?;
+                    let slice = tail.get(offset..end).ok_or_else(|| {
+                        AppError::InvalidRequestBody(format!(
+                            "envelope input '{name}': binary_data_size {size} overruns \
+                             the binary tail (R18)"
+                        ))
+                    })?;
+                    offset = end;
+                    EnsembleValue::Binary(
+                        Bytes::copy_from_slice(slice),
+                        d.content_type.clone().unwrap_or_else(|| "application/octet-stream".to_string()),
+                        d.shape.clone(),
+                        d.datatype.clone(),
+                    )
+                }
+            }
+        };
+        values.insert(name.to_string(), value);
+    }
+    if offset != tail.len() {
+        return Err(AppError::InvalidRequestBody(format!(
+            "binary tail has {} byte(s) beyond the declared sizes (R18)",
+            tail.len() - offset
+        )));
+    }
+
+    let mut absent = Vec::new();
+    for (name, d) in decl {
+        if values.contains_key(name) {
+            continue;
+        }
+        match (d.required, &d.default) {
+            (true, _) => {
+                return Err(AppError::InvalidRequestBody(format!(
+                    "envelope is missing required input '{name}' (R18)"
+                )));
+            }
+            (false, Some(def)) => {
+                values.insert(name.clone(), EnsembleValue::Json(def.clone()));
+            }
+            (false, None) => absent.push(name.clone()),
+        }
+    }
+    Ok(RootInputs::Named { values, absent })
+}
+
+/// D31 (secondary in-JSON path): decode a `{"$binary_b64": "...",
+/// "content_type": "..."}` marker object into bytes (content_type optional,
+/// defaults to application/octet-stream).
+fn decode_binary_marker(v: &Value) -> Result<(Bytes, String), AppError> {
+    let obj = v.as_object().ok_or_else(|| {
+        AppError::InvalidRequestBody(
+            "binary input data must be a {\"$binary_b64\": ...} marker object".to_string(),
+        )
+    })?;
+    let b64 = obj.get("$binary_b64").and_then(|b| b.as_str()).ok_or_else(|| {
+        AppError::InvalidRequestBody(
+            "binary marker object is missing the \"$binary_b64\" field".to_string(),
+        )
+    })?;
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+        .map_err(|e| {
+            AppError::InvalidRequestBody(format!("invalid base64 in $binary_b64 marker: {e}"))
+        })?;
+    let ct = obj
+        .get("content_type")
+        .and_then(|c| c.as_str())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    Ok((Bytes::from(bytes), ct))
+}
+
+/// D32: LSBE-1 — the in-frame self-describing container for transports
+/// without a metadata channel (gRPC data slot, WS/h2 frames):
+/// `"LSB1"` (4B magic) ‖ u64 LE head length ‖ JSON head (UTF-8) ‖ binary
+/// tail. Bare JSON never containerizes (its first byte `{` is naturally
+/// distinguishable — no heuristics). Returns the parsed head and the tail;
+/// any malformation is a 400 (R18 row).
+pub fn split_envelope(blob: &[u8]) -> Result<(serde_json::Value, Option<Bytes>), AppError> {
+    let malformed = || {
+        AppError::InvalidRequestBody(
+            "malformed LSBE-1 envelope container (expected 'LSB1' magic + u64 LE head \
+             length + JSON head + binary tail, D32)"
+                .to_string(),
+        )
+    };
+    if !blob.starts_with(b"LSB1") {
+        return Err(malformed());
+    }
+    if blob.len() < 12 {
+        return Err(malformed());
+    }
+    let head_len = u64::from_le_bytes(blob[4..12].try_into().unwrap()) as usize;
+    let head_end = 12usize.checked_add(head_len).ok_or_else(malformed)?;
+    if head_end > blob.len() {
+        return Err(AppError::InvalidRequestBody(
+            "LSBE-1 envelope head length overruns the frame (D32)".to_string(),
+        ));
+    }
+    let head: serde_json::Value = serde_json::from_slice(&blob[12..head_end]).map_err(|_| {
+        AppError::InvalidRequestBody(
+            "LSBE-1 envelope head is not valid JSON (D32)".to_string(),
+        )
+    })?;
+    let tail = if head_end == blob.len() {
+        None
+    } else {
+        Some(Bytes::copy_from_slice(&blob[head_end..]))
+    };
+    Ok((head, tail))
+}
+
+/// D32: de-frame an opaque byte payload (gRPC data slot / batch element)
+/// into the uniform internal form — transport de-framing only, zero
+/// validation (D39). Bare JSON stays Json (first byte `{`); the LSBE-1
+/// container splits into Envelope; anything else is the legacy Binary
+/// passthrough (parse_root_inputs rejects it with 400 when the ensemble
+/// declares inputs, R18).
+pub fn ensemble_payload_from_bytes(
+    data: &Bytes,
+    content_type: Option<String>,
+) -> Result<EnsembleValue, AppError> {
+    if data.starts_with(b"{") {
+        if let Ok(v) = serde_json::from_slice::<Value>(data) {
+            return Ok(EnsembleValue::Json(v));
+        }
+        // Malformed JSON — historical gRPC behaviour falls back to Binary
+        // passthrough (byte-identical for undeclared ensembles).
+    }
+    if data.starts_with(b"LSB1") {
+        let (head, tail) = split_envelope(data)?;
+        return Ok(EnsembleValue::Envelope { head, tail: tail.unwrap_or_default() });
+    }
+    Ok(EnsembleValue::Binary(
+        data.clone(),
+        content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+        None,
+        None,
+    ))
+}
+
+/// D33 (bidi): whether this ensemble declares named inputs — a declared
+/// ensemble's envelope is self-describing, so the bidi upstream triggers on
+/// the FIRST frame (no end signal); undeclared ensembles keep the legacy
+/// multi-frame aggregation (D17).
+pub async fn ensemble_declares_inputs(
+    state: &Arc<AppState>,
+    model_name: &str,
+    version: &str,
+) -> Result<bool, AppError> {
+    let plan = get_ensemble_plan(state, model_name, version).await?;
+    Ok(plan.inputs_decl.is_some())
+}
+
+/// D33/D32: de-frame a bidi FIRST frame for a DECLARED ensemble — the JSON
+/// form (WS text frame / json content-type) carries the bare JSON envelope;
+/// the binary form carries the LSBE-1 container. Transport-agnostic: the
+/// three bidi endpoints pass their frame kind as `is_json` + bytes.
+pub fn bidi_envelope_frame(
+    frame: &Bytes,
+    is_json: bool,
+    ct: Option<String>,
+) -> Result<EnsembleValue, AppError> {
+    if is_json {
+        let v: serde_json::Value = serde_json::from_slice(frame).map_err(|e| {
+            AppError::InvalidRequestBody(format!("envelope frame is not valid JSON: {e}"))
+        })?;
+        return Ok(EnsembleValue::Json(v));
+    }
+    ensemble_payload_from_bytes(frame, ct)
 }
 
 // ===== P0: EnsemblePlan cache (D6 + review ①-④) =====
@@ -860,6 +1612,18 @@ pub struct EnsemblePlan {
     /// of STREAMING steps (all nodes stream), tail = output step. Empty for
     /// non-pipeline DAGs (tail-streaming only).
     pub chains: Vec<Chain>,
+    /// MIMO (D8/D9, batch 4①): the request-level named inputs declaration —
+    /// None = legacy single anonymous input (`$request`, byte-identical).
+    pub inputs_decl: Option<IndexMap<String, InputDecl>>,
+    /// MIMO (R11/R12, batch 4①): per-step static input mode, index-aligned
+    /// with `steps`. None = legacy dynamic dispatch (no declared type
+    /// environment); Some(mode) = parse-decided assembly (no runtime type
+    /// branches).
+    pub input_modes: Vec<Option<InputMode>>,
+    /// MIMO (R4, batch 4①): per-step optional-input names referenced —
+    /// non-empty marks a CONDITIONAL step (absent input → step skipped,
+    /// D13/E6-skip channel). Index-aligned with `steps`.
+    pub conditional_refs: Vec<Vec<String>>,
     /// Source config file — mtime re-check (review ②) stats this path.
     pub config_path: PathBuf,
     /// mtime of `config_path` captured BEFORE the file read (stat-before-read):
@@ -869,6 +1633,14 @@ pub struct EnsemblePlan {
     /// production loader; None for the load-time direct-parse path
     /// (`insert_ready` stats on its own there).
     pub source_mtime: Option<std::time::SystemTime>,
+}
+
+impl EnsemblePlan {
+    /// MIMO (R11/R12): the parse-decided input mode of step `idx`
+    /// (None = legacy dynamic dispatch).
+    pub fn input_mode(&self, idx: usize) -> Option<InputMode> {
+        self.input_modes.get(idx).copied().flatten()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1198,7 +1970,7 @@ impl BidiAggregator {
                 for p in parts {
                     buf.extend_from_slice(&p);
                 }
-                Ok(EnsembleValue::Binary(bytes::Bytes::from(buf), content_type))
+                Ok(EnsembleValue::Binary(bytes::Bytes::from(buf), content_type, None, None))
             }
         }
     }
@@ -1538,13 +2310,26 @@ pub(crate) async fn execute_ensemble_inner(
     let deadline_unix_ns = opts.deadline_unix_ns;
     let tail_idx = plan.output_step;
 
+    // MIMO (D31/R18): the single root-parsing point — the KServe envelope
+    // (declared mode) or the legacy payload (byte-identical passthrough).
     let mut context: HashMap<String, EnsembleValue> = HashMap::new();
-    context.insert("request".to_string(), payload);
+    let absent_inputs: HashSet<String> = match parse_root_inputs(payload, plan.inputs_decl.as_ref())? {
+        RootInputs::Single(v) => {
+            context.insert("request".to_string(), v);
+            HashSet::new()
+        }
+        RootInputs::Named { values, absent } => {
+            for (name, v) in values {
+                context.insert(format!("inputs.{name}"), v);
+            }
+            absent.into_iter().collect()
+        }
+    };
 
     if !plan.steps[tail_idx].stream {
         // Historical unary path — byte-identical behaviour.
         run_layers(
-            &state, &plan, &plan.layers, &mut context,
+            &state, &plan, &plan.layers, &mut context, &absent_inputs,
             model_name, version, request_id, &opts, deadline_unix_ns, snapshot, depth, &ancestors,
         ).await?;
         let value = context.get(&plan.steps[tail_idx].name).cloned()
@@ -1578,7 +2363,7 @@ pub(crate) async fn execute_ensemble_inner(
             }
         }
         run_layers(
-            &state, &plan, &pre_layers, &mut context,
+            &state, &plan, &pre_layers, &mut context, &absent_inputs,
             model_name, version, request_id, &opts, deadline_unix_ns, snapshot, depth, &ancestors,
         )
         .await?;
@@ -1611,7 +2396,7 @@ pub(crate) async fn execute_ensemble_inner(
     };
     let layers_fut = async {
         run_layers(
-            &state, &plan, &plan.layers[..tail_layer], &mut context,
+            &state, &plan, &plan.layers[..tail_layer], &mut context, &absent_inputs,
             model_name, version, request_id, &opts, deadline_unix_ns, snapshot, depth, &ancestors,
         )
         .await
@@ -1624,7 +2409,7 @@ pub(crate) async fn execute_ensemble_inner(
     // already waited in the queue once). The owned permit rides the stream
     // and releases when the adapter's forward task ends (D18 teardown path).
     let mut stream = open_tail_stream(
-        &state, &plan, tail_idx, tail_layer, &context,
+        &state, &plan, tail_idx, tail_layer, &context, &absent_inputs,
         request_id, &opts, deadline_unix_ns, preflight?, snapshot, depth, &ancestors,
     ).await?;
     if let Some(capacity) = state.worker_manager.streaming_capacity() {
@@ -1645,6 +2430,7 @@ async fn run_layers(
     plan: &EnsemblePlan,
     layers: &[Vec<usize>],
     context: &mut HashMap<String, EnsembleValue>,
+    absent_inputs: &HashSet<String>,
     model_name: &str,
     version: &str,
     request_id: &str,
@@ -1655,7 +2441,7 @@ async fn run_layers(
     ancestors: &[(String, String)], // E1: this branch's chain (B1: never shared across sibling branches)
 ) -> Result<(), AppError> {
     let total_budget = crate::deadline::remaining(deadline_unix_ns);
-    let plan_run = plan.clone();
+    let plan_run = Arc::new(plan.clone());
     // E6 (batch 4): steps allowed to be absent on error (parse rules D5/D34
     // guarantee nothing references them — absence is safe by construction).
     let skip_set: HashSet<&str> = plan
@@ -1673,12 +2459,25 @@ async fn run_layers(
             // in the layer, so a cancelled ensemble does not leave sub-steps
             // running on workers (detached `tokio::spawn` would outlive the
             // parent). Completed tasks are no-ops to abort.
-            let mut set: tokio::task::JoinSet<(String, Result<EnsembleValue, AppError>)> =
+            let mut set: tokio::task::JoinSet<(String, Result<Vec<(String, EnsembleValue)>, AppError>)> =
                 tokio::task::JoinSet::new();
             for &step_idx in layer {
+                // MIMO R4 (D13): a conditional step whose optional input is
+                // absent this request is skipped — the E6-skip channel.
+                if plan_run.conditional_refs[step_idx]
+                    .iter()
+                    .any(|n| absent_inputs.contains(n))
+                {
+                    warn!(
+                        step = %plan_run.steps[step_idx].name,
+                        "ensemble step skipped (optional input absent)"
+                    );
+                    continue;
+                }
                 let state = state.clone();
                 let ctx = context.clone();
                 let step = plan_run.steps[step_idx].clone();
+                let plan_spawn = plan_run.clone();
                 let ensemble_name = model_name.to_string();
                 let request_id = request_id.to_string();
                 let client_ip = opts.client_ip.clone();
@@ -1701,7 +2500,7 @@ async fn run_layers(
                 set.spawn(async move {
                     let start = Instant::now();
                     let result =
-                        execute_step(state, &step, &ctx, &request_id, &client_ip, deadline_unix_ns, &snapshot, depth, &ancestors)
+                        execute_step(state, &plan_spawn, step_idx, &step, &ctx, &request_id, &client_ip, deadline_unix_ns, &snapshot, depth, &ancestors)
                             .await;
                     let latency = start.elapsed().as_secs_f64();
                     crate::metrics::prometheus::record_ensemble_step_latency(
@@ -1716,8 +2515,13 @@ async fn run_layers(
                     AppError::Internal(format!("ensemble step join error: {}", e))
                 })?;
                 match result {
-                    Ok(value) => {
-                        context.insert(name, value);
+                    Ok(values) => {
+                        // MIMO: materialized named outputs land under their
+                        // `step.alias` keys (undeclared steps: the single
+                        // `step` key).
+                        for (key, value) in values {
+                            context.insert(key, value);
+                        }
                     }
                     Err(e) => {
                         // E6 (batch 4): a skip step's failure leaves it
@@ -1768,6 +2572,7 @@ async fn open_tail_stream(
     tail_idx: usize,
     tail_layer: usize,
     context: &HashMap<String, EnsembleValue>,
+    absent_inputs: &HashSet<String>,
     request_id: &str,
     opts: &EnsembleExecOpts,
     deadline_unix_ns: Option<i64>,
@@ -1795,19 +2600,32 @@ async fn open_tail_stream(
     }
 
     let run_siblings = async {
-        let mut set: tokio::task::JoinSet<(String, Result<EnsembleValue, AppError>)> =
+        let mut set: tokio::task::JoinSet<(String, Result<Vec<(String, EnsembleValue)>, AppError>)> =
             tokio::task::JoinSet::new();
         for idx in siblings {
+            // MIMO R4 (D13): conditional siblings with an absent optional
+            // input are skipped (same channel as E6-skip).
+            if plan.conditional_refs[idx]
+                .iter()
+                .any(|n| absent_inputs.contains(n))
+            {
+                warn!(
+                    step = %plan.steps[idx].name,
+                    "tail-layer sibling skipped (optional input absent)"
+                );
+                continue;
+            }
             let state = state.clone();
             let ctx = context.clone();
             let step = plan.steps[idx].clone();
+            let plan_spawn = Arc::new(plan.clone());
             let request_id = request_id.to_string();
             let client_ip = opts.client_ip.clone();
             let snapshot = snapshot.clone();
             let ancestors = ancestors.to_vec();
             set.spawn(async move {
                 let name = step.name.clone();
-                execute_step(state, &step, &ctx, &request_id, &client_ip, deadline_unix_ns, &snapshot, depth, &ancestors).await
+                execute_step(state, &plan_spawn, idx, &step, &ctx, &request_id, &client_ip, deadline_unix_ns, &snapshot, depth, &ancestors).await
                     .map(|v| (name.clone(), Ok(v)))
                     .unwrap_or_else(|e| (name.clone(), Err(e)))
             });
@@ -2354,10 +3172,23 @@ async fn execute_stream_step(
     // Resolve inputs into EnsembleValues (identical to the unary path).
     let mut resolved: HashMap<String, EnsembleValue> = HashMap::new();
     for (key, ref_str) in &step.inputs {
-        let value = resolve_ref(ref_str, context)?;
-        resolved.insert(key.clone(), value);
+        match resolve_ref(plan, ref_str, context)? {
+            ResolvedRef::Value(v) => {
+                resolved.insert(key.clone(), v);
+            }
+            ResolvedRef::Absent(name) => {
+                // Streaming steps cannot be conditional (D34) — reaching
+                // here is an internal inconsistency.
+                return Err(AppError::Internal(format!(
+                    "streaming step '{}' resolved absent input '{}' (D34 violation)",
+                    step.name, name
+                )));
+            }
+        }
     }
-    let (payload_bytes, content_type_for_step) = assemble_step_payload(&step.name, &resolved, &step.params)?;
+    let (payload_bytes, content_type_for_step) = assemble_step_payload(
+        &step.name, &resolved, &step.params, plan.input_mode(step_idx),
+    )?;
 
     // P7: when the preflight already routed/built meta in parallel with the
     // pre-layers, skip the serial readiness/meta/pick block.
@@ -2765,61 +3596,103 @@ fn assemble_step_payload(
     step_name: &str,
     resolved: &HashMap<String, EnsembleValue>,
     params: &HashMap<String, Value>,
+    // MIMO (R11/R12): parse-decided mode — Some = static dispatch (no
+    // runtime type branches); None = legacy dynamic dispatch (the historical
+    // runtime checks stay byte-identical).
+    mode: Option<InputMode>,
 ) -> Result<(bytes::Bytes, Option<String>), AppError> {
     let binary_count = resolved
         .values()
-        .filter(|v| matches!(v, EnsembleValue::Binary(_, _)))
+        .filter(|v| matches!(v, EnsembleValue::Binary(..)))
         .count();
+
+    // MIMO: the static environment pre-decided the branch — the runtime
+    // checks below are unreachable for Some(mode) (R12/R9 parse-guaranteed).
+    match mode {
+        Some(InputMode::GroupJson) => {
+            return assemble_group_json(step_name, resolved, params);
+        }
+        Some(InputMode::BinaryPassThrough) => {
+            return assemble_binary_passthrough(step_name, resolved, params);
+        }
+        None => {}
+    }
 
     if binary_count == 0 {
         // All Json → build JSON object (historical path).
-        let mut obj = serde_json::Map::new();
-        for (key, val) in resolved {
-            match val {
-                EnsembleValue::Json(v) => {
-                    obj.insert(key.clone(), v.clone());
-                }
-                EnsembleValue::Binary(_, _) => unreachable!(),
-            }
-        }
-        // E3: constant step params override the assembled inputs.
-        for (key, val) in params {
-            obj.insert(key.clone(), val.clone());
-        }
-        let estimate: usize = obj
-            .iter()
-            .map(|(k, v)| k.len() + 3 + json_value_len_estimate(v))
-            .sum::<usize>()
-            + 2;
-        let mut buf = Vec::with_capacity(estimate);
-        let mut ser = serde_json::Serializer::new(&mut buf);
-        // Value serialization is infallible (E8 cleanup note).
-        serde::Serialize::serialize(&Value::Object(obj), &mut ser)
-            .expect("Value serialization is infallible");
-        Ok((bytes::Bytes::from(buf), None))
-    } else if resolved.len() == 1 && binary_count == 1 {
-        // E3: Binary assembly has no params semantics.
-        if !params.is_empty() {
-            return Err(AppError::InvalidRequestBody(format!(
-                "step '{}': params cannot be combined with a binary input (E3)",
-                step_name
-            )));
-        }
-        // Exactly one input and it is Binary → raw bytes passthrough.
-        let (data, ct) = match resolved.values().next().unwrap() {
-            EnsembleValue::Binary(data, ct) => (data.clone(), ct.clone()),
-            EnsembleValue::Json(_) => unreachable!(),
-        };
-        Ok((data, Some(ct)))
-    } else {
-        // Mixed or multiple inputs with any Binary → 400 (Option B scope).
-        Err(AppError::InvalidRequestBody(format!(
-            "step '{}' has {} input(s) with mixed JSON/Binary; \
-             a binary input must be the step's sole whole input (Option B scope)",
-            step_name,
-            resolved.len()
-        )))
+        return assemble_group_json(step_name, resolved, params);
     }
+    if resolved.len() == 1 && binary_count == 1 {
+        // Exactly one input and it is Binary → raw bytes passthrough.
+        return assemble_binary_passthrough(step_name, resolved, params);
+    }
+    // Mixed or multiple inputs with any Binary → 400 (Option B scope).
+    Err(AppError::InvalidRequestBody(format!(
+        "step '{}' has {} input(s) with mixed JSON/Binary; \
+         a binary input must be the step's sole whole input (Option B scope)",
+        step_name,
+        resolved.len()
+    )))
+}
+
+/// MIMO (R12): GroupJson assembly — all-Json inputs build one object (E3
+/// params override after the inputs). Shared by the static dispatch and the
+/// legacy dynamic path (identical bytes).
+fn assemble_group_json(
+    _step_name: &str,
+    resolved: &HashMap<String, EnsembleValue>,
+    params: &HashMap<String, Value>,
+) -> Result<(bytes::Bytes, Option<String>), AppError> {
+    let mut obj = serde_json::Map::new();
+    for (key, val) in resolved {
+        match val {
+            EnsembleValue::Json(v) => {
+                obj.insert(key.clone(), v.clone());
+            }
+            // Unreachable: legacy routes here only with binary_count == 0;
+            // static GroupJson is parse-checked (R12).
+            EnsembleValue::Binary(..) | EnsembleValue::Envelope { .. } => unreachable!(),
+        }
+    }
+    // E3: constant step params override the assembled inputs.
+    for (key, val) in params {
+        obj.insert(key.clone(), val.clone());
+    }
+    let estimate: usize = obj
+        .iter()
+        .map(|(k, v)| k.len() + 3 + json_value_len_estimate(v))
+        .sum::<usize>()
+        + 2;
+    let mut buf = Vec::with_capacity(estimate);
+    let mut ser = serde_json::Serializer::new(&mut buf);
+    // Value serialization is infallible (E8 cleanup note).
+    serde::Serialize::serialize(&Value::Object(obj), &mut ser)
+        .expect("Value serialization is infallible");
+    Ok((bytes::Bytes::from(buf), None))
+}
+
+/// MIMO (R12/D8): BinaryPassThrough assembly — the sole whole Binary input's
+/// bytes pass through (D8's bounded internal binary flow).
+fn assemble_binary_passthrough(
+    step_name: &str,
+    resolved: &HashMap<String, EnsembleValue>,
+    params: &HashMap<String, Value>,
+) -> Result<(bytes::Bytes, Option<String>), AppError> {
+    // Unreachable under R9 in static mode — kept as the defensive mirror of
+    // the legacy runtime check.
+    if !params.is_empty() {
+        return Err(AppError::InvalidRequestBody(format!(
+            "step '{}': params cannot be combined with a binary input (E3/R9)",
+            step_name
+        )));
+    }
+    let (data, ct, ..) = match resolved.values().next().unwrap() {
+        EnsembleValue::Binary(data, ct, ..) => (data.clone(), ct.clone()),
+        // Unreachable: legacy routes here only with a sole binary value;
+        // static BinaryPassThrough is parse-checked (R12).
+        _ => unreachable!(),
+    };
+    Ok((data, Some(ct)))
 }
 
 /// B3 (E8): typed step output — mirrors the unary media_type dispatch
@@ -2830,7 +3703,7 @@ fn parse_step_output(step_name: &str, single: pb::SingleResponse) -> Result<Ense
     let is_binary = !single.media_type.is_empty()
         && !single.media_type.starts_with("application/json");
     if is_binary {
-        Ok(EnsembleValue::Binary(single.data, single.media_type))
+        Ok(EnsembleValue::Binary(single.data, single.media_type, None, None))
     } else if single.data.is_empty() {
         Ok(EnsembleValue::Json(json!({})))
     } else {
@@ -2842,6 +3715,86 @@ fn parse_step_output(step_name: &str, single: pb::SingleResponse) -> Result<Ense
         })?;
         Ok(EnsembleValue::Json(v))
     }
+}
+
+/// MIMO (D10, batch 4①: the binary half): materialize a step's raw worker
+/// response into its declared named outputs — context keys are `step.alias`
+/// (an undeclared step keeps the single `step` key). Binary alias semantics
+/// (R6): path-less = the whole response (worker non-JSON media_type);
+/// path-specified = a `$binary_b64` marker object at that JSON path. A
+/// type mismatch (declared binary / worker JSON, or vice versa) is an
+/// ordinary step error (I3's runtime failure #1 — on_error semantics apply).
+/// Json aliases land with MIMO② — the declaration shape is already final.
+fn materialize_step_outputs(
+    step: &EnsembleStep,
+    raw: EnsembleValue,
+) -> Result<Vec<(String, EnsembleValue)>, AppError> {
+    let Some(decl) = &step.outputs_decl else {
+        return Ok(vec![(step.name.clone(), raw)]);
+    };
+    let mut out = Vec::with_capacity(decl.len());
+    for (alias, d) in decl {
+        let key = format!("{}.{}", step.name, alias);
+        match (&raw, d.ty) {
+            (EnsembleValue::Binary(data, ct, shape, dt), InputType::Binary) => {
+                if d.path.is_some() {
+                    return Err(AppError::Internal(format!(
+                        "step '{}' alias '{}': a path-specified binary output needs a \
+                         JSON response (the marker object lives in JSON)",
+                        step.name, alias
+                    )));
+                }
+                out.push((
+                    key,
+                    EnsembleValue::Binary(
+                        data.clone(),
+                        ct.clone(),
+                        shape.clone(),
+                        dt.clone(),
+                    ),
+                ));
+            }
+            (EnsembleValue::Binary(..), InputType::Json) => {
+                return Err(AppError::InvalidRequestBody(format!(
+                    "step '{}' alias '{}' is declared json but the worker returned \
+                     binary (type mismatch, I3)",
+                    step.name, alias
+                )));
+            }
+            (EnsembleValue::Json(v), InputType::Binary) => {
+                let path = d.path.as_deref().ok_or_else(|| {
+                    AppError::InvalidRequestBody(format!(
+                        "step '{}' alias '{}' is declared binary (whole response) but \
+                         the worker returned JSON (type mismatch, I3)",
+                        step.name, alias
+                    ))
+                })?;
+                let marker = project_json_path(v, path).map_err(|_| {
+                    AppError::InvalidRequestBody(format!(
+                        "step '{}' alias '{}': path '{}' not found in the response",
+                        step.name, alias, path
+                    ))
+                })?;
+                let (bytes, ct) = decode_binary_marker(&marker)?;
+                out.push((key, EnsembleValue::Binary(bytes, ct, None, None)));
+            }
+            (EnsembleValue::Json(_), InputType::Json) => {
+                // MIMO② (batch 4③) opens json aliases — the declaration is
+                // already legal; materialization lands with the projection.
+                return Err(AppError::Config(format!(
+                    "step '{}' alias '{}': json step.outputs land with MIMO② \
+                     (batch 4③) — use type: binary in this release",
+                    step.name, alias
+                )));
+            }
+            (EnsembleValue::Envelope { .. }, _) => {
+                return Err(AppError::Internal(
+                    "envelope reached step materialization".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// E6 (batch 4): retry classification — only transient worker-side failures
@@ -2857,9 +3810,11 @@ fn is_retryable_error(e: &AppError) -> bool {
     }
 }
 
-#[allow(clippy::too_many_arguments)] // step plumbing: state+ctx+ids+snapshot ride together by design
+#[allow(clippy::too_many_arguments)] // step plumbing: state+plan+ctx+ids+snapshot ride together by design
 async fn execute_step(
     state: Arc<AppState>,
+    plan: &EnsemblePlan,
+    step_idx: usize,
     step: &EnsembleStep,
     context: &HashMap<String, EnsembleValue>,
     request_id: &str,
@@ -2868,7 +3823,7 @@ async fn execute_step(
     snapshot: &Arc<VersionSnapshot>,
     depth: u32, // E1: nesting depth — +1 on recursion into an ensemble step
     ancestors: &[(String, String)], // E1: THIS branch's nesting chain (B1: never shared across sibling branches)
-) -> Result<EnsembleValue, AppError> {
+) -> Result<Vec<(String, EnsembleValue)>, AppError> {
     // E4/D15: resolve the sub-model version at execution time — explicit
     // versions as-is, unresolved ("latest"/omitted) via the request-scoped
     // snapshot (first resolution per model wins; registry active is the only
@@ -2893,12 +3848,25 @@ async fn execute_step(
     // Resolve inputs into EnsembleValues.
     let mut resolved: HashMap<String, EnsembleValue> = HashMap::new();
     for (key, ref_str) in &step.inputs {
-        let value = resolve_ref(ref_str, context)?;
-        resolved.insert(key.clone(), value);
+        match resolve_ref(plan, ref_str, context)? {
+            ResolvedRef::Value(v) => {
+                resolved.insert(key.clone(), v);
+            }
+            ResolvedRef::Absent(name) => {
+                return Err(AppError::Internal(format!(
+                    "step '{}' resolved absent input '{}' — conditional steps \
+                     are skipped before execution (R4)",
+                    step.name, name
+                )));
+            }
+        }
     }
 
-    // B3 (E7): input assembly — three branches (see assemble_step_payload).
-    let (payload_bytes, content_type_for_step) = assemble_step_payload(&step.name, &resolved, &step.params)?;
+    // MIMO (R11/R12): static input-mode dispatch in declared configs; legacy
+    // configs keep the dynamic runtime dispatch (byte-identical).
+    let (payload_bytes, content_type_for_step) = assemble_step_payload(
+        &step.name, &resolved, &step.params, plan.input_mode(step_idx),
+    )?;
 
     // Ensure sub-model is ready (shared autoload; unary readiness predicate)
     ensure_sub_model_loaded(&state, &step.model, &resolved_version).await?;
@@ -2946,7 +3914,7 @@ async fn execute_step(
             )));
         }
         let child_payload = match &content_type_for_step {
-            Some(ct) => EnsembleValue::Binary(payload_bytes.clone(), ct.clone()),
+            Some(ct) => EnsembleValue::Binary(payload_bytes.clone(), ct.clone(), None, None),
             None => EnsembleValue::Json(
                 serde_json::from_slice(&payload_bytes).map_err(|e| {
                     AppError::Internal(format!(
@@ -2990,7 +3958,7 @@ async fn execute_step(
             None => nested.await?,
         };
         return match outcome {
-            EnsembleOutcome::Unary(v) => Ok(v),
+            EnsembleOutcome::Unary(v) => materialize_step_outputs(step, v),
             // Unreachable under D4 (child plans with streaming are rejected
             // above) — kept as the type-level backstop.
             EnsembleOutcome::Stream(_) => Err(AppError::Internal(
@@ -3103,7 +4071,7 @@ async fn execute_step(
         }.await;
 
         match result {
-            Ok(value) => return Ok(value),
+            Ok(value) => return materialize_step_outputs(step, value),
             Err(e) => {
                 if attempt < step.retries && is_retryable_error(&e) {
                     // E6: don't sleep past the step budget — the next attempt
@@ -3213,6 +4181,7 @@ mod tests {
                 stream: false,
                 on_error: OnErrorKind::Fail,
                 retries: 0,
+                outputs_decl: None,
                 inputs: [("input".to_string(), "$request".to_string())].into(),
             },
             EnsembleStep {
@@ -3226,6 +4195,7 @@ mod tests {
                 stream: false,
                 on_error: OnErrorKind::Fail,
                 retries: 0,
+                outputs_decl: None,
                 inputs: [("data".to_string(), "$step1".to_string())].into(),
             },
         ];
@@ -3246,6 +4216,7 @@ mod tests {
                 stream: false,
                 on_error: OnErrorKind::Fail,
                 retries: 0,
+                outputs_decl: None,
                 inputs: [("input".to_string(), "$step2".to_string())].into(),
             },
             EnsembleStep {
@@ -3259,6 +4230,7 @@ mod tests {
                 stream: false,
                 on_error: OnErrorKind::Fail,
                 retries: 0,
+                outputs_decl: None,
                 inputs: [("input".to_string(), "$step1".to_string())].into(),
             },
         ];
@@ -3279,6 +4251,7 @@ mod tests {
                 stream: false,
                 on_error: OnErrorKind::Fail,
                 retries: 0,
+                outputs_decl: None,
                 inputs: [("input".to_string(), "$unknown".to_string())].into(),
             },
         ];
@@ -3299,6 +4272,7 @@ mod tests {
                 stream: false,
                 on_error: OnErrorKind::Fail,
                 retries: 0,
+                outputs_decl: None,
                 inputs: [("x".to_string(), "$request".to_string())].into(),
             },
             EnsembleStep {
@@ -3312,6 +4286,7 @@ mod tests {
                 stream: false,
                 on_error: OnErrorKind::Fail,
                 retries: 0,
+                outputs_decl: None,
                 inputs: [("x".to_string(), "$request".to_string())].into(),
             },
             EnsembleStep {
@@ -3325,6 +4300,7 @@ mod tests {
                 stream: false,
                 on_error: OnErrorKind::Fail,
                 retries: 0,
+                outputs_decl: None,
                 inputs: [("x".to_string(), "$a".to_string())].into(),
             },
         ];
@@ -3334,29 +4310,39 @@ mod tests {
         assert_eq!(layers[1].len(), 1); // c (depends on a)
     }
 
+    /// Legacy (undeclared) plan for resolve_ref tests.
+    fn legacy_plan() -> EnsemblePlan {
+        parse_ensemble_plan(
+            "ensemble:\n  steps:\n    - name: s\n      model: m\n      version: \"1\"\n      inputs: {x: \"$request\"}\n",
+            &PathBuf::from("/nonexistent/config.yaml"),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn test_resolve_ref() {
+        let plan = legacy_plan();
         let mut context = HashMap::new();
         context.insert("request".to_string(), EnsembleValue::Json(json!({"image": "cat.jpg"})));
         context.insert("step1".to_string(), EnsembleValue::Json(json!({"output": 42})));
 
         assert_eq!(
-            match resolve_ref("$request", &context).unwrap() {
-                EnsembleValue::Json(v) => v,
+            match resolve_ref(&plan, "$request", &context).unwrap() {
+                ResolvedRef::Value(EnsembleValue::Json(v)) => v,
                 _ => panic!("expected Json"),
             },
             json!({"image": "cat.jpg"})
         );
         assert_eq!(
-            match resolve_ref("$request.image", &context).unwrap() {
-                EnsembleValue::Json(v) => v,
+            match resolve_ref(&plan, "$request.image", &context).unwrap() {
+                ResolvedRef::Value(EnsembleValue::Json(v)) => v,
                 _ => panic!("expected Json"),
             },
             json!("cat.jpg")
         );
         assert_eq!(
-            match resolve_ref("$step1.output", &context).unwrap() {
-                EnsembleValue::Json(v) => v,
+            match resolve_ref(&plan, "$step1.output", &context).unwrap() {
+                ResolvedRef::Value(EnsembleValue::Json(v)) => v,
                 _ => panic!("expected Json"),
             },
             json!(42)
@@ -3367,14 +4353,14 @@ mod tests {
 
     #[test]
     fn b3_resolve_ref_request_whole_binary_passthrough() {
+        let plan = legacy_plan();
         let mut context = HashMap::new();
         context.insert(
             "request".to_string(),
-            EnsembleValue::Binary(Bytes::from_static(b"hello"), "text/plain".to_string()),
+            EnsembleValue::Binary(Bytes::from_static(b"hello"), "text/plain".to_string(), None, None),
         );
-        let result = resolve_ref("$request", &context).unwrap();
-        match result {
-            EnsembleValue::Binary(data, ct) => {
+        match resolve_ref(&plan, "$request", &context).unwrap() {
+            ResolvedRef::Value(EnsembleValue::Binary(data, ct, ..)) => {
                 assert_eq!(data.as_ref(), b"hello");
                 assert_eq!(ct, "text/plain");
             }
@@ -3384,12 +4370,13 @@ mod tests {
 
     #[test]
     fn b3_resolve_ref_request_field_on_binary_is_400() {
+        let plan = legacy_plan();
         let mut context = HashMap::new();
         context.insert(
             "request".to_string(),
-            EnsembleValue::Binary(Bytes::from_static(b"hello"), "text/plain".to_string()),
+            EnsembleValue::Binary(Bytes::from_static(b"hello"), "text/plain".to_string(), None, None),
         );
-        let err = resolve_ref("$request.field", &context).unwrap_err();
+        let err = resolve_ref(&plan, "$request.field", &context).unwrap_err();
         assert!(
             matches!(err, AppError::InvalidRequestBody(_)),
             "field access on binary must be 400, got {err:?}"
@@ -3402,19 +4389,20 @@ mod tests {
 
     #[test]
     fn b3_resolve_ref_step_binary_is_400() {
+        let plan = legacy_plan();
         let mut context = HashMap::new();
         context.insert(
             "step1".to_string(),
-            EnsembleValue::Binary(Bytes::from_static(b"hello"), "text/plain".to_string()),
+            EnsembleValue::Binary(Bytes::from_static(b"hello"), "text/plain".to_string(), None, None),
         );
         // Whole step reference on binary → 400 (Option A boundary).
-        let err = resolve_ref("$step1", &context).unwrap_err();
+        let err = resolve_ref(&plan, "$step1", &context).unwrap_err();
         assert!(
             matches!(err, AppError::InvalidRequestBody(_)),
             "step binary reference must be 400, got {err:?}"
         );
         // Field access on step binary → same 400.
-        let err = resolve_ref("$step1.field", &context).unwrap_err();
+        let err = resolve_ref(&plan, "$step1.field", &context).unwrap_err();
         assert!(
             matches!(err, AppError::InvalidRequestBody(_)),
             "step binary field access must be 400, got {err:?}"
@@ -3451,7 +4439,7 @@ mod tests {
     // === B3: input assembly three branches (E7) ===
 
     fn bin(data: &'static [u8], ct: &str) -> EnsembleValue {
-        EnsembleValue::Binary(Bytes::from_static(data), ct.to_string())
+        EnsembleValue::Binary(Bytes::from_static(data), ct.to_string(), None, None)
     }
 
     #[test]
@@ -3459,7 +4447,7 @@ mod tests {
         let mut resolved = HashMap::new();
         resolved.insert("a".to_string(), EnsembleValue::Json(json!(1)));
         resolved.insert("b".to_string(), EnsembleValue::Json(json!("x")));
-        let (bytes, ct) = assemble_step_payload("s", &resolved, &HashMap::new()).unwrap();
+        let (bytes, ct) = assemble_step_payload("s", &resolved, &HashMap::new(), None).unwrap();
         assert!(ct.is_none(), "all-Json assembly must not set a content-type");
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v, json!({"a": 1, "b": "x"}));
@@ -3469,7 +4457,7 @@ mod tests {
     fn b3_assemble_single_binary_passthrough_with_ct() {
         let mut resolved = HashMap::new();
         resolved.insert("img".to_string(), bin(b"\x00\x01\x02", "image/png"));
-        let (bytes, ct) = assemble_step_payload("s", &resolved, &HashMap::new()).unwrap();
+        let (bytes, ct) = assemble_step_payload("s", &resolved, &HashMap::new(), None).unwrap();
         assert_eq!(bytes.as_ref(), b"\x00\x01\x02", "binary payload must pass verbatim");
         assert_eq!(ct.as_deref(), Some("image/png"), "CT must be forwarded");
     }
@@ -3479,7 +4467,7 @@ mod tests {
         let mut resolved = HashMap::new();
         resolved.insert("a".to_string(), bin(b"x", "application/octet-stream"));
         resolved.insert("b".to_string(), EnsembleValue::Json(json!(1)));
-        let err = assemble_step_payload("s", &resolved, &HashMap::new()).unwrap_err();
+        let err = assemble_step_payload("s", &resolved, &HashMap::new(), None).unwrap_err();
         assert!(
             matches!(err, AppError::InvalidRequestBody(_)),
             "mixed JSON/Binary inputs must be 400, got {err:?}"
@@ -3492,7 +4480,7 @@ mod tests {
         let mut resolved = HashMap::new();
         resolved.insert("a".to_string(), bin(b"x", "application/octet-stream"));
         resolved.insert("b".to_string(), bin(b"y", "application/octet-stream"));
-        let err = assemble_step_payload("s", &resolved, &HashMap::new()).unwrap_err();
+        let err = assemble_step_payload("s", &resolved, &HashMap::new(), None).unwrap_err();
         assert!(
             matches!(err, AppError::InvalidRequestBody(_)),
             "two binary inputs must be 400, got {err:?}"
@@ -3547,7 +4535,7 @@ mod tests {
     fn b3_output_parse_binary_media_type() {
         let out = parse_step_output("s", single(b"\x00\xff", "application/octet-stream")).unwrap();
         match out {
-            EnsembleValue::Binary(d, ct) => {
+            EnsembleValue::Binary(d, ct, ..) => {
                 assert_eq!(d.as_ref(), b"\x00\xff");
                 assert_eq!(ct, "application/octet-stream");
             }
@@ -3694,6 +4682,7 @@ mod tests {
             stream,
             on_error: OnErrorKind::Fail,
             retries: 0,
+            outputs_decl: None,
         }
     }
 
@@ -3792,6 +4781,9 @@ mod tests {
             output_step: 0,
             output_field: None,
             chains: Vec::new(),
+            inputs_decl: None,
+            input_modes: Vec::new(),
+            conditional_refs: Vec::new(),
             config_path: PathBuf::from(path),
             source_mtime: None,
         })
@@ -3945,6 +4937,9 @@ mod tests {
                     output_step: 0,
                     output_field: None,
                     chains: Vec::new(),
+                    inputs_decl: None,
+                    input_modes: Vec::new(),
+                    conditional_refs: Vec::new(),
                     config_path,
                     source_mtime: None,
                 }))
@@ -4042,6 +5037,9 @@ mod tests {
                         output_step: 1,
                         output_field: None,
                         chains: Vec::new(),
+                        inputs_decl: None,
+                        input_modes: Vec::new(),
+                        conditional_refs: Vec::new(),
                         config_path: cp,
                         source_mtime: v1_mtime,
                     }))
@@ -4063,6 +5061,9 @@ mod tests {
                         output_step: 2,
                         output_field: None,
                         chains: Vec::new(),
+                        inputs_decl: None,
+                        input_modes: Vec::new(),
+                        conditional_refs: Vec::new(),
                         config_path: cp,
                         source_mtime: None,
                     }))
@@ -4345,6 +5346,7 @@ ensemble:
             timeout_secs: None,
             on_error: OnErrorKind::Fail,
             retries: 0,
+            outputs_decl: None,
         }
     }
 
@@ -4504,7 +5506,7 @@ ensemble:
     /// semantics on bytes — D7's rule applied to the output face).
     #[test]
     fn e2_select_output_field_on_binary_is_error() {
-        let v = EnsembleValue::Binary(bytes::Bytes::from_static(b"raw"), "application/octet-stream".to_string());
+        let v = EnsembleValue::Binary(bytes::Bytes::from_static(b"raw"), "application/octet-stream".to_string(), None, None);
         let res = select_output_field("s1", v, Some("score"));
         assert!(res.is_err());
     }
@@ -4545,7 +5547,7 @@ ensemble:
             ("c".to_string(), json!(4)),
         ]
         .into();
-        let (bytes, ct) = assemble_step_payload("s", &resolved, &params).unwrap();
+        let (bytes, ct) = assemble_step_payload("s", &resolved, &params, None).unwrap();
         assert_eq!(ct, None);
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v, json!({"a": 1, "b": 3, "c": 4}), "params override inputs");
@@ -4558,11 +5560,11 @@ ensemble:
     fn e3_params_rejected_with_binary_input() {
         let resolved: HashMap<String, EnsembleValue> = [(
             "data".to_string(),
-            EnsembleValue::Binary(bytes::Bytes::from_static(b"raw"), "application/octet-stream".to_string()),
+            EnsembleValue::Binary(bytes::Bytes::from_static(b"raw"), "application/octet-stream".to_string(), None, None),
         )]
         .into();
         let params: HashMap<String, Value> = [("temperature".to_string(), json!(0.7))].into();
-        let res = assemble_step_payload("s", &resolved, &params);
+        let res = assemble_step_payload("s", &resolved, &params, None);
         assert!(res.is_err(), "params × Binary input must be rejected (E3)");
     }
 
@@ -4791,5 +5793,474 @@ ensemble:
             !is_retryable_error(&AppError::ModelNotReady("not ready".into())),
             "readiness must NOT retry"
         );
+    }
+
+    // === MIMO (batch 4①): inputs declaration R1-R5, wire R18/R19, LSBE-1
+    // (D32), static type env R11/R12, step.outputs binary aliases R6-R8/R10 ===
+
+    fn json_decl() -> InputDecl {
+        InputDecl {
+            ty: InputType::Json,
+            required: true,
+            default: None,
+            content_type: None,
+            shape: None,
+            datatype: None,
+        }
+    }
+
+    /// R1: input names must be plain identifiers (the `$inputs.NAME` grammar
+    /// depends on it); a `type` is mandatory.
+    #[test]
+    fn mimo_r1_invalid_input_name_and_missing_type() {
+        for bad in ["9lives", "has-dash", "$weird"] {
+            let yaml = format!(
+                "ensemble:\n  inputs:\n    {bad}:\n      type: json\n  steps:\n    - name: s\n      model: m\n      version: \"1\"\n      inputs: {{x: \"$inputs.{bad}\"}}\n"
+            );
+            let err = parse_ensemble_plan(&yaml, &PathBuf::from("/nonexistent/config.yaml"))
+                .expect_err(&format!("input name '{bad}' must be rejected (R1)"));
+            assert!(err.to_string().contains("input"), "got: {err}");
+        }
+        let yaml = "ensemble:\n  inputs:\n    a: {}\n  steps:\n    - name: s\n      model: m\n      version: \"1\"\n      inputs: {x: \"$inputs.a\"}\n";
+        let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("missing type must be rejected (R1)");
+        assert!(err.to_string().contains("type"), "got: {err}");
+    }
+
+    /// R2: declaration fields are type-gated — default/json only,
+    /// content_type/shape/datatype binary only, required+default conflict.
+    #[test]
+    fn mimo_r2_decl_field_type_gating() {
+        let cases = [
+            ("default", "default: 1", "json 上允许,二进制上必须拒绝"),
+            ("content_type", "content_type: image/png", "json 上必须拒绝"),
+            ("shape", "shape: [1, 2]", "json 上必须拒绝"),
+            ("datatype", "datatype: FP32", "json 上必须拒绝"),
+        ];
+        for (name, extra, why) in cases {
+            let binary_yaml = format!(
+                "ensemble:\n  inputs:\n    {name}:\n      type: binary\n      {extra}\n  steps:\n    - name: s\n      model: m\n      version: \"1\"\n      inputs: {{x: \"$inputs.{name}\"}}\n"
+            );
+            let json_yaml = format!(
+                "ensemble:\n  inputs:\n    {name}:\n      type: json\n      {extra}\n  steps:\n    - name: s\n      model: m\n      version: \"1\"\n      inputs: {{x: \"$inputs.{name}\"}}\n"
+            );
+            match name {
+                "default" => {
+                    parse_ensemble_plan(&binary_yaml, &PathBuf::from("/nonexistent/config.yaml"))
+                        .expect_err("default on binary must be rejected (R2)");
+                    // required defaults true and conflicts with a default —
+                    // the legal default-on-json form declares required: false.
+                    let json_optional = json_yaml.replace(
+                        "      default: 1",
+                        "      required: false\n      default: 1",
+                    );
+                    parse_ensemble_plan(&json_optional, &PathBuf::from("/nonexistent/config.yaml"))
+                        .expect("default on json is legal (with required: false)");
+                }
+                _ => {
+                    parse_ensemble_plan(&json_yaml, &PathBuf::from("/nonexistent/config.yaml"))
+                        .expect_err(why);
+                    parse_ensemble_plan(&binary_yaml, &PathBuf::from("/nonexistent/config.yaml"))
+                        .expect("binary-only fields are legal on binary");
+                }
+            }
+        }
+        // required: true + default → semantic contradiction.
+        let yaml = "ensemble:\n  inputs:\n    a:\n      type: json\n      required: true\n      default: 1\n  steps:\n    - name: s\n      model: m\n      version: \"1\"\n      inputs: {x: \"$inputs.a\"}\n";
+        let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("required+default must be rejected (R2)");
+        assert!(err.to_string().contains("default"), "got: {err}");
+    }
+
+    /// R3: a binary root input can only be referenced whole (I1) — any path
+    /// projection on it is a parse error.
+    #[test]
+    fn mimo_r3_binary_input_path_projection_rejected() {
+        let yaml = "ensemble:\n  inputs:\n    img:\n      type: binary\n  steps:\n    - name: s\n      model: m\n      version: \"1\"\n      inputs: {x: \"$inputs.img.crop\"}\n";
+        let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("binary input path projection must be rejected (R3)");
+        assert!(err.to_string().contains("binary"), "got: {err}");
+    }
+
+    /// R4: a step referencing an optional (no-default) input is a
+    /// CONDITIONAL step — its absence must be statically provable, so
+    /// downstream references are rejected exactly like E6-skip (D13/D5).
+    #[test]
+    fn mimo_r4_conditional_step_rules() {
+        // Downstream reference to a conditional step → rejected.
+        let yaml = "ensemble:\n  inputs:\n    opt:\n      type: json\n      required: false\n  steps:\n    - name: cond\n      model: m1\n      version: \"1\"\n      inputs: {x: \"$inputs.opt\"}\n    - name: consumer\n      model: m2\n      version: \"1\"\n      inputs: {y: \"$cond\"}\n";
+        let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("conditional step downstream reference must be rejected (R4)");
+        assert!(err.to_string().contains("optional") || err.to_string().contains("conditional"), "got: {err}");
+        // Conditional × stream → rejected (D34 rule 6 third arm).
+        let yaml = "ensemble:\n  inputs:\n    opt:\n      type: json\n      required: false\n  steps:\n    - name: tail\n      model: m1\n      version: \"1\"\n      stream: true\n      inputs: {x: \"$inputs.opt\"}\n";
+        let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("conditional streaming step must be rejected (D34)");
+        let _ = err; // the rejection itself is the assertion
+        // With a default the value is always present — NOT conditional.
+        let yaml = "ensemble:\n  inputs:\n    opt:\n      type: json\n      required: false\n      default: \"x\"\n  steps:\n    - name: a\n      model: m1\n      version: \"1\"\n      inputs: {x: \"$inputs.opt\"}\n    - name: b\n      model: m2\n      version: \"1\"\n      inputs: {y: \"$a\"}\n";
+        parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect("default-carrying input must not make a step conditional (R4)");
+        // An unreferenced conditional step is legal (outputs alias null
+        // later) — the output step stays non-conditional.
+        let yaml = "ensemble:\n  inputs:\n    a:\n      type: json\n    opt:\n      type: json\n      required: false\n  steps:\n    - name: cond\n      model: m1\n      version: \"1\"\n      inputs: {x: \"$inputs.opt\"}\n    - name: main\n      model: m2\n      version: \"1\"\n      inputs: {x: \"$inputs.a\"}\n";
+        let _ = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect("an unreferenced conditional step is legal");
+    }
+
+    /// R5: the `$inputs` namespace requires a declaration; declared configs
+    /// have no anonymous root (`$request` refs are rejected).
+    #[test]
+    fn mimo_r5_namespace_gating() {
+        // Legacy config referencing $inputs → error (namespace undeclared).
+        let yaml = "ensemble:\n  steps:\n    - name: s\n      model: m\n      version: \"1\"\n      inputs: {x: \"$inputs.a\"}\n";
+        let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("$inputs in a legacy config must be rejected (R5)");
+        let _ = err;
+        // Declared config referencing $request (anonymous root) → error.
+        let yaml = "ensemble:\n  inputs:\n    a:\n      type: json\n  steps:\n    - name: s\n      model: m\n      version: \"1\"\n      inputs: {x: \"$request\"}\n";
+        let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("$request in a declared config must be rejected (R5)");
+        let _ = err;
+    }
+
+    /// R12: static input-mode dispatch — all-Json → GroupJson, exactly one
+    /// whole Binary → BinaryPassThrough, everything else → parse error.
+    #[test]
+    fn mimo_r12_input_mode_dispatch() {
+        let steps = |refs: &str| format!(
+            "ensemble:\n  inputs:\n    a:\n      type: json\n    img:\n      type: binary\n  steps:\n    - name: s\n      model: m\n      version: \"1\"\n      inputs:\n{refs}\n"
+        );
+        let plan = parse_ensemble_plan(
+            &steps("        x: \"$inputs.a\"\n        y: \"$inputs.a\""),
+            &PathBuf::from("/nonexistent/config.yaml"),
+        )
+        .unwrap();
+        assert_eq!(plan.input_mode(0), Some(InputMode::GroupJson));
+        let plan = parse_ensemble_plan(
+            &steps("        x: \"$inputs.img\""),
+            &PathBuf::from("/nonexistent/config.yaml"),
+        )
+        .unwrap();
+        assert_eq!(plan.input_mode(0), Some(InputMode::BinaryPassThrough));
+        // Mixed json+binary → rejected.
+        let err = parse_ensemble_plan(
+            &steps("        x: \"$inputs.a\"\n        y: \"$inputs.img\""),
+            &PathBuf::from("/nonexistent/config.yaml"),
+        )
+        .expect_err("mixed json/binary inputs must be rejected (R12)");
+        assert!(err.to_string().contains("binary"), "got: {err}");
+    }
+
+    /// R9: params × Binary is a static error in declared configs (moved from
+    /// the legacy runtime check once the input mode is parse-decidable).
+    #[test]
+    fn mimo_r9_params_x_binary_static_rejection() {
+        let yaml = "ensemble:\n  inputs:\n    img:\n      type: binary\n  steps:\n    - name: s\n      model: m\n      version: \"1\"\n      params:\n        t: 0.7\n      inputs: {x: \"$inputs.img\"}\n";
+        let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("params × binary must be rejected at parse (R9)");
+        assert!(err.to_string().contains("params"), "got: {err}");
+    }
+
+    /// R18: envelope parsing — named inputs, binary tail slicing in header
+    /// order, defaults, absent optionals, marker decode.
+    #[test]
+    fn mimo_r18_envelope_parsing() {
+        let decl: IndexMap<String, InputDecl> = [
+            ("text", json_decl()),
+            ("sys", {
+                let mut d = json_decl();
+                d.required = false;
+                d.default = Some(json!("be terse"));
+                d
+            }),
+            ("opt", {
+                let mut d = json_decl();
+                d.required = false;
+                d
+            }),
+            ("img", InputDecl {
+                ty: InputType::Binary,
+                required: true,
+                default: None,
+                content_type: Some("image/png".into()),
+                shape: Some(vec![1, 3]),
+                datatype: Some("FP32".into()),
+            }),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        // Happy: head + binary tail, header-order slicing, shape carried.
+        let head = json!({"id": "r1", "inputs": [
+            {"name": "text", "data": {"q": "hi"}},
+            {"name": "img", "parameters": {"binary_data_size": 3}}
+        ]});
+        let head_bytes = serde_json::to_vec(&head).unwrap();
+        let mut full = head_bytes.clone();
+        full.extend_from_slice(b"\x00\x01\x02");
+        let root = parse_root_inputs(
+            EnsembleValue::Envelope { head, tail: Bytes::from(full).slice(head_bytes.len()..) },
+            Some(&decl),
+        )
+        .unwrap();
+        let RootInputs::Named { values, absent } = root else { panic!("named expected") };
+        assert_eq!(values["text"], EnsembleValue::Json(json!({"q": "hi"})));
+        assert_eq!(values["sys"], EnsembleValue::Json(json!("be terse")), "default filled");
+        match &values["img"] {
+            EnsembleValue::Binary(b, ct, shape, dt) => {
+                assert_eq!(b.as_ref(), b"\x00\x01\x02");
+                assert_eq!(ct, "image/png");
+                assert_eq!(shape.as_deref(), Some(&vec![1, 3][..]));
+                assert_eq!(dt.as_deref(), Some("FP32"));
+            }
+            other => panic!("binary expected, got {other:?}"),
+        }
+        assert_eq!(absent, vec!["opt".to_string()]);
+
+        // Missing required → 400.
+        let head = json!({"inputs": [{"name": "text", "data": 1}]});
+        let err = parse_root_inputs(EnsembleValue::Json(head), Some(&decl)).unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
+
+        // Unknown input name → 400.
+        let head = json!({"inputs": [
+            {"name": "text", "data": 1},
+            {"name": "nope", "data": 2},
+            {"name": "img", "parameters": {"binary_data_size": 0}}
+        ]});
+        let err = parse_root_inputs(EnsembleValue::Json(head), Some(&decl)).unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
+
+        // Tail overrun (binary_data_size beyond the tail) → 400.
+        let head = json!({"inputs": [
+            {"name": "text", "data": 1},
+            {"name": "img", "parameters": {"binary_data_size": 10}}
+        ]});
+        let err = parse_root_inputs(
+            EnsembleValue::Envelope { head, tail: Bytes::from_static(b"short") },
+            Some(&decl),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
+
+        // Leftover tail bytes (more tail than declared) → 400.
+        let head = json!({"inputs": [
+            {"name": "text", "data": 1},
+            {"name": "img", "parameters": {"binary_data_size": 1}}
+        ]});
+        let err = parse_root_inputs(
+            EnsembleValue::Envelope { head, tail: Bytes::from_static(b"xx") },
+            Some(&decl),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
+
+        // $binary_b64 marker as data (secondary in-JSON path) → Binary.
+        let head = json!({"inputs": [
+            {"name": "text", "data": 1},
+            {"name": "img", "data": {"$binary_b64": "AAEC", "content_type": "image/jpeg"}}
+        ]});
+        let root = parse_root_inputs(EnsembleValue::Json(head), Some(&decl)).unwrap();
+        let RootInputs::Named { values, .. } = root else { panic!("named expected") };
+        match &values["img"] {
+            EnsembleValue::Binary(b, ct, _, _) => {
+                assert_eq!(b.as_ref(), b"\x00\x01\x02", "base64 must decode");
+                assert_eq!(ct, "image/jpeg");
+            }
+            other => panic!("binary expected, got {other:?}"),
+        }
+    }
+
+    /// R19: legacy payloads — `$inputs` top-level key is a reserved
+    /// namespace (400, D14); an envelope container without a declaration is
+    /// 400 (TritonBinary keeps its historical rejection semantics).
+    #[test]
+    fn mimo_r19_legacy_reserved_namespace() {
+        let err = parse_root_inputs(
+            EnsembleValue::Json(json!({"$inputs": [{"name": "a"}]})),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
+        let err = parse_root_inputs(
+            EnsembleValue::Envelope { head: json!({"inputs": []}), tail: Bytes::new() },
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
+        // Ordinary legacy payload passes through untouched.
+        let root = parse_root_inputs(EnsembleValue::Json(json!({"a": 1})), None).unwrap();
+        assert!(matches!(root, RootInputs::Single(EnsembleValue::Json(_))));
+    }
+
+    /// D32: LSBE-1 in-frame container split — happy path and malformed
+    /// branches (magic mismatch, head-length overflow, non-JSON head).
+    #[test]
+    fn mimo_lsbe1_split_envelope() {
+        let head = br#"{"inputs": [{"name": "text", "data": 1}]}"#;
+        let tail: &[u8] = b"\x01\x02\x03";
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"LSB1");
+        blob.extend_from_slice(&(head.len() as u64).to_le_bytes());
+        blob.extend_from_slice(head);
+        blob.extend_from_slice(tail);
+        let (v, t) = split_envelope(&blob).expect("valid container must split");
+        assert_eq!(v, json!({"inputs": [{"name": "text", "data": 1}]}));
+        assert_eq!(t.as_deref(), Some(&tail[..]));
+
+        // Magic mismatch → 400.
+        let err = split_envelope(b"XXXX................").unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
+        // Head length beyond the blob → 400.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(b"LSB1");
+        bad.extend_from_slice(&999u64.to_le_bytes());
+        bad.extend_from_slice(head);
+        let err = split_envelope(&bad).unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
+        // Head is not JSON → 400.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(b"LSB1");
+        bad.extend_from_slice(&5u64.to_le_bytes());
+        bad.extend_from_slice(b"nope!");
+        let err = split_envelope(&bad).unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
+        // Truncated before the header field → 400.
+        let err = split_envelope(b"LSB1\x01").unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
+    }
+
+    /// R10: a streaming step must not declare step.outputs (chunks have no
+    /// named-output semantics, D11).
+    #[test]
+    fn mimo_r10_streaming_step_outputs_rejected() {
+        let yaml = "ensemble:\n  steps:\n    - name: s\n      model: m\n      version: \"1\"\n      stream: true\n      outputs:\n        crop:\n          type: binary\n      inputs: {x: \"$request\"}\n";
+        let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("streaming step.outputs must be rejected (R10)");
+        assert!(err.to_string().contains("outputs"), "got: {err}");
+    }
+
+    /// R7/R8: first-segment disambiguation — a declared step must be
+    /// referenced by alias; unknown alias → error; binary alias paths → error.
+    #[test]
+    fn mimo_r7_r8_binary_alias_disambiguation() {
+        // Whole ref on a declared step → rejected.
+        let yaml = "ensemble:\n  steps:\n    - name: a\n      model: m1\n      version: \"1\"\n      outputs:\n        crop:\n          type: binary\n      inputs: {x: \"$request\"}\n    - name: b\n      model: m2\n      version: \"1\"\n      inputs: {x: \"$a\"}\n";
+        let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("whole ref on a declared step must be rejected (R7)");
+        let _ = err;
+        // Unknown alias → rejected.
+        let yaml = "ensemble:\n  steps:\n    - name: a\n      model: m1\n      version: \"1\"\n      outputs:\n        crop:\n          type: binary\n      inputs: {x: \"$request\"}\n    - name: b\n      model: m2\n      version: \"1\"\n      inputs: {x: \"$a.other\"}\n";
+        let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("unknown alias must be rejected (R7)");
+        let _ = err;
+        // Binary alias with a further path → rejected (R8).
+        let yaml = "ensemble:\n  steps:\n    - name: a\n      model: m1\n      version: \"1\"\n      outputs:\n        crop:\n          type: binary\n      inputs: {x: \"$request\"}\n    - name: b\n      model: m2\n      version: \"1\"\n      inputs: {x: \"$a.crop.x\"}\n";
+        let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("binary alias path must be rejected (R8)");
+        let _ = err;
+        // Legal: whole binary alias.
+        let yaml = "ensemble:\n  steps:\n    - name: a\n      model: m1\n      version: \"1\"\n      outputs:\n        crop:\n          type: binary\n      inputs: {x: \"$request\"}\n    - name: b\n      model: m2\n      version: \"1\"\n      inputs: {x: \"$a.crop\"}\n";
+        parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect("whole binary alias ref must parse");
+    }
+
+    /// D10 binary half (MIMO①): materialization — whole-response binary for
+    /// a path-less alias, `$binary_b64` marker decode for a path-specified
+    /// alias, and the type-mismatch error (declared binary, worker JSON).
+    #[test]
+    fn mimo_materialize_binary_outputs() {
+        let step = EnsembleStep {
+            name: "det".to_string(),
+            model: "m".to_string(),
+            version: Some("1".to_string()),
+            inputs: HashMap::new(),
+            stream: false,
+            params: HashMap::new(),
+            timeout_secs: None,
+            on_error: OnErrorKind::Fail,
+            retries: 0,
+            outputs_decl: Some(
+                [
+                    ("thumb", StepOutputDecl {
+                        ty: InputType::Binary,
+                        path: Some("$.thumb".to_string()),
+                    }),
+                    ("raw", StepOutputDecl {
+                        ty: InputType::Binary,
+                        path: None,
+                    }),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            ),
+        };
+        // JSON response + marker objects → two binary outputs.
+        let raw = EnsembleValue::Json(json!({
+            "thumb": {"$binary_b64": "AAEC", "content_type": "image/jpeg"}
+        }));
+        // (path-less alias needs the BINARY response form — separate case)
+        let err = materialize_step_outputs(&step, raw).unwrap_err();
+        assert!(
+            err.to_string().contains("binary"),
+            "path-less binary alias on a JSON response must error, got: {err}"
+        );
+        // Binary response → path-less alias passes through; marker alias
+        // errors (it needs a JSON response).
+        let raw = EnsembleValue::Binary(Bytes::from_static(b"\x00\x01"), "image/png".into(), None, None);
+        let err = materialize_step_outputs(&step, raw).unwrap_err();
+        assert!(
+            err.to_string().contains("JSON"),
+            "marker alias on a binary response must error, got: {err}"
+        );
+        // Mixed response case: whole-response alias only.
+        let step_whole = EnsembleStep {
+            outputs_decl: Some(
+                [("raw", StepOutputDecl { ty: InputType::Binary, path: None })]
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+            ),
+            ..step.clone()
+        };
+        let out = materialize_step_outputs(
+            &step_whole,
+            EnsembleValue::Binary(Bytes::from_static(b"\x00\x01"), "image/png".into(), None, None),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "det.raw");
+        match &out[0].1 {
+            EnsembleValue::Binary(b, ct, _, _) => {
+                assert_eq!(b.as_ref(), b"\x00\x01");
+                assert_eq!(ct, "image/png");
+            }
+            other => panic!("binary expected, got {other:?}"),
+        }
+        // Marker decode happy path (JSON response, marker alias only).
+        let step_marker = EnsembleStep {
+            outputs_decl: Some(
+                [("thumb", StepOutputDecl { ty: InputType::Binary, path: Some("$.thumb".into()) })]
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+            ),
+            ..step
+        };
+        let out = materialize_step_outputs(
+            &step_marker,
+            EnsembleValue::Json(json!({"thumb": {"$binary_b64": "AAEC", "content_type": "image/jpeg"}})),
+        )
+        .unwrap();
+        match &out[0].1 {
+            EnsembleValue::Binary(b, ct, _, _) => {
+                assert_eq!(b.as_ref(), b"\x00\x01\x02");
+                assert_eq!(ct, "image/jpeg");
+            }
+            other => panic!("binary expected, got {other:?}"),
+        }
     }
 }

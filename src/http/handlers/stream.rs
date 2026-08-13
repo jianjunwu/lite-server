@@ -1208,23 +1208,48 @@ async fn handle_ws_stream(
             .server
             .max_request_body_bytes
             .unwrap_or(64 * 1024 * 1024);
-        let mut aggregator = crate::ensemble::BidiAggregator::new(max_body);
         let ct = headers
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-        let push_first = match &first_frame {
-            FirstFrame::Json(text) => {
-                aggregator.push(bytes::Bytes::from(text.clone().into_bytes()), true, None)
+        // D33: a declared-inputs ensemble's envelope is self-describing —
+        // one complete envelope frame executes immediately (no close frame
+        // needed; later frames hit the existing multi-round rejection).
+        let declared = match crate::ensemble::ensemble_declares_inputs(
+            &state, &model_name, &resolved_version,
+        )
+        .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                prometheus::record_stream_rejected(&model_name, &resolved_version, "5xx", ws_start.elapsed().as_secs_f64());
+                ws_send_error(&mut ws_sink, &e).await;
+                return;
             }
-            FirstFrame::Raw(bin) => aggregator.push(bin.clone(), false, ct.as_deref()),
         };
-        if let Err(e) = push_first {
-            prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64());
-            ws_send_error(&mut ws_sink, &e).await;
-            return;
-        }
-        if !decoupled {
+        let value = if declared {
+            match &first_frame {
+                FirstFrame::Json(text) => crate::ensemble::bidi_envelope_frame(
+                    &bytes::Bytes::from(text.clone().into_bytes()), true, None,
+                ),
+                FirstFrame::Raw(bin) => {
+                    crate::ensemble::bidi_envelope_frame(bin, false, ct.clone())
+                }
+            }
+        } else {
+            let mut aggregator = crate::ensemble::BidiAggregator::new(max_body);
+            let push_first = match &first_frame {
+                FirstFrame::Json(text) => {
+                    aggregator.push(bytes::Bytes::from(text.clone().into_bytes()), true, None)
+                }
+                FirstFrame::Raw(bin) => aggregator.push(bin.clone(), false, ct.as_deref()),
+            };
+            if let Err(e) = push_first {
+                prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64());
+                ws_send_error(&mut ws_sink, &e).await;
+                return;
+            }
+            if !decoupled {
             // D33: aggregate until the app-level close frame. The loop reuses
             // the two-stage bound — chunk-idle ALWAYS on (reclaims an
             // abandoned aggregating client), overall deadline since the FIRST
@@ -1293,11 +1318,13 @@ async fn handle_ws_stream(
                 }
             }
         }
-        crate::metrics::prometheus::record_ensemble_bidi_aggregate(
-            aggregator.total_bytes(),
-            ws_start.elapsed().as_secs_f64(),
-        );
-        let value = match aggregator.finish() {
+            crate::metrics::prometheus::record_ensemble_bidi_aggregate(
+                aggregator.total_bytes(),
+                ws_start.elapsed().as_secs_f64(),
+            );
+            aggregator.finish()
+        };
+        let value = match value {
             Ok(v) => v,
             Err(e) => {
                 prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64());
