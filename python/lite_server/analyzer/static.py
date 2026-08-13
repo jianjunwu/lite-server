@@ -23,6 +23,14 @@ import yaml
 from packaging.requirements import InvalidRequirement, Requirement
 
 from lite_server import validate_model_config
+from lite_server.ensemble import (
+    DagSet,
+    EnsembleDAG,
+    InputDecl,
+    Step,
+    StepOutput,
+    canonical_ensemble_block,
+)
 
 LITAPI_ROOT = "lite_server.LitAPI"
 
@@ -307,10 +315,25 @@ class StaticAnalyzer:
             config = self._check_config(config_path, report)
         report.config = config
 
+        # --- dag.py declaration (E9-A) -------------------------------------------
+        # A dag.py declares the ensemble DAG via lite_server.ensemble; the
+        # declaration is cross-checked against config.yaml (drift → LS112).
+        # It is owned by _check_dag_decl alone — excluded from the generic
+        # source scan below to avoid double-reporting.
+        dag_py = version_dir / "dag.py"
+        report.files["has_dag_py"] = dag_py.exists()
+        if dag_py.exists():
+            self._check_dag_decl(dag_py, config, report)
+
         # --- model.py (pure AST) -------------------------------------------------
         model_py = version_dir / "model.py"
         report.files["has_model_py"] = model_py.exists()
-        py_files = sorted(version_dir.glob("*.py")) + sorted(resolved_model_dir.glob("*.py"))
+        py_files = [
+            p
+            for p in sorted(version_dir.glob("*.py"))
+            + sorted(resolved_model_dir.glob("*.py"))
+            if p.name != "dag.py"
+        ]
         if model_py.exists():
             self._analyze_sources(py_files, config, report)
         elif "ensemble" not in config:
@@ -385,6 +408,77 @@ class StaticAnalyzer:
                 return parsed
             report.checks_passed.append("config-yaml-valid")
         return parsed
+
+    # ---------------------------------------------------------------- dag decl
+
+    def _check_dag_decl(
+        self, dag_py: Path, config: dict, report: AnalysisReport
+    ) -> None:
+        """E9-A: cross-check a dag.py `EnsembleDAG` declaration against the
+        model's config.yaml — pure AST evaluation, the file is NEVER
+        executed (module-level side effects must not fire). The server runs
+        config.yaml, so a drifted declaration is a stale authoring surface,
+        reported as a warning (LS112)."""
+        try:
+            tree = ast.parse(dag_py.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, OSError, SyntaxError) as e:
+            report.findings.append(Finding(
+                "LS112", "warning", f"dag.py could not be parsed: {e}",
+                hint=(
+                    "the declaration is evaluated via pure AST — it must be "
+                    "a literal Python declaration"
+                ),
+                file="dag.py",
+            ))
+            return
+        try:
+            dag = _eval_dag_declaration(tree)
+        except _UnevaluableDecl as e:
+            report.findings.append(Finding(
+                "LS112", "warning",
+                f"dag.py EnsembleDAG declaration is not statically evaluable: {e}",
+                hint=(
+                    "only from lite_server(.ensemble) imports and literal "
+                    "arguments (constants/dict/list/Step/InputDecl/StepOutput/"
+                    "DagSet constructors) are supported — no variable "
+                    "references or arbitrary expressions"
+                ),
+                file="dag.py",
+            ))
+            return
+        if dag is None:
+            report.findings.append(Finding(
+                "LS112", "warning",
+                "dag.py does not declare a module-level EnsembleDAG",
+                hint="declare the DAG as dag = EnsembleDAG(steps=[...])",
+                file="dag.py",
+            ))
+            return
+        ensemble_block = config.get("ensemble")
+        if not isinstance(ensemble_block, dict):
+            report.findings.append(Finding(
+                "LS112", "warning",
+                "dag.py declares a DAG but config.yaml has no ensemble block",
+                hint=(
+                    "the Python declaration is for consistency checking only; "
+                    "the server executes config.yaml"
+                ),
+                file="dag.py",
+            ))
+            return
+        declared = dag.to_config(full=True)["ensemble"]
+        actual = canonical_ensemble_block(ensemble_block)
+        if declared != actual:
+            diffs = ", ".join(_diff_summary(declared, actual)[:5])
+            report.findings.append(Finding(
+                "LS112", "warning",
+                f"dag.py declaration drifted from config.yaml: {diffs}",
+                hint=(
+                    "the server executes config.yaml — fix the declaration "
+                    "or regenerate the config"
+                ),
+                file="dag.py",
+            ))
 
     # ------------------------------------------------------------- requirements
 
@@ -1048,3 +1142,184 @@ def _is_generator(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
             continue
         stack.extend(ast.iter_child_nodes(node))
     return False
+
+
+# ===== E9-A: dag.py declaration evaluation (pure AST, never executed) =====
+
+
+class _UnevaluableDecl(Exception):
+    """A dag.py declaration cannot be reduced to literals (no execution)."""
+
+
+#: declaration constructors, by their lite_server.ensemble class name
+_DECL_CLASSES: dict[str, type] = {
+    "EnsembleDAG": EnsembleDAG,
+    "Step": Step,
+    "InputDecl": InputDecl,
+    "StepOutput": StepOutput,
+    "DagSet": DagSet,
+}
+
+#: the only accepted import sources for declaration constructors
+_DECL_IMPORT_MODULES = {"lite_server", "lite_server.ensemble"}
+
+
+def _eval_dag_declaration(tree: ast.Module) -> EnsembleDAG | None:
+    """Pure-AST evaluation of a module-level `EnsembleDAG(...)` declaration.
+
+    Returns None when the file carries no declaration. Raises
+    _UnevaluableDecl when a declaration exists but uses anything beyond
+    literal construction (variables, expressions, unsourced imports) —
+    the analyzer never executes user code, so such files are surfaced as
+    unevaluable instead of guessed at.
+    """
+    aliases: dict[str, str] = {}  # local name -> real class name ("*" = module)
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module in _DECL_IMPORT_MODULES:
+            for alias in node.names:
+                if alias.name in _DECL_CLASSES:
+                    aliases[alias.asname or alias.name] = alias.name
+                elif alias.name == "ensemble":
+                    aliases[alias.asname or alias.name] = "ensemble"
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in _DECL_IMPORT_MODULES:
+                    aliases[alias.asname or alias.name.split(".")[-1]] = "*"
+
+    found: list[EnsembleDAG] = []
+    for node in tree.body:
+        for call in _module_level_calls(node):
+            name = _call_target_name(call, aliases)
+            if name is None or name not in _DECL_CLASSES:
+                continue
+            if name != "EnsembleDAG":
+                raise _UnevaluableDecl(
+                    f"only EnsembleDAG may be declared at module level, found {name}"
+                )
+            found.append(_eval_literal_call(call, aliases))
+    if len(found) > 1:
+        raise _UnevaluableDecl(
+            f"found {len(found)} EnsembleDAG declarations, only one is supported"
+        )
+    return found[0] if found else None
+
+
+def _module_level_calls(node: ast.AST):
+    """Call nodes in a top-level statement. Never descends into function or
+    class bodies (a def containing EnsembleDAG is not a declaration), and
+    never into a yielded call (its args are the literal evaluator's domain)."""
+    for child in ast.iter_child_nodes(node):
+        if isinstance(
+            child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+        ):
+            continue
+        if isinstance(child, ast.Call):
+            yield child
+            continue
+        yield from _module_level_calls(child)
+
+
+def _call_target_name(call: ast.Call, aliases: dict[str, str]) -> str | None:
+    """Resolve a call's target to a _DECL_CLASSES name; None = not a
+    declaration constructor. Raises _UnevaluableDecl when a declaration
+    class is called without a lite_server import (unsourceable)."""
+    func = call.func
+    if isinstance(func, ast.Name):
+        real = aliases.get(func.id)
+        if real in _DECL_CLASSES:
+            return real
+        if func.id in _DECL_CLASSES:
+            raise _UnevaluableDecl(
+                f"{func.id} is not imported from lite_server(.ensemble), "
+                "the declaration source cannot be verified"
+            )
+        return None
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        base = aliases.get(func.value.id)
+        if base in ("*", "ensemble") and func.attr in _DECL_CLASSES:
+            return func.attr
+        if func.attr in _DECL_CLASSES:
+            raise _UnevaluableDecl(
+                f"{func.attr} is not imported from lite_server(.ensemble), "
+                "the declaration source cannot be verified"
+            )
+    return None
+
+
+def _eval_literal_call(call: ast.Call, aliases: dict[str, str]):
+    """Construct a declaration class from literal-only arguments."""
+    real = _call_target_name(call, aliases)
+    if real is None or real not in _DECL_CLASSES:
+        raise _UnevaluableDecl("arbitrary function calls are not allowed in a declaration")
+    args = [_eval_literal(a, aliases) for a in call.args]
+    kwargs: dict[str, Any] = {}
+    for kw in call.keywords:
+        if kw.arg is None:
+            raise _UnevaluableDecl("**kwargs is not supported in a declaration")
+        kwargs[kw.arg] = _eval_literal(kw.value, aliases)
+    try:
+        return _DECL_CLASSES[real](*args, **kwargs)
+    except (TypeError, ValueError) as e:
+        raise _UnevaluableDecl(f"{real} construction failed: {e}")
+
+
+def _eval_literal(node: ast.expr, aliases: dict[str, str]) -> Any:
+    """Literal-only evaluation: constants, list/dict literals and nested
+    declaration constructors. Anything else raises _UnevaluableDecl."""
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return [_eval_literal(e, aliases) for e in node.elts]
+    if isinstance(node, ast.Dict):
+        keys = [_eval_literal(k, aliases) for k in node.keys]
+        if any(not isinstance(k, str) for k in keys):
+            raise _UnevaluableDecl("dict keys must be string literals")
+        return {
+            k: _eval_literal(v, aliases)
+            for k, v in zip(keys, node.values)
+        }
+    if isinstance(node, ast.Call):
+        return _eval_literal_call(node, aliases)
+    if (
+        isinstance(node, ast.UnaryOp)
+        and isinstance(node.op, ast.USub)
+        and isinstance(node.operand, ast.Constant)
+        and isinstance(node.operand.value, (int, float))
+    ):
+        return -node.operand.value
+    raise _UnevaluableDecl(f"{type(node).__name__} expressions are not supported")
+
+
+def _diff_summary(declared: Any, actual: Any, path: str = "") -> list[str]:
+    """Compact drift description (max 5 entries) for the finding message."""
+    if type(declared) is not type(actual):
+        return [
+            f"{path or 'root'}: declaration {type(declared).__name__} vs "
+            f"config {type(actual).__name__}"
+        ]
+    if isinstance(declared, dict):
+        diffs: list[str] = []
+        for key in sorted(set(declared) | set(actual), key=str):
+            if len(diffs) >= 5:
+                break
+            if key not in declared:
+                diffs.append(f"{path}.{key}: config only")
+            elif key not in actual:
+                diffs.append(f"{path}.{key}: declaration only")
+            else:
+                diffs += _diff_summary(
+                    declared[key], actual[key], f"{path}.{key}"
+                )[: 5 - len(diffs)]
+        return diffs
+    if isinstance(declared, list):
+        diffs = []
+        if len(declared) != len(actual):
+            return [f"{path}: length {len(declared)} vs {len(actual)}"]
+        for i, (d, a) in enumerate(zip(declared, actual)):
+            if len(diffs) >= 5:
+                break
+            diffs += _diff_summary(d, a, f"{path}[{i}]")[: 5 - len(diffs)]
+        return diffs
+    if declared != actual:
+        return [f"{path or 'root'}: {declared!r} vs {actual!r}"]
+    return []
