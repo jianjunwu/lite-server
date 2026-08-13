@@ -26,7 +26,7 @@ use uuid::Uuid;
 /// passthrough path — root input or final-step output can be opaque bytes,
 /// but binary values MUST NOT flow between internal DAG steps (Option A
 /// scope; internal binary flow is reserved for Option B).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum EnsembleValue {
     Json(serde_json::Value),
     Binary(Bytes, String /* content_type */),
@@ -141,6 +141,15 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
     let chains = build_chains(&steps, output_step)?;
     if chains.is_empty() {
         validate_stream_rules(&steps, output_step)?;
+    }
+    // E2 × D11: a streaming DAG's chunks have no field semantics — an
+    // explicit output field on a streaming DAG is a parse-time rejection.
+    if output_field.is_some() && steps.iter().any(|s| s.stream) {
+        return Err(AppError::Config(
+            "ensemble.output field projection is not supported on streaming DAGs \
+             (chunks have no field semantics, D11)"
+                .to_string(),
+        ));
     }
     let index_of: HashMap<&str, usize> = steps
         .iter()
@@ -640,6 +649,37 @@ fn topological_layers(steps: &[EnsembleStep]) -> Vec<Vec<&EnsembleStep>> {
     }
 
     layers
+}
+
+/// E2 (batch 3): apply the explicit `output: "$stepN.field"` projection to
+/// the DAG output value. None = whole value; Some = field extraction on a
+/// Json output (Binary has no field semantics — D7's rule on the output
+/// face). A missing field means the DAG's contract does not match the
+/// model's output shape.
+fn select_output_field(
+    step_name: &str,
+    value: EnsembleValue,
+    field: Option<&str>,
+) -> Result<EnsembleValue, AppError> {
+    let Some(field) = field else {
+        return Ok(value);
+    };
+    match value {
+        EnsembleValue::Json(v) => {
+            let field_val = v.get(field).cloned().ok_or_else(|| {
+                AppError::Config(format!(
+                    "ensemble.output field '{}' not found in step '{}' output",
+                    field, step_name
+                ))
+            })?;
+            Ok(EnsembleValue::Json(field_val))
+        }
+        EnsembleValue::Binary(_, _) => Err(AppError::InvalidRequestBody(format!(
+            "ensemble.output field '{}' cannot be extracted from binary step \
+             output '{}' (no field semantics on bytes)",
+            field, step_name
+        ))),
+    }
 }
 
 fn resolve_ref(ref_str: &str, context: &HashMap<String, EnsembleValue>) -> Result<EnsembleValue, AppError> {
@@ -1385,9 +1425,11 @@ pub(crate) async fn execute_ensemble_inner(
             &state, &plan, &plan.layers, &mut context,
             model_name, version, request_id, &opts, deadline_unix_ns, snapshot, depth,
         ).await?;
-        let value = plan.steps[tail_idx].name.as_str();
-        let value = context.get(value).cloned()
+        let value = context.get(&plan.steps[tail_idx].name).cloned()
             .ok_or_else(|| AppError::Internal("ensemble produced no output".to_string()))?;
+        // E2 (batch 3): explicit output field projection (whole-value pass
+        // through when `output:` carried no `.field`).
+        let value = select_output_field(&plan.steps[tail_idx].name, value, plan.output_field.as_deref())?;
         return Ok(EnsembleOutcome::Unary(value));
     }
 
@@ -2139,7 +2181,7 @@ async fn execute_stream_step(
         let value = resolve_ref(ref_str, context)?;
         resolved.insert(key.clone(), value);
     }
-    let (payload_bytes, content_type_for_step) = assemble_step_payload(&step.name, &resolved)?;
+    let (payload_bytes, content_type_for_step) = assemble_step_payload(&step.name, &resolved, &step.params)?;
 
     // P7: when the preflight already routed/built meta in parallel with the
     // pre-layers, skip the serial readiness/meta/pick block.
@@ -2343,6 +2385,13 @@ fn json_value_len_estimate(v: &serde_json::Value) -> usize {
 ///   exactly one input, a whole Binary       → raw bytes passthrough + content-type
 ///   any other combination involving Binary  → 400 (Option B scope)
 ///
+/// E3 (batch 3): `params` merge into the assembled JSON object AFTER the
+/// inputs — params win on key conflicts. The merge only shapes the payload
+/// layer (m3: it never touches the sub-model's own model_defaults/server
+/// overrides). Binary assembly has no params semantics — a non-empty params
+/// on a Binary step is rejected here (the input type is only decidable at
+/// assembly; this is the earliest enforcement point).
+///
 /// P9: the Json branch pre-sizes its buffer from a cheap estimate (no
 /// realloc chain) and hands the Vec straight to `Bytes` (ownership transfer,
 /// zero copy — the queue payload stays Bytes end-to-end, §1.4); the Binary
@@ -2351,6 +2400,7 @@ fn json_value_len_estimate(v: &serde_json::Value) -> usize {
 fn assemble_step_payload(
     step_name: &str,
     resolved: &HashMap<String, EnsembleValue>,
+    params: &HashMap<String, Value>,
 ) -> Result<(bytes::Bytes, Option<String>), AppError> {
     let binary_count = resolved
         .values()
@@ -2368,6 +2418,10 @@ fn assemble_step_payload(
                 EnsembleValue::Binary(_, _) => unreachable!(),
             }
         }
+        // E3: constant step params override the assembled inputs.
+        for (key, val) in params {
+            obj.insert(key.clone(), val.clone());
+        }
         let estimate: usize = obj
             .iter()
             .map(|(k, v)| k.len() + 3 + json_value_len_estimate(v))
@@ -2380,6 +2434,13 @@ fn assemble_step_payload(
             .expect("Value serialization is infallible");
         Ok((bytes::Bytes::from(buf), None))
     } else if resolved.len() == 1 && binary_count == 1 {
+        // E3: Binary assembly has no params semantics.
+        if !params.is_empty() {
+            return Err(AppError::InvalidRequestBody(format!(
+                "step '{}': params cannot be combined with a binary input (E3)",
+                step_name
+            )));
+        }
         // Exactly one input and it is Binary → raw bytes passthrough.
         let (data, ct) = match resolved.values().next().unwrap() {
             EnsembleValue::Binary(data, ct) => (data.clone(), ct.clone()),
@@ -2445,7 +2506,7 @@ async fn execute_step(
     }
 
     // B3 (E7): input assembly — three branches (see assemble_step_payload).
-    let (payload_bytes, content_type_for_step) = assemble_step_payload(&step.name, &resolved)?;
+    let (payload_bytes, content_type_for_step) = assemble_step_payload(&step.name, &resolved, &step.params)?;
 
     // Ensure sub-model is ready (shared autoload; unary readiness predicate)
     ensure_sub_model_loaded(&state, &step.model, &resolved_version).await?;
@@ -2932,7 +2993,7 @@ mod tests {
         let mut resolved = HashMap::new();
         resolved.insert("a".to_string(), EnsembleValue::Json(json!(1)));
         resolved.insert("b".to_string(), EnsembleValue::Json(json!("x")));
-        let (bytes, ct) = assemble_step_payload("s", &resolved).unwrap();
+        let (bytes, ct) = assemble_step_payload("s", &resolved, &HashMap::new()).unwrap();
         assert!(ct.is_none(), "all-Json assembly must not set a content-type");
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v, json!({"a": 1, "b": "x"}));
@@ -2942,7 +3003,7 @@ mod tests {
     fn b3_assemble_single_binary_passthrough_with_ct() {
         let mut resolved = HashMap::new();
         resolved.insert("img".to_string(), bin(b"\x00\x01\x02", "image/png"));
-        let (bytes, ct) = assemble_step_payload("s", &resolved).unwrap();
+        let (bytes, ct) = assemble_step_payload("s", &resolved, &HashMap::new()).unwrap();
         assert_eq!(bytes.as_ref(), b"\x00\x01\x02", "binary payload must pass verbatim");
         assert_eq!(ct.as_deref(), Some("image/png"), "CT must be forwarded");
     }
@@ -2952,7 +3013,7 @@ mod tests {
         let mut resolved = HashMap::new();
         resolved.insert("a".to_string(), bin(b"x", "application/octet-stream"));
         resolved.insert("b".to_string(), EnsembleValue::Json(json!(1)));
-        let err = assemble_step_payload("s", &resolved).unwrap_err();
+        let err = assemble_step_payload("s", &resolved, &HashMap::new()).unwrap_err();
         assert!(
             matches!(err, AppError::InvalidRequestBody(_)),
             "mixed JSON/Binary inputs must be 400, got {err:?}"
@@ -2965,7 +3026,7 @@ mod tests {
         let mut resolved = HashMap::new();
         resolved.insert("a".to_string(), bin(b"x", "application/octet-stream"));
         resolved.insert("b".to_string(), bin(b"y", "application/octet-stream"));
-        let err = assemble_step_payload("s", &resolved).unwrap_err();
+        let err = assemble_step_payload("s", &resolved, &HashMap::new()).unwrap_err();
         assert!(
             matches!(err, AppError::InvalidRequestBody(_)),
             "two binary inputs must be 400, got {err:?}"
@@ -3909,5 +3970,93 @@ ensemble:
         assert!(ensure_nesting_depth(0).is_ok());
         assert!(ensure_nesting_depth(7).is_ok());
         assert!(ensure_nesting_depth(8).is_err());
+    }
+
+    // ===== Batch 3 (E2/E3) output selection + params tests =====
+
+    /// E2: output_field selection — None passes the whole value through;
+    /// Some extracts the field from a Json output.
+    #[test]
+    fn e2_select_output_field_jsons() {
+        let v = EnsembleValue::Json(json!({"score": 0.9, "label": "a"}));
+        let whole = select_output_field("s1", v.clone(), None).unwrap();
+        assert_eq!(whole, EnsembleValue::Json(json!({"score": 0.9, "label": "a"})));
+        let field = select_output_field("s1", v, Some("score")).unwrap();
+        assert_eq!(field, EnsembleValue::Json(json!(0.9)));
+    }
+
+    /// E2: a missing field is an error (the DAG's contract does not match the
+    /// model's output shape).
+    #[test]
+    fn e2_select_output_field_missing_is_error() {
+        let v = EnsembleValue::Json(json!({"score": 0.9}));
+        let res = select_output_field("s1", v, Some("label"));
+        assert!(res.is_err(), "missing field must error, not default");
+    }
+
+    /// E2: field projection on a Binary output is rejected (no field
+    /// semantics on bytes — D7's rule applied to the output face).
+    #[test]
+    fn e2_select_output_field_on_binary_is_error() {
+        let v = EnsembleValue::Binary(bytes::Bytes::from_static(b"raw"), "application/octet-stream".to_string());
+        let res = select_output_field("s1", v, Some("score"));
+        assert!(res.is_err());
+    }
+
+    /// E2 × D11: a streaming DAG cannot declare an output FIELD (chunks have
+    /// no field semantics) — parse-time rejection.
+    #[test]
+    fn e2_streaming_output_field_rejected_at_parse() {
+        let yaml = r#"
+ensemble:
+  output: "$s2.score"
+  steps:
+    - name: s1
+      model: m1
+      version: "1"
+      inputs: {x: "$request"}
+    - name: s2
+      model: m2
+      version: "1"
+      stream: true
+      inputs: {x: "$s1"}
+"#;
+        let res = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"));
+        assert!(res.is_err(), "field-projected streaming output must be rejected");
+    }
+
+    /// E3: params merge into the assembled Json payload AFTER inputs — params
+    /// win on key conflicts.
+    #[test]
+    fn e3_params_merge_into_payload_params_win() {
+        let resolved: HashMap<String, EnsembleValue> = [
+            ("a".to_string(), EnsembleValue::Json(json!(1))),
+            ("b".to_string(), EnsembleValue::Json(json!(2))),
+        ]
+        .into();
+        let params: HashMap<String, Value> = [
+            ("b".to_string(), json!(3)),
+            ("c".to_string(), json!(4)),
+        ]
+        .into();
+        let (bytes, ct) = assemble_step_payload("s", &resolved, &params).unwrap();
+        assert_eq!(ct, None);
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v, json!({"a": 1, "b": 3, "c": 4}), "params override inputs");
+    }
+
+    /// E3: Binary assembly has no params semantics — a non-empty params on a
+    /// Binary step is rejected at assembly (the earliest point the input type
+    /// is decidable).
+    #[test]
+    fn e3_params_rejected_with_binary_input() {
+        let resolved: HashMap<String, EnsembleValue> = [(
+            "data".to_string(),
+            EnsembleValue::Binary(bytes::Bytes::from_static(b"raw"), "application/octet-stream".to_string()),
+        )]
+        .into();
+        let params: HashMap<String, Value> = [("temperature".to_string(), json!(0.7))].into();
+        let res = assemble_step_payload("s", &resolved, &params);
+        assert!(res.is_err(), "params × Binary input must be rejected (E3)");
     }
 }
