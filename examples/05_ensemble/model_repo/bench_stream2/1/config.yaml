@@ -1,0 +1,23 @@
+# 2 pre-layers + streaming tail — the bench_ens_stream_open_overlap
+# fixture (§6.4): P7 preflights the route pick + meta build during the
+# pre-layers, so the TTFT critical path only waits for the assembled payload.
+ensemble:
+  steps:
+    - name: h1
+      model: fast_echo
+      version: "1"
+      inputs:
+        payload: "$request.input"
+
+    - name: h2
+      model: fast_echo
+      version: "1"
+      inputs:
+        payload: "$h1"
+
+    - name: cap
+      model: caption_stream
+      version: "1"
+      stream: true
+      inputs:
+        input: "$h2"

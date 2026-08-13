@@ -17,3 +17,10 @@ orchestration:
     - merge
     - rank
     - multi_pipeline
+    - caption_stream
+    - stream_pipeline
+    - mmdemo
+    - fast_echo
+    - bench_chain
+    - ens_caption_direct
+    - bench_stream2

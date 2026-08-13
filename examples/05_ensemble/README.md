@@ -55,9 +55,101 @@ model_repo/
   step_b/1/
     model.py        # Postprocessing model
     config.yaml
-  pipeline/
+  pipeline/1/
     config.yaml     # Ensemble DAG definition (no model.py needed)
+    dag.py          # Optional E9-A Python declaration (declaration only)
+  caption_stream/1/
+    model.py        # Streaming captioner (stream_predict generator)
+    config.yaml
+  stream_pipeline/1/
+    config.yaml     # Streaming ensemble DAG (tail stream: true)
+  mmdemo/1/
+    config.yaml     # MIMO named inputs + step.outputs + multi-sink outputs
 ```
+
+## Python Declaration (E9-A)
+
+The `pipeline` DAG is also declared in Python at `model_repo/pipeline/1/dag.py`:
+
+```python
+from lite_server import EnsembleDAG, Step
+
+dag = EnsembleDAG(
+    steps=[
+        Step(name="preprocess", model="step_a", version="1",
+             inputs={"input": "$request.input"}),
+        Step(name="postprocess", model="step_b", version="1",
+             inputs={"input": "$preprocess.output"}),
+    ],
+)
+```
+
+The declaration **serializes to the equivalent config.yaml**; the server
+executes config.yaml — `dag.py` is an authoring surface only and is never
+run. Cross-check for drift:
+
+```bash
+python -m lite_server analyze --model pipeline --model-repo ./model_repo
+# drift → warning LS112
+```
+
+## Streaming Ensemble (tail streaming)
+
+`stream_pipeline` chains the unary `step_a` preprocess into a **streaming
+tail** (`caption_stream`, `stream: true`). The pre-layer finishes first,
+then the DAG returns the tail model's chunk stream:
+
+```bash
+curl -N -X POST http://localhost:8000/v2/models/stream_pipeline/events \
+  -H 'Content-Type: application/json' \
+  -d '{"input": "a picture of a cat"}'
+# => SSE events: {"token":"a","index":0} {"token":"picture","index":1} ...
+```
+
+Notes:
+
+- The DAG performs **no chunk-content conversion** — the tail model owns
+  the chunk format (OpenAI-style chunks require an OpenAI-style tail model).
+- A streaming DAG is rejected with 400 on unary endpoints; use the
+  streaming endpoints (`/events`, `/generate_stream`, `/v1`, gRPC
+  server-streaming, WS/h2/gRPC bidi).
+- **Unary steps queue** (bounded by `max_queue_size`); **streaming steps
+  bypass the queue** (the direct streaming path). Concurrent streaming
+  DAGs are bounded globally by `server.max_concurrent_streaming_dags`
+  (default 128 — immediate 429 when exhausted).
+
+## MIMO: named multi-input / multi-output (KServe envelope)
+
+`mmdemo` declares two named request inputs, a `step.outputs` JSON
+projection, and multi-sink outputs:
+
+```bash
+curl -X POST http://localhost:8000/v2/models/mmdemo/infer \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "inputs": [
+      {"name": "text", "data": {"input": "hello"}}
+      // system_prompt omitted — optional with default
+    ]
+  }'
+# => {"model_name":"mmdemo","outputs":[
+#      {"name":"answer","data":"preprocessed(hello) -> done"},
+#      {"name":"echo_text","data":{"input":"hello"}}]}
+```
+
+Named inputs use the **KServe V2 envelope wire**: each element matches an
+`inputs` declaration by name (`type: json` carries its value in `data`;
+`type: binary` elements carry `parameters.binary_data_size` and the raw
+bytes ride a binary tail — HTTP uses the `inference-header-content-length`
+header, gRPC/WS/h2 use the in-frame LSBE-1 container). Optional inputs
+without a `default` make the referencing step conditional (absent → step
+skipped → its sink is `null`). Declared-input models accept **only** the
+envelope shape (400 otherwise); legacy configs without `inputs` keep the
+historical plain-JSON body, byte-identical.
+
+More: [protocol.md](../../docs/protocol.md) (KServe V2),
+[model-authoring.md](../../docs/model-authoring.md), and the full
+reference in [configuration.md](../../docs/configuration.md).
 
 ## Parallel Execution
 

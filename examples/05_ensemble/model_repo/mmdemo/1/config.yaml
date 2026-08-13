@@ -1,0 +1,34 @@
+ensemble:
+  # MIMO (D8/D9): named request inputs — the KServe-envelope wire.
+  inputs:
+    text:
+      type: json
+    system_prompt:
+      type: json
+      required: false
+      default: "You are helpful."
+
+  # MIMO (D10): step.outputs — a JSON projection against the step's single
+  # worker response (path = the $.a.b dot subset).
+  steps:
+    - name: pre
+      model: step_a
+      version: "1"
+      inputs:
+        input: "$inputs.text"
+
+    - name: post
+      model: step_b
+      version: "1"
+      outputs:
+        answer:
+          type: json
+          path: "$.output"
+      inputs:
+        input: "$pre.output"
+
+  # E7 multi-sink: the response is a KServe envelope
+  # {"outputs": [{"name": "answer", ...}, {"name": "echo_text", ...}]}.
+  outputs:
+    answer: "$post.answer"
+    echo_text: "$inputs.text"

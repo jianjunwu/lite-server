@@ -1,0 +1,22 @@
+# 3-step unary chain over the µs mock worker — the bench_ens_plan_cache /
+# bench_ens_context_sharing / bench_ens_spawn_overhead fixture (§6.4).
+# Every step is whole-referenced, so P2 keeps the outputs raw-resident.
+ensemble:
+  steps:
+    - name: h1
+      model: fast_echo
+      version: "1"
+      inputs:
+        payload: "$request"
+
+    - name: h2
+      model: fast_echo
+      version: "1"
+      inputs:
+        payload: "$h1"
+
+    - name: h3
+      model: fast_echo
+      version: "1"
+      inputs:
+        payload: "$h2"

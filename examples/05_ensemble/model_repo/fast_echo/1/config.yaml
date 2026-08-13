@@ -1,0 +1,3 @@
+accelerator: cpu
+devices: 1
+workers_per_device: 1

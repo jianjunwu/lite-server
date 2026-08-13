@@ -1,0 +1,12 @@
+# Single-step streaming DAG — the bench_ens_stream_parity fixture (§6.4).
+# The ensemble forwards the caption_stream chunks untouched, so the SSE body
+# for the SAME request must be byte-identical to calling caption_stream
+# directly (P5: the ensemble forwarding layer adds zero copies/re-encodes).
+ensemble:
+  steps:
+    - name: cap
+      model: caption_stream
+      version: "1"
+      stream: true
+      inputs:
+        input: "$request.input"
