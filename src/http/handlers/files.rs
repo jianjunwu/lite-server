@@ -27,14 +27,27 @@ pub async fn upload_model_handler(
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
 
-    let target_dir = crate::validation::resolve_model_dir(&state.repo_path, &model_name, &version)?;
-    tokio::fs::create_dir_all(&target_dir)
+    // For .lma uploads the manifest version (always v-stripped by the
+    // packer) names the on-disk version directory; normalize the URL
+    // version the same way so unpack, load, and the response all agree.
+    let mut effective_version = version.clone();
+
+    // H3: everything lands in a staging dir first and is moved into place
+    // atomically after the whole request succeeds. Failures and timeouts
+    // leave no partial files and no empty version dirs: the guard removes
+    // staging, and the target is only created by the final rename.
+    let staging = state
+        .repo_path
+        .join(format!(".tmp-upload-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&staging)
         .await
         .map_err(AppError::Io)?;
+    let _staging_guard = StagingGuard(staging.clone());
 
     let mut uploaded_files: Vec<String> = Vec::new();
+    let mut total_bytes: u64 = 0;
 
-    while let Some(field) = multipart.next_field().await.map_err(|e| {
+    while let Some(mut field) = multipart.next_field().await.map_err(|e| {
         AppError::Validation(format!("multipart error: {}", e))
     })? {
         let filename = field
@@ -42,40 +55,29 @@ pub async fn upload_model_handler(
             .unwrap_or("unnamed")
             .to_string();
 
-        let data = field.bytes().await.map_err(|e| {
-            AppError::Transport(format!("read upload field: {}", e))
-        })?;
-
         if filename.ends_with(".lma") {
-            // Save .lma to temp file, then unpack via Python CLI
-            let tmp_dir = std::env::temp_dir().join(format!(
-                "lite-server-upload-{}",
-                uuid::Uuid::new_v4()
-            ));
-            tokio::fs::create_dir_all(&tmp_dir)
-                .await
-                .map_err(AppError::Io)?;
-            let tmp_file = tmp_dir.join(&filename);
-            tokio::fs::write(&tmp_file, &data)
-                .await
-                .map_err(AppError::Io)?;
+            // The artifact's internal layout carries the version directory
+            // prefix ({version}/...), so unpack --flat into the staging
+            // root — mirroring the scanner's repository-root auto-unpack —
+            // instead of the version directory (which would nest
+            // {name}/{v}/{v}/). --expect-version fails before extraction
+            // if the manifest version does not match the upload URL.
+            effective_version = version.strip_prefix('v').unwrap_or(&version).to_string();
+            let tmp_file = staging.join(&filename);
+            total_bytes += stream_field_to_file(&mut field, &tmp_file).await?;
 
-            let output = tokio::process::Command::new(crate::python::resolve_python_interpreter())
-                .args([
-                    "-m",
-                    "lite_server",
-                    "unpack",
-                    tmp_file.to_str().unwrap_or(""),
-                    "--to",
-                    target_dir.to_str().unwrap_or(""),
-                    "--flat",
-                ])
-                .output()
-                .await
-                .map_err(|e| AppError::Internal(format!("failed to run python unpack: {}", e)))?;
-
-            // Clean up temp dir
-            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+            // H1: bound the unpack subprocess with the scanner's tunable.
+            let unpack_timeout = std::time::Duration::from_secs_f32(
+                state.config.tunables.unpack_timeout_secs,
+            );
+            let output = run_unpack(
+                &crate::python::resolve_python_interpreter(),
+                &tmp_file,
+                &staging,
+                &effective_version,
+                unpack_timeout,
+            )
+            .await?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -84,10 +86,23 @@ pub async fn upload_model_handler(
                     stderr.trim()
                 )));
             }
+
+            // F10a: retain the original artifact so downloads can serve it
+            // back without repacking (preserving the author signature).
+            let artifacts_dir = state.repo_path.join(".artifacts");
+            tokio::fs::create_dir_all(&artifacts_dir)
+                .await
+                .map_err(AppError::Io)?;
+            let artifact_name = format!("{}_v{}.lma", model_name, effective_version);
+            tokio::fs::copy(&tmp_file, artifacts_dir.join(&artifact_name))
+                .await
+                .map_err(AppError::Io)?;
+
             uploaded_files.push(filename);
         } else {
-            // Raw file: write directly to target dir
-            // Sanitize filename: strip any path components
+            // Raw file: stage into the version directory (F11a streams the
+            // field to disk instead of buffering it in memory). Sanitize
+            // filename: strip any path components.
             let safe_name = std::path::Path::new(&filename)
                 .file_name()
                 .unwrap_or_default()
@@ -96,10 +111,12 @@ pub async fn upload_model_handler(
             if safe_name.is_empty() || safe_name.starts_with('.') {
                 continue;
             }
-            let file_path = target_dir.join(&safe_name);
-            tokio::fs::write(&file_path, &data)
+            let version_dir = staging.join(&version);
+            tokio::fs::create_dir_all(&version_dir)
                 .await
                 .map_err(AppError::Io)?;
+            let file_path = version_dir.join(&safe_name);
+            total_bytes += stream_field_to_file(&mut field, &file_path).await?;
             uploaded_files.push(safe_name);
         }
     }
@@ -108,35 +125,211 @@ pub async fn upload_model_handler(
         return Err(AppError::Validation("no files uploaded".to_string()));
     }
 
-    // Optionally auto-load after upload
+    // H3: move staged content into place — version dirs via swap semantics
+    // (replaced wholesale, never partial), model-root files by overwrite.
+    commit_staging(&state.repo_path, &model_name, &staging).await?;
+
+    // Optionally auto-load after upload; `loaded` reports the real outcome
+    // instead of echoing the ?load= query param.
     let auto_load = query.load.unwrap_or(true);
+    let mut load_error: Option<String> = None;
     if auto_load {
-        let config_path = target_dir.join("config.yaml");
+        let load_dir = state.repo_path.join(&model_name).join(&effective_version);
+        let config_path = load_dir.join("config.yaml");
         let mut config = crate::config::load_model_config(&config_path).unwrap_or_default();
         state.config.apply_model_defaults(&mut config);
-        if let Err(e) = state.worker_manager.load_model(&model_name, &version, &config).await {
+        if let Err(e) = state
+            .worker_manager
+            .load_model(&model_name, &effective_version, &config)
+            .await
+        {
             warn!("Auto-load after upload failed: {}", e);
+            load_error = Some(e.to_string());
         }
         let active = state.registry.get_active_version(&model_name);
         if active.is_none() {
-            let _ = state.registry.activate_version(&model_name, &version);
+            let _ = state.registry.activate_version(&model_name, &effective_version);
         }
     }
 
     info!(
         model = %model_name,
-        version = %version,
+        version = %effective_version,
         files = ?uploaded_files,
+        bytes = total_bytes,
         "Model uploaded"
     );
 
-    Ok(Json(json!({
+    let mut response = json!({
         "success": true,
         "model": model_name,
-        "version": version,
+        "version": effective_version,
         "files": uploaded_files,
-        "loaded": auto_load,
-    })))
+        "loaded": auto_load && load_error.is_none(),
+    });
+    if let Some(error) = load_error {
+        response["load_error"] = json!(error);
+    }
+
+    Ok(Json(response))
+}
+
+/// Stream a multipart field to `dest`, returning the bytes written
+/// (F11a: RAM bounded by chunk size instead of buffering the whole field).
+async fn stream_field_to_file(
+    field: &mut axum::extract::multipart::Field<'_>,
+    dest: &std::path::Path,
+) -> Result<u64, AppError> {
+    let mut file = tokio::fs::File::create(dest).await.map_err(AppError::Io)?;
+    let mut total: u64 = 0;
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|e| AppError::Transport(format!("read upload field: {}", e)))?
+    {
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
+            .await
+            .map_err(AppError::Io)?;
+        total += chunk.len() as u64;
+    }
+    tokio::io::AsyncWriteExt::flush(&mut file)
+        .await
+        .map_err(AppError::Io)?;
+    Ok(total)
+}
+
+/// Run the Python unpack CLI against `tmp_file`, extracting flat into
+/// `dest_root` and enforcing the manifest version. Bounded by `timeout`
+/// (H1) — a hung unpack is killed instead of holding the upload forever.
+async fn run_unpack(
+    interpreter: &str,
+    tmp_file: &std::path::Path,
+    dest_root: &std::path::Path,
+    expect_version: &str,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, AppError> {
+    let mut child = tokio::process::Command::new(interpreter)
+        .args([
+            "-m",
+            "lite_server",
+            "unpack",
+            tmp_file.to_str().unwrap_or(""),
+            "--to",
+            dest_root.to_str().unwrap_or(""),
+            "--flat",
+            "--expect-version",
+            expect_version,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| AppError::Internal(format!("failed to run python unpack: {}", e)))?;
+
+    // wait() (not wait_with_output) keeps the child available for kill on
+    // timeout; stdout/stderr are drained manually afterwards.
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(result) => {
+            let status = result
+                .map_err(|e| AppError::Internal(format!("python unpack failed: {}", e)))?;
+            let mut stdout = Vec::new();
+            if let Some(mut out) = child.stdout.take() {
+                let _ = tokio::io::AsyncReadExt::read_to_end(&mut out, &mut stdout).await;
+            }
+            let mut stderr = Vec::new();
+            if let Some(mut err) = child.stderr.take() {
+                let _ = tokio::io::AsyncReadExt::read_to_end(&mut err, &mut stderr).await;
+            }
+            Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            })
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(AppError::Internal(format!(
+                "artifact unpack timed out after {:.0}s",
+                timeout.as_secs_f32()
+            )))
+        }
+    }
+}
+
+/// Move a staged version directory into place with swap semantics:
+/// the existing target is renamed aside (dot-prefixed, invisible to the
+/// scanner) and removed after the new directory lands; a failed rename
+/// rolls the old directory back.
+async fn swap_dir_into(src: &std::path::Path, dst: &std::path::Path) -> Result<(), AppError> {
+    if dst.exists() {
+        let backup = dst.with_file_name(format!(
+            ".{}.old-{}",
+            dst.file_name().unwrap_or_default().to_string_lossy(),
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::rename(dst, &backup).await.map_err(AppError::Io)?;
+        match tokio::fs::rename(src, dst).await {
+            Ok(()) => {
+                let _ = tokio::fs::remove_dir_all(&backup).await;
+                Ok(())
+            }
+            Err(e) => {
+                // Rollback: restore the previous version directory.
+                let _ = tokio::fs::rename(&backup, dst).await;
+                Err(AppError::Io(e))
+            }
+        }
+    } else {
+        tokio::fs::rename(src, dst).await.map_err(AppError::Io)
+    }
+}
+
+/// Move all staged content into the model directory: directories become
+/// version dirs (swap semantics), files (manifest.json, requirements.txt)
+/// overwrite their model-root counterparts.
+async fn commit_staging(
+    repo_path: &std::path::Path,
+    model_name: &str,
+    staging: &std::path::Path,
+) -> Result<(), AppError> {
+    let model_root = repo_path.join(model_name);
+    tokio::fs::create_dir_all(&model_root)
+        .await
+        .map_err(AppError::Io)?;
+
+    let mut entries = tokio::fs::read_dir(staging)
+        .await
+        .map_err(AppError::Io)?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let src = entry.path();
+        if src.is_dir() {
+            let dst = model_root.join(entry.file_name());
+            swap_dir_into(&src, &dst).await?;
+        } else {
+            let dst = model_root.join(entry.file_name());
+            // Overwrite semantics: rename replaces atomically on Unix but
+            // fails if the destination exists on Windows.
+            if dst.exists() {
+                tokio::fs::remove_file(&dst).await.map_err(AppError::Io)?;
+            }
+            tokio::fs::rename(&src, &dst).await.map_err(AppError::Io)?;
+        }
+    }
+    Ok(())
+}
+
+/// Removes the staging directory on drop. Drop cannot await, so the
+/// removal is spawned; a crashed process leaves the residue for startup
+/// cleanup (H7) — invisible to scanner/index via the dot-directory skip.
+struct StagingGuard(std::path::PathBuf);
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        let path = self.0.clone();
+        tokio::spawn(async move {
+            let _ = tokio::fs::remove_dir_all(&path).await;
+        });
+    }
 }
 
 // ===== Download Model =====
@@ -604,6 +797,408 @@ mod upload_download_tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // ===== .lma Upload Tests =====
+
+    /// Pack a minimal model fixture into a `.lma` artifact via the Python CLI.
+    /// Model files live under `<tmp>/src/{name}/{version}/`; the artifact is
+    /// written to `<tmp>/pkgs/{name}_v{version}.lma`.
+    async fn pack_fixture_lma(
+        tmp: &std::path::Path,
+        name: &str,
+        version: &str,
+    ) -> std::path::PathBuf {
+        let version_dir = tmp.join("src").join(name).join(version);
+        tokio::fs::create_dir_all(&version_dir).await.unwrap();
+        tokio::fs::write(version_dir.join("model.py"), "def predict(x): return x\n")
+            .await
+            .unwrap();
+        tokio::fs::write(version_dir.join("config.yaml"), "max_batch_size: 1\n")
+            .await
+            .unwrap();
+
+        let pkgs_dir = tmp.join("pkgs");
+        tokio::fs::create_dir_all(&pkgs_dir).await.unwrap();
+
+        let output = tokio::process::Command::new(crate::python::resolve_python_interpreter())
+            .args([
+                "-m",
+                "lite_server.cli",
+                "pack",
+                tmp.join("src").join(name).to_str().unwrap(),
+                "--version",
+                version,
+                "--output",
+                pkgs_dir.to_str().unwrap(),
+            ])
+            .output()
+            .await
+            .expect("failed to run lite-server pack");
+        assert!(
+            output.status.success(),
+            "pack failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        pkgs_dir.join(format!("{}_v{}.lma", name, version))
+    }
+
+    /// Build a minimal multipart body carrying one binary file field.
+    fn multipart_body(boundary: &str, filename: &str, data: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\n\
+                 Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n\
+                 Content-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(data);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    #[tokio::test]
+    async fn test_upload_lma_places_files_without_nesting() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-lma-upload-{}",
+            std::process::id()
+        ));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let lma = pack_fixture_lma(&tmp, "mymodel", "1").await;
+        let data = tokio::fs::read(&lma).await.unwrap();
+
+        let state = test_app_state(tmp.clone());
+        let app = test_router(state);
+
+        let boundary = "----lmatestboundary";
+        let body = multipart_body(boundary, "mymodel_v1.lma", &data);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/repository/models/mymodel/versions/1/upload?load=false")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={}", boundary),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["loaded"], false, "load=false must report loaded=false");
+
+        // Version files must land directly under {name}/{v} — the artifact's
+        // internal version prefix must not nest a duplicate directory.
+        let model_py = tmp.join("mymodel").join("1").join("model.py");
+        assert!(
+            model_py.exists(),
+            "model.py must land at {{name}}/{{v}}/model.py"
+        );
+        assert!(
+            !tmp.join("mymodel").join("1").join("1").exists(),
+            "unpack must not nest a duplicate version directory"
+        );
+        // Canonical layout: manifest lands at the model root, matching the
+        // repository-root auto-unpack path in the scanner.
+        assert!(tmp.join("mymodel").join("manifest.json").exists());
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn test_upload_lma_rejects_manifest_version_mismatch() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-lma-mismatch-{}",
+            std::process::id()
+        ));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let lma = pack_fixture_lma(&tmp, "mymodel", "1").await;
+        let data = tokio::fs::read(&lma).await.unwrap();
+
+        let state = test_app_state(tmp.clone());
+        let app = test_router(state);
+
+        let boundary = "----lmatestboundary";
+        let body = multipart_body(boundary, "mymodel_v1.lma", &data);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/repository/models/mymodel/versions/2/upload?load=false")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={}", boundary),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // The check must fail before extraction: neither the packaged
+        // version nor the requested one may appear on disk.
+        assert!(
+            !tmp.join("mymodel").join("1").exists(),
+            "packaged version must not be extracted on mismatch"
+        );
+        assert!(
+            !tmp.join("mymodel").join("2").join("model.py").exists(),
+            "requested version must not contain files on mismatch"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // ===== Staging / Atomic Placement Tests (plan H3/H4, F10a) =====
+
+    #[tokio::test]
+    async fn test_upload_corrupted_lma_leaves_no_residue() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-lma-corrupt-{}",
+            std::process::id()
+        ));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let state = test_app_state(tmp.clone());
+        let app = test_router(state);
+
+        let boundary = "----lmatestboundary";
+        let body = multipart_body(boundary, "mymodel_v1.lma", b"this is not a zip");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/repository/models/mymodel/versions/1/upload?load=false")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={}", boundary),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // H3: a failed upload must leave nothing behind — no empty version
+        // directory, no staging residue, no retained artifact. The staging
+        // guard's removal is spawned, so wait briefly for it.
+        assert!(
+            !tmp.join("mymodel").exists(),
+            "failed upload must not leave a model directory"
+        );
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+        loop {
+            let mut residue = false;
+            let mut entries = tokio::fs::read_dir(&tmp).await.unwrap();
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(".tmp-upload") {
+                    residue = true;
+                }
+            }
+            if !residue {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "staging residue after failed upload"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            !tmp.join(".artifacts").exists(),
+            "failed upload must not retain an artifact"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn test_upload_replaces_version_dir_swap_semantics() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-upload-swap-{}",
+            std::process::id()
+        ));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let state = test_app_state(tmp.clone());
+        let app = test_router(state);
+        let boundary = "----swaptestboundary";
+
+        // First upload: two files.
+        let body = multipart_body(
+            boundary,
+            "model.py",
+            b"def predict(x): return 'A'\n",
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/repository/models/mymodel/versions/1/upload?load=false")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={}", boundary),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Add a second file directly to the version dir (simulating an
+        // earlier upload of a larger file set).
+        tokio::fs::write(tmp.join("mymodel").join("1").join("old.txt"), "stale")
+            .await
+            .unwrap();
+
+        // Second upload: only model.py. Swap semantics must replace the
+        // whole version directory, so old.txt must disappear.
+        let body = multipart_body(
+            boundary,
+            "model.py",
+            b"def predict(x): return 'B'\n",
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/repository/models/mymodel/versions/1/upload?load=false")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={}", boundary),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content = tokio::fs::read_to_string(tmp.join("mymodel").join("1").join("model.py"))
+            .await
+            .unwrap();
+        assert_eq!(content, "def predict(x): return 'B'\n");
+        assert!(
+            !tmp.join("mymodel").join("1").join("old.txt").exists(),
+            "re-upload must replace the version directory wholesale"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn test_upload_lma_retains_artifact_in_artifacts_dir() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-lma-retain-{}",
+            std::process::id()
+        ));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let lma = pack_fixture_lma(&tmp, "mymodel", "1").await;
+        let data = tokio::fs::read(&lma).await.unwrap();
+
+        let state = test_app_state(tmp.clone());
+        let app = test_router(state);
+
+        let boundary = "----lmatestboundary";
+        let body = multipart_body(boundary, "mymodel_v1.lma", &data);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/repository/models/mymodel/versions/1/upload?load=false")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={}", boundary),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // F10a: the original .lma must be retained byte-identically in
+        // <repo>/.artifacts/{name}_v{version}.lma (downloads can then
+        // serve it back without repacking and keep the author signature).
+        let retained = tmp.join(".artifacts").join("mymodel_v1.lma");
+        assert!(retained.exists(), "original artifact must be retained");
+        let retained_bytes = tokio::fs::read(&retained).await.unwrap();
+        assert_eq!(retained_bytes, data, "retained artifact must be byte-identical");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // ===== H1: unpack subprocess timeout =====
+
+    /// A hung unpack must be killed after the timeout (H1) instead of
+    /// holding the upload forever. Uses a fake interpreter so the test
+    /// does not touch the process-global python resolution env vars.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_unpack_times_out_hung_process() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-unpack-timeout-{}",
+            std::process::id()
+        ));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        // A "python" that never returns.
+        let fake_py = tmp.join("fake-python");
+        tokio::fs::write(&fake_py, "#!/bin/sh\nsleep 60\n")
+            .await
+            .unwrap();
+        tokio::fs::set_permissions(&fake_py, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        let lma = tmp.join("fake.lma");
+        tokio::fs::write(&lma, "not a zip").await.unwrap();
+        let dest = tmp.join("out");
+
+        let result = run_unpack(
+            fake_py.to_str().unwrap(),
+            &lma,
+            &dest,
+            "1",
+            std::time::Duration::from_millis(500),
+        )
+        .await;
+
+        let err = result.expect_err("unpack must fail on timeout");
+        match err {
+            AppError::Internal(msg) => {
+                assert!(msg.contains("timed out"), "unexpected message: {}", msg);
+            }
+            _ => panic!("expected Internal timeout error"),
+        }
+
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 }

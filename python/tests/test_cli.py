@@ -245,15 +245,62 @@ class TestPackUnpack:
             "artifact": str(artifact),
             "target_dir": str(target),
             "flat": False,
+            "expect_version": None,
         })()
         assert cli._cmd_unpack(args) == 0
         assert (target / "src_model" / "1" / "model.py").exists()
+
+    def test_unpack_expect_version_accepts_v_prefix(self, tmp_path):
+        from lite_server.artifact import ModelPacker
+
+        model_dir = tmp_path / "src_model"
+        vdir = model_dir / "1"
+        vdir.mkdir(parents=True)
+        (vdir / "model.py").write_text("# model")
+
+        packer = ModelPacker(model_dir, version="1")
+        artifact = packer.pack(tmp_path / "artifacts")
+
+        # The packer normalizes the version by stripping a leading 'v', so
+        # --expect-version must accept the v-prefixed URL form.
+        target = tmp_path / "unpacked"
+        args = type("Args", (), {
+            "artifact": str(artifact),
+            "target_dir": str(target),
+            "flat": False,
+            "expect_version": "v1",
+        })()
+        assert cli._cmd_unpack(args) == 0
+        assert (target / "src_model" / "1" / "model.py").exists()
+
+    def test_unpack_expect_version_mismatch_fails(self, tmp_path):
+        from lite_server.artifact import ModelPacker
+
+        model_dir = tmp_path / "src_model"
+        vdir = model_dir / "1"
+        vdir.mkdir(parents=True)
+        (vdir / "model.py").write_text("# model")
+
+        packer = ModelPacker(model_dir, version="1")
+        artifact = packer.pack(tmp_path / "artifacts")
+
+        target = tmp_path / "unpacked"
+        args = type("Args", (), {
+            "artifact": str(artifact),
+            "target_dir": str(target),
+            "flat": False,
+            "expect_version": "2",
+        })()
+        assert cli._cmd_unpack(args) == 1
+        # The check runs before extraction: nothing may land on disk.
+        assert not (target / "src_model").exists()
 
     def test_unpack_missing_artifact(self, tmp_path, capsys):
         args = type("Args", (), {
             "artifact": str(tmp_path / "nope.lma"),
             "target_dir": str(tmp_path),
             "flat": False,
+            "expect_version": None,
         })()
         assert cli._cmd_unpack(args) == 1
 
@@ -309,6 +356,7 @@ class TestPackUnpack:
             "artifact": str(artifact_dir / "src_model_v1.lma"),
             "target_dir": str(target),
             "flat": False,
+            "expect_version": None,
         })()
         assert cli._cmd_unpack(unpack_args) == 0
         assert (target / "src_model" / "1" / "model.py").exists()
@@ -342,6 +390,7 @@ class TestPackUnpack:
             "artifact": str(artifact),
             "target_dir": str(target),
             "flat": False,
+            "expect_version": None,
         })()
         assert cli._cmd_unpack(unpack_args) == 1
 

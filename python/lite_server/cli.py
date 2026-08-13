@@ -329,6 +329,12 @@ def main(argv=None):
     unpack_parser.add_argument("artifact", help="Path to .lma file")
     unpack_parser.add_argument("--to", dest="target_dir", default=".")
     unpack_parser.add_argument("--flat", action="store_true", help="Extract files directly without prepending model name directory")
+    unpack_parser.add_argument(
+        "--expect-version",
+        default=None,
+        metavar="VERSION",
+        help="Fail if the manifest version differs from VERSION (a leading 'v' is ignored)",
+    )
 
     # init
     init_parser = subparsers.add_parser("init", help="Initialize project")
@@ -2278,6 +2284,17 @@ def _cmd_unpack(args):
     unpacker = ModelUnpacker(artifact_path)
     try:
         manifest = unpacker.validate(verify_key=verify_key)
+        if args.expect_version is not None:
+            # The packer always normalizes the version by stripping a leading
+            # 'v', so compare against the manifest's normalized form.
+            expected = args.expect_version.removeprefix("v")
+            if manifest.version != expected:
+                _logger.error(
+                    "Version mismatch: artifact is v%s, upload requested v%s",
+                    manifest.version,
+                    args.expect_version,
+                )
+                return 1
         print(f"Artifact valid: {manifest.name} v{manifest.version}")
         print(f"  Files: {len(manifest.files)}")
     except Exception as e:

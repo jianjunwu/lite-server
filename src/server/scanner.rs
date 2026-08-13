@@ -115,6 +115,12 @@ pub(super) async fn scan_repo_models(repo_path: &Path) -> Vec<RepoModel> {
         else {
             continue;
         };
+        // Legal model names cannot start with a dot (IDENTIFIER_RE in
+        // validation.rs), so dot directories (.artifacts, .git, staging
+        // dirs) can never be models — skip them.
+        if model_name.starts_with('.') {
+            continue;
+        }
 
         let mut versions = Vec::new();
         if let Ok(mut version_entries) = tokio::fs::read_dir(&model_dir).await {
@@ -127,6 +133,11 @@ pub(super) async fn scan_repo_models(repo_path: &Path) -> Vec<RepoModel> {
                 else {
                     continue;
                 };
+                // Same rule as model dirs: dot-prefixed names are staging or
+                // backup leftovers, never model versions.
+                if version.starts_with('.') {
+                    continue;
+                }
                 let model_py = version_dir.join("model.py");
                 let config_yaml = version_dir.join("config.yaml");
 
@@ -282,6 +293,47 @@ max_batch_size: 4
              discovered as a model. Got {} model(s).",
             result.len()
         );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // ===== dot-directory skip (staging / VCS / artifact dirs) =====
+
+    /// Dot-prefixed directories can never be models (legal model names
+    /// cannot start with a dot — IDENTIFIER_RE in validation.rs). Staging
+    /// dirs like `.tmp-upload-*` must not produce ghost model entries.
+    #[tokio::test]
+    async fn test_scan_repo_models_skips_dot_directories() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-scan-dotskip-{}",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+
+        // A staging dir shaped like a model: version dir with model.py.
+        let staging = tmp.join(".tmp-upload-abc").join("1");
+        tokio::fs::create_dir_all(&staging).await.unwrap();
+        tokio::fs::write(staging.join("model.py"), "def predict(x): return x")
+            .await
+            .unwrap();
+
+        // A real model must still be discovered.
+        let real = tmp.join("real_model").join("1");
+        tokio::fs::create_dir_all(&real).await.unwrap();
+        tokio::fs::write(real.join("model.py"), "def predict(x): return x")
+            .await
+            .unwrap();
+
+        let result = scan_repo_models(&tmp).await;
+
+        assert_eq!(
+            result.len(),
+            1,
+            "dot directories must be skipped, got {:?}",
+            result.iter().map(|m| format!("{}:{}", m.name, m.version)).collect::<Vec<_>>()
+        );
+        assert_eq!(result[0].name, "real_model");
+        assert_eq!(result[0].version, "1");
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
