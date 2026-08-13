@@ -64,6 +64,9 @@ pub struct EnsembleConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnsembleBlock {
+    /// E8-1 (batch 5): required in the single-set form; FORBIDDEN (empty)
+    /// in the dags form — everything lives inside the sets.
+    #[serde(default)]
     pub steps: Vec<EnsembleStepRaw>,
     /// E2 (batch 3): explicit DAG output — `$stepN` or `$stepN.field`.
     /// Omitted = `steps.last()` (historical semantics).
@@ -81,6 +84,27 @@ pub struct EnsembleBlock {
     /// single-output contract.
     #[serde(default)]
     pub outputs: Option<IndexMap<String, String>>,
+    /// E8-1 (batch 5): named DAG sets selected via `x-lite-dag` — each set
+    /// carries its own steps/output/outputs/inputs and validates
+    /// independently (R15). Present = the dags form (top-level fields
+    /// forbidden); absent = the historical single-set form.
+    #[serde(default)]
+    pub dags: Option<IndexMap<String, EnsembleDagSet>>,
+}
+
+/// E8-1 (batch 5): a named DAG set — the same field surface as the
+/// single-set form (steps/output/outputs/inputs), validated through the
+/// same pipeline (R15: independent per-set validation).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnsembleDagSet {
+    pub steps: Vec<EnsembleStepRaw>,
+    #[serde(default)]
+    pub output: Option<String>,
+    #[serde(default)]
+    pub outputs: Option<IndexMap<String, String>>,
+    #[serde(default)]
+    pub inputs: Option<IndexMap<String, InputDecl>>,
 }
 
 /// MIMO (D8/D31): a named root input's declaration — the static type of
@@ -328,6 +352,89 @@ fn validate_outputs_rules(
     Ok(())
 }
 
+/// E8-1 (batch 5, D22/D38): resolve the request's DAG set — the dags form
+/// picks by name (None = "default"); an unknown name is a 400 (explicit
+/// contract, never a silent default fallback — a typo must surface).
+/// Single-form plans reject any selector (it can only name nothing).
+pub fn select_dag_set<'a>(
+    plan: &'a EnsemblePlan,
+    selector: Option<&str>,
+) -> Result<&'a EnsemblePlan, AppError> {
+    match &plan.dag_sets {
+        None => {
+            if let Some(s) = selector {
+                return Err(AppError::InvalidRequestBody(format!(
+                    "x-lite-dag selector '{s}' provided but this ensemble declares                      no dags (D22)"
+                )));
+            }
+            Ok(plan)
+        }
+        Some(sets) => {
+            let name = selector.unwrap_or("default");
+            sets.get(name).map(|p| p.as_ref()).ok_or_else(|| {
+                AppError::InvalidRequestBody(format!(
+                    "unknown dag '{name}' — declared sets: {} (D22)",
+                    sets.keys().cloned().collect::<Vec<_>>().join(", ")
+                ))
+            })
+        }
+    }
+}
+
+/// D38 (batch 5): extract + D22-validate the dag selector from the HTTP
+/// transport metadata channel (request / SSE / WS-upgrade / h2 stream
+/// headers — one key name, one client mental model).
+pub fn dag_selector_from_http(
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<String>, AppError> {
+    match headers.get("x-lite-dag") {
+        None => Ok(None),
+        Some(v) => v
+            .to_str()
+            .map_err(|_| {
+                AppError::InvalidRequestBody(
+                    "x-lite-dag header is not valid ASCII (D22)".to_string(),
+                )
+            })
+            .and_then(validate_dag_selector)
+            .map(Some),
+    }
+}
+
+/// D38 (batch 5): the gRPC transport metadata channel (`x-lite-dag` key —
+/// same name as HTTP, the deadline metadata precedent).
+pub fn dag_selector_from_grpc(
+    metadata: &tonic::metadata::MetadataMap,
+) -> Result<Option<String>, AppError> {
+    match metadata.get("x-lite-dag") {
+        None => Ok(None),
+        Some(v) => v
+            .to_str()
+            .map_err(|_| {
+                AppError::InvalidRequestBody(
+                    "x-lite-dag metadata is not valid ASCII (D22)".to_string(),
+                )
+            })
+            .and_then(validate_dag_selector)
+            .map(Some),
+    }
+}
+
+/// D22 (batch 5): selector value validation — non-empty, ≤64 chars,
+/// `[A-Za-z0-9_-]` only. The endpoints call this at EXTRACTION (transport
+/// metadata channel, D38) so a malformed value 400s before execution.
+pub fn validate_dag_selector(value: &str) -> Result<String, AppError> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(AppError::InvalidRequestBody(format!(
+            "invalid x-lite-dag value '{value}' — must be 1-64 chars of              [A-Za-z0-9_-] (D22)"
+        )));
+    }
+    Ok(value.to_string())
+}
+
 /// E7 (batch 4④, D31/D5): build the DAG response — priority
 /// outputs (E7) > output (E2) > steps.last() (historical). Multi-sink
 /// responses are KServe envelopes: JSON head `{model_name, outputs:
@@ -469,7 +576,73 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
     let config: EnsembleConfig = serde_yaml::from_str(content)
         .map_err(|e| AppError::Config(format!("failed to parse ensemble config: {}", e)))?;
 
-    let steps: Vec<EnsembleStep> = config.ensemble.steps.into_iter().map(|s| {
+    // E8-1 (batch 5): the dags form — every set parses through the SAME
+    // pipeline (R15: independent per-set validation) and the outer plan
+    // carries them by name; the single-set top-level fields are forbidden
+    // (no ambiguity about which one is the default).
+    if let Some(dags) = config.ensemble.dags {
+        if !config.ensemble.steps.is_empty()
+            || config.ensemble.output.is_some()
+            || config.ensemble.outputs.is_some()
+            || config.ensemble.inputs.is_some()
+        {
+            return Err(AppError::Config(
+                "ensemble.dags forbids top-level steps/output/outputs/inputs —                  move them into the sets (E8-1)"
+                    .to_string(),
+            ));
+        }
+        if dags.is_empty() {
+            return Err(AppError::Config(
+                "ensemble.dags declares no sets (E8-1)".to_string(),
+            ));
+        }
+        let mut sets = IndexMap::new();
+        for (name, set) in dags {
+            let plan = parse_ensemble_set(
+                set.steps, set.output, set.outputs, set.inputs, config_path,
+            )
+            .map_err(|e| {
+                AppError::Config(format!("dag set '{name}': {}", e))
+            })?;
+            sets.insert(name, Arc::new(plan));
+        }
+        return Ok(EnsemblePlan {
+            // The outer plan is a pure container — execution always selects
+            // a set first (select_dag_set).
+            steps: Vec::new(),
+            layers: Vec::new(),
+            output_step: 0,
+            output_field: None,
+            chains: Vec::new(),
+            inputs_decl: None,
+            input_modes: Vec::new(),
+            conditional_refs: Vec::new(),
+            outputs: None,
+            dag_sets: Some(sets),
+            config_path: config_path.to_path_buf(),
+            source_mtime: None,
+        });
+    }
+
+    parse_ensemble_set(
+        config.ensemble.steps,
+        config.ensemble.output,
+        config.ensemble.outputs,
+        config.ensemble.inputs,
+        config_path,
+    )
+}
+
+/// The single-set parse pipeline — shared by the historical single-set form
+/// and every E8-1 dag set (R15: one pipeline, per-set validation).
+fn parse_ensemble_set(
+    steps_raw: Vec<EnsembleStepRaw>,
+    output: Option<String>,
+    outputs: Option<IndexMap<String, String>>,
+    inputs_decl: Option<IndexMap<String, InputDecl>>,
+    config_path: &std::path::Path,
+) -> Result<EnsemblePlan, AppError> {
+    let steps: Vec<EnsembleStep> = steps_raw.into_iter().map(|s| {
         // E5: per-step timeout must be a positive, finite duration.
         if let Some(t) = s.timeout_secs {
             if !t.is_finite() || t <= 0.0 {
@@ -497,19 +670,17 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
     validate_dag(&steps)?;
     // E2: resolve the explicit output BEFORE chain construction / streaming
     // validation — both anchor on the output step.
-    let (output_step, output_field) = resolve_output(config.ensemble.output.as_deref(), &steps)?;
+    let (output_step, output_field) = resolve_output(output.as_deref(), &steps)?;
     // MIMO (batch 4①): the static type environment — inputs declaration
     // validation (R1/R2), ref analysis (R3/R5/R9/R12), input-mode dispatch
     // (R11) and conditional-step discovery (R4).
-    let inputs_decl = config.ensemble.inputs;
     validate_step_output_decls(&steps)?;
     let (input_modes, conditional_refs) = analyze_static_types(&steps, inputs_decl.as_ref())?;
     // E7 (batch 4④): multi-sink validation — R13 ref shape, E2 mutual
     // exclusion, D11/R14 streaming rules.
-    let outputs = config.ensemble.outputs;
     // The E2 × E7 exclusion needs the raw `output:` PRESENCE (output_field
     // is None both when output is omitted and when it names a whole step).
-    let single_output_omitted = config.ensemble.output.is_none();
+    let single_output_omitted = output.is_none();
     validate_outputs_rules(&steps, outputs.as_ref(), single_output_omitted, output_step)?;
     // E6 (D5/D34) + MIMO R4: an absentable step's absence must be statically
     // provable — no downstream references, no single-output reference,
@@ -563,6 +734,8 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
         conditional_refs,
         // E7 (batch 4④): multi-sink output mapping (None = single output).
         outputs,
+        // E8-1 (batch 5): a single-set plan carries no named sets.
+        dag_sets: None,
         config_path: config_path.to_path_buf(),
         // Set by the production loader (stat-before-read); None for the
         // load-time direct-parse path (insert_ready stats on its own).
@@ -1820,8 +1993,12 @@ pub async fn ensemble_declares_inputs(
     state: &Arc<AppState>,
     model_name: &str,
     version: &str,
+    // E8-1: the declaration follows the SELECTED set (per-set inputs are
+    // independent, R15).
+    dag_selector: Option<&str>,
 ) -> Result<bool, AppError> {
     let plan = get_ensemble_plan(state, model_name, version).await?;
+    let plan = select_dag_set(&plan, dag_selector)?;
     Ok(plan.inputs_decl.is_some())
 }
 
@@ -1882,6 +2059,10 @@ pub struct EnsemblePlan {
     /// a KServe envelope (build_response). None = the historical single
     /// output.
     pub outputs: Option<IndexMap<String, String>>,
+    /// E8-1 (batch 5): named DAG sets (the dags form) — the outer plan is a
+    /// pure container; execution resolves the set via [`select_dag_set`].
+    /// None = the historical single-set form.
+    pub dag_sets: Option<IndexMap<String, Arc<EnsemblePlan>>>,
     /// Source config file — mtime re-check (review ②) stats this path.
     pub config_path: PathBuf,
     /// mtime of `config_path` captured BEFORE the file read (stat-before-read):
@@ -2389,6 +2570,11 @@ pub struct EnsembleExecOpts {
     pub deadline_unix_ns: Option<i64>,
     /// StreamOpen.decoupled passthrough (batch 0).
     pub decoupled: bool,
+    /// E8-1 (batch 5, D38): the request's DAG-set name — extracted by each
+    /// endpoint from its transport metadata channel (`x-lite-dag`) and
+    /// D22-validated; the orchestration layer sees a pure string, never
+    /// transport headers.
+    pub dag_selector: Option<String>,
 }
 
 /// D25: batch-0 result — Unary keeps the historical byte-identical path;
@@ -2565,6 +2751,9 @@ pub(crate) async fn execute_ensemble_inner(
     // config version, not per request. In-flight requests hold their Arc and
     // finish on the old plan even across a reload (D23).
     let plan = get_ensemble_plan(&state, model_name, version).await?;
+    // E8-1 (D38/D22): resolve the request's DAG set (dags form) — single-
+    // form plans pass through; unknown names 400 here.
+    let plan = select_dag_set(&plan, opts.dag_selector.as_deref())?;
     let deadline_unix_ns = opts.deadline_unix_ns;
     let tail_idx = plan.output_step;
 
@@ -4186,6 +4375,7 @@ async fn execute_step(
             client_ip: client_ip.to_string(),
             deadline_unix_ns,
             decoupled: false, // the child is unary-only (D4)
+            dag_selector: None, // E8-1: nested ensembles are unary-only, no selector passthrough
         };
         let nested = execute_nested_ensemble_boxed(
             state.clone(),
@@ -5042,6 +5232,7 @@ mod tests {
             input_modes: Vec::new(),
             conditional_refs: Vec::new(),
             outputs: None,
+            dag_sets: None,
             config_path: PathBuf::from(path),
             source_mtime: None,
         })
@@ -5199,6 +5390,7 @@ mod tests {
                     input_modes: Vec::new(),
                     conditional_refs: Vec::new(),
                     outputs: None,
+                    dag_sets: None,
                     config_path,
                     source_mtime: None,
                 }))
@@ -5300,6 +5492,7 @@ mod tests {
                         input_modes: Vec::new(),
                         conditional_refs: Vec::new(),
                         outputs: None,
+                        dag_sets: None,
                         config_path: cp,
                         source_mtime: v1_mtime,
                     }))
@@ -5325,6 +5518,7 @@ mod tests {
                         input_modes: Vec::new(),
                         conditional_refs: Vec::new(),
                         outputs: None,
+                        dag_sets: None,
                         config_path: cp,
                         source_mtime: None,
                     }))
@@ -6152,6 +6346,81 @@ ensemble:
         let err = parse_ensemble_plan(bad_path, &PathBuf::from("/nonexistent/config.yaml"))
             .expect_err("array-subscript paths must be rejected (D29)");
         assert!(err.to_string().contains("path"), "got: {err}");
+    }
+
+    // === E8-1 (batch 5): named DAG sets ===
+
+    /// E8-1: the dags form forbids top-level steps/output/outputs/inputs —
+    /// everything lives inside the sets (no ambiguity about the default).
+    #[test]
+    fn e8_dags_form_forbids_top_level_fields() {
+        let yaml = "ensemble:\n  dags:\n    default:\n      steps:\n        - name: a\n          model: m\n          version: \"1\"\n          inputs: {x: \"$request\"}\n  steps:\n    - name: b\n      model: m\n      version: \"1\"\n      inputs: {x: \"$request\"}\n";
+        let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("dags + top-level steps must be rejected");
+        assert!(err.to_string().contains("dags"), "got: {err}");
+    }
+
+    /// R15: each set validates INDEPENDENTLY — an invalid set fails the
+    /// load naming the set; other sets stay untouched.
+    #[test]
+    fn e8_per_set_independent_validation() {
+        let yaml = "ensemble:\n  dags:\n    default:\n      steps:\n        - name: a\n          model: m\n          version: \"1\"\n          inputs: {x: \"$request\"}\n    broken:\n      steps:\n        - name: a\n          model: m\n          version: \"1\"\n          on_error: skip\n          inputs: {x: \"$request\"}\n        - name: b\n          model: m2\n          version: \"1\"\n          inputs: {x: \"$a\"}\n";
+        let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("a broken set must fail the load (R15)");
+        assert!(err.to_string().contains("broken"), "must name the set: {err}");
+    }
+
+    /// E8-1: set selection — None = "default", Some = exact name; unknown
+    /// name → 400 (D22: never a silent default fallback); a selector on a
+    /// single-form plan → 400.
+    #[test]
+    fn e8_select_dag_set() {
+        let plan = parse_ensemble_plan(
+            "ensemble:\n  dags:\n    default:\n      steps:\n        - name: a\n          model: m\n          version: \"1\"\n          inputs: {x: \"$request\"}\n    fast:\n      steps:\n        - name: b\n          model: m\n          version: \"1\"\n          inputs: {x: \"$request\"}\n",
+            &PathBuf::from("/nonexistent/config.yaml"),
+        )
+        .unwrap();
+        assert_eq!(select_dag_set(&plan, None).unwrap().steps[0].name, "a");
+        assert_eq!(select_dag_set(&plan, Some("fast")).unwrap().steps[0].name, "b");
+        let err = select_dag_set(&plan, Some("nope")).unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequestBody(_)), "unknown dag → 400 (D22), got {err:?}");
+        assert!(err.to_string().contains("nope"), "got: {err}");
+        // Single-form plan + selector → 400.
+        let single = parse_ensemble_plan(
+            "ensemble:\n  steps:\n    - name: a\n      model: m\n      version: \"1\"\n      inputs: {x: \"$request\"}\n",
+            &PathBuf::from("/nonexistent/config.yaml"),
+        )
+        .unwrap();
+        let err = select_dag_set(&single, Some("fast")).unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequestBody(_)), "got {err:?}");
+    }
+
+    /// D22: selector value validation — non-empty, ≤64 chars,
+    /// `[A-Za-z0-9_-]` only.
+    #[test]
+    fn e8_d22_selector_validation() {
+        assert!(validate_dag_selector("fast").is_ok());
+        assert!(validate_dag_selector("fast-v2_x").is_ok());
+        assert!(validate_dag_selector("").is_err(), "empty must be rejected");
+        assert!(validate_dag_selector("has space").is_err());
+        assert!(validate_dag_selector("has!bang").is_err());
+        let long = "a".repeat(65);
+        assert!(validate_dag_selector(&long).is_err(), ">64 chars must be rejected");
+    }
+
+    /// E8-1: per-set inputs declarations are INDEPENDENT (R15) — the
+    /// envelope contract follows the selected set.
+    #[test]
+    fn e8_per_set_inputs_independent() {
+        let plan = parse_ensemble_plan(
+            "ensemble:\n  dags:\n    default:\n      steps:\n        - name: a\n          model: m\n          version: \"1\"\n          inputs: {x: \"$request\"}\n    named:\n      inputs:\n        text:\n          type: json\n      steps:\n        - name: a\n          model: m\n          version: \"1\"\n          inputs: {x: \"$inputs.text\"}\n",
+            &PathBuf::from("/nonexistent/config.yaml"),
+        )
+        .unwrap();
+        let default = select_dag_set(&plan, None).unwrap();
+        assert!(default.inputs_decl.is_none(), "default set is legacy-form");
+        let named = select_dag_set(&plan, Some("named")).unwrap();
+        assert!(named.inputs_decl.is_some(), "named set declares inputs");
     }
 
     // === E7 (batch 4④): multi-sink outputs ===

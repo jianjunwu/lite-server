@@ -212,10 +212,12 @@ async fn do_infer(
         let ensemble_input = ensemble_input_from_body(&body)?;
         // D37 (batch 0): signature converged — execution-face opts; later
         // batches add fields (dag_selector) without touching call sites.
+        // E8-1 (D38): the dag selector rides the HTTP request header.
         let opts = crate::ensemble::EnsembleExecOpts {
             client_ip: cx.client_ip.clone(),
             deadline_unix_ns: deadline.unix_ns,
             decoupled: false,
+            dag_selector: crate::ensemble::dag_selector_from_http(&headers)?,
         };
         let result = crate::ensemble::execute_ensemble(
             state, &model_name, &resolved_version, ensemble_input, &request_id, opts,

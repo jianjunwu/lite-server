@@ -232,6 +232,7 @@ async fn h2_bidi_entry_impl(
         // transport). Undeclared ensembles keep the D17 aggregation.
         let declared = crate::ensemble::ensemble_declares_inputs(
             &state, &model_name, &resolved_version,
+            crate::ensemble::dag_selector_from_http(&headers)?.as_deref(),
         )
         .await?;
         let value = if declared {
@@ -343,10 +344,12 @@ async fn h2_bidi_entry_impl(
             );
             aggregator.finish()?
         };
+        // E8-1 (D38): the dag selector rides the h2 stream headers.
         let opts = crate::ensemble::EnsembleExecOpts {
             client_ip: cx.client_ip.clone(),
             deadline_unix_ns: deadline.unix_ns,
             decoupled: false,
+            dag_selector: crate::ensemble::dag_selector_from_http(&headers)?,
         };
         match crate::ensemble::execute_ensemble(
             state.clone(),

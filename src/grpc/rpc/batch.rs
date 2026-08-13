@@ -179,6 +179,10 @@ impl GrpcService {
         // batch. A streaming DAG is an unsupported combination → whole-RPC
         // InvalidArgument.
         if mv.as_ref().map(|m| m.model_type == ModelType::Ensemble).unwrap_or(false) {
+            // E8-1 (D38): extract + D22-validate the selector here —
+            // grpc_metadata is in scope at the caller.
+            let dag_selector = crate::ensemble::dag_selector_from_grpc(&grpc_metadata)
+                .map_err(|e| err(crate::grpc::error::app_error_to_grpc_status(&e)))?;
             return self
                 .batch_infer_ensemble(
                     model_name.to_string(),
@@ -189,6 +193,7 @@ impl GrpcService {
                     &deadline,
                     &req_ctx,
                     Instant::now(),
+                    dag_selector,
                 )
                 .await;
         }
@@ -330,6 +335,9 @@ impl GrpcService {
         deadline: &crate::deadline::ResolvedDeadline,
         req_ctx: &crate::callback::InferenceContext,
         start: Instant,
+        // E8-1 (D38): extracted + D22-validated at the caller (grpc_metadata
+        // lives there).
+        dag_selector: Option<String>,
     ) -> Result<Response<pb::BatchInferResponse>, Status> {
         let plan = crate::ensemble::get_ensemble_plan(&self.app_state, &model_name, &resolved_version)
             .await
@@ -344,6 +352,7 @@ impl GrpcService {
             client_ip,
             deadline_unix_ns: deadline.unix_ns,
             decoupled: false,
+            dag_selector,
         };
         // D15: ONE request-scope version snapshot shared by every element —
         // a batch is one logical request, so elements resolve sub-model

@@ -158,6 +158,9 @@ impl GrpcService {
                 client_ip: client_ip.clone(),
                 deadline_unix_ns: deadline.unix_ns,
                 decoupled: false,
+                // E8-1 (D38): the dag selector rides the gRPC metadata.
+                dag_selector: crate::ensemble::dag_selector_from_grpc(&grpc_metadata)
+                    .map_err(|e| crate::grpc::error::err(crate::grpc::error::app_error_to_grpc_status(&e)))?,
             };
             match crate::ensemble::execute_ensemble(
                 self.app_state.clone(),

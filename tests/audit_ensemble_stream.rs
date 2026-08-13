@@ -1024,6 +1024,26 @@ const ENS_MULTISINK_YAML: &str = r#"ensemble:
         text: "$inputs.text"
 "#;
 
+/// E8-1: named DAG sets — default runs `pre`, fast runs `echo` (distinct
+/// outputs make the selection observable).
+const ENS_DAGS_YAML: &str = r#"ensemble:
+  dags:
+    default:
+      steps:
+        - name: main
+          model: pre
+          version: "1"
+          inputs:
+            text: "$request.text"
+    fast:
+      steps:
+        - name: main
+          model: echo
+          version: "1"
+          inputs:
+            data: "$request.text"
+"#;
+
 /// R4 conditional skip: the optional input absent → `cond` (which would 500
 /// if it ran) is skipped, `main` still produces the output.
 const ENS_MIMO_COND_YAML: &str = r#"ensemble:
@@ -1205,6 +1225,7 @@ fn write_all_fixtures(repo: &std::path::Path) {
     write_ensemble(repo, "ens_mimo", ENS_MIMO_YAML);
     write_ensemble(repo, "ens_mimo_json_alias", ENS_MIMO_JSON_ALIAS_YAML);
     write_ensemble(repo, "ens_multisink", ENS_MULTISINK_YAML);
+    write_ensemble(repo, "ens_dags", ENS_DAGS_YAML);
     write_ensemble(repo, "ens_mimo_bin", ENS_MIMO_BIN_YAML);
     write_ensemble(repo, "ens_mimo_cond", ENS_MIMO_COND_YAML);
     write_ensemble(repo, "ens_mimo_stream", ENS_MIMO_STREAM_YAML);
@@ -1224,7 +1245,7 @@ fn write_server_yaml(repo: &std::path::Path, http_port: u16, extra: &str, orch_e
         format!(
             "server:\n  http_port: {http_port}\n  timeout: 30.0\n{extra}\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_dags\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n",
             repo.display()
         ),
     )
@@ -1607,7 +1628,7 @@ async fn boot_server_grpc(extra: &str) -> (String, u16, ServerGuard, std::path::
             "server:\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  timeout: 30.0\n{extra}\n\n\
              grpc:\n  enabled: true\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_dags\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n",
             repo.display()
         ),
     )
@@ -4260,4 +4281,88 @@ async fn test_audit_e7_multisink_grpc_lsbe1_response() {
     let outs = resp_head["outputs"].as_array().unwrap();
     assert_eq!(outs[0], json!({"name": "answer", "data": {"pre": "grpc sink"}}));
     assert_eq!(outs[2], json!({"name": "score", "data": null}), "skip alias → null (D5)");
+}
+
+/// E8-1 (D38/D22): x-lite-dag selects the DAG set over HTTP — no header =
+/// "default", a named set switches the output, an unknown name or malformed
+/// value is 400 (no silent default fallback).
+#[serial]
+#[tokio::test]
+async fn test_audit_e8_dag_selection_http_header() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_dags"]).await;
+
+    let client = reqwest::Client::new();
+    // No header → the default set.
+    let resp = client
+        .post(format!("{}/v2/models/ens_dags/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"text": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(r#""pre""#), "default set must run pre: {body}");
+
+    // x-lite-dag: fast → the fast set.
+    let resp = client
+        .post(format!("{}/v2/models/ens_dags/infer", base))
+        .header("Content-Type", "application/json")
+        .header("x-lite-dag", "fast")
+        .json(&json!({"text": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(r#""echo""#), "fast set must run echo: {body}");
+
+    // Unknown dag → 400 (D22: never a silent default fallback).
+    let resp = client
+        .post(format!("{}/v2/models/ens_dags/infer", base))
+        .header("Content-Type", "application/json")
+        .header("x-lite-dag", "nope")
+        .json(&json!({"text": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "unknown dag must be 400");
+
+    // Malformed value → 400.
+    let resp = client
+        .post(format!("{}/v2/models/ens_dags/infer", base))
+        .header("Content-Type", "application/json")
+        .header("x-lite-dag", "bad!")
+        .json(&json!({"text": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "malformed selector must be 400 (D22)");
+}
+
+/// E8-1 (D38): the gRPC metadata channel carries the same `x-lite-dag` key.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_audit_e8_dag_selection_grpc_metadata() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::InferRequest;
+
+    let (base, grpc_port, _guard, _repo) = boot_server_grpc("").await;
+    wait_ready_all(&base, &["ens_dags"]).await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+
+    let mut req = tonic::Request::new(InferRequest {
+        model_name: "ens_dags".into(),
+        version: "1".into(),
+        data: bytes::Bytes::from_static(br#"{"text": "x"}"#),
+        ..Default::default()
+    });
+    req.metadata_mut().insert("x-lite-dag", "fast".parse().unwrap());
+    let resp = client.infer(req).await.expect("dag-selected gRPC unary must succeed");
+    let v: Value = serde_json::from_slice(resp.into_inner().data.as_ref()).unwrap();
+    assert!(v.get("echo").is_some(), "fast set must run echo over gRPC: {v}");
 }

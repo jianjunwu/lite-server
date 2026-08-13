@@ -113,10 +113,13 @@ impl GrpcService {
                     self.server_timeout.as_secs_f32(),
                 );
                 // D37 (batch 0): signature converged — execution-face opts.
+                // E8-1 (D38): the dag selector rides the gRPC metadata.
                 let opts = crate::ensemble::EnsembleExecOpts {
                     client_ip: client_ip.clone(),
                     deadline_unix_ns: ensemble_deadline.unix_ns,
                     decoupled: false,
+                    dag_selector: crate::ensemble::dag_selector_from_grpc(&grpc_metadata)
+                        .map_err(|e| err(app_error_to_grpc_status(&e)))?,
                 };
                 let result = crate::ensemble::execute_ensemble(
                     self.app_state.clone(),

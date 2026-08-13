@@ -415,10 +415,12 @@ async fn sse_infer_impl(
     let mut ensemble_tail: Option<(String, String, String)> = None;
     let (stream_id, worker_client, mut chunk_rx) = if is_ensemble {
         let ensemble_input = super::inference::ensemble_input_from_body(&body)?;
+        // E8-1 (D38): the dag selector rides the HTTP request header.
         let opts = crate::ensemble::EnsembleExecOpts {
             client_ip: cx.client_ip.clone(),
             deadline_unix_ns: deadline.unix_ns,
             decoupled,
+            dag_selector: crate::ensemble::dag_selector_from_http(&headers)?,
         };
         match crate::ensemble::execute_ensemble(
             state.clone(), &model_name, &resolved_version, ensemble_input, &cx.request_id, opts,
@@ -1212,11 +1214,21 @@ async fn handle_ws_stream(
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
+        // E8-1 (D38): the dag selector rides the WS upgrade headers —
+        // extracted once, shared by the D33 declared check and the opts.
+        let dag_selector = match crate::ensemble::dag_selector_from_http(&headers) {
+            Ok(s) => s,
+            Err(e) => {
+                prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64());
+                ws_send_error(&mut ws_sink, &e).await;
+                return;
+            }
+        };
         // D33: a declared-inputs ensemble's envelope is self-describing —
         // one complete envelope frame executes immediately (no close frame
         // needed; later frames hit the existing multi-round rejection).
         let declared = match crate::ensemble::ensemble_declares_inputs(
-            &state, &model_name, &resolved_version,
+            &state, &model_name, &resolved_version, dag_selector.as_deref(),
         )
         .await
         {
@@ -1336,6 +1348,7 @@ async fn handle_ws_stream(
             client_ip: cx.client_ip.clone(),
             deadline_unix_ns: deadline.unix_ns,
             decoupled,
+            dag_selector,
         };
         match crate::ensemble::execute_ensemble(
             state.clone(), &model_name, &resolved_version, value, &cx.request_id, opts,
