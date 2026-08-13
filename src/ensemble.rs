@@ -256,16 +256,34 @@ pub fn spawn_ensemble_warm(
                 return;
             }
         };
+        // E4 (batch 3): pre-resolve every sub-model step and preheat the
+        // routing/LRU caches. D27: this warm pass is a TTFT hint ONLY — it is
+        // NEVER a resolution source; the request-time D15 snapshot always
+        // re-resolves against the registry, so an active drift between warm
+        // and first request has no freeze window.
+        let warm_snapshot = Arc::new(VersionSnapshot::default());
         for step in &plan.steps {
-            // E4 (batch 3): readiness for unresolved ("latest"/omitted) steps
-            // can only be checked after execution-time resolution — the
-            // resolved-version side-table + preload land with E4 (Step 1).
-            if let Some(v) = step.version.as_deref() {
-                if !registry.is_ready(&step.model, Some(v)) {
+            match warm_snapshot.resolve(&registry, step) {
+                Ok(resolved) => {
+                    // touch_last_used: an ensemble's sub-models must count as
+                    // used, or LRU eviction can unload a live DAG dependency.
+                    registry.touch_last_used(&step.model, &resolved);
+                    // routing_pick exercises the weighted-routing cache the
+                    // first request would otherwise pay cold.
+                    registry.routing_pick(&step.model);
+                    if !registry.is_ready(&step.model, Some(&resolved)) {
+                        warn!(
+                            model = %step.model,
+                            version = %resolved,
+                            "ensemble warm: sub-model not ready (first request autoloads)"
+                        );
+                    }
+                }
+                Err(e) => {
                     warn!(
                         model = %step.model,
-                        version = %v,
-                        "ensemble warm: sub-model not ready (preload deferred to batch 3)"
+                        error = %e,
+                        "ensemble warm: sub-model version resolution failed"
                     );
                 }
             }
@@ -1047,11 +1065,46 @@ impl BidiAggregator {
 /// fields without touching the signature, e.g. `dag_selector` in batch 5;
 /// D36's snapshot/depth ride the internal `execute_ensemble_inner`, not the
 /// public opts).
-/// Step 0 shim (batch 3, E4): step versions are now optional — until the
-/// D15 snapshot resolution lands (Step 1), an unresolved step reads as
-/// "latest" (a nonexistent explicit version, same observable failure).
-fn unresolved_step_version(step: &EnsembleStep) -> &str {
-    step.version.as_deref().unwrap_or("latest")
+/// D15 (E4, batch 3): request-scoped version snapshot — `model → resolved
+/// version`, lazily memoized. Every step of one request (across nesting,
+/// D36) that references the same model with an unresolved version shares
+/// the FIRST resolution, so an active-version drift mid-request can never
+/// produce a DAG where step A hit v1 and step B hit v2. Explicit step
+/// versions bypass the snapshot entirely.
+pub struct VersionSnapshot(std::sync::Mutex<HashMap<String, String>>);
+
+impl Default for VersionSnapshot {
+    fn default() -> Self {
+        Self(std::sync::Mutex::new(HashMap::new()))
+    }
+}
+
+impl VersionSnapshot {
+    /// E4/D15: resolve a step's version — explicit versions as-is; the first
+    /// unresolved resolution per model wins. Resolution source = registry
+    /// active ONLY (D27: no canary pin / weighted routing at the step level;
+    /// those precedences belong to the outer request's own version).
+    pub fn resolve(
+        &self,
+        registry: &crate::registry::ModelRegistry,
+        step: &EnsembleStep,
+    ) -> Result<String, AppError> {
+        if let Some(v) = step.version.as_deref() {
+            return Ok(v.to_string());
+        }
+        let mut snapshot = self.0.lock().unwrap();
+        if let Some(v) = snapshot.get(&step.model) {
+            return Ok(v.clone());
+        }
+        let resolved = registry.get_active_version(&step.model).ok_or_else(|| {
+            AppError::ModelNotFound(format!(
+                "sub-model '{}' has no active version (step version omitted or \"latest\")",
+                step.model
+            ))
+        })?;
+        snapshot.insert(step.model.clone(), resolved.clone());
+        Ok(resolved)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1200,6 +1253,28 @@ pub async fn execute_ensemble(
     request_id: &str,
     opts: EnsembleExecOpts,
 ) -> Result<EnsembleOutcome, AppError> {
+    // D15 (E4): request-scoped version snapshot — shared across every step
+    // of this request and (D36) across nested ensemble calls.
+    let snapshot = Arc::new(VersionSnapshot::default());
+    execute_ensemble_inner(state, model_name, version, payload, request_id, opts, &snapshot, 0)
+        .await
+}
+
+/// D36 (E1/E4): the internal execution entry — the D15 version snapshot and
+/// the nesting depth ride here, so the public signature stays fixed. Nested
+/// ensembles recurse into this function with depth+1 and the SAME snapshot:
+/// a parent and child resolving the same model share one version.
+#[allow(clippy::too_many_arguments)] // execution plumbing: state+ids+snapshot ride together by design
+pub(crate) async fn execute_ensemble_inner(
+    state: Arc<AppState>,
+    model_name: &str,
+    version: &str,
+    payload: EnsembleValue,
+    request_id: &str,
+    opts: EnsembleExecOpts,
+    snapshot: &Arc<VersionSnapshot>,
+    _depth: u32, // E1 (Step 2): nesting depth limit rides here
+) -> Result<EnsembleOutcome, AppError> {
     // P0 (D6): plan comes from the cache — parse/validate/layers run once per
     // config version, not per request. In-flight requests hold their Arc and
     // finish on the old plan even across a reload (D23).
@@ -1214,7 +1289,7 @@ pub async fn execute_ensemble(
         // Historical unary path — byte-identical behaviour.
         run_layers(
             &state, &plan, &plan.layers, &mut context,
-            model_name, version, request_id, &opts, deadline_unix_ns,
+            model_name, version, request_id, &opts, deadline_unix_ns, snapshot,
         ).await?;
         let value = plan.steps[tail_idx].name.as_str();
         let value = context.get(value).cloned()
@@ -1246,11 +1321,11 @@ pub async fn execute_ensemble(
         }
         run_layers(
             &state, &plan, &pre_layers, &mut context,
-            model_name, version, request_id, &opts, deadline_unix_ns,
+            model_name, version, request_id, &opts, deadline_unix_ns, snapshot,
         )
         .await?;
         let mut stream = spawn_chain(
-            &state, &plan, chain, &context, request_id, &opts, deadline_unix_ns,
+            &state, &plan, chain, &context, request_id, &opts, deadline_unix_ns, snapshot,
         )
         .await?;
         // P10 (D40): the permit is WEIGHTED by the chain's streaming-step
@@ -1272,14 +1347,14 @@ pub async fn execute_ensemble(
     // The autoload path stays serial (preflight only when already ready).
     let preflight_fut = async {
         tail_stream_preflight(
-            &state, &plan.steps[tail_idx], request_id, &opts, deadline_unix_ns,
+            &state, &plan.steps[tail_idx], request_id, &opts, deadline_unix_ns, snapshot,
         )
         .await
     };
     let layers_fut = async {
         run_layers(
             &state, &plan, &plan.layers[..tail_layer], &mut context,
-            model_name, version, request_id, &opts, deadline_unix_ns,
+            model_name, version, request_id, &opts, deadline_unix_ns, snapshot,
         )
         .await
     };
@@ -1292,7 +1367,7 @@ pub async fn execute_ensemble(
     // and releases when the adapter's forward task ends (D18 teardown path).
     let mut stream = open_tail_stream(
         &state, &plan, tail_idx, tail_layer, &context,
-        request_id, &opts, deadline_unix_ns, preflight?,
+        request_id, &opts, deadline_unix_ns, preflight?, snapshot,
     ).await?;
     if let Some(capacity) = state.worker_manager.streaming_capacity() {
         stream.permit = Some(capacity.try_acquire()?);
@@ -1317,6 +1392,7 @@ async fn run_layers(
     request_id: &str,
     opts: &EnsembleExecOpts,
     deadline_unix_ns: Option<i64>,
+    snapshot: &Arc<VersionSnapshot>,
 ) -> Result<(), AppError> {
     let total_budget = crate::deadline::remaining(deadline_unix_ns);
     let plan_run = plan.clone();
@@ -1338,14 +1414,20 @@ async fn run_layers(
                 let ensemble_name = model_name.to_string();
                 let request_id = request_id.to_string();
                 let client_ip = opts.client_ip.clone();
+                // E4/D15: resolve the metric label BEFORE spawning (a failed
+                // resolution aborts the layer here — the same error execute_step
+                // would surface for that step). The resolved label is the
+                // truthful version the step will call.
+                let version_label = snapshot.resolve(&state.registry, &step)?;
+                let snapshot = snapshot.clone();
                 set.spawn(async move {
                     let start = Instant::now();
                     let result =
-                        execute_step(state, &step, &ctx, &request_id, &client_ip, deadline_unix_ns)
+                        execute_step(state, &step, &ctx, &request_id, &client_ip, deadline_unix_ns, &snapshot)
                             .await;
                     let latency = start.elapsed().as_secs_f64();
                     crate::metrics::prometheus::record_ensemble_step_latency(
-                        &ensemble_name, &step.name, &step.model, unresolved_step_version(&step), latency,
+                        &ensemble_name, &step.name, &step.model, &version_label, latency,
                     );
                     (step.name, result)
                 });
@@ -1405,6 +1487,7 @@ async fn open_tail_stream(
     opts: &EnsembleExecOpts,
     deadline_unix_ns: Option<i64>,
     preflight: Option<TailPreflight>,
+    snapshot: &Arc<VersionSnapshot>,
 ) -> Result<EnsembleStream, AppError> {
     // §4.1 rule 3: same-layer sibling unary steps still run in parallel with
     // the streaming step. They never enter `context` (output semantics belong
@@ -1417,7 +1500,7 @@ async fn open_tail_stream(
         .filter(|&i| i != tail_idx)
         .collect();
 
-    let run_stream = execute_stream_step(state, plan, tail_idx, context, request_id, opts, deadline_unix_ns, preflight);
+    let run_stream = execute_stream_step(state, plan, tail_idx, context, request_id, opts, deadline_unix_ns, preflight, snapshot);
     tokio::pin!(run_stream);
 
     if siblings.is_empty() {
@@ -1433,9 +1516,10 @@ async fn open_tail_stream(
             let step = plan.steps[idx].clone();
             let request_id = request_id.to_string();
             let client_ip = opts.client_ip.clone();
+            let snapshot = snapshot.clone();
             set.spawn(async move {
                 let name = step.name.clone();
-                execute_step(state, &step, &ctx, &request_id, &client_ip, deadline_unix_ns).await
+                execute_step(state, &step, &ctx, &request_id, &client_ip, deadline_unix_ns, &snapshot).await
                     .map(|v| (name.clone(), Ok(v)))
                     .unwrap_or_else(|e| (name.clone(), Err(e)))
             });
@@ -1481,19 +1565,22 @@ async fn tail_stream_preflight(
     request_id: &str,
     opts: &EnsembleExecOpts,
     deadline_unix_ns: Option<i64>,
+    snapshot: &Arc<VersionSnapshot>,
 ) -> Result<Option<TailPreflight>, AppError> {
+    // E4/D15: execution-time version resolution (same source as execute_step).
+    let resolved_version = snapshot.resolve(&state.registry, step)?;
     // P7 constraint: only preflight an already-ready sub-model. Not ready →
     // fall back to the serial path (which runs the autoload + poll).
-    if !state.registry.is_ready(&step.model, Some(unresolved_step_version(step))) {
+    if !state.registry.is_ready(&step.model, Some(&resolved_version)) {
         return Ok(None);
     }
-    if !streaming_worker_ready(state, &step.model, unresolved_step_version(step), &pb::RequestMeta::default()).await {
+    if !streaming_worker_ready(state, &step.model, &resolved_version, &pb::RequestMeta::default()).await {
         return Ok(None);
     }
-    let mv = state.registry.get(&step.model, Some(unresolved_step_version(step)))
-        .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", step.model, unresolved_step_version(step))))?;
-    let clients = state.worker_manager.get_zmq_clients(&step.model, unresolved_step_version(step)).await
-        .ok_or_else(|| AppError::WorkerCrashed(format!("{} {} has no ZMQ clients", step.model, unresolved_step_version(step))))?;
+    let mv = state.registry.get(&step.model, Some(&resolved_version))
+        .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", step.model, resolved_version)))?;
+    let clients = state.worker_manager.get_zmq_clients(&step.model, &resolved_version).await
+        .ok_or_else(|| AppError::WorkerCrashed(format!("{} {} has no ZMQ clients", step.model, resolved_version)))?;
 
     // P-TRACE: step-level span + trace injection (content-type is patched in
     // after assembly — it depends on the payload shape).
@@ -1513,10 +1600,10 @@ async fn tail_stream_preflight(
     let meta = build_step_meta(
         &format!("{}:{}", request_id, step.name), &opts.client_ip, deadline_unix_ns, step_headers, bytes::Bytes::new(),
     );
-    let outlier = state.worker_manager.get_outlier_state(&step.model, unresolved_step_version(step)).await;
+    let outlier = state.worker_manager.get_outlier_state(&step.model, &resolved_version).await;
     let seq_registry = state.inference_queue.sequence_registry();
     let worker_id = crate::worker::pick_streaming_worker(
-        &meta, mv.workers.len(), outlier.as_deref(), seq_registry, &step.model, unresolved_step_version(step),
+        &meta, mv.workers.len(), outlier.as_deref(), seq_registry, &step.model, &resolved_version,
     ).map_err(|e| AppError::Validation(e.0))?;
     if worker_id >= clients.len() {
         return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
@@ -1599,6 +1686,7 @@ async fn consume_stream_consumer(
     deadline_unix_ns: Option<i64>,
     chain_handles: &Arc<std::sync::Mutex<Vec<StreamHandle>>>,
     is_tail: bool,
+    snapshot: &Arc<VersionSnapshot>,
 ) -> Result<(), AppError> {
     let step = &plan.steps[step_idx];
     let mut seq: u64 = 0;
@@ -1621,6 +1709,7 @@ async fn consume_stream_consumer(
                 let sub_request_id = format!("{}:{}:{}", request_id, step.name, seq);
                 let sub = execute_stream_step(
                     state, plan, step_idx, &ctx, &sub_request_id, opts, deadline_unix_ns, None,
+                    snapshot,
                 )
                 .await?;
                 {
@@ -1692,6 +1781,7 @@ async fn consume_stream_consumer(
 /// runs as a task: per-chunk nested sub-streams, flows through bounded
 /// mpsc channels (64, D2 — full = backpressure, never dropped). The chain
 /// root's AbortHandle is the D18 teardown point.
+#[allow(clippy::too_many_arguments)] // chain plumbing: state+plan+ctx+ids ride together by design
 async fn spawn_chain(
     state: &Arc<AppState>,
     plan: &EnsemblePlan,
@@ -1700,10 +1790,14 @@ async fn spawn_chain(
     request_id: &str,
     opts: &EnsembleExecOpts,
     deadline_unix_ns: Option<i64>,
+    snapshot: &Arc<VersionSnapshot>,
 ) -> Result<EnsembleStream, AppError> {
     let nodes: Vec<usize> = chain.nodes.clone();
     let tail_idx = *nodes.last().unwrap();
     let tail = &plan.steps[tail_idx];
+    // E4/D15: the metric label carries the RESOLVED tail version (the chain
+    // nodes resolve via the same snapshot when their streams open).
+    let tail_version = snapshot.resolve(&state.registry, tail)?;
 
     // Inter-hop channels (nodes.len() - 1) + the tail output channel.
     let mut hop_txs: Vec<mpsc::Sender<pb::StreamResponse>> = Vec::new();
@@ -1724,7 +1818,7 @@ async fn spawn_chain(
     // SYNCHRONOUSLY — build failures surface as real error codes before the
     // stream is returned (the chain consumers then run detached).
     let head_stream = execute_stream_step(
-        state, plan, nodes[0], context, request_id, opts, deadline_unix_ns, None,
+        state, plan, nodes[0], context, request_id, opts, deadline_unix_ns, None, snapshot,
     )
     .await?;
     {
@@ -1752,6 +1846,7 @@ async fn spawn_chain(
     let opts_h = opts.clone();
     let handles_h = chain_handles.clone();
     let tail_tx_h = tail_tx.clone();
+    let snapshot_h = snapshot.clone();
     let chain_depth = nodes.len();
     crate::metrics::prometheus::record_ensemble_pipeline_chain_depth(chain_depth);
     let root = tokio::spawn(async move {
@@ -1773,11 +1868,12 @@ async fn spawn_chain(
             let req = request_id_h.clone();
             let opts = opts_h.clone();
             let handles = handles_h.clone();
+            let snapshot = snapshot_h.clone();
             let prev_name = plan_h.steps[nodes[i - 1]].name.clone();
             tasks.push(tokio::spawn(async move {
                 consume_stream_consumer(
                     &state, &plan, node, &prev_name, up_rx, down_tx, &ctx, &req, &opts,
-                    deadline_unix_ns, &handles, is_tail,
+                    deadline_unix_ns, &handles, is_tail, &snapshot,
                 )
                 .await
             }));
@@ -1796,7 +1892,7 @@ async fn spawn_chain(
         stream_id,
         cancel_client,
         tail_model: tail.model.clone(),
-        tail_version: unresolved_step_version(tail).to_string(),
+        tail_version,
         tail_step: tail.name.clone(),
         step_deadline: None,
         chain: chain_handles,
@@ -1879,18 +1975,20 @@ async fn streaming_worker_ready(
 /// Shared sub-model autoload (unary + streaming execution faces): config
 /// parse/validation errors surface as ModelNotReady; load failures surface
 /// directly. The caller polls its own readiness predicate afterwards (unary =
-/// registry ready, streaming = `streaming_worker_ready`).
+/// registry ready, streaming = `streaming_worker_ready`). Callers pass the
+/// RESOLVED version (E4/D15 — resolution happens once per step).
 async fn ensure_sub_model_loaded(
     state: &Arc<AppState>,
-    step: &EnsembleStep,
+    model: &str,
+    version: &str,
 ) -> Result<(), AppError> {
-    if state.registry.is_ready(&step.model, Some(unresolved_step_version(step))) {
+    if state.registry.is_ready(model, Some(version)) {
         return Ok(());
     }
     let load_start = Instant::now();
-    info!("Auto-loading sub-model {} v{} for ensemble", step.model, unresolved_step_version(step));
+    info!("Auto-loading sub-model {} v{} for ensemble", model, version);
     let sub_model_dir = crate::validation::resolve_model_dir(
-        &state.repo_path, &step.model, unresolved_step_version(step),
+        &state.repo_path, model, version,
     )?;
     // 配置解析/校验失败必须可见(同 reconcile:不再 unwrap_or_default
     // 静默回退默认配置;M7 迁移哨兵依赖此错误上浮)。
@@ -1900,15 +1998,15 @@ async fn ensure_sub_model_loaded(
         Ok(c) => c,
         Err(e) => {
             return Err(AppError::ModelNotReady(format!(
-                "sub-model {} v{} has invalid config.yaml: {}", step.model, unresolved_step_version(step), e
+                "sub-model {} v{} has invalid config.yaml: {}", model, version, e
             )));
         }
     };
     state.config.apply_model_defaults(&mut config);
-    if let Err(e) = state.worker_manager.load_model(&step.model, unresolved_step_version(step), &config).await {
-        warn!("Failed to auto-load sub-model {} v{}: {}", step.model, unresolved_step_version(step), e);
+    if let Err(e) = state.worker_manager.load_model(model, version, &config).await {
+        warn!("Failed to auto-load sub-model {} v{}: {}", model, version, e);
         return Err(AppError::ModelNotReady(format!(
-            "sub-model {} v{} not ready: {}", step.model, unresolved_step_version(step), e
+            "sub-model {} v{} not ready: {}", model, version, e
         )));
     }
     // m4: autoload wait (the dominant cold-TTFT term for ensemble DAGs).
@@ -1932,8 +2030,12 @@ async fn execute_stream_step(
     opts: &EnsembleExecOpts,
     deadline_unix_ns: Option<i64>,
     preflight: Option<TailPreflight>,
+    snapshot: &Arc<VersionSnapshot>,
 ) -> Result<EnsembleStream, AppError> {
     let step = &plan.steps[step_idx];
+    // E4/D15: execution-time version resolution (same source as execute_step;
+    // the metric label tail_version below is the resolved version).
+    let resolved_version = snapshot.resolve(&state.registry, step)?;
 
     // Resolve inputs into EnsembleValues (identical to the unary path).
     let mut resolved: HashMap<String, EnsembleValue> = HashMap::new();
@@ -1951,14 +2053,14 @@ async fn execute_stream_step(
             // D19: ensure the sub-model is loaded, then poll STREAMING
             // readiness (pick non-empty) with backoff. A pick failure is a
             // retryable state.
-            ensure_sub_model_loaded(state, step).await?;
+            ensure_sub_model_loaded(state, &step.model, &resolved_version).await?;
             let mut retries = 0;
             let max_retries = 30;
             let mut delay = Duration::from_millis(50);
-            while !streaming_worker_ready(state, &step.model, unresolved_step_version(step), &pb::RequestMeta::default()).await {
+            while !streaming_worker_ready(state, &step.model, &resolved_version, &pb::RequestMeta::default()).await {
                 if retries >= max_retries {
                     return Err(AppError::ModelNotReady(format!(
-                        "sub-model {} v{} streaming not ready", step.model, unresolved_step_version(step)
+                        "sub-model {} v{} streaming not ready", step.model, resolved_version
                     )));
                 }
                 // D19: quick-fail when the remaining budget cannot cover one
@@ -1967,7 +2069,7 @@ async fn execute_stream_step(
                     if rem < delay {
                         return Err(AppError::InferenceTimeout(format!(
                             "ensemble step {}: deadline exhausted while waiting for sub-model {} v{}",
-                            step.name, step.model, unresolved_step_version(step)
+                            step.name, step.model, resolved_version
                         )));
                     }
                 }
@@ -1976,10 +2078,10 @@ async fn execute_stream_step(
                 retries += 1;
             }
 
-            let mv = state.registry.get(&step.model, Some(unresolved_step_version(step)))
-                .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", step.model, unresolved_step_version(step))))?;
-            let clients = state.worker_manager.get_zmq_clients(&step.model, unresolved_step_version(step)).await
-                .ok_or_else(|| AppError::WorkerCrashed(format!("{} {} has no ZMQ clients", step.model, unresolved_step_version(step))))?;
+            let mv = state.registry.get(&step.model, Some(&resolved_version))
+                .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", step.model, resolved_version)))?;
+            let clients = state.worker_manager.get_zmq_clients(&step.model, &resolved_version).await
+                .ok_or_else(|| AppError::WorkerCrashed(format!("{} {} has no ZMQ clients", step.model, resolved_version)))?;
 
             // P-TRACE (同 execute_step): step-level span links to the parent
             // trace and injects its context into the step headers so the
@@ -2006,10 +2108,10 @@ async fn execute_stream_step(
                 &format!("{}:{}", request_id, step.name), &opts.client_ip, deadline_unix_ns, step_headers, bytes::Bytes::new(),
             );
 
-            let outlier = state.worker_manager.get_outlier_state(&step.model, unresolved_step_version(step)).await;
+            let outlier = state.worker_manager.get_outlier_state(&step.model, &resolved_version).await;
             let seq_registry = state.inference_queue.sequence_registry();
             let worker_id = crate::worker::pick_streaming_worker(
-                &meta, mv.workers.len(), outlier.as_deref(), seq_registry, &step.model, unresolved_step_version(step),
+                &meta, mv.workers.len(), outlier.as_deref(), seq_registry, &step.model, &resolved_version,
             ).map_err(|e| AppError::Validation(e.0))?;
             if worker_id >= clients.len() {
                 return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
@@ -2035,7 +2137,7 @@ async fn execute_stream_step(
             )));
         }
     }
-    crate::metrics::prometheus::record_worker_inference(&step.model, unresolved_step_version(step), worker_id, 1);
+    crate::metrics::prometheus::record_worker_inference(&step.model, &resolved_version, worker_id, 1);
 
     let client = &clients[worker_id];
     let stream_id = format!("stream-{}", Uuid::new_v4());
@@ -2058,7 +2160,7 @@ async fn execute_stream_step(
         stream_id,
         cancel_client: Arc::clone(client),
         tail_model: step.model.clone(),
-        tail_version: unresolved_step_version(step).to_string(),
+        tail_version: resolved_version.clone(),
         tail_step: step.name.clone(),
         // D35 (batch 3): E5 timeout_secs → step wall-clock cap; adapter
         // recv_chunk overall takes min(client overall, this). Inactive until
@@ -2218,7 +2320,15 @@ async fn execute_step(
     request_id: &str,
     client_ip: &str,
     deadline_unix_ns: Option<i64>,
+    snapshot: &Arc<VersionSnapshot>,
 ) -> Result<EnsembleValue, AppError> {
+    // E4/D15: resolve the sub-model version at execution time — explicit
+    // versions as-is, unresolved ("latest"/omitted) via the request-scoped
+    // snapshot (first resolution per model wins; registry active is the only
+    // source, D27). Every readiness/queue/registry call below uses the
+    // resolved version.
+    let resolved_version = snapshot.resolve(&state.registry, step)?;
+
     // Resolve inputs into EnsembleValues.
     let mut resolved: HashMap<String, EnsembleValue> = HashMap::new();
     for (key, ref_str) in &step.inputs {
@@ -2230,26 +2340,26 @@ async fn execute_step(
     let (payload_bytes, content_type_for_step) = assemble_step_payload(&step.name, &resolved)?;
 
     // Ensure sub-model is ready (shared autoload; unary readiness predicate)
-    ensure_sub_model_loaded(&state, step).await?;
+    ensure_sub_model_loaded(&state, &step.model, &resolved_version).await?;
     // Poll with exponential backoff for worker readiness
     let mut retries = 0;
     let max_retries = 30;
     let mut delay = Duration::from_millis(50);
-    while !state.registry.is_ready(&step.model, Some(unresolved_step_version(step))) && retries < max_retries {
+    while !state.registry.is_ready(&step.model, Some(&resolved_version)) && retries < max_retries {
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(Duration::from_millis(500));
         retries += 1;
     }
 
-    if !state.registry.is_ready(&step.model, Some(unresolved_step_version(step))) {
+    if !state.registry.is_ready(&step.model, Some(&resolved_version)) {
         return Err(AppError::ModelNotReady(format!(
-            "sub-model {} v{} is not ready", step.model, unresolved_step_version(step)
+            "sub-model {} v{} is not ready", step.model, resolved_version
         )));
     }
 
     // Get model version info
-    let mv = state.registry.get(&step.model, Some(unresolved_step_version(step)))
-        .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", step.model, unresolved_step_version(step))))?;
+    let mv = state.registry.get(&step.model, Some(&resolved_version))
+        .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", step.model, resolved_version)))?;
 
     if mv.model_type == ModelType::Ensemble {
         return Err(AppError::Internal("nested ensemble not supported".to_string()));
@@ -2261,7 +2371,7 @@ async fn execute_step(
     }
 
     // Send inference request through the unified queue
-    let uid = format!("ensemble_{}_{}_{}", step.model, unresolved_step_version(step), Uuid::new_v4());
+    let uid = format!("ensemble_{}_{}_{}", step.model, resolved_version, Uuid::new_v4());
 
     // P-TRACE (蓝图 §4.3 ensemble 接线，防 trace 断裂): the sub-step RequestMeta
     // would otherwise carry empty headers, orphaning every step span from the
@@ -2302,16 +2412,16 @@ async fn execute_step(
         enqueued_at: std::time::Instant::now(),
     };
 
-    match state.inference_queue.try_submit(&step.model, unresolved_step_version(step), item) {
+    match state.inference_queue.try_submit(&step.model, &resolved_version, item) {
         Ok(()) => {}
         Err(crate::inference_queue::QueueError::Full) => {
             return Err(AppError::QueueFull(format!(
-                "Queue full for {} {}", step.model, unresolved_step_version(step)
+                "Queue full for {} {}", step.model, resolved_version
             )));
         }
         Err(_) => {
             return Err(AppError::ModelNotReady(format!(
-                "Queue not available for {} {}", step.model, unresolved_step_version(step)
+                "Queue not available for {} {}", step.model, resolved_version
             )));
         }
     }
@@ -3524,5 +3634,79 @@ ensemble:
             let res = parse_ensemble_plan(&yaml, &PathBuf::from("/nonexistent/config.yaml"));
             assert!(res.is_err(), "timeout_secs={bad} must be a config error");
         }
+    }
+
+    // ===== Batch 3 (E4/D15) snapshot resolution tests =====
+
+    fn snapshot_step(model: &str, version: Option<&str>) -> EnsembleStep {
+        EnsembleStep {
+            name: "s".to_string(),
+            model: model.to_string(),
+            version: version.map(|v| v.to_string()),
+            inputs: HashMap::new(),
+            stream: false,
+            params: HashMap::new(),
+            timeout_secs: None,
+        }
+    }
+
+    fn registry_with_active(model: &str, version: &str) -> crate::registry::ModelRegistry {
+        let registry = crate::registry::ModelRegistry::new();
+        registry.force_pin_active_version(model, version);
+        registry
+    }
+
+    /// D15: the first resolution for a model wins — a later registry drift
+    /// must not change it within the same request.
+    #[test]
+    fn e4_snapshot_memoizes_first_resolution() {
+        let registry = registry_with_active("m", "1");
+        let snapshot = VersionSnapshot::default();
+        let step = snapshot_step("m", None);
+        assert_eq!(snapshot.resolve(&registry, &step).unwrap(), "1");
+        // Active drifts to v2 AFTER the first resolution — the snapshot still
+        // serves v1 (same-request consistency, D15).
+        registry.force_pin_active_version("m", "2");
+        assert_eq!(snapshot.resolve(&registry, &step).unwrap(), "1");
+    }
+
+    /// E4: explicit versions bypass the snapshot entirely.
+    #[test]
+    fn e4_explicit_version_bypasses_snapshot() {
+        let registry = registry_with_active("m", "1");
+        let snapshot = VersionSnapshot::default();
+        let step = snapshot_step("m", Some("2"));
+        assert_eq!(snapshot.resolve(&registry, &step).unwrap(), "2");
+        assert!(
+            snapshot.0.lock().unwrap().is_empty(),
+            "explicit versions must not touch the snapshot"
+        );
+    }
+
+    /// E4: an unresolved step with no active version is an execution-time
+    /// resolution error (ModelNotFound).
+    #[test]
+    fn e4_unresolved_without_active_version_is_error() {
+        let registry = crate::registry::ModelRegistry::new();
+        let snapshot = VersionSnapshot::default();
+        let step = snapshot_step("m", None);
+        assert!(snapshot.resolve(&registry, &step).is_err());
+    }
+
+    /// D15: the memoize key is the model — two unresolved steps for the same
+    /// model share ONE snapshot entry.
+    #[test]
+    fn e4_snapshot_keyed_by_model() {
+        let registry = registry_with_active("m", "1");
+        let snapshot = VersionSnapshot::default();
+        let a = snapshot_step("m", None);
+        let b = snapshot_step("m", None);
+        assert_eq!(snapshot.resolve(&registry, &a).unwrap(), "1");
+        assert_eq!(snapshot.resolve(&registry, &b).unwrap(), "1");
+        assert_eq!(
+            snapshot.0.lock().unwrap().len(),
+            1,
+            "one snapshot entry per model"
+        );
     }
 }
