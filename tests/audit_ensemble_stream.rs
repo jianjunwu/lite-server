@@ -725,9 +725,28 @@ fn write_all_fixtures(repo: &std::path::Path) {
     write_ensemble(repo, "ens_5xx", ENS_5XX_YAML);
     write_ensemble(repo, "ens_fail", ENS_FAIL_YAML);
     write_ensemble(repo, "ens_slow", ENS_SLOW_YAML);
+    // ===== batch 3 (E1/E2/E3/E4/D35) fixtures =====
+    write_reflect(repo);
+    write_drift(repo);
+    write_tail(repo, "tail_late", "");
+    write_ensemble(repo, "ens_nested_child", ENS_NESTED_CHILD_YAML);
+    write_ensemble(repo, "ens_nested_parent", ENS_NESTED_PARENT_YAML);
+    write_ensemble(repo, "ens_self", ENS_SELF_YAML);
+    write_ensemble(repo, "ens_mut_a", ENS_MUT_A_YAML);
+    write_ensemble(repo, "ens_mut_b", ENS_MUT_B_YAML);
+    write_ensemble(repo, "ens_child_stream", ENS_CHILD_STREAM_YAML);
+    write_ensemble(repo, "ens_out_mid", ENS_OUT_MID_YAML);
+    write_ensemble(repo, "ens_out_field", ENS_OUT_FIELD_YAML);
+    write_ensemble(repo, "ens_out_missing", ENS_OUT_MISSING_YAML);
+    write_ensemble(repo, "ens_params", ENS_PARAMS_YAML);
+    write_ensemble(repo, "ens_drift", ENS_DRIFT_YAML);
+    write_ensemble(repo, "ens_drift_child", ENS_DRIFT_CHILD_YAML);
+    write_ensemble(repo, "ens_drift_parent", ENS_DRIFT_PARENT_YAML);
+    write_ensemble(repo, "ens_e5_stream", ENS_E5_STREAM_YAML);
+    write_ensemble(repo, "ens_e5_autoload", ENS_E5_AUTOLOAD_YAML);
 }
 
-fn write_server_yaml(repo: &std::path::Path, http_port: u16, extra: &str) -> std::path::PathBuf {
+fn write_server_yaml(repo: &std::path::Path, http_port: u16, extra: &str, orch_extra: &str) -> std::path::PathBuf {
     // Port-suffixed dir: tests run concurrently and must not share files.
     let dir = std::env::temp_dir().join(format!(
         "lite-server-ens-stream-yaml-{}-{}",
@@ -741,16 +760,33 @@ fn write_server_yaml(repo: &std::path::Path, http_port: u16, extra: &str) -> std
         format!(
             "server:\n  http_port: {http_port}\n  timeout: 30.0\n{extra}\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n",
             repo.display()
         ),
     )
     .unwrap();
+    // Orchestration-scope extras (e.g. per-model strategies) land inside the
+    // orchestration block — injected between the key and control_mode, so the
+    // anchored replacement keeps the rest of the block intact.
+    if !orch_extra.is_empty() {
+        let content = std::fs::read_to_string(&path).unwrap();
+        let marked = content.replacen(
+            "orchestration:\n  control_mode: explicit",
+            &format!("orchestration:{orch_extra}\n  control_mode: explicit"),
+            1,
+        );
+        std::fs::write(&path, marked).unwrap();
+    }
     path
 }
 
 /// Boot a server with the fixture repo; returns (base, guard, repo).
 async fn boot_server(extra: &str) -> (String, ServerGuard, std::path::PathBuf) {
+    boot_server_orch(extra, "").await
+}
+
+/// boot_server + orchestration-scope extras (per-model strategies).
+async fn boot_server_orch(extra: &str, orch_extra: &str) -> (String, ServerGuard, std::path::PathBuf) {
     let http_port = next_test_port();
     kill_stale_on_port(http_port);
     // Port-suffixed repo: tests run concurrently and must not share files.
@@ -758,7 +794,7 @@ async fn boot_server(extra: &str) -> (String, ServerGuard, std::path::PathBuf) {
         .join(format!("lite-server-ens-stream-{}-{}", std::process::id(), http_port));
     let _ = std::fs::remove_dir_all(&repo);
     write_all_fixtures(&repo);
-    let server_yaml = write_server_yaml(&repo, http_port, extra);
+    let server_yaml = write_server_yaml(&repo, http_port, extra, orch_extra);
     let guard = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
     wait_for_server(http_port, 30).await;
     (
@@ -1107,7 +1143,7 @@ async fn boot_server_grpc(extra: &str) -> (String, u16, ServerGuard, std::path::
             "server:\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  timeout: 30.0\n{extra}\n\n\
              grpc:\n  enabled: true\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n",
             repo.display()
         ),
     )
@@ -2243,4 +2279,651 @@ async fn test_audit_stream_pipeline_same_layer_unary_sibling_runs() {
         "non-chain unary step in the head's layer must still execute (§4.2); \
          the sibling worker saw {count} inferences"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Batch 3 fixtures (E1/E2/E3/E4/D35)
+// ---------------------------------------------------------------------------
+
+/// Nested ensembles: parent pre → ens_nested_child (echo inside).
+// NOTE: the child only consumes single-level request fields ($request.x) —
+// multi-segment paths ($request.x.pre) are MIMO/R17 territory (batch 4), so
+// the parent flattens the payload it hands down.
+const ENS_NESTED_CHILD_YAML: &str = r#"ensemble:
+  steps:
+    - name: a
+      model: pre
+      version: "1"
+      inputs:
+        text: "$request.x"
+    - name: b
+      model: echo
+      version: "1"
+      inputs:
+        data: "$a.pre"
+"#;
+
+const ENS_NESTED_PARENT_YAML: &str = r#"ensemble:
+  steps:
+    - name: pre
+      model: pre
+      version: "1"
+      inputs:
+        text: "$request.text"
+    - name: child
+      model: ens_nested_child
+      inputs:
+        x: "$pre.pre"
+"#;
+
+/// Self-referencing DAG (step → its own model) — the ancestor guard rejects
+/// it at request time.
+const ENS_SELF_YAML: &str = r#"ensemble:
+  steps:
+    - name: only
+      model: ens_self
+      inputs:
+        x: "$request"
+"#;
+
+/// Cross-model mutual recursion (ens_mut_a → ens_mut_b → ens_mut_a) — the
+/// runtime ancestor chain catches what parse-time Kahn cannot.
+const ENS_MUT_A_YAML: &str = r#"ensemble:
+  steps:
+    - name: only
+      model: ens_mut_b
+      inputs:
+        x: "$request"
+"#;
+
+const ENS_MUT_B_YAML: &str = r#"ensemble:
+  steps:
+    - name: only
+      model: ens_mut_a
+      inputs:
+        x: "$request"
+"#;
+
+/// Parent step pointing at a STREAMING child DAG — rejected (D4).
+const ENS_CHILD_STREAM_YAML: &str = r#"ensemble:
+  steps:
+    - name: child
+      model: ens_stream
+      inputs:
+        x: "$request"
+"#;
+
+/// E2: explicit output pointing at a mid-DAG step (s2 still runs).
+const ENS_OUT_MID_YAML: &str = r#"ensemble:
+  output: "$s1"
+  steps:
+    - name: s1
+      model: pre
+      version: "1"
+      inputs:
+        text: "$request.text"
+    - name: s2
+      model: echo
+      version: "1"
+      inputs:
+        data: "$s1.pre"
+"#;
+
+/// E2: field projection on the output step.
+const ENS_OUT_FIELD_YAML: &str = r#"ensemble:
+  output: "$s1.pre"
+  steps:
+    - name: s1
+      model: pre
+      version: "1"
+      inputs:
+        text: "$request.text"
+    - name: s2
+      model: echo
+      version: "1"
+      inputs:
+        data: "$s1.pre"
+"#;
+
+/// E2: output field missing from the model's actual output → 400.
+const ENS_OUT_MISSING_YAML: &str = r#"ensemble:
+  output: "$s1.nope"
+  steps:
+    - name: s1
+      model: pre
+      version: "1"
+      inputs:
+        text: "$request.text"
+"#;
+
+/// E3: params merge into the assembled payload (reflect echoes the whole
+/// request back, so the merged params are observable).
+const ENS_PARAMS_YAML: &str = r#"ensemble:
+  steps:
+    - name: s1
+      model: reflect
+      version: "1"
+      inputs:
+        data: "$request.text"
+      params:
+        bias: 2
+"#;
+
+/// E4/D15: two steps of the SAME model (drift, version omitted) must share
+/// the first resolution even when the active version changes mid-request.
+/// `fin` (reflect) surfaces BOTH steps' versions in the response.
+const ENS_DRIFT_YAML: &str = r#"ensemble:
+  steps:
+    - name: a
+      model: drift
+      inputs:
+        x: "$request.text"
+    - name: b
+      model: drift
+      inputs:
+        x: "$a.ver"
+    - name: fin
+      model: reflect
+      version: "1"
+      inputs:
+        a_ver: "$a.ver"
+        b_ver: "$b.ver"
+"#;
+
+/// E4/D36 nested variant: the CHILD DAG resolves the same model through the
+/// parent's snapshot — a child building its own table would see the drift.
+const ENS_DRIFT_CHILD_YAML: &str = r#"ensemble:
+  steps:
+    - name: c
+      model: drift
+      inputs:
+        x: "$request.x"
+"#;
+
+const ENS_DRIFT_PARENT_YAML: &str = r#"ensemble:
+  steps:
+    - name: a
+      model: drift
+      inputs:
+        x: "$request.text"
+    - name: child
+      model: ens_drift_child
+      inputs:
+        x: "$a.ver"
+    - name: fin
+      model: reflect
+      version: "1"
+      inputs:
+        a_ver: "$a.ver"
+        c_ver: "$child.ver"
+"#;
+
+/// D35: streaming step with timeout_secs 1.0 over a 0.5s/chunk tail — the
+/// recv overall bound fires mid-stream → Error frame + close.
+const ENS_E5_STREAM_YAML: &str = r#"ensemble:
+  steps:
+    - name: pre
+      model: pre
+      version: "1"
+      inputs:
+        text: "$request.text"
+    - name: tail
+      model: tail_slow
+      version: "1"
+      stream: true
+      timeout_secs: 1.0
+      inputs:
+        pre: "$pre.pre"
+"#;
+
+/// D35 pre-open exhaustion: the tail model is NOT preloaded (autoload at
+/// request) and its step budget (0.01s) cannot survive the autoload → 504.
+const ENS_E5_AUTOLOAD_YAML: &str = r#"ensemble:
+  steps:
+    - name: pre
+      model: pre
+      version: "1"
+      inputs:
+        text: "$request.text"
+    - name: tail
+      model: tail_late
+      version: "1"
+      stream: true
+      timeout_secs: 0.01
+      inputs:
+        pre: "$pre.pre"
+"#;
+
+/// Reflect worker: returns the WHOLE decoded request (params observable).
+fn write_reflect(repo: &std::path::Path) {
+    write_model_py(
+        repo,
+        "reflect",
+        r#"from lite_server import LitAPI
+
+
+class ReflectAPI(LitAPI):
+    def setup(self, device):
+        self.device = device
+
+    async def decode_request(self, request, ctx=None):
+        return request
+
+    async def predict(self, x, ctx=None):
+        return {"got": x}
+
+    async def encode_response(self, output, ctx=None):
+        return output
+"#,
+    );
+}
+
+/// Two drift versions: v1 (slow 2s, answers "v1"), v2 (fast, answers "v2").
+fn write_drift(repo: &std::path::Path) {
+    for (version, ver, sleep_s) in [("1", "v1", "        time.sleep(2.0)\n"), ("2", "v2", "")] {
+        let dir = repo.join("drift").join(version);
+        std::fs::create_dir_all(&dir).unwrap();
+        let py = format!(
+            r#"import time
+from lite_server import LitAPI
+
+
+class DriftAPI(LitAPI):
+    def setup(self, device):
+        self.device = device
+
+    async def decode_request(self, request, ctx=None):
+        return request.get("x", "")
+
+    async def predict(self, x, ctx=None):
+{sleep_s}        return {{"ver": "{ver}"}}
+
+    async def encode_response(self, output, ctx=None):
+        return output
+"#
+        );
+        std::fs::write(dir.join("model.py"), py).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "max_batch_size: 1\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+        )
+        .unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Batch 3: E1 nesting / E2 output / E3 params / E4 snapshot / D35 timeout
+// ---------------------------------------------------------------------------
+
+/// E1: two-level nesting — parent pre → child ensemble (echo) → the child's
+/// output becomes the parent step's value.
+#[serial]
+#[tokio::test]
+async fn test_audit_stream_e1_nested_happy() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_nested_parent"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_nested_parent/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"text": "hello"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "nested ensemble must succeed");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body, json!({"echo": "hello"}), "nested output mismatch: {body}");
+}
+
+/// E1: a DAG whose step references ITSELF — the runtime ancestor guard
+/// rejects it (parse-time Kahn cannot see across configs).
+#[serial]
+#[tokio::test]
+async fn test_audit_stream_e1_self_loop_400() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_self"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_self/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"x": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "self-loop must be 400");
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("recursion"), "error must name the recursion: {body}");
+}
+
+/// E1: cross-model mutual recursion (A→B→A) — the ancestor chain catches it
+/// instead of running to the depth limit.
+#[serial]
+#[tokio::test]
+async fn test_audit_stream_e1_mutual_recursion_400() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_mut_a"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_mut_a/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"x": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "mutual recursion must be 400");
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("recursion"), "error must name the recursion: {body}");
+}
+
+/// E1 × D4: a parent step pointing at a STREAMING child DAG is rejected
+/// (nested ensembles are unary-only).
+#[serial]
+#[tokio::test]
+async fn test_audit_stream_e1_child_streaming_d4_400() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_child_stream"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_child_stream/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"x": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "D4 must be 400");
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("streaming"), "error must name the streaming child: {body}");
+}
+
+/// E2: explicit output — mid-DAG step selection and field projection.
+#[serial]
+#[tokio::test]
+async fn test_audit_stream_e2_output_mid_and_field() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_out_mid", "ens_out_field"]).await;
+
+    let client = reqwest::Client::new();
+    // output: "$s1" — s1's WHOLE value, even though s2 is the config-last step.
+    let resp = client
+        .post(format!("{}/v2/models/ens_out_mid/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"text": "hello"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body, json!({"pre": "hello"}), "output must select s1: {body}");
+
+    // output: "$s1.pre" — field projection.
+    let resp = client
+        .post(format!("{}/v2/models/ens_out_field/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"text": "hello"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body, json!("hello"), "field projection mismatch: {body}");
+}
+
+/// E2: output field missing from the model's actual output → 400 (the DAG
+/// contract does not match the model's shape).
+#[serial]
+#[tokio::test]
+async fn test_audit_stream_e2_output_missing_field_400() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_out_missing"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_out_missing/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"text": "hello"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "missing field must be 400");
+}
+
+/// E3: params merge into the assembled payload (the reflect worker echoes
+/// the whole request, so both the input and the param are observable).
+#[serial]
+#[tokio::test]
+async fn test_audit_stream_e3_params_merged() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_params"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_params/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"text": "hello"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["got"]["data"], json!("hello"), "input must reach the worker: {body}");
+    assert_eq!(body["got"]["bias"], json!(2), "params must merge into the payload: {body}");
+}
+
+/// E3: params × Binary input → 400 (assembly-time rejection).
+#[serial]
+#[tokio::test]
+async fn test_audit_stream_e3_params_binary_400() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_params"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_params/infer", base))
+        .header("Content-Type", "application/octet-stream")
+        .body(vec![0x00u8, 0x01, 0x02])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "params × Binary must be 400");
+}
+
+/// E4/D15: two steps of the same model (version omitted) share the FIRST
+/// resolution — activating v2 mid-request must not split the DAG.
+#[serial]
+#[tokio::test]
+async fn test_audit_stream_e4_snapshot_active_drift() {
+    // drift must hold TWO loaded versions (v1 active, v2 pre-loaded for the
+    // mid-request activation) — default max_loaded_versions=1 would 409.
+    let (base, _guard, _repo) = boot_server_orch("", "\n  models:\n    - name: drift\n      max_loaded_versions: 2\n      versions_to_load:\n        - \"1\"").await;
+    wait_ready_all(&base, &["ens_drift"]).await;
+
+    let client = reqwest::Client::new();
+    // Pre-load drift v2 so the mid-request activation is instant.
+    let resp = client
+        .post(format!("{}/v2/repository/models/drift/versions/2/load", base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "drift v2 load must succeed");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let ready = client
+            .get(format!("{}/v2/models/drift/versions/2/ready", base))
+            .send()
+            .await
+            .unwrap();
+        let v: Value = ready.json().await.unwrap();
+        if v["ready"].as_bool() == Some(true) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "drift v2 never became ready");
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    // Loading v2 AUTO-ACTIVATES it (auto_activated=true) — restore v1 as
+    // active so the request starts against v1.
+    let restore = client
+        .post(format!("{}/v2/models/drift/versions/1/activate", base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore.status(), 200, "restore v1 active must succeed");
+
+    // Fire the request (drift v1 predicts for ~2s), activate v2 mid-flight.
+    // The request must be POLLED concurrently (tokio::spawn) — an unpolled
+    // reqwest future never sends.
+    let req_client = client.clone();
+    let req_base = base.clone();
+    let req_task = tokio::spawn(async move {
+        req_client
+            .post(format!("{}/v2/models/ens_drift/infer", req_base))
+            .header("Content-Type", "application/json")
+            .json(&json!({"text": "hello"}))
+            .send()
+            .await
+    });
+    sleep(Duration::from_millis(400)).await;
+    let activate = client
+        .post(format!("{}/v2/models/drift/versions/2/activate", base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(activate.status(), 200, "activate v2 must succeed");
+
+    let start = std::time::Instant::now();
+    let resp = req_task.await.expect("request task must not panic").unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    let got = &body["got"];
+    assert_eq!(got["a_ver"], json!("v1"), "step a must use the pre-drift v1: {body}");
+    assert_eq!(
+        got["b_ver"], json!("v1"),
+        "step b must share step a's snapshot (same-request consistency, D15): {body}"
+    );
+    // Both steps ran drift v1 (2s predict each) — a wall-clock check proves
+    // step a really used the slow v1, not the fast v2.
+    assert!(
+        start.elapsed() >= Duration::from_secs(3),
+        "both steps must have run the slow v1 (elapsed {:?})",
+        start.elapsed()
+    );
+
+    // A FRESH request re-resolves — the snapshot is per-request.
+    let resp = client
+        .post(format!("{}/v2/models/ens_drift/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"text": "hello"}))
+        .send()
+        .await
+        .unwrap();
+    let body2: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body2["got"]["a_ver"], json!("v2"),
+        "fresh request must see the new active v2: {body2}"
+    );
+}
+
+/// E4/D36 nested variant: the CHILD DAG resolves the same model through the
+/// PARENT's snapshot — a child building its own table would see the drift.
+#[serial]
+#[tokio::test]
+async fn test_audit_stream_e4_snapshot_nested_d36() {
+    let (base, _guard, _repo) = boot_server_orch("", "\n  models:\n    - name: drift\n      max_loaded_versions: 2\n      versions_to_load:\n        - \"1\"").await;
+    wait_ready_all(&base, &["ens_drift_parent"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/repository/models/drift/versions/2/load", base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let ready = client
+            .get(format!("{}/v2/models/drift/versions/2/ready", base))
+            .send()
+            .await
+            .unwrap();
+        let v: Value = ready.json().await.unwrap();
+        if v["ready"].as_bool() == Some(true) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "drift v2 never became ready");
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    // Loading v2 AUTO-ACTIVATES it (auto_activated=true) — restore v1 as
+    // active so the request starts against v1.
+    let restore = client
+        .post(format!("{}/v2/models/drift/versions/1/activate", base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore.status(), 200, "restore v1 active must succeed");
+
+    let req_client = client.clone();
+    let req_base = base.clone();
+    let req_task = tokio::spawn(async move {
+        req_client
+            .post(format!("{}/v2/models/ens_drift_parent/infer", req_base))
+            .header("Content-Type", "application/json")
+            .json(&json!({"text": "hello"}))
+            .send()
+            .await
+    });
+    sleep(Duration::from_millis(400)).await;
+    let activate = client
+        .post(format!("{}/v2/models/drift/versions/2/activate", base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(activate.status(), 200);
+
+    let resp = req_task.await.expect("request task must not panic").unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    let got = &body["got"];
+    assert_eq!(got["a_ver"], json!("v1"), "parent step a must use v1: {body}");
+    assert_eq!(
+        got["c_ver"], json!("v1"),
+        "the nested child must share the parent's snapshot (D36): {body}"
+    );
+}
+
+/// D35: a streaming step's timeout_secs cap fires mid-stream → Error frame +
+/// close (reason=deadline), chunks before the cap still flow.
+#[serial]
+#[tokio::test]
+async fn test_audit_stream_e5_stream_timeout_error_frame() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_e5_stream"]).await;
+
+    let body = sse_post(&base, "/v2/models/ens_e5_stream/events", json!({"text": "a b c d e f g h"}))
+        .await
+        .expect("stream must open (200) before the step cap fires");
+    assert!(body.contains("token"), "chunks before the cap must flow: {body}");
+    assert!(
+        body.contains("error") && !body.contains("[DONE]"),
+        "step timeout must close with an Error frame, no [DONE]: {body}"
+    );
+}
+
+/// D35 pre-open exhaustion: the tail model is not preloaded (autoload at
+/// request) and its 0.01s step budget cannot survive the autoload → 504
+/// (§4.4 deadline row, the status-code window is still open).
+#[serial]
+#[tokio::test]
+async fn test_audit_stream_e5_autoload_timeout_504() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_e5_autoload"]).await;
+
+    let err = sse_post(&base, "/v2/models/ens_e5_autoload/events", json!({"text": "hello"}))
+        .await
+        .expect_err("a step budget that cannot cover the autoload must fail");
+    assert_eq!(err, reqwest::StatusCode::GATEWAY_TIMEOUT, "must be 504 (deadline row)");
 }

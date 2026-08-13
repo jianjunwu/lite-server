@@ -452,3 +452,264 @@ async fn test_grpc_http_ensemble_parity_and_dag_not_found_mapping() {
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+// ---------------------------------------------------------------------------
+// D30 (batch 3): gRPC batch × ensemble — element-wise DAG execution
+// ---------------------------------------------------------------------------
+
+/// Unary echo sub-model for the batch fixtures.
+fn write_batch_echo(repo: &std::path::Path) {
+    let dir = repo.join("echo/1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("model.py"),
+        r#"from lite_server import LitAPI
+
+
+class EchoAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request, ctx):
+        return request.get("data", "")
+
+    def predict(self, x):
+        return {"echo": x}
+
+    def encode_response(self, output):
+        return output
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+}
+
+/// Minimal streaming tail (never executed — the D30 reject fires on the
+/// plan's stream marker before any element runs).
+fn write_batch_stream_tail(repo: &std::path::Path) {
+    let dir = repo.join("stream_tail/1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("model.py"),
+        r#"from lite_server import LitAPI
+
+
+class TailAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request, ctx):
+        return request.get("data", "")
+
+    def stream_predict(self, request, ctx=None):
+        yield {"token": request}
+
+    def encode_response(self, output):
+        return output
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        "max_batch_size: 1\nbatch_timeout: 0.0\nstream: true\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+    )
+    .unwrap();
+}
+
+fn write_batch_ensembles(repo: &std::path::Path) {
+    let dir = repo.join("ens_batch/1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        r#"ensemble:
+  steps:
+    - name: s1
+      model: echo
+      version: "1"
+      inputs:
+        data: "$request.data"
+"#,
+    )
+    .unwrap();
+    let dir = repo.join("ens_batch_stream/1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        r#"ensemble:
+  steps:
+    - name: tail
+      model: stream_tail
+      version: "1"
+      stream: true
+      inputs:
+        data: "$request.data"
+"#,
+    )
+    .unwrap();
+}
+
+/// Boot a server with the D30 fixtures (explicit loads via the API).
+#[cfg(unix)]
+async fn boot_batch_server() -> (String, u16, ServerGuard, std::path::PathBuf) {
+    let http_port = next_test_port();
+    let grpc_port = next_test_port();
+    let metrics_port = next_test_port();
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+    let repo = std::env::temp_dir()
+        .join(format!("lite-server-audit-ensbatch-{}-{}", std::process::id(), http_port));
+    let _ = std::fs::remove_dir_all(&repo);
+    write_batch_echo(&repo);
+    write_batch_stream_tail(&repo);
+    write_batch_ensembles(&repo);
+
+    let tmp_dir = std::env::temp_dir()
+        .join(format!("lite-server-audit-ensbatch-yaml-{}-{}", std::process::id(), http_port));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let server_yaml = tmp_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: {metrics_port}\n  timeout: 30.0\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: true\nmodel_repository:\n  path: {repo}\n",
+            http_port = http_port,
+            grpc_port = grpc_port,
+            metrics_port = metrics_port,
+            repo = repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let guard = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(http_port, 30).await;
+    (
+        format!("http://127.0.0.1:{}", http_port),
+        grpc_port,
+        guard,
+        repo,
+    )
+}
+
+/// D30: batch × ensemble happy — elements run in parallel and the response
+/// preserves request order; each element = the DAG's unary output.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_audit_d30_batch_ensemble_elements_ordered() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::BatchInferRequest;
+    use std::collections::HashMap;
+
+    let (base, grpc_port, _guard, _repo) = boot_batch_server().await;
+    load_model(&base, "ens_batch", "1").await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+    let req = tonic::Request::new(BatchInferRequest {
+        model_name: "ens_batch".to_string(),
+        version: "1".to_string(),
+        items: vec![
+            br#"{"data":"a"}"#.to_vec().into(),
+            br#"{"data":"b"}"#.to_vec().into(),
+            br#"{"data":"c"}"#.to_vec().into(),
+        ],
+        headers: HashMap::new(),
+    });
+    let resp = client
+        .batch_infer(req)
+        .await
+        .expect("batch ensemble must succeed");
+    let items = resp.into_inner().items;
+    assert_eq!(items.len(), 3, "one response per element");
+    let expected = [r#"{"echo":"a"}"#, r#"{"echo":"b"}"#, r#"{"echo":"c"}"#];
+    for (i, item) in items.iter().enumerate() {
+        assert_eq!(
+            item.status.as_ref().unwrap().code,
+            "Ok",
+            "element {i} must be Ok: {}",
+            item.status.as_ref().unwrap().message
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&item.data),
+            expected[i],
+            "element {i} must keep its request order"
+        );
+    }
+}
+
+/// D30: element-level failures ride the element's status (the RPC stays Ok —
+/// batch semantics); the mapped §4.4 unary-row code rides the message.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_audit_d30_batch_ensemble_element_error_mapped() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::BatchInferRequest;
+    use std::collections::HashMap;
+
+    let (base, grpc_port, _guard, _repo) = boot_batch_server().await;
+    load_model(&base, "ens_batch", "1").await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+    let req = tonic::Request::new(BatchInferRequest {
+        model_name: "ens_batch".to_string(),
+        version: "1".to_string(),
+        items: vec![
+            br#"{"data":"a"}"#.to_vec().into(),
+            br#"not json"#.to_vec().into(),
+            br#"{"data":"c"}"#.to_vec().into(),
+        ],
+        headers: HashMap::new(),
+    });
+    let resp = client
+        .batch_infer(req)
+        .await
+        .expect("element errors must not fail the batch RPC");
+    let items = resp.into_inner().items;
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0].status.as_ref().unwrap().code, "Ok");
+    let err_status = items[1].status.as_ref().unwrap();
+    assert_eq!(err_status.code, "Error", "invalid JSON element must error");
+    assert!(
+        err_status.message.starts_with("400"),
+        "element error must carry the mapped 400 (§4.4): {}",
+        err_status.message
+    );
+    assert_eq!(items[2].status.as_ref().unwrap().code, "Ok");
+    assert_eq!(String::from_utf8_lossy(&items[2].data), r#"{"echo":"c"}"#);
+}
+
+/// D30: a streaming DAG via batch → whole-RPC InvalidArgument (no
+/// element-level streaming).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_audit_d30_batch_ensemble_streaming_dag_invalid_argument() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::BatchInferRequest;
+    use std::collections::HashMap;
+
+    let (base, grpc_port, _guard, _repo) = boot_batch_server().await;
+    load_model(&base, "ens_batch_stream", "1").await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+    let req = tonic::Request::new(BatchInferRequest {
+        model_name: "ens_batch_stream".to_string(),
+        version: "1".to_string(),
+        items: vec![br#"{"data":"a"}"#.to_vec().into()],
+        headers: HashMap::new(),
+    });
+    let status = client
+        .batch_infer(req)
+        .await
+        .expect_err("streaming DAG via batch must be rejected");
+    assert_eq!(
+        status.code(),
+        tonic::Code::InvalidArgument,
+        "streaming DAG via batch → InvalidArgument, got: {status}"
+    );
+}
