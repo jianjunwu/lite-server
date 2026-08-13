@@ -4,6 +4,7 @@ use crate::proto::liteserver as pb;
 use crate::registry::types::ModelType;
 use bytes::Bytes;
 use dashmap::DashMap;
+use futures::stream::{FuturesUnordered, StreamExt};
 use indexmap::IndexMap;
 use regex::Regex;
 use serde::Deserialize;
@@ -877,6 +878,7 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
             inputs_decl: None,
             input_modes: Vec::new(),
             conditional_refs: Vec::new(),
+            step_dep_keys: Vec::new(),
             outputs: None,
             dag_sets: Some(sets),
             config_path: config_path.to_path_buf(),
@@ -993,6 +995,21 @@ fn parse_ensemble_set(
         .into_iter()
         .map(|layer| layer.into_iter().map(|s| index_of[s.name.as_str()]).collect())
         .collect();
+    // P1 (batch 6): per-step referenced context keys — spawn-time clones
+    // select these instead of the whole table. Runs after ref validation,
+    // so every ref shape is parse-proven.
+    let step_dep_keys = steps
+        .iter()
+        .map(|s| {
+            s.inputs.values().try_fold(Vec::new(), |mut keys, r| {
+                let key = context_key_for_ref(&steps, r)?;
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+                Ok::<_, AppError>(keys)
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(EnsemblePlan {
         output_step,
@@ -1005,6 +1022,7 @@ fn parse_ensemble_set(
         inputs_decl,
         input_modes,
         conditional_refs,
+        step_dep_keys,
         // E7 (batch 4④): multi-sink output mapping (None = single output).
         outputs,
         // E8-1 (batch 5): a single-set plan carries no named sets.
@@ -1867,6 +1885,50 @@ pub enum ResolvedRef {
     Absent(String),
 }
 
+/// P1 (batch 6): the context key a `$ref` resolves against — mirrors
+/// [`resolve_ref`]'s key derivation exactly (parse-time use; ref shapes are
+/// already validated, so unreachable shapes still derive the same key the
+/// runtime would compute before erroring).
+fn context_key_for_ref(steps: &[EnsembleStep], ref_str: &str) -> Result<String, AppError> {
+    let caps = REF_RE.captures(ref_str).ok_or_else(|| {
+        AppError::Config(format!("invalid reference: {}", ref_str))
+    })?;
+    let source = caps.get(1).unwrap().as_str();
+    let rest = caps.get(2).map(|m| m.as_str());
+    Ok(match source {
+        "inputs" => {
+            let name = rest.and_then(|r| r.split('.').next()).unwrap_or("");
+            format!("inputs.{name}")
+        }
+        step_name => {
+            match steps
+                .iter()
+                .find(|s| s.name == step_name)
+                .and_then(|s| s.outputs_decl.as_ref())
+            {
+                Some(_decl) => {
+                    let alias = rest.and_then(|r| r.split('.').next()).unwrap_or("");
+                    format!("{step_name}.{alias}")
+                }
+                None => step_name.to_string(),
+            }
+        }
+    })
+}
+
+/// P1 (batch 6): clone only the context keys a step references — the
+/// spawn-time whole-table clone (O(payload × steps) deep copies) is gone.
+/// A referenced key always exists in a running step (absent optional inputs
+/// skip the step before spawn), so missing keys are simply not selected.
+fn select_ctx_keys(
+    context: &HashMap<String, EnsembleValue>,
+    keys: &[String],
+) -> HashMap<String, EnsembleValue> {
+    keys.iter()
+        .filter_map(|k| context.get(k).map(|v| (k.clone(), v.clone())))
+        .collect()
+}
+
 /// Resolve a `$ref` against the runtime context. The PLAN's static type
 /// environment decides the semantics (parse rules R3/R5/R7/R8 already
 /// rejected ill-typed refs — the runtime only projects/forwards):
@@ -2378,6 +2440,12 @@ pub struct EnsemblePlan {
     /// non-empty marks a CONDITIONAL step (absent input → step skipped,
     /// D13/E6-skip channel). Index-aligned with `steps`.
     pub conditional_refs: Vec<Vec<String>>,
+    /// P1 (batch 6): per-step referenced CONTEXT keys, parse-computed from
+    /// the step's input refs (derivation mirrors [`resolve_ref`]). Spawn-time
+    /// clones select these keys instead of the whole table — the deep-copy
+    /// of every sibling output per spawn is eliminated. Index-aligned with
+    /// `steps`.
+    pub step_dep_keys: Vec<Vec<String>>,
     /// E7 (batch 4④): multi-sink aliases `{alias: $ref}` — the response is
     /// a KServe envelope (build_response). None = the historical single
     /// output.
@@ -3198,8 +3266,146 @@ pub(crate) async fn execute_ensemble_inner(
     Ok(EnsembleOutcome::Stream(stream))
 }
 
-/// Layer-barrier executor (historical engine): runs `layers` serially, each
-/// layer in a JoinSet (P-FLOW shared cancel), writing step outputs into
+/// P3/P11 (batch 6): a layer step future's completion — (step name, result).
+type StepFutOutput = (String, Result<StepResults, AppError>);
+
+/// P3/P11 (batch 6): build one step's execution future — the E8-2 when and
+/// MIMO R4 conditional-absence checks run up front (a skipped step yields
+/// None with a warn); the E4/D15 metric-label resolution runs here too, so
+/// a failed resolution aborts the layer (the same error execute_step would
+/// surface for that step). The future carries the step's latency recording.
+#[allow(clippy::too_many_arguments)] // layer plumbing: state+plan+ctx+ids ride together by design
+fn build_step_fut(
+    state: &Arc<AppState>,
+    plan_run: &Arc<EnsemblePlan>,
+    step_idx: usize,
+    context: &HashMap<String, EnsembleValue>,
+    absent_inputs: &HashSet<String>,
+    opts: &EnsembleExecOpts,
+    model_name: &str,
+    request_id: &str,
+    snapshot: &Arc<VersionSnapshot>,
+    depth: u32,
+    ancestors: &[(String, String)],
+    deadline_unix_ns: Option<i64>,
+) -> Result<Option<impl Future<Output = StepFutOutput> + 'static>, AppError> {
+    // E8-2 (batch 5): a when-false step is skipped (E6 channel).
+    if !when_passes(step_idx, plan_run, opts, context)? {
+        warn!(
+            step = %plan_run.steps[step_idx].name,
+            "ensemble step skipped (when condition false)"
+        );
+        return Ok(None);
+    }
+    // MIMO R4 (D13): a conditional step whose optional input is absent
+    // this request is skipped — the E6-skip channel.
+    if plan_run.conditional_refs[step_idx]
+        .iter()
+        .any(|n| absent_inputs.contains(n))
+    {
+        warn!(
+            step = %plan_run.steps[step_idx].name,
+            "ensemble step skipped (optional input absent)"
+        );
+        return Ok(None);
+    }
+    let state = state.clone();
+    // P1 (batch 6): the step sees only the keys it references.
+    let ctx = select_ctx_keys(context, &plan_run.step_dep_keys[step_idx]);
+    let step = plan_run.steps[step_idx].clone();
+    let plan_spawn = plan_run.clone();
+    let ensemble_name = model_name.to_string();
+    let request_id = request_id.to_string();
+    let client_ip = opts.client_ip.clone();
+    // E4/D15: resolve the metric label BEFORE the future runs (a failed
+    // resolution aborts the layer here — the same error execute_step
+    // would surface for that step). The resolved label is the truthful
+    // version the step will call.
+    let resolved_label = snapshot.resolve(&state.registry, &step)?;
+    // m4: the metric label records the actual version only for EXPLICIT
+    // versions — unresolved ("latest"/omitted) normalizes to "latest" so
+    // active drift cannot grow the label set (model × step × version).
+    let version_label = if step.version.is_some() {
+        resolved_label
+    } else {
+        "latest".to_string()
+    };
+    let snapshot = snapshot.clone();
+    let ancestors = ancestors.to_vec();
+    Ok(Some(async move {
+        let start = Instant::now();
+        let result = execute_step(
+            state, &plan_spawn, step_idx, &step, &ctx, &request_id, &client_ip,
+            deadline_unix_ns, &snapshot, depth, &ancestors,
+        )
+        .await;
+        let latency = start.elapsed().as_secs_f64();
+        crate::metrics::prometheus::record_ensemble_step_latency(
+            &ensemble_name, &step.name, &step.model, &version_label, depth, latency,
+        );
+        (step.name, result)
+    }))
+}
+
+/// P3/P11 (batch 6): a completed step's result — named outputs land in the
+/// context; a skip step's failure leaves it ABSENT and the layer continues
+/// (parse rules guarantee nothing references it); any other error
+/// propagates (B3 — client errors keep their status codes, no Internal
+/// wrapping).
+fn handle_step_result(
+    name: &str,
+    result: Result<StepResults, AppError>,
+    context: &mut HashMap<String, EnsembleValue>,
+    skip_set: &HashSet<&str>,
+) -> Result<(), AppError> {
+    match result {
+        Ok(values) => {
+            // MIMO: materialized named outputs land under their
+            // `step.alias` keys (undeclared steps: the single `step` key).
+            for (key, value) in values {
+                context.insert(key, value);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // E6 (batch 4): a skip step's failure leaves it ABSENT from the
+            // context and the layer continues (parse rules guarantee
+            // nothing references it).
+            if skip_set.contains(name) {
+                warn!(step = %name, error = %e, "ensemble step skipped (on_error: skip)");
+                Ok(())
+            } else {
+                // B3: propagate step errors directly — client errors (e.g.
+                // InvalidRequestBody from resolve_ref E7 rules) must reach
+                // the HTTP/gRPC layer with their correct status code, not
+                // be wrapped in Internal(500).
+                Err(e)
+            }
+        }
+    }
+}
+
+/// P11 (batch 6): drive one layer's step futures in-task (zero spawn) — the
+/// first failing step propagates immediately and the remaining in-flight
+/// futures are dropped with it (the historical JoinSet first-err +
+/// drop-abort semantics, P-FLOW §4.0.9 preserved).
+async fn drive_step_futs<F>(
+    mut futs: FuturesUnordered<F>,
+    context: &mut HashMap<String, EnsembleValue>,
+    skip_set: &HashSet<&str>,
+) -> Result<(), AppError>
+where
+    F: Future<Output = StepFutOutput>,
+{
+    while let Some((name, result)) = futs.next().await {
+        handle_step_result(&name, result, context, skip_set)?;
+    }
+    Ok(())
+}
+
+/// Layer-barrier executor (historical engine): runs `layers` serially,
+/// driving each layer IN-TASK (P3 + P11, batch 6 — zero spawn; the
+/// historical per-step tokio::spawn is gone), writing step outputs into
 /// `context`. Step errors propagate directly (B3). The whole run is bounded
 /// by a single shared deadline (P-DEADLINE §4.0.10): an N-layer ensemble can
 /// never exceed the parent; the per-step timeout in execute_step is the
@@ -3232,101 +3438,39 @@ async fn run_layers(
         .collect();
     let ensemble_run = async {
         for layer in layers {
-            // P-FLOW (§4.0.9): a JoinSet per layer is the ensemble's shared
-            // cancel. On any early exit — a step error, the outer total-budget
-            // timeout, or the parent request being dropped (client disconnect) —
-            // the JoinSet is dropped and tokio ABORTS every in-flight step task
-            // in the layer, so a cancelled ensemble does not leave sub-steps
-            // running on workers (detached `tokio::spawn` would outlive the
-            // parent). Completed tasks are no-ops to abort.
-            let mut set: tokio::task::JoinSet<(String, Result<StepResults, AppError>)> =
-                tokio::task::JoinSet::new();
-            for &step_idx in layer {
-                // E8-2 (batch 5): a when-false step is skipped (E6 channel).
-                if !when_passes(step_idx, &plan_run, opts, context)? {
-                    warn!(
-                        step = %plan_run.steps[step_idx].name,
-                        "ensemble step skipped (when condition false)"
-                    );
+            // P3 + P11 (batch 6): zero-spawn layer driving. A single-step
+            // layer is awaited directly (the historical JoinSet spawned a
+            // task even here); a multi-step layer is driven in-task via
+            // FuturesUnordered. P-FLOW cancel semantics are preserved: on
+            // any early exit — a step error, the outer total-budget timeout,
+            // or the parent request being dropped (client disconnect) — the
+            // layer's in-flight futures are dropped with the executor, so a
+            // cancelled ensemble never leaves sub-steps computing on workers.
+            if layer.len() == 1 {
+                let step_idx = layer[0];
+                let Some(fut) = build_step_fut(
+                    state, &plan_run, step_idx, context, absent_inputs, opts,
+                    model_name, request_id, snapshot, depth, ancestors,
+                    deadline_unix_ns,
+                )?
+                else {
                     continue;
-                }
-                // MIMO R4 (D13): a conditional step whose optional input is
-                // absent this request is skipped — the E6-skip channel.
-                if plan_run.conditional_refs[step_idx]
-                    .iter()
-                    .any(|n| absent_inputs.contains(n))
-                {
-                    warn!(
-                        step = %plan_run.steps[step_idx].name,
-                        "ensemble step skipped (optional input absent)"
-                    );
-                    continue;
-                }
-                let state = state.clone();
-                let ctx = context.clone();
-                let step = plan_run.steps[step_idx].clone();
-                let plan_spawn = plan_run.clone();
-                let ensemble_name = model_name.to_string();
-                let request_id = request_id.to_string();
-                let client_ip = opts.client_ip.clone();
-                // E4/D15: resolve the metric label BEFORE spawning (a failed
-                // resolution aborts the layer here — the same error execute_step
-                // would surface for that step). The resolved label is the
-                // truthful version the step will call.
-                let resolved_label = snapshot.resolve(&state.registry, &step)?;
-                // m4: the metric label records the actual version only for
-                // EXPLICIT versions — unresolved ("latest"/omitted) normalizes
-                // to "latest" so active drift cannot grow the label set
-                // (model × step × version).
-                let version_label = if step.version.is_some() {
-                    resolved_label
-                } else {
-                    "latest".to_string()
                 };
-                let snapshot = snapshot.clone();
-                let ancestors = ancestors.to_vec();
-                set.spawn(async move {
-                    let start = Instant::now();
-                    let result =
-                        execute_step(state, &plan_spawn, step_idx, &step, &ctx, &request_id, &client_ip, deadline_unix_ns, &snapshot, depth, &ancestors)
-                            .await;
-                    let latency = start.elapsed().as_secs_f64();
-                    crate::metrics::prometheus::record_ensemble_step_latency(
-                        &ensemble_name, &step.name, &step.model, &version_label, depth, latency,
-                    );
-                    (step.name, result)
-                });
+                let (name, result) = fut.await;
+                handle_step_result(&name, result, context, &skip_set)?;
+                continue;
             }
-
-            while let Some(joined) = set.join_next().await {
-                let (name, result) = joined.map_err(|e| {
-                    AppError::Internal(format!("ensemble step join error: {}", e))
-                })?;
-                match result {
-                    Ok(values) => {
-                        // MIMO: materialized named outputs land under their
-                        // `step.alias` keys (undeclared steps: the single
-                        // `step` key).
-                        for (key, value) in values {
-                            context.insert(key, value);
-                        }
-                    }
-                    Err(e) => {
-                        // E6 (batch 4): a skip step's failure leaves it
-                        // ABSENT from the context and the layer continues
-                        // (parse rules guarantee nothing references it).
-                        if skip_set.contains(name.as_str()) {
-                            warn!(step = %name, error = %e, "ensemble step skipped (on_error: skip)");
-                            continue;
-                        }
-                        // B3: propagate step errors directly — client errors
-                        // (e.g. InvalidRequestBody from resolve_ref E7 rules)
-                        // must reach the HTTP/gRPC layer with their correct
-                        // status code, not be wrapped in Internal(500).
-                        return Err(e);
-                    }
+            let futs: FuturesUnordered<_> = FuturesUnordered::new();
+            for &step_idx in layer {
+                if let Some(fut) = build_step_fut(
+                    state, &plan_run, step_idx, context, absent_inputs, opts,
+                    model_name, request_id, snapshot, depth, ancestors,
+                    deadline_unix_ns,
+                )? {
+                    futs.push(fut);
                 }
             }
+            drive_step_futs(futs, context, &skip_set).await?;
         }
         Ok::<(), AppError>(())
     };
@@ -3420,7 +3564,8 @@ async fn open_tail_stream(
                 continue;
             }
             let state = state.clone();
-            let ctx = context.clone();
+            // P1 (batch 6): the sibling sees only its referenced keys.
+            let ctx = select_ctx_keys(context, &plan.step_dep_keys[idx]);
             let step = plan.steps[idx].clone();
             let plan_spawn = Arc::new(plan.clone());
             let request_id = request_id.to_string();
@@ -3602,6 +3747,10 @@ async fn consume_stream_consumer(
     snapshot: &Arc<VersionSnapshot>,
 ) -> Result<(), AppError> {
     let step = &plan.steps[step_idx];
+    // P1 (batch 6): the per-chunk context clone selects only this step's
+    // referenced keys (parse-computed) — the whole-table clone per chunk
+    // is gone; the upstream chunk value is inserted per chunk below.
+    let base_ctx = select_ctx_keys(context, &plan.step_dep_keys[step_idx]);
     let mut seq: u64 = 0;
     let mut error_terminated = false;
     while let Some(chunk) = upstream.recv().await {
@@ -3614,7 +3763,7 @@ async fn consume_stream_consumer(
                         prev_step_name
                     ))
                 })?;
-                let mut ctx = context.clone();
+                let mut ctx = base_ctx.clone();
                 ctx.insert(
                     prev_step_name.to_string(),
                     EnsembleValue::Json(chunk_value),
@@ -3761,7 +3910,13 @@ async fn spawn_chain(
 
     let state_h = state.clone();
     let plan_h = plan.clone();
-    let context_h = context.clone();
+    // P1 (batch 6): per-hop context subsets — each hop resolves only its
+    // own step's refs; the whole-table clone per hop task is gone.
+    let mut hop_ctxs: Vec<HashMap<String, EnsembleValue>> = nodes
+        .iter()
+        .skip(1)
+        .map(|&node| select_ctx_keys(context, &plan.step_dep_keys[node]))
+        .collect();
     let request_id_h = request_id.to_string();
     let opts_h = opts.clone();
     let handles_h = chain_handles.clone();
@@ -3784,7 +3939,7 @@ async fn spawn_chain(
             let up_rx = std::mem::replace(&mut prev_rx, hop_rxs.remove(0));
             let state = state_h.clone();
             let plan = plan_h.clone();
-            let ctx = context_h.clone();
+            let ctx = hop_ctxs.remove(0);
             let req = request_id_h.clone();
             let opts = opts_h.clone();
             let handles = handles_h.clone();
@@ -5229,6 +5384,157 @@ mod tests {
         );
     }
 
+    // === P1 (batch 6): per-step dependency-key cloning ===
+
+    #[test]
+    fn p1_step_dep_keys_legacy_and_mimo() {
+        let plan = parse_ensemble_plan(
+            "ensemble:\n  inputs:\n    text:\n      type: json\n    image:\n      type: binary\n  steps:\n    - name: tok\n      model: pre\n      version: \"1\"\n      inputs:\n        text: \"$inputs.text\"\n    - name: enc\n      model: vis_enc\n      version: \"1\"\n      outputs:\n        thumb:\n          type: binary\n          path: \"$.thumb\"\n        emb:\n          type: json\n          path: \"$.emb\"\n      inputs:\n        img: \"$inputs.image\"\n    - name: out\n      model: echo\n      version: \"1\"\n      inputs:\n        data: \"$tok\"\n        emb: \"$enc.emb\"\n",
+            &PathBuf::from("/nonexistent/config.yaml"),
+        )
+        .unwrap();
+        assert_eq!(plan.step_dep_keys[0], vec!["inputs.text".to_string()]);
+        assert_eq!(plan.step_dep_keys[1], vec!["inputs.image".to_string()]);
+        // Step inputs are a HashMap — ref order is arbitrary; the key SET
+        // is the contract.
+        let mut keys = plan.step_dep_keys[2].clone();
+        keys.sort();
+        assert_eq!(keys, vec!["enc.emb".to_string(), "tok".to_string()]);
+    }
+
+    #[test]
+    fn p1_step_dep_keys_legacy_root_dedups() {
+        let plan = parse_ensemble_plan(
+            "ensemble:\n  steps:\n    - name: s\n      model: m\n      version: \"1\"\n      inputs:\n        x: \"$request\"\n        y: \"$request.input\"\n",
+            &PathBuf::from("/nonexistent/config.yaml"),
+        )
+        .unwrap();
+        // Both refs resolve against the same root key — one clone, not two.
+        assert_eq!(plan.step_dep_keys[0], vec!["request".to_string()]);
+    }
+
+    #[test]
+    fn p1_step_dep_keys_dag_sets_computed_per_set() {
+        let plan = parse_ensemble_plan(
+            "ensemble:\n  dags:\n    default:\n      steps:\n        - name: main\n          model: pre\n          version: \"1\"\n          inputs:\n            text: \"$request.text\"\n",
+            &PathBuf::from("/nonexistent/config.yaml"),
+        )
+        .unwrap();
+        // The outer container runs nothing — no dep keys of its own.
+        assert!(plan.step_dep_keys.is_empty());
+        let sets = plan.dag_sets.as_ref().unwrap();
+        assert_eq!(
+            sets["default"].step_dep_keys[0],
+            vec!["request".to_string()]
+        );
+    }
+
+    #[test]
+    fn p1_select_ctx_keys_clones_only_referenced_keys() {
+        let mut context = HashMap::new();
+        context.insert("a".to_string(), EnsembleValue::Json(json!(1)));
+        context.insert("b".to_string(), EnsembleValue::Json(json!(2)));
+        context.insert("c".to_string(), EnsembleValue::Json(json!(3)));
+        let subset = select_ctx_keys(&context, &["a".to_string(), "missing".to_string()]);
+        assert_eq!(subset.len(), 1, "only referenced keys are cloned");
+        assert!(subset.contains_key("a"));
+        assert!(!subset.contains_key("b"));
+        assert!(!subset.contains_key("c"));
+    }
+
+    // === P3 + P11 (batch 6): zero-spawn layer executor ===
+
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn p11_first_error_drops_remaining_layer_futures() {
+        // A failing step must propagate immediately and the layer's
+        // remaining in-flight futures are dropped with it — the historical
+        // JoinSet first-err + drop-abort semantics (a failed step's
+        // siblings never keep burning worker capacity, P-FLOW §4.0.9).
+        use futures::future::BoxFuture;
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = dropped.clone();
+        let futs: FuturesUnordered<
+            BoxFuture<'static, StepFutOutput>,
+        > = FuturesUnordered::new();
+        futs.push(Box::pin(async move {
+            // The slow sibling completes only if it is never dropped.
+            let _guard = DropFlag(d);
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            ("slow".to_string(), Ok(Vec::new()))
+        }));
+        futs.push(Box::pin(async {
+            (
+                "fast".to_string(),
+                Err(AppError::Internal("boom".to_string())),
+            )
+        }));
+        let mut context = HashMap::new();
+        let skip_set = HashSet::new();
+        let err = drive_step_futs(futs, &mut context, &skip_set)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("boom"),
+            "the first error must propagate, got {err:?}"
+        );
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "remaining layer futures must be dropped on first error"
+        );
+        assert!(context.is_empty());
+    }
+
+    #[tokio::test]
+    async fn p11_layer_success_inserts_outputs_into_context() {
+        use futures::future::BoxFuture;
+        let futs: FuturesUnordered<
+            BoxFuture<'static, StepFutOutput>,
+        > = FuturesUnordered::new();
+        futs.push(Box::pin(async {
+            (
+                "a".to_string(),
+                Ok(vec![("a".to_string(), EnsembleValue::Json(json!(1)))]),
+            )
+        }));
+        let mut context = HashMap::new();
+        let skip_set = HashSet::new();
+        drive_step_futs(futs, &mut context, &skip_set).await.unwrap();
+        assert!(
+            matches!(context.get("a"), Some(EnsembleValue::Json(v)) if *v == json!(1)),
+            "completed step outputs land in the context"
+        );
+    }
+
+    #[tokio::test]
+    async fn p11_skip_step_failure_continues_the_layer() {
+        use futures::future::BoxFuture;
+        let futs: FuturesUnordered<
+            BoxFuture<'static, StepFutOutput>,
+        > = FuturesUnordered::new();
+        futs.push(Box::pin(async {
+            (
+                "may".to_string(),
+                Err(AppError::Internal("boom".to_string())),
+            )
+        }));
+        let mut context = HashMap::new();
+        let skip_set: HashSet<&str> = ["may"].into_iter().collect();
+        drive_step_futs(futs, &mut context, &skip_set)
+            .await
+            .expect("a skip step's failure must not fail the layer");
+        assert!(
+            !context.contains_key("may"),
+            "a skipped step stays absent from the context"
+        );
+    }
+
     // ===== P-FLOW (§4.0.9): ensemble shared cancel =====
 
     #[tokio::test]
@@ -5605,6 +5911,7 @@ mod tests {
             inputs_decl: None,
             input_modes: Vec::new(),
             conditional_refs: Vec::new(),
+            step_dep_keys: Vec::new(),
             outputs: None,
             dag_sets: None,
             config_path: PathBuf::from(path),
@@ -5763,6 +6070,7 @@ mod tests {
                     inputs_decl: None,
                     input_modes: Vec::new(),
                     conditional_refs: Vec::new(),
+                    step_dep_keys: Vec::new(),
                     outputs: None,
                     dag_sets: None,
                     config_path,
@@ -5865,6 +6173,7 @@ mod tests {
                         inputs_decl: None,
                         input_modes: Vec::new(),
                         conditional_refs: Vec::new(),
+                        step_dep_keys: Vec::new(),
                         outputs: None,
                         dag_sets: None,
                         config_path: cp,
@@ -5891,6 +6200,7 @@ mod tests {
                         inputs_decl: None,
                         input_modes: Vec::new(),
                         conditional_refs: Vec::new(),
+                        step_dep_keys: Vec::new(),
                         outputs: None,
                         dag_sets: None,
                         config_path: cp,
