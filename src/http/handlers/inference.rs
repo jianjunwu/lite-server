@@ -173,14 +173,20 @@ async fn do_infer(
         model = %model_name,
         version = version.as_deref().unwrap_or("auto"),
         request_id = %request_id,
-        // P5-2: canary pin 命中时由 resolve_version record（蓝图 §4.4）。
+        // P5-2: recorded by the caller below (resolve_version returns the pin).
         pinned_version = tracing::field::Empty,
         // D11: body metadata — recorded once body is available.
         body_bytes = tracing::field::Empty,
         body_kind = tracing::field::Empty,
     );
     async move {
-    let resolved_version = resolve_version(&state, &model_name, version, &headers).await?;
+    let (resolved_version, pinned) = resolve_version(&state, &model_name, version, &headers).await?;
+    // P5-2: record the honored pin on the inference span (Span::current() is
+    // this span — the block is instrumented; same pattern as the body fields
+    // below). resolve_version itself is side-effect-free.
+    if let Some(p) = &pinned {
+        tracing::Span::current().record("pinned_version", p.as_str());
+    }
     // P-DEADLINE (§4.0.10): resolved once — shared by the ensemble cascade and
     // the unary worker wait. Client `x-lite-timeout` else server.timeout.
     let deadline = crate::deadline::resolve_from_http(&headers, state.config.server.timeout);
@@ -548,9 +554,13 @@ pub(super) async fn resolve_version(
     model_name: &str,
     version: Option<String>,
     headers: &HeaderMap,
-) -> Result<String, AppError> {
+) -> Result<(String, Option<String>), AppError> {
     // Precedence (§4.3/§4.4): explicit version > x-lite-version header pin
-    // (features.canary_override=on, P5-2) > weighted routing pick > active version.
+    // (features.canary_override=on, P5-2) > weighted routing pick > active
+    // version. Returns (resolved, honored pin) — callers record the pin on
+    // their inference span, which for SSE/WS/h2 bidi is created AFTER this
+    // resolves (Span::current() here is the handler span; gRPC bidi pattern,
+    // grpc/rpc/bidi.rs).
     let pin = headers
         .get("x-lite-version")
         .and_then(|v| v.to_str().ok())
@@ -568,8 +578,8 @@ pub(super) async fn resolve_version(
         }
         other => other,
     };
-    let resolved = match version {
-        Some(v) => v,
+    let (resolved, honored_pin) = match version {
+        Some(v) => (v, None),
         None => {
             if let Some(pin) = pin {
                 // Same guard as versioned URL paths — an invalid pin is
@@ -582,20 +592,23 @@ pub(super) async fn resolve_version(
                         model_name, pin
                     )));
                 }
-                tracing::Span::current().record("pinned_version", pin);
-                pin.to_string()
+                let v = pin.to_string();
+                (v, Some(pin.to_string()))
             } else if let Some(picked) = state.registry.routing_pick(model_name) {
-                picked
+                (picked, None)
             } else {
-                state.registry.get_active_version(model_name).ok_or_else(|| {
-                    AppError::ModelNotFound(format!("{} has no active version", model_name))
-                })?
+                (
+                    state.registry.get_active_version(model_name).ok_or_else(|| {
+                        AppError::ModelNotFound(format!("{} has no active version", model_name))
+                    })?,
+                    None,
+                )
             }
         }
     };
     // LRU touch (§4.2): coarse, no-op for unknown versions.
     state.registry.touch_last_used(model_name, &resolved);
-    Ok(resolved)
+    Ok((resolved, honored_pin))
 }
 
 pub(super) fn build_request_meta(headers: &HeaderMap, payload_bytes: Bytes, route: &str, cx: &RequestContext, deadline_unix_ns: Option<i64>) -> pb::RequestMeta {

@@ -121,7 +121,7 @@ pub async fn dispatch_custom_route(
     if let Some(ref v) = version {
         crate::validation::validate_version(v)?;
     }
-    let resolved_version = resolve_version(state, model_name, version, headers).await?;
+    let (resolved_version, _) = resolve_version(state, model_name, version, headers).await?;
 
     if !state.registry.is_ready(model_name, Some(&resolved_version)) {
         return Err(AppError::ModelNotReady(format!(

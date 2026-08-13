@@ -129,7 +129,7 @@ async fn h2_bidi_entry_impl(
     if let Some(ref v) = version {
         crate::validation::validate_version(v)?;
     }
-    let resolved_version = resolve_version(&state, model_name, version, &headers).await?;
+    let (resolved_version, pinned) = resolve_version(&state, model_name, version, &headers).await?;
     *label_version = resolved_version.clone();
     if !state.registry.is_ready(model_name, Some(&resolved_version)) {
         return Err(AppError::ModelNotReady(format!(
@@ -483,6 +483,11 @@ async fn h2_bidi_entry_impl(
         body_kind = tracing::field::Empty,
     );
     crate::telemetry::link_parent(&span, &cx.trace_cx);
+    // P5-2: pin recorded after span creation (resolve ran on the handler
+    // span; gRPC bidi pattern).
+    if let Some(p) = &pinned {
+        span.record("pinned_version", p.as_str());
+    }
     // D11: record body size with content-type label (unary/SSE/WS parity).
     let body_kind_str: &str = if initial_is_json { "json" } else { "raw" };
     prometheus::record_request_body_bytes(body_kind_str, "/predict", initial_body_len);

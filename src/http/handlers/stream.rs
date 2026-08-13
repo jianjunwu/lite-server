@@ -314,7 +314,7 @@ async fn sse_infer_entry_impl(
                 .to_string(),
         ));
     }
-    let resolved_version = resolve_version(state, model_name, version, &headers).await?;
+    let (resolved_version, pinned) = resolve_version(state, model_name, version, &headers).await?;
     *label_version = resolved_version.clone();
     if !state.registry.is_ready(model_name, Some(&resolved_version)) {
         return Err(AppError::ModelNotReady(format!(
@@ -331,6 +331,7 @@ async fn sse_infer_entry_impl(
         state.clone(),
         model_name.to_string(),
         resolved_version,
+        pinned,
         headers,
         body,
         cx,
@@ -346,6 +347,7 @@ async fn sse_infer_impl(
     state: Arc<AppState>,
     model_name: String,
     resolved_version: String,
+    pinned: Option<String>,
     headers: HeaderMap,
     body: RequestBody,
     cx: RequestContext,
@@ -357,8 +359,9 @@ async fn sse_infer_impl(
     // build_request_meta and entered around it via in_scope so telemetry::inject
     // (Context::current()) picks up THIS span, not the ambient http.server span
     // — the worker then becomes a child of the inference span. pinned_version is
-    // left Empty (resolve_version already ran in sse_infer_entry; SSE has no
-    // canary path).
+    // recorded right after creation: resolve_version (called earlier in
+    // sse_infer_entry) returns the honored pin because Span::current() there is
+    // the handler span, not this one (gRPC bidi pattern).
     let span = tracing::info_span!(
         "inference",
         model = %model_name,
@@ -371,6 +374,10 @@ async fn sse_infer_impl(
         body_kind = tracing::field::Empty,
     );
     crate::telemetry::link_parent(&span, &cx.trace_cx);
+    // P5-2: pin recorded after span creation (gRPC bidi pattern).
+    if let Some(p) = &pinned {
+        span.record("pinned_version", p.as_str());
+    }
 
     let deadline = crate::deadline::resolve_from_http(&headers, state.config.server.timeout);
     let payload_bytes = body.bytes();
@@ -1001,7 +1008,7 @@ async fn handle_ws_stream(
     let ws_start = std::time::Instant::now();
     // resolve_version 按值消费 version——先提取请求原值 label 供失败分支使用。
     let request_version_label = version.as_deref().unwrap_or("").to_string();
-    let resolved_version = match resolve_version(&state, &model_name, version, &headers).await {
+    let (resolved_version, pinned) = match resolve_version(&state, &model_name, version, &headers).await {
         Ok(v) => v,
         Err(_) => {
             // model 解析失败 → 4xx;version 未解析用请求原值(可为空串)。
@@ -1150,6 +1157,11 @@ async fn handle_ws_stream(
         body_kind = tracing::field::Empty,
     );
     crate::telemetry::link_parent(&span, &cx.trace_cx);
+    // P5-2: pin recorded after span creation (resolve ran on the handler
+    // span; gRPC bidi pattern).
+    if let Some(p) = &pinned {
+        span.record("pinned_version", p.as_str());
+    }
     let deadline = crate::deadline::resolve_from_http(&headers, state.config.server.timeout);
     // B2 (E4): payload_bytes from frame type; body_kind from frame type
     // (Text → json, Binary → raw). CT normalization for Binary frames writes
@@ -2056,6 +2068,7 @@ mod tests {
             state,
             model.to_string(),
             "1".to_string(),
+            None,
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
@@ -2084,6 +2097,105 @@ mod tests {
         );
     }
 
+    /// P5-2 regression: the honored pin must land on the INFERENCE span, which
+    /// is created after resolve_version ran (on the handler span) — the record
+    /// therefore happens at span creation, not via Span::current() in the
+    /// resolver. Captures span close lines via fmt + FmtSpan::CLOSE; the
+    /// rebuild_interest_cache inside the scoped default defeats the
+    /// NEVER-cached callsite short-circuit (g5/G3 pattern, prometheus.rs).
+    #[test]
+    fn sse_pinned_version_recorded_on_inference_span() {
+        use tracing_subscriber::fmt::format::FmtSpan;
+
+        /// Shared byte buffer behind the fmt subscriber — span close lines
+        /// (including post-creation records) land here for assertion.
+        #[derive(Clone)]
+        struct SharedWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedWriter {
+            type Writer = Self;
+            fn make_writer(&self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let writer = SharedWriter(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_span_events(FmtSpan::CLOSE)
+            .finish();
+        // Runtime INSIDE the scoped default (watcher.rs:900 pattern): the
+        // impl body and its forwarder tasks all poll on this thread while the
+        // dispatcher is set — the span creation therefore reaches the fmt
+        // layer. tokio::spawn would not work (the task polls after the guard
+        // is dropped).
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let model = "sse_pin_span";
+                let endpoint = ipc_endpoint(model);
+                let _w = spawn_done_worker(endpoint.clone());
+                let cb = Arc::new(CountingCallback {
+                    req: AtomicUsize::new(0),
+                    resp: AtomicUsize::new(0),
+                    last: Mutex::new(None),
+                });
+                let runner = Arc::new(CallbackRunner::new());
+                runner.register(cb.clone()).await;
+                let state = ready_state(model, endpoint, runner).await;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+                let sse = sse_infer_impl(
+                    state,
+                    model.to_string(),
+                    "1".to_string(),
+                    Some("1".to_string()),
+                    HeaderMap::new(),
+                    json_body(json!({})),
+                    test_cx(),
+                    false,
+                    SseFrameStyle::Legacy,
+                )
+                .await
+                .expect("sse must open");
+                // Done processed → forwarder exits and drops its span clone.
+                wait_for(|| cb.resp.load(Ordering::Relaxed) >= 1, "resp>=1").await;
+                drop(sse);
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            });
+        });
+        // The span holds a dispatcher ref, so its close line still lands in
+        // the shared buffer after the scoped default ends — poll-drain.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut output = String::new();
+        while std::time::Instant::now() < deadline {
+            let drained: Vec<u8> = writer.0.lock().unwrap().drain(..).collect();
+            output.push_str(&String::from_utf8_lossy(&drained));
+            if output.contains(r#"pinned_version="1""#) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            output.contains(r#"pinned_version="1""#),
+            "inference span must carry pinned_version=1: {output}"
+        );
+    }
+
     #[tokio::test]
     async fn sse_callbacks_fire_on_error() {
         let model = "sse_err";
@@ -2103,6 +2215,7 @@ mod tests {
             state,
             model.to_string(),
             "1".to_string(),
+            None,
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
@@ -2143,6 +2256,7 @@ mod tests {
             state,
             model.to_string(),
             "1".to_string(),
+            None,
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
@@ -2187,6 +2301,7 @@ mod tests {
             state,
             model.to_string(),
             "1".to_string(),
+            None,
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
@@ -2550,6 +2665,7 @@ mod tests {
             state,
             model.to_string(),
             "1".to_string(),
+            None,
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
@@ -3152,6 +3268,7 @@ mod tests {
             state,
             model.to_string(),
             "1".to_string(),
+            None,
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
@@ -3194,6 +3311,7 @@ mod tests {
             state,
             model.to_string(),
             "1".to_string(),
+            None,
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
@@ -3268,6 +3386,7 @@ mod tests {
             state,
             model.to_string(),
             "1".to_string(),
+            None,
             headers,
             json_body(json!({})),
             test_cx(),
@@ -3331,6 +3450,7 @@ mod tests {
             state,
             model.to_string(),
             "1".to_string(),
+            None,
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
@@ -3746,6 +3866,7 @@ mod tests {
             state,
             model.to_string(),
             "1".to_string(),
+            None,
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
@@ -3778,6 +3899,7 @@ mod tests {
             state,
             model.to_string(),
             "1".to_string(),
+            None,
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
@@ -3814,6 +3936,7 @@ mod tests {
             state,
             model.to_string(),
             "1".to_string(),
+            None,
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
@@ -3938,6 +4061,7 @@ mod tests {
             state,
             model.to_string(),
             "1".to_string(),
+            None,
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
@@ -3973,6 +4097,7 @@ mod tests {
             state,
             model.to_string(),
             "1".to_string(),
+            None,
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
@@ -4002,6 +4127,7 @@ mod tests {
             state,
             model.to_string(),
             "1".to_string(),
+            None,
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
@@ -4035,6 +4161,7 @@ mod tests {
             state,
             model.to_string(),
             "1".to_string(),
+            None,
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),

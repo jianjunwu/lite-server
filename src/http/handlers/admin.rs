@@ -251,7 +251,7 @@ pub async fn model_health_handler(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     crate::validation::validate_identifier(&model_name)?;
-    let resolved_version = resolve_version(&state, &model_name, None, &headers).await?;
+    let (resolved_version, _) = resolve_version(&state, &model_name, None, &headers).await?;
     model_health_json(&state, &model_name, &resolved_version)
 }
 

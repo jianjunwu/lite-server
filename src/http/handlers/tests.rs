@@ -117,10 +117,11 @@ mod version_routing_tests {
             .registry
             .set_weights("m", &HashMap::from([("2".into(), 100u32)]))
             .unwrap();
-        let v = resolve_version(&state, "m", Some("1".into()), &pinned_header("2"))
+        let (v, pin) = resolve_version(&state, "m", Some("1".into()), &pinned_header("2"))
             .await
             .unwrap();
         assert_eq!(v, "1");
+        assert_eq!(pin, None, "explicit URL version must not honor the pin");
     }
 
     #[tokio::test]
@@ -131,10 +132,11 @@ mod version_routing_tests {
             .registry
             .set_weights("m", &HashMap::from([("2".into(), 100u32)]))
             .unwrap();
-        let v = resolve_version(&state, "m", None, &pinned_header("1"))
+        let (v, pin) = resolve_version(&state, "m", None, &pinned_header("1"))
             .await
             .unwrap();
         assert_eq!(v, "1");
+        assert_eq!(pin.as_deref(), Some("1"), "honored pin must be returned");
     }
 
     // ===== P5-2: features.canary_override 开关门控（蓝图 §4.4, D16）=====
@@ -148,10 +150,11 @@ mod version_routing_tests {
             .registry
             .set_weights("m", &HashMap::from([("2".into(), 100u32)]))
             .unwrap();
-        let v = resolve_version(&state, "m", None, &pinned_header("1"))
+        let (v, pin) = resolve_version(&state, "m", None, &pinned_header("1"))
             .await
             .unwrap();
         assert_eq!(v, "2", "switch off → pin ignored, weights decide");
+        assert_eq!(pin, None, "ignored pin must not be returned");
     }
 
     #[tokio::test]
@@ -160,10 +163,11 @@ mod version_routing_tests {
         let state = test_state();
         register_ready(&state, "m", &["1"]);
         state.registry.activate_version("m", "1").unwrap();
-        let v = resolve_version(&state, "m", None, &pinned_header("a/b"))
+        let (v, pin) = resolve_version(&state, "m", None, &pinned_header("a/b"))
             .await
             .unwrap();
         assert_eq!(v, "1");
+        assert_eq!(pin, None, "ignored pin must not be returned");
     }
 
     #[tokio::test]
@@ -186,10 +190,11 @@ mod version_routing_tests {
             .registry
             .set_weights("m", &HashMap::from([("2".into(), 100u32)]))
             .unwrap();
-        let v = resolve_version(&state, "m", None, &HeaderMap::new())
+        let (v, pin) = resolve_version(&state, "m", None, &HeaderMap::new())
             .await
             .unwrap();
         assert_eq!(v, "2");
+        assert_eq!(pin, None);
     }
 
     #[tokio::test]
@@ -197,10 +202,11 @@ mod version_routing_tests {
         let state = test_state();
         register_ready(&state, "m", &["1", "2"]);
         state.registry.activate_version("m", "1").unwrap();
-        let v = resolve_version(&state, "m", None, &HeaderMap::new())
+        let (v, pin) = resolve_version(&state, "m", None, &HeaderMap::new())
             .await
             .unwrap();
         assert_eq!(v, "1");
+        assert_eq!(pin, None);
     }
 
     #[tokio::test]
@@ -238,10 +244,11 @@ mod version_routing_tests {
         }
 
         // Sanity: a valid pin still resolves.
-        let v = resolve_version(&state, "m", None, &pinned_header("2"))
+        let (v, pin) = resolve_version(&state, "m", None, &pinned_header("2"))
             .await
             .unwrap();
         assert_eq!(v, "2");
+        assert_eq!(pin.as_deref(), Some("2"));
     }
 
     // ===== PUT /v2/models/:m/routing (§4.3) =====

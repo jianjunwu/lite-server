@@ -3943,6 +3943,408 @@ async fn test_weighted_routing_canary() {
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 }
 
+/// Streaming variant of the canary fixture — v1 yields token "one", v2 yields
+/// token "two", so the first SSE frame identifies the serving version.
+fn write_canary_stream_model_repo(tmp_dir: &std::path::Path) {
+    let model_py = |token: &str| format!(r#"from lite_server import LitAPI
+
+
+class CanaryStreamAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request
+
+    async def stream_predict(self, request, ctx):
+        yield {{"token": "{token}"}}
+"#, token = token);
+
+    let _ = std::fs::remove_dir_all(tmp_dir);
+    let cfg = "max_batch_size: 1\nbatch_timeout: 0.0\nstream: true\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n";
+    for (v, token) in [("1", "one"), ("2", "two")] {
+        let dir = tmp_dir.join("canary_stream_model").join(v);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.py"), model_py(token)).unwrap();
+        std::fs::write(dir.join("config.yaml"), cfg).unwrap();
+    }
+}
+
+/// §4.3 weighted routing applies to bare streaming URLs too — SSE/WS/h2 bidi
+/// share `resolve_version` with unary (explicit version > pin > weighted >
+/// active). `test_weighted_routing_canary` only covers /infer; this closes
+/// the SSE gap (weighted split + pin + versioned-path skip).
+#[tokio::test]
+async fn test_weighted_routing_canary_sse() {
+    let tmp_dir = std::env::temp_dir()
+        .join(format!("lite-server-canary-sse-{}", std::process::id()));
+    write_canary_stream_model_repo(&tmp_dir);
+
+    let port = next_test_port();
+    kill_stale_on_port(port);
+    let cfg_dir =
+        std::env::temp_dir().join(format!("lite-server-canary-sse-cfg-{}", std::process::id()));
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    let server_yaml = cfg_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {}\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: false\nmodel_repository:\n  path: {}\nfeatures:\n  canary_override: true\n",
+            port,
+            tmp_dir.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(port, 30).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+
+    load_model(&base, "canary_stream_model", "1").await;
+    load_model(&base, "canary_stream_model", "2").await;
+
+    // One bare /events request; the worker yields a single token then [DONE],
+    // so the SSE body closes quickly. Returns 1/2 per the served version.
+    let sse_version = |headers: &[(&str, &str)]| {
+        let base = base.clone();
+        let client = client.clone();
+        let headers: Vec<(String, String)> =
+            headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        async move {
+            let mut req = client
+                .post(format!("{}/v2/models/canary_stream_model/events", base))
+                .json(&json!({"input": 1}));
+            for (k, v) in headers {
+                req = req.header(k, v);
+            }
+            let resp = req.send().await.unwrap();
+            assert_eq!(resp.status(), 200);
+            let body = tokio::time::timeout(Duration::from_secs(15), resp.text())
+                .await
+                .expect("SSE body did not close within 15s")
+                .unwrap();
+            if body.contains(r#""token":"one""#) {
+                1
+            } else if body.contains(r#""token":"two""#) {
+                2
+            } else {
+                panic!("unexpected SSE body: {body}");
+            }
+        }
+    };
+    let put_weights = |body: &str| {
+        let base = base.clone();
+        let client = client.clone();
+        let body = body.to_string();
+        async move {
+            let resp = client
+                .put(format!("{}/v2/models/canary_stream_model/routing", base))
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+        }
+    };
+
+    // 100/0: all traffic to v1.
+    put_weights(r#"{"weights":{"1":100,"2":0}}"#).await;
+    for _ in 0..20 {
+        assert_eq!(sse_version(&[]).await, 1, "100/0 must serve only v1");
+    }
+
+    // 90/10: roughly proportional split (n=100, expect ~10 v2, wide bounds).
+    put_weights(r#"{"weights":{"1":90,"2":10}}"#).await;
+    let mut v2_count = 0;
+    for _ in 0..100 {
+        if sse_version(&[]).await == 2 {
+            v2_count += 1;
+        }
+    }
+    assert!(
+        (2..=25).contains(&v2_count),
+        "v2 served {} / 100, expected ~10",
+        v2_count
+    );
+
+    // Header pin beats weights: 0/100 with x-lite-version: 1 → v1.
+    put_weights(r#"{"weights":{"2":100}}"#).await;
+    assert_eq!(sse_version(&[]).await, 2, "100% v2 after zeroing v1");
+    assert_eq!(
+        sse_version(&[("x-lite-version", "1")]).await,
+        1,
+        "x-lite-version header must pin to v1"
+    );
+
+    // Versioned URL skips pin and weights: /versions/1/events under 0/100.
+    let resp = client
+        .post(format!("{base}/v2/models/canary_stream_model/versions/1/events"))
+        .json(&json!({"input": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = tokio::time::timeout(Duration::from_secs(15), resp.text())
+        .await
+        .expect("SSE body did not close within 15s")
+        .unwrap();
+    assert!(
+        body.contains(r#""token":"one""#),
+        "versioned path must serve the explicit v1: {body}"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+}
+
+/// Bidi variant of the canary fixture — v1's `on_chunk` returns token "one",
+/// v2 returns token "two", so the echo frame identifies the serving version.
+fn write_canary_bidi_model_repo(tmp_dir: &std::path::Path) {
+    let model_py = |token: &str| format!(r#"from lite_server import LitAPI
+
+
+class BidiHandler:
+    def on_open(self, initial_data):
+        return {{"opened": True}}
+
+    def on_chunk(self, chunk):
+        return {{"token": "{token}"}}
+
+    def on_close(self):
+        pass
+
+
+class CanaryBidiAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request
+
+    def predict(self, x):
+        return {{"output": x}}
+
+    def encode_response(self, output):
+        return output
+
+    def bidi_stream(self):
+        return BidiHandler()
+"#, token = token);
+
+    let _ = std::fs::remove_dir_all(tmp_dir);
+    let cfg = "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n";
+    for (v, token) in [("1", "one"), ("2", "two")] {
+        let dir = tmp_dir.join("canary_bidi_model").join(v);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.py"), model_py(token)).unwrap();
+        std::fs::write(dir.join("config.yaml"), cfg).unwrap();
+    }
+}
+
+/// §4.3 weighted routing applies to bare h2 bidi URLs too — h2 bidi shares
+/// `resolve_version` with SSE/WS/unary (bidi.rs). This closes the last
+/// transport gap: weighted split + pin + versioned-path skip, over real h2
+/// full-duplex sessions (harness = test_h2_bidi_prior_knowledge_full_duplex).
+#[tokio::test]
+async fn test_weighted_routing_canary_h2_bidi() {
+    use lite_server::proto::liteserver as pb;
+    use lite_server::streaming::lpm;
+
+    let tmp_dir =
+        std::env::temp_dir().join(format!("lite-server-canary-bidi-{}", std::process::id()));
+    write_canary_bidi_model_repo(&tmp_dir);
+
+    let port = next_test_port();
+    kill_stale_on_port(port);
+    let cfg_dir =
+        std::env::temp_dir().join(format!("lite-server-canary-bidi-cfg-{}", std::process::id()));
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    let server_yaml = cfg_dir.join("server.yaml");
+    std::fs::write(
+        &server_yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {}\n  log_level: warn\nmetrics:\n  enabled: false\ngrpc:\n  enabled: false\nmodel_repository:\n  path: {}\nfeatures:\n  canary_override: true\n",
+            port,
+            tmp_dir.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let _server = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
+    wait_for_server(port, 30).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+
+    load_model(&base, "canary_bidi_model", "1").await;
+    load_model(&base, "canary_bidi_model", "2").await;
+
+    // One full-duplex h2 bidi session: Open → on_open frame → Data chunk →
+    // echo frame (token identifies the served version) → Close → terminal
+    // Close frame. Returns 1/2 per the served version.
+    let bidi_version = |path: String, headers: &[(&str, &str)]| {
+        let base = base.clone();
+        let client = client.clone();
+        let headers: Vec<(String, String)> =
+            headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        async move {
+            async fn read_frame(
+                stream: &mut (impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>>
+                              + Unpin),
+                buf: &mut bytes::BytesMut,
+            ) -> pb::BidiChunk {
+                use futures::StreamExt;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    if let Ok(Some(c)) = lpm::try_decode_frame(buf) {
+                        return c;
+                    }
+                    let next = tokio::time::timeout_at(deadline, stream.next())
+                        .await
+                        .expect("timed out waiting for LPM frame")
+                        .expect("response stream ended before frame");
+                    buf.extend_from_slice(&next.expect("response stream error"));
+                }
+            }
+
+            let (body_tx, body_rx) =
+                tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(8);
+            let body_rx = std::sync::Arc::new(std::sync::Mutex::new(body_rx));
+            let body_stream = futures::stream::poll_fn(move |cx| {
+                body_rx.lock().unwrap().poll_recv(cx)
+            });
+            // Full-duplex bootstrap: the server awaits the first LPM frame
+            // before committing the 200 — queue BidiOpen up front.
+            body_tx
+                .send(Ok(lpm::encode_frame(&pb::BidiChunk {
+                    stream_id: String::new(),
+                    payload: Some(pb::bidi_chunk::Payload::Open(pb::BidiOpen {
+                        initial_data: bytes::Bytes::from_static(b"{}"),
+                        ..Default::default()
+                    })),
+                })))
+                .await
+                .unwrap();
+            let mut req = client
+                .post(format!("{base}{path}"))
+                .header("content-type", "application/x-lite-bidi")
+                .body(reqwest::Body::wrap_stream(body_stream));
+            for (k, v) in headers {
+                req = req.header(k, v);
+            }
+            let resp = req.send().await.unwrap();
+            assert_eq!(resp.status(), 200, "h2 bidi must accept the session");
+
+            let mut resp_stream = resp.bytes_stream();
+            let mut buf = bytes::BytesMut::new();
+
+            // 1. The queued Open → on_open Data frame.
+            let f = read_frame(&mut resp_stream, &mut buf).await;
+            assert!(
+                matches!(f.payload, Some(pb::bidi_chunk::Payload::Data(_))),
+                "expected on_open Data frame, got {:?}",
+                f.payload
+            );
+
+            // 2. Data sent mid-stream → echo Data frame carrying the token.
+            body_tx
+                .send(Ok(lpm::encode_frame(&pb::BidiChunk {
+                    stream_id: String::new(),
+                    payload: Some(pb::bidi_chunk::Payload::Data(pb::BidiData {
+                        data: bytes::Bytes::from_static(br#"{"chunk": 1}"#),
+                    })),
+                })))
+                .await
+                .unwrap();
+            let f = read_frame(&mut resp_stream, &mut buf).await;
+            let served = match f.payload {
+                Some(pb::bidi_chunk::Payload::Data(d)) => {
+                    let body = String::from_utf8_lossy(&d.data);
+                    if body.contains(r#""token":"one""#) {
+                        1
+                    } else if body.contains(r#""token":"two""#) {
+                        2
+                    } else {
+                        panic!("unexpected echo frame: {body}");
+                    }
+                }
+                other => panic!("expected echo Data frame, got {other:?}"),
+            };
+
+            // 3. Close → terminal Close frame.
+            body_tx
+                .send(Ok(lpm::encode_frame(&pb::BidiChunk {
+                    stream_id: String::new(),
+                    payload: Some(pb::bidi_chunk::Payload::Close(pb::BidiClose {})),
+                })))
+                .await
+                .unwrap();
+            let f = read_frame(&mut resp_stream, &mut buf).await;
+            assert!(
+                matches!(f.payload, Some(pb::bidi_chunk::Payload::Close(_))),
+                "expected terminal Close frame, got {:?}",
+                f.payload
+            );
+            served
+        }
+    };
+    let put_weights = |body: &str| {
+        let base = base.clone();
+        let client = reqwest::Client::new();
+        let body = body.to_string();
+        async move {
+            let resp = client
+                .put(format!("{}/v2/models/canary_bidi_model/routing", base))
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+        }
+    };
+    let bare = "/v2/models/canary_bidi_model/bidi".to_string();
+
+    // 100/0: all traffic to v1.
+    put_weights(r#"{"weights":{"1":100,"2":0}}"#).await;
+    for _ in 0..20 {
+        assert_eq!(bidi_version(bare.clone(), &[]).await, 1, "100/0 must serve only v1");
+    }
+
+    // 90/10: roughly proportional split (n=100, expect ~10 v2, wide bounds).
+    put_weights(r#"{"weights":{"1":90,"2":10}}"#).await;
+    let mut v2_count = 0;
+    for _ in 0..100 {
+        if bidi_version(bare.clone(), &[]).await == 2 {
+            v2_count += 1;
+        }
+    }
+    assert!(
+        (2..=25).contains(&v2_count),
+        "v2 served {} / 100, expected ~10",
+        v2_count
+    );
+
+    // Header pin beats weights: 0/100 with x-lite-version: 1 → v1.
+    put_weights(r#"{"weights":{"2":100}}"#).await;
+    assert_eq!(bidi_version(bare.clone(), &[]).await, 2, "100% v2 after zeroing v1");
+    assert_eq!(
+        bidi_version(bare.clone(), &[("x-lite-version", "1")]).await,
+        1,
+        "x-lite-version header must pin to v1"
+    );
+
+    // Versioned URL skips pin and weights: /versions/1/bidi under 0/100.
+    assert_eq!(
+        bidi_version("/v2/models/canary_bidi_model/versions/1/bidi".to_string(), &[]).await,
+        1,
+        "versioned path must serve the explicit v1"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+}
+
 /// P5-2 (蓝图 §4.4): gRPC x-lite-version pin parity——metadata 优先、fallback
 /// proto headers map；非法 pin → InvalidArgument；pin 版本不存在 → NotFound。
 #[tokio::test]

@@ -204,7 +204,10 @@ the socket.
 - **Worker missing `predict_decoupled`**: worker sends Error frame → mapped
   per the existing terminal-error path (worker-side `FailedPrecondition`
   semantics).
-- **Canary**: SSE/WS have no canary path (parity with coupled SSE/WS).
+- **Canary**: bare (unversioned) requests resolve the version exactly like
+  unary — `x-lite-version` pin (when `features.canary_override` is on) →
+  weighted routing → active (parity with coupled SSE/WS and gRPC streaming);
+  a versioned URL path skips both.
 - **Auth / rate-limit**: identical to SSE `infer` / WS `stream` — model
   policies evaluated in the same order (auth first, then rate limit; WS
   errors go as frames, not HTTP status codes).
