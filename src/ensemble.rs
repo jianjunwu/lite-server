@@ -49,6 +49,10 @@ pub struct EnsembleConfig {
 #[serde(deny_unknown_fields)]
 pub struct EnsembleBlock {
     pub steps: Vec<EnsembleStepRaw>,
+    /// E2 (batch 3): explicit DAG output — `$stepN` or `$stepN.field`.
+    /// Omitted = `steps.last()` (historical semantics).
+    #[serde(default)]
+    pub output: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -56,21 +60,40 @@ pub struct EnsembleBlock {
 pub struct EnsembleStepRaw {
     pub name: String,
     pub model: String,
-    pub version: String,
+    /// E4 (batch 3): omitted or "latest" resolves at EXECUTION time via the
+    /// D15 request-scoped snapshot (registry active); explicit versions keep
+    /// the historical behavior. Stored unresolved in the plan — the P0 cache
+    /// never invalidates on active-version drift.
+    #[serde(default)]
+    pub version: Option<String>,
     pub inputs: HashMap<String, String>,
     /// §4.1: tail streaming. The streaming step must be the DAG output
-    /// (config `steps.last()` — explicit `output` lands with E2, batch 3).
+    /// (config `steps.last()`, or the explicit `output` — E2, batch 3).
     #[serde(default)]
     pub stream: bool,
+    /// E3 (batch 3): constant step parameters merged into the assembled JSON
+    /// payload (params win on key conflicts). Binary assembly has no params
+    /// semantics — a non-empty params on a Binary step is rejected at
+    /// assembly time.
+    #[serde(default)]
+    pub params: HashMap<String, Value>,
+    /// E5 (batch 3): per-step wall-clock cap (seconds); None = parent
+    /// deadline only.
+    #[serde(default)]
+    pub timeout_secs: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
 pub struct EnsembleStep {
     pub name: String,
     pub model: String,
-    pub version: String,
+    /// E4: unresolved form — None = omitted/"latest" (execution-time
+    /// resolution via the D15 snapshot).
+    pub version: Option<String>,
     pub inputs: HashMap<String, String>,
     pub stream: bool,
+    pub params: HashMap<String, Value>,
+    pub timeout_secs: Option<f64>,
 }
 
 lazy_static::lazy_static! {
@@ -87,20 +110,37 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
     let config: EnsembleConfig = serde_yaml::from_str(content)
         .map_err(|e| AppError::Config(format!("failed to parse ensemble config: {}", e)))?;
 
-    let steps: Vec<EnsembleStep> = config.ensemble.steps.into_iter().map(|s| EnsembleStep {
-        name: s.name,
-        model: s.model,
-        version: s.version,
-        inputs: s.inputs,
-        stream: s.stream,
-    }).collect();
+    let steps: Vec<EnsembleStep> = config.ensemble.steps.into_iter().map(|s| {
+        // E5: per-step timeout must be a positive, finite duration.
+        if let Some(t) = s.timeout_secs {
+            if !t.is_finite() || t <= 0.0 {
+                return Err(AppError::Config(format!(
+                    "step '{}': timeout_secs must be a positive finite number, got {}",
+                    s.name, t
+                )));
+            }
+        }
+        Ok(EnsembleStep {
+            name: s.name,
+            model: s.model,
+            // E4: "latest" == omitted (execution-time active resolution).
+            version: s.version.filter(|v| v != "latest"),
+            inputs: s.inputs,
+            stream: s.stream,
+            params: s.params,
+            timeout_secs: s.timeout_secs,
+        })
+    }).collect::<Result<_, AppError>>()?;
 
     validate_dag(&steps)?;
+    // E2: resolve the explicit output BEFORE chain construction / streaming
+    // validation — both anchor on the output step.
+    let (output_step, output_field) = resolve_output(config.ensemble.output.as_deref(), &steps)?;
     // Pipeline-form validation + chain construction (P-R1..R5/D26, batch 2);
     // non-pipeline streaming rules apply only when no chain exists.
-    let chains = build_chains(&steps, steps.len() - 1)?;
+    let chains = build_chains(&steps, output_step)?;
     if chains.is_empty() {
-        validate_stream_rules(&steps)?;
+        validate_stream_rules(&steps, output_step)?;
     }
     let index_of: HashMap<&str, usize> = steps
         .iter()
@@ -113,7 +153,8 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
         .collect();
 
     Ok(EnsemblePlan {
-        output_step: steps.len() - 1,
+        output_step,
+        output_field,
         steps,
         layers,
         chains,
@@ -122,6 +163,40 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
         // load-time direct-parse path (insert_ready stats on its own).
         source_mtime: None,
     })
+}
+
+/// E2 (batch 3): resolve `ensemble.output` — `$stepN` or `$stepN.field` —
+/// into the output step index + optional field path. Omitted = `steps.last()`
+/// (historical semantics).
+fn resolve_output(
+    output: Option<&str>,
+    steps: &[EnsembleStep],
+) -> Result<(usize, Option<String>), AppError> {
+    let Some(output) = output else {
+        return Ok((steps.len() - 1, None));
+    };
+    let caps = REF_RE.captures(output).ok_or_else(|| {
+        AppError::Config(format!(
+            "invalid ensemble.output '{}': expected $stepN or $stepN.field",
+            output
+        ))
+    })?;
+    let source = caps.get(1).unwrap().as_str();
+    if source == "request" {
+        return Err(AppError::Config(
+            "ensemble.output must reference a step, not $request".to_string(),
+        ));
+    }
+    let idx = steps
+        .iter()
+        .position(|s| s.name == source)
+        .ok_or_else(|| {
+            AppError::Config(format!(
+                "ensemble.output references unknown step '{}'",
+                source
+            ))
+        })?;
+    Ok((idx, caps.get(2).map(|m| m.as_str().to_string())))
 }
 
 /// Production plan loader: resolve the model dir, read config.yaml and parse
@@ -182,14 +257,17 @@ pub fn spawn_ensemble_warm(
             }
         };
         for step in &plan.steps {
-            if !registry.is_ready(&step.model, Some(&step.version)) {
-                // P6: sub-model preload + resolved-version side-table land
-                // with E4 (batch 3) — log-only for now.
-                warn!(
-                    model = %step.model,
-                    version = %step.version,
-                    "ensemble warm: sub-model not ready (preload deferred to batch 3)"
-                );
+            // E4 (batch 3): readiness for unresolved ("latest"/omitted) steps
+            // can only be checked after execution-time resolution — the
+            // resolved-version side-table + preload land with E4 (Step 1).
+            if let Some(v) = step.version.as_deref() {
+                if !registry.is_ready(&step.model, Some(v)) {
+                    warn!(
+                        model = %step.model,
+                        version = %v,
+                        "ensemble warm: sub-model not ready (preload deferred to batch 3)"
+                    );
+                }
             }
         }
     });
@@ -430,8 +508,7 @@ fn build_chains(steps: &[EnsembleStep], output_step: usize) -> Result<Vec<Chain>
                 if tail != output_step {
                     return Err(AppError::Config(format!(
                         "pipeline chain tail '{}' must be the DAG output step \
-                         (config last step); explicit `output:` lands in 0.9.0 \
-                         (batch 3) (P-R3)",
+                         (config last step, or the explicit `output:`) (P-R3)",
                         steps[tail].name
                     )));
                 }
@@ -448,7 +525,7 @@ fn build_chains(steps: &[EnsembleStep], output_step: usize) -> Result<Vec<Chain>
     Ok(chains)
 }
 
-fn validate_stream_rules(steps: &[EnsembleStep]) -> Result<(), AppError> {
+fn validate_stream_rules(steps: &[EnsembleStep], output_step: usize) -> Result<(), AppError> {
     let stream_steps: Vec<&EnsembleStep> = steps.iter().filter(|s| s.stream).collect();
     if stream_steps.is_empty() {
         return Ok(());
@@ -479,13 +556,12 @@ fn validate_stream_rules(steps: &[EnsembleStep]) -> Result<(), AppError> {
         )));
     }
 
-    // Rule 4 (B-m4): output-step semantics unified — with `output` omitted
-    // the DAG output is `steps.last()`, which must be the streaming step.
-    if steps.last().map(|s| s.name.as_str()) != Some(tail.name.as_str()) {
+    // Rule 4 (B-m4, E2 batch 3): the DAG output step — config last step or
+    // the explicit `output:` — must be the streaming step.
+    if steps[output_step].name != tail.name {
         return Err(AppError::Config(format!(
             "streaming step '{}' must be the DAG output step (config last \
-             step), or the DAG output is ambiguous; explicit `output:` lands \
-             in 0.9.0 (batch 3)",
+             step, or the explicit `output:`), or the DAG output is ambiguous",
             tail.name
         )));
     }
@@ -611,9 +687,12 @@ pub struct EnsemblePlan {
     /// Topological layers as indices into `steps` (self-owning, no refs).
     pub layers: Vec<Vec<usize>>,
     /// DAG output step (E2 semantics unified at batch 0, §4.1 rule 4): with no
-    /// explicit `output` (batch 3) this is `steps.last()`; validation ensures
-    /// a streaming DAG's output step is its streaming step.
+    /// explicit `output` this is `steps.last()`; validation ensures a
+    /// streaming DAG's output step is its streaming step.
     pub output_step: usize,
+    /// E2 (batch 3): explicit output field path (`output: "$s2.score"`).
+    /// None = the output step's whole value.
+    pub output_field: Option<String>,
     /// Pipeline chains (§4.2, batch 2): each chain is a linear consumer path
     /// of STREAMING steps (all nodes stream), tail = output step. Empty for
     /// non-pipeline DAGs (tail-streaming only).
@@ -968,6 +1047,13 @@ impl BidiAggregator {
 /// fields without touching the signature, e.g. `dag_selector` in batch 5;
 /// D36's snapshot/depth ride the internal `execute_ensemble_inner`, not the
 /// public opts).
+/// Step 0 shim (batch 3, E4): step versions are now optional — until the
+/// D15 snapshot resolution lands (Step 1), an unresolved step reads as
+/// "latest" (a nonexistent explicit version, same observable failure).
+fn unresolved_step_version(step: &EnsembleStep) -> &str {
+    step.version.as_deref().unwrap_or("latest")
+}
+
 #[derive(Debug, Clone)]
 pub struct EnsembleExecOpts {
     pub client_ip: String,
@@ -1259,7 +1345,7 @@ async fn run_layers(
                             .await;
                     let latency = start.elapsed().as_secs_f64();
                     crate::metrics::prometheus::record_ensemble_step_latency(
-                        &ensemble_name, &step.name, &step.model, &step.version, latency,
+                        &ensemble_name, &step.name, &step.model, unresolved_step_version(&step), latency,
                     );
                     (step.name, result)
                 });
@@ -1398,16 +1484,16 @@ async fn tail_stream_preflight(
 ) -> Result<Option<TailPreflight>, AppError> {
     // P7 constraint: only preflight an already-ready sub-model. Not ready →
     // fall back to the serial path (which runs the autoload + poll).
-    if !state.registry.is_ready(&step.model, Some(&step.version)) {
+    if !state.registry.is_ready(&step.model, Some(unresolved_step_version(step))) {
         return Ok(None);
     }
-    if !streaming_worker_ready(state, &step.model, &step.version, &pb::RequestMeta::default()).await {
+    if !streaming_worker_ready(state, &step.model, unresolved_step_version(step), &pb::RequestMeta::default()).await {
         return Ok(None);
     }
-    let mv = state.registry.get(&step.model, Some(&step.version))
-        .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", step.model, step.version)))?;
-    let clients = state.worker_manager.get_zmq_clients(&step.model, &step.version).await
-        .ok_or_else(|| AppError::WorkerCrashed(format!("{} {} has no ZMQ clients", step.model, step.version)))?;
+    let mv = state.registry.get(&step.model, Some(unresolved_step_version(step)))
+        .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", step.model, unresolved_step_version(step))))?;
+    let clients = state.worker_manager.get_zmq_clients(&step.model, unresolved_step_version(step)).await
+        .ok_or_else(|| AppError::WorkerCrashed(format!("{} {} has no ZMQ clients", step.model, unresolved_step_version(step))))?;
 
     // P-TRACE: step-level span + trace injection (content-type is patched in
     // after assembly — it depends on the payload shape).
@@ -1427,10 +1513,10 @@ async fn tail_stream_preflight(
     let meta = build_step_meta(
         &format!("{}:{}", request_id, step.name), &opts.client_ip, deadline_unix_ns, step_headers, bytes::Bytes::new(),
     );
-    let outlier = state.worker_manager.get_outlier_state(&step.model, &step.version).await;
+    let outlier = state.worker_manager.get_outlier_state(&step.model, unresolved_step_version(step)).await;
     let seq_registry = state.inference_queue.sequence_registry();
     let worker_id = crate::worker::pick_streaming_worker(
-        &meta, mv.workers.len(), outlier.as_deref(), seq_registry, &step.model, &step.version,
+        &meta, mv.workers.len(), outlier.as_deref(), seq_registry, &step.model, unresolved_step_version(step),
     ).map_err(|e| AppError::Validation(e.0))?;
     if worker_id >= clients.len() {
         return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
@@ -1710,7 +1796,7 @@ async fn spawn_chain(
         stream_id,
         cancel_client,
         tail_model: tail.model.clone(),
-        tail_version: tail.version.clone(),
+        tail_version: unresolved_step_version(tail).to_string(),
         tail_step: tail.name.clone(),
         step_deadline: None,
         chain: chain_handles,
@@ -1798,13 +1884,13 @@ async fn ensure_sub_model_loaded(
     state: &Arc<AppState>,
     step: &EnsembleStep,
 ) -> Result<(), AppError> {
-    if state.registry.is_ready(&step.model, Some(&step.version)) {
+    if state.registry.is_ready(&step.model, Some(unresolved_step_version(step))) {
         return Ok(());
     }
     let load_start = Instant::now();
-    info!("Auto-loading sub-model {} v{} for ensemble", step.model, step.version);
+    info!("Auto-loading sub-model {} v{} for ensemble", step.model, unresolved_step_version(step));
     let sub_model_dir = crate::validation::resolve_model_dir(
-        &state.repo_path, &step.model, &step.version,
+        &state.repo_path, &step.model, unresolved_step_version(step),
     )?;
     // 配置解析/校验失败必须可见(同 reconcile:不再 unwrap_or_default
     // 静默回退默认配置;M7 迁移哨兵依赖此错误上浮)。
@@ -1814,15 +1900,15 @@ async fn ensure_sub_model_loaded(
         Ok(c) => c,
         Err(e) => {
             return Err(AppError::ModelNotReady(format!(
-                "sub-model {} v{} has invalid config.yaml: {}", step.model, step.version, e
+                "sub-model {} v{} has invalid config.yaml: {}", step.model, unresolved_step_version(step), e
             )));
         }
     };
     state.config.apply_model_defaults(&mut config);
-    if let Err(e) = state.worker_manager.load_model(&step.model, &step.version, &config).await {
-        warn!("Failed to auto-load sub-model {} v{}: {}", step.model, step.version, e);
+    if let Err(e) = state.worker_manager.load_model(&step.model, unresolved_step_version(step), &config).await {
+        warn!("Failed to auto-load sub-model {} v{}: {}", step.model, unresolved_step_version(step), e);
         return Err(AppError::ModelNotReady(format!(
-            "sub-model {} v{} not ready: {}", step.model, step.version, e
+            "sub-model {} v{} not ready: {}", step.model, unresolved_step_version(step), e
         )));
     }
     // m4: autoload wait (the dominant cold-TTFT term for ensemble DAGs).
@@ -1869,10 +1955,10 @@ async fn execute_stream_step(
             let mut retries = 0;
             let max_retries = 30;
             let mut delay = Duration::from_millis(50);
-            while !streaming_worker_ready(state, &step.model, &step.version, &pb::RequestMeta::default()).await {
+            while !streaming_worker_ready(state, &step.model, unresolved_step_version(step), &pb::RequestMeta::default()).await {
                 if retries >= max_retries {
                     return Err(AppError::ModelNotReady(format!(
-                        "sub-model {} v{} streaming not ready", step.model, step.version
+                        "sub-model {} v{} streaming not ready", step.model, unresolved_step_version(step)
                     )));
                 }
                 // D19: quick-fail when the remaining budget cannot cover one
@@ -1881,7 +1967,7 @@ async fn execute_stream_step(
                     if rem < delay {
                         return Err(AppError::InferenceTimeout(format!(
                             "ensemble step {}: deadline exhausted while waiting for sub-model {} v{}",
-                            step.name, step.model, step.version
+                            step.name, step.model, unresolved_step_version(step)
                         )));
                     }
                 }
@@ -1890,10 +1976,10 @@ async fn execute_stream_step(
                 retries += 1;
             }
 
-            let mv = state.registry.get(&step.model, Some(&step.version))
-                .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", step.model, step.version)))?;
-            let clients = state.worker_manager.get_zmq_clients(&step.model, &step.version).await
-                .ok_or_else(|| AppError::WorkerCrashed(format!("{} {} has no ZMQ clients", step.model, step.version)))?;
+            let mv = state.registry.get(&step.model, Some(unresolved_step_version(step)))
+                .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", step.model, unresolved_step_version(step))))?;
+            let clients = state.worker_manager.get_zmq_clients(&step.model, unresolved_step_version(step)).await
+                .ok_or_else(|| AppError::WorkerCrashed(format!("{} {} has no ZMQ clients", step.model, unresolved_step_version(step))))?;
 
             // P-TRACE (同 execute_step): step-level span links to the parent
             // trace and injects its context into the step headers so the
@@ -1920,10 +2006,10 @@ async fn execute_stream_step(
                 &format!("{}:{}", request_id, step.name), &opts.client_ip, deadline_unix_ns, step_headers, bytes::Bytes::new(),
             );
 
-            let outlier = state.worker_manager.get_outlier_state(&step.model, &step.version).await;
+            let outlier = state.worker_manager.get_outlier_state(&step.model, unresolved_step_version(step)).await;
             let seq_registry = state.inference_queue.sequence_registry();
             let worker_id = crate::worker::pick_streaming_worker(
-                &meta, mv.workers.len(), outlier.as_deref(), seq_registry, &step.model, &step.version,
+                &meta, mv.workers.len(), outlier.as_deref(), seq_registry, &step.model, unresolved_step_version(step),
             ).map_err(|e| AppError::Validation(e.0))?;
             if worker_id >= clients.len() {
                 return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
@@ -1949,7 +2035,7 @@ async fn execute_stream_step(
             )));
         }
     }
-    crate::metrics::prometheus::record_worker_inference(&step.model, &step.version, worker_id, 1);
+    crate::metrics::prometheus::record_worker_inference(&step.model, unresolved_step_version(step), worker_id, 1);
 
     let client = &clients[worker_id];
     let stream_id = format!("stream-{}", Uuid::new_v4());
@@ -1972,7 +2058,7 @@ async fn execute_stream_step(
         stream_id,
         cancel_client: Arc::clone(client),
         tail_model: step.model.clone(),
-        tail_version: step.version.clone(),
+        tail_version: unresolved_step_version(step).to_string(),
         tail_step: step.name.clone(),
         // D35 (batch 3): E5 timeout_secs → step wall-clock cap; adapter
         // recv_chunk overall takes min(client overall, this). Inactive until
@@ -2149,21 +2235,21 @@ async fn execute_step(
     let mut retries = 0;
     let max_retries = 30;
     let mut delay = Duration::from_millis(50);
-    while !state.registry.is_ready(&step.model, Some(&step.version)) && retries < max_retries {
+    while !state.registry.is_ready(&step.model, Some(unresolved_step_version(step))) && retries < max_retries {
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(Duration::from_millis(500));
         retries += 1;
     }
 
-    if !state.registry.is_ready(&step.model, Some(&step.version)) {
+    if !state.registry.is_ready(&step.model, Some(unresolved_step_version(step))) {
         return Err(AppError::ModelNotReady(format!(
-            "sub-model {} v{} is not ready", step.model, step.version
+            "sub-model {} v{} is not ready", step.model, unresolved_step_version(step)
         )));
     }
 
     // Get model version info
-    let mv = state.registry.get(&step.model, Some(&step.version))
-        .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", step.model, step.version)))?;
+    let mv = state.registry.get(&step.model, Some(unresolved_step_version(step)))
+        .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", step.model, unresolved_step_version(step))))?;
 
     if mv.model_type == ModelType::Ensemble {
         return Err(AppError::Internal("nested ensemble not supported".to_string()));
@@ -2175,7 +2261,7 @@ async fn execute_step(
     }
 
     // Send inference request through the unified queue
-    let uid = format!("ensemble_{}_{}_{}", step.model, step.version, Uuid::new_v4());
+    let uid = format!("ensemble_{}_{}_{}", step.model, unresolved_step_version(step), Uuid::new_v4());
 
     // P-TRACE (蓝图 §4.3 ensemble 接线，防 trace 断裂): the sub-step RequestMeta
     // would otherwise carry empty headers, orphaning every step span from the
@@ -2216,16 +2302,16 @@ async fn execute_step(
         enqueued_at: std::time::Instant::now(),
     };
 
-    match state.inference_queue.try_submit(&step.model, &step.version, item) {
+    match state.inference_queue.try_submit(&step.model, unresolved_step_version(step), item) {
         Ok(()) => {}
         Err(crate::inference_queue::QueueError::Full) => {
             return Err(AppError::QueueFull(format!(
-                "Queue full for {} {}", step.model, step.version
+                "Queue full for {} {}", step.model, unresolved_step_version(step)
             )));
         }
         Err(_) => {
             return Err(AppError::ModelNotReady(format!(
-                "Queue not available for {} {}", step.model, step.version
+                "Queue not available for {} {}", step.model, unresolved_step_version(step)
             )));
         }
     }
@@ -2331,14 +2417,22 @@ mod tests {
             EnsembleStep {
                 name: "step1".to_string(),
                 model: "m1".to_string(),
-                version: "1".to_string(),
+                version: Some("1".to_string()),
+
+                params: HashMap::new(),
+
+                timeout_secs: None,
                 stream: false,
                 inputs: [("input".to_string(), "$request".to_string())].into(),
             },
             EnsembleStep {
                 name: "step2".to_string(),
                 model: "m2".to_string(),
-                version: "1".to_string(),
+                version: Some("1".to_string()),
+
+                params: HashMap::new(),
+
+                timeout_secs: None,
                 stream: false,
                 inputs: [("data".to_string(), "$step1".to_string())].into(),
             },
@@ -2352,14 +2446,22 @@ mod tests {
             EnsembleStep {
                 name: "step1".to_string(),
                 model: "m1".to_string(),
-                version: "1".to_string(),
+                version: Some("1".to_string()),
+
+                params: HashMap::new(),
+
+                timeout_secs: None,
                 stream: false,
                 inputs: [("input".to_string(), "$step2".to_string())].into(),
             },
             EnsembleStep {
                 name: "step2".to_string(),
                 model: "m2".to_string(),
-                version: "1".to_string(),
+                version: Some("1".to_string()),
+
+                params: HashMap::new(),
+
+                timeout_secs: None,
                 stream: false,
                 inputs: [("input".to_string(), "$step1".to_string())].into(),
             },
@@ -2373,7 +2475,11 @@ mod tests {
             EnsembleStep {
                 name: "step1".to_string(),
                 model: "m1".to_string(),
-                version: "1".to_string(),
+                version: Some("1".to_string()),
+
+                params: HashMap::new(),
+
+                timeout_secs: None,
                 stream: false,
                 inputs: [("input".to_string(), "$unknown".to_string())].into(),
             },
@@ -2387,21 +2493,33 @@ mod tests {
             EnsembleStep {
                 name: "a".to_string(),
                 model: "m1".to_string(),
-                version: "1".to_string(),
+                version: Some("1".to_string()),
+
+                params: HashMap::new(),
+
+                timeout_secs: None,
                 stream: false,
                 inputs: [("x".to_string(), "$request".to_string())].into(),
             },
             EnsembleStep {
                 name: "b".to_string(),
                 model: "m2".to_string(),
-                version: "1".to_string(),
+                version: Some("1".to_string()),
+
+                params: HashMap::new(),
+
+                timeout_secs: None,
                 stream: false,
                 inputs: [("x".to_string(), "$request".to_string())].into(),
             },
             EnsembleStep {
                 name: "c".to_string(),
                 model: "m3".to_string(),
-                version: "1".to_string(),
+                version: Some("1".to_string()),
+
+                params: HashMap::new(),
+
+                timeout_secs: None,
                 stream: false,
                 inputs: [("x".to_string(), "$a".to_string())].into(),
             },
@@ -2763,7 +2881,11 @@ mod tests {
         EnsembleStep {
             name: name.to_string(),
             model: format!("m_{}", name),
-            version: "1".to_string(),
+            version: Some("1".to_string()),
+
+            params: HashMap::new(),
+
+            timeout_secs: None,
             inputs: inputs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             stream,
         }
@@ -2776,7 +2898,7 @@ mod tests {
             sstep("s1", &[("input", "$request")], false),
             sstep("s2", &[("data", "$s1")], true),
         ];
-        assert!(validate_stream_rules(&steps).is_ok(), "tail-streaming DAG must validate");
+        assert!(validate_stream_rules(&steps, 1).is_ok(), "tail-streaming DAG must validate");
     }
 
     #[test]
@@ -2786,7 +2908,7 @@ mod tests {
             sstep("s1", &[("input", "$request")], true),
             sstep("s2", &[("data", "$request")], true),
         ];
-        let err = validate_stream_rules(&steps).unwrap_err();
+        let err = validate_stream_rules(&steps, 1).unwrap_err();
         assert!(
             err.to_string().contains("one streaming step"),
             "must reject two streaming steps, got: {err}"
@@ -2802,7 +2924,7 @@ mod tests {
             sstep("s1", &[("input", "$request")], true),
             sstep("s2", &[("data", "$request")], false),
         ];
-        let err = validate_stream_rules(&steps).unwrap_err();
+        let err = validate_stream_rules(&steps, 1).unwrap_err();
         assert!(
             err.to_string().contains("output") && err.to_string().contains("s1"),
             "must reject streaming step not at config tail, got: {err}"
@@ -2816,7 +2938,7 @@ mod tests {
             sstep("s1", &[("input", "$request")], false),
             sstep("s2", &[("data", "$s1")], false),
         ];
-        assert!(validate_stream_rules(&steps).is_ok());
+        assert!(validate_stream_rules(&steps, 1).is_ok());
     }
 
     // === P10: streaming-DAG capacity (D40) ===
@@ -2862,6 +2984,7 @@ mod tests {
             steps: Vec::new(),
             layers: Vec::new(),
             output_step: 0,
+            output_field: None,
             chains: Vec::new(),
             config_path: PathBuf::from(path),
             source_mtime: None,
@@ -3014,6 +3137,7 @@ mod tests {
                     steps: Vec::new(),
                     layers: Vec::new(),
                     output_step: 0,
+                    output_field: None,
                     chains: Vec::new(),
                     config_path,
                     source_mtime: None,
@@ -3110,6 +3234,7 @@ mod tests {
                         steps: Vec::new(),
                         layers: Vec::new(),
                         output_step: 1,
+                        output_field: None,
                         chains: Vec::new(),
                         config_path: cp,
                         source_mtime: v1_mtime,
@@ -3130,6 +3255,7 @@ mod tests {
                         steps: Vec::new(),
                         layers: Vec::new(),
                         output_step: 2,
+                        output_field: None,
                         chains: Vec::new(),
                         config_path: cp,
                         source_mtime: None,
@@ -3211,5 +3337,192 @@ ensemble:
             "unknown step field `strem` must be rejected (D24 deny_unknown_fields); \
              silently ignoring it disables streaming without any error"
         );
+    }
+
+    // ===== Batch 3 (E2/E3/E4/E5) parse-layer tests =====
+
+    /// E2: output omitted → steps.last() (historical semantics).
+    #[test]
+    fn e2_output_defaults_to_last_step() {
+        let yaml = r#"
+ensemble:
+  steps:
+    - name: s1
+      model: m1
+      version: "1"
+      inputs: {x: "$request"}
+    - name: s2
+      model: m2
+      version: "1"
+      inputs: {x: "$s1"}
+"#;
+        let plan = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml")).unwrap();
+        assert_eq!(plan.output_step, 1);
+        assert_eq!(plan.output_field, None);
+    }
+
+    /// E2: explicit output selects a named step.
+    #[test]
+    fn e2_output_selects_named_step() {
+        let yaml = r#"
+ensemble:
+  output: "$s1"
+  steps:
+    - name: s1
+      model: m1
+      version: "1"
+      inputs: {x: "$request"}
+    - name: s2
+      model: m2
+      version: "1"
+      inputs: {x: "$s1"}
+"#;
+        let plan = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml")).unwrap();
+        assert_eq!(plan.output_step, 0);
+        assert_eq!(plan.output_field, None);
+    }
+
+    /// E2: `$stepN.field` Json path.
+    #[test]
+    fn e2_output_field_path() {
+        let yaml = r#"
+ensemble:
+  output: "$s2.score"
+  steps:
+    - name: s1
+      model: m1
+      version: "1"
+      inputs: {x: "$request"}
+    - name: s2
+      model: m2
+      version: "1"
+      inputs: {x: "$s1"}
+"#;
+        let plan = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml")).unwrap();
+        assert_eq!(plan.output_step, 1);
+        assert_eq!(plan.output_field.as_deref(), Some("score"));
+    }
+
+    /// E2: unknown step / missing `$` prefix / `$request` → load-time config
+    /// errors, never a silent fallback.
+    #[test]
+    fn e2_output_rejects_unknown_step_and_bad_format() {
+        for output in ["$nope", "s1", "$request"] {
+            let yaml = format!(
+                r#"
+ensemble:
+  output: "{output}"
+  steps:
+    - name: s1
+      model: m1
+      version: "1"
+      inputs: {{x: "$request"}}
+"#
+            );
+            let res = parse_ensemble_plan(&yaml, &PathBuf::from("/nonexistent/config.yaml"));
+            assert!(res.is_err(), "output '{output}' must be a config error");
+        }
+    }
+
+    /// E2 × D11: with a streaming step, the explicit output must BE that
+    /// step (validated at parse — the DAG output IS the stream).
+    #[test]
+    fn e2_streaming_output_must_point_at_streaming_step() {
+        let yaml = r#"
+ensemble:
+  output: "$s1"
+  steps:
+    - name: s1
+      model: m1
+      version: "1"
+      inputs: {x: "$request"}
+    - name: s2
+      model: m2
+      version: "1"
+      stream: true
+      inputs: {x: "$s1"}
+"#;
+        let res = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"));
+        assert!(
+            res.is_err(),
+            "output pointing away from the streaming step must be rejected (D11)"
+        );
+    }
+
+    /// E4: version omitted / "latest" → None (execution-time resolution);
+    /// explicit versions are kept as-is.
+    #[test]
+    fn e4_version_optional_and_latest_normalized() {
+        let yaml = r#"
+ensemble:
+  steps:
+    - name: s1
+      model: m1
+      inputs: {x: "$request"}
+    - name: s2
+      model: m2
+      version: "latest"
+      inputs: {x: "$s1"}
+    - name: s3
+      model: m3
+      version: "1"
+      inputs: {x: "$s2"}
+"#;
+        let plan = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml")).unwrap();
+        assert_eq!(plan.steps[0].version, None);
+        assert_eq!(plan.steps[1].version, None, "\"latest\" == omitted (E4)");
+        assert_eq!(plan.steps[2].version.as_deref(), Some("1"));
+    }
+
+    /// E3: params parse into the step (assembly applies them in Step 3).
+    #[test]
+    fn e3_params_parse_into_step() {
+        let yaml = r#"
+ensemble:
+  steps:
+    - name: s1
+      model: m1
+      version: "1"
+      inputs: {x: "$request"}
+      params:
+        temperature: 0.7
+        top_p: 0.9
+"#;
+        let plan = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml")).unwrap();
+        let params = &plan.steps[0].params;
+        assert_eq!(params.get("temperature").and_then(|v| v.as_f64()), Some(0.7));
+        assert_eq!(params.get("top_p").and_then(|v| v.as_f64()), Some(0.9));
+    }
+
+    /// E5: timeout_secs parses; non-positive / non-finite rejected at load.
+    #[test]
+    fn e5_timeout_secs_parse_and_validation() {
+        let ok = r#"
+ensemble:
+  steps:
+    - name: s1
+      model: m1
+      version: "1"
+      inputs: {x: "$request"}
+      timeout_secs: 2.5
+"#;
+        let plan = parse_ensemble_plan(ok, &PathBuf::from("/nonexistent/config.yaml")).unwrap();
+        assert_eq!(plan.steps[0].timeout_secs, Some(2.5));
+
+        for bad in ["0", "-1", ".nan"] {
+            let yaml = format!(
+                r#"
+ensemble:
+  steps:
+    - name: s1
+      model: m1
+      version: "1"
+      inputs: {{x: "$request"}}
+      timeout_secs: {bad}
+"#
+            );
+            let res = parse_ensemble_plan(&yaml, &PathBuf::from("/nonexistent/config.yaml"));
+            assert!(res.is_err(), "timeout_secs={bad} must be a config error");
+        }
     }
 }
