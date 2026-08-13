@@ -40,6 +40,13 @@ from lite_server.response import (
     encode_tensor,
 )
 from lite_server.server_proxy import ServerProxy
+from lite_server.ensemble import (
+    DagSet,
+    EnsembleDAG,
+    InputDecl,
+    Step,
+    StepOutput,
+)
 
 __all__ = [
     "serve",
@@ -67,4 +74,10 @@ __all__ = [
     "BackgroundTask",
     "encode_tensor",
     "Headers",
+    # E9-A: declarative ensemble DAG authoring (declaration only)
+    "EnsembleDAG",
+    "Step",
+    "InputDecl",
+    "StepOutput",
+    "DagSet",
 ]
