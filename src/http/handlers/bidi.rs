@@ -504,6 +504,8 @@ async fn h2_bidi_entry_impl(
                                 ?elapsed, stream_id = %stream_id_out,
                                 "h2 bidi stream closed: deadline/idle elapsed"
                             );
+                            let deadline_hit =
+                                matches!(elapsed, crate::streaming::RecvElapsed::Deadline);
                             reason = match elapsed {
                                 crate::streaming::RecvElapsed::Deadline => {
                                     prometheus::StreamCloseReason::Deadline
@@ -512,6 +514,26 @@ async fn h2_bidi_entry_impl(
                                     prometheus::StreamCloseReason::Idle
                                 }
                             };
+                            // D35 (§4.4): a mid-stream DEADLINE is terminal —
+                            // an error frame + close (mirror the worker Error
+                            // arm).
+                            if deadline_hit {
+                                let frame = lpm::encode_frame(&pb::BidiChunk {
+                                    stream_id: stream_id_out.clone(),
+                                    payload: Some(pb::bidi_chunk::Payload::Error(
+                                        pb::BidiError {
+                                            message: "stream closed: deadline exceeded".to_string(),
+                                            error_type: String::new(),
+                                        },
+                                    )),
+                                });
+                                let _ = tx.send(frame).await;
+                                crate::callback::fire_inference_response(
+                                    &cb_runner,
+                                    &req_ctx,
+                                    open_time,
+                                );
+                            }
                             break;
                         }
                     };

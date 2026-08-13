@@ -512,6 +512,8 @@ async fn sse_infer_impl(
                         ?elapsed, stream_id = %stream_id,
                         "sse stream closed: deadline/idle elapsed"
                     );
+                    let deadline_hit =
+                        matches!(elapsed, crate::streaming::RecvElapsed::Deadline);
                     reason = match elapsed {
                         crate::streaming::RecvElapsed::Deadline => {
                             prometheus::StreamCloseReason::Deadline
@@ -520,6 +522,20 @@ async fn sse_infer_impl(
                             prometheus::StreamCloseReason::Idle
                         }
                     };
+                    // D35 (§4.4): a mid-stream DEADLINE is terminal for the
+                    // client — an Error frame + close (the status code is
+                    // already committed). Idle reclaim keeps the silent close
+                    // (decoupled reclaim semantics).
+                    if deadline_hit {
+                        let msg = "stream closed: deadline exceeded";
+                        let data = if matches!(frame, SseFrameStyle::Openai) {
+                            json!({"error": {"message": msg}}).to_string()
+                        } else {
+                            json!({"error": msg}).to_string()
+                        };
+                        let _ = event_tx.send(Ok(Event::default().data(data))).await;
+                        crate::callback::fire_inference_response(&cb_runner, &req_ctx, open_time);
+                    }
                     break;
                 }
             };
@@ -1543,6 +1559,8 @@ async fn handle_ws_stream(
                         ?elapsed, stream_id = %stream_id_for_writer,
                         "websocket stream closed: deadline/idle elapsed"
                     );
+                    let deadline_hit =
+                        matches!(elapsed, crate::streaming::RecvElapsed::Deadline);
                     reason = match elapsed {
                         crate::streaming::RecvElapsed::Deadline => {
                             prometheus::StreamCloseReason::Deadline
@@ -1551,6 +1569,16 @@ async fn handle_ws_stream(
                             prometheus::StreamCloseReason::Idle
                         }
                     };
+                    // D35 (§4.4): a mid-stream DEADLINE is terminal — an
+                    // error message + close (§4.4: 开流后失败 → Error 收口).
+                    if deadline_hit {
+                        let _ = ws_sink
+                            .send(Message::Text(
+                                json!({"error": "stream closed: deadline exceeded"}).to_string(),
+                            ))
+                            .await;
+                        crate::callback::fire_inference_response(&cb_runner, &req_ctx, open_time);
+                    }
                     break;
                 }
             };

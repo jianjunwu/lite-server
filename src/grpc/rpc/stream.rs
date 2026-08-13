@@ -303,6 +303,7 @@ impl GrpcService {
                             "stream closed: deadline/idle elapsed"
                         );
                         stream_family = "5xx";
+                        let deadline_hit = matches!(elapsed, streaming::RecvElapsed::Deadline);
                         reason = match elapsed {
                             streaming::RecvElapsed::Deadline => {
                                 crate::metrics::prometheus::StreamCloseReason::Deadline
@@ -311,6 +312,17 @@ impl GrpcService {
                                 crate::metrics::prometheus::StreamCloseReason::Idle
                             }
                         };
+                        // D35 (§4.4): a mid-stream DEADLINE is terminal — the
+                        // tonic stream must end with an Err item (the encode
+                        // layer stops at the first Err; nothing may follow).
+                        if deadline_hit {
+                            let _ = tx
+                                .send(Err(Status::deadline_exceeded(
+                                    "stream closed: deadline exceeded",
+                                )))
+                                .await;
+                            crate::callback::fire_inference_response(&cb_runner, &req_ctx, start);
+                        }
                         break;
                     }
                 };

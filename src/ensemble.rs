@@ -2169,6 +2169,17 @@ async fn ensure_sub_model_loaded(
     };
     state.config.apply_model_defaults(&mut config);
     if let Err(e) = state.worker_manager.load_model(model, version, &config).await {
+        // Concurrent autoload race (parallel steps / batch elements of the
+        // same cold sub-model): the load error usually means a SIBLING's
+        // load won — the registry flips ready when that load completes.
+        // Poll briefly before surfacing the failure, so a benign conflict
+        // never fails a whole step/element.
+        for _ in 0..30 {
+            if state.registry.is_ready(model, Some(version)) {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         warn!("Failed to auto-load sub-model {} v{}: {}", model, version, e);
         return Err(AppError::ModelNotReady(format!(
             "sub-model {} v{} not ready: {}", model, version, e
