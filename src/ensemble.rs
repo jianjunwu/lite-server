@@ -197,6 +197,10 @@ pub struct EnsembleStepRaw {
     /// outputs (chunks have no named-output semantics, D11).
     #[serde(default)]
     pub outputs: Option<IndexMap<String, StepOutputDecl>>,
+    /// E8-2 (batch 5): a when condition — false skips the step at runtime
+    /// (E6-skip channel, D34 forbids streaming × when).
+    #[serde(default)]
+    pub when: Option<String>,
 }
 
 /// E6 (batch 4): step fault tolerance modes.
@@ -206,6 +210,33 @@ pub enum OnErrorKind {
     #[default]
     Fail,
     Skip,
+}
+
+/// E8-2 (batch 5): when-expression operators — the whitelisted set only
+/// (no arbitrary expression evaluation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhenOp {
+    Eq,
+    Neq,
+    Contains,
+    In,
+}
+
+/// E8-2 (batch 5): the when-expression target — the R16/m2 whitelist:
+/// `$request.dag` / `$request.client_ip` / `$inputs.NAME[.path]`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WhenTarget {
+    Dag,
+    ClientIp,
+    Input { name: String, path: Option<String> },
+}
+
+/// E8-2 (batch 5): a parsed `when: "<ref> <op> <literal>"` expression.
+#[derive(Debug, Clone)]
+pub struct WhenExpr {
+    pub target: WhenTarget,
+    pub op: WhenOp,
+    pub literal: serde_json::Value,
 }
 
 #[derive(Debug, Clone)]
@@ -225,6 +256,9 @@ pub struct EnsembleStep {
     pub retries: u32,
     /// MIMO (D10, batch 4): named output declarations (see the raw field).
     pub outputs_decl: Option<IndexMap<String, StepOutputDecl>>,
+    /// E8-2 (batch 5): the parsed when condition (parse-validated against
+    /// the R16 whitelist; evaluated per request).
+    pub when: Option<WhenExpr>,
 }
 
 lazy_static::lazy_static! {
@@ -238,6 +272,9 @@ lazy_static::lazy_static! {
     /// array subscripts or filters (D29).
     static ref JSON_PATH_RE: Regex =
         Regex::new(r"^\$(\.[A-Za-z_][A-Za-z0-9_]*)+$").expect("invalid json path regex");
+    /// E8-2: `when: "$ref OP literal"` — OP in the whitelisted set.
+    static ref WHEN_RE: Regex =
+        Regex::new(r"^\$(\S+)\s*(==|!=|contains|in)\s*(.+)$").expect("invalid when regex");
 }
 
 /// E7 (batch 4④, R13/D11/R14): multi-sink validation.
@@ -350,6 +387,200 @@ fn validate_outputs_rules(
         }
     }
     Ok(())
+}
+
+/// E8-2 (batch 5): parse the `when: "<ref> OP <literal>"` grammar —
+/// whitelisted operators only (`== != contains in`), the literal is a JSON
+/// value, `in` requires an array literal. The R16 target whitelist is
+/// checked separately (validate_when_refs — it needs the type env).
+fn parse_when_expr(raw: &str) -> Result<WhenExpr, AppError> {
+    let caps = WHEN_RE.captures(raw).ok_or_else(|| {
+        AppError::Config(format!(
+            "invalid when expression '{raw}' — expected \"$ref OP literal\" \
+             with OP in == != contains in (E8-2)"
+        ))
+    })?;
+    let target = parse_when_target(caps.get(1).unwrap().as_str(), raw)?;
+    let op = match caps.get(2).unwrap().as_str() {
+        "==" => WhenOp::Eq,
+        "!=" => WhenOp::Neq,
+        "contains" => WhenOp::Contains,
+        _ => WhenOp::In,
+    };
+    let lit_raw = caps.get(3).unwrap().as_str();
+    // The plan's literal form is single-quoted ('x', ['a','b']); JSON
+    // accepts double quotes — try JSON first, then swap quotes (strings
+    // containing double quotes are out of the literal subset, E8-2).
+    let literal: Value = match serde_json::from_str::<Value>(lit_raw) {
+        Ok(v) => v,
+        Err(_) => {
+            let swapped: String = lit_raw
+                .chars()
+                .map(|c| if c == '\'' { '"' } else { c })
+                .collect();
+            serde_json::from_str(&swapped).map_err(|e| {
+                AppError::Config(format!("invalid when literal in '{raw}': {e}"))
+            })?
+        }
+    };
+    if op == WhenOp::In && !literal.is_array() {
+        return Err(AppError::Config(format!(
+            "when '{raw}': 'in' requires an array literal (E8-2)"
+        )));
+    }
+    Ok(WhenExpr { target, op, literal })
+}
+
+/// E8-2 (batch 5): the when target — the R16/m2 whitelist: `$request.dag` /
+/// `$request.client_ip` / `$inputs.NAME[.path]`.
+fn parse_when_target(target: &str, raw: &str) -> Result<WhenTarget, AppError> {
+    if target == "request.dag" {
+        return Ok(WhenTarget::Dag);
+    }
+    if target == "request.client_ip" {
+        return Ok(WhenTarget::ClientIp);
+    }
+    if let Some(rest) = target.strip_prefix("request.") {
+        return Err(AppError::Config(format!(
+            "when '{raw}': $request.{rest} is not whitelisted (R16/m2 — \
+             dag and client_ip only)"
+        )));
+    }
+    if let Some(rest) = target.strip_prefix("inputs.") {
+        let mut segs = rest.split('.');
+        let name = segs.next().unwrap_or("").to_string();
+        if name.is_empty() {
+            return Err(AppError::Config(format!(
+                "when '{raw}': $inputs requires a declared input name (R16)"
+            )));
+        }
+        let path_segs: Vec<&str> = segs.collect();
+        let path = if path_segs.is_empty() {
+            None
+        } else {
+            Some(path_segs.join("."))
+        };
+        return Ok(WhenTarget::Input { name, path });
+    }
+    Err(AppError::Config(format!(
+        "when '{raw}': invalid target '{target}' (R16)"
+    )))
+}
+
+/// E8-2 (batch 5): the R16 whitelist check — input names must be declared
+/// and json-typed (binary has no comparison semantics), `$inputs` requires
+/// a declaration; D34 rule 6: `when` × `stream: true` is rejected; when
+/// refs to optional inputs mark the step CONDITIONAL (the E6-skip channel).
+fn validate_when_refs(
+    steps: &[EnsembleStep],
+    inputs_decl: Option<&IndexMap<String, InputDecl>>,
+    conditional_refs: &mut [Vec<String>],
+) -> Result<(), AppError> {
+    for (i, step) in steps.iter().enumerate() {
+        let Some(expr) = &step.when else {
+            continue;
+        };
+        // D34 rule 6: a streaming response promises a stream unconditionally.
+        if step.stream {
+            return Err(AppError::Config(format!(
+                "step '{}': when cannot combine with stream: true \
+                 (a streaming response promises a stream unconditionally, D34)",
+                step.name
+            )));
+        }
+        match &expr.target {
+            WhenTarget::Dag | WhenTarget::ClientIp => {}
+            WhenTarget::Input { name, .. } => {
+                let Some(decl) = inputs_decl else {
+                    return Err(AppError::Config(format!(
+                        "step '{}': when references $inputs.{name} — requires an \
+                         ensemble.inputs declaration (R16)",
+                        step.name
+                    )));
+                };
+                let d = decl.get(name).ok_or_else(|| {
+                    AppError::Config(format!(
+                        "step '{}': when references undeclared input '{name}' (R16)",
+                        step.name
+                    ))
+                })?;
+                if d.ty == InputType::Binary {
+                    return Err(AppError::Config(format!(
+                        "step '{}': when cannot compare binary input '{name}' \
+                         (no comparison semantics on bytes, R16)",
+                        step.name
+                    )));
+                }
+                // R4/D13: an optional-input ref makes the step conditional
+                // (absent → the E6-skip channel).
+                if !d.required && d.default.is_none() {
+                    conditional_refs[i].push(name.clone());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// E8-2 (batch 5): evaluate a when expression against the request context.
+/// Strict type equality (no coercion — `1 == '1'` is false); contains/in
+/// only on strings+arrays; an absent input compares as null (`!= null` is
+/// the R16 absence check).
+pub fn eval_when(
+    expr: &WhenExpr,
+    opts: &EnsembleExecOpts,
+    context: &HashMap<String, EnsembleValue>,
+) -> Result<bool, AppError> {
+    let left: Option<Value> = match &expr.target {
+        WhenTarget::Dag => opts.dag_selector.as_deref().map(|s| json!(s)),
+        WhenTarget::ClientIp => Some(json!(opts.client_ip)),
+        WhenTarget::Input { name, path } => {
+            let key = format!("inputs.{name}");
+            match context.get(&key) {
+                None => None, // absent — compares as null below
+                Some(EnsembleValue::Json(v)) => match path {
+                    None => Some(v.clone()),
+                    Some(p) => Some(project_json_path(v, p).map_err(|e| {
+                        AppError::InvalidRequestBody(format!("when path: {e}"))
+                    })?),
+                },
+                Some(_) => {
+                    return Err(AppError::InvalidRequestBody(format!(
+                        "when cannot resolve binary input '{name}' (R16)"
+                    )));
+                }
+            }
+        }
+    };
+    // R16: absence is DISTINCT from null — `!= null` is the absence check
+    // (absent → true), `== null` matches an explicit null only.
+    Ok(match expr.op {
+        WhenOp::Eq => left == Some(expr.literal.clone()),
+        WhenOp::Neq => left != Some(expr.literal.clone()),
+        WhenOp::Contains => match (&left, &expr.literal) {
+            (Some(Value::String(s)), Value::String(sub)) => s.contains(sub.as_str()),
+            (Some(Value::Array(a)), _) => a.contains(&expr.literal),
+            _ => false, // absent / non-string/array: strict semantics
+        },
+        WhenOp::In => match &expr.literal {
+            Value::Array(a) => left.as_ref().map(|l| a.contains(l)).unwrap_or(false),
+            _ => false, // parse-rejected (In requires an array literal)
+        },
+    })
+}
+
+/// E8-2 (batch 5): the runtime gate — a when-false step is skipped (the
+/// E6-skip channel); absent steps keep every other rule intact.
+fn when_passes(
+    step_idx: usize,
+    plan: &EnsemblePlan,
+    opts: &EnsembleExecOpts,
+    context: &HashMap<String, EnsembleValue>,
+) -> Result<bool, AppError> {
+    let Some(expr) = &plan.steps[step_idx].when else {
+        return Ok(true);
+    };
+    eval_when(expr, opts, context)
 }
 
 /// E8-1 (batch 5, D22/D38): resolve the request's DAG set — the dags form
@@ -664,6 +895,9 @@ fn parse_ensemble_set(
             on_error: s.on_error.unwrap_or_default(),
             retries: s.retries.unwrap_or(0),
             outputs_decl: s.outputs,
+            // E8-2: grammar parse here; the R16 whitelist check runs once
+            // the type environment exists (validate_when_refs).
+            when: s.when.as_deref().map(parse_when_expr).transpose()?,
         })
     }).collect::<Result<_, AppError>>()?;
 
@@ -675,7 +909,11 @@ fn parse_ensemble_set(
     // validation (R1/R2), ref analysis (R3/R5/R9/R12), input-mode dispatch
     // (R11) and conditional-step discovery (R4).
     validate_step_output_decls(&steps)?;
-    let (input_modes, conditional_refs) = analyze_static_types(&steps, inputs_decl.as_ref())?;
+    let (input_modes, mut conditional_refs) = analyze_static_types(&steps, inputs_decl.as_ref())?;
+    // E8-2 (batch 5): the R16 whitelist check + D34 streaming rule + the
+    // conditional extension (when refs to optional inputs make the step
+    // absentable).
+    validate_when_refs(&steps, inputs_decl.as_ref(), &mut conditional_refs)?;
     // E7 (batch 4④): multi-sink validation — R13 ref shape, E2 mutual
     // exclusion, D11/R14 streaming rules.
     // The E2 × E7 exclusion needs the raw `output:` PRESENCE (output_field
@@ -1037,7 +1275,11 @@ fn validate_skip_rules(
     let absentable: HashSet<&str> = steps
         .iter()
         .enumerate()
-        .filter(|(i, s)| s.on_error == OnErrorKind::Skip || !conditional_refs[*i].is_empty())
+        .filter(|(i, s)| {
+            s.on_error == OnErrorKind::Skip
+                || !conditional_refs[*i].is_empty()
+                || s.when.is_some() // E8-2: a when-false step is absent too
+        })
         .map(|(_, s)| s.name.as_str())
         .collect();
     if absentable.is_empty() {
@@ -2905,6 +3147,14 @@ async fn run_layers(
             let mut set: tokio::task::JoinSet<(String, Result<Vec<(String, EnsembleValue)>, AppError>)> =
                 tokio::task::JoinSet::new();
             for &step_idx in layer {
+                // E8-2 (batch 5): a when-false step is skipped (E6 channel).
+                if !when_passes(step_idx, &plan_run, opts, context)? {
+                    warn!(
+                        step = %plan_run.steps[step_idx].name,
+                        "ensemble step skipped (when condition false)"
+                    );
+                    continue;
+                }
                 // MIMO R4 (D13): a conditional step whose optional input is
                 // absent this request is skipped — the E6-skip channel.
                 if plan_run.conditional_refs[step_idx]
@@ -3046,6 +3296,22 @@ async fn open_tail_stream(
         let mut set: tokio::task::JoinSet<(String, Result<Vec<(String, EnsembleValue)>, AppError>)> =
             tokio::task::JoinSet::new();
         for idx in siblings {
+            // E8-2: a when-false sibling is skipped (E6 channel); an eval
+            // error is warn + skip (sibling results are dropped anyway).
+            match when_passes(idx, plan, opts, context) {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(
+                        step = %plan.steps[idx].name,
+                        "tail-layer sibling skipped (when condition false)"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    warn!(step = %plan.steps[idx].name, error = %e, "tail-layer sibling when-eval failed (skipped)");
+                    continue;
+                }
+            }
             // MIMO R4 (D13): conditional siblings with an absent optional
             // input are skipped (same channel as E6-skip).
             if plan.conditional_refs[idx]
@@ -4629,6 +4895,7 @@ mod tests {
                 on_error: OnErrorKind::Fail,
                 retries: 0,
                 outputs_decl: None,
+                when: None,
                 inputs: [("input".to_string(), "$request".to_string())].into(),
             },
             EnsembleStep {
@@ -4643,6 +4910,7 @@ mod tests {
                 on_error: OnErrorKind::Fail,
                 retries: 0,
                 outputs_decl: None,
+                when: None,
                 inputs: [("data".to_string(), "$step1".to_string())].into(),
             },
         ];
@@ -4664,6 +4932,7 @@ mod tests {
                 on_error: OnErrorKind::Fail,
                 retries: 0,
                 outputs_decl: None,
+                when: None,
                 inputs: [("input".to_string(), "$step2".to_string())].into(),
             },
             EnsembleStep {
@@ -4678,6 +4947,7 @@ mod tests {
                 on_error: OnErrorKind::Fail,
                 retries: 0,
                 outputs_decl: None,
+                when: None,
                 inputs: [("input".to_string(), "$step1".to_string())].into(),
             },
         ];
@@ -4699,6 +4969,7 @@ mod tests {
                 on_error: OnErrorKind::Fail,
                 retries: 0,
                 outputs_decl: None,
+                when: None,
                 inputs: [("input".to_string(), "$unknown".to_string())].into(),
             },
         ];
@@ -4720,6 +4991,7 @@ mod tests {
                 on_error: OnErrorKind::Fail,
                 retries: 0,
                 outputs_decl: None,
+                when: None,
                 inputs: [("x".to_string(), "$request".to_string())].into(),
             },
             EnsembleStep {
@@ -4734,6 +5006,7 @@ mod tests {
                 on_error: OnErrorKind::Fail,
                 retries: 0,
                 outputs_decl: None,
+                when: None,
                 inputs: [("x".to_string(), "$request".to_string())].into(),
             },
             EnsembleStep {
@@ -4748,6 +5021,7 @@ mod tests {
                 on_error: OnErrorKind::Fail,
                 retries: 0,
                 outputs_decl: None,
+                when: None,
                 inputs: [("x".to_string(), "$a".to_string())].into(),
             },
         ];
@@ -5130,6 +5404,7 @@ mod tests {
             on_error: OnErrorKind::Fail,
             retries: 0,
             outputs_decl: None,
+            when: None,
         }
     }
 
@@ -5802,6 +6077,7 @@ ensemble:
             on_error: OnErrorKind::Fail,
             retries: 0,
             outputs_decl: None,
+            when: None,
         }
     }
 
@@ -6286,6 +6562,7 @@ ensemble:
             model: "m1".to_string(),
             version: Some("1".to_string()),
             inputs: HashMap::new(),
+            when: None,
             stream: false,
             params: HashMap::new(),
             timeout_secs: None,
@@ -6346,6 +6623,81 @@ ensemble:
         let err = parse_ensemble_plan(bad_path, &PathBuf::from("/nonexistent/config.yaml"))
             .expect_err("array-subscript paths must be rejected (D29)");
         assert!(err.to_string().contains("path"), "got: {err}");
+    }
+
+    // === E8-2 (batch 5): when expressions ===
+
+    /// E8-2 parse: the grammar is `<ref> <op> <literal>` — operators
+    /// `== != contains in`, refs from the R16/m2 whitelist
+    /// ($request.dag / $request.client_ip / $inputs.NAME[.path]).
+    #[test]
+    fn e8_when_parse_and_whitelist() {
+        let ok = "ensemble:\n  inputs:\n    mode:\n      type: json\n  steps:\n    - name: s\n      model: m\n      version: \"1\"\n      when: \"$request.dag == 'fast'\"\n      inputs: {x: \"$inputs.mode\"}\n    - name: t\n      model: m2\n      version: \"1\"\n      inputs: {x: \"$inputs.mode\"}\n";
+        let plan = parse_ensemble_plan(ok, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect("whitelisted when refs must parse");
+        assert!(plan.steps[0].when.is_some());
+        // Non-whitelisted $request field → rejected (m2).
+        let bad = "ensemble:\n  inputs:\n    mode:\n      type: json\n  steps:\n    - name: s\n      model: m\n      version: \"1\"\n      when: \"$request.nope == 'x'\"\n      inputs: {x: \"$inputs.mode\"}\n    - name: t\n      model: m2\n      version: \"1\"\n      inputs: {x: \"$inputs.mode\"}\n";
+        let err = parse_ensemble_plan(bad, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("non-whitelisted request field must be rejected (R16)");
+        assert!(err.to_string().contains("nope"), "got: {err}");
+        // Unknown input → rejected.
+        let bad = "ensemble:\n  inputs:\n    mode:\n      type: json\n  steps:\n    - name: s\n      model: m\n      version: \"1\"\n      when: \"$inputs.nope == 'x'\"\n      inputs: {x: \"$inputs.mode\"}\n    - name: t\n      model: m2\n      version: \"1\"\n      inputs: {x: \"$inputs.mode\"}\n";
+        let err = parse_ensemble_plan(bad, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("undeclared input in when must be rejected (R16)");
+        assert!(err.to_string().contains("nope"), "got: {err}");
+        // Malformed expression → rejected.
+        let bad = "ensemble:\n  inputs:\n    mode:\n      type: json\n  steps:\n    - name: s\n      model: m\n      version: \"1\"\n      when: \"$request.dag === 'x'\"\n      inputs: {x: \"$inputs.mode\"}\n    - name: t\n      model: m2\n      version: \"1\"\n      inputs: {x: \"$inputs.mode\"}\n";
+        let err = parse_ensemble_plan(bad, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("malformed when must be rejected");
+        let _ = err; // the rejection itself is the assertion
+    }
+
+    /// D34 rule 6 (third arm): `when` × `stream: true` is a parse-time
+    /// rejection (a streaming response promises a stream unconditionally).
+    #[test]
+    fn e8_when_x_stream_rejected() {
+        let yaml = "ensemble:\n  steps:\n    - name: tail\n      model: m\n      version: \"1\"\n      stream: true\n      when: \"$request.dag == 'fast'\"\n      inputs: {x: \"$request\"}\n";
+        let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("when × stream must be rejected (D34)");
+        assert!(err.to_string().contains("when"), "got: {err}");
+    }
+
+    /// E8-2: a when-step's absence must be statically provable — downstream
+    /// references are rejected exactly like E6-skip (D5 channel).
+    #[test]
+    fn e8_when_step_downstream_ref_rejected() {
+        let yaml = "ensemble:\n  steps:\n    - name: cond\n      model: m\n      version: \"1\"\n      when: \"$request.dag == 'fast'\"\n      inputs: {x: \"$request\"}\n    - name: consumer\n      model: m2\n      version: \"1\"\n      inputs: {x: \"$cond\"}\n";
+        let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("when-step downstream ref must be rejected");
+        assert!(err.to_string().contains("absent"), "got: {err}");
+    }
+
+    /// E8-2 evaluation: strict type equality (no coercion), contains/in on
+    /// strings+arrays, the absent == null check (R16).
+    #[test]
+    fn e8_when_eval_semantics() {
+        let plan = parse_ensemble_plan(
+            "ensemble:\n  inputs:\n    a:\n      type: json\n    opt:\n      type: json\n      required: false\n  steps:\n    - name: s\n      model: m\n      version: \"1\"\n      when: \"$inputs.a == 1\"\n      inputs: {x: \"$inputs.a\"}\n    - name: t\n      model: m2\n      version: \"1\"\n      when: \"$inputs.a == '1'\"\n      inputs: {x: \"$inputs.a\"}\n    - name: u\n      model: m3\n      version: \"1\"\n      when: \"$inputs.a contains 'x'\"\n      inputs: {x: \"$inputs.a\"}\n    - name: v\n      model: m4\n      version: \"1\"\n      when: \"$inputs.a in ['x', 'y']\"\n      inputs: {x: \"$inputs.a\"}\n    - name: w\n      model: m5\n      version: \"1\"\n      when: \"$inputs.opt != null\"\n      inputs: {x: \"$inputs.opt\"}\n    - name: z\n      model: m6\n      version: \"1\"\n      when: \"$request.dag == 'fast'\"\n      inputs: {x: \"$inputs.a\"}\n    - name: out\n      model: m7\n      version: \"1\"\n      inputs: {x: \"$inputs.a\"}\n",
+            &PathBuf::from("/nonexistent/config.yaml"),
+        )
+        .unwrap();
+        let mut context = HashMap::new();
+        context.insert("inputs.a".to_string(), EnsembleValue::Json(json!(1)));
+        // opt absent.
+        let opts = EnsembleExecOpts {
+            client_ip: "127.0.0.1".into(),
+            deadline_unix_ns: None,
+            decoupled: false,
+            dag_selector: Some("fast".into()),
+        };
+        assert!(eval_when(&plan.steps[0].when.as_ref().unwrap(), &opts, &context).unwrap(), "1 == 1");
+        assert!(!eval_when(&plan.steps[1].when.as_ref().unwrap(), &opts, &context).unwrap(), "1 == '1' must be false (strict, no coercion)");
+        assert!(!eval_when(&plan.steps[2].when.as_ref().unwrap(), &opts, &context).unwrap(), "number contains → false");
+        assert!(!eval_when(&plan.steps[3].when.as_ref().unwrap(), &opts, &context).unwrap(), "1 in ['x','y'] must be false");
+        // absent != null → true (absence = null, R16)
+        assert!(eval_when(&plan.steps[4].when.as_ref().unwrap(), &opts, &context).unwrap(), "absent != null must be true");
+        assert!(eval_when(&plan.steps[5].when.as_ref().unwrap(), &opts, &context).unwrap(), "$request.dag == 'fast'");
     }
 
     // === E8-1 (batch 5): named DAG sets ===
@@ -6902,6 +7254,7 @@ ensemble:
             model: "m".to_string(),
             version: Some("1".to_string()),
             inputs: HashMap::new(),
+            when: None,
             stream: false,
             params: HashMap::new(),
             timeout_secs: None,
