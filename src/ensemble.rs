@@ -206,6 +206,40 @@ lazy_static::lazy_static! {
     /// grammar's first segment depends on it).
     static ref IDENT_RE: Regex = Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$")
         .expect("invalid ident regex");
+    /// R6: step.outputs projection paths — `$.a.b` dot segments only, no
+    /// array subscripts or filters (D29).
+    static ref JSON_PATH_RE: Regex =
+        Regex::new(r"^\$(\.[A-Za-z_][A-Za-z0-9_]*)+$").expect("invalid json path regex");
+}
+
+/// MIMO (R6, batch 4③): step.outputs declaration validation — alias names
+/// are identifiers; projection paths are `$.a.b` dot segments (D29). Runs
+/// for both config modes (declarations are mode-independent).
+fn validate_step_output_decls(steps: &[EnsembleStep]) -> Result<(), AppError> {
+    for step in steps {
+        let Some(decl) = &step.outputs_decl else {
+            continue;
+        };
+        for (alias, d) in decl {
+            if !IDENT_RE.is_match(alias) {
+                return Err(AppError::Config(format!(
+                    "step '{}' output alias '{alias}' is not a valid identifier \
+                     ([A-Za-z_][A-Za-z0-9_]*, R6)",
+                    step.name
+                )));
+            }
+            if let Some(path) = &d.path {
+                if !JSON_PATH_RE.is_match(path) {
+                    return Err(AppError::Config(format!(
+                        "step '{}' alias '{alias}': path '{path}' is not a $.a.b dot \
+                         segment path (R6/D29 — no array subscripts or filters)",
+                        step.name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// MIMO (R11/R12, batch 4①): the parse-decided step input assembly — with a
@@ -262,6 +296,7 @@ pub fn parse_ensemble_plan(content: &str, config_path: &std::path::Path) -> Resu
     // validation (R1/R2), ref analysis (R3/R5/R9/R12), input-mode dispatch
     // (R11) and conditional-step discovery (R4).
     let inputs_decl = config.ensemble.inputs;
+    validate_step_output_decls(&steps)?;
     let (input_modes, conditional_refs) = analyze_static_types(&steps, inputs_decl.as_ref())?;
     // E6 (D5/D34) + MIMO R4: an absentable step's absence must be statically
     // provable — no downstream references, no single-output reference,
@@ -560,9 +595,8 @@ fn analyze_static_types(
                                     }
                                 }
                                 InputType::Json => {
-                                    // MIMO② (batch 4③) opens json alias
-                                    // projection; the declaration itself is
-                                    // complete in ①.
+                                    // MIMO② (D10): json alias projections —
+                                    // static type json (GroupJson).
                                     if inputs_decl.is_some() {
                                         if mode == Some(InputMode::BinaryPassThrough) {
                                             return Err(AppError::Config(format!(
@@ -3778,14 +3812,17 @@ fn materialize_step_outputs(
                 let (bytes, ct) = decode_binary_marker(&marker)?;
                 out.push((key, EnsembleValue::Binary(bytes, ct, None, None)));
             }
-            (EnsembleValue::Json(_), InputType::Json) => {
-                // MIMO② (batch 4③) opens json aliases — the declaration is
-                // already legal; materialization lands with the projection.
-                return Err(AppError::Config(format!(
-                    "step '{}' alias '{}': json step.outputs land with MIMO② \
-                     (batch 4③) — use type: binary in this release",
-                    step.name, alias
-                )));
+            (EnsembleValue::Json(v), InputType::Json) => {
+                // MIMO② (D10): the default path is `$.<alias>`; an explicit
+                // path projects the Json pointer subset (D29).
+                let path = d.path.as_deref().unwrap_or(alias);
+                let projected = project_json_path(v, path).map_err(|_| {
+                    AppError::InvalidRequestBody(format!(
+                        "step '{}' alias '{}': path '{}' not found in the response",
+                        step.name, alias, path
+                    ))
+                })?;
+                out.push((key, EnsembleValue::Json(projected)));
             }
             (EnsembleValue::Envelope { .. }, _) => {
                 return Err(AppError::Internal(
@@ -5793,6 +5830,104 @@ ensemble:
             !is_retryable_error(&AppError::ModelNotReady("not ready".into())),
             "readiness must NOT retry"
         );
+    }
+
+    // === MIMO② (batch 4③): D10 json aliases — path projection ===
+
+    /// R6: json alias path projections — default path `$.<alias>`, explicit
+    /// `$.a.b` paths, and refs carrying projection paths (parse + runtime).
+    #[test]
+    fn mimo2_json_alias_projection() {
+        let yaml = r#"ensemble:
+  inputs:
+    x:
+      type: json
+  steps:
+    - name: a
+      model: m1
+      version: "1"
+      outputs:
+        score:
+          type: json
+          path: "$.out.score"
+        whole:
+          type: json
+      inputs: {x: "$inputs.x"}
+    - name: b
+      model: m2
+      version: "1"
+      inputs: {x: "$a.score"}
+"#;
+        let plan = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect("json alias declarations must parse (MIMO②)");
+        assert_eq!(plan.input_mode(1), Some(InputMode::GroupJson));
+
+        // Materialize: explicit nested path + default `$.<alias>` path.
+        let step = EnsembleStep {
+            name: "a".to_string(),
+            model: "m1".to_string(),
+            version: Some("1".to_string()),
+            inputs: HashMap::new(),
+            stream: false,
+            params: HashMap::new(),
+            timeout_secs: None,
+            on_error: OnErrorKind::Fail,
+            retries: 0,
+            outputs_decl: Some(
+                [
+                    ("score", StepOutputDecl {
+                        ty: InputType::Json,
+                        path: Some("$.out.score".to_string()),
+                    }),
+                    ("whole", StepOutputDecl {
+                        ty: InputType::Json,
+                        path: None,
+                    }),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            ),
+        };
+        let out = materialize_step_outputs(
+            &step,
+            EnsembleValue::Json(json!({"out": {"score": 0.9}, "whole": {"a": 1}})),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        let map: HashMap<&str, &EnsembleValue> = out.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        assert_eq!(map["a.score"], &EnsembleValue::Json(json!(0.9)));
+        assert_eq!(map["a.whole"], &EnsembleValue::Json(json!({"a": 1})), "default path $.whole");
+
+        // Missing path → step error (I3: declared contract unmet).
+        let err = materialize_step_outputs(&step, EnsembleValue::Json(json!({"other": 1})))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("score"),
+            "missing projection path must error naming the alias, got: {err}"
+        );
+
+        // Runtime ref with a projection path on a json alias.
+        let mut context = HashMap::new();
+        context.insert("a.score".to_string(), EnsembleValue::Json(json!({"x": 7})));
+        match resolve_ref(&plan, "$a.score.x", &context).unwrap() {
+            ResolvedRef::Value(EnsembleValue::Json(v)) => assert_eq!(v, json!(7)),
+            other => panic!("expected Json 7, got {other:?}"),
+        }
+    }
+
+    /// R6: alias names must be identifiers and paths must be `$.a.b` dot
+    /// segments — both are parse-time rejections.
+    #[test]
+    fn mimo2_r6_alias_name_and_path_validation() {
+        let bad_name = "ensemble:\n  steps:\n    - name: a\n      model: m1\n      version: \"1\"\n      outputs:\n        9bad:\n          type: json\n      inputs: {x: \"$request\"}\n    - name: b\n      model: m2\n      version: \"1\"\n      inputs: {x: \"$a.9bad\"}\n";
+        let err = parse_ensemble_plan(bad_name, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("invalid alias name must be rejected (R6)");
+        assert!(err.to_string().contains("alias"), "got: {err}");
+        let bad_path = "ensemble:\n  steps:\n    - name: a\n      model: m1\n      version: \"1\"\n      outputs:\n        score:\n          type: json\n          path: \"out[0].score\"\n      inputs: {x: \"$request\"}\n    - name: b\n      model: m2\n      version: \"1\"\n      inputs: {x: \"$a.score\"}\n";
+        let err = parse_ensemble_plan(bad_path, &PathBuf::from("/nonexistent/config.yaml"))
+            .expect_err("array-subscript paths must be rejected (D29)");
+        assert!(err.to_string().contains("path"), "got: {err}");
     }
 
     // === MIMO (batch 4①): inputs declaration R1-R5, wire R18/R19, LSBE-1
