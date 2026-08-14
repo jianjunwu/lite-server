@@ -15,10 +15,12 @@ pub(super) const DEFAULT_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
 ///   older than `max_age`;
 /// - repo-root staging dirs `.tmp-upload-*` / `.tmp-unpack-*` older than
 ///   `max_age`;
-/// - repo-root swap backups `.{name}.old-{uuid}` (H3/H4 swap semantics):
-///   removed when the target dir exists (the swap completed — the backup is
-///   stale), RESTORED when it does not (the crash hit the window between
-///   rename-aside and rename-in; restoring is the only non-lossy recovery);
+/// - swap backups `.{name}.old-{uuid}` (H3/H4 swap semantics), both at the
+///   repo root (scanner model-dir swaps) and one level down (HTTP upload
+///   version-dir swaps): removed when the target dir exists (the swap
+///   completed — the backup is stale), RESTORED when it does not (the
+///   crash hit the window between rename-aside and rename-in; restoring
+///   is the only non-lossy recovery);
 /// - `{temp}/lite-server/*.sock` whose embedded server pid is dead (the
 ///   pid component is the last underscore field — unparseable names are
 ///   kept, per "只清陈旧文件").
@@ -53,14 +55,22 @@ pub(super) async fn startup_tmp_cleanup(
         }
     }
 
-    // 2. Repo-root staging dirs and swap backups.
+    // 2. Repo-root staging dirs and swap backups, plus version-level swap
+    // backups one level down: the scanner's root unpack swap parks
+    // `.{model}.old-*` at the repo root, while the HTTP upload swap
+    // (files.rs swap_dir_into) parks `.{version}.old-*` next to the
+    // version dir — both crash windows need the same recovery.
     if let Ok(mut entries) = tokio::fs::read_dir(repo_path).await {
+        let mut model_dirs: Vec<std::path::PathBuf> = Vec::new();
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().to_string();
+            let path = entry.path();
             if !name.starts_with('.') {
+                if path.is_dir() {
+                    model_dirs.push(path);
+                }
                 continue;
             }
-            let path = entry.path();
             if name.starts_with(".tmp-upload-") || name.starts_with(".tmp-unpack-") {
                 if path.is_dir()
                     && is_stale(&path, now, max_age).await
@@ -71,33 +81,26 @@ pub(super) async fn startup_tmp_cleanup(
                 }
                 continue;
             }
-            // Swap backup `.{name}.old-{uuid}`. Model names cannot contain
-            // dots (IDENTIFIER_RE), so the first ".old-" delimits the
-            // original name unambiguously.
-            if let Some(idx) = name.find(".old-") {
-                if idx == 0 || !path.is_dir() {
-                    continue;
-                }
-                let target = repo_path.join(&name[1..idx]);
-                if target.exists() {
-                    // The swap completed before the crash — the backup is
-                    // stale.
-                    if is_stale(&path, now, max_age).await
-                        && tokio::fs::remove_dir_all(&path).await.is_ok()
-                    {
-                        removed += 1;
-                        info!(path = %path.display(), "startup cleanup: removed stale swap backup");
+            sweep_swap_backup(repo_path, &name, &path, now, max_age, &mut removed, &mut restored)
+                .await;
+        }
+        for dir in model_dirs {
+            if let Ok(mut ventries) = tokio::fs::read_dir(&dir).await {
+                while let Ok(Some(ventry)) = ventries.next_entry().await {
+                    let vname = ventry.file_name().to_string_lossy().to_string();
+                    if !vname.starts_with('.') {
+                        continue;
                     }
-                } else {
-                    // Crash between rename-aside and rename-in — restore
-                    // the previous tree (deleting it would lose the model).
-                    match tokio::fs::rename(&path, &target).await {
-                        Ok(()) => {
-                            restored += 1;
-                            info!(path = %path.display(), target = %target.display(), "startup cleanup: restored swap backup (target was missing)");
-                        }
-                        Err(e) => warn!(path = %path.display(), error = %e, "startup cleanup: failed to restore swap backup"),
-                    }
+                    sweep_swap_backup(
+                        &dir,
+                        &vname,
+                        &ventry.path(),
+                        now,
+                        max_age,
+                        &mut removed,
+                        &mut restored,
+                    )
+                    .await;
                 }
             }
         }
@@ -128,6 +131,48 @@ pub(super) async fn startup_tmp_cleanup(
     }
 
     (removed, restored)
+}
+
+/// Handle one `.{name}.old-{uuid}` swap backup parked inside `parent`:
+/// removed when the target exists (the swap completed — the backup is
+/// stale), RESTORED when it does not (the crash hit the window between
+/// rename-aside and rename-in; restoring is the only non-lossy recovery).
+/// Model and version names cannot contain dots (IDENTIFIER_RE /
+/// VERSION_RE), so the first ".old-" delimits the original name
+/// unambiguously.
+async fn sweep_swap_backup(
+    parent: &Path,
+    name: &str,
+    path: &Path,
+    now: SystemTime,
+    max_age: Duration,
+    removed: &mut u64,
+    restored: &mut u64,
+) {
+    let Some(idx) = name.find(".old-") else {
+        return;
+    };
+    if idx == 0 || !path.is_dir() {
+        return;
+    }
+    let target = parent.join(&name[1..idx]);
+    if target.exists() {
+        // The swap completed before the crash — the backup is stale.
+        if is_stale(path, now, max_age).await && tokio::fs::remove_dir_all(path).await.is_ok() {
+            *removed += 1;
+            info!(path = %path.display(), "startup cleanup: removed stale swap backup");
+        }
+    } else {
+        // Crash between rename-aside and rename-in — restore the previous
+        // tree (deleting it would lose the model/version).
+        match tokio::fs::rename(path, &target).await {
+            Ok(()) => {
+                *restored += 1;
+                info!(path = %path.display(), target = %target.display(), "startup cleanup: restored swap backup (target was missing)");
+            }
+            Err(e) => warn!(path = %path.display(), error = %e, "startup cleanup: failed to restore swap backup"),
+        }
+    }
 }
 
 /// Whether `path` is older than `max_age` relative to `now`. Missing
@@ -272,6 +317,38 @@ mod tests {
         assert_eq!((removed, restored), (1, 0), "completed swap → backup is stale");
         assert!(repo.join("mymodel").exists());
         assert!(!backup.exists());
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn restores_version_level_swap_backup_when_target_is_missing() {
+        // The HTTP upload swap (files.rs swap_dir_into) parks the backup
+        // NEXT TO the version dir — repo/{model}/.{version}.old-{uuid} —
+        // not at the repo root. A crash between rename-aside and rename-in
+        // must recover that window too, else the old version tree is
+        // stranded invisible (dot-prefixed) and the version is lost.
+        let repo = unique_tmp("vrestore");
+        let backup = repo
+            .join("mymodel")
+            .join(format!(".1.old-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&backup).await.unwrap();
+        tokio::fs::write(backup.join("model.py"), "old")
+            .await
+            .unwrap();
+
+        let (_removed, restored) = startup_tmp_cleanup(
+            &repo,
+            &unique_tmp("temp"),
+            SystemTime::now(),
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(
+            restored, 1,
+            "version-level swap backup must be restored, not stranded"
+        );
+        assert!(repo.join("mymodel").join("1").join("model.py").exists());
 
         let _ = tokio::fs::remove_dir_all(&repo).await;
     }

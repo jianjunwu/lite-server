@@ -648,11 +648,12 @@ impl Admin for GrpcAdminService {
         &self,
         req: Request<pb::DeleteVersionRequest>,
     ) -> Result<Response<pb::DeleteVersionResponse>, Status> {
+        let cx = req.extensions().get::<RequestContext>().cloned();
         let r = req.into_inner();
         crate::http::handlers::admin::delete_version_impl(
             &self.app_state,
             &self.access_control,
-            None,
+            cx.as_ref(),
             Protocol::Grpc,
             &r.model_name,
             &r.version,
@@ -670,11 +671,12 @@ impl Admin for GrpcAdminService {
         &self,
         req: Request<pb::DeleteModelRequest>,
     ) -> Result<Response<pb::DeleteModelResponse>, Status> {
+        let cx = req.extensions().get::<RequestContext>().cloned();
         let r = req.into_inner();
         crate::http::handlers::admin::delete_model_core(
             &self.app_state,
             &self.access_control,
-            None,
+            cx.as_ref(),
             Protocol::Grpc,
             &r.model_name,
             r.force,
@@ -691,6 +693,7 @@ impl Admin for GrpcAdminService {
         &self,
         req: Request<pb::DeleteVersionsRequest>,
     ) -> Result<Response<pb::DeleteVersionsResponse>, Status> {
+        let cx = req.extensions().get::<RequestContext>().cloned();
         let r = req.into_inner();
         // keep == 0 means unset (wire 定稿: the HTTP keep=0 validation
         // cannot apply to a proto uint32, where absence is 0).
@@ -703,7 +706,7 @@ impl Admin for GrpcAdminService {
         let (deleted, failed) = crate::http::handlers::admin::delete_versions_core(
             &self.app_state,
             &self.access_control,
-            None,
+            cx.as_ref(),
             Protocol::Grpc,
             &r.model_name,
             keep,
@@ -759,6 +762,7 @@ impl Admin for GrpcAdminService {
         &self,
         req: Request<tonic::Streaming<pb::UploadModelRequest>>,
     ) -> Result<Response<pb::UploadModelResponse>, Status> {
+        let cx = req.extensions().get::<RequestContext>().cloned();
         let mut stream = req.into_inner();
 
         // Loose-field wire (定稿): the FIRST message carries the metadata;
@@ -768,6 +772,15 @@ impl Admin for GrpcAdminService {
             .await
             .map_err(|e| to_status(AppError::Transport(format!("read upload stream: {}", e))))?
             .ok_or_else(|| to_status(AppError::Validation("empty upload stream".to_string())))?;
+        // Reject file content on the metadata message outright — silently
+        // dropping it would corrupt the upload without any error signal.
+        if !first.file_name.is_empty() || !first.data.is_empty() {
+            return Err(to_status(AppError::InvalidRequestBody(
+                "the first UploadModel message carries metadata only \
+                 (model_name/version/load); send file_name/data in subsequent messages"
+                    .to_string(),
+            )));
+        }
         let model_name = first.model_name.clone();
         crate::validation::validate_identifier(&model_name).map_err(to_status)?;
         let url_version = first.version.clone();
@@ -805,7 +818,7 @@ impl Admin for GrpcAdminService {
         {
             let file_name = msg.file_name.clone();
             if file_name.is_empty() {
-                return Err(to_status(AppError::Validation(
+                return Err(to_status(AppError::InvalidRequestBody(
                     "file message lacks a file_name".to_string(),
                 )));
             }
@@ -817,7 +830,7 @@ impl Admin for GrpcAdminService {
                 .to_string_lossy()
                 .to_string();
             if safe_name.is_empty() || safe_name.starts_with('.') {
-                return Err(to_status(AppError::Validation(format!(
+                return Err(to_status(AppError::InvalidRequestBody(format!(
                     "invalid file name: {}",
                     file_name
                 ))));
@@ -850,7 +863,7 @@ impl Admin for GrpcAdminService {
                     // Switching files: the reassignment below closes the
                     // previous staged file.
                     if closed.contains(&safe_name) {
-                        return Err(to_status(AppError::Validation(format!(
+                        return Err(to_status(AppError::InvalidRequestBody(format!(
                             "file '{}' re-appears after another file — chunks must be contiguous",
                             file_name
                         ))));
@@ -860,7 +873,7 @@ impl Admin for GrpcAdminService {
                     if is_lma {
                         lma_count += 1;
                         if lma_count > 1 {
-                            return Err(to_status(AppError::Validation(
+                            return Err(to_status(AppError::InvalidRequestBody(
                                 "UploadModel accepts at most one .lma artifact".to_string(),
                             )));
                         }
@@ -909,7 +922,7 @@ impl Admin for GrpcAdminService {
         .map_err(to_status)?;
 
         self.audit(
-            &None,
+            &cx,
             "upload",
             &model_name,
             Some(&outcome.version),
@@ -934,6 +947,7 @@ impl Admin for GrpcAdminService {
         &self,
         req: Request<pb::DownloadModelRequest>,
     ) -> Result<Response<Self::DownloadModelStream>, Status> {
+        let cx = req.extensions().get::<RequestContext>().cloned();
         let r = req.into_inner();
         crate::validation::validate_identifier(&r.model_name).map_err(to_status)?;
         // Bare → active version (F9, same semantics as bare ready).
@@ -964,7 +978,7 @@ impl Admin for GrpcAdminService {
         .map_err(to_status)?;
 
         self.audit(
-            &None,
+            &cx,
             "download",
             &r.model_name,
             Some(&version),
@@ -2283,5 +2297,410 @@ mod tests {
         let _ = shutdown_tx.send(());
         let _ = tokio::fs::remove_dir_all(&repo).await;
         let _ = tokio::fs::remove_dir_all(&pack_tmp).await;
+    }
+
+    // ===== Audit-evidence tests (batch 3+4 review) =====
+
+    #[tokio::test]
+    async fn upload_model_first_message_file_data_is_not_silently_dropped() {
+        // Loose-field wire: the first message carries the metadata. A client
+        // that also packs file content into it must get either a rejection
+        // or faithful storage — silently dropping those bytes corrupts the
+        // uploaded model without any error.
+        let repo = unique_repo("first-chunk");
+        let (port, shutdown_tx, _handle) = spawn_admin_grpc_server_with_repo(
+            Arc::new(ModelRegistry::new()),
+            repo.clone(),
+            config_with_repo(&repo),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut client = connect_admin(port).await;
+
+        let result = client
+            .upload_model(tokio_stream::iter(vec![
+                pb::UploadModelRequest {
+                    model_name: "mymodel".to_string(),
+                    version: Some("1".to_string()),
+                    load: Some(false),
+                    file_name: "model.py".to_string(),
+                    data: Bytes::from_static(b"FIRST-"),
+                },
+                pb::UploadModelRequest {
+                    model_name: String::new(),
+                    version: None,
+                    load: None,
+                    file_name: "model.py".to_string(),
+                    data: Bytes::from_static(b"SECOND"),
+                },
+            ]))
+            .await;
+        match result {
+            Ok(resp) => {
+                assert!(resp.into_inner().success);
+                let content = tokio::fs::read(repo.join("mymodel").join("1").join("model.py"))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    content, b"FIRST-SECOND",
+                    "the first message's file bytes must not be silently dropped"
+                );
+            }
+            Err(e) => assert_eq!(
+                e.code(),
+                tonic::Code::InvalidArgument,
+                "a wire violation should surface as a client error, not silent loss: {e}"
+            ),
+        }
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    /// Capture `lite_server::audit` target events (same pattern as
+    /// audit.rs tests: scoped dispatch + rebuild_interest_cache so the
+    /// callsite interest cache cannot short-circuit the capture).
+    #[derive(Default)]
+    struct AuditRec {
+        fields: Vec<(String, String)>,
+    }
+
+    struct AuditCapture(std::sync::Arc<std::sync::Mutex<AuditRec>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AuditCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "lite_server::audit" {
+                return;
+            }
+            struct V<'a>(&'a mut Vec<(String, String)>);
+            impl tracing::field::Visit for V<'_> {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    self.0.push((f.name().to_string(), format!("{v:?}")));
+                }
+                fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                    self.0.push((f.name().to_string(), v.to_string()));
+                }
+            }
+            let mut v = V(&mut self.0.lock().unwrap().fields);
+            event.record(&mut v);
+        }
+    }
+
+    #[test]
+    fn delete_version_audit_carries_request_context() {
+        // D27: control-plane mutations audit principal / peer / request_id.
+        // The gRPC interceptor stashes a RequestContext in the request
+        // extensions (the older Admin RPCs read it from there); the
+        // repository RPCs must thread it into the audit record too.
+        let repo = std::env::temp_dir().join(format!(
+            "lite-server-grpc-audit-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let repo2 = repo.clone();
+        let rec = std::sync::Arc::new(std::sync::Mutex::new(AuditRec::default()));
+        let rec2 = rec.clone();
+        use tracing_subscriber::layer::SubscriberExt;
+        let dispatch =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(AuditCapture(rec)));
+        let handle = std::thread::spawn(move || {
+            let _guard = tracing::dispatcher::set_default(&dispatch);
+            tracing::callsite::rebuild_interest_cache();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let dir = repo2.join("mymodel").join("1");
+                tokio::fs::create_dir_all(&dir).await.unwrap();
+                tokio::fs::write(dir.join("model.py"), "def predict(x): return x")
+                    .await
+                    .unwrap();
+                let svc = build_admin_service_with_repo(
+                    Arc::new(ModelRegistry::new()),
+                    repo2.clone(),
+                );
+                let mut req = Request::new(pb::DeleteVersionRequest {
+                    model_name: "mymodel".to_string(),
+                    version: "1".to_string(),
+                    force: false,
+                });
+                req.extensions_mut().insert(RequestContext {
+                    request_id: "grpc-rid-1".to_string(),
+                    client_ip: "10.1.2.3".to_string(),
+                    trace_cx: opentelemetry::Context::new(),
+                    protocol: Protocol::Grpc,
+                    principal: None,
+                    api_protocol: None,
+                });
+                svc.delete_version(req).await.expect("delete must succeed");
+                let _ = tokio::fs::remove_dir_all(&repo2).await;
+            });
+        });
+        handle.join().unwrap();
+
+        let fields = &rec2.lock().unwrap().fields;
+        let get = |name: &str| {
+            fields
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("audit field {name} missing: {fields:?}"))
+        };
+        assert_eq!(get("action"), "delete");
+        assert_eq!(
+            get("request_id"),
+            "grpc-rid-1",
+            "the audit record must carry the request_id from the gRPC interceptor context"
+        );
+        assert_eq!(get("client_ip"), "10.1.2.3");
+    }
+
+    // ===== Wire-validation + pack-path coverage (plan F3/F11 test matrix) =====
+
+    #[tokio::test]
+    async fn upload_model_cumulative_cap_is_resource_exhausted() {
+        // F11b: the cumulative cap applies across chunks of the stream.
+        let repo = unique_repo("cap");
+        let mut config = config_with_repo(&repo);
+        config.server.max_upload_bytes = Some(10);
+        let (port, shutdown_tx, _handle) = spawn_admin_grpc_server_with_repo(
+            Arc::new(ModelRegistry::new()),
+            repo.clone(),
+            config,
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut client = connect_admin(port).await;
+
+        let err = client
+            .upload_model(tokio_stream::iter(vec![
+                pb::UploadModelRequest {
+                    model_name: "mymodel".to_string(),
+                    version: Some("1".to_string()),
+                    load: Some(false),
+                    file_name: String::new(),
+                    data: Bytes::new(),
+                },
+                pb::UploadModelRequest {
+                    model_name: String::new(),
+                    version: None,
+                    load: None,
+                    file_name: "model.py".to_string(),
+                    data: Bytes::from_static(b"12345678"),
+                },
+                pb::UploadModelRequest {
+                    model_name: String::new(),
+                    version: None,
+                    load: None,
+                    file_name: "model.py".to_string(),
+                    data: Bytes::from_static(b"9abcdef0"), // cumulative 16 > 10
+                },
+            ]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted, "{err}");
+
+        // The staging dir must be cleaned on rejection (StagingGuard drops;
+        // the removal is spawned, so poll briefly).
+        for _ in 0..50 {
+            let mut entries = tokio::fs::read_dir(&repo).await.unwrap();
+            if entries.next_entry().await.unwrap().is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let mut entries = tokio::fs::read_dir(&repo).await.unwrap();
+        assert!(
+            entries.next_entry().await.unwrap().is_none(),
+            "cap rejection must leave no staging residue"
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn upload_model_rejects_multiple_lma_artifacts() {
+        // Wire 定稿: at most one .lma per UploadModel (counted per FILE, so
+        // chunked single-.lma streams pass).
+        let repo = unique_repo("multi-lma");
+        let (port, shutdown_tx, _handle) = spawn_admin_grpc_server_with_repo(
+            Arc::new(ModelRegistry::new()),
+            repo.clone(),
+            config_with_repo(&repo),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut client = connect_admin(port).await;
+
+        let err = client
+            .upload_model(tokio_stream::iter(vec![
+                pb::UploadModelRequest {
+                    model_name: "mymodel".to_string(),
+                    version: Some("1".to_string()),
+                    load: Some(false),
+                    file_name: String::new(),
+                    data: Bytes::new(),
+                },
+                pb::UploadModelRequest {
+                    model_name: String::new(),
+                    version: None,
+                    load: None,
+                    file_name: "a.lma".to_string(),
+                    data: Bytes::from_static(b"x"),
+                },
+                pb::UploadModelRequest {
+                    model_name: String::new(),
+                    version: None,
+                    load: None,
+                    file_name: "b.lma".to_string(),
+                    data: Bytes::from_static(b"y"),
+                },
+            ]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err}");
+        assert!(
+            err.message().contains("at most one .lma"),
+            "error must name the rule: {err}"
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn upload_model_rejects_interleaved_file_chunks() {
+        // Chunks of one file must be contiguous: A, B, A would silently
+        // corrupt A if the second A were appended (or truncated if
+        // recreated) — rejected instead.
+        let repo = unique_repo("interleave");
+        let (port, shutdown_tx, _handle) = spawn_admin_grpc_server_with_repo(
+            Arc::new(ModelRegistry::new()),
+            repo.clone(),
+            config_with_repo(&repo),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut client = connect_admin(port).await;
+
+        let err = client
+            .upload_model(tokio_stream::iter(vec![
+                pb::UploadModelRequest {
+                    model_name: "mymodel".to_string(),
+                    version: Some("1".to_string()),
+                    load: Some(false),
+                    file_name: String::new(),
+                    data: Bytes::new(),
+                },
+                pb::UploadModelRequest {
+                    model_name: String::new(),
+                    version: None,
+                    load: None,
+                    file_name: "a.py".to_string(),
+                    data: Bytes::from_static(b"x"),
+                },
+                pb::UploadModelRequest {
+                    model_name: String::new(),
+                    version: None,
+                    load: None,
+                    file_name: "b.py".to_string(),
+                    data: Bytes::from_static(b"y"),
+                },
+                pb::UploadModelRequest {
+                    model_name: String::new(),
+                    version: None,
+                    load: None,
+                    file_name: "a.py".to_string(),
+                    data: Bytes::from_static(b"z"),
+                },
+            ]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err}");
+        assert!(
+            err.message().contains("contiguous"),
+            "error must name the rule: {err}"
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn download_model_full_packs_fresh_when_no_artifact() {
+        // No retained artifact anywhere → the version dir is packed into a
+        // temp .lma and streamed; the stream must reassemble into a package
+        // that unpacks back to the original tree (round-trip), and the
+        // terminal frame must describe exactly those bytes. (Temp-dir
+        // cleanup itself is unit-tested via DownloadCleanup in files.rs;
+        // asserting against the shared global temp here would race parallel
+        // tests.)
+        let repo = unique_repo("fresh-pack");
+        make_disk_version(&repo, "mymodel", "1").await;
+        let (port, shutdown_tx, _handle) = spawn_admin_grpc_server_with_repo(
+            Arc::new(ModelRegistry::new()),
+            repo.clone(),
+            config_with_repo(&repo),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut client = connect_admin(port).await;
+
+        let mut stream = client
+            .download_model(pb::DownloadModelRequest {
+                model_name: "mymodel".to_string(),
+                version: Some("1".to_string()),
+                file: None,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let mut assembled = Vec::new();
+        let mut terminal: Option<pb::DownloadModelChunk> = None;
+        while let Some(chunk) = stream.message().await.unwrap() {
+            if chunk.is_final {
+                terminal = Some(chunk);
+            } else {
+                assembled.extend_from_slice(&chunk.data);
+            }
+        }
+        let term = terminal.expect("the stream must end with a terminal frame");
+        let mut hasher = Sha256::new();
+        hasher.update(&assembled);
+        assert_eq!(term.sha256, format!("{:x}", hasher.finalize()));
+        assert_eq!(term.size, assembled.len() as u64);
+        assert_eq!(&assembled[..2], b"PK", "a fresh pack must be a zip");
+
+        // Round-trip: unpack the streamed package and compare the tree.
+        let out = unique_repo("fresh-pack-out");
+        tokio::fs::create_dir_all(&out).await.unwrap();
+        let lma = out.join("mymodel_v1.lma");
+        tokio::fs::write(&lma, &assembled).await.unwrap();
+        let unpack = crate::http::handlers::files::run_unpack(
+            &crate::python::resolve_python_interpreter(),
+            &lma,
+            &out,
+            Some("1"),
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .expect("unpack must run");
+        assert!(
+            unpack.status.success(),
+            "unpack failed: {}",
+            String::from_utf8_lossy(&unpack.stderr)
+        );
+        let model_py = tokio::fs::read(out.join("1").join("model.py")).await.unwrap();
+        assert_eq!(model_py, b"def predict(x): return x");
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+        let _ = tokio::fs::remove_dir_all(&out).await;
     }
 }
