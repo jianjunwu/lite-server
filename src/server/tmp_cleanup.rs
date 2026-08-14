@@ -353,6 +353,79 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&repo).await;
     }
 
+    #[tokio::test]
+    async fn deleted_model_swap_backup_is_not_restored_at_startup() {
+        // O1 resurrection chain: a fresh swap backup survives its swap,
+        // the model is then deleted via the API, and the server restarts
+        // within the staleness window — the sweep must find nothing to
+        // restore, or the deleted model comes back (G5's exact threat).
+        use crate::callback::{CallbackRunner, Protocol};
+        use crate::config::Config;
+        use crate::http::state::AppState;
+        use crate::inference_queue::InferenceQueue;
+        use crate::registry::ModelRegistry;
+        use crate::worker::WorkerManager;
+        use std::sync::Arc;
+
+        let repo = unique_tmp("resurrect");
+        tokio::fs::create_dir_all(repo.join("mymodel").join("1"))
+            .await
+            .unwrap();
+        tokio::fs::write(repo.join("mymodel").join("1").join("model.py"), "x = 1")
+            .await
+            .unwrap();
+        let backup = repo.join(format!(".mymodel.old-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(backup.join("1")).await.unwrap();
+        tokio::fs::write(backup.join("1").join("model.py"), "old")
+            .await
+            .unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let queue = Arc::new(InferenceQueue::new());
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            queue.clone(),
+            "error".to_string(),
+            Arc::new(CallbackRunner::new()),
+        ));
+        let state = Arc::new(AppState::new(
+            registry,
+            wm,
+            queue,
+            Config::default(),
+            repo.clone(),
+            Arc::new(CallbackRunner::new()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+        ));
+        crate::http::handlers::admin::delete_model_core(
+            &state,
+            &state.access_control,
+            None,
+            Protocol::Http,
+            "mymodel",
+            false,
+        )
+        .await
+        .expect("delete must succeed");
+
+        let (_removed, restored) = startup_tmp_cleanup(
+            &repo,
+            &unique_tmp("temp"),
+            SystemTime::now(),
+            DEFAULT_MAX_AGE,
+        )
+        .await;
+        assert_eq!(restored, 0, "a deleted model must not be restored");
+        assert!(
+            !repo.join("mymodel").exists(),
+            "the deleted model must stay deleted"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn removes_dead_pid_sockets_and_keeps_live_ones() {

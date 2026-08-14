@@ -544,6 +544,34 @@ pub(crate) async fn remove_linked_artifacts(
     removed
 }
 
+/// O1: remove swap-backup residue `.{name}.old-*` directories inside
+/// `parent` (H3/H4 swap semantics — at the repo root for model swaps, in
+/// the model dir for version swaps). A deleted model/version must take
+/// its backups with it: the H7 startup sweep restores target-missing
+/// backups, which would otherwise resurrect the deleted tree (the same
+/// threat G5 removes the linked artifacts for). Returns the paths
+/// actually removed (for the audit record).
+async fn remove_swap_backups(parent: &std::path::Path, name: &str) -> Vec<String> {
+    let mut removed = Vec::new();
+    let prefix = format!(".{}.old-", name);
+    let Ok(mut entries) = tokio::fs::read_dir(parent).await else {
+        return removed;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(fname) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        if fname.starts_with(&prefix) && tokio::fs::remove_dir_all(&path).await.is_ok() {
+            removed.push(path.display().to_string());
+        }
+    }
+    removed
+}
+
 /// Shared delete-version logic (HTTP handler, E2 batch delete and the
 /// gRPC DeleteVersion RPC all funnel through here). Unloads the worker if
 /// loaded, removes the version directory, cleans the linked artifacts (G5)
@@ -605,7 +633,11 @@ pub(crate) async fn delete_version_impl(
 
     // G5: linked artifact cleanup — the scanner-placed root .lma and the
     // .artifacts/ copy would otherwise resurrect the version on restart.
-    let linked = remove_linked_artifacts(&state.repo_path, model_name, version).await;
+    // O1: the version-level swap backup (.{v}.old-*) is the same kind of
+    // resurrection vector — the H7 startup sweep restores target-missing
+    // backups.
+    let mut linked = remove_linked_artifacts(&state.repo_path, model_name, version).await;
+    linked.extend(remove_swap_backups(&state.repo_path.join(model_name), version).await);
 
     // G4: deleting the active version is a traffic-shaping event — make the
     // resulting active state explicit in the logs.
@@ -1131,7 +1163,11 @@ pub(crate) async fn delete_model_core(
 
     // G5: linked artifacts — root .lma files would resurrect the model via
     // auto-unpack on restart; .artifacts/ copies are F10a's.
-    let removed = remove_model_artifacts(&state.repo_path, model_name).await;
+    // O1: the root-level swap backup (.{name}.old-*) is the same kind of
+    // resurrection vector — the H7 startup sweep restores target-missing
+    // backups.
+    let mut removed = remove_model_artifacts(&state.repo_path, model_name).await;
+    removed.extend(remove_swap_backups(&state.repo_path, model_name).await);
 
     let details = if removed.is_empty() {
         "model deleted".to_string()
@@ -1738,6 +1774,111 @@ mod delete_model_tests {
         });
         assert_eq!(fields.iter().find(|(n, _)| n == "action").map(|(_, v)| v.as_str()), Some("delete_model"), "{fields:?}");
         assert_eq!(fields.iter().find(|(n, _)| n == "model").map(|(_, v)| v.as_str()), Some("audit_del_m"), "{fields:?}");
+    }
+}
+
+/// O1: swap-backup residue (`.{name}.old-*`, H3/H4 swap semantics) is a
+/// resurrection vector — the H7 startup sweep restores target-missing
+/// backups, so a deleted model/version must take its backups with it.
+#[cfg(test)]
+mod delete_swap_backup_tests {
+    use super::*;
+    use crate::config::Config;
+
+    fn unique_repo(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "lite-server-del-backup-{}-{}-{}",
+            tag,
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    async fn no_dot_backup_under(dir: &std::path::Path, prefix: &str) -> bool {
+        let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+            return true;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.file_name().to_string_lossy().starts_with(prefix) {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[tokio::test]
+    async fn delete_version_removes_version_level_swap_backup() {
+        let repo = unique_repo("version");
+        tokio::fs::create_dir_all(repo.join("mymodel").join("1"))
+            .await
+            .unwrap();
+        tokio::fs::write(repo.join("mymodel").join("1").join("model.py"), "x = 1")
+            .await
+            .unwrap();
+        // Swap residue from an interrupted upload overwrite.
+        let backup = repo
+            .join("mymodel")
+            .join(format!(".1.old-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&backup).await.unwrap();
+        tokio::fs::write(backup.join("model.py"), "old")
+            .await
+            .unwrap();
+
+        let state = drift_tests::state_with_repo(Config::default(), &repo);
+        delete_version_impl(
+            &state,
+            &state.access_control,
+            None,
+            Protocol::Http,
+            "mymodel",
+            "1",
+            false,
+        )
+        .await
+        .expect("delete must succeed");
+
+        assert!(
+            no_dot_backup_under(&repo.join("mymodel"), ".1.old-").await,
+            "the version-level swap backup must be deleted with the version"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn delete_model_removes_root_level_swap_backup() {
+        let repo = unique_repo("model");
+        tokio::fs::create_dir_all(repo.join("mymodel").join("1"))
+            .await
+            .unwrap();
+        tokio::fs::write(repo.join("mymodel").join("1").join("model.py"), "x = 1")
+            .await
+            .unwrap();
+        // Swap residue from an interrupted scanner root unpack.
+        let backup = repo.join(format!(".mymodel.old-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(backup.join("1")).await.unwrap();
+        tokio::fs::write(backup.join("1").join("model.py"), "old")
+            .await
+            .unwrap();
+
+        let state = drift_tests::state_with_repo(Config::default(), &repo);
+        delete_model_core(
+            &state,
+            &state.access_control,
+            None,
+            Protocol::Http,
+            "mymodel",
+            false,
+        )
+        .await
+        .expect("delete must succeed");
+
+        assert!(
+            no_dot_backup_under(&repo, ".mymodel.old-").await,
+            "the root-level swap backup must be deleted with the model"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
     }
 }
 
