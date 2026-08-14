@@ -124,15 +124,14 @@ pub(crate) fn resolve_ref(
     };
 
     let Some(source_data) = context.get(&key) else {
-        if source == "inputs" {
-            // MIMO R4: an absent optional named input — Absent (conditional
-            // steps are pre-skipped; reaching here is an internal bug).
-            return Ok(ResolvedRef::Absent(key));
-        }
-        return Err(AppError::Config(format!(
-            "reference source not found: {}",
-            ref_str
-        )));
+        // A missing key is ABSENCE, not an error: a skipped step (E6/R4 —
+        // ensemble.outputs aliases may reference one, D5's null channel) or
+        // an absent optional input. Callers that cannot tolerate absence
+        // (step inputs) turn Absent into their own internal error. Keeping
+        // absence OUT of the error channel lets build_response propagate
+        // real errors (type misuse, projection failures) instead of
+        // swallowing them into null (C2).
+        return Ok(ResolvedRef::Absent(key));
     };
 
     match source_data {

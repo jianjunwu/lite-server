@@ -175,6 +175,13 @@ pub fn parse_root_inputs(
                 }
             }
         };
+        // C6: input names must be unique (KServe V2) — a silent last-wins
+        // overwrite would drop client data.
+        if values.contains_key(name) {
+            return Err(AppError::InvalidRequestBody(format!(
+                "envelope input '{name}' appears more than once (R18)"
+            )));
+        }
         values.insert(name.to_string(), value);
     }
     if offset != tail.len() {
@@ -250,7 +257,10 @@ pub fn split_envelope(blob: &[u8]) -> Result<(serde_json::Value, Option<Bytes>),
     if blob.len() < 12 {
         return Err(malformed());
     }
-    let head_len = u64::from_le_bytes(blob[4..12].try_into().unwrap()) as usize;
+    // try_into: on 32-bit targets a head length above usize::MAX is
+    // malformed, not a truncated slice.
+    let head_len = usize::try_from(u64::from_le_bytes(blob[4..12].try_into().unwrap()))
+        .map_err(|_| malformed())?;
     let head_end = 12usize.checked_add(head_len).ok_or_else(malformed)?;
     if head_end > blob.len() {
         return Err(AppError::InvalidRequestBody(

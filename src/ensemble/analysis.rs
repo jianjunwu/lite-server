@@ -36,7 +36,19 @@ pub(crate) fn resolve_output(
                 source
             ))
         })?;
-    Ok((idx, caps.get(2).map(|m| m.as_str().to_string())))
+    let field = caps.get(2).map(|m| m.as_str().to_string());
+    // C3 (B5 parity): the output field is a SINGLE segment — legacy refs
+    // reject multi-segment paths, and select_output_field does a single
+    // literal key lookup, so `a.b` would 500 or silently match a dotted key.
+    if let Some(f) = &field {
+        if f.contains('.') {
+            return Err(AppError::Config(format!(
+                "ensemble.output '{output}': multi-segment field paths are not \
+                 supported — use a single field ($stepN.field)"
+            )));
+        }
+    }
+    Ok((idx, field))
 }
 
 /// MIMO (batch 4①, R1-R5/R9/R11/R12): build the static type environment.
@@ -403,6 +415,20 @@ pub(crate) fn validate_dag(steps: &[EnsembleStep]) -> Result<(), AppError> {
     // Check for duplicate names
     if step_names.len() != steps.len() {
         return Err(AppError::Config("duplicate step names in ensemble".to_string()));
+    }
+
+    // C7: `request` and `inputs` are reserved root namespaces ($request /
+    // $inputs.NAME). A step with such a name is unreferenceable — refs
+    // resolve to the root, never to the step — and its result overwrites
+    // the reserved context key, corrupting later layers' root refs.
+    for s in steps {
+        if s.name == "request" || s.name == "inputs" {
+            return Err(AppError::Config(format!(
+                "step name '{}' is a reserved namespace ($request / $inputs) — \
+                 rename the step",
+                s.name
+            )));
+        }
     }
 
     // Build dependency graph

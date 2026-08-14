@@ -1220,6 +1220,7 @@ fn write_all_fixtures(repo: &std::path::Path) {
     write_ensemble(repo, "ens_chain", ENS_CHAIN_YAML);
     write_ensemble(repo, "ens_chain_fail", ENS_CHAIN_FAIL_YAML);
     write_ensemble(repo, "ens_chain_slow", ENS_CHAIN_SLOW_YAML);
+    write_ensemble(repo, "ens_chain_deadline", ENS_CHAIN_DEADLINE_YAML);
     write_ensemble(repo, "ens_chain_head_fail", ENS_CHAIN_HEAD_FAIL_YAML);
     write_ensemble(repo, "ens_chain_sibling", ENS_CHAIN_SIBLING_YAML);
     write_ensemble(repo, "ens_split", ENS_SPLIT_YAML);
@@ -1238,6 +1239,9 @@ fn write_all_fixtures(repo: &std::path::Path) {
     write_tail(repo, "tail_late", "");
     write_ensemble(repo, "ens_nested_child", ENS_NESTED_CHILD_YAML);
     write_ensemble(repo, "ens_nested_parent", ENS_NESTED_PARENT_YAML);
+    write_ensemble(repo, "ens_nested_mimo_child", ENS_NESTED_MIMO_CHILD_YAML);
+    write_ensemble(repo, "ens_nested_mimo_parent", ENS_NESTED_MIMO_PARENT_YAML);
+    write_ensemble(repo, "ens_nested_mimo_badkey", ENS_NESTED_MIMO_BADKEY_YAML);
     write_ensemble(repo, "ens_self", ENS_SELF_YAML);
     write_ensemble(repo, "ens_mut_a", ENS_MUT_A_YAML);
     write_ensemble(repo, "ens_mut_b", ENS_MUT_B_YAML);
@@ -1298,7 +1302,7 @@ fn write_server_yaml(repo: &std::path::Path, http_port: u16, extra: &str, orch_e
         format!(
             "server:\n  http_port: {http_port}\n  timeout: 30.0\n{extra}\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_dags\n    - ens_when\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n    - ens_nested_dags_parent\n    - ens_dags_inputs\n    - ens_when_dag_obs\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_deadline\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_nested_mimo_child\n    - ens_nested_mimo_parent\n    - ens_nested_mimo_badkey\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_dags\n    - ens_when\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n    - ens_nested_dags_parent\n    - ens_dags_inputs\n    - ens_when_dag_obs\n",
             repo.display()
         ),
     )
@@ -1471,6 +1475,12 @@ async fn test_audit_stream_binary_chunk_type_mismatch() {
         body.contains("error") && !body.contains("[DONE]"),
         "binary chunk on SSE must close with an Error frame, no [DONE]: {body}"
     );
+    // m7: pin the TYPE_MISMATCH classification — a generic worker_error
+    // frame must not satisfy this test.
+    assert!(
+        body.contains("binary chunk on a text endpoint"),
+        "the Error frame must be the type_mismatch one, not a generic error: {body}"
+    );
 }
 
 /// §4.4 autoload-failure row: sub-model with a corrupt config → 503.
@@ -1602,6 +1612,30 @@ async fn test_audit_stream_p10_capacity_429() {
         "429 body must name streaming capacity: {body}"
     );
 
+    // §6.3.3: the rejection is observable — record_stream_rejected fires on
+    // the P10 429 (requests_total 4xx for the ensemble model).
+    let metrics = reqwest::Client::new()
+        .get(format!("{}/metrics", base))
+        .send()
+        .await
+        .expect("/metrics")
+        .text()
+        .await
+        .unwrap();
+    let rejected = metrics
+        .lines()
+        .filter(|l| {
+            l.starts_with(r#"liteserver_requests_total{model="ens_slow""#)
+                && l.contains(r#"status="4xx""#)
+        })
+        .filter_map(|l| l.rsplit(' ').next().and_then(|v| v.parse::<u64>().ok()))
+        .sum::<u64>();
+    assert!(
+        rejected >= 1,
+        "P10 429 must be recorded (record_stream_rejected); metrics:\n{}",
+        metrics.lines().filter(|l| l.contains("ens_slow")).collect::<Vec<_>>().join("\n")
+    );
+
     // First stream still completes with its chunks.
     let first_body = first.text().await.expect("first stream body");
     assert!(
@@ -1681,7 +1715,7 @@ async fn boot_server_grpc(extra: &str) -> (String, u16, ServerGuard, std::path::
             "server:\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  timeout: 30.0\n{extra}\n\n\
              grpc:\n  enabled: true\n\n\
              model_repository:\n  path: {}\n\n\
-             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_dags\n    - ens_when\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n    - ens_nested_dags_parent\n    - ens_dags_inputs\n    - ens_when_dag_obs\n",
+             orchestration:\n  control_mode: explicit\n  load_models:\n    - pre\n    - pre_agg\n    - tail\n    - tail_upper\n    - tail_fail_chain\n    - tail_v2\n    - tail_slow\n    - tail_fail\n    - tail_binary\n    - tail_split\n    - tail_dslow\n    - pre_bad\n    - pre_5xx\n    - ghost\n    - echo\n    - ens_stream\n    - ens_agg\n    - ens_chain\n    - ens_chain_fail\n    - chain_slow_head\n    - chain_head_fail\n    - ens_chain_slow\n    - ens_chain_deadline\n    - ens_chain_head_fail\n    - ens_chain_sibling\n    - ens_split\n    - ens_dslow\n    - ens_binary\n    - ens_unary\n    - ens_pipeline\n    - ens_bad_sub\n    - ens_4xx\n    - ens_5xx\n    - ens_fail\n    - ens_slow\n    - ens_nested_child\n    - ens_nested_parent\n    - ens_nested_mimo_child\n    - ens_nested_mimo_parent\n    - ens_nested_mimo_badkey\n    - ens_self\n    - ens_mut_a\n    - ens_mut_b\n    - ens_child_stream\n    - ens_out_mid\n    - ens_out_field\n    - ens_out_missing\n    - ens_params\n    - drift\n    - ens_drift\n    - ens_drift_child\n    - ens_drift_parent\n    - ens_e5_stream\n    - ens_e5_autoload\n    - ens_sibling_race\n    - ens_e5_slow_child\n    - ens_e5_nested_timeout\n    - pre_flaky\n    - tail_flaky\n    - tail_fail_always\n    - ens_skip\n    - ens_retry\n    - ens_retry_off\n    - ens_retry_exhaust\n    - ens_stream_retry\n    - ens_stream_retry_exhaust\n    - ens_stream_committed\n    - vis_enc\n    - cropper\n    - classifier\n    - ens_mimo\n    - ens_mimo_json_alias\n    - ens_multisink\n    - ens_dags\n    - ens_when\n    - ens_mimo_bin\n    - ens_mimo_cond\n    - ens_mimo_stream\n    - ens_nested_dags_parent\n    - ens_dags_inputs\n    - ens_when_dag_obs\n",
             repo.display()
         ),
     )
@@ -2103,26 +2137,34 @@ async fn test_audit_stream_ws_bidi_aggregation_idle_timeout() {
     .await
     .unwrap();
 
-    let mut saw_error = false;
+    let mut saw_idle_error = false;
+    let mut close_code: Option<u16> = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while tokio::time::Instant::now() < deadline {
+    while tokio::time::Instant::now() < deadline && close_code.is_none() {
         match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => {
-                if t.contains("idle") || t.contains("error") {
-                    saw_error = true;
-                    break;
+                // The §4.4 contract error, not any error: the aggregation
+                // idle-timeout message must be the one sent.
+                if t.contains("bidi aggregation idle timeout") {
+                    saw_idle_error = true;
                 }
             }
-            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) => {
-                saw_error = true;
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(frame)))) => {
+                close_code = frame.map(|f| u16::from(f.code));
                 break;
             }
             _ => break,
         }
     }
     assert!(
-        saw_error,
-        "aggregation without a close trigger must hit the idle timeout"
+        saw_idle_error,
+        "aggregation without a close trigger must hit the idle timeout (idle error frame)"
+    );
+    // §4.4 close contract: idle timeout → close code 1011.
+    assert_eq!(
+        close_code,
+        Some(1011),
+        "aggregation idle timeout must close with 1011 (§4.4)"
     );
 }
 
@@ -2621,6 +2663,28 @@ const ENS_CHAIN_SLOW_YAML: &str = r#"ensemble:
         prev: "$t1"
 "#;
 
+/// Slow-TAIL chain with a tail wall-clock cap (D35 × §4.2): the tail step's
+/// `timeout_secs` must terminate the chain with an Error frame — the
+/// adapter-level min(client overall, step_deadline) only works when the
+/// chain surfaces the tail's cap in EnsembleStream.step_deadline.
+const ENS_CHAIN_DEADLINE_YAML: &str = r#"ensemble:
+  steps:
+    - name: t1
+      model: tail
+      version: "1"
+      stream: true
+      inputs:
+        pre: "$request.text"
+    - name: t2
+      model: chain_slow_head
+      version: "1"
+      stream: true
+      timeout_secs: 1
+      inputs:
+        prev: "$t1"
+"#;
+
+
 /// Head-fail chain: the HEAD worker errors on its 2nd chunk.
 const ENS_CHAIN_HEAD_FAIL_YAML: &str = r#"ensemble:
   steps:
@@ -2702,6 +2766,32 @@ async fn test_audit_stream_pipeline_midchain_failure() {
         "mid-chain failure must close with an Error frame, no [DONE]: {body}"
     );
 }
+
+/// D35 × §4.2: a pipeline chain tail's `timeout_secs` must apply — the
+/// chain surfaces it as EnsembleStream.step_deadline and the per-hop
+/// consumer enforces its own wall-clock cap; the stream terminates with an
+/// Error frame around the cap, not a 13s run to [DONE].
+#[serial]
+#[tokio::test]
+async fn test_audit_stream_pipeline_chain_tail_timeout() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_chain_deadline"]).await;
+
+    let start = std::time::Instant::now();
+    let body = sse_post(&base, "/v2/models/ens_chain_deadline/events", json!({"text": "hello chain world"}))
+        .await
+        .expect("chain SSE must open");
+    let elapsed = start.elapsed();
+    assert!(
+        body.contains("error") && !body.contains("[DONE]"),
+        "a tail deadline expiry must close with an Error frame, no [DONE]: {body}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(6),
+        "tail timeout_secs=1 must terminate the chain promptly; elapsed {elapsed:?}"
+    );
+}
+
 
 // ---------------------------------------------------------------------------
 // /audit 2026-08-13: batch-2 defect repros (read-only; no impl changes)
@@ -2852,6 +2942,49 @@ const ENS_NESTED_PARENT_YAML: &str = r#"ensemble:
       model: ens_nested_child
       inputs:
         x: "$pre.pre"
+"#;
+
+/// R17: the child declares `inputs` — the parent step's assembled group
+/// object maps DIRECTLY onto the child's named inputs (no $inputs wrapper).
+const ENS_NESTED_MIMO_CHILD_YAML: &str = r#"ensemble:
+  inputs:
+    text:
+      type: json
+  steps:
+    - name: e
+      model: echo
+      version: "1"
+      inputs:
+        data: "$inputs.text"
+"#;
+
+const ENS_NESTED_MIMO_PARENT_YAML: &str = r#"ensemble:
+  steps:
+    - name: pre
+      model: pre
+      version: "1"
+      inputs:
+        text: "$request.text"
+    - name: child
+      model: ens_nested_mimo_child
+      inputs:
+        text: "$pre.pre"
+"#;
+
+/// R17 negative: an unknown key in the parent group object → the child's
+/// entry rejects with the same 400 shape as a direct envelope error.
+const ENS_NESTED_MIMO_BADKEY_YAML: &str = r#"ensemble:
+  steps:
+    - name: pre
+      model: pre
+      version: "1"
+      inputs:
+        text: "$request.text"
+    - name: child
+      model: ens_nested_mimo_child
+      inputs:
+        text: "$pre.pre"
+        bogus: "$pre.pre"
 "#;
 
 /// Self-referencing DAG (step → its own model) — the ancestor guard rejects
@@ -3097,11 +3230,15 @@ class ReflectAPI(LitAPI):
 
 /// Two drift versions: v1 (slow 2s, answers "v1"), v2 (fast, answers "v2").
 fn write_drift(repo: &std::path::Path) {
-    for (version, ver, sleep_s) in [("1", "v1", "        time.sleep(2.0)\n"), ("2", "v2", "")] {
+    // The v1 marker file makes the mid-request activation DETERMINISTIC:
+    // the test activates v2 only after v1's predict has STARTED (i.e. after
+    // step a's version resolution), not after a blind sleep.
+    for (version, ver, sleep_s) in [("1", "v1", "        marker = os.path.join(os.path.dirname(os.path.abspath(__file__)), \"predict_started\")\n        with open(marker, \"w\") as f:\n            f.write(\"started\")\n        time.sleep(2.0)\n"), ("2", "v2", "")] {
         let dir = repo.join("drift").join(version);
         std::fs::create_dir_all(&dir).unwrap();
         let py = format!(
-            r#"import time
+            r#"import os
+import time
 from lite_server import LitAPI
 
 
@@ -3151,6 +3288,51 @@ async fn test_audit_stream_e1_nested_happy() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK, "nested ensemble must succeed");
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body, json!({"echo": "hello"}), "nested output mismatch: {body}");
+}
+
+/// R17 (MIMO × E1): a parent step's group object maps directly onto the
+/// child ensemble's declared named inputs — the child runs with them.
+#[serial]
+#[tokio::test]
+async fn test_audit_r17_nested_named_inputs_mapping() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_nested_mimo_parent"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_nested_mimo_parent/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"text": "hello r17"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "R17 nested mapping must succeed");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body, json!({"echo": "hello r17"}), "child must see the named input: {body}");
+}
+
+/// R17 negative: an unknown key for the child's declared inputs → 400
+/// (the child's entry error surfaces as the parent step's error).
+#[serial]
+#[tokio::test]
+async fn test_audit_r17_nested_unknown_key_400() {
+    let (base, _guard, _repo) = boot_server("").await;
+    wait_ready_all(&base, &["ens_nested_mimo_badkey"]).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v2/models/ens_nested_mimo_badkey/infer", base))
+        .header("Content-Type", "application/json")
+        .json(&json!({"text": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "an unknown named-input key must be a 400 (R17), got {}",
+        resp.status()
+    );
 }
 
 /// E1: a DAG whose step references ITSELF — the runtime ancestor guard
@@ -3363,7 +3545,14 @@ async fn test_audit_stream_e4_snapshot_active_drift() {
             .send()
             .await
     });
-    sleep(Duration::from_millis(400)).await;
+    // Activate only AFTER v1's predict has started (= step a's version
+    // resolution already happened) — deterministic, no blind sleep.
+    let marker = _repo.join("drift").join("1").join("predict_started");
+    let mark_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !marker.exists() {
+        assert!(tokio::time::Instant::now() < mark_deadline, "drift v1 predict never started");
+        sleep(Duration::from_millis(50)).await;
+    }
     let activate = client
         .post(format!("{}/v2/models/drift/versions/2/activate", base))
         .send()
@@ -3453,7 +3642,13 @@ async fn test_audit_stream_e4_snapshot_nested_d36() {
             .send()
             .await
     });
-    sleep(Duration::from_millis(400)).await;
+    // Same deterministic gate: activate only after v1's predict started.
+    let marker = _repo.join("drift").join("1").join("predict_started");
+    let mark_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !marker.exists() {
+        assert!(tokio::time::Instant::now() < mark_deadline, "drift v1 predict never started");
+        sleep(Duration::from_millis(50)).await;
+    }
     let activate = client
         .post(format!("{}/v2/models/drift/versions/2/activate", base))
         .send()

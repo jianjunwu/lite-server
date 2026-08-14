@@ -346,6 +346,8 @@ pub(crate) async fn execute_ensemble_inner(
     // concurrent sibling branch never sees this entry (B1: the flat shared
     // Vec misread sibling fan-out as recursion).
     let ancestors = extend_ancestor_chain(ancestors, model_name, version);
+    // P10 (§6.3.3): rejection observability needs a request-age baseline.
+    let request_start = Instant::now();
     // P0 (D6): plan comes from the cache — parse/validate/layers run once per
     // config version, not per request. In-flight requests hold their Arc and
     // finish on the old plan even across a reload (D23).
@@ -390,10 +392,10 @@ pub(crate) async fn execute_ensemble_inner(
         // Historical unary path — byte-identical behaviour (E7: multi-sink
         // responses build from the same context via build_response).
         run_layers(
-            &state, plan, &plan.layers, &mut context, &absent_inputs,
+            &state, &plan, &plan.layers, &mut context, &absent_inputs,
             model_name, version, request_id, &opts, deadline_unix_ns, snapshot, depth, &ancestors,
         ).await?;
-        return build_response(plan, model_name, &context);
+        return build_response(&plan, model_name, &context);
     }
 
     // §4.2 pipeline branch (batch 2): the DAG contains a chain — run the
@@ -419,20 +421,29 @@ pub(crate) async fn execute_ensemble_inner(
             }
         }
         run_layers(
-            &state, plan, &pre_layers, &mut context, &absent_inputs,
+            &state, &plan, &pre_layers, &mut context, &absent_inputs,
             model_name, version, request_id, &opts, deadline_unix_ns, snapshot, depth, &ancestors,
-        )
-        .await?;
-        let mut stream = spawn_chain(
-            &state, plan, chain, &context, request_id, &opts, deadline_unix_ns, snapshot,
         )
         .await?;
         // P10 (D40): the permit is WEIGHTED by the chain's streaming-step
         // count (末步 = 1, k 链 = k — residency scales linearly with the
-        // chain length).
-        if let Some(capacity) = state.worker_manager.streaming_capacity() {
-            stream.permit = Some(capacity.try_acquire_many(chain.nodes.len())?);
-        }
+        // chain length). Acquire BEFORE spawning the chain: a 429-rejected
+        // request must be side-effect-free on sub-model workers (no worker
+        // stream is opened without a permit).
+        let permit = match state.worker_manager.streaming_capacity() {
+            Some(capacity) => Some(capacity.try_acquire_many(chain.nodes.len()).inspect_err(|_| {
+                // §6.3.3: every P10 rejection is observable.
+                crate::metrics::prometheus::record_stream_rejected(
+                    model_name, version, "4xx", request_start.elapsed().as_secs_f64(),
+                );
+            })?),
+            None => None,
+        };
+        let mut stream = spawn_chain(
+            &state, &plan, chain, &context, request_id, &opts, deadline_unix_ns, snapshot,
+        )
+        .await?;
+        stream.permit = permit;
         return Ok(EnsembleOutcome::Stream(stream));
     }
 
@@ -452,7 +463,7 @@ pub(crate) async fn execute_ensemble_inner(
     };
     let layers_fut = async {
         run_layers(
-            &state, plan, &plan.layers[..tail_layer], &mut context, &absent_inputs,
+            &state, &plan, &plan.layers[..tail_layer], &mut context, &absent_inputs,
             model_name, version, request_id, &opts, deadline_unix_ns, snapshot, depth, &ancestors,
         )
         .await
@@ -462,15 +473,23 @@ pub(crate) async fn execute_ensemble_inner(
 
     // P10 (D40): acquire a streaming-DAG slot BEFORE opening the stream —
     // immediate 429 rejection on exhaustion (no queueing; the pre-layers
-    // already waited in the queue once). The owned permit rides the stream
-    // and releases when the adapter's forward task ends (D18 teardown path).
+    // already waited in the queue once), and a rejected request never opens
+    // a sub-model worker stream. The owned permit rides the stream and
+    // releases when the adapter's forward task ends (D18 teardown path).
+    let permit = match state.worker_manager.streaming_capacity() {
+        Some(capacity) => Some(capacity.try_acquire().inspect_err(|_| {
+            // §6.3.3: every P10 rejection is observable.
+            crate::metrics::prometheus::record_stream_rejected(
+                model_name, version, "4xx", request_start.elapsed().as_secs_f64(),
+            );
+        })?),
+        None => None,
+    };
     let mut stream = open_tail_stream(
-        &state, plan, tail_idx, tail_layer, &context, &absent_inputs,
+        &state, &plan, tail_idx, tail_layer, &context, &absent_inputs,
         request_id, &opts, deadline_unix_ns, preflight?, snapshot, depth, &ancestors,
     ).await?;
-    if let Some(capacity) = state.worker_manager.streaming_capacity() {
-        stream.permit = Some(capacity.try_acquire()?);
-    }
+    stream.permit = permit;
     Ok(EnsembleOutcome::Stream(stream))
 }
 
@@ -621,7 +640,7 @@ where
 /// inner safety net, this outer deadline bounds the total.
 async fn run_layers(
     state: &Arc<AppState>,
-    plan: &EnsemblePlan,
+    plan: &Arc<EnsemblePlan>,
     layers: &[Vec<usize>],
     context: &mut HashMap<String, EnsembleValue>,
     absent_inputs: &HashSet<String>,
@@ -635,7 +654,9 @@ async fn run_layers(
     ancestors: &[(String, String)], // E1: this branch's chain (B1: never shared across sibling branches)
 ) -> Result<(), AppError> {
     let total_budget = crate::deadline::remaining(deadline_unix_ns);
-    let plan_run = Arc::new(plan.clone());
+    // Arc clone is a refcount bump — the cached plan is shared, never
+    // deep-cloned per request.
+    let plan_run = plan.clone();
     // E6 (batch 4): steps allowed to be absent on error (parse rules D5/D34
     // guarantee nothing references them — absence is safe by construction).
     let skip_set: HashSet<&str> = plan
@@ -708,7 +729,7 @@ async fn run_layers(
 /// the chain spawn without touching the caller seam.
 async fn open_tail_stream(
     state: &Arc<AppState>,
-    plan: &EnsemblePlan,
+    plan: &Arc<EnsemblePlan>,
     tail_idx: usize,
     tail_layer: usize,
     context: &HashMap<String, EnsembleValue>,
@@ -775,7 +796,7 @@ async fn open_tail_stream(
             // P1 (batch 6): the sibling sees only its referenced keys.
             let ctx = select_ctx_keys(context, &plan.step_dep_keys[idx]);
             let step = plan.steps[idx].clone();
-            let plan_spawn = Arc::new(plan.clone());
+            let plan_spawn = plan.clone();
             let request_id = request_id.to_string();
             let client_ip = opts.client_ip.clone();
             let snapshot = snapshot.clone();
@@ -884,17 +905,50 @@ async fn tail_stream_preflight(
 /// failure cancels its worker and propagates upstream, D18). When the
 /// downstream closes (adapter disconnect / next hop exiting), send
 /// StreamCancel to THIS worker and end.
+/// D35: `deadline` is this hop's wall-clock cap (E5 timeout_secs, measured
+/// from the sub-stream open) — on expiry the hop emits an Error frame
+/// downstream, cancels its worker, and stops the chain.
 /// Returns `true` when the stream ended with an Error frame (chain stop).
 async fn forward_stream(
     mut rx: mpsc::Receiver<pb::StreamResponse>,
     tx: mpsc::Sender<pb::StreamResponse>,
     cancel_client: Arc<crate::transport::zmq::WorkerZmqClient>,
     stream_id: String,
+    deadline: Option<Instant>,
+    step_name: &str,
 ) -> bool {
     // m4: cumulative time this hop's downstream channel was FULL (the 64-slot
     // bound is backpressure, not a drop — saturation measures how long it held).
     let mut saturation_secs: f64 = 0.0;
-    while let Some(chunk) = rx.recv().await {
+    loop {
+        let next = match deadline {
+            Some(d) => match tokio::time::timeout_at(tokio::time::Instant::from_std(d), rx.recv()).await {
+                Ok(v) => v,
+                Err(_) => {
+                    // D35: hop wall-clock cap expired mid-stream — Error
+                    // frame downstream + cancel this hop's worker (§4.4:
+                    // every mid-stream failure reaches the client as an
+                    // Error frame).
+                    let _ = tx.send(pb::StreamResponse {
+                        payload: Some(pb::stream_response::Payload::Error(pb::StreamError {
+                            message: format!(
+                                "pipeline step '{step_name}' exceeded its timeout (D35)"
+                            ),
+                        })),
+                        ..Default::default()
+                    }).await;
+                    let _ = cancel_client
+                        .send_raw(crate::streaming::build_stream_cancel(stream_id))
+                        .await;
+                    crate::metrics::prometheus::record_ensemble_pipeline_channel_saturation_seconds(
+                        saturation_secs,
+                    );
+                    return true;
+                }
+            },
+            None => rx.recv().await,
+        };
+        let Some(chunk) = next else { break };
         match chunk.payload {
             Some(pb::stream_response::Payload::Chunk(_)) => {
                 let send_start = Instant::now();
@@ -933,6 +987,20 @@ async fn forward_stream(
     false
 }
 
+/// §4.2 / C5: a pipeline chunk is spliced RAW into the downstream step's
+/// JSON payload (P2's zero-re-serialize path), so it must be well-formed
+/// JSON — validate with a borrowed RawValue parse (no Value materialized).
+/// A garbage/binary chunk fails the chain with the historical error.
+pub(crate) fn validate_pipeline_chunk(prev_step_name: &str, data: &[u8]) -> Result<(), AppError> {
+    serde_json::from_slice::<&serde_json::value::RawValue>(data)
+        .map(|_| ())
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "pipeline chunk from '{prev_step_name}' is not valid JSON: {e}"
+            ))
+        })
+}
+
 /// §4.2: a pipeline chain consumer — one nested send_stream sub-call PER
 /// upstream chunk (chunk → 组包 → sub-stream → forward). D20: each sub-call
 /// carries request_id `{parent}:{step}:{chunk_seq}`. D18: a failed
@@ -968,6 +1036,8 @@ async fn consume_stream_consumer(
                 // P2 (batch 6): the chunk stays unparsed raw bytes (P-R2
                 // guarantees whole-reference-only consumption — the downstream
                 // assembly splices the original bytes, no per-chunk parse).
+                // C5: raw splicing requires well-formed JSON — validate.
+                validate_pipeline_chunk(prev_step_name, &c.data)?;
                 let mut ctx = base_ctx.clone();
                 ctx.insert(
                     prev_step_name.to_string(),
@@ -994,11 +1064,19 @@ async fn consume_stream_consumer(
                         handles.push(handle);
                     }
                 }
+                // D35: the hop's wall-clock cap, measured from this
+                // sub-stream's open (E5 formula per streaming step on a
+                // chain) — enforced inside forward_stream.
+                let hop_deadline = step.timeout_secs.and_then(|t| {
+                    Instant::now().checked_add(Duration::try_from_secs_f64(t).ok()?)
+                });
                 let error_terminated = forward_stream(
                     sub.chunk_rx,
                     downstream.clone(),
                     sub.cancel_client.clone(),
                     sub.stream_id.clone(),
+                    hop_deadline,
+                    &step.name,
                 )
                 .await;
                 if error_terminated {
@@ -1051,7 +1129,7 @@ async fn consume_stream_consumer(
 #[allow(clippy::too_many_arguments)] // chain plumbing: state+plan+ctx+ids ride together by design
 async fn spawn_chain(
     state: &Arc<AppState>,
-    plan: &EnsemblePlan,
+    plan: &Arc<EnsemblePlan>,
     chain: &Chain,
     context: &HashMap<String, EnsembleValue>,
     request_id: &str,
@@ -1174,7 +1252,14 @@ async fn spawn_chain(
         tail_model: tail.model.clone(),
         tail_version,
         tail_step: tail.name.clone(),
-        step_deadline: None,
+        // D35 × §4.2: the chain tail's E5 timeout_secs is a wall-clock cap
+        // measured from the chain spawn (same formula as the single-tail
+        // branch) — the adapters' recv_chunk overall takes min(client
+        // overall, this). Mid-chain hops enforce their own caps in
+        // forward_stream.
+        step_deadline: tail.timeout_secs.and_then(|t| {
+            Instant::now().checked_add(Duration::try_from_secs_f64(t).ok()?)
+        }),
         chain: chain_handles,
         // D18: the chain task tree's root handle — the adapter aborts it on
         // disconnect as the teardown backstop.

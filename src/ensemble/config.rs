@@ -116,6 +116,18 @@ fn validate_outputs_rules(
                             ref_str, step_name
                         )));
                     }
+                    // R8 (outputs face, C1): a declared BINARY alias is
+                    // whole-only — no path projection, same rule step-input
+                    // refs enforce in analyze_static_types.
+                    if decl[a].ty == InputType::Binary
+                        && rest.map(|r| r.contains('.')).unwrap_or(false)
+                    {
+                        return Err(AppError::Config(format!(
+                            "ensemble.outputs alias '{alias}': binary output '{}' \
+                             must be referenced whole (R8)",
+                            ref_str
+                        )));
+                    }
                 }
             }
         }
@@ -308,15 +320,18 @@ pub fn eval_when(
             }
         }
     };
-    // R16: absence is DISTINCT from null — `!= null` is the absence check
-    // (absent → true), `== null` matches an explicit null only.
+    // §5.5.8: `$inputs.NAME != null` is the ABSENCE check — an absent input
+    // compares AS null (absent == null → true, absent != null → false). An
+    // explicit JSON null value conflates with absence in when expressions
+    // (both take the D13 skip channel everywhere else; documented ruling).
+    let left = left.or(Some(Value::Null));
     Ok(match expr.op {
         WhenOp::Eq => left == Some(expr.literal.clone()),
         WhenOp::Neq => left != Some(expr.literal.clone()),
         WhenOp::Contains => match (&left, &expr.literal) {
             (Some(Value::String(s)), Value::String(sub)) => s.contains(sub.as_str()),
             (Some(Value::Array(a)), _) => a.contains(&expr.literal),
-            _ => false, // absent / non-string/array: strict semantics
+            _ => false, // null / non-string/array: strict semantics
         },
         WhenOp::In => match &expr.literal {
             Value::Array(a) => left.as_ref().map(|l| a.contains(l)).unwrap_or(false),
@@ -343,10 +358,12 @@ pub(crate) fn when_passes(
 /// picks by name (None = "default"); an unknown name is a 400 (explicit
 /// contract, never a silent default fallback — a typo must surface).
 /// Single-form plans reject any selector (it can only name nothing).
-pub fn select_dag_set<'a>(
-    plan: &'a EnsemblePlan,
+/// Returns an Arc clone (refcount only) so the selected plan threads into
+/// the execution engine without a per-request deep clone.
+pub fn select_dag_set(
+    plan: &std::sync::Arc<EnsemblePlan>,
     selector: Option<&str>,
-) -> Result<&'a EnsemblePlan, AppError> {
+) -> Result<std::sync::Arc<EnsemblePlan>, AppError> {
     match &plan.dag_sets {
         None => {
             if let Some(s) = selector {
@@ -354,11 +371,11 @@ pub fn select_dag_set<'a>(
                     "x-lite-dag selector '{s}' provided but this ensemble declares                      no dags (D22)"
                 )));
             }
-            Ok(plan)
+            Ok(plan.clone())
         }
         Some(sets) => {
             let name = selector.unwrap_or("default");
-            sets.get(name).map(|p| p.as_ref()).ok_or_else(|| {
+            sets.get(name).cloned().ok_or_else(|| {
                 AppError::InvalidRequestBody(format!(
                     "unknown dag '{name}' — declared sets: {} (D22)",
                     sets.keys().cloned().collect::<Vec<_>>().join(", ")
@@ -449,14 +466,16 @@ pub(crate) fn build_response(
     for (alias, ref_str) in outputs {
         let value = match resolve_ref(plan, ref_str, context) {
             Ok(ResolvedRef::Value(v)) => Some(v),
-            Ok(ResolvedRef::Absent(_)) => None,
-            Err(e) => {
-                // R13 parse-validated the ref — a runtime error here means
-                // the source is ABSENT (skipped step / missing optional
-                // input): the D5 null channel.
-                warn!(alias = %alias, ref_ = %ref_str, error = %e, "ensemble outputs alias is null (absent source, D5)");
+            // Absent (skipped step / missing optional input) → the D5 null
+            // channel. resolve_ref reports absence as Absent, never as an
+            // error — so an Err here is a REAL failure (type misuse,
+            // projection on binary, invalid raw JSON) and must propagate
+            // (C2: D5 covers absence only, never a broken DAG contract).
+            Ok(ResolvedRef::Absent(_)) => {
+                warn!(alias = %alias, ref_ = %ref_str, "ensemble outputs alias is null (absent source, D5)");
                 None
             }
+            Err(e) => return Err(e),
         };
         match value {
             None => head_outputs.push(json!({"name": alias, "data": null})),

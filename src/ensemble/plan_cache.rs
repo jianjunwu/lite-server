@@ -50,7 +50,15 @@ pub fn spawn_ensemble_warm(
         // re-resolves against the registry, so an active drift between warm
         // and first request has no freeze window.
         let warm_snapshot = Arc::new(VersionSnapshot::default());
-        for step in &plan.steps {
+        // E8-1: a dags-form plan's outer steps are EMPTY — the steps live in
+        // the sets. Warm every set's sub-models, or their routing/LRU caches
+        // stay cold (and an unreferenced sub-model risks LRU eviction while
+        // a live DAG depends on it).
+        let warm_steps: Vec<&EnsembleStep> = match &plan.dag_sets {
+            Some(sets) => sets.values().flat_map(|p| p.steps.iter()).collect(),
+            None => plan.steps.iter().collect(),
+        };
+        for step in warm_steps {
             match warm_snapshot.resolve(&registry, step) {
                 Ok(resolved) => {
                     // touch_last_used: an ensemble's sub-models must count as

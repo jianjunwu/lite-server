@@ -501,37 +501,45 @@ fn p2_declared_step_materializes_nested_raw_outcome() {
 }
 
 #[test]
-fn p2_unary_response_raw_eligible_skips_validation() {
-    let single = pb::SingleResponse {
-        data: Bytes::from_static(b"{oops"),
+fn p2_unary_response_raw_eligible_requires_valid_json() {
+    // C5: raw residency validates (borrowed parse) without materializing —
+    // whole refs SPLICE the bytes downstream, so invalid JSON must keep the
+    // historical parse error even for pass-through schemas.
+    let good = pb::SingleResponse {
+        data: Bytes::from_static(br#"{"ok": 1}"#),
         media_type: "application/json".to_string(),
         ..Default::default()
     };
     let value = unary_response_to_value(
         "s",
         pb::Response {
-            payload: Some(pb::response::Payload::Single(single.clone())),
+            payload: Some(pb::response::Payload::Single(good)),
             ..Default::default()
         },
         true,
     )
     .unwrap();
     assert!(
-        matches!(value, EnsembleValue::RawJson(r) if r.bytes.as_ref() == b"{oops"),
-        "pass-through schemas skip JSON validation (P2①)"
+        matches!(value, EnsembleValue::RawJson(r) if r.bytes.as_ref() == br#"{"ok": 1}"#),
+        "valid JSON stays unparsed raw bytes (P2①)"
     );
+    let bad = pb::SingleResponse {
+        data: Bytes::from_static(b"{oops"),
+        media_type: "application/json".to_string(),
+        ..Default::default()
+    };
     let err = unary_response_to_value(
         "s",
         pb::Response {
-            payload: Some(pb::response::Payload::Single(single)),
+            payload: Some(pb::response::Payload::Single(bad)),
             ..Default::default()
         },
-        false,
+        true,
     )
     .unwrap_err();
     assert!(
         err.to_string().contains("invalid JSON"),
-        "typed/field-referenced steps keep validation, got: {err}"
+        "invalid JSON must error even when raw-eligible (splice safety, C5), got: {err}"
     );
 }
 
@@ -2428,10 +2436,12 @@ fn e8_when_eval_semantics() {
         !eval_when(plan.steps[3].when.as_ref().unwrap(), &opts, &context).unwrap(),
         "1 in ['x','y'] must be false"
     );
-    // absent != null → true (absence = null, R16)
+    // absent compares AS null (§5.5.8: `!= null` is the absence check) —
+    // so `$inputs.opt != null` with opt ABSENT is false (the step is
+    // skipped), and `$inputs.opt == null` is true.
     assert!(
-        eval_when(plan.steps[4].when.as_ref().unwrap(), &opts, &context).unwrap(),
-        "absent != null must be true"
+        !eval_when(plan.steps[4].when.as_ref().unwrap(), &opts, &context).unwrap(),
+        "absent != null must be false (absence compares as null, §5.5.8)"
     );
     assert!(
         eval_when(plan.steps[5].when.as_ref().unwrap(), &opts, &context).unwrap(),
@@ -2474,6 +2484,7 @@ fn e8_select_dag_set() {
             &PathBuf::from("/nonexistent/config.yaml"),
         )
         .unwrap();
+    let plan = Arc::new(plan);
     assert_eq!(select_dag_set(&plan, None).unwrap().steps[0].name, "a");
     assert_eq!(
         select_dag_set(&plan, Some("fast")).unwrap().steps[0].name,
@@ -2491,7 +2502,7 @@ fn e8_select_dag_set() {
             &PathBuf::from("/nonexistent/config.yaml"),
         )
         .unwrap();
-    let err = select_dag_set(&single, Some("fast")).unwrap_err();
+    let err = select_dag_set(&Arc::new(single), Some("fast")).unwrap_err();
     assert!(
         matches!(err, AppError::InvalidRequestBody(_)),
         "got {err:?}"
@@ -2523,6 +2534,7 @@ fn e8_per_set_inputs_independent() {
             &PathBuf::from("/nonexistent/config.yaml"),
         )
         .unwrap();
+    let plan = Arc::new(plan);
     let default = select_dag_set(&plan, None).unwrap();
     assert!(default.inputs_decl.is_none(), "default set is legacy-form");
     let named = select_dag_set(&plan, Some("named")).unwrap();
@@ -3338,4 +3350,255 @@ fn test_audit_dags_tolerated_binary_element_consumes_tail() {
         }
         other => panic!("binary expected, got {other:?}"),
     }
+}
+
+// === Audit (ensemble core, 2026-08-14) — defect-proof tests ===
+
+/// AUDIT-C1 (R8): `ensemble.outputs` refs must obey the binary-alias
+/// whole-only rule, exactly like step-input refs — `$stepX.BINALIAS.path`
+/// where BINALIAS is declared `type: binary` is a parse-time config error
+/// (R8). Step inputs enforce this in analyze_static_types; the outputs
+/// validator (validate_outputs_rules) checks the alias EXISTS but never
+/// checks its declared type, so the config loads and only fails (silently,
+/// via the D5 null channel) at request time.
+#[test]
+fn audit_c1_outputs_binary_alias_path_rejected_r8() {
+    let yaml = "ensemble:\n  steps:\n    - name: enc\n      model: m1\n      version: \"1\"\n      outputs:\n        crop:\n          type: binary\n          path: \"$.crop\"\n      inputs: {x: \"$request\"}\n  outputs:\n    thumb: \"$enc.crop.foo\"\n";
+    let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+        .expect_err("a path projection on a declared BINARY alias must be parse-rejected (R8)");
+    assert!(err.to_string().contains("R8") || err.to_string().contains("binary"), "got: {err}");
+}
+
+/// AUDIT-C2 (D5/§5.5.6): build_response's null channel is for ABSENT
+/// sources only (skipped step / missing optional input). A runtime TYPE
+/// error — e.g. the aliased ref does a field projection on a step that
+/// returned Binary — is a real error (resolve_ref → 400-class) and must
+/// propagate; today EVERY resolve_ref error is swallowed into
+/// `data: null` + warn, so a broken DAG contract answers 200 with a null
+/// sink instead of failing the request.
+#[test]
+fn audit_c2_build_response_propagates_non_absence_errors() {
+    let plan = parse_ensemble_plan(
+        "ensemble:\n  steps:\n    - name: s1\n      model: m1\n      version: \"1\"\n      inputs: {x: \"$request\"}\n  outputs:\n    thumb: \"$s1.thumb\"\n",
+        &PathBuf::from("/nonexistent/config.yaml"),
+    )
+    .expect("legacy single-field outputs ref parses (R13)");
+    let mut context = HashMap::new();
+    // s1 ran and returned BINARY (worker non-JSON media type) — the alias
+    // ref `$s1.thumb` is a field projection on bytes: a type error, NOT an
+    // absence.
+    context.insert(
+        "s1".to_string(),
+        EnsembleValue::Binary(Bytes::from_static(b"\x01\x02"), "image/png".into(), None, None),
+    );
+    let result = build_response(&plan, "demo", &context);
+    assert!(
+        result.is_err(),
+        "a type error on an outputs alias must fail the request, not emit data:null (D5 covers absence only); got Ok"
+    );
+}
+
+/// AUDIT-C3 (E2/B5): `ensemble.output: "$stepN.a.b"` is a multi-segment
+/// field path. Legacy refs explicitly reject multi-segment paths (B5), and
+/// select_output_field does a SINGLE literal key lookup (`v.get("a.b")`) —
+/// so this config either 500s at request time ("field 'a.b' not found") or,
+/// worse, silently returns a literal dotted key's value. It must be
+/// parse-rejected like every other multi-segment legacy path.
+#[test]
+fn audit_c3_output_multi_segment_field_rejected() {
+    let yaml = "ensemble:\n  steps:\n    - name: s1\n      model: m1\n      version: \"1\"\n      inputs: {x: \"$request\"}\n    - name: s2\n      model: m2\n      version: \"1\"\n      inputs: {x: \"$s1\"}\n  output: \"$s2.a.b\"\n";
+    let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+        .expect_err("multi-segment ensemble.output field must be parse-rejected (B5 parity)");
+    assert!(err.to_string().contains("output") || err.to_string().contains("segment"), "got: {err}");
+}
+
+/// AUDIT-C5 (§4.2 regression, batch 6 P2 — FIXED): the pipeline chunk
+/// consumer wraps upstream chunk bytes in RawJson; pre-P2 the chunk was
+/// parsed as JSON and a non-JSON chunk failed the chain ("pipeline chunk
+/// ... is not valid JSON"). Raw splicing without validation let a
+/// binary/garbage chunk produce malformed (or injected-key) downstream
+/// JSON. The fix validates chunks at both RawJson construction seams:
+/// validate_pipeline_chunk (chain consumer) and unary_response_to_value's
+/// raw-eligibility gate.
+#[test]
+fn audit_c5_pipeline_non_json_chunk_must_not_splice_raw() {
+    // Chain consumer seam: garbage fails the chain with the historical error.
+    let garbage = Bytes::from_static(b"\xff\x00not-json");
+    let err = validate_pipeline_chunk("prev", &garbage).unwrap_err();
+    assert!(
+        err.to_string().contains("is not valid JSON"),
+        "a non-JSON upstream chunk must fail the chain (historical behavior), got: {err}"
+    );
+    // Injection-shaped chunk (`1, "injected": true` splices into valid JSON
+    // with attacker-controlled keys) — rejected as trailing data.
+    let injected = Bytes::from_static(br#"1, "injected": true"#);
+    validate_pipeline_chunk("prev", &injected)
+        .expect_err("an injection-shaped chunk must be rejected, not spliced");
+    // Valid chunks pass.
+    validate_pipeline_chunk("prev", br#"{"text": "hi"}"#)
+        .expect("a valid JSON chunk must pass");
+
+    // Unary raw-residency seam: invalid JSON must not become RawJson.
+    let bad = pb::SingleResponse {
+        data: garbage,
+        media_type: "application/json".to_string(),
+        ..Default::default()
+    };
+    unary_response_to_value(
+        "s",
+        pb::Response {
+            payload: Some(pb::response::Payload::Single(bad)),
+            ..Default::default()
+        },
+        true,
+    )
+    .expect_err("invalid JSON must error even when raw-eligible");
+}
+
+/// AUDIT-C7 (§5.5.3 reserved namespaces): `$request` is the reserved root
+/// ref. A step NAMED `request` shadows it: validate_dag/topological_layers
+/// treat `$request` refs as the ROOT (never as a dep edge on that step), so
+/// the step's result lands in context key `request` mid-run and every
+/// LATER layer's `$request` ref silently resolves to the step's output
+/// instead of the request body — order-dependent data corruption. The
+/// reserved name must be rejected at parse time.
+#[test]
+fn audit_c7_step_named_request_is_rejected() {
+    let yaml = "ensemble:\n  steps:\n    - name: request\n      model: m1\n      version: \"1\"\n      inputs: {x: \"$request\"}\n    - name: mid\n      model: m2\n      version: \"1\"\n      inputs: {x: \"$request\"}\n    - name: s3\n      model: m3\n      version: \"1\"\n      inputs: {a: \"$mid\", b: \"$request\"}\n";
+    let err = parse_ensemble_plan(yaml, &PathBuf::from("/nonexistent/config.yaml"))
+        .expect_err("a step named 'request' shadows the reserved root namespace");
+    assert!(err.to_string().contains("request"), "got: {err}");
+}
+
+/// AUDIT-C6 (R18/D31): KServe V2 envelope input names are unique by spec.
+/// A duplicate `name` currently OVERWRITES the first element silently
+/// (IndexMap::insert last-wins) — the client sent two values, one is
+/// dropped without any signal. Must be a 400.
+#[test]
+fn audit_c6_duplicate_envelope_input_names_rejected() {
+    let decl: IndexMap<String, InputDecl> = [("text".to_string(), json_decl())]
+        .into_iter()
+        .collect();
+    let dup = json!({"inputs": [
+        {"name": "text", "data": 1},
+        {"name": "text", "data": 2}
+    ]});
+    let result = parse_root_inputs(EnsembleValue::Json(dup), Some(&decl), false);
+    assert!(
+        result.is_err(),
+        "duplicate envelope input names must be a 400 (R18), not silent last-wins overwrite; got {result:?}"
+    );
+}
+
+// === D17-1/D3 aggregation coverage (2026-08-14 audit gap) ===
+
+/// D17-1: all-Binary frames → byte concat, content-type from the FIRST frame.
+#[test]
+fn d17_binary_frames_concat_with_first_content_type() {
+    let mut agg = BidiAggregator::new(1024);
+    agg.push(Bytes::from_static(b"\x01\x02"), false, Some("image/png")).unwrap();
+    agg.push(Bytes::from_static(b"\x03"), false, Some("image/jpeg")).unwrap();
+    match agg.finish().unwrap() {
+        EnsembleValue::Binary(b, ct, ..) => {
+            assert_eq!(b.as_ref(), b"\x01\x02\x03", "byte concat (D17-1)");
+            assert_eq!(ct, "image/png", "content-type from the FIRST frame (D17-1)");
+        }
+        other => panic!("binary expected, got {other:?}"),
+    }
+}
+
+/// D17-2: all-Json frames → array; a single frame stays unwrapped
+/// (historical single-frame semantics).
+#[test]
+fn d17_json_frames_aggregate_to_array_single_unwrapped() {
+    let mut agg = BidiAggregator::new(1024);
+    agg.push(Bytes::from_static(br#"{"a":1}"#), true, None).unwrap();
+    let v = agg.finish().unwrap();
+    assert!(
+        matches!(&v, EnsembleValue::Json(j) if j["a"] == json!(1)),
+        "single Json frame → the value itself (not wrapped)"
+    );
+
+    let mut agg = BidiAggregator::new(1024);
+    agg.push(Bytes::from_static(br#"{"a":1}"#), true, None).unwrap();
+    agg.push(Bytes::from_static(br#"{"b":2}"#), true, None).unwrap();
+    match agg.finish().unwrap() {
+        EnsembleValue::Json(Value::Array(items)) => {
+            assert_eq!(items.len(), 2, "multi Json frames → array (D17-2)")
+        }
+        other => panic!("array expected, got {other:?}"),
+    }
+}
+
+/// D3: the cumulative cap (max_request_body_bytes semantics) →
+/// PayloadTooLarge (413/ResourceExhausted), enforced mid-aggregation.
+#[test]
+fn d3_aggregation_cap_is_payload_too_large() {
+    let mut agg = BidiAggregator::new(4);
+    agg.push(Bytes::from_static(b"ab"), false, None).unwrap();
+    let err = agg.push(Bytes::from_static(b"cde"), false, None).unwrap_err();
+    assert!(
+        matches!(err, AppError::PayloadTooLarge { .. }),
+        "D3 cap breach → PayloadTooLarge, got {err:?}"
+    );
+}
+
+/// P6/E8-1 (audit): a dags-form plan's OUTER steps are empty — the warm
+/// pass must iterate the SETS' steps, or a dags-form ensemble's sub-models
+/// never get touch_last_used (LRU could evict a live DAG dependency).
+/// Observable via lru_eviction_candidate: the warm-referenced version gets
+/// a fresh stamp, so the never-used sibling becomes the candidate.
+#[tokio::test]
+async fn p6_warm_covers_dags_form_sub_models() {
+    let tmp = std::env::temp_dir().join(format!(
+        "lite-server-warm-dags-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let dir = tmp.join("ensdags").join("1");
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    tokio::fs::write(
+        dir.join("config.yaml"),
+        "ensemble:\n  dags:\n    default:\n      steps:\n        - name: s\n          model: warm_sub\n          version: \"1\"\n          inputs: {x: \"$request\"}\n",
+    )
+    .await
+    .unwrap();
+
+    let registry = std::sync::Arc::new(crate::registry::ModelRegistry::new());
+    for v in ["1", "2"] {
+        registry
+            .register(
+                "warm_sub",
+                v,
+                crate::config::ModelConfig::default(),
+                crate::registry::types::ModelType::LitAPI,
+                std::env::temp_dir(),
+            )
+            .unwrap();
+        registry.mark_ready("warm_sub", v).unwrap();
+    }
+
+    let plans = std::sync::Arc::new(EnsemblePlanCache::new());
+    spawn_ensemble_warm(
+        tmp.clone(),
+        Some(plans),
+        registry.clone(),
+        "ensdags".to_string(),
+        "1".to_string(),
+    );
+
+    // The warm runs detached — poll for the touch.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if registry.lru_eviction_candidate("warm_sub").as_deref() == Some("2") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "dags-form warm never touched the referenced sub-model version"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let _ = tokio::fs::remove_dir_all(&tmp).await;
 }

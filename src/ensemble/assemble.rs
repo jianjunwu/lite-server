@@ -496,14 +496,35 @@ pub(crate) async fn execute_step(
         }
         let child_payload = match &content_type_for_step {
             Some(ct) => EnsembleValue::Binary(payload_bytes.clone(), ct.clone(), None, None),
-            None => EnsembleValue::Json(
-                serde_json::from_slice(&payload_bytes).map_err(|e| {
+            None => {
+                let v: Value = serde_json::from_slice(&payload_bytes).map_err(|e| {
                     AppError::Internal(format!(
                         "ensemble step {} payload reparse failed: {}",
                         step.name, e
                     ))
-                })?,
-            ),
+                })?;
+                // R17: a child declaring `inputs` consumes the parent's
+                // assembled group object as its NAMED-INPUT map (keys =
+                // input names, no $inputs wrapper) — reframe it as the
+                // KServe envelope so the child's single parse point (R18)
+                // validates it (unknown key / missing required → 400).
+                if child_plan.inputs_decl.is_some() {
+                    let Value::Object(map) = v else {
+                        return Err(AppError::InvalidRequestBody(format!(
+                            "nested ensemble '{}' declares inputs — the parent step's \
+                             payload must be a group object of named inputs (R17)",
+                            step.model
+                        )));
+                    };
+                    let inputs: Vec<Value> = map
+                        .into_iter()
+                        .map(|(name, data)| json!({"name": name, "data": data}))
+                        .collect();
+                    EnsembleValue::Json(json!({"inputs": inputs}))
+                } else {
+                    EnsembleValue::Json(v)
+                }
+            }
         };
         let child_request_id = format!("{}:{}", request_id, step.name);
         let child_opts = EnsembleExecOpts {
@@ -692,22 +713,18 @@ pub(crate) fn unary_response_to_value(
                 "Ok" => {
                     // P2 (batch 6): a raw-eligible (pass-through schema)
                     // JSON response stays unparsed Bytes in the context —
-                    // validation is skipped by design (whole refs splice
-                    // the bytes; field access parses lazily). Field-projected
-                    // / declared steps keep the historical parse validation.
+                    // field access parses lazily. Whole refs splice the
+                    // bytes, so raw residency REQUIRES well-formed JSON:
+                    // a borrowed RawValue parse validates without
+                    // materializing (C5 — invalid JSON keeps the historical
+                    // parse error channel via parse_step_output; splicing it
+                    // would produce malformed/injected downstream payloads).
                     let is_binary = !single.media_type.is_empty()
                         && !single.media_type.starts_with("application/json");
-                    // B1/B2 (batch 6 audit): an EMPTY body and non-UTF-8
-                    // bytes fall back to parse_step_output — the empty body
-                    // keeps its historical `{}` normalization (splicing
-                    // empty bytes would produce malformed JSON downstream)
-                    // and non-UTF-8 bytes keep the historical parse error
-                    // channel (lossy decoding at the response boundary would
-                    // silently substitute U+FFFD).
                     if raw_eligible
                         && !is_binary
                         && !single.data.is_empty()
-                        && std::str::from_utf8(&single.data).is_ok()
+                        && serde_json::from_slice::<&serde_json::value::RawValue>(&single.data).is_ok()
                     {
                         Ok(EnsembleValue::RawJson(Arc::new(RawJsonValue::new(
                             single.data,

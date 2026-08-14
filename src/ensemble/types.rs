@@ -325,6 +325,8 @@ lazy_static::lazy_static! {
         Regex::new(r"^\$(\.[A-Za-z_][A-Za-z0-9_]*)+$").expect("invalid json path regex");
     /// E8-2: `when: "$ref OP literal"` — OP in the whitelisted set.
     pub(crate) static ref WHEN_RE: Regex =
-        Regex::new(r"^\$(\S+)\s*(==|!=|contains|in)\s*(.+)$").expect("invalid when regex");
+        // `\s+` before the operator: a glued token (`$request.dagin [...]`)
+        // must fail fast, not backtrack into target `dag` + op `in`.
+        Regex::new(r"^\$(\S+)\s+(==|!=|contains|in)\s*(.+)$").expect("invalid when regex");
 }
 

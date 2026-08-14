@@ -713,3 +713,42 @@ async fn test_audit_d30_batch_ensemble_streaming_dag_invalid_argument() {
         "streaming DAG via batch → InvalidArgument, got: {status}"
     );
 }
+
+/// §4.4 friendly error: an ensemble model on gRPC DecoupledInfer must get a
+/// clear InvalidArgument (the §4.5 matrix has no gRPC-decoupled ensemble
+/// row), not the misleading "no workers available" Unavailable.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_audit_grpc_decoupled_ensemble_friendly_error() {
+    use lite_server::proto::liteserver::lite_server_client::LiteServerClient;
+    use lite_server::proto::liteserver::DecoupledInferRequest;
+    use std::collections::HashMap;
+
+    let (base, grpc_port, _guard, _repo) = boot_batch_server().await;
+    load_model(&base, "ens_batch", "1").await;
+
+    let channel = grpc_tcp_channel(grpc_port).await;
+    let mut client = LiteServerClient::new(channel);
+    let req = tonic::Request::new(DecoupledInferRequest {
+        model_name: "ens_batch".to_string(),
+        version: "1".to_string(),
+        data: br#"{"data":"a"}"#.to_vec().into(),
+        headers: HashMap::new(),
+        sequence_id: None,
+    });
+    let status = client
+        .decoupled_infer(req)
+        .await
+        .expect_err("ensemble on DecoupledInfer must be rejected");
+    assert_eq!(
+        status.code(),
+        tonic::Code::InvalidArgument,
+        "ensemble DecoupledInfer → InvalidArgument (not 'no workers'), got: {status}"
+    );
+    assert!(
+        status.message().contains("ensemble"),
+        "the error must name the real reason, got: {}",
+        status.message()
+    );
+}
