@@ -585,11 +585,12 @@ timeout. The chunk-idle timeout is **always on** (reusing
 instead of hanging unbounded — long streams that keep producing chunks are
 unaffected; the overall deadline activates only when the client specified one
 (default config leaves long streams unbounded by overall deadline). Set
-`decoupled_idle_timeout_secs = 0` to disable idle reclaim. For ensemble
-streaming steps, a budget (overall or `timeout_secs`) that expires while
-chunks are flowing closes the stream with an **Error frame** (terminal
-reason `deadline`) — the HTTP status code can no longer change once the
-stream has opened.
+`decoupled_idle_timeout_secs = 0` to disable idle reclaim. On **every**
+streaming endpoint (plain model or ensemble), an overall deadline that
+expires while chunks are flowing closes the stream with an **Error frame**
+(terminal reason `deadline`) — the HTTP status code can no longer change
+once the stream has opened. An ensemble streaming step's own
+`timeout_secs` cap applies the same way.
 
 **Status when the budget expires** — read this before writing retry logic:
 

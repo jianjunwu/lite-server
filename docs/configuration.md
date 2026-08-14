@@ -48,6 +48,16 @@ server:
   max_request_body_bytes: 67108864 # Per-request body cap (bytes). Oversized → HTTP 413 / gRPC
                                # ResourceExhausted. Default 64 MiB; null = platform default
                                # (axum 2MB / tonic 4MB). Memory budget: value × in-flight requests.
+                               # Inference bodies only — artifact uploads are NOT gated by this.
+  max_upload_bytes: null       # Model-repository UPLOAD cap (bytes): total per upload request,
+                               # enforced mid-stream (HTTP multipart) / per message (gRPC
+                               # UploadModel). Oversized → HTTP 413 / gRPC ResourceExhausted.
+                               # null (default) = unlimited — artifacts are legitimately GB-scale.
+  max_concurrent_streaming_dags: 128  # Global cap on concurrent STREAMING ensemble DAGs. Streaming
+                               # steps bypass the queue (no backpressure), so this semaphore is the
+                               # memory bound: worst-case residency ≈ value × 64 × max chunk size.
+                               # Excess requests are rejected immediately (HTTP 429 / gRPC
+                               # ResourceExhausted, no queueing). 0 = unlimited.
   # Trusted-proxy client-IP cleansing — fail-safe by default.
   trusted_proxies: []          # CIDRs/IPs of fronting proxies whose X-Forwarded-For /
                                # X-Real-IP are honored. Empty (default) = the direct TCP peer is

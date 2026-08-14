@@ -473,14 +473,25 @@ impl GrpcService {
                 })
             } else {
                 // Ensemble: no worker stream — frames after the aggregation
-                // trigger are rejected (multi-round), §4.3.
+                // trigger are a protocol violation (§4.3): the exchange
+                // fails with InvalidArgument (§4.4), not a silent drop.
+                let tx_violation = tx.clone();
                 tokio::spawn(async move {
+                    let mut notified = false;
                     while let Some(Ok(chunk)) = stream.message().await.transpose() {
-                        if matches!(chunk.payload, Some(pb::bidi_chunk::Payload::Data(_))) {
+                        if matches!(chunk.payload, Some(pb::bidi_chunk::Payload::Data(_)))
+                            && !notified
+                        {
+                            notified = true;
                             tracing::warn!(
                                 stream_id = %stream_id_for_incoming,
-                                "bidi frame after aggregation trigger ignored (multi-round rejected)"
+                                "bidi frame after aggregation trigger rejected (multi-round)"
                             );
+                            let _ = tx_violation
+                                .send(Err(Status::invalid_argument(
+                                    "frames after the aggregation trigger are rejected (multi-round)",
+                                )))
+                                .await;
                         }
                     }
                 })

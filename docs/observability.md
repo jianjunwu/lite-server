@@ -66,8 +66,10 @@ identical labels to unary requests.
 
 P10 rejection semantics: when `server.max_concurrent_streaming_dags` is
 exhausted the request is rejected **immediately** (429 — no queueing); the
-rejection surfaces through `liteserver_requests_total` (status label) and
-the `ensemble_streaming_active` gauge, not a dedicated counter.
+rejection is recorded via `record_stream_rejected` at the ensemble dispatch
+(all transports) and surfaces through `liteserver_requests_total` (status
+label `4xx`) and the `ensemble_streaming_active` gauge, not a dedicated
+counter.
 
 ### OTel mirror
 

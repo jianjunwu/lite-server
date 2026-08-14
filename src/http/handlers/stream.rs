@@ -1305,6 +1305,10 @@ async fn handle_ws_stream(
                 };
                 match next {
                     Ok(Some(Ok(Message::Text(t)))) if is_close_frame(&t) => break,
+                    // A cancel control frame mid-aggregation abandons the
+                    // execution (the client gave up) — it must NOT be
+                    // aggregated into the DAG input as a data frame.
+                    Ok(Some(Ok(Message::Text(t)))) if is_cancel_or_close_frame(&t) => return,
                     Ok(Some(Ok(Message::Text(t)))) => {
                         if let Err(e) = aggregator.push(bytes::Bytes::from(t.into_bytes()), true, None) {
                             prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64());
@@ -1330,13 +1334,18 @@ async fn handle_ws_stream(
                         let deadline_fired = agg_deadline
                             .map(|d| d <= std::time::Instant::now())
                             .unwrap_or(false);
-                        let msg = if deadline_fired {
-                            "bidi aggregation exceeded the overall deadline"
-                        } else {
-                            "bidi aggregation idle timeout"
-                        };
-                        let _ = ws_sink.send(Message::Text(json!({"error": msg}).to_string())).await;
-                        let _ = ws_sink.close().await;
+                        // §4.4: aggregation idle/deadline timeout closes
+                        // with 1011 + {error:{code,message}} — route through
+                        // ws_send_error like every other error path.
+                        let e = AppError::InferenceTimeout(
+                            if deadline_fired {
+                                "bidi aggregation exceeded the overall deadline"
+                            } else {
+                                "bidi aggregation idle timeout"
+                            }
+                            .to_string(),
+                        );
+                        ws_send_error(&mut ws_sink, &e).await;
                         return;
                     }
                 }
@@ -1592,9 +1601,13 @@ async fn handle_ws_stream(
                     };
                     drop(gone_rx.borrow());
                     if let Some(msg) = err_msg {
-                        let _ = ws_sink.send(Message::Text(
-                            json!({"error": msg}).to_string(),
-                        )).await;
+                        // §4.4: a protocol violation (multi-round frames
+                        // after the aggregation trigger / data on a
+                        // decoupled stream) closes with 1003 +
+                        // {error:{code,message}} — same contract as every
+                        // other WS error, via ws_send_error.
+                        let e = AppError::InvalidRequestBody(msg);
+                        ws_send_error(&mut ws_sink, &e).await;
                     }
                     break;
                 }

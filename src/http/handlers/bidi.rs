@@ -212,6 +212,13 @@ async fn h2_bidi_entry_impl(
     // §4.1 指标行: streaming-step latency is recorded at stream close.
     let mut ensemble_tail: Option<(String, String, String)> = None;
 
+    // S5 (§4.4): on the declared-inputs ensemble path the DAG executes on
+    // the first envelope frame; the rest of the body is watched by a small
+    // reader (spawned once the outgoing channel exists) that answers late
+    // data frames with one LPM Error frame instead of dropping them
+    // silently. (buf remainder, body stream)
+    let mut post_trigger_body: Option<(BytesMut, axum::body::BodyDataStream)> = None;
+
     // 5. Open worker stream (or run the DAG for ensemble). The incoming task
     // (client→worker chunk forwarding) is spawned ONLY on the non-ensemble
     // path — ensemble aggregates the upstream inline and half-close (body
@@ -227,15 +234,16 @@ async fn h2_bidi_entry_impl(
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         // D33: a declared-inputs ensemble executes on the FIRST envelope
-        // frame — the remaining body stream is dropped (h2 half-close is
-        // then the client's normal finish; late data frames die with the
-        // transport). Undeclared ensembles keep the D17 aggregation.
+        // frame — the remaining body stream is handed to the post-trigger
+        // reader (S5: late data frames get one LPM Error frame); half-close
+        // is then the client's normal finish.
         let declared = crate::ensemble::ensemble_declares_inputs(
             &state, model_name, &resolved_version,
             crate::ensemble::dag_selector_from_http(&headers)?.as_deref(),
         )
         .await?;
         let value = if declared {
+            post_trigger_body = Some((remainder_buf, body_stream));
             // initial_data moved into meta above — meta.payload is the same
             // bytes.
             crate::ensemble::bidi_envelope_frame(&meta.payload, initial_is_json, ct.clone())?
@@ -466,6 +474,38 @@ async fn h2_bidi_entry_impl(
 
     // Spawn forwarder: incoming → worker, worker → outgoing → response body.
     let (tx, rx) = mpsc::channel::<Bytes>(64);
+
+    // S5 (§4.4): declared-inputs ensemble — data frames after the envelope
+    // trigger are a protocol violation; answer the first one with ONE LPM
+    // Error frame on the response stream, then stop reading.
+    if let Some((mut late_buf, mut late_stream)) = post_trigger_body {
+        let tx_violation = tx.clone();
+        let stream_id_violation = stream_id.clone();
+        tokio::spawn(async move {
+            loop {
+                match lpm::try_decode_frame(&mut late_buf) {
+                    Ok(Some(chunk)) => {
+                        if matches!(chunk.payload, Some(pb::bidi_chunk::Payload::Data(_))) {
+                            let frame = lpm::encode_frame(&pb::BidiChunk {
+                                stream_id: stream_id_violation.clone(),
+                                payload: Some(pb::bidi_chunk::Payload::Error(pb::BidiError {
+                                    message: "frames after the aggregation trigger are rejected (multi-round)".to_string(),
+                                    error_type: String::new(),
+                                })),
+                            });
+                            let _ = tx_violation.send(frame).await;
+                            break;
+                        }
+                    }
+                    Ok(None) => match late_stream.next().await {
+                        Some(Ok(bytes)) => late_buf.extend_from_slice(&bytes),
+                        _ => break,
+                    },
+                    Err(_) => break,
+                }
+            }
+        });
+    }
     let stream_id_out = stream_id.clone();
     let cancel_client = Arc::clone(&worker_client);
     let metrics_model = model_name.to_string();

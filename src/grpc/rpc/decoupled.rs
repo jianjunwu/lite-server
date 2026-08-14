@@ -91,6 +91,16 @@ impl GrpcService {
         }
 
         if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
+            // §4.4: an ensemble has no workers — DecoupledInfer has no
+            // ensemble branch (the §4.5 target matrix does not list it), so
+            // fail with the friendly InvalidArgument instead of falling
+            // through to the misleading "no workers available".
+            if mv.model_type == crate::registry::types::ModelType::Ensemble {
+                return Err(err(Status::invalid_argument(format!(
+                    "model {model_name} is an ensemble — DecoupledInfer is not \
+                     supported for ensembles; use StreamInfer or BidiStream"
+                ))));
+            }
             enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
             enforce_grpc_rate_limit(&self.rate_limiter, mv.policies.rate_limit.as_ref(), model_name, &client_ip)?;
         }

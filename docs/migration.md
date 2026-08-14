@@ -327,11 +327,13 @@ are byte-identical; the new surface is opt-in via config fields.
   path like every other streaming endpoint. Concurrent streaming DAGs are
   bounded globally by `server.max_concurrent_streaming_dags` (default 128
   — rejections are immediate 429, not queued).
-- **Deadline expiry mid-stream (D35):** when a streaming step's wall-clock
-  budget (`timeout_secs` or the overall request deadline) expires while
-  chunks are flowing, the client now receives an **Error frame** and a
-  clean close (terminal reason `deadline`) — previously the budget only
-  governed stream opening.
+- **Deadline expiry mid-stream (D35):** on **every** streaming endpoint
+  (plain model or ensemble, SSE / WS / h2 / gRPC), an overall deadline that
+  expires while chunks are flowing now terminates the stream with an
+  **Error frame** and a clean close (terminal reason `deadline`) —
+  previously the stream simply closed without a terminal error. Ensemble
+  streaming steps additionally apply their own `timeout_secs` wall-clock
+  cap the same way.
 
 Run `lite-server analyze --model <ensemble-model>` to cross-check config
 and the optional `dag.py` declaration (drift → LS112).

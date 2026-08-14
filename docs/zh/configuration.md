@@ -48,6 +48,15 @@ server:
   max_request_body_bytes: 67108864 # 单请求体上限（字节）。超限 → HTTP 413 / gRPC
                                # ResourceExhausted。默认 64 MiB；null = 平台默认
                                #（axum 2MB / tonic 4MB）。内存预算：该值 × 在途请求数。
+                               # 仅约束推理请求体——制品上传不受此上限约束。
+  max_upload_bytes: null       # 模型仓库「上传」上限（字节）：单次上传请求总字节数，
+                               # 流式中实时计数（HTTP multipart）/ 逐消息累计（gRPC UploadModel）。
+                               # 超限 → HTTP 413 / gRPC ResourceExhausted。
+                               # null（默认）= 无上限——制品合法地可达 GB 级。
+  max_concurrent_streaming_dags: 128  # 并发「流式 ensemble DAG」全局上限。流式 step 直连不过队列
+                               #（无背压），该信号量即内存上界：最坏驻留 ≈ 该值 × 64 × 单 chunk 大小。
+                               # 超限立即拒绝（HTTP 429 / gRPC ResourceExhausted，不排队）。
+                               # 0 = 无上限。
   # 受信代理 client-IP 清洗——默认 fail-safe。
   trusted_proxies: []          # 前置代理的 CIDR/IP，其 X-Forwarded-For / X-Real-IP 才被信任。
                                # 空（默认）= 一律用直连 TCP peer、忽略客户端代理头（防伪造 IP 绕过

@@ -548,9 +548,10 @@ worker 协作式检查。ensemble DAG 共享一份 parent 预算（子 step 得 
 流式为**两段式**：总时长上限 + chunk 间 idle 超时。chunk-idle 超时**恒开**（复用
 `decoupled_idle_timeout_secs`，默认 300s）——卡死的流会被回收而非无界挂起，持续产
 chunk 的长流不受影响；总时长上限仅在客户端显式指定 deadline 时激活（默认配置下长流
-不被总时长截断）。设 `decoupled_idle_timeout_secs = 0` 可禁用 idle 回收。ensemble
-流式 step 的预算（总时长或 `timeout_secs`）在 chunk 流动期间耗尽时，流以
+不被总时长截断）。设 `decoupled_idle_timeout_secs = 0` 可禁用 idle 回收。在**所有**
+流式端点（普通模型或 ensemble）上，整体 deadline 在 chunk 流动期间耗尽时，流以
 **Error 帧**关闭（终端 reason=deadline）——流已打开，HTTP 状态码已不可改。
+ensemble 流式 step 自身的 `timeout_secs` 预算同样按此处理。
 
 **预算耗尽时的状态码**——写重试逻辑前请先读：
 

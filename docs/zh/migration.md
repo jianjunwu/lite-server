@@ -274,9 +274,11 @@ ensemble 模型接受原始字节根输入（见[原始字节 / Tensor 请求](.
   流式 step 走直连流式路径（与其它流式端点语义一致）。并发流式 DAG 数
   由全局旋钮 `server.max_concurrent_streaming_dags` 限制（默认 128，
   超限立即 429，不排队）。
-- **流中 deadline 到期（D35）：** 流式 step 的墙钟预算（`timeout_secs`
-  或整体请求 deadline）在 chunk 流动期间到期时，客户端现在收到
-  **Error 帧**并干净关闭（终端 reason=deadline）——此前预算只约束开流。
+- **流中 deadline 到期（D35）：** 在**所有**流式端点（普通模型或
+  ensemble,SSE / WS / h2 / gRPC）上，整体 deadline 在 chunk 流动期间
+  到期时，流现在以 **Error 帧**终止并干净关闭（终端 reason=deadline)
+  ——此前流只是直接关闭、无终端错误帧。ensemble 流式 step 自身的
+  `timeout_secs` 墙钟预算同样按此处理。
 
 用 `lite-server analyze --model <ensemble-model>` 交叉检查 config 与可选的
 `dag.py` 声明（漂移 → LS112）。
