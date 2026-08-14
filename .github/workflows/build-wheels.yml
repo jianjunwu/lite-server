@@ -138,7 +138,7 @@ jobs:
         run: |
           python -m venv /tmp/v
           /tmp/v/bin/pip install -q --upgrade pip
-          /tmp/v/bin/pip install -q "protobuf~=${{ matrix.pb_major }}.0" "grpcio>=1.62"
+          /tmp/v/bin/pip install -q "protobuf~=${{ matrix.pb_major }}.0" "grpcio>=1.62" "pyyaml>=6"
           /tmp/v/bin/python - <<'PY'
           import sys
           sys.path.insert(0, "python/lite_server/proto")
