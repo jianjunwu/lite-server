@@ -3104,6 +3104,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rn7_kill_escalation_must_cap_at_three_consecutive_kills() {
+        // RN-7: a slow-starting worker (startup longer than threshold x probe
+        // interval) is repeatedly killed and respawned with no cap on
+        // consecutive kill signals. The planned fix caps escalation at 3
+        // consecutive kills, then gives up with a warning. This test pins the
+        // cap: 10 failure rounds must produce at most 3 respawn signals.
+        let outlier = OutlierState::new(1);
+        let (respawn_tx, mut respawn_rx) = mpsc::channel(8);
+        const KILL_THRESHOLD: usize = 3;
+        let mut received = 0;
+        for _ in 0..10 {
+            for _ in 0..KILL_THRESHOLD {
+                outlier.record_error(0);
+            }
+            escalate_to_kill(&outlier, 0, KILL_THRESHOLD, &Some(respawn_tx.clone()), "m", "1").await;
+            // Drain per round: channel capacity (8) is smaller than the 10
+            // rounds, so an undrained send would block forever.
+            while let Ok(sig) = respawn_rx.try_recv() {
+                assert_eq!(sig.model_name, "m");
+                assert_eq!(sig.version, "1");
+                assert_eq!(sig.worker_id, 0);
+                assert_eq!(sig.reason, "health_check");
+                received += 1;
+            }
+        }
+        assert!(
+            received <= 3,
+            "respawn signals must be capped at 3 consecutive kills, got {received}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_record_error_returns_true_only_on_new_ejection() {
         // Callers use the return value to record the per-(model, version)
         // ejection metric exactly once per ejection (§4.6).
