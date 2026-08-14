@@ -4,7 +4,7 @@
 //! DAG-executor dispatch for ensemble models.
 
 use crate::error::AppError;
-use crate::grpc::auth::{enforce_auth_grpc, enforce_grpc_rate_limit};
+use crate::grpc::auth::{enforce_auth_grpc, enforce_grpc_rate_limit, gate_unknown_model_grpc};
 use crate::grpc::canary::canary_pin;
 use crate::grpc::error::{
     app_error_to_grpc_status, err, http_status_to_grpc_code, model_error_status,
@@ -64,26 +64,37 @@ impl GrpcService {
                 &req.headers,
             )? {
                 Some(pin) => pin,
+                // F-03: gate unknown-model probes (see gate_unknown_model_grpc).
                 None => self
                     .registry
                     .routing_pick(model_name)
                     .or_else(|| self.registry.get_active_version(model_name))
-                    .ok_or_else(|| err(Status::not_found(format!("{} has no active version", model_name))))?,
+                    .ok_or_else(|| {
+                        err(gate_unknown_model_grpc(
+                            &self.registry,
+                            &grpc_metadata,
+                            &req.headers,
+                            Status::not_found(format!("{} has no active version", model_name)),
+                        ))
+                    })?,
             },
         };
         self.registry.touch_last_used(model_name, &resolved_version);
         *version_label = resolved_version.clone();
+
+        // F-03: policy checks BEFORE the readiness check — an
+        // unauthenticated probe must get Unauthenticated whether the model
+        // is missing, not ready, or fine (auth first, then rate limit).
+        if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
+            enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
+            enforce_grpc_rate_limit(&self.rate_limiter, mv.policies.rate_limit.as_ref(), model_name, &client_ip)?;
+        }
 
         if !self.registry.is_ready(model_name, Some(&resolved_version)) {
             return Err(err(Status::unavailable(format!(
                 "{} version {} is not ready",
                 model_name, resolved_version
             ))));
-        }
-
-        if let Some(mv) = self.registry.get(model_name, Some(&resolved_version)) {
-            enforce_auth_grpc(mv.policies.auth.as_ref(), &grpc_metadata, &req.headers)?;
-            enforce_grpc_rate_limit(&self.rate_limiter, mv.policies.rate_limit.as_ref(), model_name, &client_ip)?;
         }
 
         // P-ENSEMBLE-GRPC (蓝图 §4.1, D23): ensemble models have no workers —
@@ -239,7 +250,16 @@ impl GrpcService {
             Ok(()) => match crate::deadline::remaining(deadline.unix_ns) {
                 Some(t) => match tokio::time::timeout(t, response_rx).await {
                     Ok(Ok(resp)) => resp,
-                    Ok(Err(_)) => return Err(err(Status::internal("response channel closed"))),
+                    // F-18: response channel closed (worker crash/recycle) is
+                    // "upstream unavailable" — Unavailable + retry-after,
+                    // matching the HTTP 502 mapping (was Internal, which
+                    // clients treat as a non-retryable server bug).
+                    Ok(Err(_)) => {
+                        return Err(err(with_retry_after(
+                            Status::unavailable("response channel closed"),
+                            1,
+                        )));
+                    }
                     Err(_) => {
                         return Err(err(Status::deadline_exceeded(format!(
                             "inference timed out after {:.1}s",
@@ -250,7 +270,12 @@ impl GrpcService {
                 // No deadline (no client spec AND server.timeout<=0): unbounded.
                 None => match response_rx.await {
                     Ok(resp) => resp,
-                    Err(_) => return Err(err(Status::internal("response channel closed"))),
+                    Err(_) => {
+                        return Err(err(with_retry_after(
+                            Status::unavailable("response channel closed"),
+                            1,
+                        )));
+                    }
                 },
             },
             Err(crate::inference_queue::QueueError::Full) => {

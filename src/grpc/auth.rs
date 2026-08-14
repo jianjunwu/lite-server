@@ -47,6 +47,36 @@ pub(super) fn enforce_auth_grpc(
     Ok(())
 }
 
+/// F-03: unknown-model auth gate — gRPC mirror of the HTTP gate
+/// (`http/handlers/mod.rs::auth_gate_for_unknown_model`). When the target
+/// model cannot be resolved and ANY registered model declares
+/// `policies.auth`, a request carrying credentials valid for at least one
+/// declared policy sees the original resolution status; anything else gets
+/// Unauthenticated, so an unauthenticated probe cannot distinguish "no such
+/// model" from "no credentials". No auth configured anywhere → the original
+/// status is returned unchanged.
+pub(super) fn gate_unknown_model_grpc(
+    registry: &crate::registry::ModelRegistry,
+    metadata: &MetadataMap,
+    headers: &HashMap<String, String>,
+    original: Status,
+) -> Status {
+    let policies = registry.all_auth_policies();
+    if policies.is_empty() {
+        return original;
+    }
+    let authenticated = policies.iter().any(|p| {
+        // Reuse the enforce_auth_grpc credential rules (metadata first, then
+        // the case-insensitive proto headers map) by probing each policy.
+        enforce_auth_grpc(Some(p), metadata, headers).is_ok()
+    });
+    if authenticated {
+        original
+    } else {
+        err(Status::unauthenticated("missing or invalid API key"))
+    }
+}
+
 /// gRPC 限流（P3-1，对齐 HTTP `enforce_rate_limit`）：policy 来自
 /// `ModelVersion.policies.rate_limit`；`key=="ip"` 用清洗后 client_ip，否则
 /// `/predict` 路由 scope（同模型所有推理共享一桶）。超限 → ResourceExhausted

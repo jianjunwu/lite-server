@@ -94,29 +94,29 @@ fn parse_route_tail(tail: &str) -> (Option<String>, String) {
     (None, trimmed.to_string())
 }
 
-/// Dispatch a custom-route request for `/v2/models/<model>/<tail>` to a worker.
-/// Called by the fallback handler (`http::route_fallback`) after it parses the
-/// path. Resolves the model version, matches the tail against the version's
-/// declared `@route`s, and dispatches over ZMQ (bypassing the batch
-/// InferenceQueue — route calls are not aggregatable). System leaves
-/// (`infer`/`events`/`stream`/...) are exact-registered and matched by axum, so
-/// they never reach the fallback.
-// allow: 单调用点的 HTTP 请求分解(method/query/headers/body/cx),参数即
-// 请求形状本身,无收编语义。
-#[allow(clippy::too_many_arguments)]
-pub async fn dispatch_custom_route(
+/// Phase-1 result of custom-route dispatch: version resolved and tail
+/// matched against the version's declared `@route`s.
+#[derive(Debug)]
+pub struct ResolvedCustomRoute {
+    pub resolved_version: String,
+    /// The declared route pattern (sent to the worker as `meta.route`).
+    pub route_pattern: String,
+    pub path_params: HashMap<String, String>,
+}
+
+/// Phase 1 of custom-route dispatch (F-06): validate model/tail, resolve the
+/// version, and match the tail against the declared `@route`s — everything
+/// that must happen BEFORE the request body is read, so an unmatched or
+/// oversized request gets 404/405/413 without paying for (or failing on)
+/// the body read.
+pub async fn resolve_custom_route(
     state: &AppState,
     model_name: &str,
     tail: &str,
     method: &axum::http::Method,
-    query: HashMap<String, String>,
     headers: &HeaderMap,
-    body: bytes::Bytes,
-    cx: &RequestContext,
-) -> Result<Response, AppError> {
+) -> Result<ResolvedCustomRoute, AppError> {
     crate::validation::validate_identifier(model_name)?;
-    let method_str = method.as_str();
-
     let (version, route_tail) = parse_route_tail(tail);
     if let Some(ref v) = version {
         crate::validation::validate_version(v)?;
@@ -132,11 +132,42 @@ pub async fn dispatch_custom_route(
 
     // Match against this version's declared routes.
     let routes = state.worker_manager.get_routes(model_name, &resolved_version).await;
-    let (route_pattern, path_params) = match match_route(&routes, &route_tail, method_str) {
-        RouteMatch::Hit { pattern, path_params } => (pattern, path_params),
-        RouteMatch::MethodNotAllowed => return Err(AppError::MethodNotAllowed),
-        RouteMatch::NotFound => return Err(AppError::RouteNotFound),
-    };
+    match match_route(&routes, &route_tail, method.as_str()) {
+        RouteMatch::Hit { pattern, path_params } => Ok(ResolvedCustomRoute {
+            resolved_version,
+            route_pattern: pattern,
+            path_params,
+        }),
+        RouteMatch::MethodNotAllowed => Err(AppError::MethodNotAllowed),
+        RouteMatch::NotFound => Err(AppError::RouteNotFound),
+    }
+}
+
+/// Dispatch a custom-route request for `/v2/models/<model>/<tail>` to a worker.
+/// Called by the fallback handler (`http::route_fallback`) after
+/// [`resolve_custom_route`] matched the path (pre-body) and the body was
+/// read. Dispatches over ZMQ (bypassing the batch InferenceQueue — route
+/// calls are not aggregatable). System leaves (`infer`/`events`/`stream`/...)
+/// are exact-registered and matched by axum, so they never reach the fallback.
+// allow: 单调用点的 HTTP 请求分解(method/query/headers/body/cx),参数即
+// 请求形状本身,无收编语义。
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_custom_route(
+    state: &AppState,
+    model_name: &str,
+    resolved: ResolvedCustomRoute,
+    method: &axum::http::Method,
+    query: HashMap<String, String>,
+    headers: &HeaderMap,
+    body: bytes::Bytes,
+    cx: &RequestContext,
+) -> Result<Response, AppError> {
+    let method_str = method.as_str();
+    let ResolvedCustomRoute {
+        resolved_version,
+        route_pattern,
+        path_params,
+    } = resolved;
 
     // Select a worker (mirror open_worker_stream: skip ejected, else random).
     let mv = state

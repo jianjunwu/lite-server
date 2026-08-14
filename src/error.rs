@@ -30,6 +30,13 @@ pub enum AppError {
     #[error("worker crashed: {0}")]
     WorkerCrashed(String),
 
+    /// The upstream (worker) returned a malformed or unusable response —
+    /// HTTP 502. E.g. a response declaring `application/json` that is not
+    /// valid JSON (F-02: corrupt model output must surface as an upstream
+    /// failure, never be silently fabricated into a well-formed body).
+    #[error("bad gateway: {0}")]
+    BadGateway(String),
+
     #[error("validation error: {0}")]
     Validation(String),
 
@@ -144,6 +151,7 @@ impl AppError {
             AppError::InferenceTimeout(_) => "inference timeout",
             AppError::QueueFull(_) => "queue full",
             AppError::WorkerCrashed(_) => "service temporarily unavailable",
+            AppError::BadGateway(_) => "bad gateway",
             AppError::Validation(_) => "validation error",
             AppError::Conflict(_) => "conflict with current state",
             AppError::Config(_) => "invalid configuration",
@@ -210,6 +218,7 @@ impl AppError {
             AppError::InferenceTimeout(_) => "timeout",
             AppError::QueueFull(_) => "queue_full",
             AppError::WorkerCrashed(_) => "internal_error",
+            AppError::BadGateway(_) => "bad_gateway",
             AppError::Validation(_) => "invalid_parameter_value",
             AppError::Conflict(_) => "conflict",
             AppError::Config(_) => "invalid_configuration",
@@ -259,6 +268,7 @@ impl AppError {
             AppError::InferenceTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
             AppError::QueueFull(_) => StatusCode::SERVICE_UNAVAILABLE,
             AppError::WorkerCrashed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::BadGateway(_) => StatusCode::BAD_GATEWAY,
             AppError::Validation(_) => StatusCode::BAD_REQUEST,
             AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::Config(_) => StatusCode::BAD_REQUEST,
@@ -331,6 +341,7 @@ impl AppError {
             AppError::QueueFull(_) => "queue_full",
             AppError::StreamingCapacityExceeded(_) => "streaming_capacity_exceeded",
             AppError::WorkerCrashed(_) => "server_error",
+            AppError::BadGateway(_) => "server_error",
             AppError::Validation(_) => "invalid_request_error",
             AppError::Config(_) => "invalid_request_error",
             AppError::Transport(_) => "server_error",
@@ -350,8 +361,10 @@ impl AppError {
             // 上面早返,应不可达。
             AppError::ModelError(_) => unreachable!(),
         };
-        // Retry-After:QueueFull 恒 1 秒;RateLimitExceeded 取配置秒数。
-        let headers = if matches!(self, AppError::QueueFull(_)) {
+        // Retry-After:QueueFull 恒 1 秒;RateLimitExceeded 取配置秒数;
+        // BadGateway(上游崩溃/回收,F-18)恒 1 秒——与 gRPC Unavailable +
+        // retry-after metadata 对齐。
+        let headers = if matches!(self, AppError::QueueFull(_) | AppError::BadGateway(_)) {
             Some(HashMap::from([("retry-after".to_string(), "1".to_string())]))
         } else if let AppError::RateLimitExceeded { retry_after_secs } = &self {
             Some(HashMap::from([(

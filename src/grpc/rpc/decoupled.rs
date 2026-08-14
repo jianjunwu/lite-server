@@ -243,14 +243,23 @@ impl GrpcService {
                             "decoupled stream closed: deadline/idle elapsed"
                         );
                         stream_family = "5xx";
-                        reason = match elapsed {
+                        // F-11/D35 (§4.4): a mid-stream reclaim — deadline OR
+                        // idle — is terminal for the client: end with an
+                        // Err(Status) item so truncated output is
+                        // distinguishable from the worker's normal EOF
+                        // (gRPC stream.rs already does this for deadline).
+                        let status = match elapsed {
                             streaming::RecvElapsed::Deadline => {
-                                crate::metrics::prometheus::StreamCloseReason::Deadline
+                                reason = crate::metrics::prometheus::StreamCloseReason::Deadline;
+                                Status::deadline_exceeded("stream closed: deadline exceeded")
                             }
                             streaming::RecvElapsed::Idle => {
-                                crate::metrics::prometheus::StreamCloseReason::Idle
+                                reason = crate::metrics::prometheus::StreamCloseReason::Idle;
+                                Status::deadline_exceeded("stream closed: idle timeout")
                             }
                         };
+                        let _ = tx.send(Err(err(status))).await;
+                        crate::callback::fire_inference_response(&cb_runner, &req_ctx, start);
                         break;
                     }
                 };
@@ -336,5 +345,212 @@ impl GrpcService {
         .instrument(span));
 
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::callback::CallbackRunner;
+    use crate::config::ModelConfig;
+    use crate::grpc::GrpcServiceDeps;
+    use crate::http::state::AppState;
+    use crate::inference_queue::InferenceQueue;
+    use crate::rate_limit::RateLimiter;
+    use crate::registry::types::{ModelType, WorkerInfo, WorkerStatus};
+    use crate::registry::ModelRegistry;
+    use crate::transport::zmq::WorkerZmqClient;
+    use crate::worker::WorkerManager;
+    use bytes::Bytes;
+    use futures::StreamExt;
+    use prost::Message;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn test_endpoint(tag: &str) -> String {
+        #[cfg(unix)]
+        {
+            format!(
+                "ipc://{}",
+                std::env::temp_dir()
+                    .join(format!("decoupled-f11-{}-{}.sock", tag, std::process::id()))
+                    .display()
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            format!("tcp://127.0.0.1:{}", 36000 + std::process::id() % 1000)
+        }
+    }
+
+    /// PAIR worker: Open → ONE chunk, then stall (no Done / close) — the
+    /// forwarder then sits in recv_chunk until the client deadline fires.
+    fn spawn_stall_chunk_worker(endpoint: String) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(8000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                    let _ = s.send(
+                        pb::Response { uid: req.uid, ..Default::default() }.encode_to_vec(),
+                        0,
+                    );
+                    continue;
+                };
+                if !matches!(st.action, Some(pb::stream_request::Action::Open(_))) {
+                    continue;
+                }
+                let chunk = pb::Response {
+                    payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                        stream_id: st.stream_id.clone(),
+                        payload: Some(pb::stream_response::Payload::Chunk(
+                            pb::StreamChunkResponse {
+                                data: Bytes::from_static(b"{}"),
+                                is_final: false,
+                            },
+                        )),
+                    })),
+                    ..Default::default()
+                };
+                let _ = s.send(chunk.encode_to_vec(), 0);
+                // STALL: no Done / Error — only the deadline can end the stream.
+            }
+        })
+    }
+
+    /// GrpcService with one ready model backed by the stall worker.
+    async fn make_service(
+        model: &str,
+        endpoint: String,
+    ) -> (GrpcService, std::thread::JoinHandle<()>) {
+        let cb = Arc::new(CallbackRunner::new());
+        let registry = Arc::new(ModelRegistry::new());
+        let queue = Arc::new(InferenceQueue::new());
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            std::path::PathBuf::new(),
+            queue.clone(),
+            "warn".to_string(),
+            cb.clone(),
+        ));
+        registry
+            .register(
+                model,
+                "1",
+                ModelConfig::default(),
+                ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
+            .unwrap();
+        registry.mark_ready(model, "1").unwrap();
+        registry
+            .set_workers(
+                model,
+                "1",
+                vec![WorkerInfo {
+                    worker_id: 0,
+                    device: "cpu:0".to_string(),
+                    endpoint: String::new(),
+                    pid: None,
+                    status: WorkerStatus::Ready,
+                    capacity: None,
+                }],
+            )
+            .unwrap();
+        registry.activate_version(model, "1").unwrap();
+
+        let worker = spawn_stall_chunk_worker(endpoint.clone());
+        let client = Arc::new(WorkerZmqClient::new(endpoint));
+        wm.insert_zmq_clients_for_test(model, "1", vec![client]).await;
+
+        let app_state = Arc::new(AppState::new(
+            registry.clone(),
+            wm.clone(),
+            queue,
+            crate::config::Config::default(),
+            std::path::PathBuf::new(),
+            cb,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(RateLimiter::default()),
+        ));
+        let svc = GrpcService::new(GrpcServiceDeps {
+            registry,
+            worker_manager: wm,
+            streaming_metrics: false,
+            canary_override: false,
+            grpc_streaming: true,
+            callback_runner: app_state.callback_runner.clone(),
+            shutdown_state: app_state.shutdown_state.clone(),
+            server_timeout: Duration::ZERO, // no server fallback deadline
+            rate_limiter: app_state.rate_limiter.clone(),
+            decoupled_idle_timeout: None, // only the client deadline may fire
+            app_state,
+            trusted: Arc::new(Vec::new()),
+        });
+        (svc, worker)
+    }
+
+    // ===== F-11 (functional-defects-plan, D35) =============================
+    // When the client deadline fires mid-stream, the decoupled stream must
+    // end with an Err(Status) item — the gRPC stream forwarder already does
+    // this (src/grpc/rpc/stream.rs:316-321 sends Err(deadline_exceeded)),
+    // the decoupled forwarder breaks silently instead (the Err(elapsed) arm
+    // at decoupled.rs:240-255). FAILS on current code: the client observes a
+    // clean end-of-stream indistinguishable from the worker's normal EOF.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_f11_decoupled_deadline_must_send_err_frame() {
+        let model = "dec_f11";
+        let endpoint = test_endpoint(model);
+        let (svc, _worker) = make_service(model, endpoint).await;
+        // Let the client actor bind and the worker connect (ZMQ handshake).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut request = Request::new(pb::DecoupledInferRequest {
+            model_name: model.to_string(),
+            version: String::new(),
+            data: Bytes::from_static(b"{}"),
+            headers: HashMap::new(),
+            sequence_id: None,
+        });
+        // Client deadline: 500 ms. The worker stalls after one chunk, so the
+        // forwarder's recv_chunk must trip the overall deadline.
+        request
+            .metadata_mut()
+            .insert("grpc-timeout", "500m".parse().unwrap());
+
+        let mut version_label = String::new();
+        let mut request_id_out = String::new();
+        let resp = svc
+            .decoupled_infer_impl(
+                request,
+                &mut version_label,
+                &mut request_id_out,
+                std::time::Instant::now(),
+                tracing::Span::current(),
+            )
+            .await
+            .expect("decoupled stream must open");
+
+        let mut stream = resp.into_inner();
+        let mut items: Vec<Result<pb::DecoupledResponse, Status>> = Vec::new();
+        while let Ok(Some(item)) = tokio::time::timeout(Duration::from_secs(4), stream.next()).await
+        {
+            items.push(item);
+        }
+        assert!(
+            items.iter().any(|i| i.is_err()),
+            "F-11 (D35): a mid-stream client-deadline expiry must end the \
+             decoupled stream with an Err(Status) item; the current \
+             Err(elapsed) arm only breaks, so the client sees a clean \
+             end-of-stream indistinguishable from the worker's normal EOF \
+             (gRPC stream.rs:316-321 already sends Err(deadline_exceeded)). \
+             items: {items:?}"
+        );
     }
 }

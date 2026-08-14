@@ -972,16 +972,23 @@ fn enforce_owner_only_uds(path: &str, label: &str) -> Result<(), AppError> {
 }
 
 /// Effective HTTP/2 keepalive parameters (P1-2): `(interval, timeout)`.
-/// `None` when keepalive is disabled (interval unset). The timeout defaults
-/// to 20s when only the interval is configured; a timeout configured without
-/// an interval can never fire, so warn at startup.
+/// `None` when keepalive is disabled (interval unset OR 0 — the project's
+/// 0=off convention; F-01: a zero interval would reach hyper as
+/// `Duration::ZERO` and ping on every poll of an active connection).
+/// The timeout defaults to 20s when only the interval is configured; a
+/// configured 0 falls back to that default (a zero timeout would drop the
+/// connection right after the first ping). A timeout configured without an
+/// interval can never fire, so warn at startup.
 fn http2_keepalive_params(cfg: &crate::config::GrpcConfig) -> Option<(Duration, Duration)> {
     match cfg.http2_keepalive_interval_secs {
-        Some(interval) => Some((
-            Duration::from_secs(interval),
-            Duration::from_secs(cfg.http2_keepalive_timeout_secs.unwrap_or(20)),
-        )),
-        None => {
+        Some(interval) if interval > 0 => {
+            let timeout = match cfg.http2_keepalive_timeout_secs {
+                Some(t) if t > 0 => t,
+                _ => 20,
+            };
+            Some((Duration::from_secs(interval), Duration::from_secs(timeout)))
+        }
+        _ => {
             if cfg.http2_keepalive_timeout_secs.is_some() {
                 warn!(
                     "grpc.http2_keepalive_timeout_secs is set but \
@@ -1063,6 +1070,36 @@ mod tests {
         assert_eq!(
             http2_keepalive_params(&cfg),
             Some((Duration::from_secs(30), Duration::from_secs(5)))
+        );
+    }
+
+    // F-01 (audit, .claude/functional-defects-plan.md): interval/timeout 0 are
+    // passed through to tonic/hyper as Duration::ZERO instead of being treated
+    // as "off" (the project's 0=off convention). hyper's ping loop has no
+    // zero-value guard: a zero interval pings on every poll of an active
+    // connection (ping storm) and a zero timeout kills the connection right
+    // after the first ping. The test asserts the required normalization
+    // (0 -> disabled / default), which FAILS on the current code.
+    #[test]
+    fn test_f01_keepalive_zero_values_must_not_reach_hyper() {
+        let interval_zero = crate::config::GrpcConfig {
+            http2_keepalive_interval_secs: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            http2_keepalive_params(&interval_zero),
+            None,
+            "interval 0 must disable keepalive (0=off), not produce a zero-interval ping loop"
+        );
+        let timeout_zero = crate::config::GrpcConfig {
+            http2_keepalive_interval_secs: Some(30),
+            http2_keepalive_timeout_secs: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            http2_keepalive_params(&timeout_zero),
+            Some((Duration::from_secs(30), Duration::from_secs(20))),
+            "timeout 0 must fall back to the 20s default, not a zero timeout that drops the connection after the first ping"
         );
     }
 

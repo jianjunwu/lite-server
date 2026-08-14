@@ -521,30 +521,28 @@ async fn sse_infer_impl(
                         ?elapsed, stream_id = %stream_id,
                         "sse stream closed: deadline/idle elapsed"
                     );
-                    let deadline_hit =
-                        matches!(elapsed, crate::streaming::RecvElapsed::Deadline);
-                    reason = match elapsed {
+                    // D35 (§4.4, F-11): a mid-stream reclaim — deadline OR
+                    // idle — is terminal for the client: an Error frame +
+                    // close (the status code is already committed), so
+                    // truncated output is distinguishable from the worker's
+                    // normal EOF.
+                    let msg = match elapsed {
                         crate::streaming::RecvElapsed::Deadline => {
-                            prometheus::StreamCloseReason::Deadline
+                            reason = prometheus::StreamCloseReason::Deadline;
+                            "stream closed: deadline exceeded"
                         }
                         crate::streaming::RecvElapsed::Idle => {
-                            prometheus::StreamCloseReason::Idle
+                            reason = prometheus::StreamCloseReason::Idle;
+                            "stream closed: idle timeout"
                         }
                     };
-                    // D35 (§4.4): a mid-stream DEADLINE is terminal for the
-                    // client — an Error frame + close (the status code is
-                    // already committed). Idle reclaim keeps the silent close
-                    // (decoupled reclaim semantics).
-                    if deadline_hit {
-                        let msg = "stream closed: deadline exceeded";
-                        let data = if matches!(frame, SseFrameStyle::Openai) {
-                            json!({"error": {"message": msg}}).to_string()
-                        } else {
-                            json!({"error": msg}).to_string()
-                        };
-                        let _ = event_tx.send(Ok(Event::default().data(data))).await;
-                        crate::callback::fire_inference_response(&cb_runner, &req_ctx, open_time);
-                    }
+                    let data = if matches!(frame, SseFrameStyle::Openai) {
+                        json!({"error": {"message": msg}}).to_string()
+                    } else {
+                        json!({"error": msg}).to_string()
+                    };
+                    let _ = event_tx.send(Ok(Event::default().data(data))).await;
+                    crate::callback::fire_inference_response(&cb_runner, &req_ctx, open_time);
                     break;
                 }
             };
@@ -588,8 +586,11 @@ async fn sse_infer_impl(
                             }
                         }
                     } else {
-                        let data = String::from_utf8_lossy(&c.data);
-                        Some(Event::default().data(&data))
+                        // F-10(b)/B16: incremental lossy decode (split
+                        // codepoints survive) + CR normalization (a bare \r
+                        // would panic axum's Event::data field assert).
+                        direct_chunk_utf8(&mut utf8_pending, &c.data)
+                            .map(|data| Event::default().data(data))
                     }
                 }
                 Some(pb::stream_response::Payload::Error(e)) => {
@@ -893,6 +894,58 @@ fn ensemble_chunk_utf8(pending: &mut Vec<u8>, chunk: &[u8]) -> Result<Option<Str
         }
         Err(_) => Err(()),
     }
+}
+
+/// F-10(b)/B16 (audit 2026-08-14): direct-path (non-ensemble) chunk → SSE
+/// text. Two hazards in the old one-liner
+/// (`String::from_utf8_lossy(&c.data)` straight into `Event::data`):
+///
+/// - per-chunk lossy decode replaces each half of a multi-byte codepoint
+///   split across chunks with U+FFFD — silent text corruption on the wire.
+///   Here the incomplete tail (≤3 bytes) is held in `pending` and decoded
+///   with the next chunk (ensemble path parity). Genuinely invalid bytes
+///   keep the historical lossy replacement (U+FFFD + skip).
+/// - axum's `Event::data` splits on `\n` but its `field()` asserts no `\r`
+///   in a field value — a chunk containing a bare `\r` (or `\r\n`) PANICKED
+///   the forward task. CR is normalized to LF semantics before the event is
+///   built (`\r\n` → `\n`, bare `\r` → `\n`).
+///
+/// Returns None when the chunk completes no codepoint yet (tail held).
+pub fn direct_chunk_utf8(pending: &mut Vec<u8>, chunk: &[u8]) -> Option<String> {
+    pending.extend_from_slice(chunk);
+    let mut out = String::new();
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(s) => {
+                out.push_str(s);
+                pending.clear();
+                break;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                out.push_str(std::str::from_utf8(&pending[..valid]).expect("valid prefix"));
+                match e.error_len() {
+                    // Genuinely invalid sequence: lossy replace + skip it.
+                    Some(len) => {
+                        out.push('\u{FFFD}');
+                        pending.drain(..valid + len);
+                    }
+                    // Incomplete tail: hold it for the next chunk.
+                    None => {
+                        pending.drain(..valid);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    if out.contains('\r') {
+        out = out.replace("\r\n", "\n").replace('\r', "\n");
+    }
+    Some(out)
 }
 
 /// Detect a WS bidi app-level close control frame: `{"type":"close"}`.
@@ -1624,26 +1677,24 @@ async fn handle_ws_stream(
                         ?elapsed, stream_id = %stream_id_for_writer,
                         "websocket stream closed: deadline/idle elapsed"
                     );
-                    let deadline_hit =
-                        matches!(elapsed, crate::streaming::RecvElapsed::Deadline);
-                    reason = match elapsed {
+                    // D35 (§4.4, F-11): a mid-stream reclaim — deadline OR
+                    // idle — is terminal: an error message + close (§4.4:
+                    // 开流后失败 → Error 收口), so truncated output is
+                    // distinguishable from the worker's normal EOF.
+                    let msg = match elapsed {
                         crate::streaming::RecvElapsed::Deadline => {
-                            prometheus::StreamCloseReason::Deadline
+                            reason = prometheus::StreamCloseReason::Deadline;
+                            "stream closed: deadline exceeded"
                         }
                         crate::streaming::RecvElapsed::Idle => {
-                            prometheus::StreamCloseReason::Idle
+                            reason = prometheus::StreamCloseReason::Idle;
+                            "stream closed: idle timeout"
                         }
                     };
-                    // D35 (§4.4): a mid-stream DEADLINE is terminal — an
-                    // error message + close (§4.4: 开流后失败 → Error 收口).
-                    if deadline_hit {
-                        let _ = ws_sink
-                            .send(Message::Text(
-                                json!({"error": "stream closed: deadline exceeded"}).to_string(),
-                            ))
-                            .await;
-                        crate::callback::fire_inference_response(&cb_runner, &req_ctx, open_time);
-                    }
+                    let _ = ws_sink
+                        .send(Message::Text(json!({"error": msg}).to_string()))
+                        .await;
+                    crate::callback::fire_inference_response(&cb_runner, &req_ctx, open_time);
                     break;
                 }
             };

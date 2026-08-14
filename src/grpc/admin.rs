@@ -66,6 +66,11 @@ fn to_status(e: AppError) -> Status {
     super::err(super::app_error_to_grpc_status(&e))
 }
 
+/// F-13: bound on a single download-chunk send — a stalled (connected but
+/// not reading) client must not park the download task and its file handle
+/// forever.
+const DOWNLOAD_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// serde `rename_all = "snake_case"` value of a [`VersionStatus`], as a plain
 /// string (mirrors the HTTP JSON `status` field exactly).
 fn version_status_str(s: &VersionStatus) -> &'static str {
@@ -989,15 +994,25 @@ impl Admin for GrpcAdminService {
         // carrying sha256 + size (DecoupledResponse idiom). The source — and
         // its pack temp-dir cleanup guard — lives until the spawned task
         // ends (stream done or client gone).
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<pb::DownloadModelChunk, Status>>(1);
+        //
+        // F-13: open the file BEFORE replying — an open failure must fail
+        // the RPC itself (a zero-chunk OK stream is indistinguishable from a
+        // successful empty download), and a mid-stream read failure must
+        // surface as an Err item instead of a silent truncation.
+        let mut file = match tokio::fs::File::open(&src.path).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("DownloadModel: open {} failed: {}", src.path.display(), e);
+                return Err(match e.kind() {
+                    std::io::ErrorKind::NotFound => {
+                        Status::not_found(format!("{} no longer exists", src.path.display()))
+                    }
+                    _ => Status::internal(format!("failed to open {}", src.path.display())),
+                });
+            }
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<pb::DownloadModelChunk, Status>>(4);
         tokio::spawn(async move {
-            let mut file = match tokio::fs::File::open(&src.path).await {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::warn!("DownloadModel: open {} failed: {}", src.path.display(), e);
-                    return;
-                }
-            };
             let mut hasher = Sha256::new();
             let mut sent: u64 = 0;
             let mut buf = vec![0u8; 1024 * 1024];
@@ -1013,8 +1028,15 @@ impl Admin for GrpcAdminService {
                             sha256: String::new(),
                             size: 0,
                         };
-                        if tx.send(Ok(chunk)).await.is_err() {
-                            return; // client gone — stream ends here
+                        // Bounded send: a stalled client must not park this
+                        // task (and its file handle) forever.
+                        match tokio::time::timeout(DOWNLOAD_SEND_TIMEOUT, tx.send(Ok(chunk))).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) => return, // client gone — stream ends here
+                            Err(_) => {
+                                tracing::warn!("DownloadModel: client stalled; aborting send");
+                                return;
+                            }
                         }
                     }
                     Err(e) => {
@@ -1023,7 +1045,17 @@ impl Admin for GrpcAdminService {
                             src.path.display(),
                             e
                         );
-                        return; // no terminal frame — client detects truncation
+                        // Surface the truncation explicitly — a clean end
+                        // here would read as a successful short download.
+                        let _ = tokio::time::timeout(
+                            DOWNLOAD_SEND_TIMEOUT,
+                            tx.send(Err(Status::internal(format!(
+                                "read {} failed mid-download",
+                                src.path.display()
+                            )))),
+                        )
+                        .await;
+                        return;
                     }
                 }
             }
@@ -2145,6 +2177,52 @@ mod tests {
             }
         }
         assert_eq!(assembled, b"ACTIVE-ONE", "bare download must target the active version");
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    /// F-13 (functional-defects-plan.md): `File::open` failure inside the
+    /// download task is only logged and swallowed (warn + return) — the
+    /// RPC already replied OK, so the client receives a zero-chunk empty
+    /// stream indistinguishable from a successful download. The fix must
+    /// surface the failure as a non-OK status (NotFound/Internal) through
+    /// the channel. Red: the current implementation returns OK + empty
+    /// stream. (A chmod-000 file is a deterministic open-failure: exists /
+    /// canonicalize / metadata all succeed, open(O_RDONLY) fails EACCES —
+    /// no delete race needed.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_f13_download_open_failure_yields_error_status() {
+        let repo = unique_repo("f13-open-fail");
+        make_disk_version(&repo, "mymodel", "1").await;
+        std::fs::set_permissions(
+            repo.join("mymodel").join("1").join("model.py"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .unwrap();
+
+        let (port, shutdown_tx, _handle) = spawn_admin_grpc_server_with_repo(
+            Arc::new(ModelRegistry::new()),
+            repo.clone(),
+            config_with_repo(&repo),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut client = connect_admin(port).await;
+
+        let resp = client
+            .download_model(pb::DownloadModelRequest {
+                model_name: "mymodel".to_string(),
+                version: Some("1".to_string()),
+                file: Some("model.py".to_string()),
+            })
+            .await;
+        assert!(
+            resp.is_err(),
+            "an open failure must fail the RPC; today it returns OK with \
+             a zero-chunk stream"
+        );
 
         let _ = shutdown_tx.send(());
         let _ = tokio::fs::remove_dir_all(&repo).await;

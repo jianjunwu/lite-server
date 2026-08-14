@@ -426,7 +426,17 @@ async fn h2_bidi_entry_impl(
                             Some(Err(_)) | None => break,
                         }
                     }
-                    Err(_) => return, // frame error → stop (protocol violation)
+                    // F-09: a frame decode error must NOT skip the D4 close
+                    // below — break so the worker's input still half-closes
+                    // (otherwise its generator waits until its own timeout).
+                    Err(e) => {
+                        tracing::warn!(
+                            stream_id = %stream_id_inc,
+                            error = %e,
+                            "h2 bidi: malformed client frame; closing worker input"
+                        );
+                        break;
+                    }
                 }
             }
             // D4: body EOF (or transport error) without an explicit Close
@@ -566,36 +576,36 @@ async fn h2_bidi_entry_impl(
                                 ?elapsed, stream_id = %stream_id_out,
                                 "h2 bidi stream closed: deadline/idle elapsed"
                             );
-                            let deadline_hit =
-                                matches!(elapsed, crate::streaming::RecvElapsed::Deadline);
-                            reason = match elapsed {
+                            // D35 (§4.4, F-11): a mid-stream reclaim —
+                            // deadline OR idle — is terminal: an error frame
+                            // + close (mirror the worker Error arm), so
+                            // truncated output is distinguishable from the
+                            // worker's normal EOF.
+                            let msg = match elapsed {
                                 crate::streaming::RecvElapsed::Deadline => {
-                                    prometheus::StreamCloseReason::Deadline
+                                    reason = prometheus::StreamCloseReason::Deadline;
+                                    "stream closed: deadline exceeded"
                                 }
                                 crate::streaming::RecvElapsed::Idle => {
-                                    prometheus::StreamCloseReason::Idle
+                                    reason = prometheus::StreamCloseReason::Idle;
+                                    "stream closed: idle timeout"
                                 }
                             };
-                            // D35 (§4.4): a mid-stream DEADLINE is terminal —
-                            // an error frame + close (mirror the worker Error
-                            // arm).
-                            if deadline_hit {
-                                let frame = lpm::encode_frame(&pb::BidiChunk {
-                                    stream_id: stream_id_out.clone(),
-                                    payload: Some(pb::bidi_chunk::Payload::Error(
-                                        pb::BidiError {
-                                            message: "stream closed: deadline exceeded".to_string(),
-                                            error_type: String::new(),
-                                        },
-                                    )),
-                                });
-                                let _ = tx.send(frame).await;
-                                crate::callback::fire_inference_response(
-                                    &cb_runner,
-                                    &req_ctx,
-                                    open_time,
-                                );
-                            }
+                            let frame = lpm::encode_frame(&pb::BidiChunk {
+                                stream_id: stream_id_out.clone(),
+                                payload: Some(pb::bidi_chunk::Payload::Error(
+                                    pb::BidiError {
+                                        message: msg.to_string(),
+                                        error_type: String::new(),
+                                    },
+                                )),
+                            });
+                            let _ = tx.send(frame).await;
+                            crate::callback::fire_inference_response(
+                                &cb_runner,
+                                &req_ctx,
+                                open_time,
+                            );
                             break;
                         }
                     };
@@ -1794,5 +1804,49 @@ mod tests {
             drop(body_tx);
         });
         wait_for(|| prometheus::worker_inference_count(model, "1", 0) > before, "bidi worker inference").await;
+    }
+
+    // ===== F-09 (functional-defects-plan) ==================================
+    // A malformed LPM frame after Open must still end the worker's input.
+    // The incoming task's `Err(_) => return` (bidi.rs:429) skips the D4
+    // body-EOF Close (bidi.rs:435-439, reached by the `Some(Err(_)) | None
+    // => break` arm), so the worker's generator never learns the input ended
+    // and waits until its own timeout; the client gets no error frame either.
+    // FAILS on current code: the worker must observe StreamRequest::Close
+    // after the bad frame.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_f09_bad_frame_must_close_worker_input() {
+        let model = "bidi_f09";
+        let endpoint = ipc_endpoint(model);
+        let (_w, actions) = spawn_recording_worker(endpoint.clone());
+        let state = ready_state(model, endpoint).await;
+        state.registry.activate_version(model, "1").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let (body_tx, resp) = start_bidi_session(model, state).await;
+        tokio::spawn(async move {
+            let _ = axum::body::to_bytes(resp.into_body(), 1 << 20).await;
+        });
+
+        assert_eq!(
+            actions.recv_timeout(std::time::Duration::from_secs(3)).as_deref(),
+            Ok("open"),
+            "worker must see StreamOpen"
+        );
+
+        // A malformed LPM frame (non-zero flag byte → LpmError::BadFlag).
+        body_tx
+            .send(Ok(Bytes::from_static(&[0xff, 0x00, 0x00, 0x00, 0x00])))
+            .await
+            .expect("send bad frame");
+
+        assert_eq!(
+            actions.recv_timeout(std::time::Duration::from_secs(2)).as_deref(),
+            Ok("close"),
+            "F-09: a decode error in the incoming task must still deliver the \
+             D4 half-close (StreamRequest::Close) so the worker's generator \
+             sees the input end; the current `Err(_) => return` skips it and \
+             the worker waits until its own timeout"
+        );
     }
 }

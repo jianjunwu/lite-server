@@ -1335,6 +1335,17 @@ impl Config {
         check_duration_secs("tunables.file_changed_timeout_secs", self.tunables.file_changed_timeout_secs)?;
         check_duration_secs("tunables.worker_stderr_drain_secs", self.tunables.worker_stderr_drain_secs)?;
         check_duration_secs("tunables.unpack_timeout_secs", self.tunables.unpack_timeout_secs)?;
+        // F-12: h2's legal max-frame-size range is [2^14, 2^24-1]; the h2
+        // crate hard-asserts it per new connection (a plain assert!, active
+        // in release), so an out-of-range value must fail startup validation
+        // instead of panicking per connection.
+        if let Some(size) = self.grpc.http2_max_frame_size {
+            if !(16_384..=16_777_215).contains(&size) {
+                anyhow::bail!(
+                    "config field `grpc.http2_max_frame_size` must be in [16384, 16777215], got {size}"
+                );
+            }
+        }
         self.validate_tls()?;
         // B6（蓝图 §4.3，本期 gRPC only）：protocol=http 被 serde 接受但未实现——
         // 启动期 fail-fast，而非 warn 后 telemetry 整体静默关闭（docs 已标 reserved）。

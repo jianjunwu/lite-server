@@ -1255,6 +1255,31 @@ async fn do_send_batch(
     if batch.is_empty() {
         return Ok(());
     }
+    // Audit 2026-08-14 (F-18 adjacent): a 0-worker model can still deliver a
+    // batch here (queue registered with no workers, or the pool drained
+    // between collect and dispatch) — an empty inflight must fail the batch,
+    // never index-panic the collector. The structured 503 single rides the
+    // numeric-status convention so HTTP renders 503 and gRPC Unavailable
+    // (upstream unavailable, retryable) instead of a dropped response
+    // channel.
+    if inflight.is_empty() {
+        return Err(BatchError {
+            worker_idx: 0,
+            code: "Error".to_string(),
+            message: "no workers available".to_string(),
+            single: Some((
+                pb::SingleResponse {
+                    status: Some(pb::Status {
+                        code: "Error".to_string(),
+                        message: "503".to_string(),
+                    }),
+                    status_code: 503,
+                    ..Default::default()
+                },
+                None,
+            )),
+        });
+    }
 
     let batch_size = batch.len();
     // B3 direct-mode pin（x-lite-worker-id）优先于一切挑选：pin 在提交时已校验

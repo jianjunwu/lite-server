@@ -180,7 +180,13 @@ async fn do_infer(
         body_kind = tracing::field::Empty,
     );
     async move {
-    let (resolved_version, pinned) = resolve_version(&state, &model_name, version, &headers).await?;
+    // F-03: gate unknown-model probes — when any model on the server
+    // declares policies.auth, a resolution failure must not be
+    // distinguishable from "no credentials" (see auth_gate_for_unknown_model).
+    let (resolved_version, pinned) = match resolve_version(&state, &model_name, version, &headers).await {
+        Ok(v) => v,
+        Err(e) => return Err(auth_gate_for_unknown_model(&state, &headers, e)),
+    };
     // P5-2: record the honored pin on the inference span (Span::current() is
     // this span — the block is instrumented; same pattern as the body fields
     // below). resolve_version itself is side-effect-free.
@@ -197,6 +203,19 @@ async fn do_infer(
     tracing::Span::current().record("body_bytes", body.bytes().len() as i64);
     tracing::Span::current().record("body_kind", body.kind());
 
+    // F-03: policy checks BEFORE the readiness check — an unauthenticated
+    // probe must get 401 whether the model is missing, not ready, or fine
+    // (auth first, then rate limit).
+    let Some(mv) = state.registry.get(&model_name, Some(&resolved_version)) else {
+        return Err(auth_gate_for_unknown_model(
+            &state,
+            &headers,
+            AppError::ModelNotFound(format!("{} version {}", model_name, resolved_version)),
+        ));
+    };
+    enforce_auth(mv.policies.auth.as_ref(), &headers)?;
+    enforce_rate_limit(&state, mv.policies.rate_limit.as_ref(), &model_name, &cx.client_ip).await?;
+
     // Check ready
     if !state.registry.is_ready(&model_name, Some(&resolved_version)) {
         return Err(AppError::ModelNotReady(format!(
@@ -204,14 +223,6 @@ async fn do_infer(
             model_name, resolved_version
         )));
     }
-
-    // Get model version info
-    let mv = state.registry.get(&model_name, Some(&resolved_version))
-        .ok_or_else(|| AppError::ModelNotFound(format!("{} version {}", model_name, resolved_version)))?;
-
-    // Policy checks (before ensemble, after mv resolution): auth first, then rate limit
-    enforce_auth(mv.policies.auth.as_ref(), &headers)?;
-    enforce_rate_limit(&state, mv.policies.rate_limit.as_ref(), &model_name, &cx.client_ip).await?;
 
     // Handle ensemble
     if mv.model_type == ModelType::Ensemble {
@@ -381,9 +392,13 @@ async fn do_infer(
         Some(timeout_duration) => match tokio::time::timeout(timeout_duration, response_rx).await {
             Ok(Ok(resp)) => resp,
             Ok(Err(_)) => {
+                // F-18: response channel closed (worker crash/recycle) is
+                // "upstream unavailable" — 502, matching gRPC Unavailable
+                // (was 504 InferenceTimeout, which mislabels an upstream
+                // death as a timeout).
                 error!(timeout_secs = %timeout_duration.as_secs(), "Response channel closed");
                 prometheus::record_request_end(&model_name, &resolved_version, "5xx", start.elapsed().as_secs_f64());
-                return Err(AppError::InferenceTimeout("response channel closed".to_string()));
+                return Err(AppError::BadGateway("response channel closed".to_string()));
             }
             Err(_) => {
                 error!(timeout_secs = %timeout_duration.as_secs(), elapsed_ms = %start.elapsed().as_millis(), "Inference request timed out");
@@ -396,7 +411,7 @@ async fn do_infer(
             Err(_) => {
                 error!("Response channel closed");
                 prometheus::record_request_end(&model_name, &resolved_version, "5xx", start.elapsed().as_secs_f64());
-                return Err(AppError::InferenceTimeout("response channel closed".to_string()));
+                return Err(AppError::BadGateway("response channel closed".to_string()));
             }
         },
     };
@@ -428,12 +443,33 @@ async fn do_infer(
                             "application/json; charset=utf-8".to_string(),
                         )
                     } else {
-                        let data = serde_json::from_slice(&single.data).unwrap_or(json!({}));
-                        let json_body = serde_json::to_string(&data).unwrap_or_default();
-                        (
-                            axum::body::Body::from(json_body),
-                            "application/json; charset=utf-8".to_string(),
-                        )
+                        // F-02: the JSON path (declared application/json, or
+                        // legacy empty media_type) must carry VALID JSON —
+                        // parse strictly and re-encode (byte-identical guard:
+                        // sorted-key re-encode is pinned). A corrupt payload
+                        // is an upstream failure (502), never a fabricated
+                        // `{}` (was: unwrap_or(json!({}))).
+                        match serde_json::from_slice::<serde_json::Value>(&single.data) {
+                            Ok(data) => {
+                                let json_body = serde_json::to_string(&data).unwrap_or_default();
+                                (
+                                    axum::body::Body::from(json_body),
+                                    "application/json; charset=utf-8".to_string(),
+                                )
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    model = %model_name,
+                                    version = %resolved_version,
+                                    error = %e,
+                                    first_bytes = ?&single.data[..single.data.len().min(32)],
+                                    "worker returned invalid JSON on the JSON path"
+                                );
+                                return Err(AppError::BadGateway(format!(
+                                    "{model_name} version {resolved_version} returned invalid JSON"
+                                )));
+                            }
+                        }
                     };
                     let mut builder = Response::builder()
                         .header("content-type", content_type);

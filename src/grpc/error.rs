@@ -17,6 +17,9 @@ pub(super) fn http_status_to_grpc_code(http_status: u16) -> tonic::Code {
         // behavior (ResourceExhausted) rather than falling through to Internal.
         413 => tonic::Code::ResourceExhausted,
         429 => tonic::Code::ResourceExhausted,
+        // F-18: 502 Bad Gateway (upstream crash/malformed response) is
+        // "upstream unavailable", not an internal server bug.
+        502 => tonic::Code::Unavailable,
         503 => tonic::Code::Unavailable,
         504 => tonic::Code::DeadlineExceeded,
         _ => tonic::Code::Internal,
@@ -46,6 +49,7 @@ pub(crate) fn app_error_to_grpc_status(e: &AppError) -> Status {
         AppError::ModelNotReady(_) | AppError::QueueFull(_) => 503,
         AppError::VersionAlreadyLoaded(_, _) => 409,
         AppError::InferenceTimeout(_) => 504,
+        AppError::BadGateway(_) => 502,
         AppError::Validation(_)
         | AppError::Config(_)
         | AppError::Serialization(_)

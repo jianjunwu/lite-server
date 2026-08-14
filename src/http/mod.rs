@@ -29,10 +29,15 @@ use uuid::Uuid;
 
 async fn disable_keepalive_middleware(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
-    response.headers_mut().insert(
-        CONNECTION,
-        axum::http::HeaderValue::from_static("close"),
-    );
+    // F-04: never rewrite the Connection header on a 101 upgrade — replacing
+    // `Connection: Upgrade` with `close` breaks the WS handshake (RFC 6455
+    // §4.2.2 requires the Upgrade token in the 101 response).
+    if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        response.headers_mut().insert(
+            CONNECTION,
+            axum::http::HeaderValue::from_static("close"),
+        );
+    }
     response
 }
 
@@ -57,8 +62,17 @@ pub(crate) async fn route_fallback(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Response {
-    // D11 P2.1:fallback 无请求上下文,协议恒 Legacy(byte-identical)。
-    let fallback_err = |e: AppError| ProtocolError::from(e).into_response();
+    // F-17: render errors in the request's protocol — a KServe V2 dataplane
+    // URL (/v2/...) must get the flat `{"error": "<message>"}` body, not the
+    // nested Legacy shape Triton clients don't parse.
+    let protocol = if request.uri().path().starts_with("/v2/") {
+        crate::protocol::ApiProtocol::Kserve
+    } else {
+        crate::protocol::ApiProtocol::Legacy
+    };
+    let fallback_err = move |e: AppError| {
+        ProtocolError { error: e, protocol }.into_response()
+    };
     // Only `/v2/models/<model>/<tail>` paths are candidates for custom routes.
     let path = request.uri().path();
     let Some(rest) = path.strip_prefix("/v2/models/") else {
@@ -84,15 +98,27 @@ pub(crate) async fn route_fallback(
         .cloned()
         .unwrap_or_else(|| crate::request_context::RequestContext::from_http_parts(&parts, &[]));
     let headers = parts.headers.clone();
+
+    // F-06: match the custom route BEFORE reading the body — an unmatched
+    // tail is a 404 (and a wrong method a 405) regardless of body size, and
+    // an oversized body must not be read for a request that will be rejected.
+    let resolved = match crate::http::handlers::resolve_custom_route(
+        &state, &model, &tail, &method, &headers,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return fallback_err(e),
+    };
+
     let body = match axum::body::to_bytes(body, ROUTE_BODY_LIMIT).await {
         Ok(b) => b,
-        Err(_) => {
-            return fallback_err(AppError::Internal("failed to read request body".into()))
-        }
+        // F-06: an over-limit body is 413, not a generic 500.
+        Err(e) => return fallback_err(map_route_body_error(e)),
     };
 
     match crate::http::handlers::dispatch_custom_route(
-        &state, &model, &tail, &method, query, &headers, body, &cx,
+        &state, &model, resolved, &method, query, &headers, body, &cx,
     )
     .await
     {
@@ -101,13 +127,40 @@ pub(crate) async fn route_fallback(
     }
 }
 
+/// F-06: map a `to_bytes` failure on the custom-route body read — an
+/// over-limit body (`LengthLimitError` in the source chain) is
+/// `PayloadTooLarge` (413); anything else stays a 500.
+fn map_route_body_error(e: axum::Error) -> AppError {
+    let mut source: Option<&(dyn std::error::Error + 'static)> =
+        std::error::Error::source(&e);
+    while let Some(s) = source {
+        if s.is::<http_body_util::LengthLimitError>() {
+            return AppError::PayloadTooLarge {
+                max_size: ROUTE_BODY_LIMIT,
+                actual_size: None,
+            };
+        }
+        source = s.source();
+    }
+    AppError::Internal("failed to read request body".into())
+}
+
 /// Max request body size for custom-route dispatch (mirrors a typical JSON body
 /// cap). Inference uses its own ApiJson extractor limit.
 const ROUTE_BODY_LIMIT: usize = 10 * 1024 * 1024;
 
 /// Fallback for unmatched methods on matched routes — standardized 405 body.
-pub(crate) async fn method_not_allowed_fallback() -> ProtocolError {
-    ProtocolError::from(AppError::MethodNotAllowed)
+/// F-17: protocol-aware like route_fallback (KServe flat body on /v2/ paths).
+pub(crate) async fn method_not_allowed_fallback(uri: axum::http::Uri) -> ProtocolError {
+    let protocol = if uri.path().starts_with("/v2/") {
+        crate::protocol::ApiProtocol::Kserve
+    } else {
+        crate::protocol::ApiProtocol::Legacy
+    };
+    ProtocolError {
+        error: AppError::MethodNotAllowed,
+        protocol,
+    }
 }
 
 /// Middleware that injects `x-request-id` and `x-processing-time-ms` into
@@ -537,26 +590,77 @@ pub async fn start_http_server(
 async fn serve_unix(
     listener: UnixListener,
     app: Router,
-    mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), AppError> {
     use hyper_util::server::conn::auto::Builder;
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use hyper_util::service::TowerToHyperService;
 
+    let listener = Arc::new(listener);
+    accept_loop(
+        move || {
+            let listener = listener.clone();
+            async move { listener.accept().await.map(|(stream, _)| stream) }
+        },
+        shutdown_rx,
+        move |stream| {
+            let app = app.clone();
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let builder = Builder::new(TokioExecutor::new());
+                let hyper_service = TowerToHyperService::new(app);
+                let conn = builder.serve_connection_with_upgrades(io, hyper_service);
+                if let Err(e) = conn.await {
+                    tracing::debug!("Connection error: {}", e);
+                }
+            });
+        },
+    )
+    .await
+}
+
+/// F-07: classify an accept() error — transient resource errors (fd
+/// exhaustion EMFILE/ENFILE, interrupted call EINTR, aborted handshake
+/// ECONNABORTED) must be retried, not fatal: fd exhaustion hits exactly
+/// when the service is busiest, and axum-server / tonic already tolerate
+/// it on the TCP paths (50ms backoff / continue). Anything else is fatal.
+#[cfg(unix)]
+fn is_transient_accept_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted
+    ) || matches!(
+        e.raw_os_error(),
+        Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOBUFS) | Some(libc::ENOMEM)
+    )
+}
+
+/// F-07: the UDS accept loop, generic over the accept source and the
+/// connection handler so tests can inject error sequences without a
+/// failpoint. Transient accept errors sleep 50ms and retry (axum-server
+/// parity); fatal errors end the loop.
+#[cfg(unix)]
+async fn accept_loop<A, Fut, H>(
+    mut next_accept: A,
+    mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    mut handle_conn: H,
+) -> Result<(), AppError>
+where
+    A: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<tokio::net::UnixStream>>,
+    H: FnMut(tokio::net::UnixStream),
+{
     loop {
         tokio::select! {
-            result = listener.accept() => {
-                let (stream, _) = result.map_err(AppError::Io)?;
-                let app = app.clone();
-                tokio::spawn(async move {
-                    let io = TokioIo::new(stream);
-                    let builder = Builder::new(TokioExecutor::new());
-                    let hyper_service = TowerToHyperService::new(app);
-                    let conn = builder.serve_connection_with_upgrades(io, hyper_service);
-                    if let Err(e) = conn.await {
-                        tracing::debug!("Connection error: {}", e);
+            result = next_accept() => {
+                match result {
+                    Ok(stream) => handle_conn(stream),
+                    Err(e) if is_transient_accept_error(&e) => {
+                        tracing::warn!(error = %e, "transient accept error; retrying");
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
-                });
+                    Err(e) => return Err(AppError::Io(e)),
+                }
             }
             _ = &mut shutdown_rx => {
                 info!("Unix socket server received shutdown signal");
@@ -564,7 +668,6 @@ async fn serve_unix(
             }
         }
     }
-
     Ok(())
 }
 
@@ -621,6 +724,72 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let connection = response.headers().get("connection");
         assert_eq!(connection, Some(&axum::http::HeaderValue::from_static("close")));
+    }
+
+    // ===== F-07: accept-error classification + injected-loop tests =====
+
+    #[cfg(unix)]
+    #[test]
+    fn f07_accept_error_classification() {
+        use std::io::ErrorKind;
+        // Transient: fd exhaustion / interrupted / aborted handshake.
+        for raw in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert!(
+                is_transient_accept_error(&std::io::Error::from_raw_os_error(raw)),
+                "raw {raw} must be transient"
+            );
+        }
+        assert!(is_transient_accept_error(&std::io::Error::from(ErrorKind::Interrupted)));
+        assert!(is_transient_accept_error(&std::io::Error::from(ErrorKind::ConnectionAborted)));
+        // Fatal: permission / address errors.
+        for raw in [libc::EPERM, libc::EACCES, libc::EBADF] {
+            assert!(
+                !is_transient_accept_error(&std::io::Error::from_raw_os_error(raw)),
+                "raw {raw} must be fatal"
+            );
+        }
+    }
+
+    /// F-07: a stream of transient accept errors must not kill the loop;
+    /// shutdown still ends it cleanly.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn f07_transient_accept_errors_are_retried_not_fatal() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(accept_loop(
+            || async {
+                Err::<tokio::net::UnixStream, _>(std::io::Error::from_raw_os_error(libc::EMFILE))
+            },
+            rx,
+            |_| {},
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !handle.is_finished(),
+            "transient accept errors must not kill the accept loop"
+        );
+        let _ = tx.send(());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("accept loop must observe shutdown within 2s")
+            .expect("accept loop task must not panic");
+        assert!(result.is_ok(), "shutdown after transient errors must be clean");
+    }
+
+    /// F-07: a non-transient accept error stays fatal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn f07_fatal_accept_error_ends_the_loop() {
+        let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let result = accept_loop(
+            || async {
+                Err::<tokio::net::UnixStream, _>(std::io::Error::from_raw_os_error(libc::EPERM))
+            },
+            rx,
+            |_| {},
+        )
+        .await;
+        assert!(result.is_err(), "non-transient accept error must be fatal");
     }
 
     #[tokio::test]

@@ -67,6 +67,25 @@ impl ModelRegistry {
             .unwrap_or_default()
     }
 
+    /// All per-model auth policies currently registered (any model, any
+    /// version). F-03: backs the unknown-model auth gate — when ANY model
+    /// declares `policies.auth`, requests that fail model resolution are
+    /// gated so an unauthenticated probe cannot distinguish "no such model"
+    /// from "no credentials" (the 404-vs-401 differential leaks model
+    /// existence). Only called on the resolution-failure path, so a full
+    /// scan is acceptable.
+    pub fn all_auth_policies(&self) -> Vec<crate::config::AuthPolicy> {
+        let mut out = Vec::new();
+        for entry in self.models.iter() {
+            for mv in entry.versions.values() {
+                if let Some(auth) = &mv.policies.auth {
+                    out.push(auth.clone());
+                }
+            }
+        }
+        out
+    }
+
     /// True when no model is registered. O(1); used by the file watcher
     /// gate to skip events only when nothing can need reload or unload.
     pub fn is_empty(&self) -> bool {

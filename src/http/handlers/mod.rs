@@ -433,6 +433,37 @@ fn enforce_auth(
     Ok(())
 }
 
+/// F-03: unknown-model auth gate. When the target model cannot be resolved,
+/// an unauthenticated probe must not be able to distinguish "no such model"
+/// (404) from "no credentials" (401) — the differential leaks which models
+/// exist. If ANY registered model declares `policies.auth`, a request that
+/// fails model resolution is gated: credentials valid for at least one
+/// declared policy see the original resolution error; anything else gets
+/// 401. With no auth configured anywhere the original error is unchanged.
+fn auth_gate_for_unknown_model(
+    state: &AppState,
+    headers: &HeaderMap,
+    original: AppError,
+) -> AppError {
+    let policies = state.registry.all_auth_policies();
+    if policies.is_empty() {
+        return original;
+    }
+    let authenticated = policies.iter().any(|p| {
+        let value = headers
+            .get(&p.header)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        !value.is_empty()
+            && (p.keys.is_empty() || crate::access_control::ct_contains(&p.keys, value))
+    });
+    if authenticated {
+        original
+    } else {
+        AppError::Unauthorized("missing or invalid API key".to_string())
+    }
+}
+
 /// `scope` derives from the policy key: `"ip"` → client IP from the
 /// `RequestContext` (filled once by `context_middleware`), otherwise the
 /// constant `"/predict"` route scope so all inference paths for

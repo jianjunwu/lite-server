@@ -69,6 +69,28 @@ pub struct WorkerZmqClient {
     /// Test instrumentation: how many wake bytes were actually sent (the
     /// gating regression test asserts this stays near zero under load).
     wake_send_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// F-14: actor construction failure (socket/options/bind). The actor
+    /// records it here before exiting so every later send surfaces the real
+    /// cause (e.g. "address in use") instead of a generic "command channel
+    /// closed" or a misleading EAGAIN error response.
+    fatal: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// F-14: libzmq's ipc listener unlinks an existing SOCKET file before
+/// binding, so binding over a LIVE occupier silently steals the path —
+/// every send then times out with a misleading EAGAIN ("Resource
+/// temporarily unavailable"). Detect a live occupier up front (a stale
+/// leftover socket file keeps the historical steal-and-rebind behavior).
+#[cfg(unix)]
+fn ipc_live_occupier(endpoint: &str) -> bool {
+    let Some(path) = endpoint.strip_prefix("ipc://") else {
+        return false;
+    };
+    let path = std::path::Path::new(path);
+    if !path.exists() {
+        return false;
+    }
+    std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
 impl WorkerZmqClient {
@@ -112,28 +134,44 @@ impl WorkerZmqClient {
         let actor_asleep = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let actor_asleep_in_loop = actor_asleep.clone();
         let wake_send_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fatal = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let fatal_in_actor = fatal.clone();
 
         tokio::task::spawn_blocking(move || {
+            // F-14: record any construction failure so send paths fail fast
+            // with the real cause instead of queueing into a dead actor.
+            macro_rules! fatal_return {
+                ($($arg:tt)*) => {{
+                    let msg = format!($($arg)*);
+                    error!("{}", msg);
+                    *fatal_in_actor.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
+                    return;
+                }};
+            }
             let socket = match ctx.socket(zmq::PAIR) {
                 Ok(s) => s,
                 Err(e) => {
-                    error!("Failed to create ZMQ PAIR socket: {}", e);
-                    return;
+                    fatal_return!("Failed to create ZMQ PAIR socket: {}", e);
                 }
             };
 
             if let Err(e) = socket.set_sndtimeo(1000) {
-                error!("Failed to set ZMQ sndtimeout: {}", e);
-                return;
+                fatal_return!("Failed to set ZMQ sndtimeout: {}", e);
             }
             if let Err(e) = socket.set_linger(0) {
-                error!("Failed to set ZMQ linger: {}", e);
-                return;
+                fatal_return!("Failed to set ZMQ linger: {}", e);
             }
 
+            #[cfg(unix)]
+            if ipc_live_occupier(&endpoint) {
+                fatal_return!(
+                    "Failed to bind ZMQ PAIR to {}: address in use (EADDRINUSE) — \
+                     a live peer already holds the endpoint",
+                    endpoint
+                );
+            }
             if let Err(e) = socket.bind(&endpoint) {
-                error!("Failed to bind ZMQ PAIR to {}: {}", endpoint, e);
-                return;
+                fatal_return!("Failed to bind ZMQ PAIR to {}: {}", endpoint, e);
             }
 
             info!("ZMQ PAIR worker socket bound to {}", endpoint);
@@ -304,7 +342,16 @@ impl WorkerZmqClient {
             }
         });
 
-        Self { cmd_tx, wake_tx, actor_asleep, wake_send_count }
+        Self { cmd_tx, wake_tx, actor_asleep, wake_send_count, fatal }
+    }
+
+    /// F-14: the actor's recorded construction failure, if any.
+    fn fatal_err(&self) -> Option<AppError> {
+        self.fatal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .map(AppError::Transport)
     }
 
     pub async fn send(&self, request: pb::Request) -> Result<pb::Response, AppError> {
@@ -318,6 +365,9 @@ impl WorkerZmqClient {
         request: pb::Request,
         timeout: Duration,
     ) -> Result<pb::Response, AppError> {
+        if let Some(e) = self.fatal_err() {
+            return Err(e);
+        }
         let (response_tx, response_rx) = oneshot::channel();
         let cmd = ZmqCommand::Unary {
             request,
@@ -341,6 +391,9 @@ impl WorkerZmqClient {
         request: pb::Request,
         stream_id: String,
     ) -> Result<mpsc::Receiver<pb::StreamResponse>, AppError> {
+        if let Some(e) = self.fatal_err() {
+            return Err(e);
+        }
         let (chunk_tx, chunk_rx) = mpsc::channel(STREAM_CHANNEL_SIZE);
         let cmd = ZmqCommand::Stream {
             request,
@@ -365,6 +418,9 @@ impl WorkerZmqClient {
         &self,
         request: pb::Request,
     ) -> Result<(oneshot::Receiver<pb::Response>, mpsc::Receiver<pb::StreamResponse>), AppError> {
+        if let Some(e) = self.fatal_err() {
+            return Err(e);
+        }
         let (response_tx, response_rx) = oneshot::channel();
         let (chunk_tx, chunk_rx) = mpsc::channel(STREAM_CHANNEL_SIZE);
         self.cmd_tx
@@ -381,6 +437,9 @@ impl WorkerZmqClient {
     /// `StreamResponse`s on the stream's registered channel, so there is no
     /// unary reply to wait for.  See `ZmqCommand::Raw`.
     pub async fn send_raw(&self, request: pb::Request) -> Result<(), AppError> {
+        if let Some(e) = self.fatal_err() {
+            return Err(e);
+        }
         self.cmd_tx
             .send(ZmqCommand::Raw { request })
             .await
