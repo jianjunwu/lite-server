@@ -7,15 +7,15 @@ use crate::metrics::prometheus;
 use crate::registry::types::ModelType;
 use crate::request_context::RequestContext;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::HeaderMap,
     response::{IntoResponse, Json},
 };
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{error, info, warn};
 
 // ===== KServe V2 管理面(阶段 3,批次 3) =====
 
@@ -335,10 +335,11 @@ async fn scan_repository(repo_path: &std::path::Path) -> Vec<Value> {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
             if path.extension().map(|e| e == "lma").unwrap_or(false) {
-                // Simplified: just list the artifact file
+                // K2: the version lives inside the package manifest, not
+                // the filename — report null instead of a fake "1".
                 models.push(json!({
                     "name": path.file_stem().unwrap_or_default().to_string_lossy().to_string(),
-                    "version": "1",
+                    "version": Value::Null,
                     "path": path.to_string_lossy().to_string(),
                     "has_config": false,
                     "type": "artifact",
@@ -523,31 +524,535 @@ async fn reload_model_impl(
 
 // ===== Delete Version =====
 
-pub async fn delete_version_handler(
-    State(state): State<Arc<AppState>>,
-    Path((model_name, version)): Path<(String, String)>,
-    cx: RequestContext,
+/// G5: remove the linked artifacts of a deleted version — the
+/// scanner-placed root `.lma` and the F10a `.artifacts/` copy. Both use
+/// the packer output naming convention `{name}_v{version}.lma`. Returns
+/// the paths actually removed (for the audit record).
+pub(crate) async fn remove_linked_artifacts(
+    repo_path: &std::path::Path,
+    model_name: &str,
+    version: &str,
+) -> Vec<String> {
+    let artifact_name = format!("{}_v{}.lma", model_name, version);
+    let mut removed = Vec::new();
+    for dir in [repo_path.to_path_buf(), repo_path.join(".artifacts")] {
+        let path = dir.join(&artifact_name);
+        if path.is_file() && tokio::fs::remove_file(&path).await.is_ok() {
+            removed.push(path.display().to_string());
+        }
+    }
+    removed
+}
+
+/// Shared delete-version logic (HTTP handler, E2 batch delete and the
+/// future gRPC DeleteVersion RPC all funnel through here). Unloads the
+/// worker if loaded, removes the version directory, cleans the linked
+/// artifacts (G5) and emits the control-plane audit.
+pub(crate) async fn delete_version_impl(
+    state: &AppState,
+    cx: &RequestContext,
+    model_name: &str,
+    version: &str,
+    force: bool,
 ) -> Result<Json<Value>, AppError> {
-    crate::validation::validate_identifier(&model_name)?;
-    crate::validation::validate_version(&version)?;
+    crate::validation::validate_identifier(model_name)?;
+    crate::validation::validate_version(version)?;
 
     info!(model = %model_name, version = %version, "delete version requested");
-    // Unload first if loaded
-    let _ = state.worker_manager.unload_model(&model_name, Some(&version)).await;
+    // G4: capture the active pin BEFORE unload — unload clears it via
+    // registry.remove (auto-fallback may already have moved the pointer).
+    let was_active = state.registry.get_active_version(model_name).as_deref() == Some(version);
+    // E3: deleting the active version is an accident-prone, traffic-shaping
+    // mutation — refuse by default, force overrides (G4 then logs the
+    // resulting active state below).
+    if was_active && !force {
+        return Err(AppError::Conflict(format!(
+            "version {} of model {} is the active version; pass ?force=true to override",
+            version, model_name
+        )));
+    }
+    let was_loaded = state.registry.get(model_name, Some(version)).is_some();
+
+    // Unload first if loaded. H5: a failed graceful unload must not block
+    // the delete — escalate to force termination so no live worker
+    // survives on a deleted directory.
+    if was_loaded {
+        if let Err(e) = state
+            .worker_manager
+            .unload_model(model_name, Some(version))
+            .await
+        {
+            error!(
+                model = %model_name, version = %version, error = %e,
+                "graceful unload failed during delete; force-terminating workers"
+            );
+            state
+                .worker_manager
+                .force_unload_version(model_name, version)
+                .await?;
+        }
+    }
 
     // Delete directory
-    let version_dir = state.repo_path.join(&model_name).join(&version);
+    let version_dir = state.repo_path.join(model_name).join(version);
     if version_dir.exists() {
         tokio::fs::remove_dir_all(&version_dir)
             .await
             .map_err(AppError::Io)?;
     }
 
-    crate::audit::control_plane(Some(&cx), &state.access_control, Protocol::Http, "delete", &model_name, Some(&version), "deleted");
+    // G5: linked artifact cleanup — the scanner-placed root .lma and the
+    // .artifacts/ copy would otherwise resurrect the version on restart.
+    let linked = remove_linked_artifacts(&state.repo_path, model_name, version).await;
+
+    // G4: deleting the active version is a traffic-shaping event — make the
+    // resulting active state explicit in the logs.
+    if was_active {
+        match state.registry.get_active_version(model_name) {
+            Some(v) => info!(
+                model = %model_name, version = %version, new_active = %v,
+                "deleted active version; active pointer fell back to another ready version"
+            ),
+            None => warn!(
+                model = %model_name, version = %version,
+                "deleted active version; no active version remains"
+            ),
+        }
+    }
+
+    let details = if linked.is_empty() {
+        "deleted".to_string()
+    } else {
+        format!("deleted; linked artifacts removed: {}", linked.join(", "))
+    };
+
+    // H8: rewrite the registry snapshot so a later re-upload of the same
+    // version cannot inherit the deleted version's stale strategy/pins.
+    if state.config.server.cache_registry {
+        crate::registry::cache::save(&state.registry, &state.repo_path).await?;
+    }
+
+    crate::audit::control_plane(
+        Some(cx),
+        &state.access_control,
+        Protocol::Http,
+        "delete",
+        model_name,
+        Some(version),
+        &details,
+    );
 
     Ok(Json(json!({
         "success": true,
         "message": format!("Model {} version {} deleted", model_name, version),
+    })))
+}
+
+/// E3: query params for delete endpoints (?force=true overrides the
+/// active-version protection).
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct DeleteQuery {
+    pub force: Option<bool>,
+}
+
+pub async fn delete_version_handler(
+    State(state): State<Arc<AppState>>,
+    Path((model_name, version)): Path<(String, String)>,
+    Query(query): Query<DeleteQuery>,
+    cx: RequestContext,
+) -> Result<Json<Value>, AppError> {
+    delete_version_impl(&state, &cx, &model_name, &version, query.force.unwrap_or(false)).await
+}
+
+// ===== Repository Drift (E4) =====
+
+/// E4: configured version set for a model — the explicit references
+/// (versions_to_load / default_version / weights keys), adjusted for the
+/// dynamic load policies the same way reconcile computes its target
+/// ("all" = every disk version, "latest" = the highest disk version).
+fn configured_versions(
+    strategy: Option<&crate::config::ModelStrategyConfig>,
+    disk: &[String],
+) -> BTreeSet<String> {
+    let mut set = BTreeSet::new();
+    let Some(s) = strategy else { return set };
+    set.extend(s.versions_to_load.iter().cloned());
+    if let Some(d) = &s.default_version {
+        set.insert(d.clone());
+    }
+    if let Some(w) = &s.weights {
+        set.extend(w.keys().cloned());
+    }
+    match s.load_policy.as_str() {
+        "all" => set.extend(disk.iter().cloned()),
+        "latest" => {
+            if let Some(latest) = crate::server::pick_latest_version(disk) {
+                set.insert(latest);
+            }
+        }
+        _ => {}
+    }
+    set
+}
+
+/// Model directories on disk (dot-prefixed entries skipped).
+async fn disk_models(repo_path: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(mut entries) = tokio::fs::read_dir(repo_path).await else {
+        return out;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) {
+            if !name.starts_with('.') {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+/// Recursive size of a directory (iterative — async fn recursion needs
+/// boxing). Missing dir = 0.
+async fn dir_size_bytes(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if let Ok(md) = tokio::fs::metadata(&p).await {
+                total += md.len();
+            }
+        }
+    }
+    total
+}
+
+/// (model, version) pairs referenced by any ensemble chain node on disk.
+/// Parsed structurally — a chain referencing a deleted version must still
+/// be REPORTED here, which is exactly what this endpoint exists for.
+async fn ensemble_referenced_pairs(repo_path: &std::path::Path) -> BTreeSet<(String, String)> {
+    let mut refs = BTreeSet::new();
+    for model in disk_models(repo_path).await {
+        for version in disk_versions(repo_path, &model).await {
+            let cfg_path = repo_path.join(&model).join(&version).join("config.yaml");
+            let Ok(content) = tokio::fs::read_to_string(&cfg_path).await else {
+                continue;
+            };
+            if !crate::config::config_content_is_ensemble(&content) {
+                continue;
+            }
+            let Ok(cfg) = serde_yaml::from_str::<crate::ensemble::EnsembleConfig>(&content) else {
+                continue;
+            };
+            let mut steps: Vec<&crate::ensemble::EnsembleStepRaw> =
+                cfg.ensemble.steps.iter().collect();
+            if let Some(dags) = &cfg.ensemble.dags {
+                for set in dags.values() {
+                    steps.extend(set.steps.iter());
+                }
+            }
+            for step in steps {
+                if let Some(v) = &step.version {
+                    refs.insert((step.model.clone(), v.clone()));
+                }
+            }
+        }
+    }
+    refs
+}
+
+/// E4: config↔disk drift report (read-only). `configured_missing` lists
+/// versions the configuration references but that are absent on disk;
+/// `on_disk_unconfigured` lists disk versions nothing references (retire
+/// candidates in explicit mode), with size and ensemble-chain-reference
+/// hints to support the decision.
+pub async fn repository_drift_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, AppError> {
+    let orch = &state.config.orchestration;
+    let ensemble_refs = ensemble_referenced_pairs(&state.repo_path).await;
+
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    names.extend(orch.load_models.iter().cloned());
+    names.extend(orch.models.iter().map(|s| s.name.clone()));
+    names.extend(disk_models(&state.repo_path).await);
+
+    let mut configured_missing: Vec<Value> = Vec::new();
+    let mut on_disk_unconfigured: Vec<Value> = Vec::new();
+    for name in names {
+        let disk = disk_versions(&state.repo_path, &name).await;
+        let disk_set: BTreeSet<String> = disk.iter().cloned().collect();
+        let strategy = orch.models.iter().find(|s| s.name == name);
+        let in_scope = orch.load_models.iter().any(|m| m == &name) || strategy.is_some();
+        let configured: BTreeSet<String> = match strategy {
+            // Legacy: a load_models entry without a strategy loads every
+            // disk version, so nothing can be missing or unconfigured.
+            None if in_scope => disk_set.clone(),
+            _ => configured_versions(strategy, &disk),
+        };
+
+        for v in configured.difference(&disk_set) {
+            configured_missing.push(json!({ "model": name, "version": v }));
+        }
+        for v in &disk {
+            if configured.contains(v) {
+                continue;
+            }
+            on_disk_unconfigured.push(json!({
+                "model": name,
+                "version": v,
+                "size_bytes": dir_size_bytes(&state.repo_path.join(&name).join(v)).await,
+                "ensemble_referenced": ensemble_refs.contains(&(name.clone(), v.clone())),
+            }));
+        }
+    }
+
+    let sort_key = |e: &Value| {
+        (
+            e["model"].as_str().unwrap_or("").to_string(),
+            e["version"].as_str().unwrap_or("").to_string(),
+        )
+    };
+    configured_missing.sort_by_key(&sort_key);
+    on_disk_unconfigured.sort_by_key(&sort_key);
+
+    Ok(Json(json!({
+        "configured_missing": configured_missing,
+        "on_disk_unconfigured": on_disk_unconfigured,
+    })))
+}
+
+// ===== Delete Versions (batch retire, E2) =====
+
+/// E2: versions to delete for `keep=N` — all but the N highest. Semver-
+/// lenient comparison (same parser as `load_policy: latest`); versions that
+/// do not parse count as lowest and are deleted first.
+fn versions_to_delete_keep(versions: &[String], keep: usize) -> Vec<String> {
+    if versions.len() <= keep {
+        return Vec::new();
+    }
+    let mut ranked: Vec<(&String, Option<semver::Version>)> = versions
+        .iter()
+        .map(|v| (v, crate::server::parse_lenient_semver(v)))
+        .collect();
+    ranked.sort_by(|a, b| a.1.cmp(&b.1));
+    ranked
+        .iter()
+        .take(versions.len() - keep)
+        .map(|(v, _)| (*v).clone())
+        .collect()
+}
+
+/// Disk versions of a model directory — same acceptance rule as
+/// scan_repository: `model.py` present, or an ensemble `config.yaml`.
+/// Dot-prefixed entries (staging leftovers) are skipped.
+async fn disk_versions(repo_path: &std::path::Path, model_name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(mut entries) = tokio::fs::read_dir(repo_path.join(model_name)).await else {
+        return out;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        let mut is_ensemble = false;
+        let config_yaml = path.join("config.yaml");
+        if config_yaml.exists() {
+            if let Ok(content) = tokio::fs::read_to_string(&config_yaml).await {
+                is_ensemble = crate::config::config_content_is_ensemble(&content);
+            }
+        }
+        if path.join("model.py").exists() || is_ensemble {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// E2: request body for batch retire — `keep` (retain the N highest
+/// versions) or an explicit `versions` list.
+#[derive(Debug, serde::Deserialize)]
+pub struct DeleteVersionsRequest {
+    pub keep: Option<usize>,
+    pub versions: Option<Vec<String>>,
+}
+
+pub async fn delete_versions_handler(
+    State(state): State<Arc<AppState>>,
+    Path(model_name): Path<String>,
+    Query(query): Query<DeleteQuery>,
+    cx: RequestContext,
+    ApiJson(body): ApiJson<DeleteVersionsRequest>,
+) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
+    let force = query.force.unwrap_or(false);
+
+    let to_delete: Vec<String> = match (body.keep, body.versions) {
+        (Some(keep), None) => {
+            if keep == 0 {
+                return Err(AppError::Validation("keep must be >= 1".to_string()));
+            }
+            versions_to_delete_keep(&disk_versions(&state.repo_path, &model_name).await, keep)
+        }
+        (None, Some(versions)) => {
+            for v in &versions {
+                crate::validation::validate_version(v)?;
+            }
+            versions
+        }
+        _ => {
+            return Err(AppError::Validation(
+                "body must contain either \"keep\" or \"versions\"".to_string(),
+            ))
+        }
+    };
+
+    // Partial-failure semantics: run per version, any success → 200; only
+    // an all-failure batch is an error.
+    let mut deleted: Vec<String> = Vec::new();
+    let mut failed: Vec<Value> = Vec::new();
+    for version in to_delete {
+        match delete_version_impl(&state, &cx, &model_name, &version, force).await {
+            Ok(_) => deleted.push(version),
+            Err(e) => failed.push(json!({ "version": version, "error": e.to_string() })),
+        }
+    }
+
+    if deleted.is_empty() && !failed.is_empty() {
+        let summary = failed
+            .iter()
+            .map(|f| format!("{}: {}", f["version"], f["error"]))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(AppError::Internal(format!(
+            "all {} version(s) failed to delete: {}",
+            failed.len(),
+            summary
+        )));
+    }
+
+    Ok(Json(json!({ "deleted": deleted, "failed": failed })))
+}
+
+// ===== Delete Model (E1) =====
+
+/// E1/G5: remove every linked artifact of a model — all
+/// `.artifacts/{name}_v*.lma` copies plus root `{name}_v*.lma` files
+/// (filename-convention matching, per the plan). Returns the paths
+/// actually removed (for the audit record).
+async fn remove_model_artifacts(repo_path: &std::path::Path, model_name: &str) -> Vec<String> {
+    let mut removed = Vec::new();
+    let prefix = format!("{}_v", model_name);
+    for dir in [repo_path.to_path_buf(), repo_path.join(".artifacts")] {
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(fname) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+                continue;
+            };
+            if fname.starts_with(&prefix)
+                && fname.ends_with(".lma")
+                && tokio::fs::remove_file(&path).await.is_ok()
+            {
+                removed.push(path.display().to_string());
+            }
+        }
+    }
+    removed
+}
+
+pub async fn delete_model_handler(
+    State(state): State<Arc<AppState>>,
+    Path(model_name): Path<String>,
+    Query(query): Query<DeleteQuery>,
+    cx: RequestContext,
+) -> Result<Json<Value>, AppError> {
+    crate::validation::validate_identifier(&model_name)?;
+    let force = query.force.unwrap_or(false);
+
+    info!(model = %model_name, "delete model requested");
+    // E3: whole-model delete is the biggest accident surface — refuse while
+    // an active version exists unless forced.
+    if state.registry.get_active_version(&model_name).is_some() && !force {
+        return Err(AppError::Conflict(format!(
+            "model {} has an active version; pass ?force=true to override",
+            model_name
+        )));
+    }
+
+    // Unload every loaded version (registry-driven — disk-only versions are
+    // covered by the directory removal below).
+    let loaded: Vec<String> = state
+        .registry
+        .list_versions(&model_name)
+        .iter()
+        .map(|mv| mv.version.clone())
+        .collect();
+    for version in &loaded {
+        state
+            .worker_manager
+            .unload_model(&model_name, Some(version))
+            .await?;
+    }
+
+    // Delete the whole model directory (idempotent when absent).
+    let model_dir = state.repo_path.join(&model_name);
+    if model_dir.exists() {
+        tokio::fs::remove_dir_all(&model_dir)
+            .await
+            .map_err(AppError::Io)?;
+    }
+
+    // G5: linked artifacts — root .lma files would resurrect the model via
+    // auto-unpack on restart; .artifacts/ copies are F10a's.
+    let removed = remove_model_artifacts(&state.repo_path, &model_name).await;
+
+    let details = if removed.is_empty() {
+        "model deleted".to_string()
+    } else {
+        format!("model deleted; linked artifacts removed: {}", removed.join(", "))
+    };
+
+    // H8: same snapshot rewrite as the version-level delete — no ghost
+    // strategy/pins for the deleted model.
+    if state.config.server.cache_registry {
+        crate::registry::cache::save(&state.registry, &state.repo_path).await?;
+    }
+
+    crate::audit::control_plane(
+        Some(&cx),
+        &state.access_control,
+        Protocol::Http,
+        "delete_model",
+        &model_name,
+        None,
+        &details,
+    );
+
+    Ok(Json(json!({
+        "success": true,
+        "message": format!("Model {} deleted", model_name),
     })))
 }
 
@@ -759,6 +1264,34 @@ mod scan_repository_ensemble_tests {
         let _ = tokio::fs::remove_dir_all(&repo).await;
     }
 
+    /// K2: root `.lma` entries in the repository index must report
+    /// version null — the version lives inside the package manifest, not
+    /// the filename — instead of the hardcoded "1".
+    #[tokio::test]
+    async fn test_scan_repository_artifact_entry_version_null() {
+        let repo = std::env::temp_dir().join(format!(
+            "lite-server-index-artifact-null-{}",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+        tokio::fs::create_dir_all(&repo).await.unwrap();
+        tokio::fs::write(repo.join("mymodel_v2.lma"), b"fake")
+            .await
+            .unwrap();
+
+        let result = scan_repository(&repo).await;
+        let entry = result
+            .iter()
+            .find(|e| e["type"] == "artifact")
+            .expect("artifact entry must be listed");
+        assert!(
+            entry["version"].is_null(),
+            "artifact entries must report version null: {entry}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
     /// K1: `scan_repository` must skip dot-prefixed directories at the
     /// model level — staging dirs (`.tmp-upload-*`, `.artifacts`, VCS dirs)
     /// can never be models and must not leak into the repository index.
@@ -806,7 +1339,7 @@ mod scan_repository_ensemble_tests {
 }
 
 #[cfg(test)]
-mod audit_tests {
+pub(super) mod audit_tests {
     //! D27（对账 A2②）：HTTP admin 控制面 mutation 必须产出结构化审计记录
     //! （action/model/version/request_id/client_ip/principal/key_fingerprint/
     //! details 含前后值），与 gRPC Admin 同形状。
@@ -852,7 +1385,7 @@ mod audit_tests {
         }
     }
 
-    fn test_state(model: &str) -> Arc<AppState> {
+    pub(crate) fn test_state(model: &str) -> Arc<AppState> {
         let registry = Arc::new(ModelRegistry::new());
         let dir = std::env::temp_dir().join(format!("lite-server-audit-{}-{}", model, std::process::id()));
         for v in ["1", "2"] {
@@ -906,7 +1439,7 @@ mod audit_tests {
         )
     }
 
-    fn test_cx() -> RequestContext {
+    pub(crate) fn test_cx() -> RequestContext {
         RequestContext {
             request_id: "audit-rid".to_string(),
             client_ip: "127.0.0.1".to_string(),
@@ -918,7 +1451,7 @@ mod audit_tests {
     }
 
     /// 在 scoped dispatch 线程内跑 handler，返回捕获到的字段集。
-    fn run_captured<Fut: std::future::Future<Output = ()>>(f: impl FnOnce() -> Fut + Send + 'static) -> Vec<(String, String)> {
+    pub(crate) fn run_captured<Fut: std::future::Future<Output = ()>>(f: impl FnOnce() -> Fut + Send + 'static) -> Vec<(String, String)> {
         use tracing_subscriber::layer::SubscriberExt;
         let rec: Arc<Mutex<Rec>> = Default::default();
         let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(AuditLayer(rec.clone())));
@@ -977,5 +1510,368 @@ mod audit_tests {
         assert_eq!(field(&fields, "action"), Some("activate"), "{fields:?}");
         let details = field(&fields, "details").unwrap_or("");
         assert!(details.contains("failed: not ready"), "失败审计须含原因: {details}");
+    }
+
+    /// G1: delete must emit a `control_plane` audit record with
+    /// action=delete and the model/version fields.
+    #[test]
+    fn delete_version_emits_structured_audit() {
+        let fields = run_captured(|| async {
+            let state = test_state("audit_del");
+            let _resp = delete_version_handler(
+                State(state),
+                Path(("audit_del".to_string(), "1".to_string())),
+                Query(DeleteQuery { force: None }),
+                test_cx(),
+            )
+            .await
+            .expect("delete must succeed");
+        });
+        assert_eq!(field(&fields, "action"), Some("delete"), "{fields:?}");
+        assert_eq!(field(&fields, "model"), Some("audit_del"), "{fields:?}");
+        assert_eq!(
+            field(&fields, "version"),
+            Some("Some(\"1\")"),
+            "version must be recorded: {fields:?}"
+        );
+    }
+
+    /// E3: deleting the active version is refused (409) unless force.
+    #[test]
+    fn delete_active_version_without_force_is_conflict() {
+        run_captured(|| async {
+            let state = test_state("audit_del_cf");
+            state.registry.force_pin_active_version("audit_del_cf", "1");
+            let resp = delete_version_handler(
+                State(state),
+                Path(("audit_del_cf".to_string(), "1".to_string())),
+                Query(DeleteQuery { force: None }),
+                test_cx(),
+            )
+            .await;
+            let err = resp.expect_err("delete of active version without force must 409");
+            assert_eq!(err.http_status(), axum::http::StatusCode::CONFLICT, "{err:?}");
+            assert_eq!(err.error_code(), "conflict");
+            assert!(
+                format!("{err}").contains("force"),
+                "conflict message must mention the force override: {err}"
+            );
+        });
+    }
+
+    /// E3: with force the active version is deleted and the active pointer
+    /// falls back to another ready version.
+    #[test]
+    fn delete_active_version_with_force_succeeds_and_falls_back() {
+        run_captured(|| async {
+            let state = test_state("audit_del_force");
+            state.registry.mark_ready("audit_del_force", "2").unwrap();
+            state.registry.force_pin_active_version("audit_del_force", "1");
+            let resp = delete_version_handler(
+                State(state.clone()),
+                Path(("audit_del_force".to_string(), "1".to_string())),
+                Query(DeleteQuery { force: Some(true) }),
+                test_cx(),
+            )
+            .await
+            .expect("forced delete must succeed");
+            assert_eq!(resp["success"], true);
+            assert_eq!(
+                state.registry.get_active_version("audit_del_force"),
+                Some("2".to_string()),
+                "active pointer must fall back to another ready version"
+            );
+        });
+    }
+}
+
+/// E2: batch retire — keep=N semver-lenient sorting (unparseable versions
+/// count as lowest, per the plan).
+#[cfg(test)]
+mod delete_model_tests {
+    use super::*;
+
+    /// E1: model-level delete must emit a `control_plane` audit record with
+    /// action=delete_model (version is None — whole model).
+    #[test]
+    fn delete_model_emits_structured_audit() {
+        // Reuse the audit_tests capture helpers (same file, sibling mod).
+        let fields = audit_tests::run_captured(|| async {
+            let state = audit_tests::test_state("audit_del_m");
+            let _resp = delete_model_handler(
+                State(state),
+                Path("audit_del_m".to_string()),
+                Query(DeleteQuery { force: None }),
+                audit_tests::test_cx(),
+            )
+            .await
+            .expect("model delete must succeed");
+        });
+        assert_eq!(fields.iter().find(|(n, _)| n == "action").map(|(_, v)| v.as_str()), Some("delete_model"), "{fields:?}");
+        assert_eq!(fields.iter().find(|(n, _)| n == "model").map(|(_, v)| v.as_str()), Some("audit_del_m"), "{fields:?}");
+    }
+}
+
+/// E4: drift report — pure helper semantics + handler-level coverage.
+#[cfg(test)]
+mod drift_tests {
+    use super::*;
+    use crate::config::{Config, ModelStrategyConfig, OrchestrationConfig};
+    use crate::inference_queue::InferenceQueue;
+    use crate::registry::ModelRegistry;
+    use crate::worker::WorkerManager;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn configured_versions_collects_all_reference_sources() {
+        let s = ModelStrategyConfig {
+            name: "m".into(),
+            load_policy: "explicit".into(),
+            versions_to_load: vec!["1".into(), "2".into()],
+            default_version: Some("3".into()),
+            weights: Some(HashMap::from([("4".into(), 50u32)])),
+            ..Default::default()
+        };
+        let got = configured_versions(Some(&s), &["2".into(), "9".into()]);
+        assert_eq!(
+            got,
+            BTreeSet::from(["1".into(), "2".into(), "3".into(), "4".into()])
+        );
+    }
+
+    #[test]
+    fn configured_versions_all_policy_covers_disk() {
+        let s = ModelStrategyConfig {
+            name: "m".into(),
+            load_policy: "all".into(),
+            ..Default::default()
+        };
+        let got = configured_versions(Some(&s), &["1".into(), "7".into()]);
+        assert_eq!(got, BTreeSet::from(["1".into(), "7".into()]));
+    }
+
+    #[test]
+    fn configured_versions_latest_policy_picks_highest() {
+        let s = ModelStrategyConfig {
+            name: "m".into(),
+            load_policy: "latest".into(),
+            ..Default::default()
+        };
+        let got = configured_versions(Some(&s), &["1".into(), "10".into()]);
+        assert_eq!(got, BTreeSet::from(["10".into()]));
+    }
+
+    pub(super) fn state_with_repo(config: Config, repo: &std::path::Path) -> Arc<AppState> {
+        let registry = Arc::new(ModelRegistry::new());
+        let inference_queue = Arc::new(InferenceQueue::new());
+        let callback_runner = Arc::new(crate::callback::CallbackRunner::new());
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            repo.to_path_buf(),
+            inference_queue.clone(),
+            "warn".to_string(),
+            callback_runner.clone(),
+        ));
+        Arc::new(AppState::new(
+            registry,
+            wm,
+            inference_queue,
+            config,
+            repo.to_path_buf(),
+            callback_runner,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+        ))
+    }
+
+    pub(super) fn config_with(orch: OrchestrationConfig) -> Config {
+        Config {
+            orchestration: orch,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn drift_reports_missing_and_unconfigured_with_ensemble_hint() {
+        let repo = std::env::temp_dir().join(format!("lite-server-drift-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+
+        // Disk: mymodel/2 (configured), mymodel/3 (unconfigured + ensemble
+        // chain-referenced), chain/1 (an ensemble whose node references
+        // mymodel/3 — itself unconfigured because it has no config entry).
+        tokio::fs::create_dir_all(repo.join("mymodel").join("2")).await.unwrap();
+        tokio::fs::write(repo.join("mymodel").join("2").join("model.py"), "x = 1").await.unwrap();
+        tokio::fs::create_dir_all(repo.join("mymodel").join("3")).await.unwrap();
+        tokio::fs::write(repo.join("mymodel").join("3").join("model.py"), "x = 2").await.unwrap();
+        tokio::fs::write(repo.join("mymodel").join("3").join("data.txt"), "0123456789").await.unwrap();
+        tokio::fs::create_dir_all(repo.join("chain").join("1")).await.unwrap();
+        tokio::fs::write(
+            repo.join("chain").join("1").join("config.yaml"),
+            "ensemble:\n  steps:\n    - name: s1\n      model: mymodel\n      version: \"3\"\n      inputs: {}\n",
+        )
+        .await
+        .unwrap();
+
+        let orch = OrchestrationConfig {
+            control_mode: "explicit".into(),
+            poll_interval: 30,
+            load_models: vec!["mymodel".into()],
+            models: vec![ModelStrategyConfig {
+                name: "mymodel".into(),
+                load_policy: "explicit".into(),
+                versions_to_load: vec!["1".into(), "2".into()],
+                ..Default::default()
+            }],
+        };
+        let state = state_with_repo(config_with(orch), &repo);
+        let resp = repository_drift_handler(State(state)).await.unwrap();
+
+        let missing = resp["configured_missing"].as_array().unwrap();
+        assert_eq!(missing.len(), 1, "{resp:?}");
+        assert_eq!(missing[0]["model"], "mymodel");
+        assert_eq!(missing[0]["version"], "1");
+
+        let unconfigured = resp["on_disk_unconfigured"].as_array().unwrap();
+        assert_eq!(unconfigured.len(), 2, "{resp:?}");
+        let m3 = unconfigured
+            .iter()
+            .find(|e| e["model"] == "mymodel")
+            .expect("mymodel/3 must be listed");
+        assert_eq!(m3["version"], "3");
+        assert_eq!(m3["size_bytes"], 15, "5-byte model.py + 10-byte data.txt");
+        assert_eq!(m3["ensemble_referenced"], true, "chain node references mymodel/3");
+        let chain1 = unconfigured
+            .iter()
+            .find(|e| e["model"] == "chain")
+            .expect("chain/1 must be listed");
+        assert_eq!(chain1["ensemble_referenced"], false);
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn drift_empty_when_config_matches_disk() {
+        let repo = std::env::temp_dir().join(format!("lite-server-drift-ok-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+        tokio::fs::create_dir_all(repo.join("mymodel").join("1")).await.unwrap();
+        tokio::fs::write(repo.join("mymodel").join("1").join("model.py"), "x = 1").await.unwrap();
+
+        // load_models without a strategy: every disk version is configured.
+        let orch = OrchestrationConfig {
+            control_mode: "explicit".into(),
+            poll_interval: 30,
+            load_models: vec!["mymodel".into()],
+            models: vec![],
+        };
+        let state = state_with_repo(config_with(orch), &repo);
+        let resp = repository_drift_handler(State(state)).await.unwrap();
+        assert_eq!(resp["configured_missing"], json!([]), "{resp:?}");
+        assert_eq!(resp["on_disk_unconfigured"], json!([]), "{resp:?}");
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+}
+
+/// H8: delete must rewrite the on-disk registry snapshot so a later
+/// re-upload of the same version cannot inherit stale strategy/pins.
+#[cfg(test)]
+mod delete_snapshot_tests {
+    use super::*;
+    use crate::config::{Config, ModelConfig};
+    use crate::registry::types::ModelType;
+
+    fn cache_on_state(repo: &std::path::Path) -> Arc<AppState> {
+        let mut config = Config::default();
+        config.server.cache_registry = true;
+        drift_tests::state_with_repo(config, repo)
+    }
+
+    #[tokio::test]
+    async fn delete_version_rewrites_snapshot_without_deleted_version() {
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-h8-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+        tokio::fs::create_dir_all(repo.join("mymodel").join("1"))
+            .await
+            .unwrap();
+        tokio::fs::write(repo.join("mymodel").join("1").join("model.py"), "x = 1")
+            .await
+            .unwrap();
+
+        let state = cache_on_state(&repo);
+        state
+            .registry
+            .register("mymodel", "1", ModelConfig::default(), ModelType::LitAPI, repo.join("mymodel").join("1"))
+            .unwrap();
+        state
+            .registry
+            .set_weights("mymodel", &HashMap::from([("1".into(), 80u32)]))
+            .unwrap();
+
+        // Pre-write a snapshot carrying the version (what a previous run
+        // would have left behind).
+        crate::registry::cache::save(&state.registry, &repo).await.unwrap();
+
+        let cx = audit_tests::test_cx();
+        let _ = delete_version_impl(&state, &cx, "mymodel", "1", true)
+            .await
+            .expect("delete must succeed");
+
+        let raw = std::fs::read_to_string(repo.join(".lite-server-registry.json"))
+            .expect("snapshot must be rewritten");
+        let snap: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            snap["models"].get("mymodel").is_none(),
+            "deleted version must not linger in the snapshot: {snap}"
+        );
+        assert!(
+            snap["active_versions"].get("mymodel").is_none(),
+            "deleted version must not linger as a pin: {snap}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+}
+
+/// E2: batch retire — keep=N semver-lenient sorting (unparseable versions
+/// count as lowest, per the plan).
+#[cfg(test)]
+mod delete_versions_tests {
+    use super::*;
+
+    #[test]
+    fn keep_two_deletes_only_the_lowest() {
+        assert_eq!(
+            versions_to_delete_keep(&["1".to_string(), "2".to_string(), "10".to_string()], 2),
+            vec!["1".to_string()],
+            "semver: 10 > 2 > 1, so keep=2 deletes 1"
+        );
+    }
+
+    #[test]
+    fn keep_one_handles_v_prefixes_semantically() {
+        assert_eq!(
+            versions_to_delete_keep(&["v2".to_string(), "v10".to_string()], 1),
+            vec!["v2".to_string()],
+            "v10 > v2 semantically, keep=1 deletes v2"
+        );
+    }
+
+    #[test]
+    fn keep_treats_unparseable_versions_as_lowest() {
+        assert_eq!(
+            versions_to_delete_keep(&["foo".to_string(), "1".to_string(), "2".to_string()], 2),
+            vec!["foo".to_string()],
+            "unparseable versions count as lowest and are deleted first"
+        );
+    }
+
+    #[test]
+    fn keep_larger_than_version_count_deletes_nothing() {
+        assert_eq!(
+            versions_to_delete_keep(&["1".to_string(), "2".to_string()], 5),
+            Vec::<String>::new(),
+            "keep >= version count must delete nothing"
+        );
     }
 }

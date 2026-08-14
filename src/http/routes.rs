@@ -116,7 +116,7 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
         .route("/v2", get(v2_server_metadata_handler))
         .route("/v2/health/live", get(livez_handler))
         .route("/v2/health/ready", get(readyz_handler))
-        .route("/v2/models/:model_name", get(model_metadata_handler))
+        .route("/v2/models/:model_name", get(model_metadata_handler).delete(delete_model_handler))
         .route("/v2/models/:model_name/versions/:version", get(model_metadata_version_handler))
         // Admin: list models
         .route("/v2/models", get(list_models_handler))
@@ -130,6 +130,8 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
         .route("/v2/models/:model_name/versions/:version/health", get(model_health_version_handler))
         // Admin: repository index
         .route("/v2/repository/index", post(repository_index_handler))
+        // Admin: config↔disk drift report (E4, read-only)
+        .route("/v2/repository/drift", get(repository_drift_handler))
         // Admin: load (bare aliases the active version since G14/批次 3;
         // §4.4 删除理由——静默默认 version 1——由 alias 解析 active 取代,
         // 不恢复静默默认)
@@ -145,8 +147,14 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
         .route("/v2/repository/models/:model_name/versions/:version/upload", post(upload_model_handler))
         .route("/v2/repository/models/:model_name/versions/:version/download", get(download_model_handler))
         .route("/v2/repository/models/:model_name/versions/:version/files", get(list_files_handler))
+        // Admin: model-level upload (F8, .lma only — version from manifest)
+        .route("/v2/repository/models/:model_name/upload", post(upload_model_package_handler))
+        // Admin: model-level download (F9, bare = active version)
+        .route("/v2/repository/models/:model_name/download", get(download_model_package_handler))
         // Admin: delete version
         .route("/v2/models/:model_name/versions/:version", delete(delete_version_handler))
+        // Admin: batch retire (E2) — same path as list versions, DELETE method
+        .route("/v2/models/:model_name/versions", delete(delete_versions_handler))
         // Admin: activate version
         .route("/v2/models/:model_name/versions/:version/activate", post(activate_version_handler))
         // Admin: weighted/canary routing weights (§4.3)

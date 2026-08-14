@@ -886,6 +886,59 @@ impl WorkerManager {
         Ok(())
     }
 
+    /// H5 (delete escalation): terminate a version's workers forcibly,
+    /// skipping the graceful phases (callbacks, drain, stop-request). Used
+    /// when the graceful unload failed and the version directory is about
+    /// to be deleted — a delete must never leave live workers pointing at
+    /// a deleted directory. Idempotent: an already-removed version is a
+    /// no-op (registry.remove returns Ok for unknown models).
+    pub async fn force_unload_version(
+        &self,
+        model_name: &str,
+        version: &str,
+    ) -> Result<(), AppError> {
+        info!(
+            model = %model_name, version = %version,
+            "force-unloading version after failed graceful unload"
+        );
+        let key = model_version_key(model_name, version);
+        let procs = {
+            let mut workers = self.workers.write().await;
+            let mut zmq_clients = self.zmq_clients.write().await;
+            let mut outliers = self.outlier_states.write().await;
+            let mut routes = self.route_table.write().await;
+            outliers.remove(&key);
+            let _ = zmq_clients.remove(&key);
+            routes.remove(&key);
+            workers.remove(&key)
+        };
+
+        if let Some(mut procs) = procs {
+            // Skip the stop request — trigger the monitor's SIGKILL path
+            // directly (kill_on_drop reaps the process group on drop).
+            for proc in procs.iter_mut() {
+                if let Some(tx) = proc.shutdown_tx.take() {
+                    let _ = tx.send(());
+                }
+            }
+            // Clean up ZMQ socket files (Unix only).
+            #[cfg(unix)]
+            for proc in procs.iter() {
+                let socket_str = proc.endpoint.strip_prefix("ipc://").unwrap_or(&proc.endpoint);
+                let socket_path = std::path::Path::new(socket_str);
+                let _ = tokio::fs::remove_file(socket_path).await;
+            }
+        }
+
+        self.registry.remove(model_name, version)?;
+        self.sync_grpc_health().await;
+        crate::metrics::prometheus::record_model_unload(model_name, version);
+        crate::metrics::prometheus::set_active_workers(model_name, version, 0.0);
+        crate::metrics::prometheus::remove_version_weight(model_name, version);
+        crate::metrics::prometheus::remove_model_ready(model_name, version);
+        Ok(())
+    }
+
     pub async fn reload_model(
         &self,
         model_name: &str,
@@ -960,6 +1013,38 @@ mod tests {
     use tokio::sync::mpsc;
 
     // ===== Reload Channel tests =====
+
+    /// H5: force_unload_version must clean the registry (and be a no-op
+    /// for versions that never existed — the delete escalation path calls
+    /// it blindly after a failed graceful unload).
+    #[test]
+    fn test_force_unload_version_cleans_registry_and_is_idempotent() {
+        let registry = Arc::new(ModelRegistry::new());
+        registry
+            .register(
+                "m",
+                "1",
+                crate::config::ModelConfig::default(),
+                crate::registry::types::ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
+            .unwrap();
+        registry.mark_ready("m", "1").unwrap();
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            std::env::temp_dir(),
+            Arc::new(InferenceQueue::new()),
+            "error".to_string(),
+            Arc::new(CallbackRunner::new()),
+        ));
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            wm.force_unload_version("m", "1").await.unwrap();
+            assert!(registry.get("m", Some("1")).is_none(), "version must be removed");
+            // Idempotent: a second call on the deleted version is a no-op.
+            wm.force_unload_version("m", "1").await.unwrap();
+        });
+    }
 
     #[test]
     fn test_reload_channel_creation() {

@@ -101,6 +101,8 @@ notify = { version = "6.1", default-features = false, features = ["macos_fsevent
 
 # utilities
 uuid = { version = "1.10", features = ["v4", "serde"] }
+# F1: ReaderStream for streaming download responses.
+tokio-util = { version = "0.7", features = ["io"] }
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 async-trait = "0.1"

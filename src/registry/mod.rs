@@ -470,6 +470,10 @@ impl ModelRegistry {
                 None => return Ok(()),
             };
             entry.versions.remove(version);
+            // E6: drop the dead strategy-weight key alongside the version —
+            // otherwise the weights map keeps a stale entry for a version
+            // that no longer exists (a dirty read for direct weight readers).
+            entry.weights.remove(version);
             if entry.versions.is_empty() {
                 should_remove_model = true;
             }
@@ -1476,5 +1480,30 @@ mod tests {
         for h in handles {
             h.await.unwrap();
         }
+    }
+
+    /// E6 (model-upload-and-retire-plan part 3): removing a version must
+    /// also drop its key from the entry's strategy `weights` map — a dead
+    /// key there is a dirty read for anything that reads weights directly.
+    #[test]
+    fn remove_version_drops_dead_weight_key() {
+        let reg = ModelRegistry::new();
+        reg.register("m1", "1", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.register("m1", "2", test_config(), ModelType::LitAPI, tmp_dir())
+            .unwrap();
+        reg.set_weights("m1", &HashMap::from([("1".into(), 60u32), ("2".into(), 40)]))
+            .unwrap();
+
+        reg.remove("m1", "1").unwrap();
+
+        let snap = reg.snapshot_strategies();
+        assert_eq!(snap.len(), 1, "model entry must survive while v2 remains");
+        let weights = &snap[0].3;
+        assert!(
+            !weights.contains_key("1"),
+            "deleted version must not leave a dead weight key: {weights:?}"
+        );
+        assert_eq!(weights.get("2"), Some(&40));
     }
 }

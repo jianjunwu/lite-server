@@ -1637,6 +1637,7 @@ dependencies = [
  "tokio-stream",
  "tokio-test",
  "tokio-tungstenite",
+ "tokio-util",
  "tonic",
  "tonic-build",
  "tonic-health",

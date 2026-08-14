@@ -35,6 +35,7 @@ pub(crate) fn app_error_to_grpc_status(e: &AppError) -> Status {
         AppError::ModelNotFound(_) | AppError::VersionNotFound(_, _) | AppError::RouteNotFound => 404,
         AppError::ModelNotReady(_) | AppError::QueueFull(_) => 503,
         AppError::VersionAlreadyLoaded(_, _) => 409,
+        AppError::Conflict(_) => 409,
         AppError::InferenceTimeout(_) => 504,
         AppError::Validation(_)
         | AppError::Config(_)

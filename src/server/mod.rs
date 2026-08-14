@@ -82,7 +82,7 @@ pub struct LiteServer {
 /// Lenient semver parse for version directory names (§4.2): tolerates a
 /// leading `v` and missing minor/patch components (`v2` → 2.0.0, `1.2` →
 /// 1.2.0). Returns `None` for non-numeric schemes like `nightly`.
-fn parse_lenient_semver(v: &str) -> Option<semver::Version> {
+pub(crate) fn parse_lenient_semver(v: &str) -> Option<semver::Version> {
     let v = v.strip_prefix('v').unwrap_or(v);
     if let Ok(parsed) = semver::Version::parse(v) {
         return Some(parsed);
@@ -98,7 +98,7 @@ fn parse_lenient_semver(v: &str) -> Option<semver::Version> {
 /// comparison when *every* candidate parses (fixing the lexicographic
 /// `"v10" < "v2"` bug); any unparseable candidate falls the whole set back
 /// to lexicographic order — predictable for mixed naming schemes.
-fn pick_latest_version(versions: &[String]) -> Option<String> {
+pub(crate) fn pick_latest_version(versions: &[String]) -> Option<String> {
     let parsed: Option<Vec<semver::Version>> = versions
         .iter()
         .map(|v| parse_lenient_semver(v))

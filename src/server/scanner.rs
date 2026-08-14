@@ -43,8 +43,33 @@ pub(super) async fn auto_unpack_lma_files(
             continue;
         }
 
-        // H7/L1: bound the unpack subprocess — a hung `unpack` would
-        // otherwise block the whole reconcile loop forever.
+        // H6: skip re-unpacking when the extracted model dir exists and is
+        // at least as new as the artifact — a restart must not clobber an
+        // up-to-date tree (extractall overwrites in place), and it skips
+        // pointless unpack work on every boot. A replaced artifact has a
+        // newer mtime and is unpacked normally.
+        if let Some(name) = model_name_from_artifact(path.file_name()) {
+            let model_dir = repo_path.join(&name);
+            if model_dir.is_dir() {
+                let fresh = tokio::fs::metadata(&model_dir)
+                    .await
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|dir_mtime| dir_mtime >= mtime);
+                if fresh {
+                    info!(
+                        "Skipping .lma artifact {} — extracted directory is up to date",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    );
+                    continue;
+                }
+            }
+        }
+
+        // H4: unpack into a staging dir, then move each extracted model
+        // directory into the repo with swap semantics — a failed or hung
+        // unpack can never leave a half-written model dir that
+        // scan_repo_models would collect.
+        let staging = repo_path.join(format!(".tmp-unpack-{}", uuid::Uuid::new_v4()));
         let output = tokio::time::timeout(
             unpack_timeout,
             tokio::process::Command::new(crate::python::resolve_python_interpreter())
@@ -54,7 +79,7 @@ pub(super) async fn auto_unpack_lma_files(
                     "unpack",
                     path.to_str().unwrap_or(""),
                     "--to",
-                    repo_path.to_str().unwrap_or(""),
+                    staging.to_str().unwrap_or(""),
                 ])
                 .output(),
         )
@@ -68,12 +93,14 @@ pub(super) async fn auto_unpack_lma_files(
                     path.display(),
                     unpack_timeout
                 );
+                let _ = tokio::fs::remove_dir_all(&staging).await;
                 continue;
             }
         };
 
         match output {
             Ok(out) if out.status.success() => {
+                move_staging_into_repo(&staging, repo_path).await;
                 info!(
                     "Auto-unpacked .lma artifact: {}",
                     path.file_name().unwrap_or_default().to_string_lossy()
@@ -94,6 +121,52 @@ pub(super) async fn auto_unpack_lma_files(
                     e
                 );
             }
+        }
+        // Staging cleanup on every path (success move leaves it empty).
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+    }
+}
+
+/// H6: model name from the packer naming convention `{name}_v{version}.lma`.
+/// Non-conforming names return None (C3: convention holes accepted — the
+/// check is skipped, the artifact is still unpacked).
+fn model_name_from_artifact(file_name: Option<&std::ffi::OsStr>) -> Option<String> {
+    let stem = file_name?.to_str()?.strip_suffix(".lma")?;
+    let idx = stem.rfind("_v")?;
+    if idx == 0 {
+        return None;
+    }
+    Some(stem[..idx].to_string())
+}
+
+/// H4: move each extracted directory from the staging dir into the repo
+/// root with swap semantics — an existing dir is renamed aside
+/// (dot-prefixed, invisible to scan_repo_models), the new one is renamed
+/// in, and the aside copy is removed. A failed move rolls the old tree
+/// back.
+async fn move_staging_into_repo(staging: &Path, repo_path: &Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(staging).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let src = entry.path();
+        if !src.is_dir() {
+            continue;
+        }
+        let Some(name) = src.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        let dst = repo_path.join(&name);
+        let backup = repo_path.join(format!(".{}.old-{}", name, uuid::Uuid::new_v4()));
+        if dst.exists() && tokio::fs::rename(&dst, &backup).await.is_err() {
+            continue;
+        }
+        if tokio::fs::rename(&src, &dst).await.is_ok() {
+            if backup.exists() {
+                let _ = tokio::fs::remove_dir_all(&backup).await;
+            }
+        } else if backup.exists() {
+            let _ = tokio::fs::rename(&backup, &dst).await;
         }
     }
 }
@@ -334,6 +407,57 @@ max_batch_size: 4
         );
         assert_eq!(result[0].name, "real_model");
         assert_eq!(result[0].version, "1");
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // ===== H6/H4: artifact naming + staging cleanup =====
+
+    #[test]
+    fn test_model_name_from_artifact_packer_convention() {
+        assert_eq!(
+            model_name_from_artifact(Some(std::ffi::OsStr::new("mymodel_v1.lma"))),
+            Some("mymodel".to_string())
+        );
+        // "_v" inside the model name must not confuse the split (rfind).
+        assert_eq!(
+            model_name_from_artifact(Some(std::ffi::OsStr::new("my_vmodel_v2.lma"))),
+            Some("my_vmodel".to_string())
+        );
+        // Non-conforming names → None (check skipped, still unpacked).
+        assert_eq!(
+            model_name_from_artifact(Some(std::ffi::OsStr::new("artifact.lma"))),
+            None
+        );
+        assert_eq!(model_name_from_artifact(None), None);
+    }
+
+    /// H4: a corrupt artifact must leave no staging residue and no model
+    /// directories behind (the unpack fails inside the staging dir).
+    #[tokio::test]
+    async fn test_auto_unpack_corrupt_artifact_leaves_no_staging() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-unpack-corrupt-{}",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+        tokio::fs::write(tmp.join("mymodel_v1.lma"), b"not a zip at all")
+            .await
+            .unwrap();
+
+        let mut seen = HashSet::new();
+        auto_unpack_lma_files(&tmp, &mut seen, Duration::from_secs(30)).await;
+
+        let mut entries = tokio::fs::read_dir(&tmp).await.unwrap();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.starts_with(".tmp-unpack"),
+                "staging dir must be cleaned up, found {name}"
+            );
+            assert_eq!(name, "mymodel_v1.lma", "no other residue allowed");
+        }
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }

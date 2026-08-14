@@ -241,3 +241,175 @@ orchestration:
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+fn pack_model_to(tmp_dir: &std::path::Path, name: &str, model_py: &str) -> std::path::PathBuf {
+    let model_dir = tmp_dir.join(name);
+    let v1_dir = model_dir.join("1");
+    std::fs::create_dir_all(&v1_dir).unwrap();
+    std::fs::write(v1_dir.join("model.py"), model_py).unwrap();
+    std::fs::write(v1_dir.join("config.yaml"), "max_batch_size: 1\nbatch_timeout: 0.0\n").unwrap();
+
+    let output = Command::new("python")
+        .args([
+            "-m",
+            "lite_server.cli",
+            "pack",
+            model_dir.to_str().unwrap(),
+            "--version",
+            "1",
+            "--output",
+            tmp_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run lite-server pack");
+    assert!(
+        output.status.success(),
+        "pack failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    tmp_dir.join(format!("{}_v1.lma", name))
+}
+
+fn write_server_yaml_all(tmp_dir: &std::path::Path, port: u16, repo_dir: &std::path::Path) -> std::path::PathBuf {
+    let content = format!(
+        r#"
+server:
+  host: 0.0.0.0
+  http_port: {}
+  log_level: warn
+metrics:
+  enabled: false
+grpc:
+  enabled: false
+model_repository:
+  path: {}
+orchestration:
+  control_mode: all
+"#,
+        port,
+        repo_dir.to_string_lossy()
+    );
+    let yaml = tmp_dir.join(format!("server-{}.yaml", port));
+    std::fs::write(&yaml, content).unwrap();
+    yaml
+}
+
+async fn wait_ready(base: &str, model: &str) -> bool {
+    let client = reqwest::Client::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(resp) = client
+            .get(format!("{}/v2/models/{}/ready", base, model))
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+        {
+            if resp.status() == 200 {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    if body["ready"] == true {
+                        return true;
+                    }
+                }
+            }
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    false
+}
+
+/// H6: after a restart, an up-to-date extracted directory must NOT be
+/// re-unpacked (extractall would clobber local edits) — the artifact's
+/// mtime is older than the directory it produced.
+#[tokio::test]
+async fn test_lma_restart_preserves_local_edits_when_artifact_older() {
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "lite-server-lma-h6-edit-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+
+    let model_py = "from lite_server import LitAPI\n\nclass TestAPI(LitAPI):\n    def predict(self, x, **kwargs):\n        return x * 2\n";
+    let lma = pack_model_to(&tmp_dir, "my_model", model_py);
+    let repo_dir = tmp_dir.join("model_repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::copy(&lma, repo_dir.join("my_model_v1.lma")).unwrap();
+
+    let port = 18101u16;
+    kill_stale_servers(port);
+    let yaml = write_server_yaml_all(&tmp_dir, port, &repo_dir);
+    let server_a = start_server(&tmp_dir, &["--config", yaml.to_str().unwrap()]);
+    wait_for_server(port, 30).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    assert!(wait_ready(&base, "my_model").await, "model must be ready after first boot");
+    drop(server_a);
+
+    // Local edit on the extracted tree.
+    let extracted = repo_dir.join("my_model").join("1").join("model.py");
+    let mut content = std::fs::read_to_string(&extracted).unwrap();
+    content.push_str("\n# local edit\n");
+    std::fs::write(&extracted, &content).unwrap();
+
+    // Restart against the same repo.
+    let server_b = start_server(&tmp_dir, &["--config", yaml.to_str().unwrap()]);
+    wait_for_server(port, 30).await;
+    assert!(wait_ready(&base, "my_model").await, "model must be ready after restart");
+
+    let after = std::fs::read_to_string(&extracted).unwrap();
+    assert!(
+        after.contains("# local edit"),
+        "restart must not re-unpack over a fresh directory; local edit lost"
+    );
+    drop(server_b);
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// H6: a replaced artifact (newer mtime) must re-unpack normally —
+/// the updated content lands via staging + swap.
+#[tokio::test]
+async fn test_lma_restart_reunpacks_when_artifact_newer() {
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "lite-server-lma-h6-newer-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+
+    let v1_py = "from lite_server import LitAPI\n\nclass TestAPI(LitAPI):\n    def predict(self, x, **kwargs):\n        return x * 2\n";
+    let lma = pack_model_to(&tmp_dir, "my_model", v1_py);
+    let repo_dir = tmp_dir.join("model_repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::copy(&lma, repo_dir.join("my_model_v1.lma")).unwrap();
+
+    let port = 18102u16;
+    kill_stale_servers(port);
+    let yaml = write_server_yaml_all(&tmp_dir, port, &repo_dir);
+    let server_a = start_server(&tmp_dir, &["--config", yaml.to_str().unwrap()]);
+    wait_for_server(port, 30).await;
+    let base = format!("http://127.0.0.1:{}", port);
+    assert!(wait_ready(&base, "my_model").await, "model must be ready after first boot");
+    drop(server_a);
+
+    // Replace the artifact with a NEW pack (newer mtime; sleep past the
+    // filesystem mtime granularity of the extracted dir).
+    sleep(Duration::from_millis(1100)).await;
+    let v2_py = "from lite_server import LitAPI\n\nclass TestAPI(LitAPI):\n    def predict(self, x, **kwargs):\n        return x * 3\n";
+    let _ = std::fs::remove_dir_all(tmp_dir.join("my_model"));
+    let lma2 = pack_model_to(&tmp_dir, "my_model", v2_py);
+    std::fs::copy(&lma2, repo_dir.join("my_model_v1.lma")).unwrap();
+
+    let server_b = start_server(&tmp_dir, &["--config", yaml.to_str().unwrap()]);
+    wait_for_server(port, 30).await;
+    assert!(wait_ready(&base, "my_model").await, "model must be ready after restart");
+
+    let extracted = repo_dir.join("my_model").join("1").join("model.py");
+    let after = std::fs::read_to_string(&extracted).unwrap();
+    assert!(
+        after.contains("x * 3"),
+        "newer artifact must be re-unpacked; old content still on disk"
+    );
+    drop(server_b);
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}

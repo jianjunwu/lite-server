@@ -33,6 +33,11 @@ pub enum AppError {
     #[error("validation error: {0}")]
     Validation(String),
 
+    /// Request conflicts with current server state (HTTP 409). E.g.
+    /// deleting the active model version without ?force=true.
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     #[error("config error: {0}")]
     Config(String),
 
@@ -140,6 +145,7 @@ impl AppError {
             AppError::QueueFull(_) => "queue full",
             AppError::WorkerCrashed(_) => "service temporarily unavailable",
             AppError::Validation(_) => "validation error",
+            AppError::Conflict(_) => "conflict with current state",
             AppError::Config(_) => "invalid configuration",
             AppError::Transport(_) => "transport error",
             AppError::Python(_) => "internal server error",
@@ -169,6 +175,10 @@ impl AppError {
         match self {
             AppError::InvalidRequestBody(detail) => detail.clone(),
             AppError::InvalidQueryParam(detail) => detail.clone(),
+            // The detail is server-generated control-plane guidance (names
+            // the active version + the force override) — safe to pass
+            // through, same as InvalidRequestBody.
+            AppError::Conflict(detail) => detail.clone(),
             AppError::PayloadTooLarge { max_size, actual_size } => {
                 if let Some(actual) = actual_size {
                     format!(
@@ -200,6 +210,7 @@ impl AppError {
             AppError::QueueFull(_) => "queue_full",
             AppError::WorkerCrashed(_) => "internal_error",
             AppError::Validation(_) => "invalid_parameter_value",
+            AppError::Conflict(_) => "conflict",
             AppError::Config(_) => "invalid_configuration",
             AppError::Serialization(_) => "parse_error",
             AppError::FrameTooLarge => "content_size_limit_exceeded",
@@ -248,6 +259,7 @@ impl AppError {
             AppError::QueueFull(_) => StatusCode::SERVICE_UNAVAILABLE,
             AppError::WorkerCrashed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::Validation(_) => StatusCode::BAD_REQUEST,
+            AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::Config(_) => StatusCode::BAD_REQUEST,
             AppError::Transport(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::Python(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -313,6 +325,7 @@ impl AppError {
             AppError::ModelNotReady(_) => "model_not_ready",
             AppError::VersionNotFound(_, _) => "not_found_error",
             AppError::VersionAlreadyLoaded(_, _) => "conflict_error",
+            AppError::Conflict(_) => "conflict_error",
             AppError::InferenceTimeout(_) => "server_error",
             AppError::QueueFull(_) => "queue_full",
             AppError::StreamingCapacityExceeded(_) => "streaming_capacity_exceeded",

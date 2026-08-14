@@ -202,6 +202,13 @@ pub struct ServerConfig {
     /// in-flight requests; size your instance accordingly or lower this limit
     /// when concurrency is high.
     pub max_request_body_bytes: Option<usize>,
+    /// F11b: per-request cap on the total bytes accepted by the model
+    /// repository upload endpoints. None (default) = unlimited — any
+    /// numeric default would reject legitimate multi-GB artifacts, and
+    /// this differs from `max_request_body_bytes` (inference request-body
+    /// semantics, enforced by the body limit layer). Exceeding it is a
+    /// 413; the streaming count is enforced per multipart field.
+    pub max_upload_bytes: Option<u64>,
     /// P-XFF: trusted-proxy CIDRs (or bare IPs) whose `X-Forwarded-For` /
     /// `X-Real-IP` headers are honored for client-IP cleansing. Empty
     /// (default) = fail-safe: the direct TCP peer is always used and client
@@ -243,6 +250,7 @@ impl Default for ServerConfig {
             max_inflight: 0,
             max_concurrent_streaming_dags: 128,
             max_request_body_bytes: Some(64 * 1024 * 1024), // 64 MiB
+            max_upload_bytes: None,
             trusted_proxies: Vec::new(),
             cors: None,
         }
