@@ -545,16 +545,18 @@ pub(crate) async fn remove_linked_artifacts(
 }
 
 /// Shared delete-version logic (HTTP handler, E2 batch delete and the
-/// future gRPC DeleteVersion RPC all funnel through here). Unloads the
-/// worker if loaded, removes the version directory, cleans the linked
-/// artifacts (G5) and emits the control-plane audit.
+/// gRPC DeleteVersion RPC all funnel through here). Unloads the worker if
+/// loaded, removes the version directory, cleans the linked artifacts (G5)
+/// and emits the control-plane audit. Returns the audit detail string.
 pub(crate) async fn delete_version_impl(
     state: &AppState,
-    cx: &RequestContext,
+    access_control: &crate::access_control::AccessControl,
+    cx: Option<&RequestContext>,
+    protocol: Protocol,
     model_name: &str,
     version: &str,
     force: bool,
-) -> Result<Json<Value>, AppError> {
+) -> Result<String, AppError> {
     crate::validation::validate_identifier(model_name)?;
     crate::validation::validate_version(version)?;
 
@@ -641,19 +643,16 @@ pub(crate) async fn delete_version_impl(
     }
 
     crate::audit::control_plane(
-        Some(cx),
-        &state.access_control,
-        Protocol::Http,
+        cx,
+        access_control,
+        protocol,
         "delete",
         model_name,
         Some(version),
         &details,
     );
 
-    Ok(Json(json!({
-        "success": true,
-        "message": format!("Model {} version {} deleted", model_name, version),
-    })))
+    Ok(details)
 }
 
 /// E3: query params for delete endpoints (?force=true overrides the
@@ -669,7 +668,20 @@ pub async fn delete_version_handler(
     Query(query): Query<DeleteQuery>,
     cx: RequestContext,
 ) -> Result<Json<Value>, AppError> {
-    delete_version_impl(&state, &cx, &model_name, &version, query.force.unwrap_or(false)).await
+    delete_version_impl(
+        &state,
+        &state.access_control,
+        Some(&cx),
+        Protocol::Http,
+        &model_name,
+        &version,
+        query.force.unwrap_or(false),
+    )
+    .await?;
+    Ok(Json(json!({
+        "success": true,
+        "message": format!("Model {} version {} deleted", model_name, version),
+    })))
 }
 
 // ===== Repository Drift (E4) =====
@@ -778,24 +790,48 @@ async fn ensemble_referenced_pairs(repo_path: &std::path::Path) -> BTreeSet<(Str
     refs
 }
 
-/// E4: config↔disk drift report (read-only). `configured_missing` lists
-/// versions the configuration references but that are absent on disk;
+/// E4: a configured version that is absent on disk.
+pub(crate) struct DriftMissingEntry {
+    pub(crate) model: String,
+    pub(crate) version: String,
+}
+
+/// E4: a disk version nothing references, with decision-support hints.
+pub(crate) struct DriftDiskEntry {
+    pub(crate) model: String,
+    pub(crate) version: String,
+    pub(crate) size_bytes: u64,
+    pub(crate) ensemble_referenced: bool,
+}
+
+/// E4: config↔disk drift report (read-only; shared by the HTTP handler and
+/// the gRPC RepositoryDrift RPC). `configured_missing` lists versions the
+/// configuration references but that are absent on disk;
 /// `on_disk_unconfigured` lists disk versions nothing references (retire
 /// candidates in explicit mode), with size and ensemble-chain-reference
-/// hints to support the decision.
-pub async fn repository_drift_handler(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<Value>, AppError> {
+/// hints to support the decision. `model_filter: None` = whole repository
+/// (HTTP); `Some(name)` = a single model (gRPC optional field).
+pub(crate) async fn repository_drift_core(
+    state: &AppState,
+    model_filter: Option<&str>,
+) -> Result<(Vec<DriftMissingEntry>, Vec<DriftDiskEntry>), AppError> {
     let orch = &state.config.orchestration;
     let ensemble_refs = ensemble_referenced_pairs(&state.repo_path).await;
 
     let mut names: BTreeSet<String> = BTreeSet::new();
-    names.extend(orch.load_models.iter().cloned());
-    names.extend(orch.models.iter().map(|s| s.name.clone()));
-    names.extend(disk_models(&state.repo_path).await);
+    match model_filter {
+        Some(name) => {
+            names.insert(name.to_string());
+        }
+        None => {
+            names.extend(orch.load_models.iter().cloned());
+            names.extend(orch.models.iter().map(|s| s.name.clone()));
+            names.extend(disk_models(&state.repo_path).await);
+        }
+    }
 
-    let mut configured_missing: Vec<Value> = Vec::new();
-    let mut on_disk_unconfigured: Vec<Value> = Vec::new();
+    let mut configured_missing: Vec<DriftMissingEntry> = Vec::new();
+    let mut on_disk_unconfigured: Vec<DriftDiskEntry> = Vec::new();
     for name in names {
         let disk = disk_versions(&state.repo_path, &name).await;
         let disk_set: BTreeSet<String> = disk.iter().cloned().collect();
@@ -809,33 +845,48 @@ pub async fn repository_drift_handler(
         };
 
         for v in configured.difference(&disk_set) {
-            configured_missing.push(json!({ "model": name, "version": v }));
+            configured_missing.push(DriftMissingEntry {
+                model: name.clone(),
+                version: v.clone(),
+            });
         }
         for v in &disk {
             if configured.contains(v) {
                 continue;
             }
-            on_disk_unconfigured.push(json!({
-                "model": name,
-                "version": v,
-                "size_bytes": dir_size_bytes(&state.repo_path.join(&name).join(v)).await,
-                "ensemble_referenced": ensemble_refs.contains(&(name.clone(), v.clone())),
-            }));
+            on_disk_unconfigured.push(DriftDiskEntry {
+                model: name.clone(),
+                version: v.clone(),
+                size_bytes: dir_size_bytes(&state.repo_path.join(&name).join(v)).await,
+                ensemble_referenced: ensemble_refs.contains(&(name.clone(), v.clone())),
+            });
         }
     }
 
-    let sort_key = |e: &Value| {
-        (
-            e["model"].as_str().unwrap_or("").to_string(),
-            e["version"].as_str().unwrap_or("").to_string(),
-        )
-    };
-    configured_missing.sort_by_key(&sort_key);
-    on_disk_unconfigured.sort_by_key(&sort_key);
+    configured_missing.sort_by(|a, b| (&a.model, &a.version).cmp(&(&b.model, &b.version)));
+    on_disk_unconfigured.sort_by(|a, b| (&a.model, &a.version).cmp(&(&b.model, &b.version)));
 
+    Ok((configured_missing, on_disk_unconfigured))
+}
+
+pub async fn repository_drift_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, AppError> {
+    let (missing, unconfigured) = repository_drift_core(&state, None).await?;
     Ok(Json(json!({
-        "configured_missing": configured_missing,
-        "on_disk_unconfigured": on_disk_unconfigured,
+        "configured_missing": missing
+            .iter()
+            .map(|e| json!({ "model": e.model, "version": e.version }))
+            .collect::<Vec<Value>>(),
+        "on_disk_unconfigured": unconfigured
+            .iter()
+            .map(|e| json!({
+                "model": e.model,
+                "version": e.version,
+                "size_bytes": e.size_bytes,
+                "ensemble_referenced": e.ensemble_referenced,
+            }))
+            .collect::<Vec<Value>>(),
     })))
 }
 
@@ -901,22 +952,30 @@ pub struct DeleteVersionsRequest {
     pub versions: Option<Vec<String>>,
 }
 
-pub async fn delete_versions_handler(
-    State(state): State<Arc<AppState>>,
-    Path(model_name): Path<String>,
-    Query(query): Query<DeleteQuery>,
-    cx: RequestContext,
-    ApiJson(body): ApiJson<DeleteVersionsRequest>,
-) -> Result<Json<Value>, AppError> {
-    crate::validation::validate_identifier(&model_name)?;
-    let force = query.force.unwrap_or(false);
+/// E2 shared batch-retire core (HTTP handler + gRPC DeleteVersions RPC).
+/// Partial-failure semantics: per-version results; any success wins, only
+/// an all-failure batch is an error (returned as `Err`).
+// allow: the audit context (access_control/cx/protocol) is shared with the
+// sibling delete cores — same shape, one more semantic param (keep/versions).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn delete_versions_core(
+    state: &AppState,
+    access_control: &crate::access_control::AccessControl,
+    cx: Option<&RequestContext>,
+    protocol: Protocol,
+    model_name: &str,
+    keep: Option<usize>,
+    versions: Option<Vec<String>>,
+    force: bool,
+) -> Result<(Vec<String>, Vec<(String, String)>), AppError> {
+    crate::validation::validate_identifier(model_name)?;
 
-    let to_delete: Vec<String> = match (body.keep, body.versions) {
+    let to_delete: Vec<String> = match (keep, versions) {
         (Some(keep), None) => {
             if keep == 0 {
                 return Err(AppError::Validation("keep must be >= 1".to_string()));
             }
-            versions_to_delete_keep(&disk_versions(&state.repo_path, &model_name).await, keep)
+            versions_to_delete_keep(&disk_versions(&state.repo_path, model_name).await, keep)
         }
         (None, Some(versions)) => {
             for v in &versions {
@@ -931,21 +990,29 @@ pub async fn delete_versions_handler(
         }
     };
 
-    // Partial-failure semantics: run per version, any success → 200; only
-    // an all-failure batch is an error.
     let mut deleted: Vec<String> = Vec::new();
-    let mut failed: Vec<Value> = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
     for version in to_delete {
-        match delete_version_impl(&state, &cx, &model_name, &version, force).await {
+        match delete_version_impl(
+            state,
+            access_control,
+            cx,
+            protocol,
+            model_name,
+            &version,
+            force,
+        )
+        .await
+        {
             Ok(_) => deleted.push(version),
-            Err(e) => failed.push(json!({ "version": version, "error": e.to_string() })),
+            Err(e) => failed.push((version, e.to_string())),
         }
     }
 
     if deleted.is_empty() && !failed.is_empty() {
         let summary = failed
             .iter()
-            .map(|f| format!("{}: {}", f["version"], f["error"]))
+            .map(|(v, e)| format!("{}: {}", v, e))
             .collect::<Vec<_>>()
             .join("; ");
         return Err(AppError::Internal(format!(
@@ -955,7 +1022,34 @@ pub async fn delete_versions_handler(
         )));
     }
 
-    Ok(Json(json!({ "deleted": deleted, "failed": failed })))
+    Ok((deleted, failed))
+}
+
+pub async fn delete_versions_handler(
+    State(state): State<Arc<AppState>>,
+    Path(model_name): Path<String>,
+    Query(query): Query<DeleteQuery>,
+    cx: RequestContext,
+    ApiJson(body): ApiJson<DeleteVersionsRequest>,
+) -> Result<Json<Value>, AppError> {
+    let (deleted, failed) = delete_versions_core(
+        &state,
+        &state.access_control,
+        Some(&cx),
+        Protocol::Http,
+        &model_name,
+        body.keep,
+        body.versions,
+        query.force.unwrap_or(false),
+    )
+    .await?;
+    Ok(Json(json!({
+        "deleted": deleted,
+        "failed": failed
+            .into_iter()
+            .map(|(version, error)| json!({ "version": version, "error": error }))
+            .collect::<Vec<Value>>(),
+    })))
 }
 
 // ===== Delete Model (E1) =====
@@ -990,19 +1084,22 @@ async fn remove_model_artifacts(repo_path: &std::path::Path, model_name: &str) -
     removed
 }
 
-pub async fn delete_model_handler(
-    State(state): State<Arc<AppState>>,
-    Path(model_name): Path<String>,
-    Query(query): Query<DeleteQuery>,
-    cx: RequestContext,
-) -> Result<Json<Value>, AppError> {
-    crate::validation::validate_identifier(&model_name)?;
-    let force = query.force.unwrap_or(false);
+/// E1 shared whole-model delete core (HTTP handler + gRPC DeleteModel
+/// RPC). Returns the audit detail string.
+pub(crate) async fn delete_model_core(
+    state: &AppState,
+    access_control: &crate::access_control::AccessControl,
+    cx: Option<&RequestContext>,
+    protocol: Protocol,
+    model_name: &str,
+    force: bool,
+) -> Result<String, AppError> {
+    crate::validation::validate_identifier(model_name)?;
 
     info!(model = %model_name, "delete model requested");
     // E3: whole-model delete is the biggest accident surface — refuse while
     // an active version exists unless forced.
-    if state.registry.get_active_version(&model_name).is_some() && !force {
+    if state.registry.get_active_version(model_name).is_some() && !force {
         return Err(AppError::Conflict(format!(
             "model {} has an active version; pass ?force=true to override",
             model_name
@@ -1013,19 +1110,19 @@ pub async fn delete_model_handler(
     // covered by the directory removal below).
     let loaded: Vec<String> = state
         .registry
-        .list_versions(&model_name)
+        .list_versions(model_name)
         .iter()
         .map(|mv| mv.version.clone())
         .collect();
     for version in &loaded {
         state
             .worker_manager
-            .unload_model(&model_name, Some(version))
+            .unload_model(model_name, Some(version))
             .await?;
     }
 
     // Delete the whole model directory (idempotent when absent).
-    let model_dir = state.repo_path.join(&model_name);
+    let model_dir = state.repo_path.join(model_name);
     if model_dir.exists() {
         tokio::fs::remove_dir_all(&model_dir)
             .await
@@ -1034,7 +1131,7 @@ pub async fn delete_model_handler(
 
     // G5: linked artifacts — root .lma files would resurrect the model via
     // auto-unpack on restart; .artifacts/ copies are F10a's.
-    let removed = remove_model_artifacts(&state.repo_path, &model_name).await;
+    let removed = remove_model_artifacts(&state.repo_path, model_name).await;
 
     let details = if removed.is_empty() {
         "model deleted".to_string()
@@ -1055,15 +1152,33 @@ pub async fn delete_model_handler(
     }
 
     crate::audit::control_plane(
-        Some(&cx),
-        &state.access_control,
-        Protocol::Http,
+        cx,
+        access_control,
+        protocol,
         "delete_model",
-        &model_name,
+        model_name,
         None,
         &details,
     );
 
+    Ok(details)
+}
+
+pub async fn delete_model_handler(
+    State(state): State<Arc<AppState>>,
+    Path(model_name): Path<String>,
+    Query(query): Query<DeleteQuery>,
+    cx: RequestContext,
+) -> Result<Json<Value>, AppError> {
+    delete_model_core(
+        &state,
+        &state.access_control,
+        Some(&cx),
+        Protocol::Http,
+        &model_name,
+        query.force.unwrap_or(false),
+    )
+    .await?;
     Ok(Json(json!({
         "success": true,
         "message": format!("Model {} deleted", model_name),
@@ -1827,9 +1942,17 @@ mod delete_snapshot_tests {
         crate::registry::cache::save(&state.registry, &repo).await.unwrap();
 
         let cx = audit_tests::test_cx();
-        let _ = delete_version_impl(&state, &cx, "mymodel", "1", true)
-            .await
-            .expect("delete must succeed");
+        let _ = delete_version_impl(
+            &state,
+            &state.access_control,
+            Some(&cx),
+            Protocol::Http,
+            "mymodel",
+            "1",
+            true,
+        )
+        .await
+        .expect("delete must succeed");
 
         let raw = std::fs::read_to_string(repo.join(".lite-server-registry.json"))
             .expect("snapshot must be rewritten");
@@ -1952,7 +2075,16 @@ mod delete_snapshot_failure_tests {
 
         let state = state_with_repo(tmp.clone(), config);
         let cx = audit_tests::test_cx();
-        let result = delete_version_impl(&state, &cx, "mymodel", "1", false).await;
+        let result = delete_version_impl(
+            &state,
+            &state.access_control,
+            Some(&cx),
+            Protocol::Http,
+            "mymodel",
+            "1",
+            false,
+        )
+        .await;
 
         assert!(
             !version_dir.exists(),

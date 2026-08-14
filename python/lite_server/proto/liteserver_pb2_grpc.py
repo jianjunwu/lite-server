@@ -207,7 +207,7 @@ class LiteServer(object):
 class AdminStub(object):
     """===== Admin Service (P6, 蓝图 §4.1) =====
 
-    11 RPCs mirroring the HTTP admin REST surface. Additive ONLY: a new service
+    18 RPCs mirroring the HTTP admin REST surface. Additive ONLY: a new service
     and new messages; no existing message/field is touched (proto 双用途 gRPC+ZMQ，
     additive 对 ZMQ wire 向后安全). gRPC reflection (评审低#12) 已实现：opt-in
     配置 `grpc.reflection: true`（默认关），见 src/grpc/reflection.rs。
@@ -274,12 +274,47 @@ class AdminStub(object):
                 request_serializer=liteserver__pb2.GetModelStatsRequest.SerializeToString,
                 response_deserializer=liteserver__pb2.GetModelStatsResponse.FromString,
                 )
+        self.DeleteVersion = channel.unary_unary(
+                '/liteserver.Admin/DeleteVersion',
+                request_serializer=liteserver__pb2.DeleteVersionRequest.SerializeToString,
+                response_deserializer=liteserver__pb2.DeleteVersionResponse.FromString,
+                )
+        self.DeleteModel = channel.unary_unary(
+                '/liteserver.Admin/DeleteModel',
+                request_serializer=liteserver__pb2.DeleteModelRequest.SerializeToString,
+                response_deserializer=liteserver__pb2.DeleteModelResponse.FromString,
+                )
+        self.DeleteVersions = channel.unary_unary(
+                '/liteserver.Admin/DeleteVersions',
+                request_serializer=liteserver__pb2.DeleteVersionsRequest.SerializeToString,
+                response_deserializer=liteserver__pb2.DeleteVersionsResponse.FromString,
+                )
+        self.RepositoryDrift = channel.unary_unary(
+                '/liteserver.Admin/RepositoryDrift',
+                request_serializer=liteserver__pb2.RepositoryDriftRequest.SerializeToString,
+                response_deserializer=liteserver__pb2.RepositoryDriftResponse.FromString,
+                )
+        self.UploadModel = channel.stream_unary(
+                '/liteserver.Admin/UploadModel',
+                request_serializer=liteserver__pb2.UploadModelRequest.SerializeToString,
+                response_deserializer=liteserver__pb2.UploadModelResponse.FromString,
+                )
+        self.DownloadModel = channel.unary_stream(
+                '/liteserver.Admin/DownloadModel',
+                request_serializer=liteserver__pb2.DownloadModelRequest.SerializeToString,
+                response_deserializer=liteserver__pb2.DownloadModelChunk.FromString,
+                )
+        self.ListFiles = channel.unary_unary(
+                '/liteserver.Admin/ListFiles',
+                request_serializer=liteserver__pb2.ListFilesRequest.SerializeToString,
+                response_deserializer=liteserver__pb2.ListFilesResponse.FromString,
+                )
 
 
 class AdminServicer(object):
     """===== Admin Service (P6, 蓝图 §4.1) =====
 
-    11 RPCs mirroring the HTTP admin REST surface. Additive ONLY: a new service
+    18 RPCs mirroring the HTTP admin REST surface. Additive ONLY: a new service
     and new messages; no existing message/field is touched (proto 双用途 gRPC+ZMQ，
     additive 对 ZMQ wire 向后安全). gRPC reflection (评审低#12) 已实现：opt-in
     配置 `grpc.reflection: true`（默认关），见 src/grpc/reflection.rs。
@@ -351,6 +386,51 @@ class AdminServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def DeleteVersion(self, request, context):
+        """Repository lifecycle (model-upload-and-retire plan: G3 + E5 + F3) —
+        delete/drift parity with the HTTP endpoints of the same name, plus
+        file transfer RPCs. Additive-only, same as the P6 block above.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteModel(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteVersions(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RepositoryDrift(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def UploadModel(self, request_iterator, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DownloadModel(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListFiles(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_AdminServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -409,6 +489,41 @@ def add_AdminServicer_to_server(servicer, server):
                     request_deserializer=liteserver__pb2.GetModelStatsRequest.FromString,
                     response_serializer=liteserver__pb2.GetModelStatsResponse.SerializeToString,
             ),
+            'DeleteVersion': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteVersion,
+                    request_deserializer=liteserver__pb2.DeleteVersionRequest.FromString,
+                    response_serializer=liteserver__pb2.DeleteVersionResponse.SerializeToString,
+            ),
+            'DeleteModel': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteModel,
+                    request_deserializer=liteserver__pb2.DeleteModelRequest.FromString,
+                    response_serializer=liteserver__pb2.DeleteModelResponse.SerializeToString,
+            ),
+            'DeleteVersions': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteVersions,
+                    request_deserializer=liteserver__pb2.DeleteVersionsRequest.FromString,
+                    response_serializer=liteserver__pb2.DeleteVersionsResponse.SerializeToString,
+            ),
+            'RepositoryDrift': grpc.unary_unary_rpc_method_handler(
+                    servicer.RepositoryDrift,
+                    request_deserializer=liteserver__pb2.RepositoryDriftRequest.FromString,
+                    response_serializer=liteserver__pb2.RepositoryDriftResponse.SerializeToString,
+            ),
+            'UploadModel': grpc.stream_unary_rpc_method_handler(
+                    servicer.UploadModel,
+                    request_deserializer=liteserver__pb2.UploadModelRequest.FromString,
+                    response_serializer=liteserver__pb2.UploadModelResponse.SerializeToString,
+            ),
+            'DownloadModel': grpc.unary_stream_rpc_method_handler(
+                    servicer.DownloadModel,
+                    request_deserializer=liteserver__pb2.DownloadModelRequest.FromString,
+                    response_serializer=liteserver__pb2.DownloadModelChunk.SerializeToString,
+            ),
+            'ListFiles': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListFiles,
+                    request_deserializer=liteserver__pb2.ListFilesRequest.FromString,
+                    response_serializer=liteserver__pb2.ListFilesResponse.SerializeToString,
+            ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
             'liteserver.Admin', rpc_method_handlers)
@@ -419,7 +534,7 @@ def add_AdminServicer_to_server(servicer, server):
 class Admin(object):
     """===== Admin Service (P6, 蓝图 §4.1) =====
 
-    11 RPCs mirroring the HTTP admin REST surface. Additive ONLY: a new service
+    18 RPCs mirroring the HTTP admin REST surface. Additive ONLY: a new service
     and new messages; no existing message/field is touched (proto 双用途 gRPC+ZMQ，
     additive 对 ZMQ wire 向后安全). gRPC reflection (评审低#12) 已实现：opt-in
     配置 `grpc.reflection: true`（默认关），见 src/grpc/reflection.rs。
@@ -609,5 +724,124 @@ class Admin(object):
         return grpc.experimental.unary_unary(request, target, '/liteserver.Admin/GetModelStats',
             liteserver__pb2.GetModelStatsRequest.SerializeToString,
             liteserver__pb2.GetModelStatsResponse.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def DeleteVersion(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/liteserver.Admin/DeleteVersion',
+            liteserver__pb2.DeleteVersionRequest.SerializeToString,
+            liteserver__pb2.DeleteVersionResponse.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def DeleteModel(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/liteserver.Admin/DeleteModel',
+            liteserver__pb2.DeleteModelRequest.SerializeToString,
+            liteserver__pb2.DeleteModelResponse.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def DeleteVersions(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/liteserver.Admin/DeleteVersions',
+            liteserver__pb2.DeleteVersionsRequest.SerializeToString,
+            liteserver__pb2.DeleteVersionsResponse.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def RepositoryDrift(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/liteserver.Admin/RepositoryDrift',
+            liteserver__pb2.RepositoryDriftRequest.SerializeToString,
+            liteserver__pb2.RepositoryDriftResponse.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def UploadModel(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_unary(request_iterator, target, '/liteserver.Admin/UploadModel',
+            liteserver__pb2.UploadModelRequest.SerializeToString,
+            liteserver__pb2.UploadModelResponse.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def DownloadModel(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(request, target, '/liteserver.Admin/DownloadModel',
+            liteserver__pb2.DownloadModelRequest.SerializeToString,
+            liteserver__pb2.DownloadModelChunk.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def ListFiles(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/liteserver.Admin/ListFiles',
+            liteserver__pb2.ListFilesRequest.SerializeToString,
+            liteserver__pb2.ListFilesResponse.FromString,
             options, channel_credentials,
             insecure, call_credentials, compression, wait_for_ready, timeout, metadata)

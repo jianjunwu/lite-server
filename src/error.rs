@@ -170,8 +170,9 @@ impl AppError {
 
     /// Return the message shown to the client. For most variants this is the
     /// sanitized static message; InvalidRequestBody passes the parse detail
-    /// through because it describes the client's own request body.
-    fn client_message(&self) -> String {
+    /// through because it describes the client's own request body. Also the
+    /// gRPC Status message source (grpc/error.rs) — same client contract.
+    pub(crate) fn client_message(&self) -> String {
         match self {
             AppError::InvalidRequestBody(detail) => detail.clone(),
             AppError::InvalidQueryParam(detail) => detail.clone(),

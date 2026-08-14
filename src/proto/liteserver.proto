@@ -330,7 +330,7 @@ message DecoupledResponse {
 
 // ===== Admin Service (P6, 蓝图 §4.1) =====
 //
-// 11 RPCs mirroring the HTTP admin REST surface. Additive ONLY: a new service
+// 18 RPCs mirroring the HTTP admin REST surface. Additive ONLY: a new service
 // and new messages; no existing message/field is touched (proto 双用途 gRPC+ZMQ，
 // additive 对 ZMQ wire 向后安全). gRPC reflection (评审低#12) 已实现：opt-in
 // 配置 `grpc.reflection: true`（默认关），见 src/grpc/reflection.rs。
@@ -346,6 +346,16 @@ service Admin {
   rpc ActivateVersion(ActivateVersionRequest) returns (ActivateVersionResponse);
   rpc SetRouting(SetRoutingRequest) returns (SetRoutingResponse);
   rpc GetModelStats(GetModelStatsRequest) returns (GetModelStatsResponse);
+  // Repository lifecycle (model-upload-and-retire plan: G3 + E5 + F3) —
+  // delete/drift parity with the HTTP endpoints of the same name, plus
+  // file transfer RPCs. Additive-only, same as the P6 block above.
+  rpc DeleteVersion(DeleteVersionRequest) returns (DeleteVersionResponse);
+  rpc DeleteModel(DeleteModelRequest) returns (DeleteModelResponse);
+  rpc DeleteVersions(DeleteVersionsRequest) returns (DeleteVersionsResponse);
+  rpc RepositoryDrift(RepositoryDriftRequest) returns (RepositoryDriftResponse);
+  rpc UploadModel(stream UploadModelRequest) returns (UploadModelResponse);
+  rpc DownloadModel(DownloadModelRequest) returns (stream DownloadModelChunk);
+  rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
 }
 
 // --- GetInfo (mirrors GET /info) ---
@@ -493,4 +503,134 @@ message WorkerStats {
   uint32 worker_id = 1;
   bool healthy = 2;                        // !OutlierState::is_ejected
   uint64 inference_count = 3;              // WORKER_INFERENCE_TOTAL{...,worker_id}
+}
+
+// --- DeleteVersion (mirrors DELETE /v2/models/:m/versions/:v) ---
+message DeleteVersionRequest {
+  string model_name = 1;
+  string version = 2;
+  // E3 protection: deleting the active version requires force=true (HTTP
+  // `?force=`); the unforced call fails with FAILED_PRECONDITION.
+  bool force = 3;
+}
+message DeleteVersionResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// --- DeleteModel (mirrors DELETE /v2/models/:m) ---
+message DeleteModelRequest {
+  string model_name = 1;
+  bool force = 2;                          // required while an active version exists
+}
+message DeleteModelResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// --- DeleteVersions (mirrors DELETE /v2/models/:m/versions) ---
+message DeleteVersionsRequest {
+  string model_name = 1;
+  // Retain the N highest versions (lenient semver, unparseable = lowest).
+  // 0 = unset; exclusive with `versions`.
+  optional uint32 keep = 2;
+  // Explicit version list. Exclusive with `keep`.
+  repeated string versions = 3;
+  bool force = 4;                          // required for active versions in scope
+}
+message DeleteVersionsResponse {
+  repeated string deleted = 1;
+  // Partial-failure semantics (same as HTTP): per-version failures are
+  // reported here instead of failing the whole RPC.
+  repeated DeleteFailure failed = 2;
+}
+message DeleteFailure {
+  string version = 1;
+  string error = 2;
+}
+
+// --- RepositoryDrift (mirrors GET /v2/repository/drift) ---
+message RepositoryDriftRequest {
+  // Absent → whole repository (HTTP behavior); present → single model.
+  optional string model_name = 1;
+}
+message RepositoryDriftResponse {
+  repeated DriftMissingEntry configured_missing = 1;
+  repeated DriftDiskEntry on_disk_unconfigured = 2;
+}
+message DriftMissingEntry {
+  string model = 1;
+  string version = 2;
+}
+message DriftDiskEntry {
+  string model = 1;
+  string version = 2;
+  uint64 size_bytes = 3;                   // recursive directory size
+  bool ensemble_referenced = 4;            // referenced by any ensemble chain node
+}
+
+// --- UploadModel (client-streaming; mirrors the HTTP upload endpoints) ---
+//
+// Loose-field wire (定稿 2026-08-13): the FIRST message carries the request
+// metadata (model_name / optional version / optional load); every subsequent
+// message carries file content (file_name + data). A large file is sent as
+// multiple messages sharing one file_name.
+message UploadModelRequest {
+  // Metadata — first message only.
+  string model_name = 1;
+  // Absent → model-level upload (F8): a single .lma, version read from the
+  // package manifest. Present → versioned upload (raw files or one .lma).
+  optional string version = 2;
+  // Aligns with HTTP `?load=` (default true there). Absent → true.
+  optional bool load = 3;
+  // File content — subsequent messages.
+  string file_name = 4;
+  bytes data = 5;
+}
+message UploadModelResponse {
+  bool success = 1;
+  string model = 2;
+  string version = 3;
+  repeated string files = 4;
+  // Mirrors HTTP `loaded`: the real outcome of the post-upload auto-load
+  // (true only when a load was requested AND succeeded).
+  bool loaded = 5;
+  optional string load_error = 6;
+}
+
+// --- DownloadModel (server-streaming; mirrors GET .../download) ---
+message DownloadModelRequest {
+  string model_name = 1;
+  // Absent → active version (F9, same as bare ready).
+  optional string version = 2;
+  // Single-file download; absent → whole directory as one .lma (original
+  // artifact passthrough when one exists, else a fresh pack).
+  optional string file = 3;
+}
+// DecoupledResponse-style terminal frame (proto 定稿): the stream ends with
+// a final chunk carrying the sha256 (hex) and total size of the assembled
+// payload; data is empty there. Non-terminal chunks are 1 MiB max.
+message DownloadModelChunk {
+  bytes data = 1;
+  bool is_final = 2;
+  string sha256 = 3;
+  uint64 size = 4;
+}
+
+// --- ListFiles (mirrors GET /v2/repository/models/:m/versions/:v/files) ---
+message ListFilesRequest {
+  string model_name = 1;
+  string version = 2;
+}
+message ListFilesResponse {
+  string model = 1;
+  string version = 2;
+  repeated FileEntry files = 3;
+}
+message FileEntry {
+  string name = 1;
+  uint64 size = 2;
+  // Epoch seconds; absent when unreadable (HTTP JSON emits null there).
+  optional uint64 modified = 3;
+  bool is_dir = 4;
 }

@@ -28,11 +28,6 @@ pub async fn upload_model_handler(
     crate::validation::validate_identifier(&model_name)?;
     crate::validation::validate_version(&version)?;
 
-    // For .lma uploads the manifest version (always v-stripped by the
-    // packer) names the on-disk version directory; normalize the URL
-    // version the same way so unpack, load, and the response all agree.
-    let mut effective_version = version.clone();
-
     // H3: everything lands in a staging dir first and is moved into place
     // atomically after the whole request succeeds. Failures and timeouts
     // leave no partial files and no empty version dirs: the guard removes
@@ -45,14 +40,12 @@ pub async fn upload_model_handler(
         .map_err(AppError::Io)?;
     let _staging_guard = StagingGuard(staging.clone());
 
-    let mut uploaded_files: Vec<String> = Vec::new();
+    // Ingest-only loop: stream every field into the staging dir
+    // (F11a, RAM bounded by chunk size). Unpacking/validation/commit run
+    // in the shared tail (finalize_upload) — same for the gRPC
+    // UploadModel RPC.
+    let mut staged: Vec<StagedUploadFile> = Vec::new();
     let mut total_bytes: u64 = 0;
-    let mut has_raw = false;
-    // Staged .lma artifact file names — retained into .artifacts/ only
-    // after a successful commit (B2: a failed upload must leave no
-    // artifact behind for F10b to serve as the version's truth).
-    let mut staged_artifacts: Vec<String> = Vec::new();
-
     while let Some(mut field) = multipart.next_field().await.map_err(|e| {
         AppError::Validation(format!("multipart error: {}", e))
     })? {
@@ -62,13 +55,6 @@ pub async fn upload_model_handler(
             .to_string();
 
         if filename.ends_with(".lma") {
-            // The artifact's internal layout carries the version directory
-            // prefix ({version}/...), so unpack --flat into the staging
-            // root — mirroring the scanner's repository-root auto-unpack —
-            // instead of the version directory (which would nest
-            // {name}/{v}/{v}/). --expect-version fails before extraction
-            // if the manifest version does not match the upload URL.
-            effective_version = version.strip_prefix('v').unwrap_or(&version).to_string();
             // B1: strip any path components (same rule as the raw branch)
             // — multer returns the filename unsanitized, so a `../` or
             // absolute filename would otherwise escape the staging dir.
@@ -85,36 +71,13 @@ pub async fn upload_model_handler(
             }
             let tmp_file = staging.join(&safe_name);
             total_bytes += stream_field_to_file(&mut field, &tmp_file).await?;
-
-            // H1: bound the unpack subprocess with the scanner's tunable.
-            let unpack_timeout = std::time::Duration::from_secs_f32(
-                state.config.tunables.unpack_timeout_secs,
-            );
-            // H2: bound concurrent pack/unpack subprocesses.
-            let _permit = acquire_file_op_permit(unpack_timeout).await?;
-            let output = run_unpack(
-                &crate::python::resolve_python_interpreter(),
-                &tmp_file,
-                &staging,
-                Some(&effective_version),
-                unpack_timeout,
-            )
-            .await?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(AppError::Validation(format!(
-                    "artifact unpack failed: {}",
-                    stderr.trim()
-                )));
-            }
-
-            // F10a retention happens after commit_staging below (B2).
-            staged_artifacts.push(safe_name);
-            uploaded_files.push(filename);
+            staged.push(StagedUploadFile {
+                name: safe_name,
+                path: tmp_file,
+                is_lma: true,
+            });
         } else {
-            // Raw file: stage into the version directory (F11a streams the
-            // field to disk instead of buffering it in memory). Sanitize
+            // Raw file: stage into the version directory. Sanitize
             // filename: strip any path components.
             let safe_name = std::path::Path::new(&filename)
                 .file_name()
@@ -130,8 +93,11 @@ pub async fn upload_model_handler(
                 .map_err(AppError::Io)?;
             let file_path = version_dir.join(&safe_name);
             total_bytes += stream_field_to_file(&mut field, &file_path).await?;
-            uploaded_files.push(safe_name);
-            has_raw = true;
+            staged.push(StagedUploadFile {
+                name: safe_name,
+                path: file_path,
+                is_lma: false,
+            });
         }
 
         // F11b: per-field cumulative enforcement of the upload size cap.
@@ -145,54 +111,27 @@ pub async fn upload_model_handler(
         }
     }
 
-    if uploaded_files.is_empty() {
+    if staged.is_empty() {
         return Err(AppError::Validation("no files uploaded".to_string()));
-    }
-
-    // H3: move staged content into place — version dirs via swap semantics
-    // (replaced wholesale, never partial), model-root files by overwrite.
-    commit_staging(&state.repo_path, &model_name, &staging).await?;
-
-    // F10a: retain the original artifact(s) so downloads can serve them
-    // back without repacking (preserving the author signature). Only after
-    // a successful commit (B2): a failed upload must leave no orphan
-    // artifact for F10b to serve as the version's truth.
-    if !staged_artifacts.is_empty() {
-        let artifacts_dir = state.repo_path.join(".artifacts");
-        tokio::fs::create_dir_all(&artifacts_dir)
-            .await
-            .map_err(AppError::Io)?;
-        let artifact_name = format!("{}_v{}.lma", model_name, effective_version);
-        for name in &staged_artifacts {
-            tokio::fs::copy(staging.join(name), artifacts_dir.join(&artifact_name))
-                .await
-                .map_err(AppError::Io)?;
-        }
-    }
-
-    // C2 (drift patch): a raw-file upload replaced the version content —
-    // drop the stale original artifact (if any), or F10b would keep
-    // serving the old package as the truth. Downloads then fall back to
-    // repacking the new disk tree. Only after a successful commit — a
-    // failed upload must not destroy the previous artifact.
-    if has_raw {
-        let _ = crate::http::handlers::admin::remove_linked_artifacts(
-            &state.repo_path,
-            &model_name,
-            &version,
-        )
-        .await;
     }
 
     // Optionally auto-load after upload; `loaded` reports the real outcome
     // instead of echoing the ?load= query param.
     let auto_load = query.load.unwrap_or(true);
-    let load_error = auto_load_uploaded(&state, &model_name, &effective_version, auto_load).await;
+    let outcome = finalize_upload(
+        &state,
+        &model_name,
+        &staging,
+        &staged,
+        Some(&version),
+        auto_load,
+    )
+    .await?;
 
     info!(
         model = %model_name,
-        version = %effective_version,
-        files = ?uploaded_files,
+        version = %outcome.version,
+        files = ?outcome.files,
         bytes = total_bytes,
         "Model uploaded"
     );
@@ -200,20 +139,21 @@ pub async fn upload_model_handler(
     let mut response = json!({
         "success": true,
         "model": model_name,
-        "version": effective_version,
-        "files": uploaded_files,
-        "loaded": auto_load && load_error.is_none(),
+        "version": outcome.version,
+        "files": outcome.files,
+        "loaded": auto_load && outcome.load_error.is_none(),
     });
-    if let Some(error) = load_error {
+    if let Some(error) = outcome.load_error {
         response["load_error"] = json!(error);
     }
 
     Ok(Json(response))
 }
 
-/// Auto-load an uploaded version (shared by both upload endpoints).
-/// Returns the load error detail (None when not requested or on success).
-async fn auto_load_uploaded(
+/// Auto-load an uploaded version (shared by both upload endpoints and the
+/// gRPC UploadModel RPC). Returns the load error detail (None when not
+/// requested or on success).
+pub(crate) async fn auto_load_uploaded(
     state: &AppState,
     model_name: &str,
     version: &str,
@@ -241,6 +181,173 @@ async fn auto_load_uploaded(
     None
 }
 
+// ===== Shared upload tail (HTTP handlers + gRPC UploadModel RPC) =====
+
+/// A file staged during upload ingestion (multipart field or gRPC chunk
+/// group) — sanitized name plus its location inside the staging dir.
+pub(crate) struct StagedUploadFile {
+    pub(crate) name: String,
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) is_lma: bool,
+}
+
+/// Result of a finalized upload (both HTTP endpoints + gRPC UploadModel).
+pub(crate) struct UploadOutcome {
+    pub(crate) version: String,
+    pub(crate) files: Vec<String>,
+    pub(crate) load_error: Option<String>,
+}
+
+/// Unpack one staged .lma artifact into the staging root (H1 timeout via
+/// the shared tunable + H2 subprocess semaphore), failing on nonzero exit.
+async fn unpack_artifact(
+    tmp_file: &std::path::Path,
+    staging: &std::path::Path,
+    expect_version: Option<&str>,
+    unpack_timeout: std::time::Duration,
+) -> Result<(), AppError> {
+    let _permit = acquire_file_op_permit(unpack_timeout).await?;
+    let output = run_unpack(
+        &crate::python::resolve_python_interpreter(),
+        tmp_file,
+        staging,
+        expect_version,
+        unpack_timeout,
+    )
+    .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::Validation(format!(
+            "artifact unpack failed: {}",
+            stderr.trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Shared upload tail — unpack staged .lma artifacts (with manifest
+/// verification), commit into the repo (swap semantics, H3), retain the
+/// original artifact (F10a), patch the drift the raw files introduce (C2)
+/// and auto-load. `url_version: None` = model-level (F8: exactly one
+/// .lma, version read from the manifest); `Some(v)` = versioned endpoint.
+pub(crate) async fn finalize_upload(
+    state: &AppState,
+    model_name: &str,
+    staging: &std::path::Path,
+    staged: &[StagedUploadFile],
+    url_version: Option<&str>,
+    load: bool,
+) -> Result<UploadOutcome, AppError> {
+    let unpack_timeout =
+        std::time::Duration::from_secs_f32(state.config.tunables.unpack_timeout_secs);
+    let has_raw = staged.iter().any(|f| !f.is_lma);
+
+    let effective_version = match url_version {
+        None => {
+            // Model-level (F8): exactly one .lma and no raw files — there
+            // is no URL version to place raw content under.
+            if has_raw || staged.len() != 1 || !staged[0].is_lma {
+                return Err(AppError::InvalidRequestBody(format!(
+                    "model-level upload accepts a single .lma artifact; \
+                     raw files need the versioned endpoint \
+                     /v2/repository/models/{}/versions/{{v}}/upload",
+                    model_name
+                )));
+            }
+            // Unpack without a version expectation — the version is read
+            // from the manifest below and validated against the URL model
+            // name.
+            unpack_artifact(&staged[0].path, staging, None, unpack_timeout).await?;
+
+            // The unpacked manifest.json sits at the staging root.
+            let manifest_raw = tokio::fs::read_to_string(staging.join("manifest.json"))
+                .await
+                .map_err(|_| AppError::Validation("artifact manifest.json missing".to_string()))?;
+            let manifest: Value = serde_json::from_str(&manifest_raw)
+                .map_err(|_| AppError::Validation("artifact manifest.json invalid".to_string()))?;
+            let manifest_name = manifest["name"]
+                .as_str()
+                .ok_or_else(|| AppError::Validation("artifact manifest lacks a name".to_string()))?;
+            if manifest_name != model_name {
+                return Err(AppError::InvalidRequestBody(format!(
+                    "artifact is for model '{}', not '{}'",
+                    manifest_name, model_name
+                )));
+            }
+            let mversion = manifest["version"]
+                .as_str()
+                .ok_or_else(|| AppError::Validation("artifact manifest lacks a version".to_string()))?;
+            let v = mversion.strip_prefix('v').unwrap_or(mversion).to_string();
+            crate::validation::validate_version(&v)?;
+            v
+        }
+        Some(url_v) => {
+            // For .lma uploads the manifest version (always v-stripped by
+            // the packer) names the on-disk version directory; normalize
+            // the URL version the same way so unpack, load, and the
+            // response all agree. The artifact's internal layout carries
+            // the version directory prefix ({version}/...), so unpack
+            // --flat into the staging root — mirroring the scanner's
+            // repository-root auto-unpack — instead of the version
+            // directory (which would nest {name}/{v}/{v}/).
+            // --expect-version fails before extraction if the manifest
+            // version does not match the upload URL.
+            let effective = if staged.iter().any(|f| f.is_lma) {
+                url_v.strip_prefix('v').unwrap_or(url_v).to_string()
+            } else {
+                url_v.to_string()
+            };
+            for f in staged.iter().filter(|f| f.is_lma) {
+                unpack_artifact(&f.path, staging, Some(&effective), unpack_timeout).await?;
+            }
+            effective
+        }
+    };
+
+    // H3: move staged content into place — version dirs via swap semantics
+    // (replaced wholesale, never partial), model-root files by overwrite.
+    commit_staging(&state.repo_path, model_name, staging).await?;
+
+    // F10a: retain the original artifact(s) so downloads can serve them
+    // back without repacking (preserving the author signature). Only after
+    // a successful commit (B2): a failed upload must leave no orphan
+    // artifact for F10b to serve as the version's truth.
+    if staged.iter().any(|f| f.is_lma) {
+        let artifacts_dir = state.repo_path.join(".artifacts");
+        tokio::fs::create_dir_all(&artifacts_dir)
+            .await
+            .map_err(AppError::Io)?;
+        let artifact_name = format!("{}_v{}.lma", model_name, effective_version);
+        for f in staged.iter().filter(|f| f.is_lma) {
+            tokio::fs::copy(&f.path, artifacts_dir.join(&artifact_name))
+                .await
+                .map_err(AppError::Io)?;
+        }
+    }
+
+    // C2 (drift patch): a raw-file upload replaced the version content —
+    // drop the stale original artifact (if any), or F10b would keep
+    // serving the old package as the truth. Downloads then fall back to
+    // repacking the new disk tree. Only after a successful commit — a
+    // failed upload must not destroy the previous artifact.
+    if has_raw {
+        let _ = crate::http::handlers::admin::remove_linked_artifacts(
+            &state.repo_path,
+            model_name,
+            &effective_version,
+        )
+        .await;
+    }
+
+    let load_error = auto_load_uploaded(state, model_name, &effective_version, load).await;
+
+    Ok(UploadOutcome {
+        version: effective_version,
+        files: staged.iter().map(|f| f.name.clone()).collect(),
+        load_error,
+    })
+}
+
 /// F8: model-level upload — accepts exactly one `.lma` artifact; the
 /// version comes from the package manifest (the URL carries no version).
 /// Reuses the staging/swap/auto-load pipeline of the versioned endpoint.
@@ -261,13 +368,11 @@ pub async fn upload_model_package_handler(
         .map_err(AppError::Io)?;
     let _staging_guard = StagingGuard(staging.clone());
 
-    let mut uploaded_files: Vec<String> = Vec::new();
+    // Ingest-only loop (shared tail = finalize_upload). Model-level shape
+    // is enforced here for the HTTP surface; finalize_upload enforces it
+    // again for the gRPC UploadModel RPC.
+    let mut staged: Vec<StagedUploadFile> = Vec::new();
     let mut total_bytes: u64 = 0;
-    let mut effective_version: Option<String> = None;
-    // The staged .lma artifact file name — retained into .artifacts/ only
-    // after a successful commit (B2).
-    let mut staged_artifact: Option<String> = None;
-
     while let Some(mut field) = multipart.next_field().await.map_err(|e| {
         AppError::Validation(format!("multipart error: {}", e))
     })? {
@@ -281,7 +386,7 @@ pub async fn upload_model_package_handler(
                 filename, model_name
             )));
         }
-        if effective_version.is_some() {
+        if !staged.is_empty() {
             return Err(AppError::InvalidRequestBody(
                 "model-level upload accepts a single .lma artifact".to_string(),
             ));
@@ -312,90 +417,24 @@ pub async fn upload_model_package_handler(
                 });
             }
         }
-
-        // Unpack without a version expectation — the version is read from
-        // the manifest below and validated against the URL model name.
-        let unpack_timeout = std::time::Duration::from_secs_f32(
-            state.config.tunables.unpack_timeout_secs,
-        );
-        // H2: bound concurrent pack/unpack subprocesses.
-        let _permit = acquire_file_op_permit(unpack_timeout).await?;
-        let output = run_unpack(
-            &crate::python::resolve_python_interpreter(),
-            &tmp_file,
-            &staging,
-            None,
-            unpack_timeout,
-        )
-        .await?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(AppError::Validation(format!(
-                "artifact unpack failed: {}",
-                stderr.trim()
-            )));
-        }
-
-        // The unpacked manifest.json sits at the staging root.
-        let manifest_raw = tokio::fs::read_to_string(staging.join("manifest.json"))
-            .await
-            .map_err(|_| AppError::Validation("artifact manifest.json missing".to_string()))?;
-        let manifest: Value = serde_json::from_str(&manifest_raw)
-            .map_err(|_| AppError::Validation("artifact manifest.json invalid".to_string()))?;
-        let manifest_name = manifest["name"]
-            .as_str()
-            .ok_or_else(|| AppError::Validation("artifact manifest lacks a name".to_string()))?;
-        if manifest_name != model_name {
-            return Err(AppError::InvalidRequestBody(format!(
-                "artifact is for model '{}', not '{}'",
-                manifest_name, model_name
-            )));
-        }
-        let mversion = manifest["version"]
-            .as_str()
-            .ok_or_else(|| AppError::Validation("artifact manifest lacks a version".to_string()))?;
-        let v = mversion.strip_prefix('v').unwrap_or(mversion).to_string();
-        crate::validation::validate_version(&v)?;
-        effective_version = Some(v);
-        uploaded_files.push(filename);
-
-        // F10a retention happens after commit_staging below (B2) — the
-        // staged artifact stays in staging until then.
-        staged_artifact = Some(safe_name);
+        staged.push(StagedUploadFile {
+            name: safe_name,
+            path: tmp_file,
+            is_lma: true,
+        });
     }
 
-    let Some(effective_version) = effective_version else {
-        return Err(AppError::Validation(
-            "no .lma artifact in upload".to_string(),
-        ));
-    };
-    if uploaded_files.is_empty() {
+    if staged.is_empty() {
         return Err(AppError::Validation("no files uploaded".to_string()));
     }
 
-    commit_staging(&state.repo_path, &model_name, &staging).await?;
-
-    // F10a: retain the original artifact (same as the versioned path) —
-    // only after a successful commit (B2): a failed upload must leave no
-    // orphan artifact for F10b to serve as the version's truth.
-    if let Some(name) = &staged_artifact {
-        let artifacts_dir = state.repo_path.join(".artifacts");
-        tokio::fs::create_dir_all(&artifacts_dir)
-            .await
-            .map_err(AppError::Io)?;
-        let artifact_name = format!("{}_v{}.lma", model_name, effective_version);
-        tokio::fs::copy(staging.join(name), artifacts_dir.join(&artifact_name))
-            .await
-            .map_err(AppError::Io)?;
-    }
-
     let auto_load = query.load.unwrap_or(true);
-    let load_error = auto_load_uploaded(&state, &model_name, &effective_version, auto_load).await;
+    let outcome = finalize_upload(&state, &model_name, &staging, &staged, None, auto_load).await?;
 
     info!(
         model = %model_name,
-        version = %effective_version,
-        files = ?uploaded_files,
+        version = %outcome.version,
+        files = ?outcome.files,
         bytes = total_bytes,
         "Model package uploaded (model-level)"
     );
@@ -406,18 +445,18 @@ pub async fn upload_model_package_handler(
         crate::callback::Protocol::Http,
         "upload",
         &model_name,
-        Some(&effective_version),
+        Some(&outcome.version),
         "model-level",
     );
 
     let mut response = json!({
         "success": true,
         "model": model_name,
-        "version": effective_version,
-        "files": uploaded_files,
-        "loaded": auto_load && load_error.is_none(),
+        "version": outcome.version,
+        "files": outcome.files,
+        "loaded": auto_load && outcome.load_error.is_none(),
     });
-    if let Some(error) = load_error {
+    if let Some(error) = outcome.load_error {
         response["load_error"] = json!(error);
     }
 
@@ -457,7 +496,7 @@ fn file_op_sem() -> &'static tokio::sync::Semaphore {
     FILE_OP_SEM.get_or_init(|| tokio::sync::Semaphore::new(4))
 }
 
-async fn acquire_file_op_permit(
+pub(crate) async fn acquire_file_op_permit(
     timeout: std::time::Duration,
 ) -> Result<tokio::sync::SemaphorePermit<'static>, AppError> {
     match tokio::time::timeout(timeout, file_op_sem().acquire()).await {
@@ -513,7 +552,7 @@ async fn wait_child_bounded(
 /// (H1) — a hung unpack is killed instead of holding the upload forever.
 /// `expect_version: None` skips the version check (F8 model-level upload
 /// reads the version from the manifest afterwards instead).
-async fn run_unpack(
+pub(crate) async fn run_unpack(
     interpreter: &str,
     tmp_file: &std::path::Path,
     dest_root: &std::path::Path,
@@ -599,7 +638,7 @@ async fn swap_dir_into(src: &std::path::Path, dst: &std::path::Path) -> Result<(
 /// Move all staged content into the model directory: directories become
 /// version dirs (swap semantics), files (manifest.json, requirements.txt)
 /// overwrite their model-root counterparts.
-async fn commit_staging(
+pub(crate) async fn commit_staging(
     repo_path: &std::path::Path,
     model_name: &str,
     staging: &std::path::Path,
@@ -639,7 +678,7 @@ async fn commit_staging(
 /// Removes the staging directory on drop. Drop cannot await, so the
 /// removal is spawned; a crashed process leaves the residue for startup
 /// cleanup (H7) — invisible to scanner/index via the dot-directory skip.
-struct StagingGuard(std::path::PathBuf);
+pub(crate) struct StagingGuard(pub(crate) std::path::PathBuf);
 
 impl Drop for StagingGuard {
     fn drop(&mut self) {
@@ -703,14 +742,30 @@ pub async fn download_model_handler(
     download_version_impl(&state, &cx, &model_name, &version, query.file.as_deref()).await
 }
 
-/// Shared download core (versioned endpoint + F9's model-level endpoint).
-async fn download_version_impl(
+/// Shared download resolution (HTTP versioned/model-level endpoints + the
+/// gRPC DownloadModel RPC). Resolves the file to stream: a single named
+/// file, or the whole version as one .lma — original artifact passthrough
+/// first (F10b), else a fresh pack into a temp dir whose cleanup guard
+/// rides along (dropped when the consumer finishes streaming).
+pub(crate) struct DownloadSource {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) size: u64,
+    /// Content-disposition file name.
+    pub(crate) file_name: String,
+    pub(crate) content_type: &'static str,
+    /// Audit detail suffix ("file=...", "full", "full (original artifact)").
+    pub(crate) audit_detail: String,
+    /// Pack temp-dir cleanup — None for retained files (single file and
+    /// artifact passthrough are not temp).
+    cleanup: Option<DownloadCleanup>,
+}
+
+pub(crate) async fn resolve_download_source(
     state: &AppState,
-    cx: &RequestContext,
     model_name: &str,
     version: &str,
     file: Option<&str>,
-) -> Result<Response, AppError> {
+) -> Result<DownloadSource, AppError> {
     let model_dir = crate::validation::resolve_model_dir(&state.repo_path, model_name, version)?;
 
     if !model_dir.exists() {
@@ -748,43 +803,23 @@ async fn download_version_impl(
             return Err(AppError::Validation("path traversal rejected".to_string()));
         }
 
-        // F1: stream the file instead of buffering it whole; Content-Length
-        // lets the client see progress/size up front.
         let size = tokio::fs::metadata(&canonical_file)
             .await
             .map_err(AppError::Io)?
             .len();
-        let file = tokio::fs::File::open(&canonical_file)
-            .await
-            .map_err(AppError::Io)?;
         let content_type = if file_name.ends_with(".py") || file_name.ends_with(".yaml") || file_name.ends_with(".yml") || file_name.ends_with(".json") || file_name.ends_with(".txt") || file_name.ends_with(".md") {
             "text/plain; charset=utf-8"
         } else {
             "application/octet-stream"
         };
-
-        crate::audit::control_plane(
-            Some(cx),
-            &state.access_control,
-            crate::callback::Protocol::Http,
-            "download",
-            model_name,
-            Some(version),
-            &format!("file={}", file_name),
-        );
-
-        let response = Response::builder()
-            .header(CONTENT_TYPE, content_type)
-            .header(CONTENT_LENGTH, size.to_string())
-            .header(
-                CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{}\"", file_name),
-            )
-            .body(axum::body::Body::from_stream(
-                tokio_util::io::ReaderStream::new(file),
-            ))
-            .map_err(|e| AppError::Internal(format!("build response: {}", e)))?;
-        return Ok(response);
+        return Ok(DownloadSource {
+            path: canonical_file,
+            size,
+            file_name: file_name.to_string(),
+            content_type,
+            audit_detail: format!("file={}", file_name),
+            cleanup: None,
+        });
     }
 
     // Full directory download as .lma.
@@ -797,8 +832,18 @@ async fn download_version_impl(
     for dir in [state.repo_path.to_path_buf(), state.repo_path.join(".artifacts")] {
         let candidate = dir.join(&artifact_name);
         if candidate.is_file() {
-            return serve_artifact_file(state, cx, model_name, version, &candidate, &artifact_name)
-                .await;
+            let size = tokio::fs::metadata(&candidate)
+                .await
+                .map_err(AppError::Io)?
+                .len();
+            return Ok(DownloadSource {
+                path: candidate,
+                size,
+                file_name: artifact_name,
+                content_type: "application/octet-stream",
+                audit_detail: "full (original artifact)".to_string(),
+                cleanup: None,
+            });
         }
     }
 
@@ -808,7 +853,7 @@ async fn download_version_impl(
         .map_err(AppError::Io)?;
     // F2/B4: the cleanup guard is armed at creation — every early return
     // below (semaphore timeout, pack failure, missing artifact, I/O error)
-    // removes the dir; the success path moves it into the response body.
+    // removes the dir; the success path hands it to the stream consumer.
     let cleanup = DownloadCleanup(tmp_dir.clone());
 
     // H2: bound concurrent pack/unpack subprocesses; H1: bound this one
@@ -849,51 +894,31 @@ async fn download_version_impl(
         .await
         .map_err(AppError::Io)?
         .len();
-    let file = tokio::fs::File::open(&lma_path).await.map_err(AppError::Io)?;
     let artifact_name = lma_path
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
 
-    crate::audit::control_plane(
-        Some(cx),
-        &state.access_control,
-        crate::callback::Protocol::Http,
-        "download",
-        model_name,
-        Some(version),
-        "full",
-    );
-
-    let response = Response::builder()
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .header(CONTENT_LENGTH, size.to_string())
-        .header(
-            CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", artifact_name),
-        )
-        .body(axum::body::Body::from_stream(LmaDownloadBody {
-            inner: tokio_util::io::ReaderStream::new(file),
-            _cleanup: cleanup,
-        }))
-        .map_err(|e| AppError::Internal(format!("build response: {}", e)))?;
-    Ok(response)
+    Ok(DownloadSource {
+        path: lma_path,
+        size,
+        file_name: artifact_name,
+        content_type: "application/octet-stream",
+        audit_detail: "full".to_string(),
+        cleanup: Some(cleanup),
+    })
 }
 
-/// F10b: stream an existing .lma artifact file as the download response
-/// (Content-Length + audit). The file is NOT removed afterwards — it is
-/// the retained artifact, not a temp pack.
-async fn serve_artifact_file(
+/// Shared download core (versioned endpoint + F9's model-level endpoint).
+async fn download_version_impl(
     state: &AppState,
     cx: &RequestContext,
     model_name: &str,
     version: &str,
-    path: &std::path::Path,
-    artifact_name: &str,
+    file: Option<&str>,
 ) -> Result<Response, AppError> {
-    let size = tokio::fs::metadata(path).await.map_err(AppError::Io)?.len();
-    let file = tokio::fs::File::open(path).await.map_err(AppError::Io)?;
+    let src = resolve_download_source(state, model_name, version, file).await?;
 
     crate::audit::control_plane(
         Some(cx),
@@ -902,19 +927,29 @@ async fn serve_artifact_file(
         "download",
         model_name,
         Some(version),
-        "full (original artifact)",
+        &src.audit_detail,
     );
 
+    // F1: stream the file instead of buffering it whole; Content-Length
+    // lets the client see progress/size up front. The pack temp dir (when
+    // any) is cleaned when the body stream is dropped.
+    let file = tokio::fs::File::open(&src.path).await.map_err(AppError::Io)?;
+    let body = match src.cleanup {
+        Some(cleanup) => axum::body::Body::from_stream(LmaDownloadBody {
+            inner: tokio_util::io::ReaderStream::new(file),
+            _cleanup: cleanup,
+        }),
+        None => axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+    };
+
     Response::builder()
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .header(CONTENT_LENGTH, size.to_string())
+        .header(CONTENT_TYPE, src.content_type)
+        .header(CONTENT_LENGTH, src.size.to_string())
         .header(
             CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", artifact_name),
+            format!("attachment; filename=\"{}\"", src.file_name),
         )
-        .body(axum::body::Body::from_stream(
-            tokio_util::io::ReaderStream::new(file),
-        ))
+        .body(body)
         .map_err(|e| AppError::Internal(format!("build response: {}", e)))
 }
 
@@ -951,14 +986,24 @@ pub async fn download_model_package_handler(
 
 // ===== List Files =====
 
-pub async fn list_files_handler(
-    State(state): State<Arc<AppState>>,
-    Path((model_name, version)): Path<(String, String)>,
-) -> Result<Json<Value>, AppError> {
-    crate::validation::validate_identifier(&model_name)?;
-    crate::validation::validate_version(&version)?;
+/// A model-directory entry (HTTP handler + gRPC ListFiles RPC).
+pub(crate) struct FileEntryInfo {
+    pub(crate) name: String,
+    pub(crate) size: u64,
+    pub(crate) modified: Option<u64>,
+    pub(crate) is_dir: bool,
+}
 
-    let model_dir = crate::validation::resolve_model_dir(&state.repo_path, &model_name, &version)?;
+/// Shared list-files core — validated directory listing of one version.
+pub(crate) async fn list_files_impl(
+    state: &AppState,
+    model_name: &str,
+    version: &str,
+) -> Result<Vec<FileEntryInfo>, AppError> {
+    crate::validation::validate_identifier(model_name)?;
+    crate::validation::validate_version(version)?;
+
+    let model_dir = crate::validation::resolve_model_dir(&state.repo_path, model_name, version)?;
 
     if !model_dir.exists() {
         return Err(AppError::ModelNotFound(format!(
@@ -983,18 +1028,34 @@ pub async fn list_files_handler(
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs());
 
-        files.push(json!({
-            "name": name,
-            "size": size,
-            "modified": modified,
-            "is_dir": path.is_dir(),
-        }));
+        files.push(FileEntryInfo {
+            name,
+            size,
+            modified,
+            is_dir: path.is_dir(),
+        });
     }
 
+    Ok(files)
+}
+
+pub async fn list_files_handler(
+    State(state): State<Arc<AppState>>,
+    Path((model_name, version)): Path<(String, String)>,
+) -> Result<Json<Value>, AppError> {
+    let files = list_files_impl(&state, &model_name, &version).await?;
     Ok(Json(json!({
         "model": model_name,
         "version": version,
-        "files": files,
+        "files": files
+            .iter()
+            .map(|f| json!({
+                "name": f.name,
+                "size": f.size,
+                "modified": f.modified,
+                "is_dir": f.is_dir,
+            }))
+            .collect::<Vec<Value>>(),
     })))
 }
 

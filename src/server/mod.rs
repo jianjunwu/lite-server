@@ -17,6 +17,7 @@ use tracing::{info, error, warn};
 
 mod reconcile;
 mod scanner;
+mod tmp_cleanup;
 mod watcher;
 use reconcile::*;
 use watcher::*;
@@ -235,6 +236,20 @@ impl LiteServer {
 
         // Start respawn listener for health-check-kill-triggered worker restarts
         self.worker_manager.start_respawn_listener().await;
+
+        // H7: sweep crash leftovers (staging dirs, swap backups, stale pack
+        // temp dirs, dead-pid sockets) before the initial model load — a
+        // restored swap backup must be visible to the scanner.
+        let (cleaned, restored) = tmp_cleanup::startup_tmp_cleanup(
+            &std::path::PathBuf::from(&self.config.model_repository.path),
+            &std::env::temp_dir(),
+            std::time::SystemTime::now(),
+            tmp_cleanup::DEFAULT_MAX_AGE,
+        )
+        .await;
+        if cleaned > 0 || restored > 0 {
+            info!(removed = cleaned, restored, "startup tmp cleanup swept crash residue");
+        }
 
         // Load initial models; the returned seen_lma set is handed to the
         // reconcile task so .lma artifacts unpacked at startup are not

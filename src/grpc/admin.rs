@@ -15,48 +15,40 @@
 //! with the current HTTP admin surface, which is open to the bind address).
 
 use crate::access_control::AccessControl;
-use crate::callback::{CallbackRunner, ModelLifecycleContext, Protocol};
-use crate::config::Config;
+use crate::callback::{ModelLifecycleContext, Protocol};
 use crate::error::AppError;
+use crate::http::state::AppState;
 use crate::metrics::prometheus;
 use crate::proto::liteserver as pb;
 use crate::registry::types::{VersionStatus, WorkerStatus};
-use crate::registry::ModelRegistry;
 use crate::request_context::RequestContext;
-use crate::worker::WorkerManager;
+use bytes::Bytes;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 pub use pb::admin_server::{Admin, AdminServer};
 
 pub struct GrpcAdminService {
-    registry: Arc<ModelRegistry>,
-    worker_manager: Arc<WorkerManager>,
-    callback_runner: Arc<CallbackRunner>,
-    config: Arc<Config>,
-    /// File-watcher enable flag; load/unload recompute it (mirrors HTTP).
-    has_hot_reload: Arc<AtomicBool>,
+    /// Shared state with the HTTP handlers (registry / worker_manager /
+    /// config / repo_path / ...). The gRPC server builds the same AppState
+    /// as the HTTP path (grpc/mod.rs), so the repository RPCs reuse the
+    /// HTTP handlers' shared cores directly (G3/E5/F3 parity — no dual
+    /// implementation drift).
+    app_state: Arc<AppState>,
     /// D27 审计的 key 指纹来源（配置在 build 期解析，fail-fast 已在启动路径）。
+    /// The AppState built by the gRPC path carries the default instance —
+    /// audits use THIS resolved one instead.
     access_control: Arc<AccessControl>,
 }
 
 impl GrpcAdminService {
-    pub fn new(
-        registry: Arc<ModelRegistry>,
-        worker_manager: Arc<WorkerManager>,
-        callback_runner: Arc<CallbackRunner>,
-        config: Arc<Config>,
-        has_hot_reload: Arc<AtomicBool>,
-        access_control: Arc<AccessControl>,
-    ) -> Self {
+    pub fn new(app_state: Arc<AppState>, access_control: Arc<AccessControl>) -> Self {
         Self {
-            registry,
-            worker_manager,
-            callback_runner,
-            config,
-            has_hot_reload,
+            app_state,
             access_control,
         }
     }
@@ -91,12 +83,14 @@ fn version_status_str(s: &VersionStatus) -> &'static str {
 
 #[tonic::async_trait]
 impl Admin for GrpcAdminService {
+    type DownloadModelStream = ReceiverStream<Result<pb::DownloadModelChunk, Status>>;
+
     async fn get_info(
         &self,
         _req: Request<pb::GetInfoRequest>,
     ) -> Result<Response<pb::GetInfoResponse>, Status> {
         let loaded_models = self
-            .registry
+            .app_state.registry
             .list_loaded()
             .into_iter()
             .map(|(n, v, _)| format!("{}/{}", n, v))
@@ -113,7 +107,7 @@ impl Admin for GrpcAdminService {
         _req: Request<pb::ListModelsRequest>,
     ) -> Result<Response<pb::ListModelsResponse>, Status> {
         let models = self
-            .registry
+            .app_state.registry
             .list_loaded()
             .into_iter()
             .map(|(name, version, mv)| pb::ModelSummary {
@@ -133,11 +127,11 @@ impl Admin for GrpcAdminService {
     ) -> Result<Response<pb::ListVersionsResponse>, Status> {
         let model_name = req.get_ref().model_name.clone();
         crate::validation::validate_identifier(&model_name).map_err(to_status)?;
-        let versions = self.registry.list_versions(&model_name);
+        let versions = self.app_state.registry.list_versions(&model_name);
         if versions.is_empty() {
             return Err(to_status(AppError::ModelNotFound(model_name)));
         }
-        let active = self.registry.get_active_version(&model_name);
+        let active = self.app_state.registry.get_active_version(&model_name);
         let versions_v: Vec<pb::VersionSummary> = versions
             .iter()
             .map(|mv| {
@@ -177,17 +171,17 @@ impl Admin for GrpcAdminService {
         let (version, ready) = match req.get_ref().version.as_deref() {
             Some(v) => {
                 crate::validation::validate_version(v).map_err(to_status)?;
-                (Some(v.to_string()), self.registry.is_ready(&model_name, Some(v)))
+                (Some(v.to_string()), self.app_state.registry.is_ready(&model_name, Some(v)))
             }
             None => {
-                let active = self.registry.get_active_version(&model_name);
+                let active = self.app_state.registry.get_active_version(&model_name);
                 let ready = active
                     .as_deref()
-                    .is_some_and(|v| self.registry.is_ready(&model_name, Some(v)));
+                    .is_some_and(|v| self.app_state.registry.is_ready(&model_name, Some(v)));
                 (active.clone(), ready)
             }
         };
-        let active_version = self.registry.get_active_version(&model_name);
+        let active_version = self.app_state.registry.get_active_version(&model_name);
         Ok(Response::new(pb::ModelReadyResponse {
             name: model_name,
             version,
@@ -211,9 +205,9 @@ impl Admin for GrpcAdminService {
                 v.to_string()
             }
             None => self
-                .registry
+                .app_state.registry
                 .routing_pick(&model_name)
-                .or_else(|| self.registry.get_active_version(&model_name))
+                .or_else(|| self.app_state.registry.get_active_version(&model_name))
                 .ok_or_else(|| {
                     to_status(AppError::ModelNotFound(format!(
                         "{} has no active version",
@@ -222,7 +216,7 @@ impl Admin for GrpcAdminService {
                 })?,
         };
         let mv = self
-            .registry
+            .app_state.registry
             .get(&model_name, Some(&resolved))
             .ok_or_else(|| {
                 to_status(AppError::ModelNotFound(format!(
@@ -232,7 +226,7 @@ impl Admin for GrpcAdminService {
             })?;
         let total = mv.workers.len();
         let outlier = self
-            .worker_manager
+            .app_state.worker_manager
             .inference_queue()
             .get_outlier_state(&model_name, &resolved);
         let (workers, healthy_workers) = match outlier {
@@ -285,27 +279,27 @@ impl Admin for GrpcAdminService {
 
         // Read config.yaml from the model repository (mirrors HTTP
         // load_model_handler); WorkerManager.load_model re-resolves model_dir.
-        let config_path = std::path::PathBuf::from(&self.config.model_repository.path)
+        let config_path = std::path::PathBuf::from(&self.app_state.config.model_repository.path)
             .join(&model_name)
             .join(&version)
             .join("config.yaml");
         let mut config = crate::config::load_model_config(&config_path).unwrap_or_default();
-        self.config.apply_model_defaults(&mut config);
+        self.app_state.config.apply_model_defaults(&mut config);
 
-        self.worker_manager
+        self.app_state.worker_manager
             .load_model(&model_name, &version, &config)
             .await
             .map_err(to_status)?;
 
         // File-watcher flag: enable if this model opts into hot reload.
         if config.hot_reload {
-            self.has_hot_reload.store(true, Ordering::Relaxed);
+            self.app_state.has_hot_reload.store(true, Ordering::Relaxed);
         }
 
         // Auto-activate if no active version (mirrors HTTP).
-        let prev_active = self.registry.get_active_version(&model_name);
+        let prev_active = self.app_state.registry.get_active_version(&model_name);
         if prev_active.is_none() {
-            self.registry
+            self.app_state.registry
                 .activate_version(&model_name, &version)
                 .map_err(to_status)?;
         }
@@ -335,7 +329,7 @@ impl Admin for GrpcAdminService {
                 v.to_string()
             }
             None => self
-                .registry
+                .app_state.registry
                 .get_active_version(&model_name)
                 .ok_or_else(|| {
                     to_status(AppError::ModelNotFound(format!(
@@ -345,7 +339,7 @@ impl Admin for GrpcAdminService {
                 })?,
         };
         let success = self
-            .worker_manager
+            .app_state.worker_manager
             .unload_model(&model_name, Some(&version))
             .await
             .map_err(to_status)?;
@@ -357,11 +351,11 @@ impl Admin for GrpcAdminService {
         }
         // Recompute the file-watcher flag (mirrors HTTP unload_model_impl).
         let any_hot_reload = self
-            .registry
+            .app_state.registry
             .list_loaded()
             .iter()
             .any(|(_, _, mv)| mv.config.hot_reload);
-        self.has_hot_reload.store(any_hot_reload, Ordering::Relaxed);
+        self.app_state.has_hot_reload.store(any_hot_reload, Ordering::Relaxed);
         self.audit(&cx, "unload", &model_name, Some(&version), "unloaded");
         Ok(Response::new(pb::UnloadModelResponse {
             success: true,
@@ -382,7 +376,7 @@ impl Admin for GrpcAdminService {
                 v.to_string()
             }
             None => self
-                .registry
+                .app_state.registry
                 .get_active_version(&model_name)
                 .ok_or_else(|| {
                     to_status(AppError::ModelNotFound(format!(
@@ -392,7 +386,7 @@ impl Admin for GrpcAdminService {
                 })?,
         };
         let success = self
-            .worker_manager
+            .app_state.worker_manager
             .reload_model(&model_name, Some(&version))
             .await
             .map_err(to_status)?;
@@ -419,9 +413,9 @@ impl Admin for GrpcAdminService {
         crate::validation::validate_identifier(&model_name).map_err(to_status)?;
         crate::validation::validate_version(&version).map_err(to_status)?;
 
-        let previous = self.registry.get_active_version(&model_name);
+        let previous = self.app_state.registry.get_active_version(&model_name);
         let success = self
-            .registry
+            .app_state.registry
             .activate_version(&model_name, &version)
             .map_err(to_status)?;
         if !success {
@@ -440,10 +434,10 @@ impl Admin for GrpcAdminService {
         // Explicit activate is a hard cutover (§4.3): target gets 100% weight.
         // Registry activate is pointer-only so internal re-activations don't
         // clobber a canary split.
-        self.registry
+        self.app_state.registry
             .set_weights(&model_name, &HashMap::from([(version.clone(), 100u32)]))
             .map_err(to_status)?;
-        for mv in self.registry.list_versions(&model_name) {
+        for mv in self.app_state.registry.list_versions(&model_name) {
             prometheus::set_version_weight(&model_name, &mv.version, mv.weight as f64);
         }
         if let Some(from) = &previous {
@@ -451,7 +445,7 @@ impl Admin for GrpcAdminService {
                 prometheus::record_version_switch(&model_name, from, &version);
             }
         }
-        self.callback_runner
+        self.app_state.callback_runner
             .on_model_activate(&ModelLifecycleContext {
                 model_name: model_name.clone(),
                 version: version.clone(),
@@ -513,14 +507,14 @@ impl Admin for GrpcAdminService {
                     "SetRouting: `canary_percent` must be 0..=100",
                 )));
             }
-            if self.registry.get(&model_name, Some(canary_version)).is_none() {
+            if self.app_state.registry.get(&model_name, Some(canary_version)).is_none() {
                 return Err(to_status(AppError::VersionNotFound(
                     model_name.clone(),
                     canary_version.to_string(),
                 )));
             }
             // Stable side = currently active version (must exist and differ).
-            let stable = self.registry.get_active_version(&model_name).ok_or_else(|| {
+            let stable = self.app_state.registry.get_active_version(&model_name).ok_or_else(|| {
                 super::err(Status::failed_precondition(format!(
                     "SetRouting: model `{}` has no active version to use as the stable side of the canary split",
                     model_name
@@ -539,15 +533,15 @@ impl Admin for GrpcAdminService {
 
         // Capture old weights for the audit before/after.
         let old: HashMap<String, u32> = self
-            .registry
+            .app_state.registry
             .list_versions(&model_name)
             .into_iter()
             .map(|mv| (mv.version, mv.weight))
             .collect();
-        self.registry
+        self.app_state.registry
             .set_weights(&model_name, &effective)
             .map_err(to_status)?;
-        for mv in self.registry.list_versions(&model_name) {
+        for mv in self.app_state.registry.list_versions(&model_name) {
             prometheus::set_version_weight(&model_name, &mv.version, mv.weight as f64);
         }
         self.audit(
@@ -572,7 +566,7 @@ impl Admin for GrpcAdminService {
         let target_versions: Vec<String> = match req.get_ref().version.as_deref() {
             Some(v) => {
                 crate::validation::validate_version(v).map_err(to_status)?;
-                if self.registry.get(&model_name, Some(v)).is_none() {
+                if self.app_state.registry.get(&model_name, Some(v)).is_none() {
                     return Err(to_status(AppError::VersionNotFound(
                         model_name,
                         v.to_string(),
@@ -581,7 +575,7 @@ impl Admin for GrpcAdminService {
                 vec![v.to_string()]
             }
             None => self
-                .registry
+                .app_state.registry
                 .list_versions(&model_name)
                 .into_iter()
                 .map(|mv| mv.version)
@@ -590,7 +584,7 @@ impl Admin for GrpcAdminService {
 
         let mut stats = Vec::with_capacity(target_versions.len());
         for version in target_versions {
-            let Some(mv) = self.registry.get(&model_name, Some(&version)) else {
+            let Some(mv) = self.app_state.registry.get(&model_name, Some(&version)) else {
                 continue;
             };
             // inference_count = Σ REQUESTS_TOTAL across status families.
@@ -611,7 +605,7 @@ impl Admin for GrpcAdminService {
                 prometheus::QUEUE_DEPTH.with_label_values(&[&model_name, &version]).get() as i64;
 
             let outlier = self
-                .worker_manager
+                .app_state.worker_manager
                 .inference_queue()
                 .get_outlier_state(&model_name, &version);
             let workers: Vec<pb::WorkerStats> = (0..mv.workers.len() as u32)
@@ -641,15 +635,434 @@ impl Admin for GrpcAdminService {
         }
         Ok(Response::new(pb::GetModelStatsResponse { stats }))
     }
+
+    // ===== Repository lifecycle (G3 + E5 + F3) =====
+    //
+    // These mirror the HTTP repository endpoints by reusing the shared
+    // cores extracted from the HTTP handlers (delete/scan logic in
+    // http/handlers/admin.rs, file logic in http/handlers/files.rs) — one
+    // implementation, no drift. Errors map through app_error_to_grpc_status
+    // like every other Admin RPC.
+
+    async fn delete_version(
+        &self,
+        req: Request<pb::DeleteVersionRequest>,
+    ) -> Result<Response<pb::DeleteVersionResponse>, Status> {
+        let r = req.into_inner();
+        crate::http::handlers::admin::delete_version_impl(
+            &self.app_state,
+            &self.access_control,
+            None,
+            Protocol::Grpc,
+            &r.model_name,
+            &r.version,
+            r.force,
+        )
+        .await
+        .map_err(to_status)?;
+        Ok(Response::new(pb::DeleteVersionResponse {
+            success: true,
+            message: format!("Model {} version {} deleted", r.model_name, r.version),
+        }))
+    }
+
+    async fn delete_model(
+        &self,
+        req: Request<pb::DeleteModelRequest>,
+    ) -> Result<Response<pb::DeleteModelResponse>, Status> {
+        let r = req.into_inner();
+        crate::http::handlers::admin::delete_model_core(
+            &self.app_state,
+            &self.access_control,
+            None,
+            Protocol::Grpc,
+            &r.model_name,
+            r.force,
+        )
+        .await
+        .map_err(to_status)?;
+        Ok(Response::new(pb::DeleteModelResponse {
+            success: true,
+            message: format!("Model {} deleted", r.model_name),
+        }))
+    }
+
+    async fn delete_versions(
+        &self,
+        req: Request<pb::DeleteVersionsRequest>,
+    ) -> Result<Response<pb::DeleteVersionsResponse>, Status> {
+        let r = req.into_inner();
+        // keep == 0 means unset (wire 定稿: the HTTP keep=0 validation
+        // cannot apply to a proto uint32, where absence is 0).
+        let keep = r.keep.filter(|k| *k > 0).map(|k| k as usize);
+        let versions = if r.versions.is_empty() {
+            None
+        } else {
+            Some(r.versions)
+        };
+        let (deleted, failed) = crate::http::handlers::admin::delete_versions_core(
+            &self.app_state,
+            &self.access_control,
+            None,
+            Protocol::Grpc,
+            &r.model_name,
+            keep,
+            versions,
+            r.force,
+        )
+        .await
+        .map_err(to_status)?;
+        Ok(Response::new(pb::DeleteVersionsResponse {
+            deleted,
+            failed: failed
+                .into_iter()
+                .map(|(version, error)| pb::DeleteFailure { version, error })
+                .collect(),
+        }))
+    }
+
+    async fn repository_drift(
+        &self,
+        req: Request<pb::RepositoryDriftRequest>,
+    ) -> Result<Response<pb::RepositoryDriftResponse>, Status> {
+        let r = req.into_inner();
+        if let Some(m) = &r.model_name {
+            crate::validation::validate_identifier(m).map_err(to_status)?;
+        }
+        let (missing, unconfigured) = crate::http::handlers::admin::repository_drift_core(
+            &self.app_state,
+            r.model_name.as_deref(),
+        )
+        .await
+        .map_err(to_status)?;
+        Ok(Response::new(pb::RepositoryDriftResponse {
+            configured_missing: missing
+                .into_iter()
+                .map(|e| pb::DriftMissingEntry {
+                    model: e.model,
+                    version: e.version,
+                })
+                .collect(),
+            on_disk_unconfigured: unconfigured
+                .into_iter()
+                .map(|e| pb::DriftDiskEntry {
+                    model: e.model,
+                    version: e.version,
+                    size_bytes: e.size_bytes,
+                    ensemble_referenced: e.ensemble_referenced,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn upload_model(
+        &self,
+        req: Request<tonic::Streaming<pb::UploadModelRequest>>,
+    ) -> Result<Response<pb::UploadModelResponse>, Status> {
+        let mut stream = req.into_inner();
+
+        // Loose-field wire (定稿): the FIRST message carries the metadata;
+        // every subsequent message carries file content.
+        let first = stream
+            .message()
+            .await
+            .map_err(|e| to_status(AppError::Transport(format!("read upload stream: {}", e))))?
+            .ok_or_else(|| to_status(AppError::Validation("empty upload stream".to_string())))?;
+        let model_name = first.model_name.clone();
+        crate::validation::validate_identifier(&model_name).map_err(to_status)?;
+        let url_version = first.version.clone();
+        if let Some(v) = &url_version {
+            crate::validation::validate_version(v).map_err(to_status)?;
+        }
+        // Optional bool: absent → true, aligning with the HTTP ?load=
+        // default.
+        let load = first.load.unwrap_or(true);
+
+        // H3: stage everything first, commit atomically at the end — same
+        // pipeline as the HTTP multipart handlers (finalize_upload below).
+        let staging = self
+            .app_state
+            .repo_path
+            .join(format!(".tmp-upload-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&staging)
+            .await
+            .map_err(|e| to_status(AppError::Io(e)))?;
+        let _staging_guard = crate::http::handlers::files::StagingGuard(staging.clone());
+
+        let mut staged: Vec<crate::http::handlers::files::StagedUploadFile> = Vec::new();
+        let mut total_bytes: u64 = 0;
+        // Chunked writes: consecutive messages sharing a file_name append
+        // to one staged file; re-using a name after switching away is
+        // rejected (interleaved chunks would silently corrupt the file).
+        let mut open: Option<(String, tokio::fs::File)> = None;
+        let mut closed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut lma_count = 0usize;
+
+        while let Some(msg) = stream
+            .message()
+            .await
+            .map_err(|e| to_status(AppError::Transport(format!("read upload stream: {}", e))))?
+        {
+            let file_name = msg.file_name.clone();
+            if file_name.is_empty() {
+                return Err(to_status(AppError::Validation(
+                    "file message lacks a file_name".to_string(),
+                )));
+            }
+            // B1: strip path components (same rule as the HTTP branch) — a
+            // `../` or absolute name would otherwise escape the staging dir.
+            let safe_name = std::path::Path::new(&file_name)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            if safe_name.is_empty() || safe_name.starts_with('.') {
+                return Err(to_status(AppError::Validation(format!(
+                    "invalid file name: {}",
+                    file_name
+                ))));
+            }
+            let is_lma = safe_name.ends_with(".lma");
+            if url_version.is_none() && !is_lma {
+                return Err(to_status(AppError::InvalidRequestBody(format!(
+                    "model-level upload accepts a single .lma artifact (got '{}'); \
+                     raw files need the versioned endpoint \
+                     /v2/repository/models/{}/versions/{{v}}/upload",
+                    file_name, model_name
+                ))));
+            }
+
+            total_bytes = total_bytes.saturating_add(msg.data.len() as u64);
+            // F11b: cumulative upload size cap.
+            if let Some(max) = self.app_state.config.server.max_upload_bytes {
+                if total_bytes > max {
+                    return Err(to_status(AppError::PayloadTooLarge {
+                        max_size: max as usize,
+                        actual_size: Some(total_bytes),
+                    }));
+                }
+            }
+
+            // Open (or keep) the staged file for this name.
+            match &open {
+                Some((name, _)) if name == &safe_name => {}
+                _ => {
+                    // Switching files: the reassignment below closes the
+                    // previous staged file.
+                    if closed.contains(&safe_name) {
+                        return Err(to_status(AppError::Validation(format!(
+                            "file '{}' re-appears after another file — chunks must be contiguous",
+                            file_name
+                        ))));
+                    }
+                    // Wire 定稿: at most one .lma per UploadModel — counted
+                    // per FILE, so chunked .lma streams are not rejected.
+                    if is_lma {
+                        lma_count += 1;
+                        if lma_count > 1 {
+                            return Err(to_status(AppError::Validation(
+                                "UploadModel accepts at most one .lma artifact".to_string(),
+                            )));
+                        }
+                    }
+                    let dest = if is_lma {
+                        staging.join(&safe_name)
+                    } else {
+                        let version_dir = staging.join(url_version.as_deref().unwrap_or_default());
+                        tokio::fs::create_dir_all(&version_dir)
+                            .await
+                            .map_err(|e| to_status(AppError::Io(e)))?;
+                        version_dir.join(&safe_name)
+                    };
+                    let file = tokio::fs::File::create(&dest)
+                        .await
+                        .map_err(|e| to_status(AppError::Io(e)))?;
+                    open = Some((safe_name.clone(), file));
+                    closed.insert(safe_name.clone());
+                    staged.push(crate::http::handlers::files::StagedUploadFile {
+                        name: safe_name,
+                        path: dest,
+                        is_lma,
+                    });
+                }
+            }
+            if let Some((_, file)) = open.as_mut() {
+                tokio::io::AsyncWriteExt::write_all(file, &msg.data)
+                    .await
+                    .map_err(|e| to_status(AppError::Io(e)))?;
+            }
+        }
+
+        if staged.is_empty() {
+            return Err(to_status(AppError::Validation("no files uploaded".to_string())));
+        }
+
+        let outcome = crate::http::handlers::files::finalize_upload(
+            &self.app_state,
+            &model_name,
+            &staging,
+            &staged,
+            url_version.as_deref(),
+            load,
+        )
+        .await
+        .map_err(to_status)?;
+
+        self.audit(
+            &None,
+            "upload",
+            &model_name,
+            Some(&outcome.version),
+            if url_version.is_some() {
+                "gRPC versioned"
+            } else {
+                "model-level"
+            },
+        );
+
+        Ok(Response::new(pb::UploadModelResponse {
+            success: true,
+            model: model_name,
+            version: outcome.version,
+            files: outcome.files,
+            loaded: load && outcome.load_error.is_none(),
+            load_error: outcome.load_error,
+        }))
+    }
+
+    async fn download_model(
+        &self,
+        req: Request<pb::DownloadModelRequest>,
+    ) -> Result<Response<Self::DownloadModelStream>, Status> {
+        let r = req.into_inner();
+        crate::validation::validate_identifier(&r.model_name).map_err(to_status)?;
+        // Bare → active version (F9, same semantics as bare ready).
+        let version = match r.version {
+            Some(v) => {
+                crate::validation::validate_version(&v).map_err(to_status)?;
+                v
+            }
+            None => self
+                .app_state
+                .registry
+                .get_active_version(&r.model_name)
+                .ok_or_else(|| {
+                    to_status(AppError::ModelNotFound(format!(
+                        "{} has no active version; pass version explicitly",
+                        r.model_name
+                    )))
+                })?,
+        };
+
+        let src = crate::http::handlers::files::resolve_download_source(
+            &self.app_state,
+            &r.model_name,
+            &version,
+            r.file.as_deref(),
+        )
+        .await
+        .map_err(to_status)?;
+
+        self.audit(
+            &None,
+            "download",
+            &r.model_name,
+            Some(&version),
+            &src.audit_detail,
+        );
+
+        // Stream the file in 1 MiB chunks (wire 定稿) with a terminal frame
+        // carrying sha256 + size (DecoupledResponse idiom). The source — and
+        // its pack temp-dir cleanup guard — lives until the spawned task
+        // ends (stream done or client gone).
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<pb::DownloadModelChunk, Status>>(1);
+        tokio::spawn(async move {
+            let mut file = match tokio::fs::File::open(&src.path).await {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!("DownloadModel: open {} failed: {}", src.path.display(), e);
+                    return;
+                }
+            };
+            let mut hasher = Sha256::new();
+            let mut sent: u64 = 0;
+            let mut buf = vec![0u8; 1024 * 1024];
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut file, &mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        hasher.update(&buf[..n]);
+                        sent += n as u64;
+                        let chunk = pb::DownloadModelChunk {
+                            data: Bytes::copy_from_slice(&buf[..n]),
+                            is_final: false,
+                            sha256: String::new(),
+                            size: 0,
+                        };
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            return; // client gone — stream ends here
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "DownloadModel: read {} failed: {}",
+                            src.path.display(),
+                            e
+                        );
+                        return; // no terminal frame — client detects truncation
+                    }
+                }
+            }
+            let _ = tx
+                .send(Ok(pb::DownloadModelChunk {
+                    data: Bytes::new(),
+                    is_final: true,
+                    sha256: format!("{:x}", hasher.finalize()),
+                    size: sent,
+                }))
+                .await;
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn list_files(
+        &self,
+        req: Request<pb::ListFilesRequest>,
+    ) -> Result<Response<pb::ListFilesResponse>, Status> {
+        let r = req.into_inner();
+        let entries = crate::http::handlers::files::list_files_impl(
+            &self.app_state,
+            &r.model_name,
+            &r.version,
+        )
+        .await
+        .map_err(to_status)?;
+        Ok(Response::new(pb::ListFilesResponse {
+            model: r.model_name,
+            version: r.version,
+            files: entries
+                .into_iter()
+                .map(|f| pb::FileEntry {
+                    name: f.name,
+                    size: f.size,
+                    modified: f.modified,
+                    is_dir: f.is_dir,
+                })
+                .collect(),
+        }))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::callback::CallbackRunner;
-    use crate::config::ModelConfig;
+    use crate::config::{Config, ModelConfig};
     use crate::inference_queue::InferenceQueue;
     use crate::registry::types::ModelType;
+    use crate::registry::ModelRegistry;
+    use crate::worker::WorkerManager;
+    use std::sync::atomic::AtomicBool;
 
     /// A two-version registry (v1, v2) both Ready; v1 active. For outlier-backed
     /// ModelHealth tests pass `with_queue=true` to register a queue.
@@ -671,22 +1084,62 @@ mod tests {
     }
 
     fn build_admin_service(registry: Arc<ModelRegistry>) -> GrpcAdminService {
+        build_admin_service_with_repo(registry, std::env::temp_dir())
+    }
+
+    /// Same as build_admin_service but with an explicit repo path — the
+    /// repository RPC tests operate on real on-disk model dirs.
+    fn build_admin_service_with_repo(
+        registry: Arc<ModelRegistry>,
+        repo_path: std::path::PathBuf,
+    ) -> GrpcAdminService {
         let queue = Arc::new(InferenceQueue::new());
         let wm = Arc::new(WorkerManager::new(
             registry.clone(),
-            std::env::temp_dir(),
-            queue,
+            repo_path.clone(),
+            queue.clone(),
             "error".to_string(),
             Arc::new(CallbackRunner::new()),
         ));
-        GrpcAdminService::new(
+        let app_state = Arc::new(AppState::new(
             registry,
             wm,
+            queue,
+            Config::default(),
+            repo_path,
             Arc::new(CallbackRunner::new()),
-            Arc::new(Config::default()),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AccessControl::default()),
-        )
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+        ));
+        GrpcAdminService::new(app_state, Arc::new(AccessControl::default()))
+    }
+
+    /// build_admin_service with a caller-provided config (drift tests need
+    /// a configured orchestration).
+    fn build_admin_service_with_config(
+        registry: Arc<ModelRegistry>,
+        repo_path: std::path::PathBuf,
+        config: Config,
+    ) -> GrpcAdminService {
+        let queue = Arc::new(InferenceQueue::new());
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            repo_path.clone(),
+            queue.clone(),
+            "error".to_string(),
+            Arc::new(CallbackRunner::new()),
+        ));
+        let app_state = Arc::new(AppState::new(
+            registry,
+            wm,
+            queue,
+            config,
+            repo_path,
+            Arc::new(CallbackRunner::new()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+        ));
+        GrpcAdminService::new(app_state, Arc::new(AccessControl::default()))
     }
 
     // ===== GetInfo / ListModels / ListVersions =====
@@ -1089,6 +1542,21 @@ mod tests {
         tokio::sync::oneshot::Sender<()>,
         tokio::task::JoinHandle<Result<(), AppError>>,
     ) {
+        spawn_admin_grpc_server_with_repo(registry, std::env::temp_dir(), Config::default()).await
+    }
+
+    /// E2E harness for the repository RPCs: real gRPC transport against a
+    /// repo of the caller's choice (the server's AppState takes its
+    /// repo_path from config.model_repository.path).
+    async fn spawn_admin_grpc_server_with_repo(
+        registry: Arc<ModelRegistry>,
+        repo_path: std::path::PathBuf,
+        config: Config,
+    ) -> (
+        u16,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), AppError>>,
+    ) {
         // Ephemeral TCP port (tiny TOCTOU race, fails clearly rather than hangs).
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1097,7 +1565,7 @@ mod tests {
         let queue = Arc::new(InferenceQueue::new());
         let wm = Arc::new(WorkerManager::new(
             registry.clone(),
-            std::env::temp_dir(),
+            repo_path,
             queue,
             "error".to_string(),
             Arc::new(CallbackRunner::new()),
@@ -1117,7 +1585,7 @@ mod tests {
                 grpc_config: crate::config::GrpcConfig::default(),
                 rate_limiter: Arc::new(crate::rate_limit::RateLimiter::default()),
                 tls: None,
-                config: Config::default(),
+                config,
                 has_hot_reload: Arc::new(AtomicBool::new(false)),
             },
             shutdown_rx,
@@ -1148,5 +1616,672 @@ mod tests {
         assert!(resp.loaded_models.iter().any(|m| m == "e2e_m/2"));
 
         let _ = shutdown_tx.send(());
+    }
+
+    // ===== Repository RPCs (G3/E5/F3, model-upload-and-retire plan) =====
+    //
+    // Parity tests aligned with the HTTP cases (plan 3.5): force semantics,
+    // keep sorting, partial-failure detail, drift structure, the three file
+    // RPCs, DownloadModel stream integrity (sha256 terminal frame) and
+    // DeleteVersion linked-artifact cleanup (G5 alignment, D4).
+
+    fn unique_repo(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "lite-server-grpc-repo-{}-{}-{}",
+            tag,
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn config_with_repo(repo: &std::path::Path) -> Config {
+        let mut config = Config::default();
+        config.model_repository.path = repo.display().to_string();
+        config
+    }
+
+    async fn make_disk_version(repo: &std::path::Path, model: &str, version: &str) {
+        let dir = repo.join(model).join(version);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("model.py"), "def predict(x): return x")
+            .await
+            .unwrap();
+    }
+
+    async fn connect_admin(port: u16) -> pb::admin_client::AdminClient<tonic::transport::Channel> {
+        let channel = tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{}", port))
+            .unwrap()
+            .connect()
+            .await
+            .expect("must connect to the Admin gRPC server");
+        pb::admin_client::AdminClient::new(channel)
+    }
+
+    // ===== DeleteVersion (G3, aligned with the HTTP G1/E3 cases) =====
+
+    #[tokio::test]
+    async fn delete_version_removes_disk_version_and_is_idempotent() {
+        let repo = unique_repo("delv");
+        make_disk_version(&repo, "mymodel", "1").await;
+        let svc = build_admin_service_with_repo(Arc::new(ModelRegistry::new()), repo.clone());
+
+        let resp = svc
+            .delete_version(Request::new(pb::DeleteVersionRequest {
+                model_name: "mymodel".to_string(),
+                version: "1".to_string(),
+                force: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success);
+        assert!(!repo.join("mymodel").join("1").exists(), "version dir must be removed");
+
+        // Idempotent (HTTP parity): deleting a nonexistent version succeeds.
+        let resp2 = svc
+            .delete_version(Request::new(pb::DeleteVersionRequest {
+                model_name: "mymodel".to_string(),
+                version: "1".to_string(),
+                force: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp2.success);
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn delete_version_active_without_force_is_failed_precondition() {
+        let repo = unique_repo("delv-active");
+        make_disk_version(&repo, "mymodel", "1").await;
+        let reg = two_version_registry("mymodel"); // v1 active, v2 ready
+        let svc = build_admin_service_with_repo(reg, repo.clone());
+
+        let err = svc
+            .delete_version(Request::new(pb::DeleteVersionRequest {
+                model_name: "mymodel".to_string(),
+                version: "1".to_string(),
+                force: false,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+        assert!(
+            repo.join("mymodel").join("1").exists(),
+            "refused delete must leave the version dir intact"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn delete_version_force_deletes_active_version() {
+        let repo = unique_repo("delv-force");
+        make_disk_version(&repo, "mymodel", "1").await;
+        let reg = two_version_registry("mymodel");
+        let svc = build_admin_service_with_repo(reg, repo.clone());
+
+        let resp = svc
+            .delete_version(Request::new(pb::DeleteVersionRequest {
+                model_name: "mymodel".to_string(),
+                version: "1".to_string(),
+                force: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success);
+        assert!(!repo.join("mymodel").join("1").exists());
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn delete_version_cleans_linked_artifacts_g5() {
+        let repo = unique_repo("delv-g5");
+        make_disk_version(&repo, "mymodel", "1").await;
+        let root_artifact = repo.join("mymodel_v1.lma");
+        tokio::fs::write(&root_artifact, b"artifact").await.unwrap();
+        let artifacts_dir = repo.join(".artifacts");
+        tokio::fs::create_dir_all(&artifacts_dir).await.unwrap();
+        let copy = artifacts_dir.join("mymodel_v1.lma");
+        tokio::fs::write(&copy, b"artifact").await.unwrap();
+
+        let svc = build_admin_service_with_repo(Arc::new(ModelRegistry::new()), repo.clone());
+        svc.delete_version(Request::new(pb::DeleteVersionRequest {
+            model_name: "mymodel".to_string(),
+            version: "1".to_string(),
+            force: false,
+        }))
+        .await
+        .unwrap();
+
+        assert!(!root_artifact.exists(), "root .lma must be removed (G5)");
+        assert!(!copy.exists(), ".artifacts copy must be removed (G5)");
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    // ===== DeleteVersions (E2 parity) =====
+
+    #[tokio::test]
+    async fn delete_versions_keep_retains_highest() {
+        let repo = unique_repo("delvs-keep");
+        for v in ["1", "2", "3"] {
+            make_disk_version(&repo, "mymodel", v).await;
+        }
+        let svc = build_admin_service_with_repo(Arc::new(ModelRegistry::new()), repo.clone());
+
+        let resp = svc
+            .delete_versions(Request::new(pb::DeleteVersionsRequest {
+                model_name: "mymodel".to_string(),
+                keep: Some(2),
+                versions: vec![],
+                force: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.deleted, vec!["1".to_string()], "lowest version deleted");
+        assert!(resp.failed.is_empty());
+        assert!(!repo.join("mymodel").join("1").exists());
+        assert!(repo.join("mymodel").join("2").exists());
+        assert!(repo.join("mymodel").join("3").exists());
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn delete_versions_partial_failure_reports_active_without_force() {
+        let repo = unique_repo("delvs-partial");
+        make_disk_version(&repo, "mymodel", "1").await;
+        make_disk_version(&repo, "mymodel", "2").await;
+        let reg = two_version_registry("mymodel"); // v1 active
+        let svc = build_admin_service_with_repo(reg, repo.clone());
+
+        let resp = svc
+            .delete_versions(Request::new(pb::DeleteVersionsRequest {
+                model_name: "mymodel".to_string(),
+                keep: None,
+                versions: vec!["1".to_string(), "2".to_string()],
+                force: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.deleted, vec!["2".to_string()]);
+        assert_eq!(resp.failed.len(), 1, "active v1 without force fails individually");
+        assert_eq!(resp.failed[0].version, "1");
+        assert!(!resp.failed[0].error.is_empty());
+        assert!(repo.join("mymodel").join("1").exists());
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn delete_versions_all_failed_is_internal() {
+        let repo = unique_repo("delvs-allfail");
+        let reg = two_version_registry("mymodel");
+        let svc = build_admin_service_with_repo(reg, repo.clone());
+
+        let err = svc
+            .delete_versions(Request::new(pb::DeleteVersionsRequest {
+                model_name: "mymodel".to_string(),
+                keep: None,
+                versions: vec!["1".to_string()],
+                force: false,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal, "{err}");
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    // ===== DeleteModel (E1 parity) =====
+
+    #[tokio::test]
+    async fn delete_model_removes_dir_and_all_linked_artifacts() {
+        let repo = unique_repo("delm");
+        make_disk_version(&repo, "mymodel", "1").await;
+        make_disk_version(&repo, "mymodel", "2").await;
+        let root_artifact = repo.join("mymodel_v1.lma");
+        tokio::fs::write(&root_artifact, b"artifact").await.unwrap();
+        let artifacts_dir = repo.join(".artifacts");
+        tokio::fs::create_dir_all(&artifacts_dir).await.unwrap();
+        let copy = artifacts_dir.join("mymodel_v1.lma");
+        tokio::fs::write(&copy, b"artifact").await.unwrap();
+
+        let svc = build_admin_service_with_repo(Arc::new(ModelRegistry::new()), repo.clone());
+        let resp = svc
+            .delete_model(Request::new(pb::DeleteModelRequest {
+                model_name: "mymodel".to_string(),
+                force: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success);
+        assert!(!repo.join("mymodel").exists(), "whole model dir must be removed");
+        assert!(!root_artifact.exists(), "root .lma must be removed (G5)");
+        assert!(!copy.exists(), ".artifacts copy must be removed (G5)");
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn delete_model_with_active_requires_force() {
+        let repo = unique_repo("delm-active");
+        make_disk_version(&repo, "mymodel", "1").await;
+        let reg = two_version_registry("mymodel");
+        let svc = build_admin_service_with_repo(reg, repo.clone());
+
+        let err = svc
+            .delete_model(Request::new(pb::DeleteModelRequest {
+                model_name: "mymodel".to_string(),
+                force: false,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+        assert!(repo.join("mymodel").exists());
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    // ===== RepositoryDrift (E4 parity) =====
+
+    fn strategy(name: &str, versions_to_load: &[&str]) -> crate::config::ModelStrategyConfig {
+        crate::config::ModelStrategyConfig {
+            name: name.to_string(),
+            load_policy: "explicit".to_string(),
+            versions_to_load: versions_to_load.iter().map(|v| v.to_string()).collect(),
+            default_version: None,
+            max_loaded_versions: None,
+            weights: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_drift_reports_missing_and_unconfigured_with_size() {
+        let repo = unique_repo("drift");
+        make_disk_version(&repo, "mymodel", "2").await;
+        tokio::fs::write(repo.join("mymodel").join("2").join("model.py"), "payload")
+            .await
+            .unwrap();
+
+        let mut config = config_with_repo(&repo);
+        config.orchestration.load_models = vec!["mymodel".to_string()];
+        config.orchestration.models = vec![strategy("mymodel", &["1"])];
+        let svc = build_admin_service_with_config(
+            Arc::new(ModelRegistry::new()),
+            repo.clone(),
+            config,
+        );
+
+        let resp = svc
+            .repository_drift(Request::new(pb::RepositoryDriftRequest { model_name: None }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.configured_missing.len(), 1);
+        assert_eq!(resp.configured_missing[0].model, "mymodel");
+        assert_eq!(resp.configured_missing[0].version, "1");
+        assert_eq!(resp.on_disk_unconfigured.len(), 1);
+        assert_eq!(resp.on_disk_unconfigured[0].version, "2");
+        assert!(resp.on_disk_unconfigured[0].size_bytes > 0);
+        assert!(!resp.on_disk_unconfigured[0].ensemble_referenced);
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn repository_drift_model_filter_limits_scope() {
+        let repo = unique_repo("drift-filter");
+        make_disk_version(&repo, "model_a", "1").await;
+        make_disk_version(&repo, "model_b", "1").await;
+        let svc = build_admin_service_with_repo(Arc::new(ModelRegistry::new()), repo.clone());
+
+        let resp = svc
+            .repository_drift(Request::new(pb::RepositoryDriftRequest {
+                model_name: Some("model_a".to_string()),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.on_disk_unconfigured.len(), 1);
+        assert_eq!(resp.on_disk_unconfigured[0].model, "model_a");
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    // ===== UploadModel / DownloadModel / ListFiles (F3, wire 定稿) =====
+
+    #[tokio::test]
+    async fn upload_list_download_round_trip_over_real_transport() {
+        let repo = unique_repo("e2e-files");
+        let (port, shutdown_tx, _handle) = spawn_admin_grpc_server_with_repo(
+            Arc::new(ModelRegistry::new()),
+            repo.clone(),
+            config_with_repo(&repo),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut client = connect_admin(port).await;
+
+        // Chunked raw upload: model.py split across two messages sharing one
+        // file_name (loose-field wire: metadata on the first message only).
+        let content = b"def predict(x):\n    return x\n";
+        let split = 10;
+        let resp = client
+            .upload_model(tokio_stream::iter(vec![
+                pb::UploadModelRequest {
+                    model_name: "mymodel".to_string(),
+                    version: Some("1".to_string()),
+                    load: Some(false),
+                    file_name: String::new(),
+                    data: Bytes::new(),
+                },
+                pb::UploadModelRequest {
+                    model_name: String::new(),
+                    version: None,
+                    load: None,
+                    file_name: "model.py".to_string(),
+                    data: Bytes::copy_from_slice(&content[..split]),
+                },
+                pb::UploadModelRequest {
+                    model_name: String::new(),
+                    version: None,
+                    load: None,
+                    file_name: "model.py".to_string(),
+                    data: Bytes::copy_from_slice(&content[split..]),
+                },
+            ]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success);
+        assert_eq!(resp.model, "mymodel");
+        assert_eq!(resp.version, "1");
+        assert_eq!(resp.files, vec!["model.py".to_string()]);
+        assert!(!resp.loaded, "load=false must not auto-load");
+        assert!(repo.join("mymodel").join("1").join("model.py").exists());
+
+        // ListFiles sees the uploaded file.
+        let list = client
+            .list_files(pb::ListFilesRequest {
+                model_name: "mymodel".to_string(),
+                version: "1".to_string(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(list.files.len(), 1);
+        assert_eq!(list.files[0].name, "model.py");
+        assert_eq!(list.files[0].size, content.len() as u64);
+        assert!(!list.files[0].is_dir);
+
+        // DownloadModel single file: reassemble the chunks and verify the
+        // terminal frame (sha256 + size, DecoupledResponse idiom).
+        let mut stream = client
+            .download_model(pb::DownloadModelRequest {
+                model_name: "mymodel".to_string(),
+                version: Some("1".to_string()),
+                file: Some("model.py".to_string()),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let mut assembled = Vec::new();
+        let mut terminal: Option<pb::DownloadModelChunk> = None;
+        while let Some(chunk) = stream.message().await.unwrap() {
+            if chunk.is_final {
+                terminal = Some(chunk);
+            } else {
+                assembled.extend_from_slice(&chunk.data);
+            }
+        }
+        assert_eq!(assembled, content, "streamed bytes must match the upload");
+        let term = terminal.expect("the stream must end with a terminal frame");
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+        assert_eq!(term.sha256, format!("{:x}", hasher.finalize()));
+        assert_eq!(term.size, content.len() as u64);
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn download_model_serves_original_artifact_without_repack() {
+        let repo = unique_repo("e2e-artifact");
+        make_disk_version(&repo, "mymodel", "1").await;
+        // F10b passthrough: a retained artifact is served byte-identical
+        // (no python pack involved).
+        let artifact_bytes = b"FAKE-ORIGINAL-ARTIFACT-BYTES";
+        tokio::fs::write(repo.join("mymodel_v1.lma"), artifact_bytes)
+            .await
+            .unwrap();
+        let (port, shutdown_tx, _handle) = spawn_admin_grpc_server_with_repo(
+            Arc::new(ModelRegistry::new()),
+            repo.clone(),
+            config_with_repo(&repo),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut client = connect_admin(port).await;
+
+        let mut stream = client
+            .download_model(pb::DownloadModelRequest {
+                model_name: "mymodel".to_string(),
+                version: Some("1".to_string()),
+                file: None,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let mut assembled = Vec::new();
+        let mut terminal: Option<pb::DownloadModelChunk> = None;
+        while let Some(chunk) = stream.message().await.unwrap() {
+            if chunk.is_final {
+                terminal = Some(chunk);
+            } else {
+                assembled.extend_from_slice(&chunk.data);
+            }
+        }
+        assert_eq!(
+            assembled, artifact_bytes,
+            "full download must serve the original artifact byte-identical"
+        );
+        let term = terminal.expect("terminal frame required");
+        assert_eq!(term.size, artifact_bytes.len() as u64);
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn download_model_bare_uses_active_version() {
+        let repo = unique_repo("e2e-bare");
+        make_disk_version(&repo, "mymodel", "1").await;
+        tokio::fs::write(repo.join("mymodel").join("1").join("model.py"), b"ACTIVE-ONE")
+            .await
+            .unwrap();
+        let reg = two_version_registry("mymodel"); // v1 active
+        let (port, shutdown_tx, _handle) =
+            spawn_admin_grpc_server_with_repo(reg, repo.clone(), config_with_repo(&repo)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut client = connect_admin(port).await;
+
+        let mut stream = client
+            .download_model(pb::DownloadModelRequest {
+                model_name: "mymodel".to_string(),
+                version: None,
+                file: Some("model.py".to_string()),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let mut assembled = Vec::new();
+        while let Some(chunk) = stream.message().await.unwrap() {
+            if !chunk.is_final {
+                assembled.extend_from_slice(&chunk.data);
+            }
+        }
+        assert_eq!(assembled, b"ACTIVE-ONE", "bare download must target the active version");
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn upload_model_model_level_rejects_raw_file_with_guidance() {
+        let repo = unique_repo("e2e-reject");
+        let (port, shutdown_tx, _handle) = spawn_admin_grpc_server_with_repo(
+            Arc::new(ModelRegistry::new()),
+            repo.clone(),
+            config_with_repo(&repo),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut client = connect_admin(port).await;
+
+        let err = client
+            .upload_model(tokio_stream::iter(vec![
+                pb::UploadModelRequest {
+                    model_name: "mymodel".to_string(),
+                    version: None,
+                    load: Some(false),
+                    file_name: String::new(),
+                    data: Bytes::new(),
+                },
+                pb::UploadModelRequest {
+                    model_name: String::new(),
+                    version: None,
+                    load: None,
+                    file_name: "model.py".to_string(),
+                    data: Bytes::from_static(b"x = 1"),
+                },
+            ]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("versioned endpoint"),
+            "the error must guide the client to the versioned endpoint: {err}"
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    #[tokio::test]
+    async fn upload_model_lma_uses_manifest_version_and_lands_flat() {
+        // Pack a real .lma with the python CLI (same helper pattern as the
+        // HTTP e2e tests), then model-level upload it: the version must
+        // come from the manifest (wire 定稿: version absent → F8).
+        let pack_tmp = unique_repo("pack-src");
+        let model_dir = pack_tmp.join("pkgmodel").join("2");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.py"), "def predict(x): return x").unwrap();
+        std::fs::write(model_dir.join("config.yaml"), "max_batch_size: 1\nbatch_timeout: 0.0\n")
+            .unwrap();
+        let output = std::process::Command::new(crate::python::resolve_python_interpreter())
+            .args([
+                "-m",
+                "lite_server.cli",
+                "pack",
+                pack_tmp.join("pkgmodel").to_str().unwrap(),
+                "--version",
+                "2",
+                "--output",
+                pack_tmp.to_str().unwrap(),
+            ])
+            .output()
+            .expect("failed to run lite-server pack");
+        assert!(
+            output.status.success(),
+            "pack failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let artifact = pack_tmp.join("pkgmodel_v2.lma");
+        let artifact_bytes = tokio::fs::read(&artifact).await.unwrap();
+
+        let repo = unique_repo("e2e-lma");
+        let (port, shutdown_tx, _handle) = spawn_admin_grpc_server_with_repo(
+            Arc::new(ModelRegistry::new()),
+            repo.clone(),
+            config_with_repo(&repo),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut client = connect_admin(port).await;
+
+        // Chunked .lma stream, model-level (no version on the first message).
+        let mid = artifact_bytes.len() / 2;
+        let resp = client
+            .upload_model(tokio_stream::iter(vec![
+                pb::UploadModelRequest {
+                    model_name: "pkgmodel".to_string(),
+                    version: None,
+                    load: Some(false),
+                    file_name: String::new(),
+                    data: Bytes::new(),
+                },
+                pb::UploadModelRequest {
+                    model_name: String::new(),
+                    version: None,
+                    load: None,
+                    file_name: "pkgmodel_v2.lma".to_string(),
+                    data: Bytes::copy_from_slice(&artifact_bytes[..mid]),
+                },
+                pb::UploadModelRequest {
+                    model_name: String::new(),
+                    version: None,
+                    load: None,
+                    file_name: "pkgmodel_v2.lma".to_string(),
+                    data: Bytes::copy_from_slice(&artifact_bytes[mid..]),
+                },
+            ]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success);
+        assert_eq!(resp.version, "2", "version must come from the manifest");
+        // Flat landing (batch-0 placement fix): no {name}/{v}/{v}/ nesting.
+        assert!(repo.join("pkgmodel").join("2").join("model.py").exists());
+        assert!(!repo.join("pkgmodel").join("2").join("2").exists());
+        // F10a retention feeds the F10b passthrough.
+        assert!(repo.join(".artifacts").join("pkgmodel_v2.lma").exists());
+
+        // Full download serves the retained artifact byte-identical
+        // (F10b passthrough — no repack).
+        let mut stream = client
+            .download_model(pb::DownloadModelRequest {
+                model_name: "pkgmodel".to_string(),
+                version: Some("2".to_string()),
+                file: None,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let mut assembled = Vec::new();
+        let mut terminal: Option<pb::DownloadModelChunk> = None;
+        while let Some(chunk) = stream.message().await.unwrap() {
+            if chunk.is_final {
+                terminal = Some(chunk);
+            } else {
+                assembled.extend_from_slice(&chunk.data);
+            }
+        }
+        assert_eq!(assembled, artifact_bytes, "download must serve the retained artifact");
+        let term = terminal.expect("terminal frame required");
+        assert_eq!(term.size, artifact_bytes.len() as u64);
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+        let _ = tokio::fs::remove_dir_all(&pack_tmp).await;
     }
 }

@@ -13,6 +13,9 @@ pub(super) fn http_status_to_grpc_code(http_status: u16) -> tonic::Code {
         403 => tonic::Code::PermissionDenied,
         404 => tonic::Code::NotFound,
         409 => tonic::Code::AlreadyExists,
+        // F11b: upload size cap — align with tonic's own oversized-decode
+        // behavior (ResourceExhausted) rather than falling through to Internal.
+        413 => tonic::Code::ResourceExhausted,
         429 => tonic::Code::ResourceExhausted,
         503 => tonic::Code::Unavailable,
         504 => tonic::Code::DeadlineExceeded,
@@ -31,25 +34,35 @@ pub(crate) fn app_error_to_grpc_status(e: &AppError) -> Status {
         let code = http_status_to_grpc_code(d.status_code);
         return Status::new(code, format!("[{}] {}", d.error_type, d.detail));
     }
+    // E3/E5: deleting an active version without force is a state-precondition
+    // failure (client must force or activate another version first), not a
+    // resource-existence conflict — map it independently of the generic 409
+    // (which stays AlreadyExists for worker-signalled conflicts).
+    if let AppError::Conflict(_) = e {
+        return Status::new(tonic::Code::FailedPrecondition, e.client_message());
+    }
     let http_status: u16 = match e {
         AppError::ModelNotFound(_) | AppError::VersionNotFound(_, _) | AppError::RouteNotFound => 404,
         AppError::ModelNotReady(_) | AppError::QueueFull(_) => 503,
         AppError::VersionAlreadyLoaded(_, _) => 409,
-        AppError::Conflict(_) => 409,
         AppError::InferenceTimeout(_) => 504,
         AppError::Validation(_)
         | AppError::Config(_)
         | AppError::Serialization(_)
         | AppError::InvalidRequestBody(_)
         | AppError::InvalidQueryParam(_) => 400,
-        AppError::FrameTooLarge => 413,
+        AppError::FrameTooLarge | AppError::PayloadTooLarge { .. } => 413,
         AppError::RateLimitExceeded { .. } => 429,
         AppError::StreamingCapacityExceeded(_) => 429,
         AppError::Unauthorized(_) => 401,
         AppError::MethodNotAllowed => 405,
         _ => 500,
     };
-    let status = Status::new(http_status_to_grpc_code(http_status), e.pub_error_message());
+    // client_message, not pub_error_message: the passthrough variants
+    // (InvalidRequestBody / InvalidQueryParam / Conflict / PayloadTooLarge /
+    // UnsupportedMediaType / Unauthorized) carry client-safe detail — the
+    // same message contract as the HTTP JSON `error` field.
+    let status = Status::new(http_status_to_grpc_code(http_status), e.client_message());
     // §4.0.9 收口:queue-full → Unavailable + retry-after(对齐 HTTP 侧
     // QueueFull 恒挂 Retry-After: 1,以及直连路径的 with_retry_after;
     // ensemble 子步骤 QueueFull 经此集中映射)。
@@ -121,6 +134,7 @@ pub(super) fn is_client_class(code: tonic::Code) -> bool {
     matches!(
         code,
         InvalidArgument
+            | FailedPrecondition
             | NotFound
             | OutOfRange
             | Unauthenticated

@@ -601,7 +601,7 @@ pub async fn start_grpc_server(
         } else {
             None
         },
-        app_state,
+        app_state: app_state.clone(),
         trusted: trusted.clone(),
     });
     let max_request_body_bytes = config.server.max_request_body_bytes;
@@ -663,13 +663,11 @@ pub async fn start_grpc_server(
     };
 
     // P6 Admin service (蓝图 §4.1): mirrors the HTTP admin REST handlers.
-    // Built from the same injected state as the inference service.
+    // Built from the same AppState as the inference service above — the
+    // repository RPCs (delete/drift/upload/download/list) reuse the HTTP
+    // handlers' shared cores through it.
     let admin_service = crate::grpc::admin::GrpcAdminService::new(
-        registry.clone(),
-        worker_manager.clone(),
-        callback_runner.clone(),
-        Arc::new(config),
-        has_hot_reload,
+        app_state.clone(),
         access_control.clone(),
     );
     let admin_server = crate::grpc::admin::AdminServer::new(admin_service);
