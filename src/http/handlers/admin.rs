@@ -628,8 +628,16 @@ pub(crate) async fn delete_version_impl(
 
     // H8: rewrite the registry snapshot so a later re-upload of the same
     // version cannot inherit the deleted version's stale strategy/pins.
+    // B3: the rewrite is post-commit housekeeping — its failure must not
+    // mask the delete that already happened (a 500 here would misreport
+    // reality, and E2 would list the deleted version under `failed`).
     if state.config.server.cache_registry {
-        crate::registry::cache::save(&state.registry, &state.repo_path).await?;
+        if let Err(e) = crate::registry::cache::save(&state.registry, &state.repo_path).await {
+            warn!(
+                model = %model_name, version = %version, error = %e,
+                "registry snapshot rewrite after delete failed"
+            );
+        }
     }
 
     crate::audit::control_plane(
@@ -1035,9 +1043,15 @@ pub async fn delete_model_handler(
     };
 
     // H8: same snapshot rewrite as the version-level delete — no ghost
-    // strategy/pins for the deleted model.
+    // strategy/pins for the deleted model. B3: best-effort housekeeping —
+    // a rewrite failure must not mask the committed delete.
     if state.config.server.cache_registry {
-        crate::registry::cache::save(&state.registry, &state.repo_path).await?;
+        if let Err(e) = crate::registry::cache::save(&state.registry, &state.repo_path).await {
+            warn!(
+                model = %model_name, error = %e,
+                "registry snapshot rewrite after model delete failed"
+            );
+        }
     }
 
     crate::audit::control_plane(
@@ -1873,5 +1887,82 @@ mod delete_versions_tests {
             Vec::<String>::new(),
             "keep >= version count must delete nothing"
         );
+    }
+}
+
+#[cfg(test)]
+mod delete_snapshot_failure_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::inference_queue::InferenceQueue;
+    use crate::registry::ModelRegistry;
+    use crate::worker::WorkerManager;
+    use std::sync::atomic::AtomicBool;
+
+    fn state_with_repo(repo_path: std::path::PathBuf, config: Config) -> Arc<AppState> {
+        let registry = Arc::new(ModelRegistry::new());
+        let inference_queue = Arc::new(InferenceQueue::new());
+        let callback_runner = Arc::new(crate::callback::CallbackRunner::new());
+        let worker_manager = Arc::new(WorkerManager::new(
+            registry.clone(),
+            repo_path.clone(),
+            inference_queue.clone(),
+            "warn".to_string(),
+            callback_runner.clone(),
+        ));
+        Arc::new(AppState::new(
+            registry,
+            worker_manager,
+            inference_queue,
+            config,
+            repo_path,
+            callback_runner,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+        ))
+    }
+
+    /// Audit B3 (error-path assumption): H8 rewrites the registry snapshot
+    /// AFTER the version directory has been removed, and the rewrite's
+    /// failure propagates through `?` — a successful delete is reported as
+    /// a 500. The response then misrepresents reality (in an E2 batch the
+    /// already-deleted version would even be listed under `failed`). The
+    /// snapshot write is best-effort housekeeping; it must not mask the
+    /// committed mutation.
+    #[tokio::test]
+    async fn test_delete_version_snapshot_failure_does_not_mask_delete() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-del-snapshot-{}",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        let version_dir = tmp.join("mymodel").join("1");
+        tokio::fs::create_dir_all(&version_dir).await.unwrap();
+        tokio::fs::write(version_dir.join("model.py"), "def predict(x): return x\n")
+            .await
+            .unwrap();
+
+        let mut config = Config::default();
+        config.server.cache_registry = true;
+        // Block the snapshot destination: rename(tmp, dest) onto an
+        // existing directory fails, so cache::save returns an error.
+        tokio::fs::create_dir_all(tmp.join(".lite-server-registry.json"))
+            .await
+            .unwrap();
+
+        let state = state_with_repo(tmp.clone(), config);
+        let cx = audit_tests::test_cx();
+        let result = delete_version_impl(&state, &cx, "mymodel", "1", false).await;
+
+        assert!(
+            !version_dir.exists(),
+            "the version directory must be deleted regardless"
+        );
+        assert!(
+            result.is_ok(),
+            "snapshot rewrite failure must not mask a successful delete: {result:?}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 }

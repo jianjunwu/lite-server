@@ -48,6 +48,10 @@ pub async fn upload_model_handler(
     let mut uploaded_files: Vec<String> = Vec::new();
     let mut total_bytes: u64 = 0;
     let mut has_raw = false;
+    // Staged .lma artifact file names — retained into .artifacts/ only
+    // after a successful commit (B2: a failed upload must leave no
+    // artifact behind for F10b to serve as the version's truth).
+    let mut staged_artifacts: Vec<String> = Vec::new();
 
     while let Some(mut field) = multipart.next_field().await.map_err(|e| {
         AppError::Validation(format!("multipart error: {}", e))
@@ -65,7 +69,21 @@ pub async fn upload_model_handler(
             // {name}/{v}/{v}/). --expect-version fails before extraction
             // if the manifest version does not match the upload URL.
             effective_version = version.strip_prefix('v').unwrap_or(&version).to_string();
-            let tmp_file = staging.join(&filename);
+            // B1: strip any path components (same rule as the raw branch)
+            // — multer returns the filename unsanitized, so a `../` or
+            // absolute filename would otherwise escape the staging dir.
+            let safe_name = std::path::Path::new(&filename)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            if safe_name.is_empty() || safe_name.starts_with('.') || !safe_name.ends_with(".lma") {
+                return Err(AppError::Validation(format!(
+                    "invalid .lma file name: {}",
+                    filename
+                )));
+            }
+            let tmp_file = staging.join(&safe_name);
             total_bytes += stream_field_to_file(&mut field, &tmp_file).await?;
 
             // H1: bound the unpack subprocess with the scanner's tunable.
@@ -91,17 +109,8 @@ pub async fn upload_model_handler(
                 )));
             }
 
-            // F10a: retain the original artifact so downloads can serve it
-            // back without repacking (preserving the author signature).
-            let artifacts_dir = state.repo_path.join(".artifacts");
-            tokio::fs::create_dir_all(&artifacts_dir)
-                .await
-                .map_err(AppError::Io)?;
-            let artifact_name = format!("{}_v{}.lma", model_name, effective_version);
-            tokio::fs::copy(&tmp_file, artifacts_dir.join(&artifact_name))
-                .await
-                .map_err(AppError::Io)?;
-
+            // F10a retention happens after commit_staging below (B2).
+            staged_artifacts.push(safe_name);
             uploaded_files.push(filename);
         } else {
             // Raw file: stage into the version directory (F11a streams the
@@ -143,6 +152,23 @@ pub async fn upload_model_handler(
     // H3: move staged content into place — version dirs via swap semantics
     // (replaced wholesale, never partial), model-root files by overwrite.
     commit_staging(&state.repo_path, &model_name, &staging).await?;
+
+    // F10a: retain the original artifact(s) so downloads can serve them
+    // back without repacking (preserving the author signature). Only after
+    // a successful commit (B2): a failed upload must leave no orphan
+    // artifact for F10b to serve as the version's truth.
+    if !staged_artifacts.is_empty() {
+        let artifacts_dir = state.repo_path.join(".artifacts");
+        tokio::fs::create_dir_all(&artifacts_dir)
+            .await
+            .map_err(AppError::Io)?;
+        let artifact_name = format!("{}_v{}.lma", model_name, effective_version);
+        for name in &staged_artifacts {
+            tokio::fs::copy(staging.join(name), artifacts_dir.join(&artifact_name))
+                .await
+                .map_err(AppError::Io)?;
+        }
+    }
 
     // C2 (drift patch): a raw-file upload replaced the version content —
     // drop the stale original artifact (if any), or F10b would keep
@@ -238,6 +264,9 @@ pub async fn upload_model_package_handler(
     let mut uploaded_files: Vec<String> = Vec::new();
     let mut total_bytes: u64 = 0;
     let mut effective_version: Option<String> = None;
+    // The staged .lma artifact file name — retained into .artifacts/ only
+    // after a successful commit (B2).
+    let mut staged_artifact: Option<String> = None;
 
     while let Some(mut field) = multipart.next_field().await.map_err(|e| {
         AppError::Validation(format!("multipart error: {}", e))
@@ -258,7 +287,22 @@ pub async fn upload_model_package_handler(
             ));
         }
 
-        let tmp_file = staging.join(&filename);
+        // B1: strip any path components (same rule as the raw branch of
+        // the versioned endpoint) — multer returns the filename
+        // unsanitized, so a `../` or absolute filename would otherwise
+        // escape the staging dir.
+        let safe_name = std::path::Path::new(&filename)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        if safe_name.is_empty() || safe_name.starts_with('.') || !safe_name.ends_with(".lma") {
+            return Err(AppError::Validation(format!(
+                "invalid .lma file name: {}",
+                filename
+            )));
+        }
+        let tmp_file = staging.join(&safe_name);
         total_bytes += stream_field_to_file(&mut field, &tmp_file).await?;
         if let Some(max) = state.config.server.max_upload_bytes {
             if total_bytes > max {
@@ -315,15 +359,9 @@ pub async fn upload_model_package_handler(
         effective_version = Some(v);
         uploaded_files.push(filename);
 
-        // F10a: retain the original artifact (same as the versioned path).
-        let artifacts_dir = state.repo_path.join(".artifacts");
-        tokio::fs::create_dir_all(&artifacts_dir)
-            .await
-            .map_err(AppError::Io)?;
-        let artifact_name = format!("{}_v{}.lma", model_name, effective_version.as_deref().unwrap_or(""));
-        tokio::fs::copy(&tmp_file, artifacts_dir.join(&artifact_name))
-            .await
-            .map_err(AppError::Io)?;
+        // F10a retention happens after commit_staging below (B2) — the
+        // staged artifact stays in staging until then.
+        staged_artifact = Some(safe_name);
     }
 
     let Some(effective_version) = effective_version else {
@@ -336,6 +374,20 @@ pub async fn upload_model_package_handler(
     }
 
     commit_staging(&state.repo_path, &model_name, &staging).await?;
+
+    // F10a: retain the original artifact (same as the versioned path) —
+    // only after a successful commit (B2): a failed upload must leave no
+    // orphan artifact for F10b to serve as the version's truth.
+    if let Some(name) = &staged_artifact {
+        let artifacts_dir = state.repo_path.join(".artifacts");
+        tokio::fs::create_dir_all(&artifacts_dir)
+            .await
+            .map_err(AppError::Io)?;
+        let artifact_name = format!("{}_v{}.lma", model_name, effective_version);
+        tokio::fs::copy(staging.join(name), artifacts_dir.join(&artifact_name))
+            .await
+            .map_err(AppError::Io)?;
+    }
 
     let auto_load = query.load.unwrap_or(true);
     let load_error = auto_load_uploaded(&state, &model_name, &effective_version, auto_load).await;
@@ -566,6 +618,12 @@ async fn commit_staging(
             let dst = model_root.join(entry.file_name());
             swap_dir_into(&src, &dst).await?;
         } else {
+            // The staged upload artifact itself is not model content — it
+            // is retained into .artifacts/ separately (F10a) after the
+            // commit, and the staging guard removes what remains.
+            if entry.file_name().to_string_lossy().ends_with(".lma") {
+                continue;
+            }
             let dst = model_root.join(entry.file_name());
             // Overwrite semantics: rename replaces atomically on Unix but
             // fails if the destination exists on Windows.
@@ -748,6 +806,10 @@ async fn download_version_impl(
     tokio::fs::create_dir_all(&tmp_dir)
         .await
         .map_err(AppError::Io)?;
+    // F2/B4: the cleanup guard is armed at creation — every early return
+    // below (semaphore timeout, pack failure, missing artifact, I/O error)
+    // removes the dir; the success path moves it into the response body.
+    let cleanup = DownloadCleanup(tmp_dir.clone());
 
     // H2: bound concurrent pack/unpack subprocesses; H1: bound this one
     // in time.
@@ -762,30 +824,16 @@ async fn download_version_impl(
         &tmp_dir,
         pack_timeout,
     )
-    .await
-    .inspect_err(|_| {
-        let dir = tmp_dir.clone();
-        tokio::spawn(async move {
-            let _ = tokio::fs::remove_dir_all(&dir).await;
-        });
-    })?;
+    .await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
         return Err(AppError::Internal(format!("pack failed: {}", stderr.trim())));
     }
 
     // Find the generated .lma file
     let mut lma_file = None;
-    let entries = tokio::fs::read_dir(&tmp_dir).await.map_err(|e| {
-        let dir = tmp_dir.clone();
-        tokio::spawn(async move {
-            let _ = tokio::fs::remove_dir_all(&dir).await;
-        });
-        AppError::Io(e)
-    })?;
-    let mut entries = entries;
+    let mut entries = tokio::fs::read_dir(&tmp_dir).await.map_err(AppError::Io)?;
     while let Ok(Some(entry)) = entries.next_entry().await {
         if entry.path().extension().map(|e| e == "lma").unwrap_or(false) {
             lma_file = Some(entry.path());
@@ -794,7 +842,6 @@ async fn download_version_impl(
     }
 
     let Some(lma_path) = lma_file else {
-        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
         return Err(AppError::Internal("pack produced no .lma file".to_string()));
     };
 
@@ -828,7 +875,7 @@ async fn download_version_impl(
         )
         .body(axum::body::Body::from_stream(LmaDownloadBody {
             inner: tokio_util::io::ReaderStream::new(file),
-            _cleanup: DownloadCleanup(tmp_dir),
+            _cleanup: cleanup,
         }))
         .map_err(|e| AppError::Internal(format!("build response: {}", e)))?;
     Ok(response)
@@ -1360,6 +1407,12 @@ mod upload_download_tests {
         // Canonical layout: manifest lands at the model root, matching the
         // repository-root auto-unpack path in the scanner.
         assert!(tmp.join("mymodel").join("manifest.json").exists());
+        // The staged upload artifact itself is not model content — it is
+        // retained in .artifacts/, never copied into the model root.
+        assert!(
+            !tmp.join("mymodel").join("mymodel_v1.lma").exists(),
+            "the staged .lma must not be committed into the model directory"
+        );
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
@@ -2441,6 +2494,317 @@ mod upload_download_tests {
             Some("mymodel"),
             "{fields:?}"
         );
+    }
+
+    // ===== Audit 2026-08-14: defect reproductions (batches 0-2) =====
+
+    /// Build a multipart body carrying multiple file fields.
+    fn multipart_body_multi(boundary: &str, parts: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (filename, data) in parts {
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\n\
+                     Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n\
+                     Content-Type: application/octet-stream\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(data);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    /// Audit B1 (scope assumption): the .lma branch builds the staging path
+    /// from the RAW multipart filename (`staging.join(&filename)`) — multer
+    /// does not sanitize it, so a `../` filename escapes the staging dir and
+    /// writes attacker bytes outside it (the raw-file branch sanitizes via
+    /// `Path::file_name`; the .lma branch must apply the same rule). Here the
+    /// escape lands in the repo root, where the scanner would later treat a
+    /// valid .lma as an auto-unpack candidate.
+    #[tokio::test]
+    async fn test_upload_lma_filename_traversal_cannot_escape_staging() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-lma-traversal-{}",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let state = test_app_state(tmp.clone());
+        let app = test_router(state);
+
+        let boundary = "----traversalboundary";
+        let body = multipart_body(boundary, "../escaped_upload.lma", b"not a zip");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/repository/models/mymodel/versions/1/upload?load=false")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={}", boundary),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // The garbage payload fails unpack either way; the security
+        // invariant is that nothing was written outside the staging dir.
+        assert_ne!(response.status(), StatusCode::OK);
+        assert!(
+            !tmp.join("escaped_upload.lma").exists(),
+            "filename traversal wrote a file outside the staging area"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// Audit B1 (model-level variant): upload_model_package_handler has its
+    /// own `staging.join(&filename)` site with the same missing sanitize.
+    #[tokio::test]
+    async fn test_model_level_upload_lma_filename_traversal_cannot_escape_staging() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-ml-traversal-{}",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let state = test_app_state(tmp.clone());
+        let app = Router::new()
+            .route(
+                "/v2/repository/models/:model_name/upload",
+                axum::routing::post(upload_model_package_handler),
+            )
+            .with_state(state);
+
+        let boundary = "----mltraversalboundary";
+        let body = multipart_body(boundary, "../escaped_ml_upload.lma", b"not a zip");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/repository/models/mymodel/upload")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={}", boundary),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(response.status(), StatusCode::OK);
+        assert!(
+            !tmp.join("escaped_ml_upload.lma").exists(),
+            "filename traversal wrote a file outside the staging area"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// Audit B2 (ordering assumption): the F10a artifact retention runs
+    /// BEFORE the size cap is enforced — a .lma that exceeds
+    /// max_upload_bytes is rejected with 413, yet its artifact has already
+    /// been copied into .artifacts/. A rejected upload must retain nothing:
+    /// the orphan would be served back by F10b as the version's truth even
+    /// though the upload never committed.
+    #[tokio::test]
+    async fn test_upload_oversize_lma_does_not_retain_artifact() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-lma-oversize-{}",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let lma = pack_fixture_lma(&tmp, "mymodel", "1").await;
+        let data = tokio::fs::read(&lma).await.unwrap();
+        assert!(data.len() as u64 > 64, "fixture must exceed the test cap");
+
+        let mut config = Config::default();
+        config.server.max_upload_bytes = Some(64);
+        let state = test_app_state_with_config(tmp.clone(), config);
+        let app = test_router(state);
+
+        let boundary = "----oversizeboundary";
+        let body = multipart_body(boundary, "mymodel_v1.lma", &data);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/repository/models/mymodel/versions/1/upload?load=false")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={}", boundary),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            !tmp.join(".artifacts").join("mymodel_v1.lma").exists(),
+            "a rejected (413) upload must not retain an artifact"
+        );
+        assert!(
+            !tmp.join("mymodel").exists(),
+            "a rejected (413) upload must not place model files"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// Audit B2 (model-level variant): a valid .lma first field is unpacked
+    /// and retained in .artifacts/; when a LATER field is rejected (raw
+    /// files are not accepted model-level), the request fails but the
+    /// artifact copy survives — an orphan the commit never produced.
+    #[tokio::test]
+    async fn test_model_level_upload_failure_after_unpack_leaves_no_artifact() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-ml-orphan-{}",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let lma = pack_fixture_lma(&tmp, "mymodel", "2").await;
+        let data = tokio::fs::read(&lma).await.unwrap();
+
+        let state = test_app_state(tmp.clone());
+        let app = Router::new()
+            .route(
+                "/v2/repository/models/:model_name/upload",
+                axum::routing::post(upload_model_package_handler),
+            )
+            .with_state(state);
+
+        let boundary = "----mlorphanboundary";
+        let body = multipart_body_multi(
+            boundary,
+            &[
+                ("mymodel_v2.lma", data.as_slice()),
+                ("model.py", b"def predict(x): return x\n"),
+            ],
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/repository/models/mymodel/upload")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={}", boundary),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "raw files are rejected model-level"
+        );
+        assert!(
+            !tmp.join(".artifacts").join("mymodel_v2.lma").exists(),
+            "a failed upload must not retain an artifact"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// Audit B4 (resource assumption): the download handler creates its
+    /// pack temp dir BEFORE acquiring the file-op semaphore, and the
+    /// acquire's `?` early-return has no cleanup — a semaphore-timeout
+    /// rejection leaks a `lite-server-download-*` dir (F2 mandated cleanup
+    /// on every early-return). Exhaust the permits, then a download with a
+    /// tiny acquire timeout is refused; no new temp dir may remain.
+    #[tokio::test]
+    async fn test_download_semaphore_timeout_leaves_no_tmp_residue() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-dl-semleak-{}",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        let model_dir = tmp.join("mymodel").join("1");
+        tokio::fs::create_dir_all(&model_dir).await.unwrap();
+        tokio::fs::write(model_dir.join("model.py"), "def predict(x): return x\n")
+            .await
+            .unwrap();
+
+        let mut config = Config::default();
+        config.tunables.unpack_timeout_secs = 0.05;
+        let state = test_app_state_with_config(tmp.clone(), config);
+        let app = test_router(state);
+
+        let temp = std::env::temp_dir();
+        let before: std::collections::BTreeSet<String> = std::fs::read_dir(&temp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("lite-server-download-"))
+            .collect();
+
+        // Hold all four permits so the handler's acquire times out.
+        let permits = [
+            acquire_file_op_permit(std::time::Duration::from_secs(120)).await.expect("p1"),
+            acquire_file_op_permit(std::time::Duration::from_secs(120)).await.expect("p2"),
+            acquire_file_op_permit(std::time::Duration::from_secs(120)).await.expect("p3"),
+            acquire_file_op_permit(std::time::Duration::from_secs(120)).await.expect("p4"),
+        ];
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/repository/models/mymodel/versions/1/download")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        drop(permits);
+
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "acquire timeout must reject the download"
+        );
+
+        // The cleanup guard's removal is spawned from Drop, so poll briefly.
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+        loop {
+            let after: std::collections::BTreeSet<String> = std::fs::read_dir(&temp)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| n.starts_with("lite-server-download-"))
+                .collect();
+            let leaked: Vec<String> = after.difference(&before).cloned().collect();
+            if leaked.is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "semaphore-timeout rejection leaked temp dirs: {leaked:?}"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        };
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 }
 
