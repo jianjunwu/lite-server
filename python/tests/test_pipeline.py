@@ -664,6 +664,23 @@ class TestSyncAsyncAdaptation:
         pipe.close()
 
     @pytest.mark.asyncio
+    async def test_sync_generator_stream_predict_produces_generator(self):
+        """A sync-generator stream_predict must hand its generator to the
+        consumer, not be awaited: Python 3.10's asyncio.iscoroutine() returns
+        True for plain generators, and awaiting one raises TypeError."""
+
+        class GenAPI(EchoAPI):
+            def stream_predict(self, request, ctx=None):
+                for w in request.split():
+                    yield {"token": w}
+
+        pipe = Pipeline.build(GenAPI(), [])
+        ctx = RequestContext(meta=_make_meta(), mode="stream")
+        generator = await pipe.stream_predict("hello world", ctx=ctx)
+        assert list(generator) == [{"token": "hello"}, {"token": "world"}]
+        pipe.close()
+
+    @pytest.mark.asyncio
     async def test_concurrent_sync_predicts_are_serialized_in_mixed_mode(self):
         """Sync code must never run concurrently (pre-0.7 standard-loop
         semantics preserved)."""

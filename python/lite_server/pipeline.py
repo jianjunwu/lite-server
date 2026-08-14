@@ -223,7 +223,7 @@ def _adapt(fn: Callable) -> Callable[..., Awaitable]:
         # (e.g. a sync wrapper that delegates to an async inner), and
         # a callable object with async __call__ is invisible to
         # iscoroutinefunction.
-        if asyncio.iscoroutine(result):
+        if inspect.iscoroutine(result):
             return await result
         return result
 
@@ -631,7 +631,7 @@ class Pipeline:
             if ctx.early is not None:
                 return
             result = handler(ctx)
-            if asyncio.iscoroutine(result):
+            if inspect.iscoroutine(result):
                 result = await result
             from lite_server.response import Response as LiteResponse
             if isinstance(result, LiteResponse):
@@ -937,7 +937,7 @@ class Pipeline:
         for cb in self._lifecycle.get(name, ()):
             try:
                 result = getattr(cb, name)(*args)
-                if asyncio.iscoroutine(result):
+                if inspect.iscoroutine(result):
                     pending.append(result)
             except Exception:
                 logger.warning(
@@ -972,7 +972,7 @@ class Pipeline:
         result = await loop.run_in_executor(self._gen_executor, fn, *args)
         # Sync callable may still return a coroutine (e.g. an object with
         # async __call__) — same runtime guard as _adapt.
-        if asyncio.iscoroutine(result):
+        if inspect.iscoroutine(result):
             result = await result
         return result
 
