@@ -411,7 +411,7 @@ wheels = [
 
 [[package]]
 name = "miraserver"
-version = "0.8.5rc0"
+version = "0.8.5rc1"
 source = { editable = "." }
 dependencies = [
     { name = "orjson" },
