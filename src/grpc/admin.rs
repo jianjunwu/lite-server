@@ -2633,6 +2633,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(download_tmp)]
     async fn download_model_full_packs_fresh_when_no_artifact() {
         // No retained artifact anywhere → the version dir is packed into a
         // temp .lma and streamed; the stream must reassemble into a package
@@ -2702,5 +2703,86 @@ mod tests {
         let _ = shutdown_tx.send(());
         let _ = tokio::fs::remove_dir_all(&repo).await;
         let _ = tokio::fs::remove_dir_all(&out).await;
+    }
+
+    // ===== E5 error-code mapping coverage (2026-08-14 audit gap) =====
+
+    /// E5: HTTP 400-class validation failures map to InvalidArgument.
+    #[tokio::test]
+    async fn delete_versions_invalid_requests_are_invalid_argument() {
+        let repo = unique_repo("delvs-invalid");
+        make_disk_version(&repo, "mymodel", "1").await;
+        let svc = build_admin_service_with_repo(Arc::new(ModelRegistry::new()), repo.clone());
+
+        // keep=0 (unset on the wire) + no versions list → neither selector.
+        let err = svc
+            .delete_versions(Request::new(pb::DeleteVersionsRequest {
+                model_name: "mymodel".to_string(),
+                keep: Some(0),
+                versions: vec![],
+                force: false,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "no selector: {err}");
+
+        // An invalid version string in the list.
+        let err = svc
+            .delete_versions(Request::new(pb::DeleteVersionsRequest {
+                model_name: "mymodel".to_string(),
+                keep: None,
+                versions: vec!["bad ver!".to_string()],
+                force: false,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "bad version: {err}");
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    /// E5: drift with an invalid model name → InvalidArgument.
+    #[tokio::test]
+    async fn repository_drift_invalid_model_name_is_invalid_argument() {
+        let repo = unique_repo("drift-invalid");
+        let svc = build_admin_service_with_repo(Arc::new(ModelRegistry::new()), repo.clone());
+
+        let err = svc
+            .repository_drift(Request::new(pb::RepositoryDriftRequest {
+                model_name: Some("bad name!".to_string()),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err}");
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    /// E5: a missing model maps to NotFound (list files + download).
+    #[tokio::test]
+    async fn missing_model_is_not_found() {
+        let repo = unique_repo("missing-model");
+        let svc = build_admin_service_with_repo(Arc::new(ModelRegistry::new()), repo.clone());
+
+        let err = svc
+            .list_files(Request::new(pb::ListFilesRequest {
+                model_name: "ghost".to_string(),
+                version: "1".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound, "list_files: {err}");
+
+        let err = svc
+            .download_model(Request::new(pb::DownloadModelRequest {
+                model_name: "ghost".to_string(),
+                version: Some("1".to_string()),
+                file: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound, "download_model: {err}");
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
     }
 }

@@ -2303,7 +2303,11 @@ def _cmd_unpack(args):
 
     target_dir = Path(args.target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
-    target = unpacker.unpack(target_dir, prepend_name=not args.flat)
+    try:
+        target = unpacker.unpack(target_dir, prepend_name=not args.flat)
+    except Exception as e:
+        _logger.error("Unpack failed: %s", e)
+        return 1
     print(f"Extracted to: {target}")
     return 0
 

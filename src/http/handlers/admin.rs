@@ -768,7 +768,9 @@ async fn disk_models(repo_path: &std::path::Path) -> Vec<String> {
 }
 
 /// Recursive size of a directory (iterative — async fn recursion needs
-/// boxing). Missing dir = 0.
+/// boxing). Missing dir = 0. R5: symlinks are NEVER followed and not
+/// counted — a symlinked cycle would multiply-count the same files and an
+/// escaping link would roam outside the repository.
 async fn dir_size_bytes(path: &std::path::Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
@@ -777,11 +779,16 @@ async fn dir_size_bytes(path: &std::path::Path) -> u64 {
             continue;
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
-            let p = entry.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if let Ok(md) = tokio::fs::metadata(&p).await {
-                total += md.len();
+            // file_type() does not follow symlinks (unlike Path::is_dir).
+            let Ok(ft) = entry.file_type().await else {
+                continue;
+            };
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if ft.is_file() {
+                if let Ok(md) = entry.metadata().await {
+                    total += md.len();
+                }
             }
         }
     }
@@ -1147,10 +1154,23 @@ pub(crate) async fn delete_model_core(
         .map(|mv| mv.version.clone())
         .collect();
     for version in &loaded {
-        state
+        // H5 (parity with delete_version_impl): a failed graceful unload
+        // escalates to force termination — no live worker may survive on a
+        // deleted directory.
+        if let Err(e) = state
             .worker_manager
             .unload_model(model_name, Some(version))
-            .await?;
+            .await
+        {
+            error!(
+                model = %model_name, version = %version, error = %e,
+                "graceful unload failed during model delete; force-terminating workers"
+            );
+            state
+                .worker_manager
+                .force_unload_version(model_name, version)
+                .await?;
+        }
     }
 
     // Delete the whole model directory (idempotent when absent).
@@ -2037,6 +2057,52 @@ mod drift_tests {
         let resp = repository_drift_handler(State(state)).await.unwrap();
         assert_eq!(resp["configured_missing"], json!([]), "{resp:?}");
         assert_eq!(resp["on_disk_unconfigured"], json!([]), "{resp:?}");
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    /// Audit R5 (E4 symlink traversal): `dir_size_bytes` decides recursion
+    /// with `Path::is_dir`, which FOLLOWS symlinks. Two consequences:
+    /// (a) a symlink cycle inside a version dir (e.g. a venv-style self
+    /// link, not unusual in Python payload trees) makes the walk descend
+    /// until paths exceed PATH_MAX, counting the same files hundreds of
+    /// times — `size_bytes` is wildly inflated; (b) a symlink pointing
+    /// OUTSIDE the repo is descended into, so external files count toward
+    /// the version's size (and the walk can roam an entire filesystem).
+    /// Directory recursion must use symlink_metadata / file_type and never
+    /// descend through symlinks.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drift_dir_size_does_not_follow_symlinks() {
+        let repo = std::env::temp_dir().join(format!(
+            "lite-server-drift-symlink-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+        let version_dir = repo.join("mymodel").join("3");
+        tokio::fs::create_dir_all(&version_dir).await.unwrap();
+        tokio::fs::write(version_dir.join("model.py"), "x = 1")
+            .await
+            .unwrap();
+        // (a) Cycle: a symlink inside the version dir pointing at itself.
+        std::os::unix::fs::symlink(&version_dir, version_dir.join("self_link")).unwrap();
+        // (b) Escape: a symlink to an external directory with a big file.
+        let outside = repo.join("outside");
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        tokio::fs::write(outside.join("big.bin"), vec![0u8; 100_000])
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&outside, version_dir.join("escape")).unwrap();
+
+        let size = dir_size_bytes(&version_dir).await;
+        assert_eq!(
+            size,
+            5,
+            "size_bytes must count only the version dir's own files (5-byte \
+             model.py); following symlinks inflates it (cycle re-counts, \
+             escape leaks external files), got {size}"
+        );
 
         let _ = tokio::fs::remove_dir_all(&repo).await;
     }

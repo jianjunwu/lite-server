@@ -10,6 +10,11 @@ use tracing::{info, warn};
 /// so tests can exercise the boundary without touching file mtimes.
 pub(super) const DEFAULT_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
 
+/// Swap-backup restore window: a crash mid-swap is recovered within an
+/// hour; older backups with a missing target are manual-delete residue and
+/// are NOT restored (kept on disk, warned about once per boot).
+const RESTORE_WINDOW: Duration = Duration::from_secs(3600);
+
 /// Sweep crash residue at startup:
 /// - `{temp}/lite-server-upload-*` / `{temp}/lite-server-download-*` dirs
 ///   older than `max_age`;
@@ -164,7 +169,20 @@ async fn sweep_swap_backup(
         }
     } else {
         // Crash between rename-aside and rename-in — restore the previous
-        // tree (deleting it would lose the model/version).
+        // tree (deleting it would lose the model/version). Gated to the
+        // crash-recovery window: a backup older than the window with a
+        // missing target is more likely the residue of a MANUAL delete
+        // (the delete paths remove backups themselves), and resurrecting
+        // it would surprise. It is kept on disk and warned about, not
+        // deleted (no data loss).
+        if is_stale(path, now, RESTORE_WINDOW).await {
+            warn!(
+                path = %path.display(),
+                "startup cleanup: swap backup past the recovery window with missing target — \
+                 NOT restored (manual-delete residue?); remove it manually to silence"
+            );
+            return;
+        }
         match tokio::fs::rename(path, &target).await {
             Ok(()) => {
                 *restored += 1;
@@ -270,6 +288,38 @@ mod tests {
         .await;
         assert_eq!(removed, 2, "both stale staging dirs removed");
         assert!(repo.join("mymodel").join("1").exists());
+
+        let _ = tokio::fs::remove_dir_all(&repo).await;
+    }
+
+    /// A swap backup past the crash-recovery window (RESTORE_WINDOW) whose
+    /// target is missing is manual-delete residue: NOT restored (a deleted
+    /// model must not resurrect), but kept on disk (no data loss).
+    #[tokio::test]
+    async fn stale_swap_backup_with_missing_target_is_not_restored() {
+        let repo = unique_tmp("stale-restore");
+        let backup = repo.join(format!(".mymodel.old-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(backup.join("1")).await.unwrap();
+        tokio::fs::write(backup.join("1").join("model.py"), "old")
+            .await
+            .unwrap();
+        // Backdate beyond the restore window.
+        let old = SystemTime::now() - Duration::from_secs(2 * 3600);
+        std::fs::File::open(&backup)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let (_removed, restored) = startup_tmp_cleanup(
+            &repo,
+            &unique_tmp("temp"),
+            SystemTime::now(),
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(restored, 0, "past the recovery window → NOT restored");
+        assert!(backup.exists(), "kept on disk (no silent data loss)");
+        assert!(!repo.join("mymodel").exists(), "no resurrection");
 
         let _ = tokio::fs::remove_dir_all(&repo).await;
     }

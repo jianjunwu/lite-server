@@ -1,3 +1,4 @@
+use crate::error::AppError;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tokio::time::Duration;
@@ -43,15 +44,18 @@ pub(super) async fn auto_unpack_lma_files(
             continue;
         }
 
-        // H6: skip re-unpacking when the extracted model dir exists and is
+        // H6: skip re-unpacking when the extracted VERSION dir exists and is
         // at least as new as the artifact — a restart must not clobber an
         // up-to-date tree (extractall overwrites in place), and it skips
         // pointless unpack work on every boot. A replaced artifact has a
-        // newer mtime and is unpacked normally.
-        if let Some(name) = model_name_from_artifact(path.file_name()) {
-            let model_dir = repo_path.join(&name);
-            if model_dir.is_dir() {
-                let fresh = tokio::fs::metadata(&model_dir)
+        // newer mtime and is unpacked normally. The precondition is the
+        // version dir being on disk: an artifact whose version is missing
+        // (e.g. another version was uploaded after it was placed) must still
+        // be unpacked.
+        if let Some((name, version)) = model_version_from_artifact(path.file_name()) {
+            let version_dir = repo_path.join(&name).join(&version);
+            if version_dir.is_dir() {
+                let fresh = tokio::fs::metadata(&version_dir)
                     .await
                     .and_then(|m| m.modified())
                     .is_ok_and(|dir_mtime| dir_mtime >= mtime);
@@ -100,11 +104,19 @@ pub(super) async fn auto_unpack_lma_files(
 
         match output {
             Ok(out) if out.status.success() => {
-                move_staging_into_repo(&staging, repo_path).await;
-                info!(
-                    "Auto-unpacked .lma artifact: {}",
-                    path.file_name().unwrap_or_default().to_string_lossy()
-                );
+                // The unpack reported success — but the move into the repo
+                // must succeed too, or nothing landed (silent no-op).
+                match move_staging_into_repo(&staging, repo_path).await {
+                    Ok(()) => info!(
+                        "Auto-unpacked .lma artifact: {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ),
+                    Err(e) => warn!(
+                        "Unpacked .lma artifact {} but failed to move it into the repo: {}",
+                        path.display(),
+                        e
+                    ),
+                }
             }
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
@@ -127,27 +139,33 @@ pub(super) async fn auto_unpack_lma_files(
     }
 }
 
-/// H6: model name from the packer naming convention `{name}_v{version}.lma`.
-/// Non-conforming names return None (C3: convention holes accepted — the
-/// check is skipped, the artifact is still unpacked).
-fn model_name_from_artifact(file_name: Option<&std::ffi::OsStr>) -> Option<String> {
+/// H6: model name and version from the packer naming convention
+/// `{name}_v{version}.lma`. Non-conforming names return None (C3:
+/// convention holes accepted — the check is skipped, the artifact is still
+/// unpacked).
+fn model_version_from_artifact(
+    file_name: Option<&std::ffi::OsStr>,
+) -> Option<(String, String)> {
     let stem = file_name?.to_str()?.strip_suffix(".lma")?;
     let idx = stem.rfind("_v")?;
     if idx == 0 {
         return None;
     }
-    Some(stem[..idx].to_string())
+    let version = &stem[idx + 2..];
+    if version.is_empty() {
+        return None;
+    }
+    Some((stem[..idx].to_string(), version.to_string()))
 }
 
 /// H4: move each extracted directory from the staging dir into the repo
 /// root with swap semantics — an existing dir is renamed aside
 /// (dot-prefixed, invisible to scan_repo_models), the new one is renamed
 /// in, and the aside copy is removed. A failed move rolls the old tree
-/// back.
-async fn move_staging_into_repo(staging: &Path, repo_path: &Path) {
-    let Ok(mut entries) = tokio::fs::read_dir(staging).await else {
-        return;
-    };
+/// back. Failures are ERRORS (the caller must not report a successful
+/// unpack when nothing landed).
+async fn move_staging_into_repo(staging: &Path, repo_path: &Path) -> Result<(), AppError> {
+    let mut entries = tokio::fs::read_dir(staging).await.map_err(AppError::Io)?;
     while let Ok(Some(entry)) = entries.next_entry().await {
         let src = entry.path();
         if !src.is_dir() {
@@ -156,19 +174,34 @@ async fn move_staging_into_repo(staging: &Path, repo_path: &Path) {
         let Some(name) = src.file_name().map(|n| n.to_string_lossy().to_string()) else {
             continue;
         };
-        let dst = repo_path.join(&name);
-        let backup = repo_path.join(format!(".{}.old-{}", name, uuid::Uuid::new_v4()));
-        if dst.exists() && tokio::fs::rename(&dst, &backup).await.is_err() {
+        // Defense in depth (R7): the unpacker validates manifest.name, but a
+        // staging entry that is not a plain identifier can never be a legal
+        // model dir — refuse to move it into the repo.
+        if crate::validation::validate_identifier(&name).is_err() {
+            warn!(
+                "Skipping staging entry with invalid model name: {}",
+                src.display()
+            );
             continue;
         }
-        if tokio::fs::rename(&src, &dst).await.is_ok() {
+        let dst = repo_path.join(&name);
+        let backup = repo_path.join(format!(".{}.old-{}", name, uuid::Uuid::new_v4()));
+        if dst.exists() {
+            tokio::fs::rename(&dst, &backup).await.map_err(AppError::Io)?;
+        }
+        if let Err(e) = tokio::fs::rename(&src, &dst).await {
+            // Roll the old tree back, then report — a silent skip would
+            // report a successful unpack with nothing landed.
             if backup.exists() {
-                let _ = tokio::fs::remove_dir_all(&backup).await;
+                let _ = tokio::fs::rename(&backup, &dst).await;
             }
-        } else if backup.exists() {
-            let _ = tokio::fs::rename(&backup, &dst).await;
+            return Err(AppError::Io(e));
+        }
+        if backup.exists() {
+            let _ = tokio::fs::remove_dir_all(&backup).await;
         }
     }
+    Ok(())
 }
 
 pub(super) async fn scan_repo_models(repo_path: &Path) -> Vec<RepoModel> {
@@ -414,22 +447,26 @@ max_batch_size: 4
     // ===== H6/H4: artifact naming + staging cleanup =====
 
     #[test]
-    fn test_model_name_from_artifact_packer_convention() {
+    fn test_model_version_from_artifact_packer_convention() {
         assert_eq!(
-            model_name_from_artifact(Some(std::ffi::OsStr::new("mymodel_v1.lma"))),
-            Some("mymodel".to_string())
+            model_version_from_artifact(Some(std::ffi::OsStr::new("mymodel_v1.lma"))),
+            Some(("mymodel".to_string(), "1".to_string()))
         );
         // "_v" inside the model name must not confuse the split (rfind).
         assert_eq!(
-            model_name_from_artifact(Some(std::ffi::OsStr::new("my_vmodel_v2.lma"))),
-            Some("my_vmodel".to_string())
+            model_version_from_artifact(Some(std::ffi::OsStr::new("my_vmodel_v2.lma"))),
+            Some(("my_vmodel".to_string(), "2".to_string()))
         );
         // Non-conforming names → None (check skipped, still unpacked).
         assert_eq!(
-            model_name_from_artifact(Some(std::ffi::OsStr::new("artifact.lma"))),
+            model_version_from_artifact(Some(std::ffi::OsStr::new("artifact.lma"))),
             None
         );
-        assert_eq!(model_name_from_artifact(None), None);
+        assert_eq!(
+            model_version_from_artifact(Some(std::ffi::OsStr::new("mymodel_v.lma"))),
+            None
+        );
+        assert_eq!(model_version_from_artifact(None), None);
     }
 
     /// H4: a corrupt artifact must leave no staging residue and no model
@@ -458,6 +495,150 @@ max_batch_size: 4
             );
             assert_eq!(name, "mymodel_v1.lma", "no other residue allowed");
         }
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// Audit R1 (H6 precondition skipped): the freshness check compares the
+    /// artifact mtime against the MODEL dir mtime — it never verifies that
+    /// the artifact's VERSION dir exists (the plan's H6 precondition is
+    /// "版本目录已存在": the skip is only valid when the extracted version
+    /// is already on disk). An artifact for a version that is NOT on disk
+    /// is skipped whenever the model dir happens to be newer (e.g. another
+    /// version was uploaded after the artifact was placed), so the version
+    /// silently never materializes — on every boot, since the seen-set
+    /// marks it processed too.
+    #[tokio::test]
+    async fn test_auto_unpack_does_not_skip_artifact_for_missing_version() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-h6-missing-ver-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+
+        // An unrelated on-disk version — the model dir's mtime is "now".
+        let v2_dir = tmp.join("mymodel").join("2");
+        tokio::fs::create_dir_all(&v2_dir).await.unwrap();
+        tokio::fs::write(v2_dir.join("model.py"), "def predict(x): return x\n")
+            .await
+            .unwrap();
+
+        // A valid artifact for version 1 (which is NOT on disk), packed from
+        // a source tree and back-dated to BEFORE the model dir's mtime.
+        let src_v1 = tmp.join("src").join("mymodel").join("1");
+        tokio::fs::create_dir_all(&src_v1).await.unwrap();
+        tokio::fs::write(src_v1.join("model.py"), "def predict(x): return x\n")
+            .await
+            .unwrap();
+        let output = tokio::process::Command::new(crate::python::resolve_python_interpreter())
+            .args([
+                "-m",
+                "lite_server.cli",
+                "pack",
+                tmp.join("src").join("mymodel").to_str().unwrap(),
+                "--version",
+                "1",
+                "--output",
+                tmp.to_str().unwrap(),
+            ])
+            .output()
+            .await
+            .expect("failed to run lite-server pack");
+        assert!(
+            output.status.success(),
+            "pack failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let artifact = tmp.join("mymodel_v1.lma");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&artifact)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let mut seen = HashSet::new();
+        auto_unpack_lma_files(&tmp, &mut seen, Duration::from_secs(60)).await;
+
+        assert!(
+            tmp.join("mymodel").join("1").join("model.py").exists(),
+            "an artifact whose version is NOT on disk must be unpacked even \
+             when the model dir is newer than the artifact (H6's skip \
+             precondition is the VERSION dir being present)"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// Audit R7 (manifest.name traversal, unpacker side): the scanner's
+    /// auto-unpack runs `unpack --to <staging>` WITHOUT --flat, so the
+    /// unpacker prepends `manifest.name` as the top-level directory
+    /// (`target_dir / manifest.name`) — and nothing validates that name.
+    /// A crafted artifact with `name: "../escaped"` escapes the staging
+    /// dir and extracts into the repo root directly (bypassing the
+    /// staging + swap pipeline — non-atomic, partial content visible);
+    /// `../../` escapes the repo entirely (arbitrary write wherever the
+    /// server user can write). Legal model names match IDENTIFIER_RE
+    /// (`^[a-zA-Z0-9_-]+$`); the unpack target must be rejected or
+    /// sanitized when the manifest name is not a plain identifier.
+    #[tokio::test]
+    async fn test_auto_unpack_rejects_manifest_name_traversal() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-unpack-traversal-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        // Craft a checksummed-valid artifact whose manifest name escapes
+        // the staging dir. Python zipfile sanitizes MEMBER names, but the
+        // prepend-name target directory is built from the raw manifest.
+        let craft = tmp.join("craft.py");
+        tokio::fs::write(
+            &craft,
+            r#"
+import hashlib, json, sys, zipfile
+out = sys.argv[1]
+content = b"def predict(x): return x\n"
+manifest = {
+    "manifest_version": "1.0",
+    "name": "../escaped_evil",
+    "version": "1",
+    "created_at": "2026-08-14T00:00:00Z",
+    "files": {"1/model.py": {"size": len(content), "sha256": hashlib.sha256(content).hexdigest()}},
+    "signature": "",
+}
+with zipfile.ZipFile(out, "w") as zf:
+    zf.writestr("manifest.json", json.dumps(manifest))
+    zf.writestr("1/model.py", content)
+"#,
+        )
+        .await
+        .unwrap();
+        let artifact = tmp.join("evil_v1.lma");
+        let output = tokio::process::Command::new(crate::python::resolve_python_interpreter())
+            .arg(&craft)
+            .arg(&artifact)
+            .output()
+            .await
+            .expect("failed to run craft script");
+        assert!(
+            output.status.success(),
+            "craft failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let mut seen = HashSet::new();
+        auto_unpack_lma_files(&tmp, &mut seen, Duration::from_secs(60)).await;
+
+        assert!(
+            !tmp.join("escaped_evil").exists(),
+            "a manifest name with '..' must not escape the staging dir — \
+             content landed directly in the repo root, bypassing staging/swap"
+        );
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }

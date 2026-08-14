@@ -11,6 +11,7 @@ from typing import Callable, Optional, Tuple
 
 from lite_server import _json
 from lite_server.artifact.manifest import Manifest
+from lite_server.artifact.packer import _validate_name
 
 
 class ArtifactCorruptedError(ValueError):
@@ -87,7 +88,9 @@ class ModelUnpacker:
 
         if prepend_name:
             manifest = self._ensure_manifest()
-            target_dir = target_dir / manifest.name
+            # manifest.name becomes a directory component: reject anything
+            # that is not a plain identifier (path traversal guard).
+            target_dir = target_dir / _validate_name(manifest.name)
             target_dir.mkdir(parents=True, exist_ok=True)
 
         with zipfile.ZipFile(self.artifact_path, "r") as zf:
@@ -136,7 +139,7 @@ class ModelUnpacker:
             self.manifest = manifest
 
             if prepend_name:
-                extract_dir = target_dir / manifest.name
+                extract_dir = target_dir / _validate_name(manifest.name)
             else:
                 extract_dir = target_dir
             extract_dir.mkdir(parents=True, exist_ok=True)

@@ -49,12 +49,26 @@ pub async fn upload_model_handler(
     while let Some(mut field) = multipart.next_field().await.map_err(|e| {
         AppError::Validation(format!("multipart error: {}", e))
     })? {
+        // A form field without a filename is not a file — reject it
+        // instead of writing a literal "unnamed" file into the version dir.
         let filename = field
             .file_name()
-            .unwrap_or("unnamed")
+            .ok_or_else(|| {
+                AppError::Validation(
+                    "multipart field without a filename — uploads carry files only".to_string(),
+                )
+            })?
             .to_string();
 
         if filename.ends_with(".lma") {
+            // One .lma per version upload (gRPC UploadModel parity) — two
+            // packages merged into one staging dir have no defined
+            // placement/retention semantics.
+            if staged.iter().any(|f| f.is_lma) {
+                return Err(AppError::InvalidRequestBody(
+                    "a version upload accepts a single .lma artifact".to_string(),
+                ));
+            }
             // B1: strip any path components (same rule as the raw branch)
             // — multer returns the filename unsanitized, so a `../` or
             // absolute filename would otherwise escape the staging dir.
@@ -70,7 +84,13 @@ pub async fn upload_model_handler(
                 )));
             }
             let tmp_file = staging.join(&safe_name);
-            total_bytes += stream_field_to_file(&mut field, &tmp_file).await?;
+            total_bytes = stream_field_to_file(
+                &mut field,
+                &tmp_file,
+                total_bytes,
+                state.config.server.max_upload_bytes,
+            )
+            .await?;
             staged.push(StagedUploadFile {
                 name: safe_name,
                 path: tmp_file,
@@ -92,22 +112,18 @@ pub async fn upload_model_handler(
                 .await
                 .map_err(AppError::Io)?;
             let file_path = version_dir.join(&safe_name);
-            total_bytes += stream_field_to_file(&mut field, &file_path).await?;
+            total_bytes = stream_field_to_file(
+                &mut field,
+                &file_path,
+                total_bytes,
+                state.config.server.max_upload_bytes,
+            )
+            .await?;
             staged.push(StagedUploadFile {
                 name: safe_name,
                 path: file_path,
                 is_lma: false,
             });
-        }
-
-        // F11b: per-field cumulative enforcement of the upload size cap.
-        if let Some(max) = state.config.server.max_upload_bytes {
-            if total_bytes > max {
-                return Err(AppError::PayloadTooLarge {
-                    max_size: max as usize,
-                    actual_size: Some(total_bytes),
-                });
-            }
         }
     }
 
@@ -241,6 +257,7 @@ pub(crate) async fn finalize_upload(
     let unpack_timeout =
         std::time::Duration::from_secs_f32(state.config.tunables.unpack_timeout_secs);
     let has_raw = staged.iter().any(|f| !f.is_lma);
+    let has_lma = staged.iter().any(|f| f.is_lma);
 
     let effective_version = match url_version {
         None => {
@@ -304,6 +321,57 @@ pub(crate) async fn finalize_upload(
         }
     };
 
+    // F11b (zip-bomb guard): max_upload_bytes counts COMPRESSED upload
+    // bytes — a small archive can unpack to an unbounded tree. The
+    // manifest's checksum-verified file sizes declare the unpacked total;
+    // reject when it exceeds the cap too. None = no check (default).
+    if has_lma {
+        if let Some(max) = state.config.server.max_upload_bytes {
+            if let Ok(raw) = tokio::fs::read_to_string(staging.join("manifest.json")).await {
+                if let Ok(manifest) = serde_json::from_str::<Value>(&raw) {
+                    let declared: u64 = manifest["files"]
+                        .as_object()
+                        .map(|files| {
+                            files
+                                .values()
+                                .filter_map(|e| e["size"].as_u64())
+                                .sum()
+                        })
+                        .unwrap_or(0);
+                    if declared > max {
+                        return Err(AppError::PayloadTooLarge {
+                            max_size: max as usize,
+                            actual_size: Some(declared),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // R4: a MIXED raw + .lma upload with a v-prefixed URL version staged
+    // the raw files under the raw URL string while the artifact unpacked
+    // under the normalized version — merge the raw files into the
+    // effective version dir before commit so no phantom version dir (the
+    // scanner would collect it as a separate version) lands on disk.
+    if has_raw && has_lma {
+        if let Some(url_v) = url_version {
+            if url_v != effective_version {
+                let raw_dir = staging.join(url_v);
+                if raw_dir.is_dir() {
+                    let dst = staging.join(&effective_version);
+                    tokio::fs::create_dir_all(&dst).await.map_err(AppError::Io)?;
+                    for f in staged.iter().filter(|f| !f.is_lma) {
+                        tokio::fs::rename(&f.path, dst.join(&f.name))
+                            .await
+                            .map_err(AppError::Io)?;
+                    }
+                    let _ = tokio::fs::remove_dir_all(&raw_dir).await;
+                }
+            }
+        }
+    }
+
     // H3: move staged content into place — version dirs via swap semantics
     // (replaced wholesale, never partial), model-root files by overwrite.
     commit_staging(&state.repo_path, model_name, staging).await?;
@@ -311,26 +379,38 @@ pub(crate) async fn finalize_upload(
     // F10a: retain the original artifact(s) so downloads can serve them
     // back without repacking (preserving the author signature). Only after
     // a successful commit (B2): a failed upload must leave no orphan
-    // artifact for F10b to serve as the version's truth.
-    if staged.iter().any(|f| f.is_lma) {
+    // artifact for F10b to serve as the version's truth. A retention
+    // failure (e.g. ENOSPC) is NON-FATAL: the version content is already
+    // the truth on disk and F10b falls back to repacking when the original
+    // is absent — warn loudly instead of lying with a 500 (R-F10a).
+    if has_lma {
         let artifacts_dir = state.repo_path.join(".artifacts");
-        tokio::fs::create_dir_all(&artifacts_dir)
-            .await
-            .map_err(AppError::Io)?;
         let artifact_name = format!("{}_v{}.lma", model_name, effective_version);
-        for f in staged.iter().filter(|f| f.is_lma) {
-            tokio::fs::copy(&f.path, artifacts_dir.join(&artifact_name))
-                .await
-                .map_err(AppError::Io)?;
+        let retain = async {
+            tokio::fs::create_dir_all(&artifacts_dir).await?;
+            for f in staged.iter().filter(|f| f.is_lma) {
+                tokio::fs::copy(&f.path, artifacts_dir.join(&artifact_name)).await?;
+            }
+            Ok::<(), std::io::Error>(())
+        };
+        if let Err(e) = retain.await {
+            warn!(
+                model = %model_name,
+                version = %effective_version,
+                error = %e,
+                "original artifact retention failed — downloads fall back to repacking (F10b)"
+            );
         }
     }
 
-    // C2 (drift patch): a raw-file upload replaced the version content —
+    // C2 (drift patch): a raw-ONLY upload replaced the version content —
     // drop the stale original artifact (if any), or F10b would keep
     // serving the old package as the truth. Downloads then fall back to
-    // repacking the new disk tree. Only after a successful commit — a
-    // failed upload must not destroy the previous artifact.
-    if has_raw {
+    // repacking the new disk tree. A mixed upload carries a valid .lma
+    // whose artifact was just retained above — the patch must not delete
+    // it (R3). Only after a successful commit — a failed upload must not
+    // destroy the previous artifact.
+    if has_raw && !has_lma {
         let _ = crate::http::handlers::admin::remove_linked_artifacts(
             &state.repo_path,
             model_name,
@@ -376,7 +456,14 @@ pub async fn upload_model_package_handler(
     while let Some(mut field) = multipart.next_field().await.map_err(|e| {
         AppError::Validation(format!("multipart error: {}", e))
     })? {
-        let filename = field.file_name().unwrap_or("unnamed").to_string();
+        let filename = field
+            .file_name()
+            .ok_or_else(|| {
+                AppError::Validation(
+                    "multipart field without a filename — uploads carry files only".to_string(),
+                )
+            })?
+            .to_string();
 
         if !filename.ends_with(".lma") {
             return Err(AppError::InvalidRequestBody(format!(
@@ -408,15 +495,13 @@ pub async fn upload_model_package_handler(
             )));
         }
         let tmp_file = staging.join(&safe_name);
-        total_bytes += stream_field_to_file(&mut field, &tmp_file).await?;
-        if let Some(max) = state.config.server.max_upload_bytes {
-            if total_bytes > max {
-                return Err(AppError::PayloadTooLarge {
-                    max_size: max as usize,
-                    actual_size: Some(total_bytes),
-                });
-            }
-        }
+        total_bytes = stream_field_to_file(
+            &mut field,
+            &tmp_file,
+            total_bytes,
+            state.config.server.max_upload_bytes,
+        )
+        .await?;
         staged.push(StagedUploadFile {
             name: safe_name,
             path: tmp_file,
@@ -465,21 +550,38 @@ pub async fn upload_model_package_handler(
 
 /// Stream a multipart field to `dest`, returning the bytes written
 /// (F11a: RAM bounded by chunk size instead of buffering the whole field).
+/// F11a: stream a multipart field to disk (RAM bounded by chunk size).
+/// F11b/R6: the cumulative upload cap is enforced BEFORE writing each
+/// chunk — the cap must bound disk usage during ingestion, not merely
+/// reject after an oversize field already landed (parity with the gRPC
+/// UploadModel per-message check). `prior_total` is the running total
+/// across earlier fields; returns the new cumulative total.
 async fn stream_field_to_file(
     field: &mut axum::extract::multipart::Field<'_>,
     dest: &std::path::Path,
+    prior_total: u64,
+    max_total: Option<u64>,
 ) -> Result<u64, AppError> {
     let mut file = tokio::fs::File::create(dest).await.map_err(AppError::Io)?;
-    let mut total: u64 = 0;
+    let mut total = prior_total;
     while let Some(chunk) = field
         .chunk()
         .await
         .map_err(|e| AppError::Transport(format!("read upload field: {}", e)))?
     {
+        let new_total = total + chunk.len() as u64;
+        if let Some(max) = max_total {
+            if new_total > max {
+                return Err(AppError::PayloadTooLarge {
+                    max_size: max as usize,
+                    actual_size: Some(new_total),
+                });
+            }
+        }
         tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
             .await
             .map_err(AppError::Io)?;
-        total += chunk.len() as u64;
+        total = new_total;
     }
     tokio::io::AsyncWriteExt::flush(&mut file)
         .await
@@ -510,26 +612,36 @@ pub(crate) async fn acquire_file_op_permit(
 }
 
 /// H1: wait for a child process bounded by `timeout` — a hung subprocess
-/// is killed instead of holding the request open forever. wait() (not
-/// wait_with_output) keeps the child available for kill on timeout;
-/// stdout/stderr are drained manually afterwards.
+/// is killed instead of holding the request open forever. R2: stdout and
+/// stderr are drained CONCURRENTLY with the wait — a child that writes more
+/// than the pipe buffer blocks until someone reads, so a wait-then-drain
+/// order turns every chatty-but-healthy child into a spurious timeout kill.
 async fn wait_child_bounded(
     child: &mut tokio::process::Child,
     timeout: std::time::Duration,
     what: &str,
 ) -> Result<std::process::Output, AppError> {
-    match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(result) => {
+    let mut stdout_handle = child.stdout.take();
+    let mut stderr_handle = child.stderr.take();
+    let drain_out = async move {
+        let mut buf = Vec::new();
+        if let Some(mut h) = stdout_handle.take() {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut h, &mut buf).await;
+        }
+        buf
+    };
+    let drain_err = async move {
+        let mut buf = Vec::new();
+        if let Some(mut h) = stderr_handle.take() {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut h, &mut buf).await;
+        }
+        buf
+    };
+    let wait_and_drain = async { tokio::join!(child.wait(), drain_out, drain_err) };
+    match tokio::time::timeout(timeout, wait_and_drain).await {
+        Ok((result, stdout, stderr)) => {
             let status = result
                 .map_err(|e| AppError::Internal(format!("python {what} failed: {}", e)))?;
-            let mut stdout = Vec::new();
-            if let Some(mut out) = child.stdout.take() {
-                let _ = tokio::io::AsyncReadExt::read_to_end(&mut out, &mut stdout).await;
-            }
-            let mut stderr = Vec::new();
-            if let Some(mut err) = child.stderr.take() {
-                let _ = tokio::io::AsyncReadExt::read_to_end(&mut err, &mut stderr).await;
-            }
             Ok(std::process::Output {
                 status,
                 stdout,
@@ -1315,6 +1427,61 @@ mod upload_download_tests {
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 
+    /// D1 (audit): the inference request-body cap (DefaultBodyLimit on the
+    /// whole router, http/mod.rs) must NOT reject artifact uploads — F11b's
+    /// ruling is `max_upload_bytes` (default None = unlimited) as the ONLY
+    /// gate. axum 0.7.9's Multipart DOES consume DefaultBodyLimit, so the
+    /// upload routes carry their own `DefaultBodyLimit::disable()`. Mirror
+    /// the production layering: global 1 KiB cap, upload a larger file.
+    #[tokio::test]
+    async fn test_upload_route_not_bound_by_request_body_limit() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-upload-bodylimit-{}",
+            std::process::id()
+        ));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let state = test_app_state(tmp.clone());
+        // Production layering (http/mod.rs): the whole router gets the
+        // inference body cap; upload routes opt out.
+        let app = crate::http::routes::create_routes(state)
+            .layer(axum::extract::DefaultBodyLimit::max(1024));
+
+        let boundary = "----testboundaryd1";
+        let big = "x".repeat(4096);
+        let body = format!(
+            "--{boundary}\r\n\
+             Content-Disposition: form-data; name=\"file\"; filename=\"weights.bin\"\r\n\
+             Content-Type: application/octet-stream\r\n\r\n\
+             {big}\r\n\
+             --{boundary}--\r\n"
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/repository/models/mymodel/versions/1/upload?load=false")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={}", boundary),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "uploads are gated by max_upload_bytes (default None), not the \
+             inference body cap — the upload routes disable DefaultBodyLimit"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
     #[tokio::test]
     async fn test_upload_rejects_invalid_model_name() {
         let tmp = std::env::temp_dir().join(format!(
@@ -1834,7 +2001,11 @@ mod upload_download_tests {
     }
 
     /// F1: whole-directory .lma downloads must also carry Content-Length.
+    /// serial(download_tmp): this test creates a `lite-server-download-*`
+    /// dir in the SHARED system temp; the semaphore-leak test scans that
+    /// prefix — they must not interleave.
     #[tokio::test]
+    #[serial_test::serial(download_tmp)]
     async fn test_download_lma_has_content_length() {
         let tmp = std::env::temp_dir().join(format!(
             "lite-server-dl-lma-cl-{}",
@@ -2490,6 +2661,9 @@ mod upload_download_tests {
     /// (starvation protection). The hold window is tiny so parallel tests
     /// queue briefly rather than failing.
     #[tokio::test]
+    // serial(download_tmp): exhausts the GLOBAL file-op semaphore — must
+    // not interleave with the other permit-holding / tmp-scanning tests.
+    #[serial_test::serial(download_tmp)]
     async fn test_file_op_semaphore_bounds_concurrency() {
         let timeout = std::time::Duration::from_secs(120);
         let permits = [
@@ -2795,6 +2969,7 @@ mod upload_download_tests {
     /// on every early-return). Exhaust the permits, then a download with a
     /// tiny acquire timeout is refused; no new temp dir may remain.
     #[tokio::test]
+    #[serial_test::serial(download_tmp)]
     async fn test_download_semaphore_timeout_leaves_no_tmp_residue() {
         let tmp = std::env::temp_dir().join(format!(
             "lite-server-dl-semleak-{}",
@@ -2864,6 +3039,59 @@ mod upload_download_tests {
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         };
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    /// Audit R2 (pipe-drain ordering, H1 helper): `wait_child_bounded`
+    /// waits for child exit BEFORE draining the piped stdout/stderr. A
+    /// child that writes more than the OS pipe buffer (~64KB) blocks on
+    /// write and never exits, so the bounded wait always escalates to the
+    /// timeout kill — a healthy but chatty pack/unpack subprocess is
+    /// reported as "timed out" and killed. wait_with_output-style draining
+    /// (concurrent reads) is the correct shape; the timeout must bound the
+    /// whole wait+drain, not just wait().
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_unpack_completes_for_chatty_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "lite-server-unpack-chatty-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        // A "python" that writes 1 MiB to stderr (far beyond the pipe
+        // buffer) and then exits 0 — a healthy but verbose child.
+        let fake_py = tmp.join("fake-python");
+        tokio::fs::write(&fake_py, "#!/bin/sh\nhead -c 1048576 /dev/zero >&2\nexit 0\n")
+            .await
+            .unwrap();
+        tokio::fs::set_permissions(&fake_py, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        let lma = tmp.join("fake.lma");
+        tokio::fs::write(&lma, "not a zip").await.unwrap();
+        let dest = tmp.join("out");
+
+        let result = run_unpack(
+            fake_py.to_str().unwrap(),
+            &lma,
+            &dest,
+            Some("1"),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a child that exits 0 after writing >pipe-buffer output must \
+             complete, not be killed as 'timed out': {result:?}"
+        );
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
     }

@@ -144,11 +144,18 @@ pub fn create_routes(shared: Arc<AppState>) -> Router {
         .route("/v2/models/:model_name/reload", post(reload_model_handler))
         .route("/v2/models/:model_name/versions/:version/reload", post(reload_version_handler))
         // Admin: upload/download/list files
-        .route("/v2/repository/models/:model_name/versions/:version/upload", post(upload_model_handler))
+        // D1: artifact uploads are gated by `server.max_upload_bytes`
+        // (default None = unlimited, F11b), NOT by the inference body cap —
+        // axum 0.7.9's Multipart consumes DefaultBodyLimit, so the upload
+        // routes opt out explicitly (fields stream to staging, RAM is
+        // bounded without the body limit).
+        .route("/v2/repository/models/:model_name/versions/:version/upload",
+            post(upload_model_handler).route_layer(axum::extract::DefaultBodyLimit::disable()))
         .route("/v2/repository/models/:model_name/versions/:version/download", get(download_model_handler))
         .route("/v2/repository/models/:model_name/versions/:version/files", get(list_files_handler))
         // Admin: model-level upload (F8, .lma only — version from manifest)
-        .route("/v2/repository/models/:model_name/upload", post(upload_model_package_handler))
+        .route("/v2/repository/models/:model_name/upload",
+            post(upload_model_package_handler).route_layer(axum::extract::DefaultBodyLimit::disable()))
         // Admin: model-level download (F9, bare = active version)
         .route("/v2/repository/models/:model_name/download", get(download_model_package_handler))
         // Admin: delete version

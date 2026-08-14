@@ -1,3 +1,7 @@
+// Port block for this file: 18241-18245 (fixed — kill_stale_servers needs
+// stable ports). Must not overlap integration_test.rs (18092-18099/18212-18232),
+// audit_ensemble_stream.rs (19700段) or model_repository_test.rs (20000段).
+
 use serde_json::json;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -169,9 +173,9 @@ class TestAPI(LitAPI):
         r#"
 server:
   host: 0.0.0.0
-  http_port: 18095
-  grpc_port: 18096
-  metrics_port: 18097
+  http_port: 18241
+  grpc_port: 18242
+  metrics_port: 18243
   log_level: warn
 metrics:
   enabled: false
@@ -188,14 +192,14 @@ orchestration:
     std::fs::write(&server_yaml, server_yaml_content).unwrap();
 
     // 6. Start server
-    kill_stale_servers(18095);
+    kill_stale_servers(18241);
 
     let _server = start_server(&tmp_dir, &["--config", &server_yaml.to_string_lossy()]);
 
-    wait_for_server(18095, 30).await;
+    wait_for_server(18241, 30).await;
 
     let client = reqwest::Client::new();
-    let base = "http://127.0.0.1:18095";
+    let base = "http://127.0.0.1:18241";
 
     // 7. Model from .lma should be auto-discovered and ready
     let mut ready = false;
@@ -335,7 +339,7 @@ async fn test_lma_restart_preserves_local_edits_when_artifact_older() {
     std::fs::create_dir_all(&repo_dir).unwrap();
     std::fs::copy(&lma, repo_dir.join("my_model_v1.lma")).unwrap();
 
-    let port = 18101u16;
+    let port = 18244u16;
     kill_stale_servers(port);
     let yaml = write_server_yaml_all(&tmp_dir, port, &repo_dir);
     let server_a = start_server(&tmp_dir, &["--config", yaml.to_str().unwrap()]);
@@ -382,7 +386,7 @@ async fn test_lma_restart_reunpacks_when_artifact_newer() {
     std::fs::create_dir_all(&repo_dir).unwrap();
     std::fs::copy(&lma, repo_dir.join("my_model_v1.lma")).unwrap();
 
-    let port = 18102u16;
+    let port = 18245u16;
     kill_stale_servers(port);
     let yaml = write_server_yaml_all(&tmp_dir, port, &repo_dir);
     let server_a = start_server(&tmp_dir, &["--config", yaml.to_str().unwrap()]);
