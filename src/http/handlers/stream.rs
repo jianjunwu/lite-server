@@ -263,6 +263,7 @@ pub(crate) async fn openai_stream_entry(
 /// Shared entry for SSE inference: validation, ready check, rate limiting,
 /// and stream setup. Returns a `Response` so the caller can uniformly wrap
 /// CORS around both the success stream-start and any early error.
+#[allow(clippy::too_many_arguments)] // RN-13 slot threading (same precedent as sse_infer_entry_impl)
 async fn sse_infer_entry(
     state: &Arc<AppState>,
     model_name: &str,
@@ -1125,6 +1126,7 @@ fn normalize_binary_first_frame_ct(headers: &mut HeaderMap, model_name: &str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // RN-13 slot threading (same precedent as sse_infer_entry_impl)
 async fn handle_ws_stream(
     state: Arc<AppState>,
     model_name: String,

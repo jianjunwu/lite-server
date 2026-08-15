@@ -18,6 +18,13 @@ use std::time::Instant;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
+/// RN-3 (resource-leak-plan): max concurrent element tasks in a batch
+/// ensemble execution. Element count is client-controlled and unbounded;
+/// each in-flight task holds its payload plus a full DAG execution, so the
+/// spawn window caps memory/worker fan-out. Order is preserved by index
+/// slots, so the window is invisible to clients.
+const BATCH_ENSEMBLE_MAX_CONCURRENT: usize = 64;
+
 /// D30 (batch 3): element payload classification — the unary rules
 /// (`grpc_payload_is_json`: JSON content-type, or missing = JSON default)
 /// applied to a single batch element. JSON → parsed Json; anything else →
@@ -364,7 +371,20 @@ impl GrpcService {
         let item_count = req.items.len();
         let mut set: tokio::task::JoinSet<(usize, pb::InferResponse)> =
             tokio::task::JoinSet::new();
+        let mut items: Vec<Option<pb::InferResponse>> = vec![None; item_count];
         for (i, item) in req.items.into_iter().enumerate() {
+            // RN-3 (resource-leak-plan): bound concurrent element tasks — an
+            // N-element batch must not create N concurrent DAG executions
+            // (each holding its payload; N is unbounded by the client). The
+            // window drains one completed task before spawning past the cap;
+            // order is preserved by the index slots.
+            while set.len() >= BATCH_ENSEMBLE_MAX_CONCURRENT {
+                let Some(joined) = set.join_next().await else { break };
+                let (j, resp) = joined.map_err(|e| {
+                    err(Status::internal(format!("batch element task join error: {e}")))
+                })?;
+                items[j] = Some(resp);
+            }
             let payload = match d30_element_payload(&item, &req.headers) {
                 Ok(p) => p,
                 Err(msg) => {
@@ -399,7 +419,7 @@ impl GrpcService {
             });
         }
 
-        let mut items: Vec<Option<pb::InferResponse>> = vec![None; item_count];
+        // Drain the remaining in-flight element tasks.
         while let Some(joined) = set.join_next().await {
             let (i, resp) = joined.map_err(|e| {
                 err(Status::internal(format!("batch element task join error: {e}")))

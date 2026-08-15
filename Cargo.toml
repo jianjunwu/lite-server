@@ -72,8 +72,9 @@ sha2 = "0.10"
 tower-http = { version = "0.6", features = ["compression-gzip", "timeout"] }
 # Service trait for the HTTP TLS acceptor's extension-injecting wrapper (P5-1)
 tower-service = "0.3"
-# ServiceExt::map_request in the custom TCP accept loop (K1, axum serve.rs parity)
-tower = { version = "0.4", features = ["util"] }
+# ServiceExt::map_request in the custom TCP accept loop (K1, axum serve.rs
+# parity); limit: GlobalConcurrencyLimitLayer for the gRPC servers (RN-2).
+tower = { version = "0.4", features = ["util", "limit"] }
 
 # OpenTelemetry core only (P-MW, 蓝图 §4.0.1 评审 1.10): RequestContext.trace_cx
 # 的类型载体。恒依赖、无 SDK/exporter（P-TRACE 才以 opt-in feature 引入）。

@@ -331,6 +331,7 @@ async fn first_route_reply(
 /// SSE event; other media types pass chunk bytes through verbatim. A
 /// mid-stream `error` frame ends the body (as a final SSE event in SSE
 /// mode), since the status line is already on the wire.
+#[allow(clippy::too_many_arguments)] // RN-13: admission guard rides the body; same precedent as dispatch_custom_route
 fn build_route_stream_http_response(
     start: pb::StreamStart,
     chunk_rx: mpsc::Receiver<pb::StreamResponse>,

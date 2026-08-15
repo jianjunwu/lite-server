@@ -644,10 +644,29 @@ pub async fn start_grpc_server(
         interceptor::service_interceptor(access_control.clone(), EndpointClass::Health, trusted.clone()),
     );
 
+    // RN-2 (resource-leak-plan): gRPC concurrency bounds. tonic spawns a task
+    // per request; streaming RPCs bypass the inference queue; admin upload/
+    // download move large buffers — none of that had a transport-level cap.
+    const GRPC_CONCURRENCY_LIMIT_PER_CONNECTION: usize = 256;
+    const GRPC_MAX_CONCURRENT_STREAMS: u32 = 256;
+    const GRPC_MAX_HEADER_LIST_SIZE: u32 = 32 * 1024;
+    /// Server-wide in-flight RPC cap (tower GlobalConcurrencyLimitLayer —
+    /// over the cap, RPCs queue on the semaphore instead of spawning work).
+    const GRPC_GLOBAL_CONCURRENCY_LIMIT: usize = 4096;
+
     // P1-2: HTTP/2 keepalive / window / frame tuning — applied to every tonic
     // server below (main, and the admin server when grpc.admin_bind is set: P7-2).
     let make_builder = || {
         let mut builder = tonic::transport::Server::builder();
+        // RN-2 (resource-leak-plan): bound RPC fan-out. tonic spawns a task
+        // per request and streaming RPCs bypass the queue, so without limits
+        // a client can fan out unbounded concurrent work (each holding
+        // payload + stream state). Per-connection caps stop single-conn
+        // floods; the global layer (below) bounds the whole server.
+        builder = builder
+            .concurrency_limit_per_connection(GRPC_CONCURRENCY_LIMIT_PER_CONNECTION)
+            .max_concurrent_streams(GRPC_MAX_CONCURRENT_STREAMS)
+            .http2_max_header_list_size(GRPC_MAX_HEADER_LIST_SIZE);
         if let Some((interval, timeout)) = http2_keepalive_params(&grpc_config) {
             builder = builder
                 .http2_keepalive_interval(Some(interval))
@@ -696,6 +715,7 @@ pub async fn start_grpc_server(
     let admin_bind = grpc_config.admin_bind.clone();
     let mut admin_server_opt = Some(admin_server);
     let main_router = make_builder()
+        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(GRPC_GLOBAL_CONCURRENCY_LIMIT))
         .add_service(server)
         .add_service(health_service.clone());
     let main_router = if admin_bind.is_none() {
@@ -750,6 +770,7 @@ pub async fn start_grpc_server(
         // the main port's concern). Admin UDS is forced owner-only 0o600 so a
         // world-writable admin socket cannot let any local user bypass fail-closed.
         let admin_router = make_builder()
+            .layer(tower::limit::GlobalConcurrencyLimitLayer::new(GRPC_GLOBAL_CONCURRENCY_LIMIT))
             .add_service(admin_server_opt.take().expect("admin_server staged"))
             .add_service(health_service);
         // admin_bind 分离时 admin 面独立成服务组——reflection 同样挂载在此，
@@ -817,7 +838,12 @@ fn resolve_admin_bind(admin_bind: &str) -> Result<(String, u16, u32), AppError> 
 // struct 只是把列表搬家,无消歧收益。
 #[allow(clippy::too_many_arguments)]
 async fn serve_grpc_router(
-    router: tonic::transport::server::Router,
+    router: tonic::transport::server::Router<
+        tower::layer::util::Stack<
+            tower::limit::GlobalConcurrencyLimitLayer,
+            tower::layer::util::Identity,
+        >,
+    >,
     host: String,
     port: u16,
     tls: Option<Arc<crate::tls::TlsConfigStore>>,

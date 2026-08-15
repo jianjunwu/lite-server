@@ -449,11 +449,10 @@ async fn test_k3_ws_keepalive_disabled_sends_no_ping() {
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
-            Ok(Some(Ok(Message::Ping(_)))) => {
-                panic!("K3: stream_keepalive_interval_secs = 0 must disable Ping keepalives")
-            }
-            _ => {}
+        if let Ok(Some(Ok(Message::Ping(_)))) =
+            tokio::time::timeout(Duration::from_secs(1), ws.next()).await
+        {
+            panic!("K3: stream_keepalive_interval_secs = 0 must disable Ping keepalives")
         }
     }
 }
@@ -673,7 +672,7 @@ async fn test_rn13_admission_slot_released_at_headers() {
         }
     }
     assert!(
-        statuses.iter().any(|s| *s == 503),
+        statuses.contains(&503),
         "RN-13: with max_inflight=1 the admission slot must be held for the stream's \
          lifetime — all 5 sequential SSE streams returned 200; the slot was released \
          when the headers were produced: {statuses:?}"

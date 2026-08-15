@@ -118,6 +118,11 @@ struct WorkerOutlier {
     /// `min(base × 2^(series−1), max_timeout)`（sgl-router 清单：指数退避）。
     ejection_series: AtomicUsize,
     ejected: Mutex<Option<EjectedWorker>>,
+    /// RN-7 (D11): consecutive health-kill escalations without an intervening
+    /// successful probe. Deliberately NOT cleared by `reset` (respawn) — the
+    /// whole point is bounding kill+respawn loops across replacements; only a
+    /// demonstrated-healthy worker (record_success) ends the streak.
+    consecutive_kills: AtomicUsize,
 }
 
 /// Configurable outlier-ejection parameters (§3). `Default` preserves the prior
@@ -171,6 +176,7 @@ impl OutlierState {
                     consecutive_errors: AtomicUsize::new(0),
                     ejection_series: AtomicUsize::new(0),
                     ejected: Mutex::new(None),
+                    consecutive_kills: AtomicUsize::new(0),
                 })
                 .collect(),
             consecutive_threshold: config.error_threshold,
@@ -194,6 +200,8 @@ impl OutlierState {
     pub fn record_success(&self, worker_idx: usize) {
         if let Some(w) = self.workers.get(worker_idx) {
             w.consecutive_errors.store(0, Ordering::Relaxed);
+            // RN-7: a healthy probe ends the kill streak.
+            w.consecutive_kills.store(0, Ordering::Relaxed);
             let mut guard = w.ejected.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(*guard, Some(ref e) if e.half_open) {
                 *guard = None;
@@ -211,9 +219,24 @@ impl OutlierState {
             .unwrap_or(0)
     }
 
+    /// RN-7 (D11): consecutive health-kill escalations without an intervening
+    /// successful probe.
+    pub fn consecutive_kills(&self, worker_idx: usize) -> usize {
+        self.workers
+            .get(worker_idx)
+            .map(|w| w.consecutive_kills.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// RN-7: count a kill escalation (see consecutive_kills for the reset rule).
+    pub fn record_kill(&self, worker_idx: usize) {
+        if let Some(w) = self.workers.get(worker_idx) {
+            w.consecutive_kills.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Zero the consecutive error count without touching ejection state.
-    /// Used after escalating to kill+respawn so the kill signal is not
-    /// re-sent every probe interval while the replacement starts.
+    /// Used after escalating to kill+respawn so the kill signal is not    /// re-sent every probe interval while the replacement starts.
     pub fn reset_error_count(&self, worker_idx: usize) {
         if let Some(w) = self.workers.get(worker_idx) {
             w.consecutive_errors.store(0, Ordering::Relaxed);
@@ -1875,6 +1898,15 @@ async fn health_checker(
     }
 }
 
+/// RN-7 (D11): cap on consecutive health-kill escalations per worker slot.
+/// A slow-starting worker (startup > threshold × probe interval) used to be
+/// killed + respawned forever: each respawn queued the next kill behind the
+/// serial listener, and reset_error_count only throttled the loop. After
+/// this many kills without an intervening successful probe, escalation stops
+/// and the slot stays ejected (traffic keeps avoiding it) — the error log is
+/// the operator's cue. A successful probe (record_success) ends the streak.
+const MAX_CONSECUTIVE_KILLS: usize = 3;
+
 /// Kill escalation after a failed probe: once the shared consecutive-error
 /// count reaches `kill_threshold`, ask the worker manager to kill + respawn
 /// the process. `kill_threshold == 0` disables killing (ejection-only).
@@ -1892,6 +1924,14 @@ async fn escalate_to_kill(
     let Some(tx) = respawn_tx.as_ref() else {
         return;
     };
+    if outlier.consecutive_kills(idx) >= MAX_CONSECUTIVE_KILLS {
+        error!(
+            model = %model_name, version = %version, worker_idx = idx,
+            consecutive_kills = outlier.consecutive_kills(idx),
+            "Health-kill escalation cap reached; worker stays ejected, not respawning again"
+        );
+        return;
+    }
     error!(
         model = %model_name, version = %version, worker_idx = idx,
         consecutive_failures = outlier.consecutive_errors(idx),
@@ -1904,6 +1944,7 @@ async fn escalate_to_kill(
         worker_id: idx as u32,
         reason: "health_check",
     }).await;
+    outlier.record_kill(idx);
     // Throttle re-sends while the respawn is in flight: the replacement must
     // accumulate kill_threshold fresh failures before the next escalation.
     // Ejection state is left intact so traffic keeps avoiding the dead slot.

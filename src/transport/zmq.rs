@@ -179,6 +179,24 @@ impl WorkerZmqClient {
             if let Err(e) = socket.set_linger(0) {
                 fatal_return!("Failed to set ZMQ linger: {}", e);
             }
+            // RN-5 (resource-leak-plan): explicit queue bounds. libzmq's
+            // default HWM is 1000 MESSAGES (not bytes) — with MB-scale
+            // payloads the receive queue could buffer 1000×N MB; make the
+            // count explicit and add a per-frame size cap so a corrupt or
+            // hostile peer (the ipc path is predictable and unauthenticated)
+            // cannot trigger an unbounded allocation with one frame. 2 GiB:
+            // no response-side size cap exists anywhere in the serving path,
+            // and tensor outputs can legitimately exceed 512 MiB (the plan's
+            // D10 sketch), so the cap sits at the largest plausible frame.
+            if let Err(e) = socket.set_sndhwm(1000) {
+                fatal_return!("Failed to set ZMQ sndhwm: {}", e);
+            }
+            if let Err(e) = socket.set_rcvhwm(1000) {
+                fatal_return!("Failed to set ZMQ rcvhwm: {}", e);
+            }
+            if let Err(e) = socket.set_maxmsgsize(2 * 1024 * 1024 * 1024) {
+                fatal_return!("Failed to set ZMQ maxmsgsize: {}", e);
+            }
 
             #[cfg(unix)]
             if ipc_live_occupier(&endpoint) {
