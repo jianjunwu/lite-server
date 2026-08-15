@@ -126,13 +126,36 @@ pub trait Callback: Send + Sync + 'static {
 /// events to all of them with exception isolation.
 pub struct CallbackRunner {
     callbacks: RwLock<Vec<Arc<dyn Callback>>>,
+    /// C1 (resource-leak-plan): per-callback execution timeout
+    /// (callbacks.timeout_secs; None = off). The dispatch concurrency cap is
+    /// a fixed constant (CALLBACK_DISPATCH_PERMITS), not a knob.
+    dispatch_timeout: Option<std::time::Duration>,
+}
+
+/// C1: process-wide bound on in-flight inference callback dispatch tasks.
+/// Fire-and-forget dispatch (one spawn per request) with a hung callback
+/// otherwise piles up tasks without bound. Over-cap fires are dropped and
+/// counted (liteserver_callback_dispatch_dropped_total{reason="concurrency"})
+/// — queueing would only turn unbounded tasks into unbounded waiters.
+static CALLBACK_DISPATCH_PERMITS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::OnceLock::new();
+
+fn callback_dispatch_permits() -> &'static Arc<tokio::sync::Semaphore> {
+    CALLBACK_DISPATCH_PERMITS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(64)))
 }
 
 impl CallbackRunner {
     pub fn new() -> Self {
         Self {
             callbacks: RwLock::new(Vec::new()),
+            dispatch_timeout: None,
         }
+    }
+
+    /// C1: install the per-callback timeout (callbacks.timeout_secs; 0/None
+    /// = off). Called once at server startup.
+    pub fn set_dispatch_timeout(&mut self, timeout: Option<std::time::Duration>) {
+        self.dispatch_timeout = timeout;
     }
 
     /// Register a callback.
@@ -171,7 +194,26 @@ impl CallbackRunner {
         let cbs = self.callbacks.read().await;
         for (i, cb) in cbs.iter().enumerate() {
             let fut = f(Arc::clone(cb));
-            let result = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
+            // C1: per-callback timeout (callbacks.timeout_secs; off by
+            // default) — a hung callback is abandoned, the rest still run.
+            let result = match self.dispatch_timeout {
+                Some(d) => match tokio::time::timeout(
+                    d,
+                    std::panic::AssertUnwindSafe(fut).catch_unwind(),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        warn!("Callback[{}] timed out during {} — abandoned", i, event);
+                        crate::metrics::prometheus::CALLBACK_DISPATCH_DROPPED
+                            .with_label_values(&["timeout"])
+                            .inc();
+                        continue;
+                    }
+                },
+                None => std::panic::AssertUnwindSafe(fut).catch_unwind().await,
+            };
             if let Err(e) = result {
                 let msg = if let Some(s) = e.downcast_ref::<&str>() {
                     s.to_string()
@@ -271,9 +313,18 @@ pub fn fire_inference_request(runner: &Arc<CallbackRunner>, ctx: &InferenceConte
     if runner.try_is_empty() {
         return;
     }
+    // C1: bounded dispatch — over-cap fires are dropped + counted, never queued.
+    let Ok(permit) = callback_dispatch_permits().clone().try_acquire_owned() else {
+        crate::metrics::prometheus::CALLBACK_DISPATCH_DROPPED
+            .with_label_values(&["concurrency"])
+            .inc();
+        tracing::debug!("callback dispatch dropped: 64 dispatches in flight");
+        return;
+    };
     let runner = Arc::clone(runner);
     let ctx = ctx.clone();
     tokio::spawn(async move {
+        let _permit = permit;
         runner.on_inference_request(&ctx).await;
     });
 }
@@ -295,8 +346,17 @@ pub fn fire_inference_response(
         elapsed_us,
         ..ctx.clone()
     };
+    // C1: bounded dispatch — see fire_inference_request.
+    let Ok(permit) = callback_dispatch_permits().clone().try_acquire_owned() else {
+        crate::metrics::prometheus::CALLBACK_DISPATCH_DROPPED
+            .with_label_values(&["concurrency"])
+            .inc();
+        tracing::debug!("callback dispatch dropped: 64 dispatches in flight");
+        return;
+    };
     let runner = Arc::clone(runner);
     tokio::spawn(async move {
+        let _permit = permit;
         runner.on_inference_response(&resp_ctx).await;
     });
 }

@@ -846,9 +846,9 @@ impl WorkerManager {
             // its recv loop, runs the Python teardown (_run_teardown:
             // LitAPI.teardown + before/after_teardown callbacks) and exits
             // cleanly (observed by the monitor as a clean child exit).
-            if let Some(clients) = clients {
+            if let Some(ref clients) = clients {
                 let stop_req = crate::streaming::build_stop_request();
-                for client in &clients {
+                for client in clients {
                     let _ = client.send_raw(stop_req.clone()).await;
                 }
             }
@@ -862,6 +862,15 @@ impl WorkerManager {
             // reload/restart.
             for proc in procs.iter_mut() {
                 super::process::stop_worker_gracefully(proc, model_name, version).await;
+            }
+
+            // RN-10: shut each client's actor down (bounded) BEFORE deleting
+            // the socket files — a reload rebind must never race an actor
+            // still inside its blocking send (double-socket window).
+            if let Some(ref clients) = clients {
+                for client in clients {
+                    client.shutdown().await;
+                }
             }
 
             // Phase 3 — clean up ZMQ socket files (Unix only).
@@ -903,16 +912,24 @@ impl WorkerManager {
             "force-unloading version after failed graceful unload"
         );
         let key = model_version_key(model_name, version);
-        let procs = {
+        let (procs, clients) = {
             let mut workers = self.workers.write().await;
             let mut zmq_clients = self.zmq_clients.write().await;
             let mut outliers = self.outlier_states.write().await;
             let mut routes = self.route_table.write().await;
             outliers.remove(&key);
-            let _ = zmq_clients.remove(&key);
+            let clients = zmq_clients.remove(&key);
             routes.remove(&key);
-            workers.remove(&key)
+            (workers.remove(&key), clients)
         };
+
+        // RN-10: force-unload skips the graceful phases but the actor
+        // teardown must still precede the socket-file delete.
+        if let Some(clients) = clients {
+            for client in &clients {
+                client.shutdown().await;
+            }
+        }
 
         if let Some(mut procs) = procs {
             // Skip the stop request — trigger the monitor's SIGKILL path

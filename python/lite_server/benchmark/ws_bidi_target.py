@@ -33,6 +33,8 @@ def ws_bidi_session(
     pacing: Pacing,
     idle_timeout: float | None = None,
     headers: dict[str, str] | None = None,
+    ping_interval: float | None = None,
+    ping_timeout: float | None = None,
 ) -> Callable[[list], Awaitable[BidiSessionRecord]]:
     """Build a bidi session runner for a WS endpoint.
 
@@ -51,6 +53,12 @@ def ws_bidi_session(
     """
 
     connect_kwargs = {"additional_headers": headers} if headers else {}
+    # K7 (resource-leak-plan): client-side WS keepalive, opt-in (default off,
+    # aligned with the server's stream_keepalive_interval_secs).
+    if ping_interval is not None:
+        connect_kwargs["ping_interval"] = ping_interval
+    if ping_timeout is not None:
+        connect_kwargs["ping_timeout"] = ping_timeout
 
     async def session(script: list) -> BidiSessionRecord:
         from websockets.exceptions import InvalidHandshake

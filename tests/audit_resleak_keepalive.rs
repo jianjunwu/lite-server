@@ -165,11 +165,35 @@ mod keepalive_server {
         let handle = tokio::spawn(async move {
             let _ = start_http_server(options, shutdown_rx).await;
         });
+        // Readiness probe: complete one full /health request (not just a
+        // connect — a bare connect can race the connection task's gauge
+        // increment, so a later "gauge back to baseline" settle would pass
+        // vacuously while the probe connection is still open; D7's cap=1
+        // test depends on the probe connection being fully done).
         let mut ready = false;
         for _ in 0..200 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-                ready = true;
-                break;
+            if let Ok(mut probe) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                if probe
+                    .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .await
+                    .is_ok()
+                {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 512];
+                    while let Ok(n) = probe.read(&mut chunk).await {
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    if buf.starts_with(b"HTTP/1.1 200") {
+                        ready = true;
+                        break;
+                    }
+                }
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -288,6 +312,7 @@ mod keepalive_server {
     /// "tcp"}` gauge must track the connection — +1 while open, back to
     /// baseline once the K1 reaper closes it.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_k1_idle_keepalive_connection_must_be_reaped_tcp() {
         let port = free_tcp_port();
         let gauge = || {
@@ -426,6 +451,70 @@ mod keepalive_server {
             }
         }
     }
+    /// D7 (resource-leak-plan.md): `server.max_connections` is a hard cap on
+    /// open connections — with the cap at 1 and one keep-alive connection
+    /// held open, a second connection must be closed at accept (EOF/reset on
+    /// first read), while the first keeps serving.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_d7_max_connections_closes_over_cap_at_accept() {
+        let port = free_tcp_port();
+        let mut deps = build_deps_tcp(30.0, port);
+        deps.config.server.max_connections = 1;
+        let gauge = || {
+            lite_server::metrics::prometheus::HTTP_CONNECTIONS
+                .with_label_values(&["tcp"])
+                .get()
+        };
+        let gauge_baseline = gauge();
+        let (shutdown_tx, server) = spawn_test_server_tcp(port, deps).await;
+        // The readiness probe opens and closes a connection — with the cap at
+        // 1, c1 must not race the probe's server-side teardown. Wait for the
+        // gauge to settle back to baseline first.
+        let settle_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while gauge() != gauge_baseline && std::time::Instant::now() < settle_deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Connection 1: a full request (proves the connection works), then
+        // held open (keep-alive window is 30s — far past this test).
+        let mut c1 = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect 1");
+        let mut rx_buf = Vec::new();
+        c1.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write on conn 1");
+        let (status, _body) = read_response(&mut c1, &mut rx_buf).await;
+        assert_eq!(status, 200, "connection 1 must serve");
+
+        // Connection 2: over the cap — must be closed at accept.
+        let mut c2 = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect 2 (TCP handshake succeeds; close happens at the app layer)");
+        let mut probe = [0u8; 16];
+        let outcome = tokio::time::timeout(Duration::from_secs(2), c2.read(&mut probe)).await;
+        let n = match outcome {
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) => 0, // reset counts as closed
+            Err(_) => panic!(
+                "D7: with max_connections=1 and one connection held, the second connection \
+                 must be closed at accept — the read timed out (connection left open)"
+            ),
+        };
+        assert_eq!(n, 0, "D7: over-cap connection must be closed at accept, got {n} bytes");
+
+        // Connection 1 is unaffected.
+        c1.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("second write on conn 1");
+        let (status, _body) = read_response(&mut c1, &mut rx_buf).await;
+        assert_eq!(status, 200, "connection 1 must keep serving");
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+    }
+
     /// L2 (resource-leak-plan.md): `server.request_body_timeout_secs` arms an
     /// idle timeout on the request BODY (tower-http TimeoutBody semantics —
     /// per-frame, resets as bytes flow). A slowloris body (headers complete,

@@ -289,7 +289,31 @@ impl EnsemblePlanCache {
                     // Loading placeholder, drop the shard lock, then parse.
                     let my_id = self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     vacant.insert(PlanCell::Loading { id: my_id, waiters: Vec::new() });
-                    match load().await {
+                    // C2 (resource-leak-plan): a panicking loader must not
+                    // wedge the Loading slot — the task's death would leave
+                    // the placeholder in place and every waiter parked
+                    // forever. Catch the unwind and funnel it into the normal
+                    // Err path (evict + waiters notified), so the next call
+                    // re-parses.
+                    let loaded: Result<Arc<EnsemblePlan>, AppError> =
+                        match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(load()))
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(panic) => {
+                                let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                                    s.to_string()
+                                } else if let Some(s) = panic.downcast_ref::<String>() {
+                                    s.clone()
+                                } else {
+                                    "unknown panic".to_string()
+                                };
+                                Err(AppError::Internal(format!(
+                                    "ensemble plan loader panicked: {msg}"
+                                )))
+                            }
+                        };
+                    match loaded {
                         Ok(plan) => {
                             // B2: the mtime comes from the loader's
                             // stat-before-read (a mid-load write can only make

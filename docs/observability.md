@@ -20,6 +20,8 @@ the metrics, the label semantics, the bucket changes, and the semantic notes
 | `liteserver_requests_total` | `model, version, status` | **Not** gated by `features.streaming_metrics`. HTTP streaming (SSE/WS/h2-bidi) now records close-point and early-rejection. Disconnected streams keep `2xx` + a separate cancel counter. |
 | `liteserver_request_duration_seconds` | `model, version` | Buckets extended with `30/60/120` — minute-scale stream durations no longer fall into `+Inf`. **Semantics:** with streaming counted, this histogram mixes unary and stream e2e durations; long streams dominate the tail. Same for `/metrics/timeline` p99 and Admin `GetModelStats.avg_duration_ms`. |
 | `lite_server_http_request_body_bytes` | `content_type, route` | HTTP request body size histogram. `content_type` = `json` \| `raw` \| `triton_binary` — `triton_binary` covers Triton Binary Tensor Data Extension requests (`Inference-Header-Content-Length` > 0). `route` = matched-path pattern. Buckets 1 KB–256 MB. |
+| `liteserver_http_connections` | `transport` | Open HTTP connections (`transport`: `tcp`/`tls`/`uds`). Connection-level resource signal — idle keep-alive connections, TLS handshakes, and slowloris holds are visible here, not in request metrics. Not gated. |
+| `liteserver_callback_dispatch_dropped_total` | `reason` | Callback dispatches dropped by the concurrency cap (`reason="concurrency"`, 64 in-flight) or cut by `callbacks.timeout_secs` (`reason="timeout"`). Callbacks are fire-and-forget; this counter makes the loss visible. Not gated. |
 
 ### Streaming metrics
 

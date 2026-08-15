@@ -238,6 +238,7 @@ SERVER_YAML = textwrap.dedent("""\
       # request_body_timeout_secs: 0.0  # Request-body idle timeout (slowloris body); 0 = off
       # http2_keepalive_interval_secs: null  # HTTP h2 PING interval; null = off
       # http2_keepalive_timeout_secs: null   # h2 PING ack timeout (needs the interval)
+      # max_connections: 0            # Hard cap on open HTTP connections; 0 = unlimited
       # compression: false          # gzip HTTP responses (P1-4; SSE excluded)
       # socket_mode: 0o666          # chmod for a unix: UDS host (P4-1); 0o600 on
       #                              # multi-tenant hosts (HTTP UDS also serves admin)

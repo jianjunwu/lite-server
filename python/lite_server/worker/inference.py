@@ -575,6 +575,13 @@ def worker_main():
         try:
             socket.connect(args.endpoint)
             socket.setsockopt(zmq.LINGER, 0)
+            # K5 (resource-leak-plan): OS-level TCP keepalive — a dead server
+            # host is reaped by the kernel even with no frames in flight.
+            # No-op on ipc endpoints. Matches the server side (zmq.rs).
+            socket.setsockopt(zmq.TCP_KEEPALIVE, 1)
+            socket.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 60)
+            socket.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 10)
+            socket.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
             # Signal ready only after connect() is issued: the server marks the
             # version ready on this line and a request can arrive immediately —
             # the handshake must already be in flight so the server's send
@@ -599,6 +606,11 @@ def worker_main():
         try:
             async_socket.connect(args.endpoint)
             async_socket.setsockopt(zmq.LINGER, 0)
+            # K5: see the sync socket above.
+            async_socket.setsockopt(zmq.TCP_KEEPALIVE, 1)
+            async_socket.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 60)
+            async_socket.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 10)
+            async_socket.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
             # See above: ready follows connect, never precedes it.
             print(ready_payload, flush=True)
             log.info(f"Connected async ZMQ PAIR to {args.endpoint}")

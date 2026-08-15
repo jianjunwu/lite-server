@@ -38,6 +38,8 @@ server:
   http2_keepalive_interval_secs: null  # HTTP h2 PING interval (dead-peer detection only);
                                # null = off. Distinct from grpc.http2_keepalive_*
   http2_keepalive_timeout_secs: null   # h2 PING ack timeout (needs the interval set)
+  max_connections: 0           # Hard cap on open HTTP connections (TCP+TLS); over-cap
+                               # closed at accept. 0 = unlimited (default)
   compression: false           # gzip HTTP responses; SSE excluded, WS unaffected
   socket_mode: 0o666           # chmod for a unix: UDS host. The HTTP UDS also serves
                                # admin, so on multi-tenant hosts set 0o600 (owner-only).
@@ -323,6 +325,11 @@ policy only if you need cross-origin admin access.
 Full OpenTelemetry tracing + metrics SDK, exported over **OTLP/gRPC**. Two-level opt-in: a build-time cargo feature (`--features telemetry`) and a runtime switch (`telemetry.enabled`, default `false` → zero overhead). Both off ⇒ no OTel layer, no propagator, no exporter; the server behaves exactly as without OTel. Trace context reaches the Python worker via the existing `RequestMeta.headers` map (W3C `traceparent`/`tracestate`/`baggage`) — the worker reads it to correlate but creates no span (Rust-only; see [observability.md](observability.md)).
 
 ```yaml
+callbacks:
+  timeout_secs: 0.0            # Per-callback execution timeout; 0 = off. Dispatch is
+                               # always bounded (64 in-flight; over-cap drops are counted
+                               # in liteserver_callback_dispatch_dropped_total)
+
 telemetry:
   enabled: false                       # opt-in. false = no OTel (zero overhead).
   otlp_endpoint: "http://localhost:4317"  # OTLP/gRPC collector (4317).

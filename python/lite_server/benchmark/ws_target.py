@@ -33,6 +33,8 @@ def ws_stream_target(
     *,
     timeout: float | None = None,
     headers: dict[str, str] | None = None,
+    ping_interval: float | None = None,
+    ping_timeout: float | None = None,
 ) -> Callable[[dict], AsyncIterator[StreamChunk]]:
     """Build a streaming benchmark target for a WS endpoint.
 
@@ -51,6 +53,12 @@ def ws_stream_target(
     """
 
     connect_kwargs = {"additional_headers": headers} if headers else {}
+    # K7 (resource-leak-plan): client-side WS keepalive, opt-in (default off,
+    # aligned with the server's stream_keepalive_interval_secs).
+    if ping_interval is not None:
+        connect_kwargs["ping_interval"] = ping_interval
+    if ping_timeout is not None:
+        connect_kwargs["ping_timeout"] = ping_timeout
 
     async def target(payload: dict) -> AsyncIterator[StreamChunk]:
         from websockets.exceptions import (

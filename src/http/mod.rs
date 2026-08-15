@@ -621,7 +621,10 @@ pub async fn start_http_server(
                 *b = configure_conn_builder(taken, &config.server);
             }
             server
-                .acceptor(crate::tls::RotatingTlsAcceptor::new(tls_store))
+                .acceptor(
+                    crate::tls::RotatingTlsAcceptor::new(tls_store)
+                        .with_connection_limit(config.server.max_connections),
+                )
                 .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                 .await
                 .map_err(|e| AppError::Internal(format!("server error: {}", e)))?;
@@ -669,10 +672,11 @@ async fn serve_unix(
                 let hyper_service = TowerToHyperService::new(app);
                 if server_config.keepalive_timeout <= 0.0 {
                     // K2: h1-only — see serve_tcp for why the auto builder's
-                    // http1_only() cannot be used here.
+                    // http1_only() cannot be used here, and why keep_alive
+                    // stays on (F-04: 101 upgrades must not get
+                    // connection: close).
                     let mut b = hyper::server::conn::http1::Builder::new();
                     b.timer(hyper_util::rt::TokioTimer::new());
-                    b.keep_alive(false);
                     let conn = b.serve_connection(io, hyper_service).with_upgrades();
                     if let Err(e) = conn.await {
                         tracing::debug!("Connection error: {}", e);
@@ -772,6 +776,10 @@ async fn serve_tcp(
 
     let mut make_service = app.into_make_service_with_connect_info::<SocketAddr>();
     let mut connections = tokio::task::JoinSet::new();
+    // D7: hard connection cap (0 = off). The counter is decremented when the
+    // connection task ends.
+    let max_connections = server_config.max_connections;
+    let open_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -784,6 +792,20 @@ async fn serve_tcp(
                     }
                     Err(e) => return Err(AppError::Io(e)),
                 };
+                // D7: over-cap connections are closed at accept — there is no
+                // channel to answer on before the connection exists.
+                if max_connections > 0
+                    && open_connections.load(std::sync::atomic::Ordering::Acquire) >= max_connections
+                {
+                    tracing::warn!(
+                        current = max_connections,
+                        "max_connections reached; closing new connection at accept"
+                    );
+                    drop(stream);
+                    continue;
+                }
+                open_connections.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let open_connections = Arc::clone(&open_connections);
                 // L5: OS-level keepalive on the accepted socket.
                 set_tcp_keepalive(&stream);
                 poll_fn(|cx| {
@@ -813,12 +835,14 @@ async fn serve_tcp(
                         // http1_only() on the with_upgrades path (0.1.20
                         // always starts with the h2 preface sniff), so the
                         // honest h1-only implementation is hyper's own http1
-                        // builder. keep_alive(false) closes after each
-                        // response (double coverage with the Connection:
-                        // close middleware).
+                        // builder. NOTE: no keep_alive(false) here — hyper
+                        // would then stamp `connection: close` onto 101
+                        // upgrade responses too (F-04 regression); the
+                        // disable_keepalive_middleware header (which guards
+                        // 101) is what closes the connection, and hyper's h1
+                        // encoder honors it.
                         let mut b = hyper::server::conn::http1::Builder::new();
                         b.timer(TokioTimer::new());
-                        b.keep_alive(false);
                         let conn = b.serve_connection(io, hyper_service).with_upgrades();
                         if let Err(e) = conn.await {
                             tracing::debug!("Connection error: {}", e);
@@ -833,6 +857,10 @@ async fn serve_tcp(
                             tracing::debug!("Connection error: {}", e);
                         }
                     }
+                    // D7: release the connection slot FIRST — observers that
+                    // poll the L4 gauge for "connection gone" must never see
+                    // the gauge drop while the cap counter still holds.
+                    open_connections.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                     crate::metrics::prometheus::record_http_connection_close("tcp");
                 });
             }

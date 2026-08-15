@@ -28,6 +28,26 @@ pub struct Config {
     /// OTLP/gRPC 导出。默认 `enabled=false`（opt-in，零开销）；SDK/exporter 本身
     /// 经 cargo `telemetry` feature 门控。
     pub telemetry: TelemetryConfig,
+    /// C1 (resource-leak-plan): model-callback dispatch bounds.
+    pub callbacks: CallbacksConfig,
+}
+
+/// C1 (resource-leak-plan): bounds for model-callback dispatch. Dispatch is
+/// fire-and-forget (spawned per request) so a slow callback never blocks
+/// inference; these knobs bound the resulting task pile-up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CallbacksConfig {
+    /// Per-callback execution timeout in seconds. 0 (default) = off —
+    /// dispatch concurrency is still bounded (fixed cap of 64 in-flight
+    /// dispatches; over-cap fires are dropped and counted).
+    pub timeout_secs: f32,
+}
+
+impl Default for CallbacksConfig {
+    fn default() -> Self {
+        Self { timeout_secs: 0.0 }
+    }
 }
 
 /// P7-1 access-control config (蓝图 §4.2). Three endpoint classes; admin and
@@ -230,6 +250,12 @@ pub struct ServerConfig {
     /// endpoints are exempt (probes must stay reachable under load). 0 =
     /// unlimited (default; behavior unchanged).
     pub max_inflight: usize,
+    /// D7 (resource-leak-plan): hard cap on open HTTP connections (TCP + TLS;
+    /// UDS is loopback-only and exempt). max_inflight bounds REQUESTS; this
+    /// bounds CONNECTIONS — a flood of idle or slow connections cannot exhaust
+    /// fds. Over-cap connections are closed at accept (no response is possible
+    /// before the connection exists). 0 = unlimited (default; unchanged).
+    pub max_connections: usize,
     /// P-FLOW (§4.0.9): per-request body size cap in bytes. HTTP bodies
     /// exceeding it return 413 and gRPC messages return ResourceExhausted.
     /// Default 64 MiB (67_108_864). Memory budget: peak ≈ this × concurrent
@@ -287,6 +313,7 @@ impl Default for ServerConfig {
             balance_rel_threshold: 1.5,
             decoupled_idle_timeout_secs: 300.0,
             max_inflight: 0,
+            max_connections: 0,
             max_concurrent_streaming_dags: 128,
             max_request_body_bytes: Some(64 * 1024 * 1024), // 64 MiB
             max_upload_bytes: None,

@@ -1192,6 +1192,35 @@ async fn p0_cache_failed_load_not_cached() {
 }
 
 #[tokio::test]
+async fn c2_loader_panic_does_not_wedge_the_slot() {
+    // C2 (resource-leak-plan): a panicking loader used to leave the Loading
+    // placeholder in place — the key wedged and every later caller parked
+    // forever. The panic must funnel into the Err path (evict + notify).
+    let cache = EnsemblePlanCache::new();
+    let key = PlanKey {
+        model: "m".to_string(),
+        version: "1".to_string(),
+    };
+    let err = cache
+        .get_or_load(key.clone(), || async {
+            panic!("loader exploded");
+            #[allow(unreachable_code)]
+            Ok::<_, AppError>(test_plan("/nonexistent"))
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("loader exploded"),
+        "panic must surface as an Internal error, got: {err}"
+    );
+    // The slot is not wedged: the next call re-parses and succeeds.
+    let ok = cache
+        .get_or_load(key, || async { Ok::<_, AppError>(test_plan("/nonexistent")) })
+        .await;
+    assert!(ok.is_ok(), "a panicked load must not wedge the key");
+}
+
+#[tokio::test]
 async fn p0_cache_invalidate_model_clears_all_versions() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let cache = EnsemblePlanCache::new();

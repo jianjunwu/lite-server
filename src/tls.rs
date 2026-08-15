@@ -326,6 +326,10 @@ pub struct RotatingTlsAcceptor {
     /// slow-loris opening (one spawned task + TCP connection per attempt,
     /// unbounded).
     handshake_permits: Arc<Semaphore>,
+    /// D7: hard connection cap (0 = off). The counter is incremented at
+    /// accept and decremented by CountedTlsStream's Drop.
+    max_connections: usize,
+    open_connections: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// RN-1: matches the gRPC-side gate in tls_incoming.
@@ -342,7 +346,15 @@ impl RotatingTlsAcceptor {
         Self {
             store,
             handshake_permits: Arc::new(Semaphore::new(limit)),
+            max_connections: 0,
+            open_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// D7: install the hard connection cap (server.max_connections; 0 = off).
+    pub fn with_connection_limit(mut self, max_connections: usize) -> Self {
+        self.max_connections = max_connections;
+        self
     }
 }
 
@@ -354,12 +366,20 @@ impl RotatingTlsAcceptor {
 /// Drop impl).
 pub struct CountedTlsStream {
     inner: tokio_rustls::server::TlsStream<TcpStream>,
+    /// D7: the acceptor's open-connection counter (decremented on drop).
+    open_connections: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl CountedTlsStream {
-    fn new(inner: tokio_rustls::server::TlsStream<TcpStream>) -> Self {
+    fn new(
+        inner: tokio_rustls::server::TlsStream<TcpStream>,
+        open_connections: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
         crate::metrics::prometheus::record_http_connection_open("tls");
-        Self { inner }
+        Self {
+            inner,
+            open_connections,
+        }
     }
 }
 
@@ -368,6 +388,8 @@ impl Unpin for CountedTlsStream {}
 impl Drop for CountedTlsStream {
     fn drop(&mut self) {
         crate::metrics::prometheus::record_http_connection_close("tls");
+        self.open_connections
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -428,6 +450,22 @@ where
 
     fn accept(&self, stream: TcpStream, service: S) -> Self::Future {
         let acceptor = self.store.acceptor();
+        // D7: refuse over-cap connections at accept (no channel to answer on
+        // before the connection exists).
+        if self.max_connections > 0
+            && self.open_connections.load(std::sync::atomic::Ordering::Acquire)
+                >= self.max_connections
+        {
+            return Box::pin(async {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "max_connections reached",
+                ))
+            });
+        }
+        self.open_connections
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let open_connections = self.open_connections.clone();
         // L5: OS-level keepalive on the accepted socket (plaintext path
         // parity — serve_tcp does the same).
         crate::http::set_tcp_keepalive(&stream);
@@ -463,7 +501,7 @@ where
                 .peer_certificates()
                 .and_then(|certs| certs.first())
                 .map(principal_from_cert);
-            Ok((CountedTlsStream::new(tls), InjectPrincipal { inner: service, principal }))
+            Ok((CountedTlsStream::new(tls, open_connections), InjectPrincipal { inner: service, principal }))
         })
     }
 }

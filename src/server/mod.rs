@@ -155,7 +155,14 @@ impl LiteServer {
             sequence_registry.clone(),
             balance,
         ));
-        let callback_runner = Arc::new(CallbackRunner::new());
+        let callback_runner = Arc::new({
+            // C1: per-callback timeout from config (0 = off).
+            let mut r = CallbackRunner::new();
+            r.set_dispatch_timeout(
+                crate::deadline::idle_budget(config.callbacks.timeout_secs),
+            );
+            r
+        });
         // P0 (D6): install the ensemble plan cache on the production path;
         // lifecycle unload/reload invalidates it (D23 single collection point).
         let ensemble_plans = Arc::new(crate::ensemble::EnsemblePlanCache::new());

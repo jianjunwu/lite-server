@@ -34,6 +34,8 @@ server:
   http2_keepalive_interval_secs: null  # HTTP h2 PING 间隔（仅死对端检测）；null = 关闭。
                                # 与 grpc.http2_keepalive_* 不同面
   http2_keepalive_timeout_secs: null   # h2 PING ACK 超时（须先设间隔）
+  max_connections: 0           # HTTP 连接数硬顶（TCP+TLS）；超限连接在 accept 即关闭。
+                               # 0 = 不限（默认）
   compression: false           # gzip HTTP 响应；排除 SSE，不影响 WS
   socket_mode: 0o666           # unix: UDS host 的 chmod。HTTP UDS 同时服务 admin，
                                # 多租户主机建议 0o600（仅 owner）

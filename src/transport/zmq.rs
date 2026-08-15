@@ -59,6 +59,10 @@ enum ZmqCommand {
     /// routes get a terminal Error frame. The transport itself stays up —
     /// the bound socket outlives the worker and a respawned peer reconnects.
     FailAll { reason: String },
+    /// RN-10: explicit actor shutdown (unload waits for the actor to exit
+    /// before deleting the socket file). Drain-equivalent to the channel
+    /// closing, but issuable through a shared &self handle.
+    Shutdown,
 }
 
 pub struct WorkerZmqClient {
@@ -84,6 +88,16 @@ pub struct WorkerZmqClient {
     fatal: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// RN-14: per-stream chunk channel depth (server.stream_channel_size).
     stream_channel_size: usize,
+    /// RN-10: actor exit signal — set/notify when the actor's blocking loop
+    /// returns. `shutdown()` waits on it so unload never deletes/rebinds the
+    /// socket file while the old actor is still inside a blocking send.
+    actor_exit: std::sync::Arc<ActorExit>,
+}
+
+/// RN-10: see WorkerZmqClient::actor_exit.
+struct ActorExit {
+    done: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
 }
 
 /// F-14: libzmq's ipc listener unlinks an existing SOCKET file before
@@ -101,6 +115,12 @@ fn ipc_live_occupier(endpoint: &str) -> bool {
         return false;
     }
     std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+/// RN-12: process-wide libzmq context (see new_with_channel_size).
+fn shared_context() -> zmq::Context {
+    static CTX: std::sync::OnceLock<zmq::Context> = std::sync::OnceLock::new();
+    CTX.get_or_init(zmq::Context::new).clone()
 }
 
 impl WorkerZmqClient {
@@ -127,7 +147,12 @@ impl WorkerZmqClient {
         // bug: try_recv + poll(100ms) + rcvtimeo(100ms) made a 200ms cycle
         // that serial requests always paid in full).
         static WAKE_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let ctx = zmq::Context::new();
+        // RN-12 (resource-leak-plan, D12): one libzmq context process-wide —
+        // each context owns I/O thread(s), so per-client contexts made
+        // worker count = thread count. Context is Clone (refcounted handle);
+        // the actor drops its clone at exit, the process context lives.
+        let ctx = shared_context();
+        // RN-12: one libzmq context per process, cloned per client.
         let wake_endpoint = format!(
             "inproc://lite-zmq-wake-{}-{}",
             std::process::id(),
@@ -154,8 +179,17 @@ impl WorkerZmqClient {
         let wake_send_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fatal = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
         let fatal_in_actor = fatal.clone();
+        let actor_exit = std::sync::Arc::new(ActorExit {
+            done: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        });
+        let actor_exit_in_actor = actor_exit.clone();
 
         tokio::task::spawn_blocking(move || {
+            // RN-10: signal actor exit on ANY return path (fatal_return
+            // included) so shutdown() never waits the full timeout on an
+            // already-dead actor.
+            let _exit_guard = ExitGuard(actor_exit_in_actor);
             // F-14: record any construction failure so send paths fail fast
             // with the real cause instead of queueing into a dead actor.
             macro_rules! fatal_return {
@@ -196,6 +230,22 @@ impl WorkerZmqClient {
             }
             if let Err(e) = socket.set_maxmsgsize(2 * 1024 * 1024 * 1024) {
                 fatal_return!("Failed to set ZMQ maxmsgsize: {}", e);
+            }
+            // K5 (resource-leak-plan): OS-level TCP keepalive (idle 60s /
+            // interval 10s / 3 probes, matching the HTTP L5 policy). No-op
+            // on ipc endpoints; ZMTP heartbeats are deliberately NOT enabled
+            // (the application-layer health checker already probes).
+            if let Err(e) = socket.set_tcp_keepalive(1) {
+                fatal_return!("Failed to set ZMQ TCP keepalive: {}", e);
+            }
+            if let Err(e) = socket.set_tcp_keepalive_idle(60) {
+                fatal_return!("Failed to set ZMQ TCP keepalive idle: {}", e);
+            }
+            if let Err(e) = socket.set_tcp_keepalive_intvl(10) {
+                fatal_return!("Failed to set ZMQ TCP keepalive interval: {}", e);
+            }
+            if let Err(e) = socket.set_tcp_keepalive_cnt(3) {
+                fatal_return!("Failed to set ZMQ TCP keepalive count: {}", e);
             }
 
             #[cfg(unix)]
@@ -377,12 +427,22 @@ impl WorkerZmqClient {
                     if !evicted.is_empty() {
                         warn!("Swept {} orphaned pending ZMQ response(s)", evicted.len());
                     }
+                    // RN-9 (resource-leak-plan): same sweep for stream routes —
+                    // a stream route whose consumer dropped (client gone,
+                    // worker half-open and never sending a terminal frame)
+                    // otherwise leaks the entry + channel sender until the
+                    // worker dies or unloads.
+                    let before = stream_routes.len();
+                    stream_routes.retain(|_, tx| !tx.is_closed());
+                    if stream_routes.len() < before {
+                        warn!("Swept {} orphaned ZMQ stream route(s)", before - stream_routes.len());
+                    }
                     last_pending_sweep = Instant::now();
                 }
             }
         });
 
-        Self { cmd_tx, wake_tx, actor_asleep, wake_send_count, fatal, stream_channel_size }
+        Self { cmd_tx, wake_tx, actor_asleep, wake_send_count, fatal, stream_channel_size, actor_exit }
     }
 
     /// F-14: the actor's recorded construction failure, if any.
@@ -529,6 +589,40 @@ impl WorkerZmqClient {
     }
 }
 
+/// RN-10: drop guard marking actor exit on every return path.
+struct ExitGuard(std::sync::Arc<ActorExit>);
+
+impl Drop for ExitGuard {
+    fn drop(&mut self) {
+        self.0.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        // notify_one stores a permit when nobody is waiting, so a later
+        // shutdown() still observes the exit immediately.
+        self.0.notify.notify_one();
+    }
+}
+
+impl WorkerZmqClient {
+    /// RN-10 (resource-leak-plan): close the command channel, wake the actor,
+    /// and wait (bounded) for it to exit. Unload calls this before deleting
+    /// the socket file so a reload rebind never races an actor still inside
+    /// its blocking send (the old double-socket window).
+    pub async fn shutdown(&self) {
+        // The Shutdown command rides the FIFO — in-flight commands ahead of
+        // it are delivered first (same ordering guarantee as the stop
+        // message). If the actor is already dead the send fails fast.
+        let _ = self.cmd_tx.send(ZmqCommand::Shutdown).await;
+        self.wake_actor();
+        if self.actor_exit.done.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            self.actor_exit.notify.notified(),
+        )
+        .await;
+    }
+}
+
 impl Drop for WorkerZmqClient {
     fn drop(&mut self) {
         // Close the command channel BEFORE waking the actor. The actor
@@ -633,6 +727,11 @@ fn drain_commands(
                     }
                 }
             }
+            Ok(ZmqCommand::Shutdown) => {
+                // RN-10: same teardown as a closed command channel (the
+                // caller — WorkerZmqClient::shutdown — waits on actor_exit).
+                return DrainOutcome::Shutdown;
+            }
             Ok(ZmqCommand::FailAll { reason }) => {
                 // ZMQ PAIR has no peer-disconnect event: without this the
                 // entries would hang until their caller-side timeouts.
@@ -650,11 +749,12 @@ fn drain_commands(
                     // S2: a full stream channel must not silently swallow the
                     // crash frame — a dropped terminal reads as a clean EOF
                     // and the crash gets counted as a successful stream. Same
-                    // delivery contract as the overflow path above: spawn an
-                    // unbounded send; a live consumer always observes the
-                    // frame, a dead one ends the send with Closed.
+                    // delivery contract as the overflow path above: spawn a
+                    // bounded send (RN-4: OVERFLOW_DELIVERY_TIMEOUT); a live
+                    // consumer always observes the frame, a dead one ends the
+                    // send with Closed.
                     tokio::spawn(async move {
-                        let _ = tx.send(term).await;
+                        let _ = tokio::time::timeout(OVERFLOW_DELIVERY_TIMEOUT, tx.send(term)).await;
                     });
                 }
                 if n_pending > 0 || n_streams > 0 {

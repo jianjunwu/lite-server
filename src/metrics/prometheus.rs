@@ -338,6 +338,18 @@ lazy_static! {
         &["model", "version"]
     ).unwrap();
 
+    /// C1 (resource-leak-plan): callback dispatches dropped by the
+    /// concurrency gate (reason="concurrency") or cut by callbacks.timeout_secs
+    /// (reason="timeout"). Callbacks are fire-and-forget; these counters make
+    /// the loss visible.
+    pub static ref CALLBACK_DISPATCH_DROPPED: CounterVec = CounterVec::new(
+        prometheus::Opts::new(
+            "liteserver_callback_dispatch_dropped_total",
+            "Callback dispatches dropped (concurrency cap) or cut (timeout)"
+        ),
+        &["reason"]
+    ).unwrap();
+
     /// L4 (resource-leak-plan): open HTTP connections by transport
     /// (tcp|tls|uds). Connection-level observability was missing entirely —
     /// request-level metrics cannot see idle keep-alive connections, TLS
@@ -411,6 +423,7 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(WORKER_SATURATION.clone()))?;
     REGISTRY.register(Box::new(HTTP_REQUEST_BODY_BYTES.clone()))?;
     REGISTRY.register(Box::new(HTTP_CONNECTIONS.clone()))?;
+    REGISTRY.register(Box::new(CALLBACK_DISPATCH_DROPPED.clone()))?;
     Ok(())
 }
 
