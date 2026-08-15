@@ -103,6 +103,20 @@ fn kill_stale_on_port(port: u16) {
     }
 }
 
+#[cfg(unix)]
+fn established_tcp(pid: u32) -> usize {
+    let out = Command::new("lsof")
+        .args(["-nP", "-a", "-p", &pid.to_string(), "-iTCP", "-sTCP:ESTABLISHED"])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| !l.starts_with("COMMAND"))
+            .count(),
+        _ => 0,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Model repo: single doubling model (test_model/1)
 // ---------------------------------------------------------------------------
@@ -569,4 +583,81 @@ fn test_rustls_single_version_in_tree() {
         versions,
         stdout
     );
+}
+
+/// Regression (2026-08-16): the TLS serve path must complete graceful shutdown
+/// promptly when idle. Observed: with 0 open connections and 0 pending
+/// requests, `handle.graceful_shutdown(None)` never returns — `serve().await`
+/// sits until the outer `server.graceful_timeout` force-abort backstop (default
+/// 30s). The plaintext path exits immediately, so the http/mod.rs comment
+/// claiming "graceful shutdown parity with the plaintext path" does not hold.
+///
+/// The config sets graceful_timeout=10 so the backstop is NOT what lets the
+/// process exit inside the 3s assertion window — a prompt graceful shutdown is.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_tls_graceful_shutdown_completes_promptly_when_idle() {
+    let http_port = 18129u16;
+    let grpc_port = 18130u16;
+    kill_stale_on_port(http_port);
+    kill_stale_on_port(grpc_port);
+
+    let pki = TestPki::new("tls-grace-ca");
+    let dir = tls_dir("grace");
+    let (cert_pem, key_pem) = pki.sign_server();
+    let cert = write_0600(&dir, "server.crt", &cert_pem);
+    let key = write_0600(&dir, "server.key", &key_pem);
+    let empty_repo = dir.join("empty_repo");
+    std::fs::create_dir_all(&empty_repo).unwrap();
+    let yaml = dir.join("server.yaml");
+    std::fs::write(
+        &yaml,
+        format!(
+            "server:\n  host: 127.0.0.1\n  http_port: {http_port}\n  grpc_port: {grpc_port}\n  metrics_port: 18131\n  log_level: warn\n  graceful_timeout: 10.0\n  tls_cert_path: {cert}\n  tls_key_path: {key}\nmetrics:\n  enabled: false\ngrpc:\n  enabled: false\nmodel_repository:\n  path: {}\n",
+            empty_repo.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let mut child = start_server(&["--config", &yaml.to_string_lossy()]);
+    let client = https_client(&pki.ca_pem, None);
+    wait_for_https_server(&client, http_port, 20).await;
+
+    // The bug is with ZERO open connections — not an idle pooled keep-alive.
+    // Drop the reqwest client so its pooled connection closes, then wait for
+    // the server to see no established TCP connections at all.
+    drop(client);
+    let close_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while established_tcp(child.id()) > 0 {
+        if tokio::time::Instant::now() > close_deadline {
+            panic!("server connections did not close before SIGTERM");
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    // SIGTERM, then measure how long until the process exits.
+    let start = std::time::Instant::now();
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    let mut exited = false;
+    loop {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            exited = true;
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(3) {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    stop_server(child); // SIGKILL the process group (no-op if exited)
+    assert!(
+        exited,
+        "TLS HTTP server did not exit within 3s of SIGTERM with 0 open \
+         connections and 0 pending requests — graceful shutdown must complete \
+         promptly (observed: it waits out server.graceful_timeout instead)"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

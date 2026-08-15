@@ -621,6 +621,7 @@ pub async fn start_http_server(
                 *b = configure_conn_builder(taken, &config.server);
             }
             server
+                .handle(handle)
                 .acceptor(
                     crate::tls::RotatingTlsAcceptor::new(tls_store)
                         .with_connection_limit(config.server.max_connections),

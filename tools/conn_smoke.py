@@ -30,12 +30,6 @@ Requires:
 No model is loaded — the probe is GET /health, which exercises the same
 serve_tcp/serve_tls accept loop and connection gauge as real inference.
 
-Known side observation (2026-08-16, not fixed by this smoke): the TLS serve
-path does NOT complete its axum graceful_shutdown even with 0 open connections
-and 0 pending requests — it sits idle until `server.graceful_timeout` (default
-30s) force-aborts it. The plaintext path exits immediately. The generated
-configs here set graceful_timeout=2 so the suite does not stall on it.
-
 Exit code: 0 = all assertions passed; 1 = any assertion failed.
 """
 
@@ -323,11 +317,6 @@ def write_config(path, port, metrics_port, grpc_port, cap, empty_repo, tls=False
         "  tls_cert_path: " + os.path.join(TLS_CERTS, "server.crt") + "\n"
         "  tls_key_path: " + os.path.join(TLS_CERTS, "server.key") + "\n"
     ) if tls else ""
-    # graceful_timeout=2: connection-count assertions are about open
-    # connections, not drain duration. Keep shutdown fast so the suite is
-    # quick. (NOTE: the TLS serve path currently does not complete its axum
-    # graceful_shutdown with 0 open connections and relies on this backstop —
-    # see the header comment.)
     with open(path, "w") as f:
         f.write(
             "server:\n"
@@ -336,7 +325,6 @@ def write_config(path, port, metrics_port, grpc_port, cap, empty_repo, tls=False
             f"  metrics_port: {metrics_port}\n"
             f"  grpc_port: {grpc_port}\n"
             "  keepalive_timeout: 30.0\n"
-            "  graceful_timeout: 2.0\n"
             f"  max_connections: {cap}\n"
             f"{tls_block}"
             "model_repository:\n"
