@@ -22,6 +22,43 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tracing::{error, info, warn};
 
+/// W1 hardening: explicit error-path reap for the multi-worker spawn loop in
+/// `load_model`. On any error return the guard's Drop sends the shutdown
+/// signal to every spawned-but-unregistered worker (triggering the monitor's
+/// kill arm, same as the unload path at :943) instead of relying on the
+/// incidental sender-drop → monitor-kill chain. On success the Vec is taken
+/// out via `take()` and the Drop is a no-op.
+struct SpawnedWorkersGuard(Vec<WorkerProcess>);
+
+impl std::ops::Deref for SpawnedWorkersGuard {
+    type Target = Vec<WorkerProcess>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for SpawnedWorkersGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl SpawnedWorkersGuard {
+    fn take(&mut self) -> Vec<WorkerProcess> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for SpawnedWorkersGuard {
+    fn drop(&mut self) {
+        for proc in self.0.iter_mut() {
+            if let Some(tx) = proc.shutdown_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+}
+
 impl WorkerManager {
     /// Start the reload listener. Must be called once after construction.
     pub async fn start_reload_listener(self: &Arc<Self>) {
@@ -277,7 +314,7 @@ impl WorkerManager {
         let total_workers = computed;
 
         let mut worker_infos = Vec::new();
-        let mut worker_processes = Vec::new();
+        let mut worker_processes = SpawnedWorkersGuard(Vec::new());
         let mut zmq_clients_for_model = Vec::new();
 
         for worker_id in 0..total_workers {
@@ -544,7 +581,7 @@ impl WorkerManager {
             let mut clients = self.zmq_clients.write().await;
             let mut outliers = self.outlier_states.write().await;
             let key = model_version_key(model_name, version);
-            workers.insert(key.clone(), worker_processes);
+            workers.insert(key.clone(), worker_processes.take());
             clients.insert(key.clone(), zmq_clients_for_model);
             outliers.insert(key, outlier);
         }
@@ -1286,6 +1323,131 @@ class TestAPI(LitAPI):
             let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
             assert!(!alive, "worker pid {} orphaned: still alive after unload_model returned", pid);
         }
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// P1 W1 evidence (project-resource-leak-sweep-0815.md): `load_model`'s
+    /// multi-worker loop spawns workers one at a time (:283-509); when ANY
+    /// worker fails to start mid-loop the function `return Err`s and the local
+    /// `worker_processes` vec (holding each started worker's shutdown_tx /
+    /// done_rx) is dropped. The already-started workers were never inserted
+    /// into the `workers` map (:542-550), so unload cannot reach them. If the
+    /// process survives (no ownership that SIGKILLs it on that error path), it
+    /// is an orphan until the server exits.
+    ///
+    /// Fixed code must reap every spawned-but-unregistered worker on the error
+    /// path. Current code either leaves it alive (RED, defect confirmed) or the
+    /// shutdown_tx drop happens to trigger the monitor's kill arm (GREEN, this
+    /// particular path is already safe) — either way the test documents the
+    /// behavior with evidence.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_load_model_worker_failure_mid_loop_leaves_no_orphan() {
+        use std::io::Read;
+        use std::time::Duration;
+
+        let repo = std::env::temp_dir()
+            .join(format!("lite-server-w1-orphan-test-{}", std::process::id()));
+        let model_dir = repo.join("w1_model").join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        // Worker 0 (device cpu:0) records its pid so the test can track it;
+        // worker 1 (device cpu:1) refuses to start, failing the load after
+        // worker 0 is already spawned and running.
+        std::fs::write(
+            model_dir.join("model.py"),
+            r#"import os
+from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        if device == "cpu:1":
+            raise RuntimeError("device 1 refuses to start")
+        with open("setup_pid.txt", "w") as f:
+            f.write(str(os.getpid()))
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 2\nworkers_per_device: 1\n",
+        )
+        .unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let wm = WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            Arc::new(InferenceQueue::new()),
+            "debug".to_string(),
+            Arc::new(CallbackRunner::new()),
+        );
+
+        // The caller owns config construction (B4: the per-model YAML is NOT
+        // re-read for worker spawn decisions) — devices must be set here so the
+        // spawn loop creates two workers (cpu:0 / cpu:1).
+        let mut load_config = ModelConfig::default();
+        load_config.devices = Some(serde_json::json!(2));
+
+        let err = wm
+            .load_model("w1_model", "1", &load_config)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::WorkerCrashed(_)),
+            "load_model must fail when worker 1 refuses to start, got {err:?}"
+        );
+
+        // Worker 0's pid (written in setup, before its ready line).
+        let mut pid_str = String::new();
+        let pid_path = model_dir.join("setup_pid.txt");
+        std::fs::File::open(&pid_path)
+            .expect("worker 0 must have written setup_pid.txt")
+            .read_to_string(&mut pid_str)
+            .expect("read pid file");
+        let pid: i32 = pid_str.trim().parse().expect("pid is numeric");
+
+        // The workers map / registry must not report any live worker for the
+        // failed load — nothing but the orphan owns the process.
+        match registry.get("w1_model", Some("1")) {
+            Some(mv) => assert!(
+                mv.workers.is_empty(),
+                "failed load must not register workers (found {})",
+                mv.workers.len()
+            ),
+            None => {}
+        }
+
+        // W1: the spawned-but-unregistered worker must be reaped on the error
+        // path. Poll up to 5s for the pid to become unreachable (fully reaped).
+        let mut reaped = false;
+        for _ in 0..25 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        if !reaped {
+            // Clean up the orphan so the test does not leak a rogue process.
+            unsafe { libc::kill(pid, libc::SIGKILL); }
+        }
+        assert!(
+            reaped,
+            "W1: worker pid {pid} survived a failed load_model — spawned but \
+             never inserted into the workers map, so unload cannot reap it \
+             (orphan until server shutdown)"
+        );
 
         let _ = std::fs::remove_dir_all(&repo);
     }

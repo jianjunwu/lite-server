@@ -32,6 +32,31 @@ use tracing::Instrument;
 /// Content-Type for the LPM bidi response stream.
 const BIDI_CONTENT_TYPE: &str = "application/x-lite-bidi";
 
+/// H2B-1: fallback send budget when the chunk-idle budget is disabled
+/// (decoupled_idle_timeout_secs <= 0). A stalled reader must never wedge the
+/// forwarder indefinitely, so the bounded send always has SOME deadline.
+const SEND_BUDGET_FALLBACK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// H2B-1: bounded send to the response-body channel. The fast path
+/// (`try_send`) is timer-free — the 64-slot buffer absorbs normal bursts.
+/// Only a full channel (stalled reader) pays one Sleep; if the send still
+/// cannot complete within `budget`, the reader is wedged and the caller
+/// breaks out to the terminal path (which cancels the worker stream).
+/// Returns false when the frame could not be delivered (closed or timeout).
+async fn send_frame_bounded(
+    tx: &mpsc::Sender<Bytes>,
+    frame: Bytes,
+    budget: std::time::Duration,
+) -> bool {
+    match tx.try_send(frame) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+        Err(mpsc::error::TrySendError::Full(frame)) => {
+            matches!(tokio::time::timeout(budget, tx.send(frame)).await, Ok(Ok(())))
+        }
+    }
+}
+
 pub async fn h2_bidi_handler(
     state: State<Arc<AppState>>,
     path: Path<String>,
@@ -554,6 +579,9 @@ async fn h2_bidi_entry_impl(
             let open_time = std::time::Instant::now();
             let mut first_chunk = true;
             let mut last_chunk_time = open_time;
+            // H2B-1: send-side budget mirrors the chunk-idle budget; a
+            // stalled reader must trip the same reclaim as a stalled worker.
+            let send_budget = stream_idle.unwrap_or(SEND_BUDGET_FALLBACK);
             // S1/S2:收口枚举——各 break 点只置 reason,尾部 record_stream_terminal
             // 统一消费(family/cancelled 单一来源)。
             let reason;
@@ -601,7 +629,9 @@ async fn h2_bidi_entry_impl(
                                     },
                                 )),
                             });
-                            let _ = tx.send(frame).await;
+                            // H2B-1: bounded — a wedged reader must not block
+                            // the terminal path; the frame is best-effort.
+                            let _ = send_frame_bounded(&tx, frame, send_budget).await;
                             crate::callback::fire_inference_response(
                                 &cb_runner,
                                 &req_ctx,
@@ -644,7 +674,9 @@ async fn h2_bidi_entry_impl(
                                 data: c.data.clone(),
                             })),
                         });
-                        if tx.send(frame).await.is_err() {
+                        // H2B-1: bounded send — a stalled reader times out
+                        // into the same terminal path as a client disconnect.
+                        if !send_frame_bounded(&tx, frame, send_budget).await {
                             reason = prometheus::StreamCloseReason::Cancel;
                             break;
                         }
@@ -658,7 +690,8 @@ async fn h2_bidi_entry_impl(
                                 error_type: String::new(),
                             })),
                         });
-                        let _ = tx.send(frame).await;
+                        // H2B-1: bounded — best-effort terminal frame.
+                        let _ = send_frame_bounded(&tx, frame, send_budget).await;
                         crate::callback::fire_inference_response(
                             &cb_runner,
                             &req_ctx,
@@ -677,7 +710,8 @@ async fn h2_bidi_entry_impl(
                             stream_id: stream_id_out.clone(),
                             payload: Some(pb::bidi_chunk::Payload::Close(pb::BidiClose {})),
                         });
-                        let _ = tx.send(frame).await;
+                        // H2B-1: bounded — best-effort terminal frame.
+                        let _ = send_frame_bounded(&tx, frame, send_budget).await;
                         crate::callback::fire_inference_response(
                             &cb_runner,
                             &req_ctx,
@@ -1052,6 +1086,75 @@ mod tests {
                             .encode_to_vec(),
                             0,
                         );
+                        let _ = s.send(
+                            mk(pb::stream_response::Payload::Done(pb::StreamDone::default()))
+                                .encode_to_vec(),
+                            0,
+                        );
+                    }
+                    Some(pb::stream_request::Action::Chunk(_)) => {
+                        let _ = action_tx.send("chunk".to_string());
+                    }
+                    Some(pb::stream_request::Action::Close(_)) => {
+                        let _ = action_tx.send("close".to_string());
+                    }
+                    Some(pb::stream_request::Action::Cancel(_)) => {
+                        let _ = action_tx.send("cancel".to_string());
+                    }
+                    None => {}
+                }
+            }
+        });
+        (handle, action_rx)
+    }
+
+    /// PAIR worker: Open → `chunks` data frames, then a Done. Used to overflow
+    /// the 64-slot outgoing channel so a stalled (not-reading) client wedges the
+    /// forwarder's bare `tx.send` (H2B-1).
+    fn spawn_flood_worker(
+        endpoint: String,
+        chunks: usize,
+    ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<String>) {
+        let (action_tx, action_rx) = std::sync::mpsc::channel::<String>();
+        let handle = std::thread::spawn(move || {
+            let ctx = zmq::Context::new();
+            let s = ctx.socket(zmq::PAIR).expect("worker socket");
+            s.connect(&endpoint).expect("worker connect");
+            let _ = s.set_rcvtimeo(10000);
+            while let Ok(bytes) = s.recv_bytes(0) {
+                let req = match pb::Request::decode(bytes.as_slice()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let Some(pb::request::Payload::Stream(st)) = req.payload else {
+                    let _ = s.send(
+                        pb::Response { uid: req.uid, ..Default::default() }.encode_to_vec(),
+                        0,
+                    );
+                    continue;
+                };
+                let mk = |payload| pb::Response {
+                    payload: Some(pb::response::Payload::Stream(pb::StreamResponse {
+                        stream_id: st.stream_id.clone(),
+                        payload: Some(payload),
+                    })),
+                    ..Default::default()
+                };
+                match st.action {
+                    Some(pb::stream_request::Action::Open(_)) => {
+                        let _ = action_tx.send("open".to_string());
+                        for _ in 0..chunks {
+                            let _ = s.send(
+                                mk(pb::stream_response::Payload::Chunk(
+                                    pb::StreamChunkResponse {
+                                        data: Bytes::from_static(b"{}"),
+                                        is_final: false,
+                                    },
+                                ))
+                                .encode_to_vec(),
+                                0,
+                            );
+                        }
                         let _ = s.send(
                             mk(pb::stream_response::Payload::Done(pb::StreamDone::default()))
                                 .encode_to_vec(),
@@ -1562,6 +1665,82 @@ mod tests {
             Ok("close"),
             "D4: body EOF must send StreamRequest::Close to the worker"
         );
+    }
+
+    /// P1 H2B-1 evidence (project-resource-leak-sweep-0815.md): the h2 bidi
+    /// forwarder's ENTIRE send path is a bare `tx.send(frame).await` — data
+    /// frames (:647) and every terminal frame (:604/:661/:680) — with no
+    /// deadline. The recv side (`recv_chunk`, :567) DOES carry a deadline/idle
+    /// budget, but a stalled reader fills the 64-slot channel (:487) and the
+    /// forwarder parks in `tx.send`, so the deadline is never polled: the
+    /// session is permanently wedged — no terminal frame, no worker cancel, no
+    /// teardown (L1/RN-13 fixed SSE/WS/gRPC but missed bidi).
+    ///
+    /// The worker here emits just enough chunks to fill the outgoing channel
+    /// (64) and wedge the forwarder, but NOT enough to overflow the transport's
+    /// chunk channel (also 64) — the RN-14 overflow-truncation rescue therefore
+    /// does not fire, isolating the send-side deadline defect.
+    ///
+    /// Fixed code bounds the send (a send deadline breaks the loop, cancels the
+    /// worker, and drops `tx` → body EOF); current code never reaps the stalled
+    /// session. This test FAILS (RED) until the send side is bounded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn audit_h2_bidi_stalled_reader_never_reaped() {
+        use futures::StreamExt;
+
+        let model = "bidi_audit_send_deadline";
+        let endpoint = ipc_endpoint(model);
+        // Tiny reclaim window so a fixed implementation would demonstrably
+        // reap a stalled stream inside the test.
+        let mut config = crate::config::Config::default();
+        config.server.decoupled_idle_timeout_secs = 0.3;
+        // 100 chunks: > 64 (fills the outgoing channel) and < 128 (never
+        // overflows the transport chunk channel) — see doc comment above.
+        let (_w, actions) = spawn_flood_worker(endpoint.clone(), 100);
+        let state = ready_state_with_config(model, endpoint, config).await;
+        state.registry.activate_version(model, "1").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let (_body_tx, resp) = start_bidi_session(model, state).await;
+        assert_eq!(
+            actions.recv_timeout(std::time::Duration::from_secs(3)).as_deref(),
+            Ok("open"),
+            "worker must see StreamOpen"
+        );
+
+        // Stalled reader: read a handful of frames, then HOLD the stream without
+        // polling it (the client keeps the connection open but stops reading).
+        // The forwarder fills the 64-slot channel and blocks on tx.send (#65).
+        let mut stream = resp.into_body().into_data_stream();
+        let mut seen = 0usize;
+        while seen < 8 {
+            match stream.next().await {
+                Some(Ok(_)) => seen += 1,
+                Some(Err(_)) | None => break,
+            }
+        }
+        assert!(seen >= 2, "expected a few frames before stalling, saw {seen}");
+
+        // The idle window (0.3s) is long past: a fixed implementation must have
+        // bounded the send and cancelled the worker. Current code never does —
+        // the forwarder is parked in `tx.send`, so `recv_chunk`'s idle budget
+        // is never polled. Assert BEFORE resuming the read: resuming would drain
+        // the channel, un-wedge the forwarder, and let the terminal frame out,
+        // masking the defect.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let cancel = actions.recv_timeout(std::time::Duration::from_millis(300));
+        assert!(
+            matches!(cancel.as_deref(), Ok("cancel")),
+            "H2B-1: stalled bidi reader is never reaped — the forwarder is stuck \
+             in a bare tx.send (no deadline), so after {}x the idle window the \
+             worker was still not cancelled (got {cancel:?})",
+            1500.0 / 300.0
+        );
+
+        // Cleanup on the fixed path: releasing the reader lets the forwarder
+        // finish and the worker receive its cancel; on the current path the
+        // panic above has already torn the runtime down.
+        drop(stream);
     }
 
     // === B1: bidi_initial_data_is_json 7-state unit tests ===

@@ -7,6 +7,8 @@ early return, cancellation, and the full run_async_loop integration.
 import asyncio
 import json
 import logging
+import threading
+import time
 
 import pytest
 
@@ -923,6 +925,7 @@ class TestStreamExecutorIsolation:
         close_thread_name = None
         entered = threading.Event()
         release = threading.Event()
+        closed_ev = threading.Event()
 
         class CloseTrackingGenerator:
             """A generator-like object that records which thread close() runs on."""
@@ -942,6 +945,7 @@ class TestStreamExecutorIsolation:
                 nonlocal close_thread_name
                 close_thread_name = threading.current_thread().name
                 self._closed = True
+                closed_ev.set()
 
         class StreamAPI(LitAPI):
             def setup(self, device):
@@ -982,7 +986,9 @@ class TestStreamExecutorIsolation:
         with pytest.raises(asyncio.CancelledError):
             await consume_task
 
-        assert close_thread_name is not None, "generator.close() was never called"
+        # PY-2: close is fire-and-forget on the lite-gen thread — wait for it
+        # deterministically instead of assuming it landed before the task ended.
+        assert await asyncio.to_thread(closed_ev.wait, 2), "generator.close() was never called"
         assert "lite-gen" in close_thread_name, (
             f"generator.close() ran on {close_thread_name}, expected lite-gen thread — "
             "close must stay off the event loop"
@@ -2015,3 +2021,137 @@ class TestStreamTokensGenerated:
             f"final chunk was never sent and must not count toward "
             f"tokens_generated, got {got}"
         )
+
+
+# ---------------------------------------------------------------------------
+# P1 evidence — project-resource-leak-sweep-0815.md (2026-08-15)
+# ---------------------------------------------------------------------------
+
+
+class TestP1AsyncGeneratorLoopMonopoly:
+    """PY-1: an async generator without an internal `await` monopolizes the
+    event loop. `_consume_stream` (:824-845) does `async for` over the raw
+    generator, and every awaited op in the loop body (`pipe.postprocess`,
+    `socket.send`) completes synchronously for a plain model — so the loop
+    never yields, starving recv / heartbeat / ppid watchdog / `task.cancel()`.
+    """
+
+    @pytest.mark.asyncio
+    async def test_event_loop_starved_by_no_await_async_generator(self):
+        class TightGenAPI(EchoAPI):
+            async def stream_predict(self, x):
+                acc = 0
+                # Bounded CPU work per yield with NO await — this is the core of
+                # PY-1: the generator body never suspends, so `async for` in
+                # `_consume_stream` never yields control to the event loop.
+                for i in range(15_000):
+                    for _ in range(1_000):
+                        acc += i
+                    yield {"n": i}
+
+        api = TightGenAPI()
+        pipe = Pipeline.build(api, [])
+        generator = api.stream_predict({})
+        sock = AsyncSocket()
+        meta = RequestMeta(route="/predict", headers=Headers(), client_ip="",
+                           request_id="r-starve", timestamp_ns=0)
+        ctx = RequestContext(meta=meta, request={}, mode="stream")
+
+        consume = asyncio.create_task(
+            inference._consume_stream(api, pipe, generator, "s-starve", sock, log, ctx)
+        )
+        # A 10ms probe must complete in ~10ms of wall-clock on a free loop.
+        # If the no-await async generator monopolizes the loop, the probe is
+        # starved until the generator finishes, so its wall-clock elapsed time
+        # balloons (measured with time.monotonic, which is immune to the loop
+        # being blocked).
+        t0 = time.monotonic()
+        timed_out = False
+        try:
+            await asyncio.wait_for(asyncio.sleep(0.01), timeout=0.5)
+        except asyncio.TimeoutError:
+            timed_out = True
+        probe_elapsed = time.monotonic() - t0
+
+        consume.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(consume), timeout=3.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+        pipe.close()
+
+        assert not (timed_out or probe_elapsed > 0.25), (
+            "PY-1: event loop monopolized for %.1fs — the no-await async "
+            "generator never yielded, so recv / health / ppid watchdog / "
+            "task.cancel() are all unreachable" % probe_elapsed
+        )
+
+
+class TestP1SyncGeneratorCloseWedge:
+    """PY-2: with a sync generator whose next() blocks the single lite-gen
+    thread, cancellation's `generator.close()` is dispatched to the SAME
+    thread (streaming.py:846-853 → pipeline.py:959-983, max_workers=1) and
+    queues behind the blocked next() — it never runs, the recv loop wedges,
+    and the generator's finally (file/handle resources) never executes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cancel_never_runs_generator_close_behind_blocked_next(self):
+        release = threading.Event()
+        close_called = threading.Event()
+
+        class BlockingGenAPI(EchoAPI):
+            def stream_predict(self, x):
+                try:
+                    yield {"n": 1}
+                    release.wait(30)  # blocks the lite-gen thread inside next()
+                    yield {"n": 2}
+                finally:
+                    close_called.set()  # runs iff generator.close() ever executes
+
+        api = BlockingGenAPI()
+        pipe = Pipeline.build(api, [])
+        generator = api.stream_predict({})
+        sock = AsyncSocket()
+        meta = RequestMeta(route="/predict", headers=Headers(), client_ip="",
+                           request_id="r-wedge", timestamp_ns=0)
+        ctx = RequestContext(meta=meta, request={}, mode="stream")
+
+        consume = asyncio.create_task(
+            inference._consume_stream(api, pipe, generator, "s-wedge", sock, log, ctx)
+        )
+        # First chunk lands, second next() blocks the lite-gen thread.
+        await asyncio.sleep(0.4)
+        consume.cancel()
+
+        try:
+            await asyncio.wait_for(asyncio.shield(consume), timeout=1.5)
+            terminated = True
+        except asyncio.TimeoutError:
+            terminated = False  # still stuck awaiting run_blocking(generator.close)
+        except asyncio.CancelledError:
+            terminated = True  # task processed the cancel and exited
+
+        # Release the blocked thread so the queued close can run behind it.
+        release.set()
+        consume.cancel()
+        try:
+            await asyncio.wait_for(consume, timeout=1.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+
+        assert terminated, (
+            "PY-2: after cancel, _consume_stream never terminated — "
+            "generator.close() queued behind the blocked next() on the "
+            "single lite-gen thread, so the recv loop wedges"
+        )
+        # The close is fire-and-forget: it runs once the blocked next()
+        # returns (release.set() above). Wait for it deterministically
+        # instead of assuming the executor thread has already been scheduled.
+        # (pipe.close() must come AFTER this — its cancel_futures=True would
+        # sweep the still-queued close job.)
+        assert await asyncio.to_thread(close_called.wait, 2), (
+            "PY-2: generator.close() never ran — the generator's finally "
+            "(file/handle resources) leaked"
+        )
+        pipe.close()

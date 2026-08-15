@@ -976,6 +976,31 @@ class Pipeline:
             result = await result
         return result
 
+    def submit_gen_close(self, generator: Any) -> None:
+        """Schedule ``generator.close()`` on the generator thread, fire-and-forget.
+
+        PY-2: the stream cancel path must NOT await this — with
+        ``max_workers=1`` the close would queue behind a blocked ``next()``
+        and wedge the consuming task. The close runs as soon as the in-flight
+        ``next()`` returns. If the generator is still executing at that
+        point, CPython raises ``ValueError`` (closing a running generator is
+        impossible), which is swallowed here: reference-count GC runs the
+        generator's ``finally`` once the executing frame releases it. This
+        queueing is the semantic ceiling — no scheme can close a generator
+        whose ``next()`` never returns.
+        """
+        def _quiet_close() -> None:
+            try:
+                generator.close()
+            except Exception:
+                pass
+
+        if self._gen_executor is None:
+            self._gen_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="lite-gen"
+            )
+        self._gen_executor.submit(_quiet_close)
+
     def close(self) -> None:
         """Shut down the generator-consumption thread (worker teardown)."""
         if self._gen_executor is not None:

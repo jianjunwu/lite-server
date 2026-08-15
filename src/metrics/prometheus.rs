@@ -753,12 +753,13 @@ pub fn remove_model_ready(model: &str, version: &str) {
 /// semantics). Series are enumerated via REGISTRY.gather so N-label families
 /// (status/worker_id/reason/kind/…) don't need their extra values known.
 ///
-/// Scope: built-in per-version families + the GIE queued mirror. Deliberately
-/// excluded: MODEL_LOAD_TOTAL (the load/unload event log — the one series
-/// operators query *after* an unload), ENSEMBLE_STEP_LATENCY (ensemble-scoped;
-/// its model/version labels belong to the step's sub-model and age out with
-/// the *sub-model's* unload), VERSION_SWITCHES_TOTAL (routing history),
-/// worker-reported custom gauges.
+/// Scope: built-in per-version families + the GIE queued mirror + the
+/// worker-reported dynamic families and pre-registered custom families
+/// (PROM-1). Deliberately excluded: MODEL_LOAD_TOTAL (the load/unload event
+/// log — the one series operators query *after* an unload),
+/// ENSEMBLE_STEP_LATENCY (ensemble-scoped; its model/version labels belong to
+/// the step's sub-model and age out with the *sub-model's* unload),
+/// VERSION_SWITCHES_TOTAL (routing history).
 pub fn remove_version_metrics(model: &str, version: &str) {
     let families = REGISTRY.gather();
     macro_rules! purge {
@@ -821,6 +822,31 @@ pub fn remove_version_metrics(model: &str, version: &str) {
         .unwrap_or_else(|e| e.into_inner());
     for g in guard.values() {
         let _ = g.remove_label_values(&[model, version]);
+    }
+    // PROM-1: worker-reported dynamic families (prefill_ms / decode_ms /
+    // tokens_generated_total + worker gauges/counters/histograms) and the
+    // pre-registered custom metric objects. Only the (model, version) SERIES
+    // are dropped — the family objects/index are process-global and shared.
+    // A late in-flight Done frame may re-create one series via
+    // with_label_values after the purge; the stream is terminal, so it never
+    // grows beyond that single series.
+    for vec in CUSTOM_GAUGES.lock().unwrap_or_else(|e| e.into_inner()).values() {
+        let _ = vec.remove_label_values(&[model, version]);
+    }
+    for vec in CUSTOM_COUNTERS.lock().unwrap_or_else(|e| e.into_inner()).values() {
+        let _ = vec.remove_label_values(&[model, version]);
+    }
+    for vec in CUSTOM_HISTOGRAMS.lock().unwrap_or_else(|e| e.into_inner()).values() {
+        let _ = vec.remove_label_values(&[model, version]);
+    }
+    for vec in CUSTOM_GAUGE_OBJECTS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        let _ = vec.remove_label_values(&[model, version]);
+    }
+    for vec in CUSTOM_COUNTER_OBJECTS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        let _ = vec.remove_label_values(&[model, version]);
+    }
+    for vec in CUSTOM_HISTOGRAM_OBJECTS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        let _ = vec.remove_label_values(&[model, version]);
     }
 }
 
@@ -1387,6 +1413,78 @@ mod tests {
 
         let output = gather_metrics();
         assert!(output.contains("lite_server_rwmc_gauge"), "custom gauge missing: {}", output);
+    }
+
+    /// P1 PROM-1 evidence (project-resource-leak-sweep-0815.md): worker-reported
+    /// families (`lite_server_prefill_ms`/`decode_ms`/`tokens_generated_total`,
+    /// created at :1055-1096) and pre-registered custom families
+    /// (`register_custom_metrics` :1103-1160) are DELIBERATELY excluded from the
+    /// `remove_version_metrics` purge list (:762-825, doc comment: "excluded:
+    /// ... worker-reported custom gauges"). Their (model, version) series
+    /// survive unload and accumulate across version churn (tune/profile runs).
+    ///
+    /// Fixed code purges these families on unload; current code retains them —
+    /// this test FAILS (RED) until the leak is addressed.
+    #[test]
+    fn test_worker_metric_series_survive_version_purge() {
+        use crate::proto::liteserver::{MetricValue, Metrics};
+        let model = "prom_purge_ev_worker";
+        let version = "1";
+
+        // Worker-reported families.
+        record_worker_metrics(
+            model,
+            version,
+            Some(&Metrics {
+                prefill_ms: 5.0,
+                decode_ms: 3.0,
+                tokens_generated: 7,
+                gauges: vec![],
+                counters: vec![],
+                histograms: vec![],
+            }),
+        );
+        // Pre-registered custom family path.
+        register_custom_metrics(&[("purge_ev_custom", "gauge")]);
+        let idx = CUSTOM_METRIC_INDEX.lock().unwrap();
+        let gid = idx.get("purge_ev_custom:gauge").unwrap().1;
+        drop(idx);
+        record_custom_metrics(
+            model,
+            version,
+            &[MetricValue { id: gid as i32, value: 1.0 }],
+            &[],
+            &[],
+        );
+
+        // Unload: the purge macro must drop every (model, version) series.
+        remove_version_metrics(model, version);
+
+        // After unload no series in the worker/custom families may still carry
+        // the (model, version) label set.
+        for family in REGISTRY.gather().iter() {
+            let name = family.get_name();
+            let is_worker_family = name.starts_with("lite_server_prefill_ms")
+                || name.starts_with("lite_server_decode_ms")
+                || name.starts_with("lite_server_tokens_generated_total")
+                || name.starts_with("lite_server_purge_ev_custom");
+            if !is_worker_family {
+                continue;
+            }
+            for m in family.get_metric() {
+                let labels = m.get_label();
+                let hit = labels.iter().any(|l| l.get_name() == "model" && l.get_value() == model)
+                    && labels
+                        .iter()
+                        .any(|l| l.get_name() == "version" && l.get_value() == version);
+                assert!(
+                    !hit,
+                    "PROM-1: {name} retains series {{model={model},version={version}}} \
+                     after remove_version_metrics — worker/custom families are \
+                     excluded from the purge list"
+                );
+            }
+        }
     }
 
     #[test]

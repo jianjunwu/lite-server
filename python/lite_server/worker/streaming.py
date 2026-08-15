@@ -747,6 +747,14 @@ async def _handle_stream_chunk_async(
 
 _SENTINEL = object()
 
+# PY-1: event-loop yield policy for the async-generator consume loop. A
+# no-await async generator would otherwise monopolize the loop (every awaited
+# op in the loop body completes synchronously for a plain model). The clock
+# is checked only every N chunks (amortized ~2.5ns/chunk), and the loop
+# yields only when it has run longer than the threshold without suspending.
+_LOOP_YIELD_CHECK_CHUNKS = 16
+_LOOP_YIELD_INTERVAL_SECS = 0.001
+
 
 def _next_or_sentinel(generator):
     try:
@@ -822,6 +830,9 @@ async def _consume_stream(
     deadline_cut = False
     try:
         if inspect.isasyncgen(generator):
+            loop = asyncio.get_running_loop()
+            last_yield = loop.time()
+            since_check = 0
             async for output in generator:
                 if not await _process_stream_chunk(lit_api, pipe, ctx, output, stream_id, socket, log, stats):
                     return
@@ -832,6 +843,14 @@ async def _consume_stream(
                     log.info("stream %s stopping: deadline reached", stream_id)
                     deadline_cut = True
                     break
+                # PY-1: bounded loop yield — a no-await generator must not
+                # starve recv / heartbeat / watchdog / task.cancel().
+                since_check += 1
+                if since_check >= _LOOP_YIELD_CHECK_CHUNKS:
+                    since_check = 0
+                    if loop.time() - last_yield > _LOOP_YIELD_INTERVAL_SECS:
+                        await asyncio.sleep(0)
+                        last_yield = loop.time()
         else:
             while True:
                 output = await pipe.run_blocking(_next_or_sentinel, generator)
@@ -844,12 +863,11 @@ async def _consume_stream(
                     deadline_cut = True
                     break
     except asyncio.CancelledError:
-        # Propagate cancellation; try to close the generator without waiting
+        # Propagate cancellation; close the generator fire-and-forget (PY-2).
+        # Awaiting run_blocking(generator.close) would queue the close behind
+        # a blocked next() on the single lite-gen thread and wedge this task.
         if not inspect.isasyncgen(generator):
-            try:
-                await pipe.run_blocking(generator.close)
-            except Exception:
-                pass
+            pipe.submit_gen_close(generator)
         await pipe.run_on_stream_close(ctx, "cancel")
         raise
     except HTTPException as e:

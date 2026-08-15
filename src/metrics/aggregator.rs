@@ -40,6 +40,13 @@ pub struct TimelineSnapshot {
 /// the timestamp feeds the optional age bound (B6).
 type LatencySamples = DashMap<(String, String), std::sync::Mutex<VecDeque<(f64, f64)>>>;
 
+/// AGG-1: hard cap on distinct (model, version) latency-sample keys. Unknown-
+/// model request paths (404/401/429/stream-reject) create keys that the
+/// loaded-model unload path (`remove`) never reaps; without a cap a client
+/// enumerating model names grows the map linearly. 1024 keys x <=1000 samples
+/// x 16B bounds the map at ~16MB — far above any real active version count.
+pub(crate) const MAX_LATENCY_KEYS: usize = 1024;
+
 pub struct TimelineAggregator {
     /// (model, version) key -> ring buffer of entries. Structured key: both
     /// model and version may contain `_` (validation.rs), so any string
@@ -59,6 +66,8 @@ pub struct TimelineAggregator {
     p99_max_samples: std::sync::atomic::AtomicUsize,
     /// f64 bits; 0.0 = age bound off.
     p99_max_age_secs: std::sync::atomic::AtomicU64,
+    /// AGG-1: one-shot flag so the key-cap drop logs exactly one warning.
+    latency_cap_warned: std::sync::atomic::AtomicBool,
 }
 
 impl Default for TimelineAggregator {
@@ -79,6 +88,7 @@ impl TimelineAggregator {
             sample_interval_secs: std::sync::atomic::AtomicU64::new(SAMPLE_INTERVAL_SECS as u64),
             p99_max_samples: std::sync::atomic::AtomicUsize::new(P99_WINDOW_MAX_SAMPLES),
             p99_max_age_secs: std::sync::atomic::AtomicU64::new(0),
+            latency_cap_warned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -110,6 +120,21 @@ impl TimelineAggregator {
         let max_samples = self.p99_max_samples.load(Relaxed);
         let max_age = self.p99_max_age();
         let key = (model.to_string(), version.to_string());
+        // AGG-1: fast path checks key existence (single-shard read, same cost
+        // class as `entry`); only a FIRST-seen key pays the cross-shard len()
+        // for the cardinality cap. New keys beyond the cap are dropped —
+        // unknown-model requests must not grow the map without bound.
+        if !self.latency_samples.contains_key(&key)
+            && self.latency_samples.len() >= MAX_LATENCY_KEYS
+        {
+            if !self.latency_cap_warned.swap(true, Relaxed) {
+                tracing::warn!(
+                    cap = MAX_LATENCY_KEYS,
+                    "latency sample key cap reached; dropping samples for new (model, version) keys"
+                );
+            }
+            return;
+        }
         let entry = self.latency_samples.entry(key).or_insert_with(|| {
             std::sync::Mutex::new(VecDeque::with_capacity(max_samples.min(1024)))
         });
@@ -571,6 +596,29 @@ mod tests {
         assert_eq!(deque.len(), 1000);
         // First 100 should have been evicted
         assert_eq!(deque[0].1, 0.1);
+    }
+
+    /// P1 AGG-1 evidence (project-resource-leak-sweep-0815.md): `record_latency`
+    /// inserts an arbitrary (model, version) key on first touch (:107-132) and
+    /// the ONLY cleanup, `remove` (:206-213), is invoked from the loaded-model
+    /// unload path. Unknown-model requests (404/401/429/stream-reject) create
+    /// keys that never age out — with the default `p99_max_age = 0` the age
+    /// bound is off, so a client enumerating model names grows memory linearly.
+    ///
+    /// Fixed code caps unknown keys at MAX_LATENCY_KEYS; this test FAILS (RED)
+    /// until the leak is addressed.
+    #[test]
+    fn test_record_latency_unknown_model_keys_grow_unbounded() {
+        let agg = TimelineAggregator::new();
+        for i in 0..10_000 {
+            agg.record_latency(&format!("unknown-{}", i), &format!("v{}", i), 0.01);
+        }
+        let n = agg.latency_samples.len();
+        assert!(
+            n <= MAX_LATENCY_KEYS,
+            "AGG-1: record_latency held {n} keys for never-loaded models — \
+             unbounded growth from unknown-model request paths"
+        );
     }
 
     #[test]
