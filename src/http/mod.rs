@@ -742,8 +742,11 @@ pub(crate) fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
     let sock = socket2::SockRef::from(stream);
     let params = socket2::TcpKeepalive::new()
         .with_time(std::time::Duration::from_secs(60))
-        .with_interval(std::time::Duration::from_secs(10))
-        .with_retries(3);
+        .with_interval(std::time::Duration::from_secs(10));
+    // Windows SIO_KEEPALIVE_VALS exposes only idle + interval — no retry
+    // count (TCP_KEEPCNT) — so the probe count is applied where the OS has it.
+    #[cfg(not(windows))]
+    let params = params.with_retries(3);
     if let Err(e) = sock.set_tcp_keepalive(&params) {
         tracing::warn!(error = %e, "failed to set TCP keepalive on accepted socket");
     }
