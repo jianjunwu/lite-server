@@ -373,6 +373,12 @@ lazy_static! {
     /// handshakes, or slowloris holds. Incremented at accept, decremented
     /// when the connection task ends (K1's reaper makes the decrement
     /// observable on idle close).
+    ///
+    /// Blind spot: the tls series counts only POST-handshake connections
+    /// (CountedTlsStream is constructed after the handshake completes), so a
+    /// slowloris stall mid-handshake is invisible here. That phase is bounded
+    /// by the RN-1 handshake semaphore; observe it via the semaphore if
+    /// needed, not by widening this gauge's label set.
     pub static ref HTTP_CONNECTIONS: GaugeVec = GaugeVec::new(
         prometheus::Opts::new(
             "liteserver_http_connections",

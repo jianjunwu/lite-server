@@ -385,6 +385,42 @@ impl CountedTlsStream {
 
 impl Unpin for CountedTlsStream {}
 
+/// D7 leak fix: compensates the accept-time `open_connections.fetch_add`
+/// unless disarmed. CountedTlsStream — the usual decrement owner — is only
+/// constructed after a successful handshake, so every failure branch
+/// (handshake permit refused / handshake error / handshake timeout) used to
+/// leak a permanent +1 and drift the D7 cap counter upward until
+/// max_connections refused ALL TLS connections. The guard is created right
+/// after the increment, and disarmed only when CountedTlsStream takes over
+/// the decrement duty.
+struct ConnectionCountGuard {
+    open_connections: Arc<std::sync::atomic::AtomicUsize>,
+    armed: bool,
+}
+
+impl ConnectionCountGuard {
+    fn new(open_connections: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        Self {
+            open_connections,
+            armed: true,
+        }
+    }
+
+    /// Hand over the decrement duty to CountedTlsStream (handshake succeeded).
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ConnectionCountGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.open_connections
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
+
 impl Drop for CountedTlsStream {
     fn drop(&mut self) {
         crate::metrics::prometheus::record_http_connection_close("tls");
@@ -465,6 +501,9 @@ where
         }
         self.open_connections
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        // D7 leak fix: any early return from here on (permit refusal,
+        // handshake error/timeout, dropped future) must return the +1.
+        let guard = ConnectionCountGuard::new(self.open_connections.clone());
         let open_connections = self.open_connections.clone();
         // L5: OS-level keepalive on the accepted socket (plaintext path
         // parity — serve_tcp does the same).
@@ -501,6 +540,9 @@ where
                 .peer_certificates()
                 .and_then(|certs| certs.first())
                 .map(principal_from_cert);
+            // Handshake succeeded: CountedTlsStream owns the decrement from
+            // here (its Drop), so the guard must stand down.
+            guard.disarm();
             Ok((CountedTlsStream::new(tls, open_connections), InjectPrincipal { inner: service, principal }))
         })
     }
@@ -1168,5 +1210,110 @@ mod tests {
         drop(first);
         drop(c1);
         drop(c2);
+    }
+
+    /// D7 leak fix: the open-connection counter is incremented at accept but
+    /// was only decremented by CountedTlsStream's Drop — which is constructed
+    /// solely on handshake success. Every refused/failed/timed-out handshake
+    /// leaked a permanent +1, drifting the D7 cap counter upward until
+    /// max_connections refused ALL TLS connections. These three tests pin the
+    /// compensating decrement on each failure branch.
+    #[tokio::test]
+    async fn d7_counter_released_when_handshake_gate_refuses() {
+        use axum_server::accept::Accept as _;
+        use std::sync::atomic::Ordering;
+
+        let pki = TestPki::new("d7-gate-ca");
+        let (store, _dir) = store_for(&pki, TlsProtocol::Http, false, "d7-gate");
+        let acceptor = RotatingTlsAcceptor::with_handshake_limit(store, 1);
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let c1 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (s1, _) = listener.accept().await.unwrap();
+        let c2 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (s2, _) = listener.accept().await.unwrap();
+
+        // First accept takes the only permit and stalls (client never speaks
+        // TLS); its +1 is legitimately held for the test's duration.
+        let first = acceptor.accept(s1, ());
+        assert_eq!(acceptor.open_connections.load(Ordering::Acquire), 1);
+
+        // The refused accept must return its +1 immediately.
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            acceptor.accept(s2, ()),
+        )
+        .await
+        .expect("gate refusal must be immediate");
+        assert!(refused.is_err());
+        assert_eq!(
+            acceptor.open_connections.load(Ordering::Acquire),
+            1,
+            "refused handshake must not leak the D7 counter"
+        );
+
+        drop(first);
+        drop(c1);
+        drop(c2);
+    }
+
+    #[tokio::test]
+    async fn d7_counter_released_when_handshake_fails() {
+        use axum_server::accept::Accept as _;
+        use std::sync::atomic::Ordering;
+
+        let pki = TestPki::new("d7-fail-ca");
+        let (store, _dir) = store_for(&pki, TlsProtocol::Http, false, "d7-fail");
+        let acceptor = RotatingTlsAcceptor::new(store);
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        // Client drops immediately → rustls accept errors out fast (EOF).
+        drop(client);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            acceptor.accept(server, ()),
+        )
+        .await
+        .expect("failed handshake must resolve promptly");
+        assert!(result.is_err());
+        assert_eq!(
+            acceptor.open_connections.load(Ordering::Acquire),
+            0,
+            "failed handshake must not leak the D7 counter"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn d7_counter_released_when_handshake_times_out() {
+        use axum_server::accept::Accept as _;
+        use std::sync::atomic::Ordering;
+
+        let pki = TestPki::new("d7-timeout-ca");
+        let (store, _dir) = store_for(&pki, TlsProtocol::Http, false, "d7-timeout");
+        let acceptor = RotatingTlsAcceptor::new(store);
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Client connects but never speaks TLS; paused time auto-advances to
+        // the TLS_HANDSHAKE_TIMEOUT timer once the runtime idles.
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        let result = acceptor.accept(server, ()).await;
+        let err = match result {
+            Ok(_) => panic!("stalled handshake must time out"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            acceptor.open_connections.load(Ordering::Acquire),
+            0,
+            "timed-out handshake must not leak the D7 counter"
+        );
     }
 }
