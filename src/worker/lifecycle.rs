@@ -535,6 +535,9 @@ impl WorkerManager {
                 capacity: None,
             };
             worker_infos.push(info);
+            if let Some(pid) = pid {
+                crate::metrics::prometheus::set_worker_pid(model_name, version, worker_id as u32, pid);
+            }
 
             worker_processes.push(WorkerProcess {
                 worker_id: worker_id as u32,
@@ -931,6 +934,10 @@ impl WorkerManager {
         // Round2 B2: drop the rest of the per-version series + timeline state
         // (after record_model_unload — MODEL_LOAD_TOTAL is excluded from the
         // purge, the event log survives).
+        // Drop worker memory registrations BEFORE the purge: the graceful
+        // kill is async, so a scrape between purge and process exit would
+        // re-create the just-purged worker series from a live registry entry.
+        crate::metrics::prometheus::clear_worker_pids(model_name, version);
         crate::metrics::prometheus::remove_version_metrics(model_name, version);
         crate::metrics::aggregator::TIMELINE.remove(model_name, version).await;
 
@@ -997,6 +1004,9 @@ impl WorkerManager {
         crate::metrics::prometheus::remove_version_weight(model_name, version);
         crate::metrics::prometheus::remove_model_ready(model_name, version);
         // Round2 B2: same per-version purge as the graceful unload path.
+        // clear_worker_pids before the purge — same async-kill rationale as
+        // the graceful path above.
+        crate::metrics::prometheus::clear_worker_pids(model_name, version);
         crate::metrics::prometheus::remove_version_metrics(model_name, version);
         crate::metrics::aggregator::TIMELINE.remove(model_name, version).await;
         Ok(())

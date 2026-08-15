@@ -39,6 +39,23 @@ task). Unary early rejections (404/503/401/429/400 before queue dispatch)
 count toward `liteserver_requests_total`, as do ensemble unary top-level
 requests (one request = one count; sub-model steps are not counted).
 
+### Worker memory
+
+Worker processes are separate Python processes with their own PIDs; they are
+sampled in the same scrape-time refresh as the server process (registered at
+spawn/respawn, dropped at unload).
+
+| Metric | Labels | Notes |
+|---|---|---|
+| `liteserver_worker_resident_memory_bytes` | `model, version, worker_id` | RSS of a single worker process. |
+| `liteserver_worker_virtual_memory_bytes` | `model, version, worker_id` | Virtual memory of a single worker process. |
+| `liteserver_workers_resident_memory_bytes` | `model, version` | RSS summed over the version's live workers — per-version alerting without a PromQL `sum`. |
+
+A worker that dies without an unload (crash, eject, forced kill) has its
+series removed on the next scrape rather than frozen at its last value; PID
+reuse is detected via the process start time. The aggregate only sums live
+workers.
+
 ### Streaming metrics
 
 All `liteserver_stream_*` metrics below are gated by

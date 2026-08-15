@@ -676,6 +676,11 @@ impl WorkerManager {
             capacity: None,
         };
         self.registry.replace_worker(model_name, version, worker_id, new_info)?;
+        // Respawn replaced the process: point memory sampling at the new PID
+        // (same worker_id overwrites the stale entry).
+        if let Some(pid) = pid {
+            crate::metrics::prometheus::set_worker_pid(model_name, version, worker_id, pid);
+        }
 
         // Update WorkerProcess entry
         {

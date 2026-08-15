@@ -1,7 +1,7 @@
 use lazy_static::lazy_static;
 use prometheus::{
-    Counter, CounterVec, Gauge, GaugeVec, HistogramOpts, HistogramVec, IntGauge, Registry,
-    TextEncoder,
+    Counter, CounterVec, Gauge, GaugeVec, HistogramOpts, HistogramVec, IntGauge, IntGaugeVec,
+    Registry, TextEncoder,
 };
 use std::collections::HashMap;
 
@@ -455,6 +455,9 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(PROCESS_CPU_SECONDS_TOTAL.clone()))?;
     REGISTRY.register(Box::new(PROCESS_START_TIME_SECONDS.clone()))?;
     REGISTRY.register(Box::new(PROCESS_THREADS.clone()))?;
+    REGISTRY.register(Box::new(WORKER_RSS_BYTES.clone()))?;
+    REGISTRY.register(Box::new(WORKER_VIRT_BYTES.clone()))?;
+    REGISTRY.register(Box::new(WORKERS_RSS_BYTES.clone()))?;
     INFO.with_label_values(&[env!("CARGO_PKG_VERSION")]).set(1.0);
     REGISTRY.register(Box::new(CALLBACK_DISPATCH_DROPPED.clone()))?;
     Ok(())
@@ -556,6 +559,102 @@ lazy_static! {
     pub static ref PROCESS_THREADS: IntGauge = IntGauge::new(
         "liteserver_process_threads", "Thread count of the server process (Linux/Android only; 0 where unsupported)"
     ).unwrap();
+    /// Per-worker RSS. worker_id label follows the WORKER_HEALTH_STATUS
+    /// precedent (bounded slot ids, not unbounded values).
+    pub static ref WORKER_RSS_BYTES: IntGaugeVec = IntGaugeVec::new(
+        prometheus::Opts::new(
+            "liteserver_worker_resident_memory_bytes",
+            "Resident memory of a single worker process (bytes)"
+        ),
+        &["model", "version", "worker_id"]
+    ).unwrap();
+    pub static ref WORKER_VIRT_BYTES: IntGaugeVec = IntGaugeVec::new(
+        prometheus::Opts::new(
+            "liteserver_worker_virtual_memory_bytes",
+            "Virtual memory of a single worker process (bytes)"
+        ),
+        &["model", "version", "worker_id"]
+    ).unwrap();
+    /// RSS summed over the live workers of one (model, version) — alerting on
+    // per-version memory without a PromQL sum.
+    pub static ref WORKERS_RSS_BYTES: IntGaugeVec = IntGaugeVec::new(
+        prometheus::Opts::new(
+            "liteserver_workers_resident_memory_bytes",
+            "Resident memory summed over all live workers of a model version (bytes)"
+        ),
+        &["model", "version"]
+    ).unwrap();
+}
+
+/// Registry key for a sampled worker process: (model, version, worker_id).
+pub type WorkerKey = (String, String, String);
+
+/// A registered worker process. `start_time` is primed on the first sample
+/// and re-checked afterwards: a mismatch means the OS recycled the PID and the
+/// entry is stale (treated as dead). Reset on every (re)registration so a
+/// respawn re-primes.
+pub struct WorkerPidEntry {
+    pub pid: sysinfo::Pid,
+    pub start_time: Option<u64>,
+}
+
+/// Defensive bound on the worker PID registry (AGG-1-style). Worker counts
+// are config-bounded in practice; the cap only guards against hook bugs.
+pub const MAX_WORKER_PID_ENTRIES: usize = 4096;
+
+/// Insert into the worker PID registry, respecting MAX_WORKER_PID_ENTRIES.
+/// Overwriting an existing key (respawn) is always allowed. Returns false
+/// when the insert was rejected.
+fn worker_registry_insert(
+    map: &mut HashMap<WorkerKey, WorkerPidEntry>,
+    key: WorkerKey,
+    entry: WorkerPidEntry,
+) -> bool {
+    if !map.contains_key(&key) && map.len() >= MAX_WORKER_PID_ENTRIES {
+        return false;
+    }
+    map.insert(key, entry);
+    true
+}
+
+/// Register a worker process for memory sampling. Called on spawn and respawn
+/// (same worker_id overwrites the stale PID).
+pub fn set_worker_pid(model: &str, version: &str, worker_id: u32, pid: u32) {
+    let mut st = PROCESS_SAMPLER.lock().unwrap_or_else(|e| e.into_inner());
+    let key: WorkerKey = (model.to_string(), version.to_string(), worker_id.to_string());
+    let entry = WorkerPidEntry {
+        pid: sysinfo::Pid::from(pid as usize),
+        start_time: None,
+    };
+    if !worker_registry_insert(&mut st.worker_pids, key, entry) {
+        tracing::warn!(
+            model,
+            version,
+            worker_id,
+            "worker PID registry full ({MAX_WORKER_PID_ENTRIES} entries); memory metrics skipped"
+        );
+    }
+}
+
+/// Drop all worker PID entries of one (model, version) together with their
+/// exported series. Must run BEFORE remove_version_metrics on the unload path:
+/// the graceful kill is async, so a scrape between purge and process exit
+/// would otherwise re-create the just-purged series from a live registry
+/// entry.
+pub fn clear_worker_pids(model: &str, version: &str) {
+    let mut st = PROCESS_SAMPLER.lock().unwrap_or_else(|e| e.into_inner());
+    let keys: Vec<WorkerKey> = st
+        .worker_pids
+        .keys()
+        .filter(|k| k.0 == model && k.1 == version)
+        .cloned()
+        .collect();
+    for key in keys {
+        st.worker_pids.remove(&key);
+        let _ = WORKER_RSS_BYTES.remove_label_values(&[&key.0, &key.1, &key.2]);
+        let _ = WORKER_VIRT_BYTES.remove_label_values(&[&key.0, &key.1, &key.2]);
+    }
+    let _ = WORKERS_RSS_BYTES.remove_label_values(&[model, version]);
 }
 
 struct ProcessSamplerState {
@@ -563,6 +662,7 @@ struct ProcessSamplerState {
     pid: sysinfo::Pid,
     last_cpu_ms: u64,
     primed: bool,
+    worker_pids: HashMap<WorkerKey, WorkerPidEntry>,
 }
 
 lazy_static! {
@@ -571,6 +671,7 @@ lazy_static! {
         pid: sysinfo::Pid::from(std::process::id() as usize),
         last_cpu_ms: 0,
         primed: false,
+        worker_pids: HashMap::new(),
     });
 }
 
@@ -578,30 +679,92 @@ lazy_static! {
 /// scrape — scrape-time freshness without a background task. CPU seconds are
 /// derived from sysinfo's cumulative `accumulated_cpu_time` (CPU-ms), so the
 /// counter stays monotonic; the first refresh only primes the baseline.
+///
+/// Worker processes registered via set_worker_pid are sampled in the same
+/// sysinfo refresh. A registered PID absent from the refreshed map is
+/// DEFINITIVELY dead (refresh removes dead processes), so its series are
+/// removed and the entry dropped — self-healing for crash/eject/kill paths
+/// that bypass clear_worker_pids. The per-version aggregate only sums live
+/// workers; when the last worker of a version dies the aggregate series is
+/// removed too.
 pub fn refresh_process_metrics() {
     let mut st = PROCESS_SAMPLER.lock().unwrap_or_else(|e| e.into_inner());
     let pid = st.pid;
-    st.system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-    let Some(p) = st.system.process(pid) else {
-        return;
-    };
-    let (rss, virt, start, cpu_ms, n_tasks) = (
-        p.memory(),
-        p.virtual_memory(),
-        p.start_time(),
-        p.accumulated_cpu_time(),
-        p.tasks().map(|t| t.len()),
-    );
-    PROCESS_RSS_BYTES.set(rss as i64);
-    PROCESS_VIRT_BYTES.set(virt as i64);
-    PROCESS_START_TIME_SECONDS.set(start as f64);
-    if st.primed && cpu_ms >= st.last_cpu_ms {
-        PROCESS_CPU_SECONDS_TOTAL.inc_by((cpu_ms - st.last_cpu_ms) as f64 / 1000.0);
+    let mut pids: Vec<sysinfo::Pid> = Vec::with_capacity(st.worker_pids.len() + 1);
+    pids.push(pid);
+    for entry in st.worker_pids.values() {
+        if !pids.contains(&entry.pid) {
+            pids.push(entry.pid);
+        }
     }
-    st.last_cpu_ms = cpu_ms;
-    st.primed = true;
-    if let Some(n) = n_tasks {
-        PROCESS_THREADS.set(n as i64);
+    st.system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&pids), true);
+    if let Some(p) = st.system.process(pid) {
+        let (rss, virt, start, cpu_ms, n_tasks) = (
+            p.memory(),
+            p.virtual_memory(),
+            p.start_time(),
+            p.accumulated_cpu_time(),
+            p.tasks().map(|t| t.len()),
+        );
+        PROCESS_RSS_BYTES.set(rss as i64);
+        PROCESS_VIRT_BYTES.set(virt as i64);
+        PROCESS_START_TIME_SECONDS.set(start as f64);
+        if st.primed && cpu_ms >= st.last_cpu_ms {
+            PROCESS_CPU_SECONDS_TOTAL.inc_by((cpu_ms - st.last_cpu_ms) as f64 / 1000.0);
+        }
+        st.last_cpu_ms = cpu_ms;
+        st.primed = true;
+        if let Some(n) = n_tasks {
+            PROCESS_THREADS.set(n as i64);
+        }
+    }
+
+    // Worker sampling. Destructure the guard for disjoint field borrows:
+    // iterate worker_pids mutably, read system immutably.
+    let ProcessSamplerState { system, worker_pids, .. } = &mut *st;
+    let mut dead: Vec<WorkerKey> = Vec::new();
+    let mut sums: HashMap<(String, String), u64> = HashMap::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for (key, entry) in worker_pids.iter_mut() {
+        seen.insert((key.0.clone(), key.1.clone()));
+        let Some(p) = system.process(entry.pid) else {
+            dead.push(key.clone());
+            continue;
+        };
+        let start = p.start_time();
+        match entry.start_time {
+            // Same PID, different start_time: the OS recycled the PID — the
+            // worker is gone and this is someone else's process.
+            Some(primed) if primed != start => {
+                dead.push(key.clone());
+                continue;
+            }
+            None => entry.start_time = Some(start),
+            _ => {}
+        }
+        let rss = p.memory();
+        WORKER_RSS_BYTES
+            .with_label_values(&[&key.0, &key.1, &key.2])
+            .set(rss as i64);
+        WORKER_VIRT_BYTES
+            .with_label_values(&[&key.0, &key.1, &key.2])
+            .set(p.virtual_memory() as i64);
+        *sums.entry((key.0.clone(), key.1.clone())).or_default() += rss;
+    }
+    for key in dead {
+        worker_pids.remove(&key);
+        let _ = WORKER_RSS_BYTES.remove_label_values(&[&key.0, &key.1, &key.2]);
+        let _ = WORKER_VIRT_BYTES.remove_label_values(&[&key.0, &key.1, &key.2]);
+    }
+    for mv in seen {
+        match sums.get(&mv) {
+            Some(total) => WORKERS_RSS_BYTES
+                .with_label_values(&[&mv.0, &mv.1])
+                .set(*total as i64),
+            None => {
+                let _ = WORKERS_RSS_BYTES.remove_label_values(&[&mv.0, &mv.1]);
+            }
+        }
     }
 }
 
@@ -808,6 +971,9 @@ pub fn remove_version_metrics(model: &str, version: &str) {
     purge!(STREAM_REJECTED_TOTAL, "liteserver_stream_rejected_total", ["model", "version", "reason"]);
     purge!(HEALTH_CHECK_TOTAL, "liteserver_health_check_total", ["model", "version", "result"]);
     purge!(WORKER_HEALTH_STATUS, "liteserver_worker_health_status", ["model", "version", "worker_id"]);
+    purge!(WORKER_RSS_BYTES, "liteserver_worker_resident_memory_bytes", ["model", "version", "worker_id"]);
+    purge!(WORKER_VIRT_BYTES, "liteserver_worker_virtual_memory_bytes", ["model", "version", "worker_id"]);
+    purge!(WORKERS_RSS_BYTES, "liteserver_workers_resident_memory_bytes", ["model", "version"]);
     purge!(WORKER_INFERENCE_TOTAL, "liteserver_worker_inference_total", ["model", "version", "worker_id"]);
     purge!(WORKER_RESPAWNS_TOTAL, "liteserver_worker_respawns_total", ["model", "version", "reason"]);
     purge!(IN_FLIGHT_REQUESTS, "liteserver_in_flight_requests", ["model", "version"]);
@@ -2128,6 +2294,174 @@ mod tests {
         let threads = gather_family_value("liteserver_process_threads")
             .expect("process threads must be exported");
         assert!(threads >= 1.0, "live process has at least one thread, got {threads}");
+    }
+
+    // ===== Worker memory metrics (per-worker RSS/VIRT + per-version aggregate) =====
+
+    fn own_pid() -> u32 {
+        std::process::id()
+    }
+
+    fn worker_key(model: &str, version: &str, worker_id: &str) -> WorkerKey {
+        (model.to_string(), version.to_string(), worker_id.to_string())
+    }
+
+    /// True when the gathered output contains a series of `family` whose label
+    /// set contains every (name, value) pair in `expected`.
+    fn gathered_has_series(family: &str, expected: &[(&str, &str)]) -> bool {
+        REGISTRY.gather().iter().any(|mf| {
+            mf.get_name() == family
+                && mf.get_metric().iter().any(|m| {
+                    expected.iter().all(|(name, value)| {
+                        m.get_label()
+                            .iter()
+                            .any(|l| l.get_name() == *name && l.get_value() == *value)
+                    })
+                })
+        })
+    }
+
+    /// A registered live PID must produce positive per-worker RSS and VIRT
+    /// gauges after a refresh (the test process itself plays the "worker").
+    #[test]
+    fn should_sample_worker_memory_for_registered_pid() {
+        let _ = register_metrics();
+        let (m, v, w) = ("wmem_sample_m", "1", "0");
+        set_worker_pid(m, v, 0, own_pid());
+        refresh_process_metrics();
+        assert!(WORKER_RSS_BYTES.with_label_values(&[m, v, w]).get() > 0);
+        assert!(WORKER_VIRT_BYTES.with_label_values(&[m, v, w]).get() > 0);
+        clear_worker_pids(m, v);
+    }
+
+    /// The per-version aggregate must equal the sum of live per-worker RSS.
+    #[test]
+    fn should_aggregate_worker_rss_per_model_version() {
+        let _ = register_metrics();
+        let (m, v) = ("wmem_agg_m", "1");
+        set_worker_pid(m, v, 0, own_pid());
+        set_worker_pid(m, v, 1, own_pid());
+        refresh_process_metrics();
+        let w0 = WORKER_RSS_BYTES.with_label_values(&[m, v, "0"]).get();
+        let w1 = WORKER_RSS_BYTES.with_label_values(&[m, v, "1"]).get();
+        let agg = WORKERS_RSS_BYTES.with_label_values(&[m, v]).get();
+        assert!(w0 > 0 && w1 > 0);
+        // Concurrent scrapes from sibling tests may re-sample between reads;
+        // allow slack while still catching a missing or doubled sum.
+        assert!(
+            (agg - (w0 + w1)).abs() < 64 * 1024 * 1024,
+            "aggregate {agg} must equal w0+w1 {}",
+            w0 + w1
+        );
+        clear_worker_pids(m, v);
+    }
+
+    /// A worker PID that no longer exists must have its per-worker series
+    /// removed and be dropped from the registry — self-healing for the
+    /// crash/eject/kill paths that never call clear_worker_pids.
+    #[test]
+    fn should_remove_series_when_worker_pid_dead() {
+        let _ = register_metrics();
+        let (m, v, w) = ("wmem_dead_m", "1", "0");
+        set_worker_pid(m, v, 0, own_pid());
+        refresh_process_metrics();
+        assert!(WORKER_RSS_BYTES.with_label_values(&[m, v, w]).get() > 0);
+        // Simulate the process dying: point the entry at a PID that cannot
+        // exist (above every platform's PID_MAX).
+        {
+            let mut st = PROCESS_SAMPLER.lock().unwrap_or_else(|e| e.into_inner());
+            let key = worker_key(m, v, w);
+            st.worker_pids.get_mut(&key).unwrap().pid = sysinfo::Pid::from(u32::MAX as usize);
+        }
+        refresh_process_metrics();
+        assert!(!gathered_has_series("liteserver_worker_resident_memory_bytes", &[("model", m), ("version", v), ("worker_id", w)]));
+        assert!(!gathered_has_series("liteserver_worker_virtual_memory_bytes", &[("model", m), ("version", v), ("worker_id", w)]));
+        assert!(!gathered_has_series("liteserver_workers_resident_memory_bytes", &[("model", m), ("version", v)]));
+        let st = PROCESS_SAMPLER.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!st.worker_pids.contains_key(&worker_key(m, v, w)));
+    }
+
+    /// PID reuse: when the sampled start_time diverges from the primed value,
+    /// the OS recycled the PID — treat it as dead and drop the series.
+    #[test]
+    fn should_drop_series_when_pid_recycled() {
+        let _ = register_metrics();
+        let (m, v, w) = ("wmem_reuse_m", "1", "0");
+        set_worker_pid(m, v, 0, own_pid());
+        refresh_process_metrics(); // primes start_time
+        {
+            let mut st = PROCESS_SAMPLER.lock().unwrap_or_else(|e| e.into_inner());
+            let key = worker_key(m, v, w);
+            st.worker_pids.get_mut(&key).unwrap().start_time = Some(u64::MAX);
+        }
+        refresh_process_metrics();
+        assert!(!gathered_has_series("liteserver_worker_resident_memory_bytes", &[("model", m), ("version", v), ("worker_id", w)]));
+        let st = PROCESS_SAMPLER.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!st.worker_pids.contains_key(&worker_key(m, v, w)));
+    }
+
+    /// Respawn re-registers the same worker_id with a new PID; the entry must
+    /// be replaced (here the replacement is dead, so the series disappears
+    /// instead of sampling the stale live PID).
+    #[test]
+    fn should_replace_pid_on_respawn_reregistration() {
+        let _ = register_metrics();
+        let (m, v, w) = ("wmem_respawn_m", "1", "0");
+        set_worker_pid(m, v, 0, own_pid());
+        refresh_process_metrics();
+        assert!(WORKER_RSS_BYTES.with_label_values(&[m, v, w]).get() > 0);
+        set_worker_pid(m, v, 0, u32::MAX);
+        refresh_process_metrics();
+        assert!(!gathered_has_series("liteserver_worker_resident_memory_bytes", &[("model", m), ("version", v), ("worker_id", w)]));
+    }
+
+    /// clear_worker_pids drops registry entries AND exported series for
+    /// exactly one (model, version); other models stay live.
+    #[test]
+    fn should_clear_worker_pids_only_for_target_version() {
+        let _ = register_metrics();
+        let (ma, mb, v, w) = ("wmem_clear_ma", "wmem_clear_mb", "1", "0");
+        set_worker_pid(ma, v, 0, own_pid());
+        set_worker_pid(mb, v, 0, own_pid());
+        refresh_process_metrics();
+        assert!(WORKER_RSS_BYTES.with_label_values(&[ma, v, w]).get() > 0);
+        clear_worker_pids(ma, v);
+        assert!(!gathered_has_series("liteserver_worker_resident_memory_bytes", &[("model", ma), ("version", v)]));
+        assert!(!gathered_has_series("liteserver_worker_virtual_memory_bytes", &[("model", ma), ("version", v)]));
+        assert!(!gathered_has_series("liteserver_workers_resident_memory_bytes", &[("model", ma), ("version", v)]));
+        refresh_process_metrics();
+        assert!(WORKER_RSS_BYTES.with_label_values(&[mb, v, w]).get() > 0);
+        clear_worker_pids(mb, v);
+    }
+
+    /// Registry insert is capped (AGG-1-style bound); overwriting an existing
+    /// key is always allowed, even at the cap.
+    #[test]
+    fn should_reject_registry_insert_beyond_cap() {
+        let mut map = std::collections::HashMap::new();
+        let entry = || WorkerPidEntry { pid: sysinfo::Pid::from(1usize), start_time: None };
+        for i in 0..MAX_WORKER_PID_ENTRIES {
+            let key = (format!("m{i}"), "1".to_string(), "0".to_string());
+            assert!(worker_registry_insert(&mut map, key, entry()));
+        }
+        let extra = ("overflow".to_string(), "1".to_string(), "0".to_string());
+        assert!(!worker_registry_insert(&mut map, extra, entry()));
+        let existing = ("m0".to_string(), "1".to_string(), "0".to_string());
+        assert!(worker_registry_insert(&mut map, existing, entry()));
+    }
+
+    /// remove_version_metrics must purge all three worker-memory families.
+    #[test]
+    fn remove_version_metrics_purges_worker_memory_series() {
+        let _ = register_metrics();
+        let (m, v, w) = ("wmem_purge_m", "9", "0");
+        WORKER_RSS_BYTES.with_label_values(&[m, v, w]).set(1);
+        WORKER_VIRT_BYTES.with_label_values(&[m, v, w]).set(1);
+        WORKERS_RSS_BYTES.with_label_values(&[m, v]).set(1);
+        remove_version_metrics(m, v);
+        assert!(!gathered_has_series("liteserver_worker_resident_memory_bytes", &[("model", m), ("version", v)]));
+        assert!(!gathered_has_series("liteserver_worker_virtual_memory_bytes", &[("model", m), ("version", v)]));
+        assert!(!gathered_has_series("liteserver_workers_resident_memory_bytes", &[("model", m), ("version", v)]));
     }
 
     /// S7:TBT 桶追加 1/2.5/5——慢解码 chunk 间隔不落 +Inf(旧桶顶 0.5s)。
