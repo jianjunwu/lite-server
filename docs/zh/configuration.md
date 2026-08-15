@@ -111,6 +111,21 @@ metrics:
   # {namespace}:total_queued_requests / {namespace}:kv_cache_utilization
   # （vllm 兼容命名，对接 K8s LLM 自动扩缩生态）。非法命名空间启动 fail-fast。
   metric_namespace: liteserver
+  # /metrics/timeline 窗口（每 model/version 环形缓冲）
+  timeline_max_points: 30      # 每条序列保留的数据点数（点数 × 间隔 = 历史深度）
+  timeline_sample_interval_secs: 10  # 采样间隔，即 /metrics/timeline 分辨率
+  # /metrics/timeline p99 滑窗（每 model/version 延迟样本）
+  p99_window_max_samples: 1000 # 样本数上限；高 QPS 版本很快触顶
+  p99_window_max_age_secs: 0   # 样本年龄界（秒）；0 = 关闭（仅按数量界）。
+                               # 低 QPS 部署建议设置，避免 p99 跨小时陈旧。
+
+alerts:
+  # /alerts 求值阈值（开关仍是 features.alerts）。
+  # 图示为默认值；引擎按 GET /alerts 请求时求值。
+  queue_depth_warning: 100
+  queue_depth_critical: 500
+  p99_ms_warning: 500
+  p99_ms_critical: 2000
 
 rate_limit:
   max_buckets: 65536           # 限流桶数量上限（按 IP/路由 key），

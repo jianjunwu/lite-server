@@ -57,13 +57,20 @@ impl AppState {
         rate_limiter: Arc<RateLimiter>,
     ) -> Self {
         let admission = AdmissionCounter::new(config.server.max_inflight);
+        // Round2 B5: thresholds from config.alerts (defaults = legacy hardcoded).
+        let alert_thresholds = AlertThresholds {
+            queue_depth_warning: config.alerts.queue_depth_warning,
+            queue_depth_critical: config.alerts.queue_depth_critical,
+            p99_ms_warning: config.alerts.p99_ms_warning,
+            p99_ms_critical: config.alerts.p99_ms_critical,
+        };
         Self {
             registry,
             worker_manager,
             inference_queue,
             config,
             repo_path,
-            alert_engine: Arc::new(AlertEngine::new(AlertThresholds::default())),
+            alert_engine: Arc::new(AlertEngine::new(alert_thresholds)),
             shutdown_state: Arc::new(ShutdownState::new()),
             draining: Arc::new(AtomicBool::new(false)),
             callback_runner,

@@ -180,12 +180,31 @@ async fn do_infer(
         body_kind = tracing::field::Empty,
     );
     async move {
+    // A1 (round2): pre-dispatch rejections (404/503/401/429/400) must count
+    // toward requests_total — streaming parity (S1b). Post-dispatch failures
+    // record at their own sites below; this closure covers only exits before
+    // a successful queue submit. Version label: the resolved version, or the
+    // requested one ("" when absent) if resolution itself failed.
+    let handler_start = Instant::now();
+    let record_reject = |version: &str, e: &AppError| {
+        prometheus::record_request_end(
+            &model_name,
+            version,
+            status_family(e.http_status().as_u16() as i32),
+            handler_start.elapsed().as_secs_f64(),
+        );
+    };
     // F-03: gate unknown-model probes — when any model on the server
     // declares policies.auth, a resolution failure must not be
     // distinguishable from "no credentials" (see auth_gate_for_unknown_model).
+    let reject_version = version.clone().unwrap_or_default();
     let (resolved_version, pinned) = match resolve_version(&state, &model_name, version, &headers).await {
         Ok(v) => v,
-        Err(e) => return Err(auth_gate_for_unknown_model(&state, &headers, e)),
+        Err(e) => {
+            let e = auth_gate_for_unknown_model(&state, &headers, e);
+            record_reject(&reject_version, &e);
+            return Err(e);
+        }
     };
     // P5-2: record the honored pin on the inference span (Span::current() is
     // this span — the block is instrumented; same pattern as the body fields
@@ -207,97 +226,79 @@ async fn do_infer(
     // probe must get 401 whether the model is missing, not ready, or fine
     // (auth first, then rate limit).
     let Some(mv) = state.registry.get(&model_name, Some(&resolved_version)) else {
-        return Err(auth_gate_for_unknown_model(
+        let e = auth_gate_for_unknown_model(
             &state,
             &headers,
             AppError::ModelNotFound(format!("{} version {}", model_name, resolved_version)),
-        ));
+        );
+        record_reject(&resolved_version, &e);
+        return Err(e);
     };
-    enforce_auth(mv.policies.auth.as_ref(), &headers)?;
-    enforce_rate_limit(&state, mv.policies.rate_limit.as_ref(), &model_name, &cx.client_ip).await?;
+    if let Err(e) = enforce_auth(mv.policies.auth.as_ref(), &headers) {
+        record_reject(&resolved_version, &e);
+        return Err(e);
+    }
+    if let Err(e) = enforce_rate_limit(&state, mv.policies.rate_limit.as_ref(), &model_name, &cx.client_ip).await {
+        record_reject(&resolved_version, &e);
+        return Err(e);
+    }
 
     // Check ready
     if !state.registry.is_ready(&model_name, Some(&resolved_version)) {
-        return Err(AppError::ModelNotReady(format!(
+        let e = AppError::ModelNotReady(format!(
             "{} version {} is not ready",
             model_name, resolved_version
-        )));
+        ));
+        record_reject(&resolved_version, &e);
+        return Err(e);
     }
 
     // Handle ensemble
     if mv.model_type == ModelType::Ensemble {
-        let ensemble_input = ensemble_input_from_body(&body)?;
+        let ensemble_input = match ensemble_input_from_body(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                record_reject(&resolved_version, &e);
+                return Err(e);
+            }
+        };
         // D37 (batch 0): signature converged — execution-face opts; later
         // batches add fields (dag_selector) without touching call sites.
         // E8-1 (D38): the dag selector rides the HTTP request header.
+        let dag_selector = match crate::ensemble::dag_selector_from_http(&headers) {
+            Ok(v) => v,
+            Err(e) => {
+                record_reject(&resolved_version, &e);
+                return Err(e);
+            }
+        };
         let opts = crate::ensemble::EnsembleExecOpts {
             client_ip: cx.client_ip.clone(),
             deadline_unix_ns: deadline.unix_ns,
             decoupled: false,
-            dag_selector: crate::ensemble::dag_selector_from_http(&headers)?,
+            dag_selector,
         };
-        let result = crate::ensemble::execute_ensemble(
+        let result = match crate::ensemble::execute_ensemble(
             state, &model_name, &resolved_version, ensemble_input, &request_id, opts,
-        ).await?;
+        ).await {
+            Ok(v) => v,
+            Err(e) => {
+                record_reject(&resolved_version, &e);
+                return Err(e);
+            }
+        };
         // B3 (E6) egress: Json → historical Json(response).into_response();
         // Binary → body bytes + content-type header (mirror unary passthrough,
         // inference.rs:266-283).
-        return match result {
-            crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Json(v)) => Ok(Json(v).into_response()),
-            // P2 (batch 6): a raw-resident whole output emits its ORIGINAL
-            // bytes — zero copy, zero re-serialize at the response boundary.
-            crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::RawJson(raw)) => {
-                Response::builder()
-                    .status(axum::http::StatusCode::OK)
-                    .header(axum::http::header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(raw.bytes.clone()))
-                    .map_err(|e| AppError::Internal(format!("build response: {e}")))
-            }
-            crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Binary(data, ct, ..)) => {
-                // Same builder-error handling as the unary passthrough
-                // (inference.rs:291-302): a worker-supplied media_type that is
-                // not a valid header value must become a 500, never a panic.
-                Response::builder()
-                    .status(axum::http::StatusCode::OK)
-                    .header(axum::http::header::CONTENT_TYPE, &ct)
-                    .body(axum::body::Body::from(data))
-                    .map_err(|e| AppError::Internal(format!("build response: {e}")))
-            }
-            crate::ensemble::EnsembleOutcome::Stream(_) => {
-                // D1: a unary endpoint calling a streaming DAG is a client
-                // contract violation — 400 (aggregating chunks would fake
-                // unary semantics and hide backpressure/memory risk).
-                Err(AppError::InvalidRequestBody(
-                    "DAG contains a streaming step; use a streaming endpoint".to_string(),
-                ))
-            }
-            // E7 (D31): the multi-sink response — JSON head + binary tail
-            // with the Inference-Header-Content-Length split header
-            // (kserve.rs convention). A tail-less envelope degrades to
-            // plain JSON (build_response never emits one with an empty
-            // tail — the guard is defensive).
-            crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Envelope { head, tail }) => {
-                if tail.is_empty() {
-                    return Ok(Json(head).into_response());
-                }
-                let head_bytes = serde_json::to_vec(&head)
-                    .map_err(|e| AppError::Internal(format!("serialize envelope head: {e}")))?;
-                let mut body = head_bytes.clone();
-                body.extend_from_slice(&tail);
-                Response::builder()
-                    .status(axum::http::StatusCode::OK)
-                    .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
-                    .header("inference-header-content-length", head_bytes.len())
-                    .body(axum::body::Body::from(body))
-                    .map_err(|e| AppError::Internal(format!("build response: {e}")))
-            }
-        };
+        return ensemble_outcome_response(&model_name, &resolved_version, handler_start, result);
     }
 
     // Pick worker info (needed for both paths)
     let num_workers = mv.workers.len();
     if num_workers == 0 {
-        return Err(AppError::WorkerCrashed(format!("{} has no workers", model_name)));
+        let e = AppError::WorkerCrashed(format!("{} has no workers", model_name));
+        record_reject(&resolved_version, &e);
+        return Err(e);
     }
 
     let uid = format!("{}_{}-{}-{}", model_name, resolved_version, Uuid::new_v4(),
@@ -371,18 +372,24 @@ async fn do_infer(
     match state.inference_queue.try_submit(&model_name, &resolved_version, item) {
         Ok(()) => {}
         Err(crate::inference_queue::QueueError::Full) => {
-            return Err(AppError::QueueFull(format!(
+            let e = AppError::QueueFull(format!(
                 "Queue full for {} {}", model_name, resolved_version
-            )));
+            ));
+            record_reject(&resolved_version, &e);
+            return Err(e);
         }
         Err(crate::inference_queue::QueueError::InvalidWorker(msg)) => {
             // B3 direct-mode: x-lite-worker-id 不存在/已剔除 → 400（客户端错误）。
-            return Err(AppError::Validation(msg));
+            let e = AppError::Validation(msg);
+            record_reject(&resolved_version, &e);
+            return Err(e);
         }
         Err(_) => {
-            return Err(AppError::ModelNotReady(format!(
+            let e = AppError::ModelNotReady(format!(
                 "Queue not available for {} {}", model_name, resolved_version
-            )));
+            ));
+            record_reject(&resolved_version, &e);
+            return Err(e);
         }
     }
 
@@ -583,6 +590,92 @@ async fn do_infer(
     }.instrument(span).await
 }
 
+/// B7 (round2): ensemble unary egress — every exit records the top-level
+/// request exactly once (success 2xx; streaming-DAG-on-unary contract
+/// violation 4xx; response-build failure 5xx). Sub-model steps are not HTTP
+/// requests and are not counted: one request = one count, matching the
+/// non-ensemble unary path.
+fn ensemble_outcome_response(
+    model_name: &str,
+    resolved_version: &str,
+    handler_start: Instant,
+    result: crate::ensemble::EnsembleOutcome,
+) -> Result<Response, AppError> {
+    let finish = |resp: Result<Response, AppError>| {
+        let family = match &resp {
+            Ok(_) => "2xx",
+            Err(e) => status_family(e.http_status().as_u16() as i32),
+        };
+        prometheus::record_request_end(
+            model_name,
+            resolved_version,
+            family,
+            handler_start.elapsed().as_secs_f64(),
+        );
+        resp
+    };
+    match result {
+        crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Json(v)) => {
+            finish(Ok(Json(v).into_response()))
+        }
+        // P2 (batch 6): a raw-resident whole output emits its ORIGINAL
+        // bytes — zero copy, zero re-serialize at the response boundary.
+        crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::RawJson(raw)) => {
+            finish(
+                Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(raw.bytes.clone()))
+                    .map_err(|e| AppError::Internal(format!("build response: {e}"))),
+            )
+        }
+        crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Binary(data, ct, ..)) => {
+            // Same builder-error handling as the unary passthrough
+            // (inference.rs:291-302): a worker-supplied media_type that is
+            // not a valid header value must become a 500, never a panic.
+            finish(
+                Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, &ct)
+                    .body(axum::body::Body::from(data))
+                    .map_err(|e| AppError::Internal(format!("build response: {e}"))),
+            )
+        }
+        crate::ensemble::EnsembleOutcome::Stream(_) => {
+            // D1: a unary endpoint calling a streaming DAG is a client
+            // contract violation — 400 (aggregating chunks would fake
+            // unary semantics and hide backpressure/memory risk).
+            finish(Err(AppError::InvalidRequestBody(
+                "DAG contains a streaming step; use a streaming endpoint".to_string(),
+            )))
+        }
+        // E7 (D31): the multi-sink response — JSON head + binary tail
+        // with the Inference-Header-Content-Length split header
+        // (kserve.rs convention). A tail-less envelope degrades to
+        // plain JSON (build_response never emits one with an empty
+        // tail — the guard is defensive).
+        crate::ensemble::EnsembleOutcome::Unary(crate::ensemble::EnsembleValue::Envelope { head, tail }) => {
+            if tail.is_empty() {
+                return finish(Ok(Json(head).into_response()));
+            }
+            let head_bytes = match serde_json::to_vec(&head) {
+                Ok(b) => b,
+                Err(e) => return finish(Err(AppError::Internal(format!("serialize envelope head: {e}")))),
+            };
+            let mut body = head_bytes.clone();
+            body.extend_from_slice(&tail);
+            finish(
+                Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+                    .header("inference-header-content-length", head_bytes.len())
+                    .body(axum::body::Body::from(body))
+                    .map_err(|e| AppError::Internal(format!("build response: {e}"))),
+            )
+        }
+    }
+}
+
 // ===== Streaming Helpers =====
 
 pub(super) async fn resolve_version(
@@ -720,5 +813,191 @@ mod streaming_tests {
         assert_eq!(meta.route, "/custom");
         assert_eq!(meta.client_ip, "10.0.0.7");
         assert_eq!(meta.request_id, "test-id-002");
+    }
+}
+
+/// Round2 A1: unary pre-dispatch rejections must count toward
+/// `requests_total` (streaming parity, S1b) — 404/503/401/429 exits were
+/// silent before.
+#[cfg(test)]
+mod rejection_metrics_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::inference_queue::InferenceQueue;
+    use crate::registry::ModelRegistry;
+    use crate::worker::WorkerManager;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    fn test_cx() -> RequestContext {
+        RequestContext {
+            request_id: "a1-test".to_string(),
+            client_ip: String::new(),
+            trace_cx: opentelemetry::Context::new(),
+            protocol: crate::callback::Protocol::Http,
+            principal: None,
+            api_protocol: None,
+        }
+    }
+
+    fn test_state() -> Arc<AppState> {
+        let registry = Arc::new(ModelRegistry::new());
+        let inference_queue = Arc::new(InferenceQueue::new());
+        let callback_runner = Arc::new(crate::callback::CallbackRunner::new());
+        let worker_manager = Arc::new(WorkerManager::new(
+            registry.clone(),
+            std::path::PathBuf::new(),
+            inference_queue.clone(),
+            "warn".to_string(),
+            callback_runner.clone(),
+        ));
+        Arc::new(AppState::new(
+            registry,
+            worker_manager,
+            inference_queue,
+            Config::default(),
+            std::path::PathBuf::new(),
+            callback_runner,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+        ))
+    }
+
+    fn requests_total(model: &str, version: &str, family: &str) -> f64 {
+        prometheus::REQUESTS_TOTAL
+            .with_label_values(&[model, version, family])
+            .get()
+    }
+
+    fn json_body() -> RequestBody {
+        RequestBody::Json(bytes::Bytes::from_static(b"{\"x\": 1}"))
+    }
+
+    /// Unknown model → 404 (resolution failure) must record requests_total.
+    #[tokio::test]
+    async fn unary_unknown_model_records_4xx() {
+        let _ = prometheus::register_metrics();
+        let state = test_state();
+        let before = requests_total("a1_unknown", "", "4xx");
+        let result = do_infer(
+            state,
+            "a1_unknown".to_string(),
+            None,
+            "/predict".to_string(),
+            HeaderMap::new(),
+            json_body(),
+            test_cx(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(requests_total("a1_unknown", "", "4xx"), before + 1.0);
+    }
+
+    /// Registered but not ready → 503 must record requests_total under the
+    /// resolved version label.
+    #[tokio::test]
+    async fn unary_model_not_ready_records_5xx() {
+        let _ = prometheus::register_metrics();
+        let state = test_state();
+        state
+            .registry
+            .register(
+                "a1_notready",
+                "1",
+                Default::default(),
+                ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
+            .unwrap();
+        let before = requests_total("a1_notready", "1", "5xx");
+        let result = do_infer(
+            state,
+            "a1_notready".to_string(),
+            Some("1".to_string()),
+            "/predict".to_string(),
+            HeaderMap::new(),
+            json_body(),
+            test_cx(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(requests_total("a1_notready", "1", "5xx"), before + 1.0);
+    }
+
+    /// Auth declared but no credential header → 401 must record requests_total.
+    #[tokio::test]
+    async fn unary_auth_rejection_records_4xx() {
+        let _ = prometheus::register_metrics();
+        let state = test_state();
+        state
+            .registry
+            .register(
+                "a1_auth",
+                "1",
+                Default::default(),
+                ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
+            .unwrap();
+        state
+            .registry
+            .set_policies(
+                "a1_auth",
+                "1",
+                Some(crate::config::ModelPolicies {
+                    auth: Some(crate::config::AuthPolicy {
+                        header: "x-api-key".to_string(),
+                        keys: vec![],
+                    }),
+                    ..Default::default()
+                }),
+            );
+        state.registry.mark_ready("a1_auth", "1").unwrap();
+        let before = requests_total("a1_auth", "1", "4xx");
+        let result = do_infer(
+            state,
+            "a1_auth".to_string(),
+            Some("1".to_string()),
+            "/predict".to_string(),
+            HeaderMap::new(),
+            json_body(),
+            test_cx(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(requests_total("a1_auth", "1", "4xx"), before + 1.0);
+    }
+
+    // ===== Round2 B7: ensemble unary success counts requests_total =====
+
+    /// Ensemble unary success (Json egress) must record the top-level
+    /// request as 2xx — sub-model steps are not counted (one request = one
+    /// count, same as the non-ensemble unary path).
+    #[test]
+    fn ensemble_unary_json_success_records_2xx() {
+        let _ = prometheus::register_metrics();
+        let before = requests_total("b7_ens", "1", "2xx");
+        let outcome = crate::ensemble::EnsembleOutcome::Unary(
+            crate::ensemble::EnsembleValue::Json(json!({"ok": true})),
+        );
+        let resp = ensemble_outcome_response("b7_ens", "1", Instant::now(), outcome);
+        assert!(resp.is_ok());
+        assert_eq!(requests_total("b7_ens", "1", "2xx"), before + 1.0);
+    }
+
+    /// Envelope egress with a non-empty tail is also a 2xx success.
+    #[test]
+    fn ensemble_unary_envelope_success_records_2xx() {
+        let _ = prometheus::register_metrics();
+        let before = requests_total("b7_ens_env", "1", "2xx");
+        let outcome = crate::ensemble::EnsembleOutcome::Unary(
+            crate::ensemble::EnsembleValue::Envelope {
+                head: json!({"h": 1}),
+                tail: bytes::Bytes::from_static(b"\x00\x01"),
+            },
+        );
+        let resp = ensemble_outcome_response("b7_ens_env", "1", Instant::now(), outcome);
+        assert!(resp.is_ok());
+        assert_eq!(requests_total("b7_ens_env", "1", "2xx"), before + 1.0);
     }
 }

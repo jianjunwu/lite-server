@@ -426,13 +426,22 @@ impl LiteServer {
         // No-op when features.timeline is off: the task returns immediately and the
         // abort below is safe on a completed handle. The /metrics/timeline routes
         // are also unmounted (routes.rs), so sampling would serve no one.
+        // Round2 B6: apply the configured windows to the singleton (it is
+        // created lazily, possibly before config load).
+        crate::metrics::aggregator::TIMELINE.configure(
+            self.config.metrics.timeline_max_points,
+            self.config.metrics.timeline_sample_interval_secs,
+            self.config.metrics.p99_window_max_samples,
+            self.config.metrics.p99_window_max_age_secs,
+        );
         let timeline_enabled = self.config.features.timeline;
+        let timeline_sample_interval = self.config.metrics.timeline_sample_interval_secs.max(1);
         let registry_for_timeline = self.registry.clone();
         let timeline_handle = tokio::spawn(async move {
             if !timeline_enabled {
                 return;
             }
-            let mut tick = interval(Duration::from_secs(10));
+            let mut tick = interval(Duration::from_secs(timeline_sample_interval));
             loop {
                 tick.tick().await;
                 let models = registry_for_timeline.list_loaded_keys();

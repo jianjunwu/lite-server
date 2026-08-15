@@ -891,6 +891,11 @@ impl WorkerManager {
         crate::metrics::prometheus::set_active_workers(model_name, version, 0.0);
         crate::metrics::prometheus::remove_version_weight(model_name, version);
         crate::metrics::prometheus::remove_model_ready(model_name, version);
+        // Round2 B2: drop the rest of the per-version series + timeline state
+        // (after record_model_unload — MODEL_LOAD_TOTAL is excluded from the
+        // purge, the event log survives).
+        crate::metrics::prometheus::remove_version_metrics(model_name, version);
+        crate::metrics::aggregator::TIMELINE.remove(model_name, version).await;
 
         info!("Model {} version {} unloaded", model_name, version);
         Ok(())
@@ -954,6 +959,9 @@ impl WorkerManager {
         crate::metrics::prometheus::set_active_workers(model_name, version, 0.0);
         crate::metrics::prometheus::remove_version_weight(model_name, version);
         crate::metrics::prometheus::remove_model_ready(model_name, version);
+        // Round2 B2: same per-version purge as the graceful unload path.
+        crate::metrics::prometheus::remove_version_metrics(model_name, version);
+        crate::metrics::aggregator::TIMELINE.remove(model_name, version).await;
         Ok(())
     }
 

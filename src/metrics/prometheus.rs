@@ -1,6 +1,7 @@
 use lazy_static::lazy_static;
 use prometheus::{
-    CounterVec, GaugeVec, HistogramOpts, HistogramVec, Registry, TextEncoder,
+    Counter, CounterVec, Gauge, GaugeVec, HistogramOpts, HistogramVec, IntGauge, Registry,
+    TextEncoder,
 };
 use std::collections::HashMap;
 
@@ -84,7 +85,9 @@ lazy_static! {
         HistogramOpts::new(
             "liteserver_ensemble_step_latency_seconds",
             "Per-step latency in ensemble DAG"
-        ).buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]),
+        ).buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
+        // Round2 B4:桶追加 10/30/60——冷启动子模型/慢 step >5s 不落 +Inf
+        // (与 S7 REQUEST_DURATION/TTFT 同模式,纯增量)。
         // depth (m6/E1): nesting depth of the ensemble containing the step —
         // bounded by the depth limit (8), so cardinality stays contained.
         &["ensemble", "step", "model", "version", "depth"]
@@ -182,6 +185,20 @@ lazy_static! {
             "Total stream output bytes (S6)"
         ),
         &["model", "version", "stream_kind"]
+    ).unwrap();
+
+    // Round2 A6: dedicated stream rejection counter. `reason` is a bounded
+    // enum: "concurrency_limit" (P10 ensemble streaming DAG cap — a capacity
+    // signal) | "early_reject" (S1b pre-open rejections: resolve/auth/
+    // rate-limit/not-ready/first-frame). NOT gated on streaming_metrics —
+    // rejection accounting parallels requests_total (D9: only the detailed
+    // stream lifecycle metrics are gated).
+    pub static ref STREAM_REJECTED_TOTAL: CounterVec = CounterVec::new(
+        prometheus::Opts::new(
+            "liteserver_stream_rejected_total",
+            "Stream requests rejected before open, by reason (concurrency_limit|early_reject)"
+        ),
+        &["model", "version", "reason"]
     ).unwrap();
 
     // Health check metrics
@@ -383,6 +400,12 @@ lazy_static! {
 }
 
 pub fn register_metrics() -> Result<(), prometheus::Error> {
+    // Serialize concurrent callers (tests + server startup): an AlreadyReg
+    // early-return via `?` must never let a caller observe a half-registered
+    // registry — with the lock, the first caller completes the whole list
+    // before the second one fails fast on the first duplicate.
+    static REGISTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = REGISTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     REGISTRY.register(Box::new(REQUESTS_TOTAL.clone()))?;
     REGISTRY.register(Box::new(REQUEST_DURATION.clone()))?;
     REGISTRY.register(Box::new(QUEUE_DEPTH.clone()))?;
@@ -402,6 +425,7 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(STREAM_ERRORS_TOTAL.clone()))?;
     REGISTRY.register(Box::new(STREAM_DURATION_SECONDS.clone()))?;
     REGISTRY.register(Box::new(STREAM_OUTPUT_BYTES_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(STREAM_REJECTED_TOTAL.clone()))?;
     REGISTRY.register(Box::new(INFERENCE_DURATION.clone()))?;
     REGISTRY.register(Box::new(BATCH_SIZE.clone()))?;
     REGISTRY.register(Box::new(HEALTH_CHECK_TOTAL.clone()))?;
@@ -423,6 +447,15 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(WORKER_SATURATION.clone()))?;
     REGISTRY.register(Box::new(HTTP_REQUEST_BODY_BYTES.clone()))?;
     REGISTRY.register(Box::new(HTTP_CONNECTIONS.clone()))?;
+    // Round2 B3: build info + process metrics. INFO is set here (not lazily)
+    // so it is exported from process start even before the first scrape.
+    REGISTRY.register(Box::new(INFO.clone()))?;
+    REGISTRY.register(Box::new(PROCESS_RSS_BYTES.clone()))?;
+    REGISTRY.register(Box::new(PROCESS_VIRT_BYTES.clone()))?;
+    REGISTRY.register(Box::new(PROCESS_CPU_SECONDS_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(PROCESS_START_TIME_SECONDS.clone()))?;
+    REGISTRY.register(Box::new(PROCESS_THREADS.clone()))?;
+    INFO.with_label_values(&[env!("CARGO_PKG_VERSION")]).set(1.0);
     REGISTRY.register(Box::new(CALLBACK_DISPATCH_DROPPED.clone()))?;
     Ok(())
 }
@@ -491,11 +524,85 @@ pub fn register_gie_metrics(namespace: &str) -> Result<(), prometheus::Error> {
 }
 
 pub fn gather_metrics() -> String {
+    refresh_process_metrics();
     let encoder = TextEncoder::new();
     let metric_families = REGISTRY.gather();
     let mut buffer = String::new();
     encoder.encode_utf8(&metric_families, &mut buffer).unwrap();
     buffer
+}
+
+// ===== Process & build info metrics (round2 B3) =====
+
+lazy_static! {
+    /// Build info; always 1. Deployment/version identification for rollouts.
+    pub static ref INFO: GaugeVec = GaugeVec::new(
+        prometheus::Opts::new("liteserver_info", "Server build info; value is always 1"),
+        &["version"]
+    ).unwrap();
+    pub static ref PROCESS_RSS_BYTES: IntGauge = IntGauge::new(
+        "liteserver_process_resident_memory_bytes", "Resident memory of the server process (bytes)"
+    ).unwrap();
+    pub static ref PROCESS_VIRT_BYTES: IntGauge = IntGauge::new(
+        "liteserver_process_virtual_memory_bytes", "Virtual memory of the server process (bytes)"
+    ).unwrap();
+    pub static ref PROCESS_CPU_SECONDS_TOTAL: Counter = Counter::new(
+        "liteserver_process_cpu_seconds_total", "Total CPU time of the server process (seconds, cumulative across cores)"
+    ).unwrap();
+    pub static ref PROCESS_START_TIME_SECONDS: Gauge = Gauge::new(
+        "liteserver_process_start_time_seconds", "Server process start time (seconds since Unix epoch)"
+    ).unwrap();
+    /// Thread count — populated from sysinfo tasks (Linux/Android only; 0 elsewhere).
+    pub static ref PROCESS_THREADS: IntGauge = IntGauge::new(
+        "liteserver_process_threads", "Thread count of the server process (Linux/Android only; 0 where unsupported)"
+    ).unwrap();
+}
+
+struct ProcessSamplerState {
+    system: sysinfo::System,
+    pid: sysinfo::Pid,
+    last_cpu_ms: u64,
+    primed: bool,
+}
+
+lazy_static! {
+    static ref PROCESS_SAMPLER: std::sync::Mutex<ProcessSamplerState> = std::sync::Mutex::new(ProcessSamplerState {
+        system: sysinfo::System::new(),
+        pid: sysinfo::Pid::from(std::process::id() as usize),
+        last_cpu_ms: 0,
+        primed: false,
+    });
+}
+
+/// Refresh process metrics from sysinfo. Called by `gather_metrics` on every
+/// scrape — scrape-time freshness without a background task. CPU seconds are
+/// derived from sysinfo's cumulative `accumulated_cpu_time` (CPU-ms), so the
+/// counter stays monotonic; the first refresh only primes the baseline.
+pub fn refresh_process_metrics() {
+    let mut st = PROCESS_SAMPLER.lock().unwrap_or_else(|e| e.into_inner());
+    let pid = st.pid;
+    st.system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    let Some(p) = st.system.process(pid) else {
+        return;
+    };
+    let (rss, virt, start, cpu_ms, n_tasks) = (
+        p.memory(),
+        p.virtual_memory(),
+        p.start_time(),
+        p.accumulated_cpu_time(),
+        p.tasks().map(|t| t.len()),
+    );
+    PROCESS_RSS_BYTES.set(rss as i64);
+    PROCESS_VIRT_BYTES.set(virt as i64);
+    PROCESS_START_TIME_SECONDS.set(start as f64);
+    if st.primed && cpu_ms >= st.last_cpu_ms {
+        PROCESS_CPU_SECONDS_TOTAL.inc_by((cpu_ms - st.last_cpu_ms) as f64 / 1000.0);
+    }
+    st.last_cpu_ms = cpu_ms;
+    st.primed = true;
+    if let Some(n) = n_tasks {
+        PROCESS_THREADS.set(n as i64);
+    }
 }
 
 // ===== Request metrics =====
@@ -637,6 +744,84 @@ pub fn set_model_ready(model: &str, version: &str, ready: bool) {
 /// P-WARM: drop the readiness gauge label when a version is unloaded.
 pub fn remove_model_ready(model: &str, version: &str) {
     let _ = MODEL_READY.remove_label_values(&[model, version]);
+}
+
+/// Round2 B2: drop every per-(model,version) series on version unload.
+/// Long-running servers (tune/profile campaigns cycle many versions)
+/// otherwise grow the in-process label set without bound; Prometheus keeps
+/// the scraped history — the series simply goes stale (standard target
+/// semantics). Series are enumerated via REGISTRY.gather so N-label families
+/// (status/worker_id/reason/kind/…) don't need their extra values known.
+///
+/// Scope: built-in per-version families + the GIE queued mirror. Deliberately
+/// excluded: MODEL_LOAD_TOTAL (the load/unload event log — the one series
+/// operators query *after* an unload), ENSEMBLE_STEP_LATENCY (ensemble-scoped;
+/// its model/version labels belong to the step's sub-model and age out with
+/// the *sub-model's* unload), VERSION_SWITCHES_TOTAL (routing history),
+/// worker-reported custom gauges.
+pub fn remove_version_metrics(model: &str, version: &str) {
+    let families = REGISTRY.gather();
+    macro_rules! purge {
+        ($vec:expr, $family:expr, $order:expr) => {
+            if let Some(mf) = families.iter().find(|f| f.get_name() == $family) {
+                for m in mf.get_metric() {
+                    let labels = m.get_label();
+                    let matches = labels
+                        .iter()
+                        .any(|l| l.get_name() == "model" && l.get_value() == model)
+                        && labels
+                            .iter()
+                            .any(|l| l.get_name() == "version" && l.get_value() == version);
+                    if !matches {
+                        continue;
+                    }
+                    let values: Vec<&str> = $order
+                        .iter()
+                        .map(|name| {
+                            labels
+                                .iter()
+                                .find(|l| l.get_name() == *name)
+                                .map(|l| l.get_value())
+                                .unwrap_or("")
+                        })
+                        .collect();
+                    let _ = $vec.remove_label_values(&values);
+                }
+            }
+        };
+    }
+    purge!(REQUESTS_TOTAL, "liteserver_requests_total", ["model", "version", "status"]);
+    purge!(REQUEST_DURATION, "liteserver_request_duration_seconds", ["model", "version"]);
+    purge!(QUEUE_DEPTH, "liteserver_queue_depth", ["model", "version"]);
+    purge!(ACTIVE_WORKERS, "liteserver_active_workers", ["model", "version"]);
+    purge!(WORKER_EJECTIONS_TOTAL, "liteserver_worker_ejections_total", ["model", "version"]);
+    purge!(RETRIES_TOTAL, "liteserver_retries_total", ["model", "version"]);
+    purge!(STREAMING_CONNECTIONS, "liteserver_streaming_connections", ["model", "version", "protocol"]);
+    purge!(STREAMING_TTFT, "liteserver_streaming_ttft_seconds", ["model", "version", "protocol"]);
+    purge!(STREAMING_TBT, "liteserver_streaming_tbt_seconds", ["model", "version", "protocol"]);
+    purge!(STREAMING_CHUNKS_TOTAL, "liteserver_streaming_chunks_total", ["model", "version", "protocol"]);
+    purge!(STREAM_CANCELLED_TOTAL, "liteserver_stream_cancelled_total", ["model", "version", "protocol"]);
+    purge!(STREAM_ERRORS_TOTAL, "liteserver_stream_errors_total", ["model", "version", "stream_kind", "kind"]);
+    purge!(STREAM_DURATION_SECONDS, "liteserver_stream_duration_seconds", ["model", "version", "stream_kind"]);
+    purge!(STREAM_OUTPUT_BYTES_TOTAL, "liteserver_stream_output_bytes_total", ["model", "version", "stream_kind"]);
+    purge!(STREAM_REJECTED_TOTAL, "liteserver_stream_rejected_total", ["model", "version", "reason"]);
+    purge!(HEALTH_CHECK_TOTAL, "liteserver_health_check_total", ["model", "version", "result"]);
+    purge!(WORKER_HEALTH_STATUS, "liteserver_worker_health_status", ["model", "version", "worker_id"]);
+    purge!(WORKER_INFERENCE_TOTAL, "liteserver_worker_inference_total", ["model", "version", "worker_id"]);
+    purge!(WORKER_RESPAWNS_TOTAL, "liteserver_worker_respawns_total", ["model", "version", "reason"]);
+    purge!(IN_FLIGHT_REQUESTS, "liteserver_in_flight_requests", ["model", "version"]);
+    purge!(QUEUE_WAIT_SECONDS, "liteserver_queue_wait_seconds", ["model", "version"]);
+    purge!(WORKER_SATURATION, "liteserver_worker_saturation", ["model", "version"]);
+    purge!(INFERENCE_DURATION, "liteserver_inference_duration_seconds", ["model", "version"]);
+    purge!(BATCH_SIZE, "liteserver_batch_size", ["model", "version"]);
+    // GIE TotalQueuedRequests mirror (namespace-configurable name — clean via
+    // the registered vecs directly, not gather).
+    let guard = GIE_TOTAL_QUEUED_REQUESTS
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    for g in guard.values() {
+        let _ = g.remove_label_values(&[model, version]);
+    }
 }
 
 pub fn record_version_switch(model: &str, from: &str, to: &str) {
@@ -830,8 +1015,10 @@ pub fn record_stream_terminal(
 /// S1(b)/D7:open 前的早期拒绝也计一次请求(对齐 gRPC wrapper 双点语义)。
 /// family 由调用方按 `AppError::http_status` 映射;version 未解析时传请求
 /// 原值(可为空串)。与 close 收口互斥——open 失败不会抵达收口点,无重复计数。
-pub fn record_stream_rejected(model: &str, version: &str, family: &str, duration_secs: f64) {
+/// Round2 A6:同时记专属 counter(reason 有界:concurrency_limit|early_reject)。
+pub fn record_stream_rejected(model: &str, version: &str, family: &str, duration_secs: f64, reason: &'static str) {
     record_request_end(model, version, family, duration_secs);
+    STREAM_REJECTED_TOTAL.with_label_values(&[model, version, reason]).inc();
 }
 
 // Pre-defined worker metrics (liteserver compatible)
@@ -1657,6 +1844,192 @@ mod tests {
         record_stream_ttft(model, version, "sse", 5.0);
         let le5 = histogram_bucket_count("liteserver_streaming_ttft_seconds", model, 5.0);
         assert!(le5 >= 1, "5.0s TTFT must land in the new le=5 bucket (got {le5})");
+    }
+
+    /// Round2 B4:ENSEMBLE_STEP_LATENCY 桶追加 10/30/60——冷启动子模型/慢
+    /// step >5s(旧桶顶)不落 +Inf,与 S7 REQUEST_DURATION/TTFT 同模式。
+    #[test]
+    fn ensemble_step_latency_buckets_extend_past_5s() {
+        let _ = register_metrics();
+        let model = "ens_bucket_m";
+        record_ensemble_step_latency("ens_bucket_e", "s1", model, "1", 0, 15.0);
+        let le30 = histogram_bucket_count("liteserver_ensemble_step_latency_seconds", model, 30.0);
+        assert!(le30 >= 1, "15s step must land in the new le=30 bucket (got {le30})");
+    }
+
+    // ===== Round2 A6: dedicated stream rejection counter =====
+
+    /// Concurrency-limit rejections (P10, ensemble streaming DAG cap) must be
+    /// visible apart from other 4xx: they signal capacity exhaustion (scale
+    /// up), not client errors. requests_total keeps its record (backward
+    /// compat); the dedicated counter carries a bounded `reason` label.
+    #[test]
+    fn stream_rejected_records_dedicated_counter_with_reason() {
+        let _ = register_metrics();
+        let model = "a6_rej_m";
+        let before = STREAM_REJECTED_TOTAL
+            .with_label_values(&[model, "1", "concurrency_limit"])
+            .get();
+        record_stream_rejected(model, "1", "4xx", 0.001, "concurrency_limit");
+        assert_eq!(
+            STREAM_REJECTED_TOTAL
+                .with_label_values(&[model, "1", "concurrency_limit"])
+                .get(),
+            before + 1.0
+        );
+        // requests_total{4xx} keeps its record (dashboards unchanged).
+        assert!(REQUESTS_TOTAL.with_label_values(&[model, "1", "4xx"]).get() >= 1.0);
+    }
+
+    /// Reasons stay separated: an early_reject must not bump the
+    /// concurrency_limit series.
+    #[test]
+    fn stream_rejected_reasons_are_separated() {
+        let _ = register_metrics();
+        let model = "a6_rej_sep";
+        record_stream_rejected(model, "1", "4xx", 0.001, "early_reject");
+        assert_eq!(
+            STREAM_REJECTED_TOTAL
+                .with_label_values(&[model, "1", "early_reject"])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            STREAM_REJECTED_TOTAL
+                .with_label_values(&[model, "1", "concurrency_limit"])
+                .get(),
+            0.0
+        );
+    }
+
+    // ===== Round2 B2: version-unload label cleanup =====
+
+    /// Unloading a version must remove every per-(model,version) series —
+    /// long-running servers (tune/profile campaigns cycle many versions)
+    /// otherwise grow the label set without bound. Neighbor versions stay.
+    #[test]
+    fn remove_version_metrics_clears_all_per_version_series() {
+        let _ = register_metrics();
+        let model = "b2_clean_m";
+        let version = "9";
+        // Seed across label shapes: 2-label, 3-label, 4-label families.
+        record_request_end(model, version, "2xx", 0.01);
+        record_request_end(model, version, "5xx", 0.02);
+        inc_queue_depth(model, version);
+        set_active_workers(model, version, 2.0);
+        set_worker_health(model, version, 0, true);
+        set_worker_health(model, version, 1, false);
+        record_worker_inference(model, version, 0, 3);
+        record_stream_rejected(model, version, "4xx", 0.001, "concurrency_limit");
+        inc_health_check(model, version, "ok");
+        // MODEL_LOAD_TOTAL is the lifecycle event log — it must SURVIVE the
+        // cleanup (operators query it after unload).
+        record_model_load(model, version, true);
+        // Neighbor version must survive the cleanup.
+        record_request_end(model, "8", "2xx", 0.01);
+
+        remove_version_metrics(model, version);
+
+        assert_eq!(
+            MODEL_LOAD_TOTAL
+                .with_label_values(&[model, version, "load", "success"])
+                .get(),
+            1.0,
+            "load/unload event log must survive cleanup"
+        );
+        let families = REGISTRY.gather();
+        let leftover: Vec<String> = families
+            .iter()
+            .filter(|mf| mf.get_name() != "liteserver_model_load_total")
+            .flat_map(|mf| {
+                mf.get_metric()
+                    .iter()
+                    .filter(|m| {
+                        m.get_label()
+                            .iter()
+                            .any(|l| l.get_name() == "model" && l.get_value() == model)
+                            && m.get_label()
+                                .iter()
+                                .any(|l| l.get_name() == "version" && l.get_value() == version)
+                    })
+                    .map(|m| format!("{}:{:?}", mf.get_name(), m.get_label()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(leftover.is_empty(), "series left after cleanup: {leftover:?}");
+        assert_eq!(
+            REQUESTS_TOTAL.with_label_values(&[model, "8", "2xx"]).get(),
+            1.0,
+            "neighbor version must be untouched"
+        );
+    }
+
+    // ===== Round2 B3: info + process metrics =====
+
+    fn gather_family_value(metric_name: &str) -> Option<f64> {
+        REGISTRY
+            .gather()
+            .iter()
+            .find(|mf| mf.get_name() == metric_name)
+            .and_then(|mf| mf.get_metric().first())
+            .map(|m| {
+                if m.has_gauge() {
+                    m.get_gauge().get_value()
+                } else {
+                    m.get_counter().get_value()
+                }
+            })
+    }
+
+    /// liteserver_info{version} must be exported with the build version, value 1.
+    #[test]
+    fn info_metric_reports_build_version() {
+        let _ = register_metrics();
+        let families = REGISTRY.gather();
+        let family = families
+            .iter()
+            .find(|mf| mf.get_name() == "liteserver_info")
+            .expect("liteserver_info must be registered");
+        let m = family.get_metric().first().expect("info series must exist");
+        let version = m
+            .get_label()
+            .iter()
+            .find(|l| l.get_name() == "version")
+            .map(|l| l.get_value().to_string());
+        assert_eq!(version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(m.get_gauge().get_value(), 1.0);
+    }
+
+    /// gather_metrics() must refresh and export process metrics (RSS > 0 for
+    /// the live process, monotonic CPU seconds, sane start time).
+    #[test]
+    fn gather_metrics_exports_process_metrics() {
+        let _ = register_metrics();
+        let _ = gather_metrics();
+        let rss = gather_family_value("liteserver_process_resident_memory_bytes")
+            .expect("process RSS must be exported");
+        assert!(rss > 0.0, "RSS of the live process must be positive, got {rss}");
+        let cpu = gather_family_value("liteserver_process_cpu_seconds_total")
+            .expect("process CPU seconds must be exported");
+        assert!(cpu >= 0.0);
+        let start = gather_family_value("liteserver_process_start_time_seconds")
+            .expect("process start time must be exported");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        assert!(start > 0.0 && start <= now, "start time must be a past epoch, got {start}");
+    }
+
+    /// Thread count is populated where the platform exposes tasks (Linux).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gather_metrics_exports_thread_count_on_linux() {
+        let _ = register_metrics();
+        let _ = gather_metrics();
+        let threads = gather_family_value("liteserver_process_threads")
+            .expect("process threads must be exported");
+        assert!(threads >= 1.0, "live process has at least one thread, got {threads}");
     }
 
     /// S7:TBT 桶追加 1/2.5/5——慢解码 chunk 间隔不落 +Inf(旧桶顶 0.5s)。

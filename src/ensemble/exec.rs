@@ -435,6 +435,7 @@ pub(crate) async fn execute_ensemble_inner(
                 // §6.3.3: every P10 rejection is observable.
                 crate::metrics::prometheus::record_stream_rejected(
                     model_name, version, "4xx", request_start.elapsed().as_secs_f64(),
+                    "concurrency_limit",
                 );
             })?),
             None => None,
@@ -481,6 +482,7 @@ pub(crate) async fn execute_ensemble_inner(
             // §6.3.3: every P10 rejection is observable.
             crate::metrics::prometheus::record_stream_rejected(
                 model_name, version, "4xx", request_start.elapsed().as_secs_f64(),
+                "concurrency_limit",
             );
         })?),
         None => None,

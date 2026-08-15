@@ -23,6 +23,22 @@ the metrics, the label semantics, the bucket changes, and the semantic notes
 | `liteserver_http_connections` | `transport` | Open HTTP connections (`transport`: `tcp`/`tls`/`uds`). Connection-level resource signal — idle keep-alive connections, TLS handshakes, and slowloris holds are visible here, not in request metrics. Not gated. |
 | `liteserver_callback_dispatch_dropped_total` | `reason` | Callback dispatches dropped by the concurrency cap (`reason="concurrency"`, 64 in-flight) or cut by `callbacks.timeout_secs` (`reason="timeout"`). Callbacks are fire-and-forget; this counter makes the loss visible. Not gated. |
 
+### Process & build info
+
+| Metric | Labels | Notes |
+|---|---|---|
+| `liteserver_info` | `version` | Build info; value always 1. Set at startup. |
+| `liteserver_process_resident_memory_bytes` | — | RSS of the server process. |
+| `liteserver_process_virtual_memory_bytes` | — | Virtual memory of the server process. |
+| `liteserver_process_cpu_seconds_total` | — | Cumulative CPU time (seconds, across cores) — monotonic counter. |
+| `liteserver_process_start_time_seconds` | — | Process start time (Unix epoch seconds); uptime = `time() - this`. |
+| `liteserver_process_threads` | — | Thread count (populated on Linux/Android only; 0 elsewhere). |
+
+All process metrics refresh at scrape time inside `/metrics` (no background
+task). Unary early rejections (404/503/401/429/400 before queue dispatch)
+count toward `liteserver_requests_total`, as do ensemble unary top-level
+requests (one request = one count; sub-model steps are not counted).
+
 ### Streaming metrics
 
 All `liteserver_stream_*` metrics below are gated by
@@ -38,6 +54,7 @@ All `liteserver_stream_*` metrics below are gated by
 | `liteserver_stream_errors_total` | `model, version, stream_kind, kind` | Stream errors. `kind` is a closed enum: `worker_error`/`deadline`/`idle`/`protocol`/`panic` (panic reachable via WS writer only). `cancel`/`done`/`worker_eof` do not count. |
 | `liteserver_stream_duration_seconds` | `model, version, stream_kind` | Stream open→close duration. Buckets `0.1/0.5/1/2.5/5/10/30/60/120/300`. |
 | `liteserver_stream_output_bytes_total` | `model, version, stream_kind` | Σ output chunk bytes, accumulated per chunk, reported at close. |
+| `liteserver_stream_rejected_total` | `model, version, reason` | Pre-open stream rejections. `reason` is a closed enum: `concurrency_limit` (P10 DAG cap — capacity signal) / `early_reject` (resolve/auth/rate-limit/not-ready/first-frame). Not gated on `streaming_metrics`. |
 
 #### `protocol` vs `stream_kind`
 
@@ -58,7 +75,7 @@ identical labels to unary requests.
 
 | Metric | Labels | Notes |
 |---|---|---|
-| `liteserver_ensemble_step_latency_seconds` | `ensemble, step, model, version, depth` | Per-step latency in ensemble DAG. `version` records the actual version only for **explicit** versions; `latest`/omitted normalize to `"latest"` so active-version drift cannot grow the label set (model × step × version). `depth` = nesting depth (E1). For streaming steps the latency spans open→close. |
+| `liteserver_ensemble_step_latency_seconds` | `ensemble, step, model, version, depth` | Per-step latency in ensemble DAG. `version` records the actual version only for **explicit** versions; `latest`/omitted normalize to `"latest"` so active-version drift cannot grow the label set (model × step × version). `depth` = nesting depth (E1). For streaming steps the latency spans open→close. Buckets extended with `10/30/60` — cold-start sub-models / slow steps > 5 s no longer land in `+Inf`. |
 | `ensemble_streaming_active` | — | Gauge: concurrent streaming ensemble DAGs (the P10 semaphore in use). **Global, no labels** — same scope as the semaphore; per-model visibility comes from the streaming metrics above. |
 | `ensemble_autoload_wait_seconds` | — | Histogram: sub-model autoload wait duration for ensemble DAG steps (P6 cold-start tracking). |
 | `ensemble_pipeline_chain_depth` | — | Histogram: streaming steps on a pipeline chain (§4.2). |
@@ -70,8 +87,11 @@ P10 rejection semantics: when `server.max_concurrent_streaming_dags` is
 exhausted the request is rejected **immediately** (429 — no queueing); the
 rejection is recorded via `record_stream_rejected` at the ensemble dispatch
 (all transports) and surfaces through `liteserver_requests_total` (status
-label `4xx`) and the `ensemble_streaming_active` gauge, not a dedicated
-counter.
+label `4xx`), the `ensemble_streaming_active` gauge, and the dedicated
+counter `liteserver_stream_rejected_total{model, version, reason}` —
+`reason="concurrency_limit"` for the P10 cap (a capacity signal,
+distinguishable from client-error 4xx), `reason="early_reject"` for S1b
+pre-open rejections (resolve/auth/rate-limit/not-ready/first-frame).
 
 ### OTel mirror
 

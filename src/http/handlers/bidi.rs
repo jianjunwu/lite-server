@@ -88,6 +88,7 @@ async fn h2_bidi_entry(
             &label_version,
             super::status_family(e.http_status().as_u16() as i32),
             start.elapsed().as_secs_f64(),
+            "early_reject",
         );
     }
     result

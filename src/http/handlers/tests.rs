@@ -813,6 +813,31 @@ mod version_routing_tests {
             "server closed a WS pinned to a Ready version — readiness gate used the active version, got {first:?}"
         );
     }
+    /// Round2 B5: the AppState alert engine must take its thresholds from
+    /// `config.alerts`, not the hardcoded default (legacy default 100/500 —
+    /// a queue depth of 7 only fires when the configured warning is lower).
+    #[tokio::test]
+    async fn alerts_thresholds_come_from_config() {
+        let _ = crate::metrics::prometheus::register_metrics();
+        let mut config = Config::default();
+        config.alerts.queue_depth_warning = 5;
+        let state = test_state_with(config);
+
+        let agg = crate::metrics::aggregator::TimelineAggregator::new();
+        crate::metrics::prometheus::QUEUE_DEPTH
+            .with_label_values(&["b5_model", "1"])
+            .set(7.0);
+        agg.sample("b5_model", "1").await;
+
+        let alerts = state.alert_engine.evaluate(&agg).await;
+        assert!(
+            alerts.iter().any(|a| a.rule == "queue_depth" && a.severity == "warning" && a.model == "b5_model"),
+            "configured threshold (5) must fire at depth 7, got {alerts:?}"
+        );
+        crate::metrics::prometheus::QUEUE_DEPTH
+            .with_label_values(&["b5_model", "1"])
+            .set(0.0);
+    }
 }
 
 // ===== B3: custom-route callback gap =====
@@ -926,6 +951,7 @@ mod custom_route_callback_tests {
             "do_infer must fire fire_inference_response (sanity check)"
         );
     }
+
+
+
 }
-
-

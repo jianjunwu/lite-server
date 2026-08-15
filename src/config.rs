@@ -30,6 +30,9 @@ pub struct Config {
     pub telemetry: TelemetryConfig,
     /// C1 (resource-leak-plan): model-callback dispatch bounds.
     pub callbacks: CallbacksConfig,
+    /// Round2 B5: /alerts evaluation thresholds. `features.alerts` stays the
+    /// on/off switch; defaults preserve the legacy hardcoded values.
+    pub alerts: AlertsConfig,
 }
 
 /// C1 (resource-leak-plan): bounds for model-callback dispatch. Dispatch is
@@ -47,6 +50,29 @@ pub struct CallbacksConfig {
 impl Default for CallbacksConfig {
     fn default() -> Self {
         Self { timeout_secs: 0.0 }
+    }
+}
+
+/// Round2 B5: /alerts evaluation thresholds (queue depth + p99 latency).
+/// `features.alerts` remains the on/off switch — this section only tunes the
+/// values. Defaults = the legacy hardcoded AlertThresholds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AlertsConfig {
+    pub queue_depth_warning: i64,
+    pub queue_depth_critical: i64,
+    pub p99_ms_warning: f64,
+    pub p99_ms_critical: f64,
+}
+
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        Self {
+            queue_depth_warning: 100,
+            queue_depth_critical: 500,
+            p99_ms_warning: 500.0,
+            p99_ms_critical: 2000.0,
+        }
     }
 }
 
@@ -514,6 +540,16 @@ pub struct MetricsConfig {
     /// / `{namespace}:kv_cache_utilization` 暴露到 /metrics，兼容 `vllm` 模式。
     /// 非法 namespace 在启动时快速失败（register_gie_metrics 校验）。
     pub metric_namespace: String,
+    /// Round2 B6: timeline ring capacity (points per model/version).
+    pub timeline_max_points: usize,
+    /// Round2 B6: timeline sampling interval in seconds (sampler loop clamped
+    /// to >= 1; the aggregator throttle treats 0 as "no throttle").
+    pub timeline_sample_interval_secs: u64,
+    /// Round2 B6: p99 sliding-window sample cap per model/version.
+    pub p99_window_max_samples: usize,
+    /// Round2 B6: p99 sliding-window age bound in seconds. 0 (default) = off
+    /// (legacy behavior: count-bounded only).
+    pub p99_window_max_age_secs: f64,
 }
 
 impl Default for MetricsConfig {
@@ -521,6 +557,10 @@ impl Default for MetricsConfig {
         Self {
             enabled: true,
             metric_namespace: "liteserver".to_string(),
+            timeline_max_points: 30,
+            timeline_sample_interval_secs: 10,
+            p99_window_max_samples: 1000,
+            p99_window_max_age_secs: 0.0,
         }
     }
 }
@@ -1628,6 +1668,52 @@ mod tests {
         // Unset → default false (breaking 默认关).
         let cfg: Config = serde_yaml::from_str("features:\n  streaming: true\n").unwrap();
         assert!(!cfg.features.canary_override);
+    }
+
+    /// Round2 B5: alert thresholds are configurable; defaults preserve the
+    /// legacy hardcoded AlertThresholds (100/500/500/2000) so existing
+    /// deployments see zero behavior change.
+    #[test]
+    fn alerts_config_defaults_match_legacy_hardcoded() {
+        let cfg = Config::default();
+        assert_eq!(cfg.alerts.queue_depth_warning, 100);
+        assert_eq!(cfg.alerts.queue_depth_critical, 500);
+        assert_eq!(cfg.alerts.p99_ms_warning, 500.0);
+        assert_eq!(cfg.alerts.p99_ms_critical, 2000.0);
+    }
+
+    #[test]
+    fn alerts_config_parses_partial_yaml() {
+        let cfg: Config = serde_yaml::from_str("alerts:\n  queue_depth_critical: 42\n")
+            .expect("alerts section must parse");
+        assert_eq!(cfg.alerts.queue_depth_critical, 42);
+        // Unspecified thresholds keep their defaults.
+        assert_eq!(cfg.alerts.queue_depth_warning, 100);
+    }
+
+    /// Round2 B6: timeline/p99 window knobs live in the metrics section;
+    /// defaults preserve the legacy constants (30 points × 10 s, 1000-sample
+    /// p99 window, no age bound).
+    #[test]
+    fn metrics_timeline_window_knobs_default() {
+        let cfg = Config::default();
+        assert_eq!(cfg.metrics.timeline_max_points, 30);
+        assert_eq!(cfg.metrics.timeline_sample_interval_secs, 10);
+        assert_eq!(cfg.metrics.p99_window_max_samples, 1000);
+        assert_eq!(cfg.metrics.p99_window_max_age_secs, 0.0);
+    }
+
+    #[test]
+    fn metrics_timeline_window_knobs_parse() {
+        let cfg: Config = serde_yaml::from_str(
+            "metrics:\n  timeline_max_points: 60\n  p99_window_max_age_secs: 300\n",
+        )
+        .expect("metrics window knobs must parse");
+        assert_eq!(cfg.metrics.timeline_max_points, 60);
+        assert_eq!(cfg.metrics.p99_window_max_age_secs, 300.0);
+        // Unspecified knobs keep their defaults.
+        assert_eq!(cfg.metrics.timeline_sample_interval_secs, 10);
+        assert_eq!(cfg.metrics.p99_window_max_samples, 1000);
     }
 
     #[test]

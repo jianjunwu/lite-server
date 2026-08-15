@@ -122,6 +122,21 @@ metrics:
   # (vllm-compatible naming for the Kubernetes LLM-autoscaler ecosystem).
   # Invalid namespaces fail fast at startup.
   metric_namespace: liteserver
+  # /metrics/timeline window (per model/version ring buffer)
+  timeline_max_points: 30      # data points kept per series (30 × interval = history depth)
+  timeline_sample_interval_secs: 10  # sampling interval; also the /metrics/timeline resolution
+  # /metrics/timeline p99 sliding window (per model/version latency samples)
+  p99_window_max_samples: 1000 # sample cap; high-QPS versions reach it quickly
+  p99_window_max_age_secs: 0   # age bound for samples; 0 = off (count-bounded only).
+                               # Set it on low-QPS deployments so p99 cannot go stale for hours.
+
+alerts:
+  # /alerts evaluation thresholds (features.alerts stays the on/off switch).
+  # Defaults shown; the engine evaluates on demand per GET /alerts.
+  queue_depth_warning: 100
+  queue_depth_critical: 500
+  p99_ms_warning: 500
+  p99_ms_critical: 2000
 
 rate_limit:
   max_buckets: 65536           # Max distinct rate-limit buckets (per IP/route key).

@@ -187,6 +187,7 @@ async fn generate_stream_entry(
             &label_version,
             super::status_family(e.http_status().as_u16() as i32),
             start.elapsed().as_secs_f64(),
+            "early_reject",
         );
     }
     result
@@ -255,6 +256,7 @@ pub(crate) async fn openai_stream_entry(
             &label_version,
             super::status_family(e.http_status().as_u16() as i32),
             start.elapsed().as_secs_f64(),
+            "early_reject",
         );
     }
     result
@@ -297,6 +299,7 @@ async fn sse_infer_entry(
             &label_version,
             super::status_family(e.http_status().as_u16() as i32),
             start.elapsed().as_secs_f64(),
+            "early_reject",
         );
     }
     result
@@ -1151,6 +1154,7 @@ async fn handle_ws_stream(
                 &request_version_label,
                 "4xx",
                 ws_start.elapsed().as_secs_f64(),
+                "early_reject",
             );
             let _ = socket.close().await;
             return;
@@ -1164,6 +1168,7 @@ async fn handle_ws_stream(
             &resolved_version,
             "5xx",
             ws_start.elapsed().as_secs_f64(),
+            "early_reject",
         );
         let _ = socket.close().await;
         return;
@@ -1194,6 +1199,7 @@ async fn handle_ws_stream(
                 &resolved_version,
                 "4xx",
                 ws_start.elapsed().as_secs_f64(),
+                "early_reject",
             );
             let reason = if auth_failed {
                 "unauthorized"
@@ -1229,6 +1235,7 @@ async fn handle_ws_stream(
                         &resolved_version,
                         "4xx",
                         ws_start.elapsed().as_secs_f64(),
+                        "early_reject",
                     );
                     let _ = socket.close().await;
                     return;
@@ -1246,6 +1253,7 @@ async fn handle_ws_stream(
                     &resolved_version,
                     "4xx",
                     ws_start.elapsed().as_secs_f64(),
+                    "early_reject",
                 );
                 let _ = socket.close().await;
                 return;
@@ -1264,6 +1272,7 @@ async fn handle_ws_stream(
                     &resolved_version,
                     "4xx",
                     ws_start.elapsed().as_secs_f64(),
+                    "early_reject",
                 );
                 let _ = socket.send(Message::Text(json!({"error": "invalid JSON"}).to_string())).await;
                 let _ = socket.close().await;
@@ -1370,7 +1379,7 @@ async fn handle_ws_stream(
         let dag_selector = match crate::ensemble::dag_selector_from_http(&headers) {
             Ok(s) => s,
             Err(e) => {
-                prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64());
+                prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64(), "early_reject");
                 ws_send_error(&mut ws_sink, &e).await;
                 return;
             }
@@ -1385,7 +1394,7 @@ async fn handle_ws_stream(
         {
             Ok(d) => d,
             Err(e) => {
-                prometheus::record_stream_rejected(&model_name, &resolved_version, "5xx", ws_start.elapsed().as_secs_f64());
+                prometheus::record_stream_rejected(&model_name, &resolved_version, "5xx", ws_start.elapsed().as_secs_f64(), "early_reject");
                 ws_send_error(&mut ws_sink, &e).await;
                 return;
             }
@@ -1408,7 +1417,7 @@ async fn handle_ws_stream(
                 FirstFrame::Raw(bin) => aggregator.push(bin.clone(), false, ct.as_deref()),
             };
             if let Err(e) = push_first {
-                prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64());
+                prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64(), "early_reject");
                 ws_send_error(&mut ws_sink, &e).await;
                 return;
             }
@@ -1450,14 +1459,14 @@ async fn handle_ws_stream(
                     Ok(Some(Ok(Message::Text(t)))) if is_cancel_or_close_frame(&t) => return,
                     Ok(Some(Ok(Message::Text(t)))) => {
                         if let Err(e) = aggregator.push(bytes::Bytes::from(t.into_bytes()), true, None) {
-                            prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64());
+                            prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64(), "early_reject");
                             ws_send_error(&mut ws_sink, &e).await;
                             return;
                         }
                     }
                     Ok(Some(Ok(Message::Binary(b)))) => {
                         if let Err(e) = aggregator.push(bytes::Bytes::from(b), false, ct.as_deref()) {
-                            prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64());
+                            prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64(), "early_reject");
                             ws_send_error(&mut ws_sink, &e).await;
                             return;
                         }
@@ -1469,7 +1478,7 @@ async fn handle_ws_stream(
                     Ok(_) => {} // Ping/Pong ignored
                     // Idle/deadline fired with no close trigger.
                     Err(_) => {
-                        prometheus::record_stream_rejected(&model_name, &resolved_version, "5xx", ws_start.elapsed().as_secs_f64());
+                        prometheus::record_stream_rejected(&model_name, &resolved_version, "5xx", ws_start.elapsed().as_secs_f64(), "early_reject");
                         let deadline_fired = agg_deadline
                             .map(|d| d <= std::time::Instant::now())
                             .unwrap_or(false);
@@ -1499,7 +1508,7 @@ async fn handle_ws_stream(
         let value = match value {
             Ok(v) => v,
             Err(e) => {
-                prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64());
+                prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64(), "early_reject");
                 ws_send_error(&mut ws_sink, &e).await;
                 return;
             }
@@ -1526,7 +1535,7 @@ async fn handle_ws_stream(
                 (s.stream_id, s.cancel_client, s.chunk_rx)
             }
             Ok(crate::ensemble::EnsembleOutcome::Unary(_)) => {
-                prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64());
+                prometheus::record_stream_rejected(&model_name, &resolved_version, "4xx", ws_start.elapsed().as_secs_f64(), "early_reject");
                 let err = AppError::InvalidRequestBody(
                     "ensemble DAG has no streaming step; use a unary endpoint".to_string(),
                 );
@@ -1539,6 +1548,7 @@ async fn handle_ws_stream(
                     &resolved_version,
                     super::status_family(e.http_status().as_u16() as i32),
                     ws_start.elapsed().as_secs_f64(),
+                    "early_reject",
                 );
                 ws_send_error(&mut ws_sink, &e).await;
                 return;
@@ -1554,6 +1564,7 @@ async fn handle_ws_stream(
                     &resolved_version,
                     "5xx",
                     ws_start.elapsed().as_secs_f64(),
+                    "early_reject",
                 );
                 ws_send_error(&mut ws_sink, &e).await;
                 return;
