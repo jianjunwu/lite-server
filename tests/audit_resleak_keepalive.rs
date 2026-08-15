@@ -95,6 +95,22 @@ mod keepalive_server {
         }
     }
 
+    /// K1 TCP-path deps: plaintext TCP on an ephemeral port (host is not
+    /// unix:… so start_http_server takes the serve_tcp branch).
+    fn build_deps_tcp(ka: f32, port: u16) -> TestDeps {
+        let mut deps = build_deps(Path::new("/unused.sock"), ka);
+        deps.config.server.host = "127.0.0.1".to_string();
+        deps.config.server.http_port = port;
+        deps
+    }
+
+    fn free_tcp_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local_addr").port();
+        drop(listener);
+        port
+    }
+
     async fn spawn_test_server(
         sock: &Path,
         deps: TestDeps,
@@ -127,11 +143,48 @@ mod keepalive_server {
         (shutdown_tx, handle)
     }
 
+    /// Spawn the test server on plaintext TCP. The bind happens inside
+    /// start_http_server, so readiness is probed by connecting.
+    async fn spawn_test_server_tcp(
+        port: u16,
+        deps: TestDeps,
+    ) -> (tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let options = HttpServerOptions {
+            config: deps.config,
+            registry: deps.registry,
+            worker_manager: deps.worker_manager,
+            inference_queue: deps.inference_queue,
+            shutdown_state: Arc::new(ShutdownState::new()),
+            draining: Arc::new(AtomicBool::new(false)),
+            callback_runner: Arc::new(CallbackRunner::new()),
+            has_hot_reload: Arc::new(AtomicBool::new(false)),
+            rate_limiter: Arc::new(RateLimiter::default()),
+            tls: None,
+        };
+        let handle = tokio::spawn(async move {
+            let _ = start_http_server(options, shutdown_rx).await;
+        });
+        let mut ready = false;
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ready, "test server did not bind 127.0.0.1:{port}");
+        (shutdown_tx, handle)
+    }
+
     /// Read one HTTP/1.1 response (head + body) on an existing connection and
     /// return (status, body). `rx_buf` accumulates raw stream bytes so a
     /// coalesced/pipelined segment of a following response survives across
     /// calls.
-    async fn read_response(stream: &mut UnixStream, rx_buf: &mut Vec<u8>) -> (u16, Vec<u8>) {
+    async fn read_response<S>(stream: &mut S, rx_buf: &mut Vec<u8>) -> (u16, Vec<u8>)
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
         let mut chunk = [0u8; 8192];
         while !rx_buf.windows(4).any(|w| w == b"\r\n\r\n") {
             let n = stream.read(&mut chunk).await.expect("read response head");
@@ -228,6 +281,82 @@ mod keepalive_server {
         );
     }
 
+    /// K1 on the plaintext TCP path: same idle-reap assertion as the UDS
+    /// test, but driven over 127.0.0.1 so the custom serve_tcp loop (which
+    /// replaced axum::serve for builder access) is the code under test.
+    /// Also pins the L4 linkage: the `liteserver_http_connections{transport=
+    /// "tcp"}` gauge must track the connection — +1 while open, back to
+    /// baseline once the K1 reaper closes it.
+    #[tokio::test]
+    async fn test_k1_idle_keepalive_connection_must_be_reaped_tcp() {
+        let port = free_tcp_port();
+        let gauge = || {
+            lite_server::metrics::prometheus::HTTP_CONNECTIONS
+                .with_label_values(&["tcp"])
+                .get()
+        };
+        let gauge_baseline = gauge();
+        let (shutdown_tx, server) =
+            spawn_test_server_tcp(port, build_deps_tcp(1.0, port)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect to test server");
+        let mut rx_buf: Vec<u8> = Vec::new();
+        let request = b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+        // Positive control: keep-alive reuse inside the window.
+        stream.write_all(request).await.expect("write request 1");
+        let (status1, _body1) = read_response(&mut stream, &mut rx_buf).await;
+        assert_eq!(status1, 200, "first /health request must be 200");
+
+        stream.write_all(request).await.expect("write request 2");
+        let (status2, _body2) = read_response(&mut stream, &mut rx_buf).await;
+        assert_eq!(
+            status2, 200,
+            "second /health request on the same connection must be 200 (keep-alive reuse)"
+        );
+
+        // Idle past the 1.0 s window, then EOF must follow.
+        tokio::time::sleep(K1_IDLE).await;
+        let mut probe = [0u8; 16];
+        let outcome = tokio::time::timeout(K1_READ_TIMEOUT, stream.read(&mut probe)).await;
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+
+        let n = match outcome {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => panic!("K1/TCP: post-idle read failed: {e}"),
+            Err(_) => {
+                panic!(
+                    "K1/TCP (resource-leak-plan.md): after {K1_IDLE:?} idle the read did not \
+                     reach EOF within {K1_READ_TIMEOUT:?} — serve_tcp must arm the hyper idle \
+                     timer (TokioTimer + header_read_timeout)"
+                );
+            }
+        };
+        assert_eq!(
+            n, 0,
+            "K1/TCP (resource-leak-plan.md): after {K1_IDLE:?} idle (keepalive_timeout = 1.0 s) \
+             the server must close the connection — the post-idle read must return EOF (0 \
+             bytes), got {n} bytes; no hyper idle timer arms on the TCP path"
+        );
+
+        // L4 linkage: the reaped connection must drop the tcp gauge back to
+        // its baseline (poll: the decrement rides the connection task end).
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while gauge() != gauge_baseline && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            gauge(),
+            gauge_baseline,
+            "L4: liteserver_http_connections{{transport=\"tcp\"}} must return to baseline \
+             after the K1 reaper closes the idle connection"
+        );
+    }
+
     /// K2 (resource-leak-plan.md): with `keepalive_timeout = 0` the server
     /// only expresses its keep-alive policy through `Connection: close`
     /// response headers (h1 semantics) — but no serve path calls
@@ -293,6 +422,52 @@ mod keepalive_server {
                      the hyper auto builder answered with an HTTP/2 SETTINGS frame — frame \
                      type byte at offset 3 is 0x04 ({:02x?})",
                     got
+                );
+            }
+        }
+    }
+    /// L2 (resource-leak-plan.md): `server.request_body_timeout_secs` arms an
+    /// idle timeout on the request BODY (tower-http TimeoutBody semantics —
+    /// per-frame, resets as bytes flow). A slowloris body (headers complete,
+    /// then 2 bytes of a 100-byte body, then silence) must be cut loose:
+    /// either an error response or a connection close within the budget.
+    /// Currently FAILS: nothing bounds the body read, so the read stays
+    /// silent for the whole probe window.
+    #[tokio::test]
+    async fn test_l2_request_body_idle_timeout_reclaims_slowloris() {
+        let port = free_tcp_port();
+        let mut deps = build_deps_tcp(0.0, port);
+        deps.config.server.request_body_timeout_secs = 1.0;
+        let (shutdown_tx, server) = spawn_test_server_tcp(port, deps).await;
+
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect to test server");
+        // Headers complete; body stalls after 2 of 100 declared bytes.
+        stream
+            .write_all(
+                b"POST /v2/models/m/infer HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{}",
+            )
+            .await
+            .expect("write partial request");
+
+        // The server must react within ~1s (the body idle timeout). Any
+        // bytes (an error response) or EOF (connection closed) count.
+        let mut probe = [0u8; 512];
+        let outcome =
+            tokio::time::timeout(Duration::from_millis(3500), stream.read(&mut probe)).await;
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+
+        match outcome {
+            Ok(Ok(_n)) => {} // got an error response or EOF — reclaimed
+            Ok(Err(e)) => panic!("L2: probe read failed: {e}"),
+            Err(_) => {
+                panic!(
+                    "L2 (resource-leak-plan.md): a stalled request body must be reclaimed by \
+                     request_body_timeout_secs = 1.0, but 3.5s passed with no response and no \
+                     close — nothing bounds the body read (no RequestBodyTimeoutLayer anywhere)"
                 );
             }
         }

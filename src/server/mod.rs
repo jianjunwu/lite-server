@@ -61,8 +61,30 @@ impl ShutdownState {
         prometheus::SHUTDOWN_PENDING_REQUESTS.dec();
     }
 
+    /// RN-8 (resource-leak-plan): RAII pending guard. A handler panic unwinds
+    /// through the middleware (axum/hyper do not catch_unwind), so a manual
+    /// inc/dec pair would leak the count and graceful shutdown would stall on
+    /// the backstop timeout. The guard decrements on drop, panic or not.
+    pub fn pending_guard(self: &Arc<Self>) -> PendingGuard {
+        self.inc_pending();
+        PendingGuard {
+            state: Arc::clone(self),
+        }
+    }
+
     pub fn pending(&self) -> usize {
         self.pending_count.load(Ordering::Relaxed)
+    }
+}
+
+/// RN-8: see `ShutdownState::pending_guard`.
+pub struct PendingGuard {
+    state: Arc<ShutdownState>,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.state.dec_pending();
     }
 }
 
@@ -154,6 +176,7 @@ impl LiteServer {
          .with_server_tunables(config.tunables.clone())
          .with_custom_metrics(config.features.custom_metrics)
          .with_model_defaults(config.model_defaults.clone())
+         .with_stream_channel_size(config.server.stream_channel_size)
          .with_ensemble_plans(ensemble_plans);
         if let Some(capacity) = streaming_capacity {
             wm = wm.with_streaming_capacity(capacity);
@@ -291,9 +314,12 @@ impl LiteServer {
         // Structural checks (pairing, UDS exclusivity) already ran in
         // Config::validate; tls_settings() is None unless cert+key are set.
         let http_tls = match self.config.server.tls_settings() {
-            Some(s) => Some(Arc::new(crate::tls::TlsConfigStore::load(
+            // K2: ka <= 0 disables keep-alive — on the TLS path that means
+            // dropping the h2 ALPN offer (h2 has no Connection: close).
+            Some(s) => Some(Arc::new(crate::tls::TlsConfigStore::load_with_h1_only(
                 &s,
                 crate::tls::TlsProtocol::Http,
+                self.config.server.keepalive_timeout <= 0.0,
             )?)),
             None => None,
         };
@@ -864,5 +890,26 @@ mod tests {
     #[test]
     fn test_pick_latest_version_empty() {
         assert_eq!(pick_latest_version(&[]), None);
+    }
+
+    /// RN-8 (resource-leak-plan): the pending guard must decrement on drop —
+    /// including the unwind path (a handler panic must not leak the in-flight
+    /// count; graceful shutdown waits on it).
+    #[test]
+    fn test_rn8_pending_guard_decrements_on_drop_and_unwind() {
+        let state = Arc::new(ShutdownState::new());
+        {
+            let _g = state.pending_guard();
+            assert_eq!(state.pending(), 1);
+        }
+        assert_eq!(state.pending(), 0, "guard drop must decrement");
+
+        let state2 = Arc::clone(&state);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _g = state2.pending_guard();
+            panic!("simulated handler panic");
+        }));
+        assert!(result.is_err());
+        assert_eq!(state.pending(), 0, "unwind must still decrement");
     }
 }

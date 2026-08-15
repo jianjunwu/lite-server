@@ -41,6 +41,26 @@ async fn disable_keepalive_middleware(request: Request, next: Next) -> Response 
     response
 }
 
+/// L2 (resource-leak-plan): request-body idle timeout (slowloris-body guard).
+/// tower-http's TimeoutBody is an IDLE timeout — the timer resets on every
+/// body frame, so large uploads are unaffected while bytes flow; a stalled
+/// body surfaces TimeoutError to the extractor (4xx-class response). h2
+/// `/bidi` routes are exempt: their request body IS the chunk stream and
+/// idle gaps between frames are legal there.
+async fn request_body_timeout_middleware(
+    State(timeout): State<std::time::Duration>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request.uri().path().ends_with("/bidi") {
+        return next.run(request).await;
+    }
+    let request = request.map(|body| {
+        axum::body::Body::new(tower_http::timeout::TimeoutBody::new(timeout, body))
+    });
+    next.run(request).await
+}
+
 /// Newtype for the request ID stash in request extensions, written once by
 /// `observability_middleware` (outermost) and read by `context_middleware`
 /// when it builds the `RequestContext` (P-MW, D21 single-source).
@@ -89,6 +109,14 @@ pub(crate) async fn route_fallback(
         .await
         .map(|q| q.0)
         .unwrap_or_default();
+    // RN-13 (D9-A): the admission transfer cell — a streaming custom route
+    // moves the guard into its response body so the slot is held for the
+    // stream's lifetime.
+    let admission_slot = parts
+        .extensions
+        .get::<crate::admission::AdmissionSlot>()
+        .cloned()
+        .unwrap_or_default();
     let method = parts.method.clone();
     // P-MW: read the RequestContext filled by context_middleware (the
     // from_http_parts fallback only fires when the middleware is absent).
@@ -118,7 +146,7 @@ pub(crate) async fn route_fallback(
     };
 
     match crate::http::handlers::dispatch_custom_route(
-        &state, &model, resolved, &method, query, &headers, body, &cx,
+        &state, &model, resolved, &method, query, &headers, body, &cx, admission_slot,
     )
     .await
     {
@@ -235,21 +263,24 @@ async fn inflight_middleware(
     request: Request,
     next: Next,
 ) -> Response {
-    state.inc_pending();
-    let response = next.run(request).await;
-    state.dec_pending();
-    response
+    // RN-8: RAII — a handler panic must still decrement (see pending_guard).
+    let _guard = state.pending_guard();
+    next.run(request).await
 }
 
 /// P-FLOW (§4.0.9): global in-flight admission for *inference* requests.
 /// Placed inside observability (so the 503 carries x-request-id). Health/admin
 /// paths are exempt (probes must stay reachable under load). When `max_inflight`
-/// is 0 (unlimited, the default) this is a pass-through. The guard spans
-/// `next.run` — for unary it covers the full call; for SSE/WS it releases when
-/// headers are produced (same header-semantic as `inflight_middleware`).
+/// is 0 (unlimited, the default) this is a pass-through.
+///
+/// RN-13 (D9-A): the guard is parked in an `AdmissionSlot` cell — a clone
+/// rides the request extensions, one stays in this scope. Streaming handlers
+/// take the guard into their feed/writer task so the slot is held for the
+/// stream's lifetime; for unary nobody takes it and the guard drops here,
+/// when the response is produced.
 async fn admission_middleware(
     State(admission): State<crate::admission::AdmissionCounter>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     if admission.cap() == 0 {
@@ -268,7 +299,7 @@ async fn admission_middleware(
     {
         return next.run(request).await;
     }
-    let _guard = match admission.try_acquire() {
+    let guard = match admission.try_acquire() {
         Some(g) => g,
         None => {
             tracing::warn!(
@@ -286,6 +317,9 @@ async fn admission_middleware(
             return resp;
         }
     };
+    request
+        .extensions_mut()
+        .insert(crate::admission::AdmissionSlot::with_guard(guard));
     next.run(request).await
 }
 
@@ -432,6 +466,17 @@ pub async fn start_http_server(
         config.server.max_request_body_bytes.unwrap_or(64 * 1024 * 1024),
     ));
 
+    // L2 (resource-leak-plan): request-body idle timeout — see
+    // request_body_timeout_middleware. Default 0 = off (behavior unchanged).
+    let app = if config.server.request_body_timeout_secs > 0.0 {
+        app.layer(axum::middleware::from_fn_with_state(
+            std::time::Duration::from_secs_f32(config.server.request_body_timeout_secs),
+            request_body_timeout_middleware,
+        ))
+    } else {
+        app
+    };
+
     // Peer-IP fallback (innermost): inject the TCP peer IP as a fallback
     // x-real-ip for direct (non-proxied) connections so client_ip is never
     // empty (0.7.x regression). No-op on the unix-socket path (no ConnectInfo)
@@ -529,7 +574,7 @@ pub async fn start_http_server(
                 std::fs::set_permissions(path, permissions).map_err(AppError::Io)?;
             }
             info!("Starting HTTP server on unix:{}", path);
-            serve_unix(listener, app, shutdown_rx).await?;
+            serve_unix(listener, app, config.server.clone(), shutdown_rx).await?;
         }
         #[cfg(not(unix))]
         {
@@ -560,7 +605,22 @@ pub async fn start_http_server(
                     handle.graceful_shutdown(None);
                 }
             });
-            axum_server::Server::from_tcp(std_listener)
+            let mut server = axum_server::Server::from_tcp(std_listener);
+            {
+                // K1/K2/K6: same shared builder wiring as serve_tcp/serve_unix
+                // (axum-server's default builder is exactly
+                // Builder::new(TokioExecutor::new()) — the replace is a no-op
+                // swap).
+                let b = server.http_builder();
+                let taken = std::mem::replace(
+                    b,
+                    hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    ),
+                );
+                *b = configure_conn_builder(taken, &config.server);
+            }
+            server
                 .acceptor(crate::tls::RotatingTlsAcceptor::new(tls_store))
                 .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                 .await
@@ -573,13 +633,9 @@ pub async fn start_http_server(
             info!("Starting HTTP server on {}", addr);
             // into_make_service_with_connect_info makes ConnectInfo<SocketAddr>
             // available to extractors/middleware — peer_ip_fallback uses it to
-            // populate client_ip for direct connections.
-            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-                .with_graceful_shutdown(async {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-                .map_err(|e| AppError::Internal(format!("server error: {}", e)))?;
+            // populate client_ip for direct connections. serve_tcp preserves it
+            // via Connected<SocketAddr> (axum serve.rs parity).
+            serve_tcp(listener, app, config.server.clone(), shutdown_rx).await?;
         }
     }
 
@@ -590,6 +646,7 @@ pub async fn start_http_server(
 async fn serve_unix(
     listener: UnixListener,
     app: Router,
+    server_config: crate::config::ServerConfig,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), AppError> {
     use hyper_util::server::conn::auto::Builder;
@@ -605,18 +662,191 @@ async fn serve_unix(
         shutdown_rx,
         move |stream| {
             let app = app.clone();
+            let server_config = server_config.clone();
             tokio::spawn(async move {
+                crate::metrics::prometheus::record_http_connection_open("uds");
                 let io = TokioIo::new(stream);
-                let builder = Builder::new(TokioExecutor::new());
                 let hyper_service = TowerToHyperService::new(app);
-                let conn = builder.serve_connection_with_upgrades(io, hyper_service);
-                if let Err(e) = conn.await {
-                    tracing::debug!("Connection error: {}", e);
+                if server_config.keepalive_timeout <= 0.0 {
+                    // K2: h1-only — see serve_tcp for why the auto builder's
+                    // http1_only() cannot be used here.
+                    let mut b = hyper::server::conn::http1::Builder::new();
+                    b.timer(hyper_util::rt::TokioTimer::new());
+                    b.keep_alive(false);
+                    let conn = b.serve_connection(io, hyper_service).with_upgrades();
+                    if let Err(e) = conn.await {
+                        tracing::debug!("Connection error: {}", e);
+                    }
+                } else {
+                    // K1/K6: shared builder wiring (idle reaper / h2 keepalive).
+                    let builder =
+                        configure_conn_builder(Builder::new(TokioExecutor::new()), &server_config);
+                    let conn = builder.serve_connection_with_upgrades(io, hyper_service);
+                    if let Err(e) = conn.await {
+                        tracing::debug!("Connection error: {}", e);
+                    }
                 }
+                crate::metrics::prometheus::record_http_connection_close("uds");
             });
         },
     )
     .await
+}
+
+/// K1/K6: shared hyper auto-builder wiring for all three serve paths
+/// (serve_tcp / serve_unix / axum-server's http_builder). Only called when
+/// keepalive_timeout > 0 — for ka <= 0 see serve_h1_only (K2).
+///
+/// - K1: arm the h1 idle reaper — hyper applies header_read_timeout to every
+///   request-head read, including the idle wait for the next request on a
+///   keep-alive connection (hyper 1.10 h1/conn.rs poll_read_head), so an idle
+///   connection is closed once the window elapses. Requires an explicit
+///   timer; the auto builder has none by default.
+/// - K6: optional h2 keepalive PING (dead-peer detection only — hyper h2 has
+///   no idle reaper).
+fn configure_conn_builder(
+    mut builder: hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor>,
+    server: &crate::config::ServerConfig,
+) -> hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor> {
+    use hyper_util::rt::TokioTimer;
+    let ka = server.keepalive_timeout;
+    if ka > 0.0 {
+        builder.http1().timer(TokioTimer::new());
+        builder
+            .http1()
+            .header_read_timeout(std::time::Duration::from_secs_f32(ka));
+    }
+    if let Some(interval) = server.http2_keepalive_interval_secs {
+        builder.http2().timer(TokioTimer::new());
+        builder
+            .http2()
+            .keep_alive_interval(std::time::Duration::from_secs_f32(interval));
+        if let Some(t) = server.http2_keepalive_timeout_secs {
+            builder
+                .http2()
+                .keep_alive_timeout(std::time::Duration::from_secs_f32(t));
+        }
+    }
+    builder
+}
+
+/// L5 (resource-leak-plan): OS-level TCP keepalive on an accepted socket —
+/// half-open peers (dead client, dropped NAT state) are reaped by the kernel
+/// even when no application frame is in flight. Fixed policy (idle 60s,
+/// interval 10s, 3 probes), deliberately not a knob (simple-first).
+pub(crate) fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
+    let sock = socket2::SockRef::from(stream);
+    let params = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(60))
+        .with_interval(std::time::Duration::from_secs(10))
+        .with_retries(3);
+    if let Err(e) = sock.set_tcp_keepalive(&params) {
+        tracing::warn!(error = %e, "failed to set TCP keepalive on accepted socket");
+    }
+}
+
+/// K1: plaintext TCP accept loop. `axum::serve` exposes no hyper builder
+/// surface, so the keepalive_timeout idle reaper (timer + h1
+/// header_read_timeout) requires a custom loop. Mirrors axum 0.7.9's own
+/// serve.rs per-connection pattern:
+/// - `ConnectInfo<SocketAddr>` is preserved by calling the make service with
+///   the peer addr (`Connected<SocketAddr> for SocketAddr`); peer_ip_fallback
+///   must not regress.
+/// - graceful shutdown stops accepting and drains in-flight connections via a
+///   JoinSet (axum's with_graceful_shutdown parity; the outer
+///   graceful_timeout + task-abort backstop in server/mod.rs still bounds the
+///   drain).
+/// - transient accept errors (fd exhaustion etc.) retry after 50ms, same
+///   classifier as the UDS loop (F-07).
+async fn serve_tcp(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    server_config: crate::config::ServerConfig,
+    mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+) -> Result<(), AppError> {
+    use hyper_util::server::conn::auto::Builder;
+    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+    use hyper_util::service::TowerToHyperService;
+    use std::future::poll_fn;
+    use tower::ServiceExt as _;
+
+    let mut make_service = app.into_make_service_with_connect_info::<SocketAddr>();
+    let mut connections = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, peer_addr) = match result {
+                    Ok(conn) => conn,
+                    Err(e) if is_transient_accept_error(&e) => {
+                        tracing::warn!(error = %e, "transient accept error; retrying");
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                    Err(e) => return Err(AppError::Io(e)),
+                };
+                // L5: OS-level keepalive on the accepted socket.
+                set_tcp_keepalive(&stream);
+                poll_fn(|cx| {
+                    tower_service::Service::<SocketAddr>::poll_ready(&mut make_service, cx)
+                })
+                .await
+                .unwrap_or_else(|err: std::convert::Infallible| match err {});
+                let tower_service = tower_service::Service::<SocketAddr>::call(
+                    &mut make_service,
+                    peer_addr,
+                )
+                .await
+                .unwrap_or_else(|err: std::convert::Infallible| match err {})
+                .map_request(|req: axum::http::Request<hyper::body::Incoming>| {
+                    req.map(axum::body::Body::new)
+                });
+                let hyper_service = TowerToHyperService::new(tower_service);
+                let server_config = server_config.clone();
+                connections.spawn(async move {
+                    // L4: connection-level gauge, held for the task's
+                    // lifetime (K1's idle reaper closes the connection → the
+                    // task ends → the gauge decrements).
+                    crate::metrics::prometheus::record_http_connection_open("tcp");
+                    let io = TokioIo::new(stream);
+                    if server_config.keepalive_timeout <= 0.0 {
+                        // K2: h1-only — hyper-util's auto builder ignores
+                        // http1_only() on the with_upgrades path (0.1.20
+                        // always starts with the h2 preface sniff), so the
+                        // honest h1-only implementation is hyper's own http1
+                        // builder. keep_alive(false) closes after each
+                        // response (double coverage with the Connection:
+                        // close middleware).
+                        let mut b = hyper::server::conn::http1::Builder::new();
+                        b.timer(TokioTimer::new());
+                        b.keep_alive(false);
+                        let conn = b.serve_connection(io, hyper_service).with_upgrades();
+                        if let Err(e) = conn.await {
+                            tracing::debug!("Connection error: {}", e);
+                        }
+                    } else {
+                        let builder = configure_conn_builder(
+                            Builder::new(TokioExecutor::new()),
+                            &server_config,
+                        );
+                        let conn = builder.serve_connection_with_upgrades(io, hyper_service);
+                        if let Err(e) = conn.await {
+                            tracing::debug!("Connection error: {}", e);
+                        }
+                    }
+                    crate::metrics::prometheus::record_http_connection_close("tcp");
+                });
+            }
+            _ = &mut shutdown_rx => {
+                info!(
+                    "TCP server received shutdown signal; draining {} connection(s)",
+                    connections.len()
+                );
+                while connections.join_next().await.is_some() {}
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// F-07: classify an accept() error — transient resource errors (fd
@@ -624,7 +854,6 @@ async fn serve_unix(
 /// ECONNABORTED) must be retried, not fatal: fd exhaustion hits exactly
 /// when the service is busiest, and axum-server / tonic already tolerate
 /// it on the TCP paths (50ms backoff / continue). Anything else is fatal.
-#[cfg(unix)]
 fn is_transient_accept_error(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),

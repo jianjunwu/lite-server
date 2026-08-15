@@ -85,6 +85,55 @@ impl Drop for AdmissionGuard {
     }
 }
 
+/// RN-13 (resource-leak-plan, D9-A): transfer cell for the admission guard.
+///
+/// The HTTP admission middleware parks the guard in this cell (a clone rides
+/// the request extensions, one stays in the middleware scope). Streaming
+/// handlers take the guard out and move it into their feed/writer task, so
+/// the slot is held for the STREAM's lifetime — not released when the
+/// response headers are produced. Unary handlers never touch it: the
+/// middleware's own clone keeps the guard until the response is produced
+/// (unchanged unary semantics).
+///
+/// The default (empty) cell is what extractors/handlers see on paths without
+/// the admission middleware (unit tests, cap == 0 pass-through) — `take()`
+/// then returns None and nothing is held.
+#[derive(Clone, Default)]
+pub struct AdmissionSlot {
+    cell: Arc<std::sync::Mutex<Option<AdmissionGuard>>>,
+}
+
+impl AdmissionSlot {
+    pub fn with_guard(guard: AdmissionGuard) -> Self {
+        Self {
+            cell: Arc::new(std::sync::Mutex::new(Some(guard))),
+        }
+    }
+
+    /// Take the guard out of the cell (idempotent — the second call returns
+    /// None). Mutex poison recovery is deliberate: a poisoned cell must not
+    /// wedge request handling.
+    pub fn take(&self) -> Option<AdmissionGuard> {
+        self.cell.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+#[axum::async_trait]
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for AdmissionSlot {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(parts
+            .extensions
+            .get::<AdmissionSlot>()
+            .cloned()
+            .unwrap_or_default())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

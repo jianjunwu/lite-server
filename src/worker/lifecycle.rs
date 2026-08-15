@@ -453,9 +453,10 @@ impl WorkerManager {
             // Create ZMQ client (binds the socket, worker connects). CB
             // workers get cb_remove notifications when a reply slot dies
             // (B2: stops wasted generation on client disconnect/timeout).
-            let zmq_client = Arc::new(WorkerZmqClient::new_with_cb(
+            let zmq_client = Arc::new(WorkerZmqClient::new_with_channel_size(
                 endpoint.clone(),
                 model_config.continuous_batching,
+                self.stream_channel_size,
             ));
             zmq_clients_for_model.push(zmq_client.clone());
 

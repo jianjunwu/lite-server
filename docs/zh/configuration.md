@@ -22,7 +22,18 @@ server:
                                # <repo>/.lite-server-registry.json，启动时恢复。
                                # 容忍损坏文件；删除该文件即重置。
   graceful_timeout: 30.0       # 优雅关闭时等待进行中请求的最大秒数
-  keepalive_timeout: 5.0       # HTTP keep-alive 超时（秒），0 = 禁用
+  keepalive_timeout: 5.0       # HTTP keep-alive 超时（秒）；空闲连接超过该窗口被回收
+                               #（h1 空闲回收 + slowloris 头防护）。0 = 完全禁用 keep-alive
+                               #（强制 h1-only；TLS 下撤销 h2 ALPN——h2 无 close 语义）
+  stream_keepalive_interval_secs: 30.0  # 流上服务端活性帧间隔（WS Ping / SSE `: keepalive`
+                               # 注释）；0 = 关闭。用于检出静默流上的死对端、保活 NAT/LB 状态
+  stream_channel_size: 64      # 每流 chunk 通道深度（worker→服务端、SSE、gRPC）；消费滞后
+                               # 超过该深度即截断流。突发容忍可调大（内存 ≈ 深度×chunk×并发流）
+  request_body_timeout_secs: 0.0  # 请求体读取空闲超时（slowloris 体防护）；有字节流动即
+                               # 重置，大上传不受影响。0 = 关闭。h2 /bidi 请求体豁免
+  http2_keepalive_interval_secs: null  # HTTP h2 PING 间隔（仅死对端检测）；null = 关闭。
+                               # 与 grpc.http2_keepalive_* 不同面
+  http2_keepalive_timeout_secs: null   # h2 PING ACK 超时（须先设间隔）
   compression: false           # gzip HTTP 响应；排除 SSE，不影响 WS
   socket_mode: 0o666           # unix: UDS host 的 chmod。HTTP UDS 同时服务 admin，
                                # 多租户主机建议 0o600（仅 owner）

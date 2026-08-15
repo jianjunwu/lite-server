@@ -375,24 +375,36 @@ async fn wait_gauge(base: &str, model: &str, protocol: &str, want: f64, timeout_
 
 // ---------------------------------------------------------------------------
 // K3: WS keepalive — the server must emit Ping frames on an idle stream.
-// Current behaviour: the writer loop (stream.rs:1737) only sends Text/Binary,
-// no keepalive ticker exists, so no Ping ever arrives. FAIL.
+// Post-fix shape (2026-08-15): the defect is fixed by a keepalive ticker in
+// the writer loop (stream.rs) driven by `server.stream_keepalive_interval_secs`
+// (default 30s). This test boots with a 1s interval so the 5s window is a
+// meaningful assertion. Note the writer loop (and its ticker) starts only
+// after the client's first frame, so the test must send one.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[serial]
 async fn test_k3_ws_no_server_ping_keepalive() {
-    use futures::StreamExt;
+    use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
-    let (base, _guard, _repo) = boot("  timeout: 30.0", &["stall"]).await;
+    let (base, _guard, _repo) = boot(
+        "  timeout: 30.0\n  stream_keepalive_interval_secs: 1.0",
+        &["stall"],
+    )
+    .await;
     wait_ready_all(&base, &["stall"]).await;
     let http_port = port_of(&base);
     let ws_url = format!("ws://127.0.0.1:{http_port}/v2/models/stall/stream");
     let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
 
-    // Send NO client message. The writer loop only emits Text/Binary frames —
-    // there is no keepalive ticker, so no Ping can ever reach the client.
+    // Start the stream: the writer loop (with its keepalive ticker) runs only
+    // after the first client frame. The stall model then produces no chunks,
+    // so the only frames that can arrive are keepalive Pings.
+    ws.send(Message::Text(r#"{"text":"hi"}"#.to_string()))
+        .await
+        .expect("send first frame");
+
     let mut saw_ping = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
@@ -409,15 +421,49 @@ async fn test_k3_ws_no_server_ping_keepalive() {
     }
     assert!(
         saw_ping,
-        "K3: the WS server must emit a Ping keepalive within 5s of an idle stream; \
-         none arrived (stream.rs:1737 sends only Text/Binary — no keepalive ticker)"
+        "K3: with stream_keepalive_interval_secs = 1.0 the WS server must emit a Ping \
+         within 5s of an idle stream; none arrived"
     );
+}
+
+/// K3 negative: stream_keepalive_interval_secs = 0 disables keepalive frames —
+/// no Ping may arrive on an idle stream.
+#[tokio::test]
+#[serial]
+async fn test_k3_ws_keepalive_disabled_sends_no_ping() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (base, _guard, _repo) = boot(
+        "  timeout: 30.0\n  stream_keepalive_interval_secs: 0.0",
+        &["stall"],
+    )
+    .await;
+    wait_ready_all(&base, &["stall"]).await;
+    let http_port = port_of(&base);
+    let ws_url = format!("ws://127.0.0.1:{http_port}/v2/models/stall/stream");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("WS connect");
+    ws.send(Message::Text(r#"{"text":"hi"}"#.to_string()))
+        .await
+        .expect("send first frame");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(Message::Ping(_)))) => {
+                panic!("K3: stream_keepalive_interval_secs = 0 must disable Ping keepalives")
+            }
+            _ => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // K4: SSE keepalive — the feed must emit `: keepalive` comment frames.
-// Current behaviour: the feed loop (stream.rs:520-560,639) emits only
-// `data:` events, so the stalled stream is silent. FAIL.
+// Post-fix shape (2026-08-15): the feed loop emits `: keepalive` comment
+// frames on the `server.stream_keepalive_interval_secs` ticker (default 30s).
+// This test boots with a 1s interval so the 5s window is a meaningful
+// assertion. FAILS until phase 2a lands the SSE ticker.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -425,7 +471,11 @@ async fn test_k3_ws_no_server_ping_keepalive() {
 async fn test_k4_sse_no_keepalive_comment() {
     use futures::StreamExt;
 
-    let (base, _guard, _repo) = boot("  timeout: 30.0", &["stall"]).await;
+    let (base, _guard, _repo) = boot(
+        "  timeout: 30.0\n  stream_keepalive_interval_secs: 1.0",
+        &["stall"],
+    )
+    .await;
     wait_ready_all(&base, &["stall"]).await;
     let resp = http_client()
         .post(format!("{base}/v2/models/stall/events"))
@@ -454,8 +504,8 @@ async fn test_k4_sse_no_keepalive_comment() {
     }
     assert!(
         saw_keepalive,
-        "K4: the SSE feed must emit `: keepalive` comment frames within 5s of an idle \
-         stream; none arrived (stream.rs:520-560,639 emits only `data:` events)"
+        "K4: with stream_keepalive_interval_secs = 1.0 the SSE feed must emit \
+         `: keepalive` comment frames within 5s of an idle stream; none arrived"
     );
 }
 
@@ -532,16 +582,23 @@ async fn test_l1_ws_send_no_deadline_holds_connection() {
 }
 
 // ---------------------------------------------------------------------------
-// RN-6: decoupled_idle_timeout_secs=0 — a zero-traffic stream is never
-// reclaimed after the client disconnects. idle_budget returns None
-// (deadline.rs:171-177), recv_chunk becomes a pure recv, the forward task
-// hangs, and liteserver_streaming_connections never returns to 0. FAIL.
+// RN-6: decoupled_idle_timeout_secs=0 — a zero-traffic stream was never
+// reclaimed after the client disconnects (idle_budget(0) → None, recv_chunk
+// became a pure recv, the forward task hung). Post-fix mechanism (plan §8
+// RN-6): no new reclaim path — the K4 keepalive ticker gives the feed loop a
+// periodic send, and a disconnected client makes that send fail. This test
+// therefore also sets stream_keepalive_interval_secs=1.0 so detection lands
+// inside the 5s window.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[serial]
 async fn test_rn6_idle_zero_never_reclaims_stalled_stream() {
-    let (base, _guard, _repo) = boot("  decoupled_idle_timeout_secs: 0\n  timeout: 30.0", &["stall"]).await;
+    let (base, _guard, _repo) = boot(
+        "  decoupled_idle_timeout_secs: 0\n  timeout: 30.0\n  stream_keepalive_interval_secs: 1.0",
+        &["stall"],
+    )
+    .await;
     wait_ready_all(&base, &["stall"]).await;
     let resp = http_client()
         .post(format!("{base}/v2/models/stall/events"))
@@ -624,10 +681,11 @@ async fn test_rn13_admission_slot_released_at_headers() {
 }
 
 // ---------------------------------------------------------------------------
-// RN-14: burst throughput — a burst of 200 chunks must arrive intact. Current
-// behaviour: the 64-slot worker channel (zmq.rs STREAM_CHANNEL_SIZE=64,
-// overflow at zmq.rs:237-254) truncates the burst and delivers a synthetic
-// Error frame. FAIL.
+// RN-14: burst throughput. Post-fix shape (2026-08-15): the stream channel
+// depth is the `server.stream_channel_size` knob (default 64, behavior-
+// neutral; covers the ZMQ worker channel AND the SSE event channel). This
+// test boots with 1024 so a paced 500-chunk burst must arrive intact with no
+// synthetic truncation Error frame.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -635,7 +693,12 @@ async fn test_rn13_admission_slot_released_at_headers() {
 async fn test_rn14_burst_truncated_by_64_slot_channel() {
     use futures::StreamExt;
 
-    let (base, _guard, _repo) = boot("  timeout: 30.0", &["burst500"]).await;
+    let (base, _guard, _repo) = boot(
+        "  timeout: 30.0
+  stream_channel_size: 1024",
+        &["burst500"],
+    )
+    .await;
     wait_ready_all(&base, &["burst500"]).await;
     let resp = http_client()
         .post(format!("{base}/v2/models/burst500/events"))
@@ -674,12 +737,12 @@ async fn test_rn14_burst_truncated_by_64_slot_channel() {
     let saw_truncation = all.contains("\"error\"");
     assert_eq!(
         chunks, 500,
-        "RN-14: a burst of 500 chunks must all arrive; the 64-slot worker channel \
-         (zmq.rs STREAM_CHANNEL_SIZE=64) truncated the burst at {chunks} chunks"
+        "RN-14: with stream_channel_size=1024 a paced burst of 500 chunks must all \
+         arrive; truncated at {chunks} chunks"
     );
     assert!(
         !saw_truncation,
-        "RN-14: no synthetic truncation Error frame may be delivered; one was \
-         received (zmq.rs:237-254 overflow path)"
+        "RN-14: with stream_channel_size=1024 no synthetic truncation Error frame may \
+         be delivered; one was received"
     );
 }

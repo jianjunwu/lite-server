@@ -85,12 +85,13 @@ pub async fn sse_infer_handler(
     Path(model_name): Path<String>,
     headers: HeaderMap,
     cx: RequestContext,
+    slot: crate::admission::AdmissionSlot,
     ApiBody(body): ApiBody,
 ) -> Result<Response, ProtocolError> {
     // P-CORS: CORS headers are attached by `cors_middleware` (no longer per-handler).
     // D11 P2.1:错误按 T1 预筛协议渲染(SSE 客户端不发 IHCL → Legacy,byte-identical)。
     let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
-    sse_infer_entry(&state, &model_name, None, headers, body, cx, false)
+    sse_infer_entry(&state, &model_name, None, headers, body, cx, slot, false)
         .await
         .map_err(|error| ProtocolError { error, protocol })
 }
@@ -100,11 +101,12 @@ pub async fn sse_infer_version_handler(
     Path((model_name, version)): Path<(String, String)>,
     headers: HeaderMap,
     cx: RequestContext,
+    slot: crate::admission::AdmissionSlot,
     ApiBody(body): ApiBody,
 ) -> Result<Response, ProtocolError> {
     let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
     sse_infer_entry(
-        &state, &model_name, Some(version), headers, body, cx, false,
+        &state, &model_name, Some(version), headers, body, cx, slot, false,
     )
     .await
     .map_err(|error| ProtocolError { error, protocol })
@@ -117,10 +119,11 @@ pub async fn sse_decoupled_handler(
     Path(model_name): Path<String>,
     headers: HeaderMap,
     cx: RequestContext,
+    slot: crate::admission::AdmissionSlot,
     ApiBody(body): ApiBody,
 ) -> Result<Response, ProtocolError> {
     let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
-    sse_infer_entry(&state, &model_name, None, headers, body, cx, true)
+    sse_infer_entry(&state, &model_name, None, headers, body, cx, slot, true)
         .await
         .map_err(|error| ProtocolError { error, protocol })
 }
@@ -130,10 +133,11 @@ pub async fn sse_decoupled_version_handler(
     Path((model_name, version)): Path<(String, String)>,
     headers: HeaderMap,
     cx: RequestContext,
+    slot: crate::admission::AdmissionSlot,
     ApiBody(body): ApiBody,
 ) -> Result<Response, ProtocolError> {
     let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
-    sse_infer_entry(&state, &model_name, Some(version), headers, body, cx, true)
+    sse_infer_entry(&state, &model_name, Some(version), headers, body, cx, slot, true)
         .await
         .map_err(|error| ProtocolError { error, protocol })
 }
@@ -160,6 +164,7 @@ async fn generate_stream_entry(
     headers: HeaderMap,
     body: RequestBody,
     cx: RequestContext,
+    slot: crate::admission::AdmissionSlot,
 ) -> Result<Response, AppError> {
     let start = std::time::Instant::now();
     let mut label_version = version.clone().unwrap_or_default();
@@ -170,6 +175,7 @@ async fn generate_stream_entry(
         headers,
         body,
         cx,
+        slot,
         false,
         &mut label_version,
         SseFrameStyle::Generate,
@@ -193,10 +199,11 @@ pub async fn generate_stream_handler(
     Path(model_name): Path<String>,
     headers: HeaderMap,
     cx: RequestContext,
+    slot: crate::admission::AdmissionSlot,
     ApiBody(body): ApiBody,
 ) -> Result<Response, ProtocolError> {
     let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
-    generate_stream_entry(&state, &model_name, None, headers, body, cx)
+    generate_stream_entry(&state, &model_name, None, headers, body, cx, slot)
         .await
         .map_err(|error| ProtocolError { error, protocol })
 }
@@ -206,10 +213,11 @@ pub async fn generate_stream_version_handler(
     Path((model_name, version)): Path<(String, String)>,
     headers: HeaderMap,
     cx: RequestContext,
+    slot: crate::admission::AdmissionSlot,
     ApiBody(body): ApiBody,
 ) -> Result<Response, ProtocolError> {
     let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
-    generate_stream_entry(&state, &model_name, Some(version), headers, body, cx)
+    generate_stream_entry(&state, &model_name, Some(version), headers, body, cx, slot)
         .await
         .map_err(|error| ProtocolError { error, protocol })
 }
@@ -224,6 +232,7 @@ pub(crate) async fn openai_stream_entry(
     headers: HeaderMap,
     body: RequestBody,
     cx: RequestContext,
+    slot: crate::admission::AdmissionSlot,
 ) -> Result<Response, AppError> {
     let start = std::time::Instant::now();
     let mut label_version = String::new();
@@ -234,6 +243,7 @@ pub(crate) async fn openai_stream_entry(
         headers,
         body,
         cx,
+        slot,
         false,
         &mut label_version,
         SseFrameStyle::Openai,
@@ -260,6 +270,7 @@ async fn sse_infer_entry(
     headers: HeaderMap,
     body: RequestBody,
     cx: RequestContext,
+    slot: crate::admission::AdmissionSlot,
     decoupled: bool,
 ) -> Result<Response, AppError> {
     // S1(b)/D7:open 前的早期拒绝也计一次请求(对齐 gRPC wrapper 双点语义)。
@@ -273,6 +284,7 @@ async fn sse_infer_entry(
         headers,
         body,
         cx,
+        slot,
         decoupled,
         &mut label_version,
         SseFrameStyle::Legacy,
@@ -297,6 +309,7 @@ async fn sse_infer_entry_impl(
     headers: HeaderMap,
     body: RequestBody,
     cx: RequestContext,
+    slot: crate::admission::AdmissionSlot,
     decoupled: bool,
     label_version: &mut String,
     frame: SseFrameStyle,
@@ -335,6 +348,7 @@ async fn sse_infer_entry_impl(
         headers,
         body,
         cx,
+        slot,
         decoupled,
         frame,
     )
@@ -351,6 +365,7 @@ async fn sse_infer_impl(
     headers: HeaderMap,
     body: RequestBody,
     cx: RequestContext,
+    slot: crate::admission::AdmissionSlot,
     decoupled: bool,
     frame: SseFrameStyle,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, AppError> {
@@ -399,6 +414,11 @@ async fn sse_infer_impl(
         None
     };
     let stream_idle = crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
+    // K4 (resource-leak-plan): SSE keepalive comment interval (None = off).
+    // Shares the D2 knob with the WS Ping ticker (stream-liveness, distinct
+    // from the h1 idle reaper keepalive_timeout).
+    let sse_keepalive_interval =
+        crate::deadline::idle_budget(state.config.server.stream_keepalive_interval_secs);
     // §4.1 endpoint adaptation: ensemble models have no workers — dispatch
     // through the DAG executor. The returned Stream plugs the SAME variables
     // the forward loop below consumes (zero changes past this point); a Unary
@@ -473,7 +493,9 @@ async fn sse_infer_impl(
         prometheus::record_stream_open(&model_name, &resolved_version, "sse", &stream_id, decoupled);
     }
 
-    let (event_tx, event_rx) = mpsc::channel(64);
+    // RN-14: channel depth is operator-tunable (default 64). A consumer
+    // lagging by more than this truncates the stream at the ZMQ hop.
+    let (event_tx, event_rx) = mpsc::channel(state.config.server.stream_channel_size.max(1));
 
     // D4: decoupled path keeps the client for targeted cancel (vs coupled
     // broadcast). Clone before the spawn so the Arc stays alive. Ensemble
@@ -491,6 +513,10 @@ async fn sse_infer_impl(
         // P10 (D40): held for the forward task's lifetime — released on drop
         // (terminal frame / idle / disconnect; same path as D18 teardown).
         let _ensemble_permit = ensemble_permit;
+        // RN-13 (D9-A): the admission slot is held for the stream's lifetime
+        // (taken from the middleware's transfer cell; None when the path did
+        // not carry one — cap 0 / unit tests).
+        let _admission_guard = slot.take();
         let open_time = std::time::Instant::now();
         let mut first_chunk = true;
         let mut last_chunk_time = open_time;
@@ -505,11 +531,37 @@ async fn sse_infer_impl(
         // sequence — a multi-byte codepoint split across chunk boundaries is
         // buffered here (≤3 bytes) instead of being misread as binary.
         let mut utf8_pending: Vec<u8> = Vec::new();
+        // K4: keepalive comment ticker. interval_at delays the first tick by
+        // one interval (tokio::time::interval fires immediately otherwise).
+        // None = off (the select arm pends).
+        let mut ka_ticker = sse_keepalive_interval
+            .map(|d| tokio::time::interval_at(tokio::time::Instant::now() + d, d));
 
         loop {
-            let chunk = match streaming::recv_chunk(&mut chunk_rx, stream_deadline, stream_idle)
-                .await
-            {
+            let chunk = match tokio::select! {
+                c = streaming::recv_chunk(&mut chunk_rx, stream_deadline, stream_idle) => c,
+                _ = async {
+                    match &mut ka_ticker {
+                        Some(t) => t.tick().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // K4: SSE keepalive comment. The send is bounded by one
+                    // interval — a comment that cannot flush means the client
+                    // is gone. RN-6: this periodic send is also the idle=0
+                    // dead-peer detector (a disconnected client drops the
+                    // response receiver, so the send errors out here).
+                    let budget = sse_keepalive_interval.unwrap_or_default();
+                    let comment = Ok(Event::default().comment("keepalive"));
+                    match tokio::time::timeout(budget, event_tx.send(comment)).await {
+                        Ok(Ok(())) => continue,
+                        _ => {
+                            reason = prometheus::StreamCloseReason::Cancel;
+                            break;
+                        }
+                    }
+                }
+            } {
                 Ok(Some(c)) => c,
                 Ok(None) => {
                     reason = prometheus::StreamCloseReason::WorkerEof;
@@ -541,7 +593,15 @@ async fn sse_infer_impl(
                     } else {
                         json!({"error": msg}).to_string()
                     };
-                    let _ = event_tx.send(Ok(Event::default().data(data))).await;
+                    // L1: bounded — on this reclaim path the client may be
+                    // stopped, and an unbounded send into the full event
+                    // channel would hang the reclaim itself. The bound lets a
+                    // slow (still draining) client receive the terminal frame.
+                    let _ = tokio::time::timeout(
+                        streaming::TERMINAL_SEND_TIMEOUT,
+                        event_tx.send(Ok(Event::default().data(data))),
+                    )
+                    .await;
                     crate::callback::fire_inference_response(&cb_runner, &req_ctx, open_time);
                     break;
                 }
@@ -636,9 +696,23 @@ async fn sse_infer_impl(
                 _ => None,
             };
             if let Some(event) = event {
-                if event_tx.send(Ok(event)).await.is_err() {
-                    reason = prometheus::StreamCloseReason::Cancel;
-                    break;
+                // L1 (resource-leak-plan): bound the send by the overall
+                // stream deadline — a stopped reader backpressures the bounded
+                // event channel; an unbounded send here would pin the
+                // connection + worker stream past the armed deadline (the
+                // recv-side deadline can never fire while this send blocks).
+                // No armed deadline = unbounded send (D6 contract); the K4
+                // keepalive ticker is then the dead-peer detector.
+                match streaming::send_bounded(stream_deadline, event_tx.send(Ok(event))).await {
+                    streaming::SendOutcome::Sent(Ok(())) => {}
+                    streaming::SendOutcome::Sent(Err(_)) => {
+                        reason = prometheus::StreamCloseReason::Cancel;
+                        break;
+                    }
+                    streaming::SendOutcome::Deadline => {
+                        reason = prometheus::StreamCloseReason::Deadline;
+                        break;
+                    }
                 }
             }
             // m7: the type-mismatch error event was already sent — close the
@@ -753,6 +827,7 @@ pub async fn ws_stream_handler(
     headers: HeaderMap,
     ws: axum::extract::WebSocketUpgrade,
     cx: RequestContext,
+    slot: crate::admission::AdmissionSlot,
 ) -> Response {
     if let Err(e) = crate::validation::validate_identifier(&model_name) {
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
@@ -762,7 +837,7 @@ pub async fn ws_stream_handler(
     if !crate::http::cors::ws_origin_allowed(&state, &model_name, None, &headers) {
         return (axum::http::StatusCode::FORBIDDEN, "WebSocket Origin not allowed").into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, headers, socket, cx, false))
+    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, headers, socket, cx, slot, false))
 }
 
 pub async fn ws_stream_version_handler(
@@ -771,6 +846,7 @@ pub async fn ws_stream_version_handler(
     headers: HeaderMap,
     ws: axum::extract::WebSocketUpgrade,
     cx: RequestContext,
+    slot: crate::admission::AdmissionSlot,
 ) -> Response {
     if let Err(e) = crate::validation::validate_identifier(&model_name) {
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
@@ -781,7 +857,7 @@ pub async fn ws_stream_version_handler(
     if !crate::http::cors::ws_origin_allowed(&state, &model_name, Some(&version), &headers) {
         return (axum::http::StatusCode::FORBIDDEN, "WebSocket Origin not allowed").into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), headers, socket, cx, false))
+    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), headers, socket, cx, slot, false))
 }
 
 // ===== WS Decoupled =====
@@ -792,6 +868,7 @@ pub async fn ws_decoupled_handler(
     headers: HeaderMap,
     ws: axum::extract::WebSocketUpgrade,
     cx: RequestContext,
+    slot: crate::admission::AdmissionSlot,
 ) -> Response {
     if let Err(e) = crate::validation::validate_identifier(&model_name) {
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
@@ -799,7 +876,7 @@ pub async fn ws_decoupled_handler(
     if !crate::http::cors::ws_origin_allowed(&state, &model_name, None, &headers) {
         return (axum::http::StatusCode::FORBIDDEN, "WebSocket Origin not allowed").into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, headers, socket, cx, true))
+    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, headers, socket, cx, slot, true))
 }
 
 pub async fn ws_decoupled_version_handler(
@@ -808,6 +885,7 @@ pub async fn ws_decoupled_version_handler(
     headers: HeaderMap,
     ws: axum::extract::WebSocketUpgrade,
     cx: RequestContext,
+    slot: crate::admission::AdmissionSlot,
 ) -> Response {
     if let Err(e) = crate::validation::validate_identifier(&model_name) {
         return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
@@ -818,7 +896,7 @@ pub async fn ws_decoupled_version_handler(
     if !crate::http::cors::ws_origin_allowed(&state, &model_name, Some(&version), &headers) {
         return (axum::http::StatusCode::FORBIDDEN, "WebSocket Origin not allowed").into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), headers, socket, cx, true))
+    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), headers, socket, cx, slot, true))
 }
 
 /// §4.4: WS error frame + close (the connection already upgraded — there is
@@ -1054,6 +1132,7 @@ async fn handle_ws_stream(
     mut headers: HeaderMap,
     mut socket: WebSocket,
     cx: RequestContext,
+    slot: crate::admission::AdmissionSlot,
     decoupled: bool,
 ) {
     // S1(b)/D7:握手后早退也计一次请求(WS 已升级 101 无 HTTP status,family
@@ -1245,6 +1324,11 @@ async fn handle_ws_stream(
         None
     };
     let stream_idle = crate::deadline::idle_budget(state.config.server.decoupled_idle_timeout_secs);
+    // K3 (resource-leak-plan): server-initiated WS Ping keepalive interval
+    // (None = off). A periodic send gives stalled zero-traffic streams a
+    // dead-peer check and keeps intermediaries from dropping silent streams.
+    let ws_keepalive_interval =
+        crate::deadline::idle_budget(state.config.server.stream_keepalive_interval_secs);
 
     // Split socket for independent read/write halves (bidi). Done before the
     // ensemble dispatch — aggregation reads the upstream half.
@@ -1625,6 +1709,10 @@ async fn handle_ws_stream(
         // P10 (D40): held for the writer task's lifetime — released on drop
         // (terminal frame / idle / disconnect; D18 teardown path).
         let _ensemble_permit = ensemble_permit;
+        // RN-13 (D9-A): the admission slot is held for the stream's lifetime
+        // (taken from the middleware's transfer cell; None when the path did
+        // not carry one — cap 0 / unit tests).
+        let _admission_guard = slot.take();
         let open_time = stream_open_time;
         let mut first_chunk = true;
         let mut last_chunk_time = open_time;
@@ -1635,10 +1723,35 @@ async fn handle_ws_stream(
         let mut output_bytes: u64 = 0;
         // G5:per-stream chunk 数(close 日志字段,收口统一上报,非 metric)。
         let mut chunks: u64 = 0;
+        // K3: server-initiated Ping keepalive ticker. interval_at delays the
+        // first tick by one interval (tokio::time::interval fires immediately
+        // otherwise, which would Ping on stream open). None = off (arm pends).
+        let mut ping_ticker = ws_keepalive_interval
+            .map(|d| tokio::time::interval_at(tokio::time::Instant::now() + d, d));
 
         loop {
             let chunk = tokio::select! {
                 c = streaming::recv_chunk(&mut chunk_rx, stream_deadline, stream_idle) => c,
+                _ = async {
+                    match &mut ping_ticker {
+                        Some(t) => t.tick().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // K3: Ping keepalive. The send is bounded by one interval —
+                    // a Ping that cannot flush within its own interval means
+                    // the peer is gone (or so backlogged it is indistinguishable
+                    // from gone); tungstenite auto-answers inbound pings, and
+                    // D4 explicitly adds no pong-timeout reader.
+                    let budget = ws_keepalive_interval.unwrap_or_default();
+                    match tokio::time::timeout(budget, ws_sink.send(Message::Ping(Vec::new()))).await {
+                        Ok(Ok(())) => continue,
+                        _ => {
+                            reason = prometheus::StreamCloseReason::Cancel;
+                            break;
+                        }
+                    }
+                }
                 _ = gone_rx.changed() => {
                     // Reader signalled: send error (if any) to client, then break.
                     // gone=Some(msg) → protocol 违规;gone=Some("")/None → 客户端
@@ -1691,9 +1804,14 @@ async fn handle_ws_stream(
                             "stream closed: idle timeout"
                         }
                     };
-                    let _ = ws_sink
-                        .send(Message::Text(json!({"error": msg}).to_string()))
-                        .await;
+                    // L1: bounded — same rationale as the SSE reclaim path:
+                    // an unbounded send into a backlogged sink would hang the
+                    // reclaim itself; the bound lets a slow client still get it.
+                    let _ = tokio::time::timeout(
+                        streaming::TERMINAL_SEND_TIMEOUT,
+                        ws_sink.send(Message::Text(json!({"error": msg}).to_string())),
+                    )
+                    .await;
                     crate::callback::fire_inference_response(&cb_runner, &req_ctx, open_time);
                     break;
                 }
@@ -1734,9 +1852,23 @@ async fn handle_ws_stream(
                 }
                 _ => continue,
             };
-            if ws_sink.send(msg).await.is_err() {
-                reason = prometheus::StreamCloseReason::Cancel;
-                break;
+            // L1 (resource-leak-plan): bound the send by the overall stream
+            // deadline — a stopped reader backpressures the socket and an
+            // unbounded send would pin the connection + worker stream +
+            // admission slot past the armed deadline (the recv-side deadline
+            // can never fire while this send blocks). No armed deadline =
+            // unbounded send (D6 contract); the K3 Ping ticker is then the
+            // dead-peer detector.
+            match streaming::send_bounded(stream_deadline, ws_sink.send(msg)).await {
+                streaming::SendOutcome::Sent(Ok(())) => {}
+                streaming::SendOutcome::Sent(Err(_)) => {
+                    reason = prometheus::StreamCloseReason::Cancel;
+                    break;
+                }
+                streaming::SendOutcome::Deadline => {
+                    reason = prometheus::StreamCloseReason::Deadline;
+                    break;
+                }
             }
             // reason 统一在 terminal break 处置位(同 SSE 注释,无初值声明的构造保证)。
             if is_stream_terminal(&chunk) {
@@ -2136,6 +2268,7 @@ mod tests {
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
+            crate::admission::AdmissionSlot::default(),
             false,
             SseFrameStyle::Legacy,
         )
@@ -2231,6 +2364,7 @@ mod tests {
                     HeaderMap::new(),
                     json_body(json!({})),
                     test_cx(),
+                    crate::admission::AdmissionSlot::default(),
                     false,
                     SseFrameStyle::Legacy,
                 )
@@ -2283,6 +2417,7 @@ mod tests {
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
+            crate::admission::AdmissionSlot::default(),
             false,
             SseFrameStyle::Legacy,
         )
@@ -2324,6 +2459,7 @@ mod tests {
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
+            crate::admission::AdmissionSlot::default(),
             false,
             SseFrameStyle::Legacy,
         )
@@ -2369,6 +2505,7 @@ mod tests {
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
+            crate::admission::AdmissionSlot::default(),
             false,
             SseFrameStyle::Legacy,
         )
@@ -2448,7 +2585,7 @@ mod tests {
                 // No ZMQ client / workers → open_worker_stream fails, but the
                 // span is built before that. Explicit version so resolve
                 // succeeds without an active-version cutover.
-                let _ = sse_infer_entry(&state, "span_model", Some("1".to_string()), HeaderMap::new(), json_body(json!({})), test_cx(), false).await;
+                let _ = sse_infer_entry(&state, "span_model", Some("1".to_string()), HeaderMap::new(), json_body(json!({})), test_cx(), crate::admission::AdmissionSlot::default(), false).await;
             });
         });
         handle.join().expect("span test thread must not panic");
@@ -2565,6 +2702,7 @@ mod tests {
                     HeaderMap::new(),
                     json_body(json!({"x": 1})),
                     test_cx(),
+                    crate::admission::AdmissionSlot::default(),
                     false,
                 )
                 .await;
@@ -2733,6 +2871,7 @@ mod tests {
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
+            crate::admission::AdmissionSlot::default(),
             false,
             SseFrameStyle::Legacy,
         )
@@ -3336,6 +3475,7 @@ mod tests {
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
+            crate::admission::AdmissionSlot::default(),
             true, // decoupled
             SseFrameStyle::Legacy,
         )
@@ -3379,6 +3519,7 @@ mod tests {
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
+            crate::admission::AdmissionSlot::default(),
             true, // decoupled
             SseFrameStyle::Legacy,
         )
@@ -3454,6 +3595,7 @@ mod tests {
             headers,
             json_body(json!({})),
             test_cx(),
+            crate::admission::AdmissionSlot::default(),
             true, // decoupled
             SseFrameStyle::Legacy,
         )
@@ -3518,6 +3660,7 @@ mod tests {
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
+            crate::admission::AdmissionSlot::default(),
             true, // decoupled
             SseFrameStyle::Legacy,
         )
@@ -3934,6 +4077,7 @@ mod tests {
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
+            crate::admission::AdmissionSlot::default(),
             false,
             SseFrameStyle::Legacy,
         )
@@ -3967,6 +4111,7 @@ mod tests {
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
+            crate::admission::AdmissionSlot::default(),
             false,
             SseFrameStyle::Legacy,
         )
@@ -4004,6 +4149,7 @@ mod tests {
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
+            crate::admission::AdmissionSlot::default(),
             false,
             SseFrameStyle::Legacy,
         )
@@ -4038,6 +4184,7 @@ mod tests {
             Path((model.to_string(), "1".to_string())),
             HeaderMap::new(),
             test_cx(),
+            crate::admission::AdmissionSlot::default(),
             ApiBody(json_body(json!({}))),
         )
         .await;
@@ -4062,6 +4209,7 @@ mod tests {
             Path(model.to_string()),
             HeaderMap::new(),
             test_cx(),
+            crate::admission::AdmissionSlot::default(),
             ApiBody(json_body(json!({}))),
         )
         .await;
@@ -4104,6 +4252,7 @@ mod tests {
             Path(model.to_string()),
             HeaderMap::new(),
             test_cx(),
+            crate::admission::AdmissionSlot::default(),
             ApiBody(json_body(json!({}))),
         )
         .await;
@@ -4129,6 +4278,7 @@ mod tests {
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
+            crate::admission::AdmissionSlot::default(),
             false,
             SseFrameStyle::Legacy,
         )
@@ -4165,6 +4315,7 @@ mod tests {
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
+            crate::admission::AdmissionSlot::default(),
             false,
             SseFrameStyle::Legacy,
         )
@@ -4195,6 +4346,7 @@ mod tests {
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
+            crate::admission::AdmissionSlot::default(),
             false,
             SseFrameStyle::Legacy,
         )
@@ -4229,6 +4381,7 @@ mod tests {
             HeaderMap::new(),
             json_body(json!({})),
             test_cx(),
+            crate::admission::AdmissionSlot::default(),
             false,
             SseFrameStyle::Legacy,
         )

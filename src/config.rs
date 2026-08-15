@@ -142,6 +142,40 @@ pub struct ServerConfig {
     pub graceful_timeout: f32,
     /// HTTP keep-alive timeout in seconds. 0 = disable keep-alive.
     pub keepalive_timeout: f32,
+    /// K3/K4 (resource-leak-plan): interval in seconds between server-initiated
+    /// liveness frames on streaming connections — WebSocket Ping control
+    /// frames and SSE `: keepalive` comment lines. These give stalled streams
+    /// a periodic send so a dead peer is detected at the next send failure,
+    /// and keep intermediaries (NAT/load balancers) from dropping silent
+    /// streams. 0 disables keepalive frames. This is stream-liveness, NOT the
+    /// h1 idle-connection reaper — that is `keepalive_timeout`.
+    pub stream_keepalive_interval_secs: f32,
+    /// RN-14 (resource-leak-plan): depth of every per-stream chunk channel
+    /// (worker→server ZMQ route, SSE event channel, gRPC response channel).
+    /// A consumer that lags the producer by more than this truncates the
+    /// stream with a synthetic Error frame. Raise it for burst-tolerant
+    /// streaming (memory cost ≈ size × chunk size × concurrent streams).
+    /// Default 64 (behavior unchanged). Values < 1 clamp to 1.
+    pub stream_channel_size: usize,
+    /// L2 (resource-leak-plan): idle timeout in seconds for reading the
+    /// request BODY (slowloris-body guard). Idle = no body frame within the
+    /// window (the timer resets as bytes flow), so large uploads are
+    /// unaffected while they make progress. Streaming request bodies
+    /// (h2 `/bidi`) are exempt — their idle gaps are legal. 0 disables
+    /// (default; behavior unchanged). A stalled body is cut with a 4xx-class
+    /// error and the connection is reusable/closed per h1 rules.
+    pub request_body_timeout_secs: f32,
+    /// K6 (resource-leak-plan, D5): HTTP/2 keepalive PING interval in seconds
+    /// for the HTTP server (TLS ALPN / h2c). None (default) = off. hyper h2
+    /// has no idle reaper — PING only detects DEAD peers (a lost ack within
+    /// `http2_keepalive_timeout_secs` closes the connection); live-but-idle
+    /// h2 connections are the client's pool, by design. Distinct from
+    /// `grpc.http2_keepalive_*` (tonic endpoint, different surface).
+    pub http2_keepalive_interval_secs: Option<f32>,
+    /// K6: how long the server waits for a h2 PING ack before closing the
+    /// connection. Only meaningful with `http2_keepalive_interval_secs` set
+    /// (a timeout without an interval logs a startup warning and is ignored).
+    pub http2_keepalive_timeout_secs: Option<f32>,
     /// P4-1/P7-2: filesystem mode (chmod) applied to a UDS `server.host`
     /// (`unix:/path`). The HTTP UDS serves health/inference AND admin on one
     /// socket, so the default 0o666 lets any local process reach admin
@@ -236,6 +270,11 @@ impl Default for ServerConfig {
             cache_registry: false,
             graceful_timeout: 30.0,
             keepalive_timeout: 5.0,
+            stream_keepalive_interval_secs: 30.0,
+            stream_channel_size: 64,
+            request_body_timeout_secs: 0.0,
+            http2_keepalive_interval_secs: None,
+            http2_keepalive_timeout_secs: None,
             socket_mode: 0o666,
             compression: false,
             tls_cert_path: None,
@@ -1322,6 +1361,24 @@ impl Config {
         check_duration_secs("server.timeout", self.server.timeout)?;
         check_duration_secs("server.graceful_timeout", self.server.graceful_timeout)?;
         check_duration_secs("server.keepalive_timeout", self.server.keepalive_timeout)?;
+        check_duration_secs(
+            "server.stream_keepalive_interval_secs",
+            self.server.stream_keepalive_interval_secs,
+        )?;
+        check_duration_secs(
+            "server.request_body_timeout_secs",
+            self.server.request_body_timeout_secs,
+        )?;
+        // K6: a PING-ack timeout without an interval never fires (no PINGs
+        // are sent) — warn, don't fail (the interval is the master switch).
+        if self.server.http2_keepalive_interval_secs.is_none()
+            && self.server.http2_keepalive_timeout_secs.is_some()
+        {
+            tracing::warn!(
+                "server.http2_keepalive_timeout_secs is set but http2_keepalive_interval_secs \
+                 is not — no h2 PINGs are sent, so the timeout never fires"
+            );
+        }
         check_duration_secs("server.sequence_ttl_secs", self.server.sequence_ttl_secs)?;
         if self.server.balance_rel_threshold < 0.0 || !self.server.balance_rel_threshold.is_finite() {
             anyhow::bail!(

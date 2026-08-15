@@ -230,7 +230,14 @@ SERVER_YAML = textwrap.dedent("""\
       # threads: null               # Tokio worker threads (null = auto = CPU cores)
       # cache_registry: false       # Snapshot registry (strategy + active pins) on shutdown; restore on startup
       # graceful_timeout: 30.0      # Max seconds for graceful shutdown
-      # keepalive_timeout: 5.0      # HTTP keep-alive timeout (0 = disable)
+      # keepalive_timeout: 5.0      # HTTP keep-alive timeout; idle connections reaped
+      #                              # after the window. 0 = disable (h1-only; TLS drops
+      #                              # the h2 ALPN offer)
+      # stream_keepalive_interval_secs: 30.0  # WS Ping / SSE keepalive comment interval (0 = off)
+      # stream_channel_size: 64     # Per-stream chunk channel depth; raise for burst tolerance
+      # request_body_timeout_secs: 0.0  # Request-body idle timeout (slowloris body); 0 = off
+      # http2_keepalive_interval_secs: null  # HTTP h2 PING interval; null = off
+      # http2_keepalive_timeout_secs: null   # h2 PING ack timeout (needs the interval)
       # compression: false          # gzip HTTP responses (P1-4; SSE excluded)
       # socket_mode: 0o666          # chmod for a unix: UDS host (P4-1); 0o600 on
       #                              # multi-tenant hosts (HTTP UDS also serves admin)

@@ -161,6 +161,7 @@ pub async fn dispatch_custom_route(
     headers: &HeaderMap,
     body: bytes::Bytes,
     cx: &RequestContext,
+    admission_slot: crate::admission::AdmissionSlot,
 ) -> Result<Response, AppError> {
     let method_str = method.as_str();
     let ResolvedCustomRoute {
@@ -274,6 +275,9 @@ pub async fn dispatch_custom_route(
                     state.callback_runner.clone(),
                     req_ctx.clone(),
                     start,
+                    // RN-13 (D9-A): the admission guard rides the response
+                    // body — the slot is released when the stream ends.
+                    admission_slot.take(),
                 )
             }
             _ => Err(AppError::WorkerCrashed(
@@ -335,6 +339,7 @@ fn build_route_stream_http_response(
     callback_runner: std::sync::Arc<crate::callback::CallbackRunner>,
     req_ctx: crate::callback::InferenceContext,
     open_time: std::time::Instant,
+    admission_guard: Option<crate::admission::AdmissionGuard>,
 ) -> Result<Response, AppError> {
     let is_sse = start.media_type.starts_with("text/event-stream");
     let content_type = if start.media_type.is_empty() {
@@ -349,7 +354,12 @@ fn build_route_stream_http_response(
     // had streamed.
     let body = futures::stream::unfold(
         (chunk_rx, false, callback_runner, req_ctx, open_time),
-        move |(mut rx, ended, cb, ctx, t0)| async move {
+        move |(mut rx, ended, cb, ctx, t0)| {
+            // RN-13 (D9-A): force-capture the admission guard into this
+            // closure's environment — the unfold stream owns the closure, so
+            // the slot is released exactly when the body stream ends/drops.
+            let _hold = &admission_guard;
+            async move {
             if ended {
                 return None;
             }
@@ -383,6 +393,7 @@ fn build_route_stream_http_response(
                     crate::callback::fire_inference_response(&cb, &ctx, t0);
                     None
                 }
+            }
             }
         },
     );

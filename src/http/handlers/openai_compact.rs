@@ -112,6 +112,7 @@ pub async fn openai_infer_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     cx: RequestContext,
+    slot: crate::admission::AdmissionSlot,
     ApiBody(body): ApiBody,
 ) -> Result<Response, ProtocolError> {
     let protocol = crate::protocol::ApiProtocol::OpenaiCompact;
@@ -121,7 +122,7 @@ pub async fn openai_infer_handler(
         // 批次 5 审计修复(B1/B2/B7/B8/B10):流式并入 SSE 管线——鉴权/限流/
         // validate/binary-flag 400/worker 流 cancel/指标/回调全随
         // sse_infer_entry_impl 继承,帧封装 = SseFrameStyle::Openai。
-        crate::http::handlers::stream::openai_stream_entry(&state, &route.model, headers, body, cx)
+        crate::http::handlers::stream::openai_stream_entry(&state, &route.model, headers, body, cx, slot)
             .await
             .map_err(|error| ProtocolError { error, protocol })
     } else {

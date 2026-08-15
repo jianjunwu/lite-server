@@ -97,6 +97,9 @@ pub struct WorkerManager {
     // P10 (D40): global streaming-DAG semaphore (server.max_concurrent_streaming_dags).
     // None = unlimited (0) or bare unit-test WorkerManager.
     streaming_capacity: Option<Arc<crate::ensemble::StreamingCapacityState>>,
+    // RN-14: per-stream chunk channel depth for newly constructed worker
+    // stream channels (server.stream_channel_size).
+    stream_channel_size: usize,
 }
 
 struct WorkerProcess {
@@ -151,6 +154,9 @@ impl WorkerManager {
             // P10 (D40): installed on the production path (server/mod.rs)
             // from server.max_concurrent_streaming_dags; 0/None = unlimited.
             streaming_capacity: None,
+            // RN-14: default matches ServerConfig; the production path
+            // overrides via with_stream_channel_size.
+            stream_channel_size: 64,
         }
     }
 
@@ -204,6 +210,14 @@ impl WorkerManager {
     /// (`features.custom_metrics`).
     pub fn with_custom_metrics(mut self, enabled: bool) -> Self {
         self.custom_metrics = enabled;
+        self
+    }
+
+    /// RN-14 (resource-leak-plan): per-stream chunk channel depth
+    /// (`server.stream_channel_size`), applied to every worker stream channel
+    /// created from now on. Values < 1 clamp to 1.
+    pub fn with_stream_channel_size(mut self, size: usize) -> Self {
+        self.stream_channel_size = size.max(1);
         self
     }
 

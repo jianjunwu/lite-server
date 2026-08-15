@@ -337,6 +337,20 @@ lazy_static! {
         ),
         &["model", "version"]
     ).unwrap();
+
+    /// L4 (resource-leak-plan): open HTTP connections by transport
+    /// (tcp|tls|uds). Connection-level observability was missing entirely —
+    /// request-level metrics cannot see idle keep-alive connections, TLS
+    /// handshakes, or slowloris holds. Incremented at accept, decremented
+    /// when the connection task ends (K1's reaper makes the decrement
+    /// observable on idle close).
+    pub static ref HTTP_CONNECTIONS: GaugeVec = GaugeVec::new(
+        prometheus::Opts::new(
+            "liteserver_http_connections",
+            "Open HTTP connections by transport"
+        ),
+        &["transport"]
+    ).unwrap();
 }
 
 // Custom metrics reported by Python workers — std::sync::Mutex is sufficient
@@ -396,6 +410,7 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(QUEUE_WAIT_SECONDS.clone()))?;
     REGISTRY.register(Box::new(WORKER_SATURATION.clone()))?;
     REGISTRY.register(Box::new(HTTP_REQUEST_BODY_BYTES.clone()))?;
+    REGISTRY.register(Box::new(HTTP_CONNECTIONS.clone()))?;
     Ok(())
 }
 
@@ -623,6 +638,17 @@ pub fn record_ensemble_step_latency(ensemble: &str, step: &str, model: &str, ver
 }
 
 // ===== Streaming metrics =====
+
+/// L4: HTTP connection-level gauge. `transport` is one of tcp|tls|uds.
+/// Not gated on streaming_metrics — connection accounting is a server-level
+/// resource signal, not a per-stream feature.
+pub fn record_http_connection_open(transport: &str) {
+    HTTP_CONNECTIONS.with_label_values(&[transport]).inc();
+}
+
+pub fn record_http_connection_close(transport: &str) {
+    HTTP_CONNECTIONS.with_label_values(&[transport]).dec();
+}
 
 /// `stream_id`/`decoupled` 仅用于 G5 生命周期日志(metrics label 不含)。
 /// 门控继承:调用点都在 `if stream_metrics` 内。

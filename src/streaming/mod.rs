@@ -89,6 +89,44 @@ pub enum RecvElapsed {
     Idle,
 }
 
+/// L1 (resource-leak-plan): outcome of a deadline-bounded stream send.
+pub enum SendOutcome<T> {
+    /// The send completed (the underlying send's own Ok/Err).
+    Sent(T),
+    /// The overall deadline fired mid-send — reclaim the stream (the client
+    /// is stopped or gone; a terminal error frame would not flush anyway).
+    Deadline,
+}
+
+/// L1: bound a stream send by the overall stream deadline. A stopped reader
+/// backpressures the bounded channel/socket; an unbounded send would pin the
+/// connection + worker stream + admission slot past the armed deadline (the
+/// recv-side deadline can never fire while the send blocks). No armed
+/// deadline = unbounded send (D6 contract); the keepalive ticker (K3/K4) is
+/// then the dead-peer detector.
+pub async fn send_bounded<F, T>(
+    deadline: Option<std::time::Instant>,
+    send: F,
+) -> SendOutcome<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    match deadline {
+        Some(d) => match tokio::time::timeout_at(d.into(), send).await {
+            Ok(r) => SendOutcome::Sent(r),
+            Err(_) => SendOutcome::Deadline,
+        },
+        None => SendOutcome::Sent(send.await),
+    }
+}
+
+/// L1: bound for terminal-frame sends on a reclaim path. On deadline/idle
+/// reclaim the client may be stopped; an unbounded send into a backlogged
+/// channel would hang the reclaim itself. 2s lets a slow (still draining)
+/// client receive the terminal frame (D35 delivery preserved), a dead one is
+/// dropped.
+pub const TERMINAL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Receive the next worker stream chunk under a P-DEADLINE two-stage bound.
 ///
 /// `deadline`: absolute overall deadline (None = no overall bound).

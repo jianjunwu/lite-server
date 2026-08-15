@@ -65,6 +65,9 @@ struct TlsState {
 pub struct TlsConfigStore {
     settings: TlsSettings,
     protocol: TlsProtocol,
+    /// K2: HTTP listener advertises only http/1.1 (ka <= 0). See
+    /// load_with_h1_only.
+    h1_only: bool,
     state: ArcSwap<TlsState>,
 }
 
@@ -73,12 +76,26 @@ impl TlsConfigStore {
     /// files, empty/invalid PEM, a key that does not match the certificate, or
     /// an mTLS CA bundle with no usable certificate are all startup errors.
     pub fn load(settings: &TlsSettings, protocol: TlsProtocol) -> Result<Self, AppError> {
+        Self::load_with_h1_only(settings, protocol, false)
+    }
+
+    /// K2 (resource-leak-plan): `h1_only` restricts the HTTP ALPN
+    /// advertisement to http/1.1 — the only honest way to disable keep-alive
+    /// on the TLS path, since `Connection: close` has no h2 equivalent and
+    /// hyper-util's auto builder sniffs h2 regardless of http1_only(). The
+    /// flag is stored so cert rotation rebuilds keep the restriction.
+    pub fn load_with_h1_only(
+        settings: &TlsSettings,
+        protocol: TlsProtocol,
+        h1_only: bool,
+    ) -> Result<Self, AppError> {
         let pem = read_pem_files(settings)?;
-        let config = build_server_config(settings, protocol, &pem)?;
+        let config = build_server_config(settings, protocol, h1_only, &pem)?;
         warn_if_key_world_readable(&settings.key_path);
         Ok(Self {
             settings: settings.clone(),
             protocol,
+            h1_only,
             state: ArcSwap::from_pointee(TlsState {
                 content_hash: pem.content_hash(),
                 config: Arc::new(config),
@@ -103,7 +120,7 @@ impl TlsConfigStore {
         if self.state.load().content_hash == hash {
             return Ok(false);
         }
-        let config = build_server_config(&self.settings, self.protocol, &pem)?;
+        let config = build_server_config(&self.settings, self.protocol, self.h1_only, &pem)?;
         self.state.store(Arc::new(TlsState {
             content_hash: hash,
             config: Arc::new(config),
@@ -173,6 +190,7 @@ fn warn_if_key_world_readable(key_path: &str) {
 fn build_server_config(
     settings: &TlsSettings,
     protocol: TlsProtocol,
+    h1_only: bool,
     pem: &PemFiles,
 ) -> Result<ServerConfig, AppError> {
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &pem.cert[..])
@@ -243,6 +261,8 @@ fn build_server_config(
     })?;
     config.alpn_protocols = match protocol {
         TlsProtocol::Grpc => vec![b"h2".to_vec()],
+        // K2: h1_only (ka <= 0) drops the h2 offer entirely.
+        TlsProtocol::Http if h1_only => vec![b"http/1.1".to_vec()],
         TlsProtocol::Http => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
     };
     Ok(config)
@@ -301,11 +321,99 @@ pub struct TlsClientPrincipal(pub Option<String>);
 #[derive(Clone)]
 pub struct RotatingTlsAcceptor {
     store: Arc<TlsConfigStore>,
+    /// RN-1: bound concurrent handshakes — the gRPC side (tls_incoming below)
+    /// has had this gate since P5-1; the HTTP side was missing it, leaving a
+    /// slow-loris opening (one spawned task + TCP connection per attempt,
+    /// unbounded).
+    handshake_permits: Arc<Semaphore>,
 }
+
+/// RN-1: matches the gRPC-side gate in tls_incoming.
+const MAX_CONCURRENT_TLS_HANDSHAKES: usize = 1024;
 
 impl RotatingTlsAcceptor {
     pub fn new(store: Arc<TlsConfigStore>) -> Self {
-        Self { store }
+        Self::with_handshake_limit(store, MAX_CONCURRENT_TLS_HANDSHAKES)
+    }
+
+    /// RN-1 test hook: a custom limit so gate exhaustion is observable
+    /// without opening 1024 connections.
+    pub fn with_handshake_limit(store: Arc<TlsConfigStore>, limit: usize) -> Self {
+        Self {
+            store,
+            handshake_permits: Arc::new(Semaphore::new(limit)),
+        }
+    }
+}
+
+/// L4: wraps the post-handshake TLS stream so the
+/// `liteserver_http_connections{transport="tls"}` gauge is held for exactly
+/// the connection's lifetime (inc at accept, dec when hyper drops the stream
+/// at connection end). Pure delegation otherwise. Unpin: TlsStream<TcpStream>
+/// is Unpin, so plain field access suffices (no pin-project — it forbids a
+/// Drop impl).
+pub struct CountedTlsStream {
+    inner: tokio_rustls::server::TlsStream<TcpStream>,
+}
+
+impl CountedTlsStream {
+    fn new(inner: tokio_rustls::server::TlsStream<TcpStream>) -> Self {
+        crate::metrics::prometheus::record_http_connection_open("tls");
+        Self { inner }
+    }
+}
+
+impl Unpin for CountedTlsStream {}
+
+impl Drop for CountedTlsStream {
+    fn drop(&mut self) {
+        crate::metrics::prometheus::record_http_connection_close("tls");
+    }
+}
+
+impl tokio::io::AsyncRead for CountedTlsStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for CountedTlsStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
 }
 
@@ -313,14 +421,32 @@ impl<S> axum_server::accept::Accept<TcpStream, S> for RotatingTlsAcceptor
 where
     S: Clone + Send + 'static,
 {
-    type Stream = tokio_rustls::server::TlsStream<TcpStream>;
+    type Stream = CountedTlsStream;
     type Service = InjectPrincipal<S>;
     type Future =
         std::pin::Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
 
     fn accept(&self, stream: TcpStream, service: S) -> Self::Future {
         let acceptor = self.store.acceptor();
+        // L5: OS-level keepalive on the accepted socket (plaintext path
+        // parity — serve_tcp does the same).
+        crate::http::set_tcp_keepalive(&stream);
+        // RN-1: refuse over-limit handshakes immediately (try_acquire, never
+        // queue) — queueing would hold the TCP connection + task unbounded,
+        // which is exactly the resource this gate protects.
+        let permit = match self.handshake_permits.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                return Box::pin(async {
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "too many concurrent TLS handshakes",
+                    ))
+                });
+            }
+        };
         Box::pin(async move {
+            let _permit = permit; // held for the handshake duration
             let tls = match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await
             {
                 Ok(res) => res?,
@@ -337,7 +463,7 @@ where
                 .peer_certificates()
                 .and_then(|certs| certs.first())
                 .map(principal_from_cert);
-            Ok((tls, InjectPrincipal { inner: service, principal }))
+            Ok((CountedTlsStream::new(tls), InjectPrincipal { inner: service, principal }))
         })
     }
 }
@@ -936,5 +1062,73 @@ mod tests {
         );
         client_task.await.unwrap().expect("client handshake");
         let _ = stop_tx.send(());
+    }
+
+    /// K2 (resource-leak-plan): h1_only must restrict the HTTP ALPN
+    /// advertisement to http/1.1 (ka <= 0 on the TLS path); the default keeps
+    /// the h2 + http/1.1 offer.
+    #[test]
+    fn k2_h1_only_alpn_advertises_only_http11() {
+        let pki = TestPki::new("k2-ca");
+        let (cert_pem, key_pem) = pki.sign_server();
+        let pem = PemFiles {
+            cert: cert_pem.into_bytes(),
+            key: key_pem.into_bytes(),
+            ca: None,
+        };
+        // cert/key paths only appear in error messages here.
+        let s = settings("cert", "key", None);
+        let cfg = build_server_config(&s, TlsProtocol::Http, true, &pem).expect("config");
+        assert_eq!(cfg.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        let cfg = build_server_config(&s, TlsProtocol::Http, false, &pem).expect("config");
+        assert_eq!(
+            cfg.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+    }
+
+    /// RN-1 (resource-leak-plan): the HTTP TLS acceptor must bound concurrent
+    /// handshakes (slow-loris gate; the gRPC side has had one since P5-1).
+    /// With the limit exhausted, a new accept must be refused IMMEDIATELY —
+    /// queueing would hold the connection + task unbounded, the exact
+    /// resource the gate protects.
+    #[tokio::test]
+    async fn test_rn1_http_tls_handshake_gate_refuses_over_limit() {
+        use axum_server::accept::Accept as _;
+
+        let pki = TestPki::new("rn1-ca");
+        let (store, _dir) = store_for(&pki, TlsProtocol::Http, false, "rn1");
+        let acceptor = RotatingTlsAcceptor::with_handshake_limit(store, 1);
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let c1 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (s1, _) = listener.accept().await.unwrap();
+        let c2 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (s2, _) = listener.accept().await.unwrap();
+
+        // The first accept takes the only permit synchronously (held for the
+        // handshake duration; the client never speaks TLS, so the handshake
+        // stalls inside the future).
+        let first = acceptor.accept(s1, ());
+        // The second must be refused immediately — not queued.
+        let refused = match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            acceptor.accept(s2, ()),
+        )
+        .await
+        .expect("gate refusal must be immediate")
+        {
+            Ok(_) => panic!("over-limit handshake must be refused"),
+            Err(e) => e,
+        };
+        assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert!(
+            refused.to_string().contains("too many concurrent TLS handshakes"),
+            "unexpected refusal: {refused}"
+        );
+        drop(first);
+        drop(c1);
+        drop(c2);
     }
 }

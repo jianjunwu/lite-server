@@ -405,7 +405,9 @@ impl GrpcService {
         };
         crate::callback::fire_inference_request(&cb_runner, &req_ctx);
 
-        let (tx, rx) = mpsc::channel(64);
+        // RN-14: per-stream channel depth is operator-tunable (default 64).
+        let (tx, rx) =
+            mpsc::channel(self.app_state.config.server.stream_channel_size.max(1));
 
         let stream_metrics = self.streaming_metrics;
         let metrics_model = model_name.clone();
@@ -540,7 +542,12 @@ impl GrpcService {
                                 Status::deadline_exceeded("stream closed: idle timeout")
                             }
                         };
-                        let _ = tx.send(Err(status)).await;
+                        // L1: bounded terminal send — see TERMINAL_SEND_TIMEOUT.
+                        let _ = tokio::time::timeout(
+                            streaming::TERMINAL_SEND_TIMEOUT,
+                            tx.send(Err(status)),
+                        )
+                        .await;
                         crate::callback::fire_inference_response(&cb_runner, &req_ctx, start);
                         break;
                     }
@@ -565,9 +572,19 @@ impl GrpcService {
                                 data: c.data.clone(),
                             })),
                         };
-                        if tx.send(Ok(bidi_chunk)).await.is_err() {
-                            reason = crate::metrics::prometheus::StreamCloseReason::Cancel;
-                            break;
+                        // L1 (resource-leak-plan): deadline-bounded send —
+                        // a stopped reader must not pin the stream past the
+                        // armed deadline (see streaming::send_bounded).
+                        match streaming::send_bounded(stream_deadline, tx.send(Ok(bidi_chunk))).await {
+                            streaming::SendOutcome::Sent(Ok(())) => {}
+                            streaming::SendOutcome::Sent(Err(_)) => {
+                                reason = crate::metrics::prometheus::StreamCloseReason::Cancel;
+                                break;
+                            }
+                            streaming::SendOutcome::Deadline => {
+                                reason = crate::metrics::prometheus::StreamCloseReason::Deadline;
+                                break;
+                            }
                         }
                     }
                     Some(pb::stream_response::Payload::Error(ref e)) => {
@@ -589,7 +606,12 @@ impl GrpcService {
                         // Terminal: tonic's encode layer stops polling at the
                         // first Err item, so nothing may follow it on this
                         // channel (stream_infer / decoupled parity, FD-4).
-                        let _ = tx.send(Err(grpc_err)).await;
+                        // L1: bounded terminal send — see TERMINAL_SEND_TIMEOUT.
+                        let _ = tokio::time::timeout(
+                            streaming::TERMINAL_SEND_TIMEOUT,
+                            tx.send(Err(grpc_err)),
+                        )
+                        .await;
                         crate::callback::fire_inference_response(&cb_runner, &req_ctx, start);
                         break;
                     }
@@ -605,7 +627,12 @@ impl GrpcService {
                             stream_id: stream_id.clone(),
                             payload: Some(pb::bidi_chunk::Payload::Close(pb::BidiClose {})),
                         };
-                        let _ = tx.send(Ok(bidi_chunk)).await;
+                        // L1: bounded terminal send — see TERMINAL_SEND_TIMEOUT.
+                        let _ = tokio::time::timeout(
+                            streaming::TERMINAL_SEND_TIMEOUT,
+                            tx.send(Ok(bidi_chunk)),
+                        )
+                        .await;
                         // Task D: terminal frame → InferenceResponse.
                         crate::callback::fire_inference_response(&cb_runner, &req_ctx, start);
                         break;

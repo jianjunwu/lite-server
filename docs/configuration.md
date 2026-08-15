@@ -22,7 +22,22 @@ server:
                                # <repo>/.lite-server-registry.json on shutdown; restore on
                                # startup. Corrupt-file tolerant; delete the file to reset.
   graceful_timeout: 30.0       # Max seconds to wait for in-flight requests during shutdown
-  keepalive_timeout: 5.0       # HTTP keep-alive timeout (seconds), 0 = disable
+  keepalive_timeout: 5.0       # HTTP keep-alive timeout (seconds); idle connections are
+                               # reaped after this window (h1 idle reaper + slowloris-header
+                               # guard). 0 = disable keep-alive entirely (h1-only; on TLS
+                               # the h2 ALPN offer is dropped — h2 has no close semantic)
+  stream_keepalive_interval_secs: 30.0  # Server-initiated liveness frames on streams
+                               # (WS Ping / SSE `: keepalive` comment); 0 = off. Detects dead
+                               # peers on silent streams and keeps NAT/LB state warm
+  stream_channel_size: 64      # Per-stream chunk channel depth (worker->server, SSE, gRPC);
+                               # a consumer lagging by more truncates the stream. Raise for
+                               # burst tolerance (memory ~= size x chunk x concurrent streams)
+  request_body_timeout_secs: 0.0  # Idle timeout for request-body reads (slowloris-body
+                               # guard); resets as bytes flow, so large uploads are safe.
+                               # 0 = off. h2 /bidi request bodies are exempt (idle is legal)
+  http2_keepalive_interval_secs: null  # HTTP h2 PING interval (dead-peer detection only);
+                               # null = off. Distinct from grpc.http2_keepalive_*
+  http2_keepalive_timeout_secs: null   # h2 PING ack timeout (needs the interval set)
   compression: false           # gzip HTTP responses; SSE excluded, WS unaffected
   socket_mode: 0o666           # chmod for a unix: UDS host. The HTTP UDS also serves
                                # admin, so on multi-tenant hosts set 0o600 (owner-only).

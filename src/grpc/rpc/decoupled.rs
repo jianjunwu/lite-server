@@ -196,7 +196,9 @@ impl GrpcService {
         };
         crate::callback::fire_inference_request(&cb_runner, &req_ctx);
 
-        let (tx, rx) = mpsc::channel(64);
+        // RN-14: per-stream channel depth is operator-tunable (default 64).
+        let (tx, rx) =
+            mpsc::channel(self.app_state.config.server.stream_channel_size.max(1));
         let cancel_client = client.clone();
 
         let stream_metrics = self.streaming_metrics;
@@ -258,7 +260,12 @@ impl GrpcService {
                                 Status::deadline_exceeded("stream closed: idle timeout")
                             }
                         };
-                        let _ = tx.send(Err(err(status))).await;
+                        // L1: bounded terminal send — see TERMINAL_SEND_TIMEOUT.
+                        let _ = tokio::time::timeout(
+                            streaming::TERMINAL_SEND_TIMEOUT,
+                            tx.send(Err(err(status))),
+                        )
+                        .await;
                         crate::callback::fire_inference_response(&cb_runner, &req_ctx, start);
                         break;
                     }
@@ -278,9 +285,19 @@ impl GrpcService {
                             crate::metrics::prometheus::record_stream_chunk(&metrics_model, &metrics_version, "grpc");
                         }
                         let resp = pb::DecoupledResponse { data: c.data.clone(), is_final: false };
-                        if tx.send(Ok(resp)).await.is_err() {
-                            reason = crate::metrics::prometheus::StreamCloseReason::Cancel;
-                            break; // client disconnect
+                        // L1 (resource-leak-plan): deadline-bounded send —
+                        // a stopped reader must not pin the stream past the
+                        // armed deadline (see streaming::send_bounded).
+                        match streaming::send_bounded(stream_deadline, tx.send(Ok(resp))).await {
+                            streaming::SendOutcome::Sent(Ok(())) => {}
+                            streaming::SendOutcome::Sent(Err(_)) => {
+                                reason = crate::metrics::prometheus::StreamCloseReason::Cancel;
+                                break; // client disconnect
+                            }
+                            streaming::SendOutcome::Deadline => {
+                                reason = crate::metrics::prometheus::StreamCloseReason::Deadline;
+                                break;
+                            }
                         }
                     }
                     Some(pb::stream_response::Payload::Error(ref e)) => {
@@ -299,7 +316,12 @@ impl GrpcService {
                             Err(_) => err(Status::internal(e.message.clone())),
                         };
                         stream_family = grpc_code_to_status_family(grpc_err.code());
-                        let _ = tx.send(Err(grpc_err)).await;
+                        // L1: bounded terminal send — see TERMINAL_SEND_TIMEOUT.
+                        let _ = tokio::time::timeout(
+                            streaming::TERMINAL_SEND_TIMEOUT,
+                            tx.send(Err(grpc_err)),
+                        )
+                        .await;
                         crate::callback::fire_inference_response(&cb_runner, &req_ctx, start);
                         break;
                     }
@@ -313,9 +335,12 @@ impl GrpcService {
                         );
                         // Model called sender.close(): emit the terminal is_final
                         // frame, then end the gRPC stream.
-                        let _ = tx
-                            .send(Ok(pb::DecoupledResponse { data: Default::default(), is_final: true }))
-                            .await;
+                        // L1: bounded terminal send — see TERMINAL_SEND_TIMEOUT.
+                        let _ = tokio::time::timeout(
+                            streaming::TERMINAL_SEND_TIMEOUT,
+                            tx.send(Ok(pb::DecoupledResponse { data: Default::default(), is_final: true })),
+                        )
+                        .await;
                         // Task D: terminal frame → InferenceResponse.
                         crate::callback::fire_inference_response(&cb_runner, &req_ctx, start);
                         break;

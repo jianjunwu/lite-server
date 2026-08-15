@@ -16,6 +16,14 @@ use tracing::{error, info, warn};
 pub(crate) const ZMQ_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 const STREAM_CHANNEL_SIZE: usize = 64;
 
+/// RN-4 (resource-leak-plan): bound on the overflow-truncation delivery task.
+/// A consumer that recovers within this window still receives the synthetic
+/// Error frame (the B2 guarantee — a clean EOF would masquerade as normal
+/// completion); a wedged consumer no longer pins the task forever. Sized
+/// generously (30s) so only truly stuck consumers lose the frame — the task
+/// leak RN-4 targets is unbounded lifetime, not a bounded 30s hold.
+const OVERFLOW_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
 enum ZmqCommand {
     Unary {
         request: pb::Request,
@@ -74,6 +82,8 @@ pub struct WorkerZmqClient {
     /// cause (e.g. "address in use") instead of a generic "command channel
     /// closed" or a misleading EAGAIN error response.
     fatal: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// RN-14: per-stream chunk channel depth (server.stream_channel_size).
+    stream_channel_size: usize,
 }
 
 /// F-14: libzmq's ipc listener unlinks an existing SOCKET file before
@@ -101,6 +111,14 @@ impl WorkerZmqClient {
     /// `is_cb` marks the peer as a continuous-batching worker: the pending
     /// sweep then notifies it via `CbRemove` when a reply slot dies (B2).
     pub fn new_with_cb(endpoint: String, is_cb: bool) -> Self {
+        Self::new_with_channel_size(endpoint, is_cb, STREAM_CHANNEL_SIZE)
+    }
+
+    /// RN-14 (resource-leak-plan): `stream_channel_size` sets the per-stream
+    /// chunk channel depth (server.stream_channel_size; default
+    /// STREAM_CHANNEL_SIZE).
+    pub fn new_with_channel_size(endpoint: String, is_cb: bool, stream_channel_size: usize) -> Self {
+        let stream_channel_size = stream_channel_size.max(1);
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ZmqCommand>(128);
 
         // inproc wake pair sharing the actor's context: senders poke it
@@ -265,10 +283,10 @@ impl WorkerZmqClient {
                                                         // 若安静移除路由,consumer 观察到干净 EOF 误当正常
                                                         // 完成。补一个合成 Error 终态帧:克隆 sender +
                                                         // spawn 异步投递(不阻塞 actor 主循环),随后移除
-                                                        // 路由。投递不设超时(#9):恢复的 consumer 总能
-                                                        // 收到截断帧;卡死的 consumer 由 chunk-idle 回收
-                                                        // (recv_chunk 常开)或 rx drop 终结——send 随之
-                                                        // 以 Closed 完成,任务退出,无泄漏。
+                                                        // 路由。RN-4:投递有界(OVERFLOW_DELIVERY_TIMEOUT)——
+                                                        // 窗口内恢复的 consumer 仍收到截断帧;卡死的
+                                                        // consumer 不再把投递任务永久挂在 send 上
+                                                        // (无界任务泄漏)。
                                                         warn!("Stream channel full for {} — delivering truncation error", sid);
                                                         let sid_t = sid.clone();
                                                         let tx2 = tx.clone();
@@ -279,7 +297,11 @@ impl WorkerZmqClient {
                                                                     message: "stream truncated: consumer too slow (channel overflow)".to_string(),
                                                                 })),
                                                             };
-                                                            let _ = tx2.send(term).await;
+                                                            let _ = tokio::time::timeout(
+                                                                OVERFLOW_DELIVERY_TIMEOUT,
+                                                                tx2.send(term),
+                                                            )
+                                                            .await;
                                                         });
                                                     }
                                                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -342,7 +364,7 @@ impl WorkerZmqClient {
             }
         });
 
-        Self { cmd_tx, wake_tx, actor_asleep, wake_send_count, fatal }
+        Self { cmd_tx, wake_tx, actor_asleep, wake_send_count, fatal, stream_channel_size }
     }
 
     /// F-14: the actor's recorded construction failure, if any.
@@ -394,7 +416,7 @@ impl WorkerZmqClient {
         if let Some(e) = self.fatal_err() {
             return Err(e);
         }
-        let (chunk_tx, chunk_rx) = mpsc::channel(STREAM_CHANNEL_SIZE);
+        let (chunk_tx, chunk_rx) = mpsc::channel(self.stream_channel_size);
         let cmd = ZmqCommand::Stream {
             request,
             chunk_tx,
@@ -422,7 +444,7 @@ impl WorkerZmqClient {
             return Err(e);
         }
         let (response_tx, response_rx) = oneshot::channel();
-        let (chunk_tx, chunk_rx) = mpsc::channel(STREAM_CHANNEL_SIZE);
+        let (chunk_tx, chunk_rx) = mpsc::channel(self.stream_channel_size);
         self.cmd_tx
             .send(ZmqCommand::RouteOrStream { request, response_tx, chunk_tx })
             .await

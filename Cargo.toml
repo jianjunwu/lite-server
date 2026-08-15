@@ -14,6 +14,10 @@ tokio = { version = "1.40", features = ["full", "process"] }
 # HTTP framework
 axum = { version = "0.7", features = ["ws", "multipart"] }
 hyper-util = { version = "0.1", features = ["server", "tokio"] }
+# Direct dep: hyper::body::Incoming in the custom TCP accept loop (K1) and the
+# http1-only connection builder for keepalive_timeout <= 0 (K2 — hyper-util's
+# auto builder ignores http1_only() on the with_upgrades path).
+hyper = { version = "1", features = ["server", "http1"] }
 http = "1.0"
 # LengthLimitError downcast for the custom-route body cap (F-06 413 mapping).
 http-body-util = "0.1"
@@ -41,6 +45,8 @@ subtle = "2"
 # P7-2: getuid for admin UDS owner checks (cfg unix). Already in the graph via
 # tokio/mio; pinned as a direct dependency.
 libc = "0.2"
+# L5: TCP keepalive on accepted sockets (SockRef over tokio TcpStream).
+socket2 = { version = "0.5", features = ["all"] }
 
 # gRPC
 # P-TRACE (蓝图 §6.3): tonic 0.13 — opentelemetry-otlp 0.30 依赖 tonic ^0.13，
@@ -63,9 +69,11 @@ x509-parser = { version = "0.16", default-features = false }
 sha2 = "0.10"
 
 # HTTP middleware (response compression, P1-4)
-tower-http = { version = "0.6", features = ["compression-gzip"] }
+tower-http = { version = "0.6", features = ["compression-gzip", "timeout"] }
 # Service trait for the HTTP TLS acceptor's extension-injecting wrapper (P5-1)
 tower-service = "0.3"
+# ServiceExt::map_request in the custom TCP accept loop (K1, axum serve.rs parity)
+tower = { version = "0.4", features = ["util"] }
 
 # OpenTelemetry core only (P-MW, 蓝图 §4.0.1 评审 1.10): RequestContext.trace_cx
 # 的类型载体。恒依赖、无 SDK/exporter（P-TRACE 才以 opt-in feature 引入）。
