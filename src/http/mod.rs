@@ -317,10 +317,20 @@ async fn admission_middleware(
             return resp;
         }
     };
-    request
-        .extensions_mut()
-        .insert(crate::admission::AdmissionSlot::with_guard(guard));
-    next.run(request).await
+    // RN-13 (D9-A): the guard rides in an `AdmissionSlot` cell so streaming
+    // handlers can take it into their feed/writer task (stream-lifetime hold).
+    // The middleware keeps its own reference to the cell and reclaims the
+    // guard after `next.run` — unary handlers never take it out (their
+    // extractors drop the request extensions before the inference runs), so
+    // reclaiming here is what holds the slot until the response is produced.
+    // Streaming handlers already took the guard, so `take()` returns None and
+    // the stream task keeps it. `take()` is idempotent, so the guard drops
+    // exactly once either way.
+    let slot = crate::admission::AdmissionSlot::with_guard(guard);
+    request.extensions_mut().insert(slot.clone());
+    let response = next.run(request).await;
+    let _held = slot.take();
+    response
 }
 
 /// C3 (P4-2): once draining, reject new non-probe requests with 503 so
@@ -1248,6 +1258,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn p_flow_admission_holds_slot_across_unary_inference() {
+        // Regression (6f032a1, RN-13/D9-A): the middleware parked the guard in
+        // the request-extensions cell but kept no reference in scope, and the
+        // unary handlers never take it out (unlike streaming handlers). The
+        // guard was dropped when the handler's extractors consumed the request
+        // — before the inference ran — so max_inflight never bounded unary
+        // concurrency. The slot must be held until the response is produced.
+        async fn slow() -> &'static str {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            "ok"
+        }
+        let admission = crate::admission::AdmissionCounter::new(1);
+        let app = axum::Router::new()
+            .route("/v2/models/foo/infer", axum::routing::any(slow))
+            .layer(axum::middleware::from_fn_with_state(
+                admission.clone(),
+                admission_middleware,
+            ));
+        let req = || {
+            Request::builder()
+                .uri("/v2/models/foo/infer")
+                .method("POST")
+                .body(Body::empty())
+                .unwrap()
+        };
+        // Fire two requests concurrently. The first is admitted and must hold
+        // the single slot while the slow handler sleeps; the second must be
+        // rejected with 503.
+        let (a, b) = tokio::join!(app.clone().oneshot(req()), app.clone().oneshot(req()));
+        let statuses = [a.unwrap().status(), b.unwrap().status()];
+        assert_eq!(
+            statuses.iter().filter(|s| **s == StatusCode::OK).count(),
+            1,
+            "exactly one admitted, got {statuses:?}"
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|s| **s == StatusCode::SERVICE_UNAVAILABLE)
+                .count(),
+            1,
+            "second request must be 503, got {statuses:?}"
+        );
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@
 # long-waited requests; clients can bound their wait with x-lite-timeout.
 server:
   http_port: 8000
-  max_inflight: 2          # >2 concurrent inferences → 503 + Retry-After
+  max_inflight: 1          # only 1 inference at a time; the rest → 503 + Retry-After
 
 model_repository:
   path: ./model_repo

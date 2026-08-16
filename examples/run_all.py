@@ -769,10 +769,32 @@ def check_20():
     and x-lite-timeout returns 504 at the deadline."""
     results = []
     retry_afters = []
-    barrier = threading.Barrier(6)
+    # max_inflight=1: hold the single slot with one 0.8s slow_echo request,
+    # then fire two more barrier-aligned requests while the slot is occupied.
+    # The holder gets 200; both arrivals see current==cap and are rejected
+    # with 503 + Retry-After. Deterministic (a free-for-all burst races the
+    # single worker's round-trip and can stagger past the admission check).
+    def holder():
+        url = "http://localhost:8000/v2/models/slow_echo/infer"
+        req = urllib.request.Request(url, data=json.dumps({"input": 1}).encode(),
+                                     method="POST",
+                                     headers={"Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(req, timeout=15).read()
+            results.append(200)
+        except urllib.error.HTTPError as e:
+            results.append(e.code)
+        except Exception:
+            results.append(0)
 
-    def one():
-        barrier.wait()
+    t_holder = threading.Thread(target=holder)
+    t_holder.start()
+    time.sleep(0.15)  # ensure the holder is inside the 0.8s inference
+    # Two concurrent requests now contend for the occupied single slot.
+    arrive = threading.Barrier(2)
+
+    def contender():
+        arrive.wait()
         url = "http://localhost:8000/v2/models/slow_echo/infer"
         req = urllib.request.Request(url, data=json.dumps({"input": 1}).encode(),
                                      method="POST",
@@ -787,15 +809,16 @@ def check_20():
         except Exception:
             results.append(0)
 
-    threads = [threading.Thread(target=one) for _ in range(6)]
+    threads = [threading.Thread(target=contender) for _ in range(2)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
+    t_holder.join()
     ok200 = results.count(200)
     ok503 = results.count(503)
-    if ok200 < 2 or ok503 < 1:
-        return False, f"expected >=2x200 and >=1x503, got {sorted(results)}"
+    if ok200 != 1 or ok503 != 2:
+        return False, f"expected 1x200 and 2x503 (max_inflight=1, slot held), got {sorted(results)}"
     if "1" not in retry_afters:
         return False, f"503 responses missing Retry-After: 1, got {retry_afters}"
 
