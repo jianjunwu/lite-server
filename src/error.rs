@@ -820,7 +820,15 @@ mod tests {
         let counters = std::sync::Arc::new(std::sync::Mutex::new(Counters::default()));
         let layer = LevelCounter { inner: counters.clone() };
         let subscriber = tracing_subscriber::registry().with(layer);
-        tracing::subscriber::with_default(subscriber, run);
+        tracing::subscriber::with_default(subscriber, || {
+            // Determinism: a parallel test may have cached this callsite's
+            // interest as NEVER (the macro then short-circuits and the
+            // scoped dispatch is never consulted). Rebuild while the scoped
+            // default is active so events reach this layer (same pattern as
+            // g5/G3, bce5f33).
+            tracing::callsite::rebuild_interest_cache();
+            run();
+        });
         let c = counters.lock().unwrap().clone();
         c
     }

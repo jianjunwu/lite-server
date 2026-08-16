@@ -3051,6 +3051,12 @@ mod upload_download_tests {
     /// reported as "timed out" and killed. wait_with_output-style draining
     /// (concurrent reads) is the correct shape; the timeout must bound the
     /// whole wait+drain, not just wait().
+    ///
+    /// Budget rationale: the guarded regression DEADLOCKS forever (child
+    /// blocked on a full pipe), so any finite timeout still catches it; the
+    /// healthy path's runtime scales with machine load, hence a generous
+    /// 30s budget (a fixed 5s flaked under full-suite load) and only 256
+    /// KiB of output (still far beyond the pipe buffer).
     #[cfg(unix)]
     #[tokio::test]
     async fn test_run_unpack_completes_for_chatty_child() {
@@ -3064,10 +3070,10 @@ mod upload_download_tests {
         let _ = tokio::fs::remove_dir_all(&tmp).await;
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
-        // A "python" that writes 1 MiB to stderr (far beyond the pipe
+        // A "python" that writes 256 KiB to stderr (far beyond the pipe
         // buffer) and then exits 0 — a healthy but verbose child.
         let fake_py = tmp.join("fake-python");
-        tokio::fs::write(&fake_py, "#!/bin/sh\nhead -c 1048576 /dev/zero >&2\nexit 0\n")
+        tokio::fs::write(&fake_py, "#!/bin/sh\nhead -c 262144 /dev/zero >&2\nexit 0\n")
             .await
             .unwrap();
         tokio::fs::set_permissions(&fake_py, std::fs::Permissions::from_mode(0o755))
@@ -3083,7 +3089,7 @@ mod upload_download_tests {
             &lma,
             &dest,
             Some("1"),
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(30),
         )
         .await;
 
