@@ -48,6 +48,14 @@ pub fn execute_hook(
         return;
     }
 
+    // L2: reap completed hook tasks before spawning new ones — a JoinSet
+    // retains every completed task's result until reaped, so without this
+    // drain each firing would accumulate a JoinHandle until shutdown.
+    {
+        let mut set = hook_tasks.lock().unwrap_or_else(|e| e.into_inner());
+        while set.try_join_next().is_some() {}
+    }
+
     // Shell hook: fire-and-forget
     if let Some(cmd) = shell_cmd {
         let resolved = replace_hook_vars(cmd, &vars);
@@ -228,5 +236,39 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(tmp.exists(), "shell hook should have created the file");
         let _ = tokio::fs::remove_file(&tmp).await;
+    }
+
+    /// L2 reproduction (RED): lifecycle-hook tasks are spawned into a shared
+    /// `tokio::task::JoinSet` (`hook_tasks`) that is only drained at
+    /// `WorkerManager::shutdown`. A `JoinSet` retains every completed task's
+    /// result until `join_next`/`try_join_next` reaps it — so across model
+    /// loads/respawns/exits each hook firing accumulates one entry for the
+    /// server's lifetime. This test fires a batch, lets them complete, then
+    /// fires one more (which must reap the completed batch) and asserts the
+    /// retained count stays small.
+    #[tokio::test]
+    async fn l2_completed_hook_tasks_are_reaped() {
+        let hooks = crate::config::WorkerHooksConfig {
+            // Instant shell command: the task completes almost immediately.
+            on_ready: Some("true".to_string()),
+            ..Default::default()
+        };
+        let hook_tasks: HookTasks = Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new()));
+        for _ in 0..50 {
+            execute_hook("ready", &hooks, vec![], &hook_tasks);
+        }
+        // Let every spawned task complete.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Fire one more hook: its spawn must reap the 50 completed entries.
+        execute_hook("ready", &hooks, vec![], &hook_tasks);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let retained = hook_tasks.lock().unwrap_or_else(|e| e.into_inner()).len();
+        assert!(
+            retained <= 4,
+            "L2: completed hook tasks not reaped from the JoinSet: retained \
+             {retained} (expected bounded) — each hook firing accumulates a \
+             JoinHandle until shutdown"
+        );
     }
 }

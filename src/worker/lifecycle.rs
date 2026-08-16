@@ -613,6 +613,18 @@ impl WorkerManager {
                         );
                         self.registry
                             .mark_failed(model_name, version, &reason)?;
+                        // L5: workers were spawned and the queue/client/
+                        // routing state registered BEFORE warmup ran — tear
+                        // that runtime state down through the single shared
+                        // teardown path (§6.5). The registry entry stays as
+                        // Failed (D33: /health must show why the version is
+                        // not serving); only its runtime footprint is freed.
+                        self.teardown_version_runtime(model_name, version).await;
+                        crate::metrics::prometheus::set_active_workers(
+                            model_name,
+                            version,
+                            0.0,
+                        );
                         self.sync_grpc_health().await;
                         crate::metrics::prometheus::record_model_load(
                             model_name,
@@ -848,6 +860,45 @@ impl WorkerManager {
             device: None,
         }).await;
 
+        // Status must flip to Unloading BEFORE the teardown kills workers —
+        // a still-Ready version whose workers die invites respawn/routing
+        // against a half-torn-down version.
+        self.registry
+            .set_status(model_name, version, VersionStatus::Unloading)?;
+
+        self.teardown_version_runtime(model_name, version).await;
+
+        self.registry.remove(model_name, version)?;
+        self.sync_grpc_health().await;
+
+        crate::metrics::prometheus::record_model_unload(model_name, version);
+        crate::metrics::prometheus::set_active_workers(model_name, version, 0.0);
+        crate::metrics::prometheus::remove_version_weight(model_name, version);
+        crate::metrics::prometheus::remove_model_ready(model_name, version);
+        // Round2 B2: drop the rest of the per-version series + timeline state
+        // (after record_model_unload — MODEL_LOAD_TOTAL is excluded from the
+        // purge, the event log survives). Worker memory registrations were
+        // already dropped inside teardown_version_runtime (before this purge).
+        crate::metrics::prometheus::remove_version_metrics(model_name, version);
+        crate::metrics::aggregator::TIMELINE.remove(model_name, version).await;
+
+        info!("Model {} version {} unloaded", model_name, version);
+        Ok(())
+    }
+
+    /// Shared runtime teardown for a version (§6.5 single teardown path):
+    /// drain the inference queue, then stop the workers (graceful ZMQ stop →
+    /// bounded await → client shutdown → socket-file cleanup) and drop the
+    /// outlier/routing/client/worker-map state, finishing with the worker
+    /// PID metric registrations (the kills above are awaited, so the pids
+    /// are dead or dying — clearing here precedes any later metrics purge).
+    ///
+    /// Both `unload_version` and the load-time warmup-failure branch funnel
+    /// through here; a partial-init failure must never hand-roll its own
+    /// cleanup and drift from the unload sequence. The registry entry itself
+    /// is NOT touched — the caller decides whether the version disappears
+    /// (unload) or stays visible as `Failed` (warmup failure, D33).
+    async fn teardown_version_runtime(&self, model_name: &str, version: &str) {
         // Unregister the inference queue first to stop accepting new
         // requests, then wait for in-flight requests to drain before killing
         // workers (§4.2). On grace timeout, proceed anyway — a stuck request
@@ -863,9 +914,6 @@ impl WorkerManager {
             }
             drain.abort();
         }
-
-        self.registry
-            .set_status(model_name, version, VersionStatus::Unloading)?;
 
         let key = model_version_key(model_name, version);
         let (procs, clients) = {
@@ -924,25 +972,7 @@ impl WorkerManager {
             }
         }
 
-        self.registry.remove(model_name, version)?;
-        self.sync_grpc_health().await;
-
-        crate::metrics::prometheus::record_model_unload(model_name, version);
-        crate::metrics::prometheus::set_active_workers(model_name, version, 0.0);
-        crate::metrics::prometheus::remove_version_weight(model_name, version);
-        crate::metrics::prometheus::remove_model_ready(model_name, version);
-        // Round2 B2: drop the rest of the per-version series + timeline state
-        // (after record_model_unload — MODEL_LOAD_TOTAL is excluded from the
-        // purge, the event log survives).
-        // Drop worker memory registrations BEFORE the purge: the graceful
-        // kill is async, so a scrape between purge and process exit would
-        // re-create the just-purged worker series from a live registry entry.
         crate::metrics::prometheus::clear_worker_pids(model_name, version);
-        crate::metrics::prometheus::remove_version_metrics(model_name, version);
-        crate::metrics::aggregator::TIMELINE.remove(model_name, version).await;
-
-        info!("Model {} version {} unloaded", model_name, version);
-        Ok(())
     }
 
     /// H5 (delete escalation): terminate a version's workers forcibly,
@@ -1406,8 +1436,10 @@ class TestAPI(LitAPI):
         // The caller owns config construction (B4: the per-model YAML is NOT
         // re-read for worker spawn decisions) — devices must be set here so the
         // spawn loop creates two workers (cpu:0 / cpu:1).
-        let mut load_config = ModelConfig::default();
-        load_config.devices = Some(serde_json::json!(2));
+        let load_config = ModelConfig {
+            devices: Some(serde_json::json!(2)),
+            ..Default::default()
+        };
 
         let err = wm
             .load_model("w1_model", "1", &load_config)
@@ -1429,13 +1461,12 @@ class TestAPI(LitAPI):
 
         // The workers map / registry must not report any live worker for the
         // failed load — nothing but the orphan owns the process.
-        match registry.get("w1_model", Some("1")) {
-            Some(mv) => assert!(
+        if let Some(mv) = registry.get("w1_model", Some("1")) {
+            assert!(
                 mv.workers.is_empty(),
                 "failed load must not register workers (found {})",
                 mv.workers.len()
-            ),
-            None => {}
+            );
         }
 
         // W1: the spawned-but-unregistered worker must be reaped on the error
@@ -2042,5 +2073,127 @@ class TestAPI(LitAPI):
 
         let _ = wm.unload_model("m", Some("1")).await;
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// L5 reproduction (RED): `load_model` spawns workers and registers the
+    /// queue/client/outlier state BEFORE running warmup (:320-590, then :597).
+    /// When warmup fails the version is only `mark_failed` and `Err` returned —
+    /// the spawned worker processes are never torn down. Each warmup-failed
+    /// load therefore leaves live workers holding model weights until an
+    /// explicit unload / LRU eviction / server shutdown.
+    ///
+    /// Fixed code must reap the workers on the warmup-failure path. Current
+    /// code leaves them running (RED, defect confirmed).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_warmup_failure_leaves_no_live_workers() {
+        use crate::config::{WarmupPolicy, WarmupSample};
+
+        let repo = std::env::temp_dir()
+            .join(format!("lite-server-l5-warmup-{}", std::process::id()));
+        let model_dir = repo.join("l5_model").join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(
+            model_dir.join("model.py"),
+            r#"from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        return {"output": x}
+
+    def encode_response(self, output):
+        return output
+"#,
+        )
+        .unwrap();
+        // A plain config: workers spawn and become Ready; warmup is driven
+        // from the ModelConfig below (not the on-disk YAML).
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+        )
+        .unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let wm = WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            Arc::new(InferenceQueue::new()),
+            "debug".to_string(),
+            Arc::new(CallbackRunner::new()),
+        );
+
+        // Warmup enabled, sample points at a missing file → run_warmup fails
+        // reading it AFTER the worker is already spawned and Ready.
+        let mut config = ModelConfig::default();
+        config.policies.warmup = Some(WarmupPolicy {
+            enabled: true,
+            samples: vec![WarmupSample {
+                input_ref: "does_not_exist.json".to_string(),
+                iterations: 1,
+            }],
+            timeout_secs: 5.0,
+            dummy_input_ref: None,
+            iterations: None,
+        });
+
+        let err = wm.load_model("l5_model", "1", &config).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::WorkerCrashed(_)),
+            "warmup failure must fail the load, got {err:?}"
+        );
+
+        // The version is registered as Failed (load_model registered before
+        // warmup) — collect its spawned worker pids.
+        let pids: Vec<i32> = registry
+            .get("l5_model", Some("1"))
+            .map(|mv| {
+                mv.workers
+                    .iter()
+                    .filter_map(|w| w.pid)
+                    .map(|p| p as i32)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !pids.is_empty(),
+            "precondition: warmup-failed version must have spawned workers"
+        );
+
+        // Poll up to 5s for every worker to be dead (fully reaped).
+        let mut alive: Vec<i32> = pids.clone();
+        for _ in 0..25 {
+            alive = pids
+                .iter()
+                .copied()
+                .filter(|&p| unsafe { libc::kill(p, 0) } == 0)
+                .collect();
+            if alive.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        // Clean up any orphan so the test never leaks a rogue process.
+        if !alive.is_empty() {
+            for p in &alive {
+                unsafe { libc::kill(*p, libc::SIGKILL); }
+            }
+            let _ = wm.unload_model("l5_model", Some("1")).await;
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+
+        assert!(
+            alive.is_empty(),
+            "L5: warmup-failed workers still alive: {alive:?} — load_model \
+             spawned them before warmup and never reaped them on failure"
+        );
     }
 }

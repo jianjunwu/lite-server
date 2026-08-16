@@ -639,7 +639,7 @@ pub async fn start_http_server(
             // available to extractors/middleware — peer_ip_fallback uses it to
             // populate client_ip for direct connections. serve_tcp preserves it
             // via Connected<SocketAddr> (axum serve.rs parity).
-            serve_tcp(listener, app, config.server.clone(), shutdown_rx).await?;
+            serve_tcp(listener, app, config.server.clone(), shutdown_rx, None).await?;
         }
     }
 
@@ -771,6 +771,12 @@ async fn serve_tcp(
     app: Router,
     server_config: crate::config::ServerConfig,
     mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    // L1 test/observability seam: mirrors `connections.len()` — the number of
+    // connection tasks still retained in the JoinSet (in-flight + completed
+    // but not yet reaped). `None` = no-op. Lets a test assert that completed
+    // connection tasks are reaped instead of accumulating for the server's
+    // lifetime.
+    connection_tasks: Option<Arc<std::sync::atomic::AtomicUsize>>,
 ) -> Result<(), AppError> {
     use hyper_util::server::conn::auto::Builder;
     use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -867,6 +873,14 @@ async fn serve_tcp(
                     open_connections.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                     crate::metrics::prometheus::record_http_connection_close("tcp");
                 });
+                // L1: reap completed connection tasks so their JoinHandles
+                // don't accumulate in the JoinSet until shutdown.
+                while connections.try_join_next().is_some() {}
+                // L1: expose the retained connection-task count (in-flight
+                // only, after the reap above) to a test / operator.
+                if let Some(c) = &connection_tasks {
+                    c.store(connections.len(), std::sync::atomic::Ordering::Relaxed);
+                }
             }
             _ = &mut shutdown_rx => {
                 info!(
@@ -1066,6 +1080,100 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let connection = response.headers().get("connection");
         assert!(connection.is_none() || connection != Some(&axum::http::HeaderValue::from_static("close")));
+    }
+
+    // ===== L1 (memory-leak): connection-task JoinSet must not accumulate =====
+
+    /// L1 reproduction (RED): `serve_tcp`'s `connections` JoinSet retains every
+    /// completed connection task until shutdown (`join_next` in the shutdown
+    /// branch only). Across the server's lifetime each completed connection
+    /// leaves a JoinHandle behind — unbounded growth proportional to the total
+    /// number of connections ever accepted.
+    ///
+    /// The observer seam (`connection_tasks`) mirrors `connections.len()` after
+    /// every spawn, so the test asserts the retained count stays bounded after
+    /// a batch of short-lived connections instead of growing to their total.
+    #[tokio::test]
+    async fn l1_completed_connection_tasks_stay_bounded() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let connection_tasks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_tcp(
+            listener,
+            app,
+            crate::config::ServerConfig::default(),
+            shutdown_rx,
+            Some(connection_tasks.clone()),
+        ));
+
+        // Open 20 short-lived connections: GET /, read the body, drop.
+        // Each server-side connection task completes when the client closes.
+        for _ in 0..20 {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = [0u8; 4096];
+            let mut body = Vec::new();
+            loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&buf[..n]);
+            }
+            assert!(
+                String::from_utf8_lossy(&body).contains("200 OK"),
+                "connection must be served"
+            );
+            drop(stream);
+            // Let the server-side task finish closing before the next accept,
+            // so the completed-task accounting is deterministic.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // A probe connection wakes the accept loop so it records the retained
+        // count; then poll until the count converges (or timeout on the leak).
+        {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+
+        let mut retained = usize::MAX;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            retained = connection_tasks.load(std::sync::atomic::Ordering::Relaxed);
+            // Completed connection tasks must be reaped; a small bound for the
+            // in-flight probe is acceptable, but never the batch's full count.
+            if retained <= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let _ = shutdown_tx.send(());
+        server.await.unwrap().unwrap();
+
+        assert!(
+            retained <= 2,
+            "L1: completed connection tasks not reaped from the JoinSet: \
+             retained {retained} (expected bounded) — each completed connection \
+             leaks a JoinHandle until shutdown"
+        );
     }
 
     // ===== P-FLOW (§4.0.9) admission + body limit =====
