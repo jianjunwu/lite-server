@@ -586,15 +586,21 @@ fn reject_queue_timeout(item: QueueItem) {
 
 /// If queue-timeout REJECT is armed and `item` has waited past the deadline,
 /// reject it and return `None`; otherwise return `Some(item)`.
+/// M4: the reject path pairs the collector's dequeue-side
+/// `inc_queue_depth` — the only other dec lives in `send_batch_with_retry`,
+/// which a rejected item never reaches.
 fn check_queue_timeout(
     item: QueueItem,
     queue_timeout: Duration,
     action: crate::config::QueueTimeoutAction,
+    model: &str,
+    version: &str,
 ) -> Option<QueueItem> {
     if queue_timeout > Duration::ZERO
         && action == crate::config::QueueTimeoutAction::Reject
         && item.enqueued_at.elapsed() > queue_timeout
     {
+        prometheus::dec_queue_depth(model, version);
         reject_queue_timeout(item);
         None
     } else {
@@ -1711,7 +1717,13 @@ async fn batch_collector(
         // Fast path: no batching, send immediately and concurrently
         while let Some(item) = rx.recv().await {
             prometheus::inc_queue_depth(&dispatch.model_name, &dispatch.version);
-            let Some(item) = check_queue_timeout(item, queue_timeout, queue_timeout_action) else {
+            let Some(item) = check_queue_timeout(
+                item,
+                queue_timeout,
+                queue_timeout_action,
+                &dispatch.model_name,
+                &dispatch.version,
+            ) else {
                 continue;
             };
             let batch = vec![item];
@@ -1733,7 +1745,13 @@ async fn batch_collector(
             biased;
             Some(item) = rx.recv() => {
                 prometheus::inc_queue_depth(&dispatch.model_name, &dispatch.version);
-                let Some(item) = check_queue_timeout(item, queue_timeout, queue_timeout_action) else {
+                let Some(item) = check_queue_timeout(
+                    item,
+                    queue_timeout,
+                    queue_timeout_action,
+                    &dispatch.model_name,
+                    &dispatch.version,
+                ) else {
                     continue;
                 };
                 batch.push(item);
@@ -3910,6 +3928,8 @@ mod tests {
             item,
             Duration::from_millis(100),
             crate::config::QueueTimeoutAction::Reject,
+            "b1_m",
+            "1",
         );
         assert!(opt.is_none(), "expired item must be rejected");
         let resp = response_rx.await.unwrap();
@@ -3927,6 +3947,8 @@ mod tests {
             enqueued_ago("ok", Duration::ZERO),
             Duration::from_secs(10),
             crate::config::QueueTimeoutAction::Reject,
+            "b1_m",
+            "1",
         );
         assert!(opt.is_some(), "fresh item must not be rejected");
     }
@@ -3937,6 +3959,8 @@ mod tests {
             enqueued_ago("late", Duration::from_secs(5)),
             Duration::from_millis(100),
             crate::config::QueueTimeoutAction::Delay,
+            "b1_m",
+            "1",
         );
         assert!(opt.is_some(), "Delay action must not reject even when expired");
     }
@@ -3947,6 +3971,8 @@ mod tests {
             enqueued_ago("late", Duration::from_secs(5)),
             Duration::ZERO,
             crate::config::QueueTimeoutAction::Reject,
+            "b1_m",
+            "1",
         );
         assert!(opt.is_some(), "queue_timeout=0 must not reject");
     }
@@ -4016,5 +4042,77 @@ mod tests {
                 "worker {w} got {c}/{total} picks — rendezvous distribution skewed"
             );
         }
+    }
+
+    /// M4 evidence (resource-leak sweep 2026-08-16): the batch collector
+    /// increments `liteserver_queue_depth` AT DEQUEUE (batch_collector,
+    /// inference_queue.rs:1713/1735) before `check_queue_timeout`; a
+    /// queue-timeout REJECT drops the item (`reject_queue_timeout`) while the
+    /// ONLY `dec_queue_depth` lives inside `send_batch_with_retry` (:1566) —
+    /// the rejected item never reaches it, so the gauge drifts +1 per rejected
+    /// request and reads as "cumulative rejections" instead of queue depth,
+    /// polluting the timeline sampler (aggregator.rs:182) and the queue-depth
+    /// AlertEngine.
+    ///
+    /// Fixed code pairs the dec on the reject path; current code leaks it —
+    /// this test FAILS (RED) until addressed.
+    #[tokio::test]
+    async fn m4_queue_depth_inc_unpaired_on_timeout_reject() {
+        use crate::config::QueueTimeoutAction;
+        use crate::metrics::prometheus::QUEUE_DEPTH;
+
+        let (tx, rx) = priority_channel(8);
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let (reload_tx, _reload_rx) = mpsc::channel::<ReloadSignal>(1);
+        let dispatch = Arc::new(BatchDispatch {
+            zmq_clients: vec![],
+            outlier: Arc::new(OutlierState::new(1)),
+            model_name: "m4_m".to_string(),
+            version: "1".to_string(),
+            reload_tx,
+            sequence_registry: Arc::new(SequenceRegistry::new(Duration::from_secs(3600), 100)),
+            balance: BalanceConfig::default(),
+        });
+        let tunables = BatchTunables {
+            max_batch_size: 1,
+            base_timeout: Duration::ZERO,
+            adaptive: false,
+            min_timeout: Duration::ZERO,
+            queue_threshold: 0,
+            request_timeout: Duration::from_secs(2),
+            max_requests: 1000,
+            max_requests_jitter: 0,
+            max_retries: 0,
+            queue_timeout: Duration::from_millis(100),
+            queue_timeout_action: QueueTimeoutAction::Reject,
+        };
+        let item = QueueItem {
+            uid: "m4".to_string(),
+            data: Bytes::from_static(b"{}"),
+            meta: None,
+            response_tx: resp_tx,
+            inflight_guard: None,
+            // Already past the 100ms queue_timeout by the time the collector
+            // dequeues it — the reject path fires.
+            enqueued_at: Instant::now() - Duration::from_secs(1),
+        };
+        tx.try_send(item, 0).unwrap();
+        let collector = tokio::spawn(batch_collector(rx, tunables, dispatch));
+
+        // The reject path replies 503 to the client...
+        let _resp = resp_rx.await.expect("queue-timeout reject must reply");
+        // ...but the collector's dequeue inc (inference_queue.rs:1713) was
+        // never paired with a dec — the gauge is permanently +1.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let depth = QUEUE_DEPTH.with_label_values(&["m4_m", "1"]).get();
+        assert_eq!(
+            depth, 0.0,
+            "M4: liteserver_queue_depth must return to 0 after a timeout reject \
+             (dequeue inc paired with a dec); it reads {depth}"
+        );
+
+        // Teardown: close the queue and let the collector exit.
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), collector).await;
     }
 }

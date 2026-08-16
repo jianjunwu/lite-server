@@ -96,27 +96,52 @@ pub enum SendOutcome<T> {
     /// The overall deadline fired mid-send — reclaim the stream (the client
     /// is stopped or gone; a terminal error frame would not flush anyway).
     Deadline,
+    /// P0-2: the chunk-idle budget fired mid-send — the client stopped
+    /// draining (backpressure) for longer than a chunk gap; reclaim the
+    /// stream (the recv-side idle bound can never fire while the send
+    /// blocks, so the send must carry the same bound).
+    Idle,
 }
 
-/// L1: bound a stream send by the overall stream deadline. A stopped reader
-/// backpressures the bounded channel/socket; an unbounded send would pin the
-/// connection + worker stream + admission slot past the armed deadline (the
-/// recv-side deadline can never fire while the send blocks). No armed
-/// deadline = unbounded send (D6 contract); the keepalive ticker (K3/K4) is
-/// then the dead-peer detector.
+/// L1: bound a stream send by the overall stream deadline AND the chunk-idle
+/// budget — the effective cap is `min(remaining-to-deadline, idle)`. A
+/// stopped reader backpressures the bounded channel/socket; an unbounded
+/// send would pin the connection + worker stream + admission slot past the
+/// armed deadline and defeat the recv-side idle reclaim entirely (P0-2: the
+/// send sits outside the select! that polls recv_chunk). Both `None` =
+/// unbounded send (D6 contract; `decoupled_idle_timeout_secs = 0` disables
+/// the idle leg), the keepalive ticker (K3/K4) is then the dead-peer
+/// detector.
 pub async fn send_bounded<F, T>(
     deadline: Option<std::time::Instant>,
+    idle: Option<std::time::Duration>,
     send: F,
 ) -> SendOutcome<T>
 where
     F: std::future::Future<Output = T>,
 {
-    match deadline {
-        Some(d) => match tokio::time::timeout_at(d.into(), send).await {
-            Ok(r) => SendOutcome::Sent(r),
-            Err(_) => SendOutcome::Deadline,
+    let now = std::time::Instant::now();
+    // Overall deadline already expired → stop immediately (recv_chunk parity).
+    if let Some(d) = deadline {
+        if d <= now {
+            return SendOutcome::Deadline;
+        }
+    }
+    let to_deadline = deadline.map(|d| d - now);
+    let cap = match (to_deadline, idle) {
+        (None, None) => return SendOutcome::Sent(send.await),
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (Some(a), Some(b)) => if a < b { a } else { b },
+    };
+    match tokio::time::timeout(cap, send).await {
+        Ok(r) => SendOutcome::Sent(r),
+        Err(_) => match deadline {
+            // Same attribution as recv_chunk: if the overall deadline has now
+            // passed, it fired; otherwise the (shorter) idle bound did.
+            Some(d) if d <= std::time::Instant::now() => SendOutcome::Deadline,
+            _ => SendOutcome::Idle,
         },
-        None => SendOutcome::Sent(send.await),
     }
 }
 
@@ -396,5 +421,58 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(elapsed, RecvElapsed::Deadline);
+    }
+
+    // --- P0-2 evidence (resource-leak sweep 2026-08-16) ---
+
+    /// The SSE/WS/gRPC forward loops send with `send_bounded(stream_deadline,
+    /// stream_idle, ...)`. The send sits OUTSIDE the select! that polls
+    /// recv_chunk, so a stopped reader that fills the bounded event channel
+    /// makes the send block; without the idle leg the always-on chunk-idle
+    /// bound is never polled again, and the keepalive ticker is also in the
+    /// select and equally starved. N half-open clients can pin N admission
+    /// slots + worker streams + streaming permits.
+    ///
+    /// Fixed code bounds the send by the idle budget (`send_bounded`'s idle
+    /// leg); pre-fix code blocked unbounded.
+    #[tokio::test]
+    async fn send_backpressure_defeats_recv_idle_reclaim() {
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<pb::StreamResponse>(64);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<pb::StreamResponse>(64);
+        // A stopped reader: `_event_rx` is never polled. Fill the bounded
+        // event channel so any send into it blocks.
+        for _ in 0..64 {
+            event_tx.send(chunk()).await.unwrap();
+        }
+        // Worker emits one chunk, then closes its stream.
+        chunk_tx.send(chunk()).await.unwrap();
+        drop(chunk_tx);
+
+        let idle = Duration::from_millis(100);
+        let task = tokio::spawn(async move {
+            loop {
+                let c = tokio::select! {
+                    c = recv_chunk(&mut chunk_rx, None, Some(idle)) => c,
+                    _ = std::future::pending::<()>() => break, // keepalive off
+                };
+                match c {
+                    Ok(Some(chunk)) => {
+                        // The idle leg bounds the send even with no armed
+                        // overall deadline — a stopped client can no longer
+                        // pin the forward task past one chunk-idle budget.
+                        let _ = send_bounded(None, Some(idle), event_tx.send(chunk)).await;
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        // Contract: chunk-idle must reclaim the forward task even under send
+        // backpressure. 2s is 20x the 100ms idle — a bounded send would have
+        // tripped long before. Current code: the task is still alive.
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("forward task must be reclaimed by the idle bound despite send backpressure")
+            .expect("forward task must not panic");
     }
 }

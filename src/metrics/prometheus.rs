@@ -397,12 +397,18 @@ lazy_static! {
 }
 
 // Pre-allocated custom metric objects, indexed by numeric ID (from register_metric).
-// Vec is append-only; registration is idempotent (duplicate specs reuse existing index).
+// Vec shrinks only via M6b unload deregistration (swap_remove + index
+// fix-up); registration is idempotent (duplicate specs reuse existing index).
 lazy_static! {
     static ref CUSTOM_GAUGE_OBJECTS: std::sync::Mutex<Vec<GaugeVec>> = std::sync::Mutex::new(Vec::new());
     static ref CUSTOM_COUNTER_OBJECTS: std::sync::Mutex<Vec<CounterVec>> = std::sync::Mutex::new(Vec::new());
     static ref CUSTOM_HISTOGRAM_OBJECTS: std::sync::Mutex<Vec<HistogramVec>> = std::sync::Mutex::new(Vec::new());
     static ref CUSTOM_METRIC_INDEX: std::sync::Mutex<HashMap<String, (String, usize)>> = std::sync::Mutex::new(HashMap::new());
+    /// M6b: live (model, version) references per pre-registered family key
+    /// ("name:type") — a family object is deregistered once its last
+    /// referencing version unloads (see deregister_unreferenced_custom_families).
+    static ref CUSTOM_FAMILY_REFS: std::sync::Mutex<HashMap<String, std::collections::HashSet<(String, String)>>> =
+        std::sync::Mutex::new(HashMap::new());
 }
 
 pub fn register_metrics() -> Result<(), prometheus::Error> {
@@ -924,11 +930,11 @@ pub fn remove_model_ready(model: &str, version: &str) {
 ///
 /// Scope: built-in per-version families + the GIE queued mirror + the
 /// worker-reported dynamic families and pre-registered custom families
-/// (PROM-1). Deliberately excluded: MODEL_LOAD_TOTAL (the load/unload event
-/// log — the one series operators query *after* an unload),
-/// ENSEMBLE_STEP_LATENCY (ensemble-scoped; its model/version labels belong to
-/// the step's sub-model and age out with the *sub-model's* unload),
-/// VERSION_SWITCHES_TOTAL (routing history).
+/// (PROM-1) + ENSEMBLE_STEP_LATENCY (M8: its model/version labels belong to
+/// the step's sub-model and age out with the *sub-model's* unload — this
+/// purge IS that aging path). Deliberately excluded: MODEL_LOAD_TOTAL (the
+/// load/unload event log — the one series operators query *after* an
+/// unload), VERSION_SWITCHES_TOTAL (routing history).
 pub fn remove_version_metrics(model: &str, version: &str) {
     let families = REGISTRY.gather();
     macro_rules! purge {
@@ -987,6 +993,9 @@ pub fn remove_version_metrics(model: &str, version: &str) {
     purge!(WORKER_SATURATION, "liteserver_worker_saturation", ["model", "version"]);
     purge!(INFERENCE_DURATION, "liteserver_inference_duration_seconds", ["model", "version"]);
     purge!(BATCH_SIZE, "liteserver_batch_size", ["model", "version"]);
+    // M8: sub-model unload ages out its ensemble step-latency series
+    // (ensemble/step/depth values enumerated via gather).
+    purge!(ENSEMBLE_STEP_LATENCY, "liteserver_ensemble_step_latency_seconds", ["ensemble", "step", "model", "version", "depth"]);
     // GIE TotalQueuedRequests mirror (namespace-configurable name — clean via
     // the registered vecs directly, not gather).
     let guard = GIE_TOTAL_QUEUED_REQUESTS
@@ -1020,6 +1029,10 @@ pub fn remove_version_metrics(model: &str, version: &str) {
     for vec in CUSTOM_HISTOGRAM_OBJECTS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let _ = vec.remove_label_values(&[model, version]);
     }
+    // M6b: deregister pre-registered custom FAMILY OBJECTS whose last live
+    // (model, version) reference just unloaded (series purge above only
+    // drops the label sets).
+    deregister_unreferenced_custom_families(model, version);
 }
 
 pub fn record_version_switch(model: &str, from: &str, to: &str) {
@@ -1298,14 +1311,24 @@ pub fn record_worker_metrics(model: &str, version: &str, metrics: Option<&crate:
 /// Pre-register custom metric objects during model setup.
 /// Each spec is (name, type) where type is "gauge", "counter", or "histogram".
 /// Objects are stored in order — the index IS the numeric ID used at record time.
-pub fn register_custom_metrics(specs: &[(&str, &str)]) {
+/// M6b: (model, version) is recorded as a live reference of every declared
+/// family; the family object is deregistered when its last referencing
+/// version unloads (remove_version_metrics).
+pub fn register_custom_metrics(model: &str, version: &str, specs: &[(&str, &str)]) {
+    // Canonical lock order (gauges → counters → histograms → index → refs);
+    // deregister_unreferenced_custom_families takes the same set nested in
+    // the same order, so register/deregister are atomic w.r.t. each other.
     let mut gauges = CUSTOM_GAUGE_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
     let mut counters = CUSTOM_COUNTER_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
     let mut histograms = CUSTOM_HISTOGRAM_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
     let mut index = CUSTOM_METRIC_INDEX.lock().unwrap_or_else(|e| e.into_inner());
+    let mut refs = CUSTOM_FAMILY_REFS.lock().unwrap_or_else(|e| e.into_inner());
 
     for (name, metric_type) in specs {
         let key = format!("{}:{}", name, metric_type);
+        refs.entry(key.clone())
+            .or_default()
+            .insert((model.to_string(), version.to_string()));
         if index.contains_key(&key) {
             continue; // already registered — idempotent
         }
@@ -1352,6 +1375,64 @@ pub fn register_custom_metrics(specs: &[(&str, &str)]) {
                 histograms.push(h);
                 index.insert(key, ("histogram".to_string(), idx));
             }
+            _ => {}
+        }
+    }
+}
+
+/// M6b: drop this version's reference on every pre-registered custom family;
+/// a family whose last live reference is gone is deregistered (index entry,
+/// object Vec slot, REGISTRY registration). The numeric-ID index is
+/// positional, so swap_remove is paired with a fix-up of the moved object's
+/// index entry. Runs on the unload path only (cold).
+fn deregister_unreferenced_custom_families(model: &str, version: &str) {
+    // Canonical lock order: same set, same order as register_custom_metrics.
+    let mut gauges = CUSTOM_GAUGE_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut counters = CUSTOM_COUNTER_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut histograms = CUSTOM_HISTOGRAM_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut index = CUSTOM_METRIC_INDEX.lock().unwrap_or_else(|e| e.into_inner());
+    let mut refs = CUSTOM_FAMILY_REFS.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mv = (model.to_string(), version.to_string());
+    let emptied: Vec<String> = refs
+        .iter()
+        .filter(|(_, set)| set.len() == 1 && set.contains(&mv))
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in emptied {
+        refs.remove(&key);
+        let Some((mtype, idx)) = index.remove(&key) else {
+            continue;
+        };
+        /// swap_remove the object at `idx`, unregister it, and fix the index
+        /// entry of the object moved from the last slot into `idx`.
+        fn deregister_object<C>(
+            objects: &mut Vec<C>,
+            index: &mut HashMap<String, (String, usize)>,
+            idx: usize,
+            mtype: &str,
+        ) where
+            C: prometheus::core::Collector + Clone + Send + Sync + 'static,
+        {
+            if idx >= objects.len() {
+                return;
+            }
+            let obj = objects.swap_remove(idx);
+            let _ = REGISTRY.unregister(Box::new(obj));
+            let moved_from = objects.len();
+            if idx < moved_from {
+                for v in index.values_mut() {
+                    if v.0 == mtype && v.1 == moved_from {
+                        v.1 = idx;
+                        break;
+                    }
+                }
+            }
+        }
+        match mtype.as_str() {
+            "gauge" => deregister_object(&mut gauges, &mut index, idx, "gauge"),
+            "counter" => deregister_object(&mut counters, &mut index, idx, "counter"),
+            "histogram" => deregister_object(&mut histograms, &mut index, idx, "histogram"),
             _ => {}
         }
     }
@@ -1539,7 +1620,7 @@ mod tests {
     fn test_register_custom_metrics_and_record() {
         use crate::proto::liteserver::MetricValue;
 
-        register_custom_metrics(&[
+        register_custom_metrics("rcmr_model", "1", &[
             ("rcmr_gauge", "gauge"),
             ("rcmr_counter", "counter"),
             ("rcmr_histogram", "histogram"),
@@ -1567,7 +1648,7 @@ mod tests {
     fn test_record_worker_metrics_with_custom_fields() {
         use crate::proto::liteserver::{MetricValue, Metrics};
 
-        register_custom_metrics(&[("rwmc_gauge", "gauge")]);
+        register_custom_metrics("rwmc_model", "1", &[("rwmc_gauge", "gauge")]);
 
         let index = CUSTOM_METRIC_INDEX.lock().unwrap();
         let gauge_id = index.get("rwmc_gauge:gauge").unwrap().1;
@@ -1617,7 +1698,7 @@ mod tests {
             }),
         );
         // Pre-registered custom family path.
-        register_custom_metrics(&[("purge_ev_custom", "gauge")]);
+        register_custom_metrics(model, version, &[("purge_ev_custom", "gauge")]);
         let idx = CUSTOM_METRIC_INDEX.lock().unwrap();
         let gid = idx.get("purge_ev_custom:gauge").unwrap().1;
         drop(idx);
@@ -1657,6 +1738,97 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// M8 evidence (resource-leak sweep 2026-08-16): ENSEMBLE_STEP_LATENCY
+    /// carries a (ensemble, step, model, version, depth) label set, but
+    /// `remove_version_metrics` never purges this family — the family's own
+    /// doc comment promises the series "age out on sub-model unload" while no
+    /// such removal path exists anywhere. Pinned-version ensemble churn
+    /// therefore accumulates a histogram series per (sub-model, version)
+    /// forever.
+    ///
+    /// Fixed code purges this family on unload.
+    #[test]
+    fn test_ensemble_step_latency_series_survive_purge() {
+        // The purge enumerates series via REGISTRY.gather, so the family must
+        // be registered — production startup always runs register_metrics
+        // (idempotent; AlreadyReg after another test is fine).
+        let _ = register_metrics();
+        let model = "m8_sub";
+        let version = "1";
+        record_ensemble_step_latency("m8_ens", "m8_step", model, version, 1, 0.01);
+        remove_version_metrics(model, version);
+
+        // The (ensemble, step, model, version, depth) series must be gone
+        // after unload. Probed directly on the Vec (not REGISTRY.gather,
+        // whose registration only happens in init_metrics).
+        let hit = ENSEMBLE_STEP_LATENCY
+            .get_metric_with_label_values(&["m8_ens", "m8_step", model, version, "1"])
+            .map(|h| h.get_sample_count() > 0)
+            .unwrap_or(false);
+        assert!(
+            !hit,
+            "M8: ENSEMBLE_STEP_LATENCY retains series \
+             {{ensemble=m8_ens,step=m8_step,model={model},version={version}}} \
+             after remove_version_metrics — family is missing from the purge list"
+        );
+    }
+
+    /// M6b evidence (resource-leak sweep 2026-08-16): `remove_version_metrics`
+    /// purges the (model, version) SERIES (so the sibling test
+    /// `test_worker_metric_series_survive_version_purge` passes), but the
+    /// pre-registered custom metric FAMILY OBJECTS — the entries in
+    /// CUSTOM_GAUGE/COUNTER/HISTOGRAM_OBJECTS, CUSTOM_METRIC_INDEX and the
+    /// families REGISTERED into the REGISTRY — must also be deregistered once
+    /// no live model references them. Otherwise every model that declares a
+    /// metric name no previous model used adds a permanent family; /metrics
+    /// output and process memory grow monotonically across model churn.
+    ///
+    /// Fixed code deregisters a family once its last referencing version
+    /// unloads (CUSTOM_FAMILY_REFS refcounting).
+    #[test]
+    fn test_custom_metric_family_object_survives_unload() {
+        let model = "m6b_model";
+        let version = "1";
+        let before_g = CUSTOM_GAUGE_OBJECTS.lock().unwrap().len();
+        let before_i = CUSTOM_METRIC_INDEX.lock().unwrap().len();
+        // A model declares its custom metric family at worker handshake.
+        register_custom_metrics(model, version, &[("m6b_gauge", "gauge")]);
+        assert_eq!(
+            CUSTOM_GAUGE_OBJECTS.lock().unwrap().len(),
+            before_g + 1,
+            "precondition: the family object must be created"
+        );
+        assert!(
+            CUSTOM_METRIC_INDEX.lock().unwrap().contains_key("m6b_gauge:gauge"),
+            "precondition: the index entry must be created"
+        );
+        // Unload the model: its family object + index entry must be removed
+        // (no other model references it). Pre-M6b code never deregistered a
+        // family object — both survived forever.
+        remove_version_metrics(model, version);
+        assert_eq!(
+            CUSTOM_GAUGE_OBJECTS.lock().unwrap().len(),
+            before_g,
+            "M6b: gauge family object must be deregistered on unload"
+        );
+        assert!(
+            !CUSTOM_METRIC_INDEX.lock().unwrap().contains_key("m6b_gauge:gauge"),
+            "M6b: index entry must be removed on unload"
+        );
+        assert_eq!(
+            CUSTOM_METRIC_INDEX.lock().unwrap().len(),
+            before_i,
+            "M6b: index size must be restored on unload"
+        );
+        // Idempotence: a second unload of the same version is a no-op.
+        remove_version_metrics(model, version);
+        assert!(
+            !REGISTRY.gather().iter().any(|f| f.get_name() == "lite_server_m6b_gauge"),
+            "M6b: custom family lite_server_m6b_gauge still exported after unload — \
+             family objects are never deregistered"
+        );
     }
 
     #[test]
@@ -1808,7 +1980,7 @@ mod tests {
         use crate::proto::liteserver::MetricValue;
 
         // Register so the vec is non-empty, forcing the locked path
-        register_custom_metrics(&[("poison_cm", "gauge")]);
+        register_custom_metrics("poison_cm_model", "1", &[("poison_cm", "gauge")]);
         let index = CUSTOM_METRIC_INDEX.lock().unwrap();
         let gauge_id = index.get("poison_cm:gauge").unwrap().1;
         drop(index);

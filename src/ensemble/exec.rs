@@ -1106,10 +1106,12 @@ async fn consume_stream_consumer(
             _ => {}
         }
     }
-    // Tail hop: upstream exhausted = the chain finished normally — synthesize
-    // the final Done so the adapter's close收口 fires with a clean reason
-    // (the per-chunk sub-stream Dones were never forwarded).
-    if is_tail && !error_terminated {
+    // Upstream exhausted (Done or channel close) = the chain finished
+    // normally — synthesize the terminal Done downstream (P0-1). The tail's
+    // Done fires the adapter's close收口 with a clean reason (the per-chunk
+    // sub-stream Dones were never forwarded); a mid hop's Done terminates the
+    // next hop promptly instead of hanging its recv on channel teardown.
+    if !error_terminated {
         let _ = downstream
             .send(pb::StreamResponse {
                 stream_id: String::new(),
@@ -1238,6 +1240,10 @@ async fn spawn_chain(
                 .await
             }));
         }
+        // P0-1: drop the original inter-hop senders before joining — each
+        // consumer owns its clone; holding the originals until join keeps the
+        // channels open after the mids exit and hangs the tail's recv.
+        drop(hop_txs);
         for t in tasks {
             t.await
                 .map_err(|e| AppError::Internal(format!("chain task join error: {e}")))??;

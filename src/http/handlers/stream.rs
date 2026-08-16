@@ -701,13 +701,13 @@ async fn sse_infer_impl(
             };
             if let Some(event) = event {
                 // L1 (resource-leak-plan): bound the send by the overall
-                // stream deadline — a stopped reader backpressures the bounded
-                // event channel; an unbounded send here would pin the
-                // connection + worker stream past the armed deadline (the
-                // recv-side deadline can never fire while this send blocks).
-                // No armed deadline = unbounded send (D6 contract); the K4
-                // keepalive ticker is then the dead-peer detector.
-                match streaming::send_bounded(stream_deadline, event_tx.send(Ok(event))).await {
+                // stream deadline AND the chunk-idle budget (P0-2) — a
+                // stopped reader backpressures the bounded event channel;
+                // an unbounded send here would pin the connection + worker
+                // stream past the armed deadline and defeat the recv-side
+                // idle reclaim (this send is outside the select! polling
+                // recv_chunk). Both unarmed = unbounded send (D6 contract).
+                match streaming::send_bounded(stream_deadline, stream_idle, event_tx.send(Ok(event))).await {
                     streaming::SendOutcome::Sent(Ok(())) => {}
                     streaming::SendOutcome::Sent(Err(_)) => {
                         reason = prometheus::StreamCloseReason::Cancel;
@@ -715,6 +715,10 @@ async fn sse_infer_impl(
                     }
                     streaming::SendOutcome::Deadline => {
                         reason = prometheus::StreamCloseReason::Deadline;
+                        break;
+                    }
+                    streaming::SendOutcome::Idle => {
+                        reason = prometheus::StreamCloseReason::Idle;
                         break;
                     }
                 }
@@ -940,9 +944,20 @@ async fn ws_send_error(
 /// (≤3 bytes by construction) and prepended to the next chunk.
 /// Ok(Some(text)) = emit; Ok(None) = hold (nothing complete to emit);
 /// Err(()) = genuine binary.
+/// m2: emitted text is CR-normalized (`\r\n` → `\n`, bare `\r` → `\n`) like
+/// direct_chunk_utf8 — the forward task hands the string to `Event::data`,
+/// whose field() asserts no `\r` (axum-core sse.rs) and would PANIC.
 fn ensemble_chunk_utf8(pending: &mut Vec<u8>, chunk: &[u8]) -> Result<Option<String>, ()> {
+    fn normalize_cr(out: Result<Option<String>, ()>) -> Result<Option<String>, ()> {
+        match out {
+            Ok(Some(s)) if s.contains('\r') => {
+                Ok(Some(s.replace("\r\n", "\n").replace('\r', "\n")))
+            }
+            other => other,
+        }
+    }
     if pending.is_empty() {
-        return match std::str::from_utf8(chunk) {
+        return normalize_cr(match std::str::from_utf8(chunk) {
             Ok(s) => Ok(Some(s.to_string())),
             Err(e) if e.error_len().is_none() => {
                 let valid = e.valid_up_to();
@@ -955,10 +970,10 @@ fn ensemble_chunk_utf8(pending: &mut Vec<u8>, chunk: &[u8]) -> Result<Option<Str
                 }
             }
             Err(_) => Err(()),
-        };
+        });
     }
     pending.extend_from_slice(chunk);
-    match std::str::from_utf8(pending) {
+    normalize_cr(match std::str::from_utf8(pending) {
         Ok(s) => {
             let out = s.to_string();
             pending.clear();
@@ -975,7 +990,7 @@ fn ensemble_chunk_utf8(pending: &mut Vec<u8>, chunk: &[u8]) -> Result<Option<Str
             }
         }
         Err(_) => Err(()),
-    }
+    })
 }
 
 /// F-10(b)/B16 (audit 2026-08-14): direct-path (non-ensemble) chunk → SSE
@@ -1866,13 +1881,13 @@ async fn handle_ws_stream(
                 _ => continue,
             };
             // L1 (resource-leak-plan): bound the send by the overall stream
-            // deadline — a stopped reader backpressures the socket and an
-            // unbounded send would pin the connection + worker stream +
-            // admission slot past the armed deadline (the recv-side deadline
-            // can never fire while this send blocks). No armed deadline =
-            // unbounded send (D6 contract); the K3 Ping ticker is then the
-            // dead-peer detector.
-            match streaming::send_bounded(stream_deadline, ws_sink.send(msg)).await {
+            // deadline AND the chunk-idle budget (P0-2) — a stopped reader
+            // backpressures the socket and an unbounded send would pin the
+            // connection + worker stream + admission slot past the armed
+            // deadline and defeat the recv-side idle reclaim (this send is
+            // outside the select! polling recv_chunk). Both unarmed =
+            // unbounded send (D6 contract).
+            match streaming::send_bounded(stream_deadline, stream_idle, ws_sink.send(msg)).await {
                 streaming::SendOutcome::Sent(Ok(())) => {}
                 streaming::SendOutcome::Sent(Err(_)) => {
                     reason = prometheus::StreamCloseReason::Cancel;
@@ -1880,6 +1895,10 @@ async fn handle_ws_stream(
                 }
                 streaming::SendOutcome::Deadline => {
                     reason = prometheus::StreamCloseReason::Deadline;
+                    break;
+                }
+                streaming::SendOutcome::Idle => {
+                    reason = prometheus::StreamCloseReason::Idle;
                     break;
                 }
             }
@@ -4555,6 +4574,42 @@ mod tests {
              back to decoupled_idle_timeout_secs (FD-5 parity)"
         );
         wait_for(|| counter.get() >= before + 1.0, "ws first-frame idle 4xx").await;
+    }
+
+    /// M2 evidence (resource-leak sweep 2026-08-16): the ensemble text path
+    /// feeds `Event::data` with `ensemble_chunk_utf8` output verbatim
+    /// (stream.rs:639) — no CR normalization — while the direct path
+    /// normalizes `\r\n` -> `\n` and bare `\r` -> `\n` (stream.rs:1027-1029)
+    /// specifically because axum's SSE `field()` asserts no `\r` in a field
+    /// value (axum-core sse.rs:361-367) and PANICS on it. A model emitting
+    /// CR/LF text therefore panics the SSE forward task; the spawn handle is
+    /// dropped, so the panic path never cancels the worker nor records the
+    /// stream terminal (contrast the WS send_task.await Err arm, stream.rs:
+    /// 1929-1963).
+    ///
+    /// Fixed code normalizes CR in `ensemble_chunk_utf8`; current code does
+    /// not — this test FAILS (RED) until addressed.
+    #[test]
+    fn m2_ensemble_chunk_utf8_normalizes_cr_like_direct_path() {
+        // Sanity: the direct path (already fixed) turns "a\r\nb\rc" into LF
+        // form with no CR bytes.
+        let mut pending = Vec::new();
+        let direct = direct_chunk_utf8(&mut pending, b"a\r\nb\rc");
+        assert_eq!(direct.as_deref(), Some("a\nb\nc"));
+
+        // The ensemble path must do the same: it currently passes CR through,
+        // and the forward task hands that string to Event::data — which
+        // panics (axum-core sse.rs:361-367).
+        let mut pending = Vec::new();
+        let out = ensemble_chunk_utf8(&mut pending, b"a\r\nb\rc")
+            .expect("text input must be text")
+            .expect("complete chunk must emit");
+        assert!(
+            !out.contains('\r'),
+            "M2: ensemble_chunk_utf8 must normalize \\r like direct_chunk_utf8 \
+             ({out:?}) — Event::data panics on a \\r, killing the forward task \
+             without cancelling the worker"
+        );
     }
 }
 

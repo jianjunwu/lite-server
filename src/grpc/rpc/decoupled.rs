@@ -285,10 +285,11 @@ impl GrpcService {
                             crate::metrics::prometheus::record_stream_chunk(&metrics_model, &metrics_version, "grpc");
                         }
                         let resp = pb::DecoupledResponse { data: c.data.clone(), is_final: false };
-                        // L1 (resource-leak-plan): deadline-bounded send —
-                        // a stopped reader must not pin the stream past the
-                        // armed deadline (see streaming::send_bounded).
-                        match streaming::send_bounded(stream_deadline, tx.send(Ok(resp))).await {
+                        // L1 (resource-leak-plan): deadline + idle-bounded
+                        // send — a stopped reader must not pin the stream
+                        // past the armed deadline nor defeat the recv-side
+                        // idle reclaim (P0-2; see streaming::send_bounded).
+                        match streaming::send_bounded(stream_deadline, stream_idle, tx.send(Ok(resp))).await {
                             streaming::SendOutcome::Sent(Ok(())) => {}
                             streaming::SendOutcome::Sent(Err(_)) => {
                                 reason = crate::metrics::prometheus::StreamCloseReason::Cancel;
@@ -296,6 +297,10 @@ impl GrpcService {
                             }
                             streaming::SendOutcome::Deadline => {
                                 reason = crate::metrics::prometheus::StreamCloseReason::Deadline;
+                                break;
+                            }
+                            streaming::SendOutcome::Idle => {
+                                reason = crate::metrics::prometheus::StreamCloseReason::Idle;
                                 break;
                             }
                         }

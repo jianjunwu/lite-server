@@ -203,6 +203,31 @@ pub(crate) enum PlanCell {
     },
 }
 
+/// M5: a holder whose `get_or_load` future is CANCELLED (dropped) mid-load
+/// never reaches the Ok/Err write-back — `catch_unwind` guards panic, not
+/// cancellation. Without this guard the `Loading` cell would stay in the map
+/// forever and every later request for the key would park on `rx.await`.
+/// On drop, if the cell is still OUR Loading placeholder, evict it: the key
+/// returns to Vacant (next call re-parses) and the parked waiters' senders
+/// drop with the cell, resolving their `rx.await` to Err instead of hanging.
+/// The Ok path (cell already replaced by Ready) and the Err path (cell
+/// already removed) make this a no-op via the id check.
+struct LoadingGuard<'a> {
+    plans: &'a DashMap<PlanKey, PlanCell>,
+    key: PlanKey,
+    id: u64,
+}
+
+impl Drop for LoadingGuard<'_> {
+    fn drop(&mut self) {
+        // remove_if: atomic per shard — an invalidate + new-holder insert
+        // racing the drop must not evict the NEW holder's cell (id check).
+        self.plans.remove_if(&self.key, |_, cell| {
+            matches!(cell, PlanCell::Loading { id, .. } if *id == self.id)
+        });
+    }
+}
+
 /// P0: `DashMap<(model, version), Arc<EnsemblePlan>>` with single-flight
 /// loads (review ④), mtime interval re-check (review ②, coarse tokio clock,
 /// no syscall on the hot path) and model-prefix invalidation (review ③ —
@@ -289,6 +314,9 @@ impl EnsemblePlanCache {
                     // Loading placeholder, drop the shard lock, then parse.
                     let my_id = self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     vacant.insert(PlanCell::Loading { id: my_id, waiters: Vec::new() });
+                    // M5: recycle the cell if THIS future is cancelled
+                    // mid-load (dropped before the write-back below).
+                    let _guard = LoadingGuard { plans: &self.plans, key: key.clone(), id: my_id };
                     // C2 (resource-leak-plan): a panicking loader must not
                     // wedge the Loading slot — the task's death would leave
                     // the placeholder in place and every waiter parked
@@ -410,6 +438,63 @@ impl EnsemblePlanCache {
             model: model.to_string(),
             version: version.to_string(),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M5 evidence (resource-leak sweep 2026-08-16): a holder that is
+    /// CANCELLED (its `get_or_load` future is dropped) mid-load leaves the
+    /// single-flight `Loading` cell in the DashMap with the waiters' oneshots
+    /// unconsumed — `catch_unwind` guards panic but NOT future cancellation.
+    /// Every later request for the same (model, version) parks on `rx.await`
+    /// forever (no timeout), so the key is poisoned until an explicit
+    /// unload/invalidate.
+    ///
+    /// Fixed code recycles the Loading cell when the holder is dropped;
+    /// current code keeps the poisoned cell — this test FAILS (RED) until
+    /// addressed.
+    #[tokio::test]
+    async fn m5_cancelled_holder_does_not_poison_loading_cell() {
+        let cache = EnsemblePlanCache::new();
+        let key = PlanKey {
+            model: "m5_m".to_string(),
+            version: "1".to_string(),
+        };
+
+        // Holder 1 starts a load that never completes (simulated slow parse).
+        // Box::pin (not tokio::pin!): the future must be OWNED so the later
+        // drop(first) really drops it — tokio::pin! rebinds a Pin<&mut F>
+        // whose drop leaves the future alive until scope end.
+        let mut first = Box::pin(cache.get_or_load(key.clone(), || async {
+            std::future::pending::<Result<Arc<EnsemblePlan>, AppError>>().await
+        }));
+        // Drive holder 1 into the Loading cell (it parks on the pending load).
+        tokio::select! {
+            _ = &mut first => panic!("holder 1 must not complete"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        // Client disconnects: the future is dropped while holding the cell.
+        drop(first);
+
+        // A later request for the same key must return (re-parse), not park
+        // forever on the abandoned Loading cell. The re-parse fails on
+        // purpose — any terminal outcome proves the key is not poisoned.
+        let second = cache.get_or_load(key.clone(), || async {
+            Err::<Arc<EnsemblePlan>, _>(AppError::Internal("m5 re-parse".to_string()))
+        });
+        match tokio::time::timeout(Duration::from_millis(500), second)
+            .await
+            .expect("key must not stay poisoned after the holder cancels (500ms)")
+        {
+            Err(_) => {} // re-entered the Vacant path and re-parsed (failed) — correct.
+            Ok(_) => panic!(
+                "expected a re-parse outcome (Err), got Ok — the Loading cell \
+                 is still parked"
+            ),
+        }
     }
 }
 

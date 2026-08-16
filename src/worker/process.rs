@@ -574,7 +574,7 @@ impl WorkerManager {
                     .iter()
                     .map(|s| (s.name.as_str(), s.metric_type.as_str()))
                     .collect();
-                crate::metrics::prometheus::register_custom_metrics(&spec_refs);
+                crate::metrics::prometheus::register_custom_metrics(model_name, version, &spec_refs);
             }
         }
 
