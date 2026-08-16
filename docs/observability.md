@@ -58,8 +58,26 @@ workers.
 
 ### Streaming metrics
 
-All `liteserver_stream_*` metrics below are gated by
-`features.streaming_metrics`, except `liteserver_requests_total`.
+The detailed stream-lifecycle metrics below are gated by
+`features.streaming_metrics` (default on; CLI `--no-streaming-metrics`),
+**except** `liteserver_stream_rejected_total`. The `/metrics/timeline`
+`active_streams` field derives from `liteserver_streaming_connections`, so it
+reads 0 while the gate is off.
+
+Three stream-adjacent signals stay **ungated** by design — cheap server-level
+accounting you want most precisely when the expensive per-chunk metrics are
+off:
+
+| Metric | Why exempt |
+|---|---|
+| `liteserver_requests_total` / `liteserver_request_duration_seconds` | Every stream still counts as one request, at close-point or pre-open rejection; gating these would blind request-level SLOs. |
+| `liteserver_stream_rejected_total` | Rejection accounting parallels `requests_total` — the reject path is exactly what matters when lifecycle detail is off. |
+| `liteserver_http_connections` | Connection-level resource signal (idle keep-alive, TLS handshakes, slowloris), orthogonal to per-stream detail. |
+
+The stream-close **lifecycle log** (`stream closed`, carrying the close
+`reason` — plus error/cancel warnings) is likewise ungated: it is the
+debugging channel that remains when the metrics are off. The `stream opened`
+log, by contrast, fires only inside the gate.
 
 | Metric | Labels | Notes |
 |---|---|---|

@@ -106,7 +106,8 @@ grpc:
   tls_min_version: null        # "1.2"（默认）或 "1.3"
 
 metrics:
-  enabled: true                # 启用 Prometheus 指标端点
+  enabled: true                # 运行独立 Prometheus 监听器（server.metrics_port，明文——见下文 TLS 注记）。
+                               # 作用域注意：主端口 /metrics 路由恒挂载（Admin 端点类），不受此开关影响。
   # GIE/EPP 兼容指标命名空间：在 /metrics 暴露
   # {namespace}:total_queued_requests / {namespace}:kv_cache_utilization
   # （vllm 兼容命名，对接 K8s LLM 自动扩缩生态）。非法命名空间启动 fail-fast。
@@ -151,7 +152,9 @@ features:
   websocket_streaming: true    # WebSocket 路由（另需 streaming: true）
   http_bidi: true              # h2 /bidi 端点（另需 streaming: true）
   decoupled: true             # SSE /decoupled + WS /decoupled-stream（另需 streaming + 传输开关）
-  streaming_metrics: true      # 流式专用指标
+  streaming_metrics: true      # 流式生命周期指标族（liteserver_stream*/streaming_*）。
+                               # 门控边界与豁免指标见 observability.md「Streaming metrics」节。
+                               # 与 metrics.enabled 相互独立——后者控制独立监听器，本开关控制记录哪些序列。
 
 model_defaults:                # CLI 级别默认值，应用于所有模型
   max_queue_size: null         # 覆盖所有模型的 max_queue_size
@@ -512,7 +515,7 @@ lite-server serve [参数]
 | `--log-info-output` | info 日志输出文件 | `logging.info_output` |
 | `--log-error-output` | error 日志输出文件 | `logging.error_output` |
 | `--log-rotation` | 日志轮转策略（none/size/daily/hourly） | `logging.rotation` |
-| `--no-metrics` | 禁用指标 | `metrics.enabled` |
+| `--no-metrics` | 禁用独立指标监听器（主端口 `/metrics` 仍挂载） | `metrics.enabled` |
 | `--grpc-port` | gRPC 端口 | `server.grpc_port` |
 | `--no-grpc` | 禁用 gRPC | `grpc.enabled` |
 | `--no-streaming-metrics` | 禁用流式指标 | `features.streaming_metrics` |

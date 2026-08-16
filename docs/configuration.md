@@ -116,7 +116,10 @@ grpc:
   tls_min_version: null        # "1.2" (default) or "1.3"
 
 metrics:
-  enabled: true                # Enable Prometheus metrics endpoint
+  enabled: true                # Run the dedicated Prometheus listener (server.metrics_port,
+                               # plaintext — see TLS notes below). Scope note: the main-port
+                               # /metrics route is ALWAYS mounted (Admin endpoint class) and is
+                               # NOT affected by this switch.
   # GIE/EPP-compatible metric namespace: exposes
   # {namespace}:total_queued_requests / {namespace}:kv_cache_utilization on /metrics
   # (vllm-compatible naming for the Kubernetes LLM-autoscaler ecosystem).
@@ -164,7 +167,10 @@ features:
   websocket_streaming: true    # WebSocket routes (also requires streaming: true)
   http_bidi: true              # h2 /bidi endpoint (also requires streaming: true)
   decoupled: true             # SSE /decoupled + WS /decoupled-stream (also requires streaming + transport toggle)
-  streaming_metrics: true      # Streaming-specific metrics
+  streaming_metrics: true      # Streaming lifecycle metrics family (liteserver_stream*/streaming_*).
+                               # Gating boundary + exempt metrics: observability.md §Streaming metrics.
+                               # Independent of metrics.enabled — that one controls the dedicated
+                               # listener, this one controls which series are recorded.
 
 model_defaults:                # CLI-level defaults applied to all models
   max_queue_size: null         # Override max_queue_size for all models
@@ -565,7 +571,7 @@ lite-server serve [flags]
 | `--log-info-output` | Info log output file | `logging.info_output` |
 | `--log-error-output` | Error log output file | `logging.error_output` |
 | `--log-rotation` | Log rotation strategy (none/size/daily/hourly) | `logging.rotation` |
-| `--no-metrics` | Disable metrics | `metrics.enabled` |
+| `--no-metrics` | Disable the dedicated metrics listener (main-port `/metrics` stays mounted) | `metrics.enabled` |
 | `--grpc-port` | gRPC port | `server.grpc_port` |
 | `--no-grpc` | Disable gRPC | `grpc.enabled` |
 | `--no-streaming-metrics` | Disable streaming metrics | `features.streaming_metrics` |
