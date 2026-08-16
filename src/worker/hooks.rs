@@ -238,32 +238,60 @@ mod tests {
         let _ = tokio::fs::remove_file(&tmp).await;
     }
 
-    /// L2 reproduction (RED): lifecycle-hook tasks are spawned into a shared
-    /// `tokio::task::JoinSet` (`hook_tasks`) that is only drained at
-    /// `WorkerManager::shutdown`. A `JoinSet` retains every completed task's
-    /// result until `join_next`/`try_join_next` reaps it — so across model
-    /// loads/respawns/exits each hook firing accumulates one entry for the
-    /// server's lifetime. This test fires a batch, lets them complete, then
-    /// fires one more (which must reap the completed batch) and asserts the
-    /// retained count stays small.
+    /// L2 regression lock: lifecycle-hook tasks are spawned into a shared
+    /// `tokio::task::JoinSet` (`hook_tasks`); `execute_hook` reaps completed
+    /// entries (try_join_next drain) before each spawn. This test fires a
+    /// batch, waits for actual completion, then fires more (reaping) and
+    /// asserts the retained count stays small.
+    ///
+    /// Completion-signaled, NOT wall-clock: each hook firing appends one line
+    /// to a marker file and the test polls the line count (10s budget) — a
+    /// fixed `sleep(200ms)` for 50 subprocess spawns flakes on a loaded
+    /// machine (observed: retained 51 with zero reaped).
     #[tokio::test]
     async fn l2_completed_hook_tasks_are_reaped() {
+        let marker = std::env::temp_dir().join(format!(
+            "liteserver-l2-hook-{}.log",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
         let hooks = crate::config::WorkerHooksConfig {
-            // Instant shell command: the task completes almost immediately.
-            on_ready: Some("true".to_string()),
+            // Instant shell command that leaves a completion marker line.
+            on_ready: Some(format!("echo . >> {}", marker.display())),
             ..Default::default()
         };
         let hook_tasks: HookTasks = Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new()));
         for _ in 0..50 {
             execute_hook("ready", &hooks, vec![], &hook_tasks);
         }
-        // Let every spawned task complete.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        // Fire one more hook: its spawn must reap the 50 completed entries.
-        execute_hook("ready", &hooks, vec![], &hook_tasks);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        let retained = hook_tasks.lock().unwrap_or_else(|e| e.into_inner()).len();
+        // Wait until every spawned hook command actually RAN (marker lines) —
+        // process exit observed, task completion trails by a scheduler tick.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let lines = std::fs::read_to_string(&marker)
+                .map(|s| s.lines().count())
+                .unwrap_or(0);
+            if lines >= 50 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "50 hook commands did not complete within 10s ({lines} done)"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Fire more hooks: each spawn reaps every task the runtime has marked
+        // complete. Loop until the JoinSet drains (converges once the exited
+        // processes' tasks are observed complete) or the deadline expires.
+        let retained = loop {
+            execute_hook("ready", &hooks, vec![], &hook_tasks);
+            let retained = hook_tasks.lock().unwrap_or_else(|e| e.into_inner()).len();
+            if retained <= 4 || std::time::Instant::now() >= deadline {
+                break retained;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let _ = std::fs::remove_file(&marker);
         assert!(
             retained <= 4,
             "L2: completed hook tasks not reaped from the JoinSet: retained \

@@ -36,12 +36,16 @@ fn next_test_port() -> u16 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-fn start_server(args: &[&str]) -> Child {
+fn start_server(args: &[&str], log_path: &std::path::Path) -> Child {
     let mut cmd = Command::new(lite_server_bin());
+    // stderr goes to a per-boot log file (not inherit): on a boot-timeout
+    // panic wait_for_server dumps the tail, so the failure is diagnosable
+    // instead of lost in the suite's interleaved output.
+    let log = std::fs::File::create(log_path).expect("create server log");
     cmd.arg("serve")
         .current_dir(project_root())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::from(log))
         .env("LITESERVER_DIE_WITH_PARENT", "1");
     for arg in args {
         cmd.arg(arg);
@@ -72,8 +76,8 @@ fn stop_server(mut child: Child) {
 struct ServerGuard(Option<Child>);
 
 impl ServerGuard {
-    fn start(args: &[&str]) -> Self {
-        ServerGuard(Some(start_server(args)))
+    fn start(args: &[&str], log_path: &std::path::Path) -> Self {
+        ServerGuard(Some(start_server(args, log_path)))
     }
 }
 
@@ -107,7 +111,7 @@ fn kill_stale_on_port(port: u16) {
     }
 }
 
-async fn wait_for_server(port: u16, timeout_secs: u64) {
+async fn wait_for_server(port: u16, timeout_secs: u64, log_path: &std::path::Path) {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{}/health", port);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
@@ -119,7 +123,26 @@ async fn wait_for_server(port: u16, timeout_secs: u64) {
         }
         sleep(Duration::from_millis(100)).await;
     }
-    panic!("Server did not start within {} seconds", timeout_secs);
+    // Dump the server log tail so a boot failure is diagnosable from the
+    // panic message alone (the suite's interleaved stderr loses it).
+    let tail = std::fs::read_to_string(log_path)
+        .map(|s| {
+            s.lines()
+                .rev()
+                .take(50)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_else(|e| format!("<log unreadable: {e}>"));
+    panic!(
+        "Server did not start within {} seconds\n--- server log tail ({}) ---\n{}",
+        timeout_secs,
+        log_path.display(),
+        tail
+    );
 }
 
 async fn wait_model_ready(base: &str, model: &str, timeout_secs: u64) -> bool {
@@ -1338,8 +1361,11 @@ async fn boot_server_orch(extra: &str, orch_extra: &str) -> (String, ServerGuard
     let _ = std::fs::remove_dir_all(&repo);
     write_all_fixtures(&repo);
     let server_yaml = write_server_yaml(&repo, http_port, extra, orch_extra);
-    let guard = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(http_port, 30).await;
+    let log_path = repo.join("server.log");
+    let guard = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()], &log_path);
+    // 90s: a loaded machine (whole suite booting ~90 models per server)
+    // regularly exceeded the old 30s budget.
+    wait_for_server(http_port, 90, &log_path).await;
     (
         format!("http://127.0.0.1:{}", http_port),
         guard,
@@ -1721,8 +1747,10 @@ async fn boot_server_grpc(extra: &str) -> (String, u16, ServerGuard, std::path::
         ),
     )
     .unwrap();
-    let guard = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()]);
-    wait_for_server(http_port, 30).await;
+    let log_path = repo.join("server.log");
+    let guard = ServerGuard::start(&["--config", &server_yaml.to_string_lossy()], &log_path);
+    // 90s: see boot_server_orch.
+    wait_for_server(http_port, 90, &log_path).await;
     (
         format!("http://127.0.0.1:{}", http_port),
         grpc_port,

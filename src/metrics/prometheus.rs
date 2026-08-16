@@ -409,6 +409,22 @@ lazy_static! {
     /// referencing version unloads (see deregister_unreferenced_custom_families).
     static ref CUSTOM_FAMILY_REFS: std::sync::Mutex<HashMap<String, std::collections::HashSet<(String, String)>>> =
         std::sync::Mutex::new(HashMap::new());
+    /// Worker-local per-type metric id → global CUSTOM_*_OBJECTS position,
+    /// per live (model, version). Workers assign ids as per-type ordinals of
+    /// their OWN declaration order (python api.py register_metric) while the
+    /// object vecs are process-global — without this translation a second
+    /// model declaring distinct names would report into the wrong family.
+    static ref CUSTOM_MODEL_IDS: std::sync::Mutex<HashMap<(String, String), std::sync::Arc<ModelMetricIds>>> =
+        std::sync::Mutex::new(HashMap::new());
+}
+
+/// Per-(model, version) translation tables, built at register time in the
+/// worker's spec declaration order (per type).
+#[derive(Clone)]
+struct ModelMetricIds {
+    gauges: Vec<usize>,
+    counters: Vec<usize>,
+    histograms: Vec<usize>,
 }
 
 pub fn register_metrics() -> Result<(), prometheus::Error> {
@@ -1315,69 +1331,92 @@ pub fn record_worker_metrics(model: &str, version: &str, metrics: Option<&crate:
 /// family; the family object is deregistered when its last referencing
 /// version unloads (remove_version_metrics).
 pub fn register_custom_metrics(model: &str, version: &str, specs: &[(&str, &str)]) {
-    // Canonical lock order (gauges → counters → histograms → index → refs);
-    // deregister_unreferenced_custom_families takes the same set nested in
-    // the same order, so register/deregister are atomic w.r.t. each other.
+    // Canonical lock order (gauges → counters → histograms → index → refs →
+    // model_ids); deregister_unreferenced_custom_families takes the same set
+    // nested in the same order, so register/deregister are atomic w.r.t.
+    // each other.
     let mut gauges = CUSTOM_GAUGE_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
     let mut counters = CUSTOM_COUNTER_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
     let mut histograms = CUSTOM_HISTOGRAM_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
     let mut index = CUSTOM_METRIC_INDEX.lock().unwrap_or_else(|e| e.into_inner());
     let mut refs = CUSTOM_FAMILY_REFS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut model_ids = CUSTOM_MODEL_IDS.lock().unwrap_or_else(|e| e.into_inner());
 
+    let mut ids = ModelMetricIds {
+        gauges: Vec::new(),
+        counters: Vec::new(),
+        histograms: Vec::new(),
+    };
     for (name, metric_type) in specs {
         let key = format!("{}:{}", name, metric_type);
         refs.entry(key.clone())
             .or_default()
             .insert((model.to_string(), version.to_string()));
-        if index.contains_key(&key) {
-            continue; // already registered — idempotent
-        }
+        let global_idx = match index.get(&key) {
+            Some(existing) => existing.1, // already registered — idempotent
+            None => match *metric_type {
+                "gauge" => {
+                    let idx = gauges.len();
+                    let g = GaugeVec::new(
+                        prometheus::Opts::new(
+                            format!("lite_server_{}", name),
+                            format!("Custom gauge: {}", name),
+                        ),
+                        &["model", "version"],
+                    ).unwrap();
+                    let _ = REGISTRY.register(Box::new(g.clone()));
+                    gauges.push(g);
+                    index.insert(key, ("gauge".to_string(), idx));
+                    idx
+                }
+                "counter" => {
+                    let idx = counters.len();
+                    let c = CounterVec::new(
+                        prometheus::Opts::new(
+                            format!("lite_server_{}_total", name),
+                            format!("Custom counter: {}", name),
+                        ),
+                        &["model", "version"],
+                    ).unwrap();
+                    let _ = REGISTRY.register(Box::new(c.clone()));
+                    counters.push(c);
+                    index.insert(key, ("counter".to_string(), idx));
+                    idx
+                }
+                "histogram" => {
+                    let idx = histograms.len();
+                    let h = HistogramVec::new(
+                        HistogramOpts::new(
+                            format!("lite_server_{}", name),
+                            format!("Custom histogram: {}", name),
+                        )
+                        .buckets(vec![
+                            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+                        ]),
+                        &["model", "version"],
+                    ).unwrap();
+                    let _ = REGISTRY.register(Box::new(h.clone()));
+                    histograms.push(h);
+                    index.insert(key, ("histogram".to_string(), idx));
+                    idx
+                }
+                _ => continue,
+            },
+        };
+        // Translation table: the worker's per-type declaration ordinal →
+        // the family's global Vec position (record_custom_metrics resolves
+        // worker-local ids through this).
         match *metric_type {
-            "gauge" => {
-                let idx = gauges.len();
-                let g = GaugeVec::new(
-                    prometheus::Opts::new(
-                        format!("lite_server_{}", name),
-                        format!("Custom gauge: {}", name),
-                    ),
-                    &["model", "version"],
-                ).unwrap();
-                let _ = REGISTRY.register(Box::new(g.clone()));
-                gauges.push(g);
-                index.insert(key, ("gauge".to_string(), idx));
-            }
-            "counter" => {
-                let idx = counters.len();
-                let c = CounterVec::new(
-                    prometheus::Opts::new(
-                        format!("lite_server_{}_total", name),
-                        format!("Custom counter: {}", name),
-                    ),
-                    &["model", "version"],
-                ).unwrap();
-                let _ = REGISTRY.register(Box::new(c.clone()));
-                counters.push(c);
-                index.insert(key, ("counter".to_string(), idx));
-            }
-            "histogram" => {
-                let idx = histograms.len();
-                let h = HistogramVec::new(
-                    HistogramOpts::new(
-                        format!("lite_server_{}", name),
-                        format!("Custom histogram: {}", name),
-                    )
-                    .buckets(vec![
-                        0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
-                    ]),
-                    &["model", "version"],
-                ).unwrap();
-                let _ = REGISTRY.register(Box::new(h.clone()));
-                histograms.push(h);
-                index.insert(key, ("histogram".to_string(), idx));
-            }
+            "gauge" => ids.gauges.push(global_idx),
+            "counter" => ids.counters.push(global_idx),
+            "histogram" => ids.histograms.push(global_idx),
             _ => {}
         }
     }
+    model_ids.insert(
+        (model.to_string(), version.to_string()),
+        std::sync::Arc::new(ids),
+    );
 }
 
 /// M6b: drop this version's reference on every pre-registered custom family;
@@ -1392,6 +1431,11 @@ fn deregister_unreferenced_custom_families(model: &str, version: &str) {
     let mut histograms = CUSTOM_HISTOGRAM_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
     let mut index = CUSTOM_METRIC_INDEX.lock().unwrap_or_else(|e| e.into_inner());
     let mut refs = CUSTOM_FAMILY_REFS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut model_ids = CUSTOM_MODEL_IDS.lock().unwrap_or_else(|e| e.into_inner());
+
+    // The unloading version's translation table is dropped regardless of
+    // family refcounting (its workers are gone).
+    model_ids.remove(&(model.to_string(), version.to_string()));
 
     let mv = (model.to_string(), version.to_string());
     let emptied: Vec<String> = refs
@@ -1404,11 +1448,15 @@ fn deregister_unreferenced_custom_families(model: &str, version: &str) {
         let Some((mtype, idx)) = index.remove(&key) else {
             continue;
         };
-        /// swap_remove the object at `idx`, unregister it, and fix the index
-        /// entry of the object moved from the last slot into `idx`.
+        /// swap_remove the object at `idx`, unregister it, and fix every
+        /// reference to the object moved from the last slot into `idx`:
+        /// the name index entry AND every live model's translation table
+        /// (CUSTOM_MODEL_IDS) — otherwise later records of an unrelated
+        /// model would land in the wrong family.
         fn deregister_object<C>(
             objects: &mut Vec<C>,
             index: &mut HashMap<String, (String, usize)>,
+            model_ids: &mut HashMap<(String, String), std::sync::Arc<ModelMetricIds>>,
             idx: usize,
             mtype: &str,
         ) where
@@ -1427,18 +1475,39 @@ fn deregister_unreferenced_custom_families(model: &str, version: &str) {
                         break;
                     }
                 }
+                for table in model_ids.values_mut() {
+                    // make_mut clones when an in-flight record holds an Arc —
+                    // the map converges; a racing record keeps its (now
+                    // stale) snapshot for that one frame, same tolerance as
+                    // the late-Done-frame series re-creation above.
+                    let table = std::sync::Arc::make_mut(table);
+                    let list = match mtype {
+                        "gauge" => &mut table.gauges,
+                        "counter" => &mut table.counters,
+                        _ => &mut table.histograms,
+                    };
+                    for g in list.iter_mut() {
+                        if *g == moved_from {
+                            *g = idx;
+                        }
+                    }
+                }
             }
         }
         match mtype.as_str() {
-            "gauge" => deregister_object(&mut gauges, &mut index, idx, "gauge"),
-            "counter" => deregister_object(&mut counters, &mut index, idx, "counter"),
-            "histogram" => deregister_object(&mut histograms, &mut index, idx, "histogram"),
+            "gauge" => deregister_object(&mut gauges, &mut index, &mut model_ids, idx, "gauge"),
+            "counter" => deregister_object(&mut counters, &mut index, &mut model_ids, idx, "counter"),
+            "histogram" => deregister_object(&mut histograms, &mut index, &mut model_ids, idx, "histogram"),
             _ => {}
         }
     }
 }
 
-/// Record pre-registered custom metrics — hot path, O(1) per metric, no HashMap.
+/// Record pre-registered custom metrics — hot path, one map lookup + one
+/// lock per non-empty type, no per-metric HashMap. `mv.id` is the WORKER's
+/// per-type declaration ordinal; it is translated to the global object Vec
+/// position through CUSTOM_MODEL_IDS (see register_custom_metrics). Unknown
+/// model or out-of-range id → skipped (unregistered/late frames).
 pub fn record_custom_metrics(
     model: &str,
     version: &str,
@@ -1446,27 +1515,42 @@ pub fn record_custom_metrics(
     counters: &[crate::proto::liteserver::MetricValue],
     histograms: &[crate::proto::liteserver::MetricValue],
 ) {
+    if gauges.is_empty() && counters.is_empty() && histograms.is_empty() {
+        return;
+    }
+    let ids = CUSTOM_MODEL_IDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(model.to_string(), version.to_string()))
+        .cloned();
+    let Some(ids) = ids else { return };
     if !gauges.is_empty() {
         let guard = CUSTOM_GAUGE_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
         for mv in gauges {
-            if let Some(g) = guard.get(mv.id as usize) {
-                g.with_label_values(&[model, version]).set(mv.value as f64);
+            if let Some(&global) = ids.gauges.get(mv.id as usize) {
+                if let Some(g) = guard.get(global) {
+                    g.with_label_values(&[model, version]).set(mv.value as f64);
+                }
             }
         }
     }
     if !counters.is_empty() {
         let guard = CUSTOM_COUNTER_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
         for mv in counters {
-            if let Some(c) = guard.get(mv.id as usize) {
-                c.with_label_values(&[model, version]).inc_by(mv.value as f64);
+            if let Some(&global) = ids.counters.get(mv.id as usize) {
+                if let Some(c) = guard.get(global) {
+                    c.with_label_values(&[model, version]).inc_by(mv.value as f64);
+                }
             }
         }
     }
     if !histograms.is_empty() {
         let guard = CUSTOM_HISTOGRAM_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
         for mv in histograms {
-            if let Some(h) = guard.get(mv.id as usize) {
-                h.with_label_values(&[model, version]).observe(mv.value as f64);
+            if let Some(&global) = ids.histograms.get(mv.id as usize) {
+                if let Some(h) = guard.get(global) {
+                    h.with_label_values(&[model, version]).observe(mv.value as f64);
+                }
             }
         }
     }
@@ -1617,6 +1701,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(custom_metrics)]
     fn test_register_custom_metrics_and_record() {
         use crate::proto::liteserver::MetricValue;
 
@@ -1626,16 +1711,11 @@ mod tests {
             ("rcmr_histogram", "histogram"),
         ]);
 
-        // Look up the IDs assigned by register_custom_metrics
-        let index = CUSTOM_METRIC_INDEX.lock().unwrap();
-        let gauge_id = index.get("rcmr_gauge:gauge").unwrap().1;
-        let counter_id = index.get("rcmr_counter:counter").unwrap().1;
-        let histogram_id = index.get("rcmr_histogram:histogram").unwrap().1;
-        drop(index);
-
-        let gauges = vec![MetricValue { id: gauge_id as i32, value: 42.0 }];
-        let counters = vec![MetricValue { id: counter_id as i32, value: 5.0 }];
-        let histograms = vec![MetricValue { id: histogram_id as i32, value: 0.15 }];
+        // Worker-side ids are per-type declaration ordinals: this model
+        // declares one metric of each type, so every local id is 0.
+        let gauges = vec![MetricValue { id: 0, value: 42.0 }];
+        let counters = vec![MetricValue { id: 0, value: 5.0 }];
+        let histograms = vec![MetricValue { id: 0, value: 0.15 }];
         record_custom_metrics("rcmr_model", "1", &gauges, &counters, &histograms);
 
         let output = gather_metrics();
@@ -1645,20 +1725,18 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(custom_metrics)]
     fn test_record_worker_metrics_with_custom_fields() {
         use crate::proto::liteserver::{MetricValue, Metrics};
 
         register_custom_metrics("rwmc_model", "1", &[("rwmc_gauge", "gauge")]);
 
-        let index = CUSTOM_METRIC_INDEX.lock().unwrap();
-        let gauge_id = index.get("rwmc_gauge:gauge").unwrap().1;
-        drop(index);
-
         let metrics = Metrics {
             prefill_ms: 0.0,
             decode_ms: 0.0,
             tokens_generated: 0,
-            gauges: vec![MetricValue { id: gauge_id as i32, value: 99.5 }],
+            // Worker-local per-type ordinal (first gauge declared → id 0).
+            gauges: vec![MetricValue { id: 0, value: 99.5 }],
             counters: vec![],
             histograms: vec![],
         };
@@ -1679,6 +1757,7 @@ mod tests {
     /// Fixed code purges these families on unload; current code retains them —
     /// this test FAILS (RED) until the leak is addressed.
     #[test]
+    #[serial_test::serial(custom_metrics)]
     fn test_worker_metric_series_survive_version_purge() {
         use crate::proto::liteserver::{MetricValue, Metrics};
         let model = "prom_purge_ev_worker";
@@ -1697,15 +1776,12 @@ mod tests {
                 histograms: vec![],
             }),
         );
-        // Pre-registered custom family path.
+        // Pre-registered custom family path (worker-local gauge ordinal 0).
         register_custom_metrics(model, version, &[("purge_ev_custom", "gauge")]);
-        let idx = CUSTOM_METRIC_INDEX.lock().unwrap();
-        let gid = idx.get("purge_ev_custom:gauge").unwrap().1;
-        drop(idx);
         record_custom_metrics(
             model,
             version,
-            &[MetricValue { id: gid as i32, value: 1.0 }],
+            &[MetricValue { id: 0, value: 1.0 }],
             &[],
             &[],
         );
@@ -1788,39 +1864,54 @@ mod tests {
     /// Fixed code deregisters a family once its last referencing version
     /// unloads (CUSTOM_FAMILY_REFS refcounting).
     #[test]
+    #[serial_test::serial(custom_metrics)]
     fn test_custom_metric_family_object_survives_unload() {
         let model = "m6b_model";
         let version = "1";
-        let before_g = CUSTOM_GAUGE_OBJECTS.lock().unwrap().len();
-        let before_i = CUSTOM_METRIC_INDEX.lock().unwrap().len();
+        // Content-based assertions on the UNIQUE name only — the object vec
+        // and index are process-global and mutated by parallel tests, so
+        // absolute len before/after is racy.
+        assert!(
+            !CUSTOM_METRIC_INDEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("m6b_gauge:gauge"),
+            "precondition: m6b_gauge must be unregistered"
+        );
         // A model declares its custom metric family at worker handshake.
         register_custom_metrics(model, version, &[("m6b_gauge", "gauge")]);
-        assert_eq!(
-            CUSTOM_GAUGE_OBJECTS.lock().unwrap().len(),
-            before_g + 1,
-            "precondition: the family object must be created"
+        assert!(
+            CUSTOM_METRIC_INDEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("m6b_gauge:gauge"),
+            "precondition: the index entry must be created"
         );
         assert!(
-            CUSTOM_METRIC_INDEX.lock().unwrap().contains_key("m6b_gauge:gauge"),
-            "precondition: the index entry must be created"
+            CUSTOM_FAMILY_REFS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get("m6b_gauge:gauge")
+                .is_some_and(|s| s.contains(&(model.to_string(), version.to_string()))),
+            "precondition: the (model, version) reference must be recorded"
         );
         // Unload the model: its family object + index entry must be removed
         // (no other model references it). Pre-M6b code never deregistered a
         // family object — both survived forever.
         remove_version_metrics(model, version);
-        assert_eq!(
-            CUSTOM_GAUGE_OBJECTS.lock().unwrap().len(),
-            before_g,
-            "M6b: gauge family object must be deregistered on unload"
-        );
         assert!(
-            !CUSTOM_METRIC_INDEX.lock().unwrap().contains_key("m6b_gauge:gauge"),
+            !CUSTOM_METRIC_INDEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("m6b_gauge:gauge"),
             "M6b: index entry must be removed on unload"
         );
-        assert_eq!(
-            CUSTOM_METRIC_INDEX.lock().unwrap().len(),
-            before_i,
-            "M6b: index size must be restored on unload"
+        assert!(
+            !CUSTOM_FAMILY_REFS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("m6b_gauge:gauge"),
+            "M6b: reference set must be dropped on unload"
         );
         // Idempotence: a second unload of the same version is a no-op.
         remove_version_metrics(model, version);
@@ -1829,6 +1920,52 @@ mod tests {
             "M6b: custom family lite_server_m6b_gauge still exported after unload — \
              family objects are never deregistered"
         );
+    }
+
+    /// Custom-metric id misattribution (found during M6b review, 2026-08-16):
+    /// worker-side `metric_id` is a PER-TYPE ordinal within the worker's own
+    /// declaration order (python api.py `register_metric`), while the
+    /// CUSTOM_*_OBJECTS vecs are PROCESS-GLOBAL. Recording indexes the global
+    /// vec with the worker-local id directly, so a second model declaring
+    /// DISTINCT metric names reports into the first model's family (or out
+    /// of range → silently dropped).
+    ///
+    /// Fixed code translates worker-local ids through a per-(model, version)
+    /// table built at register time (CUSTOM_MODEL_IDS).
+    #[test]
+    #[serial_test::serial(custom_metrics)]
+    fn test_custom_metric_ids_translated_per_model() {
+        use crate::proto::liteserver::MetricValue;
+        // Two models, distinct gauge names; each worker declares ONE gauge,
+        // so both report worker-local id 0.
+        register_custom_metrics("cm_a", "1", &[("cm_a_gauge", "gauge")]);
+        register_custom_metrics("cm_b", "1", &[("cm_b_gauge", "gauge")]);
+        record_custom_metrics("cm_a", "1", &[MetricValue { id: 0, value: 1.0 }], &[], &[]);
+        record_custom_metrics("cm_b", "1", &[MetricValue { id: 0, value: 2.0 }], &[], &[]);
+
+        let objects = CUSTOM_GAUGE_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
+        let index = CUSTOM_METRIC_INDEX.lock().unwrap_or_else(|e| e.into_inner());
+        let a_idx = index.get("cm_a_gauge:gauge").unwrap().1;
+        let b_idx = index.get("cm_b_gauge:gauge").unwrap().1;
+        let value = |idx: usize, model: &str| {
+            objects[idx]
+                .get_metric_with_label_values(&[model, "1"])
+                .map(|g| g.get())
+                .unwrap_or(0.0)
+        };
+        assert_eq!(value(a_idx, "cm_a"), 1.0, "A's value must land in A's family");
+        assert_eq!(
+            value(a_idx, "cm_b"),
+            0.0,
+            "A's family must not gain B's label set (cross-model misattribution)"
+        );
+        assert_eq!(
+            value(b_idx, "cm_b"),
+            2.0,
+            "B's value must land in B's family — worker-local id 0 must be \
+             translated to B's global slot"
+        );
+        assert_eq!(value(b_idx, "cm_a"), 0.0, "B's family must not gain A's label set");
     }
 
     #[test]
@@ -1981,9 +2118,6 @@ mod tests {
 
         // Register so the vec is non-empty, forcing the locked path
         register_custom_metrics("poison_cm_model", "1", &[("poison_cm", "gauge")]);
-        let index = CUSTOM_METRIC_INDEX.lock().unwrap();
-        let gauge_id = index.get("poison_cm:gauge").unwrap().1;
-        drop(index);
 
         // Poison the CUSTOM_GAUGE_OBJECTS mutex
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1991,9 +2125,11 @@ mod tests {
             panic!("intentional poison");
         }));
 
-        let gauges = vec![MetricValue { id: gauge_id as i32, value: 42.0 }];
+        // Worker-local per-type ordinal 0; the (model, version) must match
+        // the registration so the record reaches the (poisoned) vec lock.
+        let gauges = vec![MetricValue { id: 0, value: 42.0 }];
         // Must NOT panic — the poisoned lock is recovered via into_inner().
-        record_custom_metrics("poison_cm_m", "1", &gauges, &[], &[]);
+        record_custom_metrics("poison_cm_model", "1", &gauges, &[], &[]);
     }
 
     // ===== P2-1 扩展: GIE/EPP 指标语义对齐 =====
