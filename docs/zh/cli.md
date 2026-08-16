@@ -401,6 +401,11 @@ lite-server profile --model <MODEL> [OPTIONS]
 `--tokenizer`、`--text-field`、`--pace`、`--rt-factor`、`--min-sessions`、
 `--cancel-after`、`--read-delay-ms`。
 
+这些透传参数与 benchmark 共用同一套组合校验（`--pace` 须配 `--bidi`、
+`--stream --transport h2` 会被拒绝、bidi payload 必须是 JSON 数组等）：
+非法组合在任何网络访问之前 exit 2，行为与 `benchmark` 完全一致。
+`--stream`/`--bidi` 与 `--duration`/`--requests` 分别互斥。
+
 **预检门禁（任一失败 → exit 2）**：服务器可达 + 模型已加载 +
 `/metrics` 可读；服务器版本 ≥ 0.8.4（reload_model 磁盘重读修复——已
 发布的 v0.8.4-rc0 tag 早于该修复，被拒绝；rc1+ 与正式版放行）；独占

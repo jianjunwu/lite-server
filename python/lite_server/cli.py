@@ -253,11 +253,12 @@ def main(argv=None):
                                 help="Constraint: bidi chunk-roundtrip p99 budget in ms")
     profile_parser.add_argument("--max-rss-mb", type=float, default=None,
                                 help="Constraint: max process-tree RSS in MB (local servers only)")
-    profile_parser.add_argument("--duration", type=float, default=30.0,
-                                help="Trial duration in seconds (default: 30)")
-    profile_parser.add_argument("--requests", type=int, default=None,
-                                help="Run exactly N requests per trial "
-                                     "(mutually exclusive with --duration)")
+    profile_term_group = profile_parser.add_mutually_exclusive_group()
+    profile_term_group.add_argument("--duration", type=float, default=30.0,
+                                    help="Trial duration in seconds (default: 30)")
+    profile_term_group.add_argument("--requests", type=int, default=None,
+                                    help="Run exactly N requests per trial "
+                                         "(mutually exclusive with --duration)")
     profile_parser.add_argument("--export", default=None,
                                 help="Write per-trial JSON checkpoints + summary to DIR")
     profile_parser.add_argument("--resume", default=None, metavar="DIR",
@@ -286,8 +287,9 @@ def main(argv=None):
                                 help="Restore config.yaml byte-exact from a stale "
                                      ".profile.backup, then exit")
     # Benchmark passthrough (stream/bidi/LLM/TTS/STT scenarios, plan §2.11)
-    profile_parser.add_argument("--stream", action="store_true", default=False)
-    profile_parser.add_argument("--bidi", action="store_true", default=False)
+    profile_stream_group = profile_parser.add_mutually_exclusive_group()
+    profile_stream_group.add_argument("--stream", action="store_true", default=False)
+    profile_stream_group.add_argument("--bidi", action="store_true", default=False)
     profile_parser.add_argument("--model-type", choices=["llm", "tts", "stt", "generic"],
                                 default="llm")
     profile_parser.add_argument("--endpoint", choices=["events", "decoupled"], default="events")
@@ -527,6 +529,48 @@ def _parse_header_args(raw: list[str] | None) -> dict[str, str]:
             )
         headers[name] = value
     return headers
+
+
+def _validate_scenario_args(args) -> str | None:
+    """Scenario-shape validation shared by the benchmark and profile CLIs.
+
+    Returns an error message (callers log it and exit 2), or None when the
+    flag combination is legal. Must run BEFORE any network contact so a bad
+    combination fails fast. Only covers checks that need no parsing or I/O —
+    goodput/tokenizer gates stay with each caller (benchmark builds the
+    token counter; profile defers to validate_objective for constraints).
+
+    ``args.transport`` may be None (profile default) — it is resolved the
+    same way both callers do before any comparison.
+    """
+    transport = args.transport or ("ws" if args.bidi else "sse")
+    if args.bidi:
+        if args.stream:
+            return "--bidi and --stream are mutually exclusive"
+        if transport == "sse":
+            return ("--bidi requires --transport ws, grpc or h2 "
+                    "(sse has no bidi mode)")
+        if args.endpoint != "events":
+            return "--endpoint does not apply to --bidi"
+        if args.rt_factor is not None and args.pace is None:
+            return "--rt-factor requires --pace"
+        if args.payload_random is not None:
+            return ("--payload-random does not apply to --bidi "
+                    "(bidi payload must be a JSON array)")
+        if args.min_sessions < 1:
+            return "--min-sessions must be >= 1"
+    elif args.pace is not None or args.rt_factor is not None:
+        return "--pace/--rt-factor require --bidi"
+    if args.endpoint != "events" and not args.stream and not args.bidi:
+        return "--endpoint requires --stream"
+    if transport != "sse" and not args.stream and not args.bidi:
+        return "--transport requires --stream"
+    if transport == "h2" and args.stream:
+        return "--transport h2 is bidi-only (use --bidi)"
+    if (args.cancel_after is not None or args.read_delay_ms is not None) \
+            and not args.stream:
+        return "--cancel-after/--read-delay-ms require --stream"
+    return None
 
 
 def _resolve_benchmark_payloads(args) -> list[dict]:
@@ -915,29 +959,9 @@ def _cmd_benchmark(args):
         _logger.error("--processes must be >= 1")
         return 2
 
-    if args.bidi:
-        if args.stream:
-            _logger.error("--bidi and --stream are mutually exclusive")
-            return 2
-        if args.transport == "sse":
-            _logger.error("--bidi requires --transport ws, grpc or h2 "
-                          "(sse has no bidi mode)")
-            return 2
-        if args.endpoint != "events":
-            _logger.error("--endpoint does not apply to --bidi")
-            return 2
-        if args.rt_factor is not None and args.pace is None:
-            _logger.error("--rt-factor requires --pace")
-            return 2
-        if args.payload_random is not None:
-            _logger.error("--payload-random does not apply to --bidi "
-                          "(bidi payload must be a JSON array)")
-            return 2
-        if args.min_sessions < 1:
-            _logger.error("--min-sessions must be >= 1")
-            return 2
-    elif args.pace is not None or args.rt_factor is not None:
-        _logger.error("--pace/--rt-factor require --bidi")
+    scenario_err = _validate_scenario_args(args)
+    if scenario_err is not None:
+        _logger.error("%s", scenario_err)
         return 2
 
     if args.max_ttft_ms is not None and not args.stream:
@@ -951,19 +975,6 @@ def _cmd_benchmark(args):
             _logger.error("--max-rtf requires --model-type tts or stt, got %s",
                           args.model_type)
             return 2
-    if args.endpoint != "events" and not args.stream and not args.bidi:
-        _logger.error("--endpoint requires --stream")
-        return 2
-    if args.transport != "sse" and not args.stream and not args.bidi:
-        _logger.error("--transport requires --stream")
-        return 2
-    if args.transport == "h2" and args.stream:
-        _logger.error("--transport h2 is bidi-only (use --bidi)")
-        return 2
-    if (args.cancel_after is not None or args.read_delay_ms is not None) \
-            and not args.stream:
-        _logger.error("--cancel-after/--read-delay-ms require --stream")
-        return 2
 
     # goodput/SLO (批次 4, plan §8.1)
     goodput_slo = None
@@ -1657,6 +1668,50 @@ def _cmd_profile(args):
         print(f"Restored {config_path} byte-exact from backup. Reload the model "
               f"via Admin to re-apply the original config.")
         return 0
+
+    # Scenario-shape validation: the same fail-fast gates benchmark applies
+    # to these passthrough flags, BEFORE any network contact (preflight).
+    scenario_err = _validate_scenario_args(args)
+    if scenario_err is not None:
+        _logger.error("%s", scenario_err)
+        return 2
+    if args.goodput is not None:
+        if not args.stream:
+            _logger.error("--goodput requires --stream")
+            return 2
+        from lite_server.benchmark.stream_metrics import parse_goodput
+
+        try:
+            goodput_slo = parse_goodput(args.goodput)
+        except ValueError as e:
+            _logger.error("--goodput: %s", e)
+            return 2
+        if "tpot" in goodput_slo and args.model_type != "llm":
+            _logger.error("--goodput tpot requires --model-type llm, got %s",
+                          args.model_type)
+            return 2
+    if args.tokenizer is not None:
+        if not args.stream:
+            _logger.error("--tokenizer requires --stream")
+            return 2
+        if args.model_type != "llm":
+            _logger.error("--tokenizer requires --model-type llm, got %s",
+                          args.model_type)
+            return 2
+    elif args.text_field is not None:
+        _logger.error("--text-field requires --tokenizer")
+        return 2
+    if args.bidi:
+        try:
+            bidi_payloads = _resolve_benchmark_payloads(args)
+        except (OSError, ValueError) as e:
+            _logger.error("payload error: %s", e)
+            return 2
+        for p in bidi_payloads:
+            if not isinstance(p, list):
+                _logger.error("--bidi payload must be a JSON array: "
+                              "[open_payload, chunk1, chunk2, ...]")
+                return 2
 
     # Scenario params (plan §2.11): fixed per scenario, not swept
     scenario = {

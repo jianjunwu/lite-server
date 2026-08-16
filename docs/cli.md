@@ -403,6 +403,12 @@ Resource metrics are generic (CPU/RAM, non-GPU) via the Prometheus
 `--tokenizer`, `--text-field`, `--pace`, `--rt-factor`, `--min-sessions`,
 `--cancel-after`, `--read-delay-ms`.
 
+These passthrough flags share benchmark's combination validation (`--pace`
+requires `--bidi`, `--stream --transport h2` is rejected, bidi payloads must
+be JSON arrays, etc.): an invalid combination exits 2 before any network
+contact, exactly as `benchmark` does. `--stream`/`--bidi` and
+`--duration`/`--requests` are mutually exclusive.
+
 **Preflight gates (any failure → exit 2):** server reachable + model loaded +
 `/metrics` readable; server version ≥ 0.8.4 (the reload_model disk re-read
 fix — the tagged v0.8.4-rc0 predates it and is refused; rc1+ and the final
