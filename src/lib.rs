@@ -181,7 +181,11 @@ pub fn run_server(
     );
     info!("Starting lite-server v{}", env!("CARGO_PKG_VERSION"));
     info!("HTTP port: {}", cfg.server.http_port);
-    info!("Metrics port: {}", cfg.server.metrics_port);
+    if cfg.metrics.enabled {
+        info!("Metrics port: {}", cfg.server.metrics_port);
+    } else {
+        info!("Metrics: disabled");
+    }
     info!("Model repo: {}", cfg.model_repository.path);
 
     let server = server::LiteServer::new(cfg);
