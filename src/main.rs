@@ -279,7 +279,11 @@ fn main() {
             debug!("Configuration loaded, log level: {}", cfg.logging.level);
             debug!("Server config: {:?}", cfg.server);
             info!("HTTP port: {}", cfg.server.http_port);
-            info!("Metrics port: {}", cfg.server.metrics_port);
+            if cfg.metrics.enabled {
+                info!("Metrics port: {}", cfg.server.metrics_port);
+            } else {
+                info!("Metrics: disabled");
+            }
             info!("Model repo: {}", cfg.model_repository.path);
 
             // Build tokio runtime with configured thread count（已在上方
