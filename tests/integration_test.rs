@@ -1166,7 +1166,14 @@ async fn test_warmup_enabled_model_loads_and_serves() {
 #[serial]
 async fn test_warmup_failure_marks_version_failed() {
     let base = shared_base().await;
-    let client = reqwest::Client::new();
+    // pool_max_idle_per_host(0): the 5s never-ready wait below idles the
+    // pooled connection right into the server's 5s h1 keepalive reap → the
+    // next request can race the FIN and eat a RST. Dial fresh per request.
+    // Any test reusing one client across a >=5s idle window needs this too.
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap();
 
     // Load returns an error (WorkerCrashed) — do not use load_model (asserts 200).
     let resp = client
