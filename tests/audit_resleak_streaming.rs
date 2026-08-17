@@ -645,38 +645,136 @@ async fn test_rn6_idle_zero_never_reclaims_stalled_stream() {
 
 // ---------------------------------------------------------------------------
 // RN-13: max_inflight admission — the slot must be held for the stream's
-// lifetime. Current behaviour: the guard (http/mod.rs:250-283) only spans
-// next.run, so the slot is released as soon as the SSE headers are produced
-// and every sequential stream slips past the cap. FAIL.
+// lifetime. Deterministic post-fix shape (2026-08-17), no timing bets.
+// Phase 1 holds stream 1 OPEN and fires a concurrent contender — with
+// max_inflight=1 the contender must be rejected (503) while the slot is
+// legitimately held. Phase 2 drops stream 1 and polls for re-admission;
+// disconnect detection rides the K4 keepalive ticker (the boot sets its
+// interval to 1s, mirroring RN-6), so the reclaim lands well inside the 15s
+// poll budget on every platform. The previous shape dropped each stream and
+// bet the server would NOT notice the disconnect within 500ms — CI runners
+// notice faster and the test failed with all-200.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[serial]
-async fn test_rn13_admission_slot_released_at_headers() {
-    let (base, _guard, _repo) = boot("  max_inflight: 1\n  timeout: 30.0", &["stall"]).await;
+async fn test_rn13_admission_slot_held_for_stream_lifetime() {
+    let (base, _guard, _repo) = boot(
+        "  max_inflight: 1\n  timeout: 30.0\n  stream_keepalive_interval_secs: 1.0",
+        &["stall"],
+    )
+    .await;
     wait_ready_all(&base, &["stall"]).await;
-    let mut statuses = Vec::new();
-    for i in 0..5 {
-        let resp = http_client()
+    let open_stream = || {
+        http_client()
             .post(format!("{base}/v2/models/stall/events"))
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .json(&json!({"text": "hi"}))
-            .send()
-            .await
-            .expect("SSE stream must open");
-        statuses.push(resp.status().as_u16());
-        drop(resp); // leave the stalled body undrained
-        if i < 4 {
-            sleep(Duration::from_millis(500)).await;
+    };
+
+    // Phase 1: the slot is held while the stream is alive → contender 503.
+    let resp1 = open_stream().send().await.expect("SSE stream must open");
+    assert_eq!(resp1.status(), 200);
+    let contender = open_stream()
+        .send()
+        .await
+        .expect("contender request must complete");
+    assert_eq!(
+        contender.status(),
+        503,
+        "RN-13: with max_inflight=1 a second request must be rejected while \
+         the first stream holds the admission slot"
+    );
+    drop(contender);
+
+    // Phase 2: client disconnect → keepalive send fails → slot reclaimed →
+    // a later stream is admitted again.
+    drop(resp1);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let resp = open_stream().send().await.expect("probe request must complete");
+        let status = resp.status().as_u16();
+        drop(resp);
+        if status == 200 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "RN-13: the admission slot was not reclaimed within 15s of the \
+             client disconnect"
+        );
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RN-13 (WS): same contract on the WS transport. The upgrade handler runs
+// BEFORE the on_upgrade future, so the guard must be taken before the 101
+// response is produced — a take inside the upgrade future deterministically
+// loses to the middleware's post-next.run reclaim (the 21908c0 regression).
+// Phase 1: one open WS stream + a concurrent upgrade → 503 (tungstenite
+// surfaces it as Error::Http). Phase 2: after the first stream disconnects,
+// a later upgrade is admitted (poll — the reclaim rides the reader's
+// disconnect detection, no fixed sleep).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn test_rn13_ws_admission_slot_held_for_stream_lifetime() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (base, _guard, _repo) = boot(
+        "  max_inflight: 1\n  timeout: 30.0\n  stream_keepalive_interval_secs: 1.0",
+        &["stall"],
+    )
+    .await;
+    wait_ready_all(&base, &["stall"]).await;
+    let http_port = port_of(&base);
+    let ws_url = format!("ws://127.0.0.1:{http_port}/v2/models/stall/stream");
+
+    // Phase 1: the slot is held while stream 1 is alive → second upgrade 503.
+    let (mut ws1, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect");
+    ws1.send(Message::Text(r#"{"text":"hi"}"#.to_string()))
+        .await
+        .expect("send first frame");
+    match tokio_tungstenite::connect_async(&ws_url).await {
+        Ok(_) => panic!(
+            "RN-13: with max_inflight=1 a second WS upgrade must be rejected \
+             while the first stream holds the admission slot"
+        ),
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            assert_eq!(
+                resp.status(),
+                503,
+                "RN-13: the contending WS upgrade must be rejected with 503"
+            );
+        }
+        Err(e) => panic!("unexpected WS connect error: {e}"),
+    }
+
+    // Phase 2: disconnect → the slot is reclaimed → a later upgrade succeeds.
+    drop(ws1);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match tokio_tungstenite::connect_async(&ws_url).await {
+            Ok((ws, _)) => {
+                drop(ws);
+                break;
+            }
+            Err(_) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "RN-13: the admission slot was not reclaimed within 15s of \
+                     the WS disconnect"
+                );
+                sleep(Duration::from_millis(500)).await;
+            }
         }
     }
-    assert!(
-        statuses.contains(&503),
-        "RN-13: with max_inflight=1 the admission slot must be held for the stream's \
-         lifetime — all 5 sequential SSE streams returned 200; the slot was released \
-         when the headers were produced: {statuses:?}"
-    );
 }
 
 // ---------------------------------------------------------------------------

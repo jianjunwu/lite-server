@@ -513,14 +513,20 @@ async fn sse_infer_impl(
         None
     };
 
+    // RN-13 (D9-A): take the admission guard BEFORE the response is
+    // produced. The middleware reclaims the transfer cell immediately after
+    // next.run returns, so a take() inside the spawned forward task races
+    // that reclaim and loses it (the 21908c0 regression: the slot was
+    // dropped when the headers were produced). None when the path did not
+    // carry one — cap 0 / unit tests.
+    let admission_guard = slot.take();
+
     tokio::spawn(async move {
         // P10 (D40): held for the forward task's lifetime — released on drop
         // (terminal frame / idle / disconnect; same path as D18 teardown).
         let _ensemble_permit = ensemble_permit;
-        // RN-13 (D9-A): the admission slot is held for the stream's lifetime
-        // (taken from the middleware's transfer cell; None when the path did
-        // not carry one — cap 0 / unit tests).
-        let _admission_guard = slot.take();
+        // RN-13 (D9-A): the admission slot is held for the stream's lifetime.
+        let _admission_guard = admission_guard;
         let open_time = std::time::Instant::now();
         let mut first_chunk = true;
         let mut last_chunk_time = open_time;
@@ -845,7 +851,13 @@ pub async fn ws_stream_handler(
     if !crate::http::cors::ws_origin_allowed(&state, &model_name, None, &headers) {
         return (axum::http::StatusCode::FORBIDDEN, "WebSocket Origin not allowed").into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, headers, socket, cx, slot, false))
+    // RN-13 (D9-A): take the guard BEFORE the upgrade response is produced —
+    // the on_upgrade future runs after the middleware's post-next.run
+    // reclaim, so a take() inside handle_ws_stream deterministically loses
+    // the guard (the 21908c0 regression). Early rejects above leave the
+    // guard in the cell for the middleware to reclaim.
+    let admission_guard = slot.take();
+    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, headers, socket, cx, admission_guard, false))
 }
 
 pub async fn ws_stream_version_handler(
@@ -865,7 +877,10 @@ pub async fn ws_stream_version_handler(
     if !crate::http::cors::ws_origin_allowed(&state, &model_name, Some(&version), &headers) {
         return (axum::http::StatusCode::FORBIDDEN, "WebSocket Origin not allowed").into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), headers, socket, cx, slot, false))
+    // RN-13 (D9-A): take the guard before the upgrade response (see
+    // ws_stream_handler).
+    let admission_guard = slot.take();
+    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), headers, socket, cx, admission_guard, false))
 }
 
 // ===== WS Decoupled =====
@@ -884,7 +899,10 @@ pub async fn ws_decoupled_handler(
     if !crate::http::cors::ws_origin_allowed(&state, &model_name, None, &headers) {
         return (axum::http::StatusCode::FORBIDDEN, "WebSocket Origin not allowed").into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, headers, socket, cx, slot, true))
+    // RN-13 (D9-A): take the guard before the upgrade response (see
+    // ws_stream_handler).
+    let admission_guard = slot.take();
+    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, None, headers, socket, cx, admission_guard, true))
 }
 
 pub async fn ws_decoupled_version_handler(
@@ -904,7 +922,10 @@ pub async fn ws_decoupled_version_handler(
     if !crate::http::cors::ws_origin_allowed(&state, &model_name, Some(&version), &headers) {
         return (axum::http::StatusCode::FORBIDDEN, "WebSocket Origin not allowed").into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), headers, socket, cx, slot, true))
+    // RN-13 (D9-A): take the guard before the upgrade response (see
+    // ws_stream_handler).
+    let admission_guard = slot.take();
+    ws.on_upgrade(move |socket| handle_ws_stream(state, model_name, Some(version), headers, socket, cx, admission_guard, true))
 }
 
 /// §4.4: WS error frame + close (the connection already upgraded — there is
@@ -1152,7 +1173,7 @@ async fn handle_ws_stream(
     mut headers: HeaderMap,
     mut socket: WebSocket,
     cx: RequestContext,
-    slot: crate::admission::AdmissionSlot,
+    admission_guard: Option<crate::admission::AdmissionGuard>,
     decoupled: bool,
 ) {
     // S1(b)/D7:握手后早退也计一次请求(WS 已升级 101 无 HTTP status,family
@@ -1738,9 +1759,10 @@ async fn handle_ws_stream(
         // (terminal frame / idle / disconnect; D18 teardown path).
         let _ensemble_permit = ensemble_permit;
         // RN-13 (D9-A): the admission slot is held for the stream's lifetime
-        // (taken from the middleware's transfer cell; None when the path did
-        // not carry one — cap 0 / unit tests).
-        let _admission_guard = slot.take();
+        // (taken synchronously by the upgrade handler before the 101 was
+        // produced; None when the path did not carry one — cap 0 / unit
+        // tests). Early returns above dropped it, releasing the slot.
+        let _admission_guard = admission_guard;
         let open_time = stream_open_time;
         let mut first_chunk = true;
         let mut last_chunk_time = open_time;

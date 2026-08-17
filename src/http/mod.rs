@@ -323,9 +323,10 @@ async fn admission_middleware(
     // guard after `next.run` — unary handlers never take it out (their
     // extractors drop the request extensions before the inference runs), so
     // reclaiming here is what holds the slot until the response is produced.
-    // Streaming handlers already took the guard, so `take()` returns None and
-    // the stream task keeps it. `take()` is idempotent, so the guard drops
-    // exactly once either way.
+    // Streaming handlers MUST take() synchronously, before their response is
+    // produced: a take() inside a spawned/upgrade task runs after this
+    // reclaim and loses the guard (the 21908c0 SSE/WS regression). `take()`
+    // is idempotent, so the guard drops exactly once either way.
     let slot = crate::admission::AdmissionSlot::with_guard(guard);
     request.extensions_mut().insert(slot.clone());
     let response = next.run(request).await;
