@@ -237,6 +237,17 @@ lazy_static! {
         &["model", "version", "reason"]
     ).unwrap();
 
+    /// Respawn attempts that FAILED (spawn/handshake of the replacement) —
+    /// WORKER_RESPAWNS_TOTAL counts successes only, so without this a worker
+    /// that can never come back is invisible in metrics (only a log line).
+    pub static ref WORKER_RESPAWN_FAILURES_TOTAL: CounterVec = CounterVec::new(
+        prometheus::Opts::new(
+            "liteserver_worker_respawn_failures_total",
+            "Total failed worker respawn attempts"
+        ),
+        &["model", "version", "reason"]
+    ).unwrap();
+
     // Shutdown tracking
     pub static ref SHUTDOWN_PENDING_REQUESTS: prometheus::IntGauge = prometheus::IntGauge::new(
         "liteserver_shutdown_pending_requests",
@@ -460,6 +471,7 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(WORKER_HEALTH_STATUS.clone()))?;
     REGISTRY.register(Box::new(WORKER_INFERENCE_TOTAL.clone()))?;
     REGISTRY.register(Box::new(WORKER_RESPAWNS_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(WORKER_RESPAWN_FAILURES_TOTAL.clone()))?;
     REGISTRY.register(Box::new(SHUTDOWN_PENDING_REQUESTS.clone()))?;
     // P10 (D40) + m4: ensemble streaming capacity gauge and batch-0/1
     // histograms — unregistered collectors never reach /metrics.
@@ -1004,6 +1016,7 @@ pub fn remove_version_metrics(model: &str, version: &str) {
     purge!(WORKERS_RSS_BYTES, "liteserver_workers_resident_memory_bytes", ["model", "version"]);
     purge!(WORKER_INFERENCE_TOTAL, "liteserver_worker_inference_total", ["model", "version", "worker_id"]);
     purge!(WORKER_RESPAWNS_TOTAL, "liteserver_worker_respawns_total", ["model", "version", "reason"]);
+    purge!(WORKER_RESPAWN_FAILURES_TOTAL, "liteserver_worker_respawn_failures_total", ["model", "version", "reason"]);
     purge!(IN_FLIGHT_REQUESTS, "liteserver_in_flight_requests", ["model", "version"]);
     purge!(QUEUE_WAIT_SECONDS, "liteserver_queue_wait_seconds", ["model", "version"]);
     purge!(WORKER_SATURATION, "liteserver_worker_saturation", ["model", "version"]);

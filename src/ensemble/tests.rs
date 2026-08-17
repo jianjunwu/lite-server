@@ -3631,3 +3631,241 @@ async fn p6_warm_covers_dags_form_sub_models() {
 
     let _ = tokio::fs::remove_dir_all(&tmp).await;
 }
+
+// === §4.4 contract: a mid-chain hop failure must reach the client as an
+// Error frame — never as a clean EOF (channel close reads as normal
+// completion downstream and synthesizes a Done). ===
+
+fn chain_consumer_state() -> Arc<crate::http::state::AppState> {
+    let cb = Arc::new(crate::callback::CallbackRunner::new());
+    let registry = Arc::new(crate::registry::ModelRegistry::new());
+    let queue = Arc::new(crate::inference_queue::InferenceQueue::new());
+    let wm = Arc::new(crate::worker::WorkerManager::new(
+        registry.clone(),
+        std::path::PathBuf::new(),
+        queue.clone(),
+        "warn".to_string(),
+        cb.clone(),
+    ));
+    Arc::new(crate::http::state::AppState::new(
+        registry,
+        wm,
+        queue,
+        crate::config::Config::default(),
+        std::path::PathBuf::new(),
+        cb,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        Arc::new(crate::rate_limit::RateLimiter::default()),
+    ))
+}
+
+/// Two streaming steps: head "pre" → tail "tail" (model "ghost", never
+/// registered — version resolution fails inside execute_stream_step).
+fn chain_consumer_plan() -> EnsemblePlan {
+    let mk_step = |name: &str, model: &str| EnsembleStep {
+        name: name.to_string(),
+        model: model.to_string(),
+        version: None,
+        inputs: HashMap::new(),
+        stream: true,
+        params: HashMap::new(),
+        timeout_secs: None,
+        on_error: OnErrorKind::Fail,
+        retries: 0,
+        outputs_decl: None,
+        when: None,
+    };
+    EnsemblePlan {
+        steps: vec![mk_step("pre", "pre_m"), mk_step("tail", "ghost")],
+        layers: Vec::new(),
+        output_step: 1,
+        output_field: None,
+        chains: Vec::new(),
+        inputs_decl: None,
+        input_modes: Vec::new(),
+        conditional_refs: Vec::new(),
+        step_dep_keys: vec![Vec::new(), Vec::new()],
+        step_raw_eligible: Vec::new(),
+        outputs: None,
+        dag_sets: None,
+        config_path: PathBuf::from("/chain-consumer-test"),
+        source_mtime: None,
+    }
+}
+
+struct ConsumerHarness {
+    up_tx: tokio::sync::mpsc::Sender<pb::StreamResponse>,
+    down_rx: tokio::sync::mpsc::Receiver<pb::StreamResponse>,
+    run: std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>>>>,
+}
+
+fn chain_consumer_harness() -> ConsumerHarness {
+    chain_consumer_harness_with(chain_consumer_state(), chain_consumer_plan())
+}
+
+fn chain_consumer_harness_with(
+    state: Arc<crate::http::state::AppState>,
+    plan: EnsemblePlan,
+) -> ConsumerHarness {
+    let plan = Arc::new(plan);
+    let (up_tx, up_rx) = tokio::sync::mpsc::channel(4);
+    let (down_tx, down_rx) = tokio::sync::mpsc::channel(4);
+    let handles = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let snapshot = Arc::new(VersionSnapshot::default());
+    let ctx: HashMap<String, EnsembleValue> = HashMap::new();
+    let opts = EnsembleExecOpts {
+        client_ip: String::new(),
+        deadline_unix_ns: None,
+        decoupled: false,
+        dag_selector: None,
+    };
+    let run = Box::pin(async move {
+        consume_stream_consumer(
+            &state, &plan, 1, "pre", up_rx, down_tx, &ctx, "req-1", &opts, None,
+            &handles, true, &snapshot,
+        )
+        .await
+    });
+    ConsumerHarness { up_tx, down_rx, run }
+}
+
+fn chunk_frame(data: &'static [u8]) -> pb::StreamResponse {
+    pb::StreamResponse {
+        stream_id: "s1".to_string(),
+        payload: Some(pb::stream_response::Payload::Chunk(pb::StreamChunkResponse {
+            data: Bytes::from_static(data),
+            is_final: false,
+        })),
+    }
+}
+
+#[tokio::test]
+async fn chain_consumer_invalid_json_chunk_emits_error_frame() {
+    let mut h = chain_consumer_harness();
+    h.up_tx.send(chunk_frame(b"not-json{")).await.unwrap();
+    drop(h.up_tx);
+
+    let res = h.run.await;
+    assert!(
+        res.is_ok(),
+        "a hop failure must be terminated in-band (Error frame), not propagated: {res:?}"
+    );
+
+    let frame = h.down_rx.recv().await.expect("an Error frame must reach downstream");
+    match frame.payload {
+        Some(pb::stream_response::Payload::Error(e)) => {
+            assert!(
+                e.message.contains("not valid JSON"),
+                "the validation failure must be described in the frame: {}",
+                e.message
+            );
+        }
+        other => panic!("expected an Error frame, got {other:?}"),
+    }
+    assert!(
+        h.down_rx.recv().await.is_none(),
+        "no Done may be synthesized after an Error frame"
+    );
+}
+
+#[tokio::test]
+async fn chain_consumer_sub_stream_open_failure_emits_error_frame() {
+    let mut h = chain_consumer_harness();
+    h.up_tx.send(chunk_frame(br#"{"text":"hi"}"#)).await.unwrap();
+    drop(h.up_tx);
+
+    let res = h.run.await;
+    assert!(
+        res.is_ok(),
+        "a sub-stream open failure must be terminated in-band (Error frame), not propagated: {res:?}"
+    );
+
+    let frame = h.down_rx.recv().await.expect("an Error frame must reach downstream");
+    match frame.payload {
+        Some(pb::stream_response::Payload::Error(e)) => {
+            assert!(
+                e.message.contains("ghost"),
+                "the failed sub-model must be named in the frame: {}",
+                e.message
+            );
+        }
+        other => panic!("expected an Error frame, got {other:?}"),
+    }
+    assert!(
+        h.down_rx.recv().await.is_none(),
+        "no Done may be synthesized after an Error frame"
+    );
+}
+
+/// Crash-death fail-fast (streaming face): with every worker of the tail
+/// sub-model dead, the hop must surface an Error frame IMMEDIATELY — not
+/// spin the D19 readiness poll to timeout.
+#[tokio::test]
+async fn chain_consumer_dead_sub_model_fails_fast_with_error_frame() {
+    let state = chain_consumer_state();
+    state
+        .registry
+        .register(
+            "ghost",
+            "1",
+            crate::config::ModelConfig::default(),
+            crate::registry::types::ModelType::LitAPI,
+            std::path::PathBuf::new(),
+        )
+        .unwrap();
+    state.registry.mark_ready("ghost", "1").unwrap();
+    state
+        .registry
+        .set_workers(
+            "ghost",
+            "1",
+            vec![crate::registry::types::WorkerInfo {
+                worker_id: 0,
+                device: "cpu:0".to_string(),
+                endpoint: String::new(),
+                pid: None,
+                status: crate::registry::types::WorkerStatus::Ready,
+                capacity: None,
+            }],
+        )
+        .unwrap();
+    let endpoint = format!(
+        "ipc://{}",
+        std::env::temp_dir()
+            .join(format!("chain-dead-{}.sock", std::process::id()))
+            .display()
+    );
+    let client = Arc::new(crate::transport::zmq::WorkerZmqClient::new(endpoint));
+    state
+        .worker_manager
+        .insert_zmq_clients_for_test("ghost", "1", vec![client])
+        .await;
+    let outlier = Arc::new(crate::inference_queue::OutlierState::new(1));
+    outlier.mark_dead(0);
+    state
+        .worker_manager
+        .insert_outlier_for_test("ghost", "1", outlier)
+        .await;
+
+    let mut plan = chain_consumer_plan();
+    plan.steps[1].version = Some("1".to_string());
+    let mut h = chain_consumer_harness_with(state, plan);
+    h.up_tx.send(chunk_frame(br#"{"text":"hi"}"#)).await.unwrap();
+    drop(h.up_tx);
+
+    tokio::time::timeout(Duration::from_secs(5), h.run)
+        .await
+        .expect("a dead sub-model must fail fast, not spin the readiness poll")
+        .expect("hop failure terminated in-band");
+    let frame = h.down_rx.recv().await.expect("an Error frame must reach downstream");
+    match frame.payload {
+        Some(pb::stream_response::Payload::Error(e)) => {
+            assert!(
+                e.message.contains("ghost"),
+                "the dead sub-model must be named in the frame: {}",
+                e.message
+            );
+        }
+        other => panic!("expected an Error frame, got {other:?}"),
+    }
+}

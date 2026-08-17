@@ -218,7 +218,14 @@ impl GrpcService {
                 model_name,
                 &resolved_version,
             )
-            .map_err(|e| err(Status::invalid_argument(e.0)))?;
+            .map_err(|e| match e {
+                crate::worker::PickError::InvalidPin(msg) => {
+                    err(Status::invalid_argument(msg))
+                }
+                crate::worker::PickError::NoLiveWorkers(msg) => {
+                    err(crate::grpc::with_retry_after(Status::unavailable(msg), 1))
+                }
+            })?;
             let client = clients[worker_id].clone();
             // P6 GetModelStats: one streaming inference dispatched to this worker.
             crate::metrics::prometheus::record_worker_inference(
@@ -271,7 +278,17 @@ impl GrpcService {
             crate::metrics::prometheus::record_stream_open(&metrics_model, &metrics_version, "grpc", &stream_id, false);
         }
 
+        // Panic收口 (detached spawn 无人 join):catch_forward_panic 保证 panic
+        // 时仍记 Panic 终态指标 + 取消 worker 流(对齐 WS 适配器的 join 臂)。
+        let panic_model = metrics_model.clone();
+        let panic_version = metrics_version.clone();
+        let panic_chain = ensemble_chain.clone();
+        let panic_abort = ensemble_abort.clone();
+        let panic_stream_id = stream_id.clone();
+        let panic_cancel_client = cancel_client.clone();
+        let panic_start = start;
         tokio::spawn(async move {
+            crate::streaming::catch_forward_panic("grpc", async move {
             // P10 (D40): held for the forward task's lifetime — released on
             // drop (terminal frame / idle / disconnect; D18 teardown path).
             let _ensemble_permit = ensemble_permit;
@@ -450,6 +467,33 @@ impl GrpcService {
                 let cancel_req = streaming::build_stream_cancel(stream_id);
                 let _ = cancel_client.send_raw(cancel_req).await;
             }
+            }, move || async move {
+                // Panic臂 (WS 同款):补记 Panic 终态 + 取消 worker 流。
+                crate::metrics::prometheus::record_stream_terminal(
+                    &panic_model,
+                    &panic_version,
+                    "grpc",
+                    "grpc_stream",
+                    panic_start,
+                    crate::metrics::prometheus::StreamCloseReason::Panic.status_family(),
+                    crate::metrics::prometheus::StreamCloseReason::Panic,
+                    stream_metrics,
+                    0,
+                    0,
+                );
+                if is_ensemble {
+                    crate::ensemble::cancel_chain(
+                        panic_chain.as_ref(),
+                        panic_abort.as_ref(),
+                        &panic_stream_id,
+                        &panic_cancel_client,
+                    )
+                    .await;
+                } else {
+                    let cancel_req = streaming::build_stream_cancel(panic_stream_id);
+                    let _ = panic_cancel_client.send_raw(cancel_req).await;
+                }
+            }).await;
         }
         .instrument(span));
 

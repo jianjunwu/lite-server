@@ -893,7 +893,10 @@ async fn tail_stream_preflight(
     let seq_registry = state.inference_queue.sequence_registry();
     let worker_id = crate::worker::pick_streaming_worker(
         &meta, mv.workers.len(), outlier.as_deref(), seq_registry, &step.model, &resolved_version,
-    ).map_err(|e| AppError::Validation(e.0))?;
+    ).map_err(|e| match e {
+        crate::worker::PickError::InvalidPin(msg) => AppError::Validation(msg),
+        crate::worker::PickError::NoLiveWorkers(msg) => AppError::WorkerCrashed(msg),
+    })?;
     if worker_id >= clients.len() {
         return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
     }
@@ -1009,7 +1012,7 @@ pub(crate) fn validate_pipeline_chunk(prev_step_name: &str, data: &[u8]) -> Resu
 /// downstream send cancels this step's worker; the chain-handle list is
 /// updated per sub-stream (tail inserted at index 0, others appended).
 #[allow(clippy::too_many_arguments)] // chain-hop plumbing: state+plan+ctx+ids ride together by design
-async fn consume_stream_consumer(
+pub(crate) async fn consume_stream_consumer(
     state: &Arc<AppState>,
     plan: &EnsemblePlan,
     step_idx: usize,
@@ -1039,18 +1042,52 @@ async fn consume_stream_consumer(
                 // guarantees whole-reference-only consumption — the downstream
                 // assembly splices the original bytes, no per-chunk parse).
                 // C5: raw splicing requires well-formed JSON — validate.
-                validate_pipeline_chunk(prev_step_name, &c.data)?;
+                if let Err(e) = validate_pipeline_chunk(prev_step_name, &c.data) {
+                    // §4.4: a mid-stream failure must reach the client as an
+                    // Error frame. Propagating Err here would drop the
+                    // downstream sender — a channel close reads as NORMAL
+                    // completion to the next hop (which then synthesizes a
+                    // Done), turning the failure into a silent clean EOF.
+                    let _ = downstream
+                        .send(pb::StreamResponse {
+                            stream_id: String::new(),
+                            payload: Some(pb::stream_response::Payload::Error(pb::StreamError {
+                                message: e.to_string(),
+                            })),
+                        })
+                        .await;
+                    error_terminated = true;
+                    break;
+                }
                 let mut ctx = base_ctx.clone();
                 ctx.insert(
                     prev_step_name.to_string(),
                     EnsembleValue::RawJson(Arc::new(RawJsonValue::new(c.data.clone()))),
                 );
                 let sub_request_id = format!("{}:{}:{}", request_id, step.name, seq);
-                let sub = execute_stream_step(
+                let sub = match execute_stream_step(
                     state, plan, step_idx, &ctx, &sub_request_id, opts, deadline_unix_ns, None,
                     snapshot,
                 )
-                .await?;
+                .await
+                {
+                    Ok(sub) => sub,
+                    Err(e) => {
+                        // §4.4: same contract as the validation arm above —
+                        // the open failure becomes an Error frame, never a
+                        // silent clean EOF.
+                        let _ = downstream
+                            .send(pb::StreamResponse {
+                                stream_id: String::new(),
+                                payload: Some(pb::stream_response::Payload::Error(pb::StreamError {
+                                    message: e.to_string(),
+                                })),
+                            })
+                            .await;
+                        error_terminated = true;
+                        break;
+                    }
+                };
                 {
                     let mut handles = chain_handles.lock().unwrap();
                     let handle = StreamHandle {
@@ -1460,6 +1497,21 @@ async fn execute_stream_step(
             let max_retries = 30;
             let mut delay = Duration::from_millis(50);
             while !streaming_worker_ready(state, &step.model, &resolved_version, &pb::RequestMeta::default()).await {
+                // Crash-death gate: a sub-model whose workers have all
+                // exited can never become ready — fail fast instead of
+                // spinning the D19 poll to exhaustion.
+                if let Some(o) = state
+                    .worker_manager
+                    .get_outlier_state(&step.model, &resolved_version)
+                    .await
+                {
+                    if o.all_dead() {
+                        return Err(AppError::WorkerCrashed(format!(
+                            "ensemble step {}: all workers for sub-model {} v{} have exited",
+                            step.name, step.model, resolved_version
+                        )));
+                    }
+                }
                 if retries >= max_retries {
                     return Err(AppError::ModelNotReady(format!(
                         "sub-model {} v{} streaming not ready", step.model, resolved_version
@@ -1524,7 +1576,10 @@ async fn execute_stream_step(
             let seq_registry = state.inference_queue.sequence_registry();
             let worker_id = crate::worker::pick_streaming_worker(
                 &meta, mv.workers.len(), outlier.as_deref(), seq_registry, &step.model, &resolved_version,
-            ).map_err(|e| AppError::Validation(e.0))?;
+            ).map_err(|e| match e {
+        crate::worker::PickError::InvalidPin(msg) => AppError::Validation(msg),
+        crate::worker::PickError::NoLiveWorkers(msg) => AppError::WorkerCrashed(msg),
+    })?;
             if worker_id >= clients.len() {
                 return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
             }
@@ -1757,7 +1812,10 @@ async fn repick_streaming_worker(
     let worker_id = crate::worker::pick_streaming_worker(
         meta, mv.workers.len(), outlier.as_deref(), seq_registry, &step.model, resolved_version,
     )
-    .map_err(|e| AppError::Validation(e.0))?;
+    .map_err(|e| match e {
+        crate::worker::PickError::InvalidPin(msg) => AppError::Validation(msg),
+        crate::worker::PickError::NoLiveWorkers(msg) => AppError::WorkerCrashed(msg),
+    })?;
     if worker_id >= clients.len() {
         return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
     }

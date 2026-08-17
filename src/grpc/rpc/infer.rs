@@ -294,6 +294,11 @@ impl GrpcService {
                 // （对齐 HTTP 400，客户端错误不落 5xx）。
                 return Err(err(Status::invalid_argument(msg)));
             }
+            Err(crate::inference_queue::QueueError::NoLiveWorkers(msg)) => {
+                // Crash-death gate: every worker process has exited →
+                // Unavailable（对齐 HTTP 503 fail-fast）。
+                return Err(err(with_retry_after(Status::unavailable(msg), 1)));
+            }
             Err(_) => {
                 return Err(err(Status::unavailable(format!(
                     "queue not available for {} {}",

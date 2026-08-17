@@ -384,6 +384,13 @@ async fn do_infer(
             record_reject(&resolved_version, &e);
             return Err(e);
         }
+        Err(crate::inference_queue::QueueError::NoLiveWorkers(msg)) => {
+            // Crash-death gate: every worker process has exited → 503
+            // fail-fast（而非挂到 request_timeout）。
+            let e = AppError::ModelNotReady(msg);
+            record_reject(&resolved_version, &e);
+            return Err(e);
+        }
         Err(_) => {
             let e = AppError::ModelNotReady(format!(
                 "Queue not available for {} {}", model_name, resolved_version

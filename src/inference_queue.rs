@@ -8,7 +8,7 @@ use crate::sequence::SequenceRegistry;
 use crate::transport::zmq::WorkerZmqClient;
 use dashmap::DashMap;
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::sync::Mutex;
@@ -88,6 +88,11 @@ pub enum QueueError {
     /// clear error (HTTP 400 / gRPC InvalidArgument) instead of silently
     /// rerouting deep in the collector.
     InvalidWorker(String),
+    /// Every worker process of the version has exited (crash monitor
+    /// observed; no live peer can ever reply). Rejected at submit so the
+    /// request fails fast (HTTP 503 / gRPC Unavailable) instead of hanging
+    /// until request_timeout on a dead PAIR socket.
+    NoLiveWorkers(String),
 }
 
 impl std::fmt::Display for QueueError {
@@ -97,6 +102,7 @@ impl std::fmt::Display for QueueError {
             QueueError::NotFound => write!(f, "queue not found for model"),
             QueueError::Full => write!(f, "queue full"),
             QueueError::InvalidWorker(msg) => write!(f, "invalid direct worker pin: {msg}"),
+            QueueError::NoLiveWorkers(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -123,6 +129,12 @@ struct WorkerOutlier {
     /// whole point is bounding kill+respawn loops across replacements; only a
     /// demonstrated-healthy worker (record_success) ends the streak.
     consecutive_kills: AtomicUsize,
+    /// Process liveness (set by the worker monitor on Crash/Killed). Unlike
+    /// ejection this NEVER time-recovers: a dead process stays unroutable
+    /// until `reset` (its replacement has spawned). Kept separate from the
+    /// circuit breaker so health probing / kill escalation keep their
+    /// existing semantics for dead workers.
+    dead: AtomicBool,
 }
 
 /// Configurable outlier-ejection parameters (§3). `Default` preserves the prior
@@ -177,6 +189,7 @@ impl OutlierState {
                     ejection_series: AtomicUsize::new(0),
                     ejected: Mutex::new(None),
                     consecutive_kills: AtomicUsize::new(0),
+                    dead: AtomicBool::new(false),
                 })
                 .collect(),
             consecutive_threshold: config.error_threshold,
@@ -249,9 +262,39 @@ impl OutlierState {
         if let Some(w) = self.workers.get(worker_idx) {
             w.consecutive_errors.store(0, Ordering::Relaxed);
             w.ejection_series.store(0, Ordering::Relaxed);
+            // The replacement process is alive: clear liveness too.
+            w.dead.store(false, Ordering::Relaxed);
             let mut guard = w.ejected.lock().unwrap_or_else(|e| e.into_inner());
             *guard = None;
         }
+    }
+
+    /// Mark the worker's process as dead (crash monitor observed a non-clean
+    /// exit). Routing must skip dead workers; unlike ejection there is no
+    /// time-based recovery — only `reset` (a spawned replacement) revives the
+    /// slot. Deliberately does NOT eject: the health checker's kill+respawn
+    /// escalation must keep observing the dead worker.
+    pub fn mark_dead(&self, worker_idx: usize) {
+        if let Some(w) = self.workers.get(worker_idx) {
+            if !w.dead.swap(true, Ordering::Relaxed) {
+                info!("Worker {worker_idx} marked dead (process exited); excluded from routing");
+            }
+        }
+    }
+
+    /// Is the worker's process known to be dead? (false for unknown index)
+    pub fn is_dead(&self, worker_idx: usize) -> bool {
+        self.workers
+            .get(worker_idx)
+            .map(|w| w.dead.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+
+    /// Every worker's process is dead — submissions must fail fast instead
+    /// of routing to a peer that can never reply. False when the model has
+    /// no workers (that case has its own "no workers available" path).
+    pub fn all_dead(&self) -> bool {
+        !self.workers.is_empty() && self.workers.iter().all(|w| w.dead.load(Ordering::Relaxed))
     }
 
     /// Record an error — increment the consecutive error count, ejecting the
@@ -850,11 +893,20 @@ impl InferenceQueue {
                         entry.worker_count
                     )));
                 }
-                if entry.outlier.is_ejected(w) {
+                if entry.outlier.is_ejected(w) || entry.outlier.is_dead(w) {
                     return Err(QueueError::InvalidWorker(format!(
-                        "x-lite-worker-id {w} is ejected for {model_name} {version}"
+                        "x-lite-worker-id {w} is ejected or dead for {model_name} {version}"
                     )));
                 }
+            }
+            // Crash-death gate: with every worker process dead, a submission
+            // could only ever hang until request_timeout on a silent PAIR
+            // socket — reject BEFORE counting so the rejection consumes no
+            // capacity (same rule as the pin check above).
+            if entry.outlier.all_dead() {
+                return Err(QueueError::NoLiveWorkers(format!(
+                    "all workers for {model_name} {version} have exited"
+                )));
             }
             (entry.tx.clone(), entry.inflight_requests.clone())
         };
@@ -908,6 +960,12 @@ fn pick_worker_least_loaded(
     let mut best_excluded: Option<(usize, usize)> = None;
 
     for (i, counter) in inflight.iter().enumerate() {
+        // A dead process can never reply — it is not a fallback candidate at
+        // all (unlike ejected, which half-open recovers). all-dead batches
+        // never reach pick: do_send_batch gates on all_dead first.
+        if outlier.is_dead(i) {
+            continue;
+        }
         let load = counter.load(Ordering::Relaxed);
         // `exclude` holds workers that already failed this retry cycle —
         // soft-avoid them so a retry lands on a different worker, but keep
@@ -1032,7 +1090,12 @@ fn pick_worker(
         return 0;
     }
     match preferred {
-        Some(w) if w < inflight.len() && !outlier.is_ejected(w) && !exclude.contains(&w) => {
+        Some(w)
+            if w < inflight.len()
+                && !outlier.is_ejected(w)
+                && !outlier.is_dead(w)
+                && !exclude.contains(&w) =>
+        {
             if affinity_overloaded(inflight, outlier, exclude, w, balance) {
                 power_of_two_pick(inflight, outlier, exclude)
             } else {
@@ -1055,7 +1118,7 @@ fn affinity_overloaded(
 ) -> bool {
     let mut min = usize::MAX;
     for (i, c) in inflight.iter().enumerate() {
-        if i == w || outlier.is_ejected(i) || exclude.contains(&i) {
+        if i == w || outlier.is_ejected(i) || outlier.is_dead(i) || exclude.contains(&i) {
             continue;
         }
         let l = c.load(Ordering::Relaxed);
@@ -1089,7 +1152,7 @@ fn power_of_two_pick(
     exclude: &[usize],
 ) -> usize {
     let live: Vec<usize> = (0..inflight.len())
-        .filter(|&i| !outlier.is_ejected(i) && !exclude.contains(&i))
+        .filter(|&i| !outlier.is_ejected(i) && !outlier.is_dead(i) && !exclude.contains(&i))
         .collect();
     if live.len() < 2 {
         return pick_worker_least_loaded(inflight, outlier, exclude);
@@ -1124,7 +1187,7 @@ pub(crate) fn rendezvous_pick(
     use std::hash::{Hash, Hasher};
     let mut best: Option<(u64, usize)> = None;
     for i in 0..num_workers {
-        if outlier.is_ejected(i) || exclude.contains(&i) {
+        if outlier.is_ejected(i) || outlier.is_dead(i) || exclude.contains(&i) {
             continue;
         }
         let mut h = DefaultHasher::new();
@@ -1309,6 +1372,27 @@ async fn do_send_batch(
             )),
         });
     }
+    // Crash-death gate: items accepted before the last worker died must not
+    // dispatch to a dead peer (the send would hang until request_timeout).
+    // Same structured-503 convention as the 0-worker guard above.
+    if outlier.all_dead() {
+        return Err(BatchError {
+            worker_idx: 0,
+            code: "Error".to_string(),
+            message: "all workers have exited".to_string(),
+            single: Some((
+                pb::SingleResponse {
+                    status: Some(pb::Status {
+                        code: "Error".to_string(),
+                        message: "503".to_string(),
+                    }),
+                    status_code: 503,
+                    ..Default::default()
+                },
+                None,
+            )),
+        });
+    }
 
     let batch_size = batch.len();
     // B3 direct-mode pin（x-lite-worker-id）优先于一切挑选：pin 在提交时已校验
@@ -1316,7 +1400,14 @@ async fn do_send_batch(
     // warn 降级正常挑选，可用性优先于 hint。
     let pin = batch_direct_pin(batch.as_slice());
     let worker_idx = match pin {
-        Some(w) if w < inflight.len() && !outlier.is_ejected(w) && !exclude.contains(&w) => w,
+        Some(w)
+            if w < inflight.len()
+                && !outlier.is_ejected(w)
+                && !outlier.is_dead(w)
+                && !exclude.contains(&w) =>
+        {
+            w
+        }
         Some(w) => {
             warn!(
                 worker_idx = w,
@@ -4114,5 +4205,135 @@ mod tests {
         // Teardown: close the queue and let the collector exit.
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(1), collector).await;
+    }
+
+    // ===== Crash-death routing gates (worker monitor mark_dead) =====
+
+    #[test]
+    fn outlier_dead_mark_all_and_reset() {
+        let o = OutlierState::new(2);
+        assert!(!o.is_dead(0) && !o.is_dead(1) && !o.all_dead());
+        o.mark_dead(0);
+        assert!(o.is_dead(0));
+        assert!(!o.all_dead(), "one live worker remains");
+        o.mark_dead(1);
+        assert!(o.all_dead());
+        // A respawned replacement revives only its own slot.
+        o.reset(0);
+        assert!(!o.is_dead(0), "reset (respawn) revives the slot");
+        assert!(!o.all_dead());
+        assert!(o.is_dead(1));
+        // Unknown index: never dead, never panics.
+        assert!(!o.is_dead(99));
+        o.mark_dead(99);
+    }
+
+    #[test]
+    fn pick_worker_least_loaded_skips_dead() {
+        // The dead worker is the LEAST loaded — it must still lose.
+        let inflight: Vec<Arc<AtomicUsize>> = vec![
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(9)),
+        ];
+        let outlier = OutlierState::new(2);
+        outlier.mark_dead(0);
+        assert_eq!(
+            pick_worker_least_loaded(&inflight, &outlier, &[]),
+            1,
+            "a dead worker must never be picked while a live one exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_submit_rejects_direct_pin_to_dead_worker() {
+        let (queue, outlier) = two_worker_queue("pin-dead").await;
+        outlier.mark_dead(1);
+        let item = hint_item("p", meta_with_headers(&[("x-lite-worker-id", "1")]));
+        let err = queue.try_submit("m", "1", item).unwrap_err();
+        assert!(
+            matches!(err, QueueError::InvalidWorker(_)),
+            "pin to a dead worker -> InvalidWorker, got {err:?}"
+        );
+        // Pinning the live worker still passes.
+        let ok = hint_item("ok", meta_with_headers(&[("x-lite-worker-id", "0")]));
+        assert!(queue.try_submit("m", "1", ok).is_ok());
+    }
+
+    #[tokio::test]
+    async fn try_submit_fails_fast_when_all_workers_dead() {
+        let (queue, outlier) = two_worker_queue("all-dead").await;
+        outlier.mark_dead(0);
+        outlier.mark_dead(1);
+        let item = hint_item("p", meta_with_headers(&[]));
+        let err = queue.try_submit("m", "1", item).unwrap_err();
+        assert!(
+            matches!(err, QueueError::NoLiveWorkers(_)),
+            "all workers dead -> NoLiveWorkers fail-fast, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_around_dead_worker() {
+        let (queue, outlier) = two_worker_queue("dead-route").await;
+        outlier.mark_dead(0);
+        for _ in 0..5 {
+            let (item, rx) = hint_item_rx("p", meta_with_headers(&[]));
+            queue.try_submit("m", "1", item).unwrap();
+            let resp = tokio::time::timeout(Duration::from_secs(5), rx)
+                .await
+                .expect("response in time")
+                .expect("channel open");
+            let data = match resp.payload {
+                Some(pb::response::Payload::Single(s)) => s.data,
+                other => panic!("expected Single, got {other:?}"),
+            };
+            assert_eq!(
+                &data[..],
+                b"w1",
+                "every request must land on the live worker"
+            );
+        }
+    }
+
+    /// Items already queued when the last worker died must not dispatch to a
+    /// dead peer (they would hang until request_timeout): do_send_batch
+    /// fails the batch with the structured 503 single instead.
+    #[tokio::test]
+    async fn do_send_batch_all_dead_fails_items_with_503() {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let (reload_tx, _reload_rx) = mpsc::channel::<ReloadSignal>(1);
+        let outlier = Arc::new(OutlierState::new(1));
+        outlier.mark_dead(0);
+        let dispatch = BatchDispatch {
+            zmq_clients: vec![Arc::new(WorkerZmqClient::new(drain_test_endpoint(
+                "all-dead-batch",
+            )))],
+            outlier,
+            model_name: "m".to_string(),
+            version: "1".to_string(),
+            reload_tx,
+            sequence_registry: Arc::new(SequenceRegistry::new(Duration::from_secs(3600), 100)),
+            balance: BalanceConfig::default(),
+        };
+        let inflight: Vec<Arc<AtomicUsize>> = vec![Arc::new(AtomicUsize::new(0))];
+        let mut batch = vec![QueueItem {
+            uid: "u".to_string(),
+            data: Bytes::from_static(b"{}"),
+            meta: None,
+            response_tx: resp_tx,
+            inflight_guard: None,
+            enqueued_at: Instant::now(),
+        }];
+        let err = do_send_batch(&mut batch, &dispatch, &inflight, Duration::from_secs(5), &[])
+            .await
+            .expect_err("all-dead dispatch must fail, not send to a dead peer");
+        let (single, _) = err.single.as_ref().expect("structured 503 single");
+        assert_eq!(single.status_code, 503);
+        fail_batch_items(&mut batch, &err);
+        let resp = resp_rx.await.expect("queued item answered");
+        match resp.payload {
+            Some(pb::response::Payload::Single(s)) => assert_eq!(s.status_code, 503),
+            other => panic!("expected Single, got {other:?}"),
+        }
     }
 }

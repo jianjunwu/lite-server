@@ -192,6 +192,39 @@ pub(crate) enum WorkerExitKind {
     Killed,
 }
 
+/// The single crash-bookkeeping closure for both monitor sites (initial
+/// spawn + respawn): a non-clean exit fails in-flight requests fast, marks
+/// the slot dead so routing stops sending new work to a process that can
+/// never reply, and flips the registry entry to Stopped. Clean exits are
+/// ignored (graceful unload has its own teardown path). The dead flag
+/// outlives ejection timeouts; only a respawned replacement (`reset`)
+/// revives the slot.
+pub(crate) fn crash_exit_handler(
+    fail_client: Option<Arc<crate::transport::zmq::WorkerZmqClient>>,
+    outlier: Option<Arc<crate::inference_queue::OutlierState>>,
+    registry: Arc<crate::registry::ModelRegistry>,
+    model_name: String,
+    version: String,
+    worker_id: u32,
+) -> impl FnOnce(WorkerExitKind) + Send + 'static {
+    move |kind| {
+        let reason = match kind {
+            WorkerExitKind::Crash => "worker process exited unexpectedly",
+            WorkerExitKind::Killed => "worker terminated by supervisor",
+            // Clean exit: the unload path's client drop handles in-flight
+            // requests — no spurious fail on stops.
+            WorkerExitKind::Clean => return,
+        };
+        if let Some(c) = &fail_client {
+            c.fail_all(reason);
+        }
+        if let Some(o) = &outlier {
+            o.mark_dead(worker_id as usize);
+        }
+        registry.mark_worker_stopped(&model_name, &version, worker_id);
+    }
+}
+
 /// Spawn a background task that monitors a worker child process.
 /// - If the process exits on its own (crash, OOM kill), logs the event and runs cleanup.
 /// - If a shutdown signal is sent via `shutdown_rx`, kills the process and runs cleanup.
@@ -404,8 +437,27 @@ impl WorkerManager {
 
     /// Respawn a single worker after it was killed (health-check kill escalation).
     /// Terminates the old worker first, then spawns a replacement and updates
-    /// all registries.
+    /// all registries. Failures are counted (WORKER_RESPAWN_FAILURES_TOTAL) —
+    /// a replacement that never comes up must be metric-visible, not log-only.
     async fn respawn_worker(
+        &self,
+        model_name: &str,
+        version: &str,
+        worker_id: u32,
+        reason: &'static str,
+    ) -> Result<(), AppError> {
+        let result = self
+            .respawn_worker_inner(model_name, version, worker_id, reason)
+            .await;
+        if result.is_err() {
+            crate::metrics::prometheus::WORKER_RESPAWN_FAILURES_TOTAL
+                .with_label_values(&[model_name, version, reason])
+                .inc();
+        }
+        result
+    }
+
+    async fn respawn_worker_inner(
         &self,
         model_name: &str,
         version: &str,
@@ -648,19 +700,21 @@ impl WorkerManager {
             let clients = self.zmq_clients.read().await;
             clients.get(&key).and_then(|cs| cs.get(worker_id as usize).cloned())
         };
+        let outlier = {
+            let outliers = self.outlier_states.read().await;
+            outliers.get(&key).cloned()
+        };
         let hooks_arc = Arc::new(model_config.hooks.clone());
         let done_rx = spawn_worker_monitor(
             child, model_name, version, worker_id, shutdown_rx,
-            move |kind| {
-                let reason = match kind {
-                    WorkerExitKind::Crash => "worker process exited unexpectedly",
-                    WorkerExitKind::Killed => "worker terminated by supervisor",
-                    WorkerExitKind::Clean => return,
-                };
-                if let Some(c) = &fail_client {
-                    c.fail_all(reason);
-                }
-            },
+            crash_exit_handler(
+                fail_client,
+                outlier,
+                self.registry.clone(),
+                model_name.to_string(),
+                version.to_string(),
+                worker_id,
+            ),
             Some(hooks_arc),
             self.hook_tasks.clone(),
             self.draining.clone(),
@@ -883,16 +937,47 @@ mod tests {
 
         let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
         let observed_c = observed.clone();
-        let fail_client = client.clone();
+        // The production crash closure: fail_all + mark_dead + Stopped.
+        let outlier = std::sync::Arc::new(crate::inference_queue::OutlierState::new(1));
+        let registry = std::sync::Arc::new(crate::registry::ModelRegistry::new());
+        registry
+            .register(
+                "test_model",
+                "1",
+                crate::config::ModelConfig::default(),
+                crate::registry::types::ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
+            .unwrap();
+        registry
+            .set_workers(
+                "test_model",
+                "1",
+                vec![crate::registry::types::WorkerInfo {
+                    worker_id: 0,
+                    device: "cpu:0".to_string(),
+                    endpoint: String::new(),
+                    pid: Some(12345),
+                    status: crate::registry::types::WorkerStatus::Ready,
+                    capacity: None,
+                }],
+            )
+            .unwrap();
         let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let done_rx = spawn_worker_monitor(
             child, "test_model", "1", 0, shutdown_rx,
-            move |kind| {
-                *observed_c.lock().unwrap() = Some(kind);
-                // Mirrors the production closures (lifecycle spawn + respawn):
-                // anything but a clean exit fails in-flight requests fast.
-                if !matches!(kind, WorkerExitKind::Clean) {
-                    fail_client.fail_all("worker process exited unexpectedly");
+            {
+                let handler = crash_exit_handler(
+                    Some(client.clone()),
+                    Some(outlier.clone()),
+                    registry.clone(),
+                    "test_model".to_string(),
+                    "1".to_string(),
+                    0,
+                );
+                move |kind| {
+                    *observed_c.lock().unwrap() = Some(kind);
+                    handler(kind);
                 }
             },
             None,
@@ -917,6 +1002,18 @@ mod tests {
             other => panic!("expected Single error, got {:?}", other),
         }
         assert_eq!(*observed.lock().unwrap(), Some(WorkerExitKind::Crash));
+        // Crash bookkeeping: the slot is dead for routing and the registry
+        // entry no longer shows the dead process as Ready.
+        assert!(
+            outlier.is_dead(0),
+            "crash must mark the worker slot dead for routing"
+        );
+        let w = &registry
+            .get("test_model", Some("1"))
+            .expect("model still registered")
+            .workers[0];
+        assert_eq!(w.status, crate::registry::types::WorkerStatus::Stopped);
+        assert_eq!(w.pid, None, "the dead pid must be cleared");
 
         drop(client);
         let _ = worker.join();
@@ -1089,6 +1186,72 @@ mod tests {
     }
 
     // ===== Respawn tests =====
+
+    fn test_worker_manager() -> (WorkerManager, std::sync::Arc<crate::registry::ModelRegistry>) {
+        let registry = std::sync::Arc::new(crate::registry::ModelRegistry::new());
+        let queue = std::sync::Arc::new(crate::inference_queue::InferenceQueue::new());
+        let cb = std::sync::Arc::new(crate::callback::CallbackRunner::new());
+        let wm = WorkerManager::new(
+            registry.clone(),
+            std::path::PathBuf::new(),
+            queue,
+            "warn".to_string(),
+            cb,
+        );
+        (wm, registry)
+    }
+
+    /// A spawn/handshake failure during load must count a load failure —
+    /// otherwise the load failure rate is silently underestimated (only the
+    /// warmup-failure path recorded it).
+    #[tokio::test]
+    async fn mark_load_failed_records_failure_metric() {
+        let (wm, registry) = test_worker_manager();
+        registry
+            .register(
+                "mfail",
+                "1",
+                crate::config::ModelConfig::default(),
+                ModelType::LitAPI,
+                std::path::PathBuf::new(),
+            )
+            .unwrap();
+        let labels = &["mfail", "1", "load", "fail"];
+        let before =
+            crate::metrics::prometheus::MODEL_LOAD_TOTAL.with_label_values(labels).get();
+        wm.mark_load_failed("mfail", "1");
+        let after =
+            crate::metrics::prometheus::MODEL_LOAD_TOTAL.with_label_values(labels).get();
+        assert_eq!(
+            after,
+            before + 1.0,
+            "mark_load_failed must count a model-load failure"
+        );
+        let status = registry.get("mfail", Some("1")).map(|mv| mv.status);
+        assert_eq!(
+            status,
+            Some(crate::registry::types::VersionStatus::Failed),
+            "the registry status flip must be preserved"
+        );
+    }
+
+    /// A failed respawn (replacement never comes up) must be visible in
+    /// metrics, not only in logs.
+    #[tokio::test]
+    async fn respawn_failure_records_metric() {
+        let (wm, _registry) = test_worker_manager();
+        let labels = &["ghost_m", "1", "health_check"];
+        let before = crate::metrics::prometheus::WORKER_RESPAWN_FAILURES_TOTAL
+            .with_label_values(labels)
+            .get();
+        wm.respawn_worker("ghost_m", "1", 0, "health_check")
+            .await
+            .expect_err("respawning an unknown model must fail");
+        let after = crate::metrics::prometheus::WORKER_RESPAWN_FAILURES_TOTAL
+            .with_label_values(labels)
+            .get();
+        assert_eq!(after, before + 1.0, "a failed respawn must be counted");
+    }
 
     #[tokio::test]
     async fn test_respawn_channel_creation() {

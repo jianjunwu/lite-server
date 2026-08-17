@@ -201,6 +201,30 @@ pub async fn recv_chunk(
     }
 }
 
+/// Run a streaming forward-task body with a uniform panic收口. The SSE /
+/// gRPC-server-stream / h2-bidi forward tasks are DETACHED spawns — nobody
+/// joins their handle, so a panicking body would silently lose its terminal
+/// metric (`record_stream_terminal` never runs) and never cancel the worker
+/// stream (the generator runs to its natural end). The unwind itself
+/// releases the body's RAII locals (P10 permit, admission guard); `on_panic`
+/// then records the Panic terminal and cancels the worker stream, mirroring
+/// the WS adapter's join-based panic arm. Normal completion never touches
+/// `on_panic`.
+pub(crate) async fn catch_forward_panic<B, P, PFut>(transport: &'static str, body: B, on_panic: P)
+where
+    B: std::future::Future<Output = ()>,
+    P: FnOnce() -> PFut,
+    PFut: std::future::Future<Output = ()>,
+{
+    if futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(body))
+        .await
+        .is_err()
+    {
+        warn!("{transport} forward task panicked; recording Panic terminal and cancelling the worker stream");
+        on_panic().await;
+    }
+}
+
 /// Observe a spawned bidi helper task instead of silently dropping its handle
 /// (#8). `abort()` alone discards any panic payload; awaiting the handle first
 /// — bounded by a short grace — surfaces a panic as a `JoinError` so we can
@@ -241,6 +265,80 @@ mod tests {
         let task = tokio::spawn(async {});
         let panicked = observe_or_abort(task).await;
         assert!(!panicked);
+    }
+
+    // --- catch_forward_panic ---
+
+    #[tokio::test]
+    async fn catch_forward_panic_runs_cleanup_on_panic() {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_c = ran.clone();
+        catch_forward_panic(
+            "test",
+            async { panic!("boom") },
+            move || {
+                let ran_c = ran_c.clone();
+                async move {
+                    ran_c.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            },
+        )
+        .await;
+        assert!(
+            ran.load(std::sync::atomic::Ordering::Relaxed),
+            "on_panic must run when the body panics"
+        );
+    }
+
+    #[tokio::test]
+    async fn catch_forward_panic_clean_body_skips_cleanup() {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_c = ran.clone();
+        catch_forward_panic(
+            "test",
+            async {},
+            move || {
+                let ran_c = ran_c.clone();
+                async move {
+                    ran_c.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            },
+        )
+        .await;
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::Relaxed),
+            "on_panic must NOT run on normal completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn catch_forward_panic_unwind_releases_body_guards_first() {
+        struct Guard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let released_body = released.clone();
+        let released_check = released.clone();
+        catch_forward_panic(
+            "test",
+            async move {
+                let _guard = Guard(released_body);
+                panic!("boom");
+            },
+            move || {
+                let released_check = released_check.clone();
+                async move {
+                    assert!(
+                        released_check.load(std::sync::atomic::Ordering::Relaxed),
+                        "RAII locals must be released by the unwind before on_panic runs"
+                    );
+                }
+            },
+        )
+        .await;
     }
 
     // --- build_stream_* helpers ---

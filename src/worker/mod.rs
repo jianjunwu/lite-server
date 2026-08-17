@@ -8,7 +8,7 @@ mod routing;
 
 pub use hooks::execute_hook;
 pub use routing::{pick_worker_random, pick_worker_skip_ejected};
-pub(crate) use routing::pick_streaming_worker;
+pub(crate) use routing::{pick_streaming_worker, PickError};
 
 use crate::callback::CallbackRunner;
 use crate::inference_queue::{
@@ -264,6 +264,19 @@ impl WorkerManager {
     ) {
         let key = model_version_key(model_name, version);
         self.zmq_clients.write().await.insert(key, clients);
+    }
+
+    /// Test-only hook: populate the outlier map without spawning workers
+    /// (unit tests that drive crash-death routing gates).
+    #[cfg(test)]
+    pub(crate) async fn insert_outlier_for_test(
+        &self,
+        model_name: &str,
+        version: &str,
+        outlier: Arc<crate::inference_queue::OutlierState>,
+    ) {
+        let key = model_version_key(model_name, version);
+        self.outlier_states.write().await.insert(key, outlier);
     }
 
     pub async fn shutdown(&self) {

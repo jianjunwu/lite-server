@@ -584,8 +584,19 @@ async fn h2_bidi_entry_impl(
     // reclaim. None when the path did not carry one — cap 0 / unit tests.
     let admission_guard = slot.take();
 
+    // Panic收口 (detached spawn 无人 join):catch_forward_panic 保证 panic 时
+    // 仍记 Panic 终态指标 + 取消 worker 流(对齐 WS 适配器的 join 臂)。
+    let panic_model = metrics_model.clone();
+    let panic_version = metrics_version.clone();
+    let panic_chain = ensemble_chain.clone();
+    let panic_abort = ensemble_abort.clone();
+    let panic_stream_id = stream_id_out.clone();
+    let panic_cancel_client = cancel_client.clone();
+    let panic_incoming_abort = incoming_task.as_ref().map(|t| t.abort_handle());
+    let panic_open_time = std::time::Instant::now();
     tokio::spawn(
         async move {
+            streaming::catch_forward_panic("http2", async move {
             // P10 (D40): held for the outgoing task's lifetime — released on
             // drop (terminal frame / idle / disconnect; D18 teardown path).
             let _ensemble_permit = ensemble_permit;
@@ -781,6 +792,37 @@ async fn h2_bidi_entry_impl(
             if let Some(task) = incoming_task {
                 streaming::observe_or_abort(task).await;
             }
+            }, move || async move {
+                // Panic臂 (WS 同款):补记 Panic 终态 + 取消 worker 流 +
+                // 回收 incoming 任务(正常尾部 observe_or_abort 的兜底)。
+                prometheus::record_stream_terminal(
+                    &panic_model,
+                    &panic_version,
+                    "http2",
+                    "http2",
+                    panic_open_time,
+                    prometheus::StreamCloseReason::Panic.status_family(),
+                    prometheus::StreamCloseReason::Panic,
+                    stream_metrics,
+                    0,
+                    0,
+                );
+                if is_ensemble {
+                    crate::ensemble::cancel_chain(
+                        panic_chain.as_ref(),
+                        panic_abort.as_ref(),
+                        &panic_stream_id,
+                        &panic_cancel_client,
+                    )
+                    .await;
+                } else {
+                    let cancel_req = streaming::build_stream_cancel(panic_stream_id);
+                    let _ = panic_cancel_client.send_raw(cancel_req).await;
+                }
+                if let Some(h) = panic_incoming_abort {
+                    h.abort();
+                }
+            }).await;
         }
         .instrument(span),
     );
@@ -843,7 +885,10 @@ async fn open_worker_stream_bidi(
         model_name,
         resolved_version,
     )
-    .map_err(|e| AppError::Validation(e.0))?;
+    .map_err(|e| match e {
+        crate::worker::PickError::InvalidPin(msg) => AppError::Validation(msg),
+        crate::worker::PickError::NoLiveWorkers(msg) => AppError::ModelNotReady(msg),
+    })?;
 
     if worker_id >= clients.len() {
         return Err(AppError::WorkerCrashed("invalid worker index".to_string()));

@@ -446,6 +446,27 @@ impl ModelRegistry {
         Ok(())
     }
 
+    /// Mark a worker's registry entry Stopped with its pid cleared — the
+    /// crash monitor's bookkeeping so /health never shows a dead process as
+    /// Ready. Best-effort: unknown model/version/slot is a no-op (the version
+    /// may already be torn down).
+    pub fn mark_worker_stopped(&self, model_name: &str, version: &str, worker_id: u32) {
+        let Ok(mut entry) = self
+            .models
+            .get_mut(model_name)
+            .ok_or_else(|| AppError::ModelNotFound(model_name.to_string()))
+        else {
+            return;
+        };
+        let Some(mv) = entry.versions.get_mut(version) else {
+            return;
+        };
+        if let Some(w) = mv.workers.iter_mut().find(|w| w.worker_id == worker_id) {
+            w.status = WorkerStatus::Stopped;
+            w.pid = None;
+        }
+    }
+
     pub fn activate_version(&self, model_name: &str, version: &str) -> Result<bool, AppError> {
         let entry = self
             .models

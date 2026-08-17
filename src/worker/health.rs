@@ -163,10 +163,14 @@ impl WorkerManager {
 
     /// Mark a version Failed during load (startup crash / timeout). Failed is
     /// load-phase only; runtime impairment is Degraded via the coordinator.
+    /// Also counts the load failure — spawn/handshake failures otherwise
+    /// never reach MODEL_LOAD_TOTAL (only the warmup path recorded it), so
+    /// the load failure rate was silently underestimated.
     pub(super) fn mark_load_failed(&self, model_name: &str, version: &str) {
         if let Err(e) = self.registry.set_status(model_name, version, VersionStatus::Failed) {
             warn!(model = %model_name, version = %version, "failed to mark version failed: {}", e);
         }
+        crate::metrics::prometheus::record_model_load(model_name, version, false);
         self.queue_grpc_health_sync();
     }
 

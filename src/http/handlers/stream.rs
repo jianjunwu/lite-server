@@ -60,7 +60,10 @@ async fn open_worker_stream(
         model_name,
         resolved_version,
     )
-    .map_err(|e| AppError::Validation(e.0))?;
+    .map_err(|e| match e {
+        crate::worker::PickError::InvalidPin(msg) => AppError::Validation(msg),
+        crate::worker::PickError::NoLiveWorkers(msg) => AppError::ModelNotReady(msg),
+    })?;
 
     if worker_id >= clients.len() {
         return Err(AppError::WorkerCrashed("invalid worker index".to_string()));
@@ -521,7 +524,19 @@ async fn sse_infer_impl(
     // carry one — cap 0 / unit tests.
     let admission_guard = slot.take();
 
+    // Panic收口 (detached spawn 无人 join):catch_forward_panic 保证 panic 时
+    // 仍记 Panic 终态指标 + 取消 worker 流(对齐 WS 适配器的 join 臂)。
+    let panic_model = model_name.clone();
+    let panic_version = resolved_version.clone();
+    let panic_chain = ensemble_chain.clone();
+    let panic_abort = ensemble_abort.clone();
+    let panic_stream_id = stream_id.clone();
+    let panic_worker_client = worker_client.clone();
+    let panic_cancel_client = cancel_client.clone();
+    let panic_state = state.clone();
+    let panic_open_time = std::time::Instant::now();
     tokio::spawn(async move {
+        streaming::catch_forward_panic("sse", async move {
         // P10 (D40): held for the forward task's lifetime — released on drop
         // (terminal frame / idle / disconnect; same path as D18 teardown).
         let _ensemble_permit = ensemble_permit;
@@ -796,6 +811,37 @@ async fn sse_infer_impl(
                 open_worker_stream_cancel(&state, &model_name, &resolved_version, cancel_req).await;
             }
         }
+        }, move || async move {
+            // Panic臂 (WS 1970 同款):补记 Panic 终态 + 取消 worker 流。
+            prometheus::record_stream_terminal(
+                &panic_model,
+                &panic_version,
+                "sse",
+                "sse",
+                panic_open_time,
+                prometheus::StreamCloseReason::Panic.status_family(),
+                prometheus::StreamCloseReason::Panic,
+                stream_metrics,
+                0,
+                0,
+            );
+            if is_ensemble {
+                crate::ensemble::cancel_chain(
+                    panic_chain.as_ref(),
+                    panic_abort.as_ref(),
+                    &panic_stream_id,
+                    &panic_worker_client,
+                )
+                .await;
+            } else {
+                let cancel_req = streaming::build_stream_cancel(panic_stream_id);
+                if let Some(client) = panic_cancel_client {
+                    let _ = client.send_raw(cancel_req).await;
+                } else {
+                    open_worker_stream_cancel(&panic_state, &panic_model, &panic_version, cancel_req).await;
+                }
+            }
+        }).await;
     }
     .instrument(span.clone()));
 

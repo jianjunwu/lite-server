@@ -4,7 +4,7 @@
 use super::hooks::{execute_hook, policies_from_config};
 use super::process::{
     classify_stderr_line, drain_worker_stderr, emit_stderr_line, new_worker_command,
-    spawn_worker_monitor, strip_level_prefix, worker_endpoint, WorkerExitKind,
+    spawn_worker_monitor, strip_level_prefix, worker_endpoint,
 };
 use super::{WorkerManager, WorkerProcess};
 use crate::callback::ModelLifecycleContext;
@@ -313,6 +313,19 @@ impl WorkerManager {
         };
         let total_workers = computed;
 
+        // Create shared OutlierState — single instance for batch_collector,
+        // health_checker, and streaming. Ejection thresholds come from
+        // ModelConfig (§3); error_threshold == 0 disables ejection. Created
+        // BEFORE the spawn loop so each worker's crash monitor can mark its
+        // slot dead (crash-death routing gate).
+        let ejection = crate::inference_queue::EjectionConfig {
+            error_threshold: model_config.ejection_error_threshold,
+            timeout: Duration::from_secs_f32(model_config.ejection_timeout),
+            max_percent: model_config.ejection_max_percent,
+            max_timeout: Duration::from_secs_f32(model_config.ejection_max_timeout),
+        };
+        let outlier = Arc::new(OutlierState::with_config(total_workers, &ejection));
+
         let mut worker_infos = Vec::new();
         let mut worker_processes = SpawnedWorkersGuard(Vec::new());
         let mut zmq_clients_for_model = Vec::new();
@@ -508,19 +521,16 @@ impl WorkerManager {
             // peer-disconnect event, so waiters would otherwise hang until
             // their caller-side timeouts (request_timeout, else 300s).
             let hooks_arc = Arc::new(model_config.hooks.clone());
-            let fail_client = zmq_client.clone();
             let done_rx = spawn_worker_monitor(
                 child, model_name, version, worker_id as u32, shutdown_rx,
-                move |kind| {
-                    let reason = match kind {
-                        WorkerExitKind::Crash => "worker process exited unexpectedly",
-                        WorkerExitKind::Killed => "worker terminated by supervisor",
-                        // Clean exit: the unload path's client drop handles
-                        // in-flight requests — no spurious fail on stops.
-                        WorkerExitKind::Clean => return,
-                    };
-                    fail_client.fail_all(reason);
-                },
+                crate::worker::process::crash_exit_handler(
+                    Some(zmq_client.clone()),
+                    Some(outlier.clone()),
+                    self.registry.clone(),
+                    model_name.to_string(),
+                    version.to_string(),
+                    worker_id as u32,
+                ),
                 Some(hooks_arc),
                 self.hook_tasks.clone(),
                 self.draining.clone(),
@@ -564,16 +574,6 @@ impl WorkerManager {
         } else {
             self.registry.mark_ready(model_name, version)?;
         }
-
-        // Create shared OutlierState — single instance for batch_collector, health_checker, and streaming.
-        // Ejection thresholds come from ModelConfig (§3); error_threshold == 0 disables ejection.
-        let ejection = crate::inference_queue::EjectionConfig {
-            error_threshold: model_config.ejection_error_threshold,
-            timeout: Duration::from_secs_f32(model_config.ejection_timeout),
-            max_percent: model_config.ejection_max_percent,
-            max_timeout: Duration::from_secs_f32(model_config.ejection_max_timeout),
-        };
-        let outlier = Arc::new(OutlierState::with_config(total_workers, &ejection));
 
         // Register inference queue for batching
         self.inference_queue

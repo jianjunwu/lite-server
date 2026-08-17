@@ -164,7 +164,12 @@ impl GrpcService {
             model_name,
             &resolved_version,
         )
-        .map_err(|e| err(Status::invalid_argument(e.0)))?;
+        .map_err(|e| match e {
+            crate::worker::PickError::InvalidPin(msg) => err(Status::invalid_argument(msg)),
+            crate::worker::PickError::NoLiveWorkers(msg) => {
+                err(crate::grpc::with_retry_after(Status::unavailable(msg), 1))
+            }
+        })?;
         let client = clients[worker_id].clone();
         crate::metrics::prometheus::record_worker_inference(
             model_name,

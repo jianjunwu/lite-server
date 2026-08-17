@@ -70,10 +70,10 @@ pub fn pick_worker_skip_ejected(num_workers: usize, outlier: &OutlierState) -> u
     let mut rng = rand::thread_rng();
     let start = rng.gen_range(0..num_workers);
 
-    // Try to find a non-ejected worker starting from random offset
+    // Try to find a non-ejected, live worker starting from random offset
     for i in 0..num_workers {
         let idx = (start + i) % num_workers;
-        if !outlier.is_ejected(idx) {
+        if !outlier.is_ejected(idx) && !outlier.is_dead(idx) {
             return idx;
         }
     }
@@ -87,7 +87,14 @@ pub fn pick_worker_skip_ejected(num_workers: usize, outlier: &OutlierState) -> u
 /// HTTP 400 (`AppError::Validation`) / gRPC `InvalidArgument` — parity with the
 /// queue's `QueueError::InvalidWorker`.
 #[derive(Debug, Clone)]
-pub(crate) struct PickError(pub String);
+pub(crate) enum PickError {
+    /// Bad client pin (`x-lite-worker-id`) — callers map to 400 /
+    /// InvalidArgument (client error, not retryable as-is).
+    InvalidPin(String),
+    /// Every worker process has exited — callers map to 503 / Unavailable
+    /// (server-side, retryable after operator intervention).
+    NoLiveWorkers(String),
+}
 
 /// Streaming worker selection (task F): one shared pick replacing the four
 /// line-for-line copies in HTTP SSE/WS (`open_worker_stream`) + gRPC
@@ -111,6 +118,16 @@ pub(crate) fn pick_streaming_worker(
     model: &str,
     version: &str,
 ) -> Result<usize, PickError> {
+    // 0. Crash-death gate: with every worker process dead, no pick can ever
+    //    succeed — fail fast instead of routing to a silent PAIR socket.
+    if let Some(o) = outlier {
+        if o.all_dead() {
+            return Err(PickError::NoLiveWorkers(format!(
+                "all workers for {model} {version} have exited"
+            )));
+        }
+    }
+
     // 1. x-lite-worker-id direct pin — validated, fail-fast (parity with the
     //    queue's try_submit direct-pin check at submit time).
     if let Some(w) = meta
@@ -118,15 +135,15 @@ pub(crate) fn pick_streaming_worker(
         .get("x-lite-worker-id")
         .and_then(|v| v.parse::<usize>().ok())
     {
-        let ejected = outlier.map(|o| o.is_ejected(w)).unwrap_or(false);
+        let ejected = outlier.map(|o| o.is_ejected(w) || o.is_dead(w)).unwrap_or(false);
         if w >= num_workers {
-            return Err(PickError(format!(
+            return Err(PickError::InvalidPin(format!(
                 "x-lite-worker-id {w} out of range (workers: {num_workers}) for {model} {version}"
             )));
         }
         if ejected {
-            return Err(PickError(format!(
-                "x-lite-worker-id {w} is ejected for {model} {version}"
+            return Err(PickError::InvalidPin(format!(
+                "x-lite-worker-id {w} is ejected or dead for {model} {version}"
             )));
         }
         return Ok(w);
@@ -139,8 +156,10 @@ pub(crate) fn pick_streaming_worker(
     let seq_normalized = crate::sequence::normalize_sequence_id(meta.sequence_id.as_deref());
     let preferred = seq_normalized.and_then(|seq| {
         let w = seq_registry.lookup(seq, model, version)?;
-        let ejected = outlier.map(|o| o.is_ejected(w)).unwrap_or(false);
-        (w < num_workers && !ejected).then_some(w)
+        let unusable = outlier
+            .map(|o| o.is_ejected(w) || o.is_dead(w))
+            .unwrap_or(false);
+        (w < num_workers && !unusable).then_some(w)
     });
     let worker_id = preferred.unwrap_or_else(|| match outlier {
         Some(o) => meta
@@ -194,6 +213,54 @@ mod tests {
             seen[idx] = true;
         }
         assert!(seen.iter().all(|&s| s), "not all workers were picked");
+    }
+
+    // ===== crash-death routing gates =====
+
+    #[test]
+    fn test_pick_worker_skip_ejected_skips_dead() {
+        let outlier = OutlierState::new(2);
+        outlier.mark_dead(0);
+        for _ in 0..20 {
+            assert_eq!(
+                pick_worker_skip_ejected(2, &outlier),
+                1,
+                "a dead worker must never be picked while a live one exists"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pick_streaming_worker_all_dead_errs() {
+        let outlier = OutlierState::new(2);
+        outlier.mark_dead(0);
+        outlier.mark_dead(1);
+        let meta = pb::RequestMeta::default();
+        let seq = SequenceRegistry::new(std::time::Duration::from_secs(60), 16);
+        let err = pick_streaming_worker(&meta, 2, Some(&outlier), &seq, "m", "1")
+            .expect_err("all workers dead must fail the pick");
+        match err {
+            PickError::NoLiveWorkers(msg) => assert!(
+                msg.contains("exited"),
+                "the pick error must name the cause: {msg}"
+            ),
+            other => panic!("expected NoLiveWorkers, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pick_streaming_worker_pin_to_dead_errs() {
+        let outlier = OutlierState::new(2);
+        outlier.mark_dead(1);
+        let mut meta = pb::RequestMeta::default();
+        meta.headers.insert("x-lite-worker-id".to_string(), "1".to_string());
+        let seq = SequenceRegistry::new(std::time::Duration::from_secs(60), 16);
+        let err = pick_streaming_worker(&meta, 2, Some(&outlier), &seq, "m", "1")
+            .expect_err("pinning a dead worker must fail the pick");
+        match err {
+            PickError::InvalidPin(msg) => assert!(msg.contains("x-lite-worker-id"), "got: {msg}"),
+            other => panic!("expected InvalidPin, got {other:?}"),
+        }
     }
 
     // ===== pick_worker_skip_ejected tests =====
@@ -323,7 +390,10 @@ mod tests {
         let reg = SequenceRegistry::new(Duration::from_secs(60), 16);
         let meta = hint_meta(&[("x-lite-worker-id", "5")], None);
         let err = pick_streaming_worker(&meta, 2, Some(&outlier), &reg, "m", "1").unwrap_err();
-        assert!(err.0.contains("out of range"), "expected out-of-range error, got: {}", err.0);
+        match err {
+            PickError::InvalidPin(msg) => assert!(msg.contains("out of range"), "expected out-of-range error, got: {msg}"),
+            other => panic!("expected InvalidPin, got {other:?}"),
+        }
     }
 
     #[test]
@@ -333,7 +403,10 @@ mod tests {
         let reg = SequenceRegistry::new(Duration::from_secs(60), 16);
         let meta = hint_meta(&[("x-lite-worker-id", "1")], None);
         let err = pick_streaming_worker(&meta, 2, Some(&outlier), &reg, "m", "1").unwrap_err();
-        assert!(err.0.contains("ejected"), "expected ejected error, got: {}", err.0);
+        match err {
+            PickError::InvalidPin(msg) => assert!(msg.contains("ejected"), "expected ejected error, got: {msg}"),
+            other => panic!("expected InvalidPin, got {other:?}"),
+        }
     }
 
     #[test]
