@@ -41,6 +41,10 @@ server:
   max_connections: 0           # Hard cap on open HTTP connections (TCP+TLS); over-cap
                                # closed at accept. 0 = unlimited (default)
   compression: false           # gzip HTTP responses; SSE excluded, WS unaffected
+  request_decompression: false # gzip request bodies decoded before handlers (all HTTP
+                               # routes except h2 /bidi, which stays 415). Decompressed
+                               # bytes count against max_request_body_bytes (zip-bomb
+                               # guard). Only gzip; other encodings → 415.
   socket_mode: 0o666           # chmod for a unix: UDS host. The HTTP UDS also serves
                                # admin, so on multi-tenant hosts set 0o600 (owner-only).
   # TLS/mTLS (see "TLS / mTLS" section below) — all optional, off by default

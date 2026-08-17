@@ -37,6 +37,10 @@ server:
   max_connections: 0           # HTTP 连接数硬顶（TCP+TLS）；超限连接在 accept 即关闭。
                                # 0 = 不限（默认）
   compression: false           # gzip HTTP 响应；排除 SSE，不影响 WS
+  request_decompression: false # gzip 请求体在进 handler 前解码（覆盖除 h2 /bidi 外的
+                               # 全部 HTTP 路由，/bidi 维持 415）。解压后字节计入
+                               # max_request_body_bytes（zip-bomb 防护）。仅支持 gzip，
+                               # 其他编码 → 415。
   socket_mode: 0o666           # unix: UDS host 的 chmod。HTTP UDS 同时服务 admin，
                                # 多租户主机建议 0o600（仅 owner）
   # TLS/mTLS（见下文「TLS / mTLS」一节）——均可选，默认关闭

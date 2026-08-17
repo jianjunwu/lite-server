@@ -1,4 +1,5 @@
 pub mod cors;
+pub(crate) mod decompress;
 pub mod handlers;
 pub mod kserve;
 pub mod routes;
@@ -476,6 +477,18 @@ pub async fn start_http_server(
     let app = app.layer(axum::extract::DefaultBodyLimit::max(
         config.server.max_request_body_bytes.unwrap_or(64 * 1024 * 1024),
     ));
+
+    // Request decompression (opt-in): gzip bodies decoded lazily before
+    // extraction, so DefaultBodyLimit caps DECOMPRESSED bytes (413 bomb guard).
+    // Inside body_timeout: idle timeout keeps measuring raw wire bytes.
+    // INVARIANT: must stay mounted inside context_middleware — the 415 arm
+    // reads RequestContext via rejection_protocol; outside it the envelope
+    // silently degrades to Legacy shape.
+    let app = if config.server.request_decompression {
+        app.layer(axum::middleware::from_fn(decompress::request_decompression_middleware))
+    } else {
+        app
+    };
 
     // L2 (resource-leak-plan): request-body idle timeout — see
     // request_body_timeout_middleware. Default 0 = off (behavior unchanged).

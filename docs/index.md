@@ -26,6 +26,7 @@ for the quick start; this index maps the full documentation set.
 |---|---|
 | [Streaming](streaming.md) | Bidirectional streaming (WS `/stream`, h2 `/bidi`) and decoupled streaming (SSE `/decoupled`, WS `/decoupled-stream`) |
 | [Protocol Compatibility](protocol.md) | Raw bytes / tensor requests, Triton Binary extension, openai-compact, known deviations from KServe V2 / Triton |
+| [Modality Transport](modality-transport.md) ([中文](zh/modality-transport.md)) | Per-payload transport & compression: codec-layer audio, gzip request/response, gRPC |
 
 ## Deployment & Operations
 

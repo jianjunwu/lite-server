@@ -232,6 +232,12 @@ pub struct ServerConfig {
     /// gzip response compression (P1-4). Default false. SSE responses are
     /// excluded (per-event flush semantics); WS upgrades are unaffected.
     pub compression: bool,
+    /// gzip request-body decompression. Default false. Applies to ALL HTTP
+    /// routes (inference AND admin) except `/bidi`, which stays 415 (frame
+    /// timeliness). Decompressed bytes count against `max_request_body_bytes`
+    /// (zip-bomb guard). Side effect when enabled: gzipped admin uploads
+    /// (e.g. .lma) are transparently decoded instead of stored compressed.
+    pub request_decompression: bool,
     /// TLS server certificate chain PEM path (P5-1). Must be set together with
     /// `tls_key_path`; setting only one is a startup error. Mutually exclusive
     /// with a UDS `server.host`.
@@ -329,6 +335,7 @@ impl Default for ServerConfig {
             http2_keepalive_timeout_secs: None,
             socket_mode: 0o666,
             compression: false,
+            request_decompression: false,
             tls_cert_path: None,
             tls_key_path: None,
             mtls_ca_path: None,
@@ -1925,6 +1932,15 @@ mod tests {
         let yaml = "server:\n  compression: true\n";
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(cfg.server.compression);
+    }
+
+    #[test]
+    fn test_request_decompression_config() {
+        // Off by default; opt-in via server.request_decompression.
+        assert!(!Config::default().server.request_decompression);
+        let yaml = "server:\n  request_decompression: true\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.server.request_decompression);
     }
 
     // ===== P-XFF: trusted_proxies =====

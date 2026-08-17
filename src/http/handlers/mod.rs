@@ -248,7 +248,7 @@ where
 
 /// C9 (P2.1):拒绝路径的协议 = T1 预筛值(middleware 填充;无 middleware
 /// 的直挂单测 → Legacy,byte-identical)。
-fn rejection_protocol(req: &axum::extract::Request) -> ApiProtocol {
+pub(crate) fn rejection_protocol(req: &axum::extract::Request) -> ApiProtocol {
     req.extensions()
         .get::<crate::request_context::RequestContext>()
         .and_then(|cx| cx.api_protocol)
