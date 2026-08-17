@@ -32,6 +32,7 @@ impl GrpcService {
         version_label: &mut String,
         request_id_out: &mut String,
         start: Instant,
+        admission: crate::admission::AdmissionGuard,
     ) -> Result<Response<ReceiverStream<Result<pb::BidiChunk, Status>>>, Status> {
         let remote_addr = request.remote_addr();
         let (grpc_metadata, extensions, mut stream) = request.into_parts();
@@ -436,6 +437,10 @@ impl GrpcService {
             // P10 (D40): held for the forward task's lifetime — released on
             // drop (terminal frame / idle / disconnect; D18 teardown path).
             let _ensemble_permit = ensemble_permit;
+            // RN-13 (O2): the admission slot is held for the session's
+            // lifetime (the wrapper acquired it before open; early open
+            // failures dropped it back).
+            let _admission_guard = admission;
             // Non-ensemble: forward incoming bidi chunks to the worker as
             // StreamRequest::Chunk (fire-and-forget — each chunk's response
             // comes back through the stream channel registered at open, so

@@ -150,10 +150,11 @@ impl GrpcService {
     }
 
     /// P-FLOW (§4.0.9): admit one inference request against the global cap.
-    /// Returns an RAII guard (held for the handler scope → unary spans the
-    /// full call; streaming releases on stream-open, the same header-semantic
-    /// as the HTTP middleware). Rejects with Unavailable + retry-after at cap;
-    /// no-op when `max_inflight` is 0 (unlimited).
+    /// Returns an RAII guard — unary handlers hold it for the handler scope;
+    /// streaming handlers pass it into their forward task so the slot is held
+    /// for the STREAM's lifetime (RN-13 O2, HTTP SSE/WS parity). Rejects with
+    /// Unavailable + retry-after at cap; no-op when `max_inflight` is 0
+    /// (unlimited).
     fn acquire_admission(
         &self,
     ) -> Result<crate::admission::AdmissionGuard, Status> {
@@ -183,7 +184,7 @@ impl LiteServer for GrpcService {
         let _guard = InflightGuard::new(self.shutdown_state.clone());
         // P-FLOW (§4.0.9): global in-flight admission cap (health/admin RPCs
         // are separate services and never reach here). Held for the handler
-        // scope; streaming releases on stream-open (header-semantic).
+        // scope (unary spans the full call).
         let _admission = self
             .acquire_admission()
             .map_err(|s| metadata::echo_early_rejection(s, &request))?;
@@ -246,7 +247,7 @@ impl LiteServer for GrpcService {
         let _guard = InflightGuard::new(self.shutdown_state.clone());
         // P-FLOW (§4.0.9): global in-flight admission cap (health/admin RPCs
         // are separate services and never reach here). Held for the handler
-        // scope; streaming releases on stream-open (header-semantic).
+        // scope (unary spans the full call).
         let _admission = self
             .acquire_admission()
             .map_err(|s| metadata::echo_early_rejection(s, &request))?;
@@ -311,9 +312,9 @@ impl LiteServer for GrpcService {
         }
         let _guard = InflightGuard::new(self.shutdown_state.clone());
         // P-FLOW (§4.0.9): global in-flight admission cap (health/admin RPCs
-        // are separate services and never reach here). Held for the handler
-        // scope; streaming releases on stream-open (header-semantic).
-        let _admission = self
+        // are separate services and never reach here). RN-13 (O2): the guard
+        // rides into the forward task — held for the stream's lifetime.
+        let admission = self
             .acquire_admission()
             .map_err(|s| metadata::echo_early_rejection(s, &request))?;
         // P2-1 请求指标：open 失败在此记一次；open 成功后由转发 task 在流
@@ -362,7 +363,7 @@ impl LiteServer for GrpcService {
         let mut version_label = request.get_ref().version.clone();
         let mut request_id = String::new();
         let result = self
-            .stream_infer_impl(request, &mut version_label, &mut request_id, start, span.clone())
+            .stream_infer_impl(request, &mut version_label, &mut request_id, start, span.clone(), admission)
             .instrument(span)
             .await;
         if let Err(s) = &result {
@@ -392,9 +393,9 @@ impl LiteServer for GrpcService {
         // holds the channel open past predict_decoupled) is in _impl.
         let _guard = InflightGuard::new(self.shutdown_state.clone());
         // P-FLOW (§4.0.9): global in-flight admission cap (health/admin RPCs
-        // are separate services and never reach here). Held for the handler
-        // scope; streaming releases on stream-open (header-semantic).
-        let _admission = self
+        // are separate services and never reach here). RN-13 (O2): the guard
+        // rides into the forward task — held for the stream's lifetime.
+        let admission = self
             .acquire_admission()
             .map_err(|s| metadata::echo_early_rejection(s, &request))?;
         let start = Instant::now();
@@ -439,7 +440,7 @@ impl LiteServer for GrpcService {
         let mut version_label = request.get_ref().version.clone();
         let mut request_id = String::new();
         let result = self
-            .decoupled_infer_impl(request, &mut version_label, &mut request_id, start, span.clone())
+            .decoupled_infer_impl(request, &mut version_label, &mut request_id, start, span.clone(), admission)
             .instrument(span)
             .await;
         if let Err(s) = &result {
@@ -466,9 +467,9 @@ impl LiteServer for GrpcService {
         }
         let _guard = InflightGuard::new(self.shutdown_state.clone());
         // P-FLOW (§4.0.9): global in-flight admission cap (health/admin RPCs
-        // are separate services and never reach here). Held for the handler
-        // scope; streaming releases on stream-open (header-semantic).
-        let _admission = self
+        // are separate services and never reach here). RN-13 (O2): the guard
+        // rides into the session task — held for the session's lifetime.
+        let admission = self
             .acquire_admission()
             .map_err(|s| metadata::echo_early_rejection(s, &request))?;
         // P2-1 请求指标 + P2-2 回显（同 stream_infer；model 在 BidiOpen 前未知，
@@ -484,6 +485,7 @@ impl LiteServer for GrpcService {
                 &mut version_label,
                 &mut request_id,
                 start,
+                admission,
             )
             .await;
         if let Err(s) = &result {
@@ -1789,6 +1791,108 @@ mod request_metrics_tests {
         // And a real infer still succeeds (admission is a no-op pass-through).
         let resp = service.infer(infer_request(model, "1")).await;
         assert!(resp.is_ok(), "cap 0 must not reject: {:?}", resp.err());
+    }
+
+    #[tokio::test]
+    async fn p_flow_streaming_admission_held_for_stream_lifetime() {
+        // RN-13 (O2): the admission slot must be held for the STREAM's
+        // lifetime, not released when the handler returns the response
+        // stream (the pre-fix header-semantic). With cap=1, an open stream
+        // saturates the cap; after the stream is dropped (and the stalled
+        // forward task trips the idle budget), the slot is reclaimed.
+        let model = "met_admit_stream";
+        let endpoint = metric_test_endpoint(model);
+        let _worker = spawn_stall_worker(endpoint.clone());
+
+        let registry = Arc::new(ModelRegistry::new());
+        registry
+            .register(model, "1", test_config(1, 0.0, 10), ModelType::LitAPI, std::env::temp_dir())
+            .unwrap();
+        registry.mark_ready(model, "1").unwrap();
+        let queue = Arc::new(InferenceQueue::new());
+        let client = Arc::new(WorkerZmqClient::new(endpoint));
+        let (reload_tx, _rx) = mpsc::channel(8);
+        queue.register_model(
+            model, "1", &test_config(1, 0.0, 10), vec![],
+            vec![client.clone()], reload_tx, Arc::new(OutlierState::new(1)), None,
+        );
+        let wm = Arc::new(WorkerManager::new(
+            registry.clone(),
+            std::env::temp_dir(),
+            queue.clone(),
+            "error".to_string(),
+            Arc::new(CallbackRunner::new()),
+        ));
+        let mut cfg = crate::config::Config::default();
+        cfg.server.max_inflight = 1;
+        let app_state = Arc::new(AppState::new(
+            registry.clone(),
+            wm.clone(),
+            queue.clone(),
+            cfg,
+            std::env::temp_dir(),
+            Arc::new(CallbackRunner::new()),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(crate::rate_limit::RateLimiter::default()),
+        ));
+        let service = GrpcService::new(GrpcServiceDeps {
+            registry,
+            worker_manager: wm,
+            streaming_metrics: false,
+            canary_override: false,
+            grpc_streaming: true,
+            callback_runner: Arc::new(CallbackRunner::new()),
+            shutdown_state: Arc::new(crate::server::ShutdownState::new()),
+            server_timeout: Duration::from_secs(5),
+            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::default()),
+            // The stall worker sends one chunk then goes silent; the idle
+            // budget is what reaps the forward task once the client drops.
+            decoupled_idle_timeout: Some(Duration::from_millis(500)),
+            app_state,
+            trusted: Arc::new(Vec::new()),
+        });
+        service
+            .worker_manager
+            .insert_zmq_clients_for_test(model, "1", vec![client])
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let resp = service
+            .stream_infer(Request::new(pb::StreamInferRequest {
+                model_name: model.to_string(),
+                version: "1".to_string(),
+                data: Bytes::from_static(b"{}"),
+                headers: HashMap::new(),
+                ..Default::default()
+            }))
+            .await
+            .expect("stream must open");
+
+        // The slot must be held while the stream is alive.
+        assert_eq!(
+            service.app_state.admission.current(),
+            1,
+            "an open stream must hold the admission slot"
+        );
+        assert!(
+            service.app_state.admission.try_acquire().is_none(),
+            "cap=1: a second admission must be rejected while the stream is alive"
+        );
+
+        // Drop the response stream → the forward task trips the idle budget
+        // → the slot is reclaimed.
+        drop(resp);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if service.app_state.admission.current() == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the admission slot was not reclaimed after the stream dropped"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]

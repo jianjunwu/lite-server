@@ -31,6 +31,7 @@ impl GrpcService {
         request_id_out: &mut String,
         start: Instant,
         span: tracing::Span,
+        admission: crate::admission::AdmissionGuard,
     ) -> Result<Response<ReceiverStream<Result<pb::StreamChunk, Status>>>, Status> {
         let remote_addr = request.remote_addr();
         let (grpc_metadata, extensions, req) = request.into_parts();
@@ -274,6 +275,10 @@ impl GrpcService {
             // P10 (D40): held for the forward task's lifetime — released on
             // drop (terminal frame / idle / disconnect; D18 teardown path).
             let _ensemble_permit = ensemble_permit;
+            // RN-13 (O2): the admission slot is held for the stream's
+            // lifetime (the wrapper acquired it before open; early open
+            // failures dropped it back).
+            let _admission_guard = admission;
             let open_time = std::time::Instant::now();
             let mut first_chunk = true;
             let mut last_chunk_time = open_time;

@@ -32,6 +32,7 @@ impl GrpcService {
         request_id_out: &mut String,
         start: Instant,
         span: tracing::Span,
+        admission: crate::admission::AdmissionGuard,
     ) -> Result<Response<ReceiverStream<Result<pb::DecoupledResponse, Status>>>, Status> {
         // P9-1 (蓝图 §4.4, D18): DecoupledInfer = a stream whose channel the
         // MODEL controls — predict_decoupled returns before close(), the worker
@@ -217,6 +218,10 @@ impl GrpcService {
             None
         };
         tokio::spawn(async move {
+            // RN-13 (O2): the admission slot is held for the stream's
+            // lifetime (the wrapper acquired it before open; early open
+            // failures dropped it back).
+            let _admission_guard = admission;
             let open_time = std::time::Instant::now();
             let mut first_chunk = true;
             let mut last_chunk_time = open_time;
@@ -563,6 +568,11 @@ mod tests {
                 &mut request_id_out,
                 std::time::Instant::now(),
                 tracing::Span::current(),
+                // No-op guard (cap 0) — the test drives the impl directly,
+                // bypassing the wrapper's acquire.
+                crate::admission::AdmissionCounter::new(0)
+                    .try_acquire()
+                    .expect("cap 0 always admits"),
             )
             .await
             .expect("decoupled stream must open");

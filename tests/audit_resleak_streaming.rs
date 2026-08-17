@@ -778,6 +778,104 @@ async fn test_rn13_ws_admission_slot_held_for_stream_lifetime() {
 }
 
 // ---------------------------------------------------------------------------
+// RN-13 (h2 bidi, O1): same admission contract on the h2 /bidi transport.
+// The bidi handler never extracted AdmissionSlot, so bidi sessions bypassed
+// max_inflight entirely. Post-fix shape mirrors the SSE/WS variants: Phase 1
+// holds a bidi session OPEN (upstream body half-open after the Open frame;
+// the stall model keeps the session silent and alive) and a concurrent
+// contender must get 503; Phase 2 drops the session and polls for
+// re-admission (the reclaim rides the incoming EOF → worker Close →
+// WorkerEof path, with the 2s chunk-idle budget as backstop).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn test_rn13_h2_bidi_admission_slot_held_for_session_lifetime() {
+    use lite_server::proto::liteserver::{bidi_chunk, BidiChunk, BidiOpen};
+
+    let (base, _guard, _repo) = boot(
+        "  max_inflight: 1\n  timeout: 30.0\n  decoupled_idle_timeout_secs: 2.0",
+        &["stall"],
+    )
+    .await;
+    wait_ready_all(&base, &["stall"]).await;
+
+    let h2 = reqwest::Client::builder()
+        .no_proxy()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    let open = lite_server::streaming::lpm::encode_frame(&BidiChunk {
+        stream_id: String::new(),
+        payload: Some(bidi_chunk::Payload::Open(BidiOpen {
+            model_name: "stall".into(),
+            version: "1".into(),
+            initial_data: bytes::Bytes::from(r#"{"text":"hi"}"#),
+            ..Default::default()
+        })),
+    });
+    // The upstream body stays half-open: the Open frame is buffered, the
+    // sender is held by the test — the session is alive and silent.
+    let (body_tx, body_rx) =
+        tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(1);
+    body_tx.send(Ok(open)).await.expect("open frame must buffer");
+    let resp = h2
+        .post(format!("{base}/v2/models/stall/bidi"))
+        .header("Content-Type", "application/json")
+        .body(reqwest::Body::wrap_stream(
+            tokio_stream::wrappers::ReceiverStream::new(body_rx),
+        ))
+        .send()
+        .await
+        .expect("h2 bidi session must open");
+    assert_eq!(resp.status(), 200);
+
+    // Phase 1: the slot is held while the session is alive → contender 503.
+    let contender = http_client()
+        .post(format!("{base}/v2/models/stall/events"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "text/event-stream")
+        .json(&json!({"text": "hi"}))
+        .send()
+        .await
+        .expect("contender request must complete");
+    assert_eq!(
+        contender.status(),
+        503,
+        "RN-13: with max_inflight=1 a contender must be rejected while the \
+         h2 bidi session holds the admission slot"
+    );
+    drop(contender);
+
+    // Phase 2: upstream half-close + response drop → session teardown →
+    // slot reclaimed → a later request is admitted again.
+    drop(body_tx);
+    drop(resp);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let resp = http_client()
+            .post(format!("{base}/v2/models/stall/events"))
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
+            .json(&json!({"text": "hi"}))
+            .send()
+            .await
+            .expect("probe request must complete");
+        let status = resp.status().as_u16();
+        drop(resp);
+        if status == 200 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "RN-13: the admission slot was not reclaimed within 15s of the \
+             bidi session teardown"
+        );
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RN-14: burst throughput. Post-fix shape (2026-08-15): the stream channel
 // depth is the `server.stream_channel_size` knob (default 64, behavior-
 // neutral; covers the ZMQ worker channel AND the SSE event channel). This

@@ -62,11 +62,12 @@ pub async fn h2_bidi_handler(
     path: Path<String>,
     headers: HeaderMap,
     cx: RequestContext,
+    slot: crate::admission::AdmissionSlot,
     request: axum::extract::Request,
 ) -> Result<Response, ProtocolError> {
     let model_name = path.0;
     let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
-    h2_bidi_entry(state, &model_name, None, headers, cx, request)
+    h2_bidi_entry(state, &model_name, None, headers, cx, slot, request)
         .await
         .map_err(|error| ProtocolError { error, protocol })
 }
@@ -76,11 +77,12 @@ pub async fn h2_bidi_version_handler(
     path: Path<(String, String)>,
     headers: HeaderMap,
     cx: RequestContext,
+    slot: crate::admission::AdmissionSlot,
     request: axum::extract::Request,
 ) -> Result<Response, ProtocolError> {
     let (model_name, version) = path.0;
     let protocol = cx.api_protocol.unwrap_or(crate::protocol::ApiProtocol::Legacy);
-    h2_bidi_entry(state, &model_name, Some(version), headers, cx, request)
+    h2_bidi_entry(state, &model_name, Some(version), headers, cx, slot, request)
         .await
         .map_err(|error| ProtocolError { error, protocol })
 }
@@ -91,6 +93,7 @@ async fn h2_bidi_entry(
     version: Option<String>,
     headers: HeaderMap,
     cx: RequestContext,
+    slot: crate::admission::AdmissionSlot,
     request: axum::extract::Request,
 ) -> Result<Response, AppError> {
     // S1(b)/D7:open 前的早期拒绝也计一次请求(对齐 gRPC wrapper 双点语义)。
@@ -103,6 +106,7 @@ async fn h2_bidi_entry(
         version,
         headers,
         cx,
+        slot,
         request,
         &mut label_version,
     )
@@ -119,12 +123,14 @@ async fn h2_bidi_entry(
     result
 }
 
+#[allow(clippy::too_many_arguments)] // RN-13 slot threading (same precedent as sse_infer_impl)
 async fn h2_bidi_entry_impl(
     state: Arc<AppState>,
     model_name: &str,
     version: Option<String>,
     headers: HeaderMap,
     cx: RequestContext,
+    slot: crate::admission::AdmissionSlot,
     request: axum::extract::Request,
     label_version: &mut String,
 ) -> Result<Response, AppError> {
@@ -570,11 +576,22 @@ async fn h2_bidi_entry_impl(
     span.record("body_bytes", initial_body_len as i64);
     span.record("body_kind", body_kind_str);
 
+    // RN-13 (D9-A, O1): take the admission guard BEFORE the response is
+    // produced — the middleware reclaims the transfer cell right after
+    // next.run returns, so a take() inside the spawned outgoing task would
+    // race that reclaim and lose it (the 21908c0 SSE/WS regression). Early
+    // rejects above leave the guard in the cell for the middleware to
+    // reclaim. None when the path did not carry one — cap 0 / unit tests.
+    let admission_guard = slot.take();
+
     tokio::spawn(
         async move {
             // P10 (D40): held for the outgoing task's lifetime — released on
             // drop (terminal frame / idle / disconnect; D18 teardown path).
             let _ensemble_permit = ensemble_permit;
+            // RN-13 (D9-A, O1): the admission slot is held for the session's
+            // lifetime.
+            let _admission_guard = admission_guard;
             // Outgoing loop: worker chunks → LPM frames → tx.
             let open_time = std::time::Instant::now();
             let mut first_chunk = true;
@@ -1395,6 +1412,7 @@ mod tests {
             Path(model.to_string()),
             HeaderMap::new(),
             test_cx(),
+            crate::admission::AdmissionSlot::default(),
             req,
         )
         .await
@@ -1578,6 +1596,7 @@ mod tests {
             Path(model.to_string()),
             HeaderMap::new(),
             test_cx(),
+            crate::admission::AdmissionSlot::default(),
             req,
         )
         .await
@@ -1833,6 +1852,7 @@ mod tests {
                 Path(model.to_string()),
                 HeaderMap::new(),
                 test_cx(),
+                crate::admission::AdmissionSlot::default(),
                 req,
             ),
         )
@@ -1933,6 +1953,7 @@ mod tests {
             Path(model.to_string()),
             HeaderMap::new(),
             test_cx(),
+            crate::admission::AdmissionSlot::default(),
             req,
         )
         .await
