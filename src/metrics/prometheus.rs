@@ -45,6 +45,25 @@ lazy_static! {
         &["model", "version", "action", "status"]
     ).unwrap();
 
+    // G6 (P-WARM): warmup observability. Duration covers every terminal run
+    // (success AND failure — a failed warmup's wall time is diagnostic too);
+    // the counter's status label is the closed WarmupStatus enum (§6.5 #10).
+    pub static ref MODEL_WARMUP_TOTAL: CounterVec = CounterVec::new(
+        prometheus::Opts::new(
+            "liteserver_model_warmup_total",
+            "Warmup runs by terminal status"
+        ),
+        &["model", "version", "status"]
+    ).unwrap();
+
+    pub static ref MODEL_WARMUP_DURATION: HistogramVec = HistogramVec::new(
+        HistogramOpts::new(
+            "liteserver_model_warmup_duration_seconds",
+            "Warmup wall time (all samples x iterations x workers)"
+        ).buckets(vec![0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0]),
+        &["model", "version"]
+    ).unwrap();
+
     pub static ref VERSION_SWITCHES_TOTAL: CounterVec = CounterVec::new(
         prometheus::Opts::new(
             "liteserver_version_switches_total",
@@ -449,6 +468,8 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(REQUEST_DURATION.clone()))?;
     REGISTRY.register(Box::new(QUEUE_DEPTH.clone()))?;
     REGISTRY.register(Box::new(MODEL_LOAD_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(MODEL_WARMUP_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(MODEL_WARMUP_DURATION.clone()))?;
     REGISTRY.register(Box::new(VERSION_SWITCHES_TOTAL.clone()))?;
     REGISTRY.register(Box::new(ACTIVE_WORKERS.clone()))?;
     REGISTRY.register(Box::new(VERSION_WEIGHT.clone()))?;
@@ -892,6 +913,36 @@ pub fn record_model_load(model: &str, version: &str, success: bool) {
     MODEL_LOAD_TOTAL.with_label_values(&[model, version, "load", status]).inc();
 }
 
+/// G6: terminal status of a warmup run — the closed label set of
+/// `liteserver_model_warmup_total` (§6.5 #10: label values are closed enums).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarmupStatus {
+    Success,
+    Failure,
+    Timeout,
+}
+
+impl WarmupStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            WarmupStatus::Success => "success",
+            WarmupStatus::Failure => "failure",
+            WarmupStatus::Timeout => "timeout",
+        }
+    }
+}
+
+/// G6: record one terminal warmup run — duration always observed (a failed
+/// run's wall time is diagnostic too), counter bumped by status.
+pub fn record_model_warmup(model: &str, version: &str, secs: f64, status: WarmupStatus) {
+    MODEL_WARMUP_DURATION
+        .with_label_values(&[model, version])
+        .observe(secs);
+    MODEL_WARMUP_TOTAL
+        .with_label_values(&[model, version, status.as_str()])
+        .inc();
+}
+
 pub fn record_model_unload(model: &str, version: &str) {
     MODEL_LOAD_TOTAL.with_label_values(&[model, version, "unload", "success"]).inc();
 }
@@ -1017,6 +1068,8 @@ pub fn remove_version_metrics(model: &str, version: &str) {
     purge!(WORKER_INFERENCE_TOTAL, "liteserver_worker_inference_total", ["model", "version", "worker_id"]);
     purge!(WORKER_RESPAWNS_TOTAL, "liteserver_worker_respawns_total", ["model", "version", "reason"]);
     purge!(WORKER_RESPAWN_FAILURES_TOTAL, "liteserver_worker_respawn_failures_total", ["model", "version", "reason"]);
+    purge!(MODEL_WARMUP_TOTAL, "liteserver_model_warmup_total", ["model", "version", "status"]);
+    purge!(MODEL_WARMUP_DURATION, "liteserver_model_warmup_duration_seconds", ["model", "version"]);
     purge!(IN_FLIGHT_REQUESTS, "liteserver_in_flight_requests", ["model", "version"]);
     purge!(QUEUE_WAIT_SECONDS, "liteserver_queue_wait_seconds", ["model", "version"]);
     purge!(WORKER_SATURATION, "liteserver_worker_saturation", ["model", "version"]);
@@ -1861,6 +1914,63 @@ mod tests {
             "M8: ENSEMBLE_STEP_LATENCY retains series \
              {{ensemble=m8_ens,step=m8_step,model={model},version={version}}} \
              after remove_version_metrics — family is missing from the purge list"
+        );
+    }
+
+    /// G6: warmup runs must be observable — a duration histogram plus a
+    /// closed-enum status counter, both per (model, version).
+    #[test]
+    fn warmup_metrics_record_duration_and_classify_status() {
+        let _ = register_metrics();
+        let model = "warmup_met_m";
+        let version = "1";
+        let counter = |status: &str| {
+            MODEL_WARMUP_TOTAL
+                .with_label_values(&[model, version, status])
+                .get()
+        };
+        let (s0, f0, t0) = (counter("success"), counter("failure"), counter("timeout"));
+        let c0 = MODEL_WARMUP_DURATION
+            .with_label_values(&[model, version])
+            .get_sample_count();
+
+        record_model_warmup(model, version, 0.25, WarmupStatus::Success);
+        record_model_warmup(model, version, 0.5, WarmupStatus::Failure);
+        record_model_warmup(model, version, 5.0, WarmupStatus::Timeout);
+
+        assert_eq!(counter("success"), s0 + 1.0);
+        assert_eq!(counter("failure"), f0 + 1.0);
+        assert_eq!(counter("timeout"), t0 + 1.0);
+        assert_eq!(
+            MODEL_WARMUP_DURATION
+                .with_label_values(&[model, version])
+                .get_sample_count(),
+            c0 + 3,
+            "every terminal run observes the duration"
+        );
+    }
+
+    /// G6 (§6.5 #11): the warmup families carry (model, version) labels, so
+    /// they must join the remove_version_metrics purge list — unloading a
+    /// version must not leave warmup series behind.
+    #[test]
+    fn warmup_metrics_purged_on_version_remove() {
+        let _ = register_metrics();
+        let model = "warmup_purge_m";
+        record_model_warmup(model, "1", 0.1, WarmupStatus::Success);
+        remove_version_metrics(model, "1");
+
+        let counter_hit = MODEL_WARMUP_TOTAL
+            .get_metric_with_label_values(&[model, "1", "success"])
+            .map(|c| c.get() > 0.0)
+            .unwrap_or(false);
+        let hist_hit = MODEL_WARMUP_DURATION
+            .get_metric_with_label_values(&[model, "1"])
+            .map(|h| h.get_sample_count() > 0)
+            .unwrap_or(false);
+        assert!(
+            !counter_hit && !hist_hit,
+            "warmup series for {model}/1 must be purged on unload"
         );
     }
 

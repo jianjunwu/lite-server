@@ -68,6 +68,30 @@ struct WarmupUnit {
     worker_pin: Option<usize>,
 }
 
+/// G6: a warmup failure paired with its terminal kind — the kind feeds the
+/// closed status label of `liteserver_model_warmup_total`; the reason stays
+/// human-readable for `last_failure` and logs.
+struct WarmupFailure {
+    kind: crate::metrics::prometheus::WarmupStatus,
+    reason: String,
+}
+
+impl WarmupFailure {
+    fn failure(reason: String) -> Self {
+        Self {
+            kind: crate::metrics::prometheus::WarmupStatus::Failure,
+            reason,
+        }
+    }
+
+    fn timeout(reason: String) -> Self {
+        Self {
+            kind: crate::metrics::prometheus::WarmupStatus::Timeout,
+            reason,
+        }
+    }
+}
+
 /// G1: build the warmup execution plan. `worker` scope (default) replays the
 /// full sample set on EVERY worker process (worker-major order) — each process
 /// owns separate engine state, so a version-wide pass would leave N-1 of N
@@ -752,6 +776,9 @@ impl WorkerManager {
     /// caller marks the version `Failed`. `pin` selects the plan shape:
     /// `None` (load) = [`build_warmup_plan`] over all workers; `Some(worker)`
     /// (G2 respawn re-warm) = the full sample set pinned to that one slot.
+    ///
+    /// G6: thin wrapper — records duration + terminal status exactly once per
+    /// run (single record point); the body lives in `run_warmup_inner`.
     pub(super) async fn run_warmup(
         &self,
         model_name: &str,
@@ -760,11 +787,41 @@ impl WorkerManager {
         policy: &crate::config::WarmupPolicy,
         pin: Option<u32>,
     ) -> Result<(), String> {
+        let start = std::time::Instant::now();
+        let result = self
+            .run_warmup_inner(model_name, version, model_config, policy, pin)
+            .await;
+        let status = match &result {
+            Ok(()) => crate::metrics::prometheus::WarmupStatus::Success,
+            Err(e) => e.kind,
+        };
+        crate::metrics::prometheus::record_model_warmup(
+            model_name,
+            version,
+            start.elapsed().as_secs_f64(),
+            status,
+        );
+        result.map_err(|e| e.reason)
+    }
+
+    async fn run_warmup_inner(
+        &self,
+        model_name: &str,
+        version: &str,
+        model_config: &ModelConfig,
+        policy: &crate::config::WarmupPolicy,
+        pin: Option<u32>,
+    ) -> Result<(), WarmupFailure> {
         let (model_dir, worker_count) = self
             .registry
             .get(model_name, Some(version))
             .map(|mv| (mv.model_dir.clone(), mv.workers.len()))
-            .ok_or_else(|| format!("version {}/{} vanished during warmup", model_name, version))?;
+            .ok_or_else(|| {
+                WarmupFailure::failure(format!(
+                    "version {}/{} vanished during warmup",
+                    model_name, version
+                ))
+            })?;
         let timeout_opt = policy.effective_timeout(model_config.request_timeout);
         let timestamp_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -777,7 +834,13 @@ impl WorkerManager {
             let dummy_path = model_dir.join(&sample.input_ref);
             let body = tokio::fs::read(&dummy_path)
                 .await
-                .map_err(|e| format!("read dummy input {}: {}", dummy_path.display(), e))?;
+                .map_err(|e| {
+                    WarmupFailure::failure(format!(
+                        "read dummy input {}: {}",
+                        dummy_path.display(),
+                        e
+                    ))
+                })?;
             payloads.push(bytes::Bytes::from(body));
         }
 
@@ -821,10 +884,12 @@ impl WorkerManager {
             match self.inference_queue.try_submit(model_name, version, item) {
                 Ok(()) => {}
                 Err(crate::inference_queue::QueueError::Full) => {
-                    return Err("warmup queue full".to_string());
+                    return Err(WarmupFailure::failure("warmup queue full".to_string()));
                 }
                 Err(_) => {
-                    return Err("warmup: inference queue not available".to_string());
+                    return Err(WarmupFailure::failure(
+                        "warmup: inference queue not available".to_string(),
+                    ));
                 }
             }
 
@@ -832,17 +897,25 @@ impl WorkerManager {
             let response = match timeout_opt {
                 Some(t) => match timeout(t, response_rx).await {
                     Ok(Ok(r)) => r,
-                    Ok(Err(_)) => return Err("warmup: response channel closed".to_string()),
+                    Ok(Err(_)) => {
+                        return Err(WarmupFailure::failure(
+                            "warmup: response channel closed".to_string(),
+                        ))
+                    }
                     Err(_) => {
-                        return Err(format!(
+                        return Err(WarmupFailure::timeout(format!(
                             "warmup: timed out after {:.1}s",
                             t.as_secs_f32()
-                        ))
+                        )))
                     }
                 },
                 None => match response_rx.await {
                     Ok(r) => r,
-                    Err(_) => return Err("warmup: response channel closed".to_string()),
+                    Err(_) => {
+                        return Err(WarmupFailure::failure(
+                            "warmup: response channel closed".to_string(),
+                        ))
+                    }
                 },
             };
 
@@ -861,7 +934,10 @@ impl WorkerManager {
                         .unwrap_or_default(),
                     _ => "unexpected response payload".to_string(),
                 };
-                return Err(format!("warmup inference returned error: {}", detail));
+                return Err(WarmupFailure::failure(format!(
+                    "warmup inference returned error: {}",
+                    detail
+                )));
             }
         }
 
@@ -2349,6 +2425,13 @@ class TestAPI(LitAPI):
         assert!(
             matches!(err, AppError::WorkerCrashed(_)),
             "warmup failure must fail the load, got {err:?}"
+        );
+        assert_eq!(
+            crate::metrics::prometheus::MODEL_WARMUP_TOTAL
+                .with_label_values(&["l5_model", "1", "failure"])
+                .get(),
+            1.0,
+            "G6: the failed warmup must be counted with status=failure"
         );
 
         // The version is registered as Failed (load_model registered before

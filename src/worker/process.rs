@@ -1377,7 +1377,18 @@ class TestAPI(LitAPI):
     #[cfg(unix)]
     #[tokio::test]
     async fn respawn_rewarms_replacement_worker() {
+        let warmups = || {
+            crate::metrics::prometheus::MODEL_WARMUP_TOTAL
+                .with_label_values(&["g2_rewarm", "1", "success"])
+                .get()
+        };
+        let w0 = warmups();
         let (wm, registry, repo, marker) = rewarm_harness("g2_rewarm", 2).await;
+        assert_eq!(
+            warmups(),
+            w0 + 1.0,
+            "G6: the load-time warmup must be counted"
+        );
         let lines = |p: &std::path::Path| {
             std::fs::read_to_string(p)
                 .unwrap_or_default()
@@ -1394,6 +1405,11 @@ class TestAPI(LitAPI):
             .await
             .expect("respawn must succeed");
 
+        assert_eq!(
+            warmups(),
+            w0 + 2.0,
+            "G6: the respawn re-warm must be counted"
+        );
         assert_eq!(
             lines(&marker),
             4,
