@@ -1062,10 +1062,21 @@ pub struct WarmupPolicy {
     /// Warmup samples, consumed in order. Each = one dummy request-body file +
     /// its iteration count. Must be non-empty when `enabled` is true.
     pub samples: Vec<WarmupSample>,
-    /// Per-warmup budget in seconds. 0 = fall back to the model's
-    /// `request_timeout` (0 there = no bound). A warmup exceeding it fails the
-    /// version.
+    /// Per-ITERATION budget in seconds (each dummy inference is bounded
+    /// individually). 0 = fall back to the model's `request_timeout`
+    /// (0 there = no bound).
     pub timeout_secs: f32,
+    /// G4: budget for the WHOLE warmup run in seconds (all samples x
+    /// iterations x worker shares combined). 0 = no total budget (default,
+    /// pre-G4 behavior). Independent of `timeout_secs` — whichever fires
+    /// first fails the run (status=timeout).
+    pub total_timeout_secs: f32,
+    /// G5: dummy inferences in flight per worker group. 1 (default) = serial,
+    /// the pre-G5 behavior. 0 is normalized to 1.
+    pub concurrency: u32,
+    /// G7: retries per failed unit (same worker, fixed 500ms interval).
+    /// 0 (default) = fail-fast (D33).
+    pub retries: u32,
     /// M7 migration sentinel — removed config shape, never consumed.
     pub dummy_input_ref: Option<String>,
     /// M7 migration sentinel — removed config shape, never consumed.
@@ -1109,6 +1120,9 @@ impl Default for WarmupPolicy {
             respawn: true,
             samples: Vec::new(),
             timeout_secs: 0.0,
+            total_timeout_secs: 0.0,
+            concurrency: 1,
+            retries: 0,
             dummy_input_ref: None,
             iterations: None,
         }
@@ -1636,6 +1650,28 @@ mod tests {
         .unwrap();
         assert!(!p.respawn);
         assert!(WarmupPolicy::default().respawn);
+    }
+
+    #[test]
+    fn warmup_batch4_knobs_parse_with_defaults() {
+        // G4/G5/G7: total budget / concurrency / retries are all additive —
+        // defaults preserve the pre-knob behavior (no total budget, serial,
+        // fail-fast).
+        let p: WarmupPolicy = serde_yaml::from_str(
+            "enabled: true\nsamples:\n  - input_ref: warmup/input.json\n",
+        )
+        .unwrap();
+        assert_eq!(p.total_timeout_secs, 0.0, "no total budget by default");
+        assert_eq!(p.concurrency, 1, "serial by default");
+        assert_eq!(p.retries, 0, "fail-fast by default (D33)");
+
+        let p: WarmupPolicy = serde_yaml::from_str(
+            "enabled: true\ntotal_timeout_secs: 30.0\nconcurrency: 4\nretries: 2\nsamples:\n  - input_ref: warmup/input.json\n",
+        )
+        .unwrap();
+        assert_eq!(p.total_timeout_secs, 30.0);
+        assert_eq!(p.concurrency, 4);
+        assert_eq!(p.retries, 2);
     }
 
     #[test]

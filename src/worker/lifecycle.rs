@@ -2,6 +2,7 @@
 //! max_requests auto-recycle listener, and FILE_CHANGED hot-reload notify.
 
 use super::hooks::{execute_hook, policies_from_config};
+use futures::StreamExt;
 use super::process::{
     classify_stderr_line, drain_worker_stderr, emit_stderr_line, new_worker_command,
     spawn_worker_monitor, strip_level_prefix, worker_endpoint,
@@ -152,6 +153,28 @@ fn build_warmup_plan_for_worker(
             sample: si,
             worker_pin: Some(worker_id as usize),
         })
+        .collect()
+}
+
+/// G5: group plan units by worker pin, preserving first-occurrence order.
+/// Every unit within a group shares one pin, so any batch the collector
+/// forms from a group is pin-unanimous (`batch_direct_pin` never conflicts);
+/// callers execute groups sequentially so units of different pins never
+/// share a collector window (a mixed batch would silently drop the pin via
+/// the conflict fallback).
+fn group_units_by_pin(plan: &[WarmupUnit]) -> Vec<Vec<WarmupUnit>> {
+    let mut order: Vec<Option<usize>> = Vec::new();
+    let mut groups: std::collections::HashMap<Option<usize>, Vec<WarmupUnit>> =
+        std::collections::HashMap::new();
+    for u in plan {
+        if !groups.contains_key(&u.worker_pin) {
+            order.push(u.worker_pin);
+        }
+        groups.entry(u.worker_pin).or_default().push(u.clone());
+    }
+    order
+        .into_iter()
+        .map(|k| groups.remove(&k).expect("key inserted above"))
         .collect()
 }
 
@@ -788,9 +811,25 @@ impl WorkerManager {
         pin: Option<u32>,
     ) -> Result<(), String> {
         let start = std::time::Instant::now();
-        let result = self
-            .run_warmup_inner(model_name, version, model_config, policy, pin)
-            .await;
+        // G4: an optional budget over the WHOLE run, independent of the
+        // per-iteration budget inside — whichever fires first fails the run.
+        let inner = self.run_warmup_inner(model_name, version, model_config, policy, pin);
+        let result = if policy.total_timeout_secs > 0.0 {
+            match timeout(
+                Duration::from_secs_f32(policy.total_timeout_secs),
+                inner,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => Err(WarmupFailure::timeout(format!(
+                    "warmup: total timeout after {:.1}s",
+                    policy.total_timeout_secs
+                ))),
+            }
+        } else {
+            inner.await
+        };
         let status = match &result {
             Ok(()) => crate::metrics::prometheus::WarmupStatus::Success,
             Err(e) => e.kind,
@@ -823,10 +862,6 @@ impl WorkerManager {
                 ))
             })?;
         let timeout_opt = policy.effective_timeout(model_config.request_timeout);
-        let timestamp_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as i64)
-            .unwrap_or(0);
 
         // Read each sample's dummy body once — worker scope replays it per worker.
         let mut payloads: Vec<bytes::Bytes> = Vec::with_capacity(policy.samples.len());
@@ -856,91 +891,164 @@ impl WorkerManager {
             "warming up model"
         );
 
-        for (ui, unit) in plan.iter().enumerate() {
-            let uid = format!("warmup_{}_{}_{}", model_name, version, ui);
-            let mut headers = std::collections::HashMap::new();
-            if let Some(w) = unit.worker_pin {
-                headers.insert("x-lite-worker-id".to_string(), w.to_string());
-            }
-            let meta = crate::proto::liteserver::RequestMeta {
-                route: "/predict".to_string(),
-                request_id: uid.clone(),
-                client_ip: "127.0.0.1".to_string(),
-                timestamp_ns,
-                headers,
-                payload: payloads[unit.sample].clone(),
-                ..Default::default()
-            };
-            let (response_tx, response_rx) = oneshot::channel();
-            let item = crate::inference_queue::QueueItem {
-                uid: uid.clone(),
-                data: payloads[unit.sample].clone(),
-                meta: Some(Arc::new(meta)),
-                response_tx,
-                inflight_guard: None,
-                enqueued_at: std::time::Instant::now(),
-                is_warmup: true,
-            };
-            match self.inference_queue.try_submit(model_name, version, item) {
-                Ok(()) => {}
-                Err(crate::inference_queue::QueueError::Full) => {
-                    return Err(WarmupFailure::failure("warmup queue full".to_string()));
-                }
-                Err(_) => {
-                    return Err(WarmupFailure::failure(
-                        "warmup: inference queue not available".to_string(),
-                    ));
-                }
-            }
-
-            // Bound the dummy inference by the warmup timeout (None = unbounded).
-            let response = match timeout_opt {
-                Some(t) => match timeout(t, response_rx).await {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(_)) => {
-                        return Err(WarmupFailure::failure(
-                            "warmup: response channel closed".to_string(),
-                        ))
-                    }
-                    Err(_) => {
-                        return Err(WarmupFailure::timeout(format!(
-                            "warmup: timed out after {:.1}s",
-                            t.as_secs_f32()
-                        )))
-                    }
-                },
-                None => match response_rx.await {
-                    Ok(r) => r,
-                    Err(_) => {
-                        return Err(WarmupFailure::failure(
-                            "warmup: response channel closed".to_string(),
-                        ))
-                    }
-                },
-            };
-
-            // A non-Ok status (or a non-Single payload) fails the warmup.
-            let ok = matches!(
-                response.payload,
-                Some(crate::proto::liteserver::response::Payload::Single(ref s))
-                    if s.status.as_ref().map(|st| st.code.as_str()).unwrap_or("Ok") != "Error"
-            );
-            if !ok {
-                let detail = match response.payload {
-                    Some(crate::proto::liteserver::response::Payload::Single(ref s)) => s
-                        .status
-                        .as_ref()
-                        .map(|st| st.message.clone())
-                        .unwrap_or_default(),
-                    _ => "unexpected response payload".to_string(),
-                };
-                return Err(WarmupFailure::failure(format!(
-                    "warmup inference returned error: {}",
-                    detail
-                )));
+        // G5: execute pin-groups SEQUENTIALLY (units of different pins never
+        // share a collector window — a mixed batch would silently drop the
+        // pin via batch_direct_pin's conflict fallback); units within a group
+        // run up to `concurrency` in flight.
+        let concurrency = policy.concurrency.max(1) as usize;
+        for group in group_units_by_pin(&plan) {
+            let mut units = futures::stream::iter(group.into_iter().map(|unit| {
+                self.run_warmup_unit(model_name, version, policy, unit, &payloads, timeout_opt)
+            }))
+            .buffer_unordered(concurrency);
+            while let Some(result) = units.next().await {
+                // First failure aborts the run: the stream (and its in-flight
+                // unit futures) drops here — response channels close and the
+                // queued items clean up via the RAII inflight guard.
+                result?;
             }
         }
 
+        Ok(())
+    }
+
+    /// G7: run one warmup unit, retrying transient failures on the same
+    /// worker (fixed 500ms interval, `policy.retries` extra attempts;
+    /// 0 = fail-fast, D33).
+    async fn run_warmup_unit(
+        &self,
+        model_name: &str,
+        version: &str,
+        policy: &crate::config::WarmupPolicy,
+        unit: WarmupUnit,
+        payloads: &[bytes::Bytes],
+        timeout_opt: Option<Duration>,
+    ) -> Result<(), WarmupFailure> {
+        let mut attempt = 0u32;
+        loop {
+            match self
+                .run_warmup_unit_once(model_name, version, &unit, payloads, timeout_opt)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    attempt += 1;
+                    if attempt > policy.retries {
+                        return Err(e);
+                    }
+                    info!(
+                        model = %model_name, version = %version,
+                        attempt,
+                        reason = %e.reason,
+                        "warmup unit failed; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+    }
+
+    /// One warmup attempt: submit the sample's dummy body (pinned when the
+    /// unit says so) and validate the response.
+    async fn run_warmup_unit_once(
+        &self,
+        model_name: &str,
+        version: &str,
+        unit: &WarmupUnit,
+        payloads: &[bytes::Bytes],
+        timeout_opt: Option<Duration>,
+    ) -> Result<(), WarmupFailure> {
+        let uid = format!(
+            "warmup_{}_{}_{}",
+            model_name,
+            version,
+            uuid::Uuid::new_v4()
+        );
+        let timestamp_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        let mut headers = std::collections::HashMap::new();
+        if let Some(w) = unit.worker_pin {
+            headers.insert("x-lite-worker-id".to_string(), w.to_string());
+        }
+        let meta = crate::proto::liteserver::RequestMeta {
+            route: "/predict".to_string(),
+            request_id: uid.clone(),
+            client_ip: "127.0.0.1".to_string(),
+            timestamp_ns,
+            headers,
+            payload: payloads[unit.sample].clone(),
+            ..Default::default()
+        };
+        let (response_tx, response_rx) = oneshot::channel();
+        let item = crate::inference_queue::QueueItem {
+            uid: uid.clone(),
+            data: payloads[unit.sample].clone(),
+            meta: Some(Arc::new(meta)),
+            response_tx,
+            inflight_guard: None,
+            enqueued_at: std::time::Instant::now(),
+            is_warmup: true,
+        };
+        match self.inference_queue.try_submit(model_name, version, item) {
+            Ok(()) => {}
+            Err(crate::inference_queue::QueueError::Full) => {
+                return Err(WarmupFailure::failure("warmup queue full".to_string()));
+            }
+            Err(_) => {
+                return Err(WarmupFailure::failure(
+                    "warmup: inference queue not available".to_string(),
+                ));
+            }
+        }
+
+        // Bound the dummy inference by the per-iteration budget (None = unbounded).
+        let response = match timeout_opt {
+            Some(t) => match timeout(t, response_rx).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(_)) => {
+                    return Err(WarmupFailure::failure(
+                        "warmup: response channel closed".to_string(),
+                    ))
+                }
+                Err(_) => {
+                    return Err(WarmupFailure::timeout(format!(
+                        "warmup: timed out after {:.1}s",
+                        t.as_secs_f32()
+                    )))
+                }
+            },
+            None => match response_rx.await {
+                Ok(r) => r,
+                Err(_) => {
+                    return Err(WarmupFailure::failure(
+                        "warmup: response channel closed".to_string(),
+                    ))
+                }
+            },
+        };
+
+        // A non-Ok status (or a non-Single payload) fails the attempt.
+        let ok = matches!(
+            response.payload,
+            Some(crate::proto::liteserver::response::Payload::Single(ref s))
+                if s.status.as_ref().map(|st| st.code.as_str()).unwrap_or("Ok") != "Error"
+        );
+        if !ok {
+            let detail = match response.payload {
+                Some(crate::proto::liteserver::response::Payload::Single(ref s)) => s
+                    .status
+                    .as_ref()
+                    .map(|st| st.message.clone())
+                    .unwrap_or_default(),
+                _ => "unexpected response payload".to_string(),
+            };
+            return Err(WarmupFailure::failure(format!(
+                "warmup inference returned error: {}",
+                detail
+            )));
+        }
         Ok(())
     }
 
@@ -2321,6 +2429,285 @@ class TestAPI(LitAPI):
     }
 
     #[test]
+    fn warmup_groups_have_uniform_pins_in_plan_order() {
+        // G5: units sharing a collector window must never mix pins (a mixed
+        // batch silently drops the pin via batch_direct_pin's conflict
+        // fallback), so the executor groups by pin — each group uniform,
+        // groups in first-occurrence order.
+        let policy = crate::config::WarmupPolicy {
+            enabled: true,
+            scope: crate::config::WarmupScope::Version,
+            samples: vec![crate::config::WarmupSample {
+                input_ref: "warmup/a.json".to_string(),
+                iterations: 7,
+            }],
+            ..Default::default()
+        };
+        let plan = build_warmup_plan(&policy, 3);
+        let groups = group_units_by_pin(&plan);
+        assert_eq!(groups.len(), 3, "three pins -> three groups");
+        let group_pins: Vec<_> = groups
+            .iter()
+            .map(|g| g[0].worker_pin)
+            .collect();
+        assert_eq!(group_pins, vec![Some(0), Some(1), Some(2)]);
+        for g in &groups {
+            assert!(
+                g.iter().all(|u| u.worker_pin == g[0].worker_pin),
+                "every group must be pin-unanimous"
+            );
+        }
+        assert_eq!(
+            groups.iter().map(|g| g.len()).sum::<usize>(),
+            7,
+            "grouping must not drop units"
+        );
+    }
+
+    /// Batch-4 e2e harness: temp repo with the caller's model source and
+    /// warmup policy; loads the model and returns manager/registry/repo plus
+    /// the load outcome for assertions.
+    #[cfg(unix)]
+    async fn warmup_e2e_load(
+        tag: &str,
+        model_py: &str,
+        policy: crate::config::WarmupPolicy,
+    ) -> (
+        WorkerManager,
+        Arc<ModelRegistry>,
+        std::path::PathBuf,
+        Result<(), AppError>,
+    ) {
+        let repo =
+            std::env::temp_dir().join(format!("lite-server-b4-{tag}-{}", std::process::id()));
+        let model_dir = repo.join(tag).join("1");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("model.py"), model_py).unwrap();
+        std::fs::write(
+            model_dir.join("config.yaml"),
+            "max_batch_size: 1\nbatch_timeout: 0.0\nstream: false\naccelerator: cpu\ndevices: 1\nworkers_per_device: 1\n",
+        )
+        .unwrap();
+        std::fs::write(model_dir.join("warmup_input.json"), "{\"input\": 7}").unwrap();
+
+        let registry = Arc::new(ModelRegistry::new());
+        let wm = WorkerManager::new(
+            registry.clone(),
+            repo.clone(),
+            Arc::new(InferenceQueue::new()),
+            "debug".to_string(),
+            Arc::new(CallbackRunner::new()),
+        );
+        let mut config = ModelConfig::default();
+        config.policies.warmup = Some(policy);
+        let result = wm.load_model(tag, "1", &config).await.map(|_| ());
+        (wm, registry, repo, result)
+    }
+
+    /// 100ms per predict (ASYNC sleep — a sync sleep would block the worker's
+    /// event loop and serialize everything, defeating the concurrency test);
+    /// appends one marker line per call.
+    #[cfg(unix)]
+    fn slow_marker_model(marker: &std::path::Path) -> String {
+        format!(
+            r#"from lite_server import LitAPI
+import asyncio
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        pass
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    async def predict(self, x):
+        with open({marker:?}, "a") as f:
+            f.write("w\n")
+        await asyncio.sleep(0.1)
+        return {{"output": x}}
+
+    def encode_response(self, output):
+        return output
+"#,
+            marker = marker.display().to_string()
+        )
+    }
+
+    /// G4: the per-iteration budget (30s here) must NOT be the only bound —
+    /// total_timeout_secs caps the whole run (all units across all workers).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warmup_total_timeout_fails_the_whole_run() {
+        let repo = std::env::temp_dir()
+            .join(format!("lite-server-b4-b4_total-{}", std::process::id()));
+        let policy = crate::config::WarmupPolicy {
+            enabled: true,
+            samples: vec![crate::config::WarmupSample {
+                input_ref: "warmup_input.json".to_string(),
+                iterations: 4,
+            }],
+            timeout_secs: 30.0,
+            total_timeout_secs: 0.25,
+            ..Default::default()
+        };
+        let (wm, _registry, repo, result) =
+            warmup_e2e_load("b4_total", &slow_marker_model(&repo.join("m.txt")), policy).await;
+        let err = result.expect_err("total timeout must fail the load");
+        assert!(
+            err.to_string().contains("total timeout"),
+            "reason must name the total budget, got: {err}"
+        );
+        assert_eq!(
+            crate::metrics::prometheus::MODEL_WARMUP_TOTAL
+                .with_label_values(&["b4_total", "1", "timeout"])
+                .get(),
+            1.0,
+            "a total-budget cut counts as status=timeout"
+        );
+        let _ = wm.unload_model("b4_total", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// G5: concurrency bounds the warmup wall time without dropping units.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warmup_concurrency_bounds_wall_time_and_runs_all_units() {
+        let repo = std::env::temp_dir()
+            .join(format!("lite-server-b4-b4_conc-{}", std::process::id()));
+        let marker = repo.join("marker.txt");
+        let policy = crate::config::WarmupPolicy {
+            enabled: true,
+            samples: vec![crate::config::WarmupSample {
+                input_ref: "warmup_input.json".to_string(),
+                iterations: 6,
+            }],
+            timeout_secs: 30.0,
+            concurrency: 3,
+            ..Default::default()
+        };
+        let (wm, _registry, repo, result) =
+            warmup_e2e_load("b4_conc", &slow_marker_model(&marker), policy).await;
+        result.expect("concurrent warmup must succeed");
+        let lines = std::fs::read_to_string(&marker)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(lines, 6, "every unit must run exactly once");
+        let wall = crate::metrics::prometheus::MODEL_WARMUP_DURATION
+            .with_label_values(&["b4_conc", "1"])
+            .get_sample_sum();
+        assert!(
+            wall < 0.5,
+            "6 x 100ms at concurrency 3 should take ~0.2s (serial: >=0.6s), took {wall:.3}s"
+        );
+        let _ = wm.unload_model("b4_conc", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// G7: retries absorb transient inference failures; zero retries keeps
+    /// the D33 fail-fast behavior.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warmup_retries_absorb_transient_failures() {
+        let repo = std::env::temp_dir()
+            .join(format!("lite-server-b4-b4_retry-{}", std::process::id()));
+        let counter = repo.join("calls.txt");
+        let model_py = format!(
+            r#"from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        self.calls = 0
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        self.calls += 1
+        with open({counter:?}, "w") as f:
+            f.write(str(self.calls))
+        if self.calls <= 2:
+            raise RuntimeError("transient")
+        return {{"output": x}}
+
+    def encode_response(self, output):
+        return output
+"#,
+            counter = counter.display().to_string()
+        );
+        let policy = crate::config::WarmupPolicy {
+            enabled: true,
+            samples: vec![crate::config::WarmupSample {
+                input_ref: "warmup_input.json".to_string(),
+                iterations: 1,
+            }],
+            timeout_secs: 30.0,
+            retries: 2,
+            ..Default::default()
+        };
+        let (wm, _registry, repo, result) = warmup_e2e_load("b4_retry", &model_py, policy).await;
+        result.expect("2 retries must absorb 2 transient failures");
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap(),
+            "3",
+            "1 initial attempt + 2 retries"
+        );
+        let _ = wm.unload_model("b4_retry", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warmup_zero_retries_keeps_fail_fast() {
+        let repo = std::env::temp_dir()
+            .join(format!("lite-server-b4-b4_noretry-{}", std::process::id()));
+        let counter = repo.join("calls.txt");
+        let model_py = format!(
+            r#"from lite_server import LitAPI
+
+
+class TestAPI(LitAPI):
+    def setup(self, device):
+        self.calls = 0
+
+    def decode_request(self, request):
+        return request.get("input", 0)
+
+    def predict(self, x):
+        self.calls += 1
+        with open({counter:?}, "w") as f:
+            f.write(str(self.calls))
+        raise RuntimeError("always")
+
+    def encode_response(self, output):
+        return output
+"#,
+            counter = counter.display().to_string()
+        );
+        let policy = crate::config::WarmupPolicy {
+            enabled: true,
+            samples: vec![crate::config::WarmupSample {
+                input_ref: "warmup_input.json".to_string(),
+                iterations: 1,
+            }],
+            timeout_secs: 30.0,
+            ..Default::default()
+        };
+        let (wm, _registry, repo, result) =
+            warmup_e2e_load("b4_noretry", &model_py, policy).await;
+        result.expect_err("no retries -> first failure fails the load (D33)");
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap(),
+            "1",
+            "exactly one attempt without retries"
+        );
+        let _ = wm.unload_model("b4_noretry", Some("1")).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
     fn warmup_plan_pinned_rewarm_covers_full_sample_set() {
         // G2: re-warming ONE replacement worker must run the full sample set
         // pinned to its slot — regardless of `scope` (a version-wide fraction
@@ -2419,6 +2806,9 @@ class TestAPI(LitAPI):
             iterations: None,
             scope: crate::config::WarmupScope::default(),
             respawn: true,
+            total_timeout_secs: 0.0,
+            concurrency: 1,
+            retries: 0,
         });
 
         let err = wm.load_model("l5_model", "1", &config).await.unwrap_err();

@@ -464,6 +464,28 @@ policies:
 { "prompt": "hello", "max_tokens": 8 }
 ```
 
+覆盖、恢复与可观测语义：
+
+- **每个 worker 都会被预热**(`scope: worker`，默认）：每个 worker 进程
+  有独立的引擎状态，因此全量样本会 pin 到每个 worker 上各跑一遍。
+  `scope: version` 则保持配置总量（Σ samples×iterations）不变，轮转
+  分摊到各 worker。
+- **respawn 重暖**(`respawn: true`，默认）：崩溃/健康剔除后的替补
+  worker 在版本回到 `ready` 之前先完成重暖（pin 到其槽位）。重暖失败
+  会把冷槽位熔断摘出——版本保持 `degraded`，熔断器的半开试探仍可在
+  后续真实流量上将其恢复——并计入
+  `liteserver_worker_respawn_failures_total{reason="warmup"}`；绝不会
+  把版本标记为 `failed`（运行期恢复 ≠ 加载失败）。
+- **预算与节奏**:`timeout_secs` 约束单次 dummy 推理；
+  `total_timeout_secs`（0 = 无）约束整个预热运行。`concurrency`
+  （默认 1 = 串行）并行化 worker 组内的 dummy 推理；`retries`（默认
+  0 = 快速失败）在同一 worker 上重跑失败样本，间隔 500ms。
+- **指标**:`liteserver_model_warmup_duration_seconds` 与
+  `liteserver_model_warmup_total{status=success|failure|timeout}`。
+  预热流量**不会**计入 `liteserver_inference_duration_seconds`、
+  `liteserver_batch_size` 或 `liteserver_worker_inference_total`——
+  这些序列保持纯真实流量信号。
+
 > 0.7.6 起，`RequireApiKey` / `Cors` / `RateLimit` / `LogRequests` 四个
 > Python policy callback 已移除——它们与 Rust 侧执行是双实现，且按 worker
 > 声明存在一致性隐患（"最后声明者胜"）。在 ``callbacks:`` 列表中引用这些

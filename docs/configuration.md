@@ -466,12 +466,18 @@ policies:
   request_log: {}                # Access log: method, path, status, elapsed
   warmup:                        # Warm the engine before serving (default off)
     enabled: true                #   false = version goes straight to Ready (no behavior change)
+    scope: worker                #   worker (default) = full sample set on EVERY worker process;
+                                 #   version = keep the configured total, round-robin across workers
+    respawn: true                #   re-warm a replacement worker after respawn (default true)
     samples:                     #   dummy inputs, consumed in order — one file per input
                                  #   shape/batch (M7; legacy dummy_input_ref/iterations removed)
       - input_ref: warmup/batch1.json   # dummy request-body JSON, relative to the model dir
         iterations: 3            #   dummy inferences for this sample (default 1)
       - input_ref: warmup/batch8.json   # another shape/batch (default iterations: 1)
-    timeout_secs: 30.0           #   per-warmup budget (0 = fall back to request_timeout; 0 there = no bound)
+    timeout_secs: 30.0           #   per-ITERATION budget (0 = fall back to request_timeout; 0 there = no bound)
+    total_timeout_secs: 0        #   whole-run budget across all units (0 = none, default)
+    concurrency: 1               #   dummy inferences in flight per worker group (default 1 = serial)
+    retries: 0                   #   retries per failed unit, 500ms apart (default 0 = fail-fast)
 
 # Callbacks (data hooks around the inference pipeline)
 callbacks:                     # Callback class paths loaded at worker startup

@@ -421,12 +421,18 @@ policies:
   request_log: {}                # 访问日志：方法、路径、状态码、耗时
   warmup:                        # 服务前预热引擎（默认关闭）
     enabled: true                #   false = 版本直接置 Ready（行为不变）
+    scope: worker                #   worker（默认）= 每个 worker 进程都跑全量样本；
+                                 #   version = 总量不变，轮转摊到各 worker
+    respawn: true                #   respawn 后对替补 worker 重新预热（默认 true）
     samples:                     #   dummy 输入列表，按序消费——每样本一个文件覆盖一种
                                  #   输入形状/batch（M7；旧 dummy_input_ref/iterations 已移除）
       - input_ref: warmup/batch1.json   # dummy 请求体 JSON 路径，相对模型目录
         iterations: 3            #   该样本的 dummy 推理次数（默认 1）
       - input_ref: warmup/batch8.json   # 另一形状/batch（iterations 缺省 1）
-    timeout_secs: 30.0           #   单次预热预算（0 = 回退到 request_timeout；二者皆 0 = 无上限）
+    timeout_secs: 30.0           #   单次 dummy 推理预算（0 = 回退到 request_timeout；二者皆 0 = 无上限）
+    total_timeout_secs: 0        #   整个预热运行的总预算（0 = 无，默认）
+    concurrency: 1               #   每个 worker 组内并发的 dummy 推理数（默认 1 = 串行）
+    retries: 0                   #   单样本失败重试次数，间隔 500ms（默认 0 = 快速失败）
 
 # Callback（推理管线数据钩子）
 callbacks:                     # Worker 启动时加载的 callback 类路径列表

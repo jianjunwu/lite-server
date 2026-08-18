@@ -475,6 +475,30 @@ policies:
 { "prompt": "hello", "max_tokens": 8 }
 ```
 
+Coverage, recovery, and observability semantics:
+
+- **Every worker is warmed** (`scope: worker`, default): each worker process
+  owns separate engine state, so the full sample set runs pinned to every
+  worker. `scope: version` instead keeps the configured total
+  (Σ samples×iterations) and round-robins it across workers.
+- **Respawn re-warm** (`respawn: true`, default): a replacement worker after
+  a crash/health-kill is re-warmed (pinned to its slot) before the version
+  returns to `ready`. A failed re-warm ejects the cold slot — the version
+  stays `degraded` and the circuit's half-open probe can still recover it on
+  later traffic — and counts
+  `liteserver_worker_respawn_failures_total{reason="warmup"}`; it never marks
+  the version `failed` (runtime recovery ≠ load failure).
+- **Budgets and pacing**: `timeout_secs` bounds each dummy inference;
+  `total_timeout_secs` (0 = none) bounds the whole run across all units.
+  `concurrency` (default 1 = serial) parallelizes units within a worker
+  group; `retries` (default 0 = fail-fast) re-runs a failed unit on the same
+  worker, 500ms apart.
+- **Metrics**: `liteserver_model_warmup_duration_seconds` and
+  `liteserver_model_warmup_total{status=success|failure|timeout}`. Warmup
+  traffic does NOT count toward `liteserver_inference_duration_seconds`,
+  `liteserver_batch_size`, or `liteserver_worker_inference_total` — those
+  series stay pure real-traffic signals.
+
 > Since 0.7.6, the four Python policy callbacks (`RequireApiKey`, `Cors`,
 > `RateLimit`, `LogRequests`) are removed — they duplicated the Rust-side
 > enforcement, and per-worker declaration had a last-declaration-wins

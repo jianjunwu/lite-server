@@ -56,6 +56,25 @@ series removed on the next scrape rather than frozen at its last value; PID
 reuse is detected via the process start time. The aggregate only sums live
 workers.
 
+### Warmup metrics
+
+Added in 0.9.0. Both families are recorded once per terminal warmup run —
+the load-time run and each respawn re-warm (`warmup.respawn`) alike — and are
+purged on version unload.
+
+| Metric | Labels | Notes |
+|---|---|---|
+| `liteserver_model_warmup_duration_seconds` | `model, version` | Whole-run wall time (all samples × iterations × worker shares), observed on success AND failure — a failed run's wall time is diagnostic too. |
+| `liteserver_model_warmup_total` | `model, version, status` | `status` ∈ `success` \| `failure` \| `timeout` (closed enum; `timeout` covers both the per-iteration and the `total_timeout_secs` budget). |
+
+Warmup traffic is synthetic: it never counts toward
+`liteserver_inference_duration_seconds`, `liteserver_batch_size`, or
+`liteserver_worker_inference_total`, so those series stay pure real-traffic
+signals (a mixed batch — respawn re-warm overlapping live traffic — records
+normally because it carries real requests). Respawn re-warm failures
+additionally count
+`liteserver_worker_respawn_failures_total{reason="warmup"}`.
+
 ### Streaming metrics
 
 The detailed stream-lifecycle metrics below are gated by
